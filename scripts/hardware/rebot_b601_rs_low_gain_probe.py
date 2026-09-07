@@ -39,8 +39,11 @@ backend).  This is deliberately not a position lock: software Kp is zero,
 gravity is recomputed from the current measured pose every cycle, and one
 moderate damping owner opposes motion.  The current feedback pose is used only
 as the next MIT reference so a human can drag the arm while gravity remains
-compensated.  A second Ctrl-C/SIGUSR1, or an actual feedback, numeric, or
-dispatch failure, requests the full six-joint safe stop.
+compensated.  A receive, numeric, motion-monitor, or model failure first falls
+back to the last completely dispatched pose and gravity-only torque while
+motor-local damping remains active when configured.  A second Ctrl-C/SIGUSR1,
+or repeated inability to dispatch both live and cached complete six-joint
+frames, requests the full six-joint safe stop.
 
 This module is motion-capable only after all of ``--allow-motion``,
 ``--auto-disable`` and the exact confirmation string are supplied.  The
@@ -821,9 +824,9 @@ def _validate_protective_hold_feedback(
     gravity-compensation reference, which is what makes the hold draggable.
     ``hold_qpos_rad`` and ``max_rebase_rad`` remain in the helper signature so
     callers and older evidence readers can pass the original admission data;
-    they are deliberately not used as a drift watchdog.  A real feedback,
-    age, or velocity failure still escalates to the caller's full-disable
-    fallback.
+    they are deliberately not used as a drift watchdog.  A feedback, age, or
+    velocity failure rejects only this live sample; the caller may continue
+    with its previously verified gravity-only cache.
     """
 
     # Validate the initial reference shape for evidence compatibility, but do
@@ -2437,7 +2440,7 @@ def _send_fault_hold_command(
     torque_limits_nm: tuple[float, ...],
     rate_hz: float,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
-) -> tuple[B601CommandReceipt, tuple[float, ...]]:
+) -> tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
     """Send one bounded all-arm gravity/damping MIT frame.
 
     ``qpos_rad`` is the current measured pose used as the next reference.  The
@@ -2453,7 +2456,7 @@ def _send_fault_hold_command(
         qpos_rad=qpos_rad,
         qvel_rad_s=_ZERO_SIX,
     )
-    requested = compute_software_torque(
+    breakdown = compute_software_torque_breakdown(
         model,
         reference=reference,
         measured_qpos_rad=measured_qpos_rad,
@@ -2462,7 +2465,7 @@ def _send_fault_hold_command(
         gravity_scale=gravity_scale,
     )
     conditioned, _torque_limited, _slew_limited = condition_torque(
-        requested,
+        breakdown.requested_torque_nm,
         previous_tau,
         absolute_limits_nm=torque_limits_nm,
         max_rate_nm_s=profile.max_torque_rate_nm_s,
@@ -2476,7 +2479,60 @@ def _send_fault_hold_command(
         torque_limits_nm=torque_limits_nm,
         joint_names=_FAULT_HOLD_JOINTS,
     )
-    return receipt, conditioned
+    return receipt, conditioned, _six(
+        breakdown.gravity_torque_nm,
+        name="fault_hold_gravity_tau_nm",
+    )
+
+
+def _send_cached_fault_hold_command(
+    backend: B601RSBackend,
+    *,
+    qpos_rad: tuple[float, ...],
+    gravity_tau_nm: tuple[float, ...],
+    previous_tau: tuple[float, ...],
+    profile: B601MitControlProfile,
+    torque_limits_nm: tuple[float, ...],
+    rate_hz: float,
+    driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
+) -> tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+    """Send a model-free degraded hold frame from the last verified cache.
+
+    The cached term is gravity only: position, Cartesian impedance, and stale
+    software-velocity damping are deliberately excluded.  Motor-local damping
+    remains active when configured.  The cached target still passes through
+    the existing absolute and slew-rate conditioner before all six joints are
+    dispatched.
+    """
+
+    period = 1.0 / _positive(rate_hz, name="rate_hz")
+    cached_q = _six(qpos_rad, name="cached_fault_hold_qpos_rad")
+    cached_gravity = _six(
+        gravity_tau_nm,
+        name="cached_fault_hold_gravity_tau_nm",
+    )
+    conditioned, _torque_limited, _slew_limited = condition_torque(
+        cached_gravity,
+        previous_tau,
+        absolute_limits_nm=torque_limits_nm,
+        max_rate_nm_s=profile.max_torque_rate_nm_s,
+        dt_sec=period,
+    )
+    reference = build_reference(
+        sequence=0,
+        timestamp_sec=time.monotonic(),
+        qpos_rad=cached_q,
+        qvel_rad_s=_ZERO_SIX,
+    )
+    receipt = backend.send_mit(
+        reference,
+        kp=_ZERO_SIX,
+        kd=_six(driver_kd_nm_s_per_rad, name="driver_kd_nm_s_per_rad"),
+        tau_nm=conditioned,
+        torque_limits_nm=torque_limits_nm,
+        joint_names=_FAULT_HOLD_JOINTS,
+    )
+    return receipt, conditioned, cached_gravity
 
 
 def _run_latched_fault_hold(
@@ -2506,6 +2562,10 @@ def _run_latched_fault_hold(
     fault_entry_max_velocity_rad_s: float | None = None,
     monitor_velocity_rad_s: float | None = None,
     monitor_acceleration_rad_s2: float | None = None,
+    cached_qpos_rad: tuple[float, ...] | None = None,
+    cached_gravity_tau_nm: tuple[float, ...] | None = None,
+    degraded_entry_reason: str | None = None,
+    degraded_telemetry: dict[str, object] | None = None,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -2526,10 +2586,12 @@ def _run_latched_fault_hold(
     as ``hold_profile`` has software Kp=0 and one damping owner.  Each later
     feedback sample becomes the next reference, and gravity is recomputed from
     that pose, so an operator can drag the arm without a fixed-position fight.
-    A configured velocity/acceleration monitor still catches genuinely
-    unprocessable motion; invalid feedback or dispatch failure immediately
-    falls back to an all-arm safe stop.  The loop has no time-based release:
-    only the explicit SIGUSR1 handler or a second Ctrl-C requests that stop.
+    A configured velocity/acceleration monitor still catches untrusted motion.
+    Receive, numeric, and model failures enter a model-free degraded hold using
+    the last verified pose and gravity-only torque.  A complete-frame dispatch
+    is retried once; full disable is reserved for an explicit request or when
+    neither the live nor cached all-six-joint frame can be sent completely.
+    The loop has no time-based release.
 
     max_iterations exists only for bounded offline tests; production calls
     leave it as None and therefore remain latched until release.
@@ -2556,6 +2618,95 @@ def _run_latched_fault_hold(
     first_hold_receipt: B601CommandReceipt | None = None
     non_hold_disable_receipt: B601ModeReceipt | None = None
     full_disable_receipt: B601ModeReceipt | None = None
+    telemetry = degraded_telemetry if degraded_telemetry is not None else {}
+    telemetry.setdefault("entry_count", 0)
+    telemetry.setdefault("recovery_count", 0)
+    telemetry.setdefault("command_count", 0)
+    telemetry.setdefault("reason_counts", {})
+    telemetry.setdefault("last_reason", None)
+    telemetry.setdefault("tx_retry_count", 0)
+    telemetry.setdefault("tx_retry_recovered_count", 0)
+    telemetry.setdefault("escalation_reason", None)
+    driver_damping_available = any(
+        value > 0.0
+        for value in _six(
+            driver_kd_nm_s_per_rad,
+            name="driver_kd_nm_s_per_rad",
+        )
+    )
+    telemetry["motor_local_damping_available"] = driver_damping_available
+    degraded_active = False
+
+    def record_degraded(category: str, detail: str) -> None:
+        nonlocal degraded_active
+        reason_counts = telemetry["reason_counts"]
+        if not isinstance(reason_counts, dict):
+            raise TypeError("degraded telemetry reason_counts must be a dict")
+        reason_counts[category] = int(reason_counts.get(category, 0)) + 1
+        telemetry["last_reason"] = detail
+        if degraded_active:
+            return
+        degraded_active = True
+        telemetry["entry_count"] = int(telemetry["entry_count"]) + 1
+        if int(telemetry["entry_count"]) > 1:
+            print(f"[B601] protective hold degraded again: {detail}", flush=True)
+            return
+        damping_note = (
+            "motor-local damping remains active"
+            if driver_damping_available
+            else "no motor-local damping is configured"
+        )
+        _operator_notice(
+            "[B601] PROTECTIVE HOLD DEGRADED: using last verified gravity; "
+            f"{damping_note} while live feedback/control recovers."
+        )
+
+    def record_recovery() -> None:
+        nonlocal degraded_active
+        if not degraded_active:
+            return
+        degraded_active = False
+        telemetry["recovery_count"] = int(telemetry["recovery_count"]) + 1
+        if int(telemetry["recovery_count"]) == 1:
+            _operator_notice(
+                "[B601] PROTECTIVE HOLD RECOVERED: live gravity update resumed."
+            )
+        else:
+            print("[B601] protective hold live update recovered again", flush=True)
+
+    def attempt_complete_frame(
+        sender: Callable[
+            [],
+            tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]],
+        ],
+        *,
+        context: str,
+    ) -> tuple[
+        tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]] | None,
+        tuple[str, ...],
+    ]:
+        """Try one complete frame and one immediate same-frame retry."""
+
+        failures: list[str] = []
+        for attempt in range(2):
+            try:
+                result = sender()
+            except Exception as exc:  # noqa: BLE001 - retry then preserve evidence
+                failures.append(f"{context}: {exc}")
+            else:
+                receipt = result[0]
+                if receipt.accepted:
+                    if attempt:
+                        telemetry["tx_retry_recovered_count"] = (
+                            int(telemetry["tx_retry_recovered_count"]) + 1
+                        )
+                    return result, tuple(failures)
+                failures.extend(
+                    receipt.errors or (f"{context}: incomplete six-joint dispatch",)
+                )
+            if attempt == 0:
+                telemetry["tx_retry_count"] = int(telemetry["tx_retry_count"]) + 1
+        return None, tuple(failures)
 
     def full_disable_fallback() -> None:
         nonlocal full_disable_receipt
@@ -2571,8 +2722,73 @@ def _run_latched_fault_hold(
         except Exception as exc:  # noqa: BLE001 - preserve safety evidence
             errors.append(f"full safe_stop: {exc}")
 
+    cached_q: tuple[float, ...] | None = None
+    cached_gravity: tuple[float, ...] | None = (
+        None
+        if cached_gravity_tau_nm is None
+        else _six(cached_gravity_tau_nm, name="cached_gravity_tau_nm")
+    )
+
+    def attempt_cached_frame(
+        context: str,
+    ) -> tuple[
+        tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]] | None,
+        tuple[str, ...],
+    ]:
+        if cached_q is None or cached_gravity is None:
+            return None, (f"{context}: no verified pose/gravity cache",)
+        return attempt_complete_frame(
+            lambda: _send_cached_fault_hold_command(
+                backend,
+                qpos_rad=cached_q,
+                gravity_tau_nm=cached_gravity,
+                previous_tau=latest_tau,
+                profile=command_profile,
+                torque_limits_nm=torque_limits_nm,
+                rate_hz=rate_hz,
+                driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+            ),
+            context=context,
+        )
+
     try:
-        if fault_entry:
+        cache_source_q = cached_qpos_rad if cached_qpos_rad is not None else qpos_rad
+        if cache_source_q is not None:
+            cached_q = _validate_in_limit_qpos(
+                cache_source_q,
+                position_limits_rad=position_limits_rad,
+                name="cached_fault_hold_qpos_rad",
+            )
+        if degraded_entry_reason is not None:
+            if cached_q is None or cached_gravity is None:
+                raise LowGainProbeError(
+                    "degraded fault hold requires a verified pose and gravity cache"
+                )
+            record_degraded("entry_without_live_feedback", degraded_entry_reason)
+            first_result, first_failures = attempt_cached_frame(
+                "degraded fault hold entry"
+            )
+            if first_result is None:
+                errors.extend(first_failures)
+                telemetry["escalation_reason"] = (
+                    "cached all-six-joint hold dispatch failed after retry"
+                )
+                full_disable_fallback()
+                return (
+                    hold_commands,
+                    latest_tau,
+                    first_hold_receipt,
+                    non_hold_disable_receipt,
+                    full_disable_receipt,
+                    errors,
+                )
+            first_hold_receipt, latest_tau, cached_gravity = first_result
+            hold_commands = 1
+            telemetry["command_count"] = int(telemetry["command_count"]) + 1
+            measured_qpos = cached_q
+            measured_qvel = _ZERO_SIX
+            hold_q = cached_q
+        elif fault_entry:
             if fault_qpos_rad is None or fault_qvel_rad_s is None:
                 raise LowGainProbeError(
                     "fault hold requires a complete current fault snapshot"
@@ -2618,23 +2834,78 @@ def _run_latched_fault_hold(
                 if fault_qvel_rad_s is not None and not operator_interrupt
                 else qvel_rad_s
             )
-        first_hold_receipt, latest_tau = _send_fault_hold_command(
-            backend,
-            model,
-            qpos_rad=hold_q,
-            measured_qpos_rad=_six(measured_qpos, name="fault_measured_qpos_rad"),
-            measured_qvel_rad_s=_six(measured_qvel, name="fault_measured_qvel_rad_s"),
-            profile=command_profile,
-            gravity_scale=gravity_scale,
-            previous_tau=latest_tau,
-            torque_limits_nm=torque_limits_nm,
-            rate_hz=rate_hz,
-            driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+        if degraded_entry_reason is None:
+            first_result, first_failures = attempt_complete_frame(
+                lambda: _send_fault_hold_command(
+                    backend,
+                    model,
+                    qpos_rad=hold_q,
+                    measured_qpos_rad=_six(
+                        measured_qpos,
+                        name="fault_measured_qpos_rad",
+                    ),
+                    measured_qvel_rad_s=_six(
+                        measured_qvel,
+                        name="fault_measured_qvel_rad_s",
+                    ),
+                    profile=command_profile,
+                    gravity_scale=gravity_scale,
+                    previous_tau=latest_tau,
+                    torque_limits_nm=torque_limits_nm,
+                    rate_hz=rate_hz,
+                    driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                ),
+                context="fault hold entry",
+            )
+            if first_result is None:
+                if cached_q is None or cached_gravity is None:
+                    errors.extend(first_failures)
+                    telemetry["escalation_reason"] = (
+                        "no verified gravity cache after hold entry failure"
+                    )
+                    full_disable_fallback()
+                    return (
+                        hold_commands,
+                        latest_tau,
+                        first_hold_receipt,
+                        non_hold_disable_receipt,
+                        full_disable_receipt,
+                        errors,
+                    )
+                record_degraded("entry_control_failure", "; ".join(first_failures))
+                first_result, cached_failures = attempt_cached_frame(
+                    "cached fault hold entry"
+                )
+                if first_result is None:
+                    errors.extend(first_failures)
+                    errors.extend(cached_failures)
+                    telemetry["escalation_reason"] = (
+                        "live and cached all-six-joint hold dispatch failed after retry"
+                    )
+                    full_disable_fallback()
+                    return (
+                        hold_commands,
+                        latest_tau,
+                        first_hold_receipt,
+                        non_hold_disable_receipt,
+                        full_disable_receipt,
+                        errors,
+                    )
+            first_hold_receipt, latest_tau, cached_gravity = first_result
+            cached_q = hold_q
+            hold_commands = 1
+            telemetry["command_count"] = int(telemetry["command_count"]) + 1
+    except Exception as exc:  # noqa: BLE001 - preserve safety evidence
+        detail = f"fault hold entry: {exc}"
+        record_degraded("entry_validation_or_control_failure", detail)
+        first_result, cached_failures = attempt_cached_frame(
+            "cached fault hold after entry failure"
         )
-        if not first_hold_receipt.accepted:
-            errors.extend(
-                first_hold_receipt.errors
-                or ("fault hold MIT dispatch was incomplete",)
+        if first_result is None:
+            errors.append(detail)
+            errors.extend(cached_failures)
+            telemetry["escalation_reason"] = (
+                "entry failed and cached six-joint hold could not be dispatched"
             )
             full_disable_fallback()
             return (
@@ -2645,18 +2916,12 @@ def _run_latched_fault_hold(
                 full_disable_receipt,
                 errors,
             )
+        first_hold_receipt, latest_tau, cached_gravity = first_result
+        measured_qpos = cached_q
+        measured_qvel = _ZERO_SIX
+        hold_q = cached_q
         hold_commands = 1
-    except Exception as exc:  # noqa: BLE001 - preserve safety evidence
-        errors.append(f"fault hold: {exc}")
-        full_disable_fallback()
-        return (
-            hold_commands,
-            latest_tau,
-            first_hold_receipt,
-            non_hold_disable_receipt,
-            full_disable_receipt,
-            errors,
-        )
+        telemetry["command_count"] = int(telemetry["command_count"]) + 1
 
     # The protective hold owns the complete arm set.  There is intentionally
     # no partial ``safe_stop`` here: disabling joints 1/4/5/6 would turn a
@@ -2678,6 +2943,13 @@ def _run_latched_fault_hold(
     while not stop.get("full_disable_requested", False):
         if max_iterations is not None and hold_commands >= max_iterations:
             break
+        cycle_error: Exception | None = None
+        cycle_result: tuple[
+            B601CommandReceipt,
+            tuple[float, ...],
+            tuple[float, ...],
+        ] | None = None
+        cycle_failures: tuple[str, ...] = ()
         try:
             state = backend.poll_feedback(request_feedback=True)
             observed_at = time.monotonic()
@@ -2761,25 +3033,29 @@ def _run_latched_fault_hold(
                 )
             if stop.get("full_disable_requested", False):
                 break
-            receipt, latest_tau = _send_fault_hold_command(
-                backend,
-                model,
-                qpos_rad=measured_q,
-                measured_qpos_rad=measured_q,
-                measured_qvel_rad_s=monitor_qvel,
-                profile=command_profile,
-                gravity_scale=gravity_scale,
-                previous_tau=latest_tau,
-                torque_limits_nm=torque_limits_nm,
-                rate_hz=rate_hz,
-                driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+            cycle_result, cycle_failures = attempt_complete_frame(
+                lambda measured_q=measured_q,
+                monitor_qvel=monitor_qvel,
+                previous_tau=latest_tau: _send_fault_hold_command(
+                    backend,
+                    model,
+                    qpos_rad=measured_q,
+                    measured_qpos_rad=measured_q,
+                    measured_qvel_rad_s=monitor_qvel,
+                    profile=command_profile,
+                    gravity_scale=gravity_scale,
+                    previous_tau=previous_tau,
+                    torque_limits_nm=torque_limits_nm,
+                    rate_hz=rate_hz,
+                    driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                ),
+                context="live protective hold",
             )
-            if not receipt.accepted:
-                errors.extend(
-                    receipt.errors or ("fault hold MIT dispatch was incomplete",)
-                )
-                full_disable_fallback()
-                break
+        except Exception as exc:  # noqa: BLE001 - preserve safety evidence
+            cycle_error = exc
+        if cycle_result is not None:
+            _receipt, latest_tau, cached_gravity = cycle_result
+            cached_q = measured_q
             hold_commands += 1
             monitor_q = measured_q
             monitor_previous_qvel = _six(
@@ -2787,15 +3063,46 @@ def _run_latched_fault_hold(
                 name="protective_hold_monitor_qvel_rad_s",
             )
             monitor_observed_at = observed_at
-        except Exception as exc:  # noqa: BLE001 - preserve safety evidence
-            errors.append(f"fault hold: {exc}")
-            full_disable_fallback()
-            break
+            telemetry["command_count"] = int(telemetry["command_count"]) + 1
+            record_recovery()
+        else:
+            detail = (
+                f"fault hold: {cycle_error}"
+                if cycle_error is not None
+                else "; ".join(cycle_failures)
+            )
+            category = (
+                "feedback_or_control_failure"
+                if cycle_error is not None
+                else "live_dispatch_failure"
+            )
+            record_degraded(category, detail)
+            monitor_baseline_pending = True
+            if cached_q is None or cached_gravity is None:
+                errors.append(detail)
+                telemetry["escalation_reason"] = "no verified degraded hold cache"
+                full_disable_fallback()
+                break
+            cached_result, cached_failures = attempt_cached_frame(
+                "degraded protective hold"
+            )
+            if cached_result is None:
+                errors.append(detail)
+                errors.extend(cached_failures)
+                telemetry["escalation_reason"] = (
+                    "live and cached all-six-joint hold dispatch failed after retry"
+                )
+                full_disable_fallback()
+                break
+            _receipt, latest_tau, cached_gravity = cached_result
+            hold_commands += 1
+            telemetry["command_count"] = int(telemetry["command_count"]) + 1
         if max_iterations is not None and hold_commands >= max_iterations:
             break
         time.sleep(period)
 
     if stop.get("full_disable_requested", False):
+        telemetry["escalation_reason"] = "explicit second stop request"
         full_disable_fallback()
     return (
         hold_commands,
@@ -2902,6 +3209,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     previous_feedback_time: float | None = None
     previous_guard_qvel: tuple[float, ...] | None = None
     previous_tau = _ZERO_SIX
+    last_verified_gravity_tau: tuple[float, ...] | None = None
     initial_q: tuple[float, ...] | None = None
     final_q: tuple[float, ...] | None = None
     cartesian_anchor_position_m: tuple[float, ...] | None = None
@@ -2942,6 +3250,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     protective_hold_non_hold_receipt: B601ModeReceipt | None = None
     protective_hold_full_disable_receipt: B601ModeReceipt | None = None
     protective_hold_reference_source: str | None = None
+    protective_hold_degraded: dict[str, object] = {
+        "entry_count": 0,
+        "recovery_count": 0,
+        "command_count": 0,
+        "reason_counts": {},
+        "last_reason": None,
+        "tx_retry_count": 0,
+        "tx_retry_recovered_count": 0,
+        "escalation_reason": None,
+    }
     startup_lock_first_receipt: B601CommandReceipt | None = None
     startup_lock_commands = 0
     arming_settle_torque_commands = 0
@@ -3157,6 +3475,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         startup_lock_commands = 1
         arming_settle_torque_commands = 1
         previous_tau = lock_tau
+        last_verified_gravity_tau = _six(
+            lock_breakdown.gravity_torque_nm,
+            name="startup_lock_gravity_tau_nm",
+        )
         set_startup_state("LOCKED")
         arming_settle_started_at_sec = time.monotonic()
         arming_settle_previous_q = arming_q
@@ -3250,6 +3572,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             startup_lock_commands += 1
             arming_settle_torque_commands += 1
             previous_tau = lock_tau
+            last_verified_gravity_tau = _six(
+                lock_breakdown.gravity_torque_nm,
+                name="arming_settle_gravity_tau_nm",
+            )
             arming_settle_previous_feedback_time = settle_state.receive_timestamp_sec
             arming_settle_last_observed_at_sec = settle_observed_at_sec
             arming_settle_samples += 1
@@ -3691,6 +4017,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             previous_feedback_time = state.receive_timestamp_sec
             previous_guard_qvel = tuple(float(value) for value in qvel)
             previous_tau = conditioned_tau
+            last_verified_gravity_tau = _six(
+                torque_breakdown.gravity_torque_nm,
+                name="active_gravity_tau_nm",
+            )
             if safe_candidate_q is not None:
                 last_safe_q = safe_candidate_q
                 last_safe_qvel = tuple(float(value) for value in qvel)
@@ -3763,20 +4093,45 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 # frame is still available, use the same bounded current-fault
                 # admission as a handled position error instead of dropping
                 # the whole arm immediately.
-                fault_entry = (
-                    not operator_interrupt or not safe_snapshot_available
-                )
-                can_attempt_hold = (
-                    fault_snapshot_available if fault_entry else safe_snapshot_available
-                )
+                degraded_entry_reason: str | None = None
+                if operator_interrupt and safe_snapshot_available:
+                    fault_entry = False
+                    can_attempt_hold = True
+                elif fault_snapshot_available:
+                    fault_entry = True
+                    can_attempt_hold = True
+                elif previous_q is not None and last_verified_gravity_tau is not None:
+                    # Loss of the current RX/control sample does not prove loss
+                    # of the TX path.  Enter a zero-Kp cached-gravity hold and
+                    # continue polling instead of dropping a loaded arm.
+                    fault_entry = False
+                    can_attempt_hold = True
+                    degraded_entry_reason = (
+                        stop_reason
+                        or str(primary_error)
+                        or "live fault snapshot unavailable"
+                    )
+                else:
+                    fault_entry = False
+                    can_attempt_hold = False
                 if can_attempt_hold:
-                    if fault_entry:
+                    if degraded_entry_reason is not None:
+                        stop["requested"] = True
+                        hold_qpos = previous_q
+                        hold_qvel = _ZERO_SIX
+                        hold_age_sec = math.inf
+                        protective_hold_reference_source = (
+                            "last_complete_command_cache"
+                        )
+                    elif fault_entry:
                         # A handled control/position fault already consumed
                         # the first protective event.  Treat the latched hold
                         # as the first stop request so one subsequent Ctrl-C
                         # (or SIGUSR1) escalates directly to full disable.
                         stop["requested"] = True
-                    if fault_entry:
+                    if degraded_entry_reason is not None:
+                        pass
+                    elif fault_entry:
                         if fault_observed_at_sec is None:
                             fault_age_sec = math.inf
                         else:
@@ -3833,6 +4188,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             fault_entry_max_velocity_rad_s=args.velocity_abort_rad_s,
                             monitor_velocity_rad_s=args.velocity_abort_rad_s,
                             monitor_acceleration_rad_s2=args.acceleration_abort_rad_s2,
+                            cached_qpos_rad=previous_q,
+                            cached_gravity_tau_nm=last_verified_gravity_tau,
+                            degraded_entry_reason=degraded_entry_reason,
+                            degraded_telemetry=protective_hold_degraded,
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
@@ -3846,8 +4205,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         if protective_hold_full_disable_receipt is not None:
                             cleanup_receipt = protective_hold_full_disable_receipt
                         # A successful operator hold is intentionally
-                        # long-lived. The second Ctrl-C/SIGUSR1 or a hold
-                        # validation failure is what authorizes full disable.
+                        # long-lived. The second Ctrl-C/SIGUSR1 or inability
+                        # to send both live and cached complete frames is what
+                        # authorizes full disable.
                         protective_hold_remains_latched = (
                             protective_hold_latched
                             and not hold_errors
@@ -3859,7 +4219,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         protective_hold_remains_latched = False
                 else:
                     cleanup_errors.append(
-                        "protective hold refused: no complete current fault snapshot"
+                        "protective hold refused: no verified pose/gravity cache"
+                    )
+                    protective_hold_degraded["escalation_reason"] = (
+                        "no verified pose/gravity cache"
                     )
                     protective_hold_remains_latched = False
                 if not protective_hold_remains_latched:
@@ -4087,6 +4450,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "reference_velocity_rad_s": _ZERO_SIX,
             "motion_velocity_limit_rad_s": args.velocity_abort_rad_s,
             "motion_acceleration_limit_rad_s2": args.acceleration_abort_rad_s2,
+            "degraded": {
+                **protective_hold_degraded,
+                "cache_semantics": (
+                    "last_complete_command_pose_plus_gravity_only; no position or "
+                    "Cartesian overlay; configured driver damping remains active"
+                ),
+                "software_damping_when_feedback_untrusted": False,
+                "complete_frame_retry_policy": "one immediate retry",
+                "full_disable_policy": (
+                    "explicit second stop or live-and-cached six-joint dispatch failure"
+                ),
+            },
         },
         "fault_hold_candidate_admission": {
             "accepted_count": fault_hold_candidate_accepted_count,
@@ -4252,9 +4627,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Human-run commissioning only; automated tests never execute this active path.",
             "The active set is the target plus explicitly selected support joints; scheme-1 J6 commissioning selects all six arm joints while only the J6 reference changes.",
             "On an exceptional stop, joint1..joint6 remain in the protective gravity/damping hold; joint7 is outside this backend, and SIGUSR1 or a second Ctrl-C requests full disable.",
-            "Protective hold admits a fresh stationary last-safe snapshot for a normal operator stop, or a complete current in-limit fault snapshot below the motion-abort velocity; otherwise it falls back to full safe_stop.",
+            "Protective hold normally admits a fresh stationary last-safe snapshot for an operator stop or a complete current in-limit fault snapshot; if RX/control has already failed, it can enter degraded hold from the pose and pure-gravity cache paired with the last complete six-joint dispatch.",
             "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
-            "While latched, every hold cycle validates a complete feedback snapshot and motion limits, then uses the current pose as the next gravity-compensation reference; any failure falls back to full safe_stop.",
+            "While latched, a valid cycle updates gravity from current feedback; RX, numeric, motion-monitor, or model failure keeps sending cached gravity with zero Kp and configured motor-local damping while feedback recovery is retried.",
+            "A complete six-joint MIT command is retried once; only failure of both live and cached complete-frame dispatch, absence of any verified cache, or an explicit second stop request permits full safe_stop.",
             "Protective hold has software Kp=0 and one derivative owner per joint: explicit driver Kd suppresses the default software damping for that joint; no two damping terms are stacked.",
             "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
@@ -4345,7 +4721,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
         help=(
             "software damping used by the draggable Ctrl-C protective hold "
-            "when no non-zero --driver-kd is selected"
+            "while feedback remains valid and no non-zero --driver-kd is selected"
         ),
     )
     parser.add_argument("--gravity-scale", type=float, default=_DEFAULT_GRAVITY_SCALE)

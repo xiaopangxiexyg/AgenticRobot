@@ -994,6 +994,71 @@ def _fault_hold_limits() -> tuple[tuple[float, float], ...]:
     )
 
 
+def _fault_hold_command_receipt(
+    *,
+    accepted: bool,
+    sequence: int = 1,
+) -> probe.B601CommandReceipt:
+    sent = tuple(probe._ALL_JOINTS) if accepted else tuple(probe._ALL_JOINTS[:-1])
+    failed = () if accepted else (probe._ALL_JOINTS[-1],)
+    return probe.B601CommandReceipt(
+        sequence=sequence,
+        mode="mit",
+        frame_id="b601_rs/joint_mit_reference",
+        requested_at_sec=1.0,
+        completed_at_sec=1.0,
+        requested_joint_names=tuple(probe._ALL_JOINTS),
+        sent_joint_names=sent,
+        failed_joint_names=failed,
+        errors=() if accepted else ("simulated incomplete dispatch",),
+        accepted=accepted,
+    )
+
+
+class _FaultHoldBackend:
+    def __init__(
+        self,
+        *,
+        feedback: tuple[object, ...] = (),
+        cached_receipts: tuple[probe.B601CommandReceipt, ...] = (),
+        allow_safe_stop: bool = False,
+    ) -> None:
+        self.feedback = list(feedback)
+        self.cached_receipts = list(cached_receipts)
+        self.allow_safe_stop = allow_safe_stop
+        self.cached_dispatches: list[dict[str, object]] = []
+        self.safe_stop_names: list[tuple[str, ...]] = []
+
+    def poll_feedback(self, *, request_feedback: bool) -> object:
+        assert request_feedback is True
+        if not self.feedback:
+            raise AssertionError("unexpected feedback poll")
+        return self.feedback.pop(0)
+
+    def send_mit(
+        self,
+        reference: object,
+        **kwargs: object,
+    ) -> probe.B601CommandReceipt:
+        self.cached_dispatches.append({"reference": reference, **kwargs})
+        if not self.cached_receipts:
+            raise AssertionError("unexpected cached MIT dispatch")
+        return self.cached_receipts.pop(0)
+
+    def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+        self.safe_stop_names.append(tuple(joint_names))
+        if not self.allow_safe_stop:
+            raise AssertionError(f"unexpected safe_stop for {joint_names}")
+        return probe.B601ModeReceipt(
+            operation="full_safe_stop",
+            requested_joint_names=tuple(joint_names),
+            completed_joint_names=tuple(joint_names),
+            failed_joint_names=(),
+            errors=(),
+            completed=True,
+        )
+
+
 def test_fault_hold_snapshot_accepts_only_fresh_stationary_in_limit_state() -> None:
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
 
@@ -1202,7 +1267,7 @@ def test_latched_protective_hold_references_current_pose_after_manual_drag(
         qpos_rad: tuple[float, ...],
         measured_qvel_rad_s: tuple[float, ...],
         **_kwargs: object,
-    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
         command_qrefs.append(qpos_rad)
         measured_qvels.append(measured_qvel_rad_s)
         receipt = probe.B601CommandReceipt(
@@ -1217,7 +1282,7 @@ def test_latched_protective_hold_references_current_pose_after_manual_drag(
             errors=(),
             accepted=True,
         )
-        return receipt, (0.0,) * 6
+        return receipt, (0.0,) * 6, (0.0,) * 6
 
     class FakeBackend:
         def __init__(self) -> None:
@@ -1285,7 +1350,7 @@ def test_operator_interrupt_ignores_transient_fault_velocity_for_first_hold(
         qpos_rad: tuple[float, ...],
         measured_qvel_rad_s: tuple[float, ...],
         **_kwargs: object,
-    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
         command_qrefs.append(qpos_rad)
         measured_qvels.append(measured_qvel_rad_s)
         receipt = probe.B601CommandReceipt(
@@ -1300,7 +1365,7 @@ def test_operator_interrupt_ignores_transient_fault_velocity_for_first_hold(
             errors=(),
             accepted=True,
         )
-        return receipt, (0.0,) * 6
+        return receipt, (0.0,) * 6, (0.0,) * 6
 
     class FakeBackend:
         def poll_feedback(self, *, request_feedback: bool) -> object:
@@ -1375,7 +1440,7 @@ def test_latched_fault_hold_uses_explicit_protective_hold_profile(
         *,
         profile: object,
         **_kwargs: object,
-    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
         profiles.append(profile)
         receipt = probe.B601CommandReceipt(
             sequence=1,
@@ -1389,7 +1454,7 @@ def test_latched_fault_hold_uses_explicit_protective_hold_profile(
             errors=(),
             accepted=True,
         )
-        return receipt, (0.0,) * 6
+        return receipt, (0.0,) * 6, (0.0,) * 6
 
     class FakeBackend:
         def poll_feedback(self, *, request_feedback: bool) -> object:
@@ -1455,7 +1520,7 @@ def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
         qpos_rad: tuple[float, ...],
         measured_qvel_rad_s: tuple[float, ...],
         **_kwargs: object,
-    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
         command_qrefs.append(qpos_rad)
         measured_qvels.append(measured_qvel_rad_s)
         receipt = probe.B601CommandReceipt(
@@ -1470,7 +1535,7 @@ def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
             errors=(),
             accepted=True,
         )
-        return receipt, (0.0,) * 6
+        return receipt, (0.0,) * 6, (0.0,) * 6
 
     class FakeBackend:
         def poll_feedback(self, *, request_feedback: bool) -> object:
@@ -1533,11 +1598,13 @@ def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
     assert errors == []
 
 
-def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
+def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
     command_qrefs: list[tuple[float, ...]] = []
+    telemetry: dict[str, object] = {}
 
     def fake_send_hold(
         _backend: object,
@@ -1547,55 +1614,161 @@ def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
         measured_qpos_rad: tuple[float, ...],
         measured_qvel_rad_s: tuple[float, ...],
         **_kwargs: object,
-    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
         assert measured_qpos_rad == q
         assert measured_qvel_rad_s == (0.0,) * 6
         command_qrefs.append(qpos_rad)
-        receipt = probe.B601CommandReceipt(
-            sequence=len(command_qrefs),
-            mode="mit",
-            frame_id="b601_rs/joint_mit_reference",
-            requested_at_sec=1.0,
-            completed_at_sec=1.0,
-            requested_joint_names=("joint2", "joint3"),
-            sent_joint_names=("joint2", "joint3"),
-            failed_joint_names=(),
-            errors=(),
-            accepted=True,
-        )
-        return receipt, (0.0,) * 6
+        return _fault_hold_command_receipt(accepted=True), gravity, gravity
 
-    class FakeBackend:
-        def poll_feedback(self, *, request_feedback: bool) -> object:
-            assert request_feedback is True
-            return type(
-                "State",
-                (),
-                {
-                    "valid": False,
-                    "stale": True,
-                    "positions_rad": None,
-                    "fault_reason": "simulated feedback loss",
-                },
-            )()
-
-        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
-            if joint_names == probe._NON_FAULT_HOLD_JOINTS:
-                operation = "safe_stop"
-            else:
-                operation = "full_safe_stop"
-            return probe.B601ModeReceipt(
-                operation=operation,
-                requested_joint_names=tuple(joint_names),
-                completed_joint_names=tuple(joint_names),
-                failed_joint_names=(),
-                errors=(),
-                completed=True,
-            )
+    backend = _FaultHoldBackend(
+        feedback=(
+            SimpleNamespace(
+                valid=False,
+                stale=True,
+                positions_rad=None,
+                fault_reason="simulated feedback loss",
+            ),
+        ),
+        cached_receipts=(_fault_hold_command_receipt(accepted=True, sequence=2),),
+    )
 
     monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
     result = probe._run_latched_fault_hold(
-        FakeBackend(),
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=2,
+        driver_kd_nm_s_per_rad=(1.0,) * 6,
+        cached_gravity_tau_nm=gravity,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, first_receipt, non_hold_receipt, full_receipt, errors = result
+    assert hold_count == 2
+    assert command_qrefs == [q]
+    assert len(backend.cached_dispatches) == 1
+    assert backend.cached_dispatches[0]["kp"] == (0.0,) * 6
+    assert backend.cached_dispatches[0]["kd"] == (1.0,) * 6
+    assert backend.cached_dispatches[0]["tau_nm"] == gravity
+    assert backend.cached_dispatches[0]["joint_names"] == probe._ALL_JOINTS
+    assert first_receipt is not None and first_receipt.accepted
+    assert non_hold_receipt is None
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["entry_count"] == 1
+    assert telemetry["command_count"] == 2
+    assert telemetry["escalation_reason"] is None
+
+
+def test_degraded_fault_hold_recovers_live_gravity_without_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    telemetry: dict[str, object] = {}
+    live_dispatch_count = 0
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        nonlocal live_dispatch_count
+        live_dispatch_count += 1
+        return _fault_hold_command_receipt(
+            accepted=True,
+            sequence=live_dispatch_count,
+        ), gravity, gravity
+
+    backend = _FaultHoldBackend(
+        feedback=(
+            SimpleNamespace(
+                valid=False,
+                stale=True,
+                positions_rad=None,
+                fault_reason="simulated one-frame feedback loss",
+            ),
+            SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            ),
+        ),
+        cached_receipts=(_fault_hold_command_receipt(accepted=True, sequence=2),),
+    )
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=3,
+        driver_kd_nm_s_per_rad=(1.0,) * 6,
+        cached_gravity_tau_nm=gravity,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
+    assert hold_count == 3
+    assert live_dispatch_count == 2
+    assert len(backend.cached_dispatches) == 1
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["entry_count"] == 1
+    assert telemetry["recovery_count"] == 1
+
+
+def test_fault_hold_retries_one_incomplete_all_joint_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    attempts = 0
+    telemetry: dict[str, object] = {}
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        nonlocal attempts
+        attempts += 1
+        return (
+            _fault_hold_command_receipt(accepted=attempts > 1, sequence=attempts),
+            (0.0,) * 6,
+            (0.0,) * 6,
+        )
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        _FaultHoldBackend(),
         object(),
         qpos_rad=q,
         qvel_rad_s=(0.0,) * 6,
@@ -1612,16 +1785,143 @@ def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
         torque_limits_nm=(1.0,) * 6,
         rate_hz=20.0,
         stop={"requested": True, "full_disable_requested": False},
-        max_iterations=2,
+        max_iterations=1,
+        degraded_telemetry=telemetry,
     )
 
-    hold_count, _latest_tau, first_receipt, non_hold_receipt, full_receipt, errors = result
+    hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
     assert hold_count == 1
-    assert command_qrefs == [q]
-    assert first_receipt is not None and first_receipt.accepted
-    assert non_hold_receipt is None
+    assert attempts == 2
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["tx_retry_count"] == 1
+    assert telemetry["tx_retry_recovered_count"] == 1
+
+
+def test_degraded_hold_disables_only_after_cached_frame_retry_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    telemetry: dict[str, object] = {}
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        return _fault_hold_command_receipt(accepted=True), gravity, gravity
+
+    backend = _FaultHoldBackend(
+        feedback=(
+            SimpleNamespace(
+                valid=False,
+                stale=True,
+                positions_rad=None,
+                fault_reason="simulated sustained feedback loss",
+            ),
+        ),
+        cached_receipts=(
+            _fault_hold_command_receipt(accepted=False, sequence=2),
+            _fault_hold_command_receipt(accepted=False, sequence=3),
+        ),
+        allow_safe_stop=True,
+    )
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=2,
+        cached_gravity_tau_nm=gravity,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
+    assert hold_count == 1
+    assert len(backend.cached_dispatches) == 2
+    assert backend.safe_stop_names == [tuple(probe._ALL_JOINTS)]
     assert full_receipt is not None and full_receipt.completed
-    assert any("feedback is not complete and valid" in error for error in errors)
+    assert errors
+    assert telemetry["escalation_reason"] == (
+        "live and cached all-six-joint hold dispatch failed after retry"
+    )
+
+
+@pytest.mark.parametrize(
+    ("degraded_entry_reason", "fault_entry", "fault_qpos", "fault_qvel"),
+    (
+        ("simulated missing active feedback", False, None, None),
+        (
+            None,
+            True,
+            (0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+            (1.0,) * 6,
+        ),
+    ),
+)
+def test_degraded_entry_uses_cached_gravity_when_live_entry_is_unavailable(
+    degraded_entry_reason: str | None,
+    fault_entry: bool,
+    fault_qpos: tuple[float, ...] | None,
+    fault_qvel: tuple[float, ...] | None,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    telemetry: dict[str, object] = {}
+    backend = _FaultHoldBackend(
+        cached_receipts=(_fault_hold_command_receipt(accepted=True),),
+    )
+
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=fault_qpos,
+        fault_qvel_rad_s=fault_qvel,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=1,
+        driver_kd_nm_s_per_rad=(1.0,) * 6,
+        cached_qpos_rad=q,
+        cached_gravity_tau_nm=gravity,
+        degraded_entry_reason=degraded_entry_reason,
+        fault_entry=fault_entry,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, first, _non_hold, full_receipt, errors = result
+    assert hold_count == 1
+    assert [item["tau_nm"] for item in backend.cached_dispatches] == [gravity]
+    assert first is not None and first.accepted
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["entry_count"] == 1
 
 
 def test_fault_hold_snapshot_rejects_out_of_limit_q() -> None:

@@ -360,9 +360,17 @@ ACTIVE
   ├─ 正常结束 ──> active-set 短暂保持 ──> 全部 arm safe_stop
   ├─ 第一次 Ctrl+C ──> PROTECTIVE_HOLD（joint1..joint6 重力+阻尼，允许拖动）
   ├─ 控制/位置错误且当前 q 完整合法 ──> PROTECTIVE_HOLD（同一全臂控制）
-  │                                      ├─ 再次 Ctrl-C/SIGUSR1 ──> 全部 arm safe_stop
-  │                                      └─ 反馈/数值/发送失败 ──> 全部 arm safe_stop
-  └─ 无法证明当前 q 完整、在限位内且可处理 ──> 全部 arm safe_stop
+  └─ 当前 RX/计算已不可用但存在已验证缓存 ──> DEGRADED_HOLD（缓存重力+电机阻尼）
+
+PROTECTIVE_HOLD
+  ├─ RX/数值/运动监视/模型异常 ──> DEGRADED_HOLD
+  ├─ 完整六轴发送失败 ──> 同一有界命令立即重试一次
+  └─ 再次 Ctrl-C/SIGUSR1 ──> 全部 arm safe_stop
+
+DEGRADED_HOLD
+  ├─ 完整合法反馈和实时重力发送恢复 ──> PROTECTIVE_HOLD
+  ├─ 缓存六轴发送失败 ──> 立即重试一次
+  └─ live 与缓存命令都持续无法完整发送 ──> 全部 arm safe_stop
 ```
 
 进入 `PROTECTIVE_HOLD` 前，程序必须同时证明：
@@ -370,7 +378,9 @@ ACTIVE
 1. 对明确的运行中 operator Ctrl-C，优先使用六关节完整、有限、在 pinned URDF position
    limits 内且未过期的 `last_safe_q`；若它已过期但当前故障帧完整合法，则使用当前故障 q。
    对普通控制/位置错误，直接使用该错误循环刚收到的完整故障快照，避免过期的
-   `last_safe_q` 把可处理的错误升级为全臂失能；
+   `last_safe_q` 把可处理的错误升级为全臂失能。如果异常发生时当前帧已经缺失或不可用，
+   但此前至少有一帧完整六轴发送成功，则使用与该完整发送配对的最后合法 q 和纯重力项
+   直接进入 `DEGRADED_HOLD`；此路径不把过期 q 当成实时测量值，也不启用位置弹簧；
 2. 首帧快照年龄按本进程单调时钟测量，并受 `--fault-hold-max-age-sec` 约束；MotorBridge
    0.4.9 没有设备源时间戳，所以 JSON 仍明确标记 `freshness_verified=false`，不能宣传成
    vendor freshness；
@@ -388,10 +398,28 @@ ACTIVE
    回执。当前反馈 q 成为下一帧参考并重新计算 `g(q)`；它不会与首次 q 比较，也不会触发
    `max-rebase` 漂移失能。这样既能抑制重力下坠，又不会因为有意拖动而与操作者对抗。
 
+`DEGRADED_HOLD` 的缓存只在一帧 `joint1..joint6` 命令完整成功后更新，并且只保存该帧对应
+的合法 q 与纯重力项。它不保存或重放关节位置项、末端 `J^T F` overlay，也不重放基于旧
+速度的软件阻尼；因此一个坏反馈、越限值或异常 overlay 不会污染降级命令。缓存重力仍走
+原有绝对力矩和变化率包络，vendor Kp 始终为零。由于主机无法在 RX 不可信时重新计算速度，
+此阶段只有显式配置且已通过驱动器力矩上限回读的非零 driver Kd 能继续提供“大阻尼”；若
+driver Kd 为零，程序会明确记录 `motor_local_damping_available=false`，此时只能诚实声称缓存
+重力保持，不能声称仍有软件大阻尼。
+
+以下异常本身都只是进入或维持 `DEGRADED_HOLD` 的理由，不再单独授权失能：feedback 再次
+缺失、invalid/stale 或 vendor 状态异常；当前观测越过 URDF 限位；主机观测时间不推进或
+`dt<=0`；有限差分速度/加速度非有限或超过配置监视值；FK、Jacobian、gravity、阻抗、功率
+一致性或总力矩组合异常。坏样本不进入缓存，程序继续轮询恢复。MIT 部分发送、驱动器拒绝
+或发送异常则先对同一有界完整六轴命令立即重试一次；若 live 命令仍失败，再尝试纯重力
+缓存命令。只有缓存命令也无法在重试后完整覆盖 J1--J6，才说明主机已经无法可靠维持这个
+控制状态，允许全臂失能。这里的“一次重试”是发送完整性判定策略，不是现场调参阈值。
+
 保持没有时间自动释放，也不会因为 EOF、普通 cleanup 或 `close()` 释放。操作者必须在另一
 终端显式发送 `SIGUSR1`，或在前台再次按 Ctrl-C，并确认返回的
-`full_disable_receipt.completed=true`。如果快照、反馈、数值或发送无法证明可处理，程序直接
-采用“全臂 safe_stop”fallback；这与正常人工拖动是两条不同的判定路径。
+`full_disable_receipt.completed=true`。除此之外，全臂失能只允许发生在从未形成任何完整
+命令缓存，或 live 与缓存六轴命令都经过立即重试仍无法完整发送的情况下。需要注意，
+`safe_stop()` 仍是 vendor 的逐关节 disable，不是原子六轴动作；失能后重载机械臂可能下坠，
+所以机械承托和物理急停仍是最终安全边界，软件不能宣称总线失联后仍可维持重力补偿。
 
 释放命令示例（不会让交接 shell 退出）：
 
