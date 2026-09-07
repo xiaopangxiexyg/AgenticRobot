@@ -1614,6 +1614,64 @@ def build_startup_lock_profile(
     )
 
 
+def build_protective_hold_profile(
+    startup_profile: B601MitControlProfile,
+    *,
+    driver_kd_nm_s_per_rad: Sequence[float],
+) -> B601MitControlProfile:
+    """Select one damping owner for the reduced protective hold.
+
+    The normal active controller may use either software damping or an
+    explicitly selected RobStride driver ``Kd``.  The temporary startup lock
+    is built from the YAML gains, but reusing its software ``Kd`` while a
+    non-zero driver ``Kd`` is active would apply two independent derivative
+    terms to the same measured motion.  That is especially visible in the
+    20-Hz protective-hold loop: a small manual displacement can produce a
+    large finite-difference velocity and an abrupt opposing torque.
+
+    Keep the YAML position lock and all existing absolute/slew bounds.  For
+    each joint, the explicitly selected driver damping owns the derivative
+    term; joints without driver damping retain the YAML software damping.
+    No gain or numeric safety threshold is introduced here.
+    """
+
+    if not isinstance(startup_profile, B601MitControlProfile):
+        raise TypeError("startup_profile must be a B601MitControlProfile")
+    driver_kd = _six(
+        driver_kd_nm_s_per_rad,
+        name="driver_kd_nm_s_per_rad",
+    )
+    software_kd = tuple(
+        0.0 if driver_value > 0.0 else startup_value
+        for startup_value, driver_value in zip(
+            startup_profile.damping_kd_nm_s_per_rad,
+            driver_kd,
+            strict=True,
+        )
+    )
+    metadata = dict(startup_profile.metadata)
+    metadata.update(
+        {
+            "torque_owner": "software_position_gravity_plus_single_damping_owner",
+            "software_damping_disabled_where_driver_kd_nonzero": True,
+            "driver_kd_nm_s_per_rad": driver_kd,
+        }
+    )
+    return B601MitControlProfile(
+        name="b601_rs_protective_hold_lock",
+        position_kp_nm_per_rad=startup_profile.position_kp_nm_per_rad,
+        damping_kd_nm_s_per_rad=software_kd,
+        max_abs_torque_nm=startup_profile.max_abs_torque_nm,
+        max_torque_rate_nm_s=startup_profile.max_torque_rate_nm_s,
+        max_abs_overlay_torque_nm=startup_profile.max_abs_overlay_torque_nm,
+        max_abs_reference_velocity_rad_s=startup_profile.max_abs_reference_velocity_rad_s,
+        max_abs_state_velocity_rad_s=startup_profile.max_abs_state_velocity_rad_s,
+        max_abs_state_acceleration_rad_s2=startup_profile.max_abs_state_acceleration_rad_s2,
+        joint_names=startup_profile.joint_names,
+        metadata=metadata,
+    )
+
+
 def blend_startup_lock_torque_breakdown(
     startup_lock: B601MitTorqueBreakdown,
     final_control: B601MitTorqueBreakdown,
@@ -2769,6 +2827,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         torque_rise_time_sec=args.torque_rise_time_sec,
         velocity_limit_rad_s=args.velocity_abort_rad_s,
     )
+    protective_hold_profile = build_protective_hold_profile(
+        startup_lock_profile,
+        driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+    )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
     active_joint_names = resolve_active_joint_names()
@@ -3702,7 +3764,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             rate_hz=args.rate_hz,
                             stop=stop,
                             driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
-                            hold_profile=startup_lock_profile,
+                            hold_profile=protective_hold_profile,
                             operator_interrupt=operator_interrupt,
                             fault_entry=fault_entry,
                             fault_entry_max_velocity_rad_s=args.velocity_abort_rad_s,
@@ -3937,6 +3999,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "max_rebase_rad": args.fault_hold_max_rebase_rad,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
             "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "software_kp_nm_per_rad": protective_hold_profile.position_kp_nm_per_rad,
+            "software_kd_nm_s_per_rad": protective_hold_profile.damping_kd_nm_s_per_rad,
+            "damping_owner": (
+                "driver_kd_where_nonzero_else_yaml_software_kd"
+            ),
             "reference_velocity_rad_s": _ZERO_SIX,
         },
         "fault_hold_candidate_admission": {
@@ -4106,6 +4173,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Protective hold admits a fresh stationary last-safe snapshot for a normal operator stop, or a complete current in-limit fault snapshot below the motion-abort velocity; otherwise it falls back to full safe_stop.",
             "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
             "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift against the selected fixed reference before sending a measured-state torque frame; any failure falls back to full safe_stop.",
+            "Protective hold uses one derivative owner per joint: explicit driver Kd suppresses the YAML software Kd for that joint; no two damping terms are stacked.",
             "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",

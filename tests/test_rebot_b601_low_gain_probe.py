@@ -93,6 +93,44 @@ def test_startup_lock_profile_uses_per_joint_yaml_gains_and_final_bounds() -> No
     assert profile.metadata["gain_source"] == "rebotarm_rs_yaml.MIT"
 
 
+def test_protective_hold_uses_one_damping_owner_per_joint() -> None:
+    startup = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
+        mit_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
+        torque_limits_nm=(9.0, 9.0, 9.0, 3.5, 3.5, 3.5),
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+
+    hold = probe.build_protective_hold_profile(
+        startup,
+        driver_kd_nm_s_per_rad=(0.0, 0.5, 0.5, 0.0, 0.0, 0.5),
+    )
+
+    assert hold.position_kp_nm_per_rad == startup.position_kp_nm_per_rad
+    assert hold.damping_kd_nm_s_per_rad == (3.0, 0.0, 0.0, 5.0, 4.0, 0.0)
+    assert hold.max_abs_torque_nm == startup.max_abs_torque_nm
+    assert hold.max_torque_rate_nm_s == startup.max_torque_rate_nm_s
+    assert hold.metadata["software_damping_disabled_where_driver_kd_nonzero"] is True
+
+
+def test_protective_hold_keeps_yaml_damping_without_driver_kd() -> None:
+    startup = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0,) * 6,
+        mit_kd_nm_s_per_rad=(3.0,) * 6,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=1.0,
+    )
+
+    hold = probe.build_protective_hold_profile(
+        startup,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+    )
+
+    assert hold.damping_kd_nm_s_per_rad == startup.damping_kd_nm_s_per_rad
+
+
 def test_startup_lock_blend_preserves_gravity_vector_and_handoffs_overlay() -> None:
     startup = probe.B601MitTorqueBreakdown(
         position_torque_nm=(1.0,) * 6,

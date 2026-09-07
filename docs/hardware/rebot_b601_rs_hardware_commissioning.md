@@ -385,8 +385,10 @@ ACTIVE
    任何真实失效仍回退全臂 `safe_stop`；
 5. 只有通过上述检查后才会发送第一帧；发送的是固定故障/last-safe q、故障快照的受限
    qvel（使用未过期 last-safe 时沿用 last-safe qvel），vendor `kp=0`，软件侧使用 pinned
-   YAML MIT Kp/Kd 作为临时位置锁，并继续经过软件 torque absolute limit 和 torque slew
-   limit。若本次运行显式选择 driver Kd，保护保持沿用同一 Kd 和已经回读的 `0x700B` 总力矩上限。q 绝不由
+   YAML MIT Kp 作为临时位置锁，并继续经过软件 torque absolute limit 和 torque slew
+   limit。每个关节只保留一个阻尼所有者：若本次运行显式选择 driver Kd，保护保持对该关节
+   关闭 YAML 软件 Kd，并沿用同一 driver Kd 和已经回读的 `0x700B` 总力矩上限；未选择
+   driver Kd 的关节才保留 YAML 软件 Kd。q 绝不由
    错误/陈旧样本补零，也不使用最后一次 command 代替最后一次合法状态。
 
 第一帧保持成功后，程序先对非保持 arm 关节发逐关节 `safe_stop`；该 receipt 不完整时
@@ -394,7 +396,7 @@ ACTIVE
 重新读取完整反馈：反馈不完整/失效、主机观测不再推进、任一关节超出 limits、有限差分速度
 超过阈值，或 joint2/joint3 偏离固定参考超过 `max-rebase`，都会停止继续发保持帧并回退到
 全部 arm `safe_stop`。通过监视时，固定参考是进入保持时选定的 `last_safe_q` 或当前故障 q；当前测量 q 只用于
-计算受限的重力/阻尼力矩，绝不用于更新参考。保持没有时间自动释放，也不会因为 EOF、普通
+计算受限的重力/单一阻尼力矩，绝不用于更新参考。保持没有时间自动释放，也不会因为 EOF、普通
 cleanup 或 `close()` 释放；操作者必须在另一终端显式发送 `SIGUSR1`，并确认返回的
 `full_disable_receipt.completed=true`。如果没有可证明的新鲜安全 q，程序直接采用官方通信
 故障同类的“无回零立即失能”fallback。
