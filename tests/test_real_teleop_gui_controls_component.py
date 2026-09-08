@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from teleop_runtime.real_teleop import terminal_input
+from robot_motion.runtime import run_best_effort_cleanup
+
 from control_station.real_teleop.control_availability import (
     GuiControlEvents,
     GuiControlState,
@@ -12,7 +13,21 @@ from control_station.real_teleop.control_availability import (
     pre_home_controls,
     teleop_controls,
 )
+from teleop_runtime.collection.camera_preview import CameraPreviewer
 from teleop_runtime.debug import run_vive_rm65_real_teleop as legacy_entrypoint
+from teleop_runtime.real_teleop import operator_control_runtime, terminal_input
+from teleop_runtime.real_teleop.components import RealTeleopComponents
+from teleop_runtime.real_teleop.movement import apply_movement_multiple
+
+
+def test_operator_control_uses_canonical_lower_runtime_dependencies() -> None:
+    assert operator_control_runtime.CameraPreviewer is CameraPreviewer
+    assert operator_control_runtime.RealTeleopComponents is RealTeleopComponents
+    assert operator_control_runtime._apply_movement_multiple is apply_movement_multiple
+    assert (
+        operator_control_runtime.run_best_effort_cleanup
+        is run_best_effort_cleanup
+    )
 
 
 def test_legacy_control_input_delegates_active_controls_to_extracted_policy() -> None:
