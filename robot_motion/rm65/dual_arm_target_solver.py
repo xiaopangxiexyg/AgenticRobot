@@ -224,6 +224,114 @@ def _load_joint_velocity_profile(
     return profile
 
 
+def _side_result_metadata(
+    output_metadata: Mapping[str, object],
+    *,
+    side: Literal["left", "right"],
+    source_command_type: str | None,
+    inactive_jitter_hold: bool | None = None,
+) -> dict[str, object]:
+    """Project cycle diagnostics into one independently mutable side payload."""
+
+    directional = output_metadata["ik_directional_singularity"]
+    directional_sides = (
+        directional.get("sides", {})
+        if isinstance(directional, Mapping)
+        else {}
+    )
+    side_directional = (
+        directional_sides.get(side, {})
+        if isinstance(directional_sides, Mapping)
+        else {}
+    )
+    admitted_velocity = output_metadata["ik_admitted_velocity_state"]
+    assert isinstance(admitted_velocity, Mapping)
+
+    def side_value(key: str) -> object:
+        values = output_metadata[key]
+        assert isinstance(values, Mapping)
+        return values.get(side)
+
+    metadata: dict[str, object] = {
+        "controller": output_metadata["controller"],
+        "scene_profile": output_metadata["scene_profile"],
+        "collision_pair_count": output_metadata["collision_pair_count"],
+        "collision_avoidance_mode": output_metadata["collision_avoidance_mode"],
+        "collision_avoidance_status": output_metadata["collision_avoidance_status"],
+        "collision_avoidance_fallback_reason": output_metadata[
+            "collision_avoidance_fallback_reason"
+        ],
+        "collision_distance_m": output_metadata["collision_distance_m"],
+        "source_command_type": source_command_type,
+        "source_target_pose_base": side_value("source_target_pose_base"),
+        "source_target_pose_desk": side_value("source_target_pose_desk"),
+        "source_target_pose_operator": side_value("source_target_pose_operator"),
+        "ik_framework": output_metadata["ik_framework"],
+        "ik_objective_mode": output_metadata["ik_objective_mode"],
+        "ik_branch_candidate": output_metadata["ik_branch_candidate"],
+        "ik_branch_distance_score_deg": output_metadata[
+            "ik_branch_distance_score_deg"
+        ],
+        "ik_solve_iterations": output_metadata["ik_solve_iterations"],
+        "ik_solve_step_mode": output_metadata["ik_solve_step_mode"],
+        "ik_solve_iteration_mode": output_metadata["ik_solve_iteration_mode"],
+        "ik_solve_iteration_max": output_metadata["ik_solve_iteration_max"],
+        "ik_solve_iteration_min": output_metadata["ik_solve_iteration_min"],
+        "ik_damping": output_metadata["ik_damping"],
+        "ik_solve_iteration_reserve_ms": output_metadata[
+            "ik_solve_iteration_reserve_ms"
+        ],
+        "ik_candidate_certification_reserve_ms": output_metadata[
+            "ik_candidate_certification_reserve_ms"
+        ],
+        "ik_solve_iteration_budget_ms": output_metadata[
+            "ik_solve_iteration_budget_ms"
+        ],
+        "ik_solve_iteration_budget_exhausted": output_metadata[
+            "ik_solve_iteration_budget_exhausted"
+        ],
+        "ik_solve_iteration_stop_reason": output_metadata[
+            "ik_solve_iteration_stop_reason"
+        ],
+        "ik_wrist_coaxial_continuity": dict(
+            output_metadata["ik_wrist_coaxial_continuity"]
+        ),
+        "ik_directional_singularity": dict(side_directional),
+        "ik_admitted_velocity_state": {
+            "enabled": bool(admitted_velocity["enabled"]),
+            "source": admitted_velocity["source"],
+            "dt_s": admitted_velocity["dt_s"],
+            "qdot_rad_s": admitted_velocity[f"{side}_qdot_rad_s"],
+            "max_abs_qdot_rad_s": admitted_velocity[
+                f"{side}_max_abs_qdot_rad_s"
+            ],
+        },
+        "ik_solve_pose_error": dict(side_value("ik_solve_pose_error") or {}),
+        "ik_current_target_hold": dict(output_metadata["ik_current_target_hold"]),
+        "ik_jump_gate_status": output_metadata["ik_jump_gate_status"],
+        "ik_jump_gate_reason": output_metadata["ik_jump_gate_reason"],
+        "ik_jump_gate_release_ready": output_metadata[
+            "ik_jump_gate_release_ready"
+        ],
+        "ik_jump_gate_hold_frames": output_metadata["ik_jump_gate_hold_frames"],
+        "ik_jump_gate_metrics": dict(side_value("ik_jump_gate_metrics") or {}),
+        "ik_candidate_selection": dict(output_metadata["ik_candidate_selection"]),
+        "joint_limit_margin": dict(side_value("joint_limit_margin") or {}),
+        "ik_frame_total_ms": output_metadata["ik_frame_total_ms"],
+        "ik_time_budget_ms": output_metadata["ik_time_budget_ms"],
+        "ik_time_budget_exceeded": output_metadata["ik_time_budget_exceeded"],
+        "execution_step_metadata": dict(output_metadata["execution_step_metadata"]),
+        "output_qpos_smoothing": dict(
+            side_value("output_qpos_smoothing") or {}
+        ),
+        "target_pose_smoothing": dict(side_value("target_pose_smoothing") or {}),
+        "target_activity": dict(side_value("target_activity") or {}),
+    }
+    if inactive_jitter_hold is not None:
+        metadata["inactive_jitter_hold"] = bool(inactive_jitter_hold)
+    return metadata
+
+
 @dataclass(frozen=True)
 class DualArmTargetContext:
     timestamp: float | None
@@ -3165,259 +3273,91 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             output_metadata["direct_target_inactive_side_hold"] = dict(
                 direct_target_inactive_hold_metadata
             )
-        left_metadata = {
-            "controller": self.name,
-            "scene_profile": self.profile.name,
-            "collision_pair_count": len(self.profile.collision_pairs),
-            "collision_avoidance_mode": self.config.contact_mode,
-            "collision_avoidance_status": status,
-            "collision_avoidance_fallback_reason": fallback_reason,
-            "collision_distance_m": min_distance_m,
-            "source_command_type": (
-                left_source_command_type
+        side_metadata = {
+            "left": _side_result_metadata(
+                output_metadata,
+                side="left",
+                source_command_type=left_source_command_type,
+                inactive_jitter_hold=left_inactive_jitter_hold is not None,
             ),
-            "source_target_pose_base": left_source_target_pose_base,
-            "source_target_pose_desk": left_source_target_pose_desk,
-            "source_target_pose_operator": left_source_target_pose_operator,
-            "ik_framework": self.config.ik_framework,
-            "ik_objective_mode": self.ik_tuning.ik_objective_mode,
-            "ik_branch_candidate": branch_candidate,
-            "ik_branch_distance_score_deg": branch_score_deg,
-            "ik_solve_iterations": int(solve_iteration_count),
-            "ik_solve_step_mode": str(self.config.solve_step_mode),
-            "ik_solve_iteration_mode": solve_iteration_mode,
-            "ik_solve_iteration_max": int(self.config.solve_max_iterations),
-            "ik_solve_iteration_min": int(self.config.solve_min_iterations),
-            "ik_damping": float(self.config.damping),
-            "ik_solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
-            "ik_candidate_certification_reserve_ms": float(
-                self.config.candidate_certification_reserve_ms
+            "right": _side_result_metadata(
+                output_metadata,
+                side="right",
+                source_command_type=right_source_command_type,
             ),
-            "ik_solve_iteration_budget_ms": max(
-                0.0,
-                float(self.config.solve_time_budget_ms or 0.0)
-                - float(self.config.solve_iteration_reserve_ms),
-            ),
-            "ik_solve_iteration_budget_exhausted": bool(
-                self._last_solve_iteration_budget_exhausted
-            ),
-            "ik_solve_iteration_stop_reason": self._last_solve_iteration_stop_reason,
-            "ik_wrist_coaxial_continuity": dict(
-                self._last_wrist_coaxial_metadata
-            ),
-            "ik_directional_singularity": dict(
-                self._last_directional_singularity_diagnostics.get(
-                    "sides",
-                    {},
-                ).get("left", {})
-                if isinstance(
-                    self._last_directional_singularity_diagnostics.get("sides"),
-                    dict,
-                )
-                else {}
-            ),
-            "ik_admitted_velocity_state": {
-                "enabled": bool(admitted_velocity_metadata["enabled"]),
-                "source": admitted_velocity_metadata["source"],
-                "dt_s": admitted_velocity_metadata["dt_s"],
-                "qdot_rad_s": admitted_velocity_metadata["left_qdot_rad_s"],
-                "max_abs_qdot_rad_s": admitted_velocity_metadata[
-                    "left_max_abs_qdot_rad_s"
-                ],
-            },
-            "ik_solve_pose_error": dict(solve_pose_error.get("left", {})),
-            "ik_current_target_hold": dict(current_target_hold_metadata),
-            "ik_jump_gate_status": jump_gate_status,
-            "ik_jump_gate_reason": jump_gate_reason,
-            "ik_jump_gate_release_ready": jump_gate_release_ready,
-            "ik_jump_gate_hold_frames": jump_gate_hold_frames,
-            "ik_jump_gate_metrics": dict(jump_gate_metrics.get("left", {})),
-            "ik_candidate_selection": dict(candidate_selection_metadata),
-            "joint_limit_margin": dict(left_limit_margin),
-            "ik_frame_total_ms": frame_total_ms,
-            "ik_time_budget_ms": time_budget_ms,
-            "ik_time_budget_exceeded": time_budget_exceeded,
-            "execution_step_metadata": dict(execution_step_metadata),
-            "output_qpos_smoothing": dict(output_qpos_smoothing.get("left", {})),
-            "inactive_jitter_hold": left_inactive_jitter_hold is not None,
-            "target_pose_smoothing": dict(
-                target_smoothing_metadata.get("left", {})
-            ),
-            "target_activity": dict(target_activity_metadata.get("left", {})),
         }
-        right_metadata = {
-            "controller": self.name,
-            "scene_profile": self.profile.name,
-            "collision_pair_count": len(self.profile.collision_pairs),
-            "collision_avoidance_mode": self.config.contact_mode,
-            "collision_avoidance_status": status,
-            "collision_avoidance_fallback_reason": fallback_reason,
-            "collision_distance_m": min_distance_m,
-            "source_command_type": (
-                right_source_command_type
-            ),
-            "source_target_pose_base": right_source_target_pose_base,
-            "source_target_pose_desk": right_source_target_pose_desk,
-            "source_target_pose_operator": right_source_target_pose_operator,
-            "ik_framework": self.config.ik_framework,
-            "ik_objective_mode": self.ik_tuning.ik_objective_mode,
-            "ik_branch_candidate": branch_candidate,
-            "ik_branch_distance_score_deg": branch_score_deg,
-            "ik_solve_iterations": int(solve_iteration_count),
-            "ik_solve_step_mode": str(self.config.solve_step_mode),
-            "ik_solve_iteration_mode": solve_iteration_mode,
-            "ik_solve_iteration_max": int(self.config.solve_max_iterations),
-            "ik_solve_iteration_min": int(self.config.solve_min_iterations),
-            "ik_damping": float(self.config.damping),
-            "ik_solve_iteration_reserve_ms": float(self.config.solve_iteration_reserve_ms),
-            "ik_candidate_certification_reserve_ms": float(
-                self.config.candidate_certification_reserve_ms
-            ),
-            "ik_solve_iteration_budget_ms": max(
-                0.0,
-                float(self.config.solve_time_budget_ms or 0.0)
-                - float(self.config.solve_iteration_reserve_ms),
-            ),
-            "ik_solve_iteration_budget_exhausted": bool(
-                self._last_solve_iteration_budget_exhausted
-            ),
-            "ik_solve_iteration_stop_reason": self._last_solve_iteration_stop_reason,
-            "ik_wrist_coaxial_continuity": dict(
-                self._last_wrist_coaxial_metadata
-            ),
-            "ik_directional_singularity": dict(
-                self._last_directional_singularity_diagnostics.get(
-                    "sides",
-                    {},
-                ).get("right", {})
-                if isinstance(
-                    self._last_directional_singularity_diagnostics.get("sides"),
-                    dict,
-                )
-                else {}
-            ),
-            "ik_admitted_velocity_state": {
-                "enabled": bool(admitted_velocity_metadata["enabled"]),
-                "source": admitted_velocity_metadata["source"],
-                "dt_s": admitted_velocity_metadata["dt_s"],
-                "qdot_rad_s": admitted_velocity_metadata["right_qdot_rad_s"],
-                "max_abs_qdot_rad_s": admitted_velocity_metadata[
-                    "right_max_abs_qdot_rad_s"
-                ],
-            },
-            "ik_solve_pose_error": dict(solve_pose_error.get("right", {})),
-            "ik_current_target_hold": dict(current_target_hold_metadata),
-            "ik_jump_gate_status": jump_gate_status,
-            "ik_jump_gate_reason": jump_gate_reason,
-            "ik_jump_gate_release_ready": jump_gate_release_ready,
-            "ik_jump_gate_hold_frames": jump_gate_hold_frames,
-            "ik_jump_gate_metrics": dict(jump_gate_metrics.get("right", {})),
-            "ik_candidate_selection": dict(candidate_selection_metadata),
-            "joint_limit_margin": dict(right_limit_margin),
-            "ik_frame_total_ms": frame_total_ms,
-            "ik_time_budget_ms": time_budget_ms,
-            "ik_time_budget_exceeded": time_budget_exceeded,
-            "execution_step_metadata": dict(execution_step_metadata),
-            "output_qpos_smoothing": dict(output_qpos_smoothing.get("right", {})),
-            "target_pose_smoothing": dict(
-                target_smoothing_metadata.get("right", {})
-            ),
-            "target_activity": dict(target_activity_metadata.get("right", {})),
+        qpos_by_side = {"left": left_qpos, "right": right_qpos}
+        raw_qpos_by_side = {"left": raw_left_qpos, "right": raw_right_qpos}
+        world_to_base_by_side = {
+            "left": left_world_to_base,
+            "right": right_world_to_base,
         }
-        left_world_pose = self.ik_solver.compute_frame_pose(self.profile.left_frame_name, active_q)
-        right_world_pose = self.ik_solver.compute_frame_pose(self.profile.right_frame_name, active_q)
-        left_base_pose = (
-            left_world_pose
-            if left_world_to_base is None
-            else left_world_to_base @ left_world_pose
-        )
-        right_base_pose = (
-            right_world_pose
-            if right_world_to_base is None
-            else right_world_to_base @ right_world_pose
-        )
-        left_tcp_base_pose = left_base_pose @ self._tool_tcp_from_solver["left"]
-        right_tcp_base_pose = right_base_pose @ self._tool_tcp_from_solver["right"]
-        left_tcp_world_pose = left_world_pose @ self._tool_tcp_from_solver["left"]
-        right_tcp_world_pose = right_world_pose @ self._tool_tcp_from_solver["right"]
-        left_metadata.update(
-            {
-                "target_pose_base": left_tcp_base_pose.copy(),
-                "target_pose_tcp_base": left_tcp_base_pose.copy(),
-                "target_pose_controlled_frame": TOOL_TCP_FRAME,
-                "solver_output_endpoint_pose_base": left_base_pose.copy(),
-                "solver_output_qpos": left_qpos.copy(),
-                "q_ik_raw": None if raw_left_qpos is None else raw_left_qpos.copy(),
-                "action_pose_source": "limited_solver_output_qpos",
-            }
-        )
-        right_metadata.update(
-            {
-                "target_pose_base": right_tcp_base_pose.copy(),
-                "target_pose_tcp_base": right_tcp_base_pose.copy(),
-                "target_pose_controlled_frame": TOOL_TCP_FRAME,
-                "solver_output_endpoint_pose_base": right_base_pose.copy(),
-                "solver_output_qpos": right_qpos.copy(),
-                "q_ik_raw": None if raw_right_qpos is None else raw_right_qpos.copy(),
-                "action_pose_source": "limited_solver_output_qpos",
-            }
-        )
-        if self.config.output_command_type == "cartesian_pose":
-            left_metadata.update(
+        frame_name_by_side = {
+            "left": self.profile.left_frame_name,
+            "right": self.profile.right_frame_name,
+        }
+        world_pose_by_side: dict[str, np.ndarray] = {}
+        tcp_world_pose_by_side: dict[str, np.ndarray] = {}
+        command_type_by_side: dict[str, str] = {}
+        command_value_by_side: dict[str, np.ndarray] = {}
+        command_frame_by_side: dict[str, str | None] = {}
+        for side in ("left", "right"):
+            qpos = qpos_by_side[side]
+            raw_qpos = raw_qpos_by_side[side]
+            world_pose = self.ik_solver.compute_frame_pose(
+                frame_name_by_side[side],
+                active_q,
+            )
+            world_to_base = world_to_base_by_side[side]
+            base_pose = (
+                world_pose
+                if world_to_base is None
+                else world_to_base @ world_pose
+            )
+            tcp_base_pose = base_pose @ self._tool_tcp_from_solver[side]
+            tcp_world_pose = world_pose @ self._tool_tcp_from_solver[side]
+            world_pose_by_side[side] = world_pose
+            tcp_world_pose_by_side[side] = tcp_world_pose
+            side_metadata[side].update(
                 {
-                    "arm_controlled_frame": TOOL_TCP_FRAME,
-                    "arm_reference_frame": "arm_base",
-                    "arm_action_spec": {
-                        "side": "left",
-                        "controlled_frame": TOOL_TCP_FRAME,
-                        "reference_frame": "arm_base",
-                        "representation": "xyz_quat",
-                        "dof": 7,
-                        "semantics": TOOL_TCP_SEMANTICS,
-                        "metadata": {"controller": self.name},
-                    },
-                    "target_pose_desk": left_tcp_world_pose.copy(),
-                    "target_pose_base": left_tcp_base_pose.copy(),
-                    "target_pose_tcp_base": left_tcp_base_pose.copy(),
+                    "target_pose_base": tcp_base_pose.copy(),
+                    "target_pose_tcp_base": tcp_base_pose.copy(),
                     "target_pose_controlled_frame": TOOL_TCP_FRAME,
-                    "solver_output_endpoint_pose_base": left_base_pose.copy(),
-                    "solver_output_qpos": left_qpos.copy(),
+                    "solver_output_endpoint_pose_base": base_pose.copy(),
+                    "solver_output_qpos": qpos.copy(),
+                    "q_ik_raw": None if raw_qpos is None else raw_qpos.copy(),
+                    "action_pose_source": "limited_solver_output_qpos",
                 }
             )
-            right_metadata.update(
-                {
-                    "arm_controlled_frame": TOOL_TCP_FRAME,
-                    "arm_reference_frame": "arm_base",
-                    "arm_action_spec": {
-                        "side": "right",
-                        "controlled_frame": TOOL_TCP_FRAME,
-                        "reference_frame": "arm_base",
-                        "representation": "xyz_quat",
-                        "dof": 7,
-                        "semantics": TOOL_TCP_SEMANTICS,
-                        "metadata": {"controller": self.name},
-                    },
-                    "target_pose_desk": right_tcp_world_pose.copy(),
-                    "target_pose_base": right_tcp_base_pose.copy(),
-                    "target_pose_tcp_base": right_tcp_base_pose.copy(),
-                    "target_pose_controlled_frame": TOOL_TCP_FRAME,
-                    "solver_output_endpoint_pose_base": right_base_pose.copy(),
-                    "solver_output_qpos": right_qpos.copy(),
-                }
-            )
-            left_command_type = "cartesian_pose"
-            right_command_type = "cartesian_pose"
-            left_command_value = left_tcp_base_pose
-            right_command_value = right_tcp_base_pose
-            left_command_frame_name = "arm_base"
-            right_command_frame_name = "arm_base"
-        else:
-            left_command_type = "joint_vector"
-            right_command_type = "joint_vector"
-            left_command_value = left_qpos
-            right_command_value = right_qpos
-            left_command_frame_name = None
-            right_command_frame_name = None
+            if self.config.output_command_type == "cartesian_pose":
+                side_metadata[side].update(
+                    {
+                        "arm_controlled_frame": TOOL_TCP_FRAME,
+                        "arm_reference_frame": "arm_base",
+                        "arm_action_spec": {
+                            "side": side,
+                            "controlled_frame": TOOL_TCP_FRAME,
+                            "reference_frame": "arm_base",
+                            "representation": "xyz_quat",
+                            "dof": 7,
+                            "semantics": TOOL_TCP_SEMANTICS,
+                            "metadata": {"controller": self.name},
+                        },
+                        "target_pose_desk": tcp_world_pose.copy(),
+                        "target_pose_base": tcp_base_pose.copy(),
+                        "target_pose_tcp_base": tcp_base_pose.copy(),
+                        "target_pose_controlled_frame": TOOL_TCP_FRAME,
+                        "solver_output_endpoint_pose_base": base_pose.copy(),
+                        "solver_output_qpos": qpos.copy(),
+                    }
+                )
+                command_type_by_side[side] = "cartesian_pose"
+                command_value_by_side[side] = tcp_base_pose
+                command_frame_by_side[side] = "arm_base"
+            else:
+                command_type_by_side[side] = "joint_vector"
+                command_value_by_side[side] = qpos
+                command_frame_by_side[side] = None
         self._last_target_poses = {
             "left": left_target.copy(),
             "right": right_target.copy(),
@@ -3435,30 +3375,19 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 status=status,
                 fallback_reason=fallback_reason,
                 side_results={
-                    "left": BimanualIKSideResult(
-                        side="left",
-                        qpos=left_qpos,
-                        raw_qpos=raw_left_qpos,
-                        solver_pose_world=left_world_pose,
-                        tool_tcp_pose_world=left_tcp_world_pose,
-                        command_type=left_command_type,
-                        command_value=left_command_value,
-                        command_frame_name=left_command_frame_name,
-                        metadata=left_metadata,
+                    side: BimanualIKSideResult(
+                        side=side,
+                        qpos=qpos_by_side[side],
+                        raw_qpos=raw_qpos_by_side[side],
+                        solver_pose_world=world_pose_by_side[side],
+                        tool_tcp_pose_world=tcp_world_pose_by_side[side],
+                        command_type=command_type_by_side[side],
+                        command_value=command_value_by_side[side],
+                        command_frame_name=command_frame_by_side[side],
+                        metadata=side_metadata[side],
                         _metadata_is_owned=True,
-                    ),
-                    "right": BimanualIKSideResult(
-                        side="right",
-                        qpos=right_qpos,
-                        raw_qpos=raw_right_qpos,
-                        solver_pose_world=right_world_pose,
-                        tool_tcp_pose_world=right_tcp_world_pose,
-                        command_type=right_command_type,
-                        command_value=right_command_value,
-                        command_frame_name=right_command_frame_name,
-                        metadata=right_metadata,
-                        _metadata_is_owned=True,
-                    ),
+                    )
+                    for side in ("left", "right")
                 },
                 metadata=output_metadata,
                 _metadata_is_owned=True,
@@ -3466,26 +3395,21 @@ class DualArmCollisionAwareRetargeter(Retargeter):
 
         command = TeleopCommand(timestamp=timestamp)
         command.metadata.update(output_metadata)
-        command.add_command(
-            EffectorCommand(
-                effector_name=self.config.left_effector_name,
-                side="left",
-                command_type=left_command_type,
-                value=left_command_value,
-                frame_name=left_command_frame_name,
-                metadata=left_metadata,
+        effector_name_by_side = {
+            "left": self.config.left_effector_name,
+            "right": self.config.right_effector_name,
+        }
+        for side in ("left", "right"):
+            command.add_command(
+                EffectorCommand(
+                    effector_name=effector_name_by_side[side],
+                    side=side,
+                    command_type=command_type_by_side[side],
+                    value=command_value_by_side[side],
+                    frame_name=command_frame_by_side[side],
+                    metadata=side_metadata[side],
+                )
             )
-        )
-        command.add_command(
-            EffectorCommand(
-                effector_name=self.config.right_effector_name,
-                side="right",
-                command_type=right_command_type,
-                value=right_command_value,
-                frame_name=right_command_frame_name,
-                metadata=right_metadata,
-            )
-        )
         return command
 
     def retarget(
