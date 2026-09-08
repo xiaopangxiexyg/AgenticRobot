@@ -550,6 +550,86 @@ def test_startup_handoff_uses_the_same_rise_time_after_gravity() -> None:
     assert probe.startup_handoff_fraction(elapsed_sec=2.0, rise_time_sec=0.5) == 1.0
 
 
+def test_vendor_status_cache_diagnostics_is_passive_and_explicitly_unverified() -> None:
+    state = SimpleNamespace(
+        velocities_reported=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        torques_reported_nm=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        freshness_verified=False,
+    )
+
+    result = probe.vendor_status_cache_diagnostics(state)
+
+    assert result == {
+        "velocity_rad_s": (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        "torque_nm": (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        "complete": True,
+        "errors": (),
+        "freshness_verified": False,
+        "semantics": (
+            "passive_motorbridge_operation_status_cache_unverified; "
+            "no_extra_can_request; not command-response correlated"
+        ),
+    }
+
+
+def test_vendor_status_cache_diagnostics_does_not_fail_when_cache_is_absent() -> None:
+    result = probe.vendor_status_cache_diagnostics(SimpleNamespace())
+
+    assert result["complete"] is False
+    assert result["velocity_rad_s"] is None
+    assert result["torque_nm"] is None
+    assert result["errors"] == (
+        "vendor_status_velocity_rad_s: unavailable",
+        "vendor_status_torque_nm: unavailable",
+    )
+
+
+def test_startup_diagnostics_reports_observed_deltas_without_a_numeric_gate() -> None:
+    samples = [
+        {
+            "startup_state": "GRAVITY_RAMP",
+            "elapsed_sec": 0.25,
+            "qpos_rad": (0.0,) * 6,
+        },
+        {
+            "startup_state": "ACTIVE",
+            "elapsed_sec": 1.0,
+            "qpos_rad": (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        },
+    ]
+
+    result = probe.summarize_startup_diagnostics(
+        pre_enable_qpos_rad=(-0.1,) * 6,
+        lock_reference_qpos_rad=(0.0,) * 6,
+        pre_control_observations=({"phase": "PRE_ENABLE_FEEDBACK"},),
+        samples=samples,
+    )
+
+    assert result["acceptance_status"] == "CAPTURED"
+    assert result["extra_can_requests"] == 0
+    assert result["pre_enable_to_post_enable_delta_rad"] == pytest.approx((0.1,) * 6)
+    assert result["post_enable_to_first_active_delta_rad"] == pytest.approx(
+        (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    )
+    assert result["pre_enable_to_first_active_delta_rad"] == pytest.approx(
+        (0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
+    )
+    assert result["displacement_gate_rad"] is None
+
+
+def test_startup_diagnostics_is_incomplete_without_active_sample() -> None:
+    result = probe.summarize_startup_diagnostics(
+        pre_enable_qpos_rad=None,
+        lock_reference_qpos_rad=None,
+        pre_control_observations=(),
+        samples=(),
+    )
+
+    assert result["acceptance_status"] == "INCOMPLETE"
+    assert result["first_active_qpos_rad"] is None
+    assert result["displacement_gate_rad"] is None
+
+
 def test_startup_lock_profile_uses_per_joint_yaml_gains_and_final_bounds() -> None:
     profile = probe.build_startup_lock_profile(
         mit_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),

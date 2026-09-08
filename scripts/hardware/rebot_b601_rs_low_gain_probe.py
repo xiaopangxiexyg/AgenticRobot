@@ -3404,6 +3404,180 @@ def startup_handoff_fraction(*, elapsed_sec: float, rise_time_sec: float) -> flo
     return min(1.0, (elapsed - rise_time) / rise_time)
 
 
+def vendor_status_cache_diagnostics(state: object) -> dict[str, object]:
+    """Return passive vendor status observations without affecting control.
+
+    RobStride operation-status frames are already produced by the existing MIT
+    exchange and cached by MotorBridge.  Reading these properties therefore
+    adds no CAN request.  The cache has no source timestamp or command-response
+    correlation in the pinned ABI, so the result is evidence only and must not
+    participate in a safety decision or torque command.
+    """
+
+    errors: list[str] = []
+
+    def optional_vector(attribute: str, label: str) -> tuple[float, ...] | None:
+        try:
+            value = getattr(state, attribute, None)
+        except Exception as exc:  # noqa: BLE001 - diagnostic property only
+            errors.append(f"{label}: {exc}")
+            return None
+        if value is None:
+            errors.append(f"{label}: unavailable")
+            return None
+        try:
+            return _six(value, name=label)
+        except (TypeError, ValueError) as exc:
+            errors.append(f"{label}: {exc}")
+            return None
+
+    velocity = optional_vector(
+        "velocities_reported",
+        "vendor_status_velocity_rad_s",
+    )
+    torque = optional_vector(
+        "torques_reported_nm",
+        "vendor_status_torque_nm",
+    )
+    return {
+        "velocity_rad_s": velocity,
+        "torque_nm": torque,
+        "complete": velocity is not None and torque is not None,
+        "errors": tuple(errors),
+        "freshness_verified": bool(
+            getattr(state, "freshness_verified", False)
+        ),
+        "semantics": (
+            "passive_motorbridge_operation_status_cache_unverified; "
+            "no_extra_can_request; not command-response correlated"
+        ),
+    }
+
+
+def build_startup_diagnostic_observation(
+    *,
+    phase: str,
+    state: object,
+    qpos_rad: Sequence[float],
+    qvel_fd_rad_s: Sequence[float] | None,
+    torque_breakdown: B601MitTorqueBreakdown | None = None,
+    conditioned_tau_nm: Sequence[float] | None = None,
+) -> dict[str, object]:
+    """Build one bounded startup trace entry from already available values."""
+
+    normalized_phase = str(phase).strip()
+    if not normalized_phase:
+        raise ValueError("startup diagnostic phase must not be empty")
+    qpos = _six(qpos_rad, name="startup_diagnostic_qpos_rad")
+    qvel = (
+        None
+        if qvel_fd_rad_s is None
+        else _six(qvel_fd_rad_s, name="startup_diagnostic_qvel_fd_rad_s")
+    )
+    conditioned = (
+        None
+        if conditioned_tau_nm is None
+        else _six(
+            conditioned_tau_nm,
+            name="startup_diagnostic_conditioned_tau_nm",
+        )
+    )
+    command = None
+    if torque_breakdown is not None:
+        if not isinstance(torque_breakdown, B601MitTorqueBreakdown):
+            raise TypeError("torque_breakdown must be B601MitTorqueBreakdown")
+        command = {
+            "gravity_tau_nm": torque_breakdown.gravity_torque_nm,
+            "position_tau_nm": torque_breakdown.position_torque_nm,
+            "damping_tau_nm": torque_breakdown.damping_torque_nm,
+            "requested_tau_nm": torque_breakdown.requested_torque_nm,
+            "conditioned_tau_nm": conditioned,
+        }
+    return {
+        "phase": normalized_phase,
+        "sequence": int(getattr(state, "sequence", 0)),
+        "feedback_timestamp_sec": getattr(
+            state,
+            "receive_timestamp_sec",
+            None,
+        ),
+        "qpos_rad": qpos,
+        "qvel_fd_rad_s": qvel,
+        "vendor_status": vendor_status_cache_diagnostics(state),
+        "command": command,
+    }
+
+
+def summarize_startup_diagnostics(
+    *,
+    pre_enable_qpos_rad: Sequence[float] | None,
+    lock_reference_qpos_rad: Sequence[float] | None,
+    pre_control_observations: Sequence[Mapping[str, object]],
+    samples: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Reduce startup motion without inventing a pass/fail displacement gate."""
+
+    pre_enable = (
+        None
+        if pre_enable_qpos_rad is None
+        else _six(pre_enable_qpos_rad, name="pre_enable_qpos_rad")
+    )
+    lock_reference = (
+        None
+        if lock_reference_qpos_rad is None
+        else _six(lock_reference_qpos_rad, name="lock_reference_qpos_rad")
+    )
+    first_active: Mapping[str, object] | None = next(
+        (sample for sample in samples if sample.get("startup_state") == "ACTIVE"),
+        None,
+    )
+    first_active_qpos = (
+        None
+        if first_active is None
+        else _six(first_active.get("qpos_rad"), name="first_active_qpos_rad")
+    )
+
+    def delta(
+        final: Sequence[float] | None,
+        initial: Sequence[float] | None,
+    ) -> tuple[float, ...] | None:
+        if final is None or initial is None:
+            return None
+        return tuple(
+            float(current - previous)
+            for current, previous in zip(final, initial, strict=True)
+        )
+
+    return {
+        "schema": "b601.startup-diagnostics.v1",
+        "passive_only": True,
+        "extra_can_requests": 0,
+        "acceptance_status": "CAPTURED" if first_active is not None else "INCOMPLETE",
+        "pre_enable_qpos_rad": pre_enable,
+        "post_enable_lock_reference_qpos_rad": lock_reference,
+        "first_active_qpos_rad": first_active_qpos,
+        "first_active_elapsed_sec": (
+            None if first_active is None else first_active.get("elapsed_sec")
+        ),
+        "pre_enable_to_post_enable_delta_rad": delta(lock_reference, pre_enable),
+        "post_enable_to_first_active_delta_rad": delta(
+            first_active_qpos,
+            lock_reference,
+        ),
+        "pre_enable_to_first_active_delta_rad": delta(
+            first_active_qpos,
+            pre_enable,
+        ),
+        "pre_control_observations": tuple(pre_control_observations),
+        "vendor_status_semantics": (
+            "passive cached operation-status evidence; raw type-2 frames require "
+            "MOTORBRIDGE_DEBUG_MODE=robstride-startup; no iqf(0x701A) or "
+            "torque_fdb(0x302C) polling is added to the control loop"
+        ),
+        "displacement_gate_rad": None,
+    }
+
+
 def build_startup_lock_profile(
     *,
     mit_kp_nm_per_rad: Sequence[float],
@@ -5006,6 +5180,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     previous_guard_qvel: tuple[float, ...] | None = None
     previous_tau = _ZERO_SIX
     last_verified_gravity_tau: tuple[float, ...] | None = None
+    pre_enable_q: tuple[float, ...] | None = None
     initial_q: tuple[float, ...] | None = None
     final_q: tuple[float, ...] | None = None
     cartesian_anchor_position_m: tuple[float, ...] | None = None
@@ -5035,6 +5210,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     motion_rejection_recovery_count = 0
     motion_rejection_confirmed_abort_count = 0
     backend_feedback_diagnostics: tuple[dict[str, object], ...] = ()
+    startup_diagnostic_observations: list[dict[str, object]] = []
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
     control_completion_reason: str | None = None
@@ -5157,6 +5333,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
             max_rebase_rad=args.fault_hold_max_rebase_rad,
         )
+        pre_enable_q = warmup_q
+        startup_diagnostic_observations.append(
+            build_startup_diagnostic_observation(
+                phase="PRE_ENABLE_FEEDBACK",
+                state=warmup_state,
+                qpos_rad=warmup_q,
+                qvel_fd_rad_s=None,
+            )
+        )
         initial_q = warmup_q
         final_q = warmup_q
         if stop["full_disable_requested"]:
@@ -5243,6 +5428,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             (current - previous) / arm_dt
             for current, previous in zip(arming_q, warmup_q, strict=True)
         )
+        startup_diagnostic_observations.append(
+            build_startup_diagnostic_observation(
+                phase="ENABLED_UNARMED",
+                state=arming_state,
+                qpos_rad=arming_q,
+                qvel_fd_rad_s=arming_qvel,
+            )
+        )
         if max(abs(value) for value in arming_qvel) > args.velocity_abort_rad_s:
             raise LowGainProbeError(
                 "post-enable feedback is moving too quickly for startup lock: "
@@ -5301,6 +5494,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 "; ".join(startup_lock_first_receipt.errors)
                 or "startup lock MIT dispatch was incomplete"
             )
+        startup_diagnostic_observations.append(
+            build_startup_diagnostic_observation(
+                phase="LOCKING_FIRST_COMMAND",
+                state=arming_state,
+                qpos_rad=arming_q,
+                qvel_fd_rad_s=arming_qvel,
+                torque_breakdown=lock_breakdown,
+                conditioned_tau_nm=lock_tau,
+            )
+        )
         startup_lock_commands = 1
         arming_settle_torque_commands = 1
         previous_tau = lock_tau
@@ -5408,6 +5611,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "arming settle startup lock dispatch was incomplete"
                 )
                 break
+            startup_diagnostic_observations.append(
+                build_startup_diagnostic_observation(
+                    phase="LOCKED_SETTLE",
+                    state=settle_state,
+                    qpos_rad=arming_settle_previous_q,
+                    qvel_fd_rad_s=arming_settle_last_qvel,
+                    torque_breakdown=lock_breakdown,
+                    conditioned_tau_nm=lock_tau,
+                )
+            )
             startup_lock_commands += 1
             arming_settle_torque_commands += 1
             previous_tau = lock_tau
@@ -5976,6 +6189,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "pose_impedance": pose_audit,
                     "freshness_verified": state.freshness_verified,
                     "freshness_semantics": state.freshness_semantics,
+                    "vendor_status": vendor_status_cache_diagnostics(state),
                 }
             )
             previous_q = q
@@ -6342,6 +6556,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         (max(abs(value) for value in sample["conditioned_tau_nm"]) for sample in samples),
         default=0.0,
     )
+    startup_diagnostics = summarize_startup_diagnostics(
+        pre_enable_qpos_rad=pre_enable_q,
+        lock_reference_qpos_rad=initial_q,
+        pre_control_observations=startup_diagnostic_observations,
+        samples=samples,
+    )
     return {
         "status": "OK" if acceptance_passed else "FAIL",
         "mode": args.mode,
@@ -6418,6 +6638,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             ),
             "all_six_joint_dispatch": True,
         },
+        "startup_diagnostics": startup_diagnostics,
         "motors_enabled_by_probe": enabled,
         "motion_commands_sent": commands_sent > 0,
         "commands_sent": commands_sent,

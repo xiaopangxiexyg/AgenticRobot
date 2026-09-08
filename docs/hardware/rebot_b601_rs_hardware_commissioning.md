@@ -377,6 +377,17 @@ vendor Kp；MIT 帧的 vendor Kp 保持为零。`LOCKED` 的过渡检查使用�
 `--velocity-abort-rad-s`，以容纳使能瞬态中仍在正常运动包络内的反馈变化；它不复用
 仅用于首次 protective-hold admission 的严格 `--fault-hold-max-velocity-rad-s`。
 
+每次运行还会把启动专项证据写入结果 JSON 的 `startup_diagnostics`。它保存使能前反馈、
+`ENABLED_UNARMED`、首个 `LOCKING` 命令、各个 `LOCKED_SETTLE` 样本以及首次
+`ACTIVE` 的位置差，并在普通逐周期 `samples[].vendor_status` 中保留 MotorBridge 已经接收的
+operation-status 缓存速度/力矩。该观测完全被动，不增加 CAN 请求，不参与控制或安全判定；
+由于 pinned ABI 没有源时间戳和命令-响应关联，它明确标为 unverified。若同时使用包含
+`robstride-startup` 调试模式的 MotorBridge，原始日志会在既有 type-17 帧之外记录 type-1
+operation-control 和 type-2 operation-status 帧，便于离线核对命令与解码。这里不在 20 Hz 控制循环中同步追加
+`iqf (0x701A)`/`torque_fdb (0x302C)` 读取，避免把每周期六次位置读取扩成十八次并降低控制节拍。
+`startup_diagnostics.displacement_gate_rad=null`：位移只作为测量证据，不新增脱离实际硬件依据的
+数值型通过阈值。
+
 ### 异常时的 protective hold（全臂可拖动重力保持）
 
 这条路径不是把某几个关节强制锁死，也不是回到预设姿态。第一次 Ctrl-C 或可处理的控制
@@ -516,7 +527,8 @@ safe_stop。由于当前
 protective-hold，第二次 Ctrl-C 或 SIGUSR1 才请求全臂失能。
 如果命令使用 `--kp 0`，捕获的参考位置不会产生位置残差力矩：这类窗口可用于检查姿态、
 漂移和模型重力输出，但不能据此反推缺失的静态重力力矩，也不构成已经求解出的重力参数。
-当前样本同样不含经过标定的关节实测力矩或电流，因此不能单独完成质量/质心辨识。
+当前样本可包含未验证 freshness 的 vendor operation-status 缓存力矩，但仍不含经过标定并与
+命令严格关联的关节实测力矩或电流，因此不能单独完成质量/质心辨识。
 
 ### 离线归约、姿态去重和拟合
 
@@ -1004,6 +1016,12 @@ Kd 作为速度耗散，但这些调参值不属于代码契约；ID7 仍不参�
 `0x701B`；因此既有把 `0x701A` 当速度得到的量纲/符号观察无效，不能据此评价速度反馈。
 在 `0x701B` 的真实设备量纲、符号和 freshness 经独立验证前，控制侧仍应使用新鲜位置的
 有界差分速度。当前不能用约 20 Hz 的同步参数读取直接闭合 125 Hz 重力/阻尼控制。
+
+启动诊断可设置 `MOTORBRIDGE_DEBUG_MODE=robstride-startup` 和
+`MOTORBRIDGE_DEBUG_LOG=<path>`，被动保存 type-1 operation-control、type-2 operation-status
+与 type-17 参数帧；
+它不读取 `0x701A/0x302C`，也不改变控制总线负载。原始 type-2 与 JSON 中的 vendor cache
+可用于检查解码和时间邻近关系，但在缺少源序号时仍不能声称逐命令严格配对。
 
 另外，`compute_b601_mit_torque()` 若已经组合软件 damping，再同时给驱动器非零 Kd，会重复
 计算阻尼。当前只允许一种明确拆分：软件 Kd 为零，driver Kp 为零，driver Kd 单独拥有
