@@ -2410,7 +2410,6 @@ def run_real_teleop(
             episode_last_state_provider=current_episode_last_state,
             set_episode_last_state=set_current_episode_last_state,
             step_index_provider=current_step_index,
-            support=globals(),
         )
         bind_reconfigure = getattr(
             clutch_input,

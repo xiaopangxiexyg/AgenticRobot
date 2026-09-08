@@ -382,11 +382,15 @@ from teleop_runtime.real_teleop.defaults import (
     INIT_ARM_QPOS_SPEED_BASELINE_PROFILE,
 )
 from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
+from teleop_runtime.real_teleop.episode_recording_runtime import (
+    DEFAULT_EPISODE_START_COUNTDOWN_SEC,
+    _episode_start_countdown_ready_to_record,
+    _episode_start_countdown_remaining,
+)
 
 
 DEFAULT_DMTAC_ROOT = Path(__file__).resolve().parents[1] / "hardware" / "DMTAC_gripper"
 DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
-DEFAULT_EPISODE_START_COUNTDOWN_SEC = 3.0
 # MIGRATION(real-teleop, batch 6): recorder filenames and their default roots
 # are owned by the extracted diagnostics component.  Importing the constants
 # here deliberately retains the legacy module-level patch point used by local
@@ -396,25 +400,6 @@ from teleop_runtime.real_teleop.debug_recorders import (
     DEFAULT_DEBUG_TIMING_LOG_ROOT,
     DEFAULT_IK_DEBUG_LOG_ROOT,
 )
-
-
-def _episode_start_countdown_remaining(now: float, deadline: float | None) -> float:
-    if deadline is None:
-        return 0.0
-    return max(0.0, float(deadline) - float(now))
-
-
-def _episode_start_countdown_ready_to_record(
-    *,
-    now: float,
-    deadline: float | None,
-    warmup_ready: bool,
-) -> bool:
-    return bool(
-        warmup_ready
-        and deadline is not None
-        and _episode_start_countdown_remaining(now, deadline) <= 0.0
-    )
 
 
 from teleop_runtime.real_teleop.hand_config import (

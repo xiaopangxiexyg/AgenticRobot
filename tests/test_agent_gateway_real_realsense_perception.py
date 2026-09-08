@@ -24,6 +24,7 @@ from agent_gateway.profiles.real.realsense_perception import (
     CameraOnlyRealPerceptionResources,
     ExclusiveRealPerceptionResources,
     RealPerceptionSourceBinding,
+    RealRgbCameraGeometryCut,
     RealSenseAgentPerceptionProvider,
     build_real_perception_source_binding,
     start_realsense_sources,
@@ -113,7 +114,45 @@ class _Source:
         self.closes += 1
 
 
-def _provider(*, front_at: float = 9.95, wrist_at: float = 9.97):
+class _RecordingRgbCameraGeometry:
+    semantic_content_hash = "geometry:test"
+
+    def __init__(self) -> None:
+        self.pose_cut_calls: list[tuple[str, float, float]] = []
+
+    @staticmethod
+    def source_catalog():
+        return (
+            {
+                "source_id": "left_wrist",
+                "role": "wrist_left",
+                "native_width": 4,
+                "native_height": 3,
+            },
+        )
+
+    def pose_cut(self, *, source_id: str, frame_acquired_at: float, now: float):
+        self.pose_cut_calls.append((source_id, frame_acquired_at, now))
+        if now < 10.2:
+            raise RuntimeError(f"real_rgb_camera_pose_from_future:{source_id}")
+        return RealRgbCameraGeometryCut(
+            source_id=source_id,
+            source_from_camera=tuple(float(value) for value in np.eye(4).reshape(-1)),
+            measured_at=frame_acquired_at,
+            available_at=10.2,
+            geometry_binding_hash=self.semantic_content_hash,
+            geometry_cut_hash="geometry-cut:test",
+            evidence_refs=("geometry-cut:test",),
+        )
+
+
+def _provider(
+    *,
+    front_at: float = 9.95,
+    wrist_at: float = 9.97,
+    rgb_camera_geometry=None,
+    clock=None,
+):
     sources = {
         "front": _Source(
             "front",
@@ -146,7 +185,8 @@ def _provider(*, front_at: float = 9.95, wrist_at: float = 9.97):
     provider = RealSenseAgentPerceptionProvider(
         source_binding=source_binding,
         current_station_revision=lambda: revision["value"],
-        clock=lambda: 10.0,
+        rgb_camera_geometry=rgb_camera_geometry,
+        clock=(lambda: 10.0) if clock is None else clock,
     )
     profile = RealPerceptionCaptureProfile(
         rgb_sources=(
@@ -158,6 +198,23 @@ def _provider(*, front_at: float = 9.95, wrist_at: float = 9.97):
     )
     provider.bind_profile(profile)
     return provider, sources, revision, profile
+
+
+def test_rgb_geometry_observes_dynamic_pose_after_frame_processing() -> None:
+    geometry = _RecordingRgbCameraGeometry()
+    observed_times = iter((10.0, 10.2))
+    provider, _sources, _revision, _profile = _provider(
+        rgb_camera_geometry=geometry,
+        clock=lambda: next(observed_times),
+    )
+
+    capture = provider.capture_rgb_geometry(
+        role="wrist_left",
+        expected_station_revision=7,
+    )
+
+    assert geometry.pose_cut_calls == [("left_wrist", 9.97, 10.2)]
+    assert capture.pose_available_at == 10.2
 
 
 def test_legacy_video_frame_export_is_object_identical() -> None:
