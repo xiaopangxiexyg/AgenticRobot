@@ -1309,7 +1309,7 @@ def test_lift_short_v2_zero_policy_holds_and_positive_policy_lifts() -> None:
     env = FastCubeLiftEnv(
         LIFT_SHORT_POSITIVE_Z_PROPRIO_TASK_CONFIG,
         include_training_reward_state=False,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     transform = build_policy_action_transform(env.config)
     try:
@@ -1346,7 +1346,7 @@ def test_pose_reset_rebuilds_solver_and_syncs_settled_actuator_state() -> None:
     env = FastCubeLiftEnv(
         CONTACT_DESCEND_CLOSE_POSE_Z_GRIPPER_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         reset_states = []
@@ -1379,7 +1379,7 @@ def test_settled_snapshot_preserves_first_actuated_policy_step() -> None:
     env = FastCubeLiftEnv(
         DEFAULT_PHYSICAL_TASK_CONFIG,
         include_training_reward_state=False,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         action = np.zeros(7, dtype=np.float32)
@@ -1416,7 +1416,7 @@ def test_descend_close_task_is_feasible_without_hidden_xy_actions() -> None:
     env = FastCubeLiftEnv(
         CONTACT_DESCEND_CLOSE_POSE_Z_GRIPPER_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         _observation, info = env.reset(seed=1)
@@ -1526,7 +1526,7 @@ def test_reach_task_kernel_preserves_pose_action_lineage_and_seeded_reset() -> N
     env = FastCubeLiftEnv(
         REACH_POSE_XYZ_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         _observation, first_info = env.reset(seed=41)
@@ -1562,7 +1562,7 @@ def test_randomized_pose_task_repeated_seed_has_identical_closed_loop_trace() ->
     env = FastCubeLiftEnv(
         REACH_GOAL_DELTA_OVERHEAD_PROGRESS_XYZ_TASK_CONFIG,
         include_training_reward_state=False,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         traces = []
@@ -1610,6 +1610,7 @@ def test_goal_delta_pick_physical_oracle_grasps_from_home() -> None:
         PICK_GOAL_DELTA_XYZ_GRIPPER_TASK_CONFIG,
         seed=1,
         lift_step_m=0.004,
+        use_model_cache=True,
     )
     if result.pose_ik_solver != "robot_motion.rm65.position_collision":
         pytest.skip(
@@ -1630,7 +1631,7 @@ def test_reach_goal_delta_matches_pose_target_in_public_action_frame() -> None:
     env = FastCubeLiftEnv(
         REACH_GOAL_DELTA_XYZ_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         observation, info = env.reset(seed=43)
@@ -1754,7 +1755,10 @@ def test_normal_v2_scripted_physical_grasp_gate_reaches_bilateral_lift() -> None
         run_scripted_physical_grasp_gate,
     )
 
-    result = run_scripted_physical_grasp_gate(DEFAULT_PHYSICAL_TASK_CONFIG)
+    result = run_scripted_physical_grasp_gate(
+        DEFAULT_PHYSICAL_TASK_CONFIG,
+        use_model_cache=True,
+    )
     if result.pose_ik_solver != "robot_motion.rm65.position_collision":
         pytest.skip(
             "Current process loaded the MuJoCo DLS fallback before the canonical "
@@ -1779,7 +1783,7 @@ def test_contact_curriculum_reset_starts_from_real_bilateral_contact() -> None:
     env = FastCubeLiftEnv(
         config,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         observation, info = env.reset(seed=1)
@@ -1802,7 +1806,7 @@ def test_contact_curriculum_reset_retries_recoverable_failure(monkeypatch) -> No
     env = FastCubeLiftEnv(
         CONTACT_CURRICULUM_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     original_reset = env.kernel.reset
     calls = 0
@@ -1907,7 +1911,10 @@ def test_contact_curriculum_v2_scripted_gate_lifts_from_reset() -> None:
         run_scripted_physical_grasp_gate,
     )
 
-    result = run_scripted_physical_grasp_gate(CONTACT_CURRICULUM_V2_TASK_CONFIG)
+    result = run_scripted_physical_grasp_gate(
+        CONTACT_CURRICULUM_V2_TASK_CONFIG,
+        use_model_cache=True,
+    )
     if result.pose_ik_solver != "robot_motion.rm65.position_collision":
         pytest.skip(
             "Current process loaded the MuJoCo DLS fallback before the canonical "
@@ -1927,7 +1934,7 @@ def test_contact_curriculum_v2_repeated_reset_preserves_liftable_grasp() -> None
     env = FastCubeLiftEnv(
         CONTACT_CURRICULUM_V2_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     lift_action = np.zeros(7, dtype=np.float32)
     lift_action[2] = 0.4
@@ -1965,7 +1972,7 @@ def test_contact_curriculum_v2_applies_lift_first_action_constraints() -> None:
     env = FastCubeLiftEnv(
         CONTACT_CURRICULUM_V2_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         env.reset(seed=1)
@@ -1991,7 +1998,7 @@ def test_contact_curriculum_v2_tracks_contact_loss_without_early_termination() -
     env = FastCubeLiftEnv(
         CONTACT_CURRICULUM_V2_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         env.reset(seed=1)
@@ -2019,7 +2026,7 @@ def test_contact_curriculum_v3_applies_only_nonnegative_lift_action() -> None:
     env = FastCubeLiftEnv(
         CONTACT_CURRICULUM_V3_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         env.reset(seed=1)
@@ -2045,7 +2052,7 @@ def test_contact_curriculum_v3_projection_preserves_locked_gripper_target() -> N
     env = FastCubeLiftEnv(
         CONTACT_CURRICULUM_V3_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     raw_lift_actions = (-0.6057, 0.1739, 0.4411, 0.3184, -0.5249)
     try:
@@ -2074,7 +2081,10 @@ def test_contact_curriculum_v3_scripted_gate_lifts_from_reset() -> None:
         run_scripted_physical_grasp_gate,
     )
 
-    result = run_scripted_physical_grasp_gate(CONTACT_CURRICULUM_V3_TASK_CONFIG)
+    result = run_scripted_physical_grasp_gate(
+        CONTACT_CURRICULUM_V3_TASK_CONFIG,
+        use_model_cache=True,
+    )
     if result.pose_ik_solver != "robot_motion.rm65.position_collision":
         pytest.skip(
             "Current process loaded the MuJoCo DLS fallback before the canonical "
@@ -2109,7 +2119,7 @@ def test_privileged_near_lift_v2_switches_to_lift_only_after_real_contact() -> N
     env = FastCubeLiftEnv(
         PRIVILEGED_NEAR_LIFT_V2_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         observation, info = env.reset(seed=1)
@@ -2546,7 +2556,7 @@ def test_post_contact_phase_exits_after_configured_contact_loss_grace() -> None:
     env = FastCubeLiftEnv(
         PRIVILEGED_SECURE_LIFT_TASK_CONFIG,
         include_training_reward_state=True,
-        use_model_cache=False,
+        use_model_cache=True,
     )
     try:
         env.reset(seed=1)

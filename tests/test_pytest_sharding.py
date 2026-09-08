@@ -81,6 +81,15 @@ def test_plan_is_deterministic_complete_and_weighted(tmp_path: Path) -> None:
 def test_full_profile_tracks_recent_dominant_modules() -> None:
     module = _load_sharding_module()
 
+    assert module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"] == pytest.approx(
+        118.155
+    )
+    assert (
+        module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"]
+        < module.FULL_WEIGHTS[
+            "tests/test_replay_position_admittance_active_pipeline.py"
+        ]
+    )
     assert module.FULL_WEIGHTS["tests/test_sim_point_grasp_experiment.py"] > 30.0
     assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] > 10.0
     assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 9.0
