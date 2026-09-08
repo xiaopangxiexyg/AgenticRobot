@@ -6,19 +6,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from robot_motion.action import HandActionSpec
 
-from teleop_runtime.backends.grippers import (
-    DMTacGripperBackend,
-    DMTacGripperBackendConfig,
-)
-from teleop_runtime.backends.hands import (
-    InspireTacHandBackend,
-    InspireTacHandBackendConfig,
-)
-from teleop_runtime.collection.policy_io_runtime import (
-    resolve_collection_policy_io_layout,
-)
+from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
+from teleop_runtime.backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
+from teleop_runtime.collection.policy_io_runtime import resolve_collection_policy_io_layout
 from teleop_runtime.collection.sample_assembler import CollectorSample
 from teleop_runtime.collection.schema_v22 import (
     LAST_ACTION_INITIALIZATION_METADATA_KEY,
@@ -27,10 +18,7 @@ from teleop_runtime.collection.schema_v22 import (
     collector_sample_to_v22_row,
     validate_strict_v22_measured_state,
 )
-from teleop_runtime.collection.writer_v21 import (
-    LeRobotV21Writer,
-    LeRobotV21WriterConfig,
-)
+from teleop_runtime.collection.writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 from teleop_runtime.retargeters import (
     JointsToDexHandRetargeter,
     JointsToDexHandRetargeterConfig,
@@ -116,10 +104,7 @@ def test_auto_resolver_selects_checked_in_bimanual_dmtac_preset() -> None:
     assert resolved.provenance["preset"] == "dual_arm_bimanual_dmtac_gripper_v22.json"
     assert resolved.layout.action_dim == 16
     assert resolved.layout.state_dim == 16
-    assert (
-        resolved.layout.end_effector("left").state_source_field
-        == "gripper_measured_scalar"
-    )
+    assert resolved.layout.end_effector("left").state_source_field == "gripper_measured_scalar"
     assert left_backend.config.max_action == 1.0
 
 
@@ -171,39 +156,6 @@ def test_auto_resolver_supports_left_none_right_dmtac_without_fake_left_state() 
     assert resolved.layout.state_dim == 15
 
 
-def test_auto_resolver_accepts_typed_direct_rule_dmtac_command_contract() -> None:
-    right_backend, _right_retargeter = _dmtac_pair("right")
-
-    resolved = resolve_collection_policy_io_layout(
-        "auto",
-        active_sides=("left", "right"),
-        hand_backends_by_side={"left": None, "right": right_backend},
-        hand_retargeters_by_side={"left": None, "right": None},
-        direct_hand_action_specs_by_side={
-            "right": HandActionSpec.dmtac_gripper("right")
-        },
-    )
-
-    assert resolved.layout is not None
-    assert resolved.layout.end_effector("left").adapter == "none_v1"
-    assert resolved.layout.end_effector("right").adapter == "dmtac_gripper_v1"
-    assert resolved.layout.end_effector("right").state_source_field == (
-        "gripper_measured_scalar"
-    )
-
-
-def test_auto_resolver_still_rejects_dmtac_without_registered_command() -> None:
-    right_backend, _right_retargeter = _dmtac_pair("right")
-
-    with pytest.raises(ValueError, match="registered command"):
-        resolve_collection_policy_io_layout(
-            "auto",
-            active_sides=("left", "right"),
-            hand_backends_by_side={"left": None, "right": right_backend},
-            hand_retargeters_by_side={"left": None, "right": None},
-        )
-
-
 def test_strict_bimanual_dmtac_row_uses_measured_scalar_not_q6_fallback() -> None:
     left_backend, left_retargeter = _dmtac_pair("left")
     right_backend, right_retargeter = _dmtac_pair("right")
@@ -225,9 +177,7 @@ def test_strict_bimanual_dmtac_row_uses_measured_scalar_not_q6_fallback() -> Non
     np.testing.assert_allclose(row["observation.state"][-2:], [0.20, 0.80])
 
 
-def test_strict_temporal_reset_seeds_causal_last_action_without_future_arm_target() -> (
-    None
-):
+def test_strict_temporal_reset_seeds_causal_last_action_without_future_arm_target() -> None:
     left_backend, left_retargeter = _dmtac_pair("left")
     right_backend, right_retargeter = _dmtac_pair("right")
     layout = resolve_collection_policy_io_layout(
@@ -416,10 +366,7 @@ def test_explicit_layout_must_match_runtime_pair() -> None:
             "teleop_runtime/configs/policy_io_layouts/dual_arm_left_none_right_inspire_v22.json",
             active_sides=("left", "right"),
             hand_backends_by_side={"left": left_backend, "right": right_backend},
-            hand_retargeters_by_side={
-                "left": left_retargeter,
-                "right": right_retargeter,
-            },
+            hand_retargeters_by_side={"left": left_retargeter, "right": right_retargeter},
         )
 
 

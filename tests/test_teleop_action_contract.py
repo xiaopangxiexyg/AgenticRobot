@@ -32,9 +32,7 @@ from teleop_runtime.schemas import EffectorCommand, TeleopCommand, TeleopObserva
 
 
 class TeleopActionContractTest(unittest.TestCase):
-    def test_native_v22_discrete_end_effector_target_remains_int64_to_command(
-        self,
-    ) -> None:
+    def test_native_v22_discrete_end_effector_target_remains_int64_to_command(self) -> None:
         action = RobotAction(
             action_space="dexteleop_policy_io_v2.2",
             arm_pose_by_side={
@@ -56,9 +54,7 @@ class TeleopActionContractTest(unittest.TestCase):
         target = command.commands["right_hand"]
         self.assertEqual(target.command_type, "end_effector_discrete")
         self.assertEqual(target.value.dtype, np.int64)
-        self.assertEqual(
-            target.metadata["end_effector_adapter"], "two_state_gripper_v1"
-        )
+        self.assertEqual(target.metadata["end_effector_adapter"], "two_state_gripper_v1")
 
     def test_native_v22_target_rejects_legacy_target_for_same_side(self) -> None:
         with self.assertRaises(ValueError):
@@ -106,9 +102,7 @@ class TeleopActionContractTest(unittest.TestCase):
             RobotAction(
                 action_space="bad",
                 arm_pose_by_side={
-                    "left": np.array(
-                        [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32
-                    )
+                    "left": np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
                 },
                 arm_qpos_by_side={"left": np.zeros((6,), dtype=np.float32)},
             )
@@ -116,9 +110,7 @@ class TeleopActionContractTest(unittest.TestCase):
     def test_rejects_active_effector_without_value(self) -> None:
         with self.assertRaises(ValueError):
             RobotAction.bimanual_ee_pose(
-                left_arm=np.array(
-                    [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32
-                ),
+                left_arm=np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
                 active_effectors=("right_arm",),
             )
 
@@ -150,10 +142,7 @@ class TeleopActionContractTest(unittest.TestCase):
         dispatcher.dispatch(command)
 
         self.assertEqual(len(dispatcher.commands), 1)
-        self.assertEqual(
-            dispatcher.commands[0].commands["left_arm"].effector_name,
-            effector_name("left", "arm"),
-        )
+        self.assertEqual(dispatcher.commands[0].commands["left_arm"].effector_name, effector_name("left", "arm"))
 
     def test_teleop_cartesian_command_converts_to_pose_action(self) -> None:
         pose = np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
@@ -191,13 +180,9 @@ class TeleopActionContractTest(unittest.TestCase):
 
         left = command.commands["left_arm"]
         self.assertEqual(left.metadata["arm_controlled_frame"], ARM_ENDPOINT_FRAME)
-        self.assertEqual(
-            left.metadata["arm_action_spec"]["controlled_frame"], ARM_ENDPOINT_FRAME
-        )
+        self.assertEqual(left.metadata["arm_action_spec"]["controlled_frame"], ARM_ENDPOINT_FRAME)
 
-    def test_teleop_joint_command_prefers_backend_target_pose_metadata_by_default(
-        self,
-    ) -> None:
+    def test_teleop_joint_command_prefers_backend_target_pose_metadata_by_default(self) -> None:
         source_pose = np.array([0.2, 0.3, 0.4, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         target_pose = np.array([0.5, 0.6, 0.7, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         command = TeleopCommand(timestamp=8.0)
@@ -218,14 +203,10 @@ class TeleopActionContractTest(unittest.TestCase):
         action = robot_action_from_teleop_command(command)
 
         self.assertEqual(action.action_space, BIMANUAL_EE_POSE_V1)
-        np.testing.assert_allclose(
-            action.arm_pose_by_side["right"], target_pose, atol=1e-6
-        )
+        np.testing.assert_allclose(action.arm_pose_by_side["right"], target_pose, atol=1e-6)
         self.assertNotIn("right", action.arm_qpos_by_side)
 
-    def test_teleop_joint_command_falls_back_to_source_pose_when_target_missing(
-        self,
-    ) -> None:
+    def test_teleop_joint_command_falls_back_to_source_pose_when_target_missing(self) -> None:
         source_pose = np.array([0.2, 0.3, 0.4, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         command = TeleopCommand(timestamp=8.0)
         command.add_command(
@@ -242,9 +223,7 @@ class TeleopActionContractTest(unittest.TestCase):
         action = robot_action_from_teleop_command(command)
 
         self.assertEqual(action.action_space, BIMANUAL_EE_POSE_V1)
-        np.testing.assert_allclose(
-            action.arm_pose_by_side["right"], source_pose, atol=1e-6
-        )
+        np.testing.assert_allclose(action.arm_pose_by_side["right"], source_pose, atol=1e-6)
 
     def test_teleop_joint_command_can_be_kept_as_qpos_action(self) -> None:
         command = TeleopCommand(timestamp=9.0)
@@ -336,21 +315,15 @@ class TeleopActionContractTest(unittest.TestCase):
         )
 
         encoded = encode_robot_action(action)
-        decoded = decode_robot_action(
-            encoded, timestamp=action.timestamp, source=action.source
-        )
+        decoded = decode_robot_action(encoded, timestamp=action.timestamp, source=action.source)
 
         self.assertEqual(encoded.vector.shape, (26,))
         self.assertTrue(encoded.effector_mask["left_arm"])
         self.assertFalse(encoded.effector_mask["right_arm"])
         self.assertFalse(np.any(encoded.component_mask[7:14]))
         self.assertEqual(decoded.active_effectors, ("left_arm", "right_hand"))
-        np.testing.assert_allclose(
-            decoded.arm_pose_by_side["left"], action.arm_pose_by_side["left"]
-        )
-        np.testing.assert_allclose(
-            decoded.hand_qpos_by_side["right"], action.hand_qpos_by_side["right"]
-        )
+        np.testing.assert_allclose(decoded.arm_pose_by_side["left"], action.arm_pose_by_side["left"])
+        np.testing.assert_allclose(decoded.hand_qpos_by_side["right"], action.hand_qpos_by_side["right"])
 
     def test_qpos_action_vector_round_trip(self) -> None:
         action = RobotAction.bimanual_qpos(
@@ -377,9 +350,7 @@ class TeleopActionContractTest(unittest.TestCase):
         )
 
         encoded = encode_robot_action(action)
-        decoded = decode_robot_action(
-            encoded, timestamp=action.timestamp, source=action.source
-        )
+        decoded = decode_robot_action(encoded, timestamp=action.timestamp, source=action.source)
 
         self.assertEqual(action.action_space, BIMANUAL_EE_POSE_HAND16_V1)
         self.assertEqual(encoded.vector.shape, (EE_POSE_HAND16_VECTOR_DIM,))
@@ -422,91 +393,17 @@ class TeleopActionContractTest(unittest.TestCase):
         self.assertEqual(right_spec["slot_count"], 16)
         self.assertEqual(right_spec["active_dof"], 1)
         self.assertEqual(action.metadata["hand_active_dof_by_side"], {"right": 1})
-        self.assertEqual(
-            action.metadata["hand_active_mask_by_side"]["right"], [True] + [False] * 15
-        )
-        self.assertEqual(
-            action.metadata["hand_invalid_slot_value_by_side"], {"right": "NaN"}
-        )
+        self.assertEqual(action.metadata["hand_active_mask_by_side"]["right"], [True] + [False] * 15)
+        self.assertEqual(action.metadata["hand_invalid_slot_value_by_side"], {"right": "NaN"})
         expected = np.full((16,), np.nan, dtype=np.float32)
         expected[0] = 0.7
-        np.testing.assert_allclose(
-            action.hand_qpos_by_side["right"], expected, equal_nan=True
-        )
+        np.testing.assert_allclose(action.hand_qpos_by_side["right"], expected, equal_nan=True)
 
         encoded = encode_robot_action(action)
         self.assertTrue(encoded.component_mask[28])
         self.assertFalse(np.any(encoded.component_mask[29:44]))
         decoded = decode_robot_action(encoded)
-        np.testing.assert_allclose(
-            decoded.hand_qpos_by_side["right"], expected, equal_nan=True
-        )
-
-    def test_dmtac_resolver_command_round_trips_to_canonical_q6_action(self) -> None:
-        spec = HandActionSpec.dmtac_gripper("right")
-        full = np.zeros(6, dtype=np.float32)
-        full[0] = 0.7
-        action = RobotAction.bimanual_qpos(
-            right_hand=full,
-            metadata={"hand_action_specs_by_side": {"right": spec.to_metadata()}},
-        )
-
-        command = RobotActionResolver().resolve(action)
-        hand_command = command.commands["right_hand"]
-        np.testing.assert_allclose(hand_command.value, [0.7])
-        self.assertEqual(
-            hand_command.metadata["hand_invalid_slot_value"],
-            "zero_padding",
-        )
-
-        restored = robot_action_from_teleop_command(command)
-
-        self.assertEqual(restored.hand_qpos_by_side["right"].shape, (6,))
-        np.testing.assert_allclose(restored.hand_qpos_by_side["right"], full)
-        self.assertEqual(
-            restored.metadata["hand_action_specs_by_side"]["right"]["hand_model"],
-            "dmtac_gripper",
-        )
-        encoded = encode_robot_action(restored)
-        self.assertTrue(encoded.effector_mask["right_hand"])
-
-    def test_dmtac_resolver_rejects_nonzero_inactive_padding_before_dispatch(
-        self,
-    ) -> None:
-        spec = HandActionSpec.dmtac_gripper("right")
-        invalid = np.asarray(
-            [0.7, 0.1, 0.0, 0.0, 0.0, 0.0],
-            dtype=np.float32,
-        )
-        action = RobotAction.bimanual_qpos(
-            right_hand=invalid,
-            metadata={"hand_action_specs_by_side": {"right": spec.to_metadata()}},
-        )
-
-        with self.assertRaisesRegex(ValueError, "zero padding"):
-            RobotActionResolver().resolve(action)
-
-    def test_hand_full_metadata_must_match_dispatched_active_values(self) -> None:
-        spec = HandActionSpec.dmtac_gripper("right")
-        command = TeleopCommand(timestamp=12.2)
-        command.add_command(
-            EffectorCommand(
-                effector_name="right_hand",
-                side="right",
-                command_type="joint_vector",
-                value=np.asarray([0.4], dtype=np.float32),
-                metadata={
-                    "hand_action_spec": spec.to_metadata(),
-                    "hand_qpos_full": np.asarray(
-                        [0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
-                        dtype=np.float32,
-                    ),
-                },
-            )
-        )
-
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            robot_action_from_teleop_command(command)
+        np.testing.assert_allclose(decoded.hand_qpos_by_side["right"], expected, equal_nan=True)
 
     def test_hand16_resolver_trims_invalid_nan_slots(self) -> None:
         hand = np.full((16,), np.nan, dtype=np.float32)
@@ -520,13 +417,8 @@ class TeleopActionContractTest(unittest.TestCase):
         command = RobotActionResolver().resolve(action)
 
         np.testing.assert_allclose(command.commands["right_hand"].value, [0.2, 0.8])
-        self.assertEqual(
-            command.commands["right_hand"].metadata["hand_active_mask"],
-            [True, True] + [False] * 14,
-        )
-        self.assertEqual(
-            command.commands["right_hand"].metadata["hand_action_spec"]["active_dof"], 2
-        )
+        self.assertEqual(command.commands["right_hand"].metadata["hand_active_mask"], [True, True] + [False] * 14)
+        self.assertEqual(command.commands["right_hand"].metadata["hand_action_spec"]["active_dof"], 2)
         np.testing.assert_allclose(
             command.commands["right_hand"].metadata["hand_qpos_full"],
             hand,

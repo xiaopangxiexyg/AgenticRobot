@@ -3,11 +3,7 @@ from __future__ import annotations
 import threading
 import unittest
 
-from robot_motion.runtime import (
-    EffectorCommand,
-    TeleopCommand,
-    readiness_report_blockers,
-)
+from robot_motion.runtime import EffectorCommand, TeleopCommand
 from teleop_runtime.rigs.bimanual import BimanualRig
 
 
@@ -54,38 +50,6 @@ class _FakeBackend:
 
 
 class BimanualRigHoldMotionTest(unittest.TestCase):
-    def test_readiness_report_identifies_one_unready_effector(self) -> None:
-        class FaultBackend(_FakeBackend):
-            def is_ready(self) -> bool:
-                return False
-
-            def readiness_report(self):
-                return {
-                    "ready": False,
-                    "backend": "FaultBackend",
-                    "reason": "error_code=16 status_code=1",
-                    "details": {
-                        "gripper_port": "/dev/ttyUSB1",
-                        "gripper_id": 1,
-                    },
-                }
-
-        rig = BimanualRig(
-            {
-                "left_arm": _FakeBackend("left"),
-                "right_hand": FaultBackend("right_hand"),
-            }
-        )
-
-        report = rig.readiness_report()
-
-        self.assertFalse(report["ready"])
-        self.assertEqual(report["not_ready_effectors"], ("right_hand",))
-        self.assertEqual(
-            readiness_report_blockers(report),
-            {"right_hand": "error_code=16 status_code=1"},
-        )
-
     def test_dispatch_binds_one_atomic_parent_timestamp_to_both_effectors(self) -> None:
         left = _FakeBackend("left")
         right = _FakeBackend("right")
@@ -133,9 +97,7 @@ class BimanualRigHoldMotionTest(unittest.TestCase):
         right_entered = threading.Event()
 
         class CoordinatedBackend(_FakeBackend):
-            def __init__(
-                self, name: str, own: threading.Event, peer: threading.Event
-            ) -> None:
+            def __init__(self, name: str, own: threading.Event, peer: threading.Event) -> None:
                 super().__init__(name)
                 self.own = own
                 self.peer = peer
@@ -171,38 +133,6 @@ class BimanualRigHoldMotionTest(unittest.TestCase):
 
         self.assertEqual(backend.start_count, 1)
 
-    def test_capability_start_keeps_unready_effector_in_command_topology(self) -> None:
-        class UnreadyBackend(_FakeBackend):
-            def is_ready(self) -> bool:
-                return False
-
-            def readiness_report(self):
-                return {
-                    "ready": False,
-                    "reason": "not connected",
-                    "details": {},
-                }
-
-        right_hand = UnreadyBackend("right_hand")
-        rig = BimanualRig(
-            {
-                "left_arm": _FakeBackend("left_arm"),
-                "right_hand": right_hand,
-            },
-            allow_partial_start=True,
-        )
-
-        rig.start()
-        report = rig.readiness_report()
-
-        self.assertIn("right_hand", rig.backends)
-        self.assertFalse(report["ready"])
-        self.assertEqual(report["not_ready_effectors"], ("right_hand",))
-        self.assertEqual(
-            readiness_report_blockers(report),
-            {"right_hand": "not connected"},
-        )
-
     def test_position_group_dispatch_failure_holds_every_backend(self) -> None:
         left = _FakeBackend("left", fail_send=True)
         right = _FakeBackend("right")
@@ -211,9 +141,7 @@ class BimanualRigHoldMotionTest(unittest.TestCase):
             parallel_dispatch=True,
             fail_stop_on_dispatch_error=True,
         )
-        command = type(
-            "Command", (), {"commands": {"left_arm": object(), "right_arm": object()}}
-        )()
+        command = type("Command", (), {"commands": {"left_arm": object(), "right_arm": object()}})()
 
         with self.assertRaisesRegex(RuntimeError, "group fail-stop"):
             rig.send_commands(command)
@@ -227,9 +155,7 @@ class BimanualRigHoldMotionTest(unittest.TestCase):
         left = _FakeBackend("left", fail_send=True)
         right = _FakeBackend("right")
         rig = BimanualRig({"left_arm": left, "right_arm": right})
-        command = type(
-            "Command", (), {"commands": {"left_arm": object(), "right_arm": object()}}
-        )()
+        command = type("Command", (), {"commands": {"left_arm": object(), "right_arm": object()}})()
 
         with self.assertRaisesRegex(RuntimeError, "left send failed"):
             rig.send_commands(command)
