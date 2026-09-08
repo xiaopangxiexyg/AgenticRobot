@@ -73,6 +73,15 @@ canonical GUI real-teleop/collection root；实际站点应显式提供设备、
 | Degraded speed | `0.5×` | 已分类异常目标，不改变正常 qdd 上限 |
 | Reference max age | `0.2 s` | Stale 时 fail-safe hold |
 
+执行 qvel 回灌是显式 opt-in。默认情况下，真实 accepted qcmd 继续锚定 coupled
+IK 的 qpos，但不会读取或替换其已准入的 IK velocity。使用
+`--position-execution-qvel-feedback` 后，运行时会从同一个后台 planner snapshot
+读取 qcmd 与 qvel；任一字段缺失、非有限或 qcmd 不一致都会 fail closed。使用
+该模式要求双臂均使用 acceleration-limited 或 sample-aligned jerk-limited planner；
+显式启用但 planner 不支持或后台 streaming 未开启时同样会 fail closed。使用
+`--no-position-execution-qvel-feedback` 或省略正向参数即可恢复稳定基线。启动日志、
+actuator trace 与 position debug metadata 都会记录最终模式。
+
 参数真值位于版本化
 [`robot_motion/rm65/position_profile.py`](../../robot_motion/rm65/position_profile.py)。
 文档表用于运行检查，不应成为第二份配置实现。

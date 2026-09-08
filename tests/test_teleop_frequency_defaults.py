@@ -226,6 +226,22 @@ def test_real_teleop_position_target_velocity_filter_can_be_bypassed() -> None:
     assert args.position_target_velocity_filter_tau_sec == pytest.approx(0.0)
 
 
+def test_real_teleop_position_execution_qvel_feedback_is_opt_in() -> None:
+    assert _parse_real_teleop_args([]).position_execution_qvel_feedback is False
+    assert (
+        _parse_real_teleop_args(
+            ["--position-execution-qvel-feedback"]
+        ).position_execution_qvel_feedback
+        is True
+    )
+    assert (
+        _parse_real_teleop_args(
+            ["--no-position-execution-qvel-feedback"]
+        ).position_execution_qvel_feedback
+        is False
+    )
+
+
 def test_real_teleop_position_command_step_envelope_rejects_impedance() -> None:
     with pytest.raises(SystemExit):
         _parse_real_teleop_args(

@@ -1718,6 +1718,7 @@ def run_real_teleop(
             f"arm_max_angvel_effective_rad_s={np.round(np.asarray(args.arm_max_angvel, dtype=float) * (0.2 if bool(getattr(args, 'strict_degree_limit', False)) else 1.0), 3).tolist()} "
             f"position_max_command_step_deg={getattr(args, 'position_max_command_step_deg', None)} "
             f"position_target_velocity_filter_tau_sec={getattr(args, 'position_target_velocity_filter_tau_sec', DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC)} "
+            f"position_execution_qvel_feedback={'on' if bool(getattr(args, 'position_execution_qvel_feedback', False)) else 'off'} "
             f"strict_degree_limit={'on' if bool(getattr(args, 'strict_degree_limit', False)) else 'off'} "
             f"actual_dt_scaling={'on' if args.arm_step_dt_scaling else 'off'} "
             f"dt_alpha={args.arm_step_dt_alpha:.2f} "
@@ -2009,6 +2010,9 @@ def run_real_teleop(
                                 "position_target_velocity_filter_tau_sec",
                                 DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
                             )
+                        ),
+                        "position_execution_qvel_feedback_enabled": bool(
+                            getattr(args, "position_execution_qvel_feedback", False)
                         ),
                         "arm_step_dt_scaling": bool(
                             getattr(args, "arm_step_dt_scaling", False)

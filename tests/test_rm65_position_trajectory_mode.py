@@ -777,12 +777,218 @@ def test_acceleration_mode_coupled_ik_sync_uses_accepted_qcmd_not_preview_qref()
     call = retargeter.calls[0]
     np.testing.assert_allclose(call["left_qpos"], left_qcmd)
     np.testing.assert_allclose(call["right_qpos"], right_qcmd)
+    assert "left_qvel" not in call
+    assert "right_qvel" not in call
     assert call["reset_tracking"] is False
     sync = components.arm_loop_step_dt_tracker["retargeter_execution_state_sync"]
+    assert sync["execution_qvel_feedback_enabled"] is False
     assert sync["source_by_side"] == {
         "left": "last_accepted_qpos",
         "right": "last_accepted_qpos",
     }
+    assert sync["left_qvel_rad_s"] is None
+    assert sync["right_qvel_rad_s"] is None
+
+
+def test_acceleration_mode_coupled_ik_sync_can_use_coherent_planner_velocity() -> None:
+    left_backend, _ = _backend()
+    right_backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="right",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            position_command_planner=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+        )
+    )
+    expected_qpos = {}
+    expected_qvel = {}
+    for side, backend, sign in (
+        ("left", left_backend, 1.0),
+        ("right", right_backend, -1.0),
+    ):
+        planner = backend._stream_planner
+        planner.reset(np.zeros(6), monotonic_time=10.0)
+        planner.accept_target(
+            np.full(6, sign * 0.2),
+            sequence=1,
+            published_monotonic_time=10.0,
+            monotonic_time=10.0,
+        )
+        proposal = planner.propose(monotonic_time=10.0 + 1.0 / 120.0)
+        planner.commit(proposal)
+        expected_qpos[side] = proposal.q_command.copy()
+        expected_qvel[side] = proposal.qd_command_rad_s.copy()
+        with backend._state_lock:
+            backend._record_command_accepted_locked(
+                proposal.q_command,
+                timestamp=20.0,
+                monotonic_time=20.0,
+            )
+
+    retargeter = _RecordingDualArmRetargeter()
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        left_command_backend=left_backend,
+        right_command_backend=right_backend,
+        left_preview_backend=left_backend,
+        right_preview_backend=right_backend,
+        dual_arm_retargeter=retargeter,
+        arm_loop_step_dt_tracker={},
+        position_execution_qvel_feedback_enabled=True,
+    )
+
+    real_teleop._sync_dual_arm_retargeter_for_real_control(
+        components,
+        reset_tracking=False,
+    )
+
+    call = retargeter.calls[0]
+    for side in ("left", "right"):
+        np.testing.assert_allclose(call[f"{side}_qpos"], expected_qpos[side])
+        np.testing.assert_allclose(call[f"{side}_qvel"], expected_qvel[side])
+    sync = components.arm_loop_step_dt_tracker["retargeter_execution_state_sync"]
+    assert sync["execution_qvel_feedback_enabled"] is True
+    assert sync["source_by_side"] == {
+        "left": "last_accepted_qpos+trajectory_planner_motion",
+        "right": "last_accepted_qpos+trajectory_planner_motion",
+    }
+
+
+def test_execution_qvel_feedback_fails_closed_without_planner_snapshot() -> None:
+    left_backend, _ = _backend()
+    right_backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="right",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=False,
+            position_command_planner=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+        )
+    )
+    retargeter = _RecordingDualArmRetargeter()
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        left_command_backend=left_backend,
+        right_command_backend=right_backend,
+        left_preview_backend=left_backend,
+        right_preview_backend=right_backend,
+        dual_arm_retargeter=retargeter,
+        arm_loop_step_dt_tracker={},
+        position_execution_qvel_feedback_enabled=True,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="right_arm coupled IK qvel feedback requires background streaming",
+    ):
+        real_teleop._sync_dual_arm_retargeter_for_real_control(
+            components,
+            reset_tracking=False,
+        )
+    assert retargeter.calls == []
+
+
+def test_execution_qvel_feedback_fails_closed_for_legacy_planner() -> None:
+    backends = {
+        side: RM65ArmBackend(
+            RM65ArmBackendConfig(
+                arm_ip="0.0.0.0",
+                side=side,
+                connect_hardware=False,
+                initial_qpos=np.zeros(6),
+                position_command_planner=POSITION_COMMAND_PLANNER_LINEAR,
+            )
+        )
+        for side in ("left", "right")
+    }
+    retargeter = _RecordingDualArmRetargeter()
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        left_command_backend=backends["left"],
+        right_command_backend=backends["right"],
+        left_preview_backend=backends["left"],
+        right_preview_backend=backends["right"],
+        dual_arm_retargeter=retargeter,
+        arm_loop_step_dt_tracker={},
+        position_execution_qvel_feedback_enabled=True,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="qvel feedback requires RM65 acceleration-limited",
+    ):
+        real_teleop._sync_dual_arm_retargeter_for_real_control(
+            components,
+            reset_tracking=False,
+        )
+    assert retargeter.calls == []
+
+
+def test_execution_qvel_feedback_rejects_mixed_execution_ticks(monkeypatch) -> None:
+    left_backend, _ = _backend()
+    right_backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="right",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            position_command_planner=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+        )
+    )
+    left_state = left_backend.get_state(
+        include_derived_pose=False,
+        include_timing_percentiles=False,
+    )
+    left_state["background_streaming"]["trajectory_planner"]["q_command"][0] = 0.1
+    monkeypatch.setattr(left_backend, "get_state", lambda **_kwargs: left_state)
+    retargeter = _RecordingDualArmRetargeter()
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        left_command_backend=left_backend,
+        right_command_backend=right_backend,
+        left_preview_backend=left_backend,
+        right_preview_backend=right_backend,
+        dual_arm_retargeter=retargeter,
+        arm_loop_step_dt_tracker={},
+        position_execution_qvel_feedback_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="states from different execution ticks"):
+        real_teleop._sync_dual_arm_retargeter_for_real_control(
+            components,
+            reset_tracking=False,
+        )
+    assert retargeter.calls == []
+
+
+def test_sample_aligned_backend_exposes_coherent_execution_motion_snapshot() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            background_streaming_hz=120.0,
+            position_command_planner=(
+                POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED
+            ),
+            position_sample_aligned_source_hz=60.0,
+            singularity_protection_enabled=False,
+        )
+    )
+
+    state = backend.get_state(
+        include_derived_pose=False,
+        include_timing_percentiles=False,
+    )
+    planner = state["background_streaming"]["trajectory_planner"]
+    np.testing.assert_allclose(planner["q_command"], state["last_accepted_qpos"])
+    np.testing.assert_allclose(planner["qd_command_rad_s"], 0.0)
 
 
 def test_acceleration_mode_coupled_ik_sync_skips_percentile_snapshot_hot_path(

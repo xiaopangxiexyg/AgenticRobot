@@ -724,11 +724,12 @@ def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None
         "left_command_backend",
         "right_command_backend",
     )
-    assert component_fields[-4:] == (
+    assert component_fields[-5:] == (
         "fix_arm_controller",
         "init_arm_controller",
         "position_reference_publisher",
         "startup_home_continuity_gate",
+        "position_execution_qvel_feedback_enabled",
     )
 
     for name in (
@@ -877,8 +878,8 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 450
-    assert sum(len(action.option_strings) for action in parser._actions) == 510
+    assert len(parser._actions) == 451
+    assert sum(len(action.option_strings) for action in parser._actions) == 512
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
     assert parser.parse_args([]).artifact_layout == "legacy"
@@ -892,6 +893,19 @@ def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary
     assert parser.parse_args([]).storage_queue_backpressure_policy == "block"
     assert parser.parse_args([]).position_ik_branch_continuity_anchor is False
     assert parser.parse_args([]).position_joint_limit_guard_mode == "legacy"
+    assert parser.parse_args([]).position_execution_qvel_feedback is False
+    assert (
+        parser.parse_args(
+            ["--position-execution-qvel-feedback"]
+        ).position_execution_qvel_feedback
+        is True
+    )
+    assert (
+        parser.parse_args(
+            ["--no-position-execution-qvel-feedback"]
+        ).position_execution_qvel_feedback
+        is False
+    )
     assert parser.parse_args([]).runtime_home_atomic_arm_snapshot is True
     assert parser.parse_args([]).runtime_home_late_weighted_vive is True
     assert parser.parse_args([]).position_admittance_shadow is False

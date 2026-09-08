@@ -1323,6 +1323,16 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--position-execution-qvel-feedback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Opt in to synchronizing coupled position IK from the authoritative "
+            "planner qpos and its matching qvel. By default, accepted qcmd still "
+            "anchors IK position but planner velocity is not read or fed back."
+        ),
+    )
+    parser.add_argument(
         "--position-velocity-ramp-sec",
         type=_positive_float,
         default=DEFAULT_POSITION_VELOCITY_RAMP_SEC,

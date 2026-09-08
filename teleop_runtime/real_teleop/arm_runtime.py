@@ -92,7 +92,15 @@ def _sync_dual_arm_retargeter_for_real_control(
 
     if components.dual_arm_retargeter is None:
         return
+    execution_qvel_feedback_enabled = bool(
+        getattr(components, "position_execution_qvel_feedback_enabled", False)
+    )
     if not _acceleration_limited_position_execution_active(components):
+        if execution_qvel_feedback_enabled:
+            raise RuntimeError(
+                "Coupled IK qvel feedback requires RM65 acceleration-limited or "
+                "sample-aligned jerk-limited command planners on all active arms."
+            )
         _sync_dual_arm_retargeter_from_preview(
             components,
             reset_tracking=reset_tracking,
@@ -100,6 +108,7 @@ def _sync_dual_arm_retargeter_for_real_control(
         return
 
     qpos_by_side: dict[str, np.ndarray] = {}
+    qvel_by_side: dict[str, np.ndarray] = {}
     accepted_monotonic_by_side: dict[str, float] = {}
     source_by_side: dict[str, str] = {}
     for side in ("left", "right"):
@@ -107,6 +116,12 @@ def _sync_dual_arm_retargeter_for_real_control(
         if not isinstance(backend, RM65ArmBackend):
             raise RuntimeError(
                 f"Acceleration-limited coupled IK requires an RM65 command backend for {side}."
+            )
+        if execution_qvel_feedback_enabled and not bool(
+            backend.config.background_streaming_enabled
+        ):
+            raise RuntimeError(
+                f"{side}_arm coupled IK qvel feedback requires background streaming."
             )
         # This runs twice per outer-loop frame (before and after preview
         # application). Use the real-time snapshot path: the complete
@@ -134,6 +149,43 @@ def _sync_dual_arm_retargeter_for_real_control(
             )
         qpos_by_side[side] = qpos.copy()
         source_by_side[side] = source
+        if execution_qvel_feedback_enabled:
+            stream = state.get("background_streaming")
+            planner = (
+                stream.get("trajectory_planner")
+                if isinstance(stream, Mapping)
+                else None
+            )
+            planner_qpos = (
+                planner.get("q_command") if isinstance(planner, Mapping) else None
+            )
+            planner_qvel = (
+                planner.get("qd_command_rad_s")
+                if isinstance(planner, Mapping)
+                else None
+            )
+            try:
+                execution_qpos = np.asarray(planner_qpos, dtype=float).reshape(6)
+                execution_qvel = np.asarray(planner_qvel, dtype=float).reshape(6)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{side}_arm has no valid authoritative planner motion snapshot "
+                    "for coupled IK qvel feedback."
+                ) from exc
+            if not np.all(np.isfinite(execution_qpos)) or not np.all(
+                np.isfinite(execution_qvel)
+            ):
+                raise RuntimeError(
+                    f"{side}_arm planner motion snapshot is non-finite; refusing "
+                    "coupled IK qvel feedback."
+                )
+            if not np.allclose(execution_qpos, qpos, rtol=0.0, atol=1e-10):
+                raise RuntimeError(
+                    f"{side}_arm accepted qcmd and planner motion snapshot disagree; "
+                    "refusing to combine states from different execution ticks."
+                )
+            qvel_by_side[side] = execution_qvel.copy()
+            source_by_side[side] = f"{source}+trajectory_planner_motion"
         accepted_monotonic = state.get("last_accepted_timestamp_monotonic")
         if accepted_monotonic is not None:
             try:
@@ -143,19 +195,39 @@ def _sync_dual_arm_retargeter_for_real_control(
             if np.isfinite(normalized_time):
                 accepted_monotonic_by_side[side] = normalized_time
 
-    components.dual_arm_retargeter.set_current_qpos_pair(
-        left_qpos=qpos_by_side["left"],
-        right_qpos=qpos_by_side["right"],
-        reset_tracking=reset_tracking,
-    )
+    if execution_qvel_feedback_enabled:
+        components.dual_arm_retargeter.set_current_qpos_pair(
+            left_qpos=qpos_by_side["left"],
+            right_qpos=qpos_by_side["right"],
+            left_qvel=qvel_by_side["left"],
+            right_qvel=qvel_by_side["right"],
+            reset_tracking=reset_tracking,
+        )
+    else:
+        components.dual_arm_retargeter.set_current_qpos_pair(
+            left_qpos=qpos_by_side["left"],
+            right_qpos=qpos_by_side["right"],
+            reset_tracking=reset_tracking,
+        )
     timestamps = tuple(accepted_monotonic_by_side.values())
     skew_sec = None if len(timestamps) < 2 else max(timestamps) - min(timestamps)
     components.arm_loop_step_dt_tracker["retargeter_execution_state_sync"] = {
+        "execution_qvel_feedback_enabled": execution_qvel_feedback_enabled,
         "source_by_side": source_by_side,
         "accepted_monotonic_by_side": dict(accepted_monotonic_by_side),
         "accepted_timestamp_skew_sec": skew_sec,
         "left_qpos": qpos_by_side["left"].tolist(),
         "right_qpos": qpos_by_side["right"].tolist(),
+        "left_qvel_rad_s": (
+            qvel_by_side["left"].tolist()
+            if execution_qvel_feedback_enabled
+            else None
+        ),
+        "right_qvel_rad_s": (
+            qvel_by_side["right"].tolist()
+            if execution_qvel_feedback_enabled
+            else None
+        ),
     }
 
 

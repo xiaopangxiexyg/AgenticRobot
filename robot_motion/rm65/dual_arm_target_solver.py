@@ -1593,6 +1593,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         *,
         left_qpos: Sequence[float] | np.ndarray | None = None,
         right_qpos: Sequence[float] | np.ndarray | None = None,
+        left_qvel: Sequence[float] | np.ndarray | None = None,
+        right_qvel: Sequence[float] | np.ndarray | None = None,
         reset_tracking: bool = True,
     ) -> None:
         left = (
@@ -1614,6 +1616,28 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             left_qpos=left,
             right_qpos=right,
         )
+        if (left_qvel is None) != (right_qvel is None):
+            raise ValueError(
+                "left_qvel and right_qvel must either both be provided or both be omitted."
+            )
+        execution_velocity_full: np.ndarray | None = None
+        if left_qvel is not None and right_qvel is not None:
+            left_velocity = np.asarray(left_qvel, dtype=float).reshape(-1)
+            right_velocity = np.asarray(right_qvel, dtype=float).reshape(-1)
+            if left_velocity.shape != (6,) or right_velocity.shape != (6,):
+                raise ValueError(
+                    "DualArmCollisionAwareRetargeter expects 6D arm qvel per side, "
+                    f"got {left_velocity.shape} and {right_velocity.shape}."
+                )
+            if not np.all(np.isfinite(left_velocity)) or not np.all(
+                np.isfinite(right_velocity)
+            ):
+                raise ValueError("arm qvel must be finite.")
+            execution_velocity_full = self._embed_arm_qpos(
+                current_full_q=np.zeros_like(full_q),
+                left_qpos=left_velocity,
+                right_qpos=right_velocity,
+            )
         self.ik_solver.set_configuration_q(full_q)
         self._last_safe_full_q = full_q.copy()
         if reset_tracking:
@@ -1638,12 +1662,13 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         ):
             # The real-position loop synchronizes the IK configuration from the
             # latest transport-accepted qcmd before and after every outer tick.
-            # That synchronization is not a lifecycle reset: keep the velocity
-            # admitted by the previous tick so Pink's acceleration constraint
-            # remains stateful.  Rebase the post-IK smoother to the same
-            # authoritative qcmd; otherwise a stale, ahead-of-transport qref can
-            # reintroduce the q4-q6 null redistribution removed by the coaxial
-            # canonicalizer.
+            # That synchronization is not a lifecycle reset. When the caller
+            # explicitly supplies a velocity from the same transport snapshot,
+            # replace the prior qref velocity as well; otherwise retain the
+            # stable baseline's admitted-reference velocity. Rebase the post-IK
+            # smoother to the same authoritative qcmd in either mode.
+            if execution_velocity_full is not None:
+                self._last_admitted_velocity_full = execution_velocity_full.copy()
             self._last_output_qpos_smoothing_full_q = full_q.copy()
             self._set_solver_motion_reference(full_q)
 
