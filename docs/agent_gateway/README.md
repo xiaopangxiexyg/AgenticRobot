@@ -12,6 +12,8 @@ SAM2 + Grounding DINO 图片定位 Skill 的源码、权重和测试路径说明
 [`SAM2_GROUNDING_DINO.md`](./SAM2_GROUNDING_DINO.md)。
 SAM2 + VGN/GraspNet 点击引导 DMTAC M 抓姿 Skill 的 RGB-D、固定相机标定、权重和只读边界见
 [`POINT_GRASP.md`](./POINT_GRASP.md)。
+抓姿生成、左右臂、真机 Gateway、RM65 运动 trace 和验收边界的集中交接见
+[`real_rm65_skill_motion_handoff_20260908.md`](./real_rm65_skill_motion_handoff_20260908.md)。
 运行资产包的下载、解压和共享根登记统一见项目根 [`README.md`](../../README.md) 的“运行资产”章节；
 本目录不重复资产包说明。
 
