@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -116,12 +114,19 @@ class _Source:
 class _RecordingRgbCameraGeometry:
     semantic_content_hash = "geometry:test"
 
-    def __init__(self) -> None:
+    def __init__(self, *, failure: str | None = None) -> None:
         self.pose_cut_calls: list[tuple[str, float, float]] = []
+        self.failure = failure
 
     @staticmethod
     def source_catalog():
         return (
+            {
+                "source_id": "front",
+                "role": "main",
+                "native_width": 4,
+                "native_height": 3,
+            },
             {
                 "source_id": "left_wrist",
                 "role": "wrist_left",
@@ -132,6 +137,8 @@ class _RecordingRgbCameraGeometry:
 
     def pose_cut(self, *, source_id: str, frame_acquired_at: float, now: float):
         self.pose_cut_calls.append((source_id, frame_acquired_at, now))
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
         if now < 10.2:
             raise RuntimeError(f"real_rgb_camera_pose_from_future:{source_id}")
         return RealRgbCameraGeometryCut(
@@ -149,6 +156,7 @@ def _provider(
     *,
     front_at: float = 9.95,
     wrist_at: float = 9.97,
+    wrist_depth: bool = False,
     rgb_camera_geometry=None,
     clock=None,
 ):
@@ -162,7 +170,7 @@ def _provider(
         "left_wrist": _Source(
             "left_wrist",
             timestamp=wrist_at,
-            enable_depth=False,
+            enable_depth=wrist_depth,
             serial="left-serial",
         ),
     }
@@ -214,6 +222,51 @@ def test_rgb_geometry_observes_dynamic_pose_after_frame_processing() -> None:
 
     assert geometry.pose_cut_calls == [("left_wrist", 9.97, 10.2)]
     assert capture.pose_available_at == 10.2
+
+
+def test_rgb_observes_frame_after_obtaining_concurrent_source_snapshot() -> None:
+    observed_source: dict[str, _Source] = {}
+
+    def clock() -> float:
+        source = observed_source.get("source")
+        return 10.2 if source is not None and source.latest_frame_reads else 10.0
+
+    provider, sources, _revision, _profile = _provider(
+        wrist_at=10.1,
+        clock=clock,
+    )
+    observed_source["source"] = sources["left_wrist"]
+
+    capture = provider.capture_rgb(
+        {
+            "selected_roles": ["wrist_left"],
+            "width": 2,
+            "height": 2,
+            "max_total_bytes": 100_000,
+        },
+        expected_station_revision=7,
+    )
+
+    assert sources["left_wrist"].latest_frame_reads == 1
+    assert capture.frames[0].acquired_at == 10.1
+
+
+def test_rgb_rejects_frame_still_from_future_after_observation() -> None:
+    provider, _sources, _revision, _profile = _provider(
+        wrist_at=10.1,
+        clock=lambda: 10.0,
+    )
+
+    with pytest.raises(RuntimeError, match="frame_from_future:left_wrist"):
+        provider.capture_rgb(
+            {
+                "selected_roles": ["wrist_left"],
+                "width": 2,
+                "height": 2,
+                "max_total_bytes": 100_000,
+            },
+            expected_station_revision=7,
+        )
 
 
 def test_legacy_video_frame_export_is_object_identical() -> None:
@@ -359,6 +412,72 @@ def test_real_provider_captures_one_correlated_immutable_rgbd_frame() -> None:
     assert len(capture.depth_content_hash) == 64
 
 
+def test_aligned_wrist_rgbd_uses_dynamic_geometry_from_the_same_frame_time() -> None:
+    geometry = _RecordingRgbCameraGeometry()
+    observed_times = iter((10.0, 10.2))
+    provider, sources, _revision, _profile = _provider(
+        wrist_depth=True,
+        rgb_camera_geometry=geometry,
+        clock=lambda: next(observed_times),
+    )
+
+    assert tuple(item["role"] for item in provider.depth_source_catalog()) == ("main",)
+    assert tuple(item["role"] for item in provider.aligned_rgbd_source_catalog()) == (
+        "main",
+        "wrist_left",
+    )
+
+    capture = provider.capture_aligned_rgbd(
+        role="wrist_left",
+        expected_station_revision=7,
+    )
+
+    assert sources["left_wrist"].latest_frame_reads == 1
+    assert geometry.pose_cut_calls == [("left_wrist", 9.97, 10.2)]
+    assert capture.source_id == "left_wrist"
+    assert capture.role == "wrist_left"
+    assert capture.source_from_camera == pytest.approx(
+        tuple(float(value) for value in np.eye(4).reshape(-1))
+    )
+
+
+def test_plain_depth_capture_does_not_expose_dynamic_wrist_geometry() -> None:
+    provider, _sources, _revision, _profile = _provider(
+        wrist_depth=True,
+        rgb_camera_geometry=_RecordingRgbCameraGeometry(),
+        clock=lambda: 10.2,
+    )
+
+    with pytest.raises(ValueError, match="Depth role is not registered"):
+        provider.capture_depth(role="wrist_left", expected_station_revision=7)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "real_rgb_camera_pose_unavailable:left_wrist",
+        "real_rgb_camera_pose_stale:left_wrist",
+        "real_rgb_camera_frame_pose_skew_exceeded:left_wrist",
+        "real_rgb_camera_pose_from_future:left_wrist",
+    ),
+)
+def test_aligned_wrist_rgbd_preserves_dynamic_geometry_fail_closed_errors(
+    failure,
+) -> None:
+    observed_times = iter((10.0, 10.2))
+    provider, _sources, _revision, _profile = _provider(
+        wrist_depth=True,
+        rgb_camera_geometry=_RecordingRgbCameraGeometry(failure=failure),
+        clock=lambda: next(observed_times),
+    )
+
+    with pytest.raises(RuntimeError, match=failure):
+        provider.capture_aligned_rgbd(
+            role="wrist_left",
+            expected_station_revision=7,
+        )
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     (
@@ -458,31 +577,30 @@ def test_checked_in_binding_exposes_all_rgb_but_only_trusted_static_depth() -> N
         "wrist_right",
     }
     assert tuple(item["role"] for item in provider.depth_source_catalog()) == ("main",)
+    assert tuple(item["role"] for item in provider.aligned_rgbd_source_catalog()) == (
+        "main",
+    )
     assert set(binding.world_from_depth_camera_by_source) == {"front"}
+    assert all(source.config.enable_depth for source in binding.camera_sources.values())
     assert all(
         source.device_info()["running"] is False
         for source in binding.camera_sources.values()
     )
 
 
-def test_binding_rejects_untrusted_wrist_depth_before_hardware_start(tmp_path) -> None:
-    payload = json.loads(
-        Path("teleop_runtime/configs/devices/agent_gateway_realsense.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    payload["left_wrist"]["enable_depth"] = True
-    config_path = tmp_path / "cameras.json"
-    config_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="exactly one trusted static"):
-        build_real_perception_source_binding(
-            camera_config_path=config_path,
-            camera_registry_path="robot_motion/configs/rm65_camera_registry.json",
-            scene_world_from_arm_base_by_side={
-                "left": np.eye(4),
-                "right": np.eye(4),
+def test_source_binding_rejects_static_pose_for_depth_disabled_source() -> None:
+    with pytest.raises(ValueError, match="belong to enabled depth sources"):
+        RealPerceptionSourceBinding(
+            camera_sources={
+                "front": _Source(
+                    "front",
+                    timestamp=1.0,
+                    enable_depth=False,
+                    serial="front-serial",
+                )
             },
+            world_from_depth_camera_by_source={"front": np.eye(4)},
+            semantic_content_hash="source-binding:test",
         )
 
 

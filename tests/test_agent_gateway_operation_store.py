@@ -424,6 +424,45 @@ def test_control_reservation_invalidates_late_result_before_port_confirmation() 
     assert store.active_operation_id is None
 
 
+def test_emergency_stop_supersedes_an_existing_control_reservation() -> None:
+    store = BoundedInMemoryAgentSkillOperationStore()
+    admitted = _admit(store, _request()).operation
+    reserved = store.reserve_control(
+        operation_id=admitted.operation_id,
+        control_kind="cancel",
+        terminal_status="cancelled",
+        reason_code="cancel_reserved",
+        current_station_revision=4,
+        updated_at=10.1,
+    )
+    assert reserved.accepted
+
+    stopped = store.terminate_after_emergency_stop(
+        operation_id=admitted.operation_id,
+        emergency_stop_confirmed=True,
+        reason_code="operation_cancelled_after_emergency_stop",
+        current_station_revision=4,
+        updated_at=10.2,
+        execution_receipt_refs=("emergency-stop:dual-arm",),
+    )
+
+    assert stopped.accepted
+    assert stopped.operation.status == "cancelled"
+    assert "emergency-stop:dual-arm" in (
+        stopped.operation.execution_receipt_refs
+    )
+    assert store.active_operation_id is None
+    late_cancel = store.finalize_control(
+        operation_id=admitted.operation_id,
+        expected_operation_hash=reserved.operation.semantic_content_hash,
+        reason_code="late_cancel",
+        current_station_revision=4,
+        updated_at=10.3,
+    )
+    assert not late_cancel.accepted
+    assert late_cancel.operation is stopped.operation
+
+
 def test_failed_control_remains_active_and_blocks_worker_progress() -> None:
     store = BoundedInMemoryAgentSkillOperationStore()
     admitted = _admit(store, _request()).operation

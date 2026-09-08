@@ -242,6 +242,16 @@ lifecycle Routes. Neutral no-I/O test/dry-run ports cannot prove either read or
 control execution. The control-domain HOLD port remains separate from passive
 read execution.
 
+The exclusive real RM65 profile additionally advertises
+`own_domain_emergency_stop_v1`. This is a domain-level safety control, not a
+motion Skill: it requires no observation, Station revision, Grant, or active
+operation and directly requests the lower owner to stop both arms. Acceptance
+requires authoritative acknowledgement from both RM65 backends. The request
+locks a one-way Gateway latch before lower I/O, supersedes an in-flight worker
+or ordinary cancellation, and rejects every later motion admission. HOLD is
+not emergency-stop proof, partial acknowledgement is a failure, and re-arm is
+deliberately outside the Agent/RPent surface.
+
 Safety-envelope selection is a motion-admission concern. A Route may publish a
 finite set of compatible reviewed envelopes, but every admitted operation pins
 one exact envelope ID, content hash, and constraint-set hash. If exactly one
@@ -285,6 +295,13 @@ real launchers retain a final validation before constructing a simulator,
 device, or lower owner, and the server repeats it immediately before bind. An
 advanced caller may pass `--root`, but is then responsible for choosing a root
 that leaves enough pathname budget.
+
+One authenticated client identity may reserve at most three persistent local
+connections: its ordinary request channel, an independent emergency-stop
+channel, and one bounded bootstrap/inspection channel during attachment
+handoff. The bound is fixed; a fourth connection is rejected. Any channel
+disconnecting or timing out still invokes the same fail-closed authenticated
+disconnect handling, so the safety channel does not weaken HOLD-on-disconnect.
 
 `--artifact-root` is optional and default-off. Supplying a real,
 non-world-writable directory enables the read-only

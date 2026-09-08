@@ -26,12 +26,6 @@ from .artifact_contracts import (
     AgentArtifactBinding,
     agent_artifact_wire_schemas_v2,
 )
-from .event_contracts import (
-    AGENT_GATEWAY_EVENT_BATCH_HASH_DOMAIN_V2,
-    AGENT_GATEWAY_EVENT_HASH_DOMAIN_V2,
-    AGENT_GATEWAY_EVENT_KINDS_V2,
-    agent_event_wire_schemas_v2,
-)
 from .evaluation_contracts import (
     AGENT_SKILL_AGGREGATE_EVALUATION_RECEIPT_HASH_DOMAIN_V1,
     AGENT_SKILL_AGGREGATE_VERDICTS_V1,
@@ -45,6 +39,17 @@ from .evaluation_contracts import (
     AGENT_SKILL_EVALUATOR_ROLES_V1,
     AGENT_SKILL_EVALUATOR_SPEC_HASH_DOMAIN_V1,
     AGENT_SKILL_MISSING_EVIDENCE_POLICIES_V1,
+)
+from .event_contracts import (
+    AGENT_GATEWAY_EVENT_BATCH_HASH_DOMAIN_V2,
+    AGENT_GATEWAY_EVENT_HASH_DOMAIN_V2,
+    AGENT_GATEWAY_EVENT_KINDS_V2,
+    agent_event_wire_schemas_v2,
+)
+from .session_contracts import (
+    AGENT_GATEWAY_SESSION_CAPABILITIES_HASH_DOMAIN_V2,
+    AGENT_SKILL_RESOURCE_CLAIM_HASH_DOMAIN_V2,
+    agent_session_wire_schemas_v2,
 )
 from .skill_catalog import (
     AGENT_SKILL_CONTROL_EFFECT_CLASSES_V1,
@@ -69,11 +74,6 @@ from .skill_io_contracts import (
     AGENT_SKILL_IO_CATALOG_HASH_DOMAIN_V2,
     AGENT_SKILL_IO_CONTRACT_HASH_DOMAIN_V2,
     agent_skill_io_wire_schemas_v2,
-)
-from .session_contracts import (
-    AGENT_GATEWAY_SESSION_CAPABILITIES_HASH_DOMAIN_V2,
-    AGENT_SKILL_RESOURCE_CLAIM_HASH_DOMAIN_V2,
-    agent_session_wire_schemas_v2,
 )
 from .version import AGENT_SKILL_PROTOCOL_VERSION_V2
 
@@ -191,6 +191,9 @@ AGENT_OWN_OPERATION_CANCEL_REQUEST_HASH_DOMAIN_V1 = (
 AGENT_OWN_DOMAIN_HOLD_REQUEST_HASH_DOMAIN_V1 = (
     "dexteleop.agent_control.own_domain_hold_request.v1"
 )
+AGENT_OWN_DOMAIN_EMERGENCY_STOP_REQUEST_HASH_DOMAIN_V1 = (
+    "dexteleop.agent_control.own_domain_emergency_stop_request.v1"
+)
 AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1 = (
     "dexteleop.agent_gateway.authoritative_port_receipt.v1"
 )
@@ -200,7 +203,15 @@ AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1 = (
 AGENT_GATEWAY_SAFETY_PROFILE_SELECTION_FEATURE_V1 = (
     "safety_profile_selection_v1"
 )
-AGENT_GATEWAY_PORT_OPERATION_KINDS_V1 = ("activate", "cancel", "hold")
+AGENT_GATEWAY_DOMAIN_EMERGENCY_STOP_FEATURE_V1 = (
+    "own_domain_emergency_stop_v1"
+)
+AGENT_GATEWAY_PORT_OPERATION_KINDS_V1 = (
+    "activate",
+    "cancel",
+    "emergency_stop",
+    "hold",
+)
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -893,6 +904,64 @@ class AgentOwnDomainHoldRequest:
         }
 
 
+@dataclass(frozen=True)
+class AgentOwnDomainEmergencyStopRequest:
+    """Observation-independent emergency stop for one exact control domain."""
+
+    client_id: str
+    control_request_id: str
+    idempotency_key: str
+    runtime_session_id: str
+    skill_route_manifest_hash: str
+    control_domain_id: str
+    target_binding_id: str
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "client_id",
+            "control_request_id",
+            "idempotency_key",
+            "runtime_session_id",
+            "skill_route_manifest_hash",
+            "control_domain_id",
+            "target_binding_id",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), field_name=field_name),
+            )
+        object.__setattr__(
+            self,
+            "reason_code",
+            _enum(
+                self.reason_code,
+                field_name="reason_code",
+                allowed=AGENT_CONTROL_REASON_CODES_V1,
+            ),
+        )
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            self.to_wire(),
+            domain=AGENT_OWN_DOMAIN_EMERGENCY_STOP_REQUEST_HASH_DOMAIN_V1,
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "client_id": self.client_id,
+            "control_request_id": self.control_request_id,
+            "idempotency_key": self.idempotency_key,
+            "runtime_session_id": self.runtime_session_id,
+            "skill_route_manifest_hash": self.skill_route_manifest_hash,
+            "control_domain_id": self.control_domain_id,
+            "target_binding_id": self.target_binding_id,
+            "reason_code": self.reason_code,
+        }
+
+
 _OWN_OPERATION_QUERY_FIELDS = frozenset(
     {
         "client_id",
@@ -926,6 +995,18 @@ _OWN_DOMAIN_HOLD_REQUEST_FIELDS = frozenset(
         "target_binding_id",
         "observation_snapshot_id",
         "expected_station_revision",
+        "reason_code",
+    }
+)
+_OWN_DOMAIN_EMERGENCY_STOP_REQUEST_FIELDS = frozenset(
+    {
+        "client_id",
+        "control_request_id",
+        "idempotency_key",
+        "runtime_session_id",
+        "skill_route_manifest_hash",
+        "control_domain_id",
+        "target_binding_id",
         "reason_code",
     }
 )
@@ -978,6 +1059,17 @@ def agent_own_domain_hold_request_from_json(
         payload_name="Own-domain HOLD request",
     )
     return AgentOwnDomainHoldRequest(**payload)
+
+
+def agent_own_domain_emergency_stop_request_from_json(
+    payload: Mapping[str, Any],
+) -> AgentOwnDomainEmergencyStopRequest:
+    _require_exact_fields(
+        payload,
+        fields=_OWN_DOMAIN_EMERGENCY_STOP_REQUEST_FIELDS,
+        payload_name="Own-domain emergency-stop request",
+    )
+    return AgentOwnDomainEmergencyStopRequest(**payload)
 
 
 @dataclass(frozen=True)
@@ -2046,6 +2138,23 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         },
         required=tuple(sorted(_OWN_DOMAIN_HOLD_REQUEST_FIELDS)),
     )
+    own_domain_emergency_stop_request = _json_schema_object(
+        schema_id="urn:dexteleop:agent-control:own-domain-emergency-stop:v1",
+        properties={
+            "client_id": {"type": "string", "minLength": 1},
+            "control_request_id": {"type": "string", "minLength": 1},
+            "idempotency_key": {"type": "string", "minLength": 1},
+            "runtime_session_id": {"type": "string", "minLength": 1},
+            "skill_route_manifest_hash": {"type": "string", "minLength": 1},
+            "control_domain_id": {"type": "string", "minLength": 1},
+            "target_binding_id": {"type": "string", "minLength": 1},
+            "reason_code": {
+                "type": "string",
+                "enum": list(AGENT_CONTROL_REASON_CODES_V1),
+            },
+        },
+        required=tuple(sorted(_OWN_DOMAIN_EMERGENCY_STOP_REQUEST_FIELDS)),
+    )
     snapshot = _json_schema_object(
         schema_id="urn:dexteleop:agent-skill:observation-snapshot:v1",
         properties={
@@ -2462,6 +2571,9 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         "own_operation_query": own_operation_query,
         "own_operation_cancel_request": own_operation_cancel_request,
         "own_domain_hold_request": own_domain_hold_request,
+        "own_domain_emergency_stop_request": (
+            own_domain_emergency_stop_request
+        ),
         "control_plane_response": control_plane_response,
         "authoritative_port_receipt": authoritative_port_receipt,
         "observation_snapshot": snapshot,
@@ -2552,6 +2664,9 @@ def agent_skill_schema_snapshot_document() -> dict[str, Any]:
         "own_domain_hold_request": (
             AGENT_OWN_DOMAIN_HOLD_REQUEST_HASH_DOMAIN_V1
         ),
+        "own_domain_emergency_stop_request": (
+            AGENT_OWN_DOMAIN_EMERGENCY_STOP_REQUEST_HASH_DOMAIN_V1
+        ),
         "own_operation_cancel_request": (
             AGENT_OWN_OPERATION_CANCEL_REQUEST_HASH_DOMAIN_V1
         ),
@@ -2639,8 +2754,10 @@ __all__ = [
     "AGENT_CONTROL_REASON_CODES_V1",
     "AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1",
     "AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1",
-    "AGENT_GATEWAY_SAFETY_PROFILE_SELECTION_FEATURE_V1",
+    "AGENT_GATEWAY_DOMAIN_EMERGENCY_STOP_FEATURE_V1",
     "AGENT_GATEWAY_PORT_OPERATION_KINDS_V1",
+    "AGENT_GATEWAY_SAFETY_PROFILE_SELECTION_FEATURE_V1",
+    "AGENT_OWN_DOMAIN_EMERGENCY_STOP_REQUEST_HASH_DOMAIN_V1",
     "AGENT_OWN_DOMAIN_HOLD_REQUEST_HASH_DOMAIN_V1",
     "AGENT_OWN_OPERATION_CANCEL_REQUEST_HASH_DOMAIN_V1",
     "AGENT_OWN_OPERATION_QUERY_HASH_DOMAIN_V1",
@@ -2648,8 +2765,8 @@ __all__ = [
     "AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_POLICIES_V1",
     "AGENT_SKILL_EVALUATION_STATUSES_V1",
     "AGENT_SKILL_EXECUTION_OUTCOMES_V1",
-    "AGENT_SKILL_MODES_V1",
     "AGENT_SKILL_INTENDED_TARGET_KINDS_V1",
+    "AGENT_SKILL_MODES_V1",
     "AGENT_SKILL_OPERATION_STATUSES_V1",
     "AGENT_SKILL_PRIVILEGE_TIERS_V1",
     "AGENT_SKILL_PROTOCOL_VERSION_V2",
@@ -2658,19 +2775,21 @@ __all__ = [
     "AGENT_SKILL_TASK_OUTCOMES_V1",
     "AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1",
     "AMBIGUOUS_LIFECYCLE_SKILL_IDS_V1",
-    "AgentOwnDomainHoldRequest",
-    "AgentOwnOperationCancelRequest",
-    "AgentOwnOperationQuery",
-    "AgentObservationSnapshot",
-    "AgentSkillOperation",
-    "AgentSkillRequest",
     "MAX_AGENT_SKILL_JSON_DEPTH_V1",
     "MAX_AGENT_SKILL_TIMEOUT_MS_V1",
     "PRIVILEGED_LIFECYCLE_SKILL_IDS_V1",
-    "agent_skill_request_from_json",
+    "AgentObservationSnapshot",
+    "AgentOwnDomainEmergencyStopRequest",
+    "AgentOwnDomainHoldRequest",
+    "AgentOwnOperationCancelRequest",
+    "AgentOwnOperationQuery",
+    "AgentSkillOperation",
+    "AgentSkillRequest",
+    "agent_own_domain_emergency_stop_request_from_json",
     "agent_own_domain_hold_request_from_json",
     "agent_own_operation_cancel_request_from_json",
     "agent_own_operation_query_from_json",
+    "agent_skill_request_from_json",
     "agent_skill_schema_snapshot_document",
     "agent_skill_schema_snapshot_json",
 ]

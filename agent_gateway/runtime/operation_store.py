@@ -26,6 +26,7 @@ AGENT_GATEWAY_OPERATION_ID_HASH_DOMAIN_V1 = (
 AGENT_GATEWAY_CONTROL_KINDS_V1 = (
     "cancel",
     "disconnect",
+    "emergency_stop",
     "hold",
     "service_close",
     "timeout",
@@ -761,6 +762,75 @@ class BoundedInMemoryAgentSkillOperationStore:
             execution_receipt_refs=execution_receipt_refs,
             finalize=True,
         )
+
+    def terminate_after_emergency_stop(
+        self,
+        *,
+        operation_id: str,
+        emergency_stop_confirmed: bool,
+        reason_code: str,
+        current_station_revision: int,
+        updated_at: float,
+        execution_receipt_refs: tuple[str, ...] = (),
+    ) -> OperationStoreOutcome:
+        """Supersede any worker/control projection after a lower emergency stop.
+
+        Emergency stop has higher precedence than an in-flight cancel, timeout,
+        or worker CAS.  The lower stop is always attempted before this method;
+        this store only fences the public operation projection.
+        """
+
+        normalized_id = _required_text(operation_id, field_name="operation_id")
+        if not isinstance(emergency_stop_confirmed, bool):
+            raise TypeError("emergency_stop_confirmed must be boolean.")
+        normalized_reason = _required_text(reason_code, field_name="reason_code")
+        revision = _revision(current_station_revision)
+        timestamp = _finite_time(updated_at, field_name="updated_at")
+        refs = tuple(
+            sorted(
+                {
+                    _required_text(item, field_name="execution_receipt_ref")
+                    for item in execution_receipt_refs
+                }
+            )
+        )
+        with self._lock:
+            current = self._operations.get(normalized_id)
+            if current is None:
+                return OperationStoreOutcome(False, "operation_not_found")
+            if current.terminal:
+                return OperationStoreOutcome(
+                    True,
+                    "operation_already_terminal",
+                    current,
+                )
+            revision = max(revision, current.current_station_revision)
+            timestamp = max(timestamp, current.updated_at)
+            status = "cancelled" if emergency_stop_confirmed else "failed"
+            progress = {
+                "phase": status,
+                "emergency_stop": {
+                    "confirmed": emergency_stop_confirmed,
+                },
+            }
+            terminated = replace(
+                current,
+                status=status,
+                reason_code=normalized_reason,
+                execution_outcome=status,
+                current_station_revision=revision,
+                updated_at=timestamp,
+                execution_receipt_refs=tuple(
+                    sorted({*current.execution_receipt_refs, *refs})
+                ),
+                progress_summary=progress,
+            )
+            self._replace_operation_locked(terminated)
+            return OperationStoreOutcome(
+                True,
+                "operation_emergency_stop_finalized",
+                terminated,
+            )
 
     def due_active_operation(self, *, now: float) -> AgentSkillOperation | None:
         timestamp = _finite_time(now, field_name="now")

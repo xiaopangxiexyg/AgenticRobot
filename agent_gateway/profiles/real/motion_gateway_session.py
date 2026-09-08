@@ -8,7 +8,11 @@ import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 
-from agent_gateway.protocol.contracts import AgentObservationSnapshot, AgentSkillRequest
+from agent_gateway.protocol.contracts import (
+    AgentObservationSnapshot,
+    AgentSkillOperation,
+    AgentSkillRequest,
+)
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.runtime.access_policy import (
     AgentSkillAccessPolicy,
@@ -57,6 +61,9 @@ from agent_gateway.transport.unix_transport import (
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import pose_matrix_to_xyzquat
+from teleop_runtime.skill_deploy.control_runtime import (
+    RealSkillMotionEmergencyStopReceipt,
+)
 from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPhase,
     RealAgentMotionPort,
@@ -89,6 +96,71 @@ def _required(value: object, *, field_name: str) -> str:
     if value != value.strip():
         raise ValueError(f"{field_name} cannot contain surrounding whitespace.")
     return value
+
+
+class RealAgentDomainEmergencyStopPort:
+    """Profile binding from Gateway safety control to the lower RM65 owner."""
+
+    no_io = False
+
+    def __init__(
+        self,
+        *,
+        port_id: str,
+        emergency_stop: Callable[[str], RealSkillMotionEmergencyStopReceipt],
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.port_id = _required(port_id, field_name="port_id")
+        if not callable(emergency_stop) or not callable(clock):
+            raise TypeError("emergency_stop and clock must be callable.")
+        self._emergency_stop = emergency_stop
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._next_sequence = 0
+        self._receipts: list[AgentGatewayAuthoritativePortReceipt] = []
+
+    @property
+    def receipts(self) -> tuple[AgentGatewayAuthoritativePortReceipt, ...]:
+        with self._lock:
+            return tuple(self._receipts)
+
+    def request_emergency_stop(
+        self,
+        *,
+        operation: AgentSkillOperation | None,
+        reason: str,
+    ) -> AgentGatewayAuthoritativePortReceipt:
+        normalized_reason = _required(reason, field_name="reason")
+        lower = self._emergency_stop(normalized_reason)
+        if not isinstance(lower, RealSkillMotionEmergencyStopReceipt):
+            raise TypeError(
+                "lower emergency_stop must return "
+                "RealSkillMotionEmergencyStopReceipt."
+            )
+        with self._lock:
+            sequence = self._next_sequence
+            self._next_sequence += 1
+        receipt = AgentGatewayAuthoritativePortReceipt(
+            port_id=self.port_id,
+            operation_kind="emergency_stop",
+            operation_id=None if operation is None else operation.operation_id,
+            succeeded=lower.succeeded,
+            status=(
+                "real_rm65_domain_emergency_stop_confirmed"
+                if lower.succeeded
+                else "real_rm65_domain_emergency_stop_unconfirmed"
+            ),
+            completed_at=float(self._clock()),
+            call_sequence=sequence,
+            lower_operation_id=(
+                None if operation is None else "real-agent-motion:" + operation.operation_id
+            ),
+            evidence_refs=lower.evidence_refs,
+            proves_motion_or_hold=lower.succeeded,
+        )
+        with self._lock:
+            self._receipts.append(receipt)
+        return receipt
 
 
 class RealAgentPrimitiveObservationProducer:
@@ -518,6 +590,7 @@ class RealAgentPrimitiveGatewaySession:
     port: RealAgentMotionPort
     observation_producer: RealAgentPrimitiveObservationProducer
     executors_by_skill_id: Mapping[str, ReusableStationAgentSkillOperationExecutor]
+    emergency_stop_port: RealAgentDomainEmergencyStopPort | None
     state_executor: PassiveReadSkillExecutor
     perception_provider: RealSenseAgentPerceptionProvider | None
     rgb_executor: PassiveReadSkillExecutor | None
@@ -541,6 +614,14 @@ class RealAgentPrimitiveGatewaySession:
     _closed_executor_ids: set[int] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
+        advertised = (
+            "own_domain_emergency_stop_v1"
+            in self.contract_bundle.route_manifest.supported_transport_features
+        )
+        if advertised != (self.emergency_stop_port is not None):
+            raise ValueError(
+                "Real emergency-stop feature and profile port must match."
+            )
         enabled = self.contract_bundle.perception_capture is not None
         if enabled != (self.perception_provider is not None):
             raise ValueError("Real perception registration and provider disagree.")
@@ -882,6 +963,9 @@ def assemble_real_agent_primitive_gateway_session(
     owns_artifact_store: bool = False,
     revision_tracker: AgentStationRevisionTracker | None = None,
     max_session_admissions_per_route: int | None = None,
+    emergency_stop: (
+        Callable[[str], RealSkillMotionEmergencyStopReceipt] | None
+    ) = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RealAgentPrimitiveGatewaySession:
@@ -904,6 +988,14 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError("max_retained_operations must be positive.")
     if not isinstance(owns_artifact_store, bool):
         raise TypeError("owns_artifact_store must be boolean.")
+    emergency_stop_advertised = (
+        "own_domain_emergency_stop_v1"
+        in contract_bundle.route_manifest.supported_transport_features
+    )
+    if emergency_stop_advertised != (emergency_stop is not None):
+        raise ValueError(
+            "Real emergency-stop feature and lower callback must match."
+        )
     perception_enabled = contract_bundle.perception_capture is not None
     if perception_enabled != isinstance(
         perception_provider,
@@ -1168,6 +1260,18 @@ def assemble_real_agent_primitive_gateway_session(
         max_grant_invocations=1,
     )
     domain_executor = executors["motion.step_tcp_cardinal"]
+    emergency_stop_port = (
+        None
+        if emergency_stop is None
+        else RealAgentDomainEmergencyStopPort(
+            port_id=(
+                "agent-gateway:real-domain-emergency-stop:"
+                + contract_bundle.route_manifest.runtime_session_id
+            ),
+            emergency_stop=emergency_stop,
+            clock=clock,
+        )
+    )
     if artifact_store is None:
         protocol_runtime = AgentGatewayProtocolRuntime.control_plane_only(
             manifest=contract_bundle.route_manifest,
@@ -1212,6 +1316,7 @@ def assemble_real_agent_primitive_gateway_session(
         access_policy=access_policy,
         executor_registry=registry,
         domain_control_port=domain_executor,
+        domain_emergency_stop_port=emergency_stop_port,
         payload_validators=contract_bundle.payload_validators,
         operation_store=BoundedInMemoryAgentSkillOperationStore(
             max_retained_operations=max_retained_operations,
@@ -1243,6 +1348,7 @@ def assemble_real_agent_primitive_gateway_session(
         port=port,
         observation_producer=producer,
         executors_by_skill_id=executors,
+        emergency_stop_port=emergency_stop_port,
         state_executor=state_executor,
         perception_provider=perception_provider,
         rgb_executor=rgb_executor,

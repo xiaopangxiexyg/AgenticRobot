@@ -259,10 +259,9 @@ class RealPerceptionSourceBinding:
             for source_id, source in sources.items()
             if bool(source.config.enable_depth)
         }
-        if set(self.world_from_depth_camera_by_source) != depth_sources:
-            raise ValueError(
-                "Every enabled depth source requires exactly one trusted pose."
-            )
+        static_depth_sources = set(self.world_from_depth_camera_by_source)
+        if not static_depth_sources.issubset(depth_sources):
+            raise ValueError("Static depth poses must belong to enabled depth sources.")
         poses = {}
         for source_id, value in self.world_from_depth_camera_by_source.items():
             matrix = _pose_matrix(
@@ -334,7 +333,7 @@ def build_real_perception_source_binding(
                 f"camera {camera_key!r} profile differs from the registry."
             )
         pose_payload = None
-        if config.enable_depth:
+        if config.enable_depth and real_camera_role_for_source(camera_key) == "main":
             frames = (spec.get("extrinsics") or {}).get("frames")
             candidates = tuple(
                 value
@@ -689,6 +688,8 @@ class RealSenseAgentPerceptionProvider:
         )
 
     def depth_source_catalog(self) -> tuple[Mapping[str, object], ...]:
+        """Expose only depth sources with a trusted static source-frame pose."""
+
         return tuple(
             {
                 "source_id": source_id,
@@ -706,17 +707,31 @@ class RealSenseAgentPerceptionProvider:
             }
             for source_id, source in self.source_binding.camera_sources.items()
             if source.config.enable_depth
+            and source_id in self.source_binding.world_from_depth_camera_by_source
         )
 
     def aligned_rgbd_source_catalog(self) -> tuple[Mapping[str, object], ...]:
-        """Expose only static depth sources aligned to their color stream."""
+        """Expose aligned RGB-D roles with trusted static or dynamic geometry."""
 
+        if self.rgb_camera_geometry is None:
+            geometry_sources = set(
+                self.source_binding.world_from_depth_camera_by_source
+            )
+        else:
+            geometry_sources = {
+                str(item["source_id"]) for item in self.rgb_geometry_source_catalog()
+            }
         return tuple(
-            item
-            for item in self.depth_source_catalog()
-            if self.source_binding.camera_sources[
-                str(item["source_id"])
-            ].config.align_depth_to_color
+            {
+                "source_id": source_id,
+                "role": real_camera_role_for_source(source_id),
+                "native_width": int(source.config.width),
+                "native_height": int(source.config.height),
+            }
+            for source_id, source in self.source_binding.camera_sources.items()
+            if source.config.enable_depth
+            and source.config.align_depth_to_color
+            and source_id in geometry_sources
         )
 
     def rgb_geometry_source_catalog(self) -> tuple[Mapping[str, object], ...]:
@@ -785,11 +800,14 @@ class RealSenseAgentPerceptionProvider:
             raise ValueError("expected_station_revision must be non-negative.")
         return value
 
-    def _frame(self, source_id: str, *, now: float):
+    def _frame(self, source_id: str):
         source = self.source_binding.camera_sources[source_id]
         frame = source.get_latest_frame()
         if frame is None:
             raise RuntimeError(f"real_perception_frame_unavailable:{source_id}")
+        observed_at = _finite_timestamp(
+            self._clock(), field_name="frame observation clock"
+        )
         source_at = _finite_timestamp(
             frame.source_timestamp,
             field_name=f"{source_id}.source_timestamp",
@@ -798,11 +816,11 @@ class RealSenseAgentPerceptionProvider:
             frame.available_timestamp,
             field_name=f"{source_id}.available_timestamp",
         )
-        if source_at > now or available_at > now:
+        if source_at > observed_at or available_at > observed_at:
             raise RuntimeError(f"real_perception_frame_from_future:{source_id}")
         if available_at < source_at:
             raise RuntimeError(f"real_perception_frame_clock_order_invalid:{source_id}")
-        if (now - source_at) * 1000.0 > self.max_frame_age_ms:
+        if (observed_at - source_at) * 1000.0 > self.max_frame_age_ms:
             raise RuntimeError(f"real_perception_frame_stale:{source_id}")
         info = source.device_info()
         if (
@@ -875,7 +893,6 @@ class RealSenseAgentPerceptionProvider:
             real_camera_role_for_source(source_id): (source_id, source)
             for source_id, source in self.source_binding.camera_sources.items()
         }
-        now = _finite_timestamp(self._clock(), field_name="capture clock")
         frames = []
         source_timestamps = []
         total_bytes = 0
@@ -883,7 +900,7 @@ class RealSenseAgentPerceptionProvider:
             if role not in source_by_role:
                 raise ValueError(f"RGB role {role!r} is not registered.")
             source_id, source = source_by_role[role]
-            frame, source_at, _info = self._frame(source_id, now=now)
+            frame, source_at, _info = self._frame(source_id)
             image = np.asarray(frame.image)
             expected_shape = (int(source.config.height), int(source.config.width), 3)
             if image.shape != expected_shape or image.dtype != np.uint8:
@@ -932,14 +949,14 @@ class RealSenseAgentPerceptionProvider:
             real_camera_role_for_source(source_id): (source_id, source)
             for source_id, source in self.source_binding.camera_sources.items()
             if source.config.enable_depth
+            and source_id in self.source_binding.world_from_depth_camera_by_source
         }
         if selected_role not in source_by_role:
             raise ValueError("Depth role is not registered.")
         if self._current_station_revision() != expected_station_revision:
             raise RuntimeError("depth_capture_station_revision_mismatch")
         source_id, source = source_by_role[selected_role]
-        now = _finite_timestamp(self._clock(), field_name="capture clock")
-        frame, source_at, info = self._frame(source_id, now=now)
+        frame, source_at, info = self._frame(source_id)
         depth = np.asarray(frame.depth_image)
         metadata = frame.depth_metadata
         if depth.ndim != 2 or depth.dtype != np.uint16:
@@ -1004,17 +1021,19 @@ class RealSenseAgentPerceptionProvider:
         expected_station_revision = self._expected_revision(expected_station_revision)
         selected_role = _required_text(role, field_name="role")
         source_by_role = {
-            real_camera_role_for_source(source_id): (source_id, source)
-            for source_id, source in self.source_binding.camera_sources.items()
-            if source.config.enable_depth and source.config.align_depth_to_color
+            str(item["role"]): (
+                str(item["source_id"]),
+                self.source_binding.camera_sources[str(item["source_id"])],
+                (int(item["native_width"]), int(item["native_height"])),
+            )
+            for item in self.aligned_rgbd_source_catalog()
         }
         if selected_role not in source_by_role:
             raise ValueError("Aligned RGB-D role is not registered.")
         if self._current_station_revision() != expected_station_revision:
             raise RuntimeError("rgbd_capture_station_revision_mismatch")
-        source_id, source = source_by_role[selected_role]
-        now = _finite_timestamp(self._clock(), field_name="capture clock")
-        frame, source_at, info = self._frame(source_id, now=now)
+        source_id, source, expected_dimensions = source_by_role[selected_role]
+        frame, source_at, info = self._frame(source_id)
         rgb = np.asarray(frame.image)
         expected_rgb_shape = (
             int(source.config.height),
@@ -1032,9 +1051,7 @@ class RealSenseAgentPerceptionProvider:
             raise RuntimeError(f"real_depth_frame_contract_mismatch:{source_id}")
         if depth_raw.shape != rgb.shape[:2]:
             raise RuntimeError(f"real_rgbd_alignment_dimensions_changed:{source_id}")
-        if (int(depth_raw.shape[1]), int(depth_raw.shape[0])) != (
-            profile.depth_dimensions_by_role[selected_role]
-        ):
+        if (int(depth_raw.shape[1]), int(depth_raw.shape[0])) != expected_dimensions:
             raise RuntimeError(f"real_depth_dimensions_changed:{source_id}")
         if not isinstance(metadata, Mapping) or metadata.get("aligned_to") != "color":
             raise RuntimeError(f"real_depth_alignment_changed:{source_id}")
@@ -1085,6 +1102,39 @@ class RealSenseAgentPerceptionProvider:
             },
             domain="dexteleop.real_aligned_rgbd.depth_content.v1",
         )
+        if self.rgb_camera_geometry is None:
+            source_from_camera = self.source_binding.world_from_depth_camera_by_source[
+                source_id
+            ]
+            geometry_binding_hash = self.source_binding.semantic_content_hash
+            geometry_cut_hash = canonical_content_hash(
+                {
+                    "source_id": source_id,
+                    "source_from_camera": source_from_camera.tolist(),
+                    "source_binding_hash": geometry_binding_hash,
+                },
+                domain="dexteleop.real_aligned_rgbd.static_geometry_cut.v1",
+            )
+            geometry = RealRgbCameraGeometryCut(
+                source_id=source_id,
+                source_from_camera=tuple(
+                    float(value) for value in source_from_camera.reshape(-1)
+                ),
+                measured_at=source_at,
+                available_at=source_at,
+                geometry_binding_hash=geometry_binding_hash,
+                geometry_cut_hash=geometry_cut_hash,
+                evidence_refs=("real-rgbd-static-camera:" + geometry_cut_hash,),
+            )
+        else:
+            pose_observed_at = _finite_timestamp(
+                self._clock(), field_name="aligned RGB-D camera pose clock"
+            )
+            geometry = self.rgb_camera_geometry.pose_cut(
+                source_id=source_id,
+                frame_acquired_at=source_at,
+                now=pose_observed_at,
+            )
         capture_hash = canonical_content_hash(
             {
                 "source_binding_hash": self.source_binding.semantic_content_hash,
@@ -1097,6 +1147,8 @@ class RealSenseAgentPerceptionProvider:
                 "station_revision": expected_station_revision,
                 "rgb_content_hash": rgb_content_hash,
                 "depth_content_hash": depth_content_hash,
+                "geometry_binding_hash": geometry.geometry_binding_hash,
+                "geometry_cut_hash": geometry.geometry_cut_hash,
             },
             domain="dexteleop.real_aligned_rgbd.capture_group.v1",
         )
@@ -1104,12 +1156,6 @@ class RealSenseAgentPerceptionProvider:
             raise RuntimeError("rgbd_capture_station_revision_changed")
         rgb.setflags(write=False)
         depth_m.setflags(write=False)
-        source_from_camera = tuple(
-            float(value)
-            for value in self.source_binding.world_from_depth_camera_by_source[
-                source_id
-            ].reshape(-1)
-        )
         return RealAlignedRgbdCapture(
             source_id=source_id,
             role=selected_role,
@@ -1122,7 +1168,7 @@ class RealSenseAgentPerceptionProvider:
             width=int(rgb.shape[1]),
             height=int(rgb.shape[0]),
             intrinsics=MappingProxyType(dict(intrinsics)),
-            source_from_camera=source_from_camera,
+            source_from_camera=geometry.source_from_camera,
             rgb=rgb,
             depth_m=depth_m,
             rgb_content_hash=rgb_content_hash,
@@ -1150,8 +1196,7 @@ class RealSenseAgentPerceptionProvider:
             raise RuntimeError("rgb_geometry_capture_station_revision_mismatch")
         source_id = source_by_role[selected_role]
         source = self.source_binding.camera_sources[source_id]
-        now = _finite_timestamp(self._clock(), field_name="capture clock")
-        frame, source_at, info = self._frame(source_id, now=now)
+        frame, source_at, info = self._frame(source_id)
         rgb = np.asarray(frame.image)
         expected_shape = (int(source.config.height), int(source.config.width), 3)
         if rgb.shape != expected_shape or rgb.dtype != np.uint8:

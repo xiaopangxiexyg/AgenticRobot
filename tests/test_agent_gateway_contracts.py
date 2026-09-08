@@ -13,10 +13,12 @@ from agent_gateway.protocol.contracts import (
     AGENT_CONTROL_REASON_CODES_V1,
     AGENT_SKILL_PROTOCOL_VERSION_V2,
     AgentObservationSnapshot,
+    AgentOwnDomainEmergencyStopRequest,
     AgentOwnDomainHoldRequest,
     AgentOwnOperationCancelRequest,
     AgentOwnOperationQuery,
     AgentSkillOperation,
+    agent_own_domain_emergency_stop_request_from_json,
     agent_own_domain_hold_request_from_json,
     agent_own_operation_cancel_request_from_json,
     agent_own_operation_query_from_json,
@@ -355,6 +357,7 @@ def test_portable_schema_snapshot_is_route_based_and_strict() -> None:
     assert "own_operation_query" in document["schemas"]
     assert "own_operation_cancel_request" in document["schemas"]
     assert "own_domain_hold_request" in document["schemas"]
+    assert "own_domain_emergency_stop_request" in document["schemas"]
     assert "control_plane_response" in document["schemas"]
     assert "authoritative_port_receipt" in document["schemas"]
     assert document["hash_domains"]["authoritative_port_receipt"] == (
@@ -371,7 +374,7 @@ def test_portable_schema_snapshot_is_route_based_and_strict() -> None:
     assert json.loads(agent_skill_schema_snapshot_json()) == document
 
 
-def test_b2c_control_requests_are_exact_scoped_and_have_no_estop_or_resume() -> None:
+def test_b2c_control_requests_are_exact_scoped_and_estop_is_observation_free() -> None:
     common = {
         "client_id": "rpent:test",
         "runtime_session_id": "runtime:test",
@@ -406,7 +409,29 @@ def test_b2c_control_requests_are_exact_scoped_and_have_no_estop_or_resume() -> 
         reason_code="agent_requested_pause",
     )
     assert agent_own_domain_hold_request_from_json(hold.to_wire()) == hold
-    assert cancel.semantic_content_hash != hold.semantic_content_hash
+    emergency_stop = AgentOwnDomainEmergencyStopRequest(
+        **common,
+        control_request_id="control:emergency-stop:1",
+        idempotency_key="idem:emergency-stop:1",
+        control_domain_id="domain:arms",
+        target_binding_id="target:rm65",
+        reason_code="agent_task_aborted",
+    )
+    assert (
+        agent_own_domain_emergency_stop_request_from_json(
+            emergency_stop.to_wire()
+        )
+        == emergency_stop
+    )
+    assert "observation_snapshot_id" not in emergency_stop.to_wire()
+    assert "expected_station_revision" not in emergency_stop.to_wire()
+    assert len(
+        {
+            cancel.semantic_content_hash,
+            hold.semantic_content_hash,
+            emergency_stop.semantic_content_hash,
+        }
+    ) == 3
 
     document = agent_skill_schema_snapshot_document()
     control_surface = {
@@ -415,10 +440,11 @@ def test_b2c_control_requests_are_exact_scoped_and_have_no_estop_or_resume() -> 
             "own_operation_query",
             "own_operation_cancel_request",
             "own_domain_hold_request",
+            "own_domain_emergency_stop_request",
         )
     }
     serialized = json.dumps(control_surface, sort_keys=True).lower()
-    for forbidden in ("estop", "e-stop", "resume", "rearm"):
+    for forbidden in ("resume", "rearm"):
         assert forbidden not in serialized
     assert tuple(document["enums"]["agent_control_reason_codes"]) == (
         AGENT_CONTROL_REASON_CODES_V1
@@ -430,6 +456,10 @@ def test_b2c_control_requests_are_exact_scoped_and_have_no_estop_or_resume() -> 
         )
     with pytest.raises(ValueError, match="Unsupported reason_code"):
         replace(hold, reason_code="resume")
+    with pytest.raises(ValueError, match="unknown fields"):
+        agent_own_domain_emergency_stop_request_from_json(
+            {**emergency_stop.to_wire(), "expected_station_revision": 4}
+        )
 
 
 def test_checked_in_schema_matches_the_canonical_generator() -> None:

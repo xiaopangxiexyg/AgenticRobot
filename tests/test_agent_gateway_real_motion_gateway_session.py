@@ -10,6 +10,7 @@ from agent_gateway.profiles.real.motion_factory import (
     attach_real_agent_primitive_gateway,
 )
 from agent_gateway.profiles.real.motion_gateway_session import (
+    RealAgentDomainEmergencyStopPort,
     assemble_real_agent_primitive_gateway_session,
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
@@ -64,10 +65,42 @@ from teleop_runtime.real_teleop.agent_motion_port import (
     RealAgentMotionPortConfig,
 )
 from teleop_runtime.real_teleop.components import RealTeleopComponents
+from teleop_runtime.skill_deploy.control_runtime import (
+    RealSkillMotionEmergencyStopReceipt,
+)
 from teleop_runtime.video_frame import VideoFrame
 
 CLIENT_ID = "rpent-real-motion-test"
 COMPONENT_ID = "right_arm"
+
+
+def test_real_domain_emergency_stop_port_preserves_dual_arm_proof() -> None:
+    reasons = []
+
+    def emergency_stop(reason: str) -> RealSkillMotionEmergencyStopReceipt:
+        reasons.append(reason)
+        return RealSkillMotionEmergencyStopReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-estop:left", "rm65-estop:right"),
+            status_by_side={"left": "confirmed", "right": "confirmed"},
+        )
+
+    port = RealAgentDomainEmergencyStopPort(
+        port_id="real-emergency-stop:test",
+        emergency_stop=emergency_stop,
+        clock=lambda: 10.0,
+    )
+
+    receipt = port.request_emergency_stop(
+        operation=None,
+        reason="agent_task_aborted",
+    )
+
+    assert receipt.succeeded
+    assert receipt.operation_kind == "emergency_stop"
+    assert receipt.proves_motion_or_hold
+    assert receipt.evidence_refs == ("rm65-estop:left", "rm65-estop:right")
+    assert reasons == ["agent_task_aborted"]
 
 
 class _Clock:
@@ -386,6 +419,10 @@ PRIMITIVE_CASES = (
 
 def test_real_wire_adapter_projects_lower_owned_arm_resource_while_idle() -> None:
     bundle, port, _ = _runtime_fixture(exclusive_owner=True)
+    assert "own_domain_emergency_stop_v1" not in (
+        bundle.route_manifest.supported_transport_features
+    )
+    assert "agent_estop" in bundle.route_manifest.explicit_exclusions
     clock = _Clock()
     gateway = assemble_real_agent_primitive_gateway_session(
         contract_bundle=bundle,

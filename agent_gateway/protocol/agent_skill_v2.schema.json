@@ -180,6 +180,7 @@
     "gateway_event_batch": "dexteleop.agent_gateway.event_batch.v2",
     "observation_snapshot": "dexteleop.agent_skill.observation_snapshot.v1",
     "operation": "dexteleop.agent_skill.operation.v2",
+    "own_domain_emergency_stop_request": "dexteleop.agent_control.own_domain_emergency_stop_request.v1",
     "own_domain_hold_request": "dexteleop.agent_control.own_domain_hold_request.v1",
     "own_operation_cancel_request": "dexteleop.agent_control.own_operation_cancel_request.v1",
     "own_operation_query": "dexteleop.agent_control.own_operation_query.v1",
@@ -201,7 +202,7 @@
     "max_json_depth": 16,
     "max_timeout_ms": 86400000
   },
-  "protocol_semantic_hash": "3ea87b8f33698ca9f091e04b649e35266d986fbcefff3ae9c28fdd9544bed188",
+  "protocol_semantic_hash": "c3576799f5089562d5f83031e653a96d8624c14ae34d901dd038f42d679eea23",
   "protocol_version": "dexteleop.agent_skill.v2",
   "schema": "dexteleop_agent_skill_schema_snapshot_v2",
   "schemas": {
@@ -808,6 +809,7 @@
           "enum": [
             "activate",
             "cancel",
+            "emergency_stop",
             "hold"
           ],
           "type": "string"
@@ -905,6 +907,7 @@
               "enum": [
                 "activate",
                 "cancel",
+                "emergency_stop",
                 "hold"
               ],
               "type": "string"
@@ -1695,6 +1698,62 @@
         "fault_class",
         "fault_rearmable",
         "snapshot_hash"
+      ],
+      "type": "object"
+    },
+    "own_domain_emergency_stop_request": {
+      "$id": "urn:dexteleop:agent-control:own-domain-emergency-stop:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "control_domain_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "control_request_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "idempotency_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason_code": {
+          "enum": [
+            "agent_anomaly_detected",
+            "agent_replan_requested",
+            "agent_requested_pause",
+            "agent_task_aborted",
+            "agent_uncertain_state"
+          ],
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_route_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "target_binding_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "control_domain_id",
+        "control_request_id",
+        "idempotency_key",
+        "reason_code",
+        "runtime_session_id",
+        "skill_route_manifest_hash",
+        "target_binding_id"
       ],
       "type": "object"
     },
@@ -4133,6 +4192,6 @@
       "type": "object"
     }
   },
-  "snapshot_hash": "2754487bcb772495ed07117b537d7273aeddeaf96a0df109457d85454af62d08",
+  "snapshot_hash": "2100d1e4b87304d3da7011817cfdbf7bdf48cbd44ed026e2556962be5f24bd97",
   "snapshot_hash_algorithm": "sha256_canonical_json_v1"
 }

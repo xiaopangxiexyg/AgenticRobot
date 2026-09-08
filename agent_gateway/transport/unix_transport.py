@@ -7,8 +7,10 @@ the owner of ``serve_forever``/shutdown process lifecycle.
 
 Linux ``SO_PEERCRED`` is authoritative for the connecting process identity.
 The JSON payload's ``client_id`` is never used to authenticate a connection.
-One persistent connection is allowed per configured client identity so a
-connection EOF/idle timeout has unambiguous disconnect-to-HOLD semantics.
+At most three persistent connections are allowed per configured client
+identity: one ordinary request channel, one independently reservable safety
+channel, and one bounded bootstrap/inspection channel during handoff. EOF or
+idle timeout on any channel keeps the conservative disconnect-to-HOLD behavior.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ AGENT_GATEWAY_UNIX_JSON_METHODS_V2 = frozenset(
         "cancel_own_operation",
         "cancel_own_read_only_operation",
         "request_hold_own_domain",
+        "request_emergency_stop_own_domain",
         "begin_artifact_upload",
         "write_artifact_chunk",
         "commit_artifact_upload",
@@ -60,6 +63,7 @@ DEFAULT_AGENT_GATEWAY_UNIX_MAX_FRAME_BYTES = 2 * 1024 * 1024
 MAX_AGENT_GATEWAY_UNIX_FRAME_BYTES = 16 * 1024 * 1024
 DEFAULT_AGENT_GATEWAY_UNIX_PEER_IDLE_TIMEOUT_SEC = 10.0
 MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES = 107
+MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT = 3
 
 _FRAME_PREFIX = struct.Struct(">I")
 _PEER_CREDENTIALS = struct.Struct("3i")
@@ -605,7 +609,7 @@ class AgentGatewayUnixJsonServer(
         self._facade_factory = facade_factory
         self._close_gateway = close_gateway
         self._connection_lock = threading.RLock()
-        self._active_connections: dict[str, socket.socket] = {}
+        self._active_connections: dict[str, dict[int, socket.socket]] = {}
         self._disconnect_events: deque[AgentGatewayUnixDisconnectEvent] = deque(
             maxlen=max_disconnect_events
         )
@@ -676,11 +680,12 @@ class AgentGatewayUnixJsonServer(
         peer = _peer_credentials(sock)
         client_id = self.peer_client_map.resolve(peer)
         with self._connection_lock:
-            if client_id in self._active_connections:
+            connections = self._active_connections.setdefault(client_id, {})
+            if len(connections) >= MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT:
                 raise PermissionError(
-                    "Only one persistent connection is allowed per client_id."
+                    "At most three persistent connections are allowed per client_id."
                 )
-            self._active_connections[client_id] = sock
+            connections[id(sock)] = sock
         try:
             facade = self._facade_factory(client_id)
             if not isinstance(facade, BoundAgentGatewayWireAdapter):
@@ -714,8 +719,11 @@ class AgentGatewayUnixJsonServer(
             return client_id, peer, facade
         except BaseException:
             with self._connection_lock:
-                if self._active_connections.get(client_id) is sock:
-                    self._active_connections.pop(client_id, None)
+                connections = self._active_connections.get(client_id)
+                if connections is not None:
+                    connections.pop(id(sock), None)
+                    if not connections:
+                        self._active_connections.pop(client_id, None)
             raise
 
     def _dispatch_request(
@@ -768,6 +776,10 @@ class AgentGatewayUnixJsonServer(
                 )
             elif request.method == "request_hold_own_domain":
                 result = facade.request_hold_own_domain(request.payload or {})
+            elif request.method == "request_emergency_stop_own_domain":
+                result = facade.request_emergency_stop_own_domain(
+                    request.payload or {}
+                )
             elif request.method == "begin_artifact_upload":
                 result = facade.begin_artifact_upload(request.payload or {})
             elif request.method == "write_artifact_chunk":
@@ -837,8 +849,11 @@ class AgentGatewayUnixJsonServer(
         reason: str,
     ) -> None:
         with self._connection_lock:
-            if self._active_connections.get(client_id) is sock:
-                self._active_connections.pop(client_id, None)
+            connections = self._active_connections.get(client_id)
+            if connections is not None:
+                connections.pop(id(sock), None)
+                if not connections:
+                    self._active_connections.pop(client_id, None)
         outcome_accepted: bool | None = None
         outcome_reason: str | None = None
         error_type: str | None = None
@@ -893,7 +908,11 @@ class AgentGatewayUnixJsonServer(
                 return
             self._transport_closed = True
             with self._connection_lock:
-                active_sockets = tuple(self._active_connections.values())
+                active_sockets = tuple(
+                    sock
+                    for connections in self._active_connections.values()
+                    for sock in connections.values()
+                )
             for active_socket in active_sockets:
                 try:
                     active_socket.shutdown(socket.SHUT_RDWR)
@@ -910,6 +929,7 @@ __all__ = [
     "AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2",
     "DEFAULT_AGENT_GATEWAY_UNIX_MAX_FRAME_BYTES",
     "DEFAULT_AGENT_GATEWAY_UNIX_PEER_IDLE_TIMEOUT_SEC",
+    "MAX_AGENT_GATEWAY_UNIX_CONNECTIONS_PER_CLIENT",
     "MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES",
     "AgentGatewayUnixDisconnectEvent",
     "AgentGatewayUnixJsonServer",

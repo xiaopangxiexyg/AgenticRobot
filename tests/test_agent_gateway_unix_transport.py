@@ -96,6 +96,16 @@ class _FakeBoundFacade(BoundAgentGatewayWireAdapter):
         self.requests.append(("request_hold_own_domain", dict(payload)))
         return {"accepted": True, "reason_code": "fake_hold_confirmed"}
 
+    def request_emergency_stop_own_domain(self, payload):
+        self._assert_client(payload)
+        self.requests.append(
+            ("request_emergency_stop_own_domain", dict(payload))
+        )
+        return {
+            "accepted": True,
+            "reason_code": "fake_emergency_stop_confirmed",
+        }
+
     def handle_authenticated_disconnect(self, *, reason: str):
         self.disconnect_reasons.append(reason)
         return SimpleNamespace(
@@ -439,6 +449,70 @@ def test_idle_or_oversized_authenticated_peer_disconnects_fail_closed(
         _stop_server(server, thread)
 
 
+def test_reserved_safety_channel_survives_bounded_bootstrap_connection(
+    short_unix_socket_path_factory,
+) -> None:
+    path = short_unix_socket_path_factory("dual-channel")
+    facade = _FakeBoundFacade("rpent:local")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    primary = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    emergency = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bootstrap = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    rejected = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    for channel in (primary, emergency, bootstrap, rejected):
+        channel.settimeout(1.0)
+    try:
+        primary.connect(str(path))
+        emergency.connect(str(path))
+        assert _raw_call(
+            primary,
+            request_id="request:primary-health",
+            method="healthz",
+            payload=None,
+        )["result"]["status"] == "ok"
+        assert _raw_call(
+            emergency,
+            request_id="request:emergency-health",
+            method="healthz",
+            payload=None,
+        )["result"]["status"] == "ok"
+        bootstrap.connect(str(path))
+        assert _raw_call(
+            bootstrap,
+            request_id="request:bootstrap-health",
+            method="healthz",
+            payload=None,
+        )["result"]["status"] == "ok"
+        _wait_for(lambda: server.active_client_ids == ("rpent:local",))
+
+        rejected.connect(str(path))
+        assert rejected.recv(1) == b""
+
+        bootstrap.close()
+        _wait_for(lambda: len(server.disconnect_events) == 1)
+        assert server.active_client_ids == ("rpent:local",)
+        assert facade.disconnect_reasons == ["authenticated_peer_eof"]
+
+        primary.close()
+        _wait_for(lambda: len(server.disconnect_events) == 2)
+        assert server.active_client_ids == ("rpent:local",)
+
+        emergency.close()
+        _wait_for(lambda: len(server.disconnect_events) == 3)
+        assert server.active_client_ids == ()
+        assert facade.disconnect_reasons == [
+            "authenticated_peer_eof",
+            "authenticated_peer_eof",
+            "authenticated_peer_eof",
+        ]
+    finally:
+        primary.close()
+        emergency.close()
+        bootstrap.close()
+        rejected.close()
+        _stop_server(server, thread)
+
+
 def test_protocol_envelope_is_exact_and_method_allowlist_has_no_shutdown(
     short_unix_socket_path_factory,
 ) -> None:
@@ -452,6 +526,7 @@ def test_protocol_envelope_is_exact_and_method_allowlist_has_no_shutdown(
         "get_own_operation",
         "cancel_own_operation",
         "request_hold_own_domain",
+        "request_emergency_stop_own_domain",
     }
     path = short_unix_socket_path_factory("allowlist")
     facade = _FakeBoundFacade("rpent:local")
@@ -507,9 +582,18 @@ def test_hardware_views_and_read_only_submission_are_additive_methods(
             method="submit_read_only_skill_request",
             payload={"client_id": "rpent:local"},
         )
+        emergency_stopped = _raw_call(
+            raw,
+            request_id="request:emergency-stop",
+            method="request_emergency_stop_own_domain",
+            payload={"client_id": "rpent:local"},
+        )
         assert resources["result"] == {"resources": []}
         assert statuses["result"] == {"statuses": []}
         assert submitted["result"]["reason_code"] == "fake_read_only_admitted"
+        assert emergency_stopped["result"]["reason_code"] == (
+            "fake_emergency_stop_confirmed"
+        )
     finally:
         raw.close()
         _stop_server(server, thread)
