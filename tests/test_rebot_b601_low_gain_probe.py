@@ -736,6 +736,51 @@ def test_feedback_boundary_normalization_admits_j3_and_keeps_other_joints_unchan
     assert normalized_joint_names == ("joint3",)
 
 
+def test_feedback_admission_limits_extend_only_approved_boundary_windows() -> None:
+    strict = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+
+    admission = probe.build_feedback_admission_position_limits(strict)
+
+    assert admission[:1] == strict[:1]
+    assert admission[1] == pytest.approx((-0.006, 3.14))
+    assert admission[2] == pytest.approx((-0.003, 3.14))
+    assert admission[3] == pytest.approx(
+        (-math.pi / 2.0 - 0.001, math.pi / 2.0)
+    )
+    assert admission[4:] == strict[4:]
+
+
+def test_backend_feedback_diagnostics_preserve_bad_finite_position() -> None:
+    bad = 2.686622237168953e36
+    state = SimpleNamespace(
+        joints=(
+            SimpleNamespace(
+                name="joint4",
+                motor_id=4,
+                feedback_id=0xFD,
+                position_rad=bad,
+                position_source="robstride_mech_pos_parameter",
+                valid=False,
+                stale=True,
+                error="joint4: mechPos(0x7019) raw=2.686622237168953e+36",
+            ),
+        )
+    )
+
+    diagnostics = probe._backend_feedback_diagnostics(state)
+
+    assert diagnostics[0]["position_rad"] == bad
+    assert diagnostics[0]["motor_id"] == 4
+    assert "mechPos(0x7019)" in diagnostics[0]["error"]
+
+
 def test_feedback_boundary_normalization_admits_j4_precision_window_only() -> None:
     j4_lower = -math.pi / 2.0
     raw = (0.1, 0.2, 0.3, j4_lower - 0.001, -0.3, 0.4)

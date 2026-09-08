@@ -94,6 +94,19 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   `--acceleration-abort-rad-s2 4.0` 只是待真机整定的 commissioning seed，不是已认证上限。
   其中位置限位检查先于更新 `final_q`、当前故障快照和 `last-safe`；有限但越过 URDF 的
   反馈只进入 `rejected_sample`，不会被用于重力、阻抗或保护保持计算。
+- 反馈接纳现在在 wired backend 入口再次执行：`feedback_position_limits_rad` 是只读的
+  接纳包络，默认回退到严格的 `position_limits_rad`，由 probe 显式传入仅扩展 J2/J3/J4
+  已批准的边界窗口。这样即使 `mechPos(0x7019)` 返回一个有限但物理上不可能的巨大数值，
+  backend 也会将该关节标为 `valid=false, stale=true`，并在错误中保留关节名、motor/feedback
+  ID、参数 ID、原始值、可用时的 IEEE-754 单精度位模式和接纳区间；坏帧不会被任何 backend 消费者误当成完整状态。出站 MIT/
+  POS_VEL 仍只使用严格 URDF 包络，读侧窗口不能放宽命令限位。active probe 会把每关节
+  backend 诊断写入 `motion_guard.rejected_sample.backend_joint_diagnostics`，随后复用上一份
+  已验证的六轴重力+阻尼缓存进入 `PROTECTIVE_HOLD`；只有完整缓存发送也失败或操作者第二次
+  Ctrl-C/SIGUSR1 才允许全臂失能。
+- 若安装的 MotorBridge 提供 `robstride_get_param_f32_host_id()`，backend 会优先使用带
+  `feedback_id/host_id` 的参数读取 ABI；旧版本没有该入口时才回退到未限定 host 的兼容调用。
+  这缩小了共享 CAN 队列中把其他设备的参数响应当成当前关节的机会，但仍不把返回值视为已验证
+  的设备时间戳/序列；读侧数值包络和上一份安全缓存仍是必须的第二道边界。
 - 2026-09-04 的人工单轴扰动被原 `0.03 rad/s` 正常控制门在 `0.098028 rad/s` 中止；
   操作者于 2026-09-06 补充确认中止前的单轴人工扰动已经验收。正常控制 qvel 默认值和
   后续人工单轴 commissioning 值据此调整为 `0.12 rad/s`，为已观察值保留约 22% 裕量。

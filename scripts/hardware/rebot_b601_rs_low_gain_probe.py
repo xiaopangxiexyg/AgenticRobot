@@ -1996,6 +1996,37 @@ def normalize_feedback_boundary_qpos(
     return tuple(normalized), tuple(normalized_joint_names)
 
 
+def build_feedback_admission_position_limits(
+    position_limits_rad: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    """Build the read-side envelope without changing command limits.
+
+    The three documented encoder-boundary windows are the only values that
+    may extend the read-side lower boundary.  Outgoing MIT/POS_VEL references
+    continue to use the strict ``position_limits_rad`` supplied by the pinned
+    URDF.  Keeping this envelope explicit also lets the wired backend reject a
+    finite but impossible parameter response before it reaches FK, gravity,
+    impedance, or dispatch.
+    """
+
+    limits = tuple(
+        (_finite(lower, name="position_limit_lower"),
+         _finite(upper, name="position_limit_upper"))
+        for lower, upper in position_limits_rad
+    )
+    if len(limits) != 6 or any(lower >= upper for lower, upper in limits):
+        raise ValueError("position_limits_rad must contain six valid intervals")
+    admission = list(limits)
+    for index, joint_name in enumerate(_ALL_JOINTS):
+        boundary = _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD.get(joint_name)
+        reference = _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD.get(joint_name)
+        if boundary is None or reference is None:
+            continue
+        lower, upper = admission[index]
+        admission[index] = (min(lower, reference - boundary), upper)
+    return tuple(admission)
+
+
 def _mode_receipt_payload(receipt: B601ModeReceipt | None) -> dict[str, object] | None:
     if receipt is None:
         return None
@@ -2027,6 +2058,26 @@ def _command_receipt_payload(
         "accepted": receipt.accepted,
         "source_sequence": receipt.source_sequence,
     }
+
+
+def _backend_feedback_diagnostics(state: object) -> tuple[dict[str, object], ...]:
+    """Serialize the backend's per-joint admission evidence for a bad frame."""
+
+    diagnostics: list[dict[str, object]] = []
+    for joint in getattr(state, "joints", ()):
+        diagnostics.append(
+            {
+                "name": getattr(joint, "name", None),
+                "motor_id": getattr(joint, "motor_id", None),
+                "feedback_id": getattr(joint, "feedback_id", None),
+                "position_rad": getattr(joint, "position_rad", None),
+                "position_source": getattr(joint, "position_source", None),
+                "valid": getattr(joint, "valid", None),
+                "stale": getattr(joint, "stale", None),
+                "error": getattr(joint, "error", None),
+            }
+        )
+    return tuple(diagnostics)
 
 
 def _driver_torque_limit_receipt_payload(
@@ -3063,6 +3114,9 @@ def _run_feedback_stability_probe(
 
     if max_samples is not None and max_samples < 1:
         raise ValueError("max_samples must be positive when provided")
+    feedback_position_limits = build_feedback_admission_position_limits(
+        position_limits
+    )
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     started = _finite(clock(), name="clock")
     deadline = started + _positive(duration_sec, name="duration_sec")
@@ -3142,9 +3196,15 @@ def _run_feedback_stability_probe(
         "urdf_path": str(model.urdf_path),
         "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
         "position_limits_rad": position_limits,
+        "feedback_position_limits_rad": feedback_position_limits,
         "position_limit_semantics": (
             "pinned URDF limits with precise J4 +/-pi/2 nominal override; "
             "feedback-only boundary windows are reported separately"
+        ),
+        "feedback_admission_semantics": (
+            "backend rejects finite positions outside the explicit read-side "
+            "envelope before FK/gravity/impedance/dispatch; approved J2/J3/J4 "
+            "boundary windows are read-only and do not relax outgoing limits"
         ),
         "transport": "motorbridge_wired_local",
         "joint_names": _ALL_JOINTS,
@@ -4888,6 +4948,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
     model, position_limits = _resolve_model_and_limits(source_root)
+    feedback_position_limits = build_feedback_admission_position_limits(
+        position_limits
+    )
     if args.mode == "gravity-calibration-fit":
         return _run_gravity_calibration_fit(
             args=args,
@@ -4899,6 +4962,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             config_path,
             allow_motion=False,
             position_limits_rad=position_limits,
+            feedback_position_limits_rad=feedback_position_limits,
         )
         return _run_feedback_stability_probe(
             B601RSBackend(config),
@@ -4919,6 +4983,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             config_path,
             allow_motion=True,
             position_limits_rad=position_limits,
+            feedback_position_limits_rad=feedback_position_limits,
         )
         return _run_driver_torque_limit_roundtrip_probe(
             B601RSBackend(config),
@@ -4951,6 +5016,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         config_path,
         allow_motion=True,
         position_limits_rad=position_limits,
+        feedback_position_limits_rad=feedback_position_limits,
     )
     startup_lock_profile = build_startup_lock_profile(
         mit_kp_nm_per_rad=tuple(joint.mit_kp for joint in config.joints),
@@ -5003,6 +5069,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     fault_hold_candidate_last_rejection: str | None = None
     rejected_motion_sample: dict[str, object] | None = None
     rejected_motion_sample_count = 0
+    backend_feedback_diagnostics: tuple[dict[str, object], ...] = ()
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
     control_completion_reason: str | None = None
@@ -5455,6 +5522,26 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             ledger.mark("feedback", state.receive_timestamp_sec)
             if not state.valid or state.positions_rad is None:
                 stop_reason = state.fault_reason or "invalid feedback snapshot"
+                backend_feedback_diagnostics = _backend_feedback_diagnostics(state)
+                rejected_motion_sample = {
+                    "reason": stop_reason,
+                    "guard": "backend_feedback_admission",
+                    "sequence": int(state.sequence),
+                    "feedback_timestamp_sec": state.receive_timestamp_sec,
+                    "feedback_dt_sec": None,
+                    "raw_qpos_rad": tuple(
+                        joint.position_rad for joint in state.joints
+                    ),
+                    "normalized_qpos_rad": None,
+                    "previous_qvel_rad_s": previous_guard_qvel,
+                    "current_qvel_rad_s": None,
+                    "qacc_fd_rad_s2": None,
+                    "backend_fault_reason": state.fault_reason,
+                    "backend_joint_diagnostics": backend_feedback_diagnostics,
+                    "command_dispatched": False,
+                    "eligible_for_last_safe": False,
+                }
+                rejected_motion_sample_count += 1
                 break
             if getattr(state, "stale", False):
                 stop_reason = "stale feedback snapshot"
@@ -6246,9 +6333,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "urdf_path": str(model.urdf_path),
         "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
         "position_limits_rad": position_limits,
+        "feedback_position_limits_rad": feedback_position_limits,
         "position_limit_semantics": (
             "pinned URDF limits with precise J4 +/-pi/2 nominal override; "
             "feedback-only boundary windows are reported separately"
+        ),
+        "feedback_admission_semantics": (
+            "backend rejects finite positions outside the explicit read-side "
+            "envelope before FK/gravity/impedance/dispatch; approved J2/J3/J4 "
+            "boundary windows are read-only and do not relax outgoing limits"
         ),
         "transport": "motorbridge_wired_local",
         "joint_names": _ALL_JOINTS,
@@ -6438,6 +6531,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "first_sample_qacc_semantics": "unavailable_without_previous_control_qvel",
             "rejected_sample_count": rejected_motion_sample_count,
             "rejected_sample": rejected_motion_sample,
+            "backend_feedback_diagnostics": backend_feedback_diagnostics,
             "rejected_sample_command_semantics": "not_dispatched",
             "rejected_sample_last_safe_semantics": "ineligible",
         },

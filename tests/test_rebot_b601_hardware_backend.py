@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import pytest
 
 from hardware.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
+    B601_RS_MECH_POS_PARAM_ID,
     B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID,
     B601_RS_POS_VEL_POS_KP_PARAM_ID,
     B601_RS_POS_VEL_VEL_KI_PARAM_ID,
@@ -424,6 +426,117 @@ def test_active_feedback_poll_uses_mech_pos_when_motor_state_cache_is_empty() ->
         joint.position_source == "robstride_mech_pos_parameter"
         for joint in state.joints
     )
+
+
+def test_active_feedback_prefers_host_qualified_mech_pos_when_available() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+
+    backend.connect()
+    _populate_states(controller)
+    motor = controller.motors[4]
+
+    def host_read(param_id: int, host_id: int, timeout_ms: int) -> float:
+        motor._call("robstride_get_param_f32_host_id", param_id, host_id, timeout_ms)
+        assert param_id == B601_RS_MECH_POS_PARAM_ID
+        assert host_id == 0xFD
+        assert timeout_ms == 100
+        return float(motor.position_param)
+
+    motor.robstride_get_param_f32_host_id = host_read  # type: ignore[attr-defined]
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is True
+    assert state.joint("joint4").position_source == (
+        "robstride_mech_pos_parameter_host_id"
+    )
+    assert (
+        "robstride_get_param_f32_host_id",
+        (B601_RS_MECH_POS_PARAM_ID, 0xFD, 100),
+    ) in motor.calls
+
+
+def test_active_feedback_rejects_finite_mech_pos_outside_read_admission_envelope() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        B601RSBackendConfig(
+            channel="can0",
+            rate_hz=500.0,
+            joints=_joint_configs(),
+            position_limits_rad=((-3.0, 3.0),) * 6,
+            feedback_position_limits_rad=((-3.0, 3.0),) * 6,
+        ),
+        controller_factory=lambda _channel: controller,
+    )
+
+    backend.connect()
+    _populate_states(controller)
+    corrupted_position = 2.686622237168953e36
+    controller.motors[4].position_param = corrupted_position
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is False
+    assert state.stale is True
+    assert state.positions_rad is None
+    joint = state.joint("joint4")
+    assert joint.valid is False
+    assert joint.stale is True
+    assert joint.position_rad == corrupted_position
+    assert joint.position_source == "robstride_mech_pos_parameter"
+    assert f"mechPos(0x{B601_RS_MECH_POS_PARAM_ID:04x})" in (joint.error or "")
+    assert repr(corrupted_position) in (joint.error or "")
+    assert "raw_f32_bits=0x7c015b2d" in (joint.error or "")
+    assert "motor_id=4" in (joint.error or "")
+    assert "outside feedback acceptance limits" in (joint.error or "")
+
+
+def test_feedback_admission_window_does_not_relax_outgoing_position_limits() -> None:
+    controller = _FakeController()
+    strict_limits = (
+        (-3.0, 3.0),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    feedback_limits = (
+        (-3.0, 3.0),
+        (-0.006, 3.14),
+        (-0.003, 3.14),
+        (-math.pi / 2.0 - 0.001, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    backend = B601RSBackend(
+        B601RSBackendConfig(
+            channel="can0",
+            rate_hz=500.0,
+            joints=_joint_configs(),
+            allow_motion=True,
+            position_limits_rad=strict_limits,
+            feedback_position_limits_rad=feedback_limits,
+        ),
+        controller_factory=lambda _channel: controller,
+    )
+
+    backend.connect()
+    _populate_states(controller)
+    controller.motors[2].position_param = -0.004
+    controller.motors[3].position_param = -0.002
+    controller.motors[4].position_param = -math.pi / 2.0 - 0.0005
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is True
+    assert state.positions_rad is not None
+    assert state.positions_rad[1:4] == pytest.approx(
+        (-0.004, -0.002, -math.pi / 2.0 - 0.0005)
+    )
+    with pytest.raises(ValueError, match=r"qpos_rad\[1\].*joint2"):
+        backend.send_position_velocity(state.positions_rad)
 
 
 def test_active_feedback_request_failure_is_invalid_and_fail_closed() -> None:
