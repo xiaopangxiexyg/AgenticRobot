@@ -218,6 +218,48 @@ def test_active_rtc_latency_gate_discards_cold_sample_and_bounds_warm_max() -> N
     assert rejected == (True, False, 0.41)
 
 
+@pytest.mark.parametrize(
+    ("inference_started_at", "released_at"),
+    (
+        (float("nan"), 10.0),
+        (10.0, float("nan")),
+        (float("inf"), 10.0),
+        (10.0, float("inf")),
+    ),
+)
+def test_active_rtc_completion_latency_rejects_nonfinite_timestamps(
+    inference_started_at: float,
+    released_at: float,
+) -> None:
+    with pytest.raises(ValueError, match="timestamps must be finite"):
+        run_policy._rtc_active_completion_latency_sec(
+            inference_started_at=inference_started_at,
+            released_at=released_at,
+        )
+
+
+def test_active_rtc_completion_latency_preserves_valid_elapsed_time() -> None:
+    assert run_policy._rtc_active_completion_latency_sec(
+        inference_started_at=10.0,
+        released_at=10.399999,
+    ) == pytest.approx(0.399999)
+    assert (
+        run_policy._rtc_active_completion_latency_sec(
+            inference_started_at=10.0,
+            released_at=10.0,
+        )
+        == 0.0
+    )
+
+
+def test_active_rtc_completion_latency_rejects_reversed_timestamps() -> None:
+    with pytest.raises(ValueError, match="release predates inference start"):
+        run_policy._rtc_active_completion_latency_sec(
+            inference_started_at=10.0,
+            released_at=9.999999,
+        )
+
+
 def test_openpi_real_shadow_profile_preserves_qpos_init_authority() -> None:
     ordinary = openpi_real._rm65_bimanual_dmtac_args()
     shadow = openpi_real._rm65_bimanual_dmtac_args(rtc_real_shadow=True)
