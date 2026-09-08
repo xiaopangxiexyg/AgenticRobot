@@ -7,11 +7,19 @@
   statusCard.innerHTML = '<span class="label">Visualization</span><span class="bad">disabled</span>';
   statusRoot.appendChild(statusCard);
   const status = statusCard.querySelector('span:last-child');
+  const captureStatusCard = document.createElement('div');
+  captureStatusCard.className = 'status-item';
+  captureStatusCard.innerHTML = '<span class="label">Quest capture</span><span class="bad">waiting for terminal</span>';
+  statusRoot.appendChild(captureStatusCard);
+  const captureStatus = captureStatusCard.querySelector('span:last-child');
+  const overlayCaptureStatus = document.getElementById('xr-overlay-capture-status');
 
   let enabled = false;
   let config = {};
   let renderer = null;
   let latestRobotMessage = null;
+  let latestCaptureStatus = null;
+  let latestCalibrationPreview = null;
   let referenceMarkerMatrix = null;
   let referenceGeneration = null;
   let coreProtocolVersion = 2;
@@ -41,6 +49,38 @@
       && value.length === 16
       && value.every((item) => Number.isFinite(Number(item)))
     );
+  }
+
+  function questEpochMatches(context, sessionId, spaceType, generation) {
+    const epochId = questReferenceEpochId(context);
+    return (
+      epochId !== null
+      && sessionId === context.xrSessionId
+      && spaceType === context.referenceSpaceType
+      && generation === context.referenceSpaceGeneration
+    );
+  }
+
+  function setCaptureStatus(text, ok) {
+    captureStatus.textContent = text;
+    captureStatus.className = ok ? 'ok' : 'bad';
+    if (overlayCaptureStatus) {
+      overlayCaptureStatus.textContent = text;
+      overlayCaptureStatus.className = ok ? 'ok' : 'bad';
+    }
+  }
+
+  function captureStatusText(message) {
+    const capture = message.capture || {};
+    const candidates = Array.isArray(capture.candidates) ? capture.candidates : [];
+    const candidateText = candidates.length === 0
+      ? 'no controller candidate'
+      : candidates.map((candidate) => (
+        `${candidate.handedness || 'none'}:${String(candidate.candidate_hash || '').slice(0, 8)}`
+      )).join(', ');
+    const controls = 'r=auto 3s window (repeat), c=seal+solve';
+    const terminal = message.terminal_message ? ` | ${message.terminal_message}` : '';
+    return `${controls} | ${capture.state || 'waiting'} | candidates=${candidateText}${terminal}`;
   }
 
   function renderableRobotRecord(record, context) {
@@ -103,6 +143,44 @@
 
     handleServerMessage(context) {
       const message = context.message;
+      if (message.feature === 'visualization' && message.type === 'capture_status') {
+        if (
+          message.protocol_version !== coreProtocolVersion
+          || message.feature_protocol_version !== 2
+        ) {
+          setCaptureStatus('capture protocol mismatch', false);
+          return;
+        }
+        latestCaptureStatus = message;
+        const capture = message.capture || {};
+        setCaptureStatus(
+          captureStatusText(message),
+          capture.state !== 'terminal' && capture.state !== 'closed',
+        );
+        return;
+      }
+      if (message.feature === 'visualization' && message.type === 'calibration_preview') {
+        if (
+          message.protocol_version !== coreProtocolVersion
+          || message.feature_protocol_version !== 2
+          || message.preview !== true
+          || message.accepted !== false
+          || message.alignment_status !== 'diagnostic_preview'
+          || !hasFiniteMatrix(message.matrix_quest_from_robot_base)
+          || typeof message.robot_coordinate_binding_hash !== 'string'
+          || message.robot_coordinate_binding_hash.length === 0
+        ) {
+          latestCalibrationPreview = null;
+          setCaptureStatus('invalid calibration preview', false);
+          return;
+        }
+        latestCalibrationPreview = message;
+        setCaptureStatus(
+          `diagnostic preview only | base axes + TCP marker | ${message.robot_frame || 'robot base'} -> ${message.tcp_frame || 'TCP'}`,
+          true,
+        );
+        return;
+      }
       if (message.feature !== 'visualization' || message.type !== 'robot_tcp') return;
       if (
         message.protocol_version !== coreProtocolVersion
@@ -139,12 +217,92 @@
         );
       }
       if (config.show_controller_axes !== false) {
-        for (const controller of context.controllerPoses) {
+        // The display list may contain a last tracked pose while WebXR is
+        // temporarily missing grip tracking.  It is deliberately separate
+        // from context.controllerPoses, which is the raw list sent to the
+        // passive capture feature and must never contain cached poses.
+        const controllerPoses = (
+          context.displayControllerPoses || context.controllerPoses || []
+        );
+        for (const controller of controllerPoses) {
           const mvp = global.QuestDevXRMath.mat4Multiply(
             context.viewProjection,
             controller.pose.transform.matrix,
           );
           global.QuestDevVisualizationRenderer.drawAxes(context.gl, renderer, mvp);
+        }
+      }
+      const preview = latestCalibrationPreview;
+      const previewEpochMatches = preview && questEpochMatches(
+        context,
+        preview.quest_session_id,
+        preview.reference_space_type,
+        preview.reference_space_generation,
+      );
+      const previewRecord = (
+        previewEpochMatches
+        && latestRobotMessage
+        && latestRobotMessage.robots
+        && latestRobotMessage.robots[preview.robot]
+      );
+      if (previewEpochMatches && preview) {
+        const baseMatrix = new Float32Array(preview.matrix_quest_from_robot_base);
+        const baseMvp = global.QuestDevXRMath.mat4Multiply(
+          context.viewProjection,
+          baseMatrix,
+        );
+        if (
+          config.show_robot_base_axes !== false
+          && typeof global.QuestDevVisualizationRenderer.drawRobotBaseAxes === 'function'
+        ) {
+          global.QuestDevVisualizationRenderer.drawRobotBaseAxes(
+            context.gl,
+            renderer,
+            baseMvp,
+          );
+        }
+        let robotTcpMatrix = null;
+        if (
+          previewRecord
+          && previewRecord.fresh === true
+          && previewRecord.pose_binding
+          && previewRecord.pose_binding.coordinate_binding_hash
+            === preview.robot_coordinate_binding_hash
+          && hasFiniteMatrix(previewRecord.matrix_robot_from_tcp)
+        ) {
+          robotTcpMatrix = new Float32Array(previewRecord.matrix_robot_from_tcp);
+        } else if (hasFiniteMatrix(preview.matrix_robot_from_tcp)) {
+          // The diagnostic message includes the last captured robot pose so c
+          // can show the TCP immediately, even before the next live feedback
+          // packet arrives.  Fresh read-only feedback supersedes this fallback.
+          robotTcpMatrix = new Float32Array(preview.matrix_robot_from_tcp);
+        }
+        if (robotTcpMatrix) {
+          const tcpMatrix = global.QuestDevXRMath.mat4Multiply(
+            baseMatrix,
+            robotTcpMatrix,
+          );
+          const tcpMvp = global.QuestDevXRMath.mat4Multiply(
+            context.viewProjection,
+            tcpMatrix,
+          );
+          if (config.show_robot_tcp_axes !== false) {
+            global.QuestDevVisualizationRenderer.drawAxes(
+              context.gl,
+              renderer,
+              tcpMvp,
+            );
+          }
+          if (
+            config.show_robot_tcp_marker !== false
+            && typeof global.QuestDevVisualizationRenderer.drawTcpMarker === 'function'
+          ) {
+            global.QuestDevVisualizationRenderer.drawTcpMarker(
+              context.gl,
+              renderer,
+              tcpMvp,
+            );
+          }
         }
       }
       if (config.show_robot_tcp_axes !== false && latestRobotMessage) {
@@ -166,6 +324,7 @@
 
     onReferenceSpaceReset() {
       latestRobotMessage = null;
+      latestCalibrationPreview = null;
       referenceMarkerMatrix = null;
       referenceGeneration = null;
       setStatus('alignment invalidated by reference-space reset', false);
@@ -175,6 +334,7 @@
       if (renderer) global.QuestDevVisualizationRenderer.destroy(renderer);
       renderer = null;
       latestRobotMessage = null;
+      latestCalibrationPreview = null;
       referenceMarkerMatrix = null;
       referenceGeneration = null;
       setStatus(enabled ? 'enabled; XR ended' : 'disabled', false);

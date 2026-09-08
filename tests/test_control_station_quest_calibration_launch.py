@@ -104,6 +104,20 @@ def test_deploy_arguments_are_closed_over_the_no_action_profile() -> None:
         assert forbidden not in argv
 
 
+def test_explicit_arm_urdf_is_forwarded_to_the_observation_deploy() -> None:
+    args = _args(
+        "--arm-urdf-path",
+        "/home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf",
+    )
+
+    argv = build_deploy_argv(args)
+
+    assert argv[-2:] == [
+        "--arm-urdf-path",
+        "/home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf",
+    ]
+
+
 def test_dry_run_prints_resolved_contract_without_constructing_runtime() -> None:
     output: list[str] = []
 
@@ -121,6 +135,9 @@ def test_dry_run_prints_resolved_contract_without_constructing_runtime() -> None
 
     assert result == 0
     assert payload["mode"] == "quest_rm65_passive_calibration_trial"
+    assert payload["terminal_capture"]["r"] == (
+        "start one fixed 3s static window; repeat after auto-completion"
+    )
     assert payload["quest_pairing"] == {
         "fixed_code": TRUSTED_LAN_EASY_PAIRING_CODE,
         "mode": "trusted_lan_easy",
@@ -134,6 +151,27 @@ def test_dry_run_prints_resolved_contract_without_constructing_runtime() -> None
         "policy": "hold",
         "send_actions": False,
     }
+
+
+def test_calibration_rejects_a_configured_second_realman_reader(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "quest-direct-realman.yaml"
+    config_path.write_text(
+        """
+server:
+  pairing:
+    enabled: true
+features:
+  visualization:
+    robot_feedback:
+      enabled: true
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="only RealMan pose reader"):
+        run(_args("--quest-config", str(config_path), "--dry-run"))
 
 
 def test_run_composes_one_factory_and_restores_pairing_environment(
@@ -175,6 +213,8 @@ def test_run_composes_one_factory_and_restores_pairing_environment(
     assert factories[0].config.force_http is False
     assert factories[0].config.capture_id == "operator-test-capture"
     assert factories[0].config.profile.profile_id == OPERATOR_TRIAL_PROFILE_ID_V1
+    assert not hasattr(factories[0].config, "realman_left_ip")
+    assert not hasattr(factories[0].config, "realman_left_urdf")
     assert policy_calls == [(build_deploy_argv(_args("--trusted-lan")), factories[0])]
     assert coordinators[0].start_calls == 1
     assert coordinators[0].close_calls == 1
@@ -253,7 +293,10 @@ def test_shell_entrypoint_is_executable_and_delegates_to_module() -> None:
     javascript = (root / "control_station/quest_calibration/static/app.js").read_text(
         encoding="utf-8"
     )
-    assert "封存候选（当前仅内存）" in html
-    assert "完成窗口（自动排空）" in html
-    assert "completeWindowWithBoundedDrain" in javascript
-    assert "attempt < 20" in javascript
+    assert "终端控制（当前运行模式）" in html
+    assert "按 <code>r</code>" in html
+    assert "按 <code>c</code>" in html
+    assert "固定 3 秒" in html
+    assert "封存候选（当前仅内存）" not in html
+    assert "completeWindowWithBoundedDrain" not in javascript
+    assert 'fetch("/intent"' not in javascript

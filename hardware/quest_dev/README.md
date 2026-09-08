@@ -13,7 +13,8 @@
 - 手柄坐标轴和最多 20 Hz 的 `gripSpace` 只读遥测；
 - host 侧按认证客户端保留 latest-only 样本，reset/end/disconnect 立即失效；
 - 固定在 TCP 上的 Quest 手柄与机器人 TCP 成对位姿离线拟合；
-- 可选 AR5 Redis `GET` 反馈；默认关闭。只有外部 reviewed binding、当前 Quest epoch 和被动 pose identity 全部匹配时才绘制 TCP axes。
+- application layer 可通过 versioned `robot_tcp` 消息发布只读机器人观测；Quest hardware
+  runtime 不创建机器人 backend，也不拥有状态刷新或设备生命周期。
 
 ## 目录结构
 
@@ -50,6 +51,11 @@ hardware/quest_dev/
 python -m pip install -r hardware/quest_dev/requirements.txt
 python -m hardware.quest_dev.server
 ```
+
+通用 `hardware.quest_dev.server` 只拥有 Quest HTTP/WSS 与 browser feature 生命周期。
+需要 RM65 状态时，应由 `control_station` / `teleop_runtime` 应用层拥有唯一 backend 和
+canonical pose journal，再向该 host 发布只读 `robot_tcp`。若 Quest 配置试图启用
+`visualization.robot_feedback`，lower runtime 会 fail closed，避免产生第二个设备 reader。
 
 默认监听 `8444`。首次 HTTPS 启动会生成本机开发用自签名证书；Quest 与主机需在
 同一受信局域网，且需在 Quest Browser 中手动接受证书风险。
@@ -136,8 +142,17 @@ curl -H "Authorization: Bearer $QUEST_DEV_PAIRING_TOKEN" \
 ## 最小几何体与手柄遥测
 
 进入 MR/VR 后，visualization feature 在首次有效 viewer pose 前方放置一个黄色线框
-立方体，并绘制手柄 RGB 坐标轴。reference space 发生 `reset` 时旧锚点立即失效，下一
+立方体，并绘制手柄 RGB 坐标轴。reference space 发生 `reset` 时旧锚点和手柄显示缓存立即失效，下一
 帧在新 generation 中重新锚定。参数位于 `features.visualization.client`。
+
+Quest 页面会把手柄采样状态区分为 `tracked`、`emulated`、`missing_grip_space`、
+`pose_unavailable` 和 `pose_error`。其中 `pose_unavailable` 就是 WebXR
+`frame.getPose(gripSpace, referenceSpace)` 返回空；它不会被缓存位姿伪装成有效标定样本。
+显示最多保留 250 ms 的上一帧真实位姿用于抑制单帧闪烁，超时后项目绘制的手柄轴会
+消失；Quest 系统自己的手柄模型仍可能可见，但它不代表 `getPose()` 当前有效。显示列表
+与发送给 `controller_pose`/被动标定的原始列表严格分离。viewer pose 暂不可用时，采集
+仍可继续接收真实 grip pose，但本帧不会绘制任何坐标轴。终端按一次 `r` 后，如果当下
+没有真实 grip pose，会保持等待并在 tracking 恢复时自动开始 3 秒窗口，无需反复按键。
 
 `controller_pose` feature 上传 `T_reference_from_grip`，但不保存轨迹，也不提供动作、
 目标或控制字段。协议见
@@ -186,8 +201,9 @@ node --test hardware/quest_dev/tests/*.test.js
 
 ## 来源与所有权
 
-- HTTPS/WSS 与 WebXR 基础来自既有 `quest_pose`，遥操作发布和 Redis 写入已移除；
-- visualization 反馈解析来自既有 AR5 只读反馈契约；旧裸 Redis pose 仍不可直接投影到 Quest；
+- HTTPS/WSS 与 WebXR 基础来自既有 `quest_pose`，遥操作发布和状态写入已移除；
+- visualization 只消费 application layer 发布的 versioned telemetry；不会初始化 Redis、
+  RealMan backend，也不会把外部缓存 pose 当作机械臂 canonical pose；
 - reviewed binding 的 parser 只验证外部 acceptance receipt，不自动创建或接受标定；
 - `hardware/quest_dev` 只拥有 Quest 接入与 feature-local 诊断，不拥有控制 authority、
   canonical safety、轨迹生成、future selection 或执行生命周期；

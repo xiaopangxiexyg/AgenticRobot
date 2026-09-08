@@ -43,12 +43,31 @@
       <span class="label">Protocol events</span>
       <pre id="event-log">waiting for server...</pre>
     </section>
+
+    <section class="panel capture-help">
+      <strong>被动标定采集</strong>
+      <p>
+        先在本页完成配对并进入 MR/VR，再回到主机终端操作：
+        按一次 <code>r</code> 自动记录固定 3 秒静止窗口，完成后重复按 <code>r</code> 采集下一个姿态；
+        <code>c</code> 封存窗口并执行诊断解算。Quest 只显示未验收预览，
+        不会驱动机械臂。
+      </p>
+    </section>
+
+    <section id="xr-overlay" class="xr-overlay" aria-live="polite">
+      <strong>Quest 被动标定</strong>
+      <span id="xr-overlay-capture-status" class="bad">等待终端连接</span>
+      <small>先配对并进入 MR/VR；终端按 r 自动记录 3 秒并重复采集，按 c 封存并解算。解算后显示机械臂根坐标轴和 TCP 末端标记。</small>
+    </section>
   </main>
   <script src="/xr_math.js"></script>
   <script src="/feature_registry.js"></script>
   <script src="/features/visualization/renderer.js"></script>
   <script src="/features/visualization/feature.js"></script>
   <script src="/features/controller_pose/feature.js"></script>
+  <script src="/controller_source_identity.js"></script>
+  <script src="/controller_pose_sampling.js"></script>
+  <script src="/controller_pose_display.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

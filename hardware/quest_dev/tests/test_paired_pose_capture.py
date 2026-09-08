@@ -226,6 +226,7 @@ def _quest_event(
     target_ray_mode: str = "tracked-pointer",
     profiles: list[str] | None = None,
     emulated_position: bool = False,
+    include_controller: bool = True,
     xr_frame_time_ms: float | None = None,
 ) -> ControllerPoseAcceptedEvent:
     payload = {
@@ -242,16 +243,20 @@ def _quest_event(
             if xr_frame_time_ms is None
             else xr_frame_time_ms
         ),
-        "controllers": [
-            {
-                "source_session_id": controller_source_session_id,
-                "handedness": handedness,
-                "target_ray_mode": target_ray_mode,
-                "profiles": profiles or ["oculus-touch-v3"],
-                "emulated_position": emulated_position,
-                "matrix_reference_from_grip": _controller_matrix(x_m=x_m),
-            }
-        ],
+        "controllers": (
+            [
+                {
+                    "source_session_id": controller_source_session_id,
+                    "handedness": handedness,
+                    "target_ray_mode": target_ray_mode,
+                    "profiles": (["oculus-touch-v3"] if profiles is None else profiles),
+                    "emulated_position": emulated_position,
+                    "matrix_reference_from_grip": _controller_matrix(x_m=x_m),
+                }
+            ]
+            if include_controller
+            else []
+        ),
     }
     sample = parse_controller_pose_sample(
         payload,
@@ -561,6 +566,22 @@ def test_static_window_success_is_candidate_only_and_round_trips_r0_dataset() ->
     reparsed = parse_paired_pose_capture_evidence(payload)
     assert reparsed.semantic_content_hash == evidence.semantic_content_hash
     assert reparsed.dataset.semantic_sha256 == evidence.dataset.semantic_sha256
+
+
+def test_candidate_dataset_does_not_seal_or_pin_final_source_cuts() -> None:
+    capture, binding, robots, _, _ = _completed_capture()
+
+    candidate = capture.candidate_dataset()
+
+    status = capture.snapshot_status()
+    assert status["sealed"] is False
+    assert status["finalizing"] is False
+    evidence = capture.seal_capture(
+        robot_cut=_healthy_robot_cut(binding=binding, latest_event=robots[-1]),
+        quest_cut=_healthy_quest_cut(binding=binding),
+    )
+    assert evidence is not None
+    assert evidence.dataset.semantic_sha256 == candidate.semantic_sha256
 
 
 def test_complete_window_requires_both_exclusive_watermarks_to_drain() -> None:
@@ -885,8 +906,8 @@ def test_robot_global_cursor_gap_fails_closed() -> None:
         capture.ingest_robot_event(skipped)
 
 
-@pytest.mark.parametrize("failure", ["identity", "emulated", "invalidation"])
-def test_selected_quest_identity_emulation_and_invalidation_are_terminal(
+@pytest.mark.parametrize("failure", ["identity", "invalidation"])
+def test_selected_quest_identity_and_invalidation_are_terminal(
     failure: str,
 ) -> None:
     capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=_binding())
@@ -897,19 +918,118 @@ def test_selected_quest_identity_emulation_and_invalidation_are_terminal(
             received_monotonic_ns=1_100_000_000,
             client_instance_id="different-page",
         )
-    elif failure == "emulated":
-        event = _quest_event(
-            event_sequence=0,
-            sample_sequence=1,
-            received_monotonic_ns=1_100_000_000,
-            emulated_position=True,
-        )
     else:
         event = _quest_invalidation(event_sequence=0)
 
     with pytest.raises(CaptureTerminalError):
         capture.ingest_quest_event(event)
     assert capture.snapshot_status()["terminal_reason"] is not None
+
+
+def test_emulated_selected_quest_pose_is_ignored_not_used_for_calibration() -> None:
+    projection = _projection()
+    binding = _binding(projection=projection)
+    capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=binding)
+    _begin(capture)
+
+    robots = (
+        _robot_event(
+            event_sequence=1,
+            source_sequence=1,
+            received_monotonic_ns=1_100_000_000,
+            projection=projection,
+        ),
+        _robot_event(
+            event_sequence=2,
+            source_sequence=2,
+            received_monotonic_ns=1_300_000_000,
+            projection=projection,
+        ),
+    )
+    quests = (
+        _quest_event(
+            event_sequence=0,
+            sample_sequence=1,
+            received_monotonic_ns=1_105_000_000,
+        ),
+        _quest_event(
+            event_sequence=1,
+            sample_sequence=2,
+            received_monotonic_ns=1_200_000_000,
+            emulated_position=True,
+        ),
+        _quest_event(
+            event_sequence=2,
+            sample_sequence=3,
+            received_monotonic_ns=1_305_000_000,
+        ),
+    )
+    for event in robots:
+        capture.ingest_robot_event(event)
+    for event in quests:
+        capture.ingest_quest_event(event)
+
+    receipt = capture.complete_window(
+        end_received_monotonic_ns=1_500_000_000,
+        robot_end_next_event_sequence=3,
+        quest_end_next_event_sequence=3,
+    )
+
+    assert receipt is not None
+    assert receipt.metrics["quest_sample_count"] == 2
+    assert receipt.metrics["quest_source_span_ns"] == 200_000_000
+    assert len(receipt.quest_events) == 3
+    assert capture.snapshot_status()["terminal_reason"] is None
+
+
+def test_emulated_quest_samples_cannot_satisfy_the_window_minimum() -> None:
+    projection = _projection()
+    binding = _binding(projection=projection)
+    capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=binding)
+    _begin(capture)
+
+    for event in (
+        _robot_event(
+            event_sequence=1,
+            source_sequence=1,
+            received_monotonic_ns=1_100_000_000,
+            projection=projection,
+        ),
+        _robot_event(
+            event_sequence=2,
+            source_sequence=2,
+            received_monotonic_ns=1_300_000_000,
+            projection=projection,
+        ),
+    ):
+        capture.ingest_robot_event(event)
+    for event in (
+        _quest_event(
+            event_sequence=0,
+            sample_sequence=1,
+            received_monotonic_ns=1_105_000_000,
+            emulated_position=True,
+        ),
+        _quest_event(
+            event_sequence=1,
+            sample_sequence=2,
+            received_monotonic_ns=1_305_000_000,
+            emulated_position=True,
+        ),
+    ):
+        capture.ingest_quest_event(event)
+
+    with pytest.raises(
+        StaticWindowRejectedError,
+        match="Quest sample count is outside profile",
+    ):
+        capture.complete_window(
+            end_received_monotonic_ns=1_500_000_000,
+            robot_end_next_event_sequence=3,
+            quest_end_next_event_sequence=2,
+        )
+    assert capture.snapshot_status()["terminal_reason"] is None
+    assert capture.snapshot_status()["active_window_id"] is None
 
 
 def test_selected_robot_invalidation_is_terminal() -> None:
@@ -1110,6 +1230,43 @@ def test_quest_sequence_time_and_controller_metadata_regression_are_terminal(
     }
     with pytest.raises(CaptureTerminalError, match=message):
         capture.ingest_quest_event(_quest_event(**values))
+
+
+def test_missing_selected_controller_pose_is_ignored_without_terminal_capture() -> None:
+    capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=_binding())
+
+    capture.ingest_quest_event(
+        _quest_event(
+            event_sequence=0,
+            sample_sequence=1,
+            include_controller=False,
+            received_monotonic_ns=1_100_000_000,
+        )
+    )
+
+    assert capture.snapshot_status()["terminal_reason"] is None
+
+
+def test_quest_profile_metadata_can_change_without_changing_selected_source() -> None:
+    capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=_binding())
+    capture.ingest_quest_event(
+        _quest_event(
+            event_sequence=0,
+            sample_sequence=2,
+            profiles=["generic-trigger"],
+            received_monotonic_ns=1_100_000_000,
+        )
+    )
+    capture.ingest_quest_event(
+        _quest_event(
+            event_sequence=1,
+            sample_sequence=3,
+            profiles=["oculus-touch-v3", "generic-trigger"],
+            received_monotonic_ns=1_200_000_000,
+        )
+    )
+
+    assert capture.snapshot_status()["terminal_reason"] is None
 
 
 def test_robot_source_sequence_regression_and_quest_clock_drift_are_terminal() -> None:

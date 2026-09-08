@@ -20,31 +20,14 @@ features:
     enabled: true
     client:
       show_robot_tcp_axes: true
+      show_robot_base_axes: true
+      show_robot_tcp_marker: true
       axis_length_m: 0.18
       show_controller_axes: true
       show_reference_marker: true
       reference_marker_size_m: 0.10
       reference_marker_forward_m: 0.8
       reference_marker_down_from_viewer_m: 0.15
-    # 可选的机械臂只读反馈。默认关闭；启用后只调用 Redis GET。
-    robot_feedback:
-      enabled: false
-      redis:
-        host: localhost
-        port: 6379
-        db: 0
-        socket_timeout_s: 0.2
-      rate_hz: 30
-      max_age_s: 0.25
-      # Reviewed bindings are intentionally absent by default. Without one,
-      # robot_tcp remains diagnostic-only and the browser draws no TCP axes.
-      frame_bindings: {}
-      # Paths are resolved relative to hardware/quest_dev when not absolute.
-      # A loaded file must be the canonical accepted_frame_binding.v1 payload.
-      frame_binding_paths: {}
-      sources:
-        ar5_1: ar5:feedback:ar5_1
-        ar5_2: ar5:feedback:ar5_2
   controller_pose:
     enabled: true
     client:

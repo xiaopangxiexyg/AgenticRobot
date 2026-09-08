@@ -14,9 +14,9 @@ from typing import Any
 import numpy as np
 
 from robot_motion.rm65 import (
-    RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_ARM_CONTROL_MODE_IMPEDANCE,
     RM65_ARM_CONTROL_MODE_POSITION,
+    RM65_BIMANUAL_POSITION_V1_NAME,
     build_rm65_pose_lift_ik_tuning,
     normalize_rm65_arm_control_mode,
 )
@@ -40,7 +40,6 @@ from ..defaults import (
 )
 from ..interfaces import EffectorBackend
 from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
-
 
 DEPLOY_RM65_ARM_MAX_ANGVEL = (0.7, 0.7, 0.9, 1.5, 1.5, 2.0)
 DEPLOY_ARM_STEP_DT_ALPHA = RM65_POSITION_SEND_DT_ALPHA
@@ -281,12 +280,21 @@ def build_arm_backends(
         action_hz=command_input_hz,
     )
     arm_canfd_follow = effective_arm_canfd_follow(args)
-    # A model RTC real-shadow can be either a passive live observation run or
-    # an explicitly authorized active run.  Keep the backend observation-only
-    # only when the caller did not request dispatch; ``--send-actions`` is the
-    # single explicit transition to normal command-capable backend configs.
-    observation_only = bool(getattr(args, "rtc_real_shadow", False)) and not bool(
-        getattr(args, "send_actions", False)
+    # Both explicit passive profiles must construct the backend in its
+    # observation-only mode.  ``--rm65-pose-observation`` is the Quest/RM65
+    # calibration path and validation already forbids it with --send-actions;
+    # retain the defensive check here because this builder is also directly
+    # exercised by tests and application leaves.  RTC real-shadow keeps its
+    # existing opt-in behavior: --send-actions is the transition back to a
+    # command-capable backend.
+    pose_observation = bool(getattr(args, "rm65_pose_observation", False))
+    send_actions = bool(getattr(args, "send_actions", False))
+    if pose_observation and send_actions:
+        raise ValueError(
+            "--rm65-pose-observation cannot construct a command-capable backend"
+        )
+    observation_only = pose_observation or (
+        bool(getattr(args, "rtc_real_shadow", False)) and not send_actions
     )
     if observation_only:
         arm_canfd_follow = False

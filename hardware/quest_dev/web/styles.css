@@ -32,6 +32,27 @@ p { color: var(--muted); line-height: 1.6; }
 .label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
 .ok { color: var(--good); }
 .bad { color: var(--bad); }
+.xr-overlay {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  z-index: 20;
+  width: min(620px, calc(100vw - 24px));
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(13, 17, 23, 0.86);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+  font-size: 13px;
+}
+.xr-overlay strong,
+.xr-overlay span,
+.xr-overlay small { display: block; }
+.xr-overlay span { margin-top: 4px; }
+.xr-overlay small { margin-top: 4px; color: var(--muted); line-height: 1.4; }
 button {
   padding: 12px 18px;
   border: 0;

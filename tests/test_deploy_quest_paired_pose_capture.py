@@ -193,6 +193,10 @@ class _QuestServer:
     def __init__(self, monotonic_ns_clock) -> None:
         self.server_instance_id = "quest-server-1"
         self.monotonic_ns_clock = monotonic_ns_clock
+        self.published_feature_messages: list[tuple[str, dict]] = []
+
+    def publish_feature_message(self, feature: str, message: dict) -> None:
+        self.published_feature_messages.append((feature, message))
 
 
 def _profile(*, max_event_history: int = 32) -> StaticWindowCaptureProfile:
@@ -230,6 +234,9 @@ def _source_bundle():
         coordinate_binding_by_side=bindings,
         _atomic_cut=journal.atomic_cut,
         _events_after=journal.events_after,
+        _latest_pose_measurement=lambda side: journal.atomic_cut().latest_by_stream.get(
+            bindings[side].stream_id
+        ),
     )
     return receiver_clock, monotonic_ns_clock, journal, bindings, source
 
@@ -342,6 +349,7 @@ def _sample_payload(
     source_session_id: str = "controller-source-1",
     handedness: str = "right",
     target_ray_mode: str = "tracked-pointer",
+    profiles: list[str] | None = None,
     emulated_position: bool = False,
 ) -> dict:
     return {
@@ -359,7 +367,7 @@ def _sample_payload(
                 "source_session_id": source_session_id,
                 "handedness": handedness,
                 "target_ray_mode": target_ray_mode,
-                "profiles": ["oculus-touch-v3"],
+                "profiles": (["oculus-touch-v3"] if profiles is None else profiles),
                 "emulated_position": emulated_position,
                 "matrix_reference_from_grip": list(IDENTITY_MATRIX),
             }
@@ -464,6 +472,38 @@ def test_candidate_is_pose_redacted_and_never_auto_selects() -> None:
     assert not hasattr(source, "snapshot")
     assert not hasattr(source, "get_state")
     assert not hasattr(source, "refresh")
+    assert (
+        journal.snapshot_calls == journal.get_state_calls == journal.refresh_calls == 0
+    )
+    app.close()
+
+
+def test_selected_capture_publishes_live_tcp_from_the_same_passive_journal() -> None:
+    receiver_clock, clock, journal, bindings, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    _, selected = _select_right(app)
+    publication_event = _robot_accepted_event(
+        event_sequence=1,
+        source_sequence=1,
+        received_monotonic_ns=clock(),
+        binding=bindings["right"],
+        receiver_clock=receiver_clock,
+    )
+    journal.events.append(publication_event)
+
+    app.poll()
+
+    feature, message = runtime.server.published_feature_messages[-1]
+    record = message["robots"]["rm65_right"]
+    assert feature == "visualization"
+    assert message["type"] == "robot_tcp"
+    assert record["source"] == "passive_pose_journal"
+    assert record["fresh"] is True
+    assert record["alignment_ready"] is False
+    assert record["pose_binding"]["coordinate_binding_hash"] == (
+        selected.robot.semantic_content_hash
+    )
+    assert record["matrix_robot_from_tcp"][12:15] == [0.2, 0.0, 0.0]
     assert (
         journal.snapshot_calls == journal.get_state_calls == journal.refresh_calls == 0
     )
@@ -729,6 +769,157 @@ def test_out_of_order_old_candidate_callback_cannot_resurrect_epoch() -> None:
     app._on_quest_event(accepted)
 
     assert app.candidates() == ()
+    assert app.snapshot_status()["terminal_reason"] is None
+    app.close()
+
+
+def test_dynamic_profiles_do_not_duplicate_one_quest_candidate() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=1,
+            received_monotonic_ns=clock(),
+            profiles=["oculus-touch-v3", "generic-trigger"],
+        ),
+    )
+
+    candidates = app.candidates()
+    assert len(candidates) == 1
+    assert candidates[0].profiles == ("oculus-touch-v3",)
+
+    _select_right(app)
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=1,
+            received_monotonic_ns=clock(),
+            profiles=["oculus-touch-v3", "generic-trigger"],
+        ),
+    )
+    app.poll()
+    assert app.snapshot_status()["terminal_reason"] is None
+    app.close()
+
+
+def test_get_pose_loss_empty_sample_does_not_create_or_poison_candidate() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    runtime._handle_session_state(1, _session_payload())
+    empty_sample = _sample_payload(
+        sample_sequence=0,
+        received_monotonic_ns=clock(),
+    )
+    empty_sample["controllers"] = []
+    empty_sample["controller_diagnostics"] = [
+        {
+            "source_session_id": "controller-source-1",
+            "handedness": "right",
+            "target_ray_mode": "tracked-pointer",
+            "tracking_state": "untracked",
+            "reason": "pose_unavailable",
+        }
+    ]
+    runtime._handle_pose_sample(1, empty_sample)
+    app.poll()
+
+    assert app.candidates() == ()
+    assert app.snapshot_status()["terminal_reason"] is None
+
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=1,
+            received_monotonic_ns=clock(),
+        ),
+    )
+    app.poll()
+
+    assert len(app.candidates()) == 1
+    assert app.snapshot_status()["terminal_reason"] is None
+    app.close()
+
+
+def test_get_pose_loss_after_candidate_disallows_selection_until_pose_returns() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    candidate = app.candidates()[0]
+
+    empty_sample = _sample_payload(
+        sample_sequence=1,
+        received_monotonic_ns=clock(),
+    )
+    empty_sample["controllers"] = []
+    empty_sample["controller_diagnostics"] = [
+        {
+            "source_session_id": candidate.controller_source_session_id,
+            "handedness": candidate.handedness,
+            "target_ray_mode": candidate.target_ray_mode,
+            "tracking_state": "untracked",
+            "reason": "pose_unavailable",
+        }
+    ]
+    runtime._handle_pose_sample(1, empty_sample)
+    app.poll()
+
+    # The candidate remains a historical discovery record, but the latest
+    # source state is empty and must not authorize capture selection.
+    assert app.candidates() == (candidate,)
+    with pytest.raises(RuntimeError, match="getPose.*returned null"):
+        app.select_unique_candidate(
+            robot_side="right",
+            preferred_handedness="right",
+        )
+    assert app.snapshot_status()["state"] == "waiting_for_selection"
+    assert app.snapshot_status()["terminal_reason"] is None
+
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=2,
+            received_monotonic_ns=clock(),
+        ),
+    )
+    app.poll()
+    _, binding = _select_right(app)
+    assert binding.quest.controller_source_session_id == (
+        candidate.controller_source_session_id
+    )
+    app.close()
+
+
+def test_stale_latest_pose_cannot_start_capture() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    clock.value += 1_000_000_000
+
+    with pytest.raises(RuntimeError, match=r"telemetry is stale \(1\.100s old"):
+        app.select_unique_candidate(
+            robot_side="right",
+            preferred_handedness="right",
+        )
+    assert app.snapshot_status()["terminal_reason"] is None
+    app.close()
+
+
+def test_emulated_latest_pose_reports_why_selection_is_unusable() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=1,
+            received_monotonic_ns=clock(),
+            emulated_position=True,
+        ),
+    )
+    app.poll()
+
+    with pytest.raises(RuntimeError, match="emulated_position.*estimating"):
+        app.select_unique_candidate(
+            robot_side="right",
+            preferred_handedness="right",
+        )
     assert app.snapshot_status()["terminal_reason"] is None
     app.close()
 
@@ -1160,6 +1351,24 @@ def test_real_reducer_completes_and_seals_one_typed_static_window() -> None:
     assert evidence.finalization.robot_end_next_event_sequence == 2
     assert evidence.finalization.quest_end_next_event_sequence == 2
     assert app.evidence is evidence
+
+    journal.events.append(
+        _robot_accepted_event(
+            event_sequence=2,
+            source_sequence=2,
+            received_monotonic_ns=clock(),
+            binding=bindings["right"],
+            receiver_clock=receiver_clock,
+        )
+    )
+    app.poll()
+    _, live_message = runtime.server.published_feature_messages[-1]
+    live_record = live_message["robots"]["rm65_right"]
+    assert live_record["fresh"] is True
+    assert live_record["source_sequence"] == 2
+    assert live_record["pose_binding"]["coordinate_binding_hash"] == (
+        evidence.binding.robot.semantic_content_hash
+    )
     app.close()
 
 
@@ -1431,6 +1640,8 @@ def test_factory_owns_one_programmatic_host_without_network_or_device_io() -> No
     assert len(builder_calls) == 1
     assert builder_calls[0][1]["monotonic_ns_clock"] is clock
     assert callable(builder_calls[0][1]["runtime_loader"])
+    assert "realman_left_ip" not in builder_calls[0][1]
+    assert "realman_left_urdf" not in builder_calls[0][1]
     assert (
         journal.snapshot_calls == journal.get_state_calls == journal.refresh_calls == 0
     )

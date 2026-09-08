@@ -3,7 +3,7 @@
 
 This file is extracted from the transport and certificate portions of
 ``quest_pose/server.py``. Optional capabilities live under ``features/`` and
-are loaded from config; the core contains no robot, Redis, or control logic.
+are loaded from config; the core contains no robot, RealMan, or control logic.
 """
 
 from __future__ import annotations

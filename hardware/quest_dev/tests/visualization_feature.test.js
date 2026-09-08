@@ -9,6 +9,7 @@ const vm = require('node:vm');
 function loadFeature() {
   let implementation = null;
   const status = { className: '', textContent: '' };
+  const overlayStatus = { className: '', textContent: '' };
   const statusCard = {
     className: '',
     innerHTML: '',
@@ -20,6 +21,8 @@ function loadFeature() {
     destroy: () => {},
     drawAxes: (...args) => draws.push(args),
     drawReferenceMarker: () => {},
+    drawRobotBaseAxes: (...args) => draws.push(args),
+    drawTcpMarker: (...args) => draws.push(args),
   };
   const xrMath = {
     mat4Multiply: (_a, b) => b,
@@ -28,7 +31,11 @@ function loadFeature() {
   const context = {
     document: {
       createElement: () => statusCard,
-      getElementById: () => ({ appendChild: () => {} }),
+      getElementById: (id) => (
+        id === 'xr-overlay-capture-status'
+          ? overlayStatus
+          : { appendChild: () => {} }
+      ),
     },
     window: {
       QuestDevFeatures: {
@@ -51,7 +58,7 @@ function loadFeature() {
   );
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), context, { filename });
   implementation.configure({}, { enabled: true, protocolVersion: 2 });
-  return { implementation, status, draws };
+  return { implementation, status, draws, overlayStatus };
 }
 
 function identityMatrix() {
@@ -156,5 +163,141 @@ test('visualization draws TCP axes only for the current accepted Quest epoch', (
 
   implementation.onReferenceSpaceReset();
   implementation.renderView(context);
+  assert.equal(draws.length, 1);
+});
+
+test('visualization renders the display-only controller list, not raw capture data', () => {
+  const { implementation, draws } = loadFeature();
+  implementation.onXRReady({ gl: {} });
+  const rawMatrix = ['raw-controller-matrix'];
+  const displayMatrix = ['cached-controller-matrix'];
+  implementation.renderView({
+    ...matchingContext(),
+    controllerPoses: [{ pose: { transform: { matrix: rawMatrix } } }],
+    displayControllerPoses: [{ pose: { transform: { matrix: displayMatrix } } }],
+  });
+  assert.equal(draws.length, 1);
+  assert.strictEqual(draws[0][2], displayMatrix);
+});
+
+test('visualization draws diagnostic robot base and raw-feedback TCP preview', () => {
+  const { implementation, draws, status, overlayStatus } = loadFeature();
+  implementation.onXRReady({ gl: {} });
+  implementation.handleServerMessage({
+    message: {
+      type: 'calibration_preview',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      preview: true,
+      accepted: false,
+      alignment_status: 'diagnostic_preview',
+      robot: 'rm65_left',
+      robot_coordinate_binding_hash: 'binding-hash-left',
+      robot_frame: 'left_arm_base',
+      tcp_frame: 'tool_tcp',
+      quest_session_id: 'xr-session-1',
+      reference_space_type: 'local-floor',
+      reference_space_generation: 0,
+      matrix_quest_from_robot_base: identityMatrix(),
+    },
+  });
+  implementation.handleServerMessage({
+    message: {
+      type: 'robot_tcp',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      robots: {
+        rm65_left: {
+          robot: 'rm65_left',
+          fresh: true,
+          alignment_ready: false,
+          matrix_robot_from_tcp: identityMatrix(),
+          pose_binding: {
+            coordinate_binding_hash: 'binding-hash-left',
+          },
+        },
+      },
+    },
+  });
+  implementation.renderView(matchingContext());
+  assert.equal(draws.length, 3);
+  assert.match(status.textContent, /robot feedback 1 fresh/);
+  assert.match(overlayStatus.textContent, /diagnostic preview only/);
+});
+
+test('diagnostic preview draws the captured TCP before live feedback arrives', () => {
+  const { implementation, draws, overlayStatus } = loadFeature();
+  implementation.onXRReady({ gl: {} });
+  implementation.handleServerMessage({
+    message: {
+      type: 'calibration_preview',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      preview: true,
+      accepted: false,
+      alignment_status: 'diagnostic_preview',
+      robot: 'rm65_left',
+      robot_coordinate_binding_hash: 'binding-hash-left',
+      robot_frame: 'left_arm_base',
+      tcp_frame: 'tool_tcp',
+      quest_session_id: 'xr-session-1',
+      reference_space_type: 'local-floor',
+      reference_space_generation: 0,
+      matrix_quest_from_robot_base: identityMatrix(),
+      matrix_robot_from_tcp: identityMatrix(),
+    },
+  });
+
+  implementation.renderView(matchingContext());
+  assert.equal(draws.length, 3);
+  assert.match(overlayStatus.textContent, /base axes \+ TCP marker/);
+});
+
+test('diagnostic preview rejects live TCP from another robot binding', () => {
+  const { implementation, draws } = loadFeature();
+  implementation.onXRReady({ gl: {} });
+  implementation.handleServerMessage({
+    message: {
+      type: 'calibration_preview',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      preview: true,
+      accepted: false,
+      alignment_status: 'diagnostic_preview',
+      robot: 'rm65_left',
+      robot_coordinate_binding_hash: 'capture-binding-hash',
+      robot_frame: 'left_arm_base',
+      tcp_frame: 'tool_tcp',
+      quest_session_id: 'xr-session-1',
+      reference_space_type: 'local-floor',
+      reference_space_generation: 0,
+      matrix_quest_from_robot_base: identityMatrix(),
+    },
+  });
+  implementation.handleServerMessage({
+    message: {
+      type: 'robot_tcp',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      robots: {
+        rm65_left: {
+          robot: 'rm65_left',
+          fresh: true,
+          alignment_ready: false,
+          matrix_robot_from_tcp: identityMatrix(),
+          pose_binding: {
+            coordinate_binding_hash: 'different-binding-hash',
+          },
+        },
+      },
+    },
+  });
+
+  implementation.renderView(matchingContext());
   assert.equal(draws.length, 1);
 });

@@ -1158,13 +1158,31 @@ def _selected_controller(
     return None if not matches else matches[0]
 
 
+def _selected_valid_controller(
+    event: ControllerPoseAcceptedEvent,
+    binding: QuestControllerCaptureBinding,
+) -> ControllerGripPose | None:
+    """Return only a selected controller pose with real tracked position.
+
+    WebXR can keep reporting a controller while its position is temporarily
+    emulated.  That sample is useful as lifecycle evidence, but it must not
+    enter the paired-pose dataset because its grip translation is not a
+    measured controller position.
+    """
+
+    controller = _selected_controller(event, binding)
+    if controller is None or controller.emulated_position:
+        return None
+    return controller
+
+
 def _quest_matrix(
     event: ControllerPoseAcceptedEvent,
     binding: QuestControllerCaptureBinding,
 ) -> np.ndarray:
-    controller = _selected_controller(event, binding)
+    controller = _selected_valid_controller(event, binding)
     if controller is None:
-        raise ValueError("selected controller is absent")
+        raise ValueError("selected controller is absent or emulated")
     return controller_wire_matrix_to_transform(controller.matrix_reference_from_grip)
 
 
@@ -1454,14 +1472,23 @@ class ManualStaticPairedPoseCapture:
         controller = _selected_controller(event, quest)
         if controller is None:
             return
-        if controller.emulated_position is not False:
-            self._terminal("selected Quest controller pose is emulated")
         if (
             controller.handedness != quest.handedness
             or controller.target_ray_mode != quest.target_ray_mode
-            or controller.profiles != quest.profiles
         ):
             self._terminal("selected Quest controller identity metadata drifted")
+        # WebXR profile strings describe current input capabilities and can
+        # change after the same XRInputSource is first exposed. They remain in
+        # event/evidence metadata, but are not source identity and therefore do
+        # not terminate an otherwise consistent selected source.
+        if len(controller.profiles) != len(set(controller.profiles)):
+            self._terminal("selected Quest controller profiles are invalid")
+        # A temporary WebXR tracking loss may expose an emulated controller
+        # position.  Keep the ordered event for evidence and sequence fences,
+        # but exclude its pose from the calibration dataset.  The window-level
+        # sample-count/span checks below remain the fail-closed acceptance gate.
+        if controller.emulated_position:
+            return
 
     def begin_window(
         self,
@@ -1663,7 +1690,7 @@ class ManualStaticPairedPoseCapture:
             for event in quest_events
             if isinstance(event, ControllerPoseAcceptedEvent)
             and event.client_id == self.binding.quest.client_id
-            and _selected_controller(event, self.binding.quest) is not None
+            and _selected_valid_controller(event, self.binding.quest) is not None
             and active.start_received_monotonic_ns
             <= event.sample.received_monotonic_ns
             <= active.end_received_monotonic_ns
@@ -1950,6 +1977,19 @@ class ManualStaticPairedPoseCapture:
             samples=tuple(samples),
         )
         return parse_paired_pose_dataset(dataset.as_dict())
+
+    def candidate_dataset(self) -> PairedPoseDataset:
+        """Return an immutable fit candidate without pinning final source cuts."""
+
+        with self._lock:
+            self._assert_live()
+            if self._active is not None:
+                raise RuntimeError(
+                    "cannot build a candidate dataset while a window is active"
+                )
+            if not self._completed:
+                raise RuntimeError("at least one accepted static window is required")
+            return self._build_dataset(tuple(self._completed))
 
     def snapshot_status(self) -> dict[str, Any]:
         """Return bounded, pose-redacted status only."""

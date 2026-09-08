@@ -2,6 +2,9 @@
 
 ## Goal
 
+当前 Quest/RM65 被动标定的现场操作、代码身份与安全交接见
+[Quest 被动标定与 RM65 可视化任务交接](quest_passive_calibration_handoff.zh-CN.md)。
+
 The final operator-facing behavior is a Quest WebXR view that overlays the
 robot's measured TCP and a policy's selected future trajectory in one reviewed
 coordinate frame.  The view is diagnostic and predictive only: it must not own
@@ -335,8 +338,9 @@ an explicit trusted-LAN easy pairing code while retaining protocol
 authentication. It is still an operator trial rather than a canonical policy
 deployment entrypoint and has not been exercised against real Quest + RM65
 hardware. Its stationary-window profile is candidate admission only; `seal`
-remains in-memory and does not publish an artifact. The remaining ordered
-slices are:
+remains in-memory by default, while explicit launcher publication flags can
+write candidate evidence and a diagnostic fit without accepting or installing
+a frame. The remaining ordered slices are:
 
 1. Exercise the one-command operator trial under the real-hardware safety
    procedure, while preserving policy deploy as the sole factory/application

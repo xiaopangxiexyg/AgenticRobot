@@ -75,7 +75,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIsInstance(config, dict)
         visualization = config["features"]["visualization"]
         self.assertTrue(visualization["enabled"])
-        self.assertFalse(visualization["robot_feedback"]["enabled"])
+        self.assertNotIn("robot_feedback", visualization)
         self.assertTrue(config["features"]["controller_pose"]["enabled"])
         self.assertTrue(config["server"]["pairing"]["enabled"])
 
@@ -657,7 +657,10 @@ class QuestDevHostTests(unittest.TestCase):
             mock.patch.object(
                 server,
                 "parse_args",
-                return_value=mock.Mock(config=config_path, http=True),
+                return_value=mock.Mock(
+                    config=config_path,
+                    http=True,
+                ),
             ),
             mock.patch.object(
                 server,
@@ -669,7 +672,10 @@ class QuestDevHostTests(unittest.TestCase):
         ):
             server.main()
 
-        build_host.assert_called_once_with(config_path, force_http=True)
+        build_host.assert_called_once_with(
+            config_path,
+            force_http=True,
+        )
         fake_host.serve_forever.assert_called_once_with()
         self.assertEqual(install_signal.call_count, 2)
         signal_handler = install_signal.call_args_list[0].args[1]
@@ -848,50 +854,15 @@ class FeatureRuntimeTests(unittest.TestCase):
                 message["feature_protocol_version"], FEATURE_PROTOCOL_VERSION
             )
 
-    def test_loop_broadcasts_read_only_feedback(self) -> None:
-        stop_event = threading.Event()
+    def test_hardware_runtime_rejects_robot_feedback_ownership(self) -> None:
+        runtime = VisualizationRuntime(
+            object(),
+            {"robot_feedback": {"enabled": True}},
+            threading.Event(),
+        )
 
-        class Reader:
-            def get(self, key: str) -> str:
-                self.last_key = key
-                return json.dumps(
-                    {
-                        "timestamp": 100.0,
-                        "robot": "ar5_1",
-                        "control_ready": False,
-                        "tcp_pose": {
-                            "position": [0, 0, 0],
-                            "orientation_quat_xyzw": [0, 0, 0, 1],
-                        },
-                    }
-                )
-
-        class BroadcastServer:
-            def __init__(self) -> None:
-                self.messages: list[dict] = []
-
-            def publish_feature_message(self, feature: str, payload: dict) -> int:
-                self.feature = feature
-                self.messages.append(payload)
-                stop_event.set()
-                return 1
-
-        host = BroadcastServer()
-        runtime = VisualizationRuntime(host, {}, stop_event)
-        runtime.reader = Reader()
-        with mock.patch(
-            "hardware.quest_dev.features.visualization.robot_feedback.time.time",
-            return_value=100.0,
-        ):
-            runtime._run_feedback_loop(
-                sources={"ar5_1": "ar5:feedback:ar5_1"},
-                rate_hz=30,
-                max_age_s=0.25,
-            )
-        self.assertEqual(host.feature, "visualization")
-        self.assertEqual(len(host.messages), 1)
-        self.assertTrue(host.messages[0]["robots"]["ar5_1"]["fresh"])
-        self.assertFalse(host.messages[0]["robots"]["ar5_1"]["control_ready"])
+        with self.assertRaisesRegex(ValueError, "application layer"):
+            runtime.start()
 
 
 if __name__ == "__main__":

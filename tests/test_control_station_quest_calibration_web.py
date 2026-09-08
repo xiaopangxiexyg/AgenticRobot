@@ -161,7 +161,8 @@ def test_assets_are_packaged_and_describe_the_no_motion_boundary() -> None:
 
     assert "不发送机械臂动作" in html
     assert 'fetch("/status.json"' in script
-    assert 'fetch("/intent"' in script
+    assert 'fetch("/intent"' not in script
+    assert "终端控制（当前运行模式）" in html
     assert '"quest_calibration/static/*.html"' in pyproject
     assert '"quest_calibration/static/*.js"' in pyproject
 

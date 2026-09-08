@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ...protocol import PROTOCOL_VERSION
@@ -13,6 +13,7 @@ FEATURE_NAME = "controller_pose"
 FEATURE_PROTOCOL_VERSION = 1
 _HANDEDNESS = {"left", "right", "none"}
 _TARGET_RAY_MODES = {"gaze", "tracked-pointer", "screen", "transient-pointer"}
+_TRACKING_STATES = {"tracked", "emulated", "untracked"}
 REFERENCE_SPACE_TYPES = {"local", "local-floor", "bounded-floor", "unbounded"}
 
 
@@ -87,6 +88,18 @@ class ControllerGripPose:
 
 
 @dataclass(frozen=True)
+class ControllerTrackingDiagnostic:
+    """Pose-redacted reason reported for one current XR input source."""
+
+    source_session_id: str
+    handedness: str
+    target_ray_mode: str
+    tracking_state: str
+    reason: str
+    error_name: str | None = None
+
+
+@dataclass(frozen=True)
 class ControllerPoseSample:
     client_instance_id: str
     xr_session_id: str
@@ -97,6 +110,12 @@ class ControllerPoseSample:
     controllers: tuple[ControllerGripPose, ...]
     received_wall_time_s: float
     received_monotonic_ns: int
+    # Operational diagnostics explain current selection availability but are
+    # deliberately excluded from calibration-evidence equality/serialization.
+    controller_diagnostics: tuple[ControllerTrackingDiagnostic, ...] = field(
+        default=(),
+        compare=False,
+    )
 
 
 def parse_controller_pose_sample(
@@ -173,6 +192,117 @@ def parse_controller_pose_sample(
                 ),
             )
         )
+
+    raw_diagnostics = payload.get("controller_diagnostics")
+    diagnostics: list[ControllerTrackingDiagnostic] = []
+    if raw_diagnostics is None:
+        # Keep protocol-v1 browser compatibility. Older clients only sent
+        # pose-bearing controllers, so their state can be inferred exactly but
+        # they cannot explain an absent pose.
+        diagnostics = [
+            ControllerTrackingDiagnostic(
+                source_session_id=controller.source_session_id,
+                handedness=controller.handedness,
+                target_ray_mode=controller.target_ray_mode,
+                tracking_state=(
+                    "emulated" if controller.emulated_position else "tracked"
+                ),
+                reason=(
+                    "emulated_position"
+                    if controller.emulated_position
+                    else "tracked"
+                ),
+            )
+            for controller in controllers
+        ]
+    else:
+        if not isinstance(raw_diagnostics, list):
+            raise TypeError("controller_diagnostics must be a list")
+        if len(raw_diagnostics) > max(0, int(max_controllers)):
+            raise ValueError("controller diagnostic count exceeds admission limit")
+        diagnostic_source_ids: set[str] = set()
+        for raw in raw_diagnostics:
+            if not isinstance(raw, Mapping):
+                raise TypeError("each controller diagnostic must be a mapping")
+            source_id = _identifier(
+                raw.get("source_session_id"),
+                "controller_diagnostics.source_session_id",
+            )
+            if source_id in diagnostic_source_ids:
+                raise ValueError(
+                    "controller diagnostic source IDs must be unique within a sample"
+                )
+            diagnostic_source_ids.add(source_id)
+            handedness = _identifier(
+                raw.get("handedness"),
+                "controller_diagnostics.handedness",
+            )
+            if handedness not in _HANDEDNESS:
+                raise ValueError("unsupported controller diagnostic handedness")
+            target_ray_mode = _identifier(
+                raw.get("target_ray_mode"),
+                "controller_diagnostics.target_ray_mode",
+            )
+            if target_ray_mode not in _TARGET_RAY_MODES:
+                raise ValueError("unsupported controller diagnostic target_ray_mode")
+            tracking_state = _identifier(
+                raw.get("tracking_state"),
+                "controller_diagnostics.tracking_state",
+            )
+            if tracking_state not in _TRACKING_STATES:
+                raise ValueError("unsupported controller diagnostic tracking_state")
+            reason = _identifier(
+                raw.get("reason"),
+                "controller_diagnostics.reason",
+                max_length=80,
+            )
+            raw_error_name = raw.get("error_name")
+            error_name = (
+                None
+                if raw_error_name is None
+                else _identifier(
+                    raw_error_name,
+                    "controller_diagnostics.error_name",
+                    max_length=80,
+                )
+            )
+            diagnostics.append(
+                ControllerTrackingDiagnostic(
+                    source_session_id=source_id,
+                    handedness=handedness,
+                    target_ray_mode=target_ray_mode,
+                    tracking_state=tracking_state,
+                    reason=reason,
+                    error_name=error_name,
+                )
+            )
+
+        controllers_by_source = {
+            controller.source_session_id: controller for controller in controllers
+        }
+        diagnostics_by_source = {
+            diagnostic.source_session_id: diagnostic for diagnostic in diagnostics
+        }
+        if set(controllers_by_source).difference(diagnostics_by_source):
+            raise ValueError("every controller pose must have a tracking diagnostic")
+        for source_id, diagnostic_item in diagnostics_by_source.items():
+            controller = controllers_by_source.get(source_id)
+            if diagnostic_item.tracking_state == "untracked":
+                if controller is not None:
+                    raise ValueError("untracked diagnostic cannot carry a pose")
+                continue
+            if controller is None:
+                raise ValueError("tracked/emulated diagnostic requires a pose")
+            if (
+                diagnostic_item.handedness != controller.handedness
+                or diagnostic_item.target_ray_mode != controller.target_ray_mode
+            ):
+                raise ValueError("controller pose/diagnostic metadata mismatch")
+            expected_state = (
+                "emulated" if controller.emulated_position else "tracked"
+            )
+            if diagnostic_item.tracking_state != expected_state:
+                raise ValueError("controller pose/diagnostic tracking state mismatch")
     return ControllerPoseSample(
         client_instance_id=_identifier(
             payload.get("client_instance_id"), "client_instance_id"
@@ -193,4 +323,5 @@ def parse_controller_pose_sample(
         received_monotonic_ns=_non_negative_int(
             received_monotonic_ns, "received_monotonic_ns"
         ),
+        controller_diagnostics=tuple(diagnostics),
     )

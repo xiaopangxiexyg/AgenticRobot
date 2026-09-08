@@ -11,8 +11,10 @@
 - 把人工划定的静止窗口整理为内存中的候选成对位姿数据。
 
 当前入口不会发送机械臂动作，不会执行 Home、Servo、Replay 或标定运动，也不会自动
-发布证据、运行拟合、验收标定、安装坐标系或渲染 policy future。`seal` 只封存当前进程
-内存中的候选；退出进程后，这些候选不会自动变成持久化标定结果。
+验收标定、安装坐标系或渲染 policy future。`seal` 先封存当前进程内存中的候选；只有
+显式加上 `--publish-sealed-evidence`（或 `--publish-diagnostic-fit`）时，干净退出后才
+会把候选证据/诊断拟合写入 content-addressed runtime artifact。它们仍然不是标定验收
+结果，也不会自动安装坐标系。
 
 ## 一、开始前检查
 
@@ -32,10 +34,12 @@
 
 ```bash
 read -rp "请输入确认过的 RM65 IP: " QUEST_ARM_IP
+QUEST_ARM_URDF=/home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf
 
 bash scripts/run_quest_calibration.sh \
-  --side right \
+  --side left \
   --arm-ip "$QUEST_ARM_IP" \
+  --arm-urdf-path "$QUEST_ARM_URDF" \
   --trusted-lan \
   --dry-run
 ```
@@ -65,8 +69,9 @@ bash scripts/run_quest_calibration.sh \
 
 ```bash
 bash scripts/run_quest_calibration.sh \
-  --side right \
+  --side left \
   --arm-ip "$QUEST_ARM_IP" \
+  --arm-urdf-path "$QUEST_ARM_URDF" \
   --trusted-lan
 ```
 
@@ -74,8 +79,9 @@ bash scripts/run_quest_calibration.sh \
 
 ```bash
 python -m control_station.quest_calibration.launch \
-  --side right \
+  --side left \
   --arm-ip "$QUEST_ARM_IP" \
+  --arm-urdf-path "$QUEST_ARM_URDF" \
   --trusted-lan
 ```
 
@@ -101,17 +107,29 @@ python -m control_station.quest_calibration.launch \
 电脑与 Quest 在同一局域网、终端进程仍在运行、端口没有被防火墙拦截。不要把完整的
 带认证 header 的 URL 粘贴到共享聊天、命令历史或截图中。
 
-## 五、桌面页面采集一个静止窗口
+## 五、终端采集一个静止窗口
 
-1. 选择正确的 Quest 控制器候选、手性和 RM65 侧别。
-2. 点击“开始窗口”。
-3. 保持机械臂和手柄静止至少 1 秒；建议每个窗口保持 2–3 秒。
-4. 点击“完成窗口（自动排空）”。页面会等待两侧事件排空，再自动递增下一个窗口号。
-5. 先完成 1–2 个窗口验证链路，再决定是否继续采集。
+1. 确认 Quest 页面已配对并进入 MR/VR，终端已经选中正确的 Quest 控制器和 RM65 侧别。
+2. 在启动终端按一次 `r`；保持机械臂和手柄静止，窗口会自动记录固定 3 秒并排空两侧事件。
+3. 等待终端显示 `window completed`，改变到下一个姿态，再按一次 `r` 进入下一窗口。
+4. 先完成 1–2 个窗口验证链路，再决定是否继续采集；完成至少 3 个窗口后按 `c` 封存并运行 AX=XB 诊断解算。
 
-`operator-trial-v1` 的主要门槛是：窗口 1–5 秒、至少 5 个机器人样本、至少 10 个
+`operator-trial-v1` 的主要门槛是：窗口 1–5 秒（当前终端固定记录 3 秒）、至少 5 个机器人样本、至少 10 个
 Quest 样本，以及有限的平移和旋转变化。单个静止窗口只产生一个代表性成对位姿，不会
-自动拆成多条标定姿态。
+自动拆成多条标定姿态。若 Quest 短暂报告 `emulated_position=true`，该事件会保留在
+有序观测证据中但不会进入标定数据集；只有真实跟踪的 Quest 样本参与计数、配对和解算。
+如果真实样本不足，窗口仍会被拒绝，而不会用模拟位姿补足。
+
+Quest 手柄坐标轴的显示使用独立的仅渲染末帧缓存：WebXR 短暂没有返回
+`gripSpace` 位姿时，画面可继续显示最近一次真实跟踪位姿，但该缓存不会发送给
+`controller_pose` 采集通道，也不会进入标定数据集。画面中的轴因此可能是冻结的诊断
+显示；采集仍以原始真实 Quest 样本为准。Quest Browser 在启动阶段可能动态更新
+`profiles`，这只属于能力诊断信息，不会改变同一左手柄的 session-local 身份；但
+`getPose()` 返回空或 `emulated_position=true` 时，该帧仍然不计入标定样本。
+
+按 `c` 后，Quest 会先显示诊断得到的机械臂根坐标系，再显示最后一个采集姿态的 TCP
+末端标记；后续新鲜的 RealMan 只读反馈会更新末端位置。该预览不等于正式验收，也不会
+安装坐标系或驱动机械臂。
 
 真正的标定数据还需要覆盖工作空间中的多个位置，并包含绕两个以上非平行轴的姿态变化。
 本入口不移动机械臂，也不替操作者决定这些运动姿态。
@@ -151,7 +169,8 @@ Quest 接收器、桌面页面和 RM65 观测资源。不要直接关闭终端�
 
 ## 九、当前边界和下一步
 
-本说明对应的是“连接 + 最简单几何体/手柄姿态 + 静止窗口候选”的操作阶段。完成真实
-测试后，下一阶段才是由独立任务负责：持久化候选证据、离线 AX=XB 诊断拟合、人工验收、
-安装 `T_quest_from_robot`，最后才讨论把 policy 预期轨迹投影到 Quest。任何前一阶段的
-成功都不能自动证明后一阶段已经完成。
+本说明对应的是“连接 + 最简单几何体/手柄姿态 + 静止窗口候选”的操作阶段。若在
+干净退出前显式加入 `--publish-sealed-evidence --publish-diagnostic-fit`，可得到候选
+证据和离线 AX=XB 诊断报告；下一阶段仍需人工验收、安装 `T_quest_from_robot`，最后才
+讨论把 policy 预期轨迹投影到 Quest。任何前一阶段的成功都不能自动证明后一阶段已经
+完成。
