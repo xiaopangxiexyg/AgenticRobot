@@ -178,7 +178,7 @@ handoff 的时间。若现场观察到刚使能轻微前倾，应从 JSON/log �
 | `gravity-calibration` | J1–J6 | 可拖动 gravity+damping；R 后暂时固定 q 记录静态位置残差 | 多窗口无需重启 |
 | `feedback-stability` | 不改变既有状态 | read-only 读取 `mechPos` 并统计有限差分 | 不切 mode、不使能、不失能、不发送控制帧 |
 | `driver-torque-limit-roundtrip` | J1–J6 | 读原值→写 scaled effort→回读→恢复→回读 | 不使能、不发 MIT/POS_VEL；成功后才可在 active 命令使用 driver Kd |
-| `gravity-calibration-fit` | 无设备 | 离线归约、配对、回归和 holdout 报告 | 只输出 candidate overlay |
+| `gravity-calibration-fit` | 无设备 | 离线归约、姿态去重、回归和 holdout 报告 | 只输出 candidate correction |
 
 `--joint` 只影响 `slow-step` 目标或单关节 gain override，不缩小 active enable/dispatch 集合。
 
@@ -315,9 +315,9 @@ sequence/timestamp，并标记 `command_dispatched=false`、`eligible_for_last_s
 
 ### 10.1 为什么旧窗口不能直接拟合
 
-此前一些窗口使用 `--kp 0`、没有 `P/N` 相反接近方向标签，或在窗口 5 尚未完成时被
-`duration-sec` 结束。它们可以用于反馈漂移、启动和故障诊断，但静态位置残差不可观测，
-也不能证明质量/质心。不要把“JSON status=OK”当成拟合输入合格。
+此前一些窗口使用 `--kp 0`，或在窗口 5 尚未完成时被 `duration-sec` 结束。它们可以用于
+反馈漂移、启动和故障诊断，但 `--kp 0` 时静态位置残差不可观测，也不能据此证明质量/质心。
+不要把“JSON status=OK”当成拟合输入合格。
 
 ### 10.2 现场采集协议
 
@@ -327,7 +327,7 @@ sequence/timestamp，并标记 `command_dispatched=false`、`eligible_for_last_s
 ```text
 LOCKING → GRAVITY_RAMP → HANDOFF → ACTIVE
   ↘ FREE_DRAG
-      P/N 标记接近方向 + R
+      R 固定当前位置
       → SETTLING（默认 2 s，不计入拟合）
       → RECORDING（默认 20 s，完全不接触）
       → FREE_DRAG
@@ -336,8 +336,8 @@ LOCKING → GRAVITY_RAMP → HANDOFF → ACTIVE
 每个窗口的现场动作：
 
 1. 在 `FREE_DRAG` 由人拖到目标姿态；松手，确认没有接触、碰撞或持续下坠。
-2. 从一侧接近时按 `P`，再按 `R`；从相反侧回到同一姿态时按 `N`，再按 `R`。按键无需
-   Enter，`P/N` 是方向标签，不是关节方向或控制命令。
+2. 按一次 `R`（无需 Enter）；程序立即以当前六关节位置作为固定参考。无需判断接近方向，
+   也不需要为了配对而再次回到同一姿态。
 3. 看到 `CALIBRATION RECORDING #N` 后手离开机械臂，但手和物理急停保持在旁边可立即
    介入；不得在记录期间用手“帮它稳住”。
 4. 看到 `CALIBRATION COMPLETE #N: returned to FREE_DRAG` 后再移动到下一姿态。
@@ -346,8 +346,8 @@ LOCKING → GRAVITY_RAMP → HANDOFF → ACTIVE
 
 推荐数据量不是“重复 100 个同类窗口”：
 
-- training：6 个信息不同的姿态，各做正/负一对，共 12 个窗口；
-- validation：3–4 个训练中未出现的新姿态，各做正/负一对，共 6–8 个窗口；
+- training：6–8 个信息不同的姿态，每个姿态一次 `R`；
+- validation：3–4 个训练中未出现的新姿态，每个姿态一次 `R`；
 - 覆盖肘部、腕部和 J2 约 1.9–2.1 rad 的代表区域，但绝不为覆盖区域主动越过物理边界；
 - 若回归矩阵秩、奇异值和姿态多样性已经足够，应停止追加同类窗口。
 
@@ -357,16 +357,17 @@ LOCKING → GRAVITY_RAMP → HANDOFF → ACTIVE
 
 1. 只提取完整 `RECORDING` 区间；每窗用 q、qvel、gravity 项和 position 项的中位数/MAD
    归约为一个姿态观测，不把 20 Hz 每帧当独立姿态。
-2. 按姿态容差和显式 `positive/negative` 标签配对；无标签只能用
-   `--calibration-allow-unpaired` 生成诊断 candidate，不能正式通过。
-3. 默认先拟合 `global-scale-joint-bias`；只有独立验证显示明显姿态相关残差且确认存在
-   未建模末端负载，才评估 `global-scale-payload`（非负质量 + 末端一阶矩）。
+2. 每个完整的 `R` 窗口直接形成一个静态残差观测；姿态容差只用于识别并平均近似重复姿态，
+   不再要求操作者提供方向标签。旧文件里的无方向标签窗口也按相同质量条件处理。
+3. 第一轮正式拟合 `global-scale`，其 `effective_gravity_scale` 可直接用于后续显式
+   `--gravity-scale` 复测；只有独立验证显示明显姿态相关残差且确认存在未建模末端负载，
+   才评估 `global-scale-payload`（非负质量 + 末端一阶矩）。
 4. 用 rank、奇异值/条件数和 log-volume 选择信息量足够的 pose；保留独立 holdout。
-5. 输出绑定 calibration dataset SHA、URDF SHA、config SHA、模型、配对数、rank、训练/验证
+5. 输出绑定 calibration dataset SHA、URDF SHA、config SHA、模型、姿态数、rank、训练/验证
    残差，`activation` 必须为 `candidate_only_until_independent_validation`。
 
-输出是有效重力 overlay，不是没有电流/力矩标定时的真实质量或质心测量。没有非零软件 Kp、
-没有双向配对、窗口不完整、秩不足或验证残差不下降，都应保持 `CANDIDATE/FAIL`。
+输出是有效重力修正，不是没有电流/力矩标定时的真实质量或质心测量。没有非零软件 Kp、
+窗口不完整、秩不足或验证残差不下降，都应保持 `CANDIDATE/FAIL`。
 
 ## 11. 真机操作和终端行为规范
 
@@ -618,7 +619,7 @@ env PYTHONDONTWRITEBYTECODE=1 "$PY" \
   --rebot-source-root "$SRC" \
   --calibration-input "$OUT_DIR/train.json" \
   --calibration-validation-input "$OUT_DIR/validation.json" \
-  --calibration-model global-scale-joint-bias \
+  --calibration-model global-scale \
   --calibration-pose-tolerance-rad 0.08 \
   --calibration-max-poses 12 \
   --calibration-max-velocity-rad-s 0.03 \
@@ -632,7 +633,7 @@ printf '[B601] fit status=%s\n' "$STATUS"
 printf '[B601] shell remains active\n'
 ```
 
-fit 完成后必须检查：完整窗口数/不完整窗口数、方向配对数、rank/奇异值、训练和验证残差、
+fit 完成后必须检查：完整窗口数/不完整窗口数、独立姿态数、rank/奇异值、训练和验证残差、
 饱和计数、dataset/URDF/config SHA 以及 `activation=candidate_only_until_independent_validation`。
 未满足条件时保留报告，不改 URDF/YAML，不把 candidate overlay 作为运行时参数自动加载。
 

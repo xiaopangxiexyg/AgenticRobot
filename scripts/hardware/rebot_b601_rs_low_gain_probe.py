@@ -35,15 +35,15 @@ freshness remains unverified by MotorBridge 0.4.9 and is reported as such.
 
 ``gravity-calibration`` hands the startup lock to a normal draggable
 gravity/damping controller.  Once ACTIVE, the operator may move joint1..joint6,
-release the arm, label the approach path with ``P`` or ``N``, and press ``R``
-without Enter.  That fresh feedback pose becomes
+release the arm, and press ``R`` without Enter.  That fresh feedback pose becomes
 the fixed software position reference for a settling interval followed by one
 recording window (20 seconds by default); completion removes the position term
 and returns to draggable gravity compensation so multiple poses can be collected
 in one run.  The configured ``--kp`` is used while the fixed reference is
 settling and recording.  ``gravity-calibration-fit`` is an offline-only mode: it
-reduces complete windows, pairs repeated poses, selects informative poses, and
-fits a candidate effective-gravity overlay without opening CAN.
+reduces each complete R window to one static residual observation, averages only
+nearby repeated poses, selects informative poses, and fits a candidate effective-
+gravity correction without opening CAN.
 
 Reaching ``--duration-sec`` ends the active experiment, but does not authorize
 drive disable.  Like the first Ctrl-C or an ordinary handled control fault, it
@@ -226,7 +226,6 @@ class OperatorKeyReader:
     def __init__(self, tty_path: Path = _OPERATOR_TTY_PATH) -> None:
         self._fd: int | None = None
         self._saved_attributes: list[object] | None = None
-        self._pending_approach_direction: str | None = None
         try:
             self._fd = os.open(tty_path, os.O_RDONLY | os.O_NONBLOCK)
             self._saved_attributes = termios.tcgetattr(self._fd)
@@ -244,48 +243,19 @@ class OperatorKeyReader:
             termios.tcflush(self._fd, termios.TCIFLUSH)
 
     def poll_record_request(self) -> bool:
-        """Return whether ``R`` was pressed, preserving the legacy API.
-
-        Formal calibration should use :meth:`poll_capture_request` so the
-        operator can label the approach path with ``P`` or ``N`` immediately
-        before ``R``.  Keeping this wrapper avoids changing the small terminal
-        reader contract used by existing callers and tests.
-        """
-
-        requested, _direction = self.poll_capture_request()
-        return requested
-
-    def poll_capture_request(self) -> tuple[bool, str | None]:
-        """Read one non-blocking key batch and return ``(R, approach)``.
-
-        ``P`` and ``N`` label the manually chosen positive/negative approach
-        path for the next recording.  The label is consumed by ``R``; an
-        unlabelled ``R`` remains valid for diagnostic capture but cannot form
-        a formally bidirectional pair during offline fitting.
-        """
+        """Return whether ``R`` was pressed in the next non-blocking key batch."""
 
         if self._fd is None:
-            return False, None
+            return False
         try:
             pressed = os.read(self._fd, 64)
         except BlockingIOError:
-            return False, None
+            return False
         except OSError as exc:
             raise LowGainProbeError(
                 "failed to read the gravity-calibration operator terminal"
             ) from exc
-        direction: str | None = None
-        requested = False
-        for key in pressed.lower():
-            if key == ord("p"):
-                self._pending_approach_direction = "positive"
-            elif key == ord("n"):
-                self._pending_approach_direction = "negative"
-            elif key == ord("r"):
-                requested = True
-                direction = self._pending_approach_direction
-                self._pending_approach_direction = None
-        return requested, direction
+        return ord("r") in pressed.lower()
 
     def close(self) -> None:
         fd = self._fd
@@ -338,24 +308,16 @@ class GravityCalibrationCapture:
         *,
         elapsed_sec: float,
         sample_start_index: int,
-        approach_direction: str | None = None,
     ) -> dict[str, object] | None:
         if self.state != "FREE_DRAG":
             return None
         reference = _six(qpos_rad, name="calibration_reference_qpos_rad")
         started = _non_negative(elapsed_sec, name="calibration_trigger_elapsed_sec")
-        if approach_direction is not None:
-            approach_direction = str(approach_direction).strip().lower()
-            if approach_direction not in ("positive", "negative"):
-                raise ValueError(
-                    "calibration approach_direction must be positive or negative"
-                )
         record_index = len(self.records) + 1
         record: dict[str, object] = {
             "index": record_index,
             "trigger_elapsed_sec": started,
             "reference_qpos_rad": reference,
-            "approach_direction": approach_direction,
             # ``sample_start_index`` is filled when RECORDING starts.  Keep the
             # trigger index separately so the settling interval can be audited.
             "trigger_sample_index": int(sample_start_index),
@@ -740,7 +702,6 @@ def evaluate_calibration_window(
         "torque_limited_count": torque_limited_count,
         "slew_limited_count": slew_limited_count,
         "reasons": tuple(reasons),
-        "approach_direction": window[0].get("approach_direction"),
     }
 
 
@@ -817,8 +778,6 @@ def reduce_gravity_calibration_windows(
         summary["recording_started_elapsed_sec"] = raw_record.get(
             "recording_started_elapsed_sec"
         )
-        summary["pair_id"] = raw_record.get("pair_id")
-        summary["approach_direction"] = raw_record.get("approach_direction")
         if bool(summary["valid"]):
             reduced.append(summary)
         else:
@@ -835,18 +794,8 @@ def pair_gravity_calibration_windows(
     windows: Sequence[Mapping[str, object]],
     *,
     pose_tolerance_rad: float,
-    require_opposite_direction: bool = False,
 ) -> dict[str, object]:
-    """Pair opposite-direction captures of the same pose by reference pose.
-
-    Direction is an operator action and is not inferable from a static JSON
-    window.  Explicit ``pair_id`` values are preferred; otherwise this helper
-    greedily pairs the nearest unpaired references within the caller-supplied
-    tolerance.  When ``require_opposite_direction`` is true, only windows
-    explicitly labelled ``positive`` and ``negative`` can form a pair.  The
-    default remains geometric-only for diagnostics and backwards-compatible
-    helper use; the formal fitter enables the strict mode.
-    """
+    """Group repeated captures of the same reference pose for averaging."""
 
     tolerance = _positive(
         pose_tolerance_rad,
@@ -860,94 +809,29 @@ def pair_gravity_calibration_windows(
         )
         normalized.append({"index": index, "window": window, "qref": qref})
 
-    by_pair_id: dict[object, list[dict[str, object]]] = {}
-    unlabelled: list[dict[str, object]] = []
-    for item in normalized:
-        pair_id = item["window"].get("pair_id")
-        if pair_id is None:
-            unlabelled.append(item)
-        else:
-            by_pair_id.setdefault(pair_id, []).append(item)
-
     pairs: list[dict[str, object]] = []
     unpaired: list[dict[str, object]] = []
-    direction_rejected_count = 0
-
-    def directions_are_opposite(
-        first_window: Mapping[str, object],
-        second_window: Mapping[str, object],
-    ) -> bool:
-        first_direction = first_window.get("approach_direction")
-        second_direction = second_window.get("approach_direction")
-        return (
-            first_direction in ("positive", "negative")
-            and second_direction in ("positive", "negative")
-            and first_direction != second_direction
-        )
-
-    for pair_id, items in by_pair_id.items():
-        if len(items) == 2:
-            if require_opposite_direction and not directions_are_opposite(
-                items[0]["window"], items[1]["window"]
-            ):
-                direction_rejected_count += 1
-                unpaired.extend(item["window"] for item in items)
-                continue
-            pairs.append(
-                {
-                    "pair_id": pair_id,
-                    "window_indices": tuple(int(item["index"]) for item in items),
-                    "windows": tuple(item["window"] for item in items),
-                    "pairing": "explicit_pair_id",
-                    "direction_verified": directions_are_opposite(
-                        items[0]["window"], items[1]["window"]
-                    ),
-                }
-            )
-        else:
-            unpaired.extend(item["window"] for item in items)
-
-    remaining = list(unlabelled)
+    remaining = list(normalized)
     while remaining:
         first = remaining.pop(0)
         if not remaining:
             unpaired.append(first["window"])
             break
-        candidate_items = [
-            item
-            for item in remaining
-            if not require_opposite_direction
-            or directions_are_opposite(first["window"], item["window"])
-        ]
-        if not candidate_items:
-            if require_opposite_direction and remaining:
-                nearest_any_distance = min(
-                    float(np.max(np.abs(first["qref"] - item["qref"])))
-                    for item in remaining
-                )
-                if nearest_any_distance <= tolerance:
-                    direction_rejected_count += 1
-            unpaired.append(first["window"])
-            continue
         distances = [
             float(np.max(np.abs(first["qref"] - item["qref"])))
-            for item in candidate_items
+            for item in remaining
         ]
         nearest_index = int(np.argmin(np.asarray(distances, dtype=float)))
         nearest_distance = distances[nearest_index]
         if nearest_distance <= tolerance:
-            second = candidate_items[nearest_index]
+            second = remaining[nearest_index]
             remaining.remove(second)
             pairs.append(
                 {
-                    "pair_id": None,
                     "window_indices": (int(first["index"]), int(second["index"])),
                     "windows": (first["window"], second["window"]),
-                    "pairing": "nearest_reference_pose",
+                    "pairing": "repeated_reference_pose_average",
                     "reference_distance_rad": nearest_distance,
-                    "direction_verified": directions_are_opposite(
-                        first["window"], second["window"]
-                    ),
                 }
             )
         else:
@@ -959,11 +843,7 @@ def pair_gravity_calibration_windows(
         "pair_count": len(pairs),
         "unpaired_count": len(unpaired),
         "pose_tolerance_rad": tolerance,
-        "require_opposite_direction": require_opposite_direction,
-        "direction_rejected_count": direction_rejected_count,
-        "verified_pair_count": sum(
-            bool(pair.get("direction_verified")) for pair in pairs
-        ),
+        "semantics": "nearby repeated poses are averaged; direction labels are not used",
     }
 
 
@@ -985,25 +865,12 @@ def _calibration_pair_observation(
 
     first = windows[0]
     return {
-        "pair_id": pair.get("pair_id"),
         "pairing": pair.get("pairing"),
         "record_indices": tuple(window.get("record_index") for window in windows),
         "reference_qpos_rad": average("reference_qpos_rad"),
         "gravity_tau_nm": average("gravity_tau_median_nm"),
         "position_tau_nm": average("position_tau_median_nm"),
         "position_tau_mad_nm": average("position_tau_mad_nm"),
-        "approach_directions": tuple(
-            window.get("approach_direction") for window in windows
-        ),
-        "direction_verified": all(
-            window.get("approach_direction") is not None for window in windows
-        )
-        and len(
-            {
-                window.get("approach_direction") for window in windows
-            }
-        )
-        == 2,
         "source_window_count": 2,
         "source_record": first.get("record_index"),
     }
@@ -1200,14 +1067,13 @@ def fit_gravity_calibration(
     payload: Mapping[str, object],
     *,
     pose_tolerance_rad: float,
-    model: str = "global-scale-joint-bias",
+    model: str = "global-scale",
     kinematic_model: B601PinocchioModel | None = None,
     max_pose_count: int | None = None,
     max_velocity_rad_s: float | None = None,
     max_position_span_rad: float | None = None,
-    require_bidirectional: bool = True,
 ) -> dict[str, object]:
-    """Fit an auditable effective gravity correction from reduced windows."""
+    """Fit an auditable effective gravity correction from R-captured windows."""
 
     if model not in (
         "global-scale",
@@ -1237,35 +1103,22 @@ def fit_gravity_calibration(
     paired = pair_gravity_calibration_windows(
         windows,
         pose_tolerance_rad=pose_tolerance_rad,
-        require_opposite_direction=require_bidirectional,
     )
-    if require_bidirectional and not paired["pairs"]:
-        return {
-            "status": "FAIL",
-            "model": model,
-            "reasons": ("no bidirectional pose pair was identified",),
-            "reduction": reduced,
-            "pairing": paired,
-        }
     observations = [
         _calibration_pair_observation(pair) for pair in paired["pairs"]
     ]
-    if not require_bidirectional:
-        observations.extend(
-            {
-                "pair_id": None,
-                "pairing": "unpaired_single_window",
-                "record_indices": (window.get("record_index"),),
-                "reference_qpos_rad": window.get("reference_qpos_rad"),
-                "gravity_tau_nm": window.get("gravity_tau_median_nm"),
-                "position_tau_nm": window.get("position_tau_median_nm"),
-                "position_tau_mad_nm": window.get("position_tau_mad_nm"),
-                "approach_directions": (window.get("approach_direction"),),
-                "direction_verified": False,
-                "source_window_count": 1,
-            }
-            for window in paired["unpaired"]
-        )
+    observations.extend(
+        {
+            "pairing": "single_static_window",
+            "record_indices": (window.get("record_index"),),
+            "reference_qpos_rad": window.get("reference_qpos_rad"),
+            "gravity_tau_nm": window.get("gravity_tau_median_nm"),
+            "position_tau_nm": window.get("position_tau_median_nm"),
+            "position_tau_mad_nm": window.get("position_tau_mad_nm"),
+            "source_window_count": 1,
+        }
+        for window in paired["unpaired"]
+    )
     selection = select_calibration_poses(
         observations,
         max_pose_count=max_pose_count,
@@ -1441,16 +1294,11 @@ def fit_gravity_calibration(
         "global-scale-joint-bias": 7,
         "global-scale-payload": 5,
     }[model]
-    formal_direction_ok = require_bidirectional and all(
-        bool(observation["direction_verified"]) for observation in selected
-    )
     fit_reasons: list[str] = []
     if invalid_record_count:
         fit_reasons.append(
             f"{invalid_record_count} calibration record(s) are incomplete or invalid"
         )
-    if not formal_direction_ok:
-        fit_reasons.append("selected observations are not explicitly bidirectional")
     if effective_rank < expected_rank:
         fit_reasons.append(
             f"regression rank {effective_rank} is below expected rank {expected_rank}"
@@ -1490,8 +1338,8 @@ def fit_gravity_calibration(
         "paired_observation_count": sum(
             int(observation["source_window_count"]) == 2 for observation in selected
         ),
-        "direction_verified_pair_count": sum(
-            bool(observation["direction_verified"]) for observation in selected
+        "observation_semantics": (
+            "each R capture is reduced independently; nearby repeats may be averaged"
         ),
         "pose_selection": selection,
         "fit": {
@@ -1510,8 +1358,9 @@ def fit_gravity_calibration(
         "reduction": reduced,
         "pairing": paired,
         "selected_observations": tuple(selected),
-        "unpaired_used": not require_bidirectional and bool(paired["unpaired"]),
-        "formal_direction_verified": formal_direction_ok,
+        "single_window_observation_count": sum(
+            int(observation["source_window_count"]) == 1 for observation in selected
+        ),
     }
 
 
@@ -1523,7 +1372,6 @@ def evaluate_gravity_calibration_model(
     pose_tolerance_rad: float = _DEFAULT_CALIBRATION_POSE_TOLERANCE_RAD,
     max_velocity_rad_s: float | None = None,
     max_position_span_rad: float | None = None,
-    require_bidirectional: bool = True,
 ) -> dict[str, object]:
     """Evaluate a fitted correction on an independent capture payload."""
 
@@ -1582,33 +1430,23 @@ def evaluate_gravity_calibration_model(
     paired = pair_gravity_calibration_windows(
         windows,
         pose_tolerance_rad=pose_tolerance_rad,
-        require_opposite_direction=require_bidirectional,
     )
-    if require_bidirectional and not paired["pairs"]:
-        return {
-            "status": "FAIL",
-            "reason": "validation has no explicitly bidirectional pose pair",
-            "reduction": reduced,
-            "pairing": paired,
-        }
     observations = [
         _calibration_pair_observation(pair) for pair in paired["pairs"]
     ]
-    if not require_bidirectional:
-        observations.extend(
-            {
-                "reference_qpos_rad": window.get("reference_qpos_rad"),
-                "gravity_tau_nm": window.get("gravity_tau_median_nm"),
-                "position_tau_nm": window.get("position_tau_median_nm"),
-                "source_window_count": 1,
-                "direction_verified": False,
-            }
-            for window in paired["unpaired"]
-        )
+    observations.extend(
+        {
+            "reference_qpos_rad": window.get("reference_qpos_rad"),
+            "gravity_tau_nm": window.get("gravity_tau_median_nm"),
+            "position_tau_nm": window.get("position_tau_median_nm"),
+            "source_window_count": 1,
+        }
+        for window in paired["unpaired"]
+    )
     if not observations:
         return {
             "status": "FAIL",
-            "reason": "validation pose pairing returned no observations",
+            "reason": "validation pose reduction returned no observations",
             "reduction": reduced,
             "pairing": paired,
         }
@@ -1758,7 +1596,6 @@ def _run_gravity_calibration_fit(
         max_pose_count=args.calibration_max_poses,
         max_velocity_rad_s=args.calibration_max_velocity_rad_s,
         max_position_span_rad=args.calibration_max_position_span_rad,
-        require_bidirectional=not args.calibration_allow_unpaired,
     )
     validation_path = getattr(args, "calibration_validation_input", None)
     validation: dict[str, object]
@@ -1797,7 +1634,6 @@ def _run_gravity_calibration_fit(
             pose_tolerance_rad=args.calibration_pose_tolerance_rad,
             max_velocity_rad_s=args.calibration_max_velocity_rad_s,
             max_position_span_rad=args.calibration_max_position_span_rad,
-            require_bidirectional=not args.calibration_allow_unpaired,
         )
     fit_status = str(fit.get("status"))
     acceptance_status = (
@@ -5767,10 +5603,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     calibration_ready = True
                     _operator_notice(
                         "[B601] CALIBRATION FREE_DRAG: move joint1..joint6, "
-                        "release external force, press P or N to label the "
-                        "approach path, then press R to record "
-                        f"{calibration_capture.record_duration_sec:g}s. "
-                        "Unlabelled R is diagnostic only."
+                        "release external force, then press R to capture the "
+                        "current pose and record "
+                        f"{calibration_capture.record_duration_sec:g}s."
                     )
                 started_record = calibration_capture.start_recording_if_due(
                     elapsed_sec=elapsed,
@@ -5790,24 +5625,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         "[B601] CALIBRATION COMPLETE "
                         f"#{completed_record['index']}: returned to FREE_DRAG."
                     )
-                capture_request = (False, None)
+                capture_requested = False
                 if calibration_ready and calibration_keys is not None:
-                    capture_request = calibration_keys.poll_capture_request()
-                if capture_request[0]:
+                    capture_requested = calibration_keys.poll_record_request()
+                if capture_requested:
                     new_record = calibration_capture.trigger(
                         q,
                         elapsed_sec=elapsed,
                         sample_start_index=len(samples),
-                        approach_direction=capture_request[1],
                     )
                     if new_record is not None:
-                        direction_note = (
-                            new_record["approach_direction"] or "unlabelled"
-                        )
                         _operator_notice(
                             "[B601] CALIBRATION CAPTURED "
-                            f"#{new_record['index']}: approach={direction_note}; "
-                            "reference fixed; settling."
+                            f"#{new_record['index']}: reference fixed; settling."
                         )
                 qref = calibration_capture.reference(q)
                 qvel_ref = _ZERO_SIX
@@ -6802,7 +6632,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--calibration-overlay-output",
         type=Path,
-        help="candidate gravity overlay JSON written by gravity-calibration-fit",
+        help="candidate effective-gravity correction JSON written by the offline fit",
     )
     parser.add_argument(
         "--calibration-report-output",
@@ -6816,7 +6646,7 @@ def build_parser() -> argparse.ArgumentParser:
             "global-scale-joint-bias",
             "global-scale-payload",
         ),
-        default="global-scale-joint-bias",
+        default="global-scale",
         help=(
             "effective gravity correction parameterization for offline fitting; "
             "payload adds an unknown non-negative tool mass and first moment"
@@ -6826,7 +6656,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--calibration-pose-tolerance-rad",
         type=float,
         default=_DEFAULT_CALIBRATION_POSE_TOLERANCE_RAD,
-        help="maximum per-joint reference difference used to infer a pose pair",
+        help="maximum per-joint reference difference used to deduplicate poses",
     )
     parser.add_argument(
         "--calibration-max-poses",
@@ -6842,11 +6672,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--calibration-max-position-span-rad",
         type=float,
         help="optional per-window stability position-span criterion for fitting",
-    )
-    parser.add_argument(
-        "--calibration-allow-unpaired",
-        action="store_true",
-        help="allow single-direction windows as a diagnostic candidate; not formal acceptance",
     )
     parser.add_argument("--warmup-sec", type=float, default=_DEFAULT_WARMUP_SEC)
     parser.add_argument(

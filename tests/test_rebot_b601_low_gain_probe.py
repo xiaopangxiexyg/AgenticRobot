@@ -169,33 +169,31 @@ def _synthetic_calibration_payload(*, software_kp: float = 5.0) -> dict[str, obj
         zip(gravity_vectors, references, strict=True)
     ):
         residual = 0.1 * (np.asarray(gravity) / 0.5) + bias
-        for direction in range(2):
-            start = len(samples)
-            for offset in range(3):
-                samples.append(
-                    {
-                        "elapsed_sec": float(len(samples)) * 0.05,
-                        "qpos_rad": reference,
-                        "qref_rad": reference,
-                        "qvel_fd_rad_s": (0.0,) * 6,
-                        "gravity_tau_nm": gravity,
-                        "position_tau_nm": tuple(residual),
-                        "requested_tau_nm": gravity,
-                        "conditioned_tau_nm": gravity,
-                        "torque_limited": False,
-                        "slew_limited": False,
-                    }
-                )
-            records.append(
+        start = len(samples)
+        for _offset in range(3):
+            samples.append(
                 {
-                    "index": len(records) + 1,
-                    "completed": True,
-                    "sample_start_index": start,
-                    "sample_end_index": len(samples),
-                    "reference_qpos_rad": reference,
-                    "approach_direction": "positive" if direction == 0 else "negative",
+                    "elapsed_sec": float(len(samples)) * 0.05,
+                    "qpos_rad": reference,
+                    "qref_rad": reference,
+                    "qvel_fd_rad_s": (0.0,) * 6,
+                    "gravity_tau_nm": gravity,
+                    "position_tau_nm": tuple(residual),
+                    "requested_tau_nm": gravity,
+                    "conditioned_tau_nm": gravity,
+                    "torque_limited": False,
+                    "slew_limited": False,
                 }
             )
+        records.append(
+            {
+                "index": len(records) + 1,
+                "completed": True,
+                "sample_start_index": start,
+                "sample_end_index": len(samples),
+                "reference_qpos_rad": reference,
+            }
+        )
     return {
         "mode": "gravity-calibration",
         "profile": {
@@ -207,10 +205,10 @@ def _synthetic_calibration_payload(*, software_kp: float = 5.0) -> dict[str, obj
     }
 
 
-def test_calibration_window_reduction_and_bidirectional_fit() -> None:
+def test_calibration_window_reduction_and_r_only_fit() -> None:
     payload = _synthetic_calibration_payload()
     reduced = probe.reduce_gravity_calibration_windows(payload)
-    assert reduced["completed_record_count"] == 4
+    assert reduced["completed_record_count"] == 2
     assert all(window["valid"] for window in reduced["windows"])
     fit = probe.fit_gravity_calibration(
         payload,
@@ -223,11 +221,11 @@ def test_calibration_window_reduction_and_bidirectional_fit() -> None:
         (0.0, 0.05, -0.03, 0.02, 0.01, -0.01),
         abs=1e-10,
     )
-    assert fit["pairing"]["pair_count"] == 2
-    assert fit["direction_verified_pair_count"] == 2
+    assert fit["pairing"]["pair_count"] == 0
+    assert fit["single_window_observation_count"] == 2
 
 
-def test_calibration_validation_uses_bidirectional_holdout_pairs() -> None:
+def test_calibration_validation_uses_independent_r_windows() -> None:
     payload = _synthetic_calibration_payload()
     fit = probe.fit_gravity_calibration(
         payload,
@@ -243,7 +241,7 @@ def test_calibration_validation_uses_bidirectional_holdout_pairs() -> None:
 
     assert validation["status"] == "PASS"
     assert validation["observation_count"] == 2
-    assert validation["pairing"]["verified_pair_count"] == 2
+    assert validation["pairing"]["pair_count"] == 0
     assert validation["residual_reduced"] is True
 
 
@@ -258,10 +256,8 @@ def test_calibration_fit_rejects_zero_kp_residual_observation() -> None:
     assert "software Kp is zero" in fit["reasons"][0]
 
 
-def test_formal_fit_rejects_geometric_pair_without_opposite_direction_labels() -> None:
+def test_formal_fit_does_not_require_operator_direction_labels() -> None:
     payload = _synthetic_calibration_payload()
-    for record in payload["gravity_calibration"]["records"]:
-        record["approach_direction"] = None
 
     fit = probe.fit_gravity_calibration(
         payload,
@@ -269,10 +265,11 @@ def test_formal_fit_rejects_geometric_pair_without_opposite_direction_labels() -
         model="global-scale",
     )
 
-    assert fit["status"] == "FAIL"
+    assert fit["status"] == "PASS"
     assert fit["pairing"]["pair_count"] == 0
-    assert fit["pairing"]["direction_rejected_count"] == 2
-    assert "bidirectional" in fit["reasons"][0]
+    assert fit["observation_semantics"] == (
+        "each R capture is reduced independently; nearby repeats may be averaged"
+    )
 
 
 def test_pose_selection_deduplicates_repeated_reference_windows() -> None:
@@ -368,33 +365,31 @@ def test_global_scale_payload_fit_recovers_mass_and_first_moment(tmp_path) -> No
             model,
             reference,
         ) @ payload_params
-        for direction in ("positive", "negative"):
-            start = len(samples)
-            for _offset in range(3):
-                samples.append(
-                    {
-                        "elapsed_sec": len(samples) * 0.05,
-                        "qpos_rad": reference,
-                        "qref_rad": reference,
-                        "qvel_fd_rad_s": (0.0,) * 6,
-                        "gravity_tau_nm": tuple(gravity),
-                        "position_tau_nm": tuple(residual),
-                        "requested_tau_nm": tuple(gravity),
-                        "conditioned_tau_nm": tuple(gravity),
-                        "torque_limited": False,
-                        "slew_limited": False,
-                    }
-                )
-            records.append(
+        start = len(samples)
+        for _offset in range(3):
+            samples.append(
                 {
-                    "index": len(records) + 1,
-                    "completed": True,
-                    "sample_start_index": start,
-                    "sample_end_index": len(samples),
-                    "reference_qpos_rad": reference,
-                    "approach_direction": direction,
+                    "elapsed_sec": len(samples) * 0.05,
+                    "qpos_rad": reference,
+                    "qref_rad": reference,
+                    "qvel_fd_rad_s": (0.0,) * 6,
+                    "gravity_tau_nm": tuple(gravity),
+                    "position_tau_nm": tuple(residual),
+                    "requested_tau_nm": tuple(gravity),
+                    "conditioned_tau_nm": tuple(gravity),
+                    "torque_limited": False,
+                    "slew_limited": False,
                 }
             )
+        records.append(
+            {
+                "index": len(records) + 1,
+                "completed": True,
+                "sample_start_index": start,
+                "sample_end_index": len(samples),
+                "reference_qpos_rad": reference,
+            }
+        )
     payload = {
         "mode": "gravity-calibration",
         "profile": {
@@ -419,7 +414,7 @@ def test_global_scale_payload_fit_recovers_mass_and_first_moment(tmp_path) -> No
     assert fit["payload_first_moment_kg_m"] == pytest.approx(
         (0.02, -0.01, 0.03)
     )
-    assert fit["formal_direction_verified"] is True
+    assert fit["single_window_observation_count"] == 8
 
 
 def test_enabled_shutdown_always_attempts_hold_before_disable() -> None:
@@ -500,15 +495,15 @@ def test_operator_key_reader_reads_r_without_enter_and_restores_terminal() -> No
     assert restored == original
 
 
-def test_operator_key_reader_carries_approach_label_into_r_capture() -> None:
+def test_operator_key_reader_ignores_non_r_calibration_keys() -> None:
     master_fd, slave_fd = pty.openpty()
     tty_path = Path(os.ttyname(slave_fd))
     reader = probe.OperatorKeyReader(tty_path)
     try:
-        os.write(master_fd, b"pR")
-        assert reader.poll_capture_request() == (True, "positive")
-        os.write(master_fd, b"nR")
-        assert reader.poll_capture_request() == (True, "negative")
+        os.write(master_fd, b"pN")
+        assert reader.poll_record_request() is False
+        os.write(master_fd, b"R")
+        assert reader.poll_record_request() is True
     finally:
         reader.close()
         os.close(master_fd)
