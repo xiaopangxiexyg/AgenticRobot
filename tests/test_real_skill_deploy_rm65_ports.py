@@ -27,6 +27,9 @@ from teleop_runtime.skill_deploy import (
     ExclusiveRM65SkillPortProfile,
     build_exclusive_rm65_skill_position_force_guard,
 )
+from teleop_runtime.skill_deploy.rm65_ports import (
+    _next_periodic_measurement_deadline,
+)
 
 
 class _Backend(EffectorBackend):
@@ -38,6 +41,7 @@ class _Backend(EffectorBackend):
         accepted: bool = True,
         close_failures: int = 0,
         hold_failures: int = 0,
+        emergency_stop_failures: int = 0,
         events: list[str] | None = None,
     ) -> None:
         self.side = side
@@ -51,6 +55,8 @@ class _Backend(EffectorBackend):
         self.close_failures = int(close_failures)
         self.hold_failures = int(hold_failures)
         self.emergency_stops = 0
+        self.emergency_stop_failures = int(emergency_stop_failures)
+        self.emergency_stopped = False
         self.events = events if events is not None else []
 
     @property
@@ -82,7 +88,15 @@ class _Backend(EffectorBackend):
             "hardware_measurement_sequence": 4 if self.side == "left" else 5,
             "hardware_measurement_valid": True,
             "hardware_read_success": True,
-            "emergency_stopped": False,
+            "hardware_read_phase_timing": {
+                "total_wall_ms": 8.0,
+                "total_thread_cpu_ms": 0.5,
+                "hardware_read_lock_wait_wall_ms": 0.1,
+                "sdk_call_wall_ms": 7.0,
+                "sdk_call_thread_cpu_ms": 0.3,
+                "parse_validation_wall_ms": 0.2,
+            },
+            "emergency_stopped": self.emergency_stopped,
             "send_result_code": 0,
             "background_streaming": {
                 "enabled": True,
@@ -122,6 +136,13 @@ class _Backend(EffectorBackend):
     def emergency_stop(self) -> None:
         self.emergency_stops += 1
         self.target_active = False
+        if self.emergency_stop_failures:
+            self.emergency_stop_failures -= 1
+            raise RuntimeError(f"{self.side} emergency stop failed")
+        self.emergency_stopped = True
+
+    def is_emergency_stopped(self) -> bool:
+        return self.emergency_stopped
 
     def read_force_data(self):
         return {
@@ -195,6 +216,7 @@ def _ports(
     force_guard_close_failures: int = 0,
     backend_close_failures: dict[str, int] | None = None,
     backend_hold_failures: dict[str, int] | None = None,
+    backend_emergency_stop_failures: dict[str, int] | None = None,
     background_measurement_sampling: bool = False,
     state_refresh_hz: float = 30.0,
     max_measurement_age_sec: float = 0.2,
@@ -208,6 +230,9 @@ def _ports(
             accepted=accepted,
             close_failures=(backend_close_failures or {}).get(side, 0),
             hold_failures=(backend_hold_failures or {}).get(side, 0),
+            emergency_stop_failures=(
+                backend_emergency_stop_failures or {}
+            ).get(side, 0),
             events=events,
         )
         for side in ("left", "right")
@@ -249,6 +274,34 @@ def _command() -> TeleopCommand:
     return command
 
 
+def test_measurement_sampler_deadline_preserves_phase_and_skips_missed_ticks() -> None:
+    assert _next_periodic_measurement_deadline(
+        previous_deadline=1.0,
+        completed_at=1.04,
+        period_sec=0.1,
+    ) == pytest.approx(1.1)
+    assert _next_periodic_measurement_deadline(
+        previous_deadline=1.0,
+        completed_at=1.25,
+        period_sec=0.1,
+    ) == pytest.approx(1.3)
+
+
+def test_background_sampler_owns_one_persistent_dual_refresh_executor() -> None:
+    ports, _, _ = _ports(background_measurement_sampling=True)
+    executor = ports._measurement_refresh_executor
+
+    assert executor is not None
+    assert ports.arm_state_reader.concurrent_refresh_executor is executor
+
+    ports.start()
+    ports.close()
+    ports.close()
+
+    assert ports._measurement_refresh_executor_shutdown is True
+    assert executor._shutdown is True
+
+
 def test_rm65_ports_read_only_authoritative_dual_hardware_qpos() -> None:
     ports, _, target_builder = _ports()
     assert ports.arm_state_reader.compute_tcp_pose is False
@@ -262,6 +315,9 @@ def test_rm65_ports_read_only_authoritative_dual_hardware_qpos() -> None:
     np.testing.assert_allclose(cut.qpos_by_side["right"], np.full(6, 0.2))
     assert cut.evidence_refs[0].startswith("rm65-hardware-qpos-cut:")
     assert cut.observation.metadata["source"] == "exclusive_rm65_skill_deploy"
+    assert cut.observation.metadata["hardware_read_phase_timing_by_side"][
+        "left"
+    ]["sdk_call_wall_ms"] == 7.0
     assert [item[2] for item in target_builder.syncs] == [True, False]
 
 
@@ -599,13 +655,17 @@ def test_rm65_ports_do_not_turn_unconfirmed_shutdown_hold_into_success() -> None
 
 
 def test_rm65_ports_start_failure_is_closed_and_not_retryable() -> None:
-    ports, backends, _ = _ports(force_guard_ready=False)
+    ports, backends, _ = _ports(
+        force_guard_ready=False,
+        background_measurement_sampling=True,
+    )
 
     with pytest.raises(RuntimeError, match="force guard is not motion-ready"):
         ports.start()
 
     assert ports.resources_started is False
     assert ports.position_force_guard.closes == 1
+    assert ports._measurement_refresh_executor_shutdown is True
     assert all(backend.holds for backend in backends.values())
     assert all(backend.closes == 1 for backend in backends.values())
     with pytest.raises(RuntimeError, match="cannot restart"):
@@ -674,6 +734,36 @@ def test_rm65_ports_fail_closed_when_force_guard_is_not_motion_ready() -> None:
     assert receipt.succeeded is False
 
 
+def test_rm65_ports_emergency_stop_requires_both_lower_latches() -> None:
+    ports, backends, _ = _ports()
+
+    receipt = ports.emergency_stop("operator_ctrl_c")
+
+    assert receipt.succeeded
+    assert dict(receipt.status_by_side) == {
+        "left": "confirmed",
+        "right": "confirmed",
+    }
+    assert len(receipt.evidence_refs) == 2
+    assert all(backend.emergency_stops == 1 for backend in backends.values())
+    assert ports.last_emergency_stop_receipt is receipt
+
+
+def test_rm65_ports_emergency_stop_partial_failure_is_not_confirmed() -> None:
+    ports, backends, _ = _ports(
+        backend_emergency_stop_failures={"left": 1}
+    )
+
+    receipt = ports.emergency_stop("operator_ctrl_c")
+
+    assert not receipt.succeeded
+    assert dict(receipt.status_by_side) == {
+        "left": "unconfirmed",
+        "right": "confirmed",
+    }
+    assert all(backend.emergency_stops == 1 for backend in backends.values())
+
+
 def test_force_guard_factory_uses_rm65_ports_without_realteleop() -> None:
     _, backends, _ = _ports()
 
@@ -738,5 +828,6 @@ def test_rm65_factory_binds_every_effect_to_the_same_port_owner() -> None:
         "command_admission",
         "command_dispatch",
         "hold_controller",
+        "emergency_stop_controller",
     ):
         assert getattr(kwargs[field_name], "__self__", None) is ports

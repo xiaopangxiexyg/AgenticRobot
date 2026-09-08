@@ -33,6 +33,7 @@ from ..protocol.artifact_contracts import (
 )
 from ..protocol.contracts import (
     AgentSkillRequest,
+    agent_own_domain_emergency_stop_request_from_json,
     agent_own_domain_hold_request_from_json,
     agent_own_operation_cancel_request_from_json,
     agent_own_operation_query_from_json,
@@ -631,6 +632,17 @@ class BoundAgentGatewayWireAdapter:
         return self.service.request_hold_own_domain(
             request=request,
             current_station_revision=self._revision(),
+        ).to_wire()
+
+    def request_emergency_stop_own_domain(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._require_full_access("request_emergency_stop_own_domain")
+        self._assert_client(payload)
+        request = agent_own_domain_emergency_stop_request_from_json(payload)
+        return self.service.request_emergency_stop_own_domain(
+            request=request,
         ).to_wire()
 
     def handle_authenticated_disconnect(

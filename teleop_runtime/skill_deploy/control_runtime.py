@@ -184,6 +184,46 @@ class RealSkillMotionHoldReceipt:
 
 
 @dataclass(frozen=True)
+class RealSkillMotionEmergencyStopReceipt:
+    """Lower-owned, per-side emergency-stop acknowledgement evidence."""
+
+    succeeded: bool
+    evidence_refs: tuple[str, ...]
+    status_by_side: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.succeeded, bool):
+            raise TypeError("succeeded must be a boolean.")
+        refs = tuple(
+            sorted(
+                {
+                    _required(value, field_name="evidence_ref")
+                    for value in self.evidence_refs
+                }
+            )
+        )
+        statuses = {
+            _required(side, field_name="status side"): _required(
+                status,
+                field_name="emergency-stop status",
+            )
+            for side, status in dict(self.status_by_side).items()
+        }
+        if set(statuses) != {"left", "right"}:
+            raise ValueError(
+                "emergency-stop status_by_side must contain left and right."
+            )
+        if self.succeeded and (
+            not refs or set(statuses.values()) != {"confirmed"}
+        ):
+            raise ValueError(
+                "successful emergency stop requires two confirmed lower sides."
+            )
+        object.__setattr__(self, "evidence_refs", refs)
+        object.__setattr__(self, "status_by_side", MappingProxyType(statuses))
+
+
+@dataclass(frozen=True)
 class RealSkillControlStep:
     lifecycle: RealSkillControlLifecycle
     port_snapshot: RealAgentMotionPortSnapshot
@@ -604,6 +644,7 @@ __all__ = [
     "RealSkillControlLifecycle",
     "RealSkillControlStep",
     "RealSkillMotionDispatchReceipt",
+    "RealSkillMotionEmergencyStopReceipt",
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
     "RealSkillMotionTargetSynchronizer",

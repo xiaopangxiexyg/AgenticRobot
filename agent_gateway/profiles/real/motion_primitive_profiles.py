@@ -848,6 +848,7 @@ def build_real_agent_primitive_contract_bundle(
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
     ) = None,
+    domain_emergency_stop_available: bool = False,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects."""
 
@@ -857,6 +858,8 @@ def build_real_agent_primitive_contract_bundle(
         raise TypeError("port_config must be typed.")
     if not isinstance(frame_graph, CoordinateFrameGraph):
         raise TypeError("frame_graph must be typed.")
+    if not isinstance(domain_emergency_stop_available, bool):
+        raise TypeError("domain_emergency_stop_available must be boolean.")
     refs = tuple(safety_envelope_refs)
     if not refs:
         raise ValueError("Real primitive Routes require lower safety-envelope refs.")
@@ -1435,22 +1438,35 @@ def build_real_agent_primitive_contract_bundle(
         target_binding_id=attachment.target_binding_id,
         target_kind="real",
         current_mode="real_active",
-        supported_transport_features=(
-            "authoritative_port_receipt_v1",
-            "idempotency_v1",
-            "own_domain_hold_v1",
-            "own_operation_cancel_v1",
-            "own_operation_status_v1",
-            "safety_profile_selection_v1",
+        supported_transport_features=tuple(
+            sorted(
+                {
+                    "authoritative_port_receipt_v1",
+                    "idempotency_v1",
+                    "own_domain_hold_v1",
+                    "own_operation_cancel_v1",
+                    "own_operation_status_v1",
+                    "safety_profile_selection_v1",
+                    *(
+                        ("own_domain_emergency_stop_v1",)
+                        if domain_emergency_stop_available
+                        else ()
+                    ),
+                }
+            )
         ),
         skill_routes=tuple(route_items),
-        explicit_exclusions=(
-            "agent_estop",
-            "agent_rearm",
-            "agent_resume",
-            "direct_hardware_refresh",
-            "raw_action_submission",
-            "second_dispatch_owner",
+        explicit_exclusions=tuple(
+            sorted(
+                {
+                    "agent_rearm",
+                    "agent_resume",
+                    "direct_hardware_refresh",
+                    "raw_action_submission",
+                    "second_dispatch_owner",
+                    *(("agent_estop",) if not domain_emergency_stop_available else ()),
+                }
+            )
         ),
     )
     validators = AgentSkillPayloadValidatorRegistry(

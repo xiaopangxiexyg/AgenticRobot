@@ -20,6 +20,7 @@ from teleop_runtime.skill_deploy.control_runtime import (
     ExclusiveRealSkillControlRuntime,
     RealSkillMeasuredQposObserver,
     RealSkillMotionDispatchReceipt,
+    RealSkillMotionEmergencyStopReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
     RealSkillMotionTargetSynchronizer,
@@ -135,6 +136,9 @@ def assemble_exclusive_real_agent_primitive_deployment(
     command_admission: Callable[[TeleopCommand, TeleopObservation, float], bool],
     command_dispatch: Callable[[TeleopCommand], RealSkillMotionDispatchReceipt],
     hold_controller: Callable[[str], RealSkillMotionHoldReceipt],
+    emergency_stop_controller: (
+        Callable[[str], RealSkillMotionEmergencyStopReceipt] | None
+    ) = None,
     measured_qpos_observer: RealSkillMeasuredQposObserver | None = None,
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
@@ -173,6 +177,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration
         ),
+        domain_emergency_stop_available=emergency_stop_controller is not None,
     )
     port = RealAgentMotionPort(
         config=port_config,
@@ -213,6 +218,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
         revision_tracker=revision_tracker,
+        emergency_stop=emergency_stop_controller,
         clock=clock,
         sleep=sleep,
     )
@@ -276,6 +282,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         command_admission=rm65_ports.admit_command,
         command_dispatch=rm65_ports.dispatch,
         hold_controller=rm65_ports.hold,
+        emergency_stop_controller=rm65_ports.emergency_stop,
         measured_qpos_observer=measured_qpos_observer,
         convergence_profile=convergence_profile,
         perception_capture=perception_capture,

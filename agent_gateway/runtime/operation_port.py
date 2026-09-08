@@ -345,6 +345,21 @@ class AgentDomainControlPort(Protocol):
 
 
 @runtime_checkable
+class AgentDomainEmergencyStopPort(Protocol):
+    """Latched domain emergency stop independent of Route/operation admission."""
+
+    port_id: str
+    no_io: bool
+
+    def request_emergency_stop(
+        self,
+        *,
+        operation: AgentSkillOperation | None,
+        reason: str,
+    ) -> AgentSkillOperationPortReceipt: ...
+
+
+@runtime_checkable
 class AgentSkillOperationPort(
     AgentSkillExecutionPort,
     AgentDomainControlPort,
@@ -598,6 +613,7 @@ __all__ = [
     "AGENT_GATEWAY_PORT_OPERATION_KINDS_V1",
     "AGENT_GATEWAY_PORT_RECEIPT_HASH_DOMAIN_V1",
     "AgentDomainControlPort",
+    "AgentDomainEmergencyStopPort",
     "AgentGatewayAuthoritativePortReceipt",
     "AgentGatewayNoIoPortReceipt",
     "AgentSkillExecutionPort",

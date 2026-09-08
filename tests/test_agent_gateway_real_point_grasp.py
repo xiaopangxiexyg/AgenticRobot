@@ -634,6 +634,83 @@ def test_vgn_candidate_maps_palm_pose_to_actual_tcp_and_centers_target_cloud() -
     assert candidates[0].click_distance_m == pytest.approx(0.0, abs=1e-12)
 
 
+def test_vgn_rejects_remote_candidate_whose_target_is_outside_dmtac_capture_region() -> None:
+    planner = object.__new__(Sam2VgnPointGraspPlanner)
+    planner.max_gripper_width_m = 0.070
+    target_camera = np.asarray(
+        [0.00081684, -0.04226071, 0.38049999], dtype=np.float64
+    )
+    target_points = np.tile(target_camera, (16, 1))
+    accepted_camera_from_tcp = np.asarray(
+        [
+            [0.94972857, -0.29088405, -0.11576753, -0.00137789],
+            [0.29889362, 0.73241412, 0.61174517, -0.04275384],
+            [-0.09315714, -0.61559404, 0.78253800, 0.39633172],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    rejected_camera_from_tcp = np.asarray(
+        [
+            [0.34516315, 0.73084277, 0.58883889, -0.02786184],
+            [-0.69471905, -0.22289373, 0.68387413, -0.01918422],
+            [0.63105296, -0.64512575, 0.43079569, 0.31433173],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    assert planner._target_center_inside_capture_region(
+        accepted_camera_from_tcp,
+        target_points,
+    )
+    assert not planner._target_center_inside_capture_region(
+        rejected_camera_from_tcp,
+        target_points,
+    )
+
+    rejected_target_tcp = np.linalg.inv(rejected_camera_from_tcp) @ np.append(
+        target_camera, 1.0
+    )
+    np.testing.assert_allclose(
+        rejected_target_tcp[:3],
+        [0.06768618, -0.01658363, 0.02961070],
+        atol=1e-8,
+    )
+
+
+def test_vgn_rank_rejects_near_click_outside_physical_capture_region() -> None:
+    planner = object.__new__(Sam2VgnPointGraspPlanner)
+    planner.max_gripper_width_m = 0.070
+    planner.max_click_distance_m = 0.080
+    good = np.eye(4, dtype=np.float64)
+    good[:3, 3] = [0.0, -0.020, -0.030999]
+    bad = np.eye(4, dtype=np.float64)
+    bad[:3, 3] = [0.0, -0.075, -0.030999]
+    grasps = [
+        SimpleNamespace(
+            width=0.05,
+            pose=SimpleNamespace(as_matrix=lambda pose=pose: pose.copy()),
+        )
+        for pose in (good, bad)
+    ]
+
+    candidates = planner._rank(
+        grasps,
+        np.asarray([0.8, 0.9]),
+        base_from_cube=np.eye(4),
+        camera_from_cube=np.eye(4),
+        target_camera=np.zeros(3),
+        target_points_camera=np.zeros((16, 3), dtype=np.float64),
+        depth=np.zeros((10, 12), dtype=np.float32),
+        intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
+        maximum=5,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].model_score == pytest.approx(0.8)
+
+
 def test_graspnet_point_conditioned_workspace_crops_unrelated_scene_points() -> None:
     planner = object.__new__(Sam2GraspNetPointGraspPlanner)
     planner.point_conditioned_workspace_margin_m = 0.120

@@ -12,7 +12,9 @@ from agent_gateway.protocol.artifact_contracts import (
 )
 from agent_gateway.protocol.contracts import (
     AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,
+    AGENT_GATEWAY_DOMAIN_EMERGENCY_STOP_FEATURE_V1,
     AgentObservationSnapshot,
+    AgentOwnDomainEmergencyStopRequest,
     AgentOwnDomainHoldRequest,
     AgentOwnOperationCancelRequest,
     AgentOwnOperationQuery,
@@ -137,6 +139,38 @@ class _AuthoritativeStationPort:
         )
 
 
+class _AuthoritativeEmergencyStopPort:
+    no_io = False
+    port_id = "agent-gateway:authoritative-emergency-stop-test"
+
+    def __init__(self, clock: _ManualClock, *, succeeded: bool = True) -> None:
+        self.clock = clock
+        self.succeeded = succeeded
+        self.calls: list[tuple[str | None, str]] = []
+
+    def request_emergency_stop(self, *, operation, reason):
+        operation_id = None if operation is None else operation.operation_id
+        self.calls.append((operation_id, reason))
+        return AgentGatewayAuthoritativePortReceipt(
+            port_id=self.port_id,
+            operation_kind="emergency_stop",
+            operation_id=operation_id,
+            succeeded=self.succeeded,
+            status=(
+                "dual_arm_emergency_stop_confirmed"
+                if self.succeeded
+                else "dual_arm_emergency_stop_unconfirmed"
+            ),
+            completed_at=self.clock(),
+            call_sequence=len(self.calls) - 1,
+            lower_operation_id=(
+                None if operation_id is None else f"lower:{operation_id}"
+            ),
+            evidence_refs=("lower-emergency-stop:left", "lower-emergency-stop:right"),
+            proves_motion_or_hold=self.succeeded,
+        )
+
+
 def _capability(
     *,
     requires_task_evaluation: bool = False,
@@ -189,6 +223,7 @@ def _manifest(
     capability: SkillExecutionRoute,
     *,
     authoritative_receipt_feature: bool = False,
+    emergency_stop_feature: bool = False,
     skill_io_catalog_hash: str | None = None,
 ) -> SkillRouteManifest:
     return SkillRouteManifest(
@@ -207,6 +242,11 @@ def _manifest(
             *(
                 (AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,)
                 if authoritative_receipt_feature
+                else ()
+            ),
+            *(
+                (AGENT_GATEWAY_DOMAIN_EMERGENCY_STOP_FEATURE_V1,)
+                if emergency_stop_feature
                 else ()
             ),
         ),
@@ -409,6 +449,154 @@ def _submit(service, manifest, capability, *, now: float = 10.0):
     )
 
 
+def _authoritative_emergency_service(
+    *,
+    may_move_robot: bool = True,
+    emergency_stop_succeeds: bool = True,
+):
+    clock = _ManualClock()
+    capability = (
+        _motion_capability(
+            cancellation_policy="hold_on_cancel_disconnect_or_timeout"
+        )
+        if may_move_robot
+        else _capability()
+    )
+    manifest = _manifest(
+        capability,
+        authoritative_receipt_feature=True,
+        emergency_stop_feature=True,
+    )
+    station_port = _AuthoritativeStationPort(
+        clock,
+        control_effect_class=capability.control_effect_class,
+    )
+    emergency_stop_port = _AuthoritativeEmergencyStopPort(
+        clock,
+        succeeded=emergency_stop_succeeds,
+    )
+    service = AgentGatewayService(
+        manifest=manifest,
+        access_policy=_policy(),
+        executor_registry=SkillExecutorRegistry.bind_all_routes_to_port(
+            manifest=manifest,
+            execution_port=station_port,
+        ),
+        domain_control_port=station_port,
+        domain_emergency_stop_port=emergency_stop_port,
+        payload_validators=_payload_validators(capability),
+        operation_store=BoundedInMemoryAgentSkillOperationStore(
+            max_retained_operations=4
+        ),
+        clock=clock,
+    )
+    assert service.publish_observation(
+        snapshot=_snapshot(manifest),
+        now=10.0,
+    ).accepted
+    return (
+        service,
+        station_port,
+        emergency_stop_port,
+        clock,
+        manifest,
+        capability,
+    )
+
+
+def test_domain_emergency_stop_without_active_operation_has_lower_proof() -> None:
+    service, _, emergency_port, _, manifest, _ = (
+        _authoritative_emergency_service()
+    )
+
+    outcome = service.request_emergency_stop_own_domain(
+        request=_emergency_stop_request(manifest),
+        now=10.1,
+    )
+
+    assert outcome.accepted
+    assert outcome.reason_code == "domain_emergency_stop_confirmed"
+    assert outcome.operation is None
+    assert outcome.port_receipt is service.emergency_stop_receipt
+    assert outcome.port_receipt.operation_kind == "emergency_stop"
+    assert outcome.port_receipt.proves_motion_or_hold
+    assert service.emergency_stop_latched
+    assert service.emergency_stop_confirmed
+    assert emergency_port.calls == [(None, "agent_task_aborted")]
+
+
+def test_domain_emergency_stop_preempts_motion_and_latches_admission() -> None:
+    service, _, emergency_port, clock, manifest, capability = (
+        _authoritative_emergency_service()
+    )
+    submitted = _submit(service, manifest, capability)
+    assert submitted.operation is not None
+    running = _activate_running(service, submitted.operation.operation_id, clock)
+
+    clock.set(10.2)
+    outcome = service.request_emergency_stop_own_domain(
+        request=_emergency_stop_request(manifest),
+        now=10.2,
+    )
+
+    assert outcome.accepted
+    assert outcome.operation is not None
+    assert outcome.operation.status == "cancelled"
+    assert outcome.operation.reason_code == (
+        "operation_cancelled_after_emergency_stop"
+    )
+    assert emergency_port.calls == [(running.operation_id, "agent_task_aborted")]
+
+    rejected = service.submit_request(
+        request=_request(
+            manifest,
+            capability,
+            sequence=2,
+            key="idem:after-emergency-stop",
+            request_id="request:after-emergency-stop",
+        ),
+        current_station_revision=4,
+        now=10.3,
+    )
+    assert not rejected.accepted
+    assert rejected.reason_code == "domain_emergency_stop_latched"
+
+
+def test_unconfirmed_domain_emergency_stop_fails_closed_and_keeps_latch() -> None:
+    service, _, _, clock, manifest, capability = (
+        _authoritative_emergency_service(emergency_stop_succeeds=False)
+    )
+    submitted = _submit(service, manifest, capability)
+    assert submitted.operation is not None
+    _activate_running(service, submitted.operation.operation_id, clock)
+
+    outcome = service.request_emergency_stop_own_domain(
+        request=_emergency_stop_request(manifest),
+        now=10.2,
+    )
+
+    assert not outcome.accepted
+    assert outcome.reason_code == "domain_emergency_stop_not_confirmed"
+    assert outcome.operation is not None
+    assert outcome.operation.status == "failed"
+    assert service.emergency_stop_latched
+    assert not service.emergency_stop_confirmed
+
+
+def test_domain_emergency_stop_latch_does_not_block_read_only_route() -> None:
+    service, _, _, _, manifest, capability = _authoritative_emergency_service(
+        may_move_robot=False
+    )
+    assert service.request_emergency_stop_own_domain(
+        request=_emergency_stop_request(manifest),
+        now=10.1,
+    ).accepted
+
+    submitted = _submit(service, manifest, capability, now=10.2)
+
+    assert submitted.accepted
+
+
 def test_default_v2_protocol_runtime_publishes_inline_io_and_replay_events() -> None:
     service, _port, _clock, manifest, capability = _service()
     runtime = service.protocol_runtime
@@ -487,6 +675,23 @@ def _hold_request(
         observation_snapshot_id="snapshot:b2a:4",
         expected_station_revision=4,
         reason_code=reason_code,
+    )
+
+
+def _emergency_stop_request(
+    manifest: SkillRouteManifest,
+    *,
+    idempotency_key: str = "control-idem:emergency-stop:1",
+) -> AgentOwnDomainEmergencyStopRequest:
+    return AgentOwnDomainEmergencyStopRequest(
+        client_id="rpent:b2a",
+        control_request_id="control:emergency-stop:1",
+        idempotency_key=idempotency_key,
+        runtime_session_id=manifest.runtime_session_id,
+        skill_route_manifest_hash=manifest.semantic_content_hash,
+        control_domain_id=manifest.control_domain_id,
+        target_binding_id=manifest.target_binding_id,
+        reason_code="agent_task_aborted",
     )
 
 

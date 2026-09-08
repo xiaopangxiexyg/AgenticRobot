@@ -516,8 +516,20 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         assert routes["perception.plan_point_grasp"] == "read_only"
         assert routes["perception.render_point_grasp_candidate"] == "read_only"
         assert routes["motion.move_tcp_to_pose"] == "motion"
+        assert "own_domain_emergency_stop_v1" in (
+            session.contract_bundle.route_manifest.supported_transport_features
+        )
+        assert session.emergency_stop_port is not None
+        assert "agent_estop" not in (
+            session.contract_bundle.route_manifest.explicit_exclusions
+        )
         assert composition.station_point_grasp_registration is not None
         assert composition.station_point_grasp_render_registration is not None
+        assert tuple(
+            composition.station_point_grasp_registration.profile.source_by_role
+        ) == ("main", "wrist_left", "wrist_right")
+        assert composition.perception_capture is not None
+        assert composition.perception_capture.profile.depth_roles == ("main",)
         assert tuple(
             composition.station_point_grasp_render_registration.profile.source_by_role
         ) == ("main", "wrist_left", "wrist_right")

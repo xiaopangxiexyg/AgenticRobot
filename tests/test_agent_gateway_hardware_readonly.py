@@ -34,7 +34,6 @@ from agent_gateway.transport.unix_transport import (
 )
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 
-
 _PREFIX = struct.Struct(">I")
 
 
@@ -337,6 +336,7 @@ def test_read_only_submission_is_server_enforced_before_admission() -> None:
         "submit_skill_request",
         "cancel_own_operation",
         "request_hold_own_domain",
+        "request_emergency_stop_own_domain",
     ),
 )
 def test_read_only_authenticated_client_cannot_use_privileged_methods(
@@ -417,6 +417,9 @@ def test_ssh_proxy_forwards_only_the_fixed_read_only_surface(
 ) -> None:
     assert "submit_skill_request" not in AGENT_GATEWAY_SSH_READ_ONLY_METHODS_V1
     assert "request_hold_own_domain" not in AGENT_GATEWAY_SSH_READ_ONLY_METHODS_V1
+    assert "request_emergency_stop_own_domain" not in (
+        AGENT_GATEWAY_SSH_READ_ONLY_METHODS_V1
+    )
     assert "cancel_own_operation" not in AGENT_GATEWAY_SSH_READ_ONLY_METHODS_V1
     assert "begin_artifact_upload" not in AGENT_GATEWAY_SSH_READ_ONLY_METHODS_V1
     assert "submit_read_only_skill_request" in (

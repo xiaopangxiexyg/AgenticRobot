@@ -20,7 +20,9 @@ from typing import Any
 from ..protocol.artifact_contracts import AgentArtifactBinding
 from ..protocol.contracts import (
     AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,
+    AGENT_GATEWAY_DOMAIN_EMERGENCY_STOP_FEATURE_V1,
     AgentObservationSnapshot,
+    AgentOwnDomainEmergencyStopRequest,
     AgentOwnDomainHoldRequest,
     AgentOwnOperationCancelRequest,
     AgentOwnOperationQuery,
@@ -38,6 +40,7 @@ from .artifact_validation import validate_skill_artifact_bindings
 from .executor_registry import SkillExecutorRegistry
 from .operation_port import (
     AgentDomainControlPort,
+    AgentDomainEmergencyStopPort,
     AgentGatewayAuthoritativePortReceipt,
     AgentGatewayNoIoPortReceipt,
     AgentSkillExecutionPort,
@@ -149,6 +152,7 @@ class AgentGatewayService:
         operation_port: AgentSkillOperationPort | None = None,
         executor_registry: SkillExecutorRegistry | None = None,
         domain_control_port: AgentDomainControlPort | None = None,
+        domain_emergency_stop_port: AgentDomainEmergencyStopPort | None = None,
         payload_validators: AgentSkillPayloadValidatorRegistry | None = None,
         operation_store: BoundedInMemoryAgentSkillOperationStore | None = None,
         protocol_runtime: AgentGatewayProtocolRuntime | None = None,
@@ -206,6 +210,31 @@ class AgentGatewayService:
             raise TypeError(
                 "domain_control_port does not implement request_hold()."
             )
+        emergency_stop_advertised = (
+            AGENT_GATEWAY_DOMAIN_EMERGENCY_STOP_FEATURE_V1
+            in manifest.supported_transport_features
+        )
+        if emergency_stop_advertised != (domain_emergency_stop_port is not None):
+            raise ValueError(
+                "domain emergency-stop feature and bound port must match."
+            )
+        if domain_emergency_stop_port is not None:
+            emergency_no_io = getattr(domain_emergency_stop_port, "no_io", None)
+            if emergency_no_io is not False:
+                raise TypeError(
+                    "domain_emergency_stop_port must be authoritative lower I/O."
+                )
+            _required_text(
+                getattr(domain_emergency_stop_port, "port_id", None),
+                field_name="domain_emergency_stop_port.port_id",
+            )
+            if not callable(
+                getattr(domain_emergency_stop_port, "request_emergency_stop", None)
+            ):
+                raise TypeError(
+                    "domain_emergency_stop_port does not implement "
+                    "request_emergency_stop()."
+                )
         if payload_validators is not None and not isinstance(
             payload_validators,
             AgentSkillPayloadValidatorRegistry,
@@ -245,6 +274,7 @@ class AgentGatewayService:
         self.access_policy = access_policy
         self.executor_registry = executor_registry
         self.domain_control_port = domain_control_port
+        self.domain_emergency_stop_port = domain_emergency_stop_port
         # Compatibility projection for existing one-port callers.  New
         # multi-executor code must use executor_registry/domain_control_port.
         self.operation_port = (
@@ -271,11 +301,30 @@ class AgentGatewayService:
             tuple[str, str, str],
             tuple[str, AgentGatewayControlPlaneOutcome | None],
         ] = OrderedDict()
+        self._emergency_stop_lock = threading.Lock()
+        self._emergency_stop_latched = False
+        self._emergency_stop_confirmed = False
+        self._emergency_stop_receipt: AgentSkillOperationPortReceipt | None = None
 
     @property
     def is_closed(self) -> bool:
         with self._admission_lock:
             return self._closed
+
+    @property
+    def emergency_stop_latched(self) -> bool:
+        with self._emergency_stop_lock:
+            return self._emergency_stop_latched
+
+    @property
+    def emergency_stop_confirmed(self) -> bool:
+        with self._emergency_stop_lock:
+            return self._emergency_stop_confirmed
+
+    @property
+    def emergency_stop_receipt(self) -> AgentSkillOperationPortReceipt | None:
+        with self._emergency_stop_lock:
+            return self._emergency_stop_receipt
 
     def get_routes(self) -> SkillRouteManifest:
         return self.manifest
@@ -640,6 +689,143 @@ class AgentGatewayService:
         )
         return result
 
+    def request_emergency_stop_own_domain(
+        self,
+        *,
+        request: AgentOwnDomainEmergencyStopRequest,
+        now: float | None = None,
+    ) -> AgentGatewayControlPlaneOutcome:
+        """Latch and request the exact lower domain emergency stop.
+
+        This safety-control path intentionally does not read an observation or
+        require a Station revision.  It is available while another operation
+        worker is active and fences later robot-motion admission immediately.
+        """
+
+        if not isinstance(request, AgentOwnDomainEmergencyStopRequest):
+            raise TypeError(
+                "request must be an AgentOwnDomainEmergencyStopRequest."
+            )
+        rejection = self._control_scope_rejection(
+            client_id=request.client_id,
+            runtime_session_id=request.runtime_session_id,
+            skill_route_manifest_hash=request.skill_route_manifest_hash,
+            control_domain_id=request.control_domain_id,
+            target_binding_id=request.target_binding_id,
+        )
+        if rejection is not None:
+            return AgentGatewayControlPlaneOutcome(
+                False,
+                rejection,
+                request.semantic_content_hash,
+            )
+        replay = self._begin_control_request(
+            action="request_emergency_stop_own_domain",
+            client_id=request.client_id,
+            idempotency_key=request.idempotency_key,
+            request_hash=request.semantic_content_hash,
+        )
+        if replay is not None:
+            return replay
+
+        timestamp = self._time() if now is None else _finite_time(now, field_name="now")
+        # Use the same lock order as motion admission.  Once this block exits,
+        # no concurrent submitter can pass the motion-route latch check after
+        # the emergency stop has begun.
+        with self._admission_lock, self._emergency_stop_lock:
+            self._emergency_stop_latched = True
+        port = self.domain_emergency_stop_port
+        active = self.operation_store.active_operation()
+        active_motion = None
+        if active is not None:
+            active_request = self.operation_store.request_for_operation(
+                active.operation_id
+            )
+            if active_request is not None:
+                active_route = self.manifest.route(
+                    active_request.skill_id,
+                    active_request.skill_version,
+                    active_request.route_id,
+                    active_request.route_version,
+                ).route
+                if active_route.may_move_robot:
+                    active_motion = active
+        try:
+            if port is None:  # Closed by constructor/manifest consistency.
+                raise RuntimeError("domain emergency-stop port is unavailable.")
+            receipt = port.request_emergency_stop(
+                operation=active_motion,
+                reason=request.reason_code,
+            )
+            self._require_port_receipt(
+                receipt,
+                expected_port=port,
+                operation_kind="emergency_stop",
+                operation_id=(
+                    None if active_motion is None else active_motion.operation_id
+                ),
+            )
+        except Exception:
+            self._abandon_control_request(
+                action="request_emergency_stop_own_domain",
+                client_id=request.client_id,
+                idempotency_key=request.idempotency_key,
+                request_hash=request.semantic_content_hash,
+            )
+            raise
+
+        confirmed = bool(receipt.succeeded and receipt.proves_motion_or_hold)
+        with self._emergency_stop_lock:
+            self._emergency_stop_confirmed = (
+                self._emergency_stop_confirmed or confirmed
+            )
+            self._emergency_stop_receipt = receipt
+        projected_operation = active_motion
+        projection_accepted = True
+        if active_motion is not None:
+            revision = max(
+                active_motion.current_station_revision,
+                self.operation_store.latest_station_revision or 0,
+            )
+            projection = self.operation_store.terminate_after_emergency_stop(
+                operation_id=active_motion.operation_id,
+                emergency_stop_confirmed=confirmed,
+                reason_code=(
+                    "operation_cancelled_after_emergency_stop"
+                    if confirmed
+                    else "operation_failed_after_unconfirmed_emergency_stop"
+                ),
+                current_station_revision=revision,
+                updated_at=max(timestamp, active_motion.updated_at),
+                execution_receipt_refs=(receipt.receipt_id,),
+            )
+            projection_accepted = projection.accepted
+            projected_operation = projection.operation
+        accepted = confirmed and projection_accepted
+        result = AgentGatewayControlPlaneOutcome(
+            accepted,
+            (
+                "domain_emergency_stop_confirmed"
+                if accepted
+                else "domain_emergency_stop_not_confirmed"
+            ),
+            request.semantic_content_hash,
+            projected_operation,
+            port_receipt=receipt,
+            publish_authoritative_port_receipt=(
+                AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1
+                in self.manifest.supported_transport_features
+            ),
+        )
+        self._complete_control_request(
+            action="request_emergency_stop_own_domain",
+            client_id=request.client_id,
+            idempotency_key=request.idempotency_key,
+            request_hash=request.semantic_content_hash,
+            outcome=result,
+        )
+        return result
+
     def grant_invocations_used(self, grant: SkillExecutionGrant) -> int:
         if not isinstance(grant, SkillExecutionGrant):
             raise TypeError("grant must be a SkillExecutionGrant.")
@@ -709,6 +895,12 @@ class AgentGatewayService:
                 request.route_version,
             )
             route = route_entry.route
+            if route.may_move_robot and self.emergency_stop_latched:
+                return AgentGatewaySubmission(
+                    accepted=False,
+                    reason_code="domain_emergency_stop_latched",
+                    access_decision=decision,
+                )
             if self.payload_validators is not None:
                 try:
                     self.payload_validators.validate_parameters(
@@ -1684,7 +1876,11 @@ class AgentGatewayService:
         self,
         receipt: object,
         *,
-        expected_port: AgentDomainControlPort | AgentSkillExecutionPort,
+        expected_port: (
+            AgentDomainControlPort
+            | AgentDomainEmergencyStopPort
+            | AgentSkillExecutionPort
+        ),
         operation_kind: str,
         operation_id: str | None,
     ) -> AgentSkillOperationPortReceipt:
@@ -1721,6 +1917,12 @@ class AgentGatewayService:
             ):
                 raise ValueError(
                     "Successful HOLD must prove the lower boundary."
+                )
+            if receipt.succeeded and operation_kind == "emergency_stop" and not (
+                receipt.proves_motion_or_hold
+            ):
+                raise ValueError(
+                    "Successful emergency stop must prove the lower boundary."
                 )
         return receipt
 

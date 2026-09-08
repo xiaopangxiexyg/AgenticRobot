@@ -285,6 +285,11 @@ def _ready_payload(
             if capabilities is None
             else list(capabilities.artifact_access_mechanisms)
         ),
+        "domain_emergency_stop_available": bool(
+            session.emergency_stop_port is not None
+            and "own_domain_emergency_stop_v1"
+            in manifest.supported_transport_features
+        ),
         "station_manifest_hash": manifest.station_manifest_hash,
         "execution_manifest_hash": manifest.execution_manifest_hash,
         "deployment_profile_hash": composition.lower.profile.semantic_content_hash,
@@ -338,8 +343,20 @@ def _stopped_payload(
 ) -> dict[str, Any]:
     snapshot = composition.deployment.control_runtime.motion_port.snapshot()
     hold = composition.deployment.control_runtime.last_hold_receipt
+    emergency_stop = composition.lower.ports.last_emergency_stop_receipt
+    gateway_emergency_stop_receipt = (
+        composition.deployment.gateway_session.service.emergency_stop_receipt
+    )
     control_fault = composition.application.control_fault
     lower_hold_proved = bool(hold is not None and hold.succeeded)
+    lower_emergency_stop_proved = bool(
+        emergency_stop is not None
+        and emergency_stop.succeeded
+        and set(emergency_stop.status_by_side.values()) == {"confirmed"}
+        and gateway_emergency_stop_receipt is not None
+        and gateway_emergency_stop_receipt.succeeded
+        and gateway_emergency_stop_receipt.proves_motion_or_hold
+    )
     passive_read_failures = []
     for skill_id, executor in (
         composition.deployment.gateway_session.executors_by_skill_id.items()
@@ -368,9 +385,27 @@ def _stopped_payload(
         "passive_read_failures": passive_read_failures,
         "lower_hold_proved": lower_hold_proved,
         "lower_hold_evidence_refs": ([] if hold is None else list(hold.evidence_refs)),
-        "safe_shutdown": lower_hold_proved,
+        "emergency_stop_latched": (
+            gateway_session.service.emergency_stop_latched
+        ),
+        "emergency_stop_confirmed": lower_emergency_stop_proved,
+        "emergency_stop_status_by_side": (
+            {}
+            if emergency_stop is None
+            else dict(emergency_stop.status_by_side)
+        ),
+        "emergency_stop_evidence_refs": (
+            []
+            if emergency_stop is None
+            else list(emergency_stop.evidence_refs)
+        ),
+        "safe_shutdown": lower_hold_proved or lower_emergency_stop_proved,
         "safe_shutdown_basis": (
-            "lower_hold_receipt" if lower_hold_proved else "missing_lower_hold_proof"
+            "lower_emergency_stop_receipt"
+            if lower_emergency_stop_proved
+            else "lower_hold_receipt"
+            if lower_hold_proved
+            else "missing_lower_safety_stop_proof"
         ),
     }
 
@@ -674,7 +709,9 @@ def main(argv: list[str] | None = None) -> int:
         stopped_payload = _stopped_payload(composition)
         print(json.dumps(stopped_payload, sort_keys=True), flush=True)
     if stopped_payload is None or not stopped_payload["safe_shutdown"]:
-        raise RuntimeError("real RM65 Skill Gateway stopped without lower HOLD proof")
+        raise RuntimeError(
+            "real RM65 Skill Gateway stopped without lower safety-stop proof"
+        )
     return 0
 
 

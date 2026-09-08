@@ -452,6 +452,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         semantic_content_hash="manifest:test",
         station_manifest_hash="station:test",
         execution_manifest_hash="execution:test",
+        supported_transport_features=("own_domain_emergency_stop_v1",),
         skill_routes=(entry,),
     )
     hold = SimpleNamespace(succeeded=True, evidence_refs=("hold:test",))
@@ -507,6 +508,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         lower=SimpleNamespace(
             profile=resolved,
             ports=SimpleNamespace(
+                last_emergency_stop_receipt=None,
                 measurement_sampler_snapshot=lambda: {
                     "enabled": True,
                     "thread_alive": False,
@@ -521,6 +523,11 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         deployment=SimpleNamespace(
             gateway_session=SimpleNamespace(
                 contract_bundle=SimpleNamespace(route_manifest=manifest),
+                emergency_stop_port=object(),
+                service=SimpleNamespace(
+                    emergency_stop_latched=False,
+                    emergency_stop_receipt=None,
+                ),
                 executors_by_skill_id={
                     "motion.step_tcp_cardinal": SimpleNamespace(),
                     "perception.capture_rgb": camera_executor,
@@ -572,7 +579,10 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         "gateway_stopped",
     ]
     assert events[0]["authorization_scope"] == "persistent_session_matching_action"
+    assert events[0]["domain_emergency_stop_available"] is True
     assert events[1]["lower_hold_proved"] is True
+    assert events[1]["emergency_stop_latched"] is False
+    assert events[1]["emergency_stop_confirmed"] is False
     assert events[1]["control_fault"] is None
     assert events[1]["measurement_sampler"]["sample_count"] == 7
     assert events[1]["control_cycle"]["cycle_count"] == 9
@@ -598,3 +608,19 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert captured["authorized_side"] == "right"
     assert captured["authorized_action"] == "forward"
     assert captured["ssh_read_only_client_id_by_uid"] == {1101: "rpent.remote.alice"}
+
+    composition.lower.ports.last_emergency_stop_receipt = SimpleNamespace(
+        succeeded=True,
+        status_by_side={"left": "confirmed", "right": "confirmed"},
+        evidence_refs=("estop:left", "estop:right"),
+    )
+    composition.deployment.gateway_session.service.emergency_stop_latched = True
+    composition.deployment.gateway_session.service.emergency_stop_receipt = (
+        SimpleNamespace(succeeded=True, proves_motion_or_hold=True)
+    )
+    stopped_after_emergency_stop = gateway_cli._stopped_payload(composition)
+    assert stopped_after_emergency_stop["emergency_stop_confirmed"] is True
+    assert stopped_after_emergency_stop["safe_shutdown"] is True
+    assert stopped_after_emergency_stop["safe_shutdown_basis"] == (
+        "lower_emergency_stop_receipt"
+    )

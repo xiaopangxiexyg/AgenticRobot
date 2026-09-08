@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,9 @@ from robot_motion.position_control import (
     resolve_periodic_tick,
 )
 from teleop_runtime.backends.arms import RM65ArmBackend, RM65ArmBackendConfig
+from teleop_runtime.backends.arms.rm65 import (
+    _next_background_stream_schedule_after_send,
+)
 from teleop_runtime.collection.diagnostics import PhaseTimer
 from teleop_runtime.debug.run_vive_rm65_real_teleop import _record_position_loop_timings
 from teleop_runtime.position_control import (
@@ -132,6 +136,48 @@ def test_periodic_tick_accounts_skips_without_catchup_burst() -> None:
     assert np.isclose(decision.wakeup_lag_sec, 0.001)
     assert np.isclose(decision.deadline_monotonic_time, 10.04)
     assert decision.deadline_missed(10.041)
+
+
+def test_rm65_post_send_schedule_rebases_only_after_a_real_stall() -> None:
+    unchanged = _next_background_stream_schedule_after_send(
+        next_scheduled=10.1,
+        sdk_result_monotonic=10.02,
+        sdk_send_gap_sec=0.1,
+        skipped_tick_count=0,
+        period_sec=0.1,
+        no_catch_up_after_send=True,
+    )
+    after_crossed_deadline = _next_background_stream_schedule_after_send(
+        next_scheduled=10.1,
+        sdk_result_monotonic=10.11,
+        sdk_send_gap_sec=0.1,
+        skipped_tick_count=0,
+        period_sec=0.1,
+        no_catch_up_after_send=True,
+    )
+    after_long_gap = _next_background_stream_schedule_after_send(
+        next_scheduled=10.1,
+        sdk_result_monotonic=10.09,
+        sdk_send_gap_sec=0.16,
+        skipped_tick_count=0,
+        period_sec=0.1,
+        no_catch_up_after_send=True,
+    )
+
+    assert unchanged == 10.1
+    assert np.isclose(after_crossed_deadline, 10.21)
+    assert np.isclose(after_long_gap, 10.19)
+
+
+def test_rm65_post_send_schedule_keeps_legacy_profile_unchanged() -> None:
+    assert _next_background_stream_schedule_after_send(
+        next_scheduled=10.1,
+        sdk_result_monotonic=10.11,
+        sdk_send_gap_sec=0.2,
+        skipped_tick_count=2,
+        period_sec=0.1,
+        no_catch_up_after_send=False,
+    ) == 10.1
 
 
 def test_real_main_loop_timing_bridge_emits_stage_and_deadline_summary() -> None:
@@ -441,6 +487,58 @@ class _AuditArm:
         del follow, trajectory_mode, radio
         self.sent_joint_deg.append(np.asarray(joint_deg, dtype=float).copy())
         return 0
+
+
+class _StallingAuditArm(_AuditArm):
+    def Movej_CANFD(self, joint_deg, follow=False, trajectory_mode=0, radio=0):
+        if len(self.sent_joint_deg) == 1:
+            time.sleep(0.025)
+        return super().Movej_CANFD(
+            joint_deg,
+            follow=follow,
+            trajectory_mode=trajectory_mode,
+            radio=radio,
+        )
+
+
+def test_rm65_stream_waits_one_period_after_sdk_stall() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            singularity_protection_enabled=False,
+            background_streaming_enabled=True,
+            background_streaming_hz=100.0,
+            background_streaming_target_max_age_sec=1.0,
+            background_streaming_no_catch_up_after_send=True,
+        )
+    )
+    backend.arm = _StallingAuditArm()
+    sdk_results: list[float] = []
+
+    def trace_sink(*sample: object) -> None:
+        sdk_results.append(float(sample[10]))
+        if len(sdk_results) == 4:
+            backend._stream_stop_event.set()
+
+    backend.set_actuator_command_trace_sink(trace_sink)
+    backend.send_command(
+        EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=np.full(6, 0.1),
+        )
+    )
+
+    backend._stream_stop_event.clear()
+    backend._background_stream_loop_impl()
+
+    gaps = np.diff(sdk_results)
+    assert gaps[0] >= 0.025
+    assert gaps[1] >= 0.007
 
 
 def test_rm65_stream_stamps_target_and_emits_complete_tick_audit() -> None:

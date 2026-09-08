@@ -310,6 +310,17 @@ class Sam2VgnPointGraspPlanner:
                     "target_height_center_max_shift_m": (
                         DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M
                     ),
+                    "target_capture_center_percentiles": [5.0, 95.0],
+                    "target_capture_opening_half_extent_m": (
+                        self.max_gripper_width_m / 2.0
+                    ),
+                    "target_capture_height_half_extent_m": (
+                        DMTAC_M_PAD_HEIGHT_M / 2.0
+                    ),
+                    "target_capture_approach_range_m": [
+                        DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+                        DMTAC_M_PALM_FROM_TOOL_TCP_Z_M + DMTAC_M_FINGER_LENGTH_M,
+                    ],
                     "model_grasp_width_axis": "+y",
                     "tool_tcp_width_axis": "+x",
                     "tool_tcp_approach_axis": "+z",
@@ -605,6 +616,37 @@ class Sam2VgnPointGraspPlanner:
             centered[:3, 3] += axis * shift
         return centered
 
+    def _target_center_inside_capture_region(
+        self,
+        camera_from_tcp: np.ndarray,
+        target_points_camera: np.ndarray,
+    ) -> bool:
+        """Require the robust target center to lie between the physical fingers."""
+
+        points = np.asarray(target_points_camera, dtype=np.float64)
+        if (
+            points.ndim != 2
+            or points.shape[1:] != (3,)
+            or len(points) < 16
+            or not np.all(np.isfinite(points))
+        ):
+            raise ValueError(
+                "target_points_camera must contain at least 16 finite XYZ points."
+            )
+        tcp_from_camera = np.linalg.inv(camera_from_tcp)
+        local = points @ tcp_from_camera[:3, :3].T + tcp_from_camera[:3, 3]
+        low, high = np.percentile(local, (5.0, 95.0), axis=0)
+        center = (low + high) * 0.5
+        half_opening = self.max_gripper_width_m / 2.0
+        half_height = DMTAC_M_PAD_HEIGHT_M / 2.0
+        palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
+        fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
+        return bool(
+            abs(center[0]) <= half_opening
+            and abs(center[1]) <= half_height
+            and palm_z <= center[2] <= fingertip_z
+        )
+
     def _rank(
         self,
         grasps: Any,
@@ -648,6 +690,11 @@ class Sam2VgnPointGraspPlanner:
                 camera_from_tcp,
                 base_from_tcp,
             )
+            if not self._target_center_inside_capture_region(
+                camera_from_tcp,
+                target_points_camera,
+            ):
+                continue
             distance = float(np.linalg.norm(camera_from_tcp[:3, 3] - target_camera))
             if distance > self.max_click_distance_m:
                 continue

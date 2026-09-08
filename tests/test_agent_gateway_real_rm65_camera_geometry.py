@@ -12,6 +12,7 @@ from agent_gateway.profiles.real.gateway_cli import (
     DEFAULT_RM65_CAMERA_REGISTRY_V4,
 )
 from agent_gateway.profiles.real.realsense_perception import (
+    RealSenseAgentPerceptionProvider,
     build_real_perception_source_binding,
 )
 from agent_gateway.profiles.real.rm65_camera_geometry import (
@@ -111,6 +112,23 @@ def test_v4_geometry_keeps_logical_urdf_identity_through_asset_symlink(
     )
 
     assert tuple(item["role"] for item in geometry.source_catalog()) == (
+        "main",
+        "wrist_left",
+        "wrist_right",
+    )
+
+
+def test_combined_rm65_exposes_wrist_rgbd_only_to_point_grasp_catalog() -> None:
+    source_binding = _source_binding(DEFAULT_RM65_CAMERA_REGISTRY_V4)
+    geometry = _build_geometry(registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4)
+    provider = RealSenseAgentPerceptionProvider(
+        source_binding=source_binding,
+        current_station_revision=lambda: 0,
+        rgb_camera_geometry=geometry,
+    )
+
+    assert tuple(item["role"] for item in provider.depth_source_catalog()) == ("main",)
+    assert tuple(item["role"] for item in provider.aligned_rgbd_source_catalog()) == (
         "main",
         "wrist_left",
         "wrist_right",
