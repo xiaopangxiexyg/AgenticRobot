@@ -1,8 +1,8 @@
 # AgenticRobot 抓姿生成与 RM65 Skill 全链路交接
 
-> 文档日期：2026-09-08（Asia/Shanghai）  
-> 文档目的：把抓姿生成、upward TCP 筛选、MuJoCo 可视化、左右臂、真机 Gateway、运动抖动修复、trace 证据、资产和验收边界集中记录，供后续开发者和远端 `user` 接手。  
-> 当前文档属于独立 Git 候选分支；它不代表已经合入 `development`，也不代表真机验收已完成。
+> 文档日期：2026-09-08（Asia/Shanghai）
+> 文档目的：把抓姿生成、upward TCP 筛选、MuJoCo 可视化、左右臂、真机 Gateway、运动抖动修复、trace 证据、资产和验收边界集中记录，供后续开发者和远端 `user` 接手。
+> 当前文档源自独立 Git 候选，现由正式 Harness Task 继续验证；它不代表已经合入 `development`，也不代表真机验收已完成。
 
 ## 1. 先看结论
 
@@ -24,12 +24,13 @@ RGB-D/点击
 
 | 项目 | 当前状态 |
 | --- | --- |
-| 当前运动候选 worktree | `/home/zc/HandMotion/Developing/temp/worktrees/root-grasp-motion-trace-20260907` |
-| 分支 | `task/root/grasp-motion-trace-20260907` |
+| 源运动候选 worktree | `/home/zc/HandMotion/Developing/temp/worktrees/root-grasp-motion-trace-20260907` |
+| 源候选分支与文档 tip | `task/root/grasp-motion-trace-20260907` / `cfdfb17c0067bdae13785b04f0b81b317918b6dd` |
 | 运动候选固定提交 | `39ce36d352bf45bbae33cc1ea42c929dc654b3ae` |
 | 候选固定基线 | `63e82b274eb548aef7fd6a9b114b2305bc9f7e36` |
-| `development` 当时观测值 | `4743d20a97fa07acc47d4217c39be4040c22b62e` |
-| 当前候选状态 | `ready-for-integration`（写入本交接文档后必须重新标记） |
+| 正式 Harness Task | `AR-20260908-real-rm65-motion-trace-integration-r0` |
+| Harness Task 基线 | `4c8d30afdf153d957e533c0b6ebab2a79b974a01` |
+| 当前候选状态 | 四个源提交已按序移植到隔离 Task；离线验证中，尚未 handoff 或前移 `development` |
 | 真机动作 | 本轮没有由 Codex 执行；必须由远端 `user` 按授权命令执行 |
 | 真机 trace 新 schema | `dexteleop.exclusive_rm65_skill_motion_trace.v2` |
 | 远端主机 | `user@192.168.70.116`，工作根 `/home/user/zc` |
@@ -45,7 +46,7 @@ RGB-D/点击
 
 尚未完成的事情：
 
-- `39ce36d3…` 尚未自动合入 `development`。
+- `39ce36d3…` 已以 patch-equivalent 提交移植到正式 Harness Task，但尚未合入 `development`。
 - 新修复后的真实 5--8 cm 远移尚未在远端硬件上执行，不能把它描述为真机通过。
 - 真机相机持续接入、Artifact/存储策略、上层 Agent 消费和摄像头闭环不在本次交接范围。
 
@@ -524,7 +525,7 @@ python scripts/worktree_inventory.py /home/zc/HandMotion/Developing/AgenticRobot
   --strict
 ```
 
-盘点只报告 owner、tip、changed paths 和 overlap，不授予并行修改或集成权限。候选新增本交接文档后，旧的 `ready-for-integration` 声明失效，必须写入新的 tip 和验证结果。
+盘点只报告 owner、tip、changed paths 和 overlap，不授予并行修改或集成权限。源候选保持只读；后续修改、验证和 handoff 由正式 Harness Task 的精确 scope、writer lease 和证据记录约束。
 
 ### 12.2 快速离线验证
 
@@ -542,7 +543,9 @@ bash scripts/run_pytest.sh \
   tests/test_agent_gateway_mujoco_long_move_trace.py
 ```
 
-结果：`108 passed`。MuJoCo 8 cm Gateway full flow 已覆盖 admission、IK、dispatch、measured convergence、terminal rule、lower HOLD 和 close。
+在正式 Harness Task 基线上的复跑结果：`89 passed, 30 warnings`。MuJoCo 8 cm Gateway full flow 已覆盖 admission、IK、dispatch、measured convergence、terminal rule、lower HOLD 和 close。
+
+额外复跑 one-shot、motion session 和 Gateway service 跨边界组合：`82 passed`，覆盖当前 `development` 的 passive-read failure diagnostics 与候选 motion trace 生命周期共存。
 
 更广的 Real Skill/Gateway/RM65 回归为 `301 passed, 2 failures`；两项失败是当前沙箱禁止 AF_UNIX bind 的环境证据：
 
@@ -617,8 +620,8 @@ PermissionError: [Errno 1] Operation not permitted
 
 按以下顺序继续最稳妥：
 
-1. 在文档候选提交后更新 branch description 和 worktree inventory，明确“文档 tip + 运动修复 tip”的组合输入。
-2. 获得具体集成授权后，在独立 integration worktree 按固定 SHA 合并并复跑受影响测试；不直接前移 `development`。
+1. 在正式 Harness Task 中完成聚焦测试、影响 Profile、代码审查和 clean checkpoint。
+2. 以 Task 的固定 clean tip 发起 integration handoff；由 integration owner 在隔离集成 worktree 组合和验证，不直接修改共享 `development` worktree。
 3. 由远端 `user` 建立新 tracked-only 目录、复核 asset symlink 和环境，再启动带 v2 trace 的 Gateway。
 4. 先执行左臂单轴 6 cm 相对移动；回传 operation JSON、HOLD、trace 目录和三文件 hash。
 5. 比较新旧 trace：measurement cadence、SDK stall、post-stall gap/burst、`moving_send_under_4ms_count`、IK over-budget 和最终 pose error。
