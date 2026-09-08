@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -143,6 +143,7 @@ class RealSkillMotionDispatchReceipt:
 
     succeeded: bool
     evidence_refs: tuple[str, ...]
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.succeeded, bool):
@@ -158,6 +159,11 @@ class RealSkillMotionDispatchReceipt:
         if self.succeeded and not refs:
             raise ValueError("a successful dispatch requires lower evidence.")
         object.__setattr__(self, "evidence_refs", refs)
+        object.__setattr__(
+            self,
+            "diagnostics",
+            MappingProxyType(dict(self.diagnostics)),
+        )
 
 
 @dataclass(frozen=True)
@@ -233,6 +239,45 @@ class RealSkillControlStep:
     dispatch_evidence_refs: tuple[str, ...]
 
 
+@dataclass
+class RealSkillControlTraceSample:
+    """Ephemeral control-cut view copied by an optional bounded trace sink.
+
+    This value never owns control state.  A sink must copy the fields it needs
+    synchronously and must not retain or mutate the command/cut objects.
+    """
+
+    cycle_sequence: int
+    cycle_started_monotonic: float
+    control_time: float | None = None
+    observation_completed_monotonic: float | None = None
+    synchronization_completed_monotonic: float | None = None
+    owner_requests_completed_monotonic: float | None = None
+    ik_completed_monotonic: float | None = None
+    admission_completed_monotonic: float | None = None
+    dispatch_ready_at: float | None = None
+    dispatch_completed_monotonic: float | None = None
+    cycle_finished_monotonic: float | None = None
+    cut: RealSkillMotionObservationCut | None = None
+    measured_pose_cut: Any | None = None
+    command: TeleopCommand | None = None
+    dispatch_receipt: RealSkillMotionDispatchReceipt | None = None
+    port_snapshot: RealAgentMotionPortSnapshot | None = None
+    command_present: bool = False
+    admitted: bool = False
+    expired_reference: bool = False
+    dispatch_attempted: bool = False
+    dispatch_succeeded: bool = False
+    outcome: str = "started"
+    error: str | None = None
+
+
+class RealSkillControlTraceSink(Protocol):
+    """Non-authoritative best-effort consumer of one completed control cut."""
+
+    def __call__(self, sample: RealSkillControlTraceSample, /) -> object: ...
+
+
 class ExclusiveRealSkillControlRuntime:
     """One control owner for a Skill-only real deployment.
 
@@ -297,6 +342,9 @@ class ExclusiveRealSkillControlRuntime:
         self._expired_reference_skip_count = 0
         self._consecutive_expired_reference_skips = 0
         self._latest_expired_measurement_age_sec: float | None = None
+        self._motion_trace_sink: RealSkillControlTraceSink | None = None
+        self._motion_trace_error_count = 0
+        self._last_motion_trace_error: str | None = None
 
     @property
     def lifecycle(self) -> RealSkillControlLifecycle:
@@ -329,7 +377,21 @@ class ExclusiveRealSkillControlRuntime:
                 "last_published_source_sequence_by_side": dict(
                     self._last_published_source_sequence_by_side or {}
                 ),
+                "motion_trace_attached": self._motion_trace_sink is not None,
+                "motion_trace_error_count": self._motion_trace_error_count,
+                "last_motion_trace_error": self._last_motion_trace_error,
             }
+
+    def set_motion_trace_sink(
+        self,
+        sink: RealSkillControlTraceSink | None,
+    ) -> None:
+        """Attach a best-effort trace sink without granting it control authority."""
+
+        if sink is not None and not callable(sink):
+            raise TypeError("motion trace sink must be callable or None.")
+        with self._lock:
+            self._motion_trace_sink = sink
 
     def start(self) -> str:
         with self._lock:
@@ -384,11 +446,33 @@ class ExclusiveRealSkillControlRuntime:
 
     def step(self, *, now: float | None = None) -> RealSkillControlStep:
         cycle_started = time.monotonic()
+        with self._lock:
+            sink = self._motion_trace_sink
+            cycle_sequence = self._control_cycle_count + 1
+        trace = (
+            None
+            if sink is None
+            else RealSkillControlTraceSample(
+                cycle_sequence=cycle_sequence,
+                cycle_started_monotonic=cycle_started,
+            )
+        )
         try:
             with self._cycle_lock:
-                return self._step(now=now, cycle_started=cycle_started)
+                result = self._step(
+                    now=now,
+                    cycle_started=cycle_started,
+                    trace=trace,
+                )
+            return result
+        except BaseException as exc:
+            if trace is not None:
+                trace.outcome = "exception"
+                trace.error = f"{type(exc).__name__}: {exc}"[:512]
+            raise
         finally:
-            elapsed = max(0.0, time.monotonic() - cycle_started)
+            cycle_finished = time.monotonic()
+            elapsed = max(0.0, cycle_finished - cycle_started)
             with self._lock:
                 self._control_cycle_count += 1
                 self._latest_control_cycle_sec = elapsed
@@ -396,12 +480,23 @@ class ExclusiveRealSkillControlRuntime:
                     self._max_control_cycle_sec,
                     elapsed,
                 )
+            if trace is not None and sink is not None:
+                trace.cycle_finished_monotonic = cycle_finished
+                try:
+                    sink(trace)
+                except Exception as exc:  # noqa: BLE001 - diagnostics are isolated.
+                    with self._lock:
+                        self._motion_trace_error_count += 1
+                        self._last_motion_trace_error = (
+                            f"{type(exc).__name__}: {exc}"[:512]
+                        )
 
     def _step(
         self,
         *,
         now: float | None = None,
         cycle_started: float | None = None,
+        trace: RealSkillControlTraceSample | None = None,
     ) -> RealSkillControlStep:
         if cycle_started is None:
             cycle_started = time.monotonic()
@@ -409,12 +504,17 @@ class ExclusiveRealSkillControlRuntime:
             self._clock() if now is None else now,
             field_name="now",
         )
+        if trace is not None:
+            trace.control_time = current_time
         if self.lifecycle in {
             RealSkillControlLifecycle.CREATED,
             RealSkillControlLifecycle.CLOSED,
         }:
             raise RuntimeError("exclusive Skill runtime is not active.")
         cut = self._observation_provider()
+        if trace is not None:
+            trace.observation_completed_monotonic = time.monotonic()
+            trace.cut = cut
         if not isinstance(cut, RealSkillMotionObservationCut):
             raise TypeError(
                 "observation_provider must return RealSkillMotionObservationCut."
@@ -438,7 +538,7 @@ class ExclusiveRealSkillControlRuntime:
             publish_measurement = source_sequences != previous_sequences
         if publish_measurement:
             self._synchronize_target_builder(cut.qpos_by_side)
-            self.motion_port.publish_measured_qpos_pair(
+            measured_pose_cut = self.motion_port.publish_measured_qpos_pair(
                 qpos_by_side=cut.qpos_by_side,
                 measured_at=cut.measured_at,
                 # The source cut may already have been available before this
@@ -447,6 +547,8 @@ class ExclusiveRealSkillControlRuntime:
                 available_at=control_cut_at,
                 source_evidence_refs=cut.evidence_refs,
             )
+            if trace is not None:
+                trace.measured_pose_cut = measured_pose_cut
             if source_sequences:
                 self._last_published_source_sequence_by_side = source_sequences
             if self._measured_qpos_observer is not None:
@@ -454,6 +556,10 @@ class ExclusiveRealSkillControlRuntime:
                     cut,
                     derived_available_at=control_cut_at,
                 )
+        elif trace is not None:
+            trace.measured_pose_cut = self.motion_port.latest_measured_pose()
+        if trace is not None:
+            trace.synchronization_completed_monotonic = time.monotonic()
         self._resume_confirmed_hold_for_pending_activation()
         snapshot = self.motion_port.apply_control_owner_requests(
             owner=self,
@@ -463,7 +569,12 @@ class ExclusiveRealSkillControlRuntime:
             owner=self,
             captured_at=control_cut_at,
         )
+        if trace is not None:
+            trace.owner_requests_completed_monotonic = time.monotonic()
+            trace.port_snapshot = snapshot
         if self.lifecycle != RealSkillControlLifecycle.RUNNING:
+            if trace is not None:
+                trace.outcome = "owner_not_running"
             return RealSkillControlStep(
                 lifecycle=self.lifecycle,
                 port_snapshot=snapshot,
@@ -477,7 +588,13 @@ class ExclusiveRealSkillControlRuntime:
             current_time,
         )
         command = value.command if isinstance(value, TeleopCommandOverride) else value
+        if trace is not None:
+            trace.ik_completed_monotonic = time.monotonic()
+            trace.command = command
         if command is None:
+            if trace is not None:
+                trace.outcome = "no_command"
+                trace.port_snapshot = self.motion_port.snapshot()
             return RealSkillControlStep(
                 lifecycle=self.lifecycle,
                 port_snapshot=self.motion_port.snapshot(),
@@ -488,15 +605,23 @@ class ExclusiveRealSkillControlRuntime:
             )
         if not isinstance(command, TeleopCommand):
             raise TypeError("motion port returned an unsupported command value.")
+        if trace is not None:
+            trace.command_present = True
         admitted = bool(
             self.motion_port.admit_command(command, cut.observation, current_time)
             and self._command_admission(command, cut.observation, current_time)
         )
+        if trace is not None:
+            trace.admission_completed_monotonic = time.monotonic()
+            trace.admitted = admitted
         if not admitted:
             self.motion_port.observe_session_step(
                 command=command,
                 command_dispatched=False,
             )
+            if trace is not None:
+                trace.outcome = "admission_rejected"
+                trace.port_snapshot = self.motion_port.snapshot()
             return RealSkillControlStep(
                 lifecycle=self.lifecycle,
                 port_snapshot=self.motion_port.snapshot(),
@@ -510,6 +635,8 @@ class ExclusiveRealSkillControlRuntime:
             time.monotonic() - cycle_started,
         )
         measurement_age_sec = max(0.0, dispatch_ready_at - cut.measured_at)
+        if trace is not None:
+            trace.dispatch_ready_at = dispatch_ready_at
         if measurement_age_sec > self._max_measurement_age_sec:
             # An expensive IK/collision cycle must never dispatch a reference
             # built from a cut that expired while it was being computed.  The
@@ -522,6 +649,10 @@ class ExclusiveRealSkillControlRuntime:
                 self._expired_reference_skip_count += 1
                 self._consecutive_expired_reference_skips += 1
                 self._latest_expired_measurement_age_sec = measurement_age_sec
+            if trace is not None:
+                trace.expired_reference = True
+                trace.outcome = "reference_expired"
+                trace.port_snapshot = self.motion_port.snapshot()
             return RealSkillControlStep(
                 lifecycle=self.lifecycle,
                 port_snapshot=self.motion_port.snapshot(),
@@ -533,6 +664,10 @@ class ExclusiveRealSkillControlRuntime:
         with self._lock:
             self._consecutive_expired_reference_skips = 0
         receipt = self._command_dispatch(command)
+        if trace is not None:
+            trace.dispatch_completed_monotonic = time.monotonic()
+            trace.dispatch_receipt = receipt
+            trace.dispatch_attempted = True
         if not isinstance(receipt, RealSkillMotionDispatchReceipt):
             raise TypeError(
                 "command_dispatch must return RealSkillMotionDispatchReceipt."
@@ -541,6 +676,11 @@ class ExclusiveRealSkillControlRuntime:
             command=command,
             command_dispatched=receipt.succeeded,
         )
+        if trace is not None:
+            trace.dispatch_succeeded = receipt.succeeded
+            trace.outcome = (
+                "dispatch_succeeded" if receipt.succeeded else "dispatch_failed"
+            )
         if not receipt.succeeded:
             operation_id = self.motion_port.snapshot().operation_id
             if operation_id is not None:
@@ -553,9 +693,12 @@ class ExclusiveRealSkillControlRuntime:
                     owner=self,
                     now=current_time,
                 )
+        final_snapshot = self.motion_port.snapshot()
+        if trace is not None:
+            trace.port_snapshot = final_snapshot
         return RealSkillControlStep(
             lifecycle=self.lifecycle,
-            port_snapshot=self.motion_port.snapshot(),
+            port_snapshot=final_snapshot,
             command_present=True,
             dispatch_attempted=True,
             dispatch_succeeded=receipt.succeeded,
@@ -643,6 +786,8 @@ __all__ = [
     "ExclusiveRealSkillControlRuntime",
     "RealSkillControlLifecycle",
     "RealSkillControlStep",
+    "RealSkillControlTraceSample",
+    "RealSkillControlTraceSink",
     "RealSkillMotionDispatchReceipt",
     "RealSkillMotionEmergencyStopReceipt",
     "RealSkillMotionHoldReceipt",

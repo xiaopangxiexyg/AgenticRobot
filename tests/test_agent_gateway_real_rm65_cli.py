@@ -175,6 +175,90 @@ def test_object_coordinate_render_debug_is_explicit_and_default_off() -> None:
     assert enabled.debug_render_object_coordinates is True
 
 
+def test_motion_trace_is_explicit_and_preallocated_duration_is_bounded() -> None:
+    parser = gateway_cli.build_parser()
+    default = parser.parse_args(
+        _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    )
+    enabled = parser.parse_args(
+        [
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--motion-trace-root",
+            "/private/trace-root",
+            "--motion-trace-max-duration-sec",
+            "45",
+        ]
+    )
+
+    assert default.motion_trace_root is None
+    assert default.motion_trace_max_duration_sec == 120.0
+    assert enabled.motion_trace_root == Path("/private/trace-root")
+    assert enabled.motion_trace_max_duration_sec == 45.0
+
+
+def test_motion_trace_attaches_and_detaches_all_three_control_rates() -> None:
+    class Owner:
+        def __init__(self, method):
+            self.values = []
+            setattr(self, method, self.values.append)
+
+    recorder = SimpleNamespace(
+        record_control_cycle=lambda *_args: None,
+        record_ik_shadow=lambda *_args: None,
+        record_actuator_command=lambda *_args: None,
+    )
+    control = Owner("set_motion_trace_sink")
+    target = Owner("set_ik_shadow_trace_sink")
+    left = Owner("set_actuator_command_trace_sink")
+    right = Owner("set_actuator_command_trace_sink")
+    composition = SimpleNamespace(
+        deployment=SimpleNamespace(control_runtime=control),
+        lower=SimpleNamespace(
+            target_builder=target,
+            arm_backends={"left": left, "right": right},
+        ),
+    )
+
+    gateway_cli._attach_motion_trace(composition, recorder)
+    errors = gateway_cli._detach_motion_trace(composition)
+
+    assert errors == []
+    assert control.values == [recorder.record_control_cycle, None]
+    assert target.values == [recorder.record_ik_shadow, None]
+    assert left.values == [recorder.record_actuator_command, None]
+    assert right.values == [recorder.record_actuator_command, None]
+
+
+def test_motion_trace_partial_attach_failure_rolls_back_existing_hooks() -> None:
+    class Owner:
+        def __init__(self, method):
+            self.values = []
+            setattr(self, method, self.values.append)
+
+    recorder = SimpleNamespace(
+        record_control_cycle=lambda *_args: None,
+        record_ik_shadow=lambda *_args: None,
+        record_actuator_command=lambda *_args: None,
+    )
+    control = Owner("set_motion_trace_sink")
+    target = Owner("set_ik_shadow_trace_sink")
+    left = Owner("set_actuator_command_trace_sink")
+    composition = SimpleNamespace(
+        deployment=SimpleNamespace(control_runtime=control),
+        lower=SimpleNamespace(
+            target_builder=target,
+            arm_backends={"left": left, "right": object()},
+        ),
+    )
+
+    with pytest.raises(TypeError, match="right RM65 backend"):
+        gateway_cli._attach_motion_trace(composition, recorder)
+
+    assert control.values == [recorder.record_control_cycle, None]
+    assert target.values == [recorder.record_ik_shadow, None]
+    assert left.values == [recorder.record_actuator_command, None]
+
+
 def test_cli_rejects_object_coordinate_debug_without_point_grasp(
     monkeypatch,
 ) -> None:

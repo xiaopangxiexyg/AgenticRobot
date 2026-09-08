@@ -214,10 +214,15 @@ def _finite_sequence(
 
 def _absolute_tcp_input_from_args(
     args: argparse.Namespace,
-) -> tuple[tuple[float, ...] | None, CameraRelativeGraspProposal | None]:
+) -> tuple[
+    tuple[float, ...] | None,
+    CameraRelativeGraspProposal | None,
+    tuple[float, ...] | None,
+]:
     xyz_value = getattr(args, "target_xyz_m", None)
     quaternion_value = getattr(args, "target_quat_xyzw", None)
     proposal_path = getattr(args, "camera_grasp_proposal", None)
+    relative_delta_value = getattr(args, "relative_delta_xyz_m", None)
     is_absolute = getattr(args, "action", None) == REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION
     if not is_absolute:
         if (
@@ -225,24 +230,44 @@ def _absolute_tcp_input_from_args(
             or quaternion_value is not None
             or getattr(args, "speed_scale", None) is not None
             or proposal_path is not None
+            or relative_delta_value is not None
         ):
             raise ValueError(
-                "absolute target/proposal and --speed-scale require "
+                "absolute/relative target, proposal, and --speed-scale require "
                 f"--action {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION}."
             )
-        return None, None
+        return None, None, None
     if proposal_path is not None:
-        if xyz_value is not None or quaternion_value is not None:
+        if (
+            xyz_value is not None
+            or quaternion_value is not None
+            or relative_delta_value is not None
+        ):
             raise ValueError(
                 "--camera-grasp-proposal is mutually exclusive with direct "
+                "--target-xyz-m/--target-quat-xyzw and "
+                "--relative-delta-xyz-m."
+            )
+        return None, load_camera_relative_grasp_proposal(proposal_path), None
+    if relative_delta_value is not None:
+        if xyz_value is not None or quaternion_value is not None:
+            raise ValueError(
+                "--relative-delta-xyz-m is mutually exclusive with direct "
                 "--target-xyz-m/--target-quat-xyzw."
             )
-        return None, load_camera_relative_grasp_proposal(proposal_path)
+        delta = _finite_sequence(
+            relative_delta_value,
+            size=3,
+            field_name="relative_delta_xyz_m",
+        )
+        if math.sqrt(sum(value * value for value in delta)) <= 1e-12:
+            raise ValueError("relative_delta_xyz_m must be nonzero.")
+        return None, None, delta
     if xyz_value is None or quaternion_value is None:
         raise ValueError(
             f"--action {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION} requires both "
             "--target-xyz-m and --target-quat-xyzw, or one "
-            "--camera-grasp-proposal."
+            "--camera-grasp-proposal/--relative-delta-xyz-m."
         )
     xyz = _finite_sequence(xyz_value, size=3, field_name="target_xyz_m")
     quaternion = _finite_sequence(
@@ -254,7 +279,39 @@ def _absolute_tcp_input_from_args(
     if norm <= 1e-12:
         raise ValueError("target_quat_xyzw must have nonzero norm.")
     normalized_quaternion = tuple(value / norm for value in quaternion)
-    return (*xyz, *normalized_quaternion), None
+    return (*xyz, *normalized_quaternion), None, None
+
+
+def _relative_tcp_target_from_snapshot(
+    *,
+    snapshot: Mapping[str, Any],
+    side: str,
+    delta_xyz_m: tuple[float, ...],
+) -> tuple[float, ...]:
+    summary = snapshot.get("measurement_summary")
+    poses = (
+        None
+        if not isinstance(summary, Mapping)
+        else summary.get("pose_xyz_quat_xyzw_by_component")
+    )
+    component_id = f"{side}_arm"
+    if not isinstance(poses, Mapping) or component_id not in poses:
+        raise RuntimeError(
+            "Observation snapshot has no measured TCP pose for the selected side."
+        )
+    measured = _finite_sequence(
+        poses[component_id],
+        size=7,
+        field_name=f"measurement_summary.{component_id}",
+    )
+    quaternion = measured[3:]
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if norm <= 1e-12:
+        raise RuntimeError("Measured TCP quaternion has zero norm.")
+    target_xyz = tuple(measured[index] + delta_xyz_m[index] for index in range(3))
+    if not all(math.isfinite(value) for value in target_xyz):
+        raise ValueError("Relative TCP target is not finite.")
+    return (*target_xyz, *(value / norm for value in quaternion))
 
 
 def _pose_target_component_allowed(
@@ -414,7 +471,11 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         raise ValueError("--socket-path must be absolute")
     expected_component = f"{args.side}_arm"
     skill_id = _ACTION_TO_SKILL_ID[args.action]
-    absolute_tcp_pose, camera_grasp_proposal = _absolute_tcp_input_from_args(args)
+    (
+        absolute_tcp_pose,
+        camera_grasp_proposal,
+        relative_delta_xyz_m,
+    ) = _absolute_tcp_input_from_args(args)
     requested_timeout = getattr(args, "operation_timeout_sec", None)
     operation_timeout_sec = (
         30.0
@@ -442,7 +503,13 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             snapshot["execution_gate"] != "ready"
         ):
             raise RuntimeError("Lower real Skill owner is not RUNNING/READY.")
-        if camera_grasp_proposal is not None:
+        if relative_delta_xyz_m is not None:
+            absolute_tcp_pose = _relative_tcp_target_from_snapshot(
+                snapshot=snapshot,
+                side=args.side,
+                delta_xyz_m=relative_delta_xyz_m,
+            )
+        elif camera_grasp_proposal is not None:
             absolute_tcp_pose = resolve_camera_relative_grasp_target(
                 proposal=camera_grasp_proposal,
                 route_manifest=manifest,
@@ -583,6 +650,18 @@ def build_parser() -> argparse.ArgumentParser:
             "absolute path to a typed camera-relative grasp proposal bound to "
             "one real Depth v2 Artifact; mutually exclusive with direct target "
             "coordinates"
+        ),
+    )
+    parser.add_argument(
+        "--relative-delta-xyz-m",
+        type=float,
+        nargs=3,
+        metavar=("DX", "DY", "DZ"),
+        help=(
+            "translation in meters along canonical_station XYZ, resolved from "
+            "the same fresh measured TCP snapshot while preserving its "
+            "orientation; only for --action move_tcp_to_pose and mutually "
+            "exclusive with direct target/proposal inputs"
         ),
     )
     parser.add_argument(
