@@ -57,5 +57,8 @@ class RealTeleopComponents:
     init_arm_controller: InitArmCommandController | None
     position_reference_publisher: PositionReferencePublisher | None
     startup_home_continuity_gate: StartupHomeContinuityGate | None = None
+    # Explicit opt-in: the stable local baseline synchronizes accepted qcmd
+    # position without replacing the retargeter's admitted IK velocity.
+    position_execution_qvel_feedback_enabled: bool = False
 
 __all__ = ["RealTeleopComponents"]

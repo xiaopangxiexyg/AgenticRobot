@@ -5430,7 +5430,10 @@ class RM65ArmBackend(EffectorBackend):
                 self._stream_planner.snapshot()
                 if isinstance(
                     self._stream_planner,
-                    AccelerationLimitedJointTrajectoryPlanner,
+                    (
+                        AccelerationLimitedJointTrajectoryPlanner,
+                        SampleAlignedJerkLimitedJointTrajectoryPlanner,
+                    ),
                 )
                 else None
             ),

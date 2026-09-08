@@ -389,6 +389,9 @@ def _new_actuator_command_trace_recorder(
         "position_command_planner": str(
             getattr(args, "position_command_planner", "")
         ),
+        "position_execution_qvel_feedback_enabled": bool(
+            getattr(args, "position_execution_qvel_feedback", False)
+        ),
         "control_debug_level": str(args.control_debug_config.level),
     }
     return ActuatorCommandTraceRecorder(
@@ -452,6 +455,9 @@ def _new_position_debug_recorder(
                 "position_target_velocity_filter_tau_sec",
                 DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
             )
+        ),
+        "position_execution_qvel_feedback_enabled": bool(
+            getattr(args, "position_execution_qvel_feedback", False)
         ),
         "effective_transport": {
             "position_background_streaming_enabled": bool(

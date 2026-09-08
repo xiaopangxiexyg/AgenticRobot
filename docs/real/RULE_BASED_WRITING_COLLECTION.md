@@ -141,9 +141,11 @@ remain a separate 15 Hz writer concern. The rule launcher intentionally does
 not select the opt-in 60 Hz Sample-Aligned QP profile: that profile
 solves a horizon synchronously at each strictly newer reference and can make
 the outer reference loop contend with the command worker. Coupled IK is
-anchored from one authoritative backend snapshot containing both accepted
-qcmd and its matching planned velocity; a previous qref velocity is never
-combined with a lagging execution position.
+anchored from the accepted qcmd. The stable default retains the previously
+admitted IK velocity; an operator may explicitly enable
+`--position-execution-qvel-feedback` to replace it with qvel from the same
+authoritative planner snapshot. In that mode a qcmd/qvel snapshot mismatch
+fails closed rather than combining states from different execution ticks.
 
 ## Hand topology
 

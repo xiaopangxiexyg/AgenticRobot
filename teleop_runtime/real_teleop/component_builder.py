@@ -2522,6 +2522,9 @@ def build_real_teleop_components(
         init_arm_controller=init_arm_controller,
         position_reference_publisher=position_reference_publisher,
         startup_home_continuity_gate=startup_home_continuity_gate,
+        position_execution_qvel_feedback_enabled=bool(
+            getattr(args, "position_execution_qvel_feedback", False)
+        ),
     )
 
 __all__ = ["build_real_teleop_components"]

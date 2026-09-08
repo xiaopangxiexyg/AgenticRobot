@@ -4777,6 +4777,74 @@ def test_single_step_runtime_sync_preserves_velocity_and_rebases_smoothing() -> 
     assert retargeter._last_output_qpos_smoothing_full_q is None
 
 
+def test_single_step_runtime_sync_can_replace_velocity_from_execution_snapshot() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            joint_acceleration_limit_rad_s2=np.ones(6, dtype=float),
+            admitted_reference_motion_limit_enabled=True,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    accepted_qcmd = np.deg2rad(np.linspace(-4.0, 5.0, 12))
+    execution_velocity = np.linspace(0.3, -0.2, 12)
+    retargeter._last_admitted_velocity_full = np.linspace(-0.8, 0.9, 12)
+
+    retargeter.set_current_qpos_pair(
+        left_qpos=accepted_qcmd[:6],
+        right_qpos=accepted_qcmd[6:],
+        left_qvel=execution_velocity[:6],
+        right_qvel=execution_velocity[6:],
+        reset_tracking=False,
+    )
+
+    np.testing.assert_allclose(
+        retargeter._last_admitted_velocity_full,
+        execution_velocity,
+    )
+    solver_anchor, solver_velocity, _ = (
+        retargeter.ik_solver.admitted_motion_references[-1]
+    )
+    np.testing.assert_allclose(solver_anchor, accepted_qcmd)
+    np.testing.assert_allclose(solver_velocity, execution_velocity)
+
+
+def test_execution_snapshot_velocity_pair_is_validated() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solve_step_mode="single_step_singularity_aware",
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    qpos = np.zeros(6, dtype=float)
+
+    with pytest.raises(ValueError, match="both be provided or both be omitted"):
+        retargeter.set_current_qpos_pair(
+            left_qpos=qpos,
+            right_qpos=qpos,
+            left_qvel=qpos,
+        )
+    with pytest.raises(ValueError, match="expects 6D arm qvel"):
+        retargeter.set_current_qpos_pair(
+            left_qpos=qpos,
+            right_qpos=qpos,
+            left_qvel=np.zeros(5),
+            right_qvel=qpos,
+        )
+    with pytest.raises(ValueError, match="arm qvel must be finite"):
+        retargeter.set_current_qpos_pair(
+            left_qpos=qpos,
+            right_qpos=qpos,
+            left_qvel=np.full(6, np.nan),
+            right_qvel=qpos,
+        )
+
+
 def test_dual_arm_explicit_execution_step_is_fallback_without_velocity_profile() -> None:
     solver = _FakeDualArmSolver()
     explicit_step = np.deg2rad(np.full(6, 0.25, dtype=float))
