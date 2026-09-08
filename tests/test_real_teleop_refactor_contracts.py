@@ -1844,24 +1844,17 @@ def test_episode_recording_runtime_refreshes_external_recorder_slot() -> None:
         frame_count=2,
         episode_dir=None,
     )
-    support = {
-        name: getattr(legacy_entrypoint, name)
-        for name in (
-            "CaptureModalityContract",
-            "DEFAULT_EPISODE_START_COUNTDOWN_SEC",
-            "RealTeleopDatasetRecorder",
-            "_arm_control_mode_arg",
-            "_build_episode_metadata",
-            "_dataset_recording_debug_text",
-            "_episode_root_dir",
-            "_episode_start_countdown_ready_to_record",
-            "_episode_start_countdown_remaining",
-            "_log",
-            "_start_episode_recording",
-            "_stop_episode_recording",
-            "bind_capture_modality_contract",
-        )
-    }
+    assert "support" not in inspect.signature(
+        episode_recording_runtime.build_episode_recording_runtime
+    ).parameters
+    assert (
+        legacy_entrypoint._episode_start_countdown_remaining
+        is episode_recording_runtime._episode_start_countdown_remaining
+    )
+    assert (
+        legacy_entrypoint._episode_start_countdown_ready_to_record
+        is episode_recording_runtime._episode_start_countdown_ready_to_record
+    )
     recording = episode_recording_runtime.build_episode_recording_runtime(
         args=SimpleNamespace(collection_warning_hz=15.0),
         components=SimpleNamespace(),
@@ -1884,7 +1877,6 @@ def test_episode_recording_runtime_refreshes_external_recorder_slot() -> None:
         episode_last_state_provider=lambda: episode_state_slot[0],
         set_episode_last_state=lambda value: episode_state_slot.__setitem__(0, value),
         step_index_provider=lambda: step_slot[0],
-        support=support,
     )
 
     assert recording.recording_active() is False

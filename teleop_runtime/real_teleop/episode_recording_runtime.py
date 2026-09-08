@@ -11,11 +11,52 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dataset_contracts.capture_modalities import (
+    CaptureModalityContract as _CaptureModalityContract,
+)
+from dataset_interface.capture_modalities import (
+    bind_capture_modality_contract as _bind_capture_modality_contract,
+)
+
+from ..log_utils import log_event as _canonical_log
 from .collection_control_plane import (
     CollectionControlOperationBusy,
     CollectionControlOperationResult,
     CollectionControlPlane,
 )
+from .control_profile import arm_control_mode as _canonical_arm_control_mode_arg
+from .dataset_recorder import RealTeleopDatasetRecorder as _RealTeleopDatasetRecorder
+from .episode_runtime import (
+    _build_episode_metadata as _canonical_build_episode_metadata,
+    _episode_root_dir as _canonical_episode_root_dir,
+    _start_episode_recording as _canonical_start_episode_recording,
+    _stop_episode_recording as _canonical_stop_episode_recording,
+)
+from .runtime_debug import (
+    _dataset_recording_debug_text as _canonical_dataset_recording_debug_text,
+)
+
+
+DEFAULT_EPISODE_START_COUNTDOWN_SEC = 3.0
+
+
+def _episode_start_countdown_remaining(now: float, deadline: float | None) -> float:
+    if deadline is None:
+        return 0.0
+    return max(0.0, float(deadline) - float(now))
+
+
+def _episode_start_countdown_ready_to_record(
+    *,
+    now: float,
+    deadline: float | None,
+    warmup_ready: bool,
+) -> bool:
+    return bool(
+        warmup_ready
+        and deadline is not None
+        and _episode_start_countdown_remaining(now, deadline) <= 0.0
+    )
 
 
 @dataclass(frozen=True)
@@ -99,27 +140,19 @@ def build_episode_recording_runtime(
     episode_last_state_provider: Callable[[], str | None],
     set_episode_last_state: Callable[[str | None], None],
     step_index_provider: Callable[[], int],
-    support: Mapping[str, Any],
 ) -> EpisodeRecordingRuntime:
-    CaptureModalityContract = support["CaptureModalityContract"]
-    DEFAULT_EPISODE_START_COUNTDOWN_SEC = support[
-        "DEFAULT_EPISODE_START_COUNTDOWN_SEC"
-    ]
-    RealTeleopDatasetRecorder = support["RealTeleopDatasetRecorder"]
-    _arm_control_mode_arg = support["_arm_control_mode_arg"]
-    _build_episode_metadata = support["_build_episode_metadata"]
-    _dataset_recording_debug_text = support["_dataset_recording_debug_text"]
-    _episode_root_dir = support["_episode_root_dir"]
-    _episode_start_countdown_ready_to_record = support[
-        "_episode_start_countdown_ready_to_record"
-    ]
-    _episode_start_countdown_remaining = support[
-        "_episode_start_countdown_remaining"
-    ]
-    _log = support["_log"]
-    _start_episode_recording = support["_start_episode_recording"]
-    _stop_episode_recording = support["_stop_episode_recording"]
-    bind_capture_modality_contract = support["bind_capture_modality_contract"]
+    # Snapshot the canonical bindings for this runtime instance.  Long-lived
+    # recording sessions should not change dependency sets after construction.
+    CaptureModalityContract = _CaptureModalityContract
+    RealTeleopDatasetRecorder = _RealTeleopDatasetRecorder
+    _arm_control_mode_arg = _canonical_arm_control_mode_arg
+    _build_episode_metadata = _canonical_build_episode_metadata
+    _dataset_recording_debug_text = _canonical_dataset_recording_debug_text
+    _episode_root_dir = _canonical_episode_root_dir
+    _log = _canonical_log
+    _start_episode_recording = _canonical_start_episode_recording
+    _stop_episode_recording = _canonical_stop_episode_recording
+    bind_capture_modality_contract = _bind_capture_modality_contract
 
     def construct_started_dataset_recorder(
         previous: Any | None = None,
