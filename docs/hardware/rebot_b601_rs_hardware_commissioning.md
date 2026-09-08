@@ -723,7 +723,11 @@ J6 方案显式使能六个 arm 关节并锚定各自的使能后当前位置，
 运行；`safe_stop` 失能后负载可能下落，停止过程中仍需保持支撑。下面命令使用
 状态分支和显式 status 打印，不使用会让交接终端提前退出的 `set -euo pipefail`；
 命令由操作者在目标 worktree 中运行，我们不在自动流程中代运行。版本化文档保留
-可移植变量；实际交接时必须替换为当前 Task 的绝对路径，并先核对固定的 commit/tree：
+可移植变量；实际交接时必须替换为当前 Task 的绝对路径，并先核对固定的 commit/tree。
+不要把 `git -C "$WT" rev-parse HEAD 2>/dev/null` 的输出直接拿去比较：路径不存在、目录
+不是 Git worktree、`.git` 不可读时，该写法会隐藏真正错误并把 `ACTUAL_HEAD` 变成空串，
+最终产生没有诊断价值的 `actual=`。统一使用下面的入口检查；它把“路径/仓库无法解析”和
+“已解析但 immutable pin 不匹配”分开报告，任一失败都只跳过探针并保留当前 shell：
 
 硬件探针必须在前台同步运行，以便操作者可立即用 Ctrl+C 或物理急停介入。探针把驱动器
 stdout/stderr 和详细诊断写入 `--log`；未显式给出时，日志默认与 `--output` 同名并使用
@@ -743,6 +747,52 @@ CFG=/path/to/reBotArm_control_py/config/rebotarm_rs.yaml
 SRC=/path/to/reBotArm_control_py
 OUT_DIR=/tmp/b601-rs-commissioning
 LOG="$OUT_DIR/command_and_output.log"
+EXPECTED_HEAD='replace-with-full-reviewed-commit-sha'
+EXPECTED_TREE='replace-with-full-reviewed-tree-sha'
+
+enter_pinned_worktree() {
+  if ! test -d "$WT"; then
+    printf 'ERROR: worktree directory not found: %s\n' "$WT"
+    return 80
+  fi
+
+  ACTUAL_HEAD="$(git -C "$WT" rev-parse --verify HEAD 2>&1)"
+  STATUS=$?
+  if test "$STATUS" -ne 0; then
+    printf 'ERROR: cannot resolve worktree HEAD: path=%s status=%s\n' "$WT" "$STATUS"
+    printf '%s\n' "$ACTUAL_HEAD"
+    return 81
+  fi
+
+  ACTUAL_TREE="$(git -C "$WT" rev-parse --verify 'HEAD^{tree}' 2>&1)"
+  STATUS=$?
+  if test "$STATUS" -ne 0; then
+    printf 'ERROR: cannot resolve worktree tree: path=%s head=%s\n' "$WT" "$ACTUAL_HEAD"
+    printf '%s\n' "$ACTUAL_TREE"
+    return 82
+  fi
+  if test "$ACTUAL_HEAD" != "$EXPECTED_HEAD"; then
+    printf 'ERROR: worktree commit mismatch: expected=%s actual=%s\n' \
+      "$EXPECTED_HEAD" "$ACTUAL_HEAD"
+    return 83
+  fi
+  if test "$ACTUAL_TREE" != "$EXPECTED_TREE"; then
+    printf 'ERROR: worktree tree mismatch: expected=%s actual=%s\n' \
+      "$EXPECTED_TREE" "$ACTUAL_TREE"
+    return 84
+  fi
+
+  SOURCE_STATUS="$(git -C "$WT" status --porcelain=v1 --untracked-files=all)" || return 85
+  if test -n "$SOURCE_STATUS"; then
+    printf '%s\n' 'ERROR: worktree contains source changes'
+    printf '%s\n' "$SOURCE_STATUS"
+    return 86
+  fi
+  cd "$WT" || {
+    printf 'ERROR: cannot enter worktree: %s\n' "$WT"
+    return 87
+  }
+}
 
 run_logged() {
   {
@@ -774,7 +824,7 @@ J1..J6 逐轴读取一份完整合法反馈、`safe_stop`、把 scaled URDF effo
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR/LOG 和 run_logged
 mkdir -p "$OUT_DIR"
-if cd "$WT"; then
+if enter_pinned_worktree; then
   if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" \
       scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode driver-torque-limit-roundtrip \
@@ -792,7 +842,8 @@ if cd "$WT"; then
   printf 'driver-limit roundtrip exit code: %s\n' "$STATUS"
   printf 'command and output log: %s\n' "$LOG"
 else
-  printf '%s\n' 'ERROR: worktree not found'
+  STATUS=$?
+  printf '[B601] preflight status=%s\n' "$STATUS"
 fi
 printf '%s\n' 'shell remains active'
 ```
@@ -811,7 +862,7 @@ J1..J6 力矩。关节位置 Kp 为零；六轴使用统一 Kd 抑制首测下�
 ```bash
 
 mkdir -p "$OUT_DIR"
-if cd "$WT"; then
+if enter_pinned_worktree; then
   if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode pose-hold \
       --config "$CFG" \
@@ -853,7 +904,8 @@ if cd "$WT"; then
   printf 'probe exit code: %s\n' "$STATUS"
   printf 'command and output log: %s\n' "$LOG"
 else
-  printf '%s\n' 'ERROR: worktree not found'
+  STATUS=$?
+  printf '[B601] preflight status=%s\n' "$STATUS"
 fi
 printf '%s\n' 'shell remains active'
 ```
@@ -892,7 +944,7 @@ printf '%s\n' 'shell remains active'
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR/LOG 和 run_logged
 mkdir -p "$OUT_DIR"
-if cd "$WT"; then
+if enter_pinned_worktree; then
   if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" \
       scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode feedback-stability \
@@ -911,7 +963,8 @@ if cd "$WT"; then
   printf 'result: %s\n' "$OUT_DIR/b601_feedback_stability_20s.json"
   printf 'command and output log: %s\n' "$LOG"
 else
-  printf '%s\n' 'ERROR: worktree not found'
+  STATUS=$?
+  printf '[B601] preflight status=%s\n' "$STATUS"
 fi
 printf '%s\n' 'shell remains active'
 ```
@@ -927,7 +980,7 @@ printf '%s\n' 'shell remains active'
 
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR 变量；先确认上一档已停止且 cleanup 完整
-if cd "$WT"; then
+if enter_pinned_worktree; then
   if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode slow-step \
       --config "$CFG" \
@@ -965,7 +1018,8 @@ if cd "$WT"; then
   printf 'probe exit code: %s\n' "$STATUS"
   printf 'command and output log: %s\n' "$LOG"
 else
-  printf '%s\n' 'ERROR: worktree not found'
+  STATUS=$?
+  printf '[B601] preflight status=%s\n' "$STATUS"
 fi
 printf '%s\n' 'shell remains active'
 ```
@@ -1013,7 +1067,7 @@ requested/effective torque 和 `F^T V == tau^T dq` 的 power error。TCP displac
 
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR；先确认 joint hold/slow-step 已完整 cleanup
-if cd "$WT"; then
+if enter_pinned_worktree; then
   if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode cartesian-hold \
       --config "$CFG" \
@@ -1050,7 +1104,8 @@ if cd "$WT"; then
   printf 'probe exit code: %s\n' "$STATUS"
   printf 'command and output log: %s\n' "$LOG"
 else
-  printf '%s\n' 'ERROR: worktree not found'
+  STATUS=$?
+  printf '[B601] preflight status=%s\n' "$STATUS"
 fi
 printf '%s\n' 'shell remains active'
 ```
