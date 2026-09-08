@@ -25,6 +25,7 @@ core = [
 ]
 test = [
     "pytest==9.1.1",
+    "pytest-timeout==2.4.0",
 ]
 dataset = [
     "pandas==2.3.3",

@@ -17,8 +17,22 @@ for argument in "$@"; do
 done
 
 PYTHON_BIN="$(bash "$REPO_ROOT/scripts/resolve_dev_python.sh")"
+PYTEST_TIMEOUT_SECONDS="${DEXTELEOP_PYTEST_TIMEOUT_SECONDS:-120}"
+PYTEST_FAULTHANDLER_TIMEOUT_SECONDS="${DEXTELEOP_PYTEST_FAULTHANDLER_TIMEOUT_SECONDS:-60}"
+
+is_positive_seconds() {
+  local value="$1"
+  [[ "$value" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] &&
+    [[ "$value" =~ [1-9] ]]
+}
+
+is_positive_seconds "$PYTEST_TIMEOUT_SECONDS" || die \
+  "DEXTELEOP_PYTEST_TIMEOUT_SECONDS must be a positive number: $PYTEST_TIMEOUT_SECONDS"
+is_positive_seconds "$PYTEST_FAULTHANDLER_TIMEOUT_SECONDS" || die \
+  "DEXTELEOP_PYTEST_FAULTHANDLER_TIMEOUT_SECONDS must be a positive number: $PYTEST_FAULTHANDLER_TIMEOUT_SECONDS"
+
 "$PYTHON_BIN" -c \
-  'import sys; assert sys.version_info[:2] == (3, 10); import osqp, pytest' \
+  'import sys; assert sys.version_info[:2] == (3, 10); import osqp, pytest, pytest_timeout' \
   || die "'$PYTHON_BIN' is not the complete DexTeleop Python 3.10 test environment"
 
 BASE_TEMP="$(mktemp -d "/tmp/dt-pytest-${UID:-user}-XXXXXX")"
@@ -90,4 +104,10 @@ prepare_asset_compat_link
 cd "$REPO_ROOT"
 export PYTHONNOUSERSITE=1
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
-"$PYTHON_BIN" -m pytest --basetemp="$BASE_TEMP" "$@"
+"$PYTHON_BIN" -m pytest \
+  -p pytest_timeout \
+  --timeout="$PYTEST_TIMEOUT_SECONDS" \
+  --timeout-method=signal \
+  -o "faulthandler_timeout=$PYTEST_FAULTHANDLER_TIMEOUT_SECONDS" \
+  --basetemp="$BASE_TEMP" \
+  "$@"
