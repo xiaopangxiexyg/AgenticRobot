@@ -123,6 +123,42 @@ from .command_filters import (
     _fix_arm_required_effectors_by_side,
 )
 from .components import RealTeleopComponents
+
+
+def _session_sources_for_command_source(
+    *,
+    rule_command_source: bool,
+    vive_source_factory: Callable[[], object],
+    keyboard_source: object,
+    hand_source: object | None,
+    angle_trigger_source: object | None,
+) -> list[object]:
+    """Assemble source production without opening an unused VIVE source."""
+
+    sources: list[object] = [keyboard_source]
+    if not rule_command_source:
+        sources.insert(0, vive_source_factory())
+    if hand_source is not None:
+        sources.append(hand_source)
+    if angle_trigger_source is not None:
+        sources.append(angle_trigger_source)
+    return sources
+
+
+def _hand_control_via_session_rig(
+    *,
+    rule_command_source: bool,
+    backend_mode: str,
+    backend: object | None,
+    inspire_retargeter: object | None,
+) -> bool:
+    """Return whether one hand backend belongs to the authoritative Rig."""
+
+    if backend is None:
+        return False
+    if inspire_retargeter is not None:
+        return True
+    return bool(rule_command_source and backend_mode == HAND_BACKEND_DMTAC_GRIPPER)
 from .startup_home_continuity import (
     StartupHomeContinuityConfig,
     StartupHomeContinuityGate,
@@ -249,6 +285,9 @@ def build_real_teleop_components(
     _resolve_movement_multiple_args(args)
     debug_timing_modules = _debug_timing_modules(args)
     active_sides = _active_sides_from_args(args)
+    rule_command_source = bool(
+        getattr(args, "_real_teleop_rule_command_source", False)
+    )
     arm_control_mode = _arm_control_mode_arg(args)
     impedance_mode = _impedance_mode_arg(args)
     strict_tool_profile = _strict_tool_profile_arg(args)
@@ -1628,8 +1667,12 @@ def build_real_teleop_components(
     left_hand_backend = hand_backends_by_side.get("left")
     right_hand_backend = hand_backends_by_side.get("right")
 
-    session_sources = [
-        VivePoseSource(
+    session_sources = _session_sources_for_command_source(
+        rule_command_source=rule_command_source,
+        keyboard_source=keyboard_source,
+        hand_source=hand_source,
+        angle_trigger_source=angle_trigger_source,
+        vive_source_factory=lambda: VivePoseSource(
             tracker_configs=tracker_configs,
             host=args.host,
             port=args.port,
@@ -1654,12 +1697,7 @@ def build_real_teleop_components(
                 or None
             ),
         ),
-        keyboard_source,
-    ]
-    if hand_source is not None:
-        session_sources.append(hand_source)
-    if angle_trigger_source is not None:
-        session_sources.append(angle_trigger_source)
+    )
 
     arm_urdf_path = require_asset_path("rm65_arm.urdf")
     side_assignments = _resolve_logical_side_assignments(args)
@@ -2018,8 +2056,18 @@ def build_real_teleop_components(
         if command_backend is None or state_backend is None:
             raise RuntimeError(f"Failed to resolve logical {side} arm assignment.")
 
-    left_hand_control_via_rig = left_hand_retargeter is not None and left_hand_backend is not None
-    right_hand_control_via_rig = right_hand_retargeter is not None and right_hand_backend is not None
+    left_hand_control_via_rig = _hand_control_via_session_rig(
+        rule_command_source=rule_command_source,
+        backend_mode=hand_backend_mode_by_side.get("left", HAND_BACKEND_NONE),
+        backend=left_hand_backend,
+        inspire_retargeter=left_hand_retargeter,
+    )
+    right_hand_control_via_rig = _hand_control_via_session_rig(
+        rule_command_source=rule_command_source,
+        backend_mode=hand_backend_mode_by_side.get("right", HAND_BACKEND_NONE),
+        backend=right_hand_backend,
+        inspire_retargeter=right_hand_retargeter,
+    )
     fix_arm_controller = None
     if bool(getattr(args, "fix_arm", False)):
         if set(active_sides) != {"left", "right"}:
@@ -2089,6 +2137,9 @@ def build_real_teleop_components(
         parallel_dispatch=arm_io_threads > 1,
         parallel_workers=max(arm_io_threads, len(rig_backends)),
         fail_stop_on_dispatch_error=arm_control_mode == "position",
+        allow_partial_start=(
+            str(getattr(args, "hardware_admission_mode", "strict")) == "capability"
+        ),
     )
     session_record_enabled = _session_recording_enabled(args)
     session_record_root = _session_record_root_dir(args) if session_record_enabled else None
@@ -2194,13 +2245,17 @@ def build_real_teleop_components(
 
     session = TeleopSession(
         config=TeleopSessionConfig(
-            mode="vive_rm65_real_teleop",
+            mode=(
+                "rule_based_rm65_real_collection"
+                if rule_command_source
+                else "vive_rm65_real_teleop"
+            ),
             tcp_mode=args.tcp_mode,
             record_enabled=session_record_enabled,
             auto_recovery_enabled=True,
             recovery_healthy_frame_count=max(1, int(args.recovery_healthy_frames)),
             hold_motion_on_freeze=True,
-            tracker_loss_hold_enabled=True,
+            tracker_loss_hold_enabled=not rule_command_source,
             tracker_auto_hold_sec=float(getattr(args, "tracker_auto_hold_sec", 0.10)),
             tracker_manual_hold_sec=float(getattr(args, "tracker_manual_hold_sec", 1.0)),
             non_freezing_fault_codes=("low_control_rate",),
@@ -2212,7 +2267,11 @@ def build_real_teleop_components(
         recorder=session_recorder,
         safety_config=TeleopSafetyConfig(
             freeze_on_fault=True,
-            required_channels=tuple(f"{side}_wrist_pose" for side in active_sides),
+            required_channels=(
+                ()
+                if rule_command_source
+                else tuple(f"{side}_wrist_pose" for side in active_sides)
+            ),
             max_translation_jump_m=float(
                 getattr(
                     args,

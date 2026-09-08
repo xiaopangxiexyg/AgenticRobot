@@ -22,6 +22,8 @@ from portable_dmtac_gripper.gripper_driver import (  # noqa: E402
     GripperError,
     InspireGripper,
     InspireGripperModbus,
+    decode_gripper_error_code,
+    describe_gripper_error_code,
 )
 
 
@@ -155,6 +157,88 @@ class DMTacGripperDriverTest(unittest.TestCase):
         self.assertEqual(InspireGripper._decode_opening_register(0xFFFE), 0)
         self.assertEqual(InspireGripper._decode_opening_register(0), 0)
         self.assertEqual(InspireGripper._decode_opening_register(1000), 1000)
+
+    def test_error_code_16_is_named_without_masking_unknown_bits(self) -> None:
+        self.assertEqual(
+            decode_gripper_error_code(16),
+            ("internal_communication_fault",),
+        )
+        self.assertEqual(
+            decode_gripper_error_code(17),
+            ("internal_communication_fault", "unknown_error_bit_0x0001"),
+        )
+        self.assertEqual(
+            describe_gripper_error_code(16),
+            "0x0010(internal_communication_fault)",
+        )
+
+    def test_clear_fault_and_confirm_waits_for_fresh_zero(self) -> None:
+        class _ConfirmingGripper(InspireGripper):
+            def __init__(self) -> None:
+                self.errors = [16, 16, 0, 0, 0]
+                self.clear_calls = 0
+
+            def clear_fault(self) -> None:
+                self.clear_calls += 1
+
+            def get_state(self):  # noqa: ANN201
+                error = self.errors.pop(0)
+                return type(
+                    "State",
+                    (),
+                    {
+                        "error_code": error,
+                        "status_code": 2,
+                        "status_text": "closed idle",
+                    },
+                )()
+
+        gripper = _ConfirmingGripper()
+
+        state = gripper.clear_fault_and_confirm(
+            timeout=0.1,
+            poll_interval=0.001,
+            ack_interval=1.0,
+        )
+
+        self.assertEqual(state.error_code, 0)
+        self.assertEqual(gripper.clear_calls, 1)
+
+    def test_clear_fault_and_confirm_rejects_transient_zero(self) -> None:
+        class _OscillatingGripper(InspireGripper):
+            def __init__(self) -> None:
+                self.errors = iter((16, 0, 16, 0, 16, 16))
+                self.clear_calls = 0
+
+            def clear_fault(self) -> None:
+                self.clear_calls += 1
+
+            def get_state(self):  # noqa: ANN201
+                error = next(self.errors, 16)
+                return type(
+                    "State",
+                    (),
+                    {
+                        "error_code": error,
+                        "status_code": 2,
+                        "status_text": "closed idle",
+                    },
+                )()
+
+        clock = _FakeClock()
+        patched_clock = self._patch_clock(clock)
+        try:
+            with self.assertRaisesRegex(
+                GripperError,
+                r"zero_streak=0/3",
+            ):
+                _OscillatingGripper().clear_fault_and_confirm(
+                    timeout=0.006,
+                    poll_interval=0.001,
+                    ack_interval=1.0,
+                )
+        finally:
+            self._restore_clock(patched_clock)
 
     def test_modbus_requests_process_exclusive_serial_ownership(self) -> None:
         old_serial = gripper_driver.serial.Serial

@@ -53,7 +53,7 @@ class RealTeleopPoseFrameActionResolver:
         self.delegate = RobotActionResolver()
 
     def resolve(self, action: RobotAction, **_: object):
-        projected = self._project_pose(action)
+        projected = self.project_action(action)
         command = self.delegate.resolve(projected)
         command.metadata.update(
             {
@@ -68,7 +68,9 @@ class RealTeleopPoseFrameActionResolver:
         )
         return command
 
-    def _project_pose(self, action: RobotAction) -> RobotAction:
+    def project_action(self, action: RobotAction) -> RobotAction:
+        """Project an action into runtime arm-base frames without resolving it."""
+
         if not action.arm_pose_by_side:
             return action
         frames = {side: action.arm_frame(side) for side in action.arm_pose_by_side}
@@ -110,6 +112,11 @@ class RealTeleopPoseFrameActionResolver:
                 f"or explicit per-side arm base frames; got {frames}."
             )
         return action
+
+    def _project_pose(self, action: RobotAction) -> RobotAction:
+        """Compatibility alias for callers predating :meth:`project_action`."""
+
+        return self.project_action(action)
 
 
 __all__ = [

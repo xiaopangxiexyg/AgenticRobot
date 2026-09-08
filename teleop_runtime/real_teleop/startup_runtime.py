@@ -15,7 +15,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from robot_motion.runtime import EffectorCommand, TeleopCommand
+from robot_motion.runtime import (
+    EffectorCommand,
+    TeleopCommand,
+    format_readiness_report,
+    readiness_report_blockers,
+)
 
 from ..collection.camera_preview import CameraPreviewer
 from ..log_utils import ChangeGate
@@ -27,6 +32,7 @@ from .camera_runtime import (
     CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC,
     CameraStartupFreshnessGate,
 )
+from .runtime_extension import runtime_extension_refresh_status
 
 if TYPE_CHECKING:
     from ..operator_ui_ports import OperatorUiPort
@@ -852,6 +858,9 @@ def _arm_after_start_calibration(
     position_force_guard_monitor: object | None = None,
     runtime_home_qpos_snapshot: Mapping[str, np.ndarray] | None = None,
     runtime_home_capture_sides: tuple[str, ...] | None = None,
+    startup_device_errors: dict[str, str] | None = None,
+    publish_runtime_hardware_status: Callable[[], None] | None = None,
+    runtime_extension: object | None = None,
 ) -> bool:
     """Try to admit real-arm control after Home and report the outcome.
 
@@ -864,6 +873,75 @@ def _arm_after_start_calibration(
     """
     arm_after_start = time.perf_counter()
     reset_elapsed_ms = 0.0
+    fix_arm_controller = getattr(components, "fix_arm_controller", None)
+    if home_captured and fix_arm_controller is not None:
+        invalidate_runtime_home_snapshot = getattr(
+            fix_arm_controller,
+            "invalidate_runtime_home_arm_snapshot",
+            None,
+        )
+        if callable(invalidate_runtime_home_snapshot):
+            invalidate_runtime_home_snapshot()
+
+    def record_rig_readiness_failure(fallback_error: BaseException) -> str:
+        """Project a dynamic Rig failure into startup diagnostics."""
+
+        rig = getattr(getattr(components, "session", None), "rig", None)
+        report_fn = getattr(rig, "readiness_report", None)
+        report: Mapping[str, object] | None = None
+        if callable(report_fn):
+            try:
+                candidate = report_fn()
+            except Exception as exc:  # noqa: BLE001 - retain admission failure.
+                _log(
+                    "Calibration",
+                    "Rig readiness report failed after arm admission rejection: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                if isinstance(candidate, Mapping):
+                    report = candidate
+
+        blockers = readiness_report_blockers(report or {})
+        if report is None and "rig is not ready" not in str(fallback_error).lower():
+            return (
+                "runtime Home 已完成但机械臂未通过 Session arm admission，保持停臂："
+                f"{type(fallback_error).__name__}: {fallback_error}"
+            )
+        if startup_device_errors is not None:
+            for effector, reason in blockers.items():
+                if effector in {"left_arm", "right_arm"}:
+                    key = f"arm.{effector.split('_', 1)[0]}.qpos"
+                elif effector in {"left_hand", "right_hand"}:
+                    key = f"hand.{effector.split('_', 1)[0]}"
+                else:
+                    key = f"rig.{effector}"
+                startup_device_errors[key] = f"{effector}: {reason}"
+            startup_device_errors["rig.session"] = (
+                f"Rig is not ready: {format_readiness_report(report or {})}"
+                if blockers
+                else f"{type(fallback_error).__name__}: {fallback_error}"
+            )
+            if callable(publish_runtime_hardware_status):
+                try:
+                    publish_runtime_hardware_status()
+                except Exception as exc:  # noqa: BLE001 - UI is observational.
+                    _log(
+                        "WebGUI",
+                        "dynamic Rig readiness status publish failed; preserving Hold: "
+                        f"{type(exc).__name__}: {exc}",
+                    )
+
+        if blockers:
+            return (
+                "runtime Home 已完成但机械臂未通过 Session arm admission，保持停臂："
+                f"{type(fallback_error).__name__}: {fallback_error}; "
+                f"Rig readiness: {format_readiness_report(report or {})}"
+            )
+        return (
+            "runtime Home 已完成但机械臂未通过 Session arm admission，保持停臂："
+            f"{type(fallback_error).__name__}: {fallback_error}"
+        )
 
     def reject_arm_admission(tag: str, message: str) -> bool:
         """Keep motion blocked when a post-Home admission step fails."""
@@ -896,6 +974,14 @@ def _arm_after_start_calibration(
                     "arm-admission Session Hold returned without a positive receipt; "
                     "application remains in calibration waiting",
                 )
+        try:
+            runtime_extension_refresh_status(runtime_extension, force=True)
+        except Exception as refresh_exc:  # noqa: BLE001 - preserve Hold safety.
+            _log(
+                tag,
+                "arm-admission failure status refresh failed; preserving Hold: "
+                f"{type(refresh_exc).__name__}: {refresh_exc}",
+            )
         return False
 
     if home_captured:
@@ -1097,16 +1183,57 @@ def _arm_after_start_calibration(
             f"{type(exc).__name__}: {exc}",
         )
     force_control_elapsed_ms = (time.perf_counter() - force_control_start) * 1000.0
+    if (
+        home_captured
+        and fix_arm_controller is not None
+        and runtime_home_qpos_snapshot is not None
+    ):
+        bind_runtime_home_snapshot = getattr(
+            fix_arm_controller,
+            "bind_runtime_home_arm_snapshot",
+            None,
+        )
+        if callable(bind_runtime_home_snapshot) and reference_epoch is not None:
+            try:
+                bind_runtime_home_snapshot(
+                    runtime_home_qpos_snapshot,
+                    epoch=reference_epoch,
+                )
+            except Exception as exc:  # noqa: BLE001 - stale Fix seed fails closed.
+                return reject_arm_admission(
+                    "FixArm",
+                    "runtime Home 固定臂快照绑定失败，保持停臂："
+                    f"{type(exc).__name__}: {exc}",
+                )
+            _log(
+                "FixArm",
+                "cached command-inert arm-only runtime Home snapshot "
+                f"epoch={reference_epoch} sides={list(runtime_home_qpos_snapshot)}",
+            )
+        elif callable(bind_runtime_home_snapshot):
+            _log(
+                "FixArm",
+                "runtime Home has no position-reference epoch; skipped optional "
+                "pre-Episode arm-only snapshot cache",
+            )
     arm_hardware_start = time.perf_counter()
     try:
         components.session.arm_hardware()
     except Exception as exc:  # noqa: BLE001 - rig/Session admission is recoverable Hold.
         return reject_arm_admission(
             "Calibration",
-            "runtime Home 已完成但机械臂未通过 Session arm admission，保持停臂："
-            f"{type(exc).__name__}: {exc}",
+            record_rig_readiness_failure(exc),
         )
     arm_hardware_elapsed_ms = (time.perf_counter() - arm_hardware_start) * 1000.0
+    if callable(publish_runtime_hardware_status):
+        try:
+            publish_runtime_hardware_status()
+        except Exception as exc:  # noqa: BLE001 - status is observational only.
+            _log(
+                "WebGUI",
+                "post-arm hardware-status refresh failed; preserving admitted "
+                f"Session state: {type(exc).__name__}: {exc}",
+            )
     publish_start = time.perf_counter()
     try:
         clutch_input.publish_teleop_running(

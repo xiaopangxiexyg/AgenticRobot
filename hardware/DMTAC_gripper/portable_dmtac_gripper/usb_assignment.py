@@ -11,7 +11,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 from portable_dm_tac import discover_device_candidates, discover_devices
 
-from .gripper_driver import InspireGripper, list_serial_devices
+from .gripper_driver import (
+    InspireGripper,
+    decode_gripper_error_code,
+    describe_gripper_error_code,
+    list_serial_devices,
+)
 
 
 SCHEMA_VERSION = "dmtac_usb_assignment.v1"
@@ -21,6 +26,10 @@ DEFAULT_GRIPPER_MOTION_AMPLITUDE = 0.3
 DEFAULT_GRIPPER_TEST_SPEED = 0.1
 DEFAULT_GRIPPER_TEST_TORQUE = 0.1
 DEFAULT_GRIPPER_MAX_ACTION = 1.0
+# ``timeout`` in the assignment remains the short USB-probe budget.  Runtime
+# command/state exchanges use this separate value so a successful preflight
+# cannot be invalidated by an overly aggressive startup read timeout.
+DEFAULT_GRIPPER_RUNTIME_TIMEOUT = 0.10
 LATEST_CONFIG_NAME = "latest.json"
 DEFAULT_GRIPPER_ID_SCAN_HINTS = (32, 46)
 DEFAULT_GRIPPER_BAUDRATE_SCAN_ORDER = (115200, 57600, 19200)
@@ -544,10 +553,34 @@ def _probe_gripper(
                 gripper_ctx = InspireGripper(**gripper_kwargs)
             with gripper_ctx as gripper:
                 state = gripper.get_state()
+            state_payload = state.to_dict()
+            error_code_raw = state_payload.get("error_code")
+            error_code = None if error_code_raw is None else int(error_code_raw)
+            healthy = error_code == 0 if error_code is not None else None
             result = {
                 "reachable": True,
+                "healthy": healthy,
+                "faulted": healthy is False,
+                "health": (
+                    "healthy"
+                    if healthy is True
+                    else "faulted"
+                    if healthy is False
+                    else "unknown"
+                ),
                 "probe_elapsed_s": round(time.time() - started_at, 6),
-                "state": state.to_dict(),
+                "state": state_payload,
+                "error_code": error_code,
+                "error_names": (
+                    []
+                    if error_code is None
+                    else list(decode_gripper_error_code(error_code))
+                ),
+                "error_description": (
+                    None
+                    if error_code is None
+                    else describe_gripper_error_code(error_code)
+                ),
                 "error": None,
                 "requested_gripper_id": requested_id,
                 "requested_baudrate": requested_baudrate,
@@ -647,6 +680,8 @@ def scan_usb_devices(
     scan_gripper_ids: bool = True,
     scan_baudrates: Sequence[int] | None = None,
     max_reachable_grippers: int | None = DEFAULT_MAX_REACHABLE_GRIPPERS,
+    preferred_gripper_ports: Sequence[str] | None = None,
+    preferred_gripper_settings: Sequence[Mapping[str, Any]] | None = None,
     progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     reachable_limit = (
@@ -680,7 +715,109 @@ def scan_usb_devices(
         port["probe"] = None
         serial_ports.append(port)
 
-    probe_ports = [port for port in serial_ports if bool(port.get("probe_attempted")) and port.get("port")]
+    # A number of CH340 adapters expose the same generic ``by-id`` symlink
+    # when they have no real USB serial number.  Such a symlink can move from
+    # one ttyUSB device to another after re-enumeration and must not promote an
+    # unrelated adapter ahead of the configured tty/by-path endpoint.
+    normalized_preferred_settings: list[tuple[set[str], int, int]] = []
+    for setting in preferred_gripper_settings or ():
+        primary = str(setting.get("port") or "").strip()
+        raw_aliases = [
+            primary,
+            *(str(alias).strip() for alias in setting.get("port_aliases") or ()),
+        ]
+        setting_identity = (
+            setting.get("identity")
+            if isinstance(setting.get("identity"), Mapping)
+            else setting
+        )
+        aliases = set(
+            _stable_gripper_aliases(
+                [alias for alias in raw_aliases if alias],
+                setting_identity,
+            )
+        )
+        if primary and not _is_unstable_gripper_by_id(primary, setting_identity):
+            aliases.add(primary)
+        if not aliases:
+            continue
+        normalized_preferred_settings.append(
+            (
+                aliases,
+                int(setting.get("gripper_id", gripper_id) or gripper_id),
+                int(setting.get("baudrate", baudrate) or baudrate),
+            )
+        )
+
+    preferred_paths = set(
+        _stable_gripper_aliases(
+            [
+                str(path).strip()
+                for path in (preferred_gripper_ports or ())
+                if str(path).strip()
+            ]
+        )
+    )
+    for aliases, _setting_id, _setting_baudrate in normalized_preferred_settings:
+        preferred_paths.update(aliases)
+
+    def _probe_aliases(port: Mapping[str, Any]) -> set[str]:
+        return set(
+            _stable_gripper_aliases(
+                [
+                    str(value).strip()
+                    for value in (
+                        port.get("port"),
+                        port.get("preferred_port"),
+                        *(port.get("port_aliases") or ()),
+                    )
+                    if str(value or "").strip()
+                ],
+                port,
+            )
+        )
+
+    def _matched_preferred_setting(port: Mapping[str, Any]) -> tuple[int, int] | None:
+        aliases = _probe_aliases(port)
+        for setting_aliases, setting_id, setting_baudrate in normalized_preferred_settings:
+            if setting_aliases.intersection(aliases):
+                return int(setting_id), int(setting_baudrate)
+        return None
+
+    def _probe_priority(port: Mapping[str, Any]) -> int:
+        aliases = _probe_aliases(port)
+        for index, (setting_aliases, _setting_id, _setting_baudrate) in enumerate(
+            normalized_preferred_settings
+        ):
+            if setting_aliases.intersection(aliases):
+                return index
+        return (
+            len(normalized_preferred_settings)
+            if preferred_paths.intersection(aliases)
+            else len(normalized_preferred_settings) + 1
+        )
+
+    # Explicit/configured endpoints are authoritative probe candidates even
+    # when a vendor driver exposes an unhelpful description that does not
+    # satisfy the serial-adapter heuristic.  Keep the existing exclusions for
+    # system ttys and known Q6 adapters so a mistaken gripper override cannot
+    # broaden probing onto those devices.
+    for port in serial_ports:
+        if (
+            probe_grippers
+            and preferred_paths.intersection(_probe_aliases(port))
+            and not bool(port.get("system_tty"))
+            and not bool(port.get("known_q6_serial"))
+        ):
+            port["probe_attempted"] = True
+            port["probe_skipped_reason"] = None
+
+    probe_ports = [
+        port
+        for port in serial_ports
+        if bool(port.get("probe_attempted")) and port.get("port")
+    ]
+    probe_ports.sort(key=_probe_priority)
     _emit_scan_progress(
         progress_callback,
         {
@@ -694,10 +831,15 @@ def scan_usb_devices(
     probe_index = 0
     reachable_count = 0
     stopped_early = False
-    for serial_index, port in enumerate(serial_ports):
-        should_probe = bool(port.get("probe_attempted") and port.get("port"))
-        if should_probe and port["port"]:
-            probe_index += 1
+    for probe_index, port in enumerate(probe_ports, start=1):
+        if port["port"]:
+            matched_setting = _matched_preferred_setting(port)
+            probe_gripper_id = (
+                int(gripper_id) if matched_setting is None else int(matched_setting[0])
+            )
+            probe_baudrate = (
+                int(baudrate) if matched_setting is None else int(matched_setting[1])
+            )
             _emit_scan_progress(
                 progress_callback,
                 {
@@ -710,13 +852,15 @@ def scan_usb_devices(
                     "product": str(port.get("product") or ""),
                     "hwid": str(port.get("hwid") or ""),
                     "scan_gripper_ids": bool(scan_gripper_ids),
+                    "gripper_id": int(probe_gripper_id),
+                    "baudrate": int(probe_baudrate),
                     "probe_all_serial": bool(probe_all_serial),
                 },
             )
             port["probe"] = _probe_gripper(
                 port["port"],
-                gripper_id=int(gripper_id),
-                baudrate=int(baudrate),
+                gripper_id=int(probe_gripper_id),
+                baudrate=int(probe_baudrate),
                 timeout=float(timeout),
                 scan_ids=bool(scan_gripper_ids),
                 scan_baudrates=scan_baudrates,
@@ -740,6 +884,11 @@ def scan_usb_devices(
                     "port": str(port.get("port") or ""),
                     "preferred_port": str(port.get("preferred_port") or ""),
                     "reachable": bool(probe.get("reachable")),
+                    "healthy": probe.get("healthy"),
+                    "faulted": bool(probe.get("faulted")),
+                    "error_code": probe.get("error_code"),
+                    "error_description": probe.get("error_description"),
+                    "state": probe.get("state"),
                     "error": probe.get("error"),
                     "probe_elapsed_s": probe.get("probe_elapsed_s"),
                     "attempted_setting_count": probe.get("attempted_setting_count"),
@@ -749,7 +898,7 @@ def scan_usb_devices(
                 reachable_count += 1
             if reachable_limit > 0 and reachable_count >= reachable_limit:
                 skipped = 0
-                for remaining in serial_ports[serial_index + 1 :]:
+                for remaining in probe_ports[probe_index:]:
                     if bool(remaining.get("probe_attempted") and remaining.get("port")):
                         remaining["probe_attempted"] = False
                         remaining["probe_skipped_reason"] = "reachable_gripper_limit"
@@ -851,6 +1000,8 @@ def _normalize_gripper_assignment(value: Any) -> dict[str, Any] | None:
     out["gripper_id"] = int(out.get("gripper_id", 1))
     out["baudrate"] = int(out.get("baudrate", 115200))
     out["timeout"] = float(out.get("timeout", 0.03))
+    if out.get("runtime_timeout") not in (None, ""):
+        out["runtime_timeout"] = float(out["runtime_timeout"])
     out["identity"] = dict(out.get("identity") or {})
     return out
 
@@ -947,6 +1098,7 @@ def _gripper_assignment_from_scan(item: Mapping[str, Any] | None) -> dict[str, A
         "gripper_id": int(detected_gripper_id),
         "baudrate": int(detected_baudrate),
         "timeout": 0.03,
+        "runtime_timeout": DEFAULT_GRIPPER_RUNTIME_TIMEOUT,
         "identity": identity,
         "port_aliases": list(item.get("port_aliases") or ()),
         "probe": copy.deepcopy(probe),

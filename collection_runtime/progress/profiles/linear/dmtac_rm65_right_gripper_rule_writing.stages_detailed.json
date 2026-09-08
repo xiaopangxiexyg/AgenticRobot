@@ -1,0 +1,32 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "dmtac_rm65_right_gripper_rule_writing_stages",
+  "profile_version": "2",
+  "task_progress_profile_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.pen_down",
+      "display_name": "靠近纸面（Replay）",
+      "description": "双臂与右夹爪平滑复现到书写起点并完成落笔。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.write",
+      "display_name": "书写（Rule-based）",
+      "description": "右臂持笔执行所选规则轨迹，左臂保持不动。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.pen_up",
+      "display_name": "离开纸面（Relative replay）",
+      "description": "以规则书写终点为边界相对复现提笔轨迹。",
+      "ordinal": 3
+    }
+  ]
+}

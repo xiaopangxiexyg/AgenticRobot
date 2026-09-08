@@ -7,6 +7,7 @@ from .contracts import (
     ObservationChannel,
     TeleopCommand,
     TeleopObservation,
+    command_effector_kind_subset,
     copy_runtime_value,
     latest_channel_timestamp,
     merge_teleop_commands,
@@ -22,6 +23,7 @@ from .lifecycle import (
     run_best_effort_cleanup,
 )
 from .rig import BimanualRig, CompositeRig
+from .readiness import format_readiness_report, readiness_report_blockers
 from .causal_history import CausalSnapshotHistory, CausalSnapshotSelection
 from .observation_cut import (
     ObservationBundle,
@@ -193,6 +195,7 @@ __all__ = [
     "PermittedDispatchResult",
     "TeleopCommand",
     "TeleopObservation",
+    "command_effector_kind_subset",
     "collect_lifecycle_failures",
     "acknowledge_worker_epoch_drain",
     "aggregate_worker_epoch_drains",
@@ -201,10 +204,12 @@ __all__ = [
     "bind_current_thread_to_cpu",
     "cpu_thread_sibling_ids",
     "exclude_cpu_ids_from_current_process",
+    "format_readiness_report",
     "copy_runtime_value",
     "latest_channel_timestamp",
     "merge_teleop_commands",
     "is_legal_epoch_transition",
     "raise_lifecycle_failures",
+    "readiness_report_blockers",
     "run_best_effort_cleanup",
 ]

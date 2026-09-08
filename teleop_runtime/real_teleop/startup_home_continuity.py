@@ -196,6 +196,33 @@ class StartupHomeContinuityGate:
         if not self._armed or self._released:
             return True
 
+        # Idle application controls such as a dedicated gripper reset do not
+        # move either arm and therefore cannot invalidate Home-to-arm-qref
+        # continuity.  They still pass through this admission callback so the
+        # Session does not need a second dispatch path, but must carry an
+        # explicit non-motion marker; an unmarked arm-less command remains a
+        # fail-closed missing-qref error.
+        command_effectors = set(command.commands)
+        arm_effectors = {f"{side}_arm" for side in self.config.active_sides}
+        if not command_effectors & arm_effectors:
+            if command_effectors and all(
+                name in {"left_hand", "right_hand"} for name in command_effectors
+            ) and bool(command.metadata.get("external_non_motion", False)):
+                payload = self._base_payload(
+                    status="non_motion_passthrough",
+                    dispatch_allowed=True,
+                )
+                payload["effectors"] = sorted(command_effectors)
+                self._last_evaluation = payload
+                command.metadata["startup_home_continuity"] = dict(payload)
+                command.metadata["dataset_recording_eligible"] = False
+                return True
+            return self._reject(
+                command,
+                status="missing_arm_qref",
+                reason="final command is missing an active arm qref",
+            )
+
         metrics_by_side: dict[str, dict[str, float]] = {}
         try:
             for side in self.config.active_sides:

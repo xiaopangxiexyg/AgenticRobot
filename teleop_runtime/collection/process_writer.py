@@ -9,12 +9,15 @@ control process GIL.
 from __future__ import annotations
 
 import multiprocessing as mp
+import math
 import os
 import queue
 import sys
+import threading
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from multiprocessing.reduction import ForkingPickler
 from collections import deque
 from dataclasses import dataclass, replace
@@ -39,7 +42,10 @@ from robot_motion.runtime.observation_cut import ObservationSampleRef
 
 from collection_runtime.sample_acceptance import (
     AcceptedSampleReceipt,
+    DEFAULT_SAMPLE_TERMINAL_EVENT_CAPACITY,
     SampleAcceptanceReceiptBuffer,
+    SampleTerminalEvent,
+    SampleTerminalEventBuffer,
 )
 from .sample_assembler import (
     CollectorSampleBuilder,
@@ -83,6 +89,15 @@ class ProcessCollectionConfig:
     worker_nice: int = 5
     native_inline_message_max_bytes: int = 256 * 1024
     sample_acceptance_receipt_capacity: int = 0
+    # Terminal outcomes are consumed by the realtime owner even when the
+    # optional progress GUI/receipt stream is disabled.  Keep this separate
+    # from the opt-in accepted-receipt capacity so fatal/rejected outcomes are
+    # never silently dropped in a headless or rule-based run.
+    sample_terminal_event_capacity: int = DEFAULT_SAMPLE_TERMINAL_EVENT_CAPACITY
+    # Child terminal messages must never wait indefinitely for a parent that
+    # stopped draining acknowledgements.  A bounded failure lets the parent
+    # observe worker death and keep the robot-control process responsive.
+    terminal_event_put_timeout_sec: float = 0.5
 
     def __post_init__(self) -> None:
         if int(self.queue_size) <= 0:
@@ -91,9 +106,13 @@ class ProcessCollectionConfig:
             raise ValueError("shared_slot_count must be positive.")
         if int(self.shared_slot_bytes) <= 0:
             raise ValueError("shared_slot_bytes must be positive.")
-        if float(self.startup_timeout_sec) <= 0.0:
+        if not math.isfinite(float(self.startup_timeout_sec)) or float(
+            self.startup_timeout_sec
+        ) <= 0.0:
             raise ValueError("startup_timeout_sec must be positive.")
-        if float(self.request_timeout_sec) <= 0.0:
+        if not math.isfinite(float(self.request_timeout_sec)) or float(
+            self.request_timeout_sec
+        ) <= 0.0:
             raise ValueError("request_timeout_sec must be positive.")
         if int(self.native_inline_message_max_bytes) <= 0:
             raise ValueError("native_inline_message_max_bytes must be positive.")
@@ -101,6 +120,14 @@ class ProcessCollectionConfig:
             raise ValueError(
                 "sample_acceptance_receipt_capacity must be non-negative."
             )
+        if int(self.sample_terminal_event_capacity) < 0:
+            raise ValueError(
+                "sample_terminal_event_capacity must be non-negative."
+            )
+        if not math.isfinite(float(self.terminal_event_put_timeout_sec)) or float(
+            self.terminal_event_put_timeout_sec
+        ) <= 0.0:
+            raise ValueError("terminal_event_put_timeout_sec must be positive.")
 
 
 @dataclass(frozen=True)
@@ -406,24 +433,39 @@ class _SharedSlotPool:
         self.available: deque[int] = deque(range(len(self.blocks)))
         self.in_use: set[int] = set()
         self.closed = False
+        self._lock = threading.RLock()
 
     @property
     def names(self) -> tuple[str, ...]:
-        return tuple(block.name for block in self.blocks)
+        with self._lock:
+            return tuple(block.name for block in self.blocks)
+
+    @property
+    def available_count(self) -> int:
+        with self._lock:
+            return len(self.available)
+
+    @property
+    def slot_count(self) -> int:
+        with self._lock:
+            return len(self.blocks)
 
     def acquire(self) -> int | None:
-        if not self.available:
-            return None
-        slot_id = int(self.available.popleft())
-        self.in_use.add(slot_id)
-        return slot_id
+        with self._lock:
+            if self.closed or not self.available:
+                return None
+            slot_id = int(self.available.popleft())
+            self.in_use.add(slot_id)
+            return slot_id
 
     def release(self, slot_id: int) -> None:
-        slot = int(slot_id)
-        if slot not in self.in_use:
-            return
-        self.in_use.remove(slot)
-        self.available.append(slot)
+        with self._lock:
+            slot = int(slot_id)
+            if slot not in self.in_use:
+                return
+            self.in_use.remove(slot)
+            if not self.closed:
+                self.available.append(slot)
 
     def pack_snapshot(
         self,
@@ -431,6 +473,17 @@ class _SharedSlotPool:
         *,
         slot_id: int,
     ) -> tuple[CollectorSampleSnapshot, int]:
+        with self._lock:
+            return self._pack_snapshot_locked(snapshot, slot_id=slot_id)
+
+    def _pack_snapshot_locked(
+        self,
+        snapshot: CollectorSampleSnapshot,
+        *,
+        slot_id: int,
+    ) -> tuple[CollectorSampleSnapshot, int]:
+        if self.closed:
+            raise RuntimeError("collection shared-memory slot pool is closed")
         block = self.blocks[int(slot_id)]
         offset = 0
 
@@ -502,17 +555,18 @@ class _SharedSlotPool:
         return packed_snapshot, int(offset)
 
     def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        for block in self.blocks:
-            try:
-                block.close()
-            finally:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+            for block in self.blocks:
                 try:
-                    block.unlink()
-                except FileNotFoundError:
-                    pass
+                    block.close()
+                finally:
+                    try:
+                        block.unlink()
+                    except FileNotFoundError:
+                        pass
 
 
 def _hydrate_snapshot(
@@ -800,13 +854,42 @@ def _worker_main(
     v25p_native_shadow_identity: EpisodeCaptureIdentity | None = None
     v25p_native_shadow_error = ""
     native_ingestion_frozen = False
+    # Keep legacy episode ownership explicit in the process owner.  The
+    # writer's lazy ``_ensure_episode_state`` fallback must never turn a stale
+    # duplicate finalize into a newly committed empty episode.
+    active_legacy_episode_index: int | None = None
     next_external_sequence_by_stream: dict[str, int] = {}
     external_intent_and_sample_frame_by_identity: dict[
         tuple[str, str], tuple[NativeStreamExternalSampleIntent, int]
     ] = {}
 
+    # ``multiprocessing.Queue.put`` can block forever when the parent has
+    # stopped polling (for example while handling a GUI transition).  Keep
+    # terminal reporting bounded; a resulting worker error is preferable to a
+    # child that permanently holds a shared-memory slot and prevents shutdown.
+    terminal_put_timeout = max(
+        0.01,
+        float(getattr(process_config, "terminal_event_put_timeout_sec", 0.5)),
+    )
+
+    def put_reply(payload: Mapping[str, Any]) -> None:
+        try:
+            reply_queue.put(dict(payload), timeout=terminal_put_timeout)
+        except queue.Full as exc:
+            raise RuntimeError(
+                "collection worker reply queue is full; parent is not draining"
+            ) from exc
+
+    def put_ack(payload: Mapping[str, Any]) -> None:
+        try:
+            ack_queue.put(dict(payload), timeout=terminal_put_timeout)
+        except queue.Full as exc:
+            raise RuntimeError(
+                "collection worker acknowledgement queue is full; parent is not draining"
+            ) from exc
+
     def publish_startup_progress(phase: str) -> None:
-        reply_queue.put(
+        put_reply(
             {
                 "kind": "startup_progress",
                 "phase": str(phase),
@@ -880,7 +963,7 @@ def _worker_main(
             sample_index_start=int(writer.next_sample_index),
         )
         builder = CollectorSampleBuilder(detached_builder_config)
-        reply_queue.put(
+        put_reply(
             {
                 "kind": "ready",
                 "ok": True,
@@ -889,11 +972,75 @@ def _worker_main(
                 "process": process_status,
             }
         )
+
+        def discard_legacy_episode(episode_index: int) -> dict[str, object]:
+            """Discard one owned legacy episode without lazy creation.
+
+            ``LeRobotV21Writer.discard_episode`` is already idempotent for a
+            missing index.  Keeping the ownership check here prevents a stale
+            frontend cleanup from touching a different active episode while
+            still allowing a repeated cleanup request to return normally.
+            """
+
+            nonlocal active_legacy_episode_index
+            nonlocal native_writer, native_ingestion_frozen
+            nonlocal v25p_native_shadow_identity, v25p_native_shadow_error
+            if (
+                active_legacy_episode_index is not None
+                and int(episode_index) != active_legacy_episode_index
+            ):
+                raise ValueError(
+                    "Discard index does not match the active episode: "
+                    f"expected={active_legacy_episode_index} "
+                    f"actual={int(episode_index)}."
+                )
+            if native_writer is not None:
+                if int(episode_index) != native_writer.legacy_episode_index:
+                    raise ValueError(
+                        "Discard index does not match native stream episode."
+                    )
+                native_writer.close_unsealed()
+                native_writer = None
+                native_ingestion_frozen = False
+                next_external_sequence_by_stream.clear()
+                external_intent_and_sample_frame_by_identity.clear()
+            if (
+                v25p_native_shadow is not None
+                and v25p_native_shadow_identity is not None
+            ):
+                v25p_native_shadow.discard_episode(v25p_native_shadow_identity)
+                v25p_native_shadow_identity = None
+                v25p_native_shadow_error = ""
+            if active_legacy_episode_index is None:
+                return {
+                    "discarded": False,
+                    "next_episode_index": int(writer.next_episode_index),
+                    "next_sample_index": int(writer.next_sample_index),
+                }
+            discarded = bool(writer.discard_episode(int(episode_index)))
+            if discarded:
+                builder.set_dataset_position(
+                    episode_index=int(writer.next_episode_index),
+                    sample_index=int(writer.next_sample_index),
+                )
+                active_legacy_episode_index = None
+            return {
+                "discarded": discarded,
+                "next_episode_index": int(writer.next_episode_index),
+                "next_sample_index": int(writer.next_sample_index),
+            }
+
         while True:
             message = input_queue.get()
             kind = str(message.get("kind", ""))
             if kind == "sample":
                 slot_id = message.get("slot_id")
+                terminal_metadata = message.get("metadata_extra")
+                if not isinstance(terminal_metadata, Mapping):
+                    terminal_metadata = {}
+                else:
+                    terminal_metadata = dict(terminal_metadata)
+                terminal_sample_timestamp: float | None = None
                 started = time.perf_counter()
                 active_stage = "worker.hydrate_shared"
                 try:
@@ -901,6 +1048,7 @@ def _worker_main(
                     snapshot, hydrated_slot = _hydrate_snapshot(
                         message["snapshot"], blocks
                     )
+                    terminal_sample_timestamp = float(snapshot.step_result.timestamp)
                     stage_ms: dict[str, float] = {
                         "worker.hydrate_shared": float(
                             (time.perf_counter() - stage_started) * 1000.0
@@ -1003,15 +1151,16 @@ def _worker_main(
                         stage_ms[job_key] = stage_ms.get(job_key, 0.0) + float(
                             (time.perf_counter() - job_started) * 1000.0
                         )
-                    ack_queue.put({"kind": "slot_free", "slot_id": slot_id})
+                    put_ack({"kind": "slot_free", "slot_id": slot_id})
                     slot_id = None
-                    ack_queue.put(
+                    put_ack(
                         {
                             "kind": "sample_done",
                             "episode_index": int(sample.episode_index),
                             "sample_index": int(sample.index),
                             "episode_frame_index": int(sample.frame_index),
                             "sample_timestamp": float(sample.timestamp),
+                            "terminal_metadata": dict(terminal_metadata),
                             "frame_count": int(builder.frame_index),
                             "elapsed_ms": float(
                                 (time.perf_counter() - started) * 1000.0
@@ -1025,28 +1174,32 @@ def _worker_main(
                     )
                 except StrictV22SampleRejection as exc:
                     if slot_id is not None:
-                        ack_queue.put({"kind": "slot_free", "slot_id": slot_id})
+                        put_ack({"kind": "slot_free", "slot_id": slot_id})
                         slot_id = None
                     # A strict measured-feedback rejection belongs to this
                     # sample, not to the writer process.  Keep the worker
                     # usable for the next valid snapshot.
-                    ack_queue.put(
+                    put_ack(
                         {
                             "kind": "sample_rejected",
                             "reason": str(exc),
                             "side": str(exc.side),
                             "rejection_reason": str(exc.reason),
                             "age_sec": exc.age_sec,
+                            "sample_timestamp": terminal_sample_timestamp,
+                            "terminal_metadata": dict(terminal_metadata),
                         }
                     )
                 except BaseException as exc:  # noqa: BLE001
                     if slot_id is not None:
-                        ack_queue.put({"kind": "slot_free", "slot_id": slot_id})
-                    ack_queue.put(
+                        put_ack({"kind": "slot_free", "slot_id": slot_id})
+                    put_ack(
                         {
                             "kind": "worker_error",
                             "error": f"{active_stage}: {type(exc).__name__}: {exc}",
                             "traceback": traceback.format_exc(),
+                            "sample_timestamp": terminal_sample_timestamp,
+                            "terminal_metadata": dict(terminal_metadata),
                         }
                     )
                 continue
@@ -1068,7 +1221,7 @@ def _worker_main(
                             "Native stream sample does not match the active episode."
                         )
                     native_writer.append(**dict(message["sample"]))
-                    ack_queue.put(
+                    put_ack(
                         {
                             "kind": "native_stream_sample_done",
                             "stream_id": str(message["sample"]["stream_id"]),
@@ -1076,7 +1229,7 @@ def _worker_main(
                         }
                     )
                 except BaseException as exc:  # noqa: BLE001
-                    ack_queue.put(
+                    put_ack(
                         {
                             "kind": "worker_error",
                             "error": (
@@ -1090,6 +1243,11 @@ def _worker_main(
             request_id = message.get("request_id")
             try:
                 if kind == "start_episode":
+                    if active_legacy_episode_index is not None:
+                        raise RuntimeError(
+                            "Previous legacy episode is still active: "
+                            f"{active_legacy_episode_index}."
+                        )
                     episode_uuid = str(message.get("episode_uuid") or "").strip()
                     identity_payload = message.get("episode_identity")
                     episode_identity = (
@@ -1221,6 +1379,7 @@ def _worker_main(
                     next_external_sequence_by_stream.clear()
                     external_intent_and_sample_frame_by_identity.clear()
                     builder.set_episode(int(episode_index))
+                    active_legacy_episode_index = int(episode_index)
                     result: Any = int(episode_index)
                 elif kind == "write_device_config":
                     writer.write_device_config(
@@ -1255,9 +1414,20 @@ def _worker_main(
                     native_ingestion_frozen = True
                     result = True
                 elif kind == "finalize_episode":
+                    requested_episode_index = int(message["episode_index"])
+                    if active_legacy_episode_index is None:
+                        raise RuntimeError(
+                            "No legacy episode is active in the process worker."
+                        )
+                    if requested_episode_index != active_legacy_episode_index:
+                        raise ValueError(
+                            "Legacy finalize index does not match the active episode: "
+                            f"expected={active_legacy_episode_index} "
+                            f"actual={requested_episode_index}."
+                        )
                     if native_writer is not None:
                         if (
-                            int(message["episode_index"])
+                            requested_episode_index
                             != native_writer.legacy_episode_index
                         ):
                             raise ValueError(
@@ -1275,7 +1445,7 @@ def _worker_main(
                                 "before legacy finalize."
                             )
                         report = writer.finalize_episode_with_artifact_report(
-                            int(message["episode_index"]),
+                            requested_episode_index,
                             summary=dict(message.get("summary") or {}),
                         )
                         try:
@@ -1297,18 +1467,18 @@ def _worker_main(
                             receipts = ()
                             receipt_error = f"{type(exc).__name__}: {exc}"
                         result = ProcessLegacyFinalizeResult(
-                            episode_index=int(message["episode_index"]),
+                            episode_index=requested_episode_index,
                             legacy_finalized=True,
                             native_stream_artifact_receipts=receipts,
                             artifact_receipt_error=receipt_error,
                         )
                     else:
                         writer.finalize_episode(
-                            int(message["episode_index"]),
+                            requested_episode_index,
                             summary=dict(message.get("summary") or {}),
                         )
                         result = ProcessLegacyFinalizeResult(
-                            episode_index=int(message["episode_index"]),
+                            episode_index=requested_episode_index,
                             legacy_finalized=True,
                         )
                     if v25p_native_shadow is not None:
@@ -1325,7 +1495,7 @@ def _worker_main(
                                     legacy_episode_record=(
                                         load_finalized_legacy_episode_record(
                                             writer_config.root_dir,
-                                            int(message["episode_index"]),
+                                            requested_episode_index,
                                         )
                                     ),
                                     completed_at=time.time(),
@@ -1358,49 +1528,12 @@ def _worker_main(
                             v25p_native_shadow_report=shadow_report,
                             v25p_native_shadow_error=shadow_error,
                         )
+                    # A subordinate native projection may remain active until
+                    # its post-finalize seal, but the legacy episode itself is
+                    # no longer finalizable after this successful edge.
+                    active_legacy_episode_index = None
                 elif kind == "discard_episode":
-                    if native_writer is not None:
-                        if (
-                            int(message["episode_index"])
-                            != native_writer.legacy_episode_index
-                        ):
-                            raise ValueError(
-                                "Discard index does not match native stream episode."
-                            )
-                        native_writer.close_unsealed()
-                        native_writer = None
-                        native_ingestion_frozen = False
-                        next_external_sequence_by_stream.clear()
-                        external_intent_and_sample_frame_by_identity.clear()
-                    if (
-                        v25p_native_shadow is not None
-                        and v25p_native_shadow_identity is not None
-                    ):
-                        v25p_native_shadow.discard_episode(
-                            v25p_native_shadow_identity
-                        )
-                        v25p_native_shadow_identity = None
-                        v25p_native_shadow_error = ""
-                    discarded = bool(
-                        writer.discard_episode(int(message["episode_index"]))
-                    )
-                    # ``start_episode`` advances both the legacy writer and the
-                    # process-local sample builder before the frontend binds its
-                    # subordinate episode artifacts.  A later startup rollback
-                    # (or a zero-frame stop) may therefore make the discarded
-                    # index reusable.  Return the authoritative cursors from the
-                    # worker so the frontend does not keep the optimistic
-                    # ``episode_index + 1`` value from ``start_episode``.
-                    if discarded:
-                        builder.set_dataset_position(
-                            episode_index=int(writer.next_episode_index),
-                            sample_index=int(writer.next_sample_index),
-                        )
-                    result = {
-                        "discarded": discarded,
-                        "next_episode_index": int(writer.next_episode_index),
-                        "next_sample_index": int(writer.next_sample_index),
-                    }
+                    result = discard_legacy_episode(int(message["episode_index"]))
                 elif kind == "native_stream_note_drops":
                     if native_writer is None:
                         raise RuntimeError(
@@ -1506,6 +1639,11 @@ def _worker_main(
                         external_intent_and_sample_frame_by_identity.clear()
                     result = True
                 elif kind == "reload_finalized_dataset_state":
+                    if active_legacy_episode_index is not None:
+                        raise RuntimeError(
+                            "Cannot reload dataset state while a legacy episode "
+                            f"is active ({active_legacy_episode_index})."
+                        )
                     writer.reload_finalized_dataset_state()
                     builder.set_dataset_position(
                         episode_index=int(writer.next_episode_index),
@@ -1542,7 +1680,7 @@ def _worker_main(
                             v25p_native_shadow_identity
                         )
                         v25p_native_shadow_identity = None
-                    reply_queue.put(
+                    put_reply(
                         {
                             "kind": "reply",
                             "request_id": request_id,
@@ -1554,7 +1692,7 @@ def _worker_main(
                 else:
                     raise ValueError(f"unknown collection worker message kind {kind!r}")
             except BaseException as exc:  # noqa: BLE001
-                reply_queue.put(
+                put_reply(
                     {
                         "kind": "reply",
                         "request_id": request_id,
@@ -1564,7 +1702,7 @@ def _worker_main(
                     }
                 )
             else:
-                reply_queue.put(
+                put_reply(
                     {
                         "kind": "reply",
                         "request_id": request_id,
@@ -1575,7 +1713,7 @@ def _worker_main(
     except BaseException as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
         worker_traceback = traceback.format_exc()
-        reply_queue.put(
+        put_reply(
             {
                 "kind": "ready" if writer is None else "fatal",
                 "ok": False,
@@ -1587,7 +1725,7 @@ def _worker_main(
             # Post-start fatal errors have no synchronous request waiter.  The
             # frontend health path drains ack_queue, so mirror the fatal event
             # there instead of degrading it to a bare "worker exited" status.
-            ack_queue.put(
+            put_ack(
                 {
                     "kind": "worker_error",
                     "error": f"worker.fatal: {error}",
@@ -1732,6 +1870,16 @@ class ProcessCollectionWorker:
         )
         self._started = False
         self._closed = False
+        # Parent-side lifecycle admission is intentionally independent from
+        # the child request lock.  Snapshot submission can run from a camera
+        # thread while an episode transition or close is in progress; this
+        # condition prevents a slot/queue operation from racing shared-memory
+        # teardown and serializes exclusive lifecycle transitions.
+        self._lifecycle_lock = threading.RLock()
+        self._lifecycle_condition = threading.Condition(self._lifecycle_lock)
+        self._lifecycle_active_operations = 0
+        self._lifecycle_exclusive = False
+        self._closing = False
         self._request_lock = self._ctx.Lock()
         self._submitted_samples = 0
         self._completed_samples = 0
@@ -1742,6 +1890,9 @@ class ProcessCollectionWorker:
         self._active_native_episode_uuid: str | None = None
         self._active_native_episode_index: int | None = None
         self._active_native_episode_frozen = False
+        self._active_legacy_episode_index: int | None = None
+        self._orphan_reply_count = 0
+        self._malformed_ack_count = 0
         self._queue_high_water = 0
         self._active_episode_frame_count = 0
         self._worker_error: str | None = None
@@ -1750,6 +1901,9 @@ class ProcessCollectionWorker:
         self._pending_sample_rejections: deque[str] = deque()
         self._sample_acceptance_receipt_buffer = SampleAcceptanceReceiptBuffer(
             capacity=int(config.sample_acceptance_receipt_capacity)
+        )
+        self._sample_terminal_event_buffer = SampleTerminalEventBuffer(
+            capacity=int(config.sample_terminal_event_capacity)
         )
         self._sample_process_ms: deque[float] = deque(maxlen=2048)
         self._parent_pack_ms: deque[float] = deque(maxlen=2048)
@@ -1760,6 +1914,80 @@ class ProcessCollectionWorker:
         self.next_episode_index = 0
         self.next_sample_index = 0
         self.process_status: dict[str, Any] = {}
+
+    @contextmanager
+    def _admit_operation(
+        self,
+        *,
+        require_started: bool = True,
+        require_legacy_episode: bool = False,
+        exclusive: bool = False,
+        allow_closing: bool = False,
+    ):
+        """Admit one parent operation across close/transition boundaries.
+
+        A few serializer diagnostics intentionally construct this proxy with
+        ``object.__new__`` and only provide the fields under test.  In that
+        compatibility case the lifecycle condition is absent and the guard
+        is a no-op; fully initialized workers always take the fail-closed
+        path below.
+        """
+
+        condition = getattr(self, "_lifecycle_condition", None)
+        if condition is None:
+            yield
+            return
+        with condition:
+            if bool(getattr(self, "_closed", False)):
+                raise RuntimeError("collection worker is closed")
+            if bool(getattr(self, "_closing", False)) and not allow_closing:
+                raise RuntimeError("collection worker is closing")
+            while True:
+                if bool(getattr(self, "_closing", False)) and not allow_closing:
+                    raise RuntimeError("collection worker is closing")
+                exclusive_active = bool(
+                    getattr(self, "_lifecycle_exclusive", False)
+                )
+                active = int(getattr(self, "_lifecycle_active_operations", 0))
+                if (exclusive and active == 0 and not exclusive_active) or (
+                    not exclusive and not exclusive_active
+                ):
+                    break
+                condition.wait()
+            if require_started and hasattr(self, "_started") and not bool(
+                getattr(self, "_started", False)
+            ):
+                raise RuntimeError(
+                    "collection worker is not started; call start() first"
+                )
+            if require_legacy_episode and hasattr(
+                self, "_active_legacy_episode_index"
+            ) and getattr(self, "_active_legacy_episode_index", None) is None:
+                raise RuntimeError("No legacy episode is active in the process worker.")
+            self._lifecycle_active_operations = active + 1
+            if exclusive:
+                self._lifecycle_exclusive = True
+        try:
+            yield
+        finally:
+            with condition:
+                self._lifecycle_active_operations = max(
+                    0,
+                    int(getattr(self, "_lifecycle_active_operations", 1)) - 1,
+                )
+                if exclusive:
+                    self._lifecycle_exclusive = False
+                condition.notify_all()
+
+    def _wait_for_lifecycle_operations(self) -> None:
+        """Wait until snapshot/native submissions have left the parent."""
+
+        condition = getattr(self, "_lifecycle_condition", None)
+        if condition is None:
+            return
+        with condition:
+            while int(getattr(self, "_lifecycle_active_operations", 0)) > 0:
+                condition.wait()
 
     def start(self) -> None:
         if self._started:
@@ -1838,69 +2066,232 @@ class ProcessCollectionWorker:
 
         return bool(self._started)
 
+    def _record_malformed_ack(
+        self,
+        reason: str,
+        message: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Latch a malformed child acknowledgement as a terminal fault.
+
+        ACKs are part of the shared-memory ownership protocol.  Silently
+        ignoring a bad ``slot_free`` or ``sample_done`` can permanently leak a
+        slot (or make flush believe a sample was durable), so malformed input
+        is fail-closed and surfaced through the same health path as a worker
+        error.  The method is defensive because it is also used by startup
+        diagnostics with lightweight test doubles that do not initialize every
+        runtime buffer.
+        """
+
+        self._malformed_ack_count = int(
+            getattr(self, "_malformed_ack_count", 0)
+        ) + 1
+        error = f"collection worker malformed acknowledgement: {reason}"
+        if getattr(self, "_worker_error", None) is None:
+            self._worker_error = error
+            self._worker_traceback = None
+        terminal_buffer = getattr(self, "_sample_terminal_event_buffer", None)
+        if terminal_buffer is not None:
+            metadata = {}
+            if isinstance(message, Mapping):
+                raw_metadata = message.get("terminal_metadata")
+                if isinstance(raw_metadata, Mapping):
+                    metadata = dict(raw_metadata)
+            try:
+                terminal_buffer.append(
+                    SampleTerminalEvent(
+                        accepted=False,
+                        metadata=metadata,
+                        reason=error,
+                        terminal_kind="fatal",
+                    )
+                )
+            except Exception:
+                # Diagnostics must never mask the latched worker fault.
+                pass
+
+    def _process_ack_message(self, message: Mapping[str, Any]) -> None:
+        kind = str(message.get("kind", "")).strip()
+        if kind == "slot_free":
+            if "slot_id" not in message or message.get("slot_id") is None:
+                raise ValueError("slot_free acknowledgement has no slot_id")
+            slot_id = int(message["slot_id"])
+            slot_count = len(getattr(self._slots, "blocks", ()))
+            if slot_count and not 0 <= slot_id < slot_count:
+                raise ValueError(
+                    f"slot_free acknowledgement has invalid slot_id={slot_id}"
+                )
+            self._slots.release(slot_id)
+            return
+
+        if kind == "sample_done":
+            required = (
+                "episode_index",
+                "sample_index",
+                "episode_frame_index",
+                "sample_timestamp",
+            )
+            missing = [key for key in required if key not in message]
+            if missing:
+                raise ValueError(
+                    "sample_done acknowledgement is missing "
+                    + ", ".join(missing)
+                )
+            frame_count = int(message.get("frame_count", 0))
+            if frame_count < 0:
+                raise ValueError("sample_done frame_count must be non-negative")
+            terminal_metadata = message.get("terminal_metadata")
+            if not isinstance(terminal_metadata, Mapping):
+                terminal_metadata = {}
+            else:
+                terminal_metadata = dict(terminal_metadata)
+            elapsed_ms = message.get("elapsed_ms")
+            if elapsed_ms is not None:
+                elapsed_ms = float(elapsed_ms)
+            stage_ms = message.get("stage_ms")
+            if stage_ms is not None and not isinstance(stage_ms, Mapping):
+                raise ValueError("sample_done stage_ms must be a mapping")
+            normalized_stage_ms = None
+            if isinstance(stage_ms, Mapping):
+                normalized_stage_ms = {
+                    str(name): (None if value is None else float(value))
+                    for name, value in stage_ms.items()
+                }
+            counts = message.get("tactile_frame_counts")
+            if counts is not None and not isinstance(counts, Mapping):
+                raise ValueError("sample_done tactile_frame_counts must be a mapping")
+            normalized_counts = None
+            if isinstance(counts, Mapping):
+                normalized_counts = {
+                    str(side): int(value) for side, value in counts.items()
+                }
+                if any(value < 0 for value in normalized_counts.values()):
+                    raise ValueError(
+                        "sample_done tactile_frame_counts must be non-negative"
+                    )
+            receipt = AcceptedSampleReceipt(
+                episode_index=int(message["episode_index"]),
+                sample_index=int(message["sample_index"]),
+                episode_frame_index=int(message["episode_frame_index"]),
+                sample_timestamp=float(message["sample_timestamp"]),
+                metadata=terminal_metadata,
+            )
+            self._completed_samples = int(
+                getattr(self, "_completed_samples", 0)
+            ) + 1
+            self._active_episode_frame_count = frame_count
+            acceptance_buffer = getattr(
+                self, "_sample_acceptance_receipt_buffer", None
+            )
+            if acceptance_buffer is not None and acceptance_buffer.capacity > 0:
+                acceptance_buffer.append(receipt)
+            terminal_buffer = getattr(
+                self, "_sample_terminal_event_buffer", None
+            )
+            if terminal_buffer is not None:
+                terminal_buffer.append(
+                    SampleTerminalEvent(
+                        accepted=True,
+                        receipt=receipt,
+                        metadata=terminal_metadata,
+                    )
+                )
+            if elapsed_ms is not None:
+                self._sample_process_ms.append(elapsed_ms)
+            if normalized_stage_ms is not None:
+                for name, value in normalized_stage_ms.items():
+                    if value is None:
+                        continue
+                    values = self._worker_stage_ms.setdefault(
+                        str(name), deque(maxlen=2048)
+                    )
+                    values.append(float(value))
+            episode_index = int(message.get("episode_index", -1))
+            if normalized_counts is not None:
+                self._tactile_counts_by_episode[episode_index] = normalized_counts
+            return
+
+        if kind == "native_stream_sample_done":
+            self._completed_native_stream_samples = int(
+                getattr(self, "_completed_native_stream_samples", 0)
+            ) + 1
+            return
+
+        if kind == "sample_rejected":
+            reason = str(message.get("reason") or "collection sample rejected")
+            self._sample_rejection_count = int(
+                getattr(self, "_sample_rejection_count", 0)
+            ) + 1
+            self._pending_sample_rejections.append(reason)
+            terminal_metadata = message.get("terminal_metadata")
+            if not isinstance(terminal_metadata, Mapping):
+                terminal_metadata = {}
+            else:
+                terminal_metadata = dict(terminal_metadata)
+            terminal_buffer = getattr(
+                self, "_sample_terminal_event_buffer", None
+            )
+            if terminal_buffer is not None:
+                terminal_buffer.append(
+                    SampleTerminalEvent(
+                        accepted=False,
+                        metadata=terminal_metadata,
+                        reason=reason,
+                        terminal_kind="rejected",
+                    )
+                )
+            return
+
+        if kind == "worker_error":
+            if self._worker_error is None:
+                self._worker_error = str(
+                    message.get("error") or "collection worker error"
+                )
+                worker_traceback = str(message.get("traceback") or "").strip()
+                self._worker_traceback = worker_traceback or None
+                if self._worker_traceback:
+                    print(
+                        "[CollectionWorker] sample processing failed:\n"
+                        f"{self._worker_traceback}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            terminal_metadata = message.get("terminal_metadata")
+            if not isinstance(terminal_metadata, Mapping):
+                terminal_metadata = {}
+            else:
+                terminal_metadata = dict(terminal_metadata)
+            terminal_buffer = getattr(
+                self, "_sample_terminal_event_buffer", None
+            )
+            if terminal_buffer is not None:
+                terminal_buffer.append(
+                    SampleTerminalEvent(
+                        accepted=False,
+                        metadata=terminal_metadata,
+                        reason=str(message.get("error") or "collection worker error"),
+                        terminal_kind="fatal",
+                    )
+                )
+            return
+
+        raise ValueError(f"unknown collection worker acknowledgement kind {kind!r}")
+
     def _drain_acks(self) -> None:
         while True:
             try:
                 message = self._ack_queue.get_nowait()
-            except queue.Empty:
+            except (queue.Empty, ValueError, OSError):
                 break
-            kind = str(message.get("kind", ""))
-            if kind == "slot_free":
-                slot_id = message.get("slot_id")
-                if slot_id is not None:
-                    self._slots.release(int(slot_id))
-            elif kind == "sample_done":
-                self._completed_samples += 1
-                self._active_episode_frame_count = int(message.get("frame_count", 0))
-                if self._sample_acceptance_receipt_buffer.capacity > 0:
-                    self._sample_acceptance_receipt_buffer.append(
-                        AcceptedSampleReceipt(
-                            episode_index=int(message["episode_index"]),
-                            sample_index=int(message["sample_index"]),
-                            episode_frame_index=int(
-                                message["episode_frame_index"]
-                            ),
-                            sample_timestamp=float(message["sample_timestamp"]),
-                        )
-                    )
-                elapsed_ms = message.get("elapsed_ms")
-                if elapsed_ms is not None:
-                    self._sample_process_ms.append(float(elapsed_ms))
-                stage_ms = message.get("stage_ms")
-                if isinstance(stage_ms, Mapping):
-                    for name, value in stage_ms.items():
-                        if value is None:
-                            continue
-                        values = self._worker_stage_ms.setdefault(
-                            str(name), deque(maxlen=2048)
-                        )
-                        values.append(float(value))
-                episode_index = int(message.get("episode_index", -1))
-                counts = message.get("tactile_frame_counts")
-                if isinstance(counts, Mapping):
-                    self._tactile_counts_by_episode[episode_index] = {
-                        str(side): int(value) for side, value in counts.items()
-                    }
-            elif kind == "native_stream_sample_done":
-                self._completed_native_stream_samples += 1
-            elif kind == "sample_rejected":
-                reason = str(message.get("reason") or "collection sample rejected")
-                self._sample_rejection_count += 1
-                self._pending_sample_rejections.append(reason)
-            elif kind == "worker_error":
-                if self._worker_error is None:
-                    self._worker_error = str(
-                        message.get("error") or "collection worker error"
-                    )
-                    worker_traceback = str(message.get("traceback") or "").strip()
-                    self._worker_traceback = worker_traceback or None
-                    if self._worker_traceback:
-                        print(
-                            "[CollectionWorker] sample processing failed:\n"
-                            f"{self._worker_traceback}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+            if not isinstance(message, Mapping):
+                self._record_malformed_ack("message is not a mapping")
+                continue
+            try:
+                self._process_ack_message(message)
+            except Exception as exc:  # noqa: BLE001 - ACK protocol is untrusted.
+                self._record_malformed_ack(
+                    f"{type(exc).__name__}: {exc}",
+                    message,
+                )
 
     def consume_sample_rejection(self) -> str | None:
         """Return one nonfatal sample-contract rejection, if available."""
@@ -1923,6 +2314,12 @@ class ProcessCollectionWorker:
 
         self._drain_acks()
         return self._sample_acceptance_receipt_buffer.drain()
+
+    def drain_sample_terminal_events(self) -> tuple[SampleTerminalEvent, ...]:
+        """Drain accepted/rejected/fatal outcomes exactly once."""
+
+        self._drain_acks()
+        return self._sample_terminal_event_buffer.drain()
 
     def _raise_if_failed(self) -> None:
         self._drain_acks()
@@ -1959,14 +2356,28 @@ class ProcessCollectionWorker:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     raise TimeoutError(f"collection worker request {kind!r} timed out")
+                # A previous request may have timed out after the child had
+                # already enqueued its reply.  Discard that stale reply and
+                # continue waiting for this request instead of turning one
+                # recoverable late response into a permanently failed worker.
                 try:
-                    reply = self._reply_queue.get(timeout=remaining)
+                    self._raise_if_failed()
+                except RuntimeError:
+                    raise
+                try:
+                    reply = self._reply_queue.get(timeout=min(0.05, remaining))
                 except queue.Empty as exc:
-                    raise TimeoutError(
-                        f"collection worker request {kind!r} timed out"
-                    ) from exc
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"collection worker request {kind!r} timed out"
+                        ) from exc
+                    continue
+                if not isinstance(reply, Mapping):
+                    self._orphan_reply_count += 1
+                    continue
                 if reply.get("request_id") != request_id:
-                    raise RuntimeError("collection worker reply ordering mismatch")
+                    self._orphan_reply_count += 1
+                    continue
                 if not bool(reply.get("ok")):
                     worker_traceback = str(reply.get("traceback") or "").strip()
                     if worker_traceback:
@@ -1987,11 +2398,34 @@ class ProcessCollectionWorker:
         *,
         metadata_extra: Mapping[str, Any] | None = None,
     ) -> bool:
+        with self._admit_operation(
+            require_started=True,
+            require_legacy_episode=True,
+        ):
+            return self._submit_snapshot_admitted(
+                snapshot,
+                metadata_extra=metadata_extra,
+            )
+
+    def _submit_snapshot_admitted(
+        self,
+        snapshot: CollectorSampleSnapshot,
+        *,
+        metadata_extra: Mapping[str, Any] | None = None,
+    ) -> bool:
         self._raise_if_failed()
         slot_id = self._slots.acquire()
         if slot_id is None:
             self._rejected_busy += 1
             return False
+        message = {
+            "kind": "sample",
+            "slot_id": int(slot_id),
+            "snapshot": None,
+            "metadata_extra": (
+                None if metadata_extra is None else dict(metadata_extra)
+            ),
+        }
         try:
             pack_started = time.perf_counter()
             packed, payload_bytes = self._slots.pack_snapshot(
@@ -2001,17 +2435,22 @@ class ProcessCollectionWorker:
                 float((time.perf_counter() - pack_started) * 1000.0)
             )
             self._shared_payload_bytes.append(float(payload_bytes))
+            message["snapshot"] = packed
+            # ``multiprocessing.Queue`` serializes from a feeder thread.  A
+            # non-picklable metadata value would otherwise only be reported by
+            # that thread, leaving the slot occupied forever and making the
+            # subsequent flush timeout look like writer/storage overload.
+            # Validate at the same synchronous boundary used by ``_request``
+            # so the caller receives a deterministic, recoverable error.
+            try:
+                ForkingPickler.dumps(message)
+            except BaseException as exc:  # noqa: BLE001 - preserve serializer detail.
+                raise TypeError(
+                    "collection worker sample is not serializable: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             queue_started = time.perf_counter()
-            self._input_queue.put_nowait(
-                {
-                    "kind": "sample",
-                    "slot_id": int(slot_id),
-                    "snapshot": packed,
-                    "metadata_extra": (
-                        None if metadata_extra is None else dict(metadata_extra)
-                    ),
-                }
-            )
+            self._input_queue.put_nowait(message)
             self._parent_queue_put_ms.append(
                 float((time.perf_counter() - queue_started) * 1000.0)
             )
@@ -2032,6 +2471,23 @@ class ProcessCollectionWorker:
         return True
 
     def start_episode(
+        self,
+        metadata: Mapping[str, Any],
+        *,
+        episode_uuid: str | None = None,
+        episode_identity: EpisodeCaptureIdentity | None = None,
+    ) -> int:
+        with self._admit_operation(
+            require_started=True,
+            exclusive=True,
+        ):
+            return self._start_episode_admitted(
+                metadata,
+                episode_uuid=episode_uuid,
+                episode_identity=episode_identity,
+            )
+
+    def _start_episode_admitted(
         self,
         metadata: Mapping[str, Any],
         *,
@@ -2082,6 +2538,7 @@ class ProcessCollectionWorker:
                 ),
             )
         )
+        self._active_legacy_episode_index = episode_index
         self.next_episode_index = episode_index + 1
         self._active_episode_frame_count = 0
         self._active_native_episode_uuid = (
@@ -2097,6 +2554,9 @@ class ProcessCollectionWorker:
         self,
         prepared: Any,
     ) -> ProcessNativeStreamEpisodeCapture:
+        # Capture proxies are prepared before the child handshake in the
+        # recorder pipeline.  Admission is enforced when the first sample or
+        # lifecycle operation reaches the worker, not at proxy construction.
         if not self.native_stream_contracts:
             raise RuntimeError(
                 "Process collection worker has no native stream contracts."
@@ -2108,6 +2568,27 @@ class ProcessCollectionWorker:
         )
 
     def submit_native_stream_sample(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        stream_id: str,
+        sample_id: str,
+        **sample: Any,
+    ) -> ProcessNativeStreamSubmissionReceipt:
+        with self._admit_operation(
+            require_started=True,
+            require_legacy_episode=True,
+        ):
+            return self._submit_native_stream_sample_admitted(
+                episode_uuid=episode_uuid,
+                legacy_episode_index=legacy_episode_index,
+                stream_id=stream_id,
+                sample_id=sample_id,
+                **sample,
+            )
+
+    def _submit_native_stream_sample_admitted(
         self,
         *,
         episode_uuid: str,
@@ -2199,6 +2680,28 @@ class ProcessCollectionWorker:
         sealed_clock_domain_id: str,
         drop_counts: Mapping[tuple[str, str], int] | None = None,
     ) -> NativeStreamEpisodeManifest:
+        with self._admit_operation(
+            require_started=True,
+            require_legacy_episode=True,
+            exclusive=True,
+        ):
+            return self._seal_native_stream_episode_admitted(
+                episode_uuid=episode_uuid,
+                legacy_episode_index=legacy_episode_index,
+                sealed_at=sealed_at,
+                sealed_clock_domain_id=sealed_clock_domain_id,
+                drop_counts=drop_counts,
+            )
+
+    def _seal_native_stream_episode_admitted(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        sealed_at: float,
+        sealed_clock_domain_id: str,
+        drop_counts: Mapping[tuple[str, str], int] | None = None,
+    ) -> NativeStreamEpisodeManifest:
         normalized_uuid = str(episode_uuid)
         normalized_index = int(legacy_episode_index)
         if (
@@ -2263,6 +2766,24 @@ class ProcessCollectionWorker:
         legacy_episode_index: int,
         drop_counts: Mapping[tuple[str, str], int] | None = None,
     ) -> None:
+        with self._admit_operation(
+            require_started=True,
+            require_legacy_episode=True,
+            exclusive=True,
+        ):
+            self._freeze_native_stream_episode_admitted(
+                episode_uuid=episode_uuid,
+                legacy_episode_index=legacy_episode_index,
+                drop_counts=drop_counts,
+            )
+
+    def _freeze_native_stream_episode_admitted(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        drop_counts: Mapping[tuple[str, str], int] | None = None,
+    ) -> None:
         normalized_uuid = str(episode_uuid)
         normalized_index = int(legacy_episode_index)
         if not self.native_external_stream_bindings:
@@ -2291,6 +2812,28 @@ class ProcessCollectionWorker:
         self._active_native_episode_frozen = True
 
     def seal_native_stream_episode_after_legacy_finalize(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+        receipts: Iterable[NativeStreamExternalArtifactReceipt],
+        sealed_at: float,
+        sealed_clock_domain_id: str,
+    ) -> NativeStreamEpisodeManifest:
+        with self._admit_operation(
+            require_started=True,
+            require_legacy_episode=False,
+            exclusive=True,
+        ):
+            return self._seal_native_stream_episode_after_legacy_finalize_admitted(
+                episode_uuid=episode_uuid,
+                legacy_episode_index=legacy_episode_index,
+                receipts=receipts,
+                sealed_at=sealed_at,
+                sealed_clock_domain_id=sealed_clock_domain_id,
+            )
+
+    def _seal_native_stream_episode_after_legacy_finalize_admitted(
         self,
         *,
         episode_uuid: str,
@@ -2337,6 +2880,22 @@ class ProcessCollectionWorker:
         episode_uuid: str,
         legacy_episode_index: int,
     ) -> None:
+        with self._admit_operation(
+            require_started=True,
+            require_legacy_episode=False,
+            exclusive=True,
+        ):
+            self._close_native_stream_episode_admitted(
+                episode_uuid=episode_uuid,
+                legacy_episode_index=legacy_episode_index,
+            )
+
+    def _close_native_stream_episode_admitted(
+        self,
+        *,
+        episode_uuid: str,
+        legacy_episode_index: int,
+    ) -> None:
         normalized_uuid = str(episode_uuid)
         normalized_index = int(legacy_episode_index)
         if self._active_native_episode_uuid is None:
@@ -2358,13 +2917,21 @@ class ProcessCollectionWorker:
         self._active_native_episode_frozen = False
 
     def write_device_config(self, device_name: str, payload: Mapping[str, Any]) -> None:
-        self._request(
-            "write_device_config",
-            device_name=str(device_name),
-            payload=dict(payload),
-        )
+        with self._admit_operation(require_started=True, exclusive=True):
+            self._request(
+                "write_device_config",
+                device_name=str(device_name),
+                payload=dict(payload),
+            )
 
     def flush(self) -> None:
+        with self._admit_operation(
+            require_started=True,
+            exclusive=True,
+        ):
+            self._flush_admitted()
+
+    def _flush_admitted(self) -> None:
         self._request("flush")
         # Sample terminal acknowledgements and synchronous request replies use
         # separate multiprocessing queues.  The worker enqueues the sample ack
@@ -2400,7 +2967,8 @@ class ProcessCollectionWorker:
             time.sleep(min(0.001, remaining))
 
     def reset_temporal_history(self) -> None:
-        self._request("reset_temporal_history")
+        with self._admit_operation(require_started=True, exclusive=True):
+            self._request("reset_temporal_history")
 
     def finalize_episode(
         self,
@@ -2408,6 +2976,30 @@ class ProcessCollectionWorker:
         *,
         summary: Mapping[str, Any],
     ) -> ProcessLegacyFinalizeResult:
+        with self._admit_operation(
+            require_started=True,
+            require_legacy_episode=True,
+            exclusive=True,
+        ):
+            return self._finalize_episode_admitted(
+                episode_index,
+                summary=summary,
+            )
+
+    def _finalize_episode_admitted(
+        self,
+        episode_index: int,
+        *,
+        summary: Mapping[str, Any],
+    ) -> ProcessLegacyFinalizeResult:
+        active_episode_index = getattr(self, "_active_legacy_episode_index", None)
+        if active_episode_index is None:
+            raise RuntimeError("No legacy episode is active in the process worker.")
+        if int(episode_index) != int(active_episode_index):
+            raise ValueError(
+                "Legacy finalize index does not match the active episode: "
+                f"expected={int(active_episode_index)} actual={int(episode_index)}."
+            )
         if self._active_native_episode_uuid is not None:
             if not self.native_external_stream_bindings:
                 raise RuntimeError(
@@ -2427,17 +3019,28 @@ class ProcessCollectionWorker:
             raise RuntimeError(
                 "Process worker returned an invalid legacy finalize result."
             )
+        self._active_legacy_episode_index = None
         return result
 
     def discard_episode(self, episode_index: int) -> bool:
+        with self._admit_operation(
+            require_started=True,
+            exclusive=True,
+        ):
+            return self._discard_episode_admitted(episode_index)
+
+    def _discard_episode_admitted(self, episode_index: int) -> bool:
         # Discard is a lifecycle boundary.  Settle every accepted sample before
         # deleting worker-owned artifacts so no late acknowledgement can
         # repopulate parent-side caches for a subsequently reused index.
-        self.flush()
-        result = self._request(
-            "discard_episode",
-            episode_index=int(episode_index),
-        )
+        self._flush_admitted()
+        active_episode_index = getattr(self, "_active_legacy_episode_index", None)
+        if active_episode_index is not None and int(episode_index) != int(active_episode_index):
+            raise ValueError(
+                "Discard index does not match the active episode: "
+                f"expected={int(active_episode_index)} actual={int(episode_index)}."
+            )
+        result = self._request("discard_episode", episode_index=int(episode_index))
         if not isinstance(result, Mapping):
             raise RuntimeError(
                 "collection worker returned invalid dataset discard state"
@@ -2446,9 +3049,11 @@ class ProcessCollectionWorker:
         self.next_episode_index = int(result.get("next_episode_index", 0))
         self.next_sample_index = int(result.get("next_sample_index", 0))
         if discarded:
+            self._active_legacy_episode_index = None
             self._active_episode_frame_count = 0
             self._tactile_counts_by_episode.pop(int(episode_index), None)
             self._sample_acceptance_receipt_buffer.reset()
+            self._sample_terminal_event_buffer.reset()
         if int(episode_index) == self._active_native_episode_index:
             self._active_native_episode_uuid = None
             self._active_native_episode_index = None
@@ -2456,11 +3061,18 @@ class ProcessCollectionWorker:
         return discarded
 
     def reload_finalized_dataset_state(self) -> None:
-        result = self._request("reload_finalized_dataset_state")
-        if not isinstance(result, Mapping):
-            raise RuntimeError("collection worker returned invalid dataset reload state")
-        self.next_episode_index = int(result.get("next_episode_index", 0))
-        self.next_sample_index = int(result.get("next_sample_index", 0))
+        with self._admit_operation(require_started=True, exclusive=True):
+            if getattr(self, "_active_legacy_episode_index", None) is not None:
+                raise RuntimeError(
+                    "Cannot reload dataset state while an episode is active."
+                )
+            result = self._request("reload_finalized_dataset_state")
+            if not isinstance(result, Mapping):
+                raise RuntimeError(
+                    "collection worker returned invalid dataset reload state"
+                )
+            self.next_episode_index = int(result.get("next_episode_index", 0))
+            self.next_sample_index = int(result.get("next_sample_index", 0))
 
     def tactile_frame_counts(self, episode_index: int) -> dict[str, int]:
         self._drain_acks()
@@ -2474,6 +3086,12 @@ class ProcessCollectionWorker:
     def stats(self) -> ProcessCollectionStats:
         self._drain_acks()
         values = list(self._sample_process_ms)
+        available_count = getattr(self._slots, "available_count", None)
+        if available_count is None:
+            available_count = len(getattr(self._slots, "available", ()))
+        slot_count = getattr(self._slots, "slot_count", None)
+        if slot_count is None:
+            slot_count = len(getattr(self._slots, "blocks", ()))
         timing_ms = {
             "parent.pack_shared": _metric_summary(list(self._parent_pack_ms)),
             "parent.queue_put": _metric_summary(list(self._parent_queue_put_ms)),
@@ -2490,8 +3108,8 @@ class ProcessCollectionWorker:
             sample_rejections=int(self._sample_rejection_count),
             queue_capacity=int(self.config.queue_size),
             queue_high_water=int(self._queue_high_water),
-            slots_available=len(self._slots.available),
-            slot_count=len(self._slots.blocks),
+            slots_available=int(available_count),
+            slot_count=int(slot_count),
             worker_alive=bool(self._started and self._process.is_alive()),
             worker_error=self._worker_error,
             worker_traceback=self._worker_traceback,
@@ -2517,18 +3135,30 @@ class ProcessCollectionWorker:
         """Cheap status for the 60 Hz frontend; avoids percentile recomputation."""
 
         self._drain_acks()
+        available_count = getattr(self._slots, "available_count", None)
+        if available_count is None:
+            available_count = len(getattr(self._slots, "available", ()))
+        slot_count = getattr(self._slots, "slot_count", None)
+        if slot_count is None:
+            slot_count = len(getattr(self._slots, "blocks", ()))
         status = {
             "submitted_samples": int(self._submitted_samples),
             "completed_samples": int(self._completed_samples),
             "rejected_busy": int(self._rejected_busy),
             "queue_high_water": int(self._queue_high_water),
-            "slots_available": len(self._slots.available),
-            "slot_count": len(self._slots.blocks),
+            "slots_available": int(available_count),
+            "slot_count": int(slot_count),
             "worker_alive": bool(self._started and self._process.is_alive()),
             "worker_error": self._worker_error,
             "worker_traceback": self._worker_traceback,
             "sample_rejection_count": int(self._sample_rejection_count),
             "pending_sample_rejections": len(self._pending_sample_rejections),
+            "orphan_reply_count": int(
+                getattr(self, "_orphan_reply_count", 0)
+            ),
+            "malformed_ack_count": int(
+                getattr(self, "_malformed_ack_count", 0)
+            ),
             "active_episode_frame_count": int(self._active_episode_frame_count),
             "parent_pack_ms_latest": (
                 None if not self._parent_pack_ms else float(self._parent_pack_ms[-1])
@@ -2561,14 +3191,38 @@ class ProcessCollectionWorker:
         return status
 
     def close(self, *, flush: bool = True, force: bool = False) -> None:
-        if self._closed:
+        condition = getattr(self, "_lifecycle_condition", None)
+        if condition is not None:
+            with condition:
+                if bool(getattr(self, "_closed", False)):
+                    return
+                if bool(getattr(self, "_closing", False)):
+                    while not bool(getattr(self, "_closed", False)):
+                        condition.wait()
+                    return
+                self._closing = True
+                # Do not close shared memory while a snapshot/native submit is
+                # still packing or enqueueing a descriptor.  Once this point
+                # is reached no new operation can be admitted.
+                while int(getattr(self, "_lifecycle_active_operations", 0)) > 0:
+                    condition.wait()
+        elif bool(getattr(self, "_closed", False)):
             return
-        self._closed = True
         try:
-            if self._process.is_alive() and not force:
+            try:
+                process_alive = bool(self._process.is_alive())
+            except (AssertionError, AttributeError):
+                process_alive = False
+            if not process_alive:
+                # A child that already exited cannot drain any parent-side
+                # Queue feeder.  Treat this as a forced close so shutdown
+                # uses ``cancel_join_thread`` below instead of an unbounded
+                # join on a pipe with no consumer.
+                force = True
+            elif not force:
                 try:
                     if flush:
-                        self.flush()
+                        self._flush_admitted()
                     self._request("close")
                 except Exception:
                     force = True
@@ -2586,9 +3240,26 @@ class ProcessCollectionWorker:
             ):
                 try:
                     runtime_queue.close()
-                    runtime_queue.join_thread()
+                    # If the worker failed or was force-terminated, its
+                    # consumer may no longer drain the parent's Queue feeder
+                    # pipe.  ``join_thread`` has no timeout and could wedge
+                    # GUI shutdown indefinitely in that case; pending queue
+                    # messages are intentionally disposable after a forced
+                    # close.  Graceful close still joins the feeder so all
+                    # requests are durably handed to the child first.
+                    if force and hasattr(runtime_queue, "cancel_join_thread"):
+                        runtime_queue.cancel_join_thread()
+                    else:
+                        runtime_queue.join_thread()
                 except Exception:
                     pass
+            if condition is not None:
+                with condition:
+                    self._closed = True
+                    self._closing = False
+                    condition.notify_all()
+            else:
+                self._closed = True
 
 
 __all__ = [

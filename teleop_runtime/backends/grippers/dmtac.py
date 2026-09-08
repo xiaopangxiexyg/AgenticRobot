@@ -18,15 +18,15 @@ from ...registry import register_backend
 from ...schemas import EffectorCommand
 from ...dmtac_tactile_fields import (
     DMTAC_DEFAULT_TACTILE_FIELDS,
-    DMTAC_DISTRIBUTED_FORCE_SHAPE,
-    DMTAC_RAW_IMAGE_SHAPE,
+    DMTAC_DISTRIBUTED_FORCE_SHAPE,  # noqa: F401 - public compatibility export
+    DMTAC_RAW_IMAGE_SHAPE,  # noqa: F401 - public compatibility export
     DMTAC_TACTILE_ARRAY_FIELDS,
-    DMTAC_TACTILE_CALIBRATED_FIELDS,
-    DMTAC_TACTILE_FIELD_ALIASES,
+    DMTAC_TACTILE_CALIBRATED_FIELDS,  # noqa: F401 - public compatibility export
+    DMTAC_TACTILE_FIELD_ALIASES,  # noqa: F401 - public compatibility export
     DMTAC_TACTILE_FIELD_DEFAULT_SHAPES,
-    DMTAC_TACTILE_FIELDS,
+    DMTAC_TACTILE_FIELDS,  # noqa: F401 - public compatibility export
     _normalize_dmtac_tactile_fields,
-    dmtac_tactile_requires_calibration,
+    dmtac_tactile_requires_calibration,  # noqa: F401 - public compatibility export
     normalize_dmtac_tactile_fields,
 )
 
@@ -36,6 +36,23 @@ DEFAULT_DMTAC_GRIPPER_SPEED = 1.0
 DEFAULT_DMTAC_GRIPPER_TORQUE = 0.2
 DEFAULT_DMTAC_GRIPPER_COMMAND_HZ = 20.0
 DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ = 20.0
+# USB assignment files historically stored the short probe timeout (30 ms)
+# under ``timeout``.  Runtime Modbus state/command exchanges need a separate,
+# bounded value because opening the port and the first response can exceed the
+# probe budget.  Keep this canonical so assignment consumers and hand-written
+# backend configs use the same safe default.
+DEFAULT_DMTAC_GRIPPER_RUNTIME_TIMEOUT = 0.10
+DMTAC_STARTUP_RECOVERY_MODES = ("stabilized", "legacy")
+DMTAC_RUNTIME_FAULT_CLEAR_CONFIRM_SAMPLES = 3
+DMTAC_GRIPPER_RECOVERABLE_SEND_STATUSES = frozenset(
+    {
+        "rate_limited",
+        "io_busy",
+        "hardware_fault",
+        "not_connected",
+        "send_exception",
+    }
+)
 GRIPPER_ACTION_MAX = 1.0
 # A state-register read takes about 10 ms on the validated 115200-baud setup.
 # Keep a short write-to-read guard, but do not hide the physical response for
@@ -397,7 +414,7 @@ class DMTacGripperBackendConfig:
     gripper_port: str = DEFAULT_DMTAC_GRIPPER_PORT
     gripper_id: int = 1
     gripper_baudrate: int = 115200
-    gripper_timeout: float = 0.10
+    gripper_timeout: float = DEFAULT_DMTAC_GRIPPER_RUNTIME_TIMEOUT
     max_open_mm: float = 70.0
     connect_hardware: bool = True
     # Deployment-only live observation shadow.  It permits telemetry/tactile
@@ -411,6 +428,26 @@ class DMTacGripperBackendConfig:
     torque: float = DEFAULT_DMTAC_GRIPPER_TORQUE
     continuous_grasp: bool = True
     clear_fault_on_start: bool = True
+    # The vendor acknowledgement write is asynchronous on several DMTAC
+    # firmware revisions.  Admission therefore performs a small, bounded
+    # sequence of fresh state reads after clearing the fault instead of
+    # trusting the first telemetry sample (which may still contain the
+    # pre-clear error code).
+    startup_fault_check_attempts: int = 3
+    startup_fault_check_interval_sec: float = 0.05
+    # ``stabilized`` is the real-hardware default.  It gives a newly opened
+    # serial/firmware session a bounded settle window and confirms an
+    # asynchronous fault ACK over a longer bounded interval.  ``legacy`` is
+    # an explicit rollback to the historical 3-read/50-ms sequence above.
+    startup_recovery_mode: str = "stabilized"
+    startup_connection_settle_sec: float = 0.25
+    startup_recovery_timeout_sec: float = 3.0
+    startup_recovery_poll_interval_sec: float = 0.20
+    startup_fault_ack_interval_sec: float = 0.75
+    runtime_fault_clear_confirm_samples: int = (
+        DMTAC_RUNTIME_FAULT_CLEAR_CONFIRM_SAMPLES
+    )
+    auto_recover_internal_communication_fault: bool = True
     open_on_start: bool = False
     reconnect_on_error: bool = True
     reconnect_cooldown_sec: float = 1.0
@@ -485,6 +522,30 @@ class DMTacGripperBackendConfig:
             raise ValueError("gripper_telemetry_command_grace_s must be non-negative.")
         if float(self.reconnect_cooldown_sec) < 0.0:
             raise ValueError("reconnect_cooldown_sec must be non-negative.")
+        if int(self.startup_fault_check_attempts) <= 0:
+            raise ValueError("startup_fault_check_attempts must be positive.")
+        if float(self.startup_fault_check_interval_sec) < 0.0:
+            raise ValueError(
+                "startup_fault_check_interval_sec must be non-negative."
+            )
+        recovery_mode = str(self.startup_recovery_mode).strip().lower()
+        if recovery_mode not in DMTAC_STARTUP_RECOVERY_MODES:
+            raise ValueError(
+                "startup_recovery_mode must be stabilized or legacy."
+            )
+        self.startup_recovery_mode = recovery_mode
+        for field_name in (
+            "startup_connection_settle_sec",
+            "startup_recovery_timeout_sec",
+            "startup_recovery_poll_interval_sec",
+            "startup_fault_ack_interval_sec",
+        ):
+            if float(getattr(self, field_name)) < 0.0:
+                raise ValueError(f"{field_name} must be non-negative.")
+        if int(self.runtime_fault_clear_confirm_samples) <= 0:
+            raise ValueError(
+                "runtime_fault_clear_confirm_samples must be positive."
+            )
         if self.disconnected_state_scalar is not None:
             disconnected_scalar = float(self.disconnected_state_scalar)
             if (
@@ -610,6 +671,12 @@ class DMTacGripperBackend(EffectorBackend):
         self._next_tactile_read_at: float | None = None
         self._latest_telemetry_elapsed_s: float | None = None
         self._telemetry_error: str | None = None
+        # Keep the complete most-recent admission failure separate from the
+        # live telemetry error.  A failed ``start`` closes the partially
+        # created device, so looking only at ``device is None`` loses the
+        # serial endpoint and vendor exception that the operator needs for a
+        # safe retry.
+        self._last_start_error: str | None = None
         self._tactile_ready: dict[str, bool] = {}
         self._stop_event: threading.Event | None = None
         self._telemetry_thread: threading.Thread | None = None
@@ -625,6 +692,11 @@ class DMTacGripperBackend(EffectorBackend):
         self._tactile_worker_last_exit_code: int | None = None
         self._tactile_worker_observed_process: Any | None = None
         self._tactile_worker_supervisor_lock = threading.Lock()
+        # Inline tactile setup belongs to one composite-device lifetime.  A
+        # gripper-only reconnect keeps the existing tactile handle, while a
+        # failed startup may create a fresh composite and must run the ready /
+        # warmup handshake exactly once for that new handle.
+        self._tactile_inline_initialized = False
         self._closing = False
         self._applied_speed: float | None = None
         self._applied_torque: float | None = None
@@ -638,6 +710,28 @@ class DMTacGripperBackend(EffectorBackend):
         self._last_reconnect_attempt_at: float | None = None
         self._last_reconnect_error: str | None = None
         self._reconnect_count = 0
+        self._connection_generation = 0
+        self._last_connection_opened_at: float | None = None
+        self._last_connection_closed_at: float | None = None
+        self._last_connection_opened_monotonic: float | None = None
+        self._last_connection_closed_monotonic: float | None = None
+        self._last_connection_open_thread: str | None = None
+        self._last_connection_close_thread: str | None = None
+        self._recovery_phase = "idle"
+        self._last_recovery_reason: str | None = None
+        self._recovery_started_at: float | None = None
+        self._recovery_completed_at: float | None = None
+        self._runtime_fault_recovery_attempted = False
+        # Runtime error 16 is tracked as an incident, not as a property of one
+        # serial handle.  In particular an automatic reconnect or one
+        # transient zero register must not re-arm another three-second ACK
+        # loop for the same physical fault.
+        self._runtime_fault_incident_sequence = 0
+        self._runtime_fault_active_incident_id: int | None = None
+        self._runtime_fault_failed_incident_id: int | None = None
+        self._runtime_fault_first_seen_at: float | None = None
+        self._runtime_fault_last_attempt_at: float | None = None
+        self._runtime_fault_zero_streak = 0
         if self.config.disconnected_state_scalar is not None:
             self._latest_joint_pos = self._q6_from_scalar(
                 float(self.config.disconnected_state_scalar),
@@ -706,6 +800,11 @@ class DMTacGripperBackend(EffectorBackend):
             apply_tactile_calibration_on_connect=not bool(
                 self.config.observation_only
             ),
+            # Keep the command transport independently recoverable when the
+            # optional tactile stack is absent.  Collection admission checks
+            # tactile freshness separately; it must not be reported as a
+            # missing hand serial backend.
+            allow_partial_connect=True,
         ).connect()
 
     def _create_gripper(self) -> Any:
@@ -736,6 +835,93 @@ class DMTacGripperBackend(EffectorBackend):
         self._last_sent_command_timestamp = None
         self._last_sent_command_completed_timestamp = None
 
+    def _mark_gripper_connection_opened_locked(self) -> None:
+        self._connection_generation += 1
+        self._last_connection_opened_at = time.time()
+        self._last_connection_opened_monotonic = time.monotonic()
+        self._last_connection_open_thread = threading.current_thread().name
+
+    def _mark_gripper_connection_closed_locked(self) -> None:
+        self._last_connection_closed_at = time.time()
+        self._last_connection_closed_monotonic = time.monotonic()
+        self._last_connection_close_thread = threading.current_thread().name
+
+    def _set_recovery_phase_locked(self, phase: str, *, reason: str) -> None:
+        now = time.time()
+        with self._state_lock:
+            self._recovery_phase = str(phase)
+            self._last_recovery_reason = str(reason)
+            if phase == "recovering":
+                self._recovery_started_at = now
+                self._recovery_completed_at = None
+            elif phase in {"ready", "failed"}:
+                self._recovery_completed_at = now
+
+    def _begin_runtime_fault_incident_locked(self) -> int:
+        """Return the stable identity for the currently observed error 16."""
+
+        with self._state_lock:
+            incident_id = self._runtime_fault_active_incident_id
+            if incident_id is None:
+                self._runtime_fault_incident_sequence += 1
+                incident_id = int(self._runtime_fault_incident_sequence)
+                self._runtime_fault_active_incident_id = incident_id
+                self._runtime_fault_failed_incident_id = None
+                self._runtime_fault_first_seen_at = time.time()
+                self._runtime_fault_last_attempt_at = None
+                self._runtime_fault_recovery_attempted = False
+            self._runtime_fault_zero_streak = 0
+            return int(incident_id)
+
+    def _runtime_fault_auto_recovery_blocked_locked(self) -> bool:
+        with self._state_lock:
+            incident_id = self._runtime_fault_active_incident_id
+            return bool(
+                incident_id is not None
+                and self._runtime_fault_failed_incident_id == incident_id
+            )
+
+    def _mark_runtime_fault_recovery_attempt_locked(self, incident_id: int) -> None:
+        with self._state_lock:
+            if self._runtime_fault_active_incident_id != int(incident_id):
+                raise RuntimeError("DMTAC runtime fault incident changed during recovery")
+            self._runtime_fault_recovery_attempted = True
+            self._runtime_fault_last_attempt_at = time.time()
+
+    def _mark_runtime_fault_recovery_failed_locked(self, incident_id: int) -> None:
+        with self._state_lock:
+            if self._runtime_fault_active_incident_id == int(incident_id):
+                self._runtime_fault_failed_incident_id = int(incident_id)
+                self._runtime_fault_zero_streak = 0
+
+    def _clear_runtime_fault_incident_locked(self, *, reason: str) -> None:
+        """Release a runtime-fault latch after stable zero confirmation."""
+
+        with self._state_lock:
+            self._runtime_fault_active_incident_id = None
+            self._runtime_fault_failed_incident_id = None
+            self._runtime_fault_recovery_attempted = False
+            self._runtime_fault_zero_streak = 0
+        self._set_recovery_phase_locked("ready", reason=reason)
+
+    def _observe_runtime_fault_zero_locked(self) -> bool:
+        """Return true only after enough consecutive zero samples to re-arm."""
+
+        with self._state_lock:
+            if self._runtime_fault_active_incident_id is None:
+                self._runtime_fault_recovery_attempted = False
+                self._runtime_fault_zero_streak = 0
+                return True
+            self._runtime_fault_zero_streak += 1
+            confirmed = self._runtime_fault_zero_streak >= int(
+                self.config.runtime_fault_clear_confirm_samples
+            )
+        if confirmed:
+            self._clear_runtime_fault_incident_locked(
+                reason="runtime_fault_cleared_externally_stable",
+            )
+        return bool(confirmed)
+
     def _apply_gripper_start_config_locked(self, *, open_on_start: bool) -> None:
         if (
             self.config.observation_only
@@ -745,14 +931,172 @@ class DMTacGripperBackend(EffectorBackend):
         ):
             return
         self._reset_applied_motion_config_locked()
-        if self.config.clear_fault_on_start:
-            self.device.clear_fault()
+        self._confirm_gripper_fault_clear_locked()
         self.device.set_speed(float(self.config.speed))
         self._applied_speed = float(self.config.speed)
         self.device.set_torque(float(self.config.torque))
         self._applied_torque = float(self.config.torque)
         if bool(open_on_start) and self.config.open_on_start:
             self.device.open(wait=False)
+
+    def _confirm_gripper_fault_clear_locked(
+        self,
+        *,
+        observed_state: object | None = None,
+    ) -> object | None:
+        """Require a fresh, fault-free vendor state before Rig admission.
+
+        ``start``, explicit reconnect, and bounded runtime fault recovery use
+        this helper while holding the backend I/O lock.  Runtime callers pass
+        their already-read fault state so recovery does not repeat that serial
+        transaction.  A real non-zero vendor error is never masked; it is
+        surfaced with the serial identity and latest status so the Session can
+        remain in fail-closed Hold and the GUI can offer retry.
+        Lightweight test/compatibility devices that do not expose a state-read
+        method keep the historical startup behaviour and are checked by their
+        normal ``is_ready`` implementation instead.
+        """
+
+        device = self.device
+        if device is None or getattr(device, "gripper", None) is None:
+            return None
+        read_state = getattr(device, "read_gripper_state", None)
+        if not callable(read_state):
+            return None
+        mode = str(self.config.startup_recovery_mode)
+        if mode != "legacy" and observed_state is None:
+            # Only a newly opened serial session needs the connection settle
+            # window.  Runtime recovery already owns a fresh faulting state.
+            settle = max(0.0, float(self.config.startup_connection_settle_sec))
+            if settle > 0.0:
+                time.sleep(settle)
+        started = time.monotonic()
+
+        def read_fresh_state() -> object:
+            try:
+                state = read_state()
+            except Exception as exc:  # noqa: BLE001 - startup must fail closed.
+                raise RuntimeError(
+                    "DMTAC fresh startup state read failed "
+                    f"(port={self.config.gripper_port!s}, "
+                    f"id={int(self.config.gripper_id)}): "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            self._apply_gripper_state(state)
+            return state
+
+        state = observed_state if observed_state is not None else read_fresh_state()
+        if observed_state is not None:
+            self._apply_gripper_state(state)
+        attempt = 1
+        last_error = self._latest_gripper_error_code
+        if last_error in (None, 0):
+            return state
+        incident_id: int | None = None
+        if mode == "stabilized" and last_error == 16:
+            incident_id = self._begin_runtime_fault_incident_locked()
+        if not self.config.clear_fault_on_start:
+            status = self._latest_gripper_status_code
+            status_text = self._latest_gripper_status_text
+            detail = (
+                f"error_code={last_error}"
+                + (f" status_code={status}" if status is not None else "")
+                + (f":{status_text}" if status_text else "")
+            )
+            raise RuntimeError(
+                "DMTAC gripper startup fault (clear_fault_on_start=False): "
+                f"{detail}"
+            )
+
+        if mode == "legacy":
+            attempts = max(1, int(self.config.startup_fault_check_attempts))
+            interval = max(0.0, float(self.config.startup_fault_check_interval_sec))
+            while attempt < attempts:
+                self.device.clear_fault()
+                if interval > 0.0:
+                    time.sleep(interval)
+                state = read_fresh_state()
+                attempt += 1
+                last_error = self._latest_gripper_error_code
+                if last_error in (None, 0):
+                    return state
+        else:
+            # The portable driver owns the asynchronous ACK/read protocol.
+            # Reuse it here instead of maintaining a second production polling
+            # loop with subtly different ordering and timing semantics.
+            confirm = getattr(self.device, "clear_fault_and_confirm", None)
+            if not callable(confirm):
+                raise RuntimeError(
+                    "DMTAC stabilized recovery requires the portable driver's "
+                    "clear_fault_and_confirm() contract."
+                )
+            if incident_id is not None and not self._runtime_fault_recovery_attempted:
+                self._mark_runtime_fault_recovery_attempt_locked(incident_id)
+            try:
+                confirmed = confirm(
+                    timeout=max(
+                        0.0,
+                        float(self.config.startup_recovery_timeout_sec),
+                    ),
+                    poll_interval=max(
+                        0.0,
+                        float(self.config.startup_recovery_poll_interval_sec),
+                    ),
+                    ack_interval=max(
+                        0.0,
+                        float(self.config.startup_fault_ack_interval_sec),
+                    ),
+                    required_consecutive_zero_reads=int(
+                        self.config.runtime_fault_clear_confirm_samples
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve fail-closed detail.
+                # The portable driver retains its last fresh register sample.
+                # Preserve that timestamp/error in the backend cache even
+                # when the bounded confirmation itself fails; otherwise the
+                # caller re-publishes the pre-recovery sample and the causal
+                # hand history can briefly select an older healthy state.
+                gripper = getattr(self.device, "gripper", None)
+                last_state = getattr(gripper, "last_state", None)
+                if last_state is not None:
+                    self._apply_gripper_state(last_state)
+                if incident_id is not None:
+                    self._mark_runtime_fault_recovery_failed_locked(incident_id)
+                status = self._latest_gripper_status_code
+                status_text = self._latest_gripper_status_text
+                detail = (
+                    f"error_code={last_error}"
+                    + (f" status_code={status}" if status is not None else "")
+                    + (f":{status_text}" if status_text else "")
+                )
+                raise RuntimeError(
+                    "DMTAC gripper fault remains after bounded startup clear "
+                    f"(port={self.config.gripper_port!s}, "
+                    f"id={int(self.config.gripper_id)}): {detail} "
+                    f"recovery_mode={mode} driver_confirm="
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            self._apply_gripper_state(confirmed)
+            if self._latest_gripper_error_code in (None, 0):
+                if incident_id is not None:
+                    self._clear_runtime_fault_incident_locked(
+                        reason="fault_clear_confirmed_stable",
+                    )
+                return confirmed
+            last_error = self._latest_gripper_error_code
+        status = self._latest_gripper_status_code
+        status_text = self._latest_gripper_status_text
+        detail = (
+            f"error_code={last_error}"
+            + (f" status_code={status}" if status is not None else "")
+            + (f":{status_text}" if status_text else "")
+        )
+        raise RuntimeError(
+            "DMTAC gripper fault remains after bounded startup clear "
+            f"(port={self.config.gripper_port!s}, id={int(self.config.gripper_id)}): "
+            f"{detail} recovery_mode={mode} attempts={attempt} "
+            f"elapsed_sec={time.monotonic() - started:.3f}"
+        )
 
     def _close_gripper_locked(self) -> None:
         device = self.device
@@ -770,25 +1114,86 @@ class DMTacGripperBackend(EffectorBackend):
                     setattr(device, "gripper", None)
                 except Exception:
                     self.device = None
+            self._mark_gripper_connection_closed_locked()
         self._invalidate_gripper_connection_state_locked()
 
     def _close_device_locked(self) -> None:
         device = self.device
+        had_gripper = bool(
+            device is not None and getattr(device, "gripper", None) is not None
+        )
         self.device = None
+        self._tactile_inline_initialized = False
         self._invalidate_gripper_connection_state_locked()
         if device is not None:
             device.close()
+        if had_gripper:
+            self._mark_gripper_connection_closed_locked()
 
     def _connect_gripper_locked(self) -> None:
         if self.device is None:
             self.device = self._create_device()
+            self._tactile_inline_initialized = False
         elif hasattr(self.device, "gripper"):
             self._close_gripper_locked()
             setattr(self.device, "gripper", self._create_gripper())
         else:
             self._close_device_locked()
             self.device = self._create_device()
+        if self.config.connect_hardware and getattr(self.device, "gripper", None) is not None:
+            self._mark_gripper_connection_opened_locked()
         self._apply_gripper_start_config_locked(open_on_start=False)
+        self._last_start_error = None
+
+    def _initialize_inline_tactile_locked(self) -> None:
+        """Complete the inline tactile ready handshake for a fresh device.
+
+        Process-isolated tactile acquisition performs this work in the child
+        process.  The synchronous path still needs the same bounded reset,
+        readiness, and warmup sequence after a failed startup/reconnect; the
+        guard prevents a gripper-only reconnect from repeatedly resetting a
+        live tactile stream.
+        """
+
+        if (
+            not self.config.connect_tactile
+            or self.config.tactile_process_read
+            or self.device is None
+            or getattr(self.device, "tactile", None) is None
+            or self._tactile_inline_initialized
+        ):
+            return
+        if self.config.tactile_reset_on_start:
+            self.device.reset_tactile()
+        self._tactile_ready = {
+            str(key): bool(value)
+            for key, value in self.device.wait_tactile_ready(
+                timeout_s=float(self.config.tactile_ready_timeout_s)
+            ).items()
+        }
+        if int(self.config.tactile_warmup_frames) > 0:
+            self.device.warmup_tactile_filter(
+                frames=int(self.config.tactile_warmup_frames),
+                timeout_ms=int(self.config.tactile_timeout_ms),
+            )
+        self._tactile_inline_initialized = True
+
+    def _ensure_background_workers_locked(self, *, start_telemetry: bool) -> None:
+        """Restore workers owned by this backend after any gripper recovery."""
+
+        if self._closing:
+            raise RuntimeError("DMTAC backend is closing")
+        if self.config.connect_tactile and self.config.tactile_process_read:
+            self._start_tactile_worker()
+        else:
+            self._initialize_inline_tactile_locked()
+        # An explicit GUI retry is allowed to create the supervisor when the
+        # original ``start`` failed before it reached that boundary.  An
+        # ad-hoc/direct telemetry read, however, must not silently create a
+        # second long-lived thread; an existing supervisor is restarted by the
+        # same idempotent helper when it has died.
+        if start_telemetry or self._telemetry_thread is not None:
+            self._start_telemetry_thread()
 
     def _quarantine_gripper_io_error_locked(
         self,
@@ -805,10 +1210,34 @@ class DMTacGripperBackend(EffectorBackend):
             self._telemetry_error = f"{error_text}; {close_error}"
             self._last_reconnect_error = close_error
 
-    def _handle_gripper_io_error_locked(self, prefix: str, exc: BaseException) -> bool:
+    def _handle_gripper_io_error_locked(
+        self,
+        prefix: str,
+        exc: BaseException,
+        *,
+        force: bool = False,
+        quarantine: bool = True,
+    ) -> bool:
         error_text = f"{prefix}: {exc}"
-        self._quarantine_gripper_io_error_locked(prefix, exc)
-        if not self.config.connect_hardware or not self.config.reconnect_on_error:
+        if not force and self._runtime_fault_auto_recovery_blocked_locked():
+            incident_id = self._runtime_fault_active_incident_id
+            suppressed = (
+                f"{error_text}; automatic reconnect suppressed after failed "
+                f"runtime fault incident={incident_id}; use explicit device retry"
+            )
+            if quarantine:
+                self._quarantine_gripper_io_error_locked(prefix, exc)
+            self._telemetry_error = suppressed
+            self._last_reconnect_error = suppressed
+            self._set_recovery_phase_locked("failed", reason=suppressed)
+            return False
+        self._set_recovery_phase_locked("recovering", reason=error_text)
+        if quarantine:
+            self._quarantine_gripper_io_error_locked(prefix, exc)
+        if not self.config.connect_hardware or (
+            not self.config.reconnect_on_error and not force
+        ):
+            self._set_recovery_phase_locked("failed", reason=error_text)
             return False
         now = time.time()
         if (
@@ -816,12 +1245,33 @@ class DMTacGripperBackend(EffectorBackend):
             and now - self._last_reconnect_attempt_at < float(self.config.reconnect_cooldown_sec)
         ):
             self._last_reconnect_error = error_text
+            self._set_recovery_phase_locked("failed", reason=error_text)
             return False
         self._last_reconnect_attempt_at = now
         try:
+            # In inline tactile mode a partial composite may retain a healthy
+            # gripper while its tactile transport failed.  Rebuilding only
+            # the gripper would keep that ``tactile=None`` object forever, so
+            # an explicit operator retry recreates the complete device and
+            # reruns the bounded tactile handshake.  Isolated worker mode
+            # intentionally keeps tactile out of the composite and is
+            # recovered by ``_start_tactile_worker`` below.
+            if (
+                force
+                and self.config.connect_tactile
+                and not self.config.tactile_process_read
+                and self.device is not None
+                and getattr(self.device, "tactile", None) is None
+            ):
+                self._close_device_locked()
             self._connect_gripper_locked()
             assert self.device is not None
-            gripper_state = self.device.read_gripper_state()
+            # Recreate all workers that are tied to this backend after a
+            # failed initial start or a quarantined serial session.  The
+            # helper is idempotent for an already-live runtime and raises on
+            # an unrecoverable worker startup failure so readiness stays
+            # fail-closed.
+            self._ensure_background_workers_locked(start_telemetry=force)
         except Exception as reconnect_exc:  # noqa: BLE001
             try:
                 self._close_gripper_locked()
@@ -832,9 +1282,19 @@ class DMTacGripperBackend(EffectorBackend):
                 )
             self._last_reconnect_error = f"reconnect_failed: {reconnect_exc}"
             self._telemetry_error = f"{error_text}; {self._last_reconnect_error}"
+            self._set_recovery_phase_locked(
+                "failed",
+                reason=self._last_reconnect_error,
+            )
             return False
-        self._apply_gripper_state(gripper_state)
         self._reconnect_count += 1
+        self._clear_runtime_fault_incident_locked(
+            reason=(
+                "explicit_reconnect_confirmed"
+                if force
+                else "automatic_reconnect_confirmed"
+            ),
+        )
         self._last_reconnect_error = None
         self._telemetry_error = None
         return True
@@ -880,8 +1340,49 @@ class DMTacGripperBackend(EffectorBackend):
         }
 
     def _start_tactile_worker(self) -> None:
-        if self._tactile_worker_process is not None:
-            return
+        process = self._tactile_worker_process
+        if process is not None:
+            try:
+                process_alive = bool(process.is_alive())
+            except Exception:
+                process_alive = False
+            if process_alive:
+                # A process can outlive its receiver thread after a transient
+                # queue/EOF failure.  Reattach the receiver instead of
+                # creating a second reader for the same queue.
+                self._start_tactile_worker_receiver()
+                return
+
+            # Do not treat an exited Process object as a healthy worker.  The
+            # old early return left failed-start backends permanently without
+            # tactile data and made an explicit gripper reconnect appear to
+            # succeed while its observation workers were already dead.
+            receiver_stop = self._tactile_worker_receiver_stop
+            receiver = self._tactile_worker_receiver_thread
+            if receiver_stop is not None:
+                receiver_stop.set()
+            if receiver is not None and receiver is not threading.current_thread():
+                receiver.join(timeout=1.0)
+            if receiver is not None and receiver.is_alive():
+                raise RuntimeError("DMTAC tactile receiver did not stop")
+            try:
+                process.join(timeout=0.1)
+            except (AssertionError, AttributeError, OSError, ValueError):
+                pass
+            queue_out = self._tactile_worker_queue
+            if queue_out is not None:
+                try:
+                    queue_out.close()
+                    queue_out.cancel_join_thread()
+                except (AttributeError, OSError, ValueError):
+                    pass
+            self._tactile_worker_process = None
+            self._tactile_worker_queue = None
+            self._tactile_worker_stop_event = None
+            self._tactile_worker_receiver_stop = None
+            self._tactile_worker_receiver_thread = None
+            self._tactile_worker_observed_process = None
+
         ctx = mp.get_context("spawn")
         self._tactile_worker_queue = ctx.Queue(
             maxsize=max(1, int(self.config.tactile_process_queue_size))
@@ -902,6 +1403,38 @@ class DMTacGripperBackend(EffectorBackend):
         self._tactile_worker_restart_pending = False
         self._start_tactile_worker_receiver()
 
+    def _start_telemetry_thread(self) -> None:
+        """Start one telemetry supervisor, including after failed startup.
+
+        ``start`` historically created this thread only after the initial
+        device handshake.  If that handshake failed, the GUI retry restored
+        the serial handle but no thread remained to supervise measured state
+        or the tactile worker.  Keep this helper idempotent so both initial
+        startup and explicit/automatic recovery share one lifecycle boundary.
+        """
+
+        if not self.config.enable_telemetry or self._closing:
+            return
+        thread = self._telemetry_thread
+        if thread is not None and thread.is_alive():
+            return
+        if thread is not None and thread is threading.current_thread():
+            return
+        stop_event = self._stop_event
+        if stop_event is None or stop_event.is_set():
+            stop_event = threading.Event()
+            self._stop_event = stop_event
+        self._telemetry_thread = threading.Thread(
+            target=self._telemetry_loop,
+            name=f"{self.name}_dmtac_gripper_telemetry",
+            daemon=True,
+        )
+        try:
+            self._telemetry_thread.start()
+        except Exception:
+            self._telemetry_thread = None
+            raise
+
     def _stop_tactile_worker_for_reconfigure(self) -> None:
         """Stop only tactile acquisition while leaving gripper control untouched."""
 
@@ -917,8 +1450,27 @@ class DMTacGripperBackend(EffectorBackend):
         if receiver is not None and receiver is not threading.current_thread():
             receiver.join(timeout=1.0)
         if process is not None:
-            process.join(timeout=DMTAC_TACTILE_PROCESS_STOP_TIMEOUT_S)
-            if process.is_alive():
+            process_alive = False
+            try:
+                process.join(timeout=DMTAC_TACTILE_PROCESS_STOP_TIMEOUT_S)
+            except AssertionError:
+                # multiprocessing raises this for a Process whose start()
+                # failed before a child was created.  It is already safe to
+                # discard that handle and let the next retry build a fresh
+                # process.
+                process_alive = False
+            except (AttributeError, OSError, ValueError):
+                # An unknown process state must be treated conservatively;
+                # terminate below if the object can still report liveness.
+                process_alive = True
+            else:
+                try:
+                    process_alive = bool(process.is_alive())
+                except AssertionError:
+                    process_alive = False
+                except Exception:
+                    process_alive = True
+            if process_alive:
                 process.terminate()
                 process.join(timeout=1.0)
         if queue_out is not None:
@@ -1021,6 +1573,20 @@ class DMTacGripperBackend(EffectorBackend):
         thread = self._tactile_worker_receiver_thread
         return bool(thread is not None and thread.is_alive())
 
+    def _tactile_worker_process_alive(self) -> bool:
+        """Return worker liveness without letting an invalid handle escape."""
+
+        process = self._tactile_worker_process
+        if process is None:
+            return False
+        try:
+            return bool(process.is_alive())
+        except Exception:
+            # ``multiprocessing.Process.is_alive`` raises AssertionError for
+            # a handle whose start() failed.  Treat it as exited so the
+            # supervisor can perform bounded cleanup and restart.
+            return False
+
     def _start_tactile_worker_receiver(self) -> None:
         if self._tactile_worker_receiver_active():
             return
@@ -1043,7 +1609,7 @@ class DMTacGripperBackend(EffectorBackend):
             except queue.Empty:
                 self._check_tactile_worker_process()
                 process = self._tactile_worker_process
-                if process is not None and not process.is_alive():
+                if process is not None and not self._tactile_worker_process_alive():
                     break
                 continue
             except (EOFError, OSError):
@@ -1055,69 +1621,242 @@ class DMTacGripperBackend(EffectorBackend):
     def start(self) -> None:
         if not self.config.connect_hardware and not self.config.connect_tactile:
             return
-        if self.device is not None:
-            return
         self._closing = False
+        self._last_start_error = None
         try:
             with self._lock:
+                # A failed/partial composite can leave a DMTac device object
+                # behind with ``gripper=None`` (for example tactile connected
+                # while the serial handshake failed).  Treat that as an
+                # unready session and rebuild it; returning early here made a
+                # later GUI retry permanently report ``not connected``.
+                if self.device is not None:
+                    gripper_ready = bool(
+                        not self.config.connect_hardware
+                        or getattr(self.device, "gripper", None) is not None
+                    )
+                    tactile_ready = bool(
+                        not self.config.connect_tactile
+                        or self.config.tactile_process_read
+                        or getattr(self.device, "tactile", None) is not None
+                    )
+                    if gripper_ready and tactile_ready and self.is_ready():
+                        self._ensure_background_workers_locked(
+                            start_telemetry=False
+                        )
+                        self._last_start_error = None
+                        self._last_reconnect_error = None
+                        self._telemetry_error = None
+                        if self.config.connect_hardware:
+                            self._clear_runtime_fault_incident_locked(
+                                reason="startup_reuse",
+                            )
+                        return
+                    if self.config.connect_hardware:
+                        self._set_recovery_phase_locked("recovering", reason="startup")
+                    self._close_device_locked()
+                elif self.config.connect_hardware:
+                    self._set_recovery_phase_locked("recovering", reason="startup")
                 self.device = self._create_device()
+                if (
+                    self.config.connect_hardware
+                    and getattr(self.device, "gripper", None) is not None
+                ):
+                    self._mark_gripper_connection_opened_locked()
                 if not self.config.observation_only:
                     self._apply_gripper_start_config_locked(open_on_start=True)
+                self._initialize_inline_tactile_locked()
                 if (
                     self.config.connect_tactile
                     and self.config.tactile_process_read
                 ):
                     self._start_tactile_worker()
-                elif self.config.connect_tactile and self.device.tactile is not None:
-                    if self.config.tactile_reset_on_start:
-                        self.device.reset_tactile()
-                    self._tactile_ready = {
-                        str(key): bool(value)
-                        for key, value in self.device.wait_tactile_ready(
-                            timeout_s=float(self.config.tactile_ready_timeout_s)
-                        ).items()
-                    }
-                    if int(self.config.tactile_warmup_frames) > 0:
-                        self.device.warmup_tactile_filter(
-                            frames=int(self.config.tactile_warmup_frames),
-                            timeout_ms=int(self.config.tactile_timeout_ms),
-                        )
             self._telemetry_error = None
+            self._last_reconnect_error = None
+            if self.config.connect_hardware:
+                self._clear_runtime_fault_incident_locked(reason="startup")
+            self._start_telemetry_thread()
         except Exception as exc:  # noqa: BLE001
+            startup_error = (
+                "connect_failed "
+                f"(port={self.config.gripper_port!s}, "
+                f"id={int(self.config.gripper_id)}, "
+                f"baud={int(self.config.gripper_baudrate)}): "
+                f"{type(exc).__name__}: {exc}"
+            )
             with self._lock:
                 device = self.device
                 self.device = None
+                self._tactile_inline_initialized = False
+            # A worker may have been created before a later startup step
+            # failed (for example process.start() or telemetry thread start).
+            # Tear it down before returning the backend to capability Hold so
+            # a subsequent explicit retry can create a fresh queue/process.
+            try:
+                self._stop_tactile_worker_for_reconfigure()
+            except Exception as worker_close_exc:  # noqa: BLE001
+                startup_error = (
+                    f"{startup_error}; worker_cleanup_failed: "
+                    f"{type(worker_close_exc).__name__}: {worker_close_exc}"
+                )
             if device is not None:
                 try:
+                    had_gripper = getattr(device, "gripper", None) is not None
                     device.close()
+                    if had_gripper:
+                        self._mark_gripper_connection_closed_locked()
                 except Exception as close_exc:  # noqa: BLE001
-                    self._telemetry_error = (
-                        f"connect_failed: {exc}; cleanup_failed: "
+                    startup_error = (
+                        f"{startup_error}; cleanup_failed: "
                         f"{type(close_exc).__name__}: {close_exc}"
                     )
-                    return
-            self._telemetry_error = f"connect_failed: {exc}"
+            self._last_start_error = startup_error
+            self._telemetry_error = startup_error
+            if self.config.enable_telemetry:
+                self._last_reconnect_error = startup_error
+            if self.config.connect_hardware:
+                self._set_recovery_phase_locked("failed", reason=startup_error)
             return
-
-        if self.config.enable_telemetry:
-            self._stop_event = threading.Event()
-            self._telemetry_thread = threading.Thread(
-                target=self._telemetry_loop,
-                name=f"{self.name}_dmtac_gripper_telemetry",
-                daemon=True,
-            )
-            self._telemetry_thread.start()
 
     def is_ready(self) -> bool:
         if self.config.connect_hardware:
             return (
-                self.device is not None
+                self._recovery_phase != "recovering"
+                and self._recovery_phase != "failed"
+                and self.device is not None
                 and getattr(self.device, "gripper", None) is not None
                 and self._latest_gripper_error_code in (None, 0)
             )
         if self.config.connect_tactile:
-            return self.device is not None
+            return (
+                self.device is not None
+                and getattr(self.device, "tactile", None) is not None
+            )
         return True
+
+    def readiness_report(self) -> dict[str, object]:
+        """Return the current gripper admission state without changing it.
+
+        DMTAC faults are reported from the latest telemetry sample, including
+        the vendor status text and the configured serial identity.  This keeps
+        a delayed telemetry fault actionable in the GUI while ``is_ready``
+        remains the fail-closed command-admission predicate.
+        """
+
+        ready = bool(self.is_ready())
+        try:
+            state = self.get_state(
+                include_tactile_arrays=False,
+                include_tactile_vector=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnosis must remain bounded.
+            state = {}
+            state_error = f"{type(exc).__name__}: {exc}"
+        else:
+            state_error = ""
+
+        details: dict[str, object] = {
+            "is_connected": bool(self.device is not None),
+            "gripper_is_connected": bool(
+                self.device is not None
+                and getattr(self.device, "gripper", None) is not None
+            ),
+            "tactile_is_connected": bool(
+                self.device is not None
+                and getattr(self.device, "tactile", None) is not None
+            ),
+            "gripper_port": str(self.config.gripper_port),
+            "gripper_id": int(self.config.gripper_id),
+            "gripper_baudrate": int(self.config.gripper_baudrate),
+            "startup_recovery_mode": str(self.config.startup_recovery_mode),
+            "recovery_phase": str(
+                state.get("gripper_recovery_phase", self._recovery_phase)
+            ),
+            "connection_generation": int(self._connection_generation),
+            "runtime_fault_incident_id": state.get(
+                "gripper_runtime_fault_active_incident_id",
+                self._runtime_fault_active_incident_id,
+            ),
+            "runtime_fault_failed_incident_id": (
+                state.get(
+                    "gripper_runtime_fault_failed_incident_id",
+                    self._runtime_fault_failed_incident_id,
+                )
+            ),
+            "runtime_fault_zero_streak": int(
+                state.get(
+                    "gripper_runtime_fault_zero_streak",
+                    self._runtime_fault_zero_streak,
+                )
+            ),
+            "runtime_fault_clear_confirm_samples": int(
+                self.config.runtime_fault_clear_confirm_samples
+            ),
+        }
+        tactile_connect_error = getattr(self.device, "tactile_connect_error", None)
+        if tactile_connect_error:
+            details["tactile_connect_error"] = str(tactile_connect_error)
+        if self._last_start_error:
+            details["startup_error"] = self._last_start_error
+        if self._last_reconnect_error:
+            details["reconnect_error"] = self._last_reconnect_error
+        if state_error:
+            details["state_read_error"] = state_error
+        if isinstance(state, dict):
+            for key in (
+                "gripper_error_code",
+                "gripper_status_code",
+                "gripper_status_text",
+                "gripper_is_moving",
+                "telemetry_error",
+                "telemetry_timestamp",
+                "gripper_measurement_timestamp",
+                "gripper_last_reconnect_error",
+            ):
+                if key in state and state[key] is not None:
+                    details[key] = state[key]
+
+        error_code = details.get("gripper_error_code")
+        status_code = details.get("gripper_status_code")
+        status_text = details.get("gripper_status_text")
+        diagnostic = str(
+            details.get("reconnect_error")
+            or details.get("startup_error")
+            or details.get("telemetry_error")
+            or ""
+        ).strip()
+        recovery_phase = str(details["recovery_phase"])
+        if recovery_phase == "recovering":
+            reason = f"recovering: {self._last_recovery_reason or 'DMTAC gripper'}"
+        elif recovery_phase == "failed":
+            reason = f"failed: {self._last_recovery_reason or diagnostic or 'DMTAC gripper'}"
+        elif diagnostic and (not details["is_connected"] or not ready):
+            reason = diagnostic
+        elif not details["is_connected"]:
+            reason = "not connected"
+        elif not details["gripper_is_connected"]:
+            reason = "gripper is not connected"
+        elif self.config.connect_tactile and not details["tactile_is_connected"] and not self.config.connect_hardware:
+            reason = "tactile sensors are not connected"
+        elif error_code not in (None, 0):
+            reason = f"error_code={error_code}"
+            if status_code is not None:
+                reason += f" status_code={status_code}"
+            if status_text:
+                reason += f":{status_text}"
+        elif state_error:
+            reason = f"state read failed: {state_error}"
+        elif not ready:
+            reason = "DMTAC backend is not ready"
+        else:
+            reason = ""
+        return {
+            "ready": ready,
+            "backend": self.name,
+            "backend_type": type(self).__name__,
+            "reason": reason,
+            "details": details,
+        }
 
     def send_command(self, command: EffectorCommand) -> bool:
         if command.effector_name != self.name:
@@ -1140,7 +1879,26 @@ class DMTacGripperBackend(EffectorBackend):
             self._last_send_skip_reason = "configured_disconnected"
             self._last_send_target_scalar = float(target_scalar)
             return True
-        sent = self._send_joint_pos(command.value, bypass_send_commands=False, force=False)
+        continuous_override = command.metadata.get(
+            "dmtac_continuous_grasp_override"
+        )
+        if continuous_override is not None and not isinstance(
+            continuous_override,
+            (bool, np.bool_),
+        ):
+            raise ValueError(
+                "dmtac_continuous_grasp_override must be boolean when provided."
+            )
+        sent = self._send_joint_pos(
+            command.value,
+            bypass_send_commands=False,
+            force=False,
+            continuous_grasp_override=(
+                None
+                if continuous_override is None
+                else bool(continuous_override)
+            ),
+        )
         if sent:
             self._last_command = command.copy()
         return sent
@@ -1158,7 +1916,12 @@ class DMTacGripperBackend(EffectorBackend):
             self._last_send_status = "intentionally_disconnected_noop"
             self._last_send_skip_reason = "configured_disconnected"
             return True
-        return self._send_joint_pos(joint_pos, bypass_send_commands=True, force=True)
+        return self._send_joint_pos(
+            joint_pos,
+            bypass_send_commands=True,
+            force=True,
+            continuous_grasp_override=None,
+        )
 
     def set_torque(self, torque: float) -> float:
         """Set normalized gripper torque and apply it to an active device now.
@@ -1196,17 +1959,65 @@ class DMTacGripperBackend(EffectorBackend):
         return value
 
     def force_reconnect_gripper(self, reason: str = "manual_reconnect") -> bool:
-        with self._lock:
-            previous_attempt_at = self._last_reconnect_attempt_at
-            self._last_reconnect_attempt_at = None
-            try:
-                return self._handle_gripper_io_error_locked(
-                    f"force_reconnect:{reason}",
-                    RuntimeError(str(reason)),
-                )
-            finally:
-                if self._last_reconnect_attempt_at is None:
-                    self._last_reconnect_attempt_at = previous_attempt_at
+        """Close and recreate the live serial gripper session immediately.
+
+        ``start()`` is intentionally idempotent for an already-live backend,
+        so a manual GUI retry must use this explicit path.  ``force=True``
+        also makes the operator-requested recovery work for profiles that
+        disable automatic reconnect; it never bypasses the subsequent
+        readiness/error-code check performed by the caller.
+        """
+
+        # Serialize explicit recovery with the tactile-worker supervisor.  A
+        # retry is also the lifecycle boundary that clears the failed-start
+        # closing latch; without it a worker left by a previous close/retry
+        # could not be recreated.
+        with self._tactile_worker_supervisor_lock:
+            with self._lock:
+                previous_attempt_at = self._last_reconnect_attempt_at
+                self._last_reconnect_attempt_at = None
+                was_closing = self._closing
+                if was_closing:
+                    # ``close`` normally leaves no live resources behind.  A
+                    # late callback while teardown is still active must not
+                    # reopen the serial link or spawn workers underneath it.
+                    telemetry_alive = bool(
+                        self._telemetry_thread is not None
+                        and self._telemetry_thread.is_alive()
+                    )
+                    try:
+                        worker_alive = bool(
+                            self._tactile_worker_process is not None
+                            and self._tactile_worker_process.is_alive()
+                        )
+                    except Exception:
+                        # An unstarted/invalid process handle is still an
+                        # active teardown concern; reject the late retry
+                        # rather than risk spawning over an unknown child.
+                        worker_alive = True
+                    receiver_alive = self._tactile_worker_receiver_active()
+                    if self.device is not None or telemetry_alive or worker_alive or receiver_alive:
+                        self._last_reconnect_error = (
+                            "reconnect rejected while DMTAC backend is still closing"
+                        )
+                        return False
+                self._closing = False
+                recovered = False
+                try:
+                    recovered = self._handle_gripper_io_error_locked(
+                        f"force_reconnect:{reason}",
+                        RuntimeError(str(reason)),
+                        force=True,
+                        quarantine=self.config.startup_recovery_mode == "legacy",
+                    )
+                    return recovered
+                finally:
+                    if self._last_reconnect_attempt_at is None:
+                        self._last_reconnect_attempt_at = previous_attempt_at
+                    # A recovery explicitly reopens a fully torn-down
+                    # backend; a failed attempt remains closed fail-closed.
+                    if was_closing and not recovered:
+                        self._closing = True
 
     def read_gripper_state_now(self) -> dict[str, object] | None:
         if not self.config.connect_hardware:
@@ -1315,6 +2126,7 @@ class DMTacGripperBackend(EffectorBackend):
         *,
         bypass_send_commands: bool,
         force: bool,
+        continuous_grasp_override: bool | None,
     ) -> bool:
         attempt_started_perf = time.perf_counter()
         attempt_started_wall = time.time()
@@ -1347,7 +2159,41 @@ class DMTacGripperBackend(EffectorBackend):
         if self._last_sent_command is not None and not bool(force):
             max_delta = float(np.max(np.abs(target - self._last_sent_command)))
             if max_delta < float(self.config.send_threshold):
-                return finish("skipped_threshold", sent=False, skip_reason="threshold")
+                # A command-cache match is not sufficient when device
+                # feedback says the gripper is elsewhere.  This occurs at an
+                # endpoint in particular: a final close increment can report
+                # fully closed while the cached target remains one increment
+                # below it, making the first reverse/open increment identical
+                # to the cached command.  Skipping on the cache alone then
+                # livelocks the feedback-gated caller forever.  Re-dispatching
+                # the same bounded target is safe and gives the actuator an
+                # edge to move away from the endpoint.
+                measured = self._latest_measured_joint_pos
+                measured_disagrees = False
+                if measured is not None:
+                    measured_values = np.asarray(measured, dtype=float).reshape(-1)
+                    command_dim = int(self.config.command_dim)
+                    if (
+                        measured_values.shape == (6,)
+                        and np.all(np.isfinite(measured_values))
+                    ):
+                        measured_disagrees = abs(
+                            float(measured_values[command_dim]) - target_scalar
+                        ) >= float(self.config.send_threshold)
+                mode_disagrees = bool(
+                    continuous_grasp_override is not None
+                    and (
+                        self._applied_continuous_grasp is None
+                        or bool(self._applied_continuous_grasp)
+                        != bool(continuous_grasp_override)
+                    )
+                )
+                if not measured_disagrees and not mode_disagrees:
+                    return finish(
+                        "skipped_threshold",
+                        sent=False,
+                        skip_reason="command_and_feedback_threshold",
+                    )
         command_time = attempt_started_wall
         if (
             self._last_sent_command_timestamp is not None
@@ -1366,7 +2212,10 @@ class DMTacGripperBackend(EffectorBackend):
                 if self.device is None or getattr(self.device, "gripper", None) is None:
                     return finish("not_connected", sent=False, skip_reason="not_connected")
                 try:
-                    self._move_gripper_locked(target_scalar)
+                    self._move_gripper_locked(
+                        target_scalar,
+                        continuous_grasp_override=continuous_grasp_override,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self._quarantine_gripper_io_error_locked("send_failed", exc)
                     return finish(
@@ -1382,10 +2231,17 @@ class DMTacGripperBackend(EffectorBackend):
         self._last_sent_command_completed_timestamp = time.time()
         return finish("sent", sent=True)
 
-    def _move_gripper_locked(self, target_scalar: float) -> None:
+    def _move_gripper_locked(
+        self,
+        target_scalar: float,
+        *,
+        continuous_grasp_override: bool | None,
+    ) -> None:
         if self.device is None:
             raise RuntimeError("device is not connected")
-        speed, torque, continuous = self._move_parameters_for_current_config()
+        speed, torque, continuous = self._move_parameters_for_current_config(
+            continuous_grasp_override=continuous_grasp_override,
+        )
         self.device.move(
             float(np.clip(target_scalar, 0.0, float(self.config.max_action))),
             speed=speed,
@@ -1400,10 +2256,18 @@ class DMTacGripperBackend(EffectorBackend):
         if continuous is not None:
             self._applied_continuous_grasp = bool(continuous)
 
-    def _move_parameters_for_current_config(self) -> tuple[float | None, float | None, bool | None]:
+    def _move_parameters_for_current_config(
+        self,
+        *,
+        continuous_grasp_override: bool | None = None,
+    ) -> tuple[float | None, float | None, bool | None]:
         speed = float(self.config.speed)
         torque = float(self.config.torque)
-        continuous = bool(self.config.continuous_grasp)
+        continuous = (
+            bool(self.config.continuous_grasp)
+            if continuous_grasp_override is None
+            else bool(continuous_grasp_override)
+        )
         speed_arg = (
             speed
             if self._applied_speed is None or abs(float(self._applied_speed) - speed) > 1e-6
@@ -1529,7 +2393,7 @@ class DMTacGripperBackend(EffectorBackend):
 
     def _check_tactile_worker_process(self) -> None:
         process = self._tactile_worker_process
-        if process is not None and not process.is_alive():
+        if process is not None and not self._tactile_worker_process_alive():
             exit_code = getattr(process, "exitcode", None)
             if process is not self._tactile_worker_observed_process:
                 self._tactile_worker_observed_process = process
@@ -1564,7 +2428,7 @@ class DMTacGripperBackend(EffectorBackend):
             return False
         self._check_tactile_worker_process()
         process = self._tactile_worker_process
-        if process is not None and process.is_alive():
+        if process is not None and self._tactile_worker_process_alive():
             return False
         if not self._tactile_worker_restart_pending:
             return False
@@ -1580,27 +2444,11 @@ class DMTacGripperBackend(EffectorBackend):
         ):
             return False
         self._tactile_worker_last_restart_attempt_at = now
-        receiver_stop = self._tactile_worker_receiver_stop
-        if receiver_stop is not None:
-            receiver_stop.set()
-        receiver = self._tactile_worker_receiver_thread
-        if receiver is not None and receiver is not threading.current_thread():
-            receiver.join(timeout=0.5)
-        if process is not None:
-            process.join(timeout=0.1)
-        queue_out = self._tactile_worker_queue
-        if queue_out is not None:
-            try:
-                queue_out.close()
-                queue_out.cancel_join_thread()
-            except (AttributeError, OSError, ValueError):
-                pass
-        self._tactile_worker_process = None
-        self._tactile_worker_queue = None
-        self._tactile_worker_stop_event = None
-        self._tactile_worker_receiver_stop = None
-        self._tactile_worker_receiver_thread = None
         try:
+            # Reuse the bounded teardown used by tactile reconfiguration.  It
+            # also clears a receiver that outlived an exited process, avoiding
+            # an orphan thread consuming the old queue after restart.
+            self._stop_tactile_worker_for_reconfigure()
             self._start_tactile_worker()
         except Exception as exc:  # noqa: BLE001
             self._tactile_worker_restart_pending = True
@@ -1643,16 +2491,24 @@ class DMTacGripperBackend(EffectorBackend):
             if remaining > 0.0:
                 self._stop_event.wait(remaining)
 
+    @staticmethod
+    def _gripper_state_error_code(gripper_state: object) -> int | None:
+        to_dict = getattr(gripper_state, "to_dict", None)
+        payload = dict(to_dict()) if callable(to_dict) else {}
+        raw = payload.get("error_code", getattr(gripper_state, "error_code", None))
+        return None if raw is None else int(raw)
+
     def _read_telemetry_once(self) -> None:
         self._maybe_restart_tactile_worker()
         device = self.device
         if device is None:
             if self.config.connect_hardware:
                 with self._lock:
-                    self._handle_gripper_io_error_locked(
-                        "telemetry_no_connection",
-                        RuntimeError("device is not connected"),
-                    )
+                    if not self._runtime_fault_auto_recovery_blocked_locked():
+                        self._handle_gripper_io_error_locked(
+                            "telemetry_no_connection",
+                            RuntimeError("device is not connected"),
+                        )
             elif self.config.connect_tactile:
                 self._telemetry_error = "device is not connected"
             return
@@ -1676,10 +2532,13 @@ class DMTacGripperBackend(EffectorBackend):
         if self.config.connect_hardware and device.gripper is None:
             with self._lock:
                 if self.device is device and getattr(device, "gripper", None) is None:
-                    self._handle_gripper_io_error_locked(
-                        "telemetry_no_gripper",
-                        RuntimeError("gripper is not connected"),
-                    )
+                    if self._runtime_fault_auto_recovery_blocked_locked():
+                        gripper_fault_unrecovered = True
+                    else:
+                        self._handle_gripper_io_error_locked(
+                            "telemetry_no_gripper",
+                            RuntimeError("gripper is not connected"),
+                        )
             device = self.device
             if device is None or getattr(device, "gripper", None) is None:
                 return
@@ -1700,6 +2559,67 @@ class DMTacGripperBackend(EffectorBackend):
                         gripper_read_started_at = time.perf_counter()
                         try:
                             gripper_state = device.read_gripper_state()
+                            state_error = self._gripper_state_error_code(gripper_state)
+                            if (
+                                state_error == 16
+                                and self.config.startup_recovery_mode == "stabilized"
+                                and self.config.auto_recover_internal_communication_fault
+                            ):
+                                incident_id = self._begin_runtime_fault_incident_locked()
+                                if not self._runtime_fault_recovery_attempted:
+                                    self._mark_runtime_fault_recovery_attempt_locked(
+                                        incident_id,
+                                    )
+                                    self._set_recovery_phase_locked(
+                                        "recovering",
+                                        reason=(
+                                            f"runtime incident={incident_id} error_code=16 "
+                                            "internal_communication_fault"
+                                        ),
+                                    )
+                                    try:
+                                        confirmed = self._confirm_gripper_fault_clear_locked(
+                                            observed_state=gripper_state,
+                                        )
+                                    except Exception as recovery_exc:  # noqa: BLE001
+                                        latest_driver_state = getattr(
+                                            getattr(device, "gripper", None),
+                                            "last_state",
+                                            None,
+                                        )
+                                        if latest_driver_state is not None:
+                                            gripper_state = latest_driver_state
+                                        self._telemetry_error = (
+                                            "runtime_fault_recovery_failed: "
+                                            f"{type(recovery_exc).__name__}: {recovery_exc}"
+                                        )
+                                        self._set_recovery_phase_locked(
+                                            "failed",
+                                            reason=self._telemetry_error,
+                                        )
+                                        self._mark_runtime_fault_recovery_failed_locked(
+                                            incident_id,
+                                        )
+                                        gripper_fault_unrecovered = True
+                                    else:
+                                        if confirmed is not None:
+                                            gripper_state = confirmed
+                                        self._clear_runtime_fault_incident_locked(
+                                            reason="runtime_fault_ack_confirmed",
+                                        )
+                                else:
+                                    gripper_fault_unrecovered = True
+                            elif state_error == 0:
+                                if not self._observe_runtime_fault_zero_locked():
+                                    # A zero observed immediately after a
+                                    # failed ACK deadline is not enough to
+                                    # define a new incident boundary.  Keep
+                                    # both command and collection admission
+                                    # closed until the configured stable
+                                    # confirmation count is reached.
+                                    gripper_fault_unrecovered = True
+                            elif self._runtime_fault_active_incident_id is not None:
+                                self._runtime_fault_zero_streak = 0
                         except Exception as exc:  # noqa: BLE001
                             gripper_read_skipped = True
                             gripper_read_skip_reason = "read_failed"
@@ -1907,6 +2827,25 @@ class DMTacGripperBackend(EffectorBackend):
             latest_tactile_read_skipped = bool(self._latest_tactile_read_skipped)
             tactile_ready = dict(self._tactile_ready)
             telemetry_error = self._telemetry_error
+            runtime_fault_recovery_attempted = bool(
+                self._runtime_fault_recovery_attempted
+            )
+            runtime_fault_incident_sequence = int(
+                self._runtime_fault_incident_sequence
+            )
+            runtime_fault_active_incident_id = (
+                self._runtime_fault_active_incident_id
+            )
+            runtime_fault_failed_incident_id = (
+                self._runtime_fault_failed_incident_id
+            )
+            runtime_fault_first_seen_at = self._runtime_fault_first_seen_at
+            runtime_fault_last_attempt_at = self._runtime_fault_last_attempt_at
+            runtime_fault_zero_streak = int(self._runtime_fault_zero_streak)
+            recovery_phase = str(self._recovery_phase)
+            last_recovery_reason = self._last_recovery_reason
+            recovery_started_at = self._recovery_started_at
+            recovery_completed_at = self._recovery_completed_at
             tactile = None
             tactile_dict = None
             if include_tactile_arrays:
@@ -2000,8 +2939,7 @@ class DMTacGripperBackend(EffectorBackend):
             "tactile_process_cpu_affinity": list(self.config.tactile_process_cpu_affinity),
             "tactile_process_queue_size": int(self.config.tactile_process_queue_size),
             "tactile_worker_alive": bool(
-                self._tactile_worker_process is not None
-                and self._tactile_worker_process.is_alive()
+                self._tactile_worker_process_alive()
             ),
             "tactile_worker_receiver_alive": self._tactile_worker_receiver_active(),
             "tactile_worker_restart_on_error": bool(
@@ -2033,6 +2971,15 @@ class DMTacGripperBackend(EffectorBackend):
             "telemetry_error": telemetry_error,
             "connect_hardware": bool(self.config.connect_hardware),
             "connect_tactile": bool(self.config.connect_tactile),
+            "tactile_is_connected": bool(
+                self.device is not None
+                and getattr(self.device, "tactile", None) is not None
+            ),
+            "tactile_connect_error": (
+                None
+                if self.device is None
+                else getattr(self.device, "tactile_connect_error", None)
+            ),
             "observation_only": bool(self.config.observation_only),
             "send_commands": bool(self.config.send_commands),
             "intentionally_disconnected": bool(
@@ -2046,6 +2993,45 @@ class DMTacGripperBackend(EffectorBackend):
             "gripper_reconnect_cooldown_sec": float(self.config.reconnect_cooldown_sec),
             "gripper_last_reconnect_attempt_timestamp": self._last_reconnect_attempt_at,
             "gripper_last_reconnect_error": self._last_reconnect_error,
+            "gripper_startup_recovery_mode": str(self.config.startup_recovery_mode),
+            "gripper_auto_recover_internal_communication_fault": bool(
+                self.config.auto_recover_internal_communication_fault
+            ),
+            "gripper_runtime_fault_recovery_attempted": bool(
+                runtime_fault_recovery_attempted
+            ),
+            "gripper_runtime_fault_incident_sequence": int(
+                runtime_fault_incident_sequence
+            ),
+            "gripper_runtime_fault_active_incident_id": (
+                runtime_fault_active_incident_id
+            ),
+            "gripper_runtime_fault_failed_incident_id": (
+                runtime_fault_failed_incident_id
+            ),
+            "gripper_runtime_fault_first_seen_timestamp": (
+                runtime_fault_first_seen_at
+            ),
+            "gripper_runtime_fault_last_attempt_timestamp": (
+                runtime_fault_last_attempt_at
+            ),
+            "gripper_runtime_fault_zero_streak": int(
+                runtime_fault_zero_streak
+            ),
+            "gripper_runtime_fault_clear_confirm_samples": int(
+                self.config.runtime_fault_clear_confirm_samples
+            ),
+            "gripper_recovery_phase": recovery_phase,
+            "gripper_last_recovery_reason": last_recovery_reason,
+            "gripper_recovery_started_timestamp": recovery_started_at,
+            "gripper_recovery_completed_timestamp": recovery_completed_at,
+            "gripper_connection_generation": int(self._connection_generation),
+            "gripper_connection_opened_timestamp": self._last_connection_opened_at,
+            "gripper_connection_closed_timestamp": self._last_connection_closed_at,
+            "gripper_connection_opened_monotonic": self._last_connection_opened_monotonic,
+            "gripper_connection_closed_monotonic": self._last_connection_closed_monotonic,
+            "gripper_connection_open_thread": self._last_connection_open_thread,
+            "gripper_connection_close_thread": self._last_connection_close_thread,
             "backend_type": "dmtac_gripper",
             "gripper_port": str(self.config.gripper_port),
             "gripper_id": int(self.config.gripper_id),
@@ -2135,6 +3121,8 @@ class DMTacGripperBackend(EffectorBackend):
                 with self._lock:
                     device = self.device
                     self.device = None
+                    if device is not None and getattr(device, "gripper", None) is not None:
+                        self._mark_gripper_connection_closed_locked()
                     self._invalidate_gripper_connection_state_locked()
                 if device is not None:
                     device.close()

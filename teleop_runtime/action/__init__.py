@@ -6,6 +6,7 @@ teleop-specific adapters/replay helpers plus compatibility exports.
 
 from .adapters import (
     TeleopCommandActionAdapterConfig,
+    canonical_hand_vector_from_effector_command,
     matrix_to_xyzquat,
     robot_action_from_teleop_command,
 )
@@ -366,6 +367,7 @@ __all__ = [
     "SyntheticHumanQposSource",
     "SyntheticHumanQposSourceSpec",
     "TeleopCommandActionAdapterConfig",
+    "canonical_hand_vector_from_effector_command",
     "TeleopRetargeterActionSource",
     "TeleopRetargeterActionSourceConfig",
     "VectorActionLayout",

@@ -80,6 +80,11 @@ def test_plan_composes_init_replay_and_custom_action_with_per_step_capture() -> 
     assert not directives[1].capture.allows("state.left")
     assert directives[3].action is custom
     assert directives[3].metadata["custom_action_source"] == "custom_open"
+    assert all(
+        not directive.action.hand_qpos_by_side
+        for directive in directives
+        if directive.action is not None
+    )
 
 
 def test_qpos_replay_reuses_existing_qpos_selection() -> None:

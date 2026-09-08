@@ -83,6 +83,45 @@ ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "control_station/real_teleop_entrypoint.py"
 
 
+def test_rule_dmtac_backend_is_owned_by_session_rig_without_q6_retargeter() -> None:
+    backend = object()
+    assert component_builder._hand_control_via_session_rig(
+        rule_command_source=True,
+        backend_mode=hand_config.HAND_BACKEND_DMTAC_GRIPPER,
+        backend=backend,
+        inspire_retargeter=None,
+    ) is True
+    assert component_builder._hand_control_via_session_rig(
+        rule_command_source=False,
+        backend_mode=hand_config.HAND_BACKEND_DMTAC_GRIPPER,
+        backend=backend,
+        inspire_retargeter=None,
+    ) is False
+    assert component_builder._hand_control_via_session_rig(
+        rule_command_source=True,
+        backend_mode=hand_config.HAND_BACKEND_DMTAC_GRIPPER,
+        backend=None,
+        inspire_retargeter=None,
+    ) is False
+
+
+def test_rule_command_source_does_not_open_vive_source() -> None:
+    calls: list[str] = []
+    keyboard = object()
+    hand = object()
+
+    sources = component_builder._session_sources_for_command_source(
+        rule_command_source=True,
+        vive_source_factory=lambda: calls.append("vive") or object(),
+        keyboard_source=keyboard,
+        hand_source=hand,
+        angle_trigger_source=None,
+    )
+
+    assert sources == [keyboard, hand]
+    assert calls == []
+
+
 def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
     assert control_loop._fresh_control_step_timestamp(
         10.0,

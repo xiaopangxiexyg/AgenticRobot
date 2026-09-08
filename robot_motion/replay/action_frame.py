@@ -201,6 +201,7 @@ def replay_robot_action_at_index(
     index: int,
     include_arms: bool = True,
     include_end_effectors: bool = False,
+    end_effector_sides: Sequence[str] | None = None,
     source: str = "replay_action",
     timestamp: float | None = None,
 ) -> RobotAction:
@@ -209,8 +210,9 @@ def replay_robot_action_at_index(
         if bool(include_arms)
         else {}
     )
+    hand_sides = tuple(active_sides if end_effector_sides is None else end_effector_sides)
     hand_qpos_by_side = (
-        replay_end_effector_targets_at_index(group, active_sides, index=int(index))
+        replay_end_effector_targets_at_index(group, hand_sides, index=int(index))
         if bool(include_end_effectors)
         else {}
     )
@@ -277,6 +279,7 @@ def replay_teleop_command_at_index(
     index: int,
     include_arms: bool = True,
     include_end_effectors: bool = False,
+    end_effector_sides: Sequence[str] | None = None,
     source: str = "replay_action",
     resolver: RobotActionResolver | None = None,
 ) -> TeleopCommand:
@@ -287,6 +290,7 @@ def replay_teleop_command_at_index(
         index=int(index),
         include_arms=bool(include_arms),
         include_end_effectors=bool(include_end_effectors),
+        end_effector_sides=end_effector_sides,
         source=str(source),
     )
     return annotate_replay_command_metadata(resolved.resolve(action), source=str(source))

@@ -51,6 +51,29 @@ from .side_mapping import (
 )
 
 
+def _validate_unique_active_arm_endpoints(
+    logical_ip_by_side: Mapping[str, tuple[str, str]],
+) -> None:
+    """Reject two active logical arms bound to the same RM65 endpoint."""
+
+    owners_by_endpoint: dict[str, tuple[str, str]] = {}
+    for logical_side, (source_name, arm_ip) in logical_ip_by_side.items():
+        endpoint = str(arm_ip or "").strip().lower()
+        if not endpoint:
+            continue
+        previous = owners_by_endpoint.get(endpoint)
+        if previous is not None and previous[0] != str(logical_side):
+            previous_side, previous_source = previous
+            raise ValueError(
+                "Active logical RM65 arms must use distinct endpoints; "
+                f"logical_{previous_side} ({previous_source}) and "
+                f"logical_{logical_side} ({source_name}) both resolve to "
+                f"{str(arm_ip)!r}. Refusing to bind two logical sides to one "
+                "physical arm."
+            )
+        owners_by_endpoint[endpoint] = (str(logical_side), str(source_name))
+
+
 def _apply_default_q6_ports(
     args: argparse.Namespace,
     *,
@@ -127,6 +150,18 @@ def _run_gui_device_preflight(
     # must therefore validate only the sides that actually own DMTAC backends,
     # while arm construction and camera admission remain bimanual.
     preflight_device_sides = dmtac_sides if require_dmtac_stack else active_sides
+    dmtac_gripper_overrides = {}
+    for side in preflight_device_sides:
+        port = str(getattr(args, f"{side}_gripper_port", "") or "").strip()
+        if not port:
+            continue
+        dmtac_gripper_overrides[str(side)] = {
+            "port": port,
+            "gripper_id": int(getattr(args, f"{side}_gripper_id", 1) or 1),
+            "baudrate": int(
+                getattr(args, f"{side}_gripper_baudrate", 115200) or 115200
+            ),
+        }
     options = DevicePreflightOptions(
         active_sides=preflight_device_sides,
         camera_config=str(getattr(args, "camera_config", DEFAULT_CAMERA_CONFIG_PATH)),
@@ -141,6 +176,7 @@ def _run_gui_device_preflight(
         probe_all_serial=bool(getattr(args, "device_preflight_probe_all_serial", False)),
         q6_config=str(getattr(args, "q6_config", "latest") or "latest"),
         dmtac_config=str(getattr(args, "dmtac_config", "latest") or "latest"),
+        dmtac_gripper_overrides=dmtac_gripper_overrides,
         dmtac_tactile_backend=str(getattr(args, "dmtac_tactile_backend", "cpu") or "cpu"),
     )
     try:
@@ -193,7 +229,7 @@ def _explicit_q6_gripper_input_requested(args: argparse.Namespace) -> bool:
 
 
 def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> None:
-    """Resolve the optional operator input without probing unrequested devices."""
+    """Resolve Q6/trigger input, or preserve an explicit no-input mode."""
     args.q6_startup_error = ""
 
     # Keep the original request separate from the resolved source.  The
@@ -211,7 +247,17 @@ def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[
                 "conflicting gripper inputs"
             )
         if requested in (None, ""):
-            requested = "angle_trigger" if legacy_angle_trigger else None
+            if legacy_angle_trigger:
+                requested = "angle_trigger"
+            elif bool(getattr(args, "_rule_based_writing_entrypoint", False)):
+                # Rule-based collection replays measured DMTAC state and has
+                # no human hand source.  Keep this an explicit resolved mode
+                # so the generic resolver never scans Q6 on the rule GUI
+                # startup path; an operator can still override it with
+                # ``--gripper-input-source q6`` when intentionally requested.
+                requested = "none"
+            else:
+                requested = None
         elif requested not in {"q6", "angle_trigger", "none"}:
             raise ValueError(
                 "gripper_input_source must be q6, angle_trigger, or none"
@@ -219,10 +265,9 @@ def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[
         setattr(args, request_marker, requested)
     requested = getattr(args, request_marker, None)
 
-    # Rule-based and other arm-only flows can keep the DMTAC backend for
-    # measured state/tactile capture while deliberately having no operator
-    # gripper input.  This is a terminal choice: do not scan Q6, load a Q6
-    # assignment, or create the angle-trigger fallback for it.
+    # ``none`` is an explicit operator topology, not a failed-device fallback.
+    # Keep DMTAC backends available for measured state/tactile collection while
+    # preventing Q6 scans, angle-trigger initialization, and input retargeters.
     if requested == "none":
         args.gripper_input_source = "none"
         return
@@ -384,6 +429,7 @@ def _validate_required_arm_ips(args: argparse.Namespace, active_sides: tuple[str
         if logical_side not in active_sides or not arm_ip:
             continue
         logical_ip_by_side[logical_side] = (source_name, arm_ip)
+    _validate_unique_active_arm_endpoints(logical_ip_by_side)
     missing = [side for side in active_sides if side not in logical_ip_by_side]
     if missing:
         raise ValueError(
@@ -408,26 +454,59 @@ def _dmtac_backend_configs(
 
     policy = _resolved_gripper_policy(args)
     policies_by_side = _resolved_gripper_policies_by_side(args, active_sides)
+    manual_sides = tuple(
+        side
+        for side in dmtac_sides
+        if str(getattr(args, f"{side}_gripper_port", "") or "").strip()
+    )
+    assignment_sides = tuple(side for side in dmtac_sides if side not in manual_sides)
     configs: dict[str, DMTacGripperBackendConfig] = {}
     if bool(getattr(args, "dmtac_default_config", True)):
         preflight_assignment = getattr(args, "_dmtac_preflight_assignment", None)
         try:
-            assignment = (
-                dict(preflight_assignment)
-                if isinstance(preflight_assignment, Mapping)
-                else load_dmtac_hardware_assignment(
+            if isinstance(preflight_assignment, Mapping):
+                assignment = dict(preflight_assignment)
+                load_sides = dmtac_sides
+            elif assignment_sides:
+                assignment = load_dmtac_hardware_assignment(
                     str(getattr(args, "dmtac_config", "latest") or "latest"),
                     validate_current_usb=bool(getattr(args, "dmtac_validate_current_usb", True)),
                     allow_missing=bool(getattr(args, "dmtac_allow_missing", False)),
                     assume_yes_for_extra=bool(getattr(args, "dmtac_assume_yes_for_extra", True)),
+                    active_sides=assignment_sides,
                 )
-            )
-            for side in dmtac_sides:
+                load_sides = dmtac_sides
+            elif manual_sides and str(
+                getattr(args, "dmtac_manual_port_mode", "transport-overlay")
+            ) != "legacy-replace":
+                # The manual serial endpoint was already identity-checked by
+                # GUI preflight when present.  Headless paths read the saved
+                # assignment without probing the replaced serial transport so
+                # tactile ownership can still be preserved.
+                assignment = load_dmtac_hardware_assignment(
+                    str(getattr(args, "dmtac_config", "latest") or "latest"),
+                    validate_current_usb=False,
+                    active_sides=manual_sides,
+                )
+                load_sides = manual_sides
+            else:
+                assignment = None
+                load_sides = ()
+            for side in load_sides:
                 side_policy = policies_by_side.get(side, policy)
                 configs.update(
                     dmtac_backend_configs_from_assignment(
                         assignment,
                         active_sides=(side,),
+                        # The GUI preflight has already compared the saved
+                        # assignment with the live USB scan and may have
+                        # rebound a side to the exact reachable tty node
+                        # (for example /dev/ttyUSB3).  Replacing that verified
+                        # endpoint with a different alias here can silently
+                        # bind the logical right side to the other physical
+                        # gripper.  Only headless/no-preflight resolution may
+                        # use an existing stable by-path alias.
+                        prefer_existing_by_path_port=preflight_assignment is None,
                         tactile_backend=str(getattr(args, "dmtac_tactile_backend", "cpu") or "cpu"),
                         speed=float(side_policy["speed"]),
                         torque=float(side_policy["torque"]),
@@ -441,11 +520,12 @@ def _dmtac_backend_configs(
                 ) from exc
             _log("DMTAC", f"WARNING: could not load DMTAC hardware assignment: {exc}")
 
-    for side in dmtac_sides:
+    for side in manual_sides:
         manual = manual_dmtac_backend_config_for_side(
             args,
             side,
             policies_by_side.get(side, policy),
+            base_config=configs.get(side),
         )
         if manual is not None:
             configs[side] = manual

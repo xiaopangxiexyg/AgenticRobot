@@ -205,6 +205,32 @@ def _collection_hand_action_specs(
     return specs
 
 
+def _rule_direct_hand_action_specs(
+    args: argparse.Namespace,
+) -> Mapping[str, HandActionSpec] | None:
+    value = getattr(args, "_real_teleop_rule_hand_action_specs_by_side", None)
+    rule_source = bool(getattr(args, "_real_teleop_rule_command_source", False))
+    if value is None:
+        if rule_source:
+            raise RuntimeError(
+                "Rule command source is missing its typed hand command contract."
+            )
+        return None
+    if not rule_source:
+        raise RuntimeError(
+            "Direct rule hand command contract cannot be attached outside "
+            "the rule command source."
+        )
+    if not isinstance(value, Mapping) or any(
+        not isinstance(spec, HandActionSpec) for spec in value.values()
+    ):
+        raise TypeError(
+            "_real_teleop_rule_hand_action_specs_by_side must map sides to "
+            "HandActionSpec values."
+        )
+    return {str(side): spec for side, spec in value.items()}
+
+
 class RealTeleopDatasetRecorder:
     def __init__(
         self,
@@ -288,6 +314,7 @@ class RealTeleopDatasetRecorder:
                 "left": components.left_gripper_retargeter or components.left_hand_retargeter,
                 "right": components.right_gripper_retargeter or components.right_hand_retargeter,
             },
+            direct_hand_action_specs_by_side=_rule_direct_hand_action_specs(args),
             arm_reference_frame_by_side=(
                 None
                 if args.pose_frame_contract is None

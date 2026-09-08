@@ -89,7 +89,15 @@ class RuleBasedCollectionAdapter(Iterator[RuleBasedCollectionEmission]):
         self,
         directive: RuleBasedCollectionDirective,
     ) -> RuleBasedCollectionEmission:
-        action = self._action_for(directive)
+        return self.emission_for_directive(directive)
+
+    def emission_for_directive(
+        self,
+        directive: RuleBasedCollectionDirective,
+    ) -> RuleBasedCollectionEmission:
+        """Resolve one already-issued directive through the configured resolver."""
+
+        action = self.action_for_directive(directive)
         command = self.resolver.resolve(action)
         return RuleBasedCollectionEmission(
             directive=directive,
@@ -103,19 +111,27 @@ class RuleBasedCollectionAdapter(Iterator[RuleBasedCollectionEmission]):
         self.cursor.reset()
 
     @staticmethod
-    def _action_for(directive: RuleBasedCollectionDirective) -> RobotAction:
+    def action_for_directive(directive: RuleBasedCollectionDirective) -> RobotAction:
         if directive.kind == "initialize":
             if not directive.qpos_by_side:
                 raise ValueError("Initialization directive has no qpos targets.")
             return RobotAction.bimanual_qpos(
                 left_arm=directive.qpos_by_side.get("left"),
                 right_arm=directive.qpos_by_side.get("right"),
+                left_hand=directive.hand_qpos_by_side.get("left"),
+                right_hand=directive.hand_qpos_by_side.get("right"),
                 source="rule_based_initialize",
                 metadata=dict(directive.metadata),
             )
         if directive.action is None:
             raise ValueError(f"Directive {directive.step_id!r} has no action.")
         return directive.action
+
+    @staticmethod
+    def _action_for(directive: RuleBasedCollectionDirective) -> RobotAction:
+        """Compatibility alias for the former private conversion seam."""
+
+        return RuleBasedCollectionAdapter.action_for_directive(directive)
 
 
 __all__ = [

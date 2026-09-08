@@ -124,8 +124,9 @@ def add_hand_backend_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         action=_GripperInputSourceAction,
         help=(
-            "Select the DMTAC gripper input explicitly: q6, angle_trigger, or none. "
-            "Use none when gripper commands are not operator-input driven. "
+            "Select the DMTAC gripper input explicitly: q6, angle_trigger, or "
+            "none. The none mode keeps configured gripper state/tactile backends "
+            "but creates no human gripper input source or retargeter. "
             "The legacy bare --gripper-angle-trigger selects angle_trigger; "
             "omit both options to preserve automatic Q6/AngleTrigger discovery."
         ),

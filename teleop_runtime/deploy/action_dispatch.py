@@ -11,32 +11,11 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from robot_motion.runtime import TeleopCommand
+from robot_motion.runtime import TeleopCommand, command_effector_kind_subset
 
 from ..backends.grippers import DMTacGripperBackend
 from ..backends.hands import InspireTacHandBackend
 from ..interfaces import EffectorBackend
-
-
-def command_effector_kind_subset(
-    command: TeleopCommand | None,
-    *,
-    kind: str,
-) -> TeleopCommand | None:
-    """Copy only one effector kind while preserving command metadata."""
-
-    if command is None:
-        return None
-    suffix = f"_{str(kind).strip()}"
-    subset = TeleopCommand(
-        timestamp=command.timestamp,
-        metadata=dict(command.metadata),
-    )
-    for effector_name, effector_command in command.commands.items():
-        if str(effector_name).endswith(suffix):
-            subset.add_command(effector_command.copy())
-    return subset if subset.commands else None
-
 
 def dispatch_position_discrete_command_checked(
     command: TeleopCommand,

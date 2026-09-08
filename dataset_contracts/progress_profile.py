@@ -10,6 +10,7 @@ from .canonical_encoding import canonical_content_hash
 
 PROGRESS_STEP_DEFINITION_SCHEMA_V1 = "dexteleop.progress_step_definition.v1"
 PROGRESS_STEP_ARM_CONTROL_SCHEMA_V1 = "dexteleop.progress_step_arm_control.v1"
+PROGRESS_STEP_ARM_CONTROL_SCHEMA_V2 = "dexteleop.progress_step_arm_control.v2"
 TASK_PROGRESS_PROFILE_SCHEMA_V1 = "dexteleop.task_progress_profile.v1"
 PROGRESS_EPISODE_BINDING_SCHEMA_V1 = "dexteleop.progress_episode_binding.v1"
 
@@ -32,6 +33,13 @@ PROGRESS_ENTRY_MODES_V1 = frozenset(
 )
 PROGRESS_ARM_CONTROL_MODES_V1 = frozenset({"teleop", "fixed_hold"})
 PROGRESS_FIXED_SCOPE_ARM_AND_END_EFFECTOR_V1 = "arm_and_end_effector"
+PROGRESS_FIXED_SCOPE_ARM_ONLY_V2 = "arm_only"
+PROGRESS_FIXED_SCOPES_V2 = frozenset(
+    {
+        PROGRESS_FIXED_SCOPE_ARM_AND_END_EFFECTOR_V1,
+        PROGRESS_FIXED_SCOPE_ARM_ONLY_V2,
+    }
+)
 
 _PROFILE_HASH_DOMAIN = "dexteleop.task_progress_profile.semantic.v1"
 _BINDING_HASH_DOMAIN = "dexteleop.progress_episode_binding.semantic.v1"
@@ -154,6 +162,84 @@ class ProgressStepArmControlV1:
 
 
 @dataclass(frozen=True)
+class ProgressStepArmControlV2:
+    """Exact per-step arm ownership including an honest arm-only Hold.
+
+    V1 intentionally remains strict for historical bimanual profiles whose
+    fixed side always includes a configured end effector. V2 adds only the
+    missing topology fact: a fixed arm may have no configured end effector,
+    in which case runtime and persisted samples must both report ``arm_only``.
+    """
+
+    left: str
+    right: str
+    fixed_scope: str
+    schema: str = field(default=PROGRESS_STEP_ARM_CONTROL_SCHEMA_V2, init=False)
+
+    def __post_init__(self) -> None:
+        for side in ("left", "right"):
+            mode = _required(getattr(self, side), name=side).lower()
+            if mode not in PROGRESS_ARM_CONTROL_MODES_V1:
+                raise ProgressProfileContractError(
+                    f"Unsupported {side} progress arm-control mode {mode!r}."
+                )
+            object.__setattr__(self, side, mode)
+        scope = _required(self.fixed_scope, name="fixed_scope").lower()
+        if scope not in PROGRESS_FIXED_SCOPES_V2:
+            raise ProgressProfileContractError(
+                f"Unsupported progress fixed_hold scope {scope!r}."
+            )
+        if (
+            not self.fixed_sides
+            and scope != PROGRESS_FIXED_SCOPE_ARM_AND_END_EFFECTOR_V1
+        ):
+            raise ProgressProfileContractError(
+                "arm_only fixed_scope requires at least one fixed_hold side."
+            )
+        object.__setattr__(self, "fixed_scope", scope)
+
+    @property
+    def teleop_sides(self) -> tuple[str, ...]:
+        return tuple(
+            side for side in ("left", "right") if getattr(self, side) == "teleop"
+        )
+
+    @property
+    def fixed_sides(self) -> tuple[str, ...]:
+        return tuple(
+            side
+            for side in ("left", "right")
+            if getattr(self, side) == "fixed_hold"
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "left": self.left,
+            "right": self.right,
+            "fixed_scope": self.fixed_scope,
+        }
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "ProgressStepArmControlV2":
+        if payload.get("schema") != PROGRESS_STEP_ARM_CONTROL_SCHEMA_V2:
+            raise ProgressProfileContractError(
+                "Unsupported progress-step arm-control schema."
+            )
+        return cls(
+            left=payload.get("left", ""),
+            right=payload.get("right", ""),
+            fixed_scope=payload.get("fixed_scope", ""),
+        )
+
+
+ProgressStepArmControl = ProgressStepArmControlV1 | ProgressStepArmControlV2
+
+
+@dataclass(frozen=True)
 class ProgressStepDefinitionV1:
     """One unique progress node; semantic types may repeat across nodes."""
 
@@ -162,7 +248,7 @@ class ProgressStepDefinitionV1:
     display_name: str
     ordinal: int
     allowed_next_step_ids: tuple[str, ...] = ()
-    arm_control: ProgressStepArmControlV1 | None = None
+    arm_control: ProgressStepArmControl | None = None
     schema: str = field(default=PROGRESS_STEP_DEFINITION_SCHEMA_V1, init=False)
 
     def __post_init__(self) -> None:
@@ -183,10 +269,10 @@ class ProgressStepDefinitionV1:
         )
         if self.arm_control is not None and not isinstance(
             self.arm_control,
-            ProgressStepArmControlV1,
+            (ProgressStepArmControlV1, ProgressStepArmControlV2),
         ):
             raise ProgressProfileContractError(
-                "arm_control must be ProgressStepArmControlV1 or None."
+                "arm_control must be ProgressStepArmControlV1/V2 or None."
             )
 
     def to_payload(self) -> dict[str, Any]:
@@ -226,7 +312,12 @@ class ProgressStepDefinitionV1:
             arm_control=(
                 None
                 if arm_control_payload is None
-                else ProgressStepArmControlV1.from_payload(arm_control_payload)
+                else (
+                    ProgressStepArmControlV1.from_payload(arm_control_payload)
+                    if arm_control_payload.get("schema")
+                    == PROGRESS_STEP_ARM_CONTROL_SCHEMA_V1
+                    else ProgressStepArmControlV2.from_payload(arm_control_payload)
+                )
             ),
         )
 

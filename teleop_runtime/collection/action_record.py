@@ -3,13 +3,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from robot_motion.action import ActionExecutionResult, ActionRecord, encode_robot_action
+from robot_motion.action import (
+    ActionExecutionResult,
+    ActionRecord,
+    BIMANUAL_MIXED_HAND16_V1,
+    BIMANUAL_MIXED_V1,
+    RobotAction,
+    encode_robot_action,
+    split_effector_name,
+)
 
 from ..action import (
     TeleopCommandActionAdapterConfig,
     robot_action_from_teleop_command,
 )
 from ..recording import _to_serializable
+from ..schemas import TeleopCommand
 from ..session import SessionStepResult
 
 
@@ -25,6 +34,137 @@ class CollectionActionRecordConfig:
     metadata: Mapping[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class CollectionCommandActionValidation:
+    """Result of validating a command at the collection dispatch boundary.
+
+    A mixed pose/qpos command is an execution-only intermediate form.  It has
+    no stable persisted vector codec; dispatched arm qpos targets are replaced
+    with each backend's accepted TCP target by ``CollectorSampleBuilder``
+    before the canonical action record is encoded.
+    """
+
+    action: RobotAction
+    vector_encoding_ready: bool
+    backend_target_pose_sides: tuple[str, ...] = ()
+
+
+_DEFERRED_BACKEND_POSE_ACTION_SPACES = frozenset(
+    {BIMANUAL_MIXED_V1, BIMANUAL_MIXED_HAND16_V1}
+)
+
+
+def canonical_collection_action_from_command(
+    command: TeleopCommand,
+    *,
+    config: CollectionActionRecordConfig | None = None,
+) -> RobotAction | None:
+    """Build the same canonical action used by formal collection metadata."""
+
+    cfg = config if config is not None else CollectionActionRecordConfig()
+    return robot_action_from_teleop_command(command, config=cfg.action_adapter)
+
+
+def _validate_deferred_backend_pose_action(
+    command: TeleopCommand,
+    action: RobotAction,
+) -> tuple[str, ...]:
+    """Validate the only non-vector-ready command accepted before dispatch."""
+
+    pose_sides = set(action.arm_pose_by_side)
+    qpos_sides = set(action.arm_qpos_by_side)
+    if not pose_sides or not qpos_sides or pose_sides & qpos_sides:
+        raise ValueError(
+            "A deferred mixed collection command requires disjoint, non-empty "
+            "pose and qpos arm targets."
+        )
+    if action.end_effector_targets_by_side:
+        raise ValueError(
+            "A deferred mixed collection command cannot contain native "
+            "end-effector targets."
+        )
+
+    active_arm_sides = {
+        side
+        for effector in action.active_effectors
+        for side, kind in (split_effector_name(effector),)
+        if kind == "arm"
+    }
+    represented_arm_sides = pose_sides | qpos_sides
+    if active_arm_sides != represented_arm_sides:
+        raise ValueError(
+            "Deferred mixed collection arm targets do not exactly match the "
+            "active arm effectors."
+        )
+
+    commands_by_effector = {}
+    for command_name, effector_command in command.commands.items():
+        effector = str(effector_command.effector_name or command_name)
+        if effector in commands_by_effector:
+            raise ValueError(
+                f"Deferred mixed collection command duplicates effector {effector!r}."
+            )
+        commands_by_effector[effector] = effector_command
+    for side in sorted(qpos_sides):
+        effector = f"{side}_arm"
+        effector_command = commands_by_effector.get(effector)
+        if effector_command is None or effector_command.command_type != "joint_vector":
+            raise ValueError(
+                "Deferred backend target-pose normalization requires an exact "
+                f"joint_vector command for {effector}."
+            )
+        if effector_command.side != side:
+            raise ValueError(
+                f"Deferred {effector} command declares side={effector_command.side!r}."
+            )
+    return tuple(sorted(qpos_sides))
+
+
+def inspect_collection_command_action(
+    command: TeleopCommand,
+    *,
+    config: CollectionActionRecordConfig | None = None,
+    allow_backend_target_pose_defer: bool = False,
+) -> CollectionCommandActionValidation:
+    """Validate a command and describe whether persisted encoding is deferred."""
+
+    action = canonical_collection_action_from_command(command, config=config)
+    if action is None:
+        raise ValueError("Collection command does not contain an active action.")
+    if action.action_space in _DEFERRED_BACKEND_POSE_ACTION_SPACES:
+        if not allow_backend_target_pose_defer:
+            raise ValueError(
+                f"Action space {action.action_space!r} requires post-dispatch "
+                "backend target-pose normalization."
+            )
+        deferred_sides = _validate_deferred_backend_pose_action(command, action)
+        return CollectionCommandActionValidation(
+            action=action,
+            vector_encoding_ready=False,
+            backend_target_pose_sides=deferred_sides,
+        )
+    encode_robot_action(action)
+    return CollectionCommandActionValidation(
+        action=action,
+        vector_encoding_ready=True,
+    )
+
+
+def validate_collection_command_action(
+    command: TeleopCommand,
+    *,
+    config: CollectionActionRecordConfig | None = None,
+    allow_backend_target_pose_defer: bool = False,
+) -> RobotAction:
+    """Require a command to satisfy the formal collection action contract."""
+
+    return inspect_collection_command_action(
+        command,
+        config=config,
+        allow_backend_target_pose_defer=allow_backend_target_pose_defer,
+    ).action
+
+
 def build_collection_action_record(
     step_result: SessionStepResult,
     *,
@@ -37,9 +177,9 @@ def build_collection_action_record(
     action = (
         None
         if step_result.command is None
-        else robot_action_from_teleop_command(
+        else canonical_collection_action_from_command(
             step_result.command,
-            config=cfg.action_adapter,
+            config=cfg,
         )
     )
     execution = ActionExecutionResult(

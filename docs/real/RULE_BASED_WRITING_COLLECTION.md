@@ -1,11 +1,34 @@
 # Rule-based real writing collection
 
-This entrypoint composes existing RealTeleop, replay, fixed-trajectory, safety,
-and formal writer implementations. It does not introduce another hardware
-loop or recorder. Rule-based motion does not use an operator gripper input:
-the launcher selects `gripper_input_source=none`, so Q6 and the angle-trigger
-fallback are both outside this path. The DMTAC backend remains available for
-its independent measured state and tactile streams.
+The default profile is rule-based writing; the opt-in `full-replay` profile
+records one complete source dataset Episode without interpreting its
+detail-stage annotations.
+
+This reconciliation contains the dedicated trajectory-collection application
+and browser UI, but the current launcher does **not** select them yet. The
+generic RealTeleop entrypoint/runtime that owns UI activation and Episode
+lifecycle is outside this branch's integration scope and has another active
+owner. Until that owner integrates the dedicated hooks, this launcher keeps the
+established RealTeleop UI and receives source/path/speed configuration from
+startup arguments. This partial path is retained for CLI construction,
+`--dry-run`, and offline validation only; it is **not** approved for real
+device execution. The owner integration must also select the rule command
+source before component construction, disable VIVE requirements, bind DMTAC
+backends into the Session Rig, and enable robot-state-only runtime Home.
+
+The application still composes the existing authoritative robot loop, replay,
+fixed trajectory, safety chain, and formal writer. It does not introduce a
+second hardware loop, safety owner, or recorder. The launcher explicitly selects
+`gripper_input_source=none`, so it never probes Q6 or creates an
+angle-trigger fallback; configured DMTAC backends remain available for
+measured state and tactile capture. The staged dedicated UI exposes only idle
+source/path/speed configuration, an ordered prevalidated queue, rule
+start/stop, pre-collection gripper reset, rule-step state, and device/safety
+messages. Those controls are not active in the current launcher. The active
+compatibility path still accepts the rule Session after robot-state Home in
+`ARMED`; it does not require a prior human-teleop command dispatch.
+`FROZEN`, Hold, Init, Fix-Hold, dataset reconfiguration, and the remaining
+collection gates still reject the start.
 
 ## Executed plan
 
@@ -13,7 +36,9 @@ The fixed plan is:
 
 1. Move both arms through the existing qpos initialization path to the first
    `right_write.pen_down` source frame. This phase is not admitted to the
-   dataset.
+   dataset. The progress profile's left-arm `fixed_hold` is deliberately not
+   applied at runtime Home: both arms remain live for these certified
+   initialization waypoints.
 2. Replay and record `right_write.pen_down`. The right arm follows the source;
    the left arm is pinned to the source episode's first `fixed_hold` target.
 3. Generate and record one selected catalog path on the right TCP. The path is
@@ -27,6 +52,166 @@ Only steps 2-4 are admitted to the formal dataset. Cameras, tactile capture,
 sample synchronization, and persistence remain atomic and are owned by the
 existing formal writer.
 
+## Complete source-Episode replay mode
+
+Pass `--mode full-replay` to select the additional, startup-time-isolated
+profile. It does not select `pen_down`, `write`, or `pen_up`, and it never
+turns one annotated substage into a complete trajectory. One startup source choice
+identifies exactly one dataset and one Episode index; the runtime loads all of
+that Episode's action rows and real timestamps. `--speed-m-s` is rejected in
+this mode so a nominal writing speed cannot silently retime the source Episode.
+
+Its complete plan is deliberately only:
+
+1. Move both arms and every enabled DMTAC gripper through the same certified,
+   measured-feedback initialization to source frame 0. Do not record this
+   transition.
+2. Replay and record source frames `0..N-1` in order. Both arms remain active;
+   enabled grippers use the source's resolved DMTAC targets. Each source frame
+   is admitted at most once, while arm references continue through the shared
+   60 Hz reference and 120 Hz command transport.
+3. Finalize the output as one independent Episode, then return to the existing
+   next-item-ready state. The staged dedicated UI can queue multiple complete
+   source Episodes, but current-launcher operation selects one startup item and
+   still requires an explicit formal Episode for every output.
+
+This profile uses the existing `ReplayTrajectoryGroup`,
+`RuleBasedInitialize`/`RuleBasedReplay`, collision/TCP envelope, Session/Rig,
+formal writer, Hold/recovery, and successful-attempt reset. It adds no replay
+cursor, device loop, writer, or production entrypoint. Its dedicated progress
+binding has one initial `execute_task.full_replay` stage, so the whole Episode
+has one truthful label and does not apply the writing profile's left-arm Fix.
+
+Legacy direct source selection does not need a detail annotation directory:
+
+```bash
+bash scripts/run_rule_based_writing_collection.sh \
+  --mode full-replay \
+  --source-dataset /absolute/path/to/source_dataset \
+  --source-episode 42 \
+  --dataset-root /absolute/path/to/output_root \
+  --tactile-bundle-root /absolute/path/to/tactile_root \
+  --initial-alignment-speed-scale 0.5 \
+  --dry-run
+```
+
+With `--source-pool-manifest`, every candidate in the selected range remains
+a complete-Episode choice regardless of which writing subphases made it
+eligible for the pool. The current launcher selects deterministically from
+startup arguments; the staged dedicated UI can expose the same candidates once
+its generic-entrypoint hooks are integrated. The source pool is only an
+immutable dataset/Episode index here; its detail annotation artifacts are not
+opened.
+
+At the final initialization waypoint, the Session first applies its normal
+command filters and safety guard, the Rig/backend accepts the command, and
+causal arm feedback must report consecutive arrival samples. Only then does
+the rule runtime ask the existing FixArm controller to capture the left-arm
+qpos from that exact filtered command. The first replay/sample remains blocked
+until this handoff matches the progress profile. Any filter rewrite, stale
+pre-existing Fix, or failed handoff enters Hold immediately instead of waiting
+for the target-arrival timeout.
+
+The formal Episode may already be open while that measured-arrival handoff is
+pending. In this bounded state it remains command-inert and sample-inert: the
+initialization cursor may continue, but no replay frame or dataset sample can
+advance. Adding the left-arm Fix never invents a runtime Home transaction,
+because no arm is becoming live. Only a profile transition that releases a
+previously fixed arm may capture that exact newly-live side at Home. If the
+rule runtime terminates during this handoff, its original abort reason is
+published to the operator status path before the writer reclaims the Episode.
+
+One rule frame advances only after both authoritative boundaries agree: every
+commanded effector must have an accepted Rig/backend receipt, and the formal
+writer must accept that frame's sequence index. A transient DMTAC
+`rate_limited`/`io_busy` result retains and retries the same frame without
+sampling; a writer rejection likewise retains the frame. Both retry paths are
+bounded and enter Hold on timeout. Terminal arrival and relative-phase boundary
+publication additionally wait for writer acceptance, so a dropped final sample
+cannot be reported as a completed phase. Live RM65 dispatch timestamps are
+fresh, strictly increasing wall-clock values; the source dataset/trajectory
+timestamp is retained separately as provenance and never drives the real
+transport clock.
+
+Rule replay uses the existing frozen V2 Balanced position stack: source
+timestamps define the replay duration, the shared replay resampler publishes
+safe references at 60 Hz, and the established acceleration-limited backend
+planner independently streams accepted commands at 120 Hz. Formal samples
+remain a separate 15 Hz writer concern. The rule launcher intentionally does
+not select the opt-in 60 Hz Sample-Aligned QP profile: that profile
+solves a horizon synchronously at each strictly newer reference and can make
+the outer reference loop contend with the command worker. Coupled IK is
+anchored from one authoritative backend snapshot containing both accepted
+qcmd and its matching planned velocity; a previous qref velocity is never
+combined with a lagging execution position.
+
+## Hand topology
+
+This specialized launcher intentionally uses no Q6 or angle-trigger input. By
+default it disables the left hand backend and constructs only the right DMTAC
+gripper backend from the saved assignment. The right-side endpoint is resolved
+from the current assignment/preflight result (a `/dev/ttyUSB*` number is not a
+physical identity and must not be copied between runs). Device preflight
+therefore requires one right-side DMTAC stack and stops serial probing after
+that one reachable gripper satisfies admission.
+
+Replay end-effectors follow the selected source hand channels whenever the
+corresponding DMTAC backend is enabled. Typed partial/NaN hand slots and the
+fully resolved `action.replay.<side>_hand_joint_target` fallback are resolved by
+the common replay contract, then normalized to the real DMTAC topology: one
+active actuator in slot 0 and five finite zero-padding slots. During the initial
+transition, each enabled hand is interpolated from its causal measured state to
+the first `pen_down` target with a maximum normalized step of `0.05`; the first
+replay frame is not released until both arms and enabled hands have settled.
+Intermediate certified arm qrefs are streamed at 60 Hz instead of stopping at
+each sparse path waypoint. Source advancement freezes if measured arm state falls more
+than four configured waypoints behind, and only the final waypoint requires the
+strict 0.15-degree arrival/dwell check. Repeated dispatch of one qref refreshes
+the transport timestamp without inventing a new sample-aligned source cut.
+
+The selected source `write` hand trajectory is rebased continuously from the
+plan's final `pen_down` target and time-normalized to the generated rule path.
+The selected `pen_up` hand trajectory is similarly rebased from the final write
+target. Every cross-phase boundary is continuous, every per-frame step is
+checked against the same bound, and all three phase terminal frames wait for
+the commanded arms and enabled hands to settle. A selected source that cannot
+provide a finite compatible DMTAC trajectory fails before any device opens.
+
+In the default topology the left hand backend is disabled and the right DMTAC
+state/tactile stream is captured; the dataset contract records the left hand as
+`hand_model=none` with explicit inactive padding. Pass `--with-left-gripper`
+(and, only when necessary, an identity-verified `--left-gripper-port`) to
+connect and capture both DMTAC stacks. Re-run the assignment/preflight after
+reconnecting hardware instead of guessing a `/dev/ttyUSB*` number. This
+remains without Q6, a foot pedal, or a second device loop. The runtime status
+publishes the exact control topology, current phase/frame, accepted/plan sample
+count, and initialization speed multiplier.
+
+The staged dedicated UI contains “松开夹爪” and “闭紧夹爪”; the current launcher
+does not expose those rule-specific buttons. Once activated by the generic
+entrypoint owner, they are available only while the shared Session is actually
+`ARMED`. A click starts a feedback-gated sequence rather than one full-range
+command: every newly advanced normalized target increment is at most `0.05`
+from the latest fresh measurement. If an accepted register write produces no
+measured motion, the runtime re-sends only that same bounded target at a low
+rate; it neither advances another increment nor resets the no-progress timeout.
+The UI reports completion only after the final measured target is reached.
+The sequence also retains the DMTAC backend's configured hardware speed,
+torque, and 20 Hz command admission, times out fail-closed after 20 seconds,
+and rejects missing, stale, or invalid feedback. Every increment goes through
+the Session filter, guard, admission, and Rig dispatch seam and never records a
+formal sample. In rule mode the configured DMTAC backend is registered as the
+Rig's `left_hand`/`right_hand` backend even though Q6 is absent; ordinary
+teleoperation retains its separate scalar-input topology. Starting formal rule
+collection cancels any queued reset and locks both buttons. Rule mode rejects
+Q6 or angle-trigger input when a DMTAC backend is enabled, preventing two
+hand-command owners.
+
+While a manual gripper action is pending, both gripper buttons, rule start, and
+all plan-configuration controls are disabled. The runtime independently rejects
+a second queued gripper intent, so HTTP/UI races cannot replace the in-flight
+feedback-gated target.
+
 ## Coordinate and admission boundary
 
 The application fails before device opening unless all of these conditions
@@ -39,8 +224,7 @@ hold:
 - the detail overlay exactly binds the source sealed progress Episode and its
   base annotation set;
 - the ordered detail stages are successful `pen_down`, `write`, and `pen_up`;
-- every source row from pen-down through pen-up labels the left arm
-  `fixed_hold`;
+- every selected source subphase labels the left arm `fixed_hold`;
 - both arms, position mode, collision avoidance, active TCP envelopes,
   tool-frame force guarding, and formal collection are enabled;
 - all Active admittance overlays are disabled.
@@ -52,6 +236,15 @@ at the authoritative pre-IK boundary and resolves each side's absolute bounds
 from the same runtime calibration workspace already selected for that arm. It
 does not add a force/admittance modifier or maintain a second workspace owner.
 
+Dataset poses remain stored as `float32` xyz-quaternions. Immediately before
+the coupled target owner, both replay targets and the measured inactive-side
+hold pose undergo a bounded SO(3) projection with a `1e-5` maximum
+orthogonality, determinant, and projection error. This only removes
+representation-scale drift (normally about `1e-8`); reflections, non-finite
+values, bad homogeneous rows, and materially distorted rotations still fail
+closed. Projection diagnostics are attached to the rule command metadata, and
+the final Active TCP envelope retains its independent `1e-9` rigid-pose check.
+
 The fixed path is authored in glyph-local XY and rotated only within
 `canonical_desk`. Its right-arm start is the causal real TCP endpoint converted
 through the current runtime contract. The existing RealTeleop resolver then
@@ -59,7 +252,83 @@ performs the canonical-desk to per-arm hardware-frame conversion.
 
 ## Offline command inspection
 
-From `/home/user/zc/AgenticRobot`, in the complete `dexteleop310` environment:
+### Cross-dataset source pool
+
+The recommended mode uses a JSON manifest. Candidate paths may be absolute or
+relative to the manifest directory. A candidate can expose one or more writing
+subphases:
+
+```json
+{
+  "schema": "dexteleop.rule_based_writing_source_pool.v1",
+  "pool_id": "writing-diversity-2026-09",
+  "candidates": [
+    {
+      "candidate_id": "day07-episode101",
+      "dataset_root": "../datasets/day07",
+      "episode_index": 101,
+      "detail_annotation_dir": "../datasets/day07/meta/progress/detail_stage_annotations/episode-uuid/detail-set",
+      "phases": ["pen_down", "write", "pen_up"],
+      "tags": ["front", "digit_1"]
+    }
+  ]
+}
+```
+
+`--source-pool-range START:END` restricts selection to a half-open slice of the
+manifest candidate list; omitting it uses the full list. For each of
+`pen_down`, `write`, and `pen_up`, the launcher selects an eligible
+candidate deterministically from the range using the manifest semantic hash
+and `--selection-seed`. The staged dedicated UI contains three independent
+selectors for every phase-eligible candidate, all nine fixed digit paths, all
+four directions, glyph height, writing speed, and an initialization-speed
+multiplier. These controls remain dormant in the current generic-entrypoint
+launcher. Its values come from validated startup arguments instead. The staged
+pre-motion form also contains the runtime-safe writer controls:
+the native tactile-bundle root and minimum-free-space reserve, tactile
+compression, writer/process/storage queue sizing, writer thread count,
+collection-frequency warning threshold, and Parquet/video enablement.
+The per-camera queue admission timeout is also configurable; when a blocking
+route exceeds it, the affected recorder is quarantined instead of stalling the
+control path indefinitely.
+When the dedicated UI is activated by its owner, applying a change rebuilds
+and validates the immutable plan on a background worker and keeps start
+disabled until validation succeeds. In both paths, the exact pool hash, range,
+candidate IDs, datasets, episodes, detail sets, tags, and pose contracts are
+recorded in every rule command and admitted formal sample.
+
+The staged dedicated UI can build and prevalidate an ordered batch without
+opening hardware resources. Each queue item remains one independent formal
+Episode and never starts automatically. With the current launcher, collect
+several combinations as separate validated invocations; do not treat dormant
+batch controls as an available operational interface.
+
+From `/home/user/zc/AgenticRobot-deployment-20260830`, in the complete
+`dexteleop310` environment:
+
+```bash
+bash scripts/run_rule_based_writing_collection.sh \
+  --source-pool-manifest /absolute/path/to/writing_source_pool.json \
+  --source-pool-range 0:200 \
+  --selection-seed 42 \
+  --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection \
+  --tactile-bundle-root /absolute/path/to/existing/tactile_root \
+  --trajectory digit_1_v1 \
+  --size-m 0.08 \
+  --direction up \
+  --initial-alignment-speed-scale 0.5 \
+  --dry-run
+```
+
+Only selected candidates are opened and contract-validated at application
+startup; all manifest candidate paths are resolved and checked for existence.
+Missing phase coverage, an empty/out-of-bounds range, an invalid detail
+binding, or any selected pose-frame mismatch fails before device opening.
+
+### Legacy single source
+
+The original three arguments remain supported and select all three subphases
+from one episode:
 
 ```bash
 bash scripts/run_rule_based_writing_collection.sh \
@@ -77,18 +346,73 @@ bash scripts/run_rule_based_writing_collection.sh \
 `--dry-run` validates only shell-level paths and prints the resolved command;
 it does not import the source episode and does not prove hardware readiness.
 
-## One real collection
+## Real collection handoff (blocked in this candidate)
 
-There is no five-pedal service or Q6 input step for this entrypoint. After the
-normal arm, DMTAC/tactile, camera, calibration, workspace-clearance, and
-operator preflight, run the collector by removing `--dry-run` from the
-inspected command. Start exactly one formal Episode in the existing GUI.
-The rule extension remains idle until the formal writer and causal dual-arm
-feedback are ready, then runs the bounded plan and enters the existing hardware
-hold after completion.
+Do not remove `--dry-run` on this reconciliation candidate. Real collection
+remains blocked until the generic entrypoint/runtime and component-builder
+owners integrate the staged hooks and rerun hardware commissioning. After that
+owner integration, no Q6 or foot-pad process is required. The launcher explicitly selects manual
+special-arm control, so an already-running foot-pad virtual keyboard is not
+opened or polled by this application. The intended integrated path captures
+robot-state-only runtime Home, waits for the dedicated UI readiness, and starts
+exactly one formal Episode through the rule-start intent. The plan arms only
+after that Episode's writer and causal dual-arm feedback are ready.
+
+If a required backend is recovered through the established device-retry UI, the retry path
+refreshes both the generic hardware projection and the rule runtime's cached
+readiness diagnosis. Recovery does not authorize motion or silently perform
+Home: after the device blockers disappear, explicitly click “重新安全初始化” and
+wait for the shared runtime Home to complete before starting a new formal
+Episode.
+
+The plan does not output motion until both the writer and causal dual-arm
+feedback are ready. The established stop/Hold action immediately blocks
+further rule commands, cancels and
+discards the whole current Episode (including already accepted samples), and
+enters hardware Hold. The UI then exposes only the safe recovery path: wait
+for Episode cleanup, run “重新安全初始化”, and start a new attempt after the
+fresh runtime Home and arm-admission receipt. External/safety Hold follows the
+same rule-attempt reset. Plan completion is different: it requests writer
+finalization, keeps the last certified position target while the writer drains,
+then releases the rule-only FixArm authority and returns to a command-inert
+ready state. It does not manufacture a hardware Hold or recapture runtime Home
+after a successful Episode.
+
+If writer preparation or Episode opening fails (for example, the configured
+minimum tactile free-space reserve exceeds the mounted disk's current free
+space), rule motion stays command-inert while the camera preview,
+safety/control loop, warning messages, and stop/Hold remain available. In the
+current launcher, correct the startup configuration and restart the validated
+invocation. Dedicated in-place writer reconfiguration/retry exists only in the
+staged UI and is not an active operational control. The reserve is never
+reduced automatically.
 
 The default fixed-path speed is derived from the right TCP average over the
-source pen-down and pen-up spans, with gaps excluded. Use
+selected source `write` span. Use
 `--speed-m-s VALUE` only when an explicit reviewed speed is required. Supported
 directions are `up`, `right`, `down`, and `left`; `--size-m` is the glyph height
-before that rotation.
+before that rotation. `--initial-alignment-speed-scale VALUE` supplies the
+startup value for the current-to-`pen_down` transition. The collision
+planner first certifies the same bounded direct path at full scale. The shared
+offline waypoint implementation then applies a C2 quintic time parameterization
+at the established 60 Hz position-reference rate, with zero endpoint velocity
+and acceleration and continuous velocity/acceleration/jerk certificates.
+The configured value in `[0.05, 1.0]` scales only the certified execution duration;
+it no longer changes path geometry or creates a sparse staircase. The values
+become immutable once rule motion begins. The staged dedicated path may rebuild
+them while an armed rule is waiting in its explicit writer-blocked state; the
+current launcher requires a corrected, newly validated invocation.
+
+By default the launcher uses the right-gripper rule-writing progress and stage
+profiles. With `--with-left-gripper`, it selects
+`catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress` together
+with
+`catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed`.
+Within the `right_write` task the admitted samples carry exactly these three
+ordered detail stages: `right_write.pen_down` (`replay`),
+`right_write.write` (`rule-base`), and `right_write.pen_up`
+(`relative_replay`). Initialization is labeled but excluded from formal sample
+counts. Each rule directive is admitted to the writer at most once, so the
+published count cannot grow through repeated control-loop dispatch of one held target. A
+normal operator or safety Hold discards the complete attempt; only the runtime's
+`rule_based_complete` event can seal this detailed event window as SUCCESS.

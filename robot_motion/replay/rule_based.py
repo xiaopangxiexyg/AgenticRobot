@@ -20,7 +20,11 @@ from robot_motion.action.schema import normalize_side
 from robot_motion.action.sources import RobotActionSource
 from robot_motion.relative_action import pose_matrix_to_xyzquat
 
-from .action_frame import replay_robot_action_at_index
+from .action_frame import (
+    replay_action_metadata,
+    replay_end_effector_targets_at_index,
+    replay_robot_action_at_index,
+)
 from .fixed_trajectory import (
     build_fixed_trajectory_targets,
     normalize_fixed_trajectory_direction,
@@ -115,6 +119,10 @@ class RuleBasedInitialize:
     capture: RuleBasedCaptureSelection = field(
         default_factory=lambda: RuleBasedCaptureSelection(enabled=False)
     )
+    # Appended after the historical fields to preserve positional construction
+    # compatibility for callers that passed ``capture`` as the sixth argument.
+    include_end_effectors: bool = False
+    end_effector_sides: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "step_id", _required_text(self.step_id, name="step_id"))
@@ -122,6 +130,16 @@ class RuleBasedInitialize:
         object.__setattr__(self, "frame_index", _non_negative_int(self.frame_index, name="frame_index"))
         object.__setattr__(self, "active_sides", _normalize_sides(self.active_sides))
         object.__setattr__(self, "qpos_source", normalize_qpos_init_source(self.qpos_source))
+        include_end_effectors = bool(self.include_end_effectors)
+        end_effector_sides = (
+            self.active_sides
+            if include_end_effectors and not self.end_effector_sides
+            else _normalize_sides(self.end_effector_sides)
+            if self.end_effector_sides
+            else ()
+        )
+        object.__setattr__(self, "include_end_effectors", include_end_effectors)
+        object.__setattr__(self, "end_effector_sides", end_effector_sides)
         if not isinstance(self.capture, RuleBasedCaptureSelection):
             raise TypeError("capture must be RuleBasedCaptureSelection.")
 
@@ -139,6 +157,11 @@ class RuleBasedReplay:
     relative_to: str | None = None
     source_start_index: int | None = None
     capture: RuleBasedCaptureSelection = field(default_factory=RuleBasedCaptureSelection)
+    # Keep these additions after ``capture`` so historical positional callers
+    # retain their original argument meaning.
+    include_end_effectors: bool = False
+    end_effector_sides: tuple[str, ...] = ()
+    wait_for_terminal_arrival: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "step_id", _required_text(self.step_id, name="step_id"))
@@ -149,6 +172,21 @@ class RuleBasedReplay:
             raise ValueError("end_index must be greater than start_index.")
         object.__setattr__(self, "active_sides", _normalize_sides(self.active_sides))
         object.__setattr__(self, "source", normalize_replay_trajectory_source(self.source))
+        include_end_effectors = bool(self.include_end_effectors)
+        end_effector_sides = (
+            self.active_sides
+            if include_end_effectors and not self.end_effector_sides
+            else _normalize_sides(self.end_effector_sides)
+            if self.end_effector_sides
+            else ()
+        )
+        object.__setattr__(self, "include_end_effectors", include_end_effectors)
+        object.__setattr__(self, "end_effector_sides", end_effector_sides)
+        object.__setattr__(
+            self,
+            "wait_for_terminal_arrival",
+            bool(self.wait_for_terminal_arrival),
+        )
         relative_to = self.relative_to
         if relative_to is not None:
             relative_to = _required_text(relative_to, name="relative_to")
@@ -311,6 +349,8 @@ class RuleBasedActionSegment:
     action_source: RobotActionSource
     stop_condition: RuleBasedSegmentStopCondition
     capture: RuleBasedCaptureSelection = field(default_factory=RuleBasedCaptureSelection)
+    allow_empty: bool = False
+    planned_steps_hint: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "step_id", _required_text(self.step_id, name="step_id"))
@@ -320,6 +360,15 @@ class RuleBasedActionSegment:
             raise TypeError("stop_condition must be RuleBasedSegmentStopCondition.")
         if not isinstance(self.capture, RuleBasedCaptureSelection):
             raise TypeError("capture must be RuleBasedCaptureSelection.")
+        object.__setattr__(self, "allow_empty", bool(self.allow_empty))
+        if self.planned_steps_hint is not None:
+            planned_steps_hint = _non_negative_int(
+                self.planned_steps_hint,
+                name="planned_steps_hint",
+            )
+            if planned_steps_hint > self.stop_condition.max_steps:
+                raise ValueError("planned_steps_hint must not exceed max_steps.")
+            object.__setattr__(self, "planned_steps_hint", planned_steps_hint)
 
 
 RuleBasedStep: TypeAlias = (
@@ -380,6 +429,9 @@ class RuleBasedCollectionDirective:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     segment_terminal: bool = False
     segment_stop_reason: str | None = None
+    # Appended after all historical fields to avoid reinterpreting positional
+    # construction of collection directives.
+    hand_qpos_by_side: Mapping[str, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.kind not in {"initialize", "replay", "custom_action", "fixed_trajectory"}:
@@ -400,6 +452,19 @@ class RuleBasedCollectionDirective:
                 for side, values in self.qpos_by_side.items()
             },
         )
+        object.__setattr__(
+            self,
+            "hand_qpos_by_side",
+            {
+                str(side): np.asarray(values, dtype=float).reshape(-1).copy()
+                for side, values in self.hand_qpos_by_side.items()
+            },
+        )
+        if any(
+            values.shape != (6,) or not np.all(np.isfinite(values))
+            for values in self.hand_qpos_by_side.values()
+        ):
+            raise ValueError("hand_qpos_by_side values must contain six finite values.")
         object.__setattr__(self, "metadata", dict(self.metadata))
         if self.segment_stop_reason is not None:
             object.__setattr__(
@@ -448,6 +513,12 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
         return self._step_index >= len(self.plan.steps)
 
     def reset(self) -> None:
+        for step in self.plan.steps:
+            if not isinstance(step, RuleBasedActionSegment):
+                continue
+            reset_source = getattr(step.action_source, "reset", None)
+            if callable(reset_source):
+                reset_source()
         self._step_index = 0
         self._directive_index = 0
         self._pending = iter(())
@@ -553,6 +624,11 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
             raise RuntimeError("No active runtime action segment is available.")
         action = step.action_source.produce_action(observation, context=context)
         if action is None:
+            if step.allow_empty and self._active_segment_emitted == 0:
+                self._active_segment_terminal = True
+                self._active_segment_stop_reason = "empty"
+                self._finish_active_segment()
+                return self.next_runtime(observation, context=context)
             raise ValueError(
                 f"Runtime action source for segment {step.step_id!r} returned None; "
                 "use stop_when to terminate after an explicit action."
@@ -587,6 +663,7 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                 "custom_action_source": source_name,
                 "custom_action_mode": "runtime_source",
                 "segment_emitted_steps": int(self._active_segment_emitted),
+                "segment_max_steps": int(step.stop_condition.max_steps),
                 "segment_stop_condition": step.stop_condition.name,
             },
             segment_terminal=self._active_segment_terminal,
@@ -614,18 +691,38 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
             if set(targets) != set(step.active_sides):
                 missing = sorted(set(step.active_sides) - set(targets))
                 raise ValueError(f"Initialization has no finite qpos target for side(s): {missing}.")
+            hand_targets: dict[str, np.ndarray] = {}
+            hand_metadata: dict[str, Any] = {}
+            if step.include_end_effectors:
+                hand_sides = step.end_effector_sides or step.active_sides
+                hand_targets = replay_end_effector_targets_at_index(
+                    group,
+                    hand_sides,
+                    index=int(step.frame_index),
+                )
+                if set(hand_targets) != set(hand_sides):
+                    missing = sorted(set(hand_sides) - set(hand_targets))
+                    raise ValueError(
+                        f"Initialization has no finite end-effector target for side(s): {missing}."
+                    )
+                hand_metadata = replay_action_metadata(
+                    group,
+                    active_sides=hand_sides,
+                )
             yield RuleBasedCollectionDirective(
                 sequence_index=step_index,
                 step_id=step.step_id,
                 kind="initialize",
                 capture=step.capture,
                 qpos_by_side=targets,
+                hand_qpos_by_side=hand_targets,
                 group_key=step.group_key,
                 replay_frame_index=step.frame_index,
                 metadata={
                     "rule_based_schema": RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
                     "rule_based_step_index": int(step_index),
                     "qpos_source_by_side": dict(sources),
+                    **hand_metadata,
                 },
             )
             return
@@ -639,6 +736,10 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                 )
             for frame_index in range(step.start_index, step.end_index):
                 action = self._replay_action(group, step, frame_index=frame_index)
+                terminal = bool(
+                    step.wait_for_terminal_arrival
+                    and frame_index == int(step.end_index) - 1
+                )
                 yield RuleBasedCollectionDirective(
                     sequence_index=step_index,
                     step_id=step.step_id,
@@ -664,6 +765,10 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                             else {}
                         ),
                     },
+                    segment_terminal=terminal,
+                    segment_stop_reason=(
+                        "replay_terminal_arrival" if terminal else None
+                    ),
                 )
             return
 
@@ -786,6 +891,8 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                     else step.start_index
                 ),
                 boundary=boundary,
+                include_end_effectors=bool(step.include_end_effectors),
+                end_effector_sides=step.end_effector_sides,
                 source="rule_based_relative_replay",
             )
         if step.source == REPLAY_TRAJECTORY_ACTION_POSE:
@@ -793,6 +900,8 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                 group,
                 step.active_sides,
                 index=frame_index,
+                include_end_effectors=bool(step.include_end_effectors),
+                end_effector_sides=step.end_effector_sides,
                 source="rule_based_replay",
             )
         targets, _ = select_replay_qpos_init_targets(
@@ -804,9 +913,20 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
         if set(targets) != set(step.active_sides):
             missing = sorted(set(step.active_sides) - set(targets))
             raise ValueError(f"Replay has no finite qpos target for side(s): {missing}.")
+        hand_targets = (
+            replay_end_effector_targets_at_index(
+                group,
+                step.end_effector_sides or step.active_sides,
+                index=frame_index,
+            )
+            if step.include_end_effectors
+            else {}
+        )
         return RobotAction.bimanual_qpos(
             left_arm=targets.get("left"),
             right_arm=targets.get("right"),
+            left_hand=hand_targets.get("left"),
+            right_hand=hand_targets.get("right"),
             source="rule_based_replay",
             metadata={"replay_frame_index": int(frame_index)},
         )

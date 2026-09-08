@@ -36,6 +36,8 @@ def test_catalog_separates_linear_and_tree_namespaces() -> None:
         "dmtac_rm65_bimanual_position_writing_five_stage_progress",
         "dmtac_rm65_bimanual_position_writing_four_stage_progress",
         "dmtac_rm65_bimanual_position_writing_three_stage_progress",
+        "dmtac_rm65_full_trajectory_replay_v1_progress",
+        "dmtac_rm65_right_gripper_rule_writing_progress",
         "example_three_stage_pick_place_progress",
         "test_dmtac_rm65_bimanual_position_v1_three_stage_progress",
     )
@@ -185,6 +187,29 @@ def test_detailed_writing_profile_is_an_explicit_additive_selection() -> None:
             topology_kind="LINEAR",
             include_detailed=True,
         )
+    )
+
+
+def test_right_gripper_rule_profile_is_arm_only_and_three_stage_detailed() -> None:
+    bundle = load_managed_task_profile(
+        "dmtac_rm65_right_gripper_rule_writing_progress_detailed"
+    )
+
+    assert bundle.progress_profile.task_id == "dmtac_rm65_rule_based_writing_v1"
+    assert tuple(bundle.progress_profile.step_by_id) == ("right_write",)
+    arm_control = bundle.progress_profile.step_by_id["right_write"].arm_control
+    assert arm_control is not None
+    assert arm_control.left == "fixed_hold"
+    assert arm_control.right == "teleop"
+    assert arm_control.fixed_scope == "arm_only"
+    assert bundle.stage_profile is not None
+    assert tuple(
+        stage.stage_id
+        for stage in bundle.stage_profile.stages_for_step("right_write")
+    ) == (
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
     )
 
 

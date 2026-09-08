@@ -17,6 +17,40 @@ from serial.tools import list_ports
 
 Number = Union[int, float]
 
+# REG_ERRORCODE is a bit field.  Keep known vendor bits machine-readable while
+# retaining unknown bits verbatim; an unknown non-zero bit is still a fault.
+GRIPPER_ERROR_BITS = {
+    0x0010: "internal_communication_fault",
+}
+
+
+def decode_gripper_error_code(error_code: int) -> tuple[str, ...]:
+    value = int(error_code) & 0xFFFF
+    if value == 0:
+        return ()
+    names: list[str] = []
+    known_mask = 0
+    for bit, name in sorted(GRIPPER_ERROR_BITS.items()):
+        known_mask |= int(bit)
+        if value & int(bit):
+            names.append(str(name))
+    unknown = value & ~known_mask
+    bit = 1
+    while unknown:
+        if unknown & bit:
+            names.append(f"unknown_error_bit_0x{bit:04X}")
+            unknown &= ~bit
+        bit <<= 1
+    return tuple(names)
+
+
+def describe_gripper_error_code(error_code: int) -> str:
+    value = int(error_code) & 0xFFFF
+    names = decode_gripper_error_code(value)
+    if not names:
+        return "none"
+    return f"0x{value:04X}({','.join(names)})"
+
 
 def _clip(v: Number, lo: Number, hi: Number) -> Number:
     return max(lo, min(v, hi))
@@ -548,6 +582,69 @@ class InspireGripper:
 
     def clear_fault(self):
         self.mb.write_single_register(self.mb.REG_FAULT_ACK, 1)
+
+    def clear_fault_and_confirm(
+        self,
+        *,
+        timeout: float = 3.0,
+        poll_interval: float = 0.20,
+        ack_interval: float = 0.75,
+        required_consecutive_zero_reads: int = 3,
+    ) -> GripperState:
+        """Acknowledge a fault and require stable fresh error_code=0 telemetry.
+
+        Fault ACK is a non-motion register write, but its firmware effect is
+        asynchronous.  Returning after the raw Modbus echo can therefore
+        expose the old error code to the caller.  A single zero can likewise
+        be a transient register observation while the controller is settling.
+        This helper remains bounded, periodically reissues the idempotent ACK,
+        and requires consecutive zero reads before returning success.
+        """
+
+        timeout_s = max(0.0, float(timeout))
+        poll_s = max(0.001, float(poll_interval))
+        ack_s = max(0.0, float(ack_interval))
+        required_zeros = int(required_consecutive_zero_reads)
+        if required_zeros <= 0:
+            raise ValueError("required_consecutive_zero_reads must be positive")
+        started = time.monotonic()
+        deadline = started + timeout_s
+        next_ack_at = started
+        attempts = 0
+        zero_streak = 0
+        last_state: GripperState | None = None
+        while True:
+            now = time.monotonic()
+            if attempts == 0 or now >= next_ack_at:
+                self.clear_fault()
+                next_ack_at = now + ack_s
+            remaining = deadline - time.monotonic()
+            if attempts > 0 and remaining <= 0.0:
+                break
+            if poll_s > 0.0:
+                time.sleep(min(poll_s, max(0.0, remaining)))
+            last_state = self.get_state()
+            attempts += 1
+            if int(last_state.error_code) == 0:
+                zero_streak += 1
+                if zero_streak >= required_zeros:
+                    return last_state
+            else:
+                zero_streak = 0
+            if time.monotonic() >= deadline:
+                break
+        detail = "no fresh state"
+        if last_state is not None:
+            detail = (
+                f"error_code={last_state.error_code} "
+                f"error={describe_gripper_error_code(last_state.error_code)} "
+                f"status_code={last_state.status_code}:{last_state.status_text}"
+            )
+        raise GripperError(
+            "DMTAC fault ACK was not confirmed before the bounded deadline: "
+            f"{detail} attempts={attempts} zero_streak={zero_streak}/"
+            f"{required_zeros} elapsed_sec={time.monotonic() - started:.3f}"
+        )
 
     def estop(self):
         self.mb.write_single_register(self.mb.REG_STOP, 1)

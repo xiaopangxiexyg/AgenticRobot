@@ -40,6 +40,10 @@ class DevicePreflightOptions:
     probe_all_serial: bool = False
     q6_config: str | Path = "latest"
     dmtac_config: str | Path = "latest"
+    # Per-side CLI/runtime transport overrides are probe hints only.  They let
+    # preflight verify the endpoint that the backend will actually open without
+    # persisting a manual override into the shared assignment.
+    dmtac_gripper_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     dmtac_tactile_gui: bool = True
     dmtac_tactile_backend: str = "cpu"
 
@@ -930,6 +934,55 @@ def _configured_dmtac_complete(
     return True
 
 
+def _assignment_hint_supports_bounded_dmtac_probe(
+    usb_assignment: Any,
+    assignment: Mapping[str, Any] | None,
+    *,
+    active_sides: Sequence[str],
+    require_tactile: bool,
+) -> bool:
+    """Return whether a saved assignment is complete enough for quick probe.
+
+    A full 247-ID scan is a recovery operation.  Once a reviewed assignment
+    contains every active gripper (and, when requested, both tactile slots),
+    the quick configured-setting probe is the only useful startup operation.
+    In particular, a temporarily busy/missing ``/dev/ttyUSB*`` must not make
+    the GUI scan every serial adapter and appear frozen for several minutes.
+    Keep this check structural and side-effect free; the normal comparison
+    below still decides whether the saved assignment is usable and whether a
+    runtime reconnect should be offered.
+    """
+
+    if not isinstance(assignment, Mapping):
+        return False
+    try:
+        assignments = assignment.get("assignments")
+        if not isinstance(assignments, Mapping):
+            return False
+        for side in active_sides:
+            side_assignment = assignments.get(str(side))
+            if not isinstance(side_assignment, Mapping):
+                return False
+            gripper = usb_assignment.gripper_for_side(assignment, str(side))
+            if not isinstance(gripper, Mapping):
+                return False
+            if not bool(gripper.get("enabled", True)):
+                return False
+            if not str(gripper.get("port") or "").strip():
+                return False
+            if int(gripper.get("gripper_id", 0) or 0) <= 0:
+                return False
+            if int(gripper.get("baudrate", 0) or 0) <= 0:
+                return False
+            if require_tactile and len(
+                usb_assignment.tactile_ids_for_side(assignment, str(side))
+            ) < 2:
+                return False
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _missing_dmtac_active_items(
     comparison: Mapping[str, Any],
     *,
@@ -981,6 +1034,120 @@ def _dmtac_gripper_label(item: Mapping[str, Any]) -> str:
 
 def _dmtac_gripper_port(item: Mapping[str, Any]) -> str:
     return str(item.get("preferred_port") or item.get("port") or item.get("device") or "")
+
+
+def _dmtac_gripper_paths(item: Mapping[str, Any]) -> set[str]:
+    return {
+        str(value).strip()
+        for value in (
+            item.get("port"),
+            item.get("device"),
+            item.get("preferred_port"),
+            *(item.get("port_aliases") or ()),
+        )
+        if str(value or "").strip()
+    }
+
+
+def _validate_dmtac_gripper_override_identities(
+    *,
+    options: DevicePreflightOptions,
+    assignment: Mapping[str, Any],
+    scan: Mapping[str, Any],
+    comparison: Mapping[str, Any],
+) -> None:
+    """Reject a side-labelled tty override that resolves to another gripper.
+
+    ``/dev/ttyUSB*`` numbers are enumeration results, not physical identities.
+    A manual override still selects the runtime transport, so merely validating
+    that *a* gripper answers on it is insufficient: after a replug it can open
+    the opposite physical gripper under the requested logical side.  When a
+    reviewed assignment provides stable identity evidence, bind the override
+    to that evidence before any backend can be constructed.
+    """
+
+    configured = assignment.get("assignments")
+    if not isinstance(configured, Mapping):
+        return
+    scanned = [
+        dict(item)
+        for item in scan.get("grippers") or ()
+        if isinstance(item, Mapping)
+    ]
+    matched = [
+        dict(item)
+        for item in comparison.get("matched") or ()
+        if isinstance(item, Mapping) and item.get("kind") == "gripper"
+    ]
+    for requested_side in options.active_sides:
+        override = options.dmtac_gripper_overrides.get(str(requested_side), {})
+        explicit_port = str(override.get("port") or "").strip()
+        if not explicit_port:
+            continue
+        side_assignment = configured.get(str(requested_side))
+        configured_gripper = (
+            side_assignment.get("gripper")
+            if isinstance(side_assignment, Mapping)
+            else None
+        )
+        # No prior identity exists during an explicit assignment flow.  That
+        # flow must establish roles through its existing confirmation path.
+        if not isinstance(configured_gripper, Mapping):
+            continue
+        current = next(
+            (
+                item
+                for item in scanned
+                if explicit_port in _dmtac_gripper_paths(item)
+            ),
+            None,
+        )
+        if current is None:
+            raise DevicePreflightError(
+                f"DMTAC {requested_side} gripper override {explicit_port!r} "
+                "does not resolve to a scanned USB gripper; refusing a "
+                "side-unverified runtime endpoint."
+            )
+        if (current.get("probe") or {}).get("reachable") is not True:
+            raise DevicePreflightError(
+                f"DMTAC {requested_side} gripper override {explicit_port!r} "
+                "did not produce a successful read-only probe; refusing to "
+                "construct the runtime backend."
+            )
+        current_paths = _dmtac_gripper_paths(current)
+        identity_sides = {
+            str(item.get("side"))
+            for item in matched
+            if isinstance(item.get("current"), Mapping)
+            and current_paths.intersection(
+                _dmtac_gripper_paths(item["current"])
+            )
+        }
+        if requested_side in identity_sides:
+            continue
+        expected = next(
+            (
+                item.get("current")
+                for item in matched
+                if str(item.get("side")) == str(requested_side)
+                and isinstance(item.get("current"), Mapping)
+            ),
+            None,
+        )
+        expected_port = (
+            _dmtac_gripper_port(expected)
+            if isinstance(expected, Mapping)
+            else str(configured_gripper.get("port") or "")
+        )
+        detected_role = ",".join(sorted(identity_sides)) or "unknown"
+        raise DevicePreflightError(
+            f"DMTAC {requested_side} gripper override {explicit_port!r} "
+            f"matches configured physical role {detected_role!r}, not "
+            f"{requested_side!r}; expected current endpoint "
+            f"{expected_port or '<unresolved>'!r}. /dev/ttyUSB* numbering "
+            "changed after enumeration. Remove the stale override and use "
+            "the stable assignment/by-path endpoint."
+        )
 
 
 def _dmtac_gripper_id(usb_assignment: Any, item: Mapping[str, Any], default: int = 1) -> int:
@@ -1286,7 +1453,13 @@ def _print_dmtac_scan_progress(payload: Mapping[str, Any]) -> None:
         return
     if event == "gripper_probe_done":
         label = str(payload.get("preferred_port") or payload.get("port") or "")
-        status = "reachable" if payload.get("reachable") else "not reachable"
+        if payload.get("reachable") and payload.get("faulted"):
+            status = (
+                "reachable but faulted"
+                f" error={payload.get('error_description') or payload.get('error_code')}"
+            )
+        else:
+            status = "reachable" if payload.get("reachable") else "not reachable"
         elapsed = payload.get("probe_elapsed_s")
         attempts = payload.get("attempted_setting_count")
         extra = []
@@ -1316,28 +1489,127 @@ def prepare_dmtac(
     result: DevicePreflightResult,
 ) -> None:
     usb_assignment, gui_config_cls, run_tactile_gui, tactile_tokens_from_assignment = _load_dmtac_modules()
+    expected_grippers = len(options.active_sides)
+    assignment_hint = None
+    assignment_hint_missing = False
+    if not options.force_reconfigure:
+        try:
+            assignment_hint = usb_assignment.load_assignment(options.dmtac_config)
+        except FileNotFoundError:
+            assignment_hint_missing = True
+    preferred_gripper_ports: list[str] = []
+    preferred_gripper_settings: list[dict[str, Any]] = []
+    hint_assignments = (
+        assignment_hint.get("assignments")
+        if isinstance(assignment_hint, Mapping)
+        else None
+    )
+    if isinstance(hint_assignments, Mapping):
+        for side in options.active_sides:
+            explicit = options.dmtac_gripper_overrides.get(str(side), {})
+            explicit_port = str(explicit.get("port") or "").strip()
+            if explicit_port and explicit_port not in preferred_gripper_ports:
+                preferred_gripper_ports.append(explicit_port)
+            if explicit_port:
+                preferred_gripper_settings.append(dict(explicit))
+            side_assignment = hint_assignments.get(str(side))
+            gripper = (
+                side_assignment.get("gripper")
+                if isinstance(side_assignment, Mapping)
+                else None
+            )
+            if not isinstance(gripper, Mapping):
+                continue
+            if not explicit_port:
+                preferred_gripper_settings.append(dict(gripper))
+            for path in (gripper.get("port"), *(gripper.get("port_aliases") or ())):
+                text = str(path or "").strip()
+                if text and text not in preferred_gripper_ports:
+                    preferred_gripper_ports.append(text)
+    else:
+        for side in options.active_sides:
+            explicit = options.dmtac_gripper_overrides.get(str(side), {})
+            explicit_port = str(explicit.get("port") or "").strip()
+            if not explicit_port:
+                continue
+            if explicit_port not in preferred_gripper_ports:
+                preferred_gripper_ports.append(explicit_port)
+            preferred_gripper_settings.append(dict(explicit))
     scan = usb_assignment.scan_usb_devices(
         probe_grippers=True,
         probe_all_serial=bool(options.probe_all_serial),
+        # Known configurations get one bounded probe at their configured
+        # setting.  A 247-ID sweep is a recovery operation, never the normal
+        # startup path for every serial candidate.
+        scan_gripper_ids=False,
+        scan_baudrates=(),
+        # Stop once the requested topology has enough reachable grippers.  A
+        # right-only run must not continue probing an otherwise connected left
+        # gripper after the right device has already satisfied admission.
+        max_reachable_grippers=expected_grippers,
+        preferred_gripper_ports=tuple(preferred_gripper_ports),
+        preferred_gripper_settings=tuple(preferred_gripper_settings),
         progress_callback=_print_dmtac_scan_progress,
     )
-    expected_grippers = len(options.active_sides)
     expected_tactile = 2 * len(options.active_sides) if options.require_dmtac_tactile else 0
     reachable_grippers = _reachable_grippers(scan)
-    if len(reachable_grippers) < expected_grippers and not bool(options.probe_all_serial):
+    for item in reachable_grippers:
+        probe = item.get("probe") if isinstance(item, Mapping) else None
+        if not isinstance(probe, Mapping) or probe.get("faulted") is not True:
+            continue
+        state = probe.get("state") if isinstance(probe.get("state"), Mapping) else {}
+        result.add(
+            "WARNING: DMTAC gripper is reachable but not healthy at preflight; "
+            "runtime will perform bounded non-motion fault-ACK recovery and must "
+            "observe a fresh error_code=0 before command admission: "
+            f"port={item.get('preferred_port') or item.get('port') or item.get('device')} "
+            f"error={probe.get('error_description') or probe.get('error_code')} "
+            f"status_code={state.get('status_code')} current={state.get('current')} "
+            f"temperature_c={state.get('temperature_c')}"
+        )
+    # Do not turn an ordinary configured-port failure into a broad serial
+    # recovery scan.  The latter probes every candidate at up to 247 IDs and
+    # is intentionally expensive; it is useful only when no complete saved
+    # topology can guide the probe (or when the operator explicitly asks for
+    # recovery with --device-preflight-probe-all-serial/--force-reconfigure).
+    complete_assignment_hint = _assignment_hint_supports_bounded_dmtac_probe(
+        usb_assignment,
+        assignment_hint,
+        active_sides=options.active_sides,
+        require_tactile=bool(options.require_dmtac_tactile),
+    )
+    allow_full_id_recovery = bool(
+        options.probe_all_serial
+        or options.force_reconfigure
+        or not complete_assignment_hint
+    )
+    if len(reachable_grippers) < expected_grippers and allow_full_id_recovery:
         retry_scan = usb_assignment.scan_usb_devices(
             probe_grippers=True,
             probe_all_serial=True,
+            scan_gripper_ids=True,
+            max_reachable_grippers=expected_grippers,
+            preferred_gripper_ports=tuple(preferred_gripper_ports),
+            preferred_gripper_settings=tuple(preferred_gripper_settings),
             progress_callback=_print_dmtac_scan_progress,
         )
         retry_reachable = _reachable_grippers(retry_scan)
         if len(retry_reachable) > len(reachable_grippers):
             result.add(
-                "DMTAC default gripper scan was insufficient; retrying with all serial ports "
-                f"found {len(retry_reachable)} reachable gripper(s)."
+                "DMTAC quick configured-setting probe was insufficient; the full-ID "
+                "recovery scan across serial candidates found "
+                f"{len(retry_reachable)} reachable gripper(s)."
             )
             scan = retry_scan
             reachable_grippers = retry_reachable
+    elif len(reachable_grippers) < expected_grippers and complete_assignment_hint:
+        result.add(
+            "DMTAC configured assignment is structurally complete but the "
+            "bounded port probe found too few reachable grippers; skipping the "
+            "247-ID recovery scan. Runtime reconnect will retry the saved "
+            "endpoint, and explicit --device-preflight-probe-all-serial can "
+            "request a full scan."
+        )
     tactile_devices = list(scan.get("tactile") or [])
     if len(tactile_devices) < expected_tactile:
         raise DevicePreflightError(
@@ -1352,8 +1624,16 @@ def prepare_dmtac(
         )
     else:
         try:
-            assignment = usb_assignment.load_assignment(options.dmtac_config)
+            if assignment_hint_missing:
+                raise FileNotFoundError(options.dmtac_config)
+            assignment = assignment_hint
             comparison = usb_assignment.compare_assignment_to_scan(assignment, scan)
+            _validate_dmtac_gripper_override_identities(
+                options=options,
+                assignment=assignment,
+                scan=scan,
+                comparison=comparison,
+            )
             text = usb_assignment.format_comparison(comparison)
             effective = comparison["effective_assignment"]
             active_missing = _missing_dmtac_active_items(

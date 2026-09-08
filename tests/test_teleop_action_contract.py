@@ -405,6 +405,67 @@ class TeleopActionContractTest(unittest.TestCase):
         decoded = decode_robot_action(encoded)
         np.testing.assert_allclose(decoded.hand_qpos_by_side["right"], expected, equal_nan=True)
 
+    def test_dmtac_resolver_command_round_trips_to_canonical_q6_action(self) -> None:
+        spec = HandActionSpec.dmtac_gripper("right")
+        full = np.zeros(6, dtype=np.float32)
+        full[0] = 0.7
+        action = RobotAction.bimanual_qpos(
+            right_hand=full,
+            metadata={"hand_action_specs_by_side": {"right": spec.to_metadata()}},
+        )
+
+        command = RobotActionResolver().resolve(action)
+        hand_command = command.commands["right_hand"]
+        np.testing.assert_allclose(hand_command.value, [0.7])
+        self.assertEqual(
+            hand_command.metadata["hand_invalid_slot_value"],
+            "zero_padding",
+        )
+
+        restored = robot_action_from_teleop_command(command)
+
+        self.assertEqual(restored.hand_qpos_by_side["right"].shape, (6,))
+        np.testing.assert_allclose(restored.hand_qpos_by_side["right"], full)
+        self.assertEqual(
+            restored.metadata["hand_action_specs_by_side"]["right"]["hand_model"],
+            "dmtac_gripper",
+        )
+        encoded = encode_robot_action(restored)
+        self.assertTrue(encoded.effector_mask["right_hand"])
+
+    def test_dmtac_resolver_rejects_nonzero_inactive_padding_before_dispatch(self) -> None:
+        spec = HandActionSpec.dmtac_gripper("right")
+        invalid = np.asarray([0.7, 0.1, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        action = RobotAction.bimanual_qpos(
+            right_hand=invalid,
+            metadata={"hand_action_specs_by_side": {"right": spec.to_metadata()}},
+        )
+
+        with self.assertRaisesRegex(ValueError, "zero padding"):
+            RobotActionResolver().resolve(action)
+
+    def test_hand_full_metadata_must_match_dispatched_active_values(self) -> None:
+        spec = HandActionSpec.dmtac_gripper("right")
+        command = TeleopCommand(timestamp=12.2)
+        command.add_command(
+            EffectorCommand(
+                effector_name="right_hand",
+                side="right",
+                command_type="joint_vector",
+                value=np.asarray([0.4], dtype=np.float32),
+                metadata={
+                    "hand_action_spec": spec.to_metadata(),
+                    "hand_qpos_full": np.asarray(
+                        [0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        dtype=np.float32,
+                    ),
+                },
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            robot_action_from_teleop_command(command)
+
     def test_hand16_resolver_trims_invalid_nan_slots(self) -> None:
         hand = np.full((16,), np.nan, dtype=np.float32)
         hand[:2] = [0.2, 0.8]

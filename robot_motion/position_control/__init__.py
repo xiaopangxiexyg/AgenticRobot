@@ -138,6 +138,7 @@ from .execution_policy import (
 )
 from .resampling import (
     CausalMotionResampler,
+    MotionTargetResampler,
     POSE_ACTION_INTERVAL_VELOCITY_SCHEMA,
     ResampledMotionReference,
     TimestampedMotionTarget,
@@ -185,6 +186,7 @@ __all__ = [
     "ROTATIONAL_ADMITTANCE_PROFILE_MODERATED_8DEG",
     "ROTATIONAL_ADMITTANCE_PROFILE_ROTATION_EMPHASIS_5DEG",
     "CausalMotionResampler",
+    "MotionTargetResampler",
     "POSE_ACTION_INTERVAL_VELOCITY_SCHEMA",
     "DEFAULT_POSITION_COMMAND_HZ",
     "DEFAULT_POSITION_DEGRADED_SPEED_SCALE",

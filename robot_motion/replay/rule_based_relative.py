@@ -134,6 +134,7 @@ def rebase_replay_action_at_boundary(
     boundary: RuleBasedBoundaryState,
     source_start_index: int = 0,
     include_end_effectors: bool = False,
+    end_effector_sides: Sequence[str] | None = None,
     source: str = "rule_based_relative_replay",
 ) -> RobotAction:
     """Rebase one pose-replay action on a measured runtime boundary.
@@ -173,11 +174,15 @@ def rebase_replay_action_at_boundary(
             f"Boundary is missing active side(s): {missing}."
         )
 
+    hand_sides = tuple(sides if end_effector_sides is None else end_effector_sides)
+    if any(side not in {"left", "right"} for side in hand_sides):
+        raise ValueError("end_effector_sides must contain only left/right sides.")
     source_action = replay_robot_action_at_index(
         group,
         sides,
         index=frame_index,
         include_end_effectors=bool(include_end_effectors),
+        end_effector_sides=hand_sides,
         source=source,
         timestamp=group.relative_time_sec(frame_index),
     )

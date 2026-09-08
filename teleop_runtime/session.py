@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .action.schema import ActionRecord
 from .action.human_proposal import HumanCommandEmission, HumanLegacyCommandObservation
@@ -31,6 +31,7 @@ from robot_motion.runtime.observation_cut import (
     ObservationSampleRef,
     ObservationSampleTracker,
 )
+from robot_motion.runtime.readiness import format_readiness_report
 
 
 TRACKER_HOLD_NONE = ""
@@ -72,6 +73,7 @@ class TeleopSessionConfig:
     tracker_channel_names: tuple[str, ...] = ()
     tracker_auto_hold_sec: float = 0.10
     tracker_manual_hold_sec: float = 1.0
+    tracker_recovery_max_age_sec: float | None = None
 
     def __post_init__(self) -> None:
         self.tcp_mode = canonical_tcp_frame(self.tcp_mode)
@@ -90,6 +92,21 @@ class TeleopSessionConfig:
             )
         self.tracker_auto_hold_sec = auto_hold_sec
         self.tracker_manual_hold_sec = manual_hold_sec
+        recovery_max_age_sec = (
+            auto_hold_sec * 0.5
+            if self.tracker_recovery_max_age_sec is None
+            else float(self.tracker_recovery_max_age_sec)
+        )
+        if (
+            not math.isfinite(recovery_max_age_sec)
+            or recovery_max_age_sec < 0.0
+            or recovery_max_age_sec > auto_hold_sec
+        ):
+            raise ValueError(
+                "tracker_recovery_max_age_sec must be finite and in "
+                "[0, tracker_auto_hold_sec]."
+            )
+        self.tracker_recovery_max_age_sec = recovery_max_age_sec
 
 
 @dataclass
@@ -112,6 +129,32 @@ class SessionStepResult:
     tracker_loss_duration_sec: float = 0.0
     tracker_loss_channels: tuple[str, ...] = ()
     home_recalibration_required: bool = False
+    # Appended to preserve positional construction compatibility.
+    dispatch_receipts: Mapping[str, object | None] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ExternalCommandDispatchResult:
+    """Result of one command submitted outside the normal control step.
+
+    External commands (for example an idle gripper reset) still use the
+    Session-owned filter, guard, dispatch-admission, and Rig seams.  They are
+    deliberately separate from :meth:`run_step`: callers can request a
+    hardware dispatch without creating a formal collection sample or changing
+    the normal teleop RUNNING state.
+    """
+
+    command: TeleopCommand | None = None
+    admitted: bool = False
+    dispatched: bool = False
+    guard_fault: FaultEvent | None = None
+    rejection_reason: str = ""
+    dispatch_receipts: Mapping[str, object | None] = field(default_factory=dict)
+    # ``fault`` is the common fail-closed diagnostic for every external
+    # command rejection.  ``guard_fault`` remains as a compatibility alias
+    # for callers that only handled guard failures.  It is appended after the
+    # historical fields to preserve positional construction compatibility.
+    fault: FaultEvent | None = None
 
 
 class TeleopSession:
@@ -267,15 +310,70 @@ class TeleopSession:
 
     def reject_command_for_guard_fault(self, fault: FaultEvent) -> None:
         """Hold and fault after a failed pre-dispatch command guard."""
-
-        if self.recorder is not None:
-            self.recorder.record_fault(fault)
         reason = (
             "pre-dispatch command safety guard failed: "
             f"{fault.code}: {fault.message}"
         )
+        # Physical inhibition is the safety boundary.  Fault persistence is
+        # best effort and must never prevent the Rig from being held.
         held = self._hold_rig_motion(reason, context="command safety guard")
+        record_error = self._record_fault_best_effort(fault)
+        if record_error is not None:
+            reason = (
+                f"{reason}; fault recording failed: "
+                f"{type(record_error).__name__}: {record_error}"
+            )
         self.fault(reason if held else f"{reason}; hold_motion failed")
+
+    def _record_fault_best_effort(self, fault: FaultEvent) -> BaseException | None:
+        """Persist a fault without weakening a fail-closed safety transition."""
+
+        if self.recorder is None:
+            return None
+        try:
+            self.recorder.record_fault(fault)
+        except BaseException as exc:  # noqa: BLE001 - diagnostics cannot block Hold.
+            return exc
+        return None
+
+    def _external_command_fault(
+        self,
+        *,
+        code: str,
+        message: str,
+        now: float,
+        command: TeleopCommand | None,
+        rejection_reason: str,
+    ) -> ExternalCommandDispatchResult:
+        """Fail closed for an external command pipeline exception.
+
+        The helper deliberately performs Rig Hold before best-effort fault
+        persistence.  An exception from an optional filter/admission hook or
+        from the Rig may leave the hardware in an unknown state, so the
+        session enters FAULT and never updates its last-safe command.
+        """
+
+        fault = FaultEvent(
+            code=str(code),
+            message=str(message),
+            severity=FaultSeverity.ERROR,
+            timestamp=float(now),
+            component="teleop_session",
+        )
+        reason = f"external command failed: {fault.code}: {fault.message}"
+        held = self._hold_rig_motion(reason, context="external command")
+        record_error = self._record_fault_best_effort(fault)
+        if record_error is not None:
+            reason = (
+                f"{reason}; fault recording failed: "
+                f"{type(record_error).__name__}: {record_error}"
+            )
+        self.fault(reason if held else f"{reason}; hold_motion failed")
+        return ExternalCommandDispatchResult(
+            command=command,
+            fault=fault,
+            rejection_reason=str(rejection_reason),
+        )
 
     def _reject_command_override_provider_error(
         self,
@@ -360,6 +458,26 @@ class TeleopSession:
 
     def _tracker_hold_is_enabled(self) -> bool:
         return bool(self.config.tracker_loss_hold_enabled and self._tracker_channel_names())
+
+    def _tracker_recovery_is_fresh(
+        self,
+        channels: Mapping[str, ObservationChannel],
+        now: float,
+    ) -> bool:
+        maximum_age = float(self.config.tracker_recovery_max_age_sec or 0.0)
+        for channel_name in self._tracker_channel_names():
+            channel = channels.get(channel_name)
+            if channel is None or not channel.valid:
+                return False
+            try:
+                timestamp = float(channel.timestamp)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(timestamp):
+                return False
+            if max(0.0, float(now) - timestamp) > maximum_age:
+                return False
+        return True
 
     @staticmethod
     def _copy_command(command: TeleopCommand) -> TeleopCommand:
@@ -666,7 +784,16 @@ class TeleopSession:
         if self.config.allow_hardware_after_debug_pass and not self.debug_passed:
             raise RuntimeError("Cannot arm hardware before debug pass is marked complete.")
         if self.rig is not None and not self.rig.is_ready():
-            raise RuntimeError("Rig is not ready.")
+            detail = ""
+            report_fn = getattr(self.rig, "readiness_report", None)
+            if callable(report_fn):
+                try:
+                    detail = format_readiness_report(report_fn())
+                except Exception as exc:  # noqa: BLE001 - preserve fail-closed admission.
+                    detail = f"readiness report failed: {type(exc).__name__}: {exc}"
+            raise RuntimeError(
+                "Rig is not ready" + (f": {detail}" if detail else ".")
+            )
         self._transition(TeleopRunState.ARMED, "hardware armed")
 
     def _hold_rig_motion(self, reason: str, *, context: str) -> bool:
@@ -954,6 +1081,178 @@ class TeleopSession:
             raise RuntimeError("TeleopSession has no rig for command dispatch.")
         return self.rig.send_commands(command, phase_recorder=phase_recorder)
 
+    def dispatch_external_command(
+        self,
+        command: TeleopCommand,
+        observation: TeleopObservation,
+        now: float,
+        *,
+        record: bool = False,
+        transition_to_running: bool = False,
+        phase_recorder: Callable[[str, float], None] | None = None,
+    ) -> ExternalCommandDispatchResult:
+        """Run one non-loop command through the normal Session safety seams.
+
+        This is the only supported path for an application control that must
+        send a command while the realtime loop is otherwise idle.  The command
+        is copied, filtered, guarded, admitted, and then sent by the Session's
+        Rig.  ``record`` and ``transition_to_running`` default to ``False`` so
+        reset controls cannot silently create a formal command row or claim
+        that rule execution has begun.
+
+        The helper is intentionally conservative: hardware dispatch is only
+        permitted while the Session is ARMED or RUNNING, and an empty command
+        is rejected.  Guard failures use the same fail-closed hold/fault path
+        as :meth:`run_step`.
+        """
+
+        if not isinstance(command, TeleopCommand):
+            raise TypeError("external command must be TeleopCommand.")
+        if observation is None:
+            raise TypeError("external command requires a non-null observation.")
+        if not isinstance(command.commands, dict) or not command.commands:
+            return ExternalCommandDispatchResult(
+                command=None,
+                rejection_reason="empty_command",
+            )
+        allowed_states = {TeleopRunState.ARMED, TeleopRunState.RUNNING}
+        if self.state_machine.state not in allowed_states:
+            return ExternalCommandDispatchResult(
+                command=None,
+                rejection_reason=(
+                    "session_state_not_dispatchable:"
+                    f"{self.state_machine.state.value}"
+                ),
+            )
+
+        current_time = float(now)
+        filtered = self._copy_command(command)
+        if filtered.timestamp is None:
+            filtered.timestamp = (
+                observation.timestamp
+                if observation.timestamp is not None
+                else current_time
+            )
+        filtered.metadata.setdefault("external_command", True)
+        filtered.metadata.setdefault("dataset_recording_eligible", bool(record))
+        if self.command_filter is not None:
+            try:
+                filtered = self.command_filter(filtered, observation, current_time)
+            except Exception as exc:  # noqa: BLE001 - external commands fail closed.
+                return self._external_command_fault(
+                    code="command_filter_exception",
+                    message=(
+                        "command_filter raised "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    now=current_time,
+                    command=None,
+                    rejection_reason="command_filter_exception",
+                )
+            if not isinstance(filtered, TeleopCommand):
+                return self._external_command_fault(
+                    code="command_filter_invalid_return",
+                    message=(
+                        "command_filter must return TeleopCommand, got "
+                        f"{type(filtered).__name__}."
+                    ),
+                    now=current_time,
+                    command=None,
+                    rejection_reason="command_filter_invalid_return",
+                )
+
+        guard_fault = self.evaluate_command_guard(
+            filtered,
+            observation,
+            current_time,
+        )
+        if guard_fault is not None:
+            self.reject_command_for_guard_fault(guard_fault)
+            return ExternalCommandDispatchResult(
+                command=filtered,
+                fault=guard_fault,
+                guard_fault=guard_fault,
+                rejection_reason=f"guard:{guard_fault.code}",
+            )
+
+        if self.command_dispatch_admission is not None:
+            try:
+                admitted = bool(
+                    self.command_dispatch_admission(
+                        filtered,
+                        observation,
+                        current_time,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - admission must fail closed.
+                return self._external_command_fault(
+                    code="command_dispatch_admission_exception",
+                    message=(
+                        "command_dispatch_admission raised "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    now=current_time,
+                    command=filtered,
+                    rejection_reason="command_dispatch_admission_exception",
+                )
+            if not admitted:
+                return ExternalCommandDispatchResult(
+                    command=filtered,
+                    rejection_reason="dispatch_admission_rejected",
+                )
+
+        if record and self.recorder is not None:
+            try:
+                self.recorder.record_command(filtered)
+            except Exception as exc:  # noqa: BLE001 - persistence failure is fail closed.
+                return self._external_command_fault(
+                    code="command_record_exception",
+                    message=(
+                        "recorder.record_command raised "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    now=current_time,
+                    command=filtered,
+                    rejection_reason="command_record_exception",
+                )
+        try:
+            receipts = self.dispatch_command(
+                filtered,
+                phase_recorder=phase_recorder,
+            )
+        except Exception as exc:  # noqa: BLE001 - dispatch may be partial.
+            return self._external_command_fault(
+                code="command_dispatch_exception",
+                message=(
+                    "Rig command dispatch raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                now=current_time,
+                command=filtered,
+                rejection_reason="command_dispatch_exception",
+            )
+        if isinstance(receipts, BaseException):
+            return self._external_command_fault(
+                code="command_dispatch_returned_exception",
+                message=(
+                    "Rig command dispatch returned an exception object: "
+                    f"{type(receipts).__name__}: {receipts}"
+                ),
+                now=current_time,
+                command=filtered,
+                rejection_reason="command_dispatch_returned_exception",
+            )
+        self._last_safe_command = self._copy_command(filtered)
+        if transition_to_running and self.state_machine.state != TeleopRunState.RUNNING:
+            self._transition(TeleopRunState.RUNNING, "external command dispatched")
+        return ExternalCommandDispatchResult(
+            command=filtered,
+            admitted=True,
+            dispatched=True,
+            fault=None,
+            dispatch_receipts=dict(receipts or {}),
+        )
+
     def run_step(
         self,
         now: float | None = None,
@@ -1102,6 +1401,18 @@ class TeleopSession:
                     raw_channels=raw_channels,
                     faults=faults,
                 )
+            if (
+                self._motion_hold_mode == TRACKER_HOLD_AUTOMATIC
+                and not self._tracker_recovery_is_fresh(channels, current_time)
+            ):
+                self._healthy_frames_since_fault_clear = 0
+                return self._held_step_result(
+                    timestamp=current_time,
+                    control_hz=control_hz,
+                    channels=channels,
+                    raw_channels=raw_channels,
+                    faults=faults,
+                )
             self._healthy_frames_since_fault_clear += 1
             if self._healthy_frames_since_fault_clear < max(
                 1, int(self.config.recovery_healthy_frame_count)
@@ -1128,7 +1439,7 @@ class TeleopSession:
             if self._motion_hold_mode == TRACKER_HOLD_AUTOMATIC:
                 self._motion_hold_mode = TRACKER_HOLD_RECOVERING
             mark_phase("session.transition_recovering")
-            print("\033[1;32;40m" + f"[Debug Info] Auto-recovery triggered" + "\033[0m")
+            print("\033[1;32;40m" + "[Debug Info] Auto-recovery triggered" + "\033[0m")
             return self._step_result(
                 timestamp=current_time,
                 state=self.state_machine.state,
@@ -1369,6 +1680,7 @@ class TeleopSession:
             observation=observation,
             command=command,
             command_dispatched=command_dispatched,
+            dispatch_receipts=dict(dispatch_receipts or {}),
             faults=faults,
         )
 

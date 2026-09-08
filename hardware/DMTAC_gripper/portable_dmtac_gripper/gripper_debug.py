@@ -127,7 +127,12 @@ def load_gripper_endpoints(value: str | Path = "latest") -> tuple[Path, dict[str
             port=port,
             gripper_id=int(gripper.get("gripper_id", 1)),
             baudrate=int(gripper.get("baudrate", 115200)),
-            timeout=float(gripper.get("timeout", 0.10)),
+            timeout=float(
+                gripper.get(
+                    "runtime_timeout",
+                    gripper.get("timeout", 0.10),
+                )
+            ),
             max_open_mm=float(gripper.get("max_open_mm", 70.0)),
         )
     return path, result

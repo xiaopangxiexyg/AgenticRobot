@@ -300,7 +300,12 @@ def _resolve_config_args(args, *, need_gripper: bool, need_tactile: bool) -> Non
         args.port = str(gripper["port"])
         args.gripper_id = int(gripper.get("gripper_id", args.gripper_id))
         args.baudrate = int(gripper.get("baudrate", args.baudrate))
-        args.timeout = float(gripper.get("timeout", args.timeout))
+        args.timeout = float(
+            gripper.get(
+                "runtime_timeout",
+                gripper.get("timeout", args.timeout),
+            )
+        )
 
     if need_tactile:
         side = _side_from_config(args, effective, kind="tactile")
@@ -315,6 +320,7 @@ def _resolve_config_args(args, *, need_gripper: bool, need_tactile: bool) -> Non
 def _command_needs_gripper(args) -> bool:
     if args.command in {
         "verify-gripper",
+        "clear-fault",
         "set-speed",
         "set-torque",
         "open",
@@ -429,6 +435,14 @@ def _print_scan_summary(scan: dict) -> None:
             if state:
                 details.append(f"joint={state.get('joint_pos')}")
                 details.append(f"opening_mm={state.get('opening_mm')}")
+                details.append(f"health={probe.get('health', 'unknown')}")
+                if probe.get("faulted") is True:
+                    details.append(
+                        f"error={probe.get('error_description') or state.get('error_code')}"
+                    )
+                    details.append(f"status={state.get('status_code')}")
+                    details.append(f"current={state.get('current')}")
+                    details.append(f"temperature_c={state.get('temperature_c')}")
             detail_text = "" if not details else " " + " ".join(details)
             print(
                 f"  [{item.get('index')}] {item.get('preferred_port') or item.get('port')}"
@@ -1401,6 +1415,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.add_argument("speed", type=float)
 
+    p = sub.add_parser(
+        "clear-fault",
+        help="Acknowledge a gripper fault and confirm fresh error_code=0 telemetry.",
+    )
+    _add_common(p)
+    p.add_argument("--confirm-timeout", type=float, default=3.0)
+    p.add_argument("--confirm-poll-interval", type=float, default=0.20)
+    p.add_argument("--ack-interval", type=float, default=0.75)
+    p.add_argument(
+        "--confirm-consecutive-zero-reads",
+        type=int,
+        default=3,
+        help=(
+            "Fresh consecutive error_code=0 samples required before success "
+            "(default: 3)."
+        ),
+    )
+    p.add_argument(
+        "--raw-ack",
+        action="store_true",
+        help="Legacy rollback: return after the Modbus ACK echo without state confirmation.",
+    )
+
     p = sub.add_parser("set-torque", help="Set the gripper torque/force parameter.")
     _add_common(p)
     p.add_argument("torque", type=float)
@@ -1569,6 +1606,20 @@ def main(argv=None) -> None:
         if args.command == "set-speed":
             dev.set_speed(args.speed)
             print("speed:", dev.get_speed())
+        elif args.command == "clear-fault":
+            if args.raw_ack:
+                dev.clear_fault()
+                print("fault ACK sent without confirmation (legacy raw-ack mode)")
+            else:
+                state = dev.clear_fault_and_confirm(
+                    timeout=args.confirm_timeout,
+                    poll_interval=args.confirm_poll_interval,
+                    ack_interval=args.ack_interval,
+                    required_consecutive_zero_reads=(
+                        args.confirm_consecutive_zero_reads
+                    ),
+                )
+                _print_gripper_state(state, args.json)
         elif args.command == "set-torque":
             dev.set_torque(args.torque)
             print("torque:", dev.get_torque())

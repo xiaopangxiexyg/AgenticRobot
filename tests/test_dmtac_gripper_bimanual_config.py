@@ -83,6 +83,403 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(state["gripper_last_send_status"], "hardware_fault")
         self.assertEqual(state["gripper_last_send_skip_reason"], "error_code=16")
 
+    def test_dmtac_readiness_report_keeps_fault_identity_and_connection_details(self) -> None:
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                gripper_port="/dev/ttyUSB1",
+                gripper_id=7,
+                connect_hardware=True,
+                connect_tactile=False,
+            )
+        )
+        backend.device = SimpleNamespace(gripper=object())
+        backend._apply_gripper_state(
+            SimpleNamespace(
+                joint_pos=0.5,
+                timestamp=123.0,
+                error_code=16,
+                status_code=1,
+                status_text="张开侧空闲/停止",
+                is_moving=False,
+                current=0,
+                temperature_c=36,
+            )
+        )
+
+        report = backend.readiness_report()
+
+        self.assertFalse(report["ready"])
+        self.assertIn("error_code=16", report["reason"])
+        self.assertIn("status_code=1", report["reason"])
+        self.assertIn("张开侧空闲/停止", report["reason"])
+        self.assertEqual(report["details"]["gripper_port"], "/dev/ttyUSB1")
+        self.assertEqual(report["details"]["gripper_id"], 7)
+
+    def test_stabilized_startup_fault_ack_waits_for_fresh_zero_state(self) -> None:
+        class _Device:
+            gripper = object()
+
+            def __init__(self) -> None:
+                self.errors = [16, 16, 0]
+                self.clear_calls = 0
+                self.confirm_kwargs = {}
+
+            def read_gripper_state(self):  # noqa: ANN201
+                error = self.errors.pop(0)
+                return SimpleNamespace(
+                    joint_pos=0.5,
+                    timestamp=time.time(),
+                    error_code=error,
+                    status_code=2,
+                    status_text="闭合侧空闲/停止",
+                    is_moving=False,
+                    current=3,
+                    temperature_c=31,
+                )
+
+            def clear_fault(self) -> None:
+                self.clear_calls += 1
+
+            def clear_fault_and_confirm(self, **kwargs):  # noqa: ANN201
+                self.confirm_kwargs = dict(kwargs)
+                self.clear_fault()
+                while True:
+                    state = self.read_gripper_state()
+                    if int(state.error_code) == 0:
+                        return state
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                startup_connection_settle_sec=0.0,
+                startup_recovery_timeout_sec=0.1,
+                startup_recovery_poll_interval_sec=0.001,
+                startup_fault_ack_interval_sec=1.0,
+            )
+        )
+        device = _Device()
+        backend.device = device
+
+        backend._confirm_gripper_fault_clear_locked()
+
+        self.assertEqual(device.clear_calls, 1)
+        self.assertEqual(device.confirm_kwargs["required_consecutive_zero_reads"], 3)
+        self.assertEqual(
+            backend.get_state(include_tactile_arrays=False)["gripper_error_code"],
+            0,
+        )
+
+    def test_legacy_startup_recovery_retains_three_read_timing(self) -> None:
+        class _Device:
+            gripper = object()
+
+            def __init__(self) -> None:
+                self.read_calls = 0
+                self.clear_calls = 0
+
+            def read_gripper_state(self):  # noqa: ANN201
+                self.read_calls += 1
+                return SimpleNamespace(
+                    joint_pos=0.5,
+                    timestamp=time.time(),
+                    error_code=16,
+                    status_code=2,
+                    status_text="闭合侧空闲/停止",
+                    is_moving=False,
+                    current=3,
+                    temperature_c=31,
+                )
+
+            def clear_fault(self) -> None:
+                self.clear_calls += 1
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                startup_recovery_mode="legacy",
+                startup_fault_check_attempts=3,
+                startup_fault_check_interval_sec=0.0,
+            )
+        )
+        device = _Device()
+        backend.device = device
+
+        with self.assertRaisesRegex(RuntimeError, "recovery_mode=legacy attempts=3"):
+            backend._confirm_gripper_fault_clear_locked()
+
+        self.assertEqual(device.read_calls, 3)
+        self.assertEqual(device.clear_calls, 2)
+
+    def test_runtime_error_16_auto_recovers_once_before_next_command_admission(self) -> None:
+        class _Device:
+            tactile = None
+            gripper = object()
+
+            def __init__(self) -> None:
+                self.errors = [16, 16, 0]
+                self.clear_calls = 0
+
+            def read_gripper_state(self):  # noqa: ANN201
+                error = self.errors.pop(0)
+                return SimpleNamespace(
+                    joint_pos=0.4,
+                    timestamp=time.time(),
+                    error_code=error,
+                    status_code=2,
+                    status_text="闭合侧空闲/停止",
+                    is_moving=False,
+                    current=2,
+                    temperature_c=30,
+                )
+
+            def clear_fault(self) -> None:
+                self.clear_calls += 1
+
+            def clear_fault_and_confirm(self, **_kwargs):  # noqa: ANN201
+                self.clear_fault()
+                while True:
+                    state = self.read_gripper_state()
+                    if int(state.error_code) == 0:
+                        return state
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                startup_connection_settle_sec=0.0,
+                startup_recovery_timeout_sec=0.1,
+                startup_recovery_poll_interval_sec=0.001,
+                startup_fault_ack_interval_sec=1.0,
+            )
+        )
+        device = _Device()
+        backend.device = device
+
+        backend._read_telemetry_once()
+
+        state = backend.get_state(include_tactile_arrays=False)
+        self.assertEqual(device.clear_calls, 1)
+        self.assertEqual(state["gripper_error_code"], 0)
+        self.assertEqual(state["gripper_recovery_phase"], "ready")
+        self.assertEqual(
+            state["gripper_last_recovery_reason"],
+            "runtime_fault_ack_confirmed",
+        )
+
+    def test_runtime_error_16_failed_recovery_is_not_repeated_and_stays_fail_closed(self) -> None:
+        class _Device:
+            tactile = None
+            gripper = object()
+
+            def read_gripper_state(self):  # noqa: ANN201
+                return SimpleNamespace(
+                    joint_pos=0.4,
+                    timestamp=time.time(),
+                    error_code=16,
+                    status_code=2,
+                    status_text="闭合侧空闲/停止",
+                    is_moving=False,
+                    current=2,
+                    temperature_c=30,
+                )
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+            )
+        )
+        backend.device = _Device()
+
+        with patch.object(
+            backend,
+            "_confirm_gripper_fault_clear_locked",
+            side_effect=RuntimeError("persistent error_code=16"),
+        ) as confirm:
+            backend._read_telemetry_once()
+            backend._read_telemetry_once()
+
+        state = backend.get_state(include_tactile_arrays=False)
+        self.assertEqual(confirm.call_count, 1)
+        self.assertTrue(state["gripper_runtime_fault_recovery_attempted"])
+        self.assertEqual(state["gripper_recovery_phase"], "failed")
+        self.assertEqual(state["gripper_runtime_fault_active_incident_id"], 1)
+        self.assertEqual(state["gripper_runtime_fault_failed_incident_id"], 1)
+        self.assertIn("persistent error_code=16", state["telemetry_error"])
+        self.assertFalse(backend.send_fixed_joint_pos(0.0))
+        state = backend.get_state(include_tactile_arrays=False)
+        self.assertEqual(state["gripper_last_send_status"], "hardware_fault")
+        self.assertEqual(state["gripper_last_send_skip_reason"], "error_code=16")
+
+    def test_runtime_error_16_transient_zero_does_not_rearm_same_incident(self) -> None:
+        class _Device:
+            tactile = None
+            gripper = object()
+
+            def __init__(self) -> None:
+                self.errors = iter((16, 0, 16, 0, 16, 16, 16, 16))
+
+            def read_gripper_state(self):  # noqa: ANN201
+                error = next(self.errors, 16)
+                return SimpleNamespace(
+                    joint_pos=0.999,
+                    timestamp=time.time(),
+                    error_code=error,
+                    status_code=2,
+                    status_text="闭合侧空闲/停止",
+                    is_moving=False,
+                    current=2,
+                    temperature_c=30,
+                )
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                runtime_fault_clear_confirm_samples=3,
+            )
+        )
+        backend.device = _Device()
+
+        with patch.object(
+            backend,
+            "_confirm_gripper_fault_clear_locked",
+            side_effect=RuntimeError("persistent error_code=16"),
+        ) as confirm:
+            # 1,200 samples model 60 seconds of 20 Hz telemetry after the
+            # failed attempt.  The incident must remain single-shot for the
+            # whole interval even when isolated zero samples appear.
+            for _ in range(1200):
+                backend._read_telemetry_once()
+
+        state = backend.get_state(include_tactile_arrays=False)
+        self.assertEqual(confirm.call_count, 1)
+        self.assertEqual(state["gripper_runtime_fault_incident_sequence"], 1)
+        self.assertEqual(state["gripper_runtime_fault_active_incident_id"], 1)
+        self.assertEqual(state["gripper_runtime_fault_failed_incident_id"], 1)
+        self.assertEqual(state["gripper_runtime_fault_zero_streak"], 0)
+        self.assertEqual(state["gripper_recovery_phase"], "failed")
+
+    def test_runtime_error_16_rearms_only_after_stable_external_zero(self) -> None:
+        class _Device:
+            tactile = None
+            gripper = object()
+
+            def __init__(self) -> None:
+                self.errors = iter((16, 0, 0, 0, 16))
+
+            def read_gripper_state(self):  # noqa: ANN201
+                error = next(self.errors, 16)
+                return SimpleNamespace(
+                    joint_pos=0.999,
+                    timestamp=time.time(),
+                    error_code=error,
+                    status_code=2,
+                    status_text="闭合侧空闲/停止",
+                    is_moving=False,
+                    current=2,
+                    temperature_c=30,
+                )
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                runtime_fault_clear_confirm_samples=3,
+            )
+        )
+        backend.device = _Device()
+
+        with patch.object(
+            backend,
+            "_confirm_gripper_fault_clear_locked",
+            side_effect=(
+                RuntimeError("incident one"),
+                RuntimeError("incident two"),
+            ),
+        ) as confirm:
+            for _ in range(4):
+                backend._read_telemetry_once()
+
+            cleared = backend.get_state(include_tactile_arrays=False)
+            self.assertEqual(confirm.call_count, 1)
+            self.assertIsNone(cleared["gripper_runtime_fault_active_incident_id"])
+            self.assertIsNone(cleared["gripper_runtime_fault_failed_incident_id"])
+            self.assertEqual(cleared["gripper_recovery_phase"], "ready")
+
+            backend._read_telemetry_once()
+
+        state = backend.get_state(include_tactile_arrays=False)
+        self.assertEqual(confirm.call_count, 2)
+        self.assertEqual(state["gripper_runtime_fault_incident_sequence"], 2)
+        self.assertEqual(state["gripper_runtime_fault_active_incident_id"], 2)
+        self.assertEqual(state["gripper_runtime_fault_failed_incident_id"], 2)
+        self.assertEqual(state["gripper_recovery_phase"], "failed")
+
+    def test_failed_runtime_fault_suppresses_automatic_transport_reconnect(self) -> None:
+        class _Gripper:
+            def close(self) -> None:
+                return None
+
+        class _Device:
+            tactile = None
+            gripper = _Gripper()
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def read_gripper_state(self):  # noqa: ANN201
+                self.calls += 1
+                if self.calls > 1:
+                    raise TimeoutError("Write timeout")
+                return SimpleNamespace(
+                    joint_pos=0.999,
+                    timestamp=time.time(),
+                    error_code=16,
+                    status_code=2,
+                    status_text="闭合侧空闲/停止",
+                    is_moving=False,
+                    current=2,
+                    temperature_c=30,
+                )
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                reconnect_on_error=True,
+            )
+        )
+        backend.device = _Device()
+
+        with (
+            patch.object(
+                backend,
+                "_confirm_gripper_fault_clear_locked",
+                side_effect=RuntimeError("persistent error_code=16"),
+            ),
+            patch.object(backend, "_connect_gripper_locked") as reconnect,
+        ):
+            backend._read_telemetry_once()
+            backend._read_telemetry_once()
+            backend._read_telemetry_once()
+
+        state = backend.get_state(include_tactile_arrays=False)
+        reconnect.assert_not_called()
+        self.assertEqual(state["gripper_recovery_phase"], "failed")
+        self.assertEqual(state["gripper_runtime_fault_failed_incident_id"], 1)
+        self.assertIn("automatic reconnect suppressed", state["telemetry_error"])
+
     def test_gui_gripper_force_request_parser_is_pure_and_side_bounded(self) -> None:
         self.assertEqual(
             parse_gripper_force_request(
@@ -254,6 +651,8 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(config.gripper_baudrate, 57600)
         self.assertEqual(config.gripper_timeout, 0.2)
         self.assertFalse(config.connect_tactile)
+
+
 
     def test_dmtac_serial_dev_id_resolves_to_sdk_index_by_default(self) -> None:
         from hardware.DMTAC_gripper.portable_dm_tac import core as dmtac_core
@@ -864,6 +1263,58 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             self.assertAlmostEqual(policy["max_action"], 1.0)
             self.assertAlmostEqual(policy["send_threshold"], 0.002)
 
+    def test_real_teleop_uses_preflight_verified_tty_endpoint(self) -> None:
+        args = SimpleNamespace(
+            hand_backend="dmtac-gripper",
+            gripper_task_profile="",
+            gripper_task="",
+            task_id="",
+            task_name="",
+            task="",
+            gripper_source_dim=None,
+            gripper_output_dim=None,
+            gripper_invert=None,
+            gripper_alpha=None,
+            gripper_speed=None,
+            gripper_torque=None,
+            gripper_max_action=None,
+            gripper_send_threshold=None,
+            gripper_command_hz=None,
+            gripper_continuous_grasp=None,
+            gripper_telemetry_hz=None,
+            dmtac_default_config=True,
+            dmtac_config="latest",
+            dmtac_validate_current_usb=False,
+            dmtac_allow_missing=False,
+            dmtac_assume_yes_for_extra=True,
+            dmtac_tactile_backend="cpu",
+            dmtac_tactile=None,
+            dmtac_tactile_timeout_ms=None,
+            dmtac_tactile_wait_for_new=None,
+            dmtac_tactile_compute_profile="dist-only",
+            dmtac_tactile_sequential_read=False,
+            _dmtac_preflight_assignment={
+                "assignments": {
+                    "right": {
+                        "gripper": {
+                            "port": "/dev/ttyUSB3",
+                            "port_aliases": [
+                                "/dev/serial/by-path/stable-right"
+                            ],
+                            "gripper_id": 1,
+                            "baudrate": 115200,
+                            "timeout": 0.03,
+                        }
+                    }
+                }
+            },
+        )
+
+        real_teleop._clear_gripper_policy_cache(args)
+        configs = real_teleop._dmtac_backend_configs(args, ("right",))
+
+        self.assertEqual(configs["right"].gripper_port, "/dev/ttyUSB3")
+
     def test_real_teleop_keeps_gripper_gui_visible_without_backend(self) -> None:
         components = SimpleNamespace(
             hand_backend_mode=real_teleop.HAND_BACKEND_DMTAC_GRIPPER,
@@ -1172,6 +1623,44 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertFalse(backend.send_command(second))
         self.assertEqual(backend.get_state()["gripper_last_send_status"], "rate_limited")
         self.assertTrue(backend.send_fixed_joint_pos(0.0))
+
+    def test_dmtac_backend_resends_cached_target_when_feedback_disagrees(self) -> None:
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=False,
+                connect_tactile=False,
+                command_hz=20.0,
+                send_threshold=0.002,
+            )
+        )
+        command = EffectorCommand(
+            effector_name="right_hand",
+            side="right",
+            command_type="gripper_scalar",
+            value=np.asarray([0.95], dtype=np.float32),
+        )
+
+        self.assertTrue(backend.send_command(command))
+        measured = np.zeros(6, dtype=np.float32)
+        measured[0] = 1.0
+        backend._latest_measured_joint_pos = measured
+        backend._latest_joint_timestamp = time.time()
+        backend._last_sent_command_timestamp = time.time() - 1.0
+
+        self.assertTrue(backend.send_command(command))
+        self.assertEqual(backend.get_state()["gripper_last_send_status"], "sent")
+
+        measured[0] = 0.95
+        backend._latest_measured_joint_pos = measured
+        backend._last_sent_command_timestamp = time.time() - 1.0
+        self.assertFalse(backend.send_command(command))
+        state = backend.get_state()
+        self.assertEqual(state["gripper_last_send_status"], "skipped_threshold")
+        self.assertEqual(
+            state["gripper_last_send_skip_reason"],
+            "command_and_feedback_threshold",
+        )
 
     def test_dmtac_backend_quarantines_failed_send_without_inline_reconnect(
         self,
@@ -1508,6 +1997,370 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertIsNone(backend.device)
         self.assertIn("connect_failed", str(state["telemetry_error"]))
 
+    def test_dmtac_startup_failure_preserves_endpoint_and_vendor_reason(self) -> None:
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                gripper_port="/dev/ttyUSB3",
+                gripper_id=1,
+                gripper_baudrate=115200,
+                connect_hardware=True,
+                connect_tactile=False,
+                enable_telemetry=False,
+            )
+        )
+
+        def _raise_connect_error():  # noqa: ANN202
+            raise RuntimeError("serial busy")
+
+        backend._create_device = _raise_connect_error  # type: ignore[method-assign]
+        backend.start()
+
+        report = backend.readiness_report()
+        self.assertFalse(report["ready"])
+        self.assertIn("connect_failed", str(report["reason"]))
+        self.assertIn("serial busy", str(report["reason"]))
+        self.assertIn("/dev/ttyUSB3", str(report["reason"]))
+        self.assertEqual(report["details"]["gripper_baudrate"], 115200)
+        self.assertIn("startup_error", report["details"])
+
+    def test_dmtac_start_rebuilds_existing_partial_device(self) -> None:
+        class _IncompleteDevice:
+            gripper = None
+            tactile = object()
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _ReadyDevice:
+            tactile = None
+
+            def __init__(self) -> None:
+                self.gripper = object()
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+            def set_speed(self, _speed: float) -> None:
+                return None
+
+            def set_torque(self, _torque: float) -> None:
+                return None
+
+        incomplete = _IncompleteDevice()
+        replacement = _ReadyDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                enable_telemetry=False,
+            )
+        )
+        backend.device = incomplete
+        backend._create_device = lambda: replacement  # type: ignore[method-assign]
+
+        backend.start()
+
+        self.assertTrue(incomplete.closed)
+        self.assertIs(backend.device, replacement)
+        self.assertTrue(backend.is_ready())
+
+    def test_dmtac_start_clears_stale_error_when_existing_device_is_ready(self) -> None:
+        class _ReadyDevice:
+            tactile = None
+            gripper = object()
+
+            def close(self) -> None:
+                return None
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                enable_telemetry=False,
+            )
+        )
+        backend.device = _ReadyDevice()
+        backend._last_start_error = "connect_failed: stale"
+        backend._last_reconnect_error = "stale"
+
+        backend.start()
+
+        self.assertTrue(backend.is_ready())
+        self.assertIsNone(backend._last_start_error)
+        self.assertIsNone(backend._last_reconnect_error)
+
+    def test_dmtac_force_reconnect_after_failed_start_restores_supervisors(self) -> None:
+        class _FakeGripper:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _FakeDevice:
+            tactile = None
+
+            def __init__(self) -> None:
+                self.gripper = _FakeGripper()
+
+            def set_speed(self, _speed: float) -> None:
+                return None
+
+            def set_torque(self, _torque: float) -> None:
+                return None
+
+            def close(self) -> None:
+                if self.gripper is not None:
+                    self.gripper.close()
+
+        attempts = 0
+        device = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=True,
+                tactile_process_read=True,
+                enable_telemetry=True,
+            )
+        )
+
+        def _create_device():  # noqa: ANN201
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("not connected")
+            return device
+
+        worker_starts: list[str] = []
+        telemetry_starts: list[str] = []
+        backend._create_device = _create_device  # type: ignore[method-assign]
+        backend._start_tactile_worker = (  # type: ignore[method-assign]
+            lambda: worker_starts.append("worker")
+        )
+        backend._start_telemetry_thread = (  # type: ignore[method-assign]
+            lambda: telemetry_starts.append("telemetry")
+        )
+
+        backend.start()
+        self.assertIsNone(backend.device)
+        self.assertIn("not connected", str(backend.readiness_report()["reason"]))
+
+        incident_id = backend._begin_runtime_fault_incident_locked()
+        backend._mark_runtime_fault_recovery_attempt_locked(incident_id)
+        backend._mark_runtime_fault_recovery_failed_locked(incident_id)
+        backend._set_recovery_phase_locked(
+            "failed",
+            reason="runtime_fault_recovery_failed:test",
+        )
+
+        self.assertTrue(backend.force_reconnect_gripper(reason="manual retry"))
+        self.assertIs(backend.device, device)
+        self.assertTrue(backend.is_ready())
+        self.assertEqual(worker_starts, ["worker"])
+        self.assertEqual(telemetry_starts, ["telemetry"])
+        recovered = backend.get_state(include_tactile_arrays=False)
+        self.assertEqual(recovered["reconnect_count"], 1)
+        self.assertIsNone(recovered["gripper_runtime_fault_active_incident_id"])
+        self.assertIsNone(recovered["gripper_runtime_fault_failed_incident_id"])
+        self.assertEqual(recovered["gripper_recovery_phase"], "ready")
+
+    def test_dmtac_force_reconnect_reopens_fully_torn_down_backend(self) -> None:
+        class _FakeGripper:
+            def close(self) -> None:
+                return None
+
+        class _FakeDevice:
+            tactile = None
+
+            def __init__(self) -> None:
+                self.gripper = _FakeGripper()
+
+            def set_speed(self, _speed: float) -> None:
+                return None
+
+            def set_torque(self, _torque: float) -> None:
+                return None
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                enable_telemetry=False,
+            )
+        )
+        backend._closing = True
+        backend._create_device = _FakeDevice  # type: ignore[method-assign]
+
+        self.assertTrue(backend.force_reconnect_gripper(reason="after close"))
+        self.assertFalse(backend._closing)
+        self.assertTrue(backend.is_ready())
+
+    def test_dmtac_tactile_worker_replaces_exited_process(self) -> None:
+        from teleop_runtime.backends.grippers import dmtac as dmtac_backend
+
+        class _DeadProcess:
+            exitcode = 7
+
+            def is_alive(self) -> bool:
+                return False
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+
+        class _AliveProcess:
+            def __init__(self) -> None:
+                self.started = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def is_alive(self) -> bool:
+                return self.started
+
+        class _Queue:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+            def cancel_join_thread(self) -> None:
+                return None
+
+        class _Context:
+            def __init__(self) -> None:
+                self.queue = _Queue()
+                self.process = _AliveProcess()
+
+            def Queue(self, maxsize: int):  # noqa: N802, ANN201
+                del maxsize
+                return self.queue
+
+            def Event(self):  # noqa: N802, ANN201
+                return threading.Event()
+
+            def Process(self, **_kwargs: object):  # noqa: N802, ANN201
+                return self.process
+
+            def Semaphore(self, value: int):  # noqa: N802, ANN201
+                return threading.Semaphore(value)
+
+        context = _Context()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=False,
+                connect_tactile=True,
+                tactile_process_read=True,
+            )
+        )
+        backend._tactile_worker_process = _DeadProcess()
+        backend._tactile_worker_queue = _Queue()
+        receiver_starts: list[str] = []
+        backend._start_tactile_worker_receiver = (  # type: ignore[method-assign]
+            lambda: receiver_starts.append("receiver")
+        )
+
+        with patch.object(dmtac_backend.mp, "get_context", return_value=context):
+            backend._start_tactile_worker()
+
+        self.assertIs(backend._tactile_worker_process, context.process)
+        self.assertTrue(context.process.started)
+        self.assertEqual(receiver_starts, ["receiver"])
+
+    def test_dmtac_force_reconnect_fails_closed_when_worker_restore_fails(self) -> None:
+        class _FakeGripper:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _FakeDevice:
+            tactile = None
+
+            def __init__(self) -> None:
+                self.gripper = _FakeGripper()
+
+            def set_speed(self, _speed: float) -> None:
+                return None
+
+            def set_torque(self, _torque: float) -> None:
+                return None
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=True,
+                tactile_process_read=True,
+                enable_telemetry=False,
+            )
+        )
+        backend._create_device = _FakeDevice  # type: ignore[method-assign]
+        backend._start_tactile_worker = (  # type: ignore[method-assign]
+            lambda: (_ for _ in ()).throw(RuntimeError("worker spawn failed"))
+        )
+
+        self.assertFalse(backend.force_reconnect_gripper(reason="worker retry"))
+        self.assertFalse(backend.is_ready())
+        report = backend.readiness_report()
+        self.assertIn("worker spawn failed", str(report["reason"]))
+        self.assertIn("reconnect_error", report["details"])
+
+    def test_dmtac_healthy_startup_does_not_require_redundant_fault_clear(self) -> None:
+        class _HealthyDevice:
+            tactile = None
+
+            def __init__(self) -> None:
+                self.gripper = object()
+                self.clear_fault_calls = 0
+
+            def clear_fault(self) -> None:
+                self.clear_fault_calls += 1
+
+            def read_gripper_state(self):  # noqa: ANN201
+                return SimpleNamespace(
+                    joint_pos=0.5,
+                    timestamp=123.0,
+                    error_code=0,
+                )
+
+            def set_speed(self, _speed: float) -> None:
+                return None
+
+            def set_torque(self, _torque: float) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        device = _HealthyDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                enable_telemetry=False,
+            )
+        )
+        backend._create_device = lambda: device  # type: ignore[method-assign]
+
+        backend.start()
+
+        self.assertTrue(backend.is_ready())
+        self.assertEqual(device.clear_fault_calls, 0)
+        backend.close()
+
     def test_dmtac_backend_direct_state_read_reconnects_and_returns_state(self) -> None:
         created_grippers = []
 
@@ -1682,6 +2535,48 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertIsNone(fake.moves[-1]["speed"])
         self.assertAlmostEqual(fake.moves[-1]["torque"], 0.4)
         self.assertTrue(fake.moves[-1]["continuous"])
+
+    def test_dmtac_backend_same_target_still_applies_manual_catch_mode_override(self) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+            def __init__(self) -> None:
+                self.moves: list[dict[str, object]] = []
+
+            def move(self, joint_pos: float, **kwargs: object) -> None:
+                self.moves.append({"joint_pos": float(joint_pos), **dict(kwargs)})
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                continuous_grasp=True,
+            )
+        )
+        backend.device = fake
+        backend._applied_speed = backend.config.speed
+        backend._applied_torque = backend.config.torque
+        backend._applied_continuous_grasp = True
+        backend._last_sent_command = np.asarray(
+            [0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
+        backend._latest_measured_joint_pos = backend._last_sent_command.copy()
+        command = EffectorCommand(
+            effector_name="right_hand",
+            side="right",
+            command_type="joint_vector",
+            value=backend._last_sent_command.copy(),
+            metadata={"dmtac_continuous_grasp_override": False},
+        )
+
+        self.assertTrue(backend.send_command(command))
+        self.assertEqual(len(fake.moves), 1)
+        self.assertFalse(fake.moves[0]["continuous"])
+        self.assertEqual(backend._last_send_status, "sent")
 
     def test_deploy_builds_dmtac_gripper_backend_from_assignment(self) -> None:
         parser = argparse.ArgumentParser()

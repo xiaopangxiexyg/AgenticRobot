@@ -29,10 +29,13 @@ from .device import (
 )
 from .force_visualizer import DistributedForceXYVisualizer, ForceVizConfig
 from .gripper_driver import (
+    GRIPPER_ERROR_BITS,
     GripperError,
     GripperState,
     InspireGripper,
     InspireGripperModbus,
+    decode_gripper_error_code,
+    describe_gripper_error_code,
     list_serial_devices,
 )
 from .tactile_filter import DistributedForceDenoiser, TactileDenoiseConfig
@@ -58,11 +61,14 @@ __all__ = [
     "DeviceConfig",
     "DeviceSnapshot",
     "ForceVizConfig",
+    "GRIPPER_ERROR_BITS",
     "GripperConfig",
     "GripperError",
     "GripperState",
     "InspireGripper",
     "InspireGripperModbus",
+    "decode_gripper_error_code",
+    "describe_gripper_error_code",
     "TacFrame",
     "TactileConfig",
     "TactileCalibration",

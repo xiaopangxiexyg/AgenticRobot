@@ -120,6 +120,8 @@ class FixArmCommandController:
         self._fixed_by_effector: dict[str, EffectorCommand] = {}
         self._latest_by_channel: dict[str, ObservationChannel] = {}
         self._fixed_by_channel: dict[str, ObservationChannel] = {}
+        self._runtime_home_epoch: int | None = None
+        self._runtime_home_arm_by_side: dict[str, EffectorCommand] = {}
         self._recalibration = _RecalibrationState()
         self._passive_home_cache = {
             side: _PassiveHomeCache() for side in self.active_sides
@@ -294,6 +296,211 @@ class FixArmCommandController:
             side=normalized,
             mode=self._mode,
         )
+
+    def bind_runtime_home_arm_snapshot(
+        self,
+        qpos_by_side: Mapping[str, object],
+        *,
+        epoch: int,
+    ) -> None:
+        """Cache one admitted runtime-Home arm snapshot for source-free startup Fix."""
+
+        if isinstance(epoch, bool) or int(epoch) != epoch or int(epoch) < 0:
+            raise ValueError("runtime Home epoch must be a non-negative integer")
+        snapshots: dict[str, EffectorCommand] = {}
+        for side, raw_qpos in qpos_by_side.items():
+            normalized = normalize_fix_arm_side(side)
+            if normalized not in self.active_sides:
+                raise ValueError(
+                    f"runtime Home snapshot contains inactive side {normalized!r}"
+                )
+            qpos = np.asarray(raw_qpos, dtype=float).reshape(-1)
+            if qpos.shape != (6,) or not np.all(np.isfinite(qpos)):
+                raise ValueError(
+                    f"runtime Home snapshot for {normalized} must be finite qpos[6]"
+                )
+            snapshots[normalized] = EffectorCommand(
+                effector_name=f"{normalized}_arm",
+                side=normalized,
+                command_type="joint_vector",
+                value=qpos.copy(),
+                frame_name="arm_base",
+                metadata={
+                    "source": "atomic_runtime_home_snapshot",
+                    "runtime_home_epoch": int(epoch),
+                },
+            )
+        missing = tuple(side for side in self.active_sides if side not in snapshots)
+        if missing:
+            raise ValueError(
+                "runtime Home snapshot is missing active side(s): " + ", ".join(missing)
+            )
+        self._runtime_home_epoch = int(epoch)
+        self._runtime_home_arm_by_side = snapshots
+
+    def invalidate_runtime_home_arm_snapshot(self) -> None:
+        """Prevent a later startup Fix from reusing an older Home epoch."""
+
+        self._runtime_home_epoch = None
+        self._runtime_home_arm_by_side = {}
+
+    def freeze_selected_from_runtime_home(
+        self,
+        *,
+        now: float,
+        expected_epoch: int,
+    ) -> FixArmTransition:
+        """Establish an arm-only Fix from the current admitted runtime Home."""
+
+        del now
+        side = self._selected_side
+        if side in self._fixed_sides:
+            return FixArmTransition(False, f"{side} is already fixed", side, self._mode)
+        if self.scope_for_side(side) != "arm_only":
+            return FixArmTransition(
+                False,
+                f"runtime Home startup Fix requires arm_only scope for {side}",
+                side,
+                self._mode,
+            )
+        if self._runtime_home_epoch is None or int(expected_epoch) != self._runtime_home_epoch:
+            return FixArmTransition(
+                False,
+                f"runtime Home snapshot epoch mismatch for {side}: "
+                f"cached={self._runtime_home_epoch!r} expected={int(expected_epoch)!r}",
+                side,
+                self._mode,
+            )
+        arm_name = f"{side}_arm"
+        snapshot = self._runtime_home_arm_by_side.get(side)
+        if snapshot is None:
+            return FixArmTransition(
+                False,
+                f"runtime Home arm snapshot is unavailable for {side}",
+                side,
+                self._mode,
+                missing_effectors=(arm_name,),
+            )
+        fixed = snapshot.copy()
+        fixed.metadata = {**dict(fixed.metadata), "fix_arm_snapshot_origin": "runtime_home"}
+        self._latest_by_effector[arm_name] = fixed.copy()
+        self._fixed_by_effector[arm_name] = fixed
+        self._fixed_by_channel = {
+            name: value
+            for name, value in self._fixed_by_channel.items()
+            if self._side_for_channel(name, value) != side
+        }
+        self._fixed_side = side
+        self._fixed_sides.add(side)
+        self._mode = "fixed"
+        self._recalibration = _RecalibrationState()
+        warning = self.warning_for_side(side)
+        self._status_message = (
+            f"{side} fixed from runtime Home epoch {self._runtime_home_epoch}"
+            if not warning
+            else f"{side} fixed from runtime Home epoch {self._runtime_home_epoch}; warning: {warning}"
+        )
+        return FixArmTransition(True, self._status_message, side, self._mode)
+
+    def freeze_arm_only_from_command(
+        self,
+        *,
+        side: str,
+        command: EffectorCommand,
+        now: float,
+        snapshot_origin: str,
+    ) -> FixArmTransition:
+        """Establish an arm-only Fix from a verified, arrived command."""
+
+        normalized = normalize_fix_arm_side(side)
+        arm_name = f"{normalized}_arm"
+        origin = str(snapshot_origin or "").strip()
+        if self.recapturing:
+            return FixArmTransition(
+                False,
+                "arrived-command Fix cannot start while Home recapture is active",
+                normalized,
+                self._mode,
+            )
+        if normalized not in self.active_sides:
+            return FixArmTransition(False, f"inactive arm side {normalized}", normalized, self._mode)
+        if normalized in self._fixed_sides:
+            return FixArmTransition(False, f"{normalized} is already fixed", normalized, self._mode)
+        if self.scope_for_side(normalized) != "arm_only":
+            return FixArmTransition(
+                False,
+                f"arrived-command Fix requires arm_only scope for {normalized}",
+                normalized,
+                self._mode,
+            )
+        if not isinstance(command, EffectorCommand):
+            return FixArmTransition(
+                False,
+                f"arrived-command Fix requires an EffectorCommand for {arm_name}",
+                normalized,
+                self._mode,
+                missing_effectors=(arm_name,),
+            )
+        if (
+            command.effector_name != arm_name
+            or command.side != normalized
+            or command.command_type != "joint_vector"
+        ):
+            return FixArmTransition(
+                False,
+                f"arrived-command Fix requires {arm_name} joint_vector; "
+                f"got name={command.effector_name!r} side={command.side!r} "
+                f"type={command.command_type!r}",
+                normalized,
+                self._mode,
+                missing_effectors=(arm_name,),
+            )
+        try:
+            qpos = np.asarray(command.value, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            qpos = np.asarray([], dtype=float)
+        if qpos.shape != (6,) or not np.all(np.isfinite(qpos)):
+            return FixArmTransition(
+                False,
+                f"arrived-command Fix requires finite {arm_name} qpos[6]",
+                normalized,
+                self._mode,
+                missing_effectors=(arm_name,),
+            )
+        if not origin:
+            return FixArmTransition(
+                False,
+                "arrived-command Fix requires a non-empty snapshot origin",
+                normalized,
+                self._mode,
+            )
+
+        fixed = command.copy()
+        fixed.value = qpos.copy()
+        fixed.metadata = {
+            **dict(fixed.metadata),
+            "fix_arm_snapshot_origin": origin,
+            "fix_arm_snapshot_captured_at": float(now),
+        }
+        self._latest_by_effector[arm_name] = fixed.copy()
+        self._fixed_by_effector[arm_name] = fixed
+        self._fixed_by_channel = {
+            name: value
+            for name, value in self._fixed_by_channel.items()
+            if self._side_for_channel(name, value) != normalized
+        }
+        self._selected_side = normalized
+        self._fixed_side = normalized
+        self._fixed_sides.add(normalized)
+        self._mode = "fixed"
+        self._recalibration = _RecalibrationState()
+        warning = self.warning_for_side(normalized)
+        self._status_message = (
+            f"{normalized} fixed from arrived command ({origin})"
+            if not warning
+            else f"{normalized} fixed from arrived command ({origin}); warning: {warning}"
+        )
+        return FixArmTransition(True, self._status_message, normalized, self._mode)
 
     def freeze_selected(self, *, now: float) -> FixArmTransition:
         del now
@@ -729,6 +936,7 @@ class FixArmCommandController:
         if clear_snapshots:
             self._latest_by_effector = {}
             self._latest_by_channel = {}
+            self.invalidate_runtime_home_arm_snapshot()
         if was_active:
             suffix = f": {reason}" if reason else ""
             self._status_message = f"{side} fix-arm stopped{suffix}"
