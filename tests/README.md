@@ -70,6 +70,24 @@ duplicate tests to raise it. A minimal environment's optional skips are useful
 feedback but do not satisfy acceptance for changed optional behavior. Record
 missing dependencies and known unrelated failures explicitly.
 
+## Maintaining the test set
+
+When behavior changes, first find and update its existing tests. Add cases for
+unrepresented behavior or failure boundaries, not one new file per fix. Exercise
+the full input matrix at the responsible layer; cross-layer tests verify real
+wiring and important combinations. New trust boundaries, safety conditions and
+recovery paths still need their own checks.
+
+Assert observable contracts rather than private layout or historical wording.
+Reuse helpers for actual repetition; parameterize shared setup with varying
+inputs, without hiding unrelated scenarios in a large table. Before retiring a
+case, identify the preserved behavior coverage or the approved retired behavior;
+obtain applicable deletion/safeguard approval, reusing prior authorization.
+Compare collection and assertions when reorganizing tests: equal counts alone
+do not establish equivalent coverage. Record this reasoning in the existing
+review, with measured runtime impact when execution cost motivates the change;
+neither net line reductions nor test-count quotas are acceptance criteria.
+
 ## Cost gates in parallel worktrees
 
 Use the fast unit and integration selectors plus the exact tests for the owner

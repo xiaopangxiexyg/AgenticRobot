@@ -95,17 +95,15 @@ developer-local absolute path.
 
 ## Verification
 
-Identify changed behavior, invariants, consumers, and failure paths; self-review
-correctness, responsibilities, and duplication. Independently review high-impact
-contract, safety, persistence, concurrency, or instruction changes; fix findings
-and recheck affected behavior. Undecided semantics go to their owner. Low-risk
-edits need no extra reviewer.
+Trace behavior, invariants, consumers and failures; review correctness, reuse,
+and replacement or justified retention of old paths. Independently review
+high-impact contract, safety, persistence, concurrency or instruction changes;
+fix and recheck findings. Undecided semantics go to their owner; low-risk edits
+need no extra reviewer.
 
-Run repository tests through `bash scripts/run_pytest.sh ...`; the wrapper owns
-the supported environment and short AF_UNIX test paths. Use `tests/README.md`
-to select focused feedback, affected contracts, and integration acceptance.
-Cover changed failure modes and boundaries; avoid tests that merely restate
-implementation text or duplicate the same behavior. Run `git diff --check`.
-Include behavior, consumers, review findings and resolution, and gaps in the handoff.
-Report offline, simulation, remote, and real-hardware evidence separately;
-none implies another.
+Use `bash scripts/run_pytest.sh ...` and `tests/README.md` for test maintenance
+and selection. Maintain existing behavior tests before adding cases; preserve
+required gates and deletion authorization. Run `git diff --check`.
+Handoff covers behavior, consumers, findings/resolution, gaps and workspace
+disposition under the selected workflow. Report offline, simulation, remote and
+hardware evidence separately; none implies another.
