@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import multiprocessing
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
-
 
 TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
 ACTUATED_TASK_CONFIG = Path(
@@ -14,6 +16,28 @@ ACTUATED_TASK_CONFIG = Path(
 FULLY_ACTUATED_TASK_CONFIG = Path(
     "sim/configs/tasks/rm65_right_cube_lift_rl_actuated_v2.json"
 )
+
+
+def _load_shared_model_artifact(
+    cache_root: str,
+    start_at: float,
+) -> tuple[str, bool, str, int, int]:
+    """Load one artifact in a fresh process after a common start barrier."""
+
+    from sim.mujoco.artifacts import ModelArtifactCache
+    from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
+
+    time.sleep(max(0.0, start_at - time.monotonic()))
+    contract = CubeLiftTaskConfig.load(TASK_CONFIG).base_contract()
+    scene, artifact = ModelArtifactCache(cache_root).load_scene(contract)
+    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    return (
+        artifact.key,
+        artifact.cache_hit,
+        manifest["mjb_sha256"],
+        int(scene.model.nq),
+        int(scene.model.nv),
+    )
 
 
 @pytest.mark.parametrize("parent_value", (None, "/parent/runtime/lib"))
@@ -124,6 +148,39 @@ def test_model_artifact_cache_hits_and_recovers_from_corruption(tmp_path: Path) 
     _third_scene, third = cache.load_scene(contract)
     assert not third.cache_hit
     assert third.mjb_path.stat().st_size > len(b"corrupt")
+
+
+def test_model_artifact_cache_publishes_one_valid_artifact_across_processes(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("mujoco")
+    from sim.mujoco.artifacts import ModelArtifactCache
+    from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
+
+    cache_root = tmp_path / "shared-cache"
+    start_at = time.monotonic() + 1.0
+    context = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=2,
+        mp_context=context,
+    ) as executor:
+        futures = [
+            executor.submit(_load_shared_model_artifact, str(cache_root), start_at)
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=90.0) for future in futures]
+
+    keys = {result[0] for result in results}
+    assert len(keys) == 1
+    assert sorted(result[1] for result in results) == [False, True]
+    assert len({result[2] for result in results}) == 1
+    assert len({result[3:] for result in results}) == 1
+
+    contract = CubeLiftTaskConfig.load(TASK_CONFIG).base_contract()
+    scene, artifact = ModelArtifactCache(cache_root).load_scene(contract)
+    assert artifact.cache_hit
+    assert artifact.key == next(iter(keys))
+    assert (int(scene.model.nq), int(scene.model.nv)) == results[0][3:]
 
 
 def test_model_artifact_cache_separates_actuated_profile(tmp_path: Path) -> None:
@@ -420,6 +477,7 @@ def test_fast_env_passes_gymnasium_checker(tmp_path: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
     from gymnasium.utils.env_checker import check_env
+
     from sim.mujoco.tasks.cube_lift import FastCubeLiftEnv
 
     env = FastCubeLiftEnv(TASK_CONFIG, model_cache_dir=tmp_path / "cache")
@@ -433,6 +491,7 @@ def test_vector_env_exposes_batched_gymnasium_spaces(tmp_path: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
     from gymnasium.vector import VectorEnv
+
     from sim.mujoco.runtime import CubeLiftVectorEnv
 
     env = CubeLiftVectorEnv(

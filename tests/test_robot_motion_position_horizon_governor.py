@@ -266,12 +266,17 @@ def test_reused_horizon_projects_microradian_position_residue_before_certificate
         iter=1,
         solve_time=0.0,
     )
+
+    def solve(*, raise_error: bool) -> SimpleNamespace:
+        assert raise_error is False
+        return SimpleNamespace(x=np.zeros(1), info=info)
+
     monkeypatch.setattr(
         workspace,
         "_solver",
         SimpleNamespace(
             update=lambda **_: None,
-            solve=lambda: SimpleNamespace(x=np.zeros(1), info=info),
+            solve=solve,
         ),
     )
 
@@ -319,12 +324,17 @@ def test_reused_horizon_does_not_silently_project_a_real_position_violation(
         iter=1,
         solve_time=0.0,
     )
+
+    def solve(*, raise_error: bool) -> SimpleNamespace:
+        assert raise_error is False
+        return SimpleNamespace(x=np.zeros(1), info=info)
+
     monkeypatch.setattr(
         workspace,
         "_solver",
         SimpleNamespace(
             update=lambda **_: None,
-            solve=lambda: SimpleNamespace(x=np.zeros(1), info=info),
+            solve=solve,
         ),
     )
 
