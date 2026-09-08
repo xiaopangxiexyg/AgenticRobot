@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from control_station import real_teleop_entrypoint
+from control_station import (
+    real_rule_based_writing_entrypoint,
+    real_teleop_entrypoint,
+)
+from control_station.rule_based_writing import RuleBasedWritingWebUi
 from robot_motion.action import HandActionSpec
 from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
@@ -229,7 +233,9 @@ def _patch_source(
     )
 
 
-def test_canonical_entrypoint_accepts_a_lightweight_extension_factory(monkeypatch) -> None:
+def test_canonical_entrypoint_accepts_a_lightweight_extension_factory(
+    monkeypatch,
+) -> None:
     args = argparse.Namespace()
     extension = object()
     calls: list[object] = []
@@ -268,6 +274,68 @@ def test_canonical_entrypoint_accepts_a_lightweight_extension_factory(monkeypatc
     assert calls[0] is configure
     assert args._real_teleop_runtime_extension is extension
     assert calls[1][0] is args
+
+
+def test_canonical_entrypoint_can_validate_extension_before_device_preflight(
+    monkeypatch,
+) -> None:
+    args = argparse.Namespace()
+    extension = object()
+    calls: list[str] = []
+
+    def _parse(*, configure_parser=None, before_device_preflight=None):
+        del configure_parser
+        calls.append("parse")
+        assert callable(before_device_preflight)
+        before_device_preflight(args)
+        calls.append("device_preflight")
+        return args
+
+    monkeypatch.setattr(
+        real_teleop_entrypoint, "_parse_args_with_configuration", _parse
+    )
+    monkeypatch.setattr(
+        real_teleop_entrypoint,
+        "_bind_real_teleop_runtime_support",
+        lambda _namespace: None,
+    )
+    monkeypatch.setattr(
+        real_teleop_entrypoint,
+        "build_real_teleop_progress_application",
+        lambda _args: None,
+    )
+    monkeypatch.setattr(
+        real_teleop_entrypoint, "run_real_teleop", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(real_teleop_entrypoint, "cleanup_active_startup", lambda: None)
+
+    real_teleop_entrypoint.run_real_teleop_entrypoint(
+        runtime_extension_factory=lambda parsed: (
+            calls.append("extension_validation"),
+            extension if parsed is args else None,
+        )[1],
+        build_runtime_extension_before_device_preflight=True,
+    )
+
+    assert calls == ["parse", "extension_validation", "device_preflight"]
+    assert args._real_teleop_runtime_extension is extension
+
+
+def test_specialized_entrypoint_injects_rule_only_ui(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(
+        real_rule_based_writing_entrypoint,
+        "run_real_teleop_entrypoint",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    real_rule_based_writing_entrypoint.main()
+
+    assert captured["control_ui_type"] is RuleBasedWritingWebUi
+    assert captured["runtime_extension_factory"] is (
+        rule_based_plan.build_rule_based_writing_extension
+    )
+    assert captured["build_runtime_extension_before_device_preflight"] is True
 
 
 def test_plan_composes_replay_write_and_relative_pen_up_with_left_hold(
@@ -367,9 +435,10 @@ def test_full_replay_mode_preserves_every_source_frame_without_detail_annotation
     assert build.source_selection["gripper_dispatch_mode"] == (
         "causal_measured_step_limited"
     )
-    assert float(
-        np.max(np.abs(np.diff(group.hand_joint_targets["right"][:, 0])))
-    ) > build.extension.config.gripper_max_step
+    assert (
+        float(np.max(np.abs(np.diff(group.hand_joint_targets["right"][:, 0]))))
+        > build.extension.config.gripper_max_step
+    )
     assert build.extension._configuration_options["collection_mode"] == (
         rule_based_plan.RULE_COLLECTION_MODE_FULL_REPLAY
     )
@@ -622,9 +691,9 @@ def test_extension_factory_selects_rule_source_without_vive_dependency(
     )
 
 
-
-
-def test_plan_fails_closed_on_pose_contract_mismatch(monkeypatch, tmp_path: Path) -> None:
+def test_plan_fails_closed_on_pose_contract_mismatch(
+    monkeypatch, tmp_path: Path
+) -> None:
     source_contract = SimpleNamespace(
         contract_hash="sha256:different",
         to_dict=lambda: _contract().to_dict(),
@@ -688,17 +757,12 @@ def test_fixed_writing_anchors_in_canonical_desk_and_resamples_source_rate() -> 
         },
     }
 
-    actions = [
-        source.produce_action(None, context=context)
-        for _ in range(41)
-    ]
+    actions = [source.produce_action(None, context=context) for _ in range(41)]
 
     assert np.allclose(actions[0].arm_pose_by_side["left"], left_hold)
     assert np.allclose(actions[0].arm_pose_by_side["right"], right_desk)
     assert set(actions[0].frame_by_effector.values()) == {"canonical_desk"}
-    positions = np.stack(
-        [action.arm_pose_by_side["right"][:3] for action in actions]
-    )
+    positions = np.stack([action.arm_pose_by_side["right"][:3] for action in actions])
     assert np.max(np.linalg.norm(np.diff(positions, axis=0), axis=1)) <= 0.002001
     interval_velocity = actions[0].metadata["pose_action_interval_velocity"]
     assert interval_velocity["quality_valid"] is True
@@ -764,7 +828,9 @@ def test_calibrated_height_descent_is_optional_pure_z_and_c2_bounded() -> None:
     assert first_step < middle_step
     assert last_step < middle_step
     assert middle_step * 60.0 <= 0.0201
-    assert actions[-1].metadata["rule_based_height_arrival_tolerance_m"] == pytest.approx(0.001)
+    assert actions[-1].metadata[
+        "rule_based_height_arrival_tolerance_m"
+    ] == pytest.approx(0.001)
 
 
 def test_fixed_writing_uses_calibrated_descent_endpoint_when_supplied() -> None:

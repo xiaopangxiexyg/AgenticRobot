@@ -83,6 +83,54 @@ ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "control_station/real_teleop_entrypoint.py"
 
 
+def test_rule_dmtac_backend_is_owned_by_session_rig_without_q6_retargeter() -> None:
+    backend = object()
+    assert (
+        component_builder._hand_control_via_session_rig(
+            rule_command_source=True,
+            backend_mode=hand_config.HAND_BACKEND_DMTAC_GRIPPER,
+            backend=backend,
+            inspire_retargeter=None,
+        )
+        is True
+    )
+    assert (
+        component_builder._hand_control_via_session_rig(
+            rule_command_source=False,
+            backend_mode=hand_config.HAND_BACKEND_DMTAC_GRIPPER,
+            backend=backend,
+            inspire_retargeter=None,
+        )
+        is False
+    )
+    assert (
+        component_builder._hand_control_via_session_rig(
+            rule_command_source=True,
+            backend_mode=hand_config.HAND_BACKEND_DMTAC_GRIPPER,
+            backend=None,
+            inspire_retargeter=None,
+        )
+        is False
+    )
+
+
+def test_rule_command_source_does_not_open_vive_source() -> None:
+    calls: list[str] = []
+    keyboard = object()
+    hand = object()
+
+    sources = component_builder._session_sources_for_command_source(
+        rule_command_source=True,
+        vive_source_factory=lambda: calls.append("vive") or object(),
+        keyboard_source=keyboard,
+        hand_source=hand,
+        angle_trigger_source=None,
+    )
+
+    assert sources == [keyboard, hand]
+    assert calls == []
+
+
 def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
     assert control_loop._fresh_control_step_timestamp(
         10.0,
@@ -104,9 +152,7 @@ def test_safety_hold_latches_before_a_failing_session_hold() -> None:
             *,
             require_home_recalibration: bool,
         ) -> bool:
-            events.append(
-                ("hardware", message, require_home_recalibration)
-            )
+            events.append(("hardware", message, require_home_recalibration))
             raise RuntimeError("baseline reset failed")
 
     class Clutch:
@@ -161,9 +207,7 @@ def test_unreceipted_progress_failure_latches_distinct_fail_closed_hold() -> Non
     assert control_loop._latch_unreceipted_progress_failure_hold(
         progress_failure_pending=True,
         clutch_input=clutch,
-        pause_recording=(
-            lambda _now, *, reason: events.append(("pause", reason))
-        ),
+        pause_recording=(lambda _now, *, reason: events.append(("pause", reason))),
         log=lambda *_args, **_kwargs: None,
         now=10.0,
     )
@@ -211,9 +255,10 @@ def test_formal_writer_ready_handshake_is_not_global_startup_work() -> None:
     assert "prepare_startup_dataset_recorder(" not in runtime_source
     assert "formal dataset writer deferred until collection start" in runtime_source
     assert "正在启动隔离 writer 并等待 ready 握手" not in runtime_source
-    assert runtime_source.count(
-        "set_dataset_recorder=assign_current_dataset_recorder"
-    ) == 2
+    assert (
+        runtime_source.count("set_dataset_recorder=assign_current_dataset_recorder")
+        == 2
+    )
     assert "set_current_dataset_recorder" not in runtime_source
 
 
@@ -349,9 +394,7 @@ def test_transactional_dataset_selection_defers_live_state_and_start_request(
     assert args.dataset_root == "/tmp/old-dataset"
     assert control._dataset_selection_pending is True
     assert control._episode_start_requested is False
-    assert control.ui.published[-1][
-        "dataset_configuration_transition_active"
-    ] is True
+    assert control.ui.published[-1]["dataset_configuration_transition_active"] is True
 
     callbacks["on_commit"](callbacks["snapshot"])
     assert args.collection_task_id == "new-id"
@@ -364,9 +407,7 @@ def test_transactional_dataset_selection_defers_live_state_and_start_request(
     callbacks["on_complete"]()
     assert control._dataset_selection_pending is False
     assert control._episode_start_requested is True
-    assert control.ui.published[-1][
-        "dataset_configuration_transition_active"
-    ] is False
+    assert control.ui.published[-1]["dataset_configuration_transition_active"] is False
     assert any(
         "数采任务已更新" in message
         for title, message in control.ui.messages
@@ -464,12 +505,10 @@ def test_pending_dataset_selection_rejects_progress_configuration_intents() -> N
     )
     control._dataset_selection_pending = True
     control._progress_profile_selection_intents = __import__("collections").deque()
-    control._progress_arm_control_mode_selection_intents = (
-        __import__("collections").deque()
-    )
-    control._progress_entry_step_selection_intents = (
-        __import__("collections").deque()
-    )
+    control._progress_arm_control_mode_selection_intents = __import__(
+        "collections"
+    ).deque()
+    control._progress_entry_step_selection_intents = __import__("collections").deque()
     control._progress_ui_payload = {}
     control._progress_ui_controls = ()
     control._progress_ui_transport_revision = 0
@@ -513,7 +552,10 @@ def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
         "from teleop_runtime.collection.writer_runtime import CollectionWriterRuntime"
         in debug_source
     )
-    assert "from ..collection.writer_runtime import CollectionWriterRuntime" in real_recorder_source
+    assert (
+        "from ..collection.writer_runtime import CollectionWriterRuntime"
+        in real_recorder_source
+    )
     assert "self.writer_runtime = CollectionWriterRuntime(" in real_recorder_source
     assert "self.writer_runtime = CollectionWriterRuntime(" in collection_runtime_source
     assert "from teleop_runtime.debug" not in real_recorder_source
@@ -524,9 +566,13 @@ def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
 
 def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
     assert list(inspect.signature(legacy_entrypoint.parse_args).parameters) == []
-    assert list(inspect.signature(cli_resolution.parse_real_teleop_args).parameters) == []
+    assert (
+        list(inspect.signature(cli_resolution.parse_real_teleop_args).parameters) == []
+    )
     assert list(inspect.signature(legacy_entrypoint.main).parameters) == []
-    assert list(inspect.signature(legacy_entrypoint._build_components).parameters) == ["args"]
+    assert list(inspect.signature(legacy_entrypoint._build_components).parameters) == [
+        "args"
+    ]
     control_parameters = list(
         inspect.signature(legacy_entrypoint.RealTeleopControlInput.__init__).parameters
     )
@@ -553,7 +599,9 @@ def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
         "close",
     )
     for method_name in recorder_methods:
-        assert callable(getattr(legacy_entrypoint.RealTeleopDatasetRecorder, method_name))
+        assert callable(
+            getattr(legacy_entrypoint.RealTeleopDatasetRecorder, method_name)
+        )
     from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
 
     assert legacy_entrypoint.RealTeleopDatasetRecorder is RealTeleopDatasetRecorder
@@ -567,18 +615,37 @@ def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
     assert "from ..debug" not in cli_resolution_source
 
 
-def test_batch_one_payload_modules_preserve_legacy_names_and_do_not_reverse_import() -> None:
+def test_batch_one_payload_modules_preserve_legacy_names_and_do_not_reverse_import() -> (
+    None
+):
     assert legacy_entrypoint._json_safe_value is status_payloads._json_safe_value
-    assert legacy_entrypoint._build_tactile_camera_status is status_payloads._build_tactile_camera_status
-    assert legacy_entrypoint._camera_status_for_source is status_payloads._camera_status_for_source
-    assert legacy_entrypoint._build_camera_status is status_payloads._build_camera_status
-    assert legacy_entrypoint._wrist_depth_requested is status_payloads._wrist_depth_requested
+    assert (
+        legacy_entrypoint._build_tactile_camera_status
+        is status_payloads._build_tactile_camera_status
+    )
+    assert (
+        legacy_entrypoint._camera_status_for_source
+        is status_payloads._camera_status_for_source
+    )
+    assert (
+        legacy_entrypoint._build_camera_status is status_payloads._build_camera_status
+    )
+    assert (
+        legacy_entrypoint._wrist_depth_requested
+        is status_payloads._wrist_depth_requested
+    )
     assert (
         legacy_entrypoint._with_expected_wrist_depth_camera_statuses
         is status_payloads._with_expected_wrist_depth_camera_statuses
     )
-    assert legacy_entrypoint.WRIST_DEPTH_CAMERA_KEYS is status_payloads.WRIST_DEPTH_CAMERA_KEYS
-    assert legacy_entrypoint._action_debug_jitter_focus is action_debug_payload._action_debug_jitter_focus
+    assert (
+        legacy_entrypoint.WRIST_DEPTH_CAMERA_KEYS
+        is status_payloads.WRIST_DEPTH_CAMERA_KEYS
+    )
+    assert (
+        legacy_entrypoint._action_debug_jitter_focus
+        is action_debug_payload._action_debug_jitter_focus
+    )
     assert (
         legacy_entrypoint._action_debug_backend_snapshot_from_state
         is action_debug_payload._action_debug_backend_snapshot_from_state
@@ -678,7 +745,9 @@ def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None
     assert legacy_entrypoint.RealTeleopComponents.__module__ == (
         "teleop_runtime.debug.run_vive_rm65_real_teleop"
     )
-    component_fields = tuple(item.name for item in fields(components.RealTeleopComponents))
+    component_fields = tuple(
+        item.name for item in fields(components.RealTeleopComponents)
+    )
     assert component_fields[:4] == (
         "session",
         "active_sides",
@@ -705,7 +774,10 @@ def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None
     ):
         assert getattr(legacy_entrypoint, name) is getattr(cli_value_parsers, name)
 
-    assert legacy_entrypoint.RealDatasetFinalizeTask is dataset_finalize.RealDatasetFinalizeTask
+    assert (
+        legacy_entrypoint.RealDatasetFinalizeTask
+        is dataset_finalize.RealDatasetFinalizeTask
+    )
     assert legacy_entrypoint.RealDatasetFinalizeTask.__module__ == (
         "teleop_runtime.debug.run_vive_rm65_real_teleop"
     )
@@ -733,16 +805,22 @@ def test_batch_two_pure_modules_preserve_legacy_identity_and_contracts() -> None
         "_qpos_compact_debug",
         "_pose_delta_compact_debug",
     ):
-        assert getattr(legacy_entrypoint, name) is getattr(debug_payload_primitives, name)
+        assert getattr(legacy_entrypoint, name) is getattr(
+            debug_payload_primitives, name
+        )
 
 
-def test_hand_and_gripper_config_modules_preserve_legacy_identity_and_boundaries() -> None:
+def test_hand_and_gripper_config_modules_preserve_legacy_identity_and_boundaries() -> (
+    None
+):
     for legacy_name, module_name in (
         ("_hand_backend_mode", "hand_backend_mode"),
         ("_hand_backend_mode_for_side", "hand_backend_mode_for_side"),
         ("_dmtac_sides", "dmtac_sides"),
     ):
-        assert getattr(legacy_entrypoint, legacy_name) is getattr(hand_config, module_name)
+        assert getattr(legacy_entrypoint, legacy_name) is getattr(
+            hand_config, module_name
+        )
 
     for name in (
         "HAND_BACKEND_INSPIRE",
@@ -773,11 +851,15 @@ def test_hand_and_gripper_config_modules_preserve_legacy_identity_and_boundaries
         ("_gripper_force_dataset_metadata", "gripper_force_dataset_metadata"),
         ("_clear_gripper_policy_cache", "clear_gripper_policy_cache"),
     ):
-        assert getattr(legacy_entrypoint, legacy_name) is getattr(gripper_policy, module_name)
-    assert legacy_entrypoint.GRIPPER_POLICY_DEFAULTS is gripper_policy.GRIPPER_POLICY_DEFAULTS
+        assert getattr(legacy_entrypoint, legacy_name) is getattr(
+            gripper_policy, module_name
+        )
     assert (
-        legacy_entrypoint._dmtac_tactile_enabled
-        is dmtac_config.dmtac_tactile_enabled
+        legacy_entrypoint.GRIPPER_POLICY_DEFAULTS
+        is gripper_policy.GRIPPER_POLICY_DEFAULTS
+    )
+    assert (
+        legacy_entrypoint._dmtac_tactile_enabled is dmtac_config.dmtac_tactile_enabled
     )
     assert (
         legacy_entrypoint._apply_gripper_policy_to_dmtac_config
@@ -829,14 +911,19 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
     assert args.dmtac_tactile_backend == "cpu"
     assert args.gripper_warmup_probe is True
     assert args.hand_joint_order == legacy_entrypoint.DEFAULT_INSPIRE_HAND_JOINT_ORDER
-    assert legacy_entrypoint.DEFAULT_TASKS_CONFIG_PATH is hand_cli.DEFAULT_TASKS_CONFIG_PATH
+    assert (
+        legacy_entrypoint.DEFAULT_TASKS_CONFIG_PATH
+        is hand_cli.DEFAULT_TASKS_CONFIG_PATH
+    )
 
     source = (ROOT / "teleop_runtime/cli_value_parsers.py").read_text(encoding="utf-8")
     assert "teleop_runtime.debug" not in source
     assert "run_vive" not in source
 
 
-def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
+def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> (
+    None
+):
     parser = cli.build_real_teleop_argument_parser()
     assert len(parser._actions) == 450
     assert sum(len(action.option_strings) for action in parser._actions) == 510
@@ -863,19 +950,15 @@ def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary
     assert parser.parse_args([]).position_admittance_active_max_tool_excursion_m == 0.08
     assert parser.parse_args([]).position_admittance_translation_response_weight == 1.0
     assert parser.parse_args([]).position_admittance_rotation_response_weight == 1.0
-    assert parser.parse_args([]).position_admittance_rotation_filter_tau_sec == pytest.approx(
-        0.010857362
-    )
+    assert parser.parse_args(
+        []
+    ).position_admittance_rotation_filter_tau_sec == pytest.approx(0.010857362)
     assert (
-        parser.parse_args(
-            ["--position-admittance-shadow"]
-        ).position_admittance_shadow
+        parser.parse_args(["--position-admittance-shadow"]).position_admittance_shadow
         is True
     )
     assert (
-        parser.parse_args(
-            ["--position-admittance-active"]
-        ).position_admittance_active
+        parser.parse_args(["--position-admittance-active"]).position_admittance_active
         is True
     )
     assert parser.parse_args([]).idle_tactile_compression is False
@@ -884,16 +967,12 @@ def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary
         is True
     )
     assert (
-        parser.parse_args(
-            ["--no-idle-tactile-compression"]
-        ).idle_tactile_compression
+        parser.parse_args(["--no-idle-tactile-compression"]).idle_tactile_compression
         is False
     )
     assert parser.parse_args([]).tactile_artifact_integrity is False
     assert (
-        parser.parse_args(
-            ["--tactile-artifact-integrity"]
-        ).tactile_artifact_integrity
+        parser.parse_args(["--tactile-artifact-integrity"]).tactile_artifact_integrity
         is True
     )
     assert (
@@ -950,9 +1029,16 @@ def test_runtime_metadata_and_movement_modules_preserve_legacy_contracts() -> No
         legacy_entrypoint._position_ik_iteration_metadata
         is runtime_metadata.position_ik_iteration_metadata
     )
-    assert legacy_entrypoint._movement_multiple_value is movement.movement_multiple_value
-    assert legacy_entrypoint._movement_multiple_ui_state is movement.movement_multiple_ui_state
-    assert legacy_entrypoint._apply_movement_multiple is movement.apply_movement_multiple
+    assert (
+        legacy_entrypoint._movement_multiple_value is movement.movement_multiple_value
+    )
+    assert (
+        legacy_entrypoint._movement_multiple_ui_state
+        is movement.movement_multiple_ui_state
+    )
+    assert (
+        legacy_entrypoint._apply_movement_multiple is movement.apply_movement_multiple
+    )
     assert (
         legacy_entrypoint._resolve_movement_multiple_args
         is movement.resolve_movement_multiple_args
@@ -984,7 +1070,9 @@ def test_runtime_metadata_and_movement_modules_preserve_legacy_contracts() -> No
         assert "teleop_runtime.debug" not in source
 
 
-def test_component_configuration_helpers_preserve_legacy_identity_and_boundaries() -> None:
+def test_component_configuration_helpers_preserve_legacy_identity_and_boundaries() -> (
+    None
+):
     for name in (
         "_alignment_qpos_pair",
         "_force_tare_sec_arg",
@@ -1120,9 +1208,9 @@ def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
     }
     support = {
         "_arm_control_mode_arg": lambda args: "position",
-            "_attach_actuator_command_trace_sink": lambda *args: None,
-            "_attach_ik_shadow_trace_sink": lambda *args: None,
-            "_attach_position_audit_sink": lambda *args: None,
+        "_attach_actuator_command_trace_sink": lambda *args: None,
+        "_attach_ik_shadow_trace_sink": lambda *args: None,
+        "_attach_position_audit_sink": lambda *args: None,
         "_attach_singularity_transition_trace_sink": lambda *args: None,
         "_close_camera_sources": lambda sources: None,
         "_log": lambda *args: None,
@@ -1218,7 +1306,9 @@ def test_repeated_runtime_emergency_stop_skips_already_latched_backend(
     assert errors == {}
 
 
-def test_episode_recording_shutdown_commits_force_guard_reason_before_resources() -> None:
+def test_episode_recording_shutdown_commits_force_guard_reason_before_resources() -> (
+    None
+):
     close_calls: list[dict[str, object]] = []
 
     class Fault:
@@ -1256,9 +1346,7 @@ def test_episode_recording_shutdown_commits_force_guard_reason_before_resources(
             "end_reason": "position_force_guard",
             "summary": {
                 "reason": "position_force_guard",
-                "position_force_guard_fault": {
-                    "code": "joint_force_limit"
-                },
+                "position_force_guard_fault": {"code": "joint_force_limit"},
                 "peak_force_n": 42.0,
             },
             "timeout_sec": 15.0,
@@ -1303,9 +1391,9 @@ def test_real_component_builder_preserves_legacy_wrapper_and_import_boundary(
         inspect.signature(component_builder.build_real_teleop_components).parameters
     ) == ["args", "dmtac_backend_configs"]
 
-    source = (
-        ROOT / "teleop_runtime/real_teleop/component_builder.py"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "teleop_runtime/real_teleop/component_builder.py").read_text(
+        encoding="utf-8"
+    )
     assert "run_vive_rm65_real_teleop" in source
     assert "from teleop_runtime.debug" not in source
     assert "from ..debug" not in source
@@ -1381,8 +1469,7 @@ def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
 
     noop = lambda *args, **kwargs: None
     values = {
-        item.name: noop
-        for item in fields(control_loop.RealTeleopControlLoopContext)
+        item.name: noop for item in fields(control_loop.RealTeleopControlLoopContext)
     }
     values.update(
         {
@@ -1446,10 +1533,7 @@ def test_safety_dispatch_recovery_uses_bound_teleop_admission_state() -> None:
     assert "teleop_active" not in source
     assert 'getattr(clutch_input, "_teleop_started", False)' in source
     assert "teleop_admitted and _consume_joint_hard_limit_dispatch" in source
-    assert (
-        "teleop_admitted and _consume_joint_horizon_certification_dispatch"
-        in source
-    )
+    assert "teleop_admitted and _consume_joint_horizon_certification_dispatch" in source
 
 
 def test_every_hold_contains_subordinate_failures_before_motion_stays_blocked() -> None:
@@ -1684,9 +1768,7 @@ def test_generic_device_retry_never_starts_or_reuses_dataset_writer() -> None:
         startup_device_errors=errors,
         position_force_guard_requested=False,
         dataset_recorder_provider=lambda: current_recorder["value"],
-        set_dataset_recorder=lambda value: current_recorder.__setitem__(
-            "value", value
-        ),
+        set_dataset_recorder=lambda value: current_recorder.__setitem__("value", value),
         foot_pad_input_provider=lambda: None,
         set_foot_pad_input=lambda _value: None,
         dataset_recorder_type=Recorder,
@@ -1786,9 +1868,7 @@ def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -
 
     visualizer = FakeVisualizer()
     clutch = SimpleNamespace(
-        set_visualization_state=lambda **kwargs: visualization_updates.append(
-            kwargs
-        ),
+        set_visualization_state=lambda **kwargs: visualization_updates.append(kwargs),
     )
     preview = visualization_runtime.build_visualization_runtime(
         args=SimpleNamespace(tactile_visualization_available=False),
@@ -1844,9 +1924,12 @@ def test_episode_recording_runtime_refreshes_external_recorder_slot() -> None:
         frame_count=2,
         episode_dir=None,
     )
-    assert "support" not in inspect.signature(
-        episode_recording_runtime.build_episode_recording_runtime
-    ).parameters
+    assert (
+        "support"
+        not in inspect.signature(
+            episode_recording_runtime.build_episode_recording_runtime
+        ).parameters
+    )
     assert (
         legacy_entrypoint._episode_start_countdown_remaining
         is episode_recording_runtime._episode_start_countdown_remaining
@@ -1938,7 +2021,9 @@ def test_camera_episode_and_special_arm_modules_preserve_legacy_seams() -> None:
         "_release_gui_qpos_init_transit",
     ):
         assert getattr(legacy_entrypoint, name) is getattr(special_arm_runtime, name)
-    assert list(inspect.signature(legacy_entrypoint._start_gui_qpos_init).parameters) == [
+    assert list(
+        inspect.signature(legacy_entrypoint._start_gui_qpos_init).parameters
+    ) == [
         "args",
         "components",
         "now",
@@ -2001,15 +2086,18 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
         ),
         consume_init_qpos_emergency_stop_request=lambda: False,
     )
-    assert legacy_entrypoint._wait_for_real_teleop_start_request(
-        SimpleNamespace(),
-        clutch,
-        arm_mode="position",
-        args=SimpleNamespace(),
-        control_ui=None,
-        ik_debug_log_recorder=SimpleNamespace(),
-        ik_debug_profile_base_enabled=False,
-    ) is None
+    assert (
+        legacy_entrypoint._wait_for_real_teleop_start_request(
+            SimpleNamespace(),
+            clutch,
+            arm_mode="position",
+            args=SimpleNamespace(),
+            control_ui=None,
+            ik_debug_log_recorder=SimpleNamespace(),
+            ik_debug_profile_base_enabled=False,
+        )
+        is None
+    )
     assert calls == [
         "maintenance:True",
         "poll",
@@ -2018,9 +2106,9 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
         "maintenance:False",
     ]
 
-    source = (
-        ROOT / "teleop_runtime/real_teleop/startup_runtime.py"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "teleop_runtime/real_teleop/startup_runtime.py").read_text(
+        encoding="utf-8"
+    )
     assert "from teleop_runtime.debug" not in source
     assert "from ..debug" not in source
 
@@ -2082,9 +2170,7 @@ def test_tcp_pose_envelope_home_rebind_precedes_real_hardware_arm(
     )
     components = SimpleNamespace(
         active_sides=("left", "right"),
-        dual_arm_retargeter=SimpleNamespace(
-            pre_ik_target_safety_filter=SafetyFilter()
-        ),
+        dual_arm_retargeter=SimpleNamespace(pre_ik_target_safety_filter=SafetyFilter()),
         position_reference_publisher=SimpleNamespace(
             reset_epoch=lambda: events.append("epoch_reset") or 4
         ),
@@ -2337,9 +2423,7 @@ def test_relative_tcp_pose_envelope_refuses_arm_without_runtime_home(
     )
     components = SimpleNamespace(
         active_sides=("left",),
-        dual_arm_retargeter=SimpleNamespace(
-            pre_ik_target_safety_filter=safety_filter
-        ),
+        dual_arm_retargeter=SimpleNamespace(pre_ik_target_safety_filter=safety_filter),
         position_reference_publisher=SimpleNamespace(reset_epoch=lambda: 1),
         session=SimpleNamespace(
             hold_hardware=lambda reason: events.append("hold_hardware"),
@@ -2381,9 +2465,7 @@ def test_shadow_relative_tcp_pose_envelope_never_blocks_arm_without_home(
     )
     components = SimpleNamespace(
         active_sides=("left",),
-        dual_arm_retargeter=SimpleNamespace(
-            pre_ik_target_safety_filter=safety_filter
-        ),
+        dual_arm_retargeter=SimpleNamespace(pre_ik_target_safety_filter=safety_filter),
         position_reference_publisher=SimpleNamespace(reset_epoch=lambda: 1),
         session=SimpleNamespace(
             hold_hardware=lambda reason: events.append("hold_hardware"),
@@ -2452,9 +2534,7 @@ def test_progress_arm_target_after_home_reaches_exact_authority(
     target_fixed: tuple[str, ...],
 ) -> None:
     controller = _ProgressArmTargetController(initial_fixed)
-    pending = SimpleNamespace(
-        plan=SimpleNamespace(target_fixed_sides=target_fixed)
-    )
+    pending = SimpleNamespace(plan=SimpleNamespace(target_fixed_sides=target_fixed))
 
     ready, detail = control_loop._apply_pending_progress_arm_target_after_home(
         components=SimpleNamespace(fix_arm_controller=controller),
@@ -2470,24 +2550,18 @@ def test_progress_arm_target_after_home_reaches_exact_authority(
 def test_progress_home_arm_receipt_precedes_progress_commit() -> None:
     source = inspect.getsource(control_loop.run_real_teleop_control_loop)
     explicit_home = source[
-        source.index("if clutch_input.consume_calibration_request():") :
-        source.index("episode_delete_index =", source.index("if clutch_input.consume_calibration_request():"))
+        source.index("if clutch_input.consume_calibration_request():") : source.index(
+            "episode_delete_index =",
+            source.index("if clutch_input.consume_calibration_request():"),
+        )
     ]
 
-    target_index = explicit_home.index(
-        "_apply_pending_progress_arm_target_after_home("
-    )
-    arm_index = explicit_home.index(
-        "arm_admitted = _arm_after_start_calibration("
-    )
+    target_index = explicit_home.index("_apply_pending_progress_arm_target_after_home(")
+    arm_index = explicit_home.index("arm_admitted = _arm_after_start_calibration(")
     negative_receipt_index = explicit_home.index("if not arm_admitted:")
     progress_commit_index = explicit_home.index("progress_workflow.handle_command(")
-    handled_receipt_index = explicit_home.index(
-        "if not bool(progress_result.handled):"
-    )
-    clear_pending_index = explicit_home.index(
-        "pending_progress_arm_transition = None"
-    )
+    handled_receipt_index = explicit_home.index("if not bool(progress_result.handled):")
+    clear_pending_index = explicit_home.index("pending_progress_arm_transition = None")
 
     assert target_index < arm_index < negative_receipt_index
     assert (
@@ -2497,30 +2571,36 @@ def test_progress_home_arm_receipt_precedes_progress_commit() -> None:
         < clear_pending_index
     )
     assert "clear_fix_snapshots=profile_home_pending is None" in explicit_home
-    assert 'reason="progress_arm_profile_transition"' in explicit_home[
-        negative_receipt_index:progress_commit_index
-    ]
+    assert (
+        'reason="progress_arm_profile_transition"'
+        in explicit_home[negative_receipt_index:progress_commit_index]
+    )
     assert "progress transaction blocker" in explicit_home
 
 
-def test_collection_transition_suspends_progress_without_clearing_same_binding() -> None:
+def test_collection_transition_suspends_progress_without_clearing_same_binding() -> (
+    None
+):
     source = inspect.getsource(control_loop.run_real_teleop_control_loop)
     binding = source[
-        source.index("collection_transition_pending =") :
-        source.index("_latch_unreceipted_progress_failure_hold(")
+        source.index("collection_transition_pending =") : source.index(
+            "_latch_unreceipted_progress_failure_hold("
+        )
     ]
 
     assert "progress_configured = bool(" in binding
-    assert "not context.collection_transition_active()" not in binding[
-        : binding.index("if not progress_configured:")
-    ]
+    assert (
+        "not context.collection_transition_active()"
+        not in binding[: binding.index("if not progress_configured:")]
+    )
     assert (
         "if progress_workflow is not None and not collection_transition_pending:"
         in binding
     )
     recorder_change = binding[
-        binding.index("elif progress_workflow_recorder is not dataset_recorder:") :
-        binding.index("progress_failure_pending = False")
+        binding.index(
+            "elif progress_workflow_recorder is not dataset_recorder:"
+        ) : binding.index("progress_failure_pending = False")
     ]
     assert "if not collection_transition_pending:" in recorder_change
 
@@ -2528,8 +2608,9 @@ def test_collection_transition_suspends_progress_without_clearing_same_binding()
 def test_two_pedal_home_requires_arm_receipt_before_success() -> None:
     source = inspect.getsource(control_loop.run_real_teleop_control_loop)
     fast_home = source[
-        source.index("fast_two_pedal_fixed_side =") :
-        source.index("if clutch_input.consume_calibration_request():")
+        source.index("fast_two_pedal_fixed_side =") : source.index(
+            "if clutch_input.consume_calibration_request():"
+        )
     ]
 
     arm_index = fast_home.index("arm_admitted = _arm_after_start_calibration(")
@@ -2546,8 +2627,7 @@ def test_two_pedal_home_requires_arm_receipt_before_success() -> None:
 def test_arm_admission_rejection_latches_application_before_session_hold() -> None:
     source = inspect.getsource(startup_runtime._arm_after_start_calibration)
     rejection = source[
-        source.index("def reject_arm_admission(") :
-        source.index("if home_captured:")
+        source.index("def reject_arm_admission(") : source.index("if home_captured:")
     ]
 
     waiting_index = rejection.index("clutch_input.publish_calibration_waiting(")
@@ -2560,8 +2640,7 @@ def test_arm_admission_rejection_latches_application_before_session_hold() -> No
 def test_runtime_home_requires_a_positive_precalibration_hold_receipt() -> None:
     source = inspect.getsource(control_loop.run_real_teleop_control_loop)
     explicit_home = source[
-        source.index("if clutch_input.consume_calibration_request():") :
-        source.index(
+        source.index("if clutch_input.consume_calibration_request():") : source.index(
             "episode_delete_index =",
             source.index("if clutch_input.consume_calibration_request():"),
         )
@@ -2579,36 +2658,34 @@ def test_runtime_home_requires_a_positive_precalibration_hold_receipt() -> None:
 def test_active_admittance_receipts_gate_home_and_recording_transitions() -> None:
     source = inspect.getsource(control_loop.run_real_teleop_control_loop)
     fast_home = source[
-        source.index("fast_two_pedal_fixed_side =") :
-        source.index("if clutch_input.consume_calibration_request():")
+        source.index("fast_two_pedal_fixed_side =") : source.index(
+            "if clutch_input.consume_calibration_request():"
+        )
     ]
     explicit_home = source[
-        source.index("if clutch_input.consume_calibration_request():") :
-        source.index(
+        source.index("if clutch_input.consume_calibration_request():") : source.index(
             "episode_delete_index =",
             source.index("if clutch_input.consume_calibration_request():"),
         )
     ]
     episode_start = source[
-        source.index("if clutch_input.consume_episode_start_request():") :
-        source.index('mark_loop_phase("loop.keys")')
+        source.index("if clutch_input.consume_episode_start_request():") : source.index(
+            'mark_loop_phase("loop.keys")'
+        )
     ]
     episode_open = source[
-        source.index("countdown_control_plane_started_at =") :
-        source.index(
+        source.index("countdown_control_plane_started_at =") : source.index(
             "dataset_recorder = context.dataset_recorder()",
             source.index("countdown_control_plane_started_at ="),
         )
     ]
 
     for home_transition in (fast_home, explicit_home):
-        reset_gate = home_transition.index(
-            "if not reset_position_admittance_shadow("
-        )
+        reset_gate = home_transition.index("if not reset_position_admittance_shadow(")
         assert "continue" in home_transition[reset_gate:]
-    assert fast_home.index("if not reset_position_admittance_shadow(") < fast_home.index(
-        "success=True"
-    )
+    assert fast_home.index(
+        "if not reset_position_admittance_shadow("
+    ) < fast_home.index("success=True")
     assert explicit_home.index(
         "if not reset_position_admittance_shadow("
     ) < explicit_home.index("progress_workflow.handle_command(")
@@ -2628,14 +2705,12 @@ def test_active_admittance_receipts_gate_home_and_recording_transitions() -> Non
 
 
 def test_active_tcp_pose_envelope_fault_has_explicit_pre_dispatch_hold_path() -> None:
-    source = (
-        ROOT / "teleop_runtime/real_teleop/control_loop.py"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "teleop_runtime/real_teleop/control_loop.py").read_text(
+        encoding="utf-8"
+    )
     run_step_marker = "step_result = components.session.run_step("
     active_fault_marker = "except TCPPoseEnvelopeRuntimeError as exc:"
-    generic_fault_marker = (
-        "except Exception as exc:  # noqa: BLE001 - only safety races are consumed here."
-    )
+    generic_fault_marker = "except Exception as exc:  # noqa: BLE001 - only safety races are consumed here."
 
     run_step_index = source.index(run_step_marker)
     active_fault_index = source.index(active_fault_marker, run_step_index)
@@ -2749,7 +2824,9 @@ def test_arm_force_gripper_and_debug_frame_modules_preserve_legacy_seams() -> No
         assert getattr(legacy_entrypoint, name) is getattr(gripper_control, name)
 
     assert list(
-        inspect.signature(legacy_entrypoint._promote_angle_trigger_gripper_input_to_q6).parameters
+        inspect.signature(
+            legacy_entrypoint._promote_angle_trigger_gripper_input_to_q6
+        ).parameters
     ) == ["args", "components", "ready_timeout_sec"]
     assert callable(gripper_recovery.promote_angle_trigger_gripper_input_to_q6)
 
@@ -2814,9 +2891,7 @@ def test_gripper_warmup_runtime_keeps_probe_state_inside_one_closure() -> None:
             backend if side == "left" else None
         ),
         run_probe_for_side=run_probe,
-        safe_float_value=lambda value: (
-            None if value is None else float(value)
-        ),
+        safe_float_value=lambda value: None if value is None else float(value),
         log=lambda stage, message, *, now=None: logs.append((stage, message, now)),
     )
 
@@ -2884,7 +2959,9 @@ def test_gripper_warmup_runtime_never_moves_profile_fixed_side() -> None:
     assert called_sides == ["right"]
 
 
-def test_gripper_warmup_runtime_keeps_partial_entry_grippers_passive_by_default() -> None:
+def test_gripper_warmup_runtime_keeps_partial_entry_grippers_passive_by_default() -> (
+    None
+):
     called_sides: list[str] = []
     backend = SimpleNamespace(config=SimpleNamespace(connect_hardware=True))
     args = SimpleNamespace(
@@ -3161,9 +3238,10 @@ def test_vive_calibration_runtime_and_shared_math_preserve_legacy_contracts() ->
         "_load_gui_vive_calibration_profile": ["args", "components"],
     }
     for name, expected_parameters in expected_profile_parameters.items():
-        assert list(
-            inspect.signature(getattr(legacy_entrypoint, name)).parameters
-        ) == expected_parameters
+        assert (
+            list(inspect.signature(getattr(legacy_entrypoint, name)).parameters)
+            == expected_parameters
+        )
         assert list(
             inspect.signature(getattr(vive_calibration_profiles, name)).parameters
         ) == [*expected_parameters, "profile_dir"]
@@ -3196,7 +3274,9 @@ def test_vive_calibration_runtime_and_shared_math_preserve_legacy_contracts() ->
         assert "from ..debug" not in source
 
 
-def test_hand_runtime_and_gripper_status_preserve_legacy_identity_and_boundaries() -> None:
+def test_hand_runtime_and_gripper_status_preserve_legacy_identity_and_boundaries() -> (
+    None
+):
     for name in (
         "_build_runtime_hand_command_for_recovery",
         "_dmtac_command_contract_configured",
@@ -3252,14 +3332,22 @@ def test_dataset_layout_module_preserves_legacy_adapters_and_import_boundary() -
         ("_sanitize_dataset_name_for_path", "sanitize_dataset_name_for_path"),
         ("_default_task_id_from_name", "default_task_id_from_name"),
     ):
-        assert getattr(legacy_entrypoint, legacy_name) is getattr(dataset_layout, module_name)
+        assert getattr(legacy_entrypoint, legacy_name) is getattr(
+            dataset_layout, module_name
+        )
 
-    assert list(inspect.signature(legacy_entrypoint._load_task_registry).parameters) == ["args"]
-    assert list(inspect.signature(legacy_entrypoint._task_definition_for_key).parameters) == [
+    assert list(
+        inspect.signature(legacy_entrypoint._load_task_registry).parameters
+    ) == ["args"]
+    assert list(
+        inspect.signature(legacy_entrypoint._task_definition_for_key).parameters
+    ) == [
         "args",
         "key",
     ]
-    assert list(inspect.signature(legacy_entrypoint._collection_task_ui_state).parameters) == ["args"]
+    assert list(
+        inspect.signature(legacy_entrypoint._collection_task_ui_state).parameters
+    ) == ["args"]
 
     assert dataset_layout.expand_cli_path("~/dexteleop").name == "dexteleop"
     assert dataset_layout.sanitize_dataset_name_for_path("Pick  chips") == "Pick_chips"
@@ -3276,13 +3364,26 @@ def test_dataset_layout_module_preserves_legacy_adapters_and_import_boundary() -
         collection_task_name_zh="",
         collection_task_description="",
     )
-    layout = dataset_layout.resolve_formal_dataset_layout(layout_args, date_prefix="2026-07-15")
+    layout = dataset_layout.resolve_formal_dataset_layout(
+        layout_args, date_prefix="2026-07-15"
+    )
     assert isinstance(layout, dataset_layout.FormalDatasetLayout)
     assert layout.dataset_dir_name == "2026-07-15_vive_rm65_real_teleop"
-    assert layout.dataset_root == Path("/tmp/dexteleop-layout-contract") / layout.dataset_dir_name
-    assert gui_collection_tasks.FormalDatasetLayout is dataset_layout.FormalDatasetLayout
-    assert gui_collection_tasks.resolve_formal_dataset_layout is dataset_layout.resolve_formal_dataset_layout
-    assert gui_collection_tasks.toggle_round_trip_phase is dataset_layout.toggle_round_trip_phase
+    assert (
+        layout.dataset_root
+        == Path("/tmp/dexteleop-layout-contract") / layout.dataset_dir_name
+    )
+    assert (
+        gui_collection_tasks.FormalDatasetLayout is dataset_layout.FormalDatasetLayout
+    )
+    assert (
+        gui_collection_tasks.resolve_formal_dataset_layout
+        is dataset_layout.resolve_formal_dataset_layout
+    )
+    assert (
+        gui_collection_tasks.toggle_round_trip_phase
+        is dataset_layout.toggle_round_trip_phase
+    )
     for path in (
         ROOT / "teleop_runtime/real_teleop/dataset_layout.py",
         ROOT / "teleop_runtime/gui/collection_tasks.py",
@@ -3292,7 +3393,9 @@ def test_dataset_layout_module_preserves_legacy_adapters_and_import_boundary() -
         assert "teleop_runtime.debug" not in source
 
 
-def test_dataset_selection_owns_pending_contract_admission_without_ui_or_devices() -> None:
+def test_dataset_selection_owns_pending_contract_admission_without_ui_or_devices() -> (
+    None
+):
     selection_source = (
         ROOT / "teleop_runtime/real_teleop/dataset_selection.py"
     ).read_text(encoding="utf-8")
@@ -3419,8 +3522,8 @@ def test_two_pedal_transition_cannot_bypass_missing_dispatch_receipt() -> None:
     control._two_pedal_mode_active = lambda: True
     control._manual_single_arm_switch_enabled = lambda: True
     control._reject_two_pedal_switch_during_init = lambda *, now: False
-    control._publish_two_pedal_alert = (
-        lambda *, message, **_kwargs: alerts.append(str(message))
+    control._publish_two_pedal_alert = lambda *, message, **_kwargs: alerts.append(
+        str(message)
     )
 
     control._request_two_pedal_fixed_side(
@@ -3622,10 +3725,7 @@ def test_control_lifecycle_state_survives_ui_transport_failure(
     control.set_fix_hold_active(False, message="one side released")
     assert control._fix_hold_active is False
     assert control._teleop_dispatch_confirmed is False
-    assert (
-        control._teleop_dispatch_projection
-        == "fix_hold_released_waiting_dispatch"
-    )
+    assert control._teleop_dispatch_projection == "fix_hold_released_waiting_dispatch"
     assert control._gripper_control_enabled is False
     assert control.gripper_control_enabled() is False
     assert control.publish_teleop_dispatch_running()
@@ -3774,7 +3874,9 @@ def test_plus_curation_runtime_owns_request_and_writer_thread_lifecycle() -> Non
     assert "hardware" not in runtime_source
 
 
-def test_debug_ik_payload_module_preserves_legacy_identity_and_import_boundary() -> None:
+def test_debug_ik_payload_module_preserves_legacy_identity_and_import_boundary() -> (
+    None
+):
     for name in (
         "_ik_profile_compact_debug",
         "_execution_step_compact_debug",
@@ -3841,10 +3943,13 @@ def test_batch_two_cli_parsers_and_debug_primitives_are_pure() -> None:
         "translation_m": 0.0,
         "rotation_deg": 0.0,
     }
-    assert debug_payload_primitives._compact_debug_value(
-        {"values": np.arange(20), "ik_resolver_init": "omitted"},
-        max_items=4,
-    )["values"]["omitted"] is True
+    assert (
+        debug_payload_primitives._compact_debug_value(
+            {"values": np.arange(20), "ik_resolver_init": "omitted"},
+            max_items=4,
+        )["values"]["omitted"]
+        is True
+    )
 
 
 def test_batch_two_ik_payloads_match_for_metadata_snapshots() -> None:
@@ -3872,7 +3977,10 @@ def test_batch_two_ik_payloads_match_for_metadata_snapshots() -> None:
     assert payload["available"] is True
     assert payload["ik_warning"]["active"] is True
     assert payload["ik_warning"]["codes"] == ["failed", "hold_entry", "hold_last_safe"]
-    assert status_payloads._build_ik_timing_payload(active_command=None)["available"] is False
+    assert (
+        status_payloads._build_ik_timing_payload(active_command=None)["available"]
+        is False
+    )
 
 
 def test_batch_three_debug_timing_payloads_preserve_snapshot_outputs() -> None:
@@ -3906,15 +4014,24 @@ def test_batch_three_debug_timing_payloads_preserve_snapshot_outputs() -> None:
         metadata={"seq": 7, "sender_timestamp": 9.25, "ignored": "x"},
     )
     result = SimpleNamespace(faults=(fault,), channels={"left_wrist_pose": channel})
-    assert debug_timing_payload._fault_signature(result.faults) == ("hold_last_safe:left_arm",)
-    assert debug_timing_payload._faults_log_payload(result) == legacy_entrypoint._faults_log_payload(result)
-    assert debug_timing_payload._channels_log_payload(result, now=10.0) == legacy_entrypoint._channels_log_payload(
+    assert debug_timing_payload._fault_signature(result.faults) == (
+        "hold_last_safe:left_arm",
+    )
+    assert debug_timing_payload._faults_log_payload(
+        result
+    ) == legacy_entrypoint._faults_log_payload(result)
+    assert debug_timing_payload._channels_log_payload(
+        result, now=10.0
+    ) == legacy_entrypoint._channels_log_payload(
         result,
         now=10.0,
     )
-    assert debug_timing_payload._phase_timings_log_payload(
-        [("slow", 0.02), ("fast", 0.001)]
-    )["top"][0]["name"] == "slow"
+    assert (
+        debug_timing_payload._phase_timings_log_payload(
+            [("slow", 0.02), ("fast", 0.001)]
+        )["top"][0]["name"]
+        == "slow"
+    )
     assert debug_timing_payload._latency_log_payload(None, now=10.0) == {
         "reference_time": 10.0,
         "step_age_ms": None,
@@ -3926,7 +4043,9 @@ def test_batch_three_debug_timing_payloads_preserve_snapshot_outputs() -> None:
     }
 
 
-def test_in_place_impedance_debug_catalogs_preserve_order_and_special_handling() -> None:
+def test_in_place_impedance_debug_catalogs_preserve_order_and_special_handling() -> (
+    None
+):
     compact_keys = legacy_entrypoint._IMPEDANCE_RECORD_COMPACT_KEYS
     debug_keys = legacy_entrypoint._IMPEDANCE_RECORD_DEBUG_KEYS
 
@@ -3956,10 +4075,7 @@ def test_in_place_impedance_debug_catalogs_preserve_order_and_special_handling()
         "pose_tracking_angular_rad",
     )
 
-    record = {
-        key: key
-        for key in set(compact_keys) | set(debug_keys) | {"ik_metadata"}
-    }
+    record = {key: key for key in set(compact_keys) | set(debug_keys) | {"ik_metadata"}}
     record["ik_metadata"] = {"status": "ok"}
     compact = legacy_entrypoint._impedance_record_compact_debug(record)
     debug = legacy_entrypoint._impedance_record_debug(record)
@@ -4054,6 +4170,7 @@ def test_batch_one_status_payloads_match_for_snapshot_inputs() -> None:
         now=10.0,
     )
 
+
 def test_control_input_poll_keeps_input_and_publish_order_without_hardware() -> None:
     events: list[str] = []
 
@@ -4099,12 +4216,18 @@ def test_control_input_poll_keeps_input_and_publish_order_without_hardware() -> 
     control._tracker_side_request_kind = "normal"
     control._tracker_side_request_deadline = 0.0
     control._q6_hold_recalibration_gesture = SimpleNamespace()
-    control._handle_foot_pad_special_arm_event = (
-        lambda event, *, now: events.append(f"foot_pad.route:{event}")
+    control._handle_foot_pad_special_arm_event = lambda event, *, now: events.append(
+        f"foot_pad.route:{event}"
     )
-    control.request_hold = lambda *, reason="manual": events.append(f"request_hold:{reason}")
-    control._poll_q6_hold_recalibration_gesture = lambda *, now: events.append("q6.poll")
-    control.publish_raw_tracker_pose_state = lambda *, now: events.append("publish.raw_tracker")
+    control.request_hold = lambda *, reason="manual": events.append(
+        f"request_hold:{reason}"
+    )
+    control._poll_q6_hold_recalibration_gesture = lambda *, now: events.append(
+        "q6.poll"
+    )
+    control.publish_raw_tracker_pose_state = lambda *, now: events.append(
+        "publish.raw_tracker"
+    )
     control.publish_gripper_status = lambda *, now: events.append("publish.gripper")
 
     control.poll()

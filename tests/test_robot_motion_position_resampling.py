@@ -6,6 +6,7 @@ from scipy.spatial.transform import Rotation
 
 from robot_motion.position_control import (
     CausalMotionResampler,
+    MotionTargetResampler,
     PoseActionMotionIntentStateMachine,
     TimestampedMotionTarget,
     build_uniform_time_grid,
@@ -24,7 +25,9 @@ def _z_pose(angle_deg: float, xyz: tuple[float, float, float]) -> np.ndarray:
     return pose
 
 
-def test_offline_resampling_uses_jittered_timestamps_and_appends_exact_endpoint() -> None:
+def test_offline_resampling_uses_jittered_timestamps_and_appends_exact_endpoint() -> (
+    None
+):
     start = 10.0
     targets = [
         TimestampedMotionTarget(
@@ -94,6 +97,42 @@ def test_pose_resampling_uses_linear_xyz_and_shortest_quaternion_arc() -> None:
     )
 
 
+def test_lazy_motion_target_resampler_matches_offline_reference_semantics() -> None:
+    targets = [
+        TimestampedMotionTarget(
+            timestamp=0.0,
+            source_index=0,
+            pose_by_side={"right": _z_pose(0.0, (0.0, 0.0, 0.0))},
+        ),
+        TimestampedMotionTarget(
+            timestamp=0.1,
+            source_index=1,
+            pose_by_side={"right": _z_pose(10.0, (0.02, 0.0, 0.0))},
+        ),
+    ]
+    eager = resample_motion_targets(targets, reference_hz=20.0)
+    lazy = MotionTargetResampler(targets)
+
+    assert lazy.source_timestamps == (0.0, 0.1)
+    for expected in eager:
+        actual = lazy.resample_at(
+            expected.timestamp,
+            sequence=expected.sequence,
+        )
+        assert actual.sequence == expected.sequence
+        assert actual.left_source_index == expected.left_source_index
+        assert actual.right_source_index == expected.right_source_index
+        assert actual.interpolation_alpha == pytest.approx(expected.interpolation_alpha)
+        np.testing.assert_allclose(
+            actual.pose_by_side["right"],
+            expected.pose_by_side["right"],
+        )
+        assert (
+            actual.metadata["pose_action_interval_velocity"]
+            == (expected.metadata["pose_action_interval_velocity"])
+        )
+
+
 def test_pose_speed_uses_action_interval_and_final_step_falls_back() -> None:
     targets = [
         TimestampedMotionTarget(
@@ -123,8 +162,12 @@ def test_pose_speed_uses_action_interval_and_final_step_falls_back() -> None:
     assert speed_inside["selection"] == "bracketing_current_to_next"
     assert speed_at_start["start_source_index"] == 0
     assert speed_at_start["end_source_index"] == 1
-    assert speed_at_start["by_side"]["right"]["linear_speed_p90_m_s"] == pytest.approx(0.2)
-    assert speed_inside["by_side"]["right"]["linear_speed_p90_m_s"] == pytest.approx(0.2)
+    assert speed_at_start["by_side"]["right"]["linear_speed_p90_m_s"] == pytest.approx(
+        0.2
+    )
+    assert speed_inside["by_side"]["right"]["linear_speed_p90_m_s"] == pytest.approx(
+        0.2
+    )
     assert speed_inside["by_side"]["right"]["angular_speed_p90_rad_s"] == pytest.approx(
         np.deg2rad(90.0)
     )
@@ -134,14 +177,18 @@ def test_pose_speed_uses_action_interval_and_final_step_falls_back() -> None:
     assert speed_at_next_action["selection"] == "current_to_next"
     assert speed_at_next_action["start_source_index"] == 1
     assert speed_at_next_action["end_source_index"] == 2
-    assert speed_at_next_action["by_side"]["right"]["linear_speed_p90_m_s"] == pytest.approx(0.3)
+    assert speed_at_next_action["by_side"]["right"][
+        "linear_speed_p90_m_s"
+    ] == pytest.approx(0.3)
 
     # The chunk/final-step rule has no successor and deliberately reuses the
     # previous -> current source-action interval.
     assert speed_at_final["selection"] == "previous_to_current_fallback"
     assert speed_at_final["start_source_index"] == 1
     assert speed_at_final["end_source_index"] == 2
-    assert speed_at_final["by_side"]["right"]["linear_speed_p90_m_s"] == pytest.approx(0.3)
+    assert speed_at_final["by_side"]["right"]["linear_speed_p90_m_s"] == pytest.approx(
+        0.3
+    )
 
 
 def test_pose_action_motion_intent_reuses_interval_speed_at_60hz() -> None:
@@ -170,7 +217,9 @@ def test_pose_action_motion_intent_reuses_interval_speed_at_60hz() -> None:
     assert states[-1]["evidence"]["quality_valid"] is True
 
 
-def test_causal_resampling_interpolates_only_when_both_brackets_were_available() -> None:
+def test_causal_resampling_interpolates_only_when_both_brackets_were_available() -> (
+    None
+):
     resampler = CausalMotionResampler()
     resampler.push(
         TimestampedMotionTarget(
@@ -217,7 +266,9 @@ def test_causal_resampling_interpolates_only_when_both_brackets_were_available()
         resampler.sample_at(2.1, emitted_timestamp=2.0)
 
 
-def test_causal_resampling_uses_future_logical_target_already_available_from_chunk() -> None:
+def test_causal_resampling_uses_future_logical_target_already_available_from_chunk() -> (
+    None
+):
     resampler = CausalMotionResampler()
     resampler.push(
         TimestampedMotionTarget(
@@ -260,9 +311,9 @@ def test_causal_pose_speed_respects_chunk_lookahead_and_tail_fallback() -> None:
         )
     )
     no_neighbor = resampler.sample_at(10.0, emitted_timestamp=10.0)
-    assert no_neighbor.metadata["pose_action_interval_velocity"][
-        "quality_valid"
-    ] is False
+    assert (
+        no_neighbor.metadata["pose_action_interval_velocity"]["quality_valid"] is False
+    )
 
     # Same-chunk next action is known at the current emission cut.
     resampler.push(

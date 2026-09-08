@@ -74,7 +74,9 @@ def _controller(selected_side: str = "left") -> FixArmCommandController:
     )
 
 
-def _channel(name: str, side: str, value: float, timestamp: float = 1.0) -> ObservationChannel:
+def _channel(
+    name: str, side: str, value: float, timestamp: float = 1.0
+) -> ObservationChannel:
     return ObservationChannel(
         channel_name=name,
         capability="pose6d" if name.endswith("_wrist_pose") else "joint_vector",
@@ -96,13 +98,105 @@ def _channels(
 ) -> dict[str, ObservationChannel]:
     return {
         "left_wrist_pose": _channel("left_wrist_pose", "left", left_wrist, timestamp),
-        "right_wrist_pose": _channel("right_wrist_pose", "right", right_wrist, timestamp),
+        "right_wrist_pose": _channel(
+            "right_wrist_pose", "right", right_wrist, timestamp
+        ),
         "left_hand_q6": _channel("left_hand_q6", "left", left_hand, timestamp),
         "right_hand_q6": _channel("right_hand_q6", "right", right_hand, timestamp),
     }
 
 
 class FixArmCommandControllerTests(unittest.TestCase):
+    def test_arm_only_fix_can_start_from_current_runtime_home_without_input(
+        self,
+    ) -> None:
+        controller = FixArmCommandController(
+            active_sides=("left", "right"),
+            selected_side="left",
+            required_effectors_by_side={
+                "left": ("left_arm",),
+                "right": ("right_arm",),
+            },
+        )
+        left_home = np.linspace(0.1, 0.6, 6)
+        controller.bind_runtime_home_arm_snapshot(
+            {"left": left_home, "right": np.zeros(6)},
+            epoch=17,
+        )
+
+        transition = controller.freeze_selected_from_runtime_home(
+            now=2.0,
+            expected_epoch=17,
+        )
+
+        self.assertTrue(transition.ok)
+        self.assertEqual(controller.fixed_sides, ("left",))
+        self.assertEqual(controller.scope_for_side("left"), "arm_only")
+        command = TeleopCommand(timestamp=2.1)
+        command.add_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.full(6, 9.0),
+            )
+        )
+        command.add_command(
+            EffectorCommand(
+                effector_name="right_arm",
+                side="right",
+                command_type="joint_vector",
+                value=np.full(6, 3.0),
+            )
+        )
+        filtered = controller.filter_command(command, None, 2.1)
+        np.testing.assert_allclose(filtered.commands["left_arm"].value, left_home)
+        np.testing.assert_allclose(
+            filtered.commands["right_arm"].value,
+            np.full(6, 3.0),
+        )
+        self.assertEqual(
+            filtered.commands["left_arm"].metadata["runtime_home_epoch"],
+            17,
+        )
+        self.assertNotIn("left_hand", filtered.commands)
+
+    def test_runtime_home_fix_rejects_stale_epoch_and_hand_scope(self) -> None:
+        qpos = {"left": np.zeros(6), "right": np.ones(6)}
+        arm_only = FixArmCommandController(
+            active_sides=("left", "right"),
+            selected_side="left",
+            required_effectors_by_side={
+                "left": ("left_arm",),
+                "right": ("right_arm",),
+            },
+        )
+        arm_only.bind_runtime_home_arm_snapshot(qpos, epoch=4)
+        stale = arm_only.freeze_selected_from_runtime_home(
+            now=1.0,
+            expected_epoch=5,
+        )
+        self.assertFalse(stale.ok)
+        self.assertIn("epoch mismatch", stale.message)
+        self.assertFalse(arm_only.fixed)
+        arm_only.cancel_active(now=1.1, clear_snapshots=True)
+        cleared = arm_only.freeze_selected_from_runtime_home(
+            now=1.2,
+            expected_epoch=4,
+        )
+        self.assertFalse(cleared.ok)
+        self.assertIn("cached=None", cleared.message)
+
+        arm_and_hand = _controller("left")
+        arm_and_hand.bind_runtime_home_arm_snapshot(qpos, epoch=4)
+        unsupported = arm_and_hand.freeze_selected_from_runtime_home(
+            now=1.0,
+            expected_epoch=4,
+        )
+        self.assertFalse(unsupported.ok)
+        self.assertIn("arm_only", unsupported.message)
+        self.assertFalse(arm_and_hand.fixed)
+
     def test_two_pedal_switch_replaces_fixed_side_atomically(self) -> None:
         controller = _controller("right")
         controller.filter_channels(
@@ -191,7 +285,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
             "stable_tracker_sample_accepted",
         )
 
-    def test_profile_transition_can_rebase_from_latest_fresh_moving_sample(self) -> None:
+    def test_profile_transition_can_rebase_from_latest_fresh_moving_sample(
+        self,
+    ) -> None:
         controller = _controller("right")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -272,7 +368,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertFalse(status["fresh_rebase_ready"])
 
-    def test_single_arm_mode_caches_both_sides_for_immediate_followup_switch(self) -> None:
+    def test_single_arm_mode_caches_both_sides_for_immediate_followup_switch(
+        self,
+    ) -> None:
         controller = _controller("right")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -376,7 +474,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertEqual(status["reason"], "tracker_channel_invalid")
 
-    def test_two_pedal_transition_uses_actual_fixed_side_after_selection_drift(self) -> None:
+    def test_two_pedal_transition_uses_actual_fixed_side_after_selection_drift(
+        self,
+    ) -> None:
         controller = _controller("left")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -541,7 +641,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
         self.assertTrue(controller.complete_recalibration(now=1.5).ok)
         self.assertEqual(controller.fixed_sides, ())
 
-    def test_both_sides_can_be_fixed_and_releasing_one_keeps_the_other_fixed(self) -> None:
+    def test_both_sides_can_be_fixed_and_releasing_one_keeps_the_other_fixed(
+        self,
+    ) -> None:
         controller = _controller("left")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -563,7 +665,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
             1.3,
         )
         np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
-        np.testing.assert_allclose(filtered.commands["right_arm"].value, np.full(6, 2.0))
+        np.testing.assert_allclose(
+            filtered.commands["right_arm"].value, np.full(6, 2.0)
+        )
 
         self.assertTrue(controller.select_side("left").ok)
         self.assertTrue(
@@ -584,7 +688,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
         init.active_side = "right"
         transition = coordinator.update(fix_controller=fix, init_controller=init)
         self.assertTrue(transition.entered)
-        self.assertEqual(transition.source_by_side, {"left": "fix_arm", "right": "init_fixed"})
+        self.assertEqual(
+            transition.source_by_side, {"left": "fix_arm", "right": "init_fixed"}
+        )
 
         # Starting target-side Home recapture is still a pending release; the
         # episode must remain paused until recapture completes.
@@ -615,7 +721,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
         self.assertEqual(transition.locked_sides, ("left", "right"))
         self.assertFalse(coordinator.active)
 
-    def test_freeze_reuses_fixed_side_input_channels_and_leaves_other_side_live(self) -> None:
+    def test_freeze_reuses_fixed_side_input_channels_and_leaves_other_side_live(
+        self,
+    ) -> None:
         controller = _controller("left")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -631,14 +739,24 @@ class FixArmCommandControllerTests(unittest.TestCase):
         self.assertTrue(transition.ok)
 
         filtered_channels = controller.filter_channels(
-            _channels(left_wrist=10.0, right_wrist=20.0, left_hand=30.0, right_hand=40.0),
+            _channels(
+                left_wrist=10.0, right_wrist=20.0, left_hand=30.0, right_hand=40.0
+            ),
             now=1.2,
         )
 
-        np.testing.assert_allclose(filtered_channels["left_wrist_pose"].value, np.eye(4) * 1.0)
-        np.testing.assert_allclose(filtered_channels["left_hand_q6"].value, np.full(6, 3.0))
-        np.testing.assert_allclose(filtered_channels["right_wrist_pose"].value, np.eye(4) * 20.0)
-        np.testing.assert_allclose(filtered_channels["right_hand_q6"].value, np.full(6, 40.0))
+        np.testing.assert_allclose(
+            filtered_channels["left_wrist_pose"].value, np.eye(4) * 1.0
+        )
+        np.testing.assert_allclose(
+            filtered_channels["left_hand_q6"].value, np.full(6, 3.0)
+        )
+        np.testing.assert_allclose(
+            filtered_channels["right_wrist_pose"].value, np.eye(4) * 20.0
+        )
+        np.testing.assert_allclose(
+            filtered_channels["right_hand_q6"].value, np.full(6, 40.0)
+        )
         self.assertEqual(filtered_channels["left_wrist_pose"].timestamp, 1.2)
         self.assertTrue(filtered_channels["left_wrist_pose"].metadata["fix_arm_frozen"])
 
@@ -669,17 +787,27 @@ class FixArmCommandControllerTests(unittest.TestCase):
         self.assertEqual(filtered.metadata["fix_arm_mode"], "fixed")
         self.assertEqual(filtered.metadata["fix_arm_scope"], "arm_and_end_effector")
         self.assertEqual(filtered.metadata["fix_arm_warning"], "")
-        self.assertEqual(filtered.metadata["fix_arm_effectors"], ["left_arm", "left_hand"])
+        self.assertEqual(
+            filtered.metadata["fix_arm_effectors"], ["left_arm", "left_hand"]
+        )
         np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
-        np.testing.assert_allclose(filtered.commands["left_hand"].value, np.full(6, 3.0))
-        np.testing.assert_allclose(filtered.commands["right_arm"].value, np.full(6, 20.0))
-        np.testing.assert_allclose(filtered.commands["right_hand"].value, np.full(6, 40.0))
+        np.testing.assert_allclose(
+            filtered.commands["left_hand"].value, np.full(6, 3.0)
+        )
+        np.testing.assert_allclose(
+            filtered.commands["right_arm"].value, np.full(6, 20.0)
+        )
+        np.testing.assert_allclose(
+            filtered.commands["right_hand"].value, np.full(6, 40.0)
+        )
         self.assertTrue(filtered.commands["left_arm"].metadata["fix_arm_active"])
         self.assertEqual(filtered.commands["left_arm"].metadata["fix_arm_side"], "left")
         for effector_command in filtered.commands.values():
             np.testing.assert_equal(np.asarray(effector_command.value).shape, (6,))
 
-    def test_arm_only_fix_emits_a_warning_when_no_end_effector_is_configured(self) -> None:
+    def test_arm_only_fix_emits_a_warning_when_no_end_effector_is_configured(
+        self,
+    ) -> None:
         controller = FixArmCommandController(
             active_sides=("left", "right"),
             required_effectors_by_side={
@@ -708,11 +836,17 @@ class FixArmCommandControllerTests(unittest.TestCase):
             1.2,
         )
         self.assertEqual(filtered.metadata["fix_arm_scope"], "arm_only")
-        self.assertIn("end_effector_not_configured", filtered.metadata["fix_arm_warning"])
+        self.assertIn(
+            "end_effector_not_configured", filtered.metadata["fix_arm_warning"]
+        )
         np.testing.assert_allclose(filtered.commands["left_arm"].value, np.full(6, 1.0))
-        np.testing.assert_allclose(filtered.commands["left_hand"].value, np.full(6, 30.0))
+        np.testing.assert_allclose(
+            filtered.commands["left_hand"].value, np.full(6, 30.0)
+        )
 
-    def test_freeze_does_not_inject_fixed_command_when_pipeline_omits_it_by_default(self) -> None:
+    def test_freeze_does_not_inject_fixed_command_when_pipeline_omits_it_by_default(
+        self,
+    ) -> None:
         controller = _controller("left")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -738,9 +872,13 @@ class FixArmCommandControllerTests(unittest.TestCase):
         filtered = controller.filter_command(right_only, None, 1.2)
 
         self.assertEqual(set(filtered.commands), {"right_arm"})
-        np.testing.assert_allclose(filtered.commands["right_arm"].value, np.full(6, 20.0))
+        np.testing.assert_allclose(
+            filtered.commands["right_arm"].value, np.full(6, 20.0)
+        )
 
-    def test_freeze_can_inject_allowed_fixed_effector_for_out_of_band_dispatch(self) -> None:
+    def test_freeze_can_inject_allowed_fixed_effector_for_out_of_band_dispatch(
+        self,
+    ) -> None:
         controller = _controller("left")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -762,7 +900,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(set(hand_only.commands), {"left_hand"})
-        np.testing.assert_allclose(hand_only.commands["left_hand"].value, np.full(6, 3.0))
+        np.testing.assert_allclose(
+            hand_only.commands["left_hand"].value, np.full(6, 3.0)
+        )
 
     def test_freeze_requires_previous_commands_for_all_required_effectors(self) -> None:
         controller = _controller("right")
@@ -831,7 +971,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
 
         filtered = controller.filter_faults(faults, {}, 1.2)
 
-        self.assertEqual([fault.message for fault in filtered], ["right invalid", "slow"])
+        self.assertEqual(
+            [fault.message for fault in filtered], ["right invalid", "slow"]
+        )
 
     def test_cancel_active_releases_fixed_side_for_hold(self) -> None:
         controller = _controller("left")
@@ -859,7 +1001,9 @@ class FixArmCommandControllerTests(unittest.TestCase):
 
 
 class FixArmRuntimeHomeTests(unittest.TestCase):
-    def test_incremental_home_capture_updates_only_fixed_side_and_releases(self) -> None:
+    def test_incremental_home_capture_updates_only_fixed_side_and_releases(
+        self,
+    ) -> None:
         controller = _controller("left")
         controller.filter_channels(
             _channels(left_wrist=1.0, right_wrist=2.0, left_hand=3.0, right_hand=4.0),
@@ -907,9 +1051,15 @@ class FixArmRuntimeHomeTests(unittest.TestCase):
             channels={"left_wrist_pose": channel},
             calibration=calibration,
             now=1.3,
-            pose_from_channel=lambda item, _calibration: np.asarray(item.value, dtype=float),
+            pose_from_channel=lambda item, _calibration: np.asarray(
+                item.value, dtype=float
+            ),
             mean_pose=lambda samples: samples[0],
-            resolve_robot_home=lambda side: (robot_home.copy(), np.arange(6), "test_home"),
+            resolve_robot_home=lambda side: (
+                robot_home.copy(),
+                np.arange(6),
+                "test_home",
+            ),
             side_retargeter=lambda side: retargeter,
             tcp_mode="tool_tcp",
         )
@@ -921,9 +1071,15 @@ class FixArmRuntimeHomeTests(unittest.TestCase):
             channels={"left_wrist_pose": channel},
             calibration=calibration,
             now=1.4,
-            pose_from_channel=lambda item, _calibration: np.asarray(item.value, dtype=float),
+            pose_from_channel=lambda item, _calibration: np.asarray(
+                item.value, dtype=float
+            ),
             mean_pose=lambda samples: samples[0],
-            resolve_robot_home=lambda side: (robot_home.copy(), np.arange(6), "test_home"),
+            resolve_robot_home=lambda side: (
+                robot_home.copy(),
+                np.arange(6),
+                "test_home",
+            ),
             side_retargeter=lambda side: retargeter,
             tcp_mode="tool_tcp",
         )
@@ -946,9 +1102,15 @@ class FixArmRuntimeHomeTests(unittest.TestCase):
                 channels={"left_wrist_pose": channel},
                 calibration=calibration,
                 now=timestamp,
-                pose_from_channel=lambda item, _calibration: np.asarray(item.value, dtype=float),
+                pose_from_channel=lambda item, _calibration: np.asarray(
+                    item.value, dtype=float
+                ),
                 mean_pose=lambda samples: samples[0],
-                resolve_robot_home=lambda side: (robot_home.copy(), np.arange(6), "test_home"),
+                resolve_robot_home=lambda side: (
+                    robot_home.copy(),
+                    np.arange(6),
+                    "test_home",
+                ),
                 side_retargeter=lambda side: retargeter,
                 tcp_mode="tool_tcp",
             )
@@ -959,7 +1121,9 @@ class FixArmRuntimeHomeTests(unittest.TestCase):
             calibration.arms["left_arm"].home_pose_for_tcp_mode(),
             robot_home,
         )
-        np.testing.assert_allclose(calibration.captured_home_qpos["left_arm"], np.arange(6))
+        np.testing.assert_allclose(
+            calibration.captured_home_qpos["left_arm"], np.arange(6)
+        )
         self.assertIsNotNone(retargeter.anchors)
         self.assertIsNone(calibration.arms["right_arm"].home_pose_for_tcp_mode())
 
@@ -1037,7 +1201,9 @@ class FixArmPoseSnapshotTests(unittest.TestCase):
                 saved["commands"]["active_command"]["commands"]["right_arm"]["value"],
                 [2.0] * 6,
             )
-            index_rows = recorder.index_path.read_text(encoding="utf-8").strip().splitlines()
+            index_rows = (
+                recorder.index_path.read_text(encoding="utf-8").strip().splitlines()
+            )
             self.assertEqual(len(index_rows), 1)
             self.assertEqual(json.loads(index_rows[0])["path"], str(record.path))
 

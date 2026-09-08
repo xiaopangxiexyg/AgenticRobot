@@ -3,7 +3,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from robot_motion.runtime import EffectorCommand, TeleopCommand
+from robot_motion.runtime import (
+    EffectorCommand,
+    TeleopCommand,
+    command_effector_kind_subset,
+)
 from teleop_runtime.deploy import action_dispatch, run_policy
 
 
@@ -55,6 +59,7 @@ class _Backend:
 
 
 def test_run_policy_preserves_action_dispatch_compatibility_exports() -> None:
+    assert action_dispatch.command_effector_kind_subset is command_effector_kind_subset
     assert (
         run_policy.command_effector_kind_subset
         is action_dispatch.command_effector_kind_subset
@@ -67,12 +72,15 @@ def test_run_policy_preserves_action_dispatch_compatibility_exports() -> None:
 
 def test_command_effector_kind_subset_copies_only_requested_commands() -> None:
     command = _mixed_command()
+    execution_work_item = object()
+    command.execution_work_item = execution_work_item
 
     subset = action_dispatch.command_effector_kind_subset(command, kind="hand")
 
     assert subset is not None
     assert subset.timestamp == 12.5
     assert subset.metadata == {"source": "unit"}
+    assert subset.execution_work_item is execution_work_item
     assert set(subset.commands) == {"left_hand"}
     assert subset.commands["left_hand"] is not command.commands["left_hand"]
     subset.commands["left_hand"].metadata["owner"] = "changed"
@@ -105,9 +113,10 @@ def test_discrete_dispatch_records_generic_backend_receipt() -> None:
     assert command.metadata["position_discrete_backend_receipts"]["left_hand"] == (
         effector_receipt
     )
-    assert command.commands["left_hand"].metadata[
-        "position_discrete_backend_receipt"
-    ] == effector_receipt
+    assert (
+        command.commands["left_hand"].metadata["position_discrete_backend_receipt"]
+        == effector_receipt
+    )
 
 
 def test_discrete_dispatch_exception_is_attached_before_propagation() -> None:
