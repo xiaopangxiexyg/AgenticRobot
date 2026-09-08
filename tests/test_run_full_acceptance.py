@@ -28,7 +28,26 @@ def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
         )
     wrapper = scripts / "run_full_acceptance.sh"
     shutil.copy2(SOURCE_WRAPPER, wrapper)
-    shutil.copy2(SOURCE_SHARDING, scripts / "pytest_sharding.py")
+    sharding_real = scripts / "pytest_sharding_real.py"
+    shutil.copy2(SOURCE_SHARDING, sharding_real)
+    (scripts / "pytest_sharding.py").write_text(
+        """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+if sys.argv[1:2] == ["check-sockets"]:
+    status = int(os.environ.get("FAKE_SOCKET_PREFLIGHT_STATUS", "0"))
+    if status:
+        print("fake socket preflight rejected", file=sys.stderr)
+    raise SystemExit(status)
+
+real = Path(__file__).with_name("pytest_sharding_real.py")
+raise SystemExit(subprocess.run([sys.executable, str(real), *sys.argv[1:]]).returncode)
+""",
+        encoding="utf-8",
+    )
 
     sync_root = tmp_path / "sync"
     sync_root.mkdir()
@@ -81,6 +100,7 @@ def _run_wrapper(
     *,
     shard_count: int | str | None = None,
     fail_shard: str = "",
+    socket_preflight_status: int = 0,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.pop("DEXTELEOP_FULL_ACCEPTANCE_SHARDS", None)
@@ -90,6 +110,7 @@ def _run_wrapper(
             "DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT": str(run_root),
             "FAKE_FAIL_SHARD": fail_shard,
             "FAKE_SHARD_COUNT": str(4 if shard_count is None else shard_count),
+            "FAKE_SOCKET_PREFLIGHT_STATUS": str(socket_preflight_status),
             "FAKE_SYNC_ROOT": str(sync_root),
         }
     )
@@ -200,6 +221,30 @@ def test_wrapper_rejects_unsupported_shard_counts(
 
     assert completed.returncode == 2
     assert "must be an integer from 1 to 6" in completed.stderr
+    assert not list(sync_root.glob("*.started"))
+    assert not os.path.lexists(checkout / "assets")
+
+
+def test_wrapper_rejects_missing_socket_capability_before_artifact_root(
+    tmp_path: Path,
+) -> None:
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    run_root = tmp_path / "socket-blocked"
+
+    completed = _run_wrapper(
+        wrapper,
+        sync_root,
+        assets,
+        run_root,
+        socket_preflight_status=2,
+    )
+
+    assert completed.returncode == 2
+    assert "fake socket preflight rejected" in completed.stderr
+    assert "complete acceptance requires working loopback TCP" in completed.stderr
+    assert not os.path.lexists(run_root)
     assert not list(sync_root.glob("*.started"))
     assert not os.path.lexists(checkout / "assets")
 

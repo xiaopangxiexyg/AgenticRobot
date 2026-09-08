@@ -100,10 +100,51 @@ def test_socket_preflight_reports_the_blocked_transport(
         module.check_required_local_sockets()
 
 
-def test_socket_preflight_cli_accepts_local_transports() -> None:
-    completed = _run("check-sockets")
+def test_socket_preflight_accepts_both_local_transports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_sharding_module()
+    families: list[int] = []
 
-    assert completed.returncode == 0, completed.stderr
+    class FakeConnection:
+        def close(self) -> None:
+            return None
+
+    class FakeSocket:
+        def __init__(self, family: int, _kind: int) -> None:
+            self.family = family
+            self.address = None
+            families.append(family)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def bind(self, address) -> None:
+            self.address = address
+
+        def listen(self, _backlog: int) -> None:
+            return None
+
+        def getsockname(self):
+            return self.address
+
+        def connect(self, _address) -> None:
+            return None
+
+        def accept(self):
+            return FakeConnection(), None
+
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+
+    module.check_required_local_sockets()
+
+    assert families == [socket.AF_UNIX, socket.AF_UNIX, socket.AF_INET, socket.AF_INET]
 
 
 def _write_junit(path: Path, *, name: str, failures: int = 0) -> None:

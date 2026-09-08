@@ -348,3 +348,73 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 本批完成了低风险的 5/6 分片 opt-in、同一次 Run 内共享 MuJoCo 内容缓存、OSQP 显式状态返回策略，以及一个由全量验收暴露的测试导入顺序修复。绿色实现运行覆盖 795 个模块、9102 个 testcase，0 failures、0 errors，墙钟 206.84 秒；默认值保持 4 是有意的安全决策。
 
 本次复核时 development 为 c0140d0fbf362bf9b3e94e840548a007b0a0039f；它自 merge-base 起未修改候选的 9 个文件，隔离 merge-tree 无冲突标记。候选已标记 `ready-for-integration`，但尚未合并或 push。集成者仍必须从固定 development 创建隔离 integration worktree、合入固定候选 tip、验证组合提交，并在获得明确授权后才可推进 development 或远端。
+
+## 12. 后续阶段：能力预检与六分片再平衡
+
+本节覆盖在上一候选仍等待集成期间继续完成的下一阶段，并取代上节对“当前候选”的描述；前述历史运行和设计约束仍然有效。
+
+### 12.1 固定身份与变更边界
+
+后续候选从当时的 `development` `c2c3abbb6f66d5529d617831ade06af4fe698750` 建立，先合入固定的上一阶段候选 `9723125d1ce58aefef964d28b66df5602cbb3aec`，形成依赖检查点 `6e0cc3d3614d09a59eba4b0e83b3391ad1a92f4f`。本阶段实现提交为：
+
+- branch: `task/root/full-acceptance-capability-balance-20260908`；
+- implementation commit: `151e093603ad85047a2dd6775104c45f9dc712f7`；
+- tree: `4de741099df6f80b75a46459efc2b4a18d89bb65`；
+- worktree: `/tmp/ar-full-acceptance-capability-balance-20260908`。
+
+新增行为只有两类：
+
+1. 完整验收在建立 artifact root 和启动 shard 之前，实际创建、监听、连接并接受一次 loopback TCP 与 AF_UNIX socket；能力缺失时立即失败；
+2. `FULL_WEIGHTS` 只使用上一轮同一 socket-capable 绿色 JUnit 中累计用时不少于 5 秒的模块进行刷新。
+
+没有删除测试、改变 `not hardware` marker、增加 skip/xfail、放宽断言或超时，也没有修改硬件、真机、远端和 `legacy/`。相同 base 与实现提交均包含 799 个 tracked `tests/test_*.py` 模块；最终计划包含 799 个唯一模块，missing/extra 均为空。
+
+### 12.2 能力预检证据
+
+在不允许本地 socket 的受限上下文中，wrapper 在约 0.2 秒内以 code 2 拒绝：
+
+```
+pytest_sharding: error: required local socket capability unavailable for AF_UNIX: [Errno 1] Operation not permitted
+[dexteleop-full-acceptance] ERROR: complete acceptance requires working loopback TCP and Unix sockets
+```
+
+指定的 Run root 没有被创建，因此不会先消耗数分钟再以一批可预知的 transport failures 结束。socket-capable 上下文中的 wrapper/sharding 聚焦测试为 12 passed；受限上下文中排除必须成功创建 socket 的正向 CLI 用例后为 4 passed、1 deselected。
+
+### 12.3 绿色六分片结果
+
+最终固定实现提交在 socket-capable 本机上下文中的复验 artifact 为：
+
+```
+/tmp/ar-full-acceptance-151e0936-six-shard-rerun-20260908
+```
+
+结果如下：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 测试模块 | 799 |
+| aggregate testcase | 9306 |
+| passed / skipped | 9290 / 16 |
+| failures / errors | 0 / 0 |
+| JUnit 各 shard 时间合计 | 1139.432 s |
+| 最长 shard | 196.335 s |
+| aggregate JUnit SHA-256 | `994d5d2b11a2befac4476cfccbea75b8ac10d49060a0aed2ec3a3c7989f8dc31` |
+
+六个 shard 的 JUnit 时间分别为 196.335、194.023、191.847、187.007、188.534、181.686 秒，全部 status 0。计划估算分别为 192.924800、192.923020、192.921540、192.922420、192.925440、192.922360 秒；估算的平衡只用于分配，不替代实际运行证据。
+
+上一绿色固定组合 `677fea4be03a43018aaa7c8d34d4153f107264c7` 的 795 模块运行最长 shard 为 212.905 秒。本次代码基线新增了测试，因此只能作保守的实测快照比较：在覆盖模块从 795 增至 799、aggregate testcase 从 9096 增至 9306 的情况下，关键路径仍减少 16.570 秒，约 7.8%。这不是跨主机 SLA，集成后的固定组合仍需重新运行。
+
+### 12.4 首轮抖动与判定
+
+同一实现提交的首轮 6-shard 运行保存在：
+
+```
+/tmp/ar-full-acceptance-151e0936-six-shard-20260908
+```
+
+它覆盖相同的 799 模块和 9306 个唯一 testcase，但有 1 failure：
+`tests/test_mujoco_state_bc_live_hitl.py::test_state_bc_policy_reaches_mujoco_and_supports_human_handback` 在 human handback 时触发 3 秒 admission timeout。该用例在相同提交上单独连续运行 3 次均通过（约 8.83、8.09、8.17 秒），随后在完整六分片复验中通过（6.92 秒）。因此当前证据支持“负载下的一次性调度抖动”，不支持修改功能实现或放宽安全相关超时；失败 artifact 保留，不能把首轮标成绿色。
+
+### 12.5 当前交付边界
+
+本阶段候选是 clean、固定的 ready-for-integration 输入，不等于已合入 `development`，也不等于 Harness Profile 已在最终集成提交上通过。集成 owner 应重新读取届时的 `development`、检查与并行候选的路径及语义重叠、在隔离 worktree 合入固定 tip，并在最终组合上重跑聚焦检查和 socket-capable 完整验收。没有明确授权时不得移动 `development` 或 push。
