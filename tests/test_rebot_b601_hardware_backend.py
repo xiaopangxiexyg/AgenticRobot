@@ -504,7 +504,7 @@ def test_feedback_admission_window_does_not_relax_outgoing_position_limits() -> 
     )
     feedback_limits = (
         (-3.0, 3.0),
-        (-0.006, 3.14),
+        (-0.01, 3.14),
         (-0.003, 3.14),
         (-math.pi / 2.0 - 0.001, math.pi / 2.0),
         (-1.57, 1.57),

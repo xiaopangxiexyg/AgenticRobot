@@ -446,6 +446,22 @@ def test_enabled_shutdown_always_attempts_hold_before_disable() -> None:
     )
 
 
+def test_protective_hold_notice_is_high_visibility_and_log_safe() -> None:
+    notice = probe._protective_hold_notice(
+        "protective hold degraded",
+        "ARM STATE: joint1..joint6 remain ENABLED.",
+        "DAMPING: UNAVAILABLE while feedback is untrusted.",
+    )
+
+    lines = notice.splitlines()
+    assert lines[0] == "=" * 72
+    assert lines[-1] == "=" * 72
+    assert "[B601] !!! PROTECTIVE HOLD DEGRADED !!!" in lines
+    assert "[B601] ARM STATE: joint1..joint6 remain ENABLED." in lines
+    assert "[B601] DAMPING: UNAVAILABLE while feedback is untrusted." in lines
+    assert "\x1b" not in notice
+
+
 def test_duration_completion_latches_hold_and_interrupts_active_record() -> None:
     stop = {"requested": False, "full_disable_requested": False}
     capture = probe.GravityCalibrationCapture(20.0)
@@ -709,7 +725,7 @@ def test_feedback_boundary_normalization_is_per_joint_and_preserves_raw_values()
 
 
 def test_feedback_boundary_normalization_does_not_admit_more_negative_values() -> None:
-    for index, value in ((1, -6.0001e-3), (2, -3.0001e-3)):
+    for index, value in ((1, -10.0001e-3), (2, -3.0001e-3)):
         raw_values = [0.0] * 6
         raw_values[index] = value
         raw = tuple(raw_values)
@@ -749,12 +765,27 @@ def test_feedback_admission_limits_extend_only_approved_boundary_windows() -> No
     admission = probe.build_feedback_admission_position_limits(strict)
 
     assert admission[:1] == strict[:1]
-    assert admission[1] == pytest.approx((-0.006, 3.14))
+    assert admission[1] == pytest.approx((-0.01, 3.14))
     assert admission[2] == pytest.approx((-0.003, 3.14))
     assert admission[3] == pytest.approx(
         (-math.pi / 2.0 - 0.001, math.pi / 2.0)
     )
     assert admission[4:] == strict[4:]
+
+
+def test_feedback_boundary_normalization_admits_observed_j2_startup_transient_only() -> None:
+    observed = -0.0076273283921182156
+    raw = (0.1, observed, 0.2, 0.3, 0.4, 0.5)
+
+    normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+    assert normalized == (0.1, 0.0, 0.2, 0.3, 0.4, 0.5)
+    assert normalized_joint_names == ("joint2",)
+
+    beyond = (0.1, -0.0100001, 0.2, 0.3, 0.4, 0.5)
+    unchanged, unchanged_joint_names = probe.normalize_feedback_boundary_qpos(beyond)
+    assert unchanged == beyond
+    assert unchanged_joint_names == ()
 
 
 def test_backend_feedback_diagnostics_preserve_bad_finite_position() -> None:
@@ -1023,7 +1054,7 @@ def test_feedback_stability_probe_normalizes_only_admitted_j2_j3_boundary(tmp_pa
         "joint4": 0,
     }
     assert boundary["intervals_rad"] == {
-        "joint2": (-6.0e-3, 0.0),
+        "joint2": (-1.0e-2, 0.0),
         "joint3": (-3.0e-3, 0.0),
         "joint4": pytest.approx(
             (-math.pi / 2.0 - 1.0e-3, -math.pi / 2.0)
@@ -2171,6 +2202,7 @@ def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
 
 def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
     gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
@@ -2243,6 +2275,12 @@ def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
     assert telemetry["entry_count"] == 1
     assert telemetry["command_count"] == 2
     assert telemetry["escalation_reason"] is None
+    terminal = capsys.readouterr().out
+    assert "!!! PROTECTIVE HOLD LATCHED !!!" in terminal
+    assert "CONTROL: live gravity compensation and damping are ACTIVE." in terminal
+    assert "!!! PROTECTIVE HOLD DEGRADED !!!" in terminal
+    assert "DAMPING: motor-local damping remains ACTIVE." in terminal
+    assert "REASON: fault hold: protective hold feedback is not complete" in terminal
 
 
 def test_degraded_fault_hold_recovers_live_gravity_without_disable(
@@ -2493,6 +2531,52 @@ def test_degraded_entry_uses_cached_gravity_when_live_entry_is_unavailable(
     assert full_receipt is None
     assert errors == []
     assert telemetry["entry_count"] == 1
+
+
+def test_degraded_entry_without_driver_damping_reports_damping_unavailable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    backend = _FaultHoldBackend(
+        cached_receipts=(_fault_hold_command_receipt(accepted=True),),
+    )
+
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=None,
+        fault_qvel_rad_s=None,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=1,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+        cached_qpos_rad=q,
+        cached_gravity_tau_nm=gravity,
+        degraded_entry_reason="simulated unavailable feedback",
+    )
+
+    hold_count, _latest_tau, first, _non_hold, full_receipt, errors = result
+    assert hold_count == 1
+    assert first is not None and first.accepted
+    assert full_receipt is None
+    assert errors == []
+    terminal = capsys.readouterr().out
+    assert "!!! PROTECTIVE HOLD DEGRADED !!!" in terminal
+    assert "DAMPING: UNAVAILABLE while feedback is untrusted" in terminal
+    assert "!!! PROTECTIVE HOLD LATCHED !!!" in terminal
+    assert "CONTROL: DEGRADED cached gravity" in terminal
 
 
 def test_fault_hold_snapshot_rejects_out_of_limit_q() -> None:

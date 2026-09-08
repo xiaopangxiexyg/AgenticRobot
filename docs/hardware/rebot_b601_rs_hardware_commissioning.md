@@ -78,14 +78,18 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   MIT/POS_VEL 控制帧，也不改变运行前已经存在的电机状态；`CAPTURED` 只表示采样完成，
   不能解读为力控或硬件通过。该结果用于判断 `last-safe` 速度门是否被反馈量化噪声触发，
   不允许据此直接放宽保护阈值。
-- 反馈进入限位/速度/阻抗计算前，J2 的已标定边界
-  `-6e-3 <= q < 0 rad`、J3 的已观测边界 `-3e-3 <= q < 0 rad` 会被表示为合法的
+- 反馈进入限位/速度/阻抗计算前，J2 的已观测零位/启动边界
+  `-1e-2 <= q < 0 rad`、J3 的已观测边界 `-3e-3 <= q < 0 rad` 会被表示为合法的
   `0 rad`。J4 的运行坐标额定边界按权威 `+/-pi/2` 表示（源 URDF 的
   `-1.57/1.57` 仅是两位小数的记录），并额外接纳
   `-pi/2-0.001 <= q < -pi/2 rad`，投影到精确的 `-pi/2`。这些都是反馈状态的
   有界投影，不修改源 URDF 或真实机械硬限位；反馈窗口本身不改变出站参考或
   torque/slew 包络。超过各自窗口的读数仍 fail-closed。JSON 样本同时保留 `raw_qpos_rad`、归一化后的
   `qpos_rad` 和 `boundary_normalized_joint_names`，便于复核实际读数。
+- J2 的 `-1e-2 rad` 是只读接纳下限，不是常规工作范围：两次零位只读捕获曾观察到
+  `-4.943/-4.517 mrad`，2026-09-08 使用 host-id 限定反馈的启动锁/重力交接又观察到
+  连贯的 `-7.627 mrad` 边界瞬态，因此仅对 J2 保留到 `-10 mrad` 的整值余量。J3/J4
+  窗口和全部出站命令限位保持不变；比该下限更负的 J2 反馈仍 fail-closed。
 - active low-gain probe 用相邻 normalized q 与精确 host receive `dt` 计算 qvel，再用连续
   qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0`、非有限值、
   qvel 或 qacc 越限都在任何 MIT dispatch 前拒绝。JSON 的 `motion_guard.rejected_sample`
@@ -101,7 +105,10 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   ID、参数 ID、原始值、可用时的 IEEE-754 单精度位模式和接纳区间；坏帧不会被任何 backend 消费者误当成完整状态。出站 MIT/
   POS_VEL 仍只使用严格 URDF 包络，读侧窗口不能放宽命令限位。active probe 会把每关节
   backend 诊断写入 `motion_guard.rejected_sample.backend_joint_diagnostics`，随后复用上一份
-  已验证的六轴重力+阻尼缓存进入 `PROTECTIVE_HOLD`；只有完整缓存发送也失败或操作者第二次
+  已验证的六轴重力缓存进入 `PROTECTIVE_HOLD`；只有已配置 driver Kd 时，反馈不可信的
+  降级阶段才仍有电机本地阻尼。终端会用完整分隔线分别显示 `PROTECTIVE HOLD DEGRADED`、
+  `LATCHED` 和 `RECOVERED`，并明确当前六轴仍使能、控制能力和再次 Ctrl-C/SIGUSR1 的
+  全失能含义。只有完整缓存发送也失败或操作者第二次
   Ctrl-C/SIGUSR1 才允许全臂失能。
 - 若安装的 MotorBridge 提供 `robstride_get_param_f32_host_id()`，backend 会优先使用带
   `feedback_id/host_id` 的参数读取 ABI；旧版本没有该入口时才回退到未限定 host 的兼容调用。
@@ -560,7 +567,8 @@ env PYTHONDONTWRITEBYTECODE=1 "$PY" \
   --calibration-settling-sec 2 \
   --calibration-duration-sec 20 \
   --kp 5.0 \
-  --kd 1.0 \
+  --kd 0 \
+  --driver-kd 1.0 \
   --gravity-scale 1.0 \
   --torque-limit-scale 0.40 \
   --apply-driver-torque-limits \

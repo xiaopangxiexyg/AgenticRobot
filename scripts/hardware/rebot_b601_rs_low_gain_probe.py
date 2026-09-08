@@ -70,8 +70,8 @@ same explicit ``mechPos`` reads with ``allow_motion=False`` and never changes
 the vendor mode or enable state.  Automated tests exercise the pure helpers
 only; they never construct a hardware backend.
 
-At feedback admission, the observed J2 zero-state boundary is represented with
-a calibrated ``[-6e-3, 0)`` rad projection to the URDF lower limit.  The latest
+At feedback admission, the observed J2 zero/startup boundary is represented
+with a ``[-1e-2, 0)`` rad projection to the URDF lower limit.  The latest
 zero-state and post-fault captures extend the same treatment to J3 with a
 calibrated ``[-3e-3, 0)`` compatibility window.  J4's rounded ``-1.57/1.57``
 URDF entries are represented by the authoritative ``+/-pi/2`` nominal limits
@@ -148,13 +148,15 @@ _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = _ALL_JOINTS
 _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3", "joint4")
-# J2 was observed at -4.943 mrad and -4.517 mrad in two independent
-# zero-state, read-only captures.  J3 was observed at -0.682 mrad in the latest
-# zero-state capture and -2.216 mrad after the gravity fault.  Keep small,
-# explicit margins for those measured states only; these are feedback-admission
-# boundaries, not relaxed model limits.
+# J2 was observed at -4.943 mrad and -4.517 mrad in two independent zero-state,
+# read-only captures, then at -7.627 mrad during the bounded post-enable startup
+# transient with host-qualified feedback.  The J2-only 10 mrad envelope covers
+# those measured states with a small round margin.  J3 was observed at
+# -0.682 mrad in the latest zero-state capture and -2.216 mrad after the gravity
+# fault.  These are feedback-admission boundaries, not relaxed model or command
+# limits.
 _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD = {
-    "joint2": 6.0e-3,
+    "joint2": 1.0e-2,
     "joint3": 3.0e-3,
     "joint4": 1.0e-3,
 }
@@ -1970,8 +1972,8 @@ def normalize_feedback_boundary_qpos(
     """Normalize only the explicitly admitted encoder boundary observations.
 
     RobStride ``mechPos`` may report a value just below a physical/model lower
-    boundary after zeroing or at a rounded nominal limit.  J2 uses the measured
-    ``-6e-3 <= q < 0`` boundary, J3 uses ``-3e-3 <= q < 0``, and J4 uses a
+    boundary after zeroing or at a rounded nominal limit.  J2 uses the observed
+    ``-1e-2 <= q < 0`` boundary, J3 uses ``-3e-3 <= q < 0``, and J4 uses a
     separate ``0.001`` rad window immediately below its precise ``-pi/2``
     nominal boundary.  Every other joint and every more-negative value is
     returned unchanged so the caller's existing exact position-limit check
@@ -3279,7 +3281,7 @@ def _run_feedback_stability_probe(
             "This mode only requests vendor feedback and reads mechPos; it never changes mode, enables, disables, or sends MIT/POS_VEL control frames.",
             "Run only after the operator has independently made the arm safe; this probe does not alter the existing enable state.",
             "The stationarity gate is diagnostic evidence for protective-hold review, not permission to relax the active safety threshold.",
-            "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Raw readings are retained per sample, and values beyond each compatibility window remain outside the strict effective limit.",
+            "J2 feedback readings in [-1e-2, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Raw readings are retained per sample, and values beyond each compatibility window remain outside the strict effective limit.",
             "MotorBridge 0.4.9 provides no source timestamp or sequence, so freshness remains unverified.",
         ],
     }
@@ -4182,6 +4184,18 @@ def _operator_notice(message: str) -> None:
         return
 
 
+def _protective_hold_notice(title: str, *details: str) -> str:
+    """Build a high-visibility, log-safe protective-hold state banner."""
+
+    heading = str(title).strip().upper()
+    if not heading:
+        raise ValueError("protective hold notice title must not be empty")
+    lines = ["=" * 72, f"[B601] !!! {heading} !!!"]
+    lines.extend(f"[B601] {str(detail).strip()}" for detail in details)
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
 def _signal_handler(stop: dict[str, bool], signum: int, _frame: object) -> None:
     """Latch protective hold; a second SIGINT or SIGUSR1 requests full stop."""
 
@@ -4472,17 +4486,24 @@ def _run_latched_fault_hold(
             return
         degraded_active = True
         telemetry["entry_count"] = int(telemetry["entry_count"]) + 1
-        if int(telemetry["entry_count"]) > 1:
-            print(f"[B601] protective hold degraded again: {detail}", flush=True)
-            return
         damping_note = (
-            "motor-local damping remains active"
+            "DAMPING: motor-local damping remains ACTIVE."
             if driver_damping_available
-            else "no motor-local damping is configured"
+            else (
+                "DAMPING: UNAVAILABLE while feedback is untrusted; no "
+                "motor-local damping is configured."
+            )
         )
         _operator_notice(
-            "[B601] PROTECTIVE HOLD DEGRADED: using last verified gravity; "
-            f"{damping_note} while live feedback/control recovers."
+            _protective_hold_notice(
+                "PROTECTIVE HOLD DEGRADED",
+                "ARM STATE: joint1..joint6 remain ENABLED.",
+                "CONTROL: repeating the last verified gravity command.",
+                damping_note,
+                f"REASON: {detail}",
+                "ACTION: keep physical support and E-stop ready while live "
+                "feedback/control recovers.",
+            )
         )
 
     def record_recovery() -> None:
@@ -4491,12 +4512,13 @@ def _run_latched_fault_hold(
             return
         degraded_active = False
         telemetry["recovery_count"] = int(telemetry["recovery_count"]) + 1
-        if int(telemetry["recovery_count"]) == 1:
-            _operator_notice(
-                "[B601] PROTECTIVE HOLD RECOVERED: live gravity update resumed."
+        _operator_notice(
+            _protective_hold_notice(
+                "PROTECTIVE HOLD RECOVERED",
+                "CONTROL: live gravity update and damping have resumed.",
+                "ARM STATE: joint1..joint6 remain ENABLED in protective hold.",
             )
-        else:
-            print("[B601] protective hold live update recovered again", flush=True)
+        )
 
     def attempt_complete_frame(
         sender: Callable[
@@ -4751,10 +4773,21 @@ def _run_latched_fault_hold(
     # no partial ``safe_stop`` here: disabling joints 1/4/5/6 would turn a
     # draggable gravity hold into an asymmetric, unstable load path.
 
+    control_state = (
+        "CONTROL: DEGRADED cached gravity; damping availability is reported "
+        "above."
+        if degraded_active
+        else "CONTROL: live gravity compensation and damping are ACTIVE."
+    )
     _operator_notice(
-        "B601 protective hold latched: joint1..joint6 remain enabled with "
-        "gravity compensation and damping; joint7 is not part of this backend. "
-        f"pid={os.getpid()}; press Ctrl-C again or send SIGUSR1 for full disable."
+        _protective_hold_notice(
+            "PROTECTIVE HOLD LATCHED",
+            "ARM STATE: joint1..joint6 remain ENABLED; joint7 is outside this "
+            "backend.",
+            control_state,
+            f"PID: {os.getpid()}.",
+            "FULL DISABLE: press Ctrl-C again or send SIGUSR1.",
+        )
     )
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
@@ -6693,7 +6726,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "While latched, a valid cycle updates gravity from current feedback; RX, numeric, motion-monitor, or model failure keeps sending cached gravity with zero Kp and configured motor-local damping while feedback recovery is retried.",
             "A complete six-joint MIT command is retried once; only failure of both live and cached complete-frame dispatch, absence of any verified cache, or an explicit second stop request permits full safe_stop.",
             "Protective hold has software Kp=0 and one derivative owner per joint: explicit driver Kd suppresses the default software damping for that joint; no two damping terms are stacked.",
-            "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Raw active samples are retained, and values beyond each compatibility window remain outside the strict effective limit.",
+            "J2 feedback readings in [-1e-2, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Raw active samples are retained, and values beyond each compatibility window remain outside the strict effective limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
             "After enable, the active path captures a fresh q0 and immediately sends an all-six-joint bounded software position lock at q0; lock frames continue during the four-sample arming-settle gate.",

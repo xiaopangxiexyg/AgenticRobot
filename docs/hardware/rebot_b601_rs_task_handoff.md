@@ -266,7 +266,8 @@ receipt 不完整，不能把程序退出当作设备安全已确认。
 URDF 的机械边界仍是权威物理/模型边界；反馈观测存在编码器量化、减速器回差和浮点误差，
 因此只在进入运动学/guard 前做有界兼容投影：
 
-- J2：`-0.006 <= raw_q < 0` 投影到 `0`；
+- J2：`-0.010 <= raw_q < 0` 投影到 `0`；该范围覆盖两次零位只读捕获和
+  2026-09-08 host-id 限定反馈下观察到的 `-0.007627 rad` 启动边界瞬态；
 - J3：`-0.003 <= raw_q < 0` 投影到 `0`；
 - J4：运行 nominal boundary 使用精确 `[-pi/2, +pi/2]`，对
   `-pi/2-0.001 <= raw_q < -pi/2` 投影到 `-pi/2`；
@@ -388,7 +389,10 @@ LOCKING → GRAVITY_RAMP → HANDOFF → ACTIVE
 [B601] STOP: Ctrl-C ...
 [DRIVE] 3 / 2 / 1 / ENABLE
 [B601] STARTUP ...
-[B601] PROTECTIVE HOLD ...
+========================================================================
+[B601] !!! PROTECTIVE HOLD LATCHED / DEGRADED / RECOVERED !!!
+[B601] ARM STATE / CONTROL / DAMPING / FULL DISABLE ...
+========================================================================
 最终 JSON 摘要、结果路径、log 路径、shell remains active
 ```
 
@@ -578,7 +582,8 @@ env PYTHONDONTWRITEBYTECODE=1 "$PY" \
   --calibration-settling-sec 2 \
   --calibration-duration-sec 20 \
   --kp 5.0 \
-  --kd 1.0 \
+  --kd 0 \
+  --driver-kd 1.0 \
   --gravity-scale 1.0 \
   --torque-limit-scale 0.40 \
   --apply-driver-torque-limits \
