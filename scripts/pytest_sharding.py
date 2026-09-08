@@ -19,7 +19,7 @@ from pathlib import Path
 # here makes the default plan useful in a clean checkout without depending on
 # mutable Harness history.
 FULL_WEIGHTS = {
-    "tests/test_mujoco_temp_pipeline.py": 187.797,
+    "tests/test_mujoco_temp_pipeline.py": 118.155,
     "tests/test_replay_position_admittance_active_pipeline.py": 140.292,
     "tests/test_mujoco_fast_runtime.py": 68.659,
     "tests/test_mujoco_formal_compound_authority.py": 51.678,
