@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from robot_motion.action import HandActionSpec
 
 from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
 from teleop_runtime.backends.hands import InspireTacHandBackend, InspireTacHandBackendConfig
@@ -154,6 +155,39 @@ def test_auto_resolver_supports_left_none_right_dmtac_without_fake_left_state() 
     )
     assert resolved.layout.action_dim == 15
     assert resolved.layout.state_dim == 15
+
+
+def test_auto_resolver_accepts_typed_direct_rule_dmtac_command_contract() -> None:
+    right_backend, _right_retargeter = _dmtac_pair("right")
+
+    resolved = resolve_collection_policy_io_layout(
+        "auto",
+        active_sides=("left", "right"),
+        hand_backends_by_side={"left": None, "right": right_backend},
+        hand_retargeters_by_side={"left": None, "right": None},
+        direct_hand_action_specs_by_side={
+            "right": HandActionSpec.dmtac_gripper("right")
+        },
+    )
+
+    assert resolved.layout is not None
+    assert resolved.layout.end_effector("left").adapter == "none_v1"
+    assert resolved.layout.end_effector("right").adapter == "dmtac_gripper_v1"
+    assert resolved.layout.end_effector("right").state_source_field == (
+        "gripper_measured_scalar"
+    )
+
+
+def test_auto_resolver_still_rejects_dmtac_without_registered_command() -> None:
+    right_backend, _right_retargeter = _dmtac_pair("right")
+
+    with pytest.raises(ValueError, match="registered command"):
+        resolve_collection_policy_io_layout(
+            "auto",
+            active_sides=("left", "right"),
+            hand_backends_by_side={"left": None, "right": right_backend},
+            hand_retargeters_by_side={"left": None, "right": None},
+        )
 
 
 def test_strict_bimanual_dmtac_row_uses_measured_scalar_not_q6_fallback() -> None:

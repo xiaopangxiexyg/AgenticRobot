@@ -224,6 +224,7 @@ class RobotActionResolver:
             qpos_array = np.asarray(qpos, dtype=np.float32).reshape(-1)
             spec = hand_specs.get(side)
             if spec is not None:
+                qpos_array = spec.validate_vector(qpos_array)
                 command_value = spec.active_values(qpos_array)
                 active_mask = list(spec.active_mask or ())
                 spec_metadata = spec.to_metadata()
@@ -250,10 +251,16 @@ class RobotActionResolver:
                         "hand_slot_dof": int(qpos_array.size),
                         "hand_active_mask": active_mask,
                         "hand_qpos_full": qpos_array.copy(),
-                        "hand_invalid_slot_value": "NaN",
+                        "hand_invalid_slot_value": (
+                            spec.invalid_slot_value if spec is not None else "none"
+                        ),
                         "hand_slot_semantics": (
-                            "Only finite slots are valid actuator targets; NaN slots are padding and "
-                            "must not be interpreted as zero commands."
+                            spec.semantics
+                            if spec is not None
+                            else (
+                                "Every finite slot is an active actuator target; "
+                                "no inactive padding slots are present."
+                            )
                         ),
                         "hand_action_spec": spec_metadata,
                     },

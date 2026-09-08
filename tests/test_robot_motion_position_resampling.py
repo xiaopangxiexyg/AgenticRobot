@@ -6,6 +6,7 @@ from scipy.spatial.transform import Rotation
 
 from robot_motion.position_control import (
     CausalMotionResampler,
+    MotionTargetResampler,
     PoseActionMotionIntentStateMachine,
     TimestampedMotionTarget,
     build_uniform_time_grid,
@@ -92,6 +93,43 @@ def test_pose_resampling_uses_linear_xyz_and_shortest_quaternion_arc() -> None:
     assert references[1].metadata["pose_interpolation"] == (
         "xyz_linear+quaternion_shortest_path_slerp"
     )
+
+
+def test_lazy_motion_target_resampler_matches_offline_reference_semantics() -> None:
+    targets = [
+        TimestampedMotionTarget(
+            timestamp=0.0,
+            source_index=0,
+            pose_by_side={"right": _z_pose(0.0, (0.0, 0.0, 0.0))},
+        ),
+        TimestampedMotionTarget(
+            timestamp=0.1,
+            source_index=1,
+            pose_by_side={"right": _z_pose(10.0, (0.02, 0.0, 0.0))},
+        ),
+    ]
+    eager = resample_motion_targets(targets, reference_hz=20.0)
+    lazy = MotionTargetResampler(targets)
+
+    assert lazy.source_timestamps == (0.0, 0.1)
+    for expected in eager:
+        actual = lazy.resample_at(
+            expected.timestamp,
+            sequence=expected.sequence,
+        )
+        assert actual.sequence == expected.sequence
+        assert actual.left_source_index == expected.left_source_index
+        assert actual.right_source_index == expected.right_source_index
+        assert actual.interpolation_alpha == pytest.approx(
+            expected.interpolation_alpha
+        )
+        np.testing.assert_allclose(
+            actual.pose_by_side["right"],
+            expected.pose_by_side["right"],
+        )
+        assert actual.metadata["pose_action_interval_velocity"] == (
+            expected.metadata["pose_action_interval_velocity"]
+        )
 
 
 def test_pose_speed_uses_action_interval_and_final_step_falls_back() -> None:

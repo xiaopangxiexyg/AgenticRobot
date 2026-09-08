@@ -103,6 +103,94 @@ def _channels(
 
 
 class FixArmCommandControllerTests(unittest.TestCase):
+    def test_arm_only_fix_can_start_from_current_runtime_home_without_input(self) -> None:
+        controller = FixArmCommandController(
+            active_sides=("left", "right"),
+            selected_side="left",
+            required_effectors_by_side={
+                "left": ("left_arm",),
+                "right": ("right_arm",),
+            },
+        )
+        left_home = np.linspace(0.1, 0.6, 6)
+        controller.bind_runtime_home_arm_snapshot(
+            {"left": left_home, "right": np.zeros(6)},
+            epoch=17,
+        )
+
+        transition = controller.freeze_selected_from_runtime_home(
+            now=2.0,
+            expected_epoch=17,
+        )
+
+        self.assertTrue(transition.ok)
+        self.assertEqual(controller.fixed_sides, ("left",))
+        self.assertEqual(controller.scope_for_side("left"), "arm_only")
+        command = TeleopCommand(timestamp=2.1)
+        command.add_command(
+            EffectorCommand(
+                effector_name="left_arm",
+                side="left",
+                command_type="joint_vector",
+                value=np.full(6, 9.0),
+            )
+        )
+        command.add_command(
+            EffectorCommand(
+                effector_name="right_arm",
+                side="right",
+                command_type="joint_vector",
+                value=np.full(6, 3.0),
+            )
+        )
+        filtered = controller.filter_command(command, None, 2.1)
+        np.testing.assert_allclose(filtered.commands["left_arm"].value, left_home)
+        np.testing.assert_allclose(
+            filtered.commands["right_arm"].value,
+            np.full(6, 3.0),
+        )
+        self.assertEqual(
+            filtered.commands["left_arm"].metadata["runtime_home_epoch"],
+            17,
+        )
+        self.assertNotIn("left_hand", filtered.commands)
+
+    def test_runtime_home_fix_rejects_stale_epoch_and_hand_scope(self) -> None:
+        qpos = {"left": np.zeros(6), "right": np.ones(6)}
+        arm_only = FixArmCommandController(
+            active_sides=("left", "right"),
+            selected_side="left",
+            required_effectors_by_side={
+                "left": ("left_arm",),
+                "right": ("right_arm",),
+            },
+        )
+        arm_only.bind_runtime_home_arm_snapshot(qpos, epoch=4)
+        stale = arm_only.freeze_selected_from_runtime_home(
+            now=1.0,
+            expected_epoch=5,
+        )
+        self.assertFalse(stale.ok)
+        self.assertIn("epoch mismatch", stale.message)
+        self.assertFalse(arm_only.fixed)
+        arm_only.cancel_active(now=1.1, clear_snapshots=True)
+        cleared = arm_only.freeze_selected_from_runtime_home(
+            now=1.2,
+            expected_epoch=4,
+        )
+        self.assertFalse(cleared.ok)
+        self.assertIn("cached=None", cleared.message)
+
+        arm_and_hand = _controller("left")
+        arm_and_hand.bind_runtime_home_arm_snapshot(qpos, epoch=4)
+        unsupported = arm_and_hand.freeze_selected_from_runtime_home(
+            now=1.0,
+            expected_epoch=4,
+        )
+        self.assertFalse(unsupported.ok)
+        self.assertIn("arm_only", unsupported.message)
+        self.assertFalse(arm_and_hand.fixed)
+
     def test_two_pedal_switch_replaces_fixed_side_atomically(self) -> None:
         controller = _controller("right")
         controller.filter_channels(

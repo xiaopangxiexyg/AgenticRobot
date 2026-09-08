@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from control_station import real_teleop_entrypoint
+from control_station import real_rule_based_writing_entrypoint, real_teleop_entrypoint
+from control_station.rule_based_writing import RuleBasedWritingWebUi
 from robot_motion.action import HandActionSpec
 from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
@@ -268,6 +269,64 @@ def test_canonical_entrypoint_accepts_a_lightweight_extension_factory(monkeypatc
     assert calls[0] is configure
     assert args._real_teleop_runtime_extension is extension
     assert calls[1][0] is args
+
+
+def test_canonical_entrypoint_can_validate_extension_before_device_preflight(
+    monkeypatch,
+) -> None:
+    args = argparse.Namespace()
+    extension = object()
+    calls: list[str] = []
+
+    def _parse(*, configure_parser=None, before_device_preflight=None):
+        del configure_parser
+        calls.append("parse")
+        assert callable(before_device_preflight)
+        before_device_preflight(args)
+        calls.append("device_preflight")
+        return args
+
+    monkeypatch.setattr(real_teleop_entrypoint, "_parse_args_with_configuration", _parse)
+    monkeypatch.setattr(
+        real_teleop_entrypoint,
+        "_bind_real_teleop_runtime_support",
+        lambda _namespace: None,
+    )
+    monkeypatch.setattr(
+        real_teleop_entrypoint,
+        "build_real_teleop_progress_application",
+        lambda _args: None,
+    )
+    monkeypatch.setattr(real_teleop_entrypoint, "run_real_teleop", lambda *_a, **_k: None)
+    monkeypatch.setattr(real_teleop_entrypoint, "cleanup_active_startup", lambda: None)
+
+    real_teleop_entrypoint.run_real_teleop_entrypoint(
+        runtime_extension_factory=lambda parsed: (
+            calls.append("extension_validation"),
+            extension if parsed is args else None,
+        )[1],
+        build_runtime_extension_before_device_preflight=True,
+    )
+
+    assert calls == ["parse", "extension_validation", "device_preflight"]
+    assert args._real_teleop_runtime_extension is extension
+
+
+def test_specialized_entrypoint_injects_rule_only_ui(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(
+        real_rule_based_writing_entrypoint,
+        "run_real_teleop_entrypoint",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    real_rule_based_writing_entrypoint.main()
+
+    assert captured["control_ui_type"] is RuleBasedWritingWebUi
+    assert captured["runtime_extension_factory"] is (
+        rule_based_plan.build_rule_based_writing_extension
+    )
+    assert captured["build_runtime_extension_before_device_preflight"] is True
 
 
 def test_plan_composes_replay_write_and_relative_pen_up_with_left_hold(
