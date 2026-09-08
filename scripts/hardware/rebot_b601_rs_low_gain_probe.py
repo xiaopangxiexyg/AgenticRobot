@@ -2275,6 +2275,19 @@ def evaluate_feedback_motion_guard(
     }
 
 
+def advance_motion_rejection_confirmation(
+    pending_rejection: Mapping[str, object] | None,
+    current_rejection: Mapping[str, object] | None,
+) -> tuple[Mapping[str, object] | None, str]:
+    """Quarantine one motion outlier and abort only when the next also fails."""
+
+    if current_rejection is None:
+        return None, "recovered" if pending_rejection is not None else "clear"
+    if pending_rejection is None:
+        return current_rejection, "quarantine"
+    return current_rejection, "abort"
+
+
 def evaluate_feedback_position_guard(
     *,
     sequence: int,
@@ -4938,6 +4951,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     fault_hold_candidate_last_rejection: str | None = None
     rejected_motion_sample: dict[str, object] | None = None
     rejected_motion_sample_count = 0
+    pending_motion_rejection: Mapping[str, object] | None = None
+    last_quarantined_motion_sample: Mapping[str, object] | None = None
+    motion_rejection_quarantine_count = 0
+    motion_rejection_recovery_count = 0
+    motion_rejection_confirmed_abort_count = 0
     backend_feedback_diagnostics: tuple[dict[str, object], ...] = ()
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
@@ -5452,13 +5470,6 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 rejected_motion_sample_count += 1
                 stop_reason = str(position_rejection["reason"])
                 break
-            # Only an in-limit, finite sample may become the active state or a
-            # candidate protective-hold snapshot.  An invalid finite value is
-            # evidence only; it must never contaminate the final pose or hold
-            # admission path.
-            final_q = q
-            fault_qpos_for_hold = q
-            fault_observed_at_sec = observed_at_sec
             if previous_q is None:
                 qvel = _ZERO_SIX
                 dt = period
@@ -5489,7 +5500,6 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     (current - previous) / dt
                     for current, previous in zip(q, previous_q, strict=True)
                 )
-            fault_qvel_for_hold = tuple(float(value) for value in qvel)
             if any(not math.isfinite(value) for value in qvel):
                 stop_reason = "non-finite finite-difference velocity"
                 rejected_motion_sample = {
@@ -5541,11 +5551,48 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 }
                 rejected_motion_sample_count += 1
                 break
+            (
+                pending_motion_rejection,
+                motion_rejection_action,
+            ) = advance_motion_rejection_confirmation(
+                pending_motion_rejection,
+                motion_rejection,
+            )
             if motion_rejection is not None:
                 rejected_motion_sample = motion_rejection
                 rejected_motion_sample_count += 1
+                if motion_rejection_action == "quarantine":
+                    last_quarantined_motion_sample = motion_rejection
+                    motion_rejection_quarantine_count += 1
+                    print(
+                        "[B601] motion sample quarantined; no command dispatched: "
+                        f"{motion_rejection['reason']}",
+                        flush=True,
+                    )
+                    next_deadline += period
+                    completed_at = time.monotonic()
+                    if completed_at > next_deadline:
+                        schedule_overruns += 1
+                        next_deadline = completed_at
+                    continue
+                motion_rejection_confirmed_abort_count += 1
                 stop_reason = str(motion_rejection["reason"])
                 break
+            if motion_rejection_action == "recovered":
+                motion_rejection_recovery_count += 1
+                print(
+                    "[B601] quarantined motion sample recovered on the next "
+                    "feedback frame; live control continues.",
+                    flush=True,
+                )
+            # Only an in-limit, finite, motion-admitted sample may become the
+            # active state or a candidate protective-hold snapshot.  A
+            # quarantined sample is evidence only and must not contaminate
+            # final pose, fault entry, finite-difference history, or last-safe.
+            final_q = q
+            fault_qpos_for_hold = q
+            fault_qvel_for_hold = tuple(float(value) for value in qvel)
+            fault_observed_at_sec = observed_at_sec
             if args.mode == "slow-step" and initial_q is not None:
                 try:
                     validate_target_excursion(
@@ -6394,6 +6441,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "first_sample_qacc_semantics": "unavailable_without_previous_control_qvel",
             "rejected_sample_count": rejected_motion_sample_count,
             "rejected_sample": rejected_motion_sample,
+            "confirmation_policy": (
+                "quarantine_first_motion_rejection_and_confirm_on_next_frame"
+            ),
+            "quarantined_sample_count": motion_rejection_quarantine_count,
+            "recovered_quarantine_count": motion_rejection_recovery_count,
+            "confirmed_abort_count": motion_rejection_confirmed_abort_count,
+            "last_quarantined_sample": last_quarantined_motion_sample,
+            "pending_rejection_at_exit": pending_motion_rejection,
             "backend_feedback_diagnostics": backend_feedback_diagnostics,
             "rejected_sample_command_semantics": "not_dispatched",
             "rejected_sample_last_safe_semantics": "ineligible",

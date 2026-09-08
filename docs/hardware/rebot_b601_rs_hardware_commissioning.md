@@ -91,13 +91,18 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   连贯的 `-7.627 mrad` 边界瞬态，因此仅对 J2 保留到 `-10 mrad` 的整值余量。J3/J4
   窗口和全部出站命令限位保持不变；比该下限更负的 J2 反馈仍 fail-closed。
 - active low-gain probe 用相邻 normalized q 与精确 host receive `dt` 计算 qvel，再用连续
-  qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0`、非有限值、
-  qvel 或 qacc 越限都在任何 MIT dispatch 前拒绝。JSON 的 `motion_guard.rejected_sample`
-  独立保存 offending joint、raw/normalized q、previous/current qvel、qacc、dt、seq/timestamp，
-  并标记 `command_dispatched=false`、`eligible_for_last_safe=false`。默认
+  qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0` 和非有限值
+  立即拒绝。有限但 qvel 或 qacc 越限的第一帧在任何 MIT dispatch 前隔离：不更新
+  `previous_q`、feedback timestamp、qvel history、`final_q`、fault snapshot 或 `last-safe`，
+  电机继续保持上一份完整命令和已配置的 driver Kd。下一帧以最后可信位置和跨过异常帧的
+  总 `dt` 重新计算；恢复正常则继续 ACTIVE/标定，连续第二帧仍越限才进入 protective hold。
+  这不是把 `12.6 rad/s` 当成合法拖动，也不改变 CLI 配置的速度/加速度阈值。JSON 的
+  `motion_guard.rejected_sample` 独立保存 offending joint、raw/normalized q、previous/current
+  qvel、qacc、dt、seq/timestamp，并标记 `command_dispatched=false`、
+  `eligible_for_last_safe=false`；确认策略和隔离/恢复/连续中止计数也一并保存。默认
   `--acceleration-abort-rad-s2 4.0` 只是待真机整定的 commissioning seed，不是已认证上限。
-  其中位置限位检查先于更新 `final_q`、当前故障快照和 `last-safe`；有限但越过 URDF 的
-  反馈只进入 `rejected_sample`，不会被用于重力、阻抗或保护保持计算。
+  位置限位和 motion guard 都先于更新 `final_q`、当前故障快照和 `last-safe`；被拒绝的
+  反馈只进入 evidence，不会被用于重力、阻抗或保护保持计算。
 - 反馈接纳现在在 wired backend 入口再次执行：`feedback_position_limits_rad` 是只读的
   接纳包络，默认回退到严格的 `position_limits_rad`，由 probe 显式传入仅扩展 J2/J3/J4
   已批准的边界窗口。这样即使 `mechPos(0x7019)` 返回一个有限但物理上不可能的巨大数值，
@@ -481,8 +486,9 @@ J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令�
 恢复项。非零 driver Kd 只有在
 `--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
-加速度、位置误差、非有限差分或部分发送会结束 ACTIVE 阶段并优先进入 protective/degraded
-hold，而不是直接失能；只有明确最终停止或 live 与缓存完整六轴发送都失败才允许
+位置误差、非有限差分或部分发送会结束 ACTIVE 阶段并优先进入 protective/degraded hold；
+单个有限的速度/加速度越限帧按上述两帧确认策略先隔离。上述路径都不直接失能；只有明确
+最终停止或 live 与缓存完整六轴发送都失败才允许
 safe_stop。由于当前
 `mechPos` 是同步参数读取且 MotorBridge 没有源序号/时间戳，本探针的默认 20 Hz
 只是低速 commissioning 节拍，不是高频 haptic loop，也不声明 freshness、力传感器

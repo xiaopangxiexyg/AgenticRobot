@@ -915,6 +915,35 @@ def test_feedback_position_guard_accepts_only_the_pinned_position_limits() -> No
     )
 
 
+def test_motion_rejection_confirmation_quarantines_first_rejection() -> None:
+    rejection = {"reason": "velocity abort", "sequence": 10}
+
+    pending, action = probe.advance_motion_rejection_confirmation(None, rejection)
+
+    assert pending is rejection
+    assert action == "quarantine"
+
+
+def test_motion_rejection_confirmation_recovers_on_next_valid_frame() -> None:
+    pending, action = probe.advance_motion_rejection_confirmation(
+        {"reason": "velocity abort", "sequence": 10},
+        None,
+    )
+
+    assert pending is None
+    assert action == "recovered"
+
+
+def test_motion_rejection_confirmation_aborts_on_consecutive_rejection() -> None:
+    first = {"reason": "velocity abort", "sequence": 10}
+    second = {"reason": "acceleration abort", "sequence": 11}
+
+    pending, action = probe.advance_motion_rejection_confirmation(first, second)
+
+    assert pending is second
+    assert action == "abort"
+
+
 def test_feedback_stability_probe_never_enters_motion_path(tmp_path) -> None:
     class FakeBackend:
         config = SimpleNamespace(channel="can0")

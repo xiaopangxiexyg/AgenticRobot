@@ -122,6 +122,9 @@ tau_request = gravity_scale * g(q)
   round-trip；driver Kd 只提供电机局部速度耗散，不提供位置锁。
 - 未选择 driver Kd 时，软件 Kd 由 host 计算；20 Hz 反馈的有限差分量化可能产生阶梯感，
   这是连续性 commissioning 的观察项，不应通过叠加两个 Kd 解决。
+- active path 的单帧有限差分 qvel/qacc 越限先隔离，不下发、不更新控制历史或安全缓存；
+  下一帧相对最后可信样本恢复时继续运行，连续两帧越限才转入 protective hold。该策略用于
+  拒绝已观测到的 J4 单帧伪零值，不提高用户配置的运动阈值，也不放宽位置/力矩边界。
 - protective hold 去掉软件位置 Kp，以当前反馈作为每周期参考，保持可拖动；其重力在
   可信反馈下逐周期重算。
 - degraded hold 使用“最后完整发送的 pose + gravity-only torque”缓存；反馈不可信时
