@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 
 from dataset_contracts.v22 import EndEffectorSpec, PolicyIOLayout
 from dataset_interface.policy_io_layout import load_policy_io_layout
+from robot_motion.action import HandActionSpec
 
 from ..backends.grippers import DMTacGripperBackend, GRIPPER_ACTION_MAX
 from ..backends.hands import InspireTacHandBackend
@@ -53,34 +54,18 @@ def _side_component(
     return None if values is None else values.get(side)
 
 
-def _dmtac_spec(
+def _dmtac_backend_spec(
     *,
     side: str,
     backend: DMTacGripperBackend,
-    retargeter: ScalarToGripperRetargeter,
 ) -> EndEffectorSpec:
     backend_config = backend.config
-    retargeter_config = retargeter.config
-    if str(retargeter_config.side) != side:
-        raise ValueError(
-            f"{side} ScalarToGripperRetargeter declares side={retargeter_config.side!r}."
-        )
-    if str(retargeter_config.effector_name) != str(backend.name):
-        raise ValueError(
-            f"{side} gripper backend/retargeter effector mismatch: "
-            f"{backend.name!r} != {retargeter_config.effector_name!r}."
-        )
-    if int(backend_config.command_dim) != 0 or int(retargeter_config.output_dim) != 0:
+    if int(backend_config.command_dim) != 0:
         raise ValueError("DM-Tac v2.2 collection requires its only actuator in slot 0.")
     if abs(float(backend_config.max_action) - float(GRIPPER_ACTION_MAX)) > 1e-6:
         raise ValueError(
             "DM-Tac v2.2 collection requires max_action=1.0; "
             f"got {backend_config.max_action!r}."
-        )
-    if abs(float(retargeter_config.output_max) - float(GRIPPER_ACTION_MAX)) > 1e-6:
-        raise ValueError(
-            "DM-Tac retargeter output_max must be 1.0 for v2.2 collection; "
-            f"got {retargeter_config.output_max!r}."
         )
     return EndEffectorSpec.continuous(
         side,
@@ -102,6 +87,56 @@ def _dmtac_spec(
             "collection_state_max_age_sec": 0.5,
         },
     )
+
+
+def _dmtac_spec(
+    *,
+    side: str,
+    backend: DMTacGripperBackend,
+    retargeter: ScalarToGripperRetargeter,
+) -> EndEffectorSpec:
+    retargeter_config = retargeter.config
+    if str(retargeter_config.side) != side:
+        raise ValueError(
+            f"{side} ScalarToGripperRetargeter declares side={retargeter_config.side!r}."
+        )
+    if str(retargeter_config.effector_name) != str(backend.name):
+        raise ValueError(
+            f"{side} gripper backend/retargeter effector mismatch: "
+            f"{backend.name!r} != {retargeter_config.effector_name!r}."
+        )
+    if int(retargeter_config.output_dim) != 0:
+        raise ValueError("DM-Tac v2.2 collection requires its only actuator in slot 0.")
+    if abs(float(retargeter_config.output_max) - float(GRIPPER_ACTION_MAX)) > 1e-6:
+        raise ValueError(
+            "DM-Tac retargeter output_max must be 1.0 for v2.2 collection; "
+            f"got {retargeter_config.output_max!r}."
+        )
+    return _dmtac_backend_spec(side=side, backend=backend)
+
+
+def _direct_dmtac_spec(
+    *,
+    side: str,
+    backend: DMTacGripperBackend,
+    command_spec: HandActionSpec,
+) -> EndEffectorSpec:
+    """Bind a typed direct RobotAction command to measured DMTAC state."""
+
+    expected = HandActionSpec.dmtac_gripper(
+        side,
+        gripper_slot=int(backend.config.command_dim),
+    )
+    if command_spec.to_metadata() != expected.to_metadata():
+        raise ValueError(
+            f"{side} direct DMTAC HandActionSpec does not match the backend "
+            "slot/command contract."
+        )
+    if str(backend.name) != f"{side}_hand":
+        raise ValueError(
+            f"{side} direct DMTAC backend declares effector {backend.name!r}."
+        )
+    return _dmtac_backend_spec(side=side, backend=backend)
 
 
 def _inspire_spec(
@@ -148,14 +183,15 @@ def derive_collection_policy_io_layout(
     active_sides: Sequence[str],
     hand_backends_by_side: Mapping[str, Any] | None,
     hand_retargeters_by_side: Mapping[str, Any] | None,
+    direct_hand_action_specs_by_side: Mapping[str, HandActionSpec] | None = None,
     arm_controlled_frame_by_side: Mapping[str, str] | None = None,
     arm_reference_frame_by_side: Mapping[str, str] | None = None,
 ) -> PolicyIOLayout:
     """Create a v2.2 layout from actual runtime component instances.
 
-    A configured end effector needs both a target-producing retargeter and a
-    feedback-producing backend.  This intentionally does not infer a discrete
-    contract: a future discrete pair must register its vocabulary explicitly.
+    A configured end effector needs a registered target producer and a
+    feedback-producing backend. Ordinary teleop registers the target through
+    a retargeter; a direct rule source may provide its typed action spec.
     """
 
     _normalized_sides(active_sides)
@@ -163,7 +199,8 @@ def derive_collection_policy_io_layout(
     for side in _SIDES:
         backend = _side_component(hand_backends_by_side, side)
         retargeter = _side_component(hand_retargeters_by_side, side)
-        if backend is None and retargeter is None:
+        direct_spec = _side_component(direct_hand_action_specs_by_side, side)
+        if backend is None and retargeter is None and direct_spec is None:
             effectors[side] = EndEffectorSpec.none(side)
         elif isinstance(backend, DMTacGripperBackend) and isinstance(
             retargeter, ScalarToGripperRetargeter
@@ -172,6 +209,16 @@ def derive_collection_policy_io_layout(
                 side=side,
                 backend=backend,
                 retargeter=retargeter,
+            )
+        elif (
+            isinstance(backend, DMTacGripperBackend)
+            and retargeter is None
+            and isinstance(direct_spec, HandActionSpec)
+        ):
+            effectors[side] = _direct_dmtac_spec(
+                side=side,
+                backend=backend,
+                command_spec=direct_spec,
             )
         elif isinstance(backend, InspireTacHandBackend) and isinstance(
             retargeter, JointsToDexHandRetargeter
@@ -185,7 +232,9 @@ def derive_collection_policy_io_layout(
             raise ValueError(
                 f"Unsupported or incomplete v2.2 end-effector pair for {side}: "
                 f"backend={type(backend).__name__ if backend is not None else None}, "
-                f"retargeter={type(retargeter).__name__ if retargeter is not None else None}. "
+                f"retargeter={type(retargeter).__name__ if retargeter is not None else None}, "
+                "direct_command_spec="
+                f"{type(direct_spec).__name__ if direct_spec is not None else None}. "
                 "A v2.2 collector requires a registered command and measured-state pair."
             )
     return PolicyIOLayout(
@@ -248,6 +297,7 @@ def resolve_collection_policy_io_layout(
     active_sides: Sequence[str],
     hand_backends_by_side: Mapping[str, Any] | None,
     hand_retargeters_by_side: Mapping[str, Any] | None,
+    direct_hand_action_specs_by_side: Mapping[str, HandActionSpec] | None = None,
     arm_controlled_frame_by_side: Mapping[str, str] | None = None,
     arm_reference_frame_by_side: Mapping[str, str] | None = None,
     preset_dir: Path = DEFAULT_POLICY_IO_LAYOUT_PRESET_DIR,
@@ -264,6 +314,7 @@ def resolve_collection_policy_io_layout(
         active_sides=active_sides,
         hand_backends_by_side=hand_backends_by_side,
         hand_retargeters_by_side=hand_retargeters_by_side,
+        direct_hand_action_specs_by_side=direct_hand_action_specs_by_side,
         arm_controlled_frame_by_side=arm_controlled_frame_by_side,
         arm_reference_frame_by_side=arm_reference_frame_by_side,
     )

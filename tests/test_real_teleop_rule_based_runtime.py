@@ -1567,8 +1567,7 @@ def test_rule_start_is_unavailable_with_preexisting_fix_authority() -> None:
     recorder = _Recorder(_Poller())
     session, _clutch, ui = _bind(extension, recorder, arm=False)
     controller = _install_arm_only_fix_controller(extension)
-    rule_runtime_module._freeze_rule_arm_only_from_arrived_command(
-        controller,
+    transition = controller.freeze_arm_only_from_command(
         side="left",
         command=EffectorCommand(
             effector_name="left_arm",
@@ -1579,6 +1578,7 @@ def test_rule_start_is_unavailable_with_preexisting_fix_authority() -> None:
         now=1.0,
         snapshot_origin="test_preexisting_fix",
     )
+    assert transition.ok is True
     assert controller.fixed_sides == ("left",)
     assert extension.status().rule_start_available is False
 
@@ -2072,9 +2072,7 @@ def test_dual_gripper_initial_alignment_is_interpolated_and_gates_first_replay()
     }
     assert replay.command.metadata["rule_based_capture_enabled"] is True
     assert session.command_guard(replay.command, SimpleNamespace(), now) is None
-    canonical_action = validate_collection_command_action(
-        rule_runtime_module._collection_validation_command(replay.command)
-    )
+    canonical_action = validate_collection_command_action(replay.command)
     for side in ("left", "right"):
         assert canonical_action.hand_qpos_by_side[side].shape == (6,)
         np.testing.assert_array_equal(

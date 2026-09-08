@@ -60,6 +60,7 @@ from .arm_state_sync import (
     _run_initial_alignment_start_check,
     _sync_preview_from_real_state_real,
     _sync_real_execution_step_limits,
+    capture_runtime_arm_qpos_snapshot,
 )
 from .arm_tool_config import (
     _force_tare_sec_arg,
@@ -179,7 +180,10 @@ from .recording_admission import (
 from .recording_admission import (
     recording_warmup_status as _recording_warmup_status,
 )
-from .runtime_extension import RealTeleopRuntimeExtension
+from .runtime_extension import (
+    RealTeleopRuntimeExtension,
+    runtime_extension_service_startup_control_plane,
+)
 from .runtime_home import (
     _emit_collision_proxy_logs,
     _emit_home_alignment_logs,
@@ -427,6 +431,17 @@ def _emergency_stop_runtime_arms_before_collection_drain(
     return None
 
 
+def _is_runtime_home_state_blocker(detail: object) -> bool:
+    """Identify the synthetic Session-state diagnostic that Home resolves."""
+
+    text = str(detail or "").strip().lower()
+    return (
+        text.startswith("session state=")
+        and "runtime home and hardware arm admission" in text
+        and "required before rule collection" in text
+    )
+
+
 def run_real_teleop(
     args: argparse.Namespace,
     *,
@@ -448,6 +463,11 @@ def run_real_teleop(
         ) from exc
     if hasattr(args, "_resolved_position_admittance_profile"):
         delattr(args, "_resolved_position_admittance_profile")
+    control_ui_type = getattr(args, "_real_teleop_control_ui_type", CalibrationWebUi)
+    if hasattr(args, "_real_teleop_control_ui_type"):
+        delattr(args, "_real_teleop_control_ui_type")
+    if not isinstance(control_ui_type, type):
+        raise TypeError("_real_teleop_control_ui_type must be a UI class.")
     materialize_real_teleop_artifact_context(args)
     startup_cleanup = _activate_startup_cleanup(logger=_log)
     capability_admission = (
@@ -456,7 +476,7 @@ def run_real_teleop(
     startup_ui = initialize_startup_ui(
         args,
         startup_cleanup=startup_cleanup,
-        ui_type=CalibrationWebUi,
+        ui_type=control_ui_type,
         progress_type=GuiStartupProgress,
     )
     control_ui = startup_ui.control_ui
@@ -1306,6 +1326,50 @@ def run_real_teleop(
         # the manual retry button.
         publish_runtime_hardware_status()
 
+        runtime_extension_bound = False
+        runtime_extension_started = False
+        episode_recording_runtime = None
+        if runtime_extension is not None and bool(
+            getattr(runtime_extension, "bind_before_startup_admission", False)
+        ):
+            bind_extension_runtime = getattr(runtime_extension, "bind_runtime", None)
+            start_extension = getattr(runtime_extension, "start", None)
+            if not callable(bind_extension_runtime) or not callable(start_extension):
+                raise TypeError(
+                    "early-bound runtime extension requires bind_runtime() and start()."
+                )
+
+            def startup_recording_active() -> bool:
+                recorder = current_dataset_recorder()
+                return bool(
+                    recorder is not None and getattr(recorder, "is_recording", False)
+                )
+
+            def startup_pause_recording(
+                *_args: object,
+                **_kwargs: object,
+            ) -> bool:
+                return False
+
+            bind_extension_runtime(
+                components=components,
+                clutch_input=clutch_input,
+                camera_sources=camera_sources,
+                dataset_recorder=current_dataset_recorder(),
+                dataset_recorder_provider=current_dataset_recorder,
+                episode_recorder=episode_recorder,
+                control_ui=control_ui,
+                recording_active=startup_recording_active,
+                pause_recording=startup_pause_recording,
+                collection_transition_active=lambda: bool(
+                    episode_recording_runtime is not None
+                    and episode_recording_runtime.collection_transition_active()
+                ),
+            )
+            runtime_extension_bound = True
+            start_extension(components=components)
+            runtime_extension_started = True
+
         def set_current_visualization_state(
             previewer: object | None,
             camera_active: bool,
@@ -2010,14 +2074,36 @@ def run_real_teleop(
         startup_progress_runtime.publish()
         startup_home_captured = False
         startup_home_qpos_snapshot: dict[str, np.ndarray] = {}
-        manual_startup_request = _manual_calibration_confirmation_required(args, components)
+        startup_home_mode = str(
+            getattr(runtime_extension, "startup_home_mode", "tracker_and_robot")
+        )
+        robot_state_only_home = startup_home_mode == "robot_state_only"
+        if startup_home_mode not in {"tracker_and_robot", "robot_state_only"}:
+            raise RuntimeError(
+                f"unsupported runtime extension startup_home_mode={startup_home_mode!r}."
+            )
+        manual_startup_request = bool(
+            not robot_state_only_home
+            and _manual_calibration_confirmation_required(args, components)
+        )
         last_startup_camera_status_at = 0.0
 
         def update_startup_runtime_status() -> None:
             nonlocal last_startup_camera_status_at
             sync_foot_pad_runtime_status()
             tick_idle_tactile_compression()
+            consume_device_retry = getattr(
+                clutch_input,
+                "consume_device_retry_request",
+                None,
+            )
+            if callable(consume_device_retry) and consume_device_retry():
+                retry_failed_devices()
             now = time.time()
+            runtime_extension_service_startup_control_plane(
+                runtime_extension,
+                now=now,
+            )
             if now - last_startup_camera_status_at < 0.2:
                 return
             last_startup_camera_status_at = now
@@ -2055,13 +2141,18 @@ def run_real_teleop(
                 startup_request = requested
             core_startup_keys = {
                 "rig.session",
-                "vive.clock_sync",
                 *(f"arm.{side}.qpos" for side in components.active_sides),
             }
+            if not robot_state_only_home:
+                core_startup_keys.add("vive.clock_sync")
             core_startup_blockers = {
                 key: startup_device_errors[key]
                 for key in sorted(core_startup_keys)
                 if key in startup_device_errors
+                and not (
+                    key == "rig.session"
+                    and _is_runtime_home_state_blocker(startup_device_errors[key])
+                )
             }
             if core_startup_blockers:
                 detail = "; ".join(
@@ -2078,22 +2169,32 @@ def run_real_teleop(
                 # GUI's two-second Home delay, so retain the same fail-closed
                 # barrier immediately before sampling.
                 require_idle_tactile_quiesced("startup_runtime_home")
-                startup_home_qpos_snapshot = _runtime_home_calibration(
-                    components,
-                    arm_mode="real",
-                    timeout_sec=args.calibration_timeout,
-                    fresh_data_timeout_sec=runtime_home_fresh_data_timeout_sec(
-                        args.calibration_timeout
-                    ),
-                    num_samples=args.calibration_samples,
-                    progress_callback=clutch_input.publish_runtime_home_progress,
-                    atomic_robot_home_snapshot=bool(
-                        getattr(args, "runtime_home_atomic_arm_snapshot", True)
-                    ),
-                    late_weighted_human_home=bool(
-                        getattr(args, "runtime_home_late_weighted_vive", True)
-                    ),
-                )
+                if robot_state_only_home:
+                    startup_home_qpos_snapshot = capture_runtime_arm_qpos_snapshot(
+                        components
+                    )
+                    _log(
+                        "RuleBased",
+                        "captured robot-state-only runtime Home; VIVE tracker "
+                        "sources and tracker-loss gating are disabled for this rule source.",
+                    )
+                else:
+                    startup_home_qpos_snapshot = _runtime_home_calibration(
+                        components,
+                        arm_mode="real",
+                        timeout_sec=args.calibration_timeout,
+                        fresh_data_timeout_sec=runtime_home_fresh_data_timeout_sec(
+                            args.calibration_timeout
+                        ),
+                        num_samples=args.calibration_samples,
+                        progress_callback=clutch_input.publish_runtime_home_progress,
+                        atomic_robot_home_snapshot=bool(
+                            getattr(args, "runtime_home_atomic_arm_snapshot", True)
+                        ),
+                        late_weighted_human_home=bool(
+                            getattr(args, "runtime_home_late_weighted_vive", True)
+                        ),
+                    )
             except Exception as exc:  # noqa: BLE001
                 message = _runtime_home_failure_message(exc)
                 _log("Calibration", message)
@@ -2101,7 +2202,7 @@ def run_real_teleop(
                     f"{message}\n本次开始遥操已取消并回到未遥操状态；"
                     "请检查 VIVE sender/tracker_role 后重新点击“开始遥操”。"
                 )
-                if not clutch_input.enabled:
+                if robot_state_only_home or not clutch_input.enabled:
                     raise
                 manual_startup_request = True
                 continue
@@ -2132,6 +2233,9 @@ def run_real_teleop(
                 if bool(getattr(args, "runtime_home_atomic_arm_snapshot", True))
                 else None
             ),
+            startup_device_errors=startup_device_errors,
+            publish_runtime_hardware_status=publish_runtime_hardware_status,
+            runtime_extension=runtime_extension,
         )
         if not startup_arm_admitted:
             _log(
@@ -2468,23 +2572,30 @@ def run_real_teleop(
             return camera_previewer, bool(camera_preview_active), tactile_visualizer
 
         if runtime_extension is not None:
-            bind_extension_runtime = getattr(runtime_extension, "bind_runtime", None)
-            if callable(bind_extension_runtime):
-                bind_extension_runtime(
-                    components=components,
-                    clutch_input=clutch_input,
-                    camera_sources=camera_sources,
-                    dataset_recorder=current_dataset_recorder(),
-                    dataset_recorder_provider=current_dataset_recorder,
-                    episode_recorder=episode_recorder,
-                    control_ui=control_ui,
-                    recording_active=recording_active,
-                    pause_recording=pause_recording,
-                )
-            start_extension = getattr(runtime_extension, "start", None)
-            if not callable(start_extension):
-                raise TypeError("runtime_extension lacks start().")
-            start_extension(components=components)
+            if not runtime_extension_bound:
+                bind_extension_runtime = getattr(runtime_extension, "bind_runtime", None)
+                if callable(bind_extension_runtime):
+                    bind_extension_runtime(
+                        components=components,
+                        clutch_input=clutch_input,
+                        camera_sources=camera_sources,
+                        dataset_recorder=current_dataset_recorder(),
+                        dataset_recorder_provider=current_dataset_recorder,
+                        episode_recorder=episode_recorder,
+                        control_ui=control_ui,
+                        recording_active=recording_active,
+                        pause_recording=pause_recording,
+                        collection_transition_active=(
+                            episode_recording_runtime.collection_transition_active
+                        ),
+                    )
+                    runtime_extension_bound = True
+            if not runtime_extension_started:
+                start_extension = getattr(runtime_extension, "start", None)
+                if not callable(start_extension):
+                    raise TypeError("runtime_extension lacks start().")
+                start_extension(components=components)
+                runtime_extension_started = True
 
         run_real_teleop_control_loop(
             RealTeleopControlLoopContext(

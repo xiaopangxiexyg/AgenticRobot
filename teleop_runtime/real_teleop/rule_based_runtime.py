@@ -24,22 +24,18 @@ from robot_motion.relative_action import pose_matrix_to_xyzquat
 from robot_motion.action import HandActionSpec, RobotAction
 from robot_motion.position_control import (
     DEFAULT_POSITION_REFERENCE_HZ,
+    MotionTargetResampler,
     PoseActionMotionIntentStateMachine,
     TimestampedMotionTarget,
     build_uniform_time_grid,
     resolve_periodic_tick,
-)
-from robot_motion.position_control.resampling import (
-    _normalize_targets as _normalize_motion_targets,
-    _resample_at as _resample_motion_target_at,
 )
 from robot_motion.rm65 import BimanualPoseTarget, BimanualPoseTargetSource
 from robot_motion.transforms import project_near_rigid_pose
 from robot_motion.runtime import (
     EffectorCommand,
     TeleopCommand,
-)
-from robot_motion.runtime.readiness import (
+    command_effector_kind_subset,
     format_readiness_report,
     readiness_report_blockers,
 )
@@ -61,7 +57,7 @@ from ..collection.rule_based_adapter import (
     RuleBasedCollectionAdapter,
     RuleBasedCollectionEmission,
 )
-from ..backends.grippers.dmtac import DMTAC_GRIPPER_RECOVERABLE_SEND_STATUSES
+from ..backends.grippers import DMTAC_GRIPPER_RECOVERABLE_SEND_STATUSES
 from ..collection.action_record import validate_collection_command_action
 from ..command_override import TeleopCommandOverride
 from ..diagnostics import FaultEvent, FaultSeverity
@@ -89,225 +85,6 @@ RULE_BASED_REAL_TELEOP_SCHEMA_V1 = "dexteleop.rule_based_real_teleop.v1"
 _RULE_POSE_RIGID_PROJECTION_LIMIT = 1e-5
 _RULE_UI_STATUS_HZ = 15.0
 _WRITING_HEIGHT_DESCENT_STEP_ID = "right_write.pen_down.height_descent"
-
-
-def command_effector_kind_subset(
-    command: TeleopCommand | None,
-    *,
-    kind: str,
-) -> TeleopCommand | None:
-    """Copy one effector kind without taking ownership of dispatch.
-
-    The remote branch moved this transport-neutral helper into
-    ``robot_motion.runtime``.  This reconciliation task intentionally leaves
-    that shared package outside its scope, so the rule-writing leaf keeps the
-    same lineage-preserving behavior locally until the shared helper is
-    promoted by its owner.
-    """
-
-    if command is None:
-        return None
-    suffix = f"_{str(kind).strip()}"
-    subset = TeleopCommand(
-        timestamp=command.timestamp,
-        metadata=dict(command.metadata),
-        execution_work_item=command.execution_work_item,
-    )
-    for effector_name, effector_command in command.commands.items():
-        if str(effector_name).endswith(suffix):
-            subset.add_command(effector_command.copy())
-    return subset if subset.commands else None
-
-
-def _collection_validation_command(command: TeleopCommand) -> TeleopCommand:
-    """Restore fixed-slot hand vectors for collection-only validation.
-
-    The local action adapter predates its newer canonical-hand restoration
-    seam. DMTAC dispatch correctly carries one active gripper value together
-    with the exact six-slot source in command metadata. Validate that binding
-    and restore the fixed-slot vector only in this copied validation command;
-    the dispatched command remains one-dimensional.
-    """
-
-    restored = TeleopCommand(
-        timestamp=command.timestamp,
-        metadata=dict(command.metadata),
-        execution_work_item=command.execution_work_item,
-    )
-    for effector_name, effector_command in command.commands.items():
-        candidate = effector_command.copy()
-        metadata = dict(candidate.metadata)
-        spec_payload = metadata.get("hand_action_spec")
-        full_payload = metadata.get("hand_qpos_full")
-        if (
-            candidate.command_type == "joint_vector"
-            and str(effector_name).endswith("_hand")
-            and isinstance(spec_payload, Mapping)
-            and full_payload is not None
-        ):
-            spec = HandActionSpec.from_metadata(spec_payload)
-            full = spec.validate_vector(full_payload)
-            active = np.asarray(candidate.value, dtype=np.float32).reshape(-1)
-            expected = spec.active_values(full)
-            if not np.allclose(
-                active,
-                expected,
-                rtol=0.0,
-                atol=0.0,
-                equal_nan=True,
-            ):
-                raise ValueError(
-                    f"{effector_name} active command differs from hand_qpos_full"
-                )
-            candidate.value = full
-        restored.add_command(candidate)
-    return restored
-
-
-def _project_rule_action_to_runtime(
-    resolver: RealTeleopPoseFrameActionResolver,
-    action: RobotAction,
-) -> RobotAction:
-    """Use the current pose-frame owner without requiring its newer API name.
-
-    The remote rule branch made project_action public, while local
-    development still exposes the same projection as _project_pose.
-    Keep that ownership in the resolver and bridge only the method name here;
-    this task must not modify the shared pose-frame module.
-    """
-
-    project = getattr(resolver, "project_action", None)
-    if not callable(project):
-        project = getattr(resolver, "_project_pose", None)
-    if not callable(project):
-        raise RuntimeError("rule pose-frame resolver has no projection seam")
-    projected = project(action)
-    if not isinstance(projected, RobotAction):
-        raise TypeError("rule pose-frame projection must return RobotAction")
-    return projected
-
-
-def _freeze_rule_arm_only_from_arrived_command(
-    controller: object,
-    *,
-    side: str,
-    command: EffectorCommand,
-    now: float,
-    snapshot_origin: str,
-) -> None:
-    """Establish a deferred Fix while preserving the local controller owner.
-
-    Newer remote controllers provide freeze_arm_only_from_command. Local
-    development predates that public seam and its ordinary freeze path
-    requires live wrist input, which rule initialization intentionally does
-    not synthesize. Use the native seam when present; otherwise perform the
-    narrow equivalent against the established controller state after strict
-    arm-only validation. This compatibility path neither dispatches nor
-    invents an observation channel.
-    """
-
-    native = getattr(controller, "freeze_arm_only_from_command", None)
-    if callable(native):
-        transition = native(
-            side=side,
-            command=command,
-            now=float(now),
-            snapshot_origin=snapshot_origin,
-        )
-        if not bool(getattr(transition, "ok", False)):
-            raise RuntimeError(str(getattr(transition, "message", "unknown failure")))
-        return
-
-    normalized = str(side).strip().lower()
-    arm_name = f"{normalized}_arm"
-    if normalized not in tuple(getattr(controller, "active_sides", ()) or ()):
-        raise RuntimeError(f"inactive arm side {normalized!r}")
-    scope_for_side = getattr(controller, "scope_for_side", None)
-    if not callable(scope_for_side) or str(scope_for_side(normalized)) != "arm_only":
-        raise RuntimeError(f"arrived-command Fix requires arm_only scope for {normalized}")
-    if bool(getattr(controller, "recapturing", False)):
-        raise RuntimeError("arrived-command Fix cannot start during Home recapture")
-    if normalized in tuple(getattr(controller, "fixed_sides", ()) or ()):
-        raise RuntimeError(f"{normalized} is already fixed")
-    if (
-        not isinstance(command, EffectorCommand)
-        or command.effector_name != arm_name
-        or command.side != normalized
-        or command.command_type != "joint_vector"
-    ):
-        raise RuntimeError(f"arrived-command Fix requires {arm_name} joint_vector")
-    qpos = np.asarray(command.value, dtype=float).reshape(-1)
-    if qpos.shape != (6,) or not np.all(np.isfinite(qpos)):
-        raise RuntimeError(f"arrived-command Fix requires finite {arm_name} qpos[6]")
-    origin = str(snapshot_origin or "").strip()
-    if not origin:
-        raise RuntimeError("arrived-command Fix requires a snapshot origin")
-
-    fixed = command.copy()
-    fixed.value = qpos.copy()
-    fixed.metadata = {
-        **dict(fixed.metadata),
-        "fix_arm_snapshot_origin": origin,
-        "fix_arm_snapshot_captured_at": float(now),
-    }
-    controller._latest_by_effector[arm_name] = fixed.copy()
-    controller._fixed_by_effector[arm_name] = fixed
-    controller._fixed_by_channel = {
-        name: value
-        for name, value in controller._fixed_by_channel.items()
-        if controller._side_for_channel(name, value) != normalized
-    }
-    controller._selected_side = normalized
-    controller._fixed_side = normalized
-    controller._fixed_sides.add(normalized)
-    controller._mode = "fixed"
-    controller._status_message = f"{normalized} fixed from arrived command ({origin})"
-
-
-class MotionTargetResampler:
-    """Scope-local bridge to the established lazy resampling primitives.
-
-    The remote rule-writing branch promoted this wrapper into the shared
-    position-control API.  The shared module is intentionally outside this
-    reconciliation scope, so this leaf preserves lazy evaluation without
-    widening ownership or eagerly resampling a complete replay on the realtime
-    owner thread.
-    """
-
-    def __init__(self, samples: Sequence[TimestampedMotionTarget]) -> None:
-        self._samples = _normalize_motion_targets(samples)
-        self._source_timestamps = tuple(
-            float(sample.timestamp) for sample in self._samples
-        )
-
-    @property
-    def samples(self) -> tuple[TimestampedMotionTarget, ...]:
-        return self._samples
-
-    @property
-    def source_timestamps(self) -> tuple[float, ...]:
-        return self._source_timestamps
-
-    def resample_at(
-        self,
-        query_timestamp: float,
-        *,
-        sequence: int,
-        causal: bool = False,
-        emitted_timestamp: float | None = None,
-    ) -> Any:
-        emitted = (
-            float(query_timestamp)
-            if emitted_timestamp is None
-            else float(emitted_timestamp)
-        )
-        return _resample_motion_target_at(
-            self._samples,
-            query_timestamp=float(query_timestamp),
-            sequence=int(sequence),
-            causal=bool(causal),
-            emitted_timestamp=emitted,
-        )
 
 
 def _mutable_metadata_copy(value: Any) -> Any:
@@ -1029,7 +806,7 @@ class RuleBasedRealTeleopExtension:
                 return None
             try:
                 validate_collection_command_action(
-                    _collection_validation_command(command),
+                    command,
                     allow_backend_target_pose_defer=True,
                 )
             except (TypeError, ValueError) as exc:
@@ -3144,10 +2921,7 @@ class RuleBasedRealTeleopExtension:
             source_emission = self._project_writing_replay_height(source_emission)
             source_directive = source_emission.directive
             source_frame_index = int(source_directive.replay_frame_index or 0)
-            projected = _project_rule_action_to_runtime(
-                resolver,
-                source_emission.action,
-            )
+            projected = resolver.project_action(source_emission.action)
             projected_actions.append(projected)
             targets.append(
                 TimestampedMotionTarget(
@@ -3515,10 +3289,7 @@ class RuleBasedRealTeleopExtension:
             raise RuntimeError("rule pose-frame resolver was replaced")
 
         self._ensure_pose_action_motion_intent_step(emission.directive.step_id)
-        projected_action = _project_rule_action_to_runtime(
-            resolver,
-            emission.action,
-        )
+        projected_action = resolver.project_action(emission.action)
         projected_command = resolver.delegate.resolve(projected_action)
         active_sides = tuple(
             side for side in ("left", "right") if side in projected_action.arm_pose_by_side
@@ -4894,13 +4665,14 @@ class RuleBasedRealTeleopExtension:
                 raise RuntimeError(
                     f"verified final initialization command is missing {side}_arm"
                 )
-            _freeze_rule_arm_only_from_arrived_command(
-                controller,
+            transition = controller.freeze_arm_only_from_command(
                 side=side,
                 command=command,
                 now=float(now),
                 snapshot_origin="rule_initial_alignment_arrived",
             )
+            if not transition.ok:
+                raise RuntimeError(transition.message)
         actual_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
         if actual_fixed != contract.target_fixed_sides:
             raise RuntimeError(

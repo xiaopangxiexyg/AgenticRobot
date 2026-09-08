@@ -150,6 +150,54 @@ def _sync_preview_from_real_state_real(
     return synced
 
 
+def capture_runtime_arm_qpos_snapshot(
+    components: RealTeleopComponents,
+) -> dict[str, np.ndarray]:
+    """Read one finite active-arm qpos snapshot without tracker authority."""
+
+    active = []
+    for side in components.active_sides:
+        backend = (
+            components.left_state_backend
+            if side == "left"
+            else components.right_state_backend
+        )
+        if backend is None:
+            raise RuntimeError(f"{side}_arm has no real state backend.")
+        active.append((side, backend))
+
+    executor = components.arm_state_read_executor
+    if executor is not None and len(active) > 1:
+        future_by_side = {
+            side: executor.submit(backend.refresh_state_from_hardware)
+            for side, backend in active
+        }
+        states = {side: future.result() for side, future in future_by_side.items()}
+    else:
+        states = {
+            side: backend.refresh_state_from_hardware()
+            for side, backend in active
+        }
+
+    snapshot: dict[str, np.ndarray] = {}
+    for side in components.active_sides:
+        qpos = states[side].get("current_qpos")
+        if qpos is None:
+            raise RuntimeError(f"{side}_arm state snapshot has no current_qpos.")
+        try:
+            value = np.asarray(qpos, dtype=float).reshape(6).copy()
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{side}_arm state snapshot has invalid current_qpos."
+            ) from exc
+        if not np.all(np.isfinite(value)):
+            raise RuntimeError(
+                f"{side}_arm state snapshot has non-finite current_qpos."
+            )
+        snapshot[side] = value
+    return snapshot
+
+
 def _reset_runtime_motion_state_from_real_qpos(
     components: RealTeleopComponents,
     *,
@@ -339,6 +387,7 @@ def _sync_real_execution_step_limits(
     components.dual_arm_retargeter.set_execution_dt_sec(effective_loop_dt)
 
 __all__ = [
+    "capture_runtime_arm_qpos_snapshot",
     "_reset_runtime_motion_state_from_real_qpos",
     "_run_initial_alignment_start_check",
     "_sync_preview_from_real_state_real",

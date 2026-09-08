@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from control_station.real_teleop_entrypoint import run_real_teleop_entrypoint
+from control_station.rule_based_writing import RuleBasedWritingWebUi
 from teleop_runtime.real_teleop.rule_based_writing_plan import (
     add_rule_based_writing_arguments,
     build_rule_based_writing_extension,
@@ -13,6 +14,8 @@ def main() -> None:
     run_real_teleop_entrypoint(
         configure_parser=add_rule_based_writing_arguments,
         runtime_extension_factory=build_rule_based_writing_extension,
+        control_ui_type=RuleBasedWritingWebUi,
+        build_runtime_extension_before_device_preflight=True,
     )
 
 

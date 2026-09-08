@@ -239,6 +239,7 @@ def _hand_vector(
     cfg: TeleopCommandActionAdapterConfig,
     command_metadata: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, HandActionSpec]:
+    metadata = {} if command_metadata is None else command_metadata
     arr = np.asarray(value, dtype=np.float32).reshape(-1)
     if np.any(np.isinf(arr)):
         raise ValueError(f"{side}_hand joint_vector contains non-finite values.")
@@ -246,10 +247,35 @@ def _hand_vector(
     spec = _hand_spec_for(
         side=side,
         cfg=cfg,
-        command_metadata={} if command_metadata is None else command_metadata,
+        command_metadata=metadata,
         value_size=int(arr.size),
         finite_count=finite_count,
     )
+    if int(spec.slot_count) != int(cfg.hand_slot_dof):
+        raise ValueError(
+            f"{side}_hand hand_action_spec slot_count={spec.slot_count} does not match "
+            f"hand_slot_dof={cfg.hand_slot_dof}."
+        )
+
+    if "hand_qpos_full" in metadata:
+        full = spec.validate_vector(metadata["hand_qpos_full"])
+        if arr.shape == (spec.active_dof,):
+            actual = arr
+            expected = spec.active_values(full)
+        elif arr.shape == (spec.slot_count,):
+            actual = spec.validate_vector(arr)
+            expected = full
+        else:
+            raise ValueError(
+                f"{side}_hand joint_vector must have shape ({spec.active_dof},) or "
+                f"({spec.slot_count},), got {arr.shape}."
+            )
+        if not np.allclose(actual, expected, rtol=0.0, atol=0.0, equal_nan=True):
+            raise ValueError(
+                f"{side}_hand hand_qpos_full does not match the dispatched joint_vector."
+            )
+        return full, spec
+
     if arr.shape == (spec.slot_count,):
         if spec.slot_count == INSPIRE_HAND_DOF and not np.all(np.isfinite(arr)):
             raise ValueError(f"{side}_hand q6 joint_vector must be fully finite.")
@@ -272,6 +298,30 @@ def _hand_vector(
     active_indices = [index for index, active in enumerate(spec.active_mask or ()) if active]
     padded[np.asarray(active_indices, dtype=int)] = arr.astype(np.float32, copy=False)
     return padded, spec
+
+
+def canonical_hand_vector_from_effector_command(
+    command: EffectorCommand,
+    *,
+    config: TeleopCommandActionAdapterConfig | None = None,
+) -> tuple[np.ndarray, HandActionSpec]:
+    """Restore one dispatched hand command to its canonical fixed-slot vector."""
+
+    cfg = config if config is not None else TeleopCommandActionAdapterConfig()
+    side, kind = split_effector_name(command.effector_name)
+    if kind != "hand" or command.command_type != "joint_vector":
+        raise ValueError("Expected a joint_vector hand EffectorCommand.")
+    if command.side != side:
+        raise ValueError(
+            f"Hand command side={command.side!r} conflicts with "
+            f"effector_name={command.effector_name!r}."
+        )
+    return _hand_vector(
+        command.value,
+        side=side,
+        cfg=cfg,
+        command_metadata=command.metadata,
+    )
 
 
 def robot_action_from_teleop_command(

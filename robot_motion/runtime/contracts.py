@@ -104,6 +104,27 @@ MotionObservation = TeleopObservation
 MotionCommand = TeleopCommand
 
 
+def command_effector_kind_subset(
+    command: TeleopCommand | None,
+    *,
+    kind: str,
+) -> TeleopCommand | None:
+    """Copy one effector kind while preserving command-level lineage."""
+
+    if command is None:
+        return None
+    suffix = f"_{str(kind).strip()}"
+    subset = TeleopCommand(
+        timestamp=command.timestamp,
+        metadata=dict(command.metadata),
+        execution_work_item=command.execution_work_item,
+    )
+    for effector_name, effector_command in command.commands.items():
+        if str(effector_name).endswith(suffix):
+            subset.add_command(effector_command.copy())
+    return subset if subset.commands else None
+
+
 def merge_teleop_commands(
     commands: Mapping[str, TeleopCommand] | list[TeleopCommand] | tuple[TeleopCommand, ...]
 ) -> TeleopCommand:
@@ -148,6 +169,7 @@ __all__ = [
     "ObservationChannel",
     "TeleopCommand",
     "TeleopObservation",
+    "command_effector_kind_subset",
     "copy_runtime_value",
     "latest_channel_timestamp",
     "merge_teleop_commands",

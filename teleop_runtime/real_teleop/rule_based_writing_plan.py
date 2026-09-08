@@ -42,6 +42,7 @@ from robot_motion.action import BIMANUAL_EE_POSE_V1, HandActionSpec, RobotAction
 from robot_motion.action.hand_spec import hand_action_specs_from_metadata
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_HAND_SLICES
 from robot_motion.position_control import (
+    MotionTargetResampler,
     TimestampedMotionTarget,
     resample_motion_targets,
 )
@@ -82,7 +83,6 @@ from teleop_runtime.deploy.replay import (
     resolve_replay_parquet_path,
 )
 from teleop_runtime.real_teleop.rule_based_runtime import (
-    MotionTargetResampler,
     RuleBasedRealTeleopConfig,
     RuleBasedRealTeleopDeployment,
     RuleBasedRealTeleopExtension,

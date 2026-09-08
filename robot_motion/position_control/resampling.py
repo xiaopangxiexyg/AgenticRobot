@@ -503,8 +503,15 @@ def _resample_at(
     sequence: int,
     causal: bool,
     emitted_timestamp: float,
+    source_timestamps: Sequence[float] | None = None,
 ) -> ResampledMotionReference:
-    timestamps = [sample.timestamp for sample in samples]
+    timestamps = (
+        tuple(float(value) for value in source_timestamps)
+        if source_timestamps is not None
+        else tuple(sample.timestamp for sample in samples)
+    )
+    if len(timestamps) != len(samples):
+        raise ValueError("source_timestamps must match the motion target count")
     query = _finite_time(query_timestamp, name="query_timestamp")
     emitted = _finite_time(emitted_timestamp, name="emitted_timestamp")
 
@@ -586,6 +593,47 @@ def _resample_at(
     )
 
 
+class MotionTargetResampler:
+    """Validate and freeze a source timeline for lazy timestamp evaluation."""
+
+    def __init__(self, samples: Sequence[TimestampedMotionTarget]) -> None:
+        self._samples = _normalize_targets(samples)
+        self._source_timestamps = tuple(
+            float(sample.timestamp) for sample in self._samples
+        )
+
+    @property
+    def samples(self) -> tuple[TimestampedMotionTarget, ...]:
+        return self._samples
+
+    @property
+    def source_timestamps(self) -> tuple[float, ...]:
+        return self._source_timestamps
+
+    def resample_at(
+        self,
+        query_timestamp: float,
+        *,
+        sequence: int,
+        causal: bool = False,
+        emitted_timestamp: float | None = None,
+    ) -> ResampledMotionReference:
+        query = _finite_time(query_timestamp, name="query_timestamp")
+        emitted = (
+            query
+            if emitted_timestamp is None
+            else _finite_time(emitted_timestamp, name="emitted_timestamp")
+        )
+        return _resample_at(
+            self._samples,
+            query_timestamp=query,
+            sequence=sequence,
+            causal=bool(causal),
+            emitted_timestamp=emitted,
+            source_timestamps=self._source_timestamps,
+        )
+
+
 def resample_motion_targets(
     samples: Sequence[TimestampedMotionTarget],
     *,
@@ -599,7 +647,8 @@ def resample_motion_targets(
     reference grid so jittered/non-integer input periods are preserved.
     """
 
-    targets = _normalize_targets(samples)
+    resampler = MotionTargetResampler(samples)
+    targets = resampler.samples
     rate = validate_resample_rate(reference_hz, name="reference_hz")
     timestamps = build_uniform_time_grid(
         targets[0].timestamp,
@@ -608,9 +657,8 @@ def resample_motion_targets(
         include_final=include_final,
     )
     return [
-        _resample_at(
-            targets,
-            query_timestamp=timestamp,
+        resampler.resample_at(
+            timestamp,
             sequence=sequence,
             causal=False,
             emitted_timestamp=timestamp,
@@ -710,6 +758,7 @@ class CausalMotionResampler:
 
 __all__ = [
     "CausalMotionResampler",
+    "MotionTargetResampler",
     "POSE_ACTION_INTERVAL_VELOCITY_SCHEMA",
     "ResampledMotionReference",
     "TimestampedMotionTarget",

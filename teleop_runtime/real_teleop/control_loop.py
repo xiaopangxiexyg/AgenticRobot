@@ -60,6 +60,7 @@ from .arm_runtime import (
 from .arm_state_sync import (
     _state_qpos,
     _sync_real_execution_step_limits,
+    capture_runtime_arm_qpos_snapshot,
 )
 from .collection_bridge import (
     collection_sample_step_result as _collection_sample_step_result,
@@ -1130,52 +1131,6 @@ def _stage_progress_fixed_side_direct(
         expected_epoch=int(expected_runtime_home_epoch),
     )
     return transition, bool(transition.ok)
-
-
-def _capture_runtime_arm_qpos_snapshot(components: Any) -> dict[str, np.ndarray]:
-    """Read one finite active-arm qpos snapshot without tracker authority."""
-
-    active = []
-    for side in components.active_sides:
-        backend = (
-            components.left_state_backend
-            if side == "left"
-            else components.right_state_backend
-        )
-        if backend is None:
-            raise RuntimeError(f"{side}_arm has no real state backend.")
-        active.append((side, backend))
-
-    executor = components.arm_state_read_executor
-    if executor is not None and len(active) > 1:
-        future_by_side = {
-            side: executor.submit(backend.refresh_state_from_hardware)
-            for side, backend in active
-        }
-        states = {side: future.result() for side, future in future_by_side.items()}
-    else:
-        states = {
-            side: backend.refresh_state_from_hardware()
-            for side, backend in active
-        }
-
-    snapshot: dict[str, np.ndarray] = {}
-    for side in components.active_sides:
-        qpos = states[side].get("current_qpos")
-        if qpos is None:
-            raise RuntimeError(f"{side}_arm state snapshot has no current_qpos.")
-        try:
-            value = np.asarray(qpos, dtype=float).reshape(6).copy()
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"{side}_arm state snapshot has invalid current_qpos."
-            ) from exc
-        if not np.all(np.isfinite(value)):
-            raise RuntimeError(
-                f"{side}_arm state snapshot has non-finite current_qpos."
-            )
-        snapshot[side] = value
-    return snapshot
 
 
 def _reconcile_idle_progress_entry_arm_control(
@@ -3798,7 +3753,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             try:
                 require_idle_tactile_quiesced("explicit_runtime_home")
                 if rule_runtime_home_retry:
-                    runtime_home_qpos_snapshot = _capture_runtime_arm_qpos_snapshot(
+                    runtime_home_qpos_snapshot = capture_runtime_arm_qpos_snapshot(
                         components
                     )
                     _log(

@@ -8,7 +8,7 @@ the canonical debug entrypoint.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import inspect
 import os
 from pathlib import Path
@@ -166,6 +166,8 @@ def _validate_tactile_bundle_root(
 
 def _parse_real_teleop_args(
     parser: argparse.ArgumentParser,
+    *,
+    before_device_preflight: Callable[[argparse.Namespace], None] | None = None,
 ) -> argparse.Namespace:
     raw_argv = list(sys.argv[1:])
     args = parser.parse_args()
@@ -830,6 +832,8 @@ def _parse_real_teleop_args(
         _apply_default_arm_ips(args, active_sides=active_sides)
         _validate_required_arm_ips(args, active_sides)
         _save_explicit_arm_ips_latest(args, raw_argv=raw_argv)
+        if before_device_preflight is not None:
+            before_device_preflight(args)
         _run_gui_device_preflight(args, active_sides=active_sides, parser=parser)
         _apply_default_q6_ports(args, parser=parser)
     except ValueError as exc:
@@ -900,13 +904,18 @@ def parse_real_teleop_args() -> argparse.Namespace:
 
 def parse_real_teleop_args_with_parser(
     parser: argparse.ArgumentParser,
+    *,
+    before_device_preflight: Callable[[argparse.Namespace], None] | None = None,
 ) -> argparse.Namespace:
     """Resolve a Station-extended canonical parser without duplicating rules."""
 
     if not isinstance(parser, argparse.ArgumentParser):
         raise TypeError("parser must be an argparse.ArgumentParser.")
     add_exclusive_hitl_arguments(parser)
-    return _parse_real_teleop_args(parser)
+    return _parse_real_teleop_args(
+        parser,
+        before_device_preflight=before_device_preflight,
+    )
 
 
 __all__ = [

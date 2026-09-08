@@ -767,13 +767,17 @@ from control_station.real_agent_primitive_runtime import (
 def _parse_args_with_configuration(
     *,
     configure_parser: Callable[[argparse.ArgumentParser], None] | None = None,
+    before_device_preflight: Callable[[argparse.Namespace], None] | None = None,
 ) -> argparse.Namespace:
     _bind_cli_resolution_support(globals())
     parser = build_real_teleop_argument_parser()
     add_real_agent_primitive_arguments(parser)
     if configure_parser is not None:
         configure_parser(parser)
-    args = parse_real_teleop_args_with_parser(parser)
+    args = parse_real_teleop_args_with_parser(
+        parser,
+        before_device_preflight=before_device_preflight,
+    )
     validate_real_agent_primitive_arguments(args, parser)
     return args
 
@@ -1737,6 +1741,8 @@ def run_real_teleop_entrypoint(
     runtime_extension_factory: Callable[[argparse.Namespace], object | None] = (
         build_real_agent_primitive_extension
     ),
+    control_ui_type: type | None = None,
+    build_runtime_extension_before_device_preflight: bool = False,
 ) -> None:
     """Run the canonical lifecycle with an optional application extension.
 
@@ -1746,10 +1752,27 @@ def run_real_teleop_entrypoint(
     """
 
     try:
-        args = _parse_args_with_configuration(configure_parser=configure_parser)
+        runtime_extension: object | None = None
+        if build_runtime_extension_before_device_preflight:
+
+            def _build_extension_before_device_preflight(
+                parsed_args: argparse.Namespace,
+            ) -> None:
+                nonlocal runtime_extension
+                runtime_extension = runtime_extension_factory(parsed_args)
+
+            args = _parse_args_with_configuration(
+                configure_parser=configure_parser,
+                before_device_preflight=_build_extension_before_device_preflight,
+            )
+        else:
+            args = _parse_args_with_configuration(configure_parser=configure_parser)
         _bind_real_teleop_runtime_support(globals())
-        runtime_extension = runtime_extension_factory(args)
+        if not build_runtime_extension_before_device_preflight:
+            runtime_extension = runtime_extension_factory(args)
         args._real_teleop_runtime_extension = runtime_extension
+        if control_ui_type is not None:
+            args._real_teleop_control_ui_type = control_ui_type
         run_real_teleop(
             args,
             progress_application=build_real_teleop_progress_application(args),

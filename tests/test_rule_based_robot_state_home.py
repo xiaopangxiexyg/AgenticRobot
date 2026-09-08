@@ -6,9 +6,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from teleop_runtime.real_teleop.control_loop import (
-    _capture_runtime_arm_qpos_snapshot,
+from teleop_runtime.real_teleop.arm_state_sync import (
+    capture_runtime_arm_qpos_snapshot,
 )
+
+
 class _StateBackend:
     def __init__(self, qpos) -> None:
         self._qpos = qpos
@@ -29,7 +31,7 @@ def test_rule_runtime_home_reads_only_current_arm_qpos_without_tracker_channels(
             right_state_backend=right,
             arm_state_read_executor=executor,
         )
-        snapshot = _capture_runtime_arm_qpos_snapshot(components)
+        snapshot = capture_runtime_arm_qpos_snapshot(components)
 
     np.testing.assert_allclose(snapshot["left"], np.arange(6, dtype=float))
     np.testing.assert_allclose(snapshot["right"], np.arange(6, dtype=float) + 10.0)
@@ -48,4 +50,4 @@ def test_rule_runtime_home_rejects_missing_or_nonfinite_arm_state() -> None:
     )
 
     with pytest.raises(RuntimeError, match="non-finite"):
-        _capture_runtime_arm_qpos_snapshot(components)
+        capture_runtime_arm_qpos_snapshot(components)
