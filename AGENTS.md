@@ -13,7 +13,8 @@ documents and Skills for conditional workflows and implementation detail.
   matching entries in `docs/setup/local_resources_manifest_v1.json` before
   changing ignored resources or their bindings; do not load the whole manifest
   when a focused query is sufficient.
-- Read `README_ENV.md` for Python, dependency, installation, and lockfile work.
+- Locate the relevant `README_ENV.md` heading for Python, dependency,
+  installation, or lockfile work; load only that section and its shared boundary.
 - Use the existing README and CLI `--help` for runnable entrypoints. Do not add
   a second production entrypoint for an existing lifecycle.
 
@@ -101,8 +102,9 @@ high-impact contract, safety, persistence, concurrency or instruction changes;
 fix and recheck findings. Undecided semantics go to their owner; low-risk edits
 need no extra reviewer.
 
-Use `bash scripts/run_pytest.sh ...` and `tests/README.md` for test maintenance
-and selection. Maintain existing behavior tests before adding cases; preserve
+Use `bash scripts/run_pytest.sh ...`; start with the default suite and selection
+table in `tests/README.md`, loading later sections only for markers, costly
+environments, or test migration. Maintain existing behavior tests before adding cases; preserve
 required gates and deletion authorization. Run `git diff --check`.
 Handoff covers behavior, consumers, findings/resolution, gaps and workspace
 disposition under the selected workflow. Report offline, simulation, remote and

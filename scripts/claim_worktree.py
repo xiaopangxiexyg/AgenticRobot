@@ -104,14 +104,28 @@ def claim_worktree(args: argparse.Namespace) -> dict[str, object]:
         ),
         f"cannot resolve base {args.base!r}",
     )
-    asset_root, source = resolve_asset_root(
-        repo_root,
-        explicit_root=args.asset_root,
-    )
-    asset_status = inspect_asset_store(asset_root, source=source)
+    owns_agentic_assets = repo_root == REPO_ROOT.resolve()
+    if not owns_agentic_assets and (args.asset_root is not None or args.require_assets):
+        raise AssetStoreError(
+            "asset store options are AgenticRobot-only when --repo-root targets "
+            "another repository"
+        )
     canonical_asset_root = None
-    if asset_status.available or args.asset_root is not None or args.require_assets:
-        canonical_asset_root = require_available_store(asset_status)
+    source = None
+    asset_warning = None
+    if owns_agentic_assets:
+        asset_root, source = resolve_asset_root(
+            repo_root,
+            explicit_root=args.asset_root,
+        )
+        asset_status = inspect_asset_store(asset_root, source=source)
+        if asset_status.available or args.asset_root is not None or args.require_assets:
+            canonical_asset_root = require_available_store(asset_status)
+        if canonical_asset_root is None:
+            asset_warning = (
+                asset_status.error
+                or "Development assets unavailable; asset-dependent checks require setup."
+            )
     description = build_branch_description(
         owner=args.owner,
         base_commit=base_commit,
@@ -140,7 +154,11 @@ def claim_worktree(args: argparse.Namespace) -> dict[str, object]:
             f"branch.{args.branch}.description",
             description,
         )
-        link_result = "not-requested-or-unavailable"
+        link_result = (
+            "not-requested-or-unavailable"
+            if owns_agentic_assets
+            else "not-applicable-external-repository"
+        )
         if canonical_asset_root is not None:
             record_asset_root(repo_root, canonical_asset_root)
             link_result = ensure_worktree_asset_link(
@@ -162,12 +180,7 @@ def claim_worktree(args: argparse.Namespace) -> dict[str, object]:
         "asset_root": str(canonical_asset_root) if canonical_asset_root else None,
         "asset_source": source,
         "asset_link_result": link_result,
-        "asset_warning": None
-        if canonical_asset_root
-        else (
-            asset_status.error
-            or "Development assets unavailable; asset-dependent checks require setup."
-        ),
+        "asset_warning": asset_warning,
     }
 
 

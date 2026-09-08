@@ -1,7 +1,7 @@
 # 独立 Git 开发与交接
 
-这是 AgenticRobot 维护的通用轻量 Git 流程，RPent 等仓库可复用。默认开发入口
-仍为 HarnessCodingTool 定义的 Harness。选择独立 Git 时说明一次即可，不需要
+这是 AgenticRobot 自身的轻量 Git 流程；其他仓库应维护自己的开发规则，不依赖
+本仓脚本或资产。默认开发入口仍为 HarnessCodingTool 定义的 Harness。选择独立 Git 时说明一次即可，不需要
 Harness 服务、Task、lease 或机器人资产。已受 Harness 管理的工作必须先完成
 明确交接才能切换；不能用本流程绕过其冲突、写入、证据或集成门禁。
 
@@ -14,16 +14,15 @@ git worktree list --porcelain
 git status --short --branch
 ```
 
-本项目通常以 AgenticRobot `development`、RPent `correction` 为基线；其他开发线
-必须来自实际任务。复用清楚归属的现有任务，或为独立范围建立新工作区。短路径、
+本项目通常以 AgenticRobot `development` 为基线；其他开发线必须来自实际任务。
+复用清楚归属的现有任务，或为独立范围建立新工作区。短路径、
 不同基线和隔离集成是合理的新建原因；后续修复复用本任务归属明确的工作区，
 不按对话轮次新建副本。保留分支不要求常驻 checkout。不要仅为命名统一重命名旧分支。
 
-从 AgenticRobot 运行认领工具；`--repo-root` 可指定另一个 Git 仓库：
+从目标 AgenticRobot checkout 运行认领工具：
 
 ```bash
 python scripts/claim_worktree.py \
-  --repo-root /absolute/path/to/repository \
   --branch codex/<task-name> \
   --path /absolute/path/to/new-worktree \
   --base <development-line-or-commit> --owner <actual-owner> \
@@ -39,6 +38,8 @@ Harness Task，检查其当前范围并与其协调者解决重叠。
 资产不是认领前提。已配置且完整的只读资产可以自动链接；缺失资产会明确报告，
 纯代码或文档任务仍可创建。`--asset-root` 或 `--require-assets` 表示本次要求完整
 资产，验证失败则不创建分支。后续资产任务参考 `docs/setup/LOCAL_RESOURCES.md`。
+兼容的外部 `--repo-root` 只创建 Git worktree 和分支描述，不读取或挂接本仓资产；
+外部项目应优先使用自己的工作流。
 
 ## 一个分支描述，按需读取
 

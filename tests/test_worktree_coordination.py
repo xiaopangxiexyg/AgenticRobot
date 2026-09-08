@@ -83,7 +83,8 @@ def test_claim_without_assets_round_trips_through_inventory(repo, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["asset_root"] is None
-    assert payload["asset_warning"]
+    assert payload["asset_warning"] is None
+    assert payload["asset_link_result"] == "not-applicable-external-repository"
     assert not (target / "assets").exists()
     (target / "tracked.txt").write_text("changed\n")
     workflow = target / ".github" / "workflows" / "test.yml"

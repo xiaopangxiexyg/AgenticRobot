@@ -24,6 +24,18 @@ def _load_asset_tool():
     return module
 
 
+def _load_claim_tool(monkeypatch):
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "scripts"))
+    spec = importlib.util.spec_from_file_location(
+        "claim_worktree_test_module", CLAIM_TOOL_PATH
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _write_required_store(root: Path, asset_tool) -> None:
     for requirement in asset_tool.load_requirements():
         if not requirement.required_by_default:
@@ -118,7 +130,9 @@ def test_resolution_precedence_is_explicit_environment_git_then_worktree(
     ) == (explicit.resolve(), "explicit")
 
 
-def test_claim_worktree_records_owner_and_links_shared_assets(tmp_path: Path) -> None:
+def test_claim_worktree_rejects_agentic_assets_for_external_repository(
+    tmp_path: Path,
+) -> None:
     asset_tool = _load_asset_tool()
     repo = tmp_path / "repo"
     base = _init_repository(repo)
@@ -157,134 +171,52 @@ def test_claim_worktree_records_owner_and_links_shared_assets(tmp_path: Path) ->
         text=True,
     )
 
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    payload = json.loads(completed.stdout)
-    assert payload["ok"] is True
-    assert (worktree / "assets").is_symlink()
-    assert (worktree / "assets").resolve() == store.resolve()
-    assert _run_git(repo, "config", "--local", "--get", "dexteleop.assetRoot") == str(
-        store.resolve()
-    )
-    description = _run_git(
-        repo,
-        "config",
-        "--local",
-        "--get",
-        f"branch.{branch}.description",
-    )
-    spec = importlib.util.spec_from_file_location(
-        "worktree_coordination", REPO_ROOT / "scripts" / "worktree_coordination.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    fields, errors = module.parse_description(description)
-    assert errors == []
-    assert fields["base"] == [base]
-    assert fields["owner"] == ["test"]
-    assert fields["state"] == ["active"]
-    assert fields["tip"] == ["pending"]
-
-
-def test_claim_worktree_without_assets_keeps_pure_code_development_available(
-    tmp_path: Path,
-) -> None:
-    repo = tmp_path / "repo"
-    base = _init_repository(repo)
-    worktree = tmp_path / "claimed-worktree"
-    branch = "task/test/no-assets-20260907"
-    environment = os.environ.copy()
-    environment.pop("DEXTELEOP_ASSET_ROOT", None)
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(CLAIM_TOOL_PATH),
-            "--repo-root",
-            str(repo),
-            "--branch",
-            branch,
-            "--path",
-            str(worktree),
-            "--base",
-            base,
-            "--owner",
-            "test",
-            "--write-scope",
-            "docs/**",
-            "--semantic-scope",
-            "pure documentation",
-            "--validation",
-            "diff check",
-            "--json",
-        ],
-        cwd=repo,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    payload = json.loads(completed.stdout)
-    assert payload["ok"] is True
-    assert payload["asset_root"] is None
-    assert payload["asset_link_result"] == "not-requested-or-unavailable"
-    assert payload["asset_warning"]
-    assert not (worktree / "assets").exists()
-    assert _run_git(repo, "rev-parse", branch) == base
-
-
-def test_claim_worktree_require_assets_fails_before_creation(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    base = _init_repository(repo)
-    worktree = tmp_path / "claimed-worktree"
-    branch = "task/test/required-assets-20260907"
-    environment = os.environ.copy()
-    environment.pop("DEXTELEOP_ASSET_ROOT", None)
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(CLAIM_TOOL_PATH),
-            "--repo-root",
-            str(repo),
-            "--branch",
-            branch,
-            "--path",
-            str(worktree),
-            "--base",
-            base,
-            "--owner",
-            "test",
-            "--write-scope",
-            "sim/**",
-            "--semantic-scope",
-            "asset-dependent simulation",
-            "--validation",
-            "asset-backed simulation checks",
-            "--require-assets",
-            "--json",
-        ],
-        cwd=repo,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
     assert completed.returncode == 2
     payload = json.loads(completed.stdout)
     assert payload["ok"] is False
-    assert "asset store" in payload["error"]
+    assert "AgenticRobot-only" in payload["error"]
     assert not worktree.exists()
-    assert (
-        subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-            cwd=repo,
-            check=False,
-        ).returncode
-        == 1
+
+
+def test_claim_worktree_keeps_assets_for_its_own_repository(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    asset_tool = _load_asset_tool()
+    claim_tool = _load_claim_tool(monkeypatch)
+    repo = tmp_path / "repo"
+    base = _init_repository(repo)
+    store = tmp_path / "asset-store"
+    _write_required_store(store, asset_tool)
+    worktree = tmp_path / "claimed-worktree"
+    monkeypatch.setattr(claim_tool, "REPO_ROOT", repo.resolve())
+    args = claim_tool._build_parser().parse_args(
+        [
+            "--branch",
+            "task/test/own-assets-20260909",
+            "--path",
+            str(worktree),
+            "--base",
+            base,
+            "--owner",
+            "test",
+            "--write-scope",
+            "scripts/**",
+            "--semantic-scope",
+            "development paths only",
+            "--validation",
+            "focused offline tests",
+            "--asset-root",
+            str(store),
+        ]
     )
+
+    payload = claim_tool.claim_worktree(args)
+
+    assert (worktree / "assets").is_symlink()
+    assert (worktree / "assets").resolve() == store.resolve()
+    assert payload["asset_link_result"] == "linked"
+    assert payload["asset_warning"] is None
 
 
 def test_claim_worktree_without_assets_keeps_pure_code_development_available(
@@ -330,8 +262,8 @@ def test_claim_worktree_without_assets_keeps_pure_code_development_available(
     payload = json.loads(completed.stdout)
     assert payload["ok"] is True
     assert payload["asset_root"] is None
-    assert payload["asset_link_result"] == "not-requested-or-unavailable"
-    assert payload["asset_warning"]
+    assert payload["asset_link_result"] == "not-applicable-external-repository"
+    assert payload["asset_warning"] is None
     assert not (worktree / "assets").exists()
     assert _run_git(repo, "rev-parse", branch) == base
 

@@ -5,67 +5,28 @@ description: Change or review AgenticRobot Gateway protocol, admission, transpor
 
 # Change Agent Gateway
 
-Own changes to the Gateway contract and its application bindings. Use
-`$remote-access` for remote execution, `$debug-teleop-ik-motion` for the
-pose-to-command motion path, and `$manage-project-local-resources` for ignored
-resource placement; combine Skills only when the task crosses those boundaries.
-
-Treat `agent_gateway/AGENTS.md` as the invariant contract. Locate relevant
-[Gateway README](../../../agent_gateway/README.md) sections by heading or symbol
-and inspect the current code, registration, profile documentation, and tests for
-the changed surface. Do not load the full README by default.
-
-## Classify the change
-
-Choose one primary owner before editing:
-
-- `protocol/`: wire types, schemas, hashes, and catalogs.
-- `runtime/`: admission, operation state, reconciliation, and lower-port calls.
-- `transport/`: authenticated transport over the runtime facade.
-- `skills/`: target-independent semantics and strict I/O schemas.
-- `profiles/`: concrete resources, Routes, executors, frames, and lifecycle.
-- compatibility path: stateless forwarding to the current public contract.
-
-If the change spans owners, define the public contract and dependency order
-before implementing downstream bindings.
-Identify the actual producer and consumer on both sides, including RPent when
-affected. An unchanged schema alone does not prove unchanged runtime behavior.
+Use this Skill only to route a Gateway-owned change. `agent_gateway/AGENTS.md`
+is the single authority for owner boundaries, effects, artifacts, admission,
+safety, and receipts; read it before editing. Locate only the relevant
+[Gateway README](../../../agent_gateway/README.md) headings and current symbols.
+Use `$remote-access`, `$debug-teleop-ik-motion`, or
+`$manage-project-local-resources` only when the task actually crosses those
+separate boundaries.
 
 ## Workflow
 
-1. Trace the existing definition, schema, Route, registration, runtime facade,
-   executor, resource owner, and caller. Inspect current tests and generated
-   catalogs rather than relying on prose feature lists.
-2. Separate semantic Skill choice from trusted Route, deployment, frame,
-   resource, safety, and controller binding.
-3. Modify the owning type, schema, registration template, or profile first.
-4. Preserve the scoped AGENTS contracts for protocol identity, admission,
-   effects, lower receipts, resource lifecycle, and compatibility. Make invalid
-   combinations fail at construction or admission rather than in downstream
-   execution.
-5. Update current backend or capability information in versioned manifests,
-   registries, or profile documentation, not in `AGENTS.md`.
+1. Identify the real producer, consumer, and primary owner from the directory
+   map in `agent_gateway/AGENTS.md`.
+2. Trace the current definition through registration, runtime, executor, and
+   caller; inspect the focused tests and generated catalog when affected.
+3. Change the owning boundary first, then update current consumers and the
+   versioned manifest, registry, or profile documentation that exposes it.
+4. Preserve construction/admission failure for invalid combinations and the
+   scoped safety and receipt contracts.
 
 ## Validation
 
-Run tests through `bash scripts/run_pytest.sh ...`.
-
-- Protocol/schema: registration, catalog, hash/snapshot, serialization, and
-  compatibility tests.
-- Runtime/transport: admission, reconciliation, operation store, events,
-  authentication, endpoint, and disconnect/timeout tests.
-- Artifact I/O: slot, store, transfer, quota, hash/length, grant, receipt, gap,
-  and collection tests.
-- Concrete profile: neutral import boundary plus that profile's lifecycle,
-  frame, resource, executor, and failure tests.
-- Real motion: authorization, single-use grant, fresh state, safety envelope,
-  control-owner, fault, timeout, disconnect, and confirmed-HOLD tests.
-
-Report the exact boundary tested. In-memory or contract validation does not
-establish simulator, deployment, or real-hardware readiness.
-
-For a cross-owner contract change, include evidence from the producer and the
-affected consumer, including relevant rejection, timeout, or cancellation paths.
-Give the reviewer the fixed diff and that evidence. Fix findings in the owning
-worktree and recheck affected contracts before handing off a new candidate;
-unresolved contract choices return to the semantic owner.
+Run focused owner and consumer tests through `bash scripts/run_pytest.sh ...`;
+include the applicable rejection, timeout, or cancellation path. Report the
+exact boundary tested. Contract or in-memory evidence does not establish
+deployment, simulator, or hardware readiness.
