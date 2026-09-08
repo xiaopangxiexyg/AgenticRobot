@@ -13,6 +13,7 @@ import pytest
 
 from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
 from teleop_runtime.skill_deploy import (
+    REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
     ExclusiveRealSkillControlRuntime,
     RealAgentMotionActivation,
     RealAgentMotionOwnerIdentity,
@@ -168,6 +169,14 @@ def test_independent_runtime_owns_dispatch_and_lower_confirmed_hold() -> None:
     assert len(dispatched) == 1
     assert active.port_snapshot.phase == RealAgentMotionPhase.ACTIVE
     assert active.port_snapshot.dispatch_count == 1
+    operation_trace = dispatched[0].metadata[
+        REAL_AGENT_MOTION_COMMAND_METADATA_KEY
+    ]
+    assert operation_trace["target_pose_semantics"] == "actual_tool_tcp_world"
+    np.testing.assert_allclose(
+        operation_trace["target_tool_tcp_pose_world"],
+        _activation().target_pose_world,
+    )
     owner = port.latest_owner_state()
     assert owner is not None
     assert owner.owner_kind == "exclusive_real_skill_motion_port"
@@ -231,6 +240,38 @@ def test_measured_qpos_projection_uses_post_synchronization_availability() -> No
     assert measured is not None
     assert measured.measured_at == 1.9
     assert measured.available_at == 2.25
+
+
+def test_motion_trace_failure_isolated_from_control_cycle() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=_observation_cut,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: RealSkillMotionDispatchReceipt(
+            succeeded=True,
+            evidence_refs=("unused-dispatch:trace",),
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("unused-hold:trace",),
+        ),
+    )
+
+    def failing_trace(_sample) -> None:
+        raise RuntimeError("synthetic trace failure")
+
+    runtime.set_motion_trace_sink(failing_trace)
+    runtime.start()
+
+    step = runtime.step(now=2.0)
+
+    assert step.command_present is False
+    timing = runtime.control_cycle_snapshot()
+    assert timing["motion_trace_error_count"] == 1
+    assert "synthetic trace failure" in timing["last_motion_trace_error"]
 
 
 def test_reused_hardware_source_sequence_does_not_publish_fake_measurements() -> None:

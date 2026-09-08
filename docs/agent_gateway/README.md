@@ -12,6 +12,8 @@ SAM2 + Grounding DINO 图片定位 Skill 的源码、权重和测试路径说明
 [`SAM2_GROUNDING_DINO.md`](./SAM2_GROUNDING_DINO.md)。
 SAM2 + VGN/GraspNet 点击引导 DMTAC M 抓姿 Skill 的 RGB-D、固定相机标定、权重和只读边界见
 [`POINT_GRASP.md`](./POINT_GRASP.md)。
+抓姿生成、左右臂、真机 Gateway、RM65 运动 trace 和验收边界的集中交接见
+[`real_rm65_skill_motion_handoff_20260908.md`](./real_rm65_skill_motion_handoff_20260908.md)。
 运行资产包的下载、解压和共享根登记统一见项目根 [`README.md`](../../README.md) 的“运行资产”章节；
 本目录不重复资产包说明。
 
@@ -86,6 +88,14 @@ Grant。它的公共目标始终是 `canonical_station` 下的实际 DMTAC `tool
 实时 observation/schema 绑定 frame graph、Station frame、tool config 和 calibration hash，
 不允许调用方用字符串把 arm-base 或 camera pose 冒充 Station pose。
 
+需要从当前姿态做较远但仍受原有 envelope 约束的诊断移动时，可用
+`--relative-delta-xyz-m DX DY DZ` 替代绝对目标或相机 proposal。该偏移沿
+`canonical_station` 的 XYZ 轴解释；客户端只从同一份提交所绑定的 fresh observation
+snapshot 取一次实测 TCP，增加平移并保持实测姿态，随后提交原有绝对
+`move_tcp_to_pose` 参数。它不新增 Route 或放宽下层 10 cm 相对范围、workspace、IK、碰撞、
+dispatch、收敛与终态 HOLD 门禁。首次真机远移建议单轴 5--8 cm、
+`--speed-scale 0.15`--`0.20`，并同时启用下述 motion trace。
+
 若抓姿生成器使用同一 Gateway session 内 Station-aware Depth v2 的输出，可把直接数值参数
 替换为 `--camera-grasp-proposal /absolute/path/grasp-proposal.json`。该文件使用
 `dexteleop.real.camera_relative_grasp_proposal.v1`，必须逐项绑定当前 runtime session、Route
@@ -124,6 +134,36 @@ revision/frame graph/calibration 应关闭失败。DMTAC TCP 到 solver endpoint
 仍只在下层 target owner 执行一次，Gateway/上层不得硬编码约 0.13–0.14 m 的偏置。
 这些说明和离线测试不构成真机运行授权；任何真实调用仍需下层 envelope、IK、碰撞/跳变/
 奇异性门禁、dispatch admission、收敛检查和终态 HOLD 证明。
+
+#### 真机 Skill 运动 trace
+
+需要定位抖动、超时或发送降频时，可在启动 `real-rm65` 时显式增加：
+
+```bash
+--motion-trace-root /absolute/private/motion_traces \
+--motion-trace-max-duration-sec 120
+```
+
+trace 不改变目标、IK、admission、freshness、碰撞、轨迹或 HOLD。启动前一次性为 60 Hz
+reference/IK 和左右各 120 Hz actuator command 分配固定内存；运行期间只复制固定字段，缓冲区
+满时累计 drop 而不等待，不执行 JSON、FK 或磁盘写入。下层停止并解除 trace callback 后才生成：
+
+- `motion_trace.npz`：30 Hz 实测 qpos/TCP、60 Hz 请求目标/原始 IK/最终 qref/分支/碰撞余量/
+  各阶段耗时，以及左右 120 Hz 的实际 SDK qcmd、发送时刻与结果；
+- `summary.json`：branch switch、reference/qcmd/measured 的 step/velocity/acceleration/jerk、
+  send gap、SDK latency、deadline、pose error 和 trace drop/error 汇总；
+- `manifest.json`：schema、dtype、时钟、容量、运行身份和完整性状态。
+
+进程退出后从 `gateway_stopped.motion_trace.output_dir` 取得实际目录，再检查：
+
+```bash
+python -m teleop_runtime.skill_deploy.motion_trace inspect \
+  /absolute/private/motion_traces/<session-directory>
+```
+
+`gateway_stopped.motion_trace.closed=true`、`manifest.json.result.closed=true` 且
+`summary.json` 存在，才表示 requested trace 已完整落盘；trace 成功不等价于运动成功，运动仍以
+operation outcome、实测收敛和 lower-confirmed HOLD 为准。
 
 ### 真机只读 perception profile（H1）
 

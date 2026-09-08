@@ -168,6 +168,7 @@ def _backend_config(
         ),
         background_streaming_enabled=True,
         background_streaming_hz=position.rates.command_hz,
+        background_streaming_no_catch_up_after_send=True,
         background_streaming_target_max_age_sec=command.reference_max_age_sec,
         background_streaming_target_admission_mode=(
             RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING

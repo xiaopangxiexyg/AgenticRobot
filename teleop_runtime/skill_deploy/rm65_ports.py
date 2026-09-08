@@ -12,6 +12,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -43,6 +44,27 @@ from .control_runtime import (
     RealSkillMotionObservationCut,
 )
 from .motion_port import REAL_AGENT_MOTION_COMMAND_METADATA_KEY
+
+
+def _next_periodic_measurement_deadline(
+    *,
+    previous_deadline: float,
+    completed_at: float,
+    period_sec: float,
+) -> float:
+    """Advance one phase-locked sampler deadline without catch-up bursts."""
+
+    deadline = float(previous_deadline) + float(period_sec)
+    completed = float(completed_at)
+    period = float(period_sec)
+    if not all(math.isfinite(value) for value in (deadline, completed, period)):
+        raise ValueError("measurement sampler timing values must be finite.")
+    if period <= 0.0:
+        raise ValueError("measurement sampler period must be positive.")
+    if deadline <= completed:
+        missed = math.floor((completed - deadline) / period) + 1
+        deadline += missed * period
+    return deadline
 
 
 class RM65SkillTargetBuilder(Protocol):
@@ -188,6 +210,14 @@ class ExclusiveRM65SkillDeployPorts:
         self.position_force_guard = position_force_guard
         self.profile = profile or ExclusiveRM65SkillPortProfile()
         self.clock = clock
+        measurement_refresh_executor = (
+            ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="exclusive-rm65-state-refresh",
+            )
+            if self.profile.background_measurement_sampling
+            else None
+        )
         self.arm_state_reader = ArmStateReader(
             backends,
             refresh_hz=self.profile.state_refresh_hz,
@@ -197,6 +227,11 @@ class ExclusiveRM65SkillDeployPorts:
             # freshness gate can inspect it.
             compute_tcp_pose=False,
             clock=clock,
+            concurrent_refresh_executor=measurement_refresh_executor,
+        )
+        self._measurement_refresh_executor = measurement_refresh_executor
+        self._measurement_refresh_executor_shutdown = (
+            measurement_refresh_executor is None
         )
         self._sync_lock = threading.Lock()
         self._target_builder_synchronized = False
@@ -337,7 +372,19 @@ class ExclusiveRM65SkillDeployPorts:
         if not measurement_sampler_stopped:
             errors.append("measurement_sampler_join_timeout")
 
-        if measurement_sampler_stopped and self._force_guard_started:
+        measurement_refresh_executor_stopped = False
+        if measurement_sampler_stopped:
+            try:
+                self._shutdown_measurement_refresh_executor()
+            except Exception as exc:  # noqa: BLE001 - retain lower resources.
+                errors.append(
+                    "measurement_refresh_executor: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                measurement_refresh_executor_stopped = True
+
+        if measurement_refresh_executor_stopped and self._force_guard_started:
             try:
                 self.position_force_guard.close()
             except Exception as exc:  # noqa: BLE001 - still close both arms.
@@ -345,7 +392,9 @@ class ExclusiveRM65SkillDeployPorts:
             else:
                 self._force_guard_started = False
 
-        for side in ("right", "left") if measurement_sampler_stopped else ():
+        for side in (
+            ("right", "left") if measurement_refresh_executor_stopped else ()
+        ):
             if side not in self._backend_close_pending:
                 continue
             try:
@@ -360,7 +409,9 @@ class ExclusiveRM65SkillDeployPorts:
         """Publish terminal ownership only after every resource is released."""
 
         cleanup_complete = (
-            not self._force_guard_started and not self._backend_close_pending
+            self._measurement_refresh_executor_shutdown
+            and not self._force_guard_started
+            and not self._backend_close_pending
         )
         with self._resource_lock:
             self._resources_started = False
@@ -410,7 +461,11 @@ class ExclusiveRM65SkillDeployPorts:
                 self._measurement_stop.set()
                 return
             # Do not burst through missed deadlines after a slow SDK read.
-            deadline = time.monotonic() + period
+            deadline = _next_periodic_measurement_deadline(
+                previous_deadline=deadline,
+                completed_at=time.monotonic(),
+                period_sec=period,
+            )
 
     def _publish_measurement_sample(
         self,
@@ -459,6 +514,16 @@ class ExclusiveRM65SkillDeployPorts:
             return thread is None
         thread.join(timeout=max(1.0, 4.0 / self.profile.state_refresh_hz))
         return not thread.is_alive()
+
+    def _shutdown_measurement_refresh_executor(self) -> None:
+        if self._measurement_refresh_executor_shutdown:
+            return
+        executor = self._measurement_refresh_executor
+        if executor is None:
+            self._measurement_refresh_executor_shutdown = True
+            return
+        executor.shutdown(wait=True, cancel_futures=True)
+        self._measurement_refresh_executor_shutdown = True
 
     def measurement_sampler_snapshot(self) -> dict[str, object]:
         """Return bounded timing/fault evidence without backend I/O."""
@@ -529,6 +594,7 @@ class ExclusiveRM65SkillDeployPorts:
         available_at = max(requested_at, float(self.clock()))
         qpos_by_side: dict[str, np.ndarray] = {}
         measured_at_by_side: dict[str, float] = {}
+        hardware_read_phase_timing_by_side: dict[str, dict[str, float]] = {}
         evidence_payload: dict[str, Any] = {}
         source_sequence_by_side: dict[str, int] = {}
         for side in ("left", "right"):
@@ -610,6 +676,15 @@ class ExclusiveRM65SkillDeployPorts:
             qpos_by_side[side] = qpos.copy()
             measured_at_by_side[side] = measured_at
             source_sequence_by_side[side] = sequence
+            raw_timing = state.get("hardware_read_phase_timing")
+            if isinstance(raw_timing, Mapping):
+                hardware_read_phase_timing_by_side[side] = {
+                    str(key): float(value)
+                    for key, value in raw_timing.items()
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                }
             evidence_payload[side] = {
                 "measurement_timestamp": measured_at,
                 "measurement_sequence": sequence,
@@ -635,6 +710,9 @@ class ExclusiveRM65SkillDeployPorts:
                     "hardware_qpos_cut_hash": evidence_hash,
                     "concurrently_refreshed_sides": ("left", "right"),
                     "hardware_measurement_span_sec": measurement_span_sec,
+                    "hardware_read_phase_timing_by_side": (
+                        hardware_read_phase_timing_by_side
+                    ),
                 },
             ),
             qpos_by_side=qpos_by_side,
@@ -730,10 +808,28 @@ class ExclusiveRM65SkillDeployPorts:
                     for name, receipt in dict(batch.get("effectors") or {}).items()
                 },
             }
+            post_health = dict(batch.get("arm_backend_health") or {})
+            diagnostics = {
+                "position_dispatch_timing": dict(
+                    batch.get("position_dispatch_timing") or {}
+                ),
+                "backend_streaming_by_side": {
+                    side: dict(
+                        dict(post_health.get("sides") or {})
+                        .get(side, {})
+                        .get("background_streaming")
+                        or {}
+                    )
+                    for side in ("left", "right")
+                },
+            }
         except Exception as exc:  # noqa: BLE001 - convert to fail-closed receipt.
             succeeded = False
             summary = {
                 "accepted": False,
+                "error_type": type(exc).__name__,
+            }
+            diagnostics = {
                 "error_type": type(exc).__name__,
             }
         receipt_hash = canonical_content_hash(
@@ -743,6 +839,7 @@ class ExclusiveRM65SkillDeployPorts:
         return RealSkillMotionDispatchReceipt(
             succeeded=succeeded,
             evidence_refs=("rm65-skill-dispatch:" + receipt_hash,),
+            diagnostics=diagnostics,
         )
 
     def hold(self, reason: str) -> RealSkillMotionHoldReceipt:

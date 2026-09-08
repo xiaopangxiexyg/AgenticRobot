@@ -498,6 +498,7 @@ def _compact_background_streaming_state(state: Mapping[str, Any]) -> dict[str, A
         "last_send_dt_sec",
         "max_inter_send_gap_sec",
         "deadline_miss_count",
+        "skipped_tick_count",
         "low_rate_count",
         "target_admission_mode",
         "last_target_admission_timing",

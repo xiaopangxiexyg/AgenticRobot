@@ -8,6 +8,7 @@ import os
 import signal
 import stat
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,11 @@ from teleop_runtime.skill_deploy import (
     ExclusiveRM65SkillDeploymentProfile,
     assemble_exclusive_rm65_skill_lower,
     resolve_exclusive_rm65_skill_deployment_profile,
+)
+from teleop_runtime.skill_deploy.motion_trace import (
+    DEFAULT_SKILL_MOTION_TRACE_MAX_DURATION_SEC,
+    SkillMotionTraceConfig,
+    SkillMotionTraceRecorder,
 )
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
@@ -133,6 +139,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--collision-scene-profile",
         default="dual_arm_hand_proxy_open",
         help="trusted lower coupled-IK/collision scene profile name",
+    )
+    parser.add_argument(
+        "--motion-trace-root",
+        type=Path,
+        help=(
+            "optional absolute existing non-world-writable directory; enables "
+            "preallocated 30/60/120 Hz RM65 Skill motion tracing and writes "
+            "NPZ/manifest/summary only after lower shutdown"
+        ),
+    )
+    parser.add_argument(
+        "--motion-trace-max-duration-sec",
+        type=float,
+        default=DEFAULT_SKILL_MOTION_TRACE_MAX_DURATION_SEC,
+        help="fixed preallocated trace duration (default: 120s)",
     )
     parser.add_argument("--authorized-side", choices=("left", "right"), required=True)
     parser.add_argument(
@@ -335,6 +356,9 @@ def _ready_payload(
 
 def _stopped_payload(
     composition: ExclusiveRM65AgentPrimitiveComposition,
+    *,
+    motion_trace: SkillMotionTraceRecorder | None = None,
+    motion_trace_close_error: BaseException | None = None,
 ) -> dict[str, Any]:
     snapshot = composition.deployment.control_runtime.motion_port.snapshot()
     hold = composition.deployment.control_runtime.last_hold_receipt
@@ -365,6 +389,27 @@ def _stopped_payload(
         "control_cycle": (
             composition.deployment.control_runtime.control_cycle_snapshot()
         ),
+        "motion_trace": (
+            {
+                "enabled": False,
+                "closed": False,
+                "output_dir": None,
+                "close_error": None,
+            }
+            if motion_trace is None
+            else {
+                "enabled": True,
+                **motion_trace.snapshot(),
+                "close_error": (
+                    None
+                    if motion_trace_close_error is None
+                    else (
+                        f"{type(motion_trace_close_error).__name__}: "
+                        f"{motion_trace_close_error}"
+                    )[:512]
+                ),
+            }
+        ),
         "passive_read_failures": passive_read_failures,
         "lower_hold_proved": lower_hold_proved,
         "lower_hold_evidence_refs": ([] if hold is None else list(hold.evidence_refs)),
@@ -373,6 +418,79 @@ def _stopped_payload(
             "lower_hold_receipt" if lower_hold_proved else "missing_lower_hold_proof"
         ),
     }
+
+
+def _attach_motion_trace(
+    composition: ExclusiveRM65AgentPrimitiveComposition,
+    recorder: SkillMotionTraceRecorder,
+) -> None:
+    """Attach all fixed-field observers before any lower worker starts."""
+
+    control_runtime = composition.deployment.control_runtime
+    target_builder = composition.lower.target_builder
+    backends = composition.lower.arm_backends
+    ik_setter = getattr(target_builder, "set_ik_shadow_trace_sink", None)
+    if not callable(ik_setter):
+        raise TypeError("RM65 target builder lacks the fixed-field IK trace hook")
+    detach: list[tuple[object, str]] = []
+    try:
+        control_runtime.set_motion_trace_sink(recorder.record_control_cycle)
+        detach.append((control_runtime, "set_motion_trace_sink"))
+        ik_setter(recorder.record_ik_shadow)
+        detach.append((target_builder, "set_ik_shadow_trace_sink"))
+        for side in ("left", "right"):
+            backend = backends[side]
+            setter = getattr(backend, "set_actuator_command_trace_sink", None)
+            if not callable(setter):
+                raise TypeError(f"{side} RM65 backend lacks the actuator trace hook")
+            setter(recorder.record_actuator_command)
+            detach.append((backend, "set_actuator_command_trace_sink"))
+    except Exception as attach_error:
+        rollback_errors: list[str] = []
+        for owner, method in reversed(detach):
+            try:
+                getattr(owner, method)(None)
+            except Exception as rollback_error:  # noqa: BLE001 - bounded cleanup.
+                rollback_errors.append(
+                    f"{method}:{type(rollback_error).__name__}:{rollback_error}"[:512]
+                )
+        if rollback_errors:
+            raise RuntimeError(
+                "motion trace attach failed and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from attach_error
+        raise
+
+
+def _detach_motion_trace(
+    composition: ExclusiveRM65AgentPrimitiveComposition,
+) -> list[str]:
+    """Best-effort detach after lower shutdown; return bounded diagnostics."""
+
+    errors: list[str] = []
+    for label, owner, method in (
+        (
+            "control",
+            composition.deployment.control_runtime,
+            "set_motion_trace_sink",
+        ),
+        ("ik", composition.lower.target_builder, "set_ik_shadow_trace_sink"),
+        (
+            "left_actuator",
+            composition.lower.arm_backends["left"],
+            "set_actuator_command_trace_sink",
+        ),
+        (
+            "right_actuator",
+            composition.lower.arm_backends["right"],
+            "set_actuator_command_trace_sink",
+        ),
+    ):
+        try:
+            getattr(owner, method)(None)
+        except Exception as exc:  # noqa: BLE001 - preserve all detach failures.
+            errors.append(f"{label}:{type(exc).__name__}:{exc}"[:512])
+    return errors
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -402,6 +520,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--peer-idle-timeout-sec must be positive")
     if not 0.0 < args.grant_lifetime_sec <= 30.0:
         parser.error("--grant-lifetime-sec must be in (0, 30]")
+    if (
+        not np.isfinite(float(args.motion_trace_max_duration_sec))
+        or args.motion_trace_max_duration_sec <= 0.0
+    ):
+        parser.error("--motion-trace-max-duration-sec must be positive and finite")
 
     socket_path = _absolute_socket_path(parser, args.socket_path)
     camera_registry_arg = _effective_camera_registry(args)
@@ -526,6 +649,15 @@ def main(argv: list[str] | None = None) -> int:
             flag="--artifact-root",
         )
     )
+    motion_trace_root = (
+        None
+        if args.motion_trace_root is None
+        else _absolute_managed_directory(
+            parser,
+            args.motion_trace_root,
+            flag="--motion-trace-root",
+        )
+    )
     object_localizer = None
     point_grasp_planner = None
     camera_mount_urdf = None
@@ -578,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.embodiment_instance_id is not None
         else "dual-rm65:" + resolved.semantic_content_hash[:16]
     )
+    runtime_session_id = _runtime_session_id(args.runtime_session_id)
     composition = assemble_exclusive_rm65_agent_primitive_composition(
         lower=lower,
         socket_path=socket_path,
@@ -594,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
             for uid, client_id in client_bindings.client_id_by_uid.items()
             if client_id in client_bindings.read_only_client_ids
         },
-        runtime_session_id=_runtime_session_id(args.runtime_session_id),
+        runtime_session_id=runtime_session_id,
         control_domain_id=args.control_domain_id,
         embodiment_instance_id=embodiment_instance_id,
         max_retained_operations=args.max_retained_operations,
@@ -608,6 +741,42 @@ def main(argv: list[str] | None = None) -> int:
         point_grasp_planner=point_grasp_planner,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
     )
+
+    motion_trace: SkillMotionTraceRecorder | None = None
+    if motion_trace_root is not None:
+        trace_session_dir = motion_trace_root / (
+            time.strftime("%Y%m%d_%H%M%S")
+            + "_exclusive_rm65_skill_"
+            + uuid.uuid4().hex[:8]
+        )
+        motion_trace = SkillMotionTraceRecorder(
+            SkillMotionTraceConfig(
+                output_dir=trace_session_dir,
+                reference_hz=resolved.position_profile.rates.reference_hz,
+                command_hz=resolved.position_profile.rates.command_hz,
+                measurement_hz=composition.lower.ports.profile.state_refresh_hz,
+                max_duration_sec=args.motion_trace_max_duration_sec,
+                metadata={
+                    "entrypoint": "python -m agent_gateway real-rm65",
+                    "runtime_session_id": runtime_session_id,
+                    "control_domain_id": args.control_domain_id,
+                    "authorized_side": args.authorized_side,
+                    "authorized_action": args.authorized_action,
+                    "authorized_actions": args.authorized_actions,
+                    "position_profile": args.position_profile,
+                    "position_profile_hash": (
+                        resolved.position_profile.to_metadata()["sha256"]
+                    ),
+                    "collision_scene_profile": args.collision_scene_profile,
+                    "lower_profile_hash": resolved.semantic_content_hash,
+                },
+            )
+        )
+        try:
+            _attach_motion_trace(composition, motion_trace)
+        except Exception:
+            motion_trace.close()
+            raise
 
     ready = threading.Event()
     stop_requested = threading.Event()
@@ -636,6 +805,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     application_thread.start()
     stopped_payload: dict[str, Any] | None = None
+    motion_trace_close_error: BaseException | None = None
     try:
         while not ready.wait(0.1):
             if application_error or not application_thread.is_alive():
@@ -671,10 +841,35 @@ def main(argv: list[str] | None = None) -> int:
             application_thread.join(timeout=3.0)
         for signum, previous in previous_handlers.items():
             signal.signal(signum, previous)
-        stopped_payload = _stopped_payload(composition)
+        if motion_trace is not None and application_thread.is_alive():
+            motion_trace.stop_accepting()
+            motion_trace_close_error = RuntimeError(
+                "lower application thread did not stop; motion trace was not "
+                "detached or written"
+            )
+        elif motion_trace is not None:
+            detach_errors = _detach_motion_trace(composition)
+            if detach_errors:
+                motion_trace_close_error = RuntimeError(
+                    "motion trace detach failed: " + "; ".join(detach_errors)
+                )
+            try:
+                motion_trace.close()
+            except BaseException as error:  # noqa: BLE001 - report after HOLD proof.
+                if motion_trace_close_error is None:
+                    motion_trace_close_error = error
+        stopped_payload = _stopped_payload(
+            composition,
+            motion_trace=motion_trace,
+            motion_trace_close_error=motion_trace_close_error,
+        )
         print(json.dumps(stopped_payload, sort_keys=True), flush=True)
     if stopped_payload is None or not stopped_payload["safe_shutdown"]:
         raise RuntimeError("real RM65 Skill Gateway stopped without lower HOLD proof")
+    if motion_trace_close_error is not None:
+        raise RuntimeError("requested RM65 Skill motion trace was not completed") from (
+            motion_trace_close_error
+        )
     return 0
 
 

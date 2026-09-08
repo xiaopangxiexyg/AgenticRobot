@@ -1035,6 +1035,12 @@ class RealAgentMotionPort:
                 "measured_state_revision": activation.measured_state_revision,
                 "measured_state_hash": activation.measured_state_hash,
                 "speed_scale": activation.speed_scale,
+                # Observational trace input only.  This is the already-admitted
+                # actual tool-TCP target in the execution world frame; lower
+                # command generation and safety continue to use ``activation``
+                # directly rather than reading this metadata copy.
+                "target_tool_tcp_pose_world": activation.target_pose_world.copy(),
+                "target_pose_semantics": "actual_tool_tcp_world",
             }
             command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = dict(
                 operation_metadata
