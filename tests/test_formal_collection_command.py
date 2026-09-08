@@ -5,9 +5,13 @@ import subprocess
 
 import pytest
 
+from collection_runtime.progress.profiles import load_managed_task_profile
 from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
 from teleop_runtime.real_teleop.defaults import (
     DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC,
+)
+from teleop_runtime.real_teleop.progress_adapter import (
+    resolve_real_teleop_progress_entry,
 )
 
 
@@ -48,6 +52,8 @@ def test_launcher_help_documents_two_terminal_commands() -> None:
     assert "foot-pad" in result.stdout
     assert "collect" in result.stdout
     assert "--tactile-bundle-root" in result.stdout
+    assert "--entry-step" in result.stdout
+    assert "--gripper-input-source" in result.stdout
 
 
 def test_five_pedal_dry_run_is_fixed_to_count_five() -> None:
@@ -62,6 +68,7 @@ def test_collection_dry_run_fixes_control_progress_and_tactile_contract(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("GRIPPER_WARMUP_PROBE", raising=False)
+    monkeypatch.delenv("FORMAL_GRIPPER_INPUT_SOURCE", raising=False)
     tactile_root = tmp_path / "tactile"
     tactile_root.mkdir()
     dataset_root = tmp_path / "not-created-dataset-root"
@@ -78,9 +85,7 @@ def test_collection_dry_run_fixes_control_progress_and_tactile_contract(
     assert result.returncode == 0, result.stderr
     output = result.stdout
     assert "POSITION_FORMAL" not in output
-    assert "--position-admittance-active" in output
-    assert "--fix-arm" in output
-    assert "--no-fix-arm" not in output
+    assert "--position-admittance-" not in output
     assert (
         "--position-control-profile "
         "rm65_bimanual_position_v2_balanced_60hz_jerk_v2"
@@ -91,11 +96,85 @@ def test_collection_dry_run_fixes_control_progress_and_tactile_contract(
         "catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress"
     ) in output
     assert "--collection-progress-gui" in output
+    assert "--gripper-input-source q6" in output
+    assert "--gripper-input-source angle_trigger" not in output
+    assert "--q6-config latest" in output
+    assert "--q6-config-required" in output
     assert "--tactile-storage external" in output
     assert f"--tactile-bundle-root {tactile_root}" in output
     assert "--tactile-artifact-integrity" in output
     assert "--idle-tactile-compression" in output
     assert "--no-gripper-warmup-probe" in output
+
+
+def test_collection_can_explicitly_select_angle_trigger_without_q6_probe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FORMAL_GRIPPER_INPUT_SOURCE", raising=False)
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+
+    result = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+        "--gripper-input-source",
+        "angle_trigger",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--gripper-input-source angle_trigger" in result.stdout
+    assert "--gripper-input-source q6" not in result.stdout
+    assert "--q6-config" not in result.stdout
+
+
+def test_collection_gripper_source_cli_overrides_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FORMAL_GRIPPER_INPUT_SOURCE", "angle_trigger")
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+
+    inherited = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+    )
+    explicit = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+        "--gripper-input-source",
+        "q6",
+    )
+
+    assert inherited.returncode == 0, inherited.stderr
+    assert "--gripper-input-source angle_trigger" in inherited.stdout
+    assert explicit.returncode == 0, explicit.stderr
+    assert "--gripper-input-source q6" in explicit.stdout
+    assert "--q6-config-required" in explicit.stdout
+
+
+def test_collection_rejects_unknown_gripper_input_source(tmp_path: Path) -> None:
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+
+    result = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+        "--gripper-input-source",
+        "auto",
+    )
+
+    assert result.returncode == 2
+    assert "must be q6 or angle_trigger" in result.stderr
 
 
 def test_collection_environment_selects_task_name_and_detailed_profile(
@@ -128,6 +207,49 @@ def test_collection_environment_selects_task_name_and_detailed_profile(
         "--collection-stage-profile "
         "catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
     ) in output
+
+
+def test_collection_selects_five_stage_detail_and_starts_at_dipping(
+    tmp_path: Path,
+) -> None:
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+
+    result = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+        "--task-name",
+        "5_stage_writing_detail",
+        "--progress-profile",
+        "catalog:dmtac_rm65_bimanual_position_writing_five_stage_progress_detailed",
+        "--entry-step",
+        "right_dip_ink",
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout
+    assert "--collection-task-name 5_stage_writing_detail" in output
+    assert (
+        "--collection-progress-profile "
+        "catalog:dmtac_rm65_bimanual_position_writing_five_stage_progress"
+    ) in output
+    assert (
+        "--collection-stage-profile "
+        "catalog:dmtac_rm65_bimanual_position_writing_five_stage_progress_detailed"
+    ) in output
+    assert "--collection-progress-entry-step right_dip_ink" in output
+
+    detailed = load_managed_task_profile(
+        "dmtac_rm65_bimanual_position_writing_five_stage_progress_detailed"
+    )
+    assert detailed.stage_profile is not None
+    assert resolve_real_teleop_progress_entry(
+        progress_profile=detailed.progress_profile,
+        stage_profile=detailed.stage_profile,
+        entry_step_id="right_dip_ink",
+    ) == ("right_dip_ink", "right_dip_ink.approach", "NOMINAL")
 
 
 def test_collection_can_explicitly_enable_gripper_motion_probe(

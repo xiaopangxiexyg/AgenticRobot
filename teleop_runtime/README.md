@@ -313,10 +313,13 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 - `--show-tracker-frame-viz`
 - `--frame-viz-mode`
 
-运行时 VIVE tracker 到手腕/TCP 的默认局部高度修正集中在
-`teleop_runtime/hand_tcp_alignment.py` 的 `ViveTrackerAlignmentConfig`。
-现有默认值保持 `height_correction_m = 0.04`，各入口统一暴露
-`--vive-tracker-height-correction-m` 和 `--no-vive-tracker-height-correction`。
+运行时 VIVE tracker 到手腕/TCP 的默认局部高度修正由
+`teleop_runtime/configs/vive_tracker_alignment.json` 配置，并由
+`teleop_runtime/hand_tcp_alignment.py` 统一加载。默认值按最终解析出的
+gripper 输入源选择：Q6 为 `0.04 m`，AngleTrigger 为 `0.08 m`；自动从
+Q6 回退到 AngleTrigger 时同样选择 `0.08 m`。各入口统一暴露
+`--vive-tracker-height-correction-m`（显式覆盖配置）和
+`--no-vive-tracker-height-correction`。
 
 ### 3. Home Anchor
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..backends.grippers import DMTacGripperBackendConfig
 from ..calibration import TeleopCalibration
+from ..hand_tcp_alignment import DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG
 from ..session import TeleopSession, TeleopSessionConfig
 from ..safety import TeleopSafetyConfig
 from ..sources.hand import AngleTriggerSource
@@ -17,6 +18,7 @@ from .builders import (
 from .gripper_input import (
     GRIPPER_INPUT_ANGLE_TRIGGER,
     GRIPPER_INPUT_Q6,
+    gripper_mapping_invert_for_input_source,
 )
 from .passive_vive_q6 import seed_vive_home_anchors
 
@@ -149,7 +151,15 @@ def build_passive_single_vive_gripper_session(
             source=angle_source,
             input_channel_name=f"{side}_angle_trigger",
             source_dim=None,
+            invert=gripper_mapping_invert_for_input_source(
+                GRIPPER_INPUT_ANGLE_TRIGGER
+            ),
         )
+    tracker_height_correction_m = (
+        DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_for_gripper_input_source(
+            source_config.gripper_input_source
+        )
+    )
     session = build_single_side_passive_session(
         side=side,
         calibration=calibration,
@@ -158,6 +168,7 @@ def build_passive_single_vive_gripper_session(
         vive_clock_sync_port=source_config.vive_clock_sync_port,
         vive_source_tracker_role=source_config.vive_source_tracker_role,
         hand_backend_config=backend_config,
+        vive_tracker_height_correction_m=tracker_height_correction_m,
         safety_config=safety_config,
         **kwargs,
     )

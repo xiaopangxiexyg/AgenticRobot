@@ -14,6 +14,7 @@ import warnings
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
+from typing import Any
 
 import numpy as np
 
@@ -58,6 +59,7 @@ from ..cli_value_parsers import _active_sides_from_args
 from ..configs import (
     build_annotated_dual_rm65_calibration,
     build_bimanual_pose_smoother,
+    gripper_mapping_invert_for_input_source,
     load_default_pose_smoothing_config,
     load_impedance_pose_smoothing_config,
 )
@@ -69,6 +71,8 @@ from ..hand_render import (
 from ..hand_tcp_alignment import (
     DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
     tracker_hand_to_rm65_tcp_rotation,
+    vive_tracker_alignment_input_source_from_args,
+    vive_tracker_height_correction_m_from_args,
     vive_tracker_local_translation_offset_from_args as _vive_tracker_local_translation_offset,
 )
 from ..initial_alignment import TeleopInitialAlignment
@@ -602,6 +606,8 @@ def build_real_teleop_components(
                 f"{args.dmtac_startup_error}",
             )
     tracker_translation_offset = _vive_tracker_local_translation_offset(args)
+    tracker_height_correction_m = vive_tracker_height_correction_m_from_args(args)
+    tracker_alignment_input_source = vive_tracker_alignment_input_source_from_args(args)
     calibration.metadata.update(
         {
             "source_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
@@ -951,12 +957,10 @@ def build_real_teleop_components(
             ),
             "initial_alignment_source": args.load_initial_alignment,
             "vive_tracker_height_correction_enabled": tracker_translation_offset is not None,
-            "vive_tracker_height_correction_m": float(
-                getattr(
-                    args,
-                    "vive_tracker_height_correction_m",
-                    DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m,
-                )
+            "vive_tracker_height_correction_m": tracker_height_correction_m,
+            "vive_tracker_height_correction_input_source": tracker_alignment_input_source,
+            "vive_tracker_alignment_config_source": (
+                DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.source_path
             ),
             "vive_tracker_local_translation_offset_m": None
             if tracker_translation_offset is None
@@ -1602,7 +1606,10 @@ def build_real_teleop_components(
                         effector_name=f"{side}_hand",
                         source_dim=(int(policy["source_dim"]) if gripper_input_source == "q6" else None),
                         output_dim=int(policy["output_dim"]),
-                        invert=bool(policy["invert"]),
+                        invert=gripper_mapping_invert_for_input_source(
+                            gripper_input_source,
+                            configured_invert=bool(policy["invert"]),
+                        ),
                         alpha=float(policy["alpha"]),
                         input_min=float(policy["input_min"]),
                         input_max=float(policy["input_max"]),

@@ -545,6 +545,7 @@ def test_progress_gui_is_visible_and_selectable_before_runtime_home(
         "dmtac_bimanual_writing_acquire_present_window_v1",
         "dmtac_rm65_bimanual_position_v1_progress",
         "dmtac_rm65_bimanual_position_writing_five_stage_progress",
+        "dmtac_rm65_bimanual_position_writing_five_stage_progress_detailed",
         "dmtac_rm65_bimanual_position_writing_four_stage_progress",
         "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed",
         "dmtac_rm65_bimanual_position_writing_three_stage_progress",
@@ -588,7 +589,7 @@ def test_progress_gui_keeps_profile_selection_available_for_any_formal_task(
     )
 
     assert payload["configured"] is False
-    assert len(payload["available_profiles"]) == 11
+    assert len(payload["available_profiles"]) == 12
     assert payload["profile_selection_enabled"] is True
     assert "长程任务进度 profile" in str(payload["message"])
     assert "dmtac_impedance_15_40hz" not in str(payload["message"])

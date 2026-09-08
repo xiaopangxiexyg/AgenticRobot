@@ -1,0 +1,68 @@
+{
+  "schema": "dexteleop.task_progress_profile.v1",
+  "profile_id": "dmtac_rm65_bimanual_position_writing_five_stage_progress",
+  "profile_version": "2",
+  "task_id": "dmtac_rm65_bimanual_position_v1",
+  "steps": [
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "semantic_type": "ACQUIRE_OBJECT",
+      "display_name": "右手拿取毛笔",
+      "ordinal": 1,
+      "arm_control": {"schema": "dexteleop.progress_step_arm_control.v1", "left": "teleop", "right": "teleop", "fixed_scope": "arm_and_end_effector"},
+      "allowed_next_step_ids": [
+        "left_remove_brush_cap"
+      ]
+    },
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "left_remove_brush_cap",
+      "semantic_type": "REMOVE_BRUSH_CAP",
+      "display_name": "左手取下笔盖",
+      "ordinal": 2,
+      "arm_control": {"schema": "dexteleop.progress_step_arm_control.v1", "left": "teleop", "right": "fixed_hold", "fixed_scope": "arm_and_end_effector"},
+      "allowed_next_step_ids": [
+        "right_dip_ink"
+      ]
+    },
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "right_dip_ink",
+      "semantic_type": "DIP_INK",
+      "display_name": "沾墨水",
+      "ordinal": 3,
+      "arm_control": {"schema": "dexteleop.progress_step_arm_control.v1", "left": "fixed_hold", "right": "teleop", "fixed_scope": "arm_and_end_effector"},
+      "allowed_next_step_ids": [
+        "right_write"
+      ]
+    },
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "right_write",
+      "semantic_type": "WRITE_WITH_BRUSH",
+      "display_name": "右手书写",
+      "ordinal": 4,
+      "arm_control": {"schema": "dexteleop.progress_step_arm_control.v1", "left": "fixed_hold", "right": "teleop", "fixed_scope": "arm_and_end_effector"},
+      "allowed_next_step_ids": [
+        "right_return_brush"
+      ]
+    },
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "right_return_brush",
+      "semantic_type": "PLACE_OBJECT",
+      "display_name": "右手放回毛笔",
+      "ordinal": 5,
+      "arm_control": {"schema": "dexteleop.progress_step_arm_control.v1", "left": "fixed_hold", "right": "teleop", "fixed_scope": "arm_and_end_effector"},
+      "allowed_next_step_ids": []
+    }
+  ],
+  "initial_step_id": "right_acquire_brush",
+  "terminal_step_ids": [
+    "right_return_brush"
+  ],
+  "topology_kind": "LINEAR",
+  "allow_retry_after_failure": true,
+  "semantic_content_hash": "84a7c30c815f5853daf0ffa7ca7692925e1e8540a7cf58aaa02a28193feddaad"
+}

@@ -28,6 +28,7 @@ from .gripper_input import (
     GRIPPER_INPUT_CHOICES,
     GRIPPER_INPUT_Q6,
     SingleGripperInputSelection,
+    gripper_mapping_invert_for_input_source,
     resolve_single_gripper_input,
 )
 from .passive_vive_gripper import (
@@ -85,6 +86,7 @@ __all__ = [
     "load_pose_smoothing_config",
     "load_q6_hardware_assignment",
     "load_realsense_camera_config_map",
+    "gripper_mapping_invert_for_input_source",
     "PoseSmoother",
     "PoseSmoothingConfig",
     "PassiveViveQ6SessionConfig",

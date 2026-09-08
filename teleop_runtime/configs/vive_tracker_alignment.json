@@ -1,0 +1,10 @@
+{
+  "schema_version": "teleop_runtime.vive_tracker_alignment.v1",
+  "height_correction_enabled": true,
+  "height_correction_local_axis": [0.0, 0.0, -1.0],
+  "default_gripper_input_source": "q6",
+  "height_correction_m_by_gripper_input_source": {
+    "q6": 0.04,
+    "angle_trigger": 0.08
+  }
+}

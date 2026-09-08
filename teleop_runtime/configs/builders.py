@@ -85,6 +85,7 @@ class PassiveHandInputBinding:
     source: ObservationSource
     input_channel_name: str
     source_dim: int | None
+    invert: bool = False
 
     def __post_init__(self) -> None:
         channel = str(self.input_channel_name).strip()
@@ -122,6 +123,7 @@ def _build_hand_retargeter(
     side: str,
     input_channel_name: str,
     source_dim: int | None = 2,
+    invert: bool = False,
 ):
     effector_name = _hand_effector_name(config, side=side)
     if isinstance(config, DMTacGripperBackendConfig):
@@ -132,6 +134,7 @@ def _build_hand_retargeter(
                 effector_name=effector_name,
                 source_dim=source_dim,
                 output_dim=0,
+                invert=bool(invert),
                 output_max=float(config.max_action),
             )
         )
@@ -525,6 +528,7 @@ def build_single_side_passive_session(
                 side=normalized_side,
                 input_channel_name=hand_input_binding.input_channel_name,
                 source_dim=hand_input_binding.source_dim,
+                invert=hand_input_binding.invert,
             )
         )
     return TeleopSession(
