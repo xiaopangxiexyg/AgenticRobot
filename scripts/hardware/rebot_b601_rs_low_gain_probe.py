@@ -153,8 +153,8 @@ _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3", "joint4")
 # transient with host-qualified feedback.  The J2-only 10 mrad envelope covers
 # those measured states with a small round margin.  J3 was observed at
 # -0.682 mrad in the latest zero-state capture and -2.216 mrad after the gravity
-# fault.  These are feedback-admission boundaries, not relaxed model or command
-# limits.
+# fault.  These are compatibility projections, separate from the J4--J6 real
+# feedback operating margins below and from the unchanged command limits.
 _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD = {
     "joint2": 1.0e-2,
     "joint3": 3.0e-3,
@@ -167,6 +167,17 @@ _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD = {
     "joint2": 0.0,
     "joint3": 0.0,
     "joint4": -math.pi / 2.0,
+}
+# J4--J6 can be moved slightly beyond the URDF's nominal planning interval on
+# the physical B601.  Admit that observed operating region for feedback and
+# gravity/FK evaluation without changing the URDF or the backend's outgoing
+# command limits.  Unlike the encoder-zero compatibility windows above, these
+# values are real joint positions and must never be projected back to a model
+# boundary.
+_FEEDBACK_OPERATING_MARGIN_RAD = {
+    "joint4": 0.1,
+    "joint5": 0.1,
+    "joint6": 0.1,
 }
 # The source URDF stores J4 as +/-1.57 (rounded to two decimals), while the
 # vendor rating and commissioning documentation specify +/-90 degrees.  Keep
@@ -1839,12 +1850,13 @@ def build_feedback_admission_position_limits(
 ) -> tuple[tuple[float, float], ...]:
     """Build the read-side envelope without changing command limits.
 
-    The three documented encoder-boundary windows are the only values that
-    may extend the read-side lower boundary.  Outgoing MIT/POS_VEL references
-    continue to use the strict ``position_limits_rad`` supplied by the pinned
-    URDF.  Keeping this envelope explicit also lets the wired backend reject a
-    finite but impossible parameter response before it reaches FK, gravity,
-    impedance, or dispatch.
+    The documented encoder-boundary windows extend only their read-side lower
+    boundary.  J4--J6 additionally receive a symmetric 0.1 rad feedback
+    operating margin because the physical joints were observed moving there
+    continuously.  Outgoing MIT/POS_VEL references continue to use the strict
+    ``position_limits_rad`` supplied by the pinned URDF.  Keeping this envelope
+    explicit also lets the wired backend reject a finite but impossible
+    parameter response before it reaches FK, gravity, impedance, or dispatch.
     """
 
     limits = tuple(
@@ -1856,6 +1868,9 @@ def build_feedback_admission_position_limits(
         raise ValueError("position_limits_rad must contain six valid intervals")
     admission = list(limits)
     for index, joint_name in enumerate(_ALL_JOINTS):
+        margin = _FEEDBACK_OPERATING_MARGIN_RAD.get(joint_name, 0.0)
+        lower, upper = admission[index]
+        admission[index] = (lower - margin, upper + margin)
         boundary = _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD.get(joint_name)
         reference = _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD.get(joint_name)
         if boundary is None or reference is None:
@@ -1863,6 +1878,35 @@ def build_feedback_admission_position_limits(
         lower, upper = admission[index]
         admission[index] = (min(lower, reference - boundary), upper)
     return tuple(admission)
+
+
+def clamp_reference_qpos_to_command_limits(
+    qpos_rad: Sequence[float],
+    *,
+    position_limits_rad: Sequence[tuple[float, float]],
+) -> tuple[float, ...]:
+    """Clamp an inert vendor reference to the unchanged command envelope.
+
+    The commissioning path always sends vendor Kp=0 and computes any position
+    term in software before dispatch.  A feedback pose inside the wider
+    read-side operating envelope may therefore be used by FK/gravity while the
+    encoded vendor q reference remains inside the nominal URDF command limits.
+    This helper must not be used to make a planned position command appear
+    valid; slow-step planning is checked against the nominal limits first.
+    """
+
+    qpos = _six(qpos_rad, name="reference_qpos_rad")
+    limits = tuple(
+        (_finite(lower, name="position_limit_lower"),
+         _finite(upper, name="position_limit_upper"))
+        for lower, upper in position_limits_rad
+    )
+    if len(limits) != 6 or any(lower >= upper for lower, upper in limits):
+        raise ValueError("position_limits_rad must contain six valid intervals")
+    return tuple(
+        min(max(value, lower), upper)
+        for value, (lower, upper) in zip(qpos, limits, strict=True)
+    )
 
 
 def _mode_receipt_payload(receipt: B601ModeReceipt | None) -> dict[str, object] | None:
@@ -2013,7 +2057,7 @@ def _validate_fault_hold_snapshot(
         if not lower <= value <= upper:
             raise LowGainProbeError(
                 f"fault hold qpos_rad[{index}]={value:.6f} is outside "
-                f"URDF limits [{lower:.6f}, {upper:.6f}]"
+                f"position acceptance limits [{lower:.6f}, {upper:.6f}]"
             )
     if fault_qpos_rad is not None:
         fault_q, _ = normalize_feedback_boundary_qpos(
@@ -2037,7 +2081,8 @@ def _validate_fault_hold_snapshot(
         ):
             if not lower <= value <= upper:
                 raise LowGainProbeError(
-                    f"fault qpos_rad[{index}]={value:.6f} is outside URDF limits"
+                    f"fault qpos_rad[{index}]={value:.6f} is outside "
+                    "position acceptance limits"
                 )
         max_rebase = _bounded(
             max_rebase_rad,
@@ -2125,7 +2170,7 @@ def _validate_fault_entry_snapshot(
         if not lower <= value <= upper:
             raise LowGainProbeError(
                 f"fault entry qpos_rad[{index}]={value:.6f} is outside "
-                f"URDF limits [{lower:.6f}, {upper:.6f}]"
+                f"position acceptance limits [{lower:.6f}, {upper:.6f}]"
             )
     return q
 
@@ -2297,13 +2342,13 @@ def evaluate_feedback_position_guard(
     position_limits_rad: Sequence[tuple[float, float]],
     previous_qvel_rad_s: Sequence[float] | None = None,
 ) -> dict[str, object] | None:
-    """Reject an out-of-limit position before it can enter active state.
+    """Reject a position outside the explicit feedback operating envelope.
 
     Feedback admission is deliberately separate from the motion watchdog.  A
     finite but implausible ``mechPos`` value must be retained as evidence and
     must never replace ``final_q``, a fault-hold snapshot, or ``last_safe``.
-    URDF limits remain the sole position boundary; this helper adds no
-    independent magnitude threshold.
+    The caller supplies the read-side envelope separately from the unchanged
+    URDF command limits; this helper adds no independent magnitude threshold.
     """
 
     timestamp = _finite(feedback_timestamp_sec, name="feedback_timestamp_sec")
@@ -2328,7 +2373,7 @@ def evaluate_feedback_position_guard(
             continue
         reason = (
             f"feedback qpos_rad[{index}]={value:.6f} is outside "
-            f"URDF limits [{lower:.6f}, {upper:.6f}]"
+            f"feedback operating limits [{lower:.6f}, {upper:.6f}]"
         )
         return {
             "reason": reason,
@@ -2437,7 +2482,7 @@ def _validate_in_limit_qpos(
     for index, (value, (lower, upper)) in enumerate(zip(qpos, limits, strict=True)):
         if not lower <= value <= upper:
             raise LowGainProbeError(
-                f"{name}[{index}]={value:.6f} is outside URDF limits "
+                f"{name}[{index}]={value:.6f} is outside position acceptance limits "
                 f"[{lower:.6f}, {upper:.6f}]"
             )
     return qpos
@@ -3013,12 +3058,12 @@ def _run_feedback_stability_probe(
                 errors.append(f"invalid feedback snapshot: {exc}")
                 break
             for index, (value, (lower, upper)) in enumerate(
-                zip(q, position_limits, strict=True)
+                zip(q, feedback_position_limits, strict=True)
             ):
                 if not lower <= value <= upper:
                     errors.append(
                         f"feedback qpos_rad[{index}]={value:.6f} is outside "
-                        f"URDF limits [{lower:.6f}, {upper:.6f}]"
+                        f"feedback operating limits [{lower:.6f}, {upper:.6f}]"
                     )
                     break
             if errors:
@@ -3050,13 +3095,22 @@ def _run_feedback_stability_probe(
         "feedback_position_limits_rad": feedback_position_limits,
         "position_limit_semantics": (
             "pinned URDF limits with precise J4 +/-pi/2 nominal override; "
-            "feedback-only boundary windows are reported separately"
+            "feedback-only boundary windows and J4-J6 operating margins are "
+            "reported separately"
         ),
         "feedback_admission_semantics": (
             "backend rejects finite positions outside the explicit read-side "
             "envelope before FK/gravity/impedance/dispatch; approved J2/J3/J4 "
-            "boundary windows are read-only and do not relax outgoing limits"
+            "boundary windows and J4-J6 operating margins are read-only and "
+            "do not relax outgoing limits"
         ),
+        "feedback_operating_margin": {
+            "margin_rad": _FEEDBACK_OPERATING_MARGIN_RAD,
+            "semantics": (
+                "feedback_and_model_evaluation_only; URDF and outgoing command "
+                "limits remain unchanged"
+            ),
+        },
         "transport": "motorbridge_wired_local",
         "joint_names": _ALL_JOINTS,
         "active_joint_names": (),
@@ -4125,6 +4179,7 @@ def _send_fault_hold_command(
     gravity_scale: float,
     previous_tau: tuple[float, ...],
     torque_limits_nm: tuple[float, ...],
+    command_position_limits_rad: Sequence[tuple[float, float]],
     rate_hz: float,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
@@ -4158,8 +4213,18 @@ def _send_fault_hold_command(
         max_rate_nm_s=profile.max_torque_rate_nm_s,
         dt_sec=period,
     )
+    dispatch_reference = build_reference(
+        sequence=reference.sequence,
+        timestamp_sec=reference.source_timestamp_sec,
+        qpos_rad=clamp_reference_qpos_to_command_limits(
+            reference.qpos_rad,
+            position_limits_rad=command_position_limits_rad,
+        ),
+        qvel_rad_s=reference.qvel_rad_s,
+        joint_torque_overlay_nm=reference.joint_torque_overlay_nm,
+    )
     receipt = backend.send_mit(
-        reference,
+        dispatch_reference,
         kp=_ZERO_SIX,
         kd=_six(driver_kd_nm_s_per_rad, name="driver_kd_nm_s_per_rad"),
         tau_nm=conditioned,
@@ -4180,6 +4245,7 @@ def _send_cached_fault_hold_command(
     previous_tau: tuple[float, ...],
     profile: B601MitControlProfile,
     torque_limits_nm: tuple[float, ...],
+    command_position_limits_rad: Sequence[tuple[float, float]],
     rate_hz: float,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
@@ -4208,7 +4274,10 @@ def _send_cached_fault_hold_command(
     reference = build_reference(
         sequence=0,
         timestamp_sec=time.monotonic(),
-        qpos_rad=cached_q,
+        qpos_rad=clamp_reference_qpos_to_command_limits(
+            cached_q,
+            position_limits_rad=command_position_limits_rad,
+        ),
         qvel_rad_s=_ZERO_SIX,
     )
     receipt = backend.send_mit(
@@ -4232,6 +4301,7 @@ def _run_latched_fault_hold(
     fault_qpos_rad: tuple[float, ...] | None,
     fault_qvel_rad_s: tuple[float, ...] | None,
     position_limits_rad: tuple[tuple[float, float], ...],
+    command_position_limits_rad: tuple[tuple[float, float], ...] | None = None,
     max_age_sec: float,
     max_velocity_rad_s: float,
     max_rebase_rad: float,
@@ -4285,6 +4355,11 @@ def _run_latched_fault_hold(
     """
 
     errors: list[str] = []
+    command_limits = (
+        position_limits_rad
+        if command_position_limits_rad is None
+        else command_position_limits_rad
+    )
     latest_tau = previous_tau
     command_profile = profile if hold_profile is None else hold_profile
     monitor_velocity_limit = _positive(
@@ -4440,6 +4515,7 @@ def _run_latched_fault_hold(
                 previous_tau=latest_tau,
                 profile=command_profile,
                 torque_limits_nm=torque_limits_nm,
+                command_position_limits_rad=command_limits,
                 rate_hz=rate_hz,
                 driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
             ),
@@ -4547,6 +4623,7 @@ def _run_latched_fault_hold(
                     gravity_scale=gravity_scale,
                     previous_tau=latest_tau,
                     torque_limits_nm=torque_limits_nm,
+                    command_position_limits_rad=command_limits,
                     rate_hz=rate_hz,
                     driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                 ),
@@ -4752,6 +4829,7 @@ def _run_latched_fault_hold(
                     gravity_scale=gravity_scale,
                     previous_tau=previous_tau,
                     torque_limits_nm=torque_limits_nm,
+                    command_position_limits_rad=command_limits,
                     rate_hz=rate_hz,
                     driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                 ),
@@ -5074,7 +5152,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             warmup_state.positions_rad,
             qvel_rad_s=_ZERO_SIX,
             observed_age_sec=0.0,
-            position_limits_rad=position_limits,
+            position_limits_rad=feedback_position_limits,
             max_age_sec=args.fault_hold_max_age_sec,
             max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
             max_rebase_rad=args.fault_hold_max_rebase_rad,
@@ -5158,7 +5236,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             raise LowGainProbeError("non-positive warmup-to-enable observation interval")
         arming_q = _validate_in_limit_qpos(
             arming_state.positions_rad,
-            position_limits_rad=position_limits,
+            position_limits_rad=feedback_position_limits,
             name="arming_qpos_rad",
         )
         arming_qvel = tuple(
@@ -5200,8 +5278,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             max_rate_nm_s=startup_lock_profile.max_torque_rate_nm_s,
             dt_sec=arm_dt,
         )
+        startup_lock_dispatch_reference = build_reference(
+            sequence=lock_reference.sequence,
+            timestamp_sec=lock_reference.source_timestamp_sec,
+            qpos_rad=clamp_reference_qpos_to_command_limits(
+                lock_reference.qpos_rad,
+                position_limits_rad=position_limits,
+            ),
+            qvel_rad_s=lock_reference.qvel_rad_s,
+            joint_torque_overlay_nm=lock_reference.joint_torque_overlay_nm,
+        )
         startup_lock_first_receipt = backend.send_mit(
-            lock_reference,
+            startup_lock_dispatch_reference,
             kp=_ZERO_SIX,
             kd=driver_kd_nm_s_per_rad,
             tau_nm=lock_tau,
@@ -5267,7 +5355,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     previous_qpos_rad=arming_settle_previous_q,
                     current_timestamp_sec=settle_state.receive_timestamp_sec,
                     previous_timestamp_sec=arming_settle_previous_feedback_time,
-                    position_limits_rad=position_limits,
+                    position_limits_rad=feedback_position_limits,
                     max_velocity_rad_s=arming_settle_velocity_limit_rad_s,
                 )
             except (LowGainProbeError, TypeError, ValueError) as exc:
@@ -5297,8 +5385,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 max_rate_nm_s=startup_lock_profile.max_torque_rate_nm_s,
                 dt_sec=settle_dt,
             )
+            lock_dispatch_reference = build_reference(
+                sequence=lock_reference.sequence,
+                timestamp_sec=lock_reference.source_timestamp_sec,
+                qpos_rad=clamp_reference_qpos_to_command_limits(
+                    lock_reference.qpos_rad,
+                    position_limits_rad=position_limits,
+                ),
+                qvel_rad_s=lock_reference.qvel_rad_s,
+                joint_torque_overlay_nm=lock_reference.joint_torque_overlay_nm,
+            )
             lock_receipt = backend.send_mit(
-                lock_reference,
+                lock_dispatch_reference,
                 kp=_ZERO_SIX,
                 kd=driver_kd_nm_s_per_rad,
                 tau_nm=lock_tau,
@@ -5462,7 +5560,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 feedback_timestamp_sec=state.receive_timestamp_sec,
                 raw_qpos_rad=raw_q,
                 normalized_qpos_rad=q,
-                position_limits_rad=position_limits,
+                position_limits_rad=feedback_position_limits,
                 previous_qvel_rad_s=previous_guard_qvel,
             )
             if position_rejection is not None:
@@ -5615,7 +5713,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         0.0,
                         time.monotonic() - observed_at_sec,
                     ),
-                    position_limits_rad=position_limits,
+                    position_limits_rad=feedback_position_limits,
                     max_age_sec=args.fault_hold_max_age_sec,
                     max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
                     max_rebase_rad=args.fault_hold_max_rebase_rad,
@@ -5791,8 +5889,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             )
             compute_time = time.monotonic()
             ledger.mark("compute", compute_time)
+            dispatch_reference = build_reference(
+                sequence=reference.sequence,
+                timestamp_sec=reference.source_timestamp_sec,
+                qpos_rad=clamp_reference_qpos_to_command_limits(
+                    reference.qpos_rad,
+                    position_limits_rad=position_limits,
+                ),
+                qvel_rad_s=reference.qvel_rad_s,
+                joint_torque_overlay_nm=reference.joint_torque_overlay_nm,
+            )
             receipt = backend.send_mit(
-                reference,
+                dispatch_reference,
                 # Driver Kp stays zero so the end-effector spring remains the
                 # sole position-restoring owner.  Optional driver Kd supplies
                 # only motor-local damping behind verified 0x700B bounds.
@@ -5822,6 +5930,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "qvel_fd_rad_s": qvel,
                     "qacc_fd_rad_s2": qacc,
                     "qref_rad": qref,
+                    "dispatch_qref_rad": dispatch_reference.qpos_rad,
                     "qvel_ref_rad_s": qvel_ref,
                     "startup_state": startup_state_history[-1],
                     "gravity_ramp_fraction": gravity_ramp,
@@ -6072,7 +6181,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             observed_age_sec=hold_age_sec,
                             fault_qpos_rad=fault_qpos_for_hold,
                             fault_qvel_rad_s=fault_qvel_for_hold,
-                            position_limits_rad=position_limits,
+                            position_limits_rad=feedback_position_limits,
+                            command_position_limits_rad=position_limits,
                             max_age_sec=args.fault_hold_max_age_sec,
                             max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
                             max_rebase_rad=args.fault_hold_max_rebase_rad,
@@ -6246,13 +6356,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "feedback_position_limits_rad": feedback_position_limits,
         "position_limit_semantics": (
             "pinned URDF limits with precise J4 +/-pi/2 nominal override; "
-            "feedback-only boundary windows are reported separately"
+            "feedback-only boundary windows and J4-J6 operating margins are "
+            "reported separately"
         ),
         "feedback_admission_semantics": (
             "backend rejects finite positions outside the explicit read-side "
             "envelope before FK/gravity/impedance/dispatch; approved J2/J3/J4 "
-            "boundary windows are read-only and do not relax outgoing limits"
+            "boundary windows and J4-J6 operating margins do not relax "
+            "outgoing limits"
         ),
+        "feedback_operating_margin": {
+            "margin_rad": _FEEDBACK_OPERATING_MARGIN_RAD,
+            "semantics": (
+                "feedback_and_model_evaluation_only; URDF and outgoing command "
+                "limits remain unchanged"
+            ),
+        },
         "transport": "motorbridge_wired_local",
         "joint_names": _ALL_JOINTS,
         "active_joint_names": active_joint_names,
@@ -6611,7 +6730,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "While latched, a valid cycle updates gravity from current feedback; RX, numeric, motion-monitor, or model failure keeps sending cached gravity with zero Kp and configured motor-local damping while feedback recovery is retried.",
             "A complete six-joint MIT command is retried once; only failure of both live and cached complete-frame dispatch, absence of any verified cache, or an explicit second stop request permits full safe_stop.",
             "Protective hold has software Kp=0 and one derivative owner per joint: explicit driver Kd suppresses the default software damping for that joint; no two damping terms are stacked.",
-            "J2 feedback readings in [-1e-2, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Raw active samples are retained, and values beyond each compatibility window remain outside the strict effective limit.",
+            "J2 feedback readings in [-1e-2, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Separately, real J4-J6 feedback is admitted within 0.1 rad of each nominal URDF boundary without projection, so FK and gravity follow the measured pose.",
+            "All outgoing MIT/POS_VEL references remain inside the nominal URDF command envelope. In this probe vendor Kp is zero, so a feedback-following MIT reference is clamped only for encoding after the software position/gravity torque has already been computed from the real accepted pose.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
             "After enable, the active path captures a fresh q0 and immediately sends an all-six-joint bounded software position lock at q0; lock frames continue during the four-sample arming-settle gate.",

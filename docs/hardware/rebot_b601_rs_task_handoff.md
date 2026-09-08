@@ -28,7 +28,8 @@
   `--rebot-source-root /home/zc/HandMotion/Developing/reBotArm_control_py`，不能依赖一个
   未记录版本的本地模型副本。
 - 已完成的代码重点是：六轴 gravity+damping protective hold、启动锁到最终控制器的
-  连续 handoff、J2/J3/J4 反馈边界兼容、qvel/qacc/非有限值 guard，以及交互式多姿态重力
+  连续 handoff、J2/J3/J4 编码器边界兼容、J4/J5/J6 反馈工作余量、qvel/qacc/非有限值
+  guard，以及交互式多姿态重力
   残差采集和离线 candidate fit。
 - 当前可以继续做正式采集和离线拟合；不能宣称重力参数、摩擦、真实力矩比例、高带宽
   触觉或最终 `HARDWARE_PASS` 已完成标定。
@@ -254,7 +255,7 @@ receipt 不完整，不能把程序退出当作设备安全已确认。
 | 事件 | 首选处理 | 何时升级 |
 | --- | --- | --- |
 | feedback 缺失/无效/过期/vendor 异常 | degraded cached gravity + driver Kd（若已配置） | 无完整缓存或缓存帧重试仍失败 |
-| 位置再次越过 URDF/有效边界 | 拒绝该样本，保留上一合法 cache | 无合法 cache 或无法完整发送 cache |
+| 位置再次越过反馈工作包络 | 拒绝该样本，保留上一合法 cache | 无合法 cache 或无法完整发送 cache |
 | timestamp 不前进、`dt<=0` | 不用该样本更新 q/qvel，进入降级 | 后续 cache dispatch 也失败 |
 | qvel/qacc 非有限或超过 gate | 不接受为 last-safe，降级保持 | 无安全 cache 或发送失败 |
 | FK/Jacobian/gravity/impedance/tau 异常 | 不发送异常计算结果，使用 gravity cache | cache 不存在/发送失败 |
@@ -264,22 +265,26 @@ receipt 不完整，不能把程序退出当作设备安全已确认。
 
 ## 8. 反馈边界和数值异常处理
 
-### 8.1 不改 URDF 的 tolerance + projection
+### 8.1 不改 URDF 的边界投影与反馈工作包络
 
-URDF 的机械边界仍是权威物理/模型边界；反馈观测存在编码器量化、减速器回差和浮点误差，
-因此只在进入运动学/guard 前做有界兼容投影：
+URDF 继续定义 nominal 模型、规划和出站命令边界，但它不是这台实物在人工拖动下每个可达
+角度的完整证明。反馈观测分为编码器边界兼容和真实工作余量两层：
 
 - J2：`-0.010 <= raw_q < 0` 投影到 `0`；该范围覆盖两次零位只读捕获和
   2026-09-08 host-id 限定反馈下观察到的 `-0.007627 rad` 启动边界瞬态；
 - J3：`-0.003 <= raw_q < 0` 投影到 `0`；
 - J4：运行 nominal boundary 使用精确 `[-pi/2, +pi/2]`，对
   `-pi/2-0.001 <= raw_q < -pi/2` 投影到 `-pi/2`；
-- 超出上述窗口仍 fail-closed；不把任意大负值 clamp 成零；不改写源 URDF。
+- J4/J5/J6 在各自 nominal URDF 上下界外另接纳 `0.1 rad` 的真实反馈工作余量；这些值
+  不做投影，可进入 FK、Jacobian 和 `g(q)`；
+- 超出上述窗口/余量仍 fail-closed；不把任意大值 clamp 成边界；不改写源 URDF。
 
 每个证据 JSON 同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
 `boundary_normalized_joint_names`。出站 reference 和 torque envelope 仍按有效 nominal limit
-约束。J4 源 URDF 的 `-1.57/1.57` 是两位小数记录，不能把它误读成比 `±90°` 更窄的真实
-机械边界。
+约束；slow-step 不能借用读侧余量。active probe 的 vendor Kp 固定为零，因此位于读侧余量
+时，软件位置/重力计算保留真实姿态，而编码到 MIT 帧的无效位置 reference 夹回 nominal
+范围，不把读侧余量变成 driver 位置命令。J4 源 URDF 的 `-1.57/1.57` 是两位小数记录，
+不能把它误读成比 `±90°` 更窄的真实机械边界。
 
 ### 8.2 运动 guard 的顺序
 
@@ -651,10 +656,22 @@ fit 完成后必须检查：完整窗口数/不完整窗口数、独立姿态数
 - 2026-09-04/06 的单轴人工扰动在旧 `0.03 rad/s` gate 下出现 `0.098028 rad/s`，原始
   JSON 应保留 `FAIL`；操作者另行确认“人工单轴扰动现象已验收”。后续正常 qvel seed 使用
   `0.12 rad/s`，不联动放宽 qacc 或 fault-hold stationarity。
-- J2/J3 边界观察和 J4 精确 `±pi/2`/0.001 rad 兼容窗口只作用于反馈接纳；曾出现的 J4
-  巨大非有限/异常数值必须 fail-closed，不能通过扩大 clamp 消除。
-- 交互采集曾完成 1–4 号窗口，后续窗口 5 在 duration 边界前未完成，或旧版本因 J4 四舍
-  五入边界中止；这类数据可诊断但不能直接作为正式重力拟合输入。
+- J2/J3 边界观察和 J4 精确 `±pi/2`/0.001 rad 兼容窗口只作用于反馈接纳；J4/J5/J6
+  另有各 `0.1 rad` 的真实反馈工作余量，但不放宽出站命令。曾出现的 J4 巨大非有限/异常
+  数值必须 fail-closed，不能通过扩大 clamp 消除。
+- 2026-09-08 type-17 调试运行完成 4 个有效窗口后，J6 从 `2.774` 连续移动到
+  `3.232712 rad`，其中触发旧上界的 `3.142859 rad` 来自 status=0、device=6、host=0xFD、
+  parameter=0x7019 的正常回复，不是单帧通信伪值；这组证据支持上述 J6 工作余量。
+- 同一次 4 窗口数据每窗 399 帧、最大窗口速度 `0.0077 rad/s`、最大位置跨度
+  `0.00058 rad`，且没有 torque/slew saturation，可保留为训练候选。`global-scale` 离线拟合
+  只给出 `1.0 -> 0.9999686` 和约 `0.00052 N.m` 的原始 RMS 残差，且没有独立验证批次；
+  因此它不支持现在修改运行时重力比例、joint bias 或 payload 参数。
+- `R` 在操作者松手后把当时位置设为 reference；按键前已发生的轻微下坠，以及被静摩擦
+  挡住而没有形成位置误差的重力残差，都不会出现在 `position_tau=Kp*(qref-q)` 中。因此这
+  4 点不能解释启动/自由拖动阶段的轻微前倾，后者仍应通过启动轨迹或实际电流/力矩观测定位。
+- 更早的交互采集曾完成 1–4 号窗口，后续窗口 5 在 duration 边界前未完成，或旧版本因 J4
+  四舍五入边界中止；这类 Kp=0、窗口不完整或来源不清的旧数据只可诊断，不能与上面本次
+  4 个有效 Kp=5 窗口混为同一正式输入。
 - protective hold 的人工验收重点是：首次 Ctrl-C 后 J1–J6 仍 enabled、gravity+damping
   可拖动；再次 Ctrl-C/SIGUSR1 才完成六轴 disable。程序因为操作者中断而返回 FAIL 时，
   仍须阅读 hold/cleanup 字段再判定安全行为。

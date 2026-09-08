@@ -83,13 +83,14 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   `0 rad`。J4 的运行坐标额定边界按权威 `+/-pi/2` 表示（源 URDF 的
   `-1.57/1.57` 仅是两位小数的记录），并额外接纳
   `-pi/2-0.001 <= q < -pi/2 rad`，投影到精确的 `-pi/2`。这些都是反馈状态的
-  有界投影，不修改源 URDF 或真实机械硬限位；反馈窗口本身不改变出站参考或
-  torque/slew 包络。超过各自窗口的读数仍 fail-closed。JSON 样本同时保留 `raw_qpos_rad`、归一化后的
+  有界投影，不修改源 URDF 或真实机械硬限位。J4/J5/J6 另有独立的反馈工作包络：
+  在 nominal URDF 上下界外各接纳 `0.1 rad`，真实反馈不做投影，仍进入 FK 和重力计算；
+  这不是自动规划或位置命令范围。超过工作包络的读数仍 fail-closed。JSON 样本同时保留 `raw_qpos_rad`、归一化后的
   `qpos_rad` 和 `boundary_normalized_joint_names`，便于复核实际读数。
 - J2 的 `-1e-2 rad` 是只读接纳下限，不是常规工作范围：两次零位只读捕获曾观察到
   `-4.943/-4.517 mrad`，2026-09-08 使用 host-id 限定反馈的启动锁/重力交接又观察到
-  连贯的 `-7.627 mrad` 边界瞬态，因此仅对 J2 保留到 `-10 mrad` 的整值余量。J3/J4
-  窗口和全部出站命令限位保持不变；比该下限更负的 J2 反馈仍 fail-closed。
+  连贯的 `-7.627 mrad` 边界瞬态，因此仅对 J2 保留到 `-10 mrad` 的整值余量。J2/J3
+  不额外扩展一般工作包络；比各自下限更负的反馈仍 fail-closed。
 - active low-gain probe 用相邻 normalized q 与精确 host receive `dt` 计算 qvel，再用连续
   qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0` 和非有限值
   立即拒绝。有限但 qvel 或 qacc 越限的第一帧在任何 MIT dispatch 前隔离：不更新
@@ -104,11 +105,14 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   位置限位和 motion guard 都先于更新 `final_q`、当前故障快照和 `last-safe`；被拒绝的
   反馈只进入 evidence，不会被用于重力、阻抗或保护保持计算。
 - 反馈接纳现在在 wired backend 入口再次执行：`feedback_position_limits_rad` 是只读的
-  接纳包络，默认回退到严格的 `position_limits_rad`，由 probe 显式传入仅扩展 J2/J3/J4
-  已批准的边界窗口。这样即使 `mechPos(0x7019)` 返回一个有限但物理上不可能的巨大数值，
+  接纳包络，默认回退到严格的 `position_limits_rad`；probe 显式加入 J2/J3/J4
+  已批准的边界窗口，以及 J4/J5/J6 各 `0.1 rad` 的反馈工作余量。这样即使
+  `mechPos(0x7019)` 返回一个有限但物理上不可能的巨大数值，
   backend 也会将该关节标为 `valid=false, stale=true`，并在错误中保留关节名、motor/feedback
   ID、参数 ID、原始值、可用时的 IEEE-754 单精度位模式和接纳区间；坏帧不会被任何 backend 消费者误当成完整状态。出站 MIT/
-  POS_VEL 仍只使用严格 URDF 包络，读侧窗口不能放宽命令限位。active probe 会把每关节
+  POS_VEL 仍只使用严格 URDF 包络。active probe 的 vendor Kp 固定为零；当真实反馈位于
+  J4/J5/J6 工作余量时，软件位置项和 `g(q)` 使用真实接纳姿态，编码进 MIT 帧的无效位置参考
+  则夹在 nominal 命令包络内。读侧余量不能用于放宽 slow-step 或其他规划命令。active probe 会把每关节
   backend 诊断写入 `motion_guard.rejected_sample.backend_joint_diagnostics`，随后复用上一份
   已验证的六轴重力缓存进入 `PROTECTIVE_HOLD`；只有已配置 driver Kd 时，反馈不可信的
   降级阶段才仍有电机本地阻尼。终端会用完整分隔线分别显示 `PROTECTIVE HOLD DEGRADED`、
@@ -421,7 +425,7 @@ DEGRADED_HOLD
    `--protective-hold-kd`（默认 `1.0 N·m·s/rad`）作为中等阻尼；显式选择 driver Kd 时，
    该关节由 driver 单独负责阻尼，软件 Kd 自动为零。两条路径都继续经过现有软件绝对力矩和
    slew 包络，以及已回读的 `0x700B` 总力矩上限（如有）；
-5. 保持循环每次读取完整反馈，检查有限性、URDF 位置限位、时间推进、运动监视和 MIT 发送
+5. 保持循环每次读取完整反馈，检查有限性、反馈工作包络、时间推进、运动监视和 MIT 发送
    回执。当前反馈 q 成为下一帧参考并重新计算 `g(q)`；它不会与首次 q 比较，也不会触发
    `max-rebase` 漂移失能。这样既能抑制重力下坠，又不会因为有意拖动而与操作者对抗。
 
@@ -434,7 +438,7 @@ driver Kd 为零，程序会明确记录 `motor_local_damping_available=false`�
 重力保持，不能声称仍有软件大阻尼。
 
 以下异常本身都只是进入或维持 `DEGRADED_HOLD` 的理由，不再单独授权失能：feedback 再次
-缺失、invalid/stale 或 vendor 状态异常；当前观测越过 URDF 限位；主机观测时间不推进或
+缺失、invalid/stale 或 vendor 状态异常；当前观测越过反馈工作包络；主机观测时间不推进或
 `dt<=0`；有限差分速度/加速度非有限或超过配置监视值；FK、Jacobian、gravity、阻抗、功率
 一致性或总力矩组合异常。坏样本不进入缓存，程序继续轮询恢复。MIT 部分发送、驱动器拒绝
 或发送异常则先对同一有界完整六轴命令立即重试一次；若 live 命令仍失败，再尝试纯重力

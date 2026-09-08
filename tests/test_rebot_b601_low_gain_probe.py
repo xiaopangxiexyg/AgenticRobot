@@ -729,7 +729,10 @@ def test_feedback_boundary_normalization_does_not_admit_more_negative_values() -
 
         assert normalized == raw
         assert normalized_joint_names == ()
-        with pytest.raises(probe.LowGainProbeError, match="outside URDF limits"):
+        with pytest.raises(
+            probe.LowGainProbeError,
+            match="outside position acceptance limits",
+        ):
             probe._validate_fault_hold_snapshot(
                 raw,
                 qvel_rad_s=(0.0,) * 6,
@@ -747,7 +750,7 @@ def test_feedback_boundary_normalization_admits_j3_and_keeps_other_joints_unchan
     assert normalized_joint_names == ("joint3",)
 
 
-def test_feedback_admission_limits_extend_only_approved_boundary_windows() -> None:
+def test_feedback_admission_limits_separate_boundary_windows_and_wrist_margin() -> None:
     strict = (
         (-2.8, 2.8),
         (0.0, 3.14),
@@ -763,9 +766,10 @@ def test_feedback_admission_limits_extend_only_approved_boundary_windows() -> No
     assert admission[1] == pytest.approx((-0.01, 3.14))
     assert admission[2] == pytest.approx((-0.003, 3.14))
     assert admission[3] == pytest.approx(
-        (-math.pi / 2.0 - 0.001, math.pi / 2.0)
+        (-math.pi / 2.0 - 0.1, math.pi / 2.0 + 0.1)
     )
-    assert admission[4:] == strict[4:]
+    assert admission[4] == pytest.approx((-1.67, 1.67))
+    assert admission[5] == pytest.approx((-3.24, 3.24))
 
 
 def test_feedback_boundary_normalization_admits_observed_j2_startup_transient_only() -> None:
@@ -819,7 +823,7 @@ def test_feedback_boundary_normalization_admits_j4_precision_window_only() -> No
     assert normalized[4:] == raw[4:]
 
 
-def test_feedback_boundary_normalization_rejects_j4_beyond_redundancy() -> None:
+def test_j4_operating_margin_does_not_project_real_position() -> None:
     j4_lower = -math.pi / 2.0
     raw = (0.1, 0.2, 0.3, j4_lower - 0.001 - 1e-9, -0.3, 0.4)
 
@@ -827,19 +831,61 @@ def test_feedback_boundary_normalization_rejects_j4_beyond_redundancy() -> None:
 
     assert normalized == raw
     assert normalized_joint_names == ()
-    with pytest.raises(probe.LowGainProbeError, match="outside URDF limits"):
+    strict = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (j4_lower, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    admitted = probe._validate_in_limit_qpos(
+        raw,
+        position_limits_rad=probe.build_feedback_admission_position_limits(strict),
+        name="j4_operating_qpos_rad",
+    )
+    assert admitted[3] == pytest.approx(raw[3])
+
+
+def test_wrist_feedback_margin_admits_observed_j6_but_rejects_beyond_margin() -> None:
+    strict = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    admission = probe.build_feedback_admission_position_limits(strict)
+    observed = (0.1, 0.2, 0.3, 0.4, 0.5, 3.2327115535736084)
+
+    assert probe._validate_in_limit_qpos(
+        observed,
+        position_limits_rad=admission,
+        name="observed_j6_qpos_rad",
+    ) == observed
+    with pytest.raises(probe.LowGainProbeError, match="position acceptance limits"):
         probe._validate_in_limit_qpos(
-            raw,
-            position_limits_rad=(
-                (-2.8, 2.8),
-                (0.0, 3.14),
-                (0.0, 3.14),
-                (j4_lower, math.pi / 2.0),
-                (-1.57, 1.57),
-                (-3.14, 3.14),
-            ),
-            name="j4_boundary_qpos_rad",
+            (*observed[:5], 3.240001),
+            position_limits_rad=admission,
+            name="beyond_j6_qpos_rad",
         )
+
+
+def test_feedback_reference_clamp_keeps_outgoing_command_limits_nominal() -> None:
+    strict = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+
+    assert probe.clamp_reference_qpos_to_command_limits(
+        (0.0, 0.5, 0.5, -1.62, 1.63, 3.2327115535736084),
+        position_limits_rad=strict,
+    ) == pytest.approx((0.0, 0.5, 0.5, -math.pi / 2.0, 1.57, 3.14))
 
 
 def test_resolve_model_and_limits_uses_precise_j4_nominal_boundary(monkeypatch, tmp_path) -> None:
@@ -1639,6 +1685,61 @@ def _fault_hold_command_receipt(
         errors=() if accepted else ("simulated incomplete dispatch",),
         accepted=accepted,
     )
+
+
+def test_fault_hold_uses_real_feedback_for_gravity_and_nominal_dispatch_reference() -> None:
+    observed = (0.1, 0.7, 1.1, 0.0, -0.1, 3.2327115535736084)
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.gravity_qpos: list[tuple[float, ...]] = []
+
+        def arm_generalized_gravity(
+            self,
+            qpos_rad: object,
+        ) -> tuple[float, ...]:
+            self.gravity_qpos.append(tuple(qpos_rad))
+            return (0.0,) * 6
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.reference: object | None = None
+
+        def send_mit(
+            self,
+            reference: object,
+            **_kwargs: object,
+        ) -> probe.B601CommandReceipt:
+            self.reference = reference
+            return _fault_hold_command_receipt(accepted=True)
+
+    model = FakeModel()
+    backend = FakeBackend()
+    profile = probe.build_software_profile(
+        kp=0.0,
+        kd=0.0,
+        torque_limits_nm=(5.0,) * 6,
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+
+    probe._send_fault_hold_command(
+        backend,
+        model,
+        qpos_rad=observed,
+        measured_qpos_rad=observed,
+        measured_qvel_rad_s=(0.0,) * 6,
+        profile=profile,
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(5.0,) * 6,
+        command_position_limits_rad=_fault_hold_limits(),
+        rate_hz=20.0,
+    )
+
+    assert model.gravity_qpos == [observed]
+    assert backend.reference is not None
+    assert backend.reference.qpos_rad == pytest.approx((*observed[:5], 3.14))
 
 
 class _FaultHoldBackend:
@@ -2604,7 +2705,10 @@ def test_degraded_entry_without_driver_damping_reports_damping_unavailable(
 
 
 def test_fault_hold_snapshot_rejects_out_of_limit_q() -> None:
-    with pytest.raises(probe.LowGainProbeError, match="outside URDF limits"):
+    with pytest.raises(
+        probe.LowGainProbeError,
+        match="outside position acceptance limits",
+    ):
         probe._validate_fault_hold_snapshot(
             (0.1, 3.2, 1.1, 0.0, -0.1, 0.2),
             qvel_rad_s=(0.0,) * 6,
