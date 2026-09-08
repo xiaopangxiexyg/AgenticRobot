@@ -103,6 +103,11 @@ configure_shards() {
   esac
 }
 
+verify_local_socket_capabilities() {
+  python3 "$REPO_ROOT/scripts/pytest_sharding.py" check-sockets || die \
+    "complete acceptance requires working loopback TCP and Unix sockets"
+}
+
 prepare_shards() {
   local index
   mkdir -- "$RUN_ROOT/mujoco-cache"
@@ -188,9 +193,10 @@ run_shard() {
 }
 
 trap cleanup EXIT
+configure_shards
+verify_local_socket_capabilities
 prepare_run_root
 prepare_asset_compat_link
-configure_shards
 # Wrapper configuration is private to this invocation.  Do not leak it into
 # pytest shards, whose tests may launch a nested acceptance wrapper.
 unset DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT

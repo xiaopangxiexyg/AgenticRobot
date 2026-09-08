@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import socket
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from pathlib import Path
@@ -17,36 +19,46 @@ from pathlib import Path
 # here makes the default plan useful in a clean checkout without depending on
 # mutable Harness history.
 FULL_WEIGHTS = {
-    "tests/test_mujoco_temp_pipeline.py": 169.954,
-    "tests/test_replay_position_admittance_active_pipeline.py": 125.723,
-    "tests/test_mujoco_fast_runtime.py": 60.045,
-    "tests/test_mujoco_formal_compound_authority.py": 48.254,
-    "tests/test_control_station_mujoco_sim_hil.py": 45.573,
-    "tests/test_mujoco_dmtac_gripper.py": 27.169,
-    "tests/test_v25p_dual_write_shadow.py": 22.809,
-    "tests/test_mujoco_cube_lift.py": 21.966,
-    "tests/test_control_station_sim_hil_allocation_profile.py": 18.706,
-    "tests/test_real_shadow_acceptance.py": 18.238,
-    "tests/test_collection_process_writer.py": 18.217,
-    "tests/test_replay_position_admittance_ik_trace.py": 16.378,
-    "tests/test_rebot_b601_submodule_boundary.py": 14.055,
-    "tests/test_mujoco_trajectory_composition_publication.py": 13.626,
-    "tests/test_mujoco_collision_safety.py": 13.113,
-    "tests/test_mujoco_state_bc_evaluation.py": 11.431,
-    "tests/test_camera_semantic_materialize.py": 10.185,
-    "tests/test_mujoco.py": 10.054,
-    "tests/test_position_admittance_active_shared_ik.py": 9.396,
-    "tests/test_refinement_annotation_gui.py": 9.130,
-    "tests/test_mujoco_actuated_position.py": 8.981,
-    "tests/test_runtime_domain_boundaries.py": 8.961,
-    "tests/test_runtime_artifact_migration_boundaries.py": 8.722,
-    "tests/test_v25p_producer_dual_write.py": 6.922,
-    "tests/test_mujoco_pose_execution_observation.py": 6.664,
-    "tests/test_control_station_exclusive_hitl.py": 6.634,
-    "tests/test_rebot_b601_mujoco_haptics.py": 6.517,
-    "tests/test_mujoco_state_bc_live_hitl.py": 6.365,
-    "tests/test_dmtac_viewer.py": 6.336,
-    "tests/test_mujoco_cube_drop.py": 6.208,
+    "tests/test_mujoco_temp_pipeline.py": 187.797,
+    "tests/test_replay_position_admittance_active_pipeline.py": 140.292,
+    "tests/test_mujoco_fast_runtime.py": 68.659,
+    "tests/test_mujoco_formal_compound_authority.py": 51.678,
+    "tests/test_control_station_mujoco_sim_hil.py": 49.336,
+    "tests/test_sim_point_grasp_experiment.py": 32.655,
+    "tests/test_mujoco_dmtac_gripper.py": 30.259,
+    "tests/test_mujoco_cube_lift.py": 23.928,
+    "tests/test_v25p_dual_write_shadow.py": 22.886,
+    "tests/test_control_station_sim_hil_allocation_profile.py": 21.805,
+    "tests/test_real_shadow_acceptance.py": 20.261,
+    "tests/test_replay_position_admittance_ik_trace.py": 17.676,
+    "tests/test_mujoco_collision_safety.py": 17.085,
+    "tests/test_rebot_b601_submodule_boundary.py": 15.904,
+    "tests/test_mujoco_trajectory_composition_publication.py": 14.740,
+    "tests/test_mujoco_state_bc_evaluation.py": 12.594,
+    "tests/test_collection_process_writer.py": 12.536,
+    "tests/test_camera_semantic_materialize.py": 11.648,
+    "tests/test_mujoco.py": 11.343,
+    "tests/test_runtime_artifact_migration.py": 10.476,
+    "tests/test_position_admittance_active_shared_ik.py": 10.203,
+    "tests/test_mujoco_actuated_position.py": 9.679,
+    "tests/test_runtime_artifact_migration_boundaries.py": 9.637,
+    "tests/test_modality_storage.py": 9.476,
+    "tests/test_refinement_annotation_gui.py": 8.376,
+    "tests/test_runtime_domain_boundaries.py": 7.701,
+    "tests/test_control_station_exclusive_hitl.py": 7.503,
+    "tests/test_mujoco_pose_execution_observation.py": 7.336,
+    "tests/test_rebot_b601_mujoco_haptics.py": 7.151,
+    "tests/test_mujoco_component_action_profile.py": 6.942,
+    "tests/test_mujoco_state_bc_live_hitl.py": 6.876,
+    "tests/test_dmtac_viewer.py": 6.756,
+    "tests/test_mujoco_cube_drop.py": 6.308,
+    "tests/test_mujoco_physics_scene.py": 6.212,
+    "tests/test_rebot_b601_mujoco_mit.py": 6.081,
+    "tests/test_openpi_policy_emission_source.py": 6.056,
+    "tests/test_control_station_boundaries.py": 5.864,
+    "tests/test_v25p_producer_dual_write.py": 5.654,
+    "tests/test_control_station_contracts.py": 5.560,
+    "tests/test_real_teleop_progress_adapter.py": 5.351,
 }
 
 FAST_WEIGHTS = {
@@ -68,6 +80,31 @@ FAST_WEIGHTS = {
 }
 
 WEIGHT_PROFILES = {"fast": FAST_WEIGHTS, "full": FULL_WEIGHTS}
+
+
+def check_required_local_sockets() -> None:
+    """Verify the local transports exercised by complete acceptance."""
+
+    with tempfile.TemporaryDirectory(prefix="dt-full-socket-") as directory:
+        probes = (
+            (socket.AF_UNIX, str(Path(directory) / "probe.sock"), "AF_UNIX"),
+            (socket.AF_INET, ("127.0.0.1", 0), "loopback AF_INET"),
+        )
+        for family, address, label in probes:
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as server:
+                    server.settimeout(1.0)
+                    server.bind(address)
+                    server.listen(1)
+                    with socket.socket(family, socket.SOCK_STREAM) as client:
+                        client.settimeout(1.0)
+                        client.connect(server.getsockname())
+                        connection, _ = server.accept()
+                        connection.close()
+            except OSError as error:
+                raise OSError(
+                    f"required local socket capability unavailable for {label}: {error}"
+                ) from error
 
 
 def _estimated_weight(path: Path, relative_path: str, profile: str) -> float:
@@ -236,6 +273,10 @@ def _parser() -> argparse.ArgumentParser:
     merge = commands.add_parser("merge-junit", help="merge and validate shard JUnit")
     merge.add_argument("--output", type=Path, required=True)
     merge.add_argument("sources", type=Path, nargs="+")
+    commands.add_parser(
+        "check-sockets",
+        help="verify loopback TCP and Unix sockets before complete acceptance",
+    )
     return parser
 
 
@@ -251,8 +292,10 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.profile,
                 arguments.prefix,
             )
-        else:
+        elif arguments.command == "merge-junit":
             merge_junit(arguments.output, arguments.sources)
+        else:
+            check_required_local_sockets()
     except (OSError, ValueError, ET.ParseError) as error:
         print(f"pytest_sharding: error: {error}", file=sys.stderr)
         return 2

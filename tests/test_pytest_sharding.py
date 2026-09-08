@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import socket
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -11,6 +13,14 @@ import pytest
 pytestmark = pytest.mark.unit
 
 SHARDING = Path(__file__).resolve().parents[1] / "scripts/pytest_sharding.py"
+
+
+def _load_sharding_module():
+    spec = importlib.util.spec_from_file_location("pytest_sharding", SHARDING)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _run(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -66,6 +76,34 @@ def test_plan_is_deterministic_complete_and_weighted(tmp_path: Path) -> None:
     assert set(planned) == {f"tests/{name}" for name in sizes}
     loads = [shard["estimated_seconds"] for shard in first_manifest["shards"]]
     assert max(loads) - min(loads) <= 0.3
+
+
+def test_full_profile_tracks_recent_dominant_modules() -> None:
+    module = _load_sharding_module()
+
+    assert module.FULL_WEIGHTS["tests/test_sim_point_grasp_experiment.py"] > 30.0
+    assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] > 10.0
+    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 9.0
+
+
+def test_socket_preflight_reports_the_blocked_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_sharding_module()
+
+    def blocked_socket(*_args, **_kwargs):
+        raise PermissionError(1, "blocked for test")
+
+    monkeypatch.setattr(socket, "socket", blocked_socket)
+
+    with pytest.raises(OSError, match="unavailable for AF_UNIX"):
+        module.check_required_local_sockets()
+
+
+def test_socket_preflight_cli_accepts_local_transports() -> None:
+    completed = _run("check-sockets")
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def _write_junit(path: Path, *, name: str, failures: int = 0) -> None:

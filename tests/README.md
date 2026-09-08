@@ -109,8 +109,16 @@ may be appended, but the marker, cache, JUnit, and basetemp options remain
 owned by the wrapper.
 
 `scripts/run_full_acceptance.sh` is the complete non-hardware integration gate.
+Before allocating an artifact root or starting any shard, it verifies that the
+host can create both loopback TCP and Unix sockets required by the complete
+suite. An incapable sandbox therefore fails immediately instead of running the
+remaining modules and reporting predictable transport errors at the end.
 It assigns every discovered `tests/test_*.py` module exactly once using a
 checked-in sparse timing profile plus a deterministic source-size fallback.
+The sparse full-suite weights come from testcase durations in a complete,
+socket-capable green Run and cover only modules that contributed at least five
+seconds there. Refresh them only from another exact green full-suite artifact;
+failed, capability-limited, or focused runs are not representative inputs.
 The default remains four shards. Each shard has separate pytest, Python, XDG,
 Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
 Run share only its content-addressed MuJoCo model cache; that cache uses process
