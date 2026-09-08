@@ -10,7 +10,7 @@ Usage:
 
 Commands:
   foot-pad  Start the five-pedal forwarding service.
-  collect   Start formal dual-arm 60 Hz force-admittance collection with the
+  collect   Start formal dual-arm 60 Hz pure-position collection with the
             selected writing progress profile and detail-overlay compatible
             capture metadata.
 
@@ -23,7 +23,11 @@ Collect options:
                               (or pass a *_detailed catalog ref; its matching
                               fine-stage profile is selected automatically).
   --stage-profile REF         Explicit fine-stage profile reference.
+  --entry-step ID             Start each Episode at this coarse progress step;
+                              defaults to the profile's initial step.
   --tactile-min-free-gb N     Defaults to TACTILE_BUNDLE_MIN_FREE_GB or 200.
+  --gripper-input-source MODE Use q6 (default) or angle_trigger. Defaults to
+                              FORMAL_GRIPPER_INPUT_SOURCE when set.
   --gripper-warmup-probe      Enable active open->half->open probing. Use only
                               when both grippers are clear of tools/objects.
   --no-gripper-warmup-probe   Disable active gripper motion probing (default).
@@ -89,7 +93,9 @@ else
 fi
 PROGRESS_PROFILE="${COLLECTION_PROGRESS_PROFILE:-catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress}"
 STAGE_PROFILE="${COLLECTION_STAGE_PROFILE:-}"
+PROGRESS_ENTRY_STEP="${COLLECTION_PROGRESS_ENTRY_STEP:-}"
 TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-200}"
+GRIPPER_INPUT_SOURCE="${FORMAL_GRIPPER_INPUT_SOURCE:-q6}"
 GRIPPER_WARMUP_PROBE="${GRIPPER_WARMUP_PROBE:-off}"
 if [[ -n "${TACTILE_BUNDLE_MIN_FREE_GB:-}" ]]; then
   TACTILE_MIN_FREE_SOURCE=environment
@@ -126,10 +132,20 @@ while [[ $# -gt 0 ]]; do
       STAGE_PROFILE="$2"
       shift 2
       ;;
+    --entry-step)
+      [[ $# -ge 2 ]] || die "--entry-step requires ID."
+      PROGRESS_ENTRY_STEP="$2"
+      shift 2
+      ;;
     --tactile-min-free-gb)
       [[ $# -ge 2 ]] || die "--tactile-min-free-gb requires N."
       TACTILE_MIN_FREE_GB="$2"
       TACTILE_MIN_FREE_SOURCE=command_line
+      shift 2
+      ;;
+    --gripper-input-source)
+      [[ $# -ge 2 ]] || die "--gripper-input-source requires q6 or angle_trigger."
+      GRIPPER_INPUT_SOURCE="$2"
       shift 2
       ;;
     --gripper-warmup-probe)
@@ -186,6 +202,24 @@ case "${GRIPPER_WARMUP_PROBE,,}" in
     ;;
 esac
 
+case "${GRIPPER_INPUT_SOURCE,,}" in
+  q6)
+    GRIPPER_INPUT_SOURCE=q6
+    GRIPPER_INPUT_ARGS=(
+      --gripper-input-source q6
+      --q6-config latest
+      --q6-config-required
+    )
+    ;;
+  angle_trigger)
+    GRIPPER_INPUT_SOURCE=angle_trigger
+    GRIPPER_INPUT_ARGS=(--gripper-input-source angle_trigger)
+    ;;
+  *)
+    die "gripper input source must be q6 or angle_trigger: $GRIPPER_INPUT_SOURCE"
+    ;;
+esac
+
 if [[ -n "$DATASET_ROOT" ]]; then
   [[ "$DATASET_ROOT" == /* ]] || die "dataset root must be absolute: $DATASET_ROOT"
   export DATASET_BASE="$DATASET_ROOT"
@@ -203,19 +237,18 @@ TELEOP_ARGS=(
   "${DMTAC_A_ARGS[@]}"
   "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}"
   "${DATASET_COMMON_ARGS[@]}"
-  "${POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_DAMPED_ADMITTANCE_ARGS[@]}"
+  "${POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ARGS[@]}"
   "${POSITION_COLLECTION_PROCESS_ARGS[@]}"
   "${POSITION_COLLECTION_PRODUCTION_ARGS[@]}"
   --dataset-root "$DATASET_BASE"
   --collection-task-id dmtac_rm65_bimanual_position_v1
   --collection-task-name "$TASK_NAME"
   --collection-task-description
-  "formal dual-arm 60 Hz force-admittance writing collection with selected progress profile and post-capture detail overlay"
+  "formal dual-arm 60 Hz pure-position writing collection with selected progress profile and post-capture detail overlay"
   --collection-progress-profile
   "$PROGRESS_PROFILE"
   --collection-progress-gui
-  --q6-config latest
-  --q6-config-required
+  "${GRIPPER_INPUT_ARGS[@]}"
   --dmtac-config latest
   --require-dmtac-config
   --camera-config teleop_runtime/configs/devices/realsense.json
@@ -235,6 +268,9 @@ TELEOP_ARGS=(
 if [[ -n "$STAGE_PROFILE" ]]; then
   TELEOP_ARGS+=(--collection-stage-profile "$STAGE_PROFILE")
 fi
+if [[ -n "$PROGRESS_ENTRY_STEP" ]]; then
+  TELEOP_ARGS+=(--collection-progress-entry-step "$PROGRESS_ENTRY_STEP")
+fi
 
 RUN_COMMAND=(
   taskset -c 0-7
@@ -250,13 +286,15 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 printf '%s\n' \
-  '[DexTeleop] starting formal 60 Hz force-admittance collection.' \
+  '[DexTeleop] starting formal 60 Hz pure-position collection.' \
   '[DexTeleop] five-pedal forwarding must be running in a separate terminal.' \
   "[DexTeleop] task=$TASK_NAME" \
   "[DexTeleop] task_name_source=$TASK_NAME_SOURCE" \
   "[DexTeleop] dataset_root=$DATASET_BASE" \
   "[DexTeleop] progress_profile=$PROGRESS_PROFILE" \
   "[DexTeleop] stage_profile=${STAGE_PROFILE:-auto}" \
+  "[DexTeleop] progress_entry_step=${PROGRESS_ENTRY_STEP:-profile_initial}" \
+  "[DexTeleop] gripper_input_source=$GRIPPER_INPUT_SOURCE" \
   "[DexTeleop] tactile_bundle_root=$TACTILE_BUNDLE_ROOT" \
   "[DexTeleop] tactile_bundle_min_free_gb=$TACTILE_BUNDLE_MIN_FREE_GB source=$TACTILE_MIN_FREE_SOURCE" \
   "[DexTeleop] gripper_warmup_probe=$GRIPPER_WARMUP_PROBE"

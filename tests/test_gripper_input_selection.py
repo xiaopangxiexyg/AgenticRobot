@@ -16,6 +16,7 @@ from teleop_runtime.configs import gripper_input as selection_module
 from teleop_runtime.configs.gripper_input import (
     GRIPPER_INPUT_ANGLE_TRIGGER,
     GRIPPER_INPUT_Q6,
+    gripper_mapping_invert_for_input_source,
     resolve_single_gripper_input,
 )
 from teleop_runtime.schemas import ObservationChannel, TeleopObservation
@@ -91,6 +92,34 @@ def test_explicit_angle_trigger_skips_all_q6_discovery(
 
     assert selection.resolved_source == GRIPPER_INPUT_ANGLE_TRIGGER
     assert selection.fallback_reason is None
+
+
+@pytest.mark.parametrize(
+    ("source", "configured_invert", "expected"),
+    (
+        ("q6", False, False),
+        ("q6", True, True),
+        ("angle_trigger", False, True),
+        ("angle_trigger", True, False),
+    ),
+)
+def test_gripper_mapping_invert_is_source_specific(
+    source: str,
+    configured_invert: bool,
+    expected: bool,
+) -> None:
+    assert (
+        gripper_mapping_invert_for_input_source(
+            source,
+            configured_invert=configured_invert,
+        )
+        is expected
+    )
+
+
+def test_gripper_mapping_requires_a_resolved_source() -> None:
+    with pytest.raises(ValueError, match="resolved q6 or angle_trigger"):
+        gripper_mapping_invert_for_input_source("auto")
 
 
 def test_explicit_q6_fails_instead_of_silently_falling_back(
@@ -228,6 +257,7 @@ def test_passive_single_vive_angle_trigger_uses_common_gripper_retargeter(
     assert hand_retargeter.config.input_channel_name == "right_angle_trigger"
     assert hand_retargeter.config.source_dim is None
     assert hand_retargeter.config.effector_name == "right_hand"
+    assert hand_retargeter.config.invert is True
     arm_retargeter = session.retargeters[0]
     assert arm_retargeter.config.output_frame_name == "right_arm_base"
     observation = TeleopObservation(
@@ -245,7 +275,7 @@ def test_passive_single_vive_angle_trigger_uses_common_gripper_retargeter(
                 channel_name="right_angle_trigger",
                 capability="scalar",
                 side="right",
-                value=0.5,
+                value=0.0,
                 frame_name=None,
                 timestamp=1.0,
                 source_name="angle_trigger",
@@ -268,5 +298,5 @@ def test_passive_single_vive_angle_trigger_uses_common_gripper_retargeter(
     assert set(merged.commands) == {"right_arm", "right_hand"}
     np.testing.assert_allclose(
         merged.commands["right_hand"].value,
-        np.asarray([0.5, 0, 0, 0, 0, 0], dtype=np.float32),
+        np.asarray([1.0, 0, 0, 0, 0, 0], dtype=np.float32),
     )

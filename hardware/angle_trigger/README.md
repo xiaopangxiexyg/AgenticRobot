@@ -75,6 +75,10 @@ python -m hardware.angle_trigger --side right --recalibrate-angles
 `AngleTriggerReader` can also be used by another Python process after calling
 `prepare_reader()` or by constructing it with a resolved assignment and angle
 calibration. `reader.read()` returns only its declared active sides. The
+reader and calibration retain their raw normalized `0..1` values. At the
+real-teleop scalar-to-DMTAC boundary (and its passive Sim-HIL mirror), the
+angle-trigger mapping is intentionally reversed: trigger `0` commands closed
+and trigger `1` commands open. Q6 mapping remains unchanged.
 bilateral default returns `{"left": 0.0..1.0, "right": 0.0..1.0}`; a right-only
 reader returns `{"right": 0.0..1.0}`.
 

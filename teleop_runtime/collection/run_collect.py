@@ -44,6 +44,8 @@ from ..defaults import DEFAULT_TELEOP_POSITION_REFERENCE_HZ
 from ..hand_tcp_alignment import (
     DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
     tracker_hand_to_rm65_tcp_rotation,
+    vive_tracker_alignment_input_source_from_args,
+    vive_tracker_height_correction_m_from_args,
     vive_tracker_local_translation_offset_from_args,
 )
 from ..retargeters import (
@@ -657,12 +659,14 @@ def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
     calibration.metadata["right_tool_profile"] = getattr(args, "right_tool_profile", "") or None
     offset = _vive_tracker_local_translation_offset(args)
     calibration.metadata["vive_tracker_height_correction_enabled"] = offset is not None
-    calibration.metadata["vive_tracker_height_correction_m"] = float(
-        getattr(
-            args,
-            "vive_tracker_height_correction_m",
-            DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.height_correction_m,
-        )
+    calibration.metadata["vive_tracker_height_correction_m"] = (
+        vive_tracker_height_correction_m_from_args(args)
+    )
+    calibration.metadata["vive_tracker_height_correction_input_source"] = (
+        vive_tracker_alignment_input_source_from_args(args)
+    )
+    calibration.metadata["vive_tracker_alignment_config_source"] = (
+        DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG.source_path
     )
     calibration.metadata["vive_tracker_local_translation_offset_m"] = (
         None if offset is None else offset.tolist()

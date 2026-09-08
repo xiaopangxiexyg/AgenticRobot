@@ -75,7 +75,7 @@ The formal DMTAC task also provides three writing variants:
   enters writing preparation directly instead of presenting the brush to the
   left hand.
 
-Both variants own an exact same-name `.stages.json` profile and keep the
+All three variants own an exact same-name `.stages.json` profile and keep the
 formal `dmtac_rm65_bimanual_position_v1` task ID as their own profile metadata.
 RealTeleop exposes all admitted LINEAR profiles independently of the formal
 dataset task/name, so this ID is not a GUI filtering key. They are different
@@ -89,6 +89,15 @@ coarse four-stage Episode, the annotation application discovers this same
 pair after the coarse annotation set is sealed and publishes the fine labels
 as an additive detail overlay; it never rewrites the original Episode,
 Parquet, video, or coarse annotation set.
+
+The five-stage writing profile additionally owns the explicit
+`dmtac_rm65_bimanual_position_writing_five_stage_progress_detailed` selection.
+It preserves the same five coarse steps, splits `right_dip_ink` into
+`right_dip_ink.approach`, `right_dip_ink.dip`, and
+`right_dip_ink.depart`, and uses the same three `right_write` fine stages as
+the four-stage detailed selection. A nominal partial Episode may select the
+`right_dip_ink` coarse entry; omitting a fine-stage entry then deterministically
+starts at `right_dip_ink.approach` and records truncated-history semantics.
 
 `dmtac_rm65_right_gripper_rule_writing_progress` is the dedicated one-step
 profile for rule-based writing with both RM65 arms but only the right DMTAC

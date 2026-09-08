@@ -1,0 +1,112 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "dmtac_rm65_bimanual_position_writing_five_stage_stages",
+  "profile_version": "3",
+  "task_progress_profile_hash": "84a7c30c815f5853daf0ffa7ca7692925e1e8540a7cf58aaa02a28193feddaad",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.approach",
+      "display_name": "靠近毛笔",
+      "description": "右手移动并靠近待抓取的毛笔。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.grasp",
+      "display_name": "正确抓住毛笔",
+      "description": "右手建立正确且稳定的毛笔抓取。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_acquire_brush",
+      "stage_id": "right_acquire_brush.lift_and_present",
+      "display_name": "提起毛笔并送至左手",
+      "description": "右手提起毛笔并送到左手能够取下笔盖的位置。",
+      "ordinal": 3
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "left_remove_brush_cap",
+      "stage_id": "left_remove_brush_cap.remove",
+      "display_name": "取下笔盖",
+      "description": "左手从毛笔上取下笔盖。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "left_remove_brush_cap",
+      "stage_id": "left_remove_brush_cap.return",
+      "display_name": "放回笔盖",
+      "description": "左手将取下的笔盖放回指定位置。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_dip_ink",
+      "stage_id": "right_dip_ink.approach",
+      "display_name": "靠近蘸水",
+      "description": "右手持毛笔靠近蘸水位置，笔尖尚未接触水面。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_dip_ink",
+      "stage_id": "right_dip_ink.dip",
+      "display_name": "蘸水",
+      "description": "右手将毛笔笔尖蘸入水中并完成润笔。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_dip_ink",
+      "stage_id": "right_dip_ink.depart",
+      "display_name": "离开蘸水",
+      "description": "右手将毛笔笔尖移离水面并离开蘸水位置。",
+      "ordinal": 3
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.pen_down",
+      "display_name": "右手落笔",
+      "description": "右手将毛笔笔尖落到纸面并建立稳定接触，准备开始书写。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.write",
+      "display_name": "写字",
+      "description": "右手持毛笔在纸面完成规定的书写内容。",
+      "ordinal": 2
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.pen_up",
+      "display_name": "右手提笔",
+      "description": "右手完成书写后将毛笔笔尖提离纸面，结束书写动作。",
+      "ordinal": 3
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_return_brush",
+      "stage_id": "right_return_brush.align",
+      "display_name": "调整放回位置",
+      "description": "右手调整毛笔到正确的放回位置和姿态。",
+      "ordinal": 1
+    },
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_return_brush",
+      "stage_id": "right_return_brush.release",
+      "display_name": "放下归位",
+      "description": "右手放下毛笔并完成归位。",
+      "ordinal": 2
+    }
+  ]
+}

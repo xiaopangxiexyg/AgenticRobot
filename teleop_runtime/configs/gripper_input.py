@@ -17,6 +17,29 @@ GRIPPER_INPUT_CHOICES = (
 )
 
 
+def gripper_mapping_invert_for_input_source(
+    source: str,
+    *,
+    configured_invert: bool = False,
+) -> bool:
+    """Resolve the source-specific scalar-to-DMTAC direction.
+
+    DMTAC commands use ``0=open`` and ``1=closed``. Real-teleop angle
+    triggers intentionally use the opposite endpoint mapping, while Q6 keeps
+    the configured mapping. A configured inversion composes with that
+    source-specific direction so existing explicit overrides remain usable.
+    """
+
+    normalized_source = _normalized_source(source)
+    if normalized_source == GRIPPER_INPUT_AUTO:
+        raise ValueError(
+            "gripper mapping requires a resolved q6 or angle_trigger source."
+        )
+    return bool(configured_invert) ^ (
+        normalized_source == GRIPPER_INPUT_ANGLE_TRIGGER
+    )
+
+
 def _normalized_side(value: str) -> str:
     side = str(value).strip().lower()
     if side not in {"left", "right"}:
@@ -247,5 +270,6 @@ __all__ = [
     "GRIPPER_INPUT_CHOICES",
     "GRIPPER_INPUT_Q6",
     "SingleGripperInputSelection",
+    "gripper_mapping_invert_for_input_source",
     "resolve_single_gripper_input",
 ]

@@ -257,6 +257,39 @@ def test_writing_five_stage_profile_adds_only_the_ink_dipping_stage() -> None:
     ) == five.progress_profile
 
 
+def test_five_stage_detailed_profile_splits_dipping_and_writing() -> None:
+    coarse = load_managed_task_profile(
+        "dmtac_rm65_bimanual_position_writing_five_stage_progress"
+    )
+    detailed = load_managed_task_profile(
+        "dmtac_rm65_bimanual_position_writing_five_stage_progress_detailed"
+    )
+
+    assert detailed.is_detailed is True
+    assert detailed.progress_profile == coarse.progress_profile
+    assert detailed.stage_profile is not None
+    assert tuple(
+        stage.stage_id
+        for stage in detailed.stage_profile.stages_for_step("right_dip_ink")
+    ) == (
+        "right_dip_ink.approach",
+        "right_dip_ink.dip",
+        "right_dip_ink.depart",
+    )
+    assert tuple(
+        stage.display_name
+        for stage in detailed.stage_profile.stages_for_step("right_dip_ink")
+    ) == ("靠近蘸水", "蘸水", "离开蘸水")
+    assert tuple(
+        stage.stage_id
+        for stage in detailed.stage_profile.stages_for_step("right_write")
+    ) == (
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
+    )
+
+
 def test_three_stage_sample_owns_coarse_and_internal_stage_profiles() -> None:
     bundle = load_managed_task_profile(
         "example_three_stage_pick_place_progress"
