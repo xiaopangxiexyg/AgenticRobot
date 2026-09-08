@@ -386,7 +386,7 @@ def _stopped_payload(
         "lower_hold_proved": lower_hold_proved,
         "lower_hold_evidence_refs": ([] if hold is None else list(hold.evidence_refs)),
         "emergency_stop_latched": (
-            gateway_session.service.emergency_stop_latched
+            composition.deployment.gateway_session.service.emergency_stop_latched
         ),
         "emergency_stop_confirmed": lower_emergency_stop_proved,
         "emergency_stop_status_by_side": (
