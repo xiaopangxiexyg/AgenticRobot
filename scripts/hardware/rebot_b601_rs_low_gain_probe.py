@@ -45,6 +45,16 @@ reduces each complete R window to one static residual observation, averages only
 nearby repeated poses, selects informative poses, and fits a candidate effective-
 gravity correction without opening CAN.
 
+``startup-replay`` diagnoses the startup handoff without disabling the arm or
+asking the operator to recreate an interior pose.  After the ordinary startup
+has reached ACTIVE, the arm remains in the same gravity/damping controller and
+may settle naturally.  The operator then presses ``R`` once without touching
+the arm.  The current six-joint pose is captured, the existing bounded startup
+software lock is ramped in, held for ``--freeze-sec``, and ramped back out to
+the same gravity/damping controller.  Gravity remains fully present throughout
+the replay.  The transition records measured displacement but adds no numeric
+acceptance gate and sends no extra CAN requests.
+
 Reaching ``--duration-sec`` ends the active experiment, but does not authorize
 drive disable.  Like the first Ctrl-C or an ordinary handled control fault, it
 enters the same latched all-arm gravity/damping protective hold.  A subsequent
@@ -245,8 +255,7 @@ class OperatorKeyReader:
         except OSError as exc:
             self.close()
             raise LowGainProbeError(
-                "gravity-calibration requires an interactive controlling terminal "
-                "for the R capture key"
+                "interactive R capture requires a controlling terminal"
             ) from exc
 
     def flush(self) -> None:
@@ -264,7 +273,7 @@ class OperatorKeyReader:
             return False
         except OSError as exc:
             raise LowGainProbeError(
-                "failed to read the gravity-calibration operator terminal"
+                "failed to read the operator terminal"
             ) from exc
         return ord("r") in pressed.lower()
 
@@ -470,6 +479,233 @@ class GravityCalibrationCapture:
         self.recording_started_elapsed_sec = None
         self.active_record_index = None
         return record
+
+
+@dataclass
+class StartupReplayCapture:
+    """Own one operator-triggered lock-in/hold/handoff replay.
+
+    The operator selects the naturally settled pose by pressing ``R``.  No
+    automatic stationarity threshold is introduced.  The existing startup
+    software lock is then mixed in and back out with the configured torque rise
+    duration while gravity remains at full scale.  ``locked_duration_sec`` is
+    the existing ``--freeze-sec`` interval, not a new hidden timing constant.
+    """
+
+    transition_duration_sec: float
+    locked_duration_sec: float
+    state: str = "WAITING_FOR_R"
+    reference_qpos_rad: tuple[float, ...] | None = None
+    trigger_elapsed_sec: float | None = None
+    events: list[dict[str, object]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.transition_duration_sec = _positive(
+            self.transition_duration_sec,
+            name="startup_replay_transition_duration_sec",
+        )
+        self.locked_duration_sec = _non_negative(
+            self.locked_duration_sec,
+            name="startup_replay_locked_duration_sec",
+        )
+
+    def trigger(
+        self,
+        qpos_rad: Sequence[float],
+        qvel_rad_s: Sequence[float],
+        *,
+        elapsed_sec: float,
+        sample_index: int,
+    ) -> dict[str, object] | None:
+        if self.state != "WAITING_FOR_R":
+            return None
+        elapsed = _non_negative(elapsed_sec, name="startup_replay_elapsed_sec")
+        self.reference_qpos_rad = _six(
+            qpos_rad,
+            name="startup_replay_reference_qpos_rad",
+        )
+        self.trigger_elapsed_sec = elapsed
+        self.state = "RAMP_IN"
+        return self._append_event(
+            state="RAMP_IN",
+            qpos_rad=qpos_rad,
+            qvel_rad_s=qvel_rad_s,
+            elapsed_sec=elapsed,
+            sample_index=sample_index,
+        )
+
+    def advance(
+        self,
+        qpos_rad: Sequence[float],
+        qvel_rad_s: Sequence[float],
+        *,
+        elapsed_sec: float,
+        sample_index: int,
+    ) -> tuple[dict[str, object], ...]:
+        """Advance all elapsed replay phase boundaries before one command."""
+
+        if self.trigger_elapsed_sec is None:
+            return ()
+        elapsed = _non_negative(elapsed_sec, name="startup_replay_elapsed_sec")
+        since_trigger = elapsed - self.trigger_elapsed_sec
+        if since_trigger < 0.0:
+            raise ValueError("startup replay time precedes its trigger")
+        emitted: list[dict[str, object]] = []
+        boundaries = (
+            ("RAMP_IN", self.transition_duration_sec, "RELOCKED"),
+            (
+                "RELOCKED",
+                self.transition_duration_sec + self.locked_duration_sec,
+                "HANDOFF",
+            ),
+            (
+                "HANDOFF",
+                2.0 * self.transition_duration_sec + self.locked_duration_sec,
+                "SECOND_ACTIVE",
+            ),
+        )
+        for expected, boundary, following in boundaries:
+            if self.state != expected or since_trigger < boundary:
+                continue
+            self.state = following
+            emitted.append(
+                self._append_event(
+                    state=following,
+                    qpos_rad=qpos_rad,
+                    qvel_rad_s=qvel_rad_s,
+                    elapsed_sec=elapsed,
+                    sample_index=sample_index,
+                )
+            )
+        return tuple(emitted)
+
+    def lock_fraction(self, elapsed_sec: float) -> float:
+        """Return the replay lock share; gravity is never scaled by it."""
+
+        if self.state == "WAITING_FOR_R":
+            return 0.0
+        if self.trigger_elapsed_sec is None:
+            raise ValueError("active startup replay is missing its trigger")
+        elapsed = _non_negative(elapsed_sec, name="startup_replay_elapsed_sec")
+        since_trigger = max(0.0, elapsed - self.trigger_elapsed_sec)
+        if self.state == "RAMP_IN":
+            return min(1.0, since_trigger / self.transition_duration_sec)
+        if self.state == "RELOCKED":
+            return 1.0
+        if self.state == "HANDOFF":
+            handoff_elapsed = (
+                since_trigger
+                - self.transition_duration_sec
+                - self.locked_duration_sec
+            )
+            return 1.0 - min(
+                1.0,
+                max(0.0, handoff_elapsed) / self.transition_duration_sec,
+            )
+        if self.state == "SECOND_ACTIVE":
+            return 0.0
+        raise ValueError(f"unknown startup replay state: {self.state}")
+
+    def reference(self, current_qpos_rad: Sequence[float]) -> tuple[float, ...]:
+        current = _six(current_qpos_rad, name="startup_replay_current_qpos_rad")
+        if self.state == "WAITING_FOR_R":
+            return current
+        if self.reference_qpos_rad is None:
+            raise ValueError("active startup replay reference is missing")
+        return self.reference_qpos_rad
+
+    def _append_event(
+        self,
+        *,
+        state: str,
+        qpos_rad: Sequence[float],
+        qvel_rad_s: Sequence[float],
+        elapsed_sec: float,
+        sample_index: int,
+    ) -> dict[str, object]:
+        event: dict[str, object] = {
+            "state": state,
+            "elapsed_sec": float(elapsed_sec),
+            "sample_index": int(sample_index),
+            "qpos_rad": _six(qpos_rad, name="startup_replay_event_qpos_rad"),
+            "qvel_fd_rad_s": _six(
+                qvel_rad_s,
+                name="startup_replay_event_qvel_rad_s",
+            ),
+        }
+        self.events.append(event)
+        return event
+
+
+def evaluate_startup_replay_capture(
+    capture: StartupReplayCapture | None,
+    *,
+    final_qpos_rad: Sequence[float] | None,
+    sample_count: int,
+) -> dict[str, object]:
+    """Report replay completion and measured deltas without a numeric gate."""
+
+    if capture is None:
+        return {
+            "status": "NOT_APPLICABLE",
+            "state": None,
+            "events": (),
+            "reference_qpos_rad": None,
+            "reference_to_second_active_delta_rad": None,
+            "reference_to_final_delta_rad": None,
+            "second_active_observation_count": 0,
+            "displacement_gate_rad": None,
+            "reasons": (),
+        }
+    event_by_state = {str(event["state"]): event for event in capture.events}
+    second_active = event_by_state.get("SECOND_ACTIVE")
+    completed_samples = int(sample_count)
+    if completed_samples < 0:
+        raise ValueError("startup replay sample_count must be non-negative")
+    second_active_observation_count = (
+        0
+        if second_active is None
+        else max(
+            0,
+            completed_samples - (int(second_active["sample_index"]) + 1),
+        )
+    )
+    reference = capture.reference_qpos_rad
+    final_q = (
+        None
+        if final_qpos_rad is None
+        else _six(final_qpos_rad, name="startup_replay_final_qpos_rad")
+    )
+
+    def delta(target: object) -> tuple[float, ...] | None:
+        if reference is None or target is None:
+            return None
+        target_q = _six(target, name="startup_replay_delta_target_qpos_rad")
+        return tuple(
+            current - origin
+            for current, origin in zip(target_q, reference, strict=True)
+        )
+
+    reasons: list[str] = []
+    if reference is None:
+        reasons.append("operator did not trigger startup replay with R")
+    elif second_active is None:
+        reasons.append("startup replay did not reach SECOND_ACTIVE")
+    elif second_active_observation_count == 0:
+        reasons.append("startup replay has no feedback after SECOND_ACTIVE command")
+    return {
+        "status": "PASS" if not reasons else "FAIL",
+        "state": capture.state,
+        "events": tuple(capture.events),
+        "reference_qpos_rad": reference,
+        "reference_to_second_active_delta_rad": delta(
+            None if second_active is None else second_active["qpos_rad"]
+        ),
+        "reference_to_final_delta_rad": delta(final_q),
+        "second_active_observation_count": second_active_observation_count,
+        "displacement_gate_rad": None,
+        "reasons": tuple(reasons),
+    }
 
 
 def evaluate_gravity_calibration_capture(
@@ -2687,11 +2923,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "cartesian-hold",
         "pose-hold",
         "gravity-calibration",
+        "startup-replay",
         "gravity-calibration-fit",
     ):
         raise ValueError(
             "mode must be hold, slow-step, cartesian-hold, pose-hold, or "
-            "gravity-calibration"
+            "gravity-calibration or startup-replay"
         )
     _positive(args.rate_hz, name="rate_hz")
     _positive(args.duration_sec, name="duration_sec")
@@ -2715,6 +2952,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 _DEFAULT_CALIBRATION_SETTLING_SEC,
             ),
             name="calibration_settling_sec",
+        )
+    if args.mode == "startup-replay" and args.kp != 0.0:
+        raise LowGainProbeError(
+            "startup-replay requires --kp 0 so both observation intervals use "
+            "gravity and damping only"
         )
     _non_negative(
         getattr(
@@ -4047,11 +4289,12 @@ def plan_reference(
         raise ValueError("position_limits_rad must contain six pairs")
     if joint not in _ALL_JOINTS:
         raise ValueError(f"unknown B601-RS joint: {joint}")
-    if mode in ("hold", "cartesian-hold", "pose-hold"):
+    if mode in ("hold", "cartesian-hold", "pose-hold", "startup-replay"):
         return tuple(float(value) for value in initial), _ZERO_SIX, True
     if mode != "slow-step":
         raise ValueError(
-            "mode must be hold, slow-step, cartesian-hold, or pose-hold"
+            "mode must be hold, slow-step, cartesian-hold, pose-hold, or "
+            "startup-replay"
         )
     direction = 1 if int(step_direction) >= 0 else -1
     step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
@@ -5261,8 +5504,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         if args.mode == "gravity-calibration"
         else None
     )
-    calibration_keys: OperatorKeyReader | None = None
+    startup_replay_capture = (
+        StartupReplayCapture(
+            transition_duration_sec=args.torque_rise_time_sec,
+            locked_duration_sec=args.freeze_sec,
+        )
+        if args.mode == "startup-replay"
+        else None
+    )
+    operator_keys: OperatorKeyReader | None = None
     calibration_ready = False
+    startup_replay_ready = False
     last_control_elapsed_sec = 0.0
     connected = False
     enabled = False
@@ -5284,10 +5536,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         lambda signum, frame: _signal_handler(stop, signum, frame),
     )
     try:
-        if calibration_capture is not None:
+        if calibration_capture is not None or startup_replay_capture is not None:
             # Establish the interactive input path before opening the backend or
             # changing any drive state.
-            calibration_keys = OperatorKeyReader()
+            operator_keys = OperatorKeyReader()
         backend.connect()
         connected = True
         warmup_deadline = time.monotonic() + args.warmup_sec
@@ -5953,11 +6205,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 set_startup_state("ACTIVE")
             if calibration_capture is not None:
                 if handoff_fraction >= 1.0 and not calibration_ready:
-                    if calibration_keys is None:
+                    if operator_keys is None:
                         raise LowGainProbeError(
                             "gravity-calibration operator terminal is unavailable"
                         )
-                    calibration_keys.flush()
+                    operator_keys.flush()
                     calibration_ready = True
                     _operator_notice(
                         "[B601] CALIBRATION FREE_DRAG: move joint1..joint6, "
@@ -5984,8 +6236,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         f"#{completed_record['index']}: returned to FREE_DRAG."
                     )
                 capture_requested = False
-                if calibration_ready and calibration_keys is not None:
-                    capture_requested = calibration_keys.poll_record_request()
+                if calibration_ready and operator_keys is not None:
+                    capture_requested = operator_keys.poll_record_request()
                 if capture_requested:
                     new_record = calibration_capture.trigger(
                         q,
@@ -5998,6 +6250,64 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             f"#{new_record['index']}: reference fixed; settling."
                         )
                 qref = calibration_capture.reference(q)
+                qvel_ref = _ZERO_SIX
+                step_done = True
+            elif startup_replay_capture is not None:
+                if handoff_fraction >= 1.0 and not startup_replay_ready:
+                    if operator_keys is None:
+                        raise LowGainProbeError(
+                            "startup-replay operator terminal is unavailable"
+                        )
+                    operator_keys.flush()
+                    startup_replay_ready = True
+                    _operator_notice(
+                        "[B601] STARTUP REPLAY READY: allow the arm to settle "
+                        "under gravity compensation and damping; when it has "
+                        "stopped, do not touch it and press R once."
+                    )
+                replay_events = startup_replay_capture.advance(
+                    q,
+                    qvel,
+                    elapsed_sec=elapsed,
+                    sample_index=len(samples),
+                )
+                for replay_event in replay_events:
+                    replay_state = replay_event["state"]
+                    if replay_state == "RELOCKED":
+                        _operator_notice(
+                            "[B601] STARTUP REPLAY RELOCKED: current reference "
+                            "is held; do not touch."
+                        )
+                    elif replay_state == "HANDOFF":
+                        _operator_notice(
+                            "[B601] STARTUP REPLAY HANDOFF: position lock is "
+                            "ramping out; gravity remains fully active."
+                        )
+                    elif replay_state == "SECOND_ACTIVE":
+                        _operator_notice(
+                            "[B601] STARTUP REPLAY SECOND_ACTIVE: gravity and "
+                            "normal damping only; continue not touching the arm."
+                        )
+                replay_requested = False
+                if (
+                    startup_replay_ready
+                    and startup_replay_capture.state == "WAITING_FOR_R"
+                    and operator_keys is not None
+                ):
+                    replay_requested = operator_keys.poll_record_request()
+                if replay_requested:
+                    replay_event = startup_replay_capture.trigger(
+                        q,
+                        qvel,
+                        elapsed_sec=elapsed,
+                        sample_index=len(samples),
+                    )
+                    if replay_event is not None:
+                        _operator_notice(
+                            "[B601] STARTUP REPLAY CAPTURED: six-joint reference "
+                            "captured; bounded position lock is ramping in."
+                        )
+                qref = startup_replay_capture.reference(q)
                 qvel_ref = _ZERO_SIX
                 step_done = True
             else:
@@ -6072,10 +6382,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             # slew; applying a second scalar gravity ramp here would create a
             # compensation gap and allow the arm to sag during handoff.
             gravity_ramp = 1.0
+            replay_lock_fraction = (
+                startup_replay_capture.lock_fraction(elapsed)
+                if startup_replay_capture is not None
+                else 0.0
+            )
+            lock_reference_qpos = (
+                startup_replay_capture.reference_qpos_rad
+                if startup_replay_capture is not None
+                and startup_replay_capture.reference_qpos_rad is not None
+                else initial_q
+            )
             startup_lock_reference = build_reference(
                 sequence=state.sequence,
                 timestamp_sec=state.receive_timestamp_sec,
-                qpos_rad=initial_q,
+                qpos_rad=lock_reference_qpos,
                 qvel_rad_s=_ZERO_SIX,
             )
             startup_lock_torque_breakdown = compute_software_torque_breakdown(
@@ -6086,11 +6407,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 profile=startup_lock_profile,
                 gravity_scale=args.gravity_scale,
             )
+            effective_handoff_fraction = (
+                1.0 - replay_lock_fraction
+                if startup_replay_capture is not None
+                and startup_replay_capture.reference_qpos_rad is not None
+                else handoff_fraction
+            )
             torque_breakdown = blend_startup_lock_torque_breakdown(
                 startup_lock_torque_breakdown,
                 target_torque_breakdown,
                 gravity_fraction=gravity_ramp,
-                handoff_fraction=handoff_fraction,
+                handoff_fraction=effective_handoff_fraction,
             )
             requested_tau = torque_breakdown.requested_torque_nm
             conditioned_tau, torque_limited, slew_limited = condition_torque(
@@ -6148,6 +6475,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "startup_state": startup_state_history[-1],
                     "gravity_ramp_fraction": gravity_ramp,
                     "startup_handoff_fraction": handoff_fraction,
+                    "startup_replay_state": (
+                        startup_replay_capture.state
+                        if startup_replay_capture is not None
+                        else None
+                    ),
+                    "startup_replay_lock_fraction": replay_lock_fraction,
                     "calibration_state": (
                         calibration_capture.state
                         if calibration_capture is not None
@@ -6227,8 +6560,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     except Exception as exc:  # noqa: BLE001 - report unexpected probe failure
         primary_error = exc
     finally:
-        if calibration_keys is not None:
-            calibration_keys.close()
+        if operator_keys is not None:
+            operator_keys.close()
         full_stop_attempts = 0
 
         def issue_full_safe_stop() -> None:
@@ -6527,7 +6860,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     calibration_acceptance = evaluate_gravity_calibration_capture(
         calibration_capture
     )
+    startup_replay_acceptance = evaluate_startup_replay_capture(
+        startup_replay_capture,
+        final_qpos_rad=final_q,
+        sample_count=len(samples),
+    )
     calibration_passed = calibration_acceptance["status"] in (
+        "PASS",
+        "NOT_APPLICABLE",
+    )
+    startup_replay_passed = startup_replay_acceptance["status"] in (
         "PASS",
         "NOT_APPLICABLE",
     )
@@ -6547,7 +6889,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         active_joint_names=active_joint_names,
     )
     response_passed = bool(slow_step_response["passed"])
-    acceptance_passed = control_passed and response_passed and calibration_passed
+    acceptance_passed = (
+        control_passed
+        and response_passed
+        and calibration_passed
+        and startup_replay_passed
+    )
     max_abs_requested = max(
         (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
         default=0.0,
@@ -6639,6 +6986,42 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "all_six_joint_dispatch": True,
         },
         "startup_diagnostics": startup_diagnostics,
+        "startup_replay": {
+            "enabled": startup_replay_capture is not None,
+            "interaction": (
+                "FIRST_ACTIVE -> operator R after natural settling -> "
+                "RAMP_IN -> RELOCKED -> HANDOFF -> SECOND_ACTIVE"
+            ),
+            "transition_duration_sec": (
+                startup_replay_capture.transition_duration_sec
+                if startup_replay_capture is not None
+                else None
+            ),
+            "locked_duration_sec": (
+                startup_replay_capture.locked_duration_sec
+                if startup_replay_capture is not None
+                else None
+            ),
+            "gravity_fraction_during_replay": 1.0,
+            "vendor_kp_nm_per_rad": _ZERO_SIX,
+            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "lock_gain_source": "rebotarm_rs_yaml.MIT",
+            "software_lock_kp_nm_per_rad": (
+                startup_lock_profile.position_kp_nm_per_rad
+                if startup_replay_capture is not None
+                else None
+            ),
+            "software_lock_kd_nm_s_per_rad": (
+                startup_lock_profile.damping_kd_nm_s_per_rad
+                if startup_replay_capture is not None
+                else None
+            ),
+            "extra_can_requests": 0,
+            "operator_stationarity_semantics": (
+                "operator_observed_before_R; no automatic stationarity threshold"
+            ),
+            **startup_replay_acceptance,
+        },
         "motors_enabled_by_probe": enabled,
         "motion_commands_sent": commands_sent > 0,
         "commands_sent": commands_sent,
@@ -6825,13 +7208,25 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "slow_step_response": slow_step_response,
         "joint_impedance": {
-            "enabled": args.mode in ("hold", "gravity-calibration"),
+            "enabled": args.mode in (
+                "hold",
+                "gravity-calibration",
+                "startup-replay",
+            ),
             "reference_source": (
                 "interactive_current_or_R_captured_qpos"
                 if args.mode == "gravity-calibration"
-                else "fresh_post_enable_settled_qpos"
+                else (
+                    "operator_R_captured_replay_qpos"
+                    if args.mode == "startup-replay"
+                    else "fresh_post_enable_settled_qpos"
+                )
             ),
-            "reference_qpos_rad": initial_q if args.mode == "hold" else None,
+            "reference_qpos_rad": (
+                startup_replay_capture.reference_qpos_rad
+                if startup_replay_capture is not None
+                else (initial_q if args.mode == "hold" else None)
+            ),
             "reference_velocity_rad_s": _ZERO_SIX,
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
@@ -6983,6 +7378,7 @@ def build_parser() -> argparse.ArgumentParser:
             "cartesian-hold",
             "pose-hold",
             "gravity-calibration",
+            "startup-replay",
             "gravity-calibration-fit",
             "feedback-stability",
             "driver-torque-limit-roundtrip",
@@ -7075,8 +7471,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=_DEFAULT_FREEZE_SEC,
         help=(
-            "legacy command-line compatibility value; an enabled probe now "
-            "enters latched protective hold instead of timed freeze-and-disable"
+            "startup-replay relock hold duration; otherwise retained for "
+            "command-line compatibility because enabled probes enter latched "
+            "protective hold instead of timed freeze-and-disable"
         ),
     )
     parser.add_argument("--rate-hz", type=float, default=_DEFAULT_RATE_HZ)

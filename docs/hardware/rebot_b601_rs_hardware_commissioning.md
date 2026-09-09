@@ -388,6 +388,28 @@ operation-control 和 type-2 operation-status 帧，便于离线核对命令与�
 `startup_diagnostics.displacement_gate_rad=null`：位移只作为测量证据，不新增脱离实际硬件依据的
 数值型通过阈值。
 
+### 连续使能的启动交接回放
+
+`startup-replay` 用于区分“从零位边界进入自由空间平衡”和“非边界姿态下仍有重力模型偏差”。
+它先完整执行普通启动状态机，然后保持 gravity+damping，让机械臂在软承托和物理急停保护下
+自行稳定。操作者确认机械臂已经停止后，只按一次 `R`，不拖动机械臂。程序捕获当前六轴
+姿态，并在同一次使能会话内自动执行：
+
+```text
+FIRST_ACTIVE → WAITING_FOR_R → RAMP_IN → RELOCKED → HANDOFF → SECOND_ACTIVE
+```
+
+`RAMP_IN` 使用 `--torque-rise-time-sec` 把既有 YAML-derived 软件 startup lock 从零平滑加入；
+`RELOCKED` 使用既有 `--freeze-sec` 保持；`HANDOFF` 再用同一 rise time 把 lock 平滑撤去。
+完整重力向量在全部阶段保持比例 `1.0`，vendor Kp 始终为零，显式 driver Kd 保持不变，所有
+力矩继续经过同一个绝对值和变化率 conditioner。该模式不自动判断“已经稳定”，避免增加会被
+静摩擦误导的速度/持续时间阈值；`R` 只选择回放参考，不是安全按钮。
+
+结果 JSON 的 `startup_replay` 保存 R 时参考、每次状态转换的 q/有限差分速度、第二次 ACTIVE
+和最终位置相对参考的六轴差值；`samples[]` 同时保存 `startup_replay_state` 和
+`startup_replay_lock_fraction`。`displacement_gate_rad` 仍为 `null`，完成回放只代表证据完整，
+不代表重力模型已经通过验收。持续时间到期和首次 Ctrl-C 仍进入既有六轴 protective hold。
+
 ### 异常时的 protective hold（全臂可拖动重力保持）
 
 这条路径不是把某几个关节强制锁死，也不是回到预设姿态。第一次 Ctrl-C 或可处理的控制

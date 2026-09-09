@@ -510,6 +510,78 @@ def test_operator_key_reader_ignores_non_r_calibration_keys() -> None:
         os.close(slave_fd)
 
 
+def test_startup_replay_ramps_lock_in_holds_and_hands_back_out() -> None:
+    capture = probe.StartupReplayCapture(
+        transition_duration_sec=0.5,
+        locked_duration_sec=1.0,
+    )
+    reference = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    zero_velocity = (0.0,) * 6
+
+    event = capture.trigger(
+        reference,
+        zero_velocity,
+        elapsed_sec=3.0,
+        sample_index=60,
+    )
+
+    assert event is not None
+    assert event["state"] == "RAMP_IN"
+    assert capture.lock_fraction(3.0) == 0.0
+    assert capture.lock_fraction(3.25) == pytest.approx(0.5)
+    assert capture.advance(
+        reference,
+        zero_velocity,
+        elapsed_sec=3.5,
+        sample_index=70,
+    )[0]["state"] == "RELOCKED"
+    assert capture.lock_fraction(3.5) == 1.0
+    assert capture.advance(
+        reference,
+        zero_velocity,
+        elapsed_sec=4.5,
+        sample_index=90,
+    )[0]["state"] == "HANDOFF"
+    assert capture.lock_fraction(4.75) == pytest.approx(0.5)
+    assert capture.advance(
+        (0.1, 0.21, 0.3, 0.4, 0.5, 0.6),
+        zero_velocity,
+        elapsed_sec=5.0,
+        sample_index=100,
+    )[0]["state"] == "SECOND_ACTIVE"
+    assert capture.lock_fraction(5.0) == 0.0
+
+    result = probe.evaluate_startup_replay_capture(
+        capture,
+        final_qpos_rad=(0.1, 0.22, 0.3, 0.4, 0.5, 0.6),
+        sample_count=102,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["reference_to_second_active_delta_rad"][1] == pytest.approx(0.01)
+    assert result["reference_to_final_delta_rad"][1] == pytest.approx(0.02)
+    assert result["second_active_observation_count"] == 1
+    assert result["displacement_gate_rad"] is None
+
+
+def test_startup_replay_without_r_is_incomplete_without_a_numeric_gate() -> None:
+    capture = probe.StartupReplayCapture(
+        transition_duration_sec=0.5,
+        locked_duration_sec=1.0,
+    )
+
+    result = probe.evaluate_startup_replay_capture(
+        capture,
+        final_qpos_rad=(0.0,) * 6,
+        sample_count=0,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["state"] == "WAITING_FOR_R"
+    assert result["displacement_gate_rad"] is None
+    assert result["reasons"] == ("operator did not trigger startup replay with R",)
+
+
 def test_shared_gravity_ramp_preserves_vector_and_keeps_damping_live() -> None:
     target = probe.B601MitTorqueBreakdown(
         position_torque_nm=(0.0,) * 6,
@@ -3140,6 +3212,41 @@ def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
     )
     with pytest.raises(probe.LowGainProbeError, match="observation-only"):
         probe._validate_cli(driver_write_args)
+
+
+def test_startup_replay_cli_requires_gravity_only_observation_profile() -> None:
+    parser = probe.build_parser()
+    base = [
+        "--mode",
+        "startup-replay",
+        "--config",
+        "config.yaml",
+        "--rebot-source-root",
+        "source",
+        "--allow-motion",
+        "--auto-disable",
+        "--confirmation",
+        probe.CONFIRMATION,
+    ]
+
+    with pytest.raises(probe.LowGainProbeError, match="requires --kp 0"):
+        probe._validate_cli(parser.parse_args(base))
+
+    args = parser.parse_args([*base, "--kp", "0"])
+    probe._validate_cli(args)
+    qref, qvel_ref, done = probe.plan_reference(
+        (0.1,) * 6,
+        mode="startup-replay",
+        joint="joint1",
+        elapsed_sec=0.0,
+        step_rad=0.0,
+        step_speed_rad_s=0.1,
+        step_direction=1,
+        position_limits_rad=((-1.0, 1.0),) * 6,
+    )
+    assert qref == (0.1,) * 6
+    assert qvel_ref == (0.0,) * 6
+    assert done is True
 
 
 def test_driver_torque_limit_roundtrip_cli_requires_explicit_authority() -> None:

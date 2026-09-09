@@ -186,6 +186,7 @@ operation-status 缓存速度/力矩。两者都不增加 CAN 请求、不参与
 | `cartesian-hold` | J1–J6 | 当前 FK 平移锚点，平移 spring 经 `J.T` 共同调节 | 不控制姿态 |
 | `pose-hold` | J1–J6 | 当前 FK 的完整 SE(3) 锚点，平移+旋转 wrench 经 `J.T` 共同调节 | 正式末端阻抗首测；软件 joint Kp=0 |
 | `gravity-calibration` | J1–J6 | 可拖动 gravity+damping；R 后暂时固定 q 记录静态位置残差 | 多窗口无需重启 |
+| `startup-replay` | J1–J6 | 首次自然稳定后按 R；同一次使能中平滑加锁、保持并再次交接 | 区分边界释放与非边界重力偏差；不自动判稳 |
 | `feedback-stability` | 不改变既有状态 | read-only 读取 `mechPos` 并统计有限差分 | 不切 mode、不使能、不失能、不发送控制帧 |
 | `driver-torque-limit-roundtrip` | J1–J6 | 读原值→写 scaled effort→回读→恢复→回读 | 不使能、不发 MIT/POS_VEL；成功后才可在 active 命令使用 driver Kd |
 | `gravity-calibration-fit` | 无设备 | 离线归约、姿态去重、回归和 holdout 报告 | 只输出 candidate correction |
