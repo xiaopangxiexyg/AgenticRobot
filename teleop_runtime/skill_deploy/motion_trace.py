@@ -96,6 +96,13 @@ _REFERENCE_DTYPE = np.dtype(
         ("ik_frame_total_ms", "<f8"),
         ("ik_time_budget_ms", "<f8"),
         ("ik_time_budget_exceeded", "u1"),
+        ("ik_profile_solve_calls", "<f8"),
+        ("ik_profile_solve_total_ms", "<f8"),
+        ("ik_profile_solve_qp_ms", "<f8"),
+        ("ik_profile_solve_integrate_ms", "<f8"),
+        ("ik_profile_solve_set_configuration_ms", "<f8"),
+        ("ik_profile_min_distance_calls", "<f8"),
+        ("ik_profile_min_distance_total_ms", "<f8"),
         ("command_present", "u1"),
         ("admitted", "u1"),
         ("expired_reference", "u1"),
@@ -331,6 +338,13 @@ class SkillMotionTraceRecorder:
                 "collision_distance_m",
                 "ik_frame_total_ms",
                 "ik_time_budget_ms",
+                "ik_profile_solve_total_ms",
+                "ik_profile_solve_qp_ms",
+                "ik_profile_solve_integrate_ms",
+                "ik_profile_solve_set_configuration_ms",
+                "ik_profile_solve_calls",
+                "ik_profile_min_distance_calls",
+                "ik_profile_min_distance_total_ms",
                 "observation_ms",
                 "synchronization_ms",
                 "owner_requests_ms",
@@ -485,6 +499,28 @@ class SkillMotionTraceRecorder:
             row["ik_time_budget_ms"] = _number(metadata.get("ik_time_budget_ms"))
             row["ik_time_budget_exceeded"] = int(
                 bool(metadata.get("ik_time_budget_exceeded", False))
+            )
+            ik_profile = _mapping(metadata.get("ik_debug_profile"))
+            row["ik_profile_solve_calls"] = _number(
+                ik_profile.get("solve_calls")
+            )
+            row["ik_profile_solve_total_ms"] = _number(
+                ik_profile.get("solve_total_ms")
+            )
+            row["ik_profile_solve_qp_ms"] = _number(
+                ik_profile.get("solve_qp_ms")
+            )
+            row["ik_profile_solve_integrate_ms"] = _number(
+                ik_profile.get("solve_integrate_ms")
+            )
+            row["ik_profile_solve_set_configuration_ms"] = _number(
+                ik_profile.get("solve_set_configuration_ms")
+            )
+            row["ik_profile_min_distance_calls"] = _number(
+                ik_profile.get("min_distance_calls")
+            )
+            row["ik_profile_min_distance_total_ms"] = _number(
+                ik_profile.get("min_distance_total_ms")
             )
 
             start = sample.cycle_started_monotonic
@@ -889,6 +925,29 @@ class SkillMotionTraceRecorder:
                 np.sum(reference["ik_time_budget_exceeded"])
             ),
             "ik_branch_switch_count": int(branch_switches),
+            "ik_profile": {
+                "profiled_reference_count": int(
+                    np.sum(np.isfinite(reference["ik_profile_solve_calls"]))
+                ),
+                "solve_calls": self._percentiles(
+                    reference["ik_profile_solve_calls"].astype(float)
+                ),
+                "min_distance_calls": self._percentiles(
+                    reference["ik_profile_min_distance_calls"].astype(float)
+                ),
+                **{
+                    name.removeprefix("ik_profile_"): self._percentiles(
+                        reference[name]
+                    )
+                    for name in (
+                        "ik_profile_solve_total_ms",
+                        "ik_profile_solve_qp_ms",
+                        "ik_profile_solve_integrate_ms",
+                        "ik_profile_solve_set_configuration_ms",
+                        "ik_profile_min_distance_total_ms",
+                    )
+                },
+            },
             "timing_ms": {
                 name: self._percentiles(reference[name])
                 for name in (

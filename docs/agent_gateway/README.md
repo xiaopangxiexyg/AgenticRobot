@@ -141,12 +141,18 @@ revision/frame graph/calibration 应关闭失败。DMTAC TCP 到 solver endpoint
 
 ```bash
 --motion-trace-root /absolute/private/motion_traces \
---motion-trace-max-duration-sec 120
+--motion-trace-max-duration-sec 120 \
+--debug-motion-skill
 ```
 
 trace 不改变目标、IK、admission、freshness、碰撞、轨迹或 HOLD。启动前一次性为 60 Hz
 reference/IK 和左右各 120 Hz actuator command 分配固定内存；运行期间只复制固定字段，缓冲区
 满时累计 drop 而不等待，不执行 JSON、FK 或磁盘写入。下层停止并解除 trace callback 后才生成：
+
+`--debug-motion-skill` 默认关闭，并且缺少 `--motion-trace-root` 时拒绝启动。开启后只让既有
+IK solver 将每帧 `solve/QP/integrate/set-configuration/min-distance` 分段耗时写入同一份
+预分配 trace；`debug_profile_print_every=0`，因此不会在控制热路径逐帧打印。关闭该参数即可
+回退到原有 target-builder 配置和 trace 字段缺省行为。
 
 - `motion_trace.npz`：30 Hz 实测 qpos/TCP、60 Hz 请求目标/原始 IK/最终 qref/分支/碰撞余量/
   各阶段耗时，以及左右 120 Hz 的实际 SDK qcmd、发送时刻与结果；

@@ -41,6 +41,15 @@ def _command(*, index: int) -> TeleopCommand:
             "ik_frame_total_ms": 9.0 + index,
             "ik_time_budget_ms": 16.667,
             "ik_time_budget_exceeded": index == 2,
+            "ik_debug_profile": {
+                "solve_calls": index + 1,
+                "solve_total_ms": 4.0 + index,
+                "solve_qp_ms": 2.0 + index,
+                "solve_integrate_ms": 0.4 + index,
+                "solve_set_configuration_ms": 0.2 + index,
+                "min_distance_calls": index + 2,
+                "min_distance_total_ms": 3.0 + index,
+            },
             "ik_jump_gate_status": "pass",
         }
     )
@@ -208,6 +217,13 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
         assert arrays["left_actuator"].shape == (3,)
         assert arrays["right_actuator"].shape == (3,)
         assert arrays["reference"][2]["ik_time_budget_exceeded"] == 1
+        assert arrays["reference"][2]["ik_profile_solve_calls"] == 3
+        assert arrays["reference"][2]["ik_profile_solve_qp_ms"] == pytest.approx(
+            4.0
+        )
+        assert arrays["reference"][2][
+            "ik_profile_min_distance_total_ms"
+        ] == pytest.approx(5.0)
         assert arrays["reference"][1]["measurement_span_ms"] == pytest.approx(2.0)
         np.testing.assert_allclose(
             arrays["reference"][1]["hardware_read_sdk_call_wall_ms"],
@@ -223,6 +239,11 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
     assert summary["dispatch_succeeded_count"] == 3
     assert summary["ik_time_budget_exceeded_count"] == 1
     assert summary["ik_branch_switch_count"] == 0
+    assert summary["ik_profile"]["profiled_reference_count"] == 3
+    assert summary["ik_profile"]["solve_qp_ms"]["max"] == pytest.approx(4.0)
+    assert summary["ik_profile"]["min_distance_total_ms"][
+        "max"
+    ] == pytest.approx(5.0)
     assert summary["actuator_timing"]["left"]["accepted_count"] == 3
     assert summary["actuator_timing"]["left"]["post_stall_burst_count"] == 0
     assert summary["actuator_timing"]["left"]["moving_send_under_4ms_count"] == 0

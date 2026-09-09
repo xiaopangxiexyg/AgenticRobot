@@ -196,6 +196,86 @@ def test_motion_trace_is_explicit_and_preallocated_duration_is_bounded() -> None
     assert enabled.motion_trace_max_duration_sec == 45.0
 
 
+def test_motion_skill_debug_is_explicit_and_requires_trace_root(
+    monkeypatch,
+) -> None:
+    parser = gateway_cli.build_parser()
+    default = parser.parse_args(
+        _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    )
+    assert default.debug_motion_skill is False
+
+    resolved = False
+
+    def should_not_resolve(profile):
+        del profile
+        nonlocal resolved
+        resolved = True
+        raise AssertionError("debug validation must precede profile resolution")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        should_not_resolve,
+    )
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    argv.append("--debug-motion-skill")
+
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main(argv)
+
+    assert captured.value.code == 2
+    assert resolved is False
+
+
+def test_motion_skill_debug_reaches_only_the_lower_builder(
+    monkeypatch,
+    tmp_path,
+    short_unix_socket_path_factory,
+) -> None:
+    resolved = SimpleNamespace(semantic_content_hash="a" * 64)
+    captured = {}
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        lambda profile: resolved,
+    )
+
+    def assemble(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after lower binding")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "assemble_exclusive_rm65_skill_lower",
+        assemble,
+    )
+    socket_path = short_unix_socket_path_factory("motion-debug")
+    socket_path.parent.chmod(0o2750)
+    trace_root = tmp_path / "trace"
+    trace_root.mkdir(mode=0o700)
+    argv = _argv(
+        confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+        socket_path=socket_path,
+    )
+    argv.extend(
+        [
+            "--debug-motion-skill",
+            "--motion-trace-root",
+            str(trace_root),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="stop after lower binding"):
+        gateway_cli.main(argv)
+
+    assert captured == {
+        "profile": resolved,
+        "debug_motion_skill": True,
+    }
+
+
 def test_motion_trace_attaches_and_detaches_all_three_control_rates() -> None:
     class Owner:
         def __init__(self, method):
