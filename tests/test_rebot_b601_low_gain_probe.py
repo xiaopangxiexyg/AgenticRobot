@@ -3694,3 +3694,37 @@ def test_driver_damping_requires_verified_driver_torque_limits() -> None:
     args.kd = 1.0
     with pytest.raises(probe.LowGainProbeError, match="software --kd 0"):
         probe._validate_cli(args)
+
+
+def test_driver_damping_accepts_explicit_six_joint_gains() -> None:
+    args = _parse_pose_args(
+        "--kd",
+        "0",
+        "--driver-kd",
+        "0.4",
+        "0.6",
+        "0.6",
+        "0.3",
+        "0.25",
+        "0.2",
+    )
+    args.apply_driver_torque_limits = True
+
+    probe._validate_cli(args)
+
+    assert probe._one_or_six_non_negative(args.driver_kd, name="driver_kd") == (
+        0.4,
+        0.6,
+        0.6,
+        0.3,
+        0.25,
+        0.2,
+    )
+
+
+def test_driver_damping_rejects_ambiguous_joint_count() -> None:
+    args = _parse_pose_args("--kd", "0", "--driver-kd", "0.4", "0.6")
+    args.apply_driver_torque_limits = True
+
+    with pytest.raises(ValueError, match="one or six"):
+        probe._validate_cli(args)

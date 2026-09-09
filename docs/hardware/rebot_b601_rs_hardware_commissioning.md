@@ -560,7 +560,9 @@ breakaway，位置锁最终提供约 `-0.268 N·m` 修正，方向和量级均�
 进入最终 active 后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；vendor `kd`
 默认也是零。只有上述有明确起止状态的临时启动锁允许非零 vendor Kp。
 为避免 20 Hz 有限差分阻尼产生阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度
-耗散交给电机内部环；driver `kp` 仍固定为零，因此末端 `J^T wrench` 仍是唯一最终位置
+耗散交给电机内部环。`--driver-kd 0.6` 仍表示六轴共用一个值；也可以按 J1--J6 顺序
+直接给出六项，例如 `--driver-kd 0.4 0.6 0.6 0.3 0.25 0.2`。driver `kp` 仍固定为零，
+因此末端 `J^T wrench` 仍是唯一最终位置
 恢复项。非零 driver Kd 只有在
 `--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、

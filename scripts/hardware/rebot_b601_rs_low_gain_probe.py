@@ -2057,6 +2057,24 @@ def _non_negative_six(
     return normalized
 
 
+def _one_or_six_non_negative(
+    values: object,
+    *,
+    name: str,
+) -> tuple[float, ...]:
+    """Expand one shared gain or accept explicit joint1..joint6 gains."""
+
+    if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+        normalized = tuple(values)
+    else:
+        normalized = (values,)
+    if len(normalized) == 1:
+        normalized *= 6
+    if len(normalized) != 6:
+        raise ValueError(f"{name} must contain one or six values")
+    return _non_negative_six(normalized, name=name)
+
+
 def _positive(value: object, *, name: str) -> float:
     normalized = _finite(value, name=name)
     if normalized <= 0.0:
@@ -2884,7 +2902,13 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 _positive(value, name=name)
         return
     if args.mode == "feedback-stability":
-        if getattr(args, "driver_kd", 0.0) != 0.0:
+        if any(
+            value > 0.0
+            for value in _one_or_six_non_negative(
+                getattr(args, "driver_kd", 0.0),
+                name="driver_kd",
+            )
+        ):
             raise LowGainProbeError(
                 "feedback-stability rejects --driver-kd; it is observation-only"
             )
@@ -3012,11 +3036,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         ),
         name="protective_hold_kd",
     )
-    driver_kd = _non_negative(
+    driver_kd = _one_or_six_non_negative(
         getattr(args, "driver_kd", 0.0),
         name="driver_kd",
     )
-    if driver_kd > 0.0 and not args.apply_driver_torque_limits:
+    if any(value > 0.0 for value in driver_kd) and not args.apply_driver_torque_limits:
         raise LowGainProbeError(
             "non-zero --driver-kd requires --apply-driver-torque-limits"
         )
@@ -3026,7 +3050,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         _non_negative(target_kp, name="target_kp")
     if target_kd is not None:
         _non_negative(target_kd, name="target_kd")
-    if driver_kd > 0.0 and (
+    if any(value > 0.0 for value in driver_kd) and (
         args.kd > 0.0 or (target_kd is not None and target_kd > 0.0)
     ):
         raise LowGainProbeError(
@@ -5642,9 +5666,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
     _validate_cli(args)
-    driver_kd_nm_s_per_rad = (
-        _non_negative(getattr(args, "driver_kd", 0.0), name="driver_kd"),
-    ) * 6
+    driver_kd_nm_s_per_rad = _one_or_six_non_negative(
+        getattr(args, "driver_kd", 0.0),
+        name="driver_kd",
+    )
     gravity_joint_scales = _non_negative_six(
         getattr(args, "gravity_joint_scales", _ONE_SIX),
         name="gravity_joint_scales",
@@ -7998,10 +8023,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--driver-kd",
         type=float,
-        default=0.0,
+        nargs="+",
+        metavar="KD",
+        default=(0.0,),
         help=(
-            "optional all-arm motor-local MIT damping; requires "
-            "--apply-driver-torque-limits and does not add position stiffness"
+            "one shared or six joint1..joint6 motor-local MIT damping gains; "
+            "requires --apply-driver-torque-limits and adds no position stiffness"
         ),
     )
     parser.add_argument(

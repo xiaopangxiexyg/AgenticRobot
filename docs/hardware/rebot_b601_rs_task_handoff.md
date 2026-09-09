@@ -135,7 +135,8 @@ ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结�
 - `pose-hold` 的位置恢复只能来自末端 6D spring 经完整 Jacobian 转置映射；软件关节 Kp
   应为零。`cartesian-hold` 同理，只产生平移 overlay。
 - 软件 Kd 和 driver Kd 只能有一个实际阻尼 owner。临时锁期间 YAML Kd 由电机本地拥有，
-  主机临时 Kd 为零；交接时本地 Kd 连续回到 active driver Kd。`--driver-kd > 0` 时必须
+  主机临时 Kd 为零；交接时本地 Kd 连续回到 active driver Kd。`--driver-kd` 接受一个
+  六轴共用值或按 J1--J6 顺序给出的六项；任一项非零时必须
   `--kd 0`、不使用非零 `--target-kd`，并且先完成六轴 `0x700B` 临时 torque-limit
   round-trip；driver Kd 只提供电机局部速度耗散，不提供位置锁。
 - 未选择 driver Kd 时，软件 Kd 由 host 计算；20 Hz 反馈的有限差分量化可能产生阶梯感，
