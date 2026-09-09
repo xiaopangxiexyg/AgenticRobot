@@ -403,6 +403,9 @@ def _stopped_payload(
         "measurement_sampler": (
             composition.lower.ports.measurement_sampler_snapshot()
         ),
+        "arm_backend_diagnostics": (
+            composition.lower.ports.arm_backend_diagnostics_snapshot()
+        ),
         "control_cycle": (
             composition.deployment.control_runtime.control_cycle_snapshot()
         ),

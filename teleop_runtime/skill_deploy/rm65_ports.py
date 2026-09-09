@@ -146,6 +146,84 @@ def _bounded_backend_state(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bounded_backend_diagnostics_state(
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    background = state.get("background_streaming")
+    background_state = (
+        dict(background) if isinstance(background, Mapping) else {}
+    )
+    raw_attempts = background_state.get("fault_stop_attempts")
+    bounded_attempts: list[dict[str, Any]] = []
+    if isinstance(raw_attempts, (list, tuple)):
+        for raw_attempt in raw_attempts[:4]:
+            if not isinstance(raw_attempt, Mapping):
+                continue
+            bounded_attempts.append(
+                {
+                    "method": raw_attempt.get("method"),
+                    "result_code": raw_attempt.get("result_code"),
+                    "result_text": _bounded_diagnostic_text(
+                        raw_attempt.get("result_text")
+                    ),
+                    "exception": _bounded_diagnostic_text(
+                        raw_attempt.get("exception")
+                    ),
+                }
+            )
+    raw_health_reasons = background_state.get("health_reasons")
+    health_reasons = (
+        list(raw_health_reasons)
+        if isinstance(raw_health_reasons, (list, tuple))
+        else []
+    )
+    return {
+        "hardware_ready": state.get("hardware_ready"),
+        "emergency_stopped": bool(state.get("emergency_stopped", False)),
+        "send_result_code": state.get("send_result_code"),
+        "send_result_text": _bounded_diagnostic_text(
+            state.get("send_result_text")
+        ),
+        "background_enabled": bool(background_state.get("enabled", False)),
+        "background_healthy": background_state.get("healthy"),
+        "background_health_reasons": [
+            str(reason)[:128]
+            for reason in health_reasons[:16]
+        ],
+        "background_thread_alive": background_state.get("thread_alive"),
+        "background_target_active": background_state.get("target_active"),
+        "background_target_stale": background_state.get("target_stale"),
+        "background_fault": _bounded_diagnostic_text(
+            background_state.get("fault")
+        ),
+        "background_fault_count": background_state.get("fault_count"),
+        "background_fault_timestamp": background_state.get("fault_timestamp"),
+        "background_fault_stop_attempted": background_state.get(
+            "fault_stop_attempted"
+        ),
+        "background_fault_stop_success": background_state.get(
+            "fault_stop_success"
+        ),
+        "background_fault_stop_attempts": bounded_attempts,
+        "background_fault_stop_timestamp": background_state.get(
+            "fault_stop_timestamp"
+        ),
+        "background_shutdown_requested": background_state.get(
+            "shutdown_requested"
+        ),
+        "background_shutdown_complete": background_state.get(
+            "shutdown_complete"
+        ),
+        "background_join_timed_out": background_state.get("join_timed_out"),
+    }
+
+
+def _bounded_diagnostic_text(value: object, *, limit: int = 512) -> str | None:
+    if value is None:
+        return None
+    return " ".join(str(value).split())[:limit]
+
+
 def build_exclusive_rm65_skill_position_force_guard(
     *,
     arm_backends: Mapping[str, EffectorBackend],
@@ -611,6 +689,23 @@ class ExclusiveRM65SkillDeployPorts:
                 {} if cut is None else dict(cut.source_sequence_by_side)
             ),
         }
+
+    def arm_backend_diagnostics_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return cached, bounded terminal evidence without hardware reads."""
+
+        snapshot: dict[str, dict[str, Any]] = {}
+        for side in ("left", "right"):
+            backend = self.arm_backends[side]
+            try:
+                snapshot[side] = _bounded_backend_diagnostics_state(
+                    backend.get_state()
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve unreadable side.
+                snapshot[side] = {
+                    "state_error_type": type(exc).__name__,
+                    "state_error": _bounded_diagnostic_text(exc),
+                }
+        return snapshot
 
     def observe(self) -> RealSkillMotionObservationCut:
         """Consume the latest fresh cut; background mode performs no device I/O."""

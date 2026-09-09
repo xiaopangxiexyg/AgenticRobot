@@ -845,6 +845,77 @@ def test_rm65_ports_emergency_stop_requires_both_lower_latches() -> None:
     assert ports.last_emergency_stop_receipt is receipt
 
 
+def test_rm65_ports_backend_diagnostics_preserve_bounded_sender_fault() -> None:
+    ports, backends, _ = _ports()
+    right = backends["right"]
+    original_get_state = right.get_state
+
+    def faulted_state():
+        state = original_get_state()
+        state["send_result_code"] = 7
+        state["send_result_text"] = "error code 7"
+        state["background_streaming"].update(
+            {
+                "healthy": False,
+                "health_reasons": ["fault_latched", "thread_not_alive"],
+                "thread_alive": False,
+                "fault": (
+                    "Movej_CANFD returned non-zero/unknown result: error code 7"
+                ),
+                "fault_count": 1,
+                "fault_stop_attempted": True,
+                "fault_stop_success": True,
+                "fault_stop_attempts": [
+                    {
+                        "method": "Arm_Slow_Stop",
+                        "result_code": 0,
+                        "result_text": "0",
+                        "exception": None,
+                    }
+                ],
+                "shutdown_complete": True,
+            }
+        )
+        return state
+
+    right.get_state = faulted_state
+
+    snapshot = ports.arm_backend_diagnostics_snapshot()
+
+    assert snapshot["left"]["background_fault"] is None
+    assert snapshot["right"] == {
+        "hardware_ready": True,
+        "emergency_stopped": False,
+        "send_result_code": 7,
+        "send_result_text": "error code 7",
+        "background_enabled": True,
+        "background_healthy": False,
+        "background_health_reasons": ["fault_latched", "thread_not_alive"],
+        "background_thread_alive": False,
+        "background_target_active": False,
+        "background_target_stale": False,
+        "background_fault": (
+            "Movej_CANFD returned non-zero/unknown result: error code 7"
+        ),
+        "background_fault_count": 1,
+        "background_fault_timestamp": None,
+        "background_fault_stop_attempted": True,
+        "background_fault_stop_success": True,
+        "background_fault_stop_attempts": [
+            {
+                "method": "Arm_Slow_Stop",
+                "result_code": 0,
+                "result_text": "0",
+                "exception": None,
+            }
+        ],
+        "background_fault_stop_timestamp": None,
+        "background_shutdown_requested": None,
+        "background_shutdown_complete": True,
+        "background_join_timed_out": None,
+    }
+
+
 def test_rm65_ports_emergency_stop_partial_failure_is_not_confirmed() -> None:
     ports, backends, _ = _ports(
         backend_emergency_stop_failures={"left": 1}

@@ -593,6 +593,17 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             profile=resolved,
             ports=SimpleNamespace(
                 last_emergency_stop_receipt=None,
+                arm_backend_diagnostics_snapshot=lambda: {
+                    "left": {"background_fault": None},
+                    "right": {
+                        "background_fault": (
+                            "Movej_CANFD returned non-zero/unknown result: "
+                            "error code 7"
+                        ),
+                        "background_fault_stop_attempted": True,
+                        "background_fault_stop_success": True,
+                    },
+                },
                 measurement_sampler_snapshot=lambda: {
                     "enabled": True,
                     "thread_alive": False,
@@ -671,6 +682,13 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert events[1]["emergency_stop_confirmed"] is False
     assert events[1]["control_fault"] is None
     assert events[1]["measurement_sampler"]["sample_count"] == 7
+    assert events[1]["arm_backend_diagnostics"]["right"] == {
+        "background_fault": (
+            "Movej_CANFD returned non-zero/unknown result: error code 7"
+        ),
+        "background_fault_stop_attempted": True,
+        "background_fault_stop_success": True,
+    }
     assert events[1]["control_cycle"]["cycle_count"] == 9
     assert events[1]["passive_read_failures"] == [
         {

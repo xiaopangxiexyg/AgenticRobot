@@ -3185,7 +3185,7 @@ def test_structured_dispatch_preserves_partial_dual_arm_receipts_on_exception() 
     assert receipts["right_arm"]["status"] == "exception"
 
 
-def test_pre_hand_arm_health_gate_rejects_background_stream_fault() -> None:
+def test_pre_hand_arm_health_gate_preserves_background_stream_fault() -> None:
     class FaultedArmBackend:
         def is_ready(self) -> bool:
             return True
@@ -3199,13 +3199,32 @@ def test_pre_hand_arm_health_gate_rejects_background_stream_fault() -> None:
                     "thread_alive": False,
                     "target_active": False,
                     "target_stale": False,
-                    "fault": "unit sdk failure",
+                    "fault": (
+                        "Movej_CANFD returned non-zero/unknown result: error code 7"
+                    ),
+                    "fault_count": 1,
+                    "fault_stop_attempted": True,
+                    "fault_stop_success": True,
+                    "fault_stop_attempts": [
+                        {
+                            "method": "Arm_Slow_Stop",
+                            "result_code": 0,
+                            "result_text": "0",
+                            "exception": None,
+                        }
+                    ],
                     "shutdown_requested": False,
-                    "shutdown_complete": False,
+                    "shutdown_complete": True,
                 },
             }
 
-    with pytest.raises(RuntimeError, match="background_fault"):
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "background_fault=.*Movej_CANFD returned non-zero/unknown result: "
+            "error code 7"
+        ),
+    ):
         require_arm_backends_ready_for_position_dispatch(
             {"left": FaultedArmBackend(), "right": FaultedArmBackend()},
             require_background_target=True,

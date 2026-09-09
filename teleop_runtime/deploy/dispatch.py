@@ -322,7 +322,14 @@ def require_arm_backends_ready_for_position_dispatch(
         for side, item in health["sides"].items():
             reasons = item.get("reasons") or []
             if reasons:
-                failures.append(f"{side}=" + ",".join(str(reason) for reason in reasons))
+                failure = f"{side}=" + ",".join(
+                    str(reason) for reason in reasons
+                )
+                background = item.get("background_streaming")
+                if isinstance(background, Mapping) and background.get("fault"):
+                    fault = " ".join(str(background["fault"]).split())[:512]
+                    failure += f" [background_fault={fault}]"
+                failures.append(failure)
         if not failures:
             failures.append("no_arm_backends")
         raise RuntimeError(
@@ -489,6 +496,11 @@ def _compact_background_streaming_state(state: Mapping[str, Any]) -> dict[str, A
         "target_stale",
         "fault",
         "fault_count",
+        "fault_timestamp",
+        "fault_stop_attempted",
+        "fault_stop_success",
+        "fault_stop_attempts",
+        "fault_stop_timestamp",
         "shutdown_requested",
         "shutdown_complete",
         "join_timed_out",
