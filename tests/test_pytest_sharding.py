@@ -94,7 +94,7 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
         58.974
     )
     assert module.FULL_WEIGHTS["tests/test_rm65_grasp_trajectory.py"] == pytest.approx(
-        39.908
+        31.391
     )
     assert module.FULL_WEIGHTS[
         "tests/test_mujoco_formal_compound_authority.py"

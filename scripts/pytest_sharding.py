@@ -24,7 +24,7 @@ FULL_WEIGHTS = {
     "tests/test_replay_position_admittance_active_pipeline.py": 106.650,
     "tests/test_mujoco_fast_runtime.py": 58.974,
     "tests/test_control_station_mujoco_sim_hil.py": 49.169,
-    "tests/test_rm65_grasp_trajectory.py": 39.908,
+    "tests/test_rm65_grasp_trajectory.py": 31.391,
     "tests/test_rebot_b601_real2sim.py": 21.898,
     "tests/test_control_station_sim_hil_allocation_profile.py": 21.484,
     "tests/test_v25p_dual_write_shadow.py": 20.941,
