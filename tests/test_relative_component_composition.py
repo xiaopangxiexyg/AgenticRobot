@@ -245,7 +245,7 @@ def _contract(
         strategy_version="development",
         composition_spec_hash=spec.semantic_content_hash,
         implementation_contract_hashes=(rules.semantic_content_hash,),
-        maximum_decision_latency_sec=0.01,
+        maximum_decision_latency_sec=None,
     )
     strategy = FormalComponentCompositionStrategyV2(
         strategy_spec=strategy_spec,

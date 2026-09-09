@@ -46,6 +46,7 @@ from sim.mujoco.actuation import (
     cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
 )
+from sim.mujoco.artifacts import ModelArtifactCache
 from sim.mujoco.adapters import (
     MujocoPositionExecutionConfig,
     MujocoPositionExecutionRig,
@@ -898,7 +899,7 @@ def _physical_rollout(
     contract = replace(base_contract, timing=timing)
     arm_profile = rm65_bimanual_udp_feedback_profile()
     gripper_profile = cad_bimanual_dmtac_gripper_profile()
-    scene = MujocoScene.from_contract(
+    scene, _model_artifact = ModelArtifactCache().load_scene(
         contract,
         position_actuation_profile=arm_profile,
         gripper_actuation_profile=gripper_profile,

@@ -142,6 +142,7 @@ def test_model_artifact_cache_hits_and_recovers_from_corruption(tmp_path: Path) 
     second_scene, second = cache.load_scene(contract)
     assert second.cache_hit
     assert second.key == first.key
+    assert second_scene.data is not first_scene.data
     np.testing.assert_allclose(second_scene.model.opt.timestep, first_scene.model.opt.timestep)
 
     first.mjb_path.write_bytes(b"corrupt")
@@ -285,7 +286,6 @@ def test_pose_planner_recovers_only_small_mujoco_joint_limit_residual() -> None:
     env = FastCubeLiftEnv(
         "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json",
         use_settled_snapshot=False,
-        use_model_cache=False,
     )
     try:
         env.reset(seed=11)
@@ -329,7 +329,6 @@ def test_pose_planner_hard_limit_violation_terminates_only_current_episode(
     env = FastCubeLiftEnv(
         "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json",
         use_settled_snapshot=False,
-        use_model_cache=False,
     )
     try:
         env.reset(seed=12)
@@ -371,7 +370,6 @@ def test_pose_planner_uses_mujoco_collision_clearance() -> None:
     env = FastCubeLiftEnv(
         "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json",
         use_settled_snapshot=False,
-        use_model_cache=False,
     )
     try:
         env.reset(seed=13)
