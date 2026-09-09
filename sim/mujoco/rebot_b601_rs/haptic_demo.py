@@ -89,6 +89,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Host torque rate for --real2sim-controller only.",
     )
     parser.add_argument(
+        "--torque-rise-time-sec", type=float,
+        help=(
+            "Simulation rate normalization: URDF effort ceiling divided by this time. "
+            "Not the startup handoff duration; omission preserves the driver default."
+        ),
+    )
+    parser.add_argument(
         "--fixture-stiffness-scale", type=float, default=1.0,
         help="Offline fixture stiffness multiplier; does not relax acceptance or limits.",
     )
@@ -185,6 +192,7 @@ def run_haptic_fixture_demo(
     startup_profile: B601SimStartupProfile | None = None,
     fixture_stiffness_scale: float = 1.0,
     fixture_damping_scale: float = 1.0,
+    torque_rise_time_sec: float | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
@@ -199,6 +207,12 @@ def run_haptic_fixture_demo(
     duration = float(duration_sec)
     if not math.isfinite(duration) or duration <= 0.0:
         raise ValueError("duration_sec must be finite and positive")
+    if torque_rise_time_sec is not None and (
+        isinstance(torque_rise_time_sec, bool)
+        or not math.isfinite(torque_rise_time_sec)
+        or torque_rise_time_sec <= 0.0
+    ):
+        raise ValueError("torque_rise_time_sec must be finite and positive")
     for name, value in (
         ("fixture_stiffness_scale", fixture_stiffness_scale),
         ("fixture_damping_scale", fixture_damping_scale),
@@ -315,7 +329,11 @@ def run_haptic_fixture_demo(
         gravity_mps2=(0.0, 0.0, -9.81),
         actuation_mode="effort",
     )
-    base_profile = default_b601_mit_profile(scene)
+    base_profile = (
+        default_b601_mit_profile(scene)
+        if torque_rise_time_sec is None
+        else default_b601_mit_profile(scene, torque_rise_time_sec=torque_rise_time_sec)
+    )
     profile = replace(
         base_profile,
         damping_kd_nm_s_per_rad=(
@@ -730,6 +748,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         startup_profile=startup,
         fixture_stiffness_scale=args.fixture_stiffness_scale,
         fixture_damping_scale=args.fixture_damping_scale,
+        torque_rise_time_sec=args.torque_rise_time_sec,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return code

@@ -334,3 +334,83 @@ printf '%s\n' 'shell remains active'
 `git diff --check` 通过。新增 signed/positive/absorbed work 恒等式、本地阻尼非正功和
 125 Hz 保持期间正功回归。固定同一外部 vendor 路径的 500 Hz 前后 CLI 对照中，
 移除新增 `power_diagnostics` 后整份 JSON 完全一致，确认本次观测没有改变原有输出。
+
+## M1 主机前馈变化率隔离与 125 Hz 验证
+
+基线 `e2e47c63fade534130b651d4fb619e6ff41090ea`，后继分支
+`codex/b601-real2sim-feedforward-rate`。核实时本地 development 为 `24aa543b`，
+尚不包含该基线；本批仍是有序后继候选，不声称已完成合并。
+
+复用已有 `default_b601_mit_profile(..., torque_rise_time_sec=...)`，仅在现有 demo
+开放同名 CLI/API 参数。省略时原样使用驱动器默认 0.05 s，不复制默认常量。
+其语义是 `max_torque_rate = URDF effort ceiling / torque_rise_time_sec`，**不是启动锁
+交接时长**。real2sim 下限制 host feedforward；motor-local Kp/Kd 不经过它。
+profile 已有 metadata 与六轴实际变化率数值继续作为 JSON 证据来源。
+参数必须有限且大于零；未改刚度、阻尼、URDF、力矩绝对上限和运动/效果门限。
+
+### 1.5 s 对照
+
+以下 rate scale 是相对原默认变化率的实验记法（不是新 CLI 参数），对应 normalization
+时间分别为 0.05、0.5、5 s。实际实验通过已有 profile 构造参数完成。
+
+| host Hz | rate scale | 结果 | 已执行 ticks | slew 受限 ticks |
+| --- | --- | --- | --- | --- |
+| 20 | 1 | J6 acceleration guard | 351 | 0 |
+| 20 | 0.1 | 同上 | 351 | 0 |
+| 20 | 0.01 | J2 velocity guard | 1150 | 16 |
+| 125 | 1 | J6 acceleration guard | 329 | 8 |
+| 125 | 0.1 | J6 acceleration guard | 337 | 10 |
+| 125 | 0.01 | PASS | 1500 | 155 |
+| 500 | 1 / 0.1 / 0.01 | 均 PASS | 各 1500 | 21 / 21 / 29 |
+
+20 Hz 原配置在失败前没有触发 slew，不能解释为 slew 延迟导致这次失败；强行进一步
+降低变化率也只是把失败换成 J2 速度保护。125 Hz 则得到一个可继续验证的有限候选。
+
+### 10 s 方向验证
+
+固定 operator gravity、官方启动锁参数，125 Hz、normalization=5 s：
+`pose-6d/pose-tx/pose-ty/pose-tz/pose-rx/pose-rz` 六项 PASS；
+`pose-ry` 完整运行且无 driver fault，但效果 FAIL。绕 Y 的最大角误差约 0.016606 rad，
+初始约 0.014996 rad，比例约 1.107，超过既有 1.10 的峰值增长指标；最终误差已收敛。
+原默认 500 Hz 在同一 10 s `pose-ry` 对照中也因同一峰值指标 FAIL（约 0.016593 rad）。
+因此不能把此项全部归因于低频，也不能四舍五入或放宽指标来判 PASS。
+
+这把“125 Hz 下完全不可运行”细化为“特定前馈变化率下，多数固定扰动通过，单轴效果仍有缺口”。
+它不是全工作空间稳定域、真机参数建议或 HARDWARE_PASS。20 Hz 仍不通过。
+下一步应隔离标定/plant 不匹配对 Y 轴瞬态的影响，并继续 M1 故障路径与 M2 数据契约，
+不应围绕单个姿态继续盲目压低变化率。
+
+仅仿真前台复现（Python 日志与命令写同一固定文件）：
+
+```bash
+WT=/tmp/b601-real2sim-feedforward-rate
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python
+LOG=/tmp/b601-real2sim-command-and-output.log
+ARGS=( "$PY" -m sim.mujoco.rebot_b601_rs.haptic_demo
+  --rebot-source-root hardware/reBotArm_control_py
+  --fixture pose-6d --real2sim-controller --host-hz 125 --duration-sec 10
+  --torque-rise-time-sec 5
+  --startup-lock-kp 50 150 150 50 50 50
+  --startup-lock-kd 3 10 10 5 4 4 )
+printf '%s\n' 'SIMULATION ONLY; foreground run'
+if (
+  cd "$WT" || exit 2
+  printf 'command:'
+  printf ' %q' "${ARGS[@]}"
+  printf '\n'
+  PYTHONDONTWRITEBYTECODE=1 "${ARGS[@]}"
+) >> "$LOG" 2>&1; then
+  STATUS=0
+else
+  STATUS=$?
+fi
+printf 'simulation exit code: %s\nlog: %s\n' "$STATUS" "$LOG"
+printf '%s\n' 'shell remains active'
+```
+
+把 fixture 改成 `pose-ry` 应返回 exit 3，保留失败供后续定位。未运行真机、未修改环境、
+总路线图或先前待合并候选；本批依赖基线并等待合并。
+
+验证：七个 B601/边界测试文件 **141 passed**（38.68 s），新增参数非法值、CLI 转发及
+10 s `pose-6d` PASS / `pose-ry` 效果 FAIL 的回归；Ruff、资源 audit、文档 Bash 语法和
+`git diff --check` 通过。归一化参数只控制已有变化率，不改变完整的启动阶段时长。

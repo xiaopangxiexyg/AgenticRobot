@@ -452,9 +452,11 @@ def test_fixture_gain_cli_forwards_explicit_scales(monkeypatch, capsys):
     assert haptic_demo.main([
         "--rebot-source-root", "vendor", "--fixture-stiffness-scale", "0.25",
         "--fixture-damping-scale", "0.1",
+        "--torque-rise-time-sec", "5",
     ]) == 3
     assert captured["fixture_stiffness_scale"] == 0.25
     assert captured["fixture_damping_scale"] == 0.1
+    assert captured["torque_rise_time_sec"] == 5.0
     assert '"diagnostic": true' in capsys.readouterr().out
 
 
@@ -466,6 +468,41 @@ def test_wall_rejects_both_zero_gains_before_model_load():
             source_root="not-a-vendor-checkout", fixture_name="wall",
             fixture_stiffness_scale=0.0, fixture_damping_scale=0.0,
         )
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf"), True])
+def test_fixture_rate_rejects_invalid_values_before_model_load(value):
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+
+    with pytest.raises(ValueError, match="torque_rise_time_sec"):
+        run_haptic_fixture_demo(
+            source_root="not-a-vendor-checkout", fixture_name="pose-6d",
+            torque_rise_time_sec=value,
+        )
+
+
+@pytest.mark.parametrize("fixture_name, expected_code", [("pose-6d", 0), ("pose-ry", 3)])
+def test_tighter_feedforward_rate_preserves_effect_acceptance(fixture_name, expected_code):
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+
+    code, report = run_haptic_fixture_demo(
+        source_root=SOURCE, fixture_name=fixture_name, real2sim_controller=True,
+        host_hz=125.0, duration_sec=10.0, torque_rise_time_sec=5.0,
+        startup_profile=B601SimStartupProfile(
+            lock_kp_nm_per_rad=(50, 150, 150, 50, 50, 50),
+            lock_kd_nm_s_per_rad=(3, 10, 10, 5, 4, 4),
+        ),
+    )
+    assert code == expected_code
+    a = report["simulation_acceptance"]
+    assert a["run_completed"]
+    assert not a["driver_faulted"]
+    assert a["final_control_phase"] == "ACTIVE"
+    profile = report["driver"]["profile"]
+    np.testing.assert_allclose(
+        profile["max_torque_rate_nm_s"], np.asarray(profile["max_abs_torque_nm"]) / 5.0
+    )
+    assert bool(report["effect_acceptance"]["passed"]) == (expected_code == 0)
 
 
 def test_long_run_clock_roundoff_does_not_allow_foreign_step(startup_driver):
