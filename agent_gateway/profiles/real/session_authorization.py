@@ -14,6 +14,7 @@ from agent_gateway.runtime.access_policy import (
 from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
+    GRASP_APPROACH_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
@@ -30,6 +31,7 @@ REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN = (
 # persistent-session token; the retired one-shot token is intentionally invalid.
 REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN = REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
 REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION = "move_tcp_to_pose"
+REAL_AGENT_GRASP_APPROACH_ACTION = "approach_grasp_pose"
 REAL_AGENT_PRIMITIVE_ACTIONS = (
     "forward",
     "backward",
@@ -41,6 +43,7 @@ REAL_AGENT_PRIMITIVE_ACTIONS = (
     "level_forward_left_30",
     "level_forward_right_30",
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+    REAL_AGENT_GRASP_APPROACH_ACTION,
 )
 _FIXED_SKILL_ID_BY_ACTION = {
     **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
@@ -48,6 +51,7 @@ _FIXED_SKILL_ID_BY_ACTION = {
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
+    REAL_AGENT_GRASP_APPROACH_ACTION: GRASP_APPROACH_SKILL_ID_V1,
 }
 _ACTION_BY_FIXED_SKILL_ID = {
     skill_id: action for action, skill_id in _FIXED_SKILL_ID_BY_ACTION.items()
@@ -77,10 +81,13 @@ def _requested_action_and_component_ids(
         "direction"
     ) != fixed_cardinal_action:
         return None, ()
-    if request.skill_id == TCP_POSE_TARGET_SKILL_ID_V1:
+    if request.skill_id in {
+        TCP_POSE_TARGET_SKILL_ID_V1,
+        GRASP_APPROACH_SKILL_ID_V1,
+    }:
         targets = parameters.get("pose_targets_by_component")
         if not isinstance(targets, Mapping):
-            return REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, ()
+            return _ACTION_BY_FIXED_SKILL_ID[request.skill_id], ()
         component_ids = tuple(
             sorted(
                 key
@@ -89,8 +96,8 @@ def _requested_action_and_component_ids(
             )
         )
         if len(component_ids) != len(targets):
-            return REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, ()
-        return REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, component_ids
+            return _ACTION_BY_FIXED_SKILL_ID[request.skill_id], ()
+        return _ACTION_BY_FIXED_SKILL_ID[request.skill_id], component_ids
     requested_action = (
         parameters.get("direction")
         if request.skill_id == "motion.step_tcp_cardinal"
@@ -254,6 +261,7 @@ class RealAgentPrimitiveSessionAuthorization:
 
 __all__ = [
     "REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION",
+    "REAL_AGENT_GRASP_APPROACH_ACTION",
     "REAL_AGENT_PRIMITIVE_ACTIONS",
     "REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN",
     "REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN",

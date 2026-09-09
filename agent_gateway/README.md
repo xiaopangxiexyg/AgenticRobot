@@ -634,7 +634,7 @@ python -m agent_gateway real-rm65 \
   --point-grasp-backend vgn \
   --point-grasp-asset-bundle /absolute/assets/perception/sam2_vgn_point_grasp \
   --authorized-side right \
-  --authorized-action move_tcp_to_pose \
+  --authorized-actions move_tcp_to_pose approach_grasp_pose \
   --confirm AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES
 ```
 
@@ -708,6 +708,37 @@ reviewed profile. The request still passes the lower TCP envelope, coupled IK,
 collision/jump/singularity gates, dispatch admission, convergence evaluation,
 and terminal HOLD proof.
 
+For a grasp approach that must route around the deployed URDF table and three
+camera poles, authorize and call `approach_grasp_pose` instead:
+
+```bash
+python -m agent_gateway.profiles.real.one_shot_client \
+  --socket-path /absolute/private/gateway.sock \
+  --side right \
+  --action approach_grasp_pose \
+  --target-xyz-m 0.31 -0.12 0.28 \
+  --target-quat-xyzw 0 0 0 1 \
+  --speed-scale 0.20 \
+  --confirm EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE
+```
+
+`motion.approach_grasp_pose@1` resolves endpoint IK from the latest measured
+dual-arm qpos, keeps the inactive arm fixed, tries the direct joint path first,
+and invokes the bounded collision-aware planner only when needed. Every path is
+densely rechecked with the production URDF/FCL collision model and the bound TCP
+workspace envelope before the existing lower owner can dispatch it. The lower
+owner atomically rechecks the trajectory start and inactive-arm hold at the
+PENDING-to-ACTIVE edge. Active control interpolates adjacent certified qpos
+samples by its own clock, never re-enters dynamic Cartesian IK, and cannot report
+terminal success before the planned duration has elapsed. Missing/stale qpos,
+start drift, unauthorized inactive-arm motion, unreachable targets, blocked
+endpoints, unavailable collision checking, or exhausted path search return
+distinct zero-motion failures. Activation and completion evidence retain the
+immutable trajectory identity plus the latest measured/lower state and terminal
+HOLD without accumulating an unbounded per-poll or per-frame reference list.
+MuJoCo replay and terminal review are acceptance-test tools only; this
+production Skill imports and starts neither.
+
 A grasp generator that consumes the real Station-aware Depth v2 output may use
 the same action without manually converting camera coordinates. It writes one
 bounded UTF-8 JSON proposal and passes its absolute path instead of the direct
@@ -717,7 +748,7 @@ bounded UTF-8 JSON proposal and passes its absolute path instead of the direct
 python -m agent_gateway.profiles.real.one_shot_client \
   --socket-path /absolute/private/gateway.sock \
   --side right \
-  --action move_tcp_to_pose \
+  --action approach_grasp_pose \
   --camera-grasp-proposal /absolute/path/grasp-proposal.json \
   --speed-scale 0.20 \
   --confirm EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE
@@ -746,8 +777,8 @@ T_canonical_station_actual_tool_tcp
   @ T_camera_optical_frame_actual_tool_tcp
 ```
 
-It then supplies the resulting canonical-Station pose to the unchanged
-`motion.move_tcp_to_pose@1` request. The proposal is not a Grant, does not make
+It then supplies the resulting canonical-Station pose to the
+`motion.approach_grasp_pose@1` request. The proposal is not a Grant, does not make
 the perception operation authoritative for motion, and is not forwarded as a
 motion input Artifact. The same explicit session authorization, one-use Grant,
 fresh RUNNING/READY snapshot, safety envelope, IK/collision admission,

@@ -13,6 +13,7 @@ from types import MappingProxyType
 from agent_gateway.protocol.skill_catalog import SkillDefinition
 
 TCP_POSE_TARGET_SKILL_ID_V1 = "motion.move_tcp_to_pose"
+GRASP_APPROACH_SKILL_ID_V1 = "motion.approach_grasp_pose"
 TCP_CARDINAL_STEP_SKILL_ID_V1 = "motion.step_tcp_cardinal"
 TCP_STEP_FORWARD_SKILL_ID_V1 = "motion.step_tcp_forward"
 TCP_STEP_BACKWARD_SKILL_ID_V1 = "motion.step_tcp_backward"
@@ -148,6 +149,36 @@ def tcp_pose_target_skill_definition_v1(
     )
 
 
+def grasp_approach_skill_definition_v1(
+    *,
+    controlled_component_ids: tuple[str, ...],
+) -> SkillDefinition:
+    """Return the URDF/FCL table-and-pole-aware grasp approach definition."""
+
+    return SkillDefinition(
+        skill_id=GRASP_APPROACH_SKILL_ID_V1,
+        skill_version="1",
+        skill_kind="motion",
+        summary=(
+            "Move one selected RM65 tool_tcp to an absolute grasp pose through "
+            "a densely revalidated joint path that avoids the deployed URDF "
+            "table and camera poles."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=_component_ids(controlled_component_ids),
+        parameter_semantics_id="grasp_approach.absolute.xyz_quat_xyzw.v1",
+        execution_result_semantics_id="component_action_execution.v1",
+        task_outcome_semantics_id="tcp_pose_arrival.v1",
+        entry_predicate_ids=(
+            "route_ready.v1",
+            "measured_start_pose_valid.v1",
+            "urdf_obstacle_path_found.v1",
+        ),
+        task_outcome_predicate_ids=("tcp_pose_within_tolerance.v1",),
+    )
+
+
 def cardinal_tcp_step_skill_definition_v1(
     *,
     controlled_component_ids: tuple[str, ...],
@@ -247,10 +278,11 @@ def fixed_level_tcp_orientation_skill_definition_v1(
 __all__ = [
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
     "FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1",
-    "FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1",
     "FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1",
+    "FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1",
+    "GRASP_APPROACH_SKILL_ID_V1",
     "INLINE_TCP_TRAJECTORY_SKILL_ID_V1",
     "REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1",
     "TCP_CARDINAL_STEP_SKILL_ID_V1",
@@ -267,5 +299,6 @@ __all__ = [
     "cardinal_tcp_step_skill_definition_v1",
     "fixed_cardinal_tcp_step_skill_definition_v1",
     "fixed_level_tcp_orientation_skill_definition_v1",
+    "grasp_approach_skill_definition_v1",
     "tcp_pose_target_skill_definition_v1",
 ]

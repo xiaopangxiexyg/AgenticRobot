@@ -52,6 +52,7 @@ from agent_gateway.runtime.station_operation_worker import (
 from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
 from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
+    GRASP_APPROACH_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from agent_gateway.transport.unix_transport import (
@@ -981,6 +982,7 @@ def assemble_real_agent_primitive_gateway_session(
     perception_provider: RealSenseAgentPerceptionProvider | None = None,
     localization_provider: ObjectLocalizationProvider | None = None,
     station_point_grasp_planner: object | None = None,
+    grasp_trajectory_planner: Callable[..., object] | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     revision_tracker: AgentStationRevisionTracker | None = None,
@@ -1036,6 +1038,14 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError("Localization registration requires its exact provider.")
     if grasp_enabled != (station_point_grasp_planner is not None):
         raise ValueError("Point-grasp registration requires its exact planner.")
+    grasp_approach_enabled = any(
+        entry.route.skill_id == GRASP_APPROACH_SKILL_ID_V1
+        for entry in contract_bundle.route_manifest.skill_routes
+    )
+    if grasp_approach_enabled != callable(grasp_trajectory_planner):
+        raise ValueError(
+            "Grasp approach Route requires exactly one URDF/FCL trajectory planner."
+        )
     if max_session_admissions_per_route is not None and (
         isinstance(max_session_admissions_per_route, bool)
         or not isinstance(max_session_admissions_per_route, int)
@@ -1096,7 +1106,10 @@ def assemble_real_agent_primitive_gateway_session(
     for entry in motion_entries:
         route = entry.route
         binding = contract_bundle.binding_for_skill(route.skill_id)
-        if route.skill_id == TCP_POSE_TARGET_SKILL_ID_V1:
+        if route.skill_id in {
+            TCP_POSE_TARGET_SKILL_ID_V1,
+            GRASP_APPROACH_SKILL_ID_V1,
+        }:
             profile = contract_bundle.pose_target_profile
             if profile is None:
                 raise RuntimeError(
@@ -1125,6 +1138,11 @@ def assemble_real_agent_primitive_gateway_session(
                 profile=_profile,
                 request=request,
                 operation=operation,
+                grasp_trajectory_planner=(
+                    grasp_trajectory_planner
+                    if _route.skill_id == GRASP_APPROACH_SKILL_ID_V1
+                    else None
+                ),
                 clock=clock,
                 sleep=sleep,
             )

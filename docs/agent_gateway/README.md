@@ -115,9 +115,12 @@ T_station_actual_tool_tcp
 
 session、Station、frame graph、相机/深度部署或机械臂任一身份不一致时，都会在提交运动请求
 前关闭失败。proposal 不是 Grant，不会绕过一次性授权，也不会作为 motion Artifact 进入
-下层；解析后的结果仍是原有 `move_tcp_to_pose` 的 Station TCP 参数，并继续经过 envelope、
-IK、碰撞/跳变/奇异性、dispatch、收敛和终态 HOLD。直接 `--target-*` 模式保持不变，且与
-`--camera-grasp-proposal` 互斥。
+下层；解析后的结果是所请求 `move_tcp_to_pose` 或 `approach_grasp_pose` Route 的 Station TCP
+参数。抓姿执行应选后者，由下层在激活前完成 URDF/FCL、TCP envelope、非活动臂固定和整条
+qpos 路径复核；Active 阶段只按控制时钟插值已复核的 qpos，不再动态重算 Cartesian IK，并在
+规划时长结束、实测收敛且终态 HOLD 确认后才成功。激活和执行回执只保留固定轨迹身份、最新
+实测/下层状态与终态 HOLD，不随轮询或控制帧数无限累积。直接 `--target-*` 模式保持不变，且
+与 `--camera-grasp-proposal` 互斥。
 
 MuJoCo 任意抓姿可视化的显式输入则是所选机械臂 base 下的实际 DMTAC TCP，二者数值不能
 直接复用。相同物理目标应通过选定 collision-scene URDF/profile 的固定链转换：

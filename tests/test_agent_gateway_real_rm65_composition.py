@@ -245,7 +245,11 @@ def test_composition_binds_selected_side_to_one_lower_graph_without_start(
         RM65_SKILL_EXECUTION_FRAME_ID_V1
     )
     assert RM65_SKILL_STATION_FRAME_ID_V1 in composition.frame_graph.frame_by_id
-    assert len(composition.safety_envelope_ref.allowed_route_ids) == 11
+    assert len(composition.safety_envelope_ref.allowed_route_ids) == 12
+    assert (
+        "real.rm65.agent_skill_grasp_approach"
+        in composition.safety_envelope_ref.allowed_route_ids
+    )
     assert (
         REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1
         in composition.safety_envelope_ref.allowed_route_ids
@@ -403,7 +407,7 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         assert session.service.protocol_runtime.session_capabilities.artifact_transfer_enabled
         assert session.rgb_executor is not None
         assert session.depth_executor is not None
-        assert len(session.contract_bundle.route_manifest.skill_routes) == 14
+        assert len(session.contract_bundle.route_manifest.skill_routes) == 15
         effects = {
             entry.route.skill_id: entry.route.control_effect_class
             for entry in session.contract_bundle.route_manifest.skill_routes

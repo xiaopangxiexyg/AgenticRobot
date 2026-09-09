@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib
 import json
 import subprocess
@@ -15,6 +16,7 @@ from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservati
 from teleop_runtime.skill_deploy import (
     REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
     ExclusiveRealSkillControlRuntime,
+    RealAgentJointTrajectory,
     RealAgentMotionActivation,
     RealAgentMotionOwnerIdentity,
     RealAgentMotionPhase,
@@ -198,6 +200,67 @@ def test_independent_runtime_owns_dispatch_and_lower_confirmed_hold() -> None:
 
     runtime.close()
     assert runtime.lifecycle == RealSkillControlLifecycle.CLOSED
+
+
+def test_preplanned_grasp_path_dispatch_never_enters_dynamic_target_builder() -> None:
+    builder = _TargetBuilder()
+
+    def reject_dynamic_target(_target):
+        raise AssertionError("preplanned grasp path entered dynamic target solving")
+
+    builder.build_command_for_target_pair = reject_dynamic_target
+    port = _port(builder)
+    dispatched: list[TeleopCommand] = []
+    trajectory = RealAgentJointTrajectory(
+        time_from_start_sec=np.array([0.0, 0.25], dtype=float),
+        qpos_by_side={
+            "left": np.array(
+                [[0.0] * 6, [0.1, 0.0, 0.0, 0.0, 0.0, 0.0]],
+                dtype=float,
+            ),
+            "right": np.full((2, 6), 0.2, dtype=float),
+        },
+        planner_evidence_refs=("rm65-grasp-path:runtime-test",),
+    )
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=lambda: RealSkillMotionObservationCut(
+            observation=TeleopObservation(timestamp=2.0),
+            qpos_by_side={
+                "left": np.zeros(6, dtype=float),
+                "right": np.full(6, 0.2, dtype=float),
+            },
+            measured_at=1.9,
+            available_at=1.95,
+            evidence_refs=("hardware-qpos-cut:preplanned-grasp",),
+        ),
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: (
+            dispatched.append(command)
+            or RealSkillMotionDispatchReceipt(
+                succeeded=True,
+                evidence_refs=("rm65-dispatch:preplanned-grasp",),
+            )
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-hold:preplanned-grasp",),
+        ),
+        max_measurement_age_sec=1.0,
+        clock=lambda: 2.0,
+    )
+
+    runtime.start()
+    port.submit_activation(replace(_activation(), joint_trajectory=trajectory))
+    step = runtime.step(now=2.0)
+
+    assert step.dispatch_succeeded is True
+    assert len(dispatched) == 1
+    assert set(dispatched[0].commands) == {"left_arm", "right_arm"}
+    np.testing.assert_allclose(dispatched[0].commands["right_arm"].value, 0.2)
+    metadata = dispatched[0].metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
+    assert metadata["joint_trajectory_hash"] == trajectory.semantic_content_hash
 
 
 def test_measured_qpos_projection_uses_post_synchronization_availability() -> None:

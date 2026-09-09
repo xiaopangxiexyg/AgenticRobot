@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from agent_gateway.profiles.real.motion_gateway_session import (
     assemble_real_agent_primitive_gateway_session,
@@ -35,6 +36,7 @@ from teleop_runtime.real_teleop.agent_motion_port import (
 )
 from teleop_runtime.skill_deploy.motion_port import (
     REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
+    RealAgentJointTrajectory,
 )
 
 
@@ -108,6 +110,7 @@ def _runtime_fixture(
     *,
     station_from_execution_x: float = 0.0,
     include_inactive_command: bool = False,
+    include_grasp_approach: bool = False,
 ):
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
@@ -166,7 +169,9 @@ def _runtime_fixture(
         schema="dexteleop.deployment_safety_envelope.v1",
         content_hash="real-envelope-hash:lifecycle-test",
         constraint_set_hash="real-constraint-hash:lifecycle-test",
-        allowed_route_ids=real_agent_motion_route_ids_v1(),
+        allowed_route_ids=real_agent_motion_route_ids_v1(
+            include_grasp_approach=include_grasp_approach,
+        ),
     )
     bundle = build_real_agent_primitive_contract_bundle(
         attachment=attachment,
@@ -232,8 +237,14 @@ def _request_and_operation(bundle, *, clock: _Clock):
     return request, operation, route, bundle.binding_for_skill(route.skill_id)
 
 
-def _pose_request_and_operation(bundle, *, clock: _Clock, speed_scale: float):
-    entry = bundle.route_manifest.route("motion.move_tcp_to_pose", "1")
+def _pose_request_and_operation(
+    bundle,
+    *,
+    clock: _Clock,
+    speed_scale: float,
+    skill_id: str = "motion.move_tcp_to_pose",
+):
+    entry = bundle.route_manifest.route(skill_id, "1")
     route = entry.route
     profile = bundle.pose_target_profile
     request = AgentSkillRequest(
@@ -283,6 +294,444 @@ def _pose_request_and_operation(bundle, *, clock: _Clock, speed_scale: float):
         deadline_at=clock() + 10.0,
     )
     return request, operation, route, bundle.binding_for_skill(route.skill_id)
+
+
+def _stationary_grasp_trajectory(
+    qpos_by_side: dict[str, np.ndarray],
+) -> RealAgentJointTrajectory:
+    return RealAgentJointTrajectory(
+        time_from_start_sec=np.array([0.0, 0.5], dtype=float),
+        qpos_by_side={
+            side: np.stack([qpos_by_side[side], qpos_by_side[side]])
+            for side in ("left", "right")
+        },
+        planner_evidence_refs=("rm65-grasp-path:lifecycle-test",),
+    )
+
+
+def _publish_qpos(
+    port: RealAgentMotionPort,
+    *,
+    qpos_by_side: dict[str, np.ndarray],
+    measured_at: float,
+    available_at: float,
+) -> None:
+    port.publish_measured_qpos_pair(
+        qpos_by_side=qpos_by_side,
+        measured_at=measured_at,
+        available_at=available_at,
+        source_evidence_refs=("hardware-qpos-cut:lifecycle-test",),
+    )
+
+
+def test_grasp_approach_activates_only_the_preplanned_joint_trajectory() -> None:
+    bundle, port, builder = _runtime_fixture(include_grasp_approach=True)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle,
+        clock=clock,
+        speed_scale=0.2,
+        skill_id="motion.approach_grasp_pose",
+    )
+    qpos_by_side = {
+        "left": np.zeros(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    _publish_qpos(
+        port,
+        qpos_by_side=qpos_by_side,
+        measured_at=clock(),
+        available_at=clock(),
+    )
+    trajectory = _stationary_grasp_trajectory(qpos_by_side)
+    planner_calls = 0
+
+    def planner(**_kwargs) -> RealAgentJointTrajectory:
+        nonlocal planner_calls
+        planner_calls += 1
+        return trajectory
+
+    def lower_owner_sleep(duration: float) -> None:
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.pose_target_profile,
+        request=request,
+        operation=operation,
+        grasp_trajectory_planner=planner,
+        clock=clock,
+        sleep=lower_owner_sleep,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert activation.succeeded is True
+    assert planner_calls == 1
+    assert port.snapshot().phase == RealAgentMotionPhase.ACTIVE
+    command = port.command_for_observation(
+        TeleopObservation(timestamp=clock()),
+        clock(),
+    )
+    assert isinstance(command, TeleopCommand)
+    metadata = command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
+    assert metadata["joint_trajectory_hash"] == trajectory.semantic_content_hash
+    assert builder.last_target is None
+
+
+def test_grasp_approach_activation_evidence_stays_bounded_while_owner_waits() -> None:
+    bundle, port, _builder = _runtime_fixture(include_grasp_approach=True)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle,
+        clock=clock,
+        speed_scale=0.2,
+        skill_id="motion.approach_grasp_pose",
+    )
+    qpos_by_side = {
+        "left": np.zeros(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    _publish_qpos(
+        port,
+        qpos_by_side=qpos_by_side,
+        measured_at=clock(),
+        available_at=clock(),
+    )
+    poll_count = 0
+
+    def delayed_owner_sleep(duration: float) -> None:
+        nonlocal poll_count
+        clock.value += duration
+        poll_count += 1
+        _publish_qpos(
+            port,
+            qpos_by_side=qpos_by_side,
+            measured_at=clock(),
+            available_at=clock(),
+        )
+        if poll_count == 150:
+            port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.pose_target_profile,
+        request=request,
+        operation=operation,
+        grasp_trajectory_planner=(
+            lambda **_kwargs: _stationary_grasp_trajectory(qpos_by_side)
+        ),
+        clock=clock,
+        sleep=delayed_owner_sleep,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert poll_count == 150
+    assert activation.succeeded is True
+    assert len(activation.evidence_refs) < 16
+    assert port.snapshot().phase == RealAgentMotionPhase.ACTIVE
+
+
+def test_grasp_approach_rejects_stale_qpos_after_planning_and_holds() -> None:
+    bundle, port, _builder = _runtime_fixture(include_grasp_approach=True)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle,
+        clock=clock,
+        speed_scale=0.2,
+        skill_id="motion.approach_grasp_pose",
+    )
+    qpos_by_side = {
+        "left": np.zeros(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    _publish_qpos(
+        port,
+        qpos_by_side=qpos_by_side,
+        measured_at=clock(),
+        available_at=clock(),
+    )
+
+    def planner(**_kwargs) -> RealAgentJointTrajectory:
+        clock.value += 0.25
+        return _stationary_grasp_trajectory(qpos_by_side)
+
+    def lower_owner_sleep(duration: float) -> None:
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.pose_target_profile,
+        request=request,
+        operation=operation,
+        grasp_trajectory_planner=planner,
+        clock=clock,
+        sleep=lower_owner_sleep,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert activation.succeeded is False
+    assert activation.status == "grasp_path_postplan_measured_qpos_stale"
+    assert activation.lower_hold_confirmed is True
+    assert port.snapshot().phase == RealAgentMotionPhase.HELD
+    assert len(owner.holds) == 1
+
+
+def test_grasp_approach_rejects_future_qpos_after_planning_and_holds() -> None:
+    bundle, port, _builder = _runtime_fixture(include_grasp_approach=True)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle,
+        clock=clock,
+        speed_scale=0.2,
+        skill_id="motion.approach_grasp_pose",
+    )
+    qpos_by_side = {
+        "left": np.zeros(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    _publish_qpos(
+        port,
+        qpos_by_side=qpos_by_side,
+        measured_at=clock(),
+        available_at=clock(),
+    )
+
+    def planner(**_kwargs) -> RealAgentJointTrajectory:
+        _publish_qpos(
+            port,
+            qpos_by_side=qpos_by_side,
+            measured_at=clock() + 0.1,
+            available_at=clock() + 0.1,
+        )
+        return _stationary_grasp_trajectory(qpos_by_side)
+
+    def lower_owner_sleep(duration: float) -> None:
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.pose_target_profile,
+        request=request,
+        operation=operation,
+        grasp_trajectory_planner=planner,
+        clock=clock,
+        sleep=lower_owner_sleep,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert activation.succeeded is False
+    assert activation.status == "grasp_path_postplan_measured_qpos_from_future"
+    assert activation.lower_hold_confirmed is True
+    assert port.snapshot().phase == RealAgentMotionPhase.HELD
+    assert len(owner.holds) == 1
+
+
+def test_grasp_approach_cancelled_after_planning_never_activates_motion() -> None:
+    bundle, port, _builder = _runtime_fixture(include_grasp_approach=True)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle,
+        clock=clock,
+        speed_scale=0.2,
+        skill_id="motion.approach_grasp_pose",
+    )
+    qpos_by_side = {
+        "left": np.zeros(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    _publish_qpos(
+        port,
+        qpos_by_side=qpos_by_side,
+        measured_at=clock(),
+        available_at=clock(),
+    )
+    cancel_checks = iter((False, True))
+
+    def lower_owner_sleep(duration: float) -> None:
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.pose_target_profile,
+        request=request,
+        operation=operation,
+        grasp_trajectory_planner=(
+            lambda **_kwargs: _stationary_grasp_trajectory(qpos_by_side)
+        ),
+        clock=clock,
+        sleep=lower_owner_sleep,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: next(cancel_checks),
+    )
+
+    assert activation.succeeded is False
+    assert activation.status == "real_primitive_cancelled_before_activation"
+    assert activation.lower_hold_confirmed is True
+    assert port.snapshot().phase == RealAgentMotionPhase.HELD
+    assert port.snapshot().dispatch_count == 0
+    assert len(owner.holds) == 1
+
+
+def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed() -> None:
+    bundle, port, _builder = _runtime_fixture(include_grasp_approach=True)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle,
+        clock=clock,
+        speed_scale=0.2,
+        skill_id="motion.approach_grasp_pose",
+    )
+    qpos_by_side = {
+        "left": np.zeros(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    _publish_qpos(
+        port,
+        qpos_by_side=qpos_by_side,
+        measured_at=clock(),
+        available_at=clock(),
+    )
+    trajectory = _stationary_grasp_trajectory(qpos_by_side)
+    target_pose = np.eye(4, dtype=float)
+    target_pose[:3, 3] = (0.4, 0.2, 0.3)
+    dispatch_times: list[float] = []
+
+    def lower_owner_sleep(duration: float) -> None:
+        clock.value += duration
+        snapshot = port.apply_owner_requests(session=owner, now=clock())
+        if snapshot.phase != RealAgentMotionPhase.ACTIVE:
+            return
+        command = port.command_for_observation(
+            TeleopObservation(timestamp=clock()),
+            clock(),
+        )
+        assert isinstance(command, TeleopCommand)
+        port.observe_session_step(command=command, command_dispatched=True)
+        dispatch_times.append(clock())
+        port.publish_measured_pose(
+            pose_world_by_component={"right_arm": target_pose},
+            measured_at=clock(),
+            available_at=clock(),
+            source_evidence_refs=(
+                f"real-hardware-cut:grasp-target:{len(dispatch_times)}",
+            ),
+        )
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.pose_target_profile,
+        request=request,
+        operation=operation,
+        grasp_trajectory_planner=lambda **_kwargs: trajectory,
+        clock=clock,
+        sleep=lower_owner_sleep,
+    )
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    assert activation.succeeded is True
+    activated_at = port.snapshot().activated_at
+    assert activated_at is not None
+
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert completion.succeeded is True
+    assert dispatch_times[-1] >= activated_at + 0.5
+    assert len(dispatch_times) > 3
+    assert len(completion.execution_receipt_refs) < 16
+    assert (
+        "real-agent-joint-trajectory:" + trajectory.semantic_content_hash
+        in completion.execution_receipt_refs
+    )
+
+
+def test_real_lifecycle_rejects_future_measured_tcp_pose() -> None:
+    bundle, port, _builder = _runtime_fixture()
+    clock = _Clock()
+    request, operation, route, binding = _request_and_operation(bundle, clock=clock)
+    port.publish_measured_pose(
+        pose_world_by_component={"right_arm": np.eye(4, dtype=float)},
+        measured_at=clock() + 0.1,
+        available_at=clock() + 0.1,
+        source_evidence_refs=("real-hardware-cut:future",),
+    )
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.cardinal_profile,
+        request=request,
+        operation=operation,
+        clock=clock,
+        sleep=lambda _duration: None,
+    )
+
+    with pytest.raises(RuntimeError, match="from the future"):
+        lifecycle.activate(
+            request=request,
+            operation=operation,
+            cancel_requested=lambda: False,
+        )
+    assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
 
 
 def test_real_lifecycle_resolves_dispatches_converges_and_confirms_hold() -> None:

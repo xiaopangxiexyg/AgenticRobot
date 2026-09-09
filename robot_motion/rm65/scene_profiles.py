@@ -15,6 +15,7 @@ from xml.etree import ElementTree as ET
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from ..scene_obstacles import AxisAlignedBoxObstacle
 from .assets import require_asset_path
 from .constants import DEFAULT_COLLISION_SCENE
 
@@ -119,6 +120,35 @@ class DualArmSceneProfile:
     left_pose_transform: np.ndarray
     right_pose_transform: np.ndarray
     solution_layout: Literal["auto", "dual_arm_hand"]
+
+
+def fixed_scene_aabb_obstacles(
+    profile: DualArmSceneProfile,
+) -> tuple[AxisAlignedBoxObstacle, ...]:
+    """Expose axis-aligned URDF table/poles to the sampled path planner."""
+
+    if not isinstance(profile, DualArmSceneProfile):
+        raise TypeError("profile must be a DualArmSceneProfile.")
+    obstacles = []
+    for box in profile.fixed_scene_boxes:
+        if box.parent_link_name != "world":
+            raise ValueError(
+                f"fixed scene box {box.name!r} is not attached directly to world"
+            )
+        world_from_box = box.world_to_box_pose_matrix()
+        if not np.allclose(world_from_box[:3, :3], np.eye(3), atol=1e-9):
+            raise ValueError(
+                f"fixed scene box {box.name!r} is rotated and cannot be "
+                "represented by an axis-aligned obstacle"
+            )
+        obstacles.append(
+            AxisAlignedBoxObstacle(
+                obstacle_id=f"fixed-scene:{box.name}",
+                center_xyz_m=tuple(float(value) for value in world_from_box[:3, 3]),
+                size_xyz_m=box.box_size_xyz,
+            )
+        )
+    return tuple(obstacles)
 
 
 def _parse_float_tuple(
@@ -449,4 +479,5 @@ __all__ = [
     "HandProxyBoxSpec",
     "build_dual_arm_scene_profile",
     "build_rm65_dual_arm_scene_profile",
+    "fixed_scene_aabb_obstacles",
 ]

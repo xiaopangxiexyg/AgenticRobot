@@ -30,6 +30,10 @@ from teleop_runtime.skill_deploy import (
     RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
     ExclusiveRM65SkillLowerAssembly,
     RealAgentMotionPortConfig,
+    build_exclusive_rm65_skill_target_builder,
+)
+from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65GraspJointTrajectoryPlanner,
 )
 
 from .exclusive_application import (
@@ -113,7 +117,7 @@ def _public_tool_profiles(lower: ExclusiveRM65SkillLowerAssembly) -> dict[str, o
 
 
 def _route_ids() -> tuple[str, ...]:
-    return real_agent_motion_route_ids_v1()
+    return real_agent_motion_route_ids_v1(include_grasp_approach=True)
 
 
 @dataclass(frozen=True)
@@ -733,6 +737,15 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         )
 
     try:
+        grasp_trajectory_planner = RM65GraspJointTrajectoryPlanner(
+            profile=lower.profile,
+            planning_target_builder=build_exclusive_rm65_skill_target_builder(
+                lower.profile
+            ),
+            target_envelope_filter=(
+                lower.target_builder.pre_ik_target_safety_filter
+            ),
+        )
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
             target_builder=lower.target_builder,
             rm65_ports=lower.ports,
@@ -750,6 +763,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 station_point_grasp_render_registration
             ),
             station_point_grasp_planner=point_grasp_planner,
+            grasp_trajectory_planner=grasp_trajectory_planner,
             perception_provider_factory=provider_factory,
             measured_qpos_observer=(
                 measured_qpos_observer if rgb_camera_geometry is not None else None

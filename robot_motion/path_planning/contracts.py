@@ -111,6 +111,8 @@ class JointPathPlannerConfig:
     sample_padding_rad: float = float(np.deg2rad(45.0))
     goal_bias: float = 0.2
     shortcut_attempts: int = 80
+    adaptive_edge_resolution_rad: float | None = None
+    adaptive_refinement_distance_m: float | None = None
 
     def __post_init__(self) -> None:
         seed = int(self.seed)
@@ -128,6 +130,29 @@ class JointPathPlannerConfig:
             if not np.isfinite(number) or number <= 0.0:
                 raise ValueError(f"{name} must be positive and finite.")
             object.__setattr__(self, name, number)
+        adaptive_resolution = self.adaptive_edge_resolution_rad
+        adaptive_distance = self.adaptive_refinement_distance_m
+        if (adaptive_resolution is None) != (adaptive_distance is None):
+            raise ValueError(
+                "adaptive edge resolution and refinement distance must be supplied together."
+            )
+        if adaptive_resolution is not None:
+            adaptive_resolution = float(adaptive_resolution)
+            adaptive_distance = float(adaptive_distance)
+            if (
+                not np.isfinite(adaptive_resolution)
+                or adaptive_resolution <= 0.0
+                or adaptive_resolution >= self.edge_resolution_rad
+            ):
+                raise ValueError(
+                    "adaptive_edge_resolution_rad must be positive and finer than edge_resolution_rad."
+                )
+            if not np.isfinite(adaptive_distance) or adaptive_distance <= 0.0:
+                raise ValueError(
+                    "adaptive_refinement_distance_m must be positive and finite."
+                )
+            object.__setattr__(self, "adaptive_edge_resolution_rad", adaptive_resolution)
+            object.__setattr__(self, "adaptive_refinement_distance_m", adaptive_distance)
         bias = float(self.goal_bias)
         if not np.isfinite(bias) or not 0.0 <= bias <= 1.0:
             raise ValueError("goal_bias must be within [0, 1].")

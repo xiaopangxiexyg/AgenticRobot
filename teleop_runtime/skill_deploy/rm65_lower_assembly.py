@@ -229,6 +229,30 @@ def _default_force_guard_factory(
     )
 
 
+def build_exclusive_rm65_skill_target_builder(
+    profile: ResolvedExclusiveRM65SkillDeploymentProfile,
+    *,
+    debug_motion_skill: bool = False,
+    target_builder_factory: RM65SkillTargetBuilderFactory = (
+        DualArmCollisionAwareRetargeter
+    ),
+) -> RM65SkillTargetBuilder:
+    """Build the real Skill's URDF kinematics without opening hardware."""
+
+    if not isinstance(profile, ResolvedExclusiveRM65SkillDeploymentProfile):
+        raise TypeError("profile must be resolved and typed.")
+    if not isinstance(debug_motion_skill, bool):
+        raise TypeError("debug_motion_skill must be bool.")
+    if not callable(target_builder_factory):
+        raise TypeError("target_builder_factory must be callable.")
+    return target_builder_factory(
+        _target_builder_config(
+            profile,
+            debug_motion_skill=debug_motion_skill,
+        )
+    )
+
+
 def assemble_exclusive_rm65_skill_lower(
     *,
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
@@ -255,11 +279,10 @@ def assemble_exclusive_rm65_skill_lower(
     ):
         if not callable(factory):
             raise TypeError(f"{name} must be callable.")
-    target_builder = target_builder_factory(
-        _target_builder_config(
-            profile,
-            debug_motion_skill=debug_motion_skill,
-        )
+    target_builder = build_exclusive_rm65_skill_target_builder(
+        profile,
+        debug_motion_skill=debug_motion_skill,
+        target_builder_factory=target_builder_factory,
     )
     backends = {
         side: backend_factory(_backend_config(profile, side=side))
@@ -315,4 +338,5 @@ __all__ = [
     "RM65SkillBackendFactory",
     "RM65SkillTargetBuilderFactory",
     "assemble_exclusive_rm65_skill_lower",
+    "build_exclusive_rm65_skill_target_builder",
 ]

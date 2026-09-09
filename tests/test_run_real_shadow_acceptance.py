@@ -10,6 +10,7 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 import scripts.run_real_shadow_acceptance as acceptance
+from robot_motion.rm65 import DEFAULT_GRASP_PATH_COLLISION_SCENE
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from teleop_runtime.skill_deploy.rm65_profile import (
     ExclusiveRM65SkillDeploymentProfile,
@@ -120,11 +121,26 @@ def test_scene_cli_builds_sorted_cubes_and_clearance() -> None:
             "0.2",
         ]
     )
-    scene = acceptance._scene_from_cli(args)
+    scene = acceptance._scene_from_cli(
+        args,
+        collision_scene_profile=DEFAULT_GRASP_PATH_COLLISION_SCENE,
+    )
     assert isinstance(scene, ObstacleSceneSnapshot)
-    assert [item.obstacle_id for item in scene.obstacles] == ["cube-0", "cube-1"]
+    assert [item.obstacle_id for item in scene.obstacles] == [
+        "cube-0",
+        "cube-1",
+        "fixed-scene:camera_pole",
+        "fixed-scene:left_camera_pole",
+        "fixed-scene:right_camera_pole",
+        "fixed-scene:table",
+    ]
     assert scene.minimum_clearance_m == pytest.approx(0.03)
     assert scene.reference_frame_id == acceptance.OBSTACLE_FRAME_ID
+    table = next(
+        item for item in scene.obstacles if item.obstacle_id == "fixed-scene:table"
+    )
+    assert table.center_xyz_m == pytest.approx((-0.472, 0.0, 0.005))
+    assert table.size_xyz_m == pytest.approx((0.824, 1.3, 0.05))
 
 
 def test_static_identity_and_binding_use_explicit_sim_contract() -> None:
@@ -184,36 +200,24 @@ def test_execute_real_parser_uses_post_simulation_confirmation() -> None:
     assert callable(consume)
 
 
-def test_relative_target_cli_supports_combined_translation_and_tool_rotation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from sim.sim_real_tests.mujoco import arbitrary_grasp_pose_motion
-
+def test_relative_target_cli_supports_combined_translation_and_tool_rotation() -> None:
     measured = np.eye(4)
     measured[:3, :3] = Rotation.from_euler("z", 30.0, degrees=True).as_matrix()
-
-    class FakeControl:
-        def __init__(self):
-            self.scene = SimpleNamespace(get_arm_qpos=lambda _side: np.zeros(6))
-            self.retargeter = SimpleNamespace(
-                tool_tcp_world_targets_for_qpos_pair=lambda **_kwargs: {
-                    "left": measured,
-                    "right": np.eye(4),
-                }
-            )
-            self.world_to_base_by_side = {
-                "left": np.eye(4),
-                "right": np.eye(4),
-            }
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(acceptance, "_simulation_config", lambda *_args: object())
-    monkeypatch.setattr(
-        arbitrary_grasp_pose_motion,
-        "build_shadow_initialized_control",
-        lambda *_args, **_kwargs: FakeControl(),
+    target_builder = SimpleNamespace(
+        set_current_qpos_pair=lambda **_kwargs: None,
+        tool_tcp_world_targets_for_qpos_pair=lambda **_kwargs: {
+            "left": measured,
+            "right": np.eye(4),
+        },
+    )
+    snapshot = SimpleNamespace(
+        qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)}
+    )
+    profile = SimpleNamespace(
+        scene_world_from_arm_base_by_side={
+            "left": np.eye(4),
+            "right": np.eye(4),
+        }
     )
     args = acceptance.build_parser().parse_args(
         [
@@ -236,9 +240,10 @@ def test_relative_target_cli_supports_combined_translation_and_tool_rotation(
     assert pose is None
     assert mode == "measured_current_tcp_plus_base_translation_and_tool_rotation"
     target = acceptance._target_from_current(
-        SimpleNamespace(),
-        SimpleNamespace(),
+        snapshot,
+        profile,
         side="left",
+        target_builder=target_builder,
         translation_offset_m=args.target_offset_xyz_m,
         tool_rotation_offset_rpy_deg=args.target_offset_rpy_deg,
     )
@@ -273,24 +278,33 @@ def test_relative_rotation_requires_relative_target_mode() -> None:
         acceptance._pose_from_cli(args)
 
 
-def test_require_obstacle_detour_rejects_empty_scene_before_hardware_setup() -> None:
-    assert (
-        acceptance.main(
-            [
-                "--arm-ip-assignment",
-                "/does/not/matter.json",
-                "--dmtac-assignment",
-                "/does/not/matter.json",
-                "--target-offset-xyz-m",
-                "0.02",
-                "0",
-                "0",
-                "--require-obstacle-detour",
-                "--no-motion",
-            ]
-        )
-        == 2
+def test_require_obstacle_detour_can_exercise_only_fixed_scene_obstacles() -> None:
+    args = acceptance.build_parser().parse_args(
+        [
+            "--arm-ip-assignment",
+            "/does/not/matter.json",
+            "--dmtac-assignment",
+            "/does/not/matter.json",
+            "--target-offset-xyz-m",
+            "0.02",
+            "0",
+            "0",
+            "--require-obstacle-detour",
+            "--no-motion",
+        ]
     )
+    scene = acceptance._scene_from_cli(
+        args,
+        collision_scene_profile=DEFAULT_GRASP_PATH_COLLISION_SCENE,
+    )
+
+    assert args.require_obstacle_detour is True
+    assert {item.obstacle_id for item in scene.obstacles} == {
+        "fixed-scene:camera_pole",
+        "fixed-scene:left_camera_pole",
+        "fixed-scene:right_camera_pole",
+        "fixed-scene:table",
+    }
 
 
 def test_authority_factory_rejects_when_terminal_confirmation_was_not_obtained() -> (
@@ -326,46 +340,32 @@ def test_terminal_confirmation_is_interactive_and_bound_to_completed_receipts() 
     )
 
 
-def test_relative_target_preserves_measured_orientation_and_requires_fresh_ik(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from sim.sim_real_tests.mujoco import arbitrary_grasp_pose_motion
-
+def test_relative_target_preserves_measured_orientation_and_requires_fresh_ik() -> None:
     measured = np.eye(4)
     measured[:3, :3] = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
     measured[:3, 3] = (0.20, -0.10, 0.35)
 
-    class FakeControl:
-        def __init__(self):
-            self.closed = False
-            self.scene = SimpleNamespace(
-                get_arm_qpos=lambda side: np.full(6, 1.0 if side == "left" else 2.0)
-            )
-            self.retargeter = SimpleNamespace(
-                tool_tcp_world_targets_for_qpos_pair=lambda **_kwargs: {
-                    "left": np.eye(4),
-                    "right": measured,
-                }
-            )
-            self.world_to_base_by_side = {
-                "left": np.eye(4),
-                "right": np.eye(4),
-            }
-
-        def close(self):
-            self.closed = True
-
-    control = FakeControl()
-    monkeypatch.setattr(acceptance, "_simulation_config", lambda *_args: object())
-    monkeypatch.setattr(
-        arbitrary_grasp_pose_motion,
-        "build_shadow_initialized_control",
-        lambda *_args, **_kwargs: control,
+    target_builder = SimpleNamespace(
+        set_current_qpos_pair=lambda **_kwargs: None,
+        tool_tcp_world_targets_for_qpos_pair=lambda **_kwargs: {
+            "left": np.eye(4),
+            "right": measured,
+        },
+    )
+    snapshot = SimpleNamespace(
+        qpos_by_side={"left": np.ones(6), "right": np.full(6, 2.0)}
+    )
+    profile = SimpleNamespace(
+        scene_world_from_arm_base_by_side={
+            "left": np.eye(4),
+            "right": np.eye(4),
+        }
     )
     target = acceptance._target_from_current(
-        SimpleNamespace(),
-        SimpleNamespace(),
+        snapshot,
+        profile,
         side="right",
+        target_builder=target_builder,
         translation_offset_m=(0.01, 0.02, -0.03),
     )
 
@@ -377,7 +377,6 @@ def test_relative_target_preserves_measured_orientation_and_requires_fresh_ik(
         measured[:3, 3] + np.array([0.01, 0.02, -0.03]),
     )
     assert target.known_qpos_rad is None
-    assert control.closed is True
 
 
 def test_execute_real_rejects_zero_motion_target_before_hardware_setup() -> None:

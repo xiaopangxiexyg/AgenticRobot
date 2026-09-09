@@ -174,6 +174,59 @@ def test_collision_backend_failure_is_not_misreported_as_search_exhaustion() -> 
     assert result.waypoints == ()
 
 
+def test_near_collision_edges_are_refined_without_slowing_clear_edges() -> None:
+    class _NarrowCollisionOracle:
+        scene_hash = "narrow-collision"
+
+        def __init__(self) -> None:
+            self.queries: list[float] = []
+
+        def check(self, qpos_by_component):
+            value = float(qpos_by_component["left"][0])
+            self.queries.append(value)
+            blocked = 0.145 <= value <= 0.155
+            return JointConfigurationCheck(
+                safe=not blocked,
+                minimum_distance_m=0.025,
+                reason="narrow_collision" if blocked else "near_clearance",
+            )
+
+    oracle = _NarrowCollisionOracle()
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [0.0]},
+        target_qpos_by_component={"left": [0.2]},
+        movable_components=("left",),
+        oracle=oracle,
+        config=_planner_config(
+            max_iterations=1,
+            max_nodes=2,
+            edge_resolution_rad=0.1,
+            adaptive_edge_resolution_rad=0.01,
+            adaptive_refinement_distance_m=0.03,
+        ),
+        scene_hash="narrow-collision",
+    )
+
+    assert result.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+    assert any(0.145 <= value <= 0.155 for value in oracle.queries)
+
+    clear = _NarrowCollisionOracle()
+    clear_result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-0.2]},
+        target_qpos_by_component={"left": [-0.1]},
+        movable_components=("left",),
+        oracle=clear,
+        config=_planner_config(
+            edge_resolution_rad=0.1,
+            adaptive_edge_resolution_rad=0.01,
+            adaptive_refinement_distance_m=0.02,
+        ),
+        scene_hash="narrow-collision",
+    )
+    assert clear_result.status is JointPathStatus.PATH_FOUND
+    assert len(clear.queries) == 2
+
+
 def test_bounded_search_exhaustion_does_not_claim_kinematic_unreachability() -> None:
     class _SolidWall:
         def check(self, qpos_by_component):

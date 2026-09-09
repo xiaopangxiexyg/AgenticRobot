@@ -16,6 +16,7 @@ from robot_motion.rm65 import (
 )
 from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
+    DEFAULT_GRASP_PATH_COLLISION_SCENE,
     as_rm65_qpos,
     build_rm65_dual_arm_scene_profile,
     default_tool_profile_dir,
@@ -39,6 +40,10 @@ def test_default_collision_scene_is_dual_arm_hand_proxy_open():
     assert tuple(box.geometry_name for box in profile.fixed_scene_boxes) == (
         DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES
     )
+
+
+def test_default_grasp_path_collision_scene_is_strict():
+    assert DEFAULT_GRASP_PATH_COLLISION_SCENE == "dual_arm_hand_proxy_strict"
 
 
 def test_tool_profiles_load_from_existing_calibration_directory():

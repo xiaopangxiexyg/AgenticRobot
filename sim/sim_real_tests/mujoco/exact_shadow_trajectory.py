@@ -20,8 +20,17 @@ import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.path_planning import JointPathPlannerConfig, JointPathStatus
-from robot_motion.rm65 import load_rm65_tool_profile, tool_tcp_pose_flange_m_rad
-from robot_motion.rm65.grasp_reachability import GraspReachabilityStatus
+from robot_motion.rm65 import (
+    DEFAULT_GRASP_PATH_COLLISION_SCENE,
+    load_rm65_tool_profile,
+    tool_tcp_pose_flange_m_rad,
+)
+from robot_motion.rm65.grasp_reachability import (
+    CollisionCandidateAssessment,
+    CollisionCandidateStatus,
+    GraspReachabilityStatus,
+    IKCandidate,
+)
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from robot_motion.shadow_execution import (
@@ -41,7 +50,7 @@ _COMPATIBILITY_REASON_REF_PREFIX = "mujoco-shadow-compatibility-reason:"
 
 @dataclass(frozen=True)
 class RealTcpObstacleTrajectoryRequest:
-    """One DMTac TCP goal and immutable cube scene for simulation-first planning."""
+    """One DMTac TCP goal and immutable URDF-world obstacle scene."""
 
     side: str
     target_pose_base_from_dmtac_tcp: np.ndarray
@@ -101,7 +110,7 @@ class RealTcpObstacleTrajectoryRequest:
 
 
 class MujocoShadowTrajectoryPreparationError(RuntimeError):
-    """Typed endpoint/path rejection from concrete MuJoCo preparation."""
+    """Typed rejection while preparing a registered shadow trajectory."""
 
     def __init__(
         self,
@@ -141,31 +150,6 @@ def _refs(values: Sequence[str], *, name: str) -> tuple[str, ...]:
     return refs
 
 
-def build_obstacle_bound_shadow_control(
-    snapshot: AuthoritativeRobotStateSnapshot,
-    obstacle_scene: ObstacleSceneSnapshot,
-) -> object:
-    """Cold-start MuJoCo from the real cut and bind the exact immutable scene."""
-
-    from .arbitrary_grasp_pose_motion import (
-        build_obstacle_collision_oracle,
-        build_shadow_initialized_control,
-    )
-
-    control = build_shadow_initialized_control(snapshot)
-    try:
-        control.shadow_obstacle_oracle = build_obstacle_collision_oracle(
-            control,
-            obstacle_scene,
-        )
-        return control
-    except BaseException:
-        close = getattr(control, "close", None)
-        if callable(close):
-            close()
-        raise
-
-
 def _path_preparation_reason(status: JointPathStatus) -> str:
     return {
         JointPathStatus.START_BLOCKED: "path_start_collision_blocked",
@@ -196,30 +180,86 @@ def _selected_reachable_candidate_qpos(endpoint: object) -> np.ndarray:
     )
 
 
+def _urdf_endpoint_collision_checker(
+    snapshot: AuthoritativeRobotStateSnapshot,
+    *,
+    side: str,
+    oracle: object,
+):
+    """Check endpoint candidates only against the bound URDF/FCL scene."""
+
+    def check(
+        candidate: IKCandidate, _target_pose: np.ndarray
+    ) -> CollisionCandidateAssessment:
+        if candidate.qpos_rad is None:
+            return CollisionCandidateAssessment(
+                status=CollisionCandidateStatus.ERROR,
+                reason_code="candidate_qpos_missing",
+            )
+        qpos = {
+            item: np.asarray(snapshot.qpos_by_side[item], dtype=float).copy()
+            for item in _SIDES
+        }
+        qpos[side] = np.asarray(candidate.qpos_rad, dtype=float).copy()
+        assessment = oracle.check(qpos)
+        payload = assessment.to_dict()
+        obstacle_id = assessment.metadata.get("closest_obstacle_id")
+        geometry_names = tuple(
+            str(value)
+            for value in assessment.metadata.get("closest_geometry_names", ())
+        )
+        if not assessment.collision_check_available:
+            status = CollisionCandidateStatus.ERROR
+            reason = "urdf_endpoint_collision_check_unavailable"
+        elif not assessment.safe:
+            status = CollisionCandidateStatus.BLOCKED
+            reason = "urdf_endpoint_collision_blocked"
+        else:
+            status = CollisionCandidateStatus.SAFE
+            reason = "urdf_endpoint_collision_safe"
+        return CollisionCandidateAssessment(
+            status=status,
+            reason_code=reason,
+            minimum_distance_m=assessment.minimum_distance_m,
+            required_distance_m=float(
+                assessment.metadata.get("minimum_clearance_m", 0.0)
+            ),
+            obstacle_ids=(
+                (str(obstacle_id),) if obstacle_id else geometry_names
+            ),
+            metadata={
+                "collision_source": "pinocchio_fcl_urdf_scene",
+                "obstacle_check": payload,
+            },
+        )
+
+    return check
+
+
 def build_registered_tcp_obstacle_trajectory(
     snapshot: AuthoritativeRobotStateSnapshot,
     request: RealTcpObstacleTrajectoryRequest,
     *,
     reachability_config: object | None = None,
     planner_config: JointPathPlannerConfig | None = None,
-    control_factory: (
+    planning_context_factory: (
         Callable[[AuthoritativeRobotStateSnapshot, ObstacleSceneSnapshot], object]
         | None
     ) = None,
     wall_clock: Callable[[], float] = time.time,
 ) -> RegisteredShadowJointTrajectory:
-    """Plan a real TCP request with Sim endpoint and obstacle semantics."""
+    """Plan a real TCP request against the supplied URDF/FCL context."""
 
     from ..rm65.random_grasp_pose_reachability import (
         RM65RandomGraspPoseReachabilityConfig,
     )
     from .arbitrary_grasp_pose_motion import (
+        ADAPTIVE_OBSTACLE_REFINEMENT_DISTANCE_M,
+        FINAL_OBSTACLE_EDGE_RESOLUTION_RAD,
         GraspMotionTarget,
-        _MujocoFclObstacleOracle,
         build_collision_checked_multiwaypoint_joint_fk_reference_plan,
         evaluate_motion_target_endpoint,
-        plan_obstacle_aware_joint_path,
-        revalidate_obstacle_path,
+        plan_revalidated_obstacle_aware_joint_path,
     )
 
     if not isinstance(snapshot, AuthoritativeRobotStateSnapshot):
@@ -228,7 +268,11 @@ def build_registered_tcp_obstacle_trajectory(
         raise TypeError("request must be RealTcpObstacleTrajectoryRequest.")
     if not callable(wall_clock):
         raise TypeError("wall_clock must be callable.")
-    path_config = planner_config or JointPathPlannerConfig()
+    path_config = planner_config or JointPathPlannerConfig(
+        shortcut_attempts=8,
+        adaptive_edge_resolution_rad=FINAL_OBSTACLE_EDGE_RESOLUTION_RAD,
+        adaptive_refinement_distance_m=ADAPTIVE_OBSTACLE_REFINEMENT_DISTANCE_M,
+    )
     if not isinstance(path_config, JointPathPlannerConfig):
         raise TypeError("planner_config must be JointPathPlannerConfig.")
     endpoint_config = reachability_config or RM65RandomGraspPoseReachabilityConfig()
@@ -236,9 +280,8 @@ def build_registered_tcp_obstacle_trajectory(
         raise TypeError(
             "reachability_config must be RM65RandomGraspPoseReachabilityConfig."
         )
-    factory = control_factory or build_obstacle_bound_shadow_control
-    if not callable(factory):
-        raise TypeError("control_factory must be callable.")
+    if not callable(planning_context_factory):
+        raise TypeError("planning_context_factory must be callable.")
 
     target = GraspMotionTarget(
         side=request.side,
@@ -268,32 +311,53 @@ def build_registered_tcp_obstacle_trajectory(
             "linear_speed_m_s": request.linear_speed_m_s,
             "angular_speed_deg_s": request.angular_speed_deg_s,
             "minimum_duration_sec": request.minimum_duration_sec,
-            "path_strategy": "direct_then_deterministic_birrt",
+            "path_strategy": (
+                "direct_then_deterministic_birrt_urdf_fcl_with_near_collision_edge_refinement_v2"
+            ),
+            "collision_source": "selected_rm65_urdf_pinocchio_fcl",
+            "path_collision_profile": DEFAULT_GRASP_PATH_COLLISION_SCENE,
             "time_parameterization": "per_segment_quintic_stop_at_waypoint",
             "require_obstacle_detour": request.require_obstacle_detour,
         },
         domain="agenticrobot.real_shadow_acceptance.planner_config.v1",
     )
 
-    control = None
+    planning_context = None
     try:
         try:
-            control = factory(snapshot, request.obstacle_scene)
-            fcl_oracle = control.shadow_obstacle_oracle
-            path_oracle = _MujocoFclObstacleOracle(control, fcl_oracle)
+            planning_context = planning_context_factory(
+                snapshot, request.obstacle_scene
+            )
+            fcl_oracle = planning_context.obstacle_oracle
+            path_oracle = planning_context.path_obstacle_oracle
+            path_revalidation_oracle = (
+                planning_context.path_revalidation_obstacle_oracle
+            )
+            if (
+                str(planning_context.path_collision_profile_name)
+                != DEFAULT_GRASP_PATH_COLLISION_SCENE
+            ):
+                raise ValueError(
+                    "real grasp path planner must use the strict collision profile"
+                )
         except Exception as exc:
             raise MujocoShadowTrajectoryPreparationError(
-                "planning_simulation_initialization_failed",
+                "urdf_planning_context_initialization_failed",
                 additional_reason_codes=(type(exc).__name__,),
                 details={"exception": str(exc)},
             ) from exc
 
         try:
             endpoint, _binding, solver = evaluate_motion_target_endpoint(
-                control,
+                planning_context,
                 target,
                 config=endpoint_config,
                 obstacle_oracle=fcl_oracle,
+                collision_checker=_urdf_endpoint_collision_checker(
+                    snapshot,
+                    side=request.side,
+                    oracle=fcl_oracle,
+                ),
             )
         except Exception as exc:
             raise MujocoShadowTrajectoryPreparationError(
@@ -309,19 +373,25 @@ def build_registered_tcp_obstacle_trajectory(
             )
 
         selected_qpos = _selected_reachable_candidate_qpos(endpoint)
-        path = plan_obstacle_aware_joint_path(
-            control,
-            side=request.side,
-            target_qpos_rad=selected_qpos,
-            single_arm_solver=solver,
-            obstacle_oracle=path_oracle,
-            planner_config=path_config,
+        path, final_check, planning_attempts = (
+            plan_revalidated_obstacle_aware_joint_path(
+                planning_context,
+                side=request.side,
+                target_qpos_rad=selected_qpos,
+                single_arm_solver=solver,
+                obstacle_oracle=path_oracle,
+                final_obstacle_oracle=path_revalidation_oracle,
+                planner_config=path_config,
+            )
         )
         if path.status is not JointPathStatus.PATH_FOUND:
             raise MujocoShadowTrajectoryPreparationError(
                 _path_preparation_reason(path.status),
                 additional_reason_codes=(path.reason or path.status.value,),
-                details={"path_receipt": path.to_dict()},
+                details={
+                    "path_receipt": path.to_dict(),
+                    "planning_attempts": planning_attempts,
+                },
             )
         if (
             request.require_obstacle_detour
@@ -332,15 +402,22 @@ def build_registered_tcp_obstacle_trajectory(
                 additional_reason_codes=(path.reason or "direct_path_clear",),
                 details={"path_receipt": path.to_dict()},
             )
-        final_check = revalidate_obstacle_path(path.waypoints, oracle=path_oracle)
+        if final_check is None:
+            raise MujocoShadowTrajectoryPreparationError(
+                "final_path_revalidation_missing",
+                details={"planning_attempts": planning_attempts},
+            )
         if not bool(final_check.get("safe", False)):
             raise MujocoShadowTrajectoryPreparationError(
                 str(final_check.get("reason_code", "final_path_revalidation_failed")),
-                details={"final_revalidation": final_check},
+                details={
+                    "final_revalidation": final_check,
+                    "planning_attempts": planning_attempts,
+                },
             )
 
         reference = build_collision_checked_multiwaypoint_joint_fk_reference_plan(
-            control,
+            planning_context,
             side=request.side,
             waypoints_qpos_rad=tuple(
                 waypoint[request.side] for waypoint in path.waypoints
@@ -348,6 +425,7 @@ def build_registered_tcp_obstacle_trajectory(
             linear_speed_m_s=request.linear_speed_m_s,
             angular_speed_deg_s=request.angular_speed_deg_s,
             minimum_duration_sec=request.minimum_duration_sec,
+            collision_oracle=path_revalidation_oracle,
         )
         if reference.status != "safe":
             raise MujocoShadowTrajectoryPreparationError(
@@ -356,13 +434,13 @@ def build_registered_tcp_obstacle_trajectory(
                     str(
                         reference.metadata.get(
                             "reason_code",
-                            "mujoco_time_parameterized_path_collision_blocked",
+                            "urdf_time_parameterized_path_collision_blocked",
                         )
                     ),
                 ),
                 details={"reference_plan": dict(reference.metadata)},
             )
-        reference_hz = float(control.contract.timing.ik_hz)
+        reference_hz = float(planning_context.contract.timing.ik_hz)
         if not np.isfinite(reference_hz) or reference_hz <= 0.0:
             raise MujocoShadowTrajectoryPreparationError(
                 "invalid_reference_rate",
@@ -408,8 +486,8 @@ def build_registered_tcp_obstacle_trajectory(
             points=points,
         )
     finally:
-        if control is not None:
-            close = getattr(control, "close", None)
+        if planning_context is not None:
+            close = getattr(planning_context, "close", None)
             if callable(close):
                 close()
 
@@ -1318,7 +1396,6 @@ __all__ = [
     "MujocoShadowModelBinding",
     "MujocoShadowTrajectoryPreparationError",
     "RealTcpObstacleTrajectoryRequest",
-    "build_obstacle_bound_shadow_control",
     "build_registered_tcp_obstacle_trajectory",
     "execute_registered_shadow_trajectory",
     "verify_mujoco_shadow_compatibility",

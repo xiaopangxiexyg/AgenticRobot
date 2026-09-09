@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Protocol
@@ -24,11 +24,12 @@ from robot_motion.rm65.dual_arm_target_solver import (
     BimanualPoseTarget,
     BimanualPoseTargetSource,
 )
-from robot_motion.runtime import TeleopCommand, TeleopObservation
+from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
 from teleop_runtime.command_override import TeleopCommandOverride
 from teleop_runtime.transforms import validate_pose_matrix
 
 REAL_AGENT_MOTION_COMMAND_METADATA_KEY = "real_agent_motion_operation"
+REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD = 0.01
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -243,6 +244,7 @@ class RealAgentMotionActivation:
     submitted_at: float
     expires_at: float
     speed_scale: float = 1.0
+    joint_trajectory: RealAgentJointTrajectory | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -282,10 +284,125 @@ class RealAgentMotionActivation:
         if not 0.0 < speed_scale <= 1.0:
             raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
         object.__setattr__(self, "speed_scale", speed_scale)
+        if self.joint_trajectory is not None and not isinstance(
+            self.joint_trajectory, RealAgentJointTrajectory
+        ):
+            raise TypeError("joint_trajectory must be typed or None.")
         object.__setattr__(
             self,
             "target_pose_world",
             _immutable_pose(self.target_pose_world, field_name="target_pose_world"),
+        )
+
+
+@dataclass(frozen=True)
+class RealAgentJointTrajectory:
+    """One request-bound dual-arm qpos reference generated before activation."""
+
+    time_from_start_sec: np.ndarray
+    qpos_by_side: Mapping[str, np.ndarray]
+    planner_evidence_refs: tuple[str, ...]
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        times = np.asarray(self.time_from_start_sec, dtype=float).reshape(-1).copy()
+        if (
+            times.size < 2
+            or not np.all(np.isfinite(times))
+            or abs(float(times[0])) > 1e-12
+            or np.any(np.diff(times) <= 0.0)
+        ):
+            raise ValueError(
+                "time_from_start_sec must start at zero and strictly increase."
+            )
+        qpos = {}
+        for side in ("left", "right"):
+            values = np.asarray(dict(self.qpos_by_side).get(side), dtype=float).copy()
+            if values.shape != (times.size, 6) or not np.all(np.isfinite(values)):
+                raise ValueError(
+                    f"qpos_by_side.{side} must be sample_count x 6 and finite."
+                )
+            values.setflags(write=False)
+            qpos[side] = values
+        refs = tuple(sorted({str(value).strip() for value in self.planner_evidence_refs}))
+        if not refs or any(not value for value in refs):
+            raise ValueError("planner_evidence_refs must be non-empty.")
+        times.setflags(write=False)
+        object.__setattr__(self, "time_from_start_sec", times)
+        object.__setattr__(self, "qpos_by_side", MappingProxyType(qpos))
+        object.__setattr__(self, "planner_evidence_refs", refs)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                {
+                    "time_from_start_sec": times,
+                    "qpos_by_side": qpos,
+                    "planner_evidence_refs": refs,
+                },
+                domain="dexteleop.real_agent_motion.joint_trajectory.v1",
+            ),
+        )
+
+    @property
+    def evidence_refs(self) -> tuple[str, ...]:
+        return (
+            *self.planner_evidence_refs,
+            "real-agent-joint-trajectory:" + self.semantic_content_hash,
+        )
+
+
+@dataclass(frozen=True)
+class RealAgentMotionMeasuredQposCut:
+    revision: int
+    measured_at: float
+    available_at: float
+    qpos_by_side: Mapping[str, np.ndarray]
+    source_evidence_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int):
+            raise TypeError("revision must be an integer.")
+        if self.revision < 0:
+            raise ValueError("revision must be non-negative.")
+        measured_at = _finite(self.measured_at, field_name="measured_at")
+        available_at = _finite(self.available_at, field_name="available_at")
+        if available_at < measured_at:
+            raise ValueError("available_at cannot precede measured_at.")
+        qpos = {}
+        for side in ("left", "right"):
+            values = np.asarray(dict(self.qpos_by_side).get(side), dtype=float).reshape(-1)
+            if values.shape != (6,) or not np.all(np.isfinite(values)):
+                raise ValueError(f"qpos_by_side.{side} must contain six finite values.")
+            frozen = values.copy()
+            frozen.setflags(write=False)
+            qpos[side] = frozen
+        refs = tuple(sorted({str(value).strip() for value in self.source_evidence_refs}))
+        if not refs or any(not value for value in refs):
+            raise ValueError("source_evidence_refs must be non-empty.")
+        object.__setattr__(self, "measured_at", measured_at)
+        object.__setattr__(self, "available_at", available_at)
+        object.__setattr__(self, "qpos_by_side", MappingProxyType(qpos))
+        object.__setattr__(self, "source_evidence_refs", refs)
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "revision": self.revision,
+                "measured_at": self.measured_at,
+                "available_at": self.available_at,
+                "qpos_by_side": dict(self.qpos_by_side),
+                "source_evidence_refs": self.source_evidence_refs,
+            },
+            domain="dexteleop.real_agent_motion.measured_qpos_cut.v1",
+        )
+
+    @property
+    def evidence_refs(self) -> tuple[str, ...]:
+        return (
+            *self.source_evidence_refs,
+            "real-agent-measured-qpos:" + self.semantic_content_hash,
         )
 
 
@@ -494,6 +611,7 @@ class RealAgentMotionPort:
         self._last_operation: RealAgentMotionActivation | None = None
         self._domain_hold_id: str | None = None
         self._latest_measured_pose: RealAgentMotionMeasuredPoseCut | None = None
+        self._latest_measured_qpos: RealAgentMotionMeasuredQposCut | None = None
         self._activated_at: float | None = None
         self._last_command_at: float | None = None
         self._dispatch_count = 0
@@ -685,6 +803,18 @@ class RealAgentMotionPort:
             raise ValueError(
                 "activation execution_frame_spec_hash does not match the lower binding."
             )
+        if activation.joint_trajectory is not None:
+            inactive_side = "right" if activation.side == "left" else "left"
+            inactive_qpos = activation.joint_trajectory.qpos_by_side[inactive_side]
+            if not np.allclose(
+                inactive_qpos,
+                np.broadcast_to(inactive_qpos[0], inactive_qpos.shape),
+                atol=1e-12,
+                rtol=0.0,
+            ):
+                raise ValueError(
+                    "preplanned trajectory cannot move the unauthorized inactive arm."
+                )
         with self._lock:
             if self._phase not in {
                 RealAgentMotionPhase.INACTIVE,
@@ -820,6 +950,25 @@ class RealAgentMotionPort:
 
         if set(qpos_by_side) != {"left", "right"}:
             raise ValueError("qpos_by_side must exactly contain left and right.")
+        with self._lock:
+            next_revision = (
+                0
+                if self._latest_measured_qpos is None
+                else self._latest_measured_qpos.revision + 1
+            )
+            qpos_cut = RealAgentMotionMeasuredQposCut(
+                revision=next_revision,
+                measured_at=measured_at,
+                available_at=available_at,
+                qpos_by_side=qpos_by_side,
+                source_evidence_refs=source_evidence_refs,
+            )
+            current = self._latest_measured_qpos
+            if current is not None and qpos_cut.measured_at < current.measured_at:
+                raise ValueError("Measured qpos timestamp regressed.")
+            if current is not None and qpos_cut.available_at < current.available_at:
+                raise ValueError("Measured qpos availability regressed.")
+            self._latest_measured_qpos = qpos_cut
         targets = self._target_builder.tool_tcp_world_targets_for_qpos_pair(
             left_qpos=np.asarray(qpos_by_side["left"], dtype=float),
             right_qpos=np.asarray(qpos_by_side["right"], dtype=float),
@@ -839,6 +988,10 @@ class RealAgentMotionPort:
     def latest_measured_pose(self) -> RealAgentMotionMeasuredPoseCut | None:
         with self._lock:
             return self._latest_measured_pose
+
+    def latest_measured_qpos(self) -> RealAgentMotionMeasuredQposCut | None:
+        with self._lock:
+            return self._latest_measured_qpos
 
     def apply_control_owner_requests(
         self,
@@ -862,12 +1015,39 @@ class RealAgentMotionPort:
                     return self._snapshot_locked()
                 if owner.skill_motion_owner_state() != ("running", "ready"):
                     return self._snapshot_locked()
-                self._active = self._pending
-                self._pending = None
-                self._phase = RealAgentMotionPhase.ACTIVE
-                self._activated_at = current_time
+                pending = self._pending
+                trajectory = pending.joint_trajectory
+                start_problem = None
+                if trajectory is not None:
+                    latest_qpos = self._latest_measured_qpos
+                    if latest_qpos is None:
+                        start_problem = "preplanned trajectory activation qpos unavailable"
+                    elif any(
+                        float(
+                            np.max(
+                                np.abs(
+                                    latest_qpos.qpos_by_side[side]
+                                    - trajectory.qpos_by_side[side][0]
+                                )
+                            )
+                        )
+                        > REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD
+                        for side in ("left", "right")
+                    ):
+                        start_problem = "preplanned trajectory start changed before activation"
+                if start_problem is None:
+                    self._active = pending
+                    self._pending = None
+                    self._phase = RealAgentMotionPhase.ACTIVE
+                    self._activated_at = current_time
+                    self._advance_revision()
+                    return self._snapshot_locked()
+                hold_operation_id = pending.operation_id
+                hold_reason = start_problem
+                self._hold_reason = hold_reason
+                self._hold_requested_at = current_time
+                self._phase = RealAgentMotionPhase.HOLD_REQUESTED
                 self._advance_revision()
-                return self._snapshot_locked()
             if self._phase == RealAgentMotionPhase.HOLD_REQUESTED:
                 operation = self._operation()
                 hold_operation_id = (
@@ -928,7 +1108,7 @@ class RealAgentMotionPort:
         observation: TeleopObservation,
         now: float,
     ) -> TeleopCommandOverride | TeleopCommand | None:
-        """Build the active target through the existing coupled safe solver."""
+        """Build the active dynamic target or evaluate one preplanned qpos path."""
 
         current_time = _finite(now, field_name="now")
         with self._lock:
@@ -946,6 +1126,99 @@ class RealAgentMotionPort:
             assert self._active is not None
             activation = self._active
         try:
+            if activation.joint_trajectory is not None:
+                trajectory = activation.joint_trajectory
+                with self._lock:
+                    activated_at = self._activated_at
+                if activated_at is None:
+                    raise RuntimeError("active trajectory has no activation timestamp")
+                elapsed = max(0.0, current_time - activated_at)
+                next_sample_index = int(
+                    np.searchsorted(
+                        trajectory.time_from_start_sec,
+                        elapsed,
+                        side="right",
+                    )
+                )
+                if next_sample_index <= 0:
+                    sample_index = 0
+                    next_sample_index = 0
+                    interpolation_alpha = 0.0
+                elif next_sample_index >= trajectory.time_from_start_sec.size:
+                    sample_index = trajectory.time_from_start_sec.size - 1
+                    next_sample_index = sample_index
+                    interpolation_alpha = 0.0
+                else:
+                    sample_index = next_sample_index - 1
+                    lower_time = float(trajectory.time_from_start_sec[sample_index])
+                    upper_time = float(
+                        trajectory.time_from_start_sec[next_sample_index]
+                    )
+                    interpolation_alpha = min(
+                        1.0,
+                        max(0.0, (elapsed - lower_time) / (upper_time - lower_time)),
+                    )
+                command = TeleopCommand(timestamp=observation.timestamp)
+                operation_metadata = {
+                    "operation_id": activation.operation_id,
+                    "request_id": activation.request_id,
+                    "component_id": activation.component_id,
+                    "side": activation.side,
+                    "primitive_id": activation.primitive_id,
+                    "primitive_hash": activation.primitive_hash,
+                    "activation_grant_id": activation.activation_grant_id,
+                    "activation_grant_hash": activation.activation_grant_hash,
+                    "execution_frame_id": activation.execution_frame_id,
+                    "execution_frame_spec_hash": activation.execution_frame_spec_hash,
+                    "measured_state_revision": activation.measured_state_revision,
+                    "measured_state_hash": activation.measured_state_hash,
+                    "speed_scale": activation.speed_scale,
+                    "joint_trajectory_hash": trajectory.semantic_content_hash,
+                    "trajectory_sample_index": sample_index,
+                    "trajectory_next_sample_index": next_sample_index,
+                    "trajectory_interpolation_alpha": interpolation_alpha,
+                    "trajectory_sample_count": int(
+                        trajectory.time_from_start_sec.size
+                    ),
+                    "trajectory_time_from_start_sec": float(
+                        trajectory.time_from_start_sec[sample_index]
+                    ),
+                    "target_tool_tcp_pose_world": activation.target_pose_world.copy(),
+                    "target_pose_semantics": "actual_tool_tcp_world",
+                }
+                command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = dict(
+                    operation_metadata
+                )
+                for side in ("left", "right"):
+                    command.add_command(
+                        EffectorCommand(
+                            effector_name=f"{side}_arm",
+                            side=side,
+                            command_type="joint_vector",
+                            value=(
+                                trajectory.qpos_by_side[side][sample_index]
+                                + interpolation_alpha
+                                * (
+                                    trajectory.qpos_by_side[side][next_sample_index]
+                                    - trajectory.qpos_by_side[side][sample_index]
+                                )
+                            ),
+                            metadata={
+                                REAL_AGENT_MOTION_COMMAND_METADATA_KEY: dict(
+                                    operation_metadata
+                                )
+                            },
+                        )
+                    )
+                with self._lock:
+                    if (
+                        self._phase == RealAgentMotionPhase.ACTIVE
+                        and self._active is not None
+                        and self._active.operation_id == activation.operation_id
+                    ):
+                        self._last_command_at = current_time
+                        self._advance_revision()
+                return command
             current_tool_tcp_targets = (
                 self._target_builder.current_tool_tcp_world_targets()
             )
@@ -1135,8 +1408,11 @@ class RealAgentMotionPort:
 
 __all__ = [
     "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
+    "REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD",
+    "RealAgentJointTrajectory",
     "RealAgentMotionActivation",
     "RealAgentMotionMeasuredPoseCut",
+    "RealAgentMotionMeasuredQposCut",
     "RealAgentMotionOwnerCut",
     "RealAgentMotionOwnerIdentity",
     "RealAgentMotionPhase",

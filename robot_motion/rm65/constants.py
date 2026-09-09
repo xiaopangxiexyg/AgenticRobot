@@ -14,6 +14,7 @@ TOOL_TCP_FRAME = "tool_tcp"
 POSITION_ENDPOINT_PROFILE_NAME = "position_endpoint"
 
 DEFAULT_COLLISION_SCENE = "dual_arm_hand_proxy_open"
+DEFAULT_GRASP_PATH_COLLISION_SCENE = "dual_arm_hand_proxy_strict"
 
 # Static mirror of the active canonical RM65 URDF arm-joint limits, in radians.
 # The URDF is authoritative; the guard test in ``test_robot_motion_rm65_shared``

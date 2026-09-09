@@ -3,9 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from robot_motion.rm65.obstacle_collision import RM65ObstacleCollisionOracle
-from robot_motion.scene_obstacles import AxisAlignedBoxObstacle, ObstacleSceneSnapshot
-
+from robot_motion.rm65.obstacle_collision import (
+    AttachedBoxCollisionProxy,
+    RM65ObstacleCollisionOracle,
+)
+from robot_motion.scene_obstacles import (
+    AxisAlignedBoxObstacle,
+    ObstacleSceneSnapshot,
+)
 
 pin = pytest.importorskip("pinocchio")
 hppfcl = pytest.importorskip("hppfcl")
@@ -59,7 +64,9 @@ def test_oracle_uses_link_geometry_and_does_not_mutate_live_collision_model() ->
     )
 
     clear = oracle.check({"arm": np.array([0.0])})
+    repeated_clear = oracle.check({"arm": np.array([0.0])})
     blocked = oracle.check({"arm": np.array([0.5])})
+    assert repeated_clear is clear
     assert clear.collision_check_available is True
     assert clear.safe is True
     assert blocked.collision_check_available is True
@@ -84,6 +91,73 @@ def test_clearance_margin_can_block_a_geometrically_separated_link() -> None:
     assert check.collision_check_available is True
     assert check.minimum_distance_m == pytest.approx(0.05, abs=1e-6)
     assert check.safe is False
+
+
+def test_early_exit_query_preserves_clearance_decision_and_distance() -> None:
+    model, collision_model = _simple_prismatic_collision_model()
+    kwargs = {
+        "model": model,
+        "base_collision_model": collision_model,
+        "reference_full_q": np.zeros(model.nq),
+        "qpos_indices_by_component": {"arm": (0,)},
+        "scene": _scene(center_x=0.5, clearance=0.06),
+    }
+    distance_oracle = RM65ObstacleCollisionOracle(**kwargs)
+    early_exit_oracle = RM65ObstacleCollisionOracle(
+        **kwargs,
+        stop_at_first_clearance_violation=True,
+    )
+
+    for qpos in (np.array([0.0]), np.array([0.3])):
+        distance_check = distance_oracle.check({"arm": qpos})
+        early_exit_check = early_exit_oracle.check({"arm": qpos})
+        assert early_exit_check.safe is distance_check.safe
+        assert early_exit_check.minimum_distance_m == pytest.approx(
+            distance_check.minimum_distance_m,
+            abs=1e-9,
+        )
+        assert (
+            early_exit_check.metadata["query_mode"]
+            == "first_clearance_violation"
+        )
+
+
+def test_attached_box_proxy_tracks_parent_frame_without_mutating_live_model() -> None:
+    model, collision_model = _simple_prismatic_collision_model()
+    joint_id = model.getJointId("moving_x")
+    frame_id = model.addFrame(
+        pin.Frame(
+            "camera_mount",
+            joint_id,
+            0,
+            pin.SE3.Identity(),
+            pin.FrameType.OP_FRAME,
+        )
+    )
+    initial_geometry_count = len(collision_model.geometryObjects)
+    proxy = AttachedBoxCollisionProxy(
+        geometry_name="camera_proxy",
+        parent_frame_name=model.frames[frame_id].name,
+        center_xyz_m=(0.0, 0.0, 0.0),
+        size_xyz_m=(0.1, 0.1, 0.1),
+    )
+    oracle = RM65ObstacleCollisionOracle(
+        model=model,
+        base_collision_model=collision_model,
+        reference_full_q=np.zeros(model.nq),
+        qpos_indices_by_component={"arm": (0,)},
+        scene=_scene(center_x=0.5),
+        attached_box_proxies=(proxy,),
+    )
+
+    clear = oracle.check({"arm": np.array([0.0])})
+    blocked = oracle.check({"arm": np.array([0.5])})
+
+    assert clear.safe is True
+    assert blocked.safe is False
+    assert blocked.metadata["attached_proxy_geometry_count"] == 1
+    assert blocked.metadata["base_geometry_count"] == initial_geometry_count + 1
+    assert len(collision_model.geometryObjects) == initial_geometry_count
 
 
 def test_frame_contract_mismatch_is_rejected_before_geometry_construction() -> None:

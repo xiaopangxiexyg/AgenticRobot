@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from itertools import pairwise
 from types import SimpleNamespace
 
@@ -243,9 +244,13 @@ def _robot_self_zero_distance_check() -> CollisionCheckResult:
     )
 
 
-def test_zero_distance_robot_self_query_recovers_only_with_separated_witness() -> None:
-    recovered = motion._recover_zero_distance_robot_self_query(
-        _robot_self_zero_distance_check(),
+@pytest.mark.parametrize("pair_class", ["1:2", "1:4", "2:2", "4:4"])
+def test_zero_distance_mesh_query_recovers_only_with_separated_witness(
+    pair_class: str,
+) -> None:
+    check = replace(_robot_self_zero_distance_check(), pair_class=pair_class)
+    recovered = motion._recover_zero_distance_mesh_query(
+        check,
         pair_has_contact=False,
         witness_distance_m=0.0387,
         minimum_clearance_m=0.002,
@@ -255,10 +260,10 @@ def test_zero_distance_robot_self_query_recovers_only_with_separated_witness() -
     assert recovered.minimum_distance_m == pytest.approx(0.0387)
 
 
-def test_zero_distance_robot_self_query_stays_blocked_on_contact_or_small_gap() -> None:
+def test_zero_distance_mesh_query_stays_blocked_on_contact_or_small_gap() -> None:
     check = _robot_self_zero_distance_check()
     assert (
-        motion._recover_zero_distance_robot_self_query(
+        motion._recover_zero_distance_mesh_query(
             check,
             pair_has_contact=True,
             witness_distance_m=0.0387,
@@ -266,8 +271,18 @@ def test_zero_distance_robot_self_query_stays_blocked_on_contact_or_small_gap() 
         )
         == check
     )
+    unsupported = replace(check, pair_class="1:1")
     assert (
-        motion._recover_zero_distance_robot_self_query(
+        motion._recover_zero_distance_mesh_query(
+            unsupported,
+            pair_has_contact=False,
+            witness_distance_m=0.0387,
+            minimum_clearance_m=0.002,
+        )
+        == unsupported
+    )
+    assert (
+        motion._recover_zero_distance_mesh_query(
             check,
             pair_has_contact=False,
             witness_distance_m=0.001,
@@ -530,6 +545,38 @@ def _blocked_receipt() -> GraspReachabilityReceipt:
         reference_frame_spec_hash=DEFAULT_REFERENCE_FRAME_SPEC_HASH,
         target_pose=tuple(tuple(row) for row in np.eye(4)),
     )
+
+
+def test_urdf_segment_recheck_uses_exact_point_one_degree_resolution() -> None:
+    checked: list[dict[str, np.ndarray]] = []
+
+    class Oracle:
+        def check(self, candidate):
+            checked.append(candidate)
+            return JointConfigurationCheck(
+                safe=True,
+                collision_check_available=True,
+                reason="safe",
+                minimum_distance_m=0.05,
+            )
+
+    target = np.zeros(6)
+    target[0] = np.deg2rad(0.35)
+    result = motion._direct_joint_path_oracle_assessment(
+        _FakeControl(),
+        side="left",
+        start_qpos_rad=np.zeros(6),
+        target_qpos_rad=target,
+        oracle=Oracle(),
+    )
+
+    assert result["safe"] is True
+    assert result["collision_sample_count"] == 5
+    assert len(checked) == 5
+    assert max(
+        np.rad2deg(checked[index + 1]["left"][0] - checked[index]["left"][0])
+        for index in range(4)
+    ) <= 0.1
 
 
 def test_rejected_endpoint_emits_no_motion_or_dispatch(monkeypatch) -> None:
@@ -968,6 +1015,31 @@ class _SequenceOracle:
         return self.checks.pop(0)
 
 
+def test_combined_obstacle_oracle_reuses_exact_configuration_checks() -> None:
+    oracle = object.__new__(motion._MujocoFclObstacleOracle)
+    oracle._check_cache = {}
+    queries: list[dict[str, np.ndarray]] = []
+    expected = JointConfigurationCheck(safe=True, minimum_distance_m=0.08)
+
+    def check_uncached(qpos_by_component):
+        queries.append(
+            {key: np.asarray(value).copy() for key, value in qpos_by_component.items()}
+        )
+        return expected
+
+    oracle._check_uncached = check_uncached
+    first = {"left": np.zeros(6), "right": np.ones(6)}
+    same = {key: value.copy() for key, value in first.items()}
+
+    assert oracle.check(first) is expected
+    assert oracle.check(same) is expected
+    assert len(queries) == 1
+
+    same["left"][0] = 0.1
+    assert oracle.check(same) is expected
+    assert len(queries) == 2
+
+
 def test_final_obstacle_revalidation_is_dense_and_fail_closed() -> None:
     safe = JointConfigurationCheck(safe=True, minimum_distance_m=0.08)
     blocked = JointConfigurationCheck(
@@ -993,6 +1065,55 @@ def test_final_obstacle_revalidation_is_dense_and_fail_closed() -> None:
     assert len(oracle.queries) == 3
     assert all(set(query) == {"left", "right"} for query in oracle.queries)
     assert all(np.array_equal(query["right"], np.ones(6)) for query in oracle.queries)
+
+
+def test_obstacle_plan_is_revalidated_without_a_second_global_search(
+    monkeypatch,
+) -> None:
+    waypoints = (
+        {"left": np.zeros(6), "right": np.zeros(6)},
+        {"left": np.full(6, 0.2), "right": np.zeros(6)},
+    )
+    planned_configs: list[JointPathPlannerConfig] = []
+
+    def plan(*_args, planner_config, **_kwargs):
+        planned_configs.append(planner_config)
+        return JointPathPlanResult(
+            status=JointPathStatus.PATH_FOUND,
+            start_qpos_by_component=waypoints[0],
+            target_qpos_by_component=waypoints[-1],
+            movable_components=("left",),
+            waypoints=waypoints,
+            scene_hash="test-scene",
+            reason="bounded_search_found_path",
+        )
+
+    final_check = {
+        "safe": False,
+        "collision_check_available": True,
+        "reason_code": "final_obstacle_revalidation_blocked",
+    }
+    monkeypatch.setattr(motion, "plan_obstacle_aware_joint_path", plan)
+    monkeypatch.setattr(
+        motion,
+        "revalidate_obstacle_path",
+        lambda *_args, **_kwargs: final_check,
+    )
+
+    path, final, attempts = motion.plan_revalidated_obstacle_aware_joint_path(
+        SimpleNamespace(),
+        side="left",
+        target_qpos_rad=np.full(6, 0.2),
+        single_arm_solver=SimpleNamespace(),
+        obstacle_oracle=SimpleNamespace(),
+        planner_config=JointPathPlannerConfig(shortcut_attempts=8),
+    )
+
+    assert path.status is JointPathStatus.PATH_FOUND
+    assert final is final_check
+    assert len(planned_configs) == 1
+    assert planned_configs[0].edge_resolution_rad == pytest.approx(np.deg2rad(1.0))
+    assert [attempt["phase"] for attempt in attempts] == ["planning"]
 
 
 def test_obstacle_search_bounds_stay_local_and_within_joint_limits(
@@ -1036,8 +1157,16 @@ def test_obstacle_search_bounds_stay_local_and_within_joint_limits(
 
 def test_execute_path_search_exhaustion_emits_no_motion(monkeypatch) -> None:
     receipt, binding = _reachable_receipt_and_binding()
-    oracle = SimpleNamespace(scene_hash="test-scene")
-    monkeypatch.setattr(motion, "build_obstacle_collision_oracle", lambda *_: oracle)
+    endpoint_oracle = SimpleNamespace(scene_hash="test-scene")
+    path_oracle = SimpleNamespace(scene_hash="test-scene")
+    monkeypatch.setattr(
+        motion, "build_obstacle_collision_oracle", lambda *_: endpoint_oracle
+    )
+    monkeypatch.setattr(
+        motion,
+        "build_path_obstacle_collision_oracle",
+        lambda *_args, **_kwargs: path_oracle,
+    )
     monkeypatch.setattr(
         motion, "_MujocoFclObstacleOracle", lambda _control, value: value
     )
@@ -1112,6 +1241,58 @@ def test_cli_builds_repeatable_world_frame_obstacle_cubes() -> None:
         _validate_args(
             parser.parse_args(["--obstacle-cube-world-m", "0", "0", "0", "0"])
         )
+
+
+def test_cli_can_bind_fixed_scene_to_a_deterministic_joint_target() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--side",
+            "right",
+            "--target-qpos-rad",
+            "-1.6",
+            "0.8",
+            "-2.1",
+            "2.2",
+            "-0.7",
+            "1.2",
+            "--include-fixed-scene-obstacles",
+            "--planner-seed",
+            "7",
+            "--planner-max-iterations",
+            "80",
+            "--planner-max-nodes",
+            "120",
+        ]
+    )
+
+    _validate_args(args)
+    scene = _obstacle_scene_from_args(args)
+
+    assert _uses_continuous_random_mode(args) is False
+    assert args.planner_seed == 7
+    assert args.planner_max_iterations == 80
+    assert args.planner_max_nodes == 120
+    assert scene is not None
+    assert {item.obstacle_id for item in scene.obstacles} == {
+        "fixed-scene:camera_pole",
+        "fixed-scene:left_camera_pole",
+        "fixed-scene:right_camera_pole",
+        "fixed-scene:table",
+    }
+
+
+def test_cli_fixed_scene_review_owns_target_and_enables_fixed_obstacles() -> None:
+    args = build_parser().parse_args(
+        ["--fixed-scene-review", "table-detour-left", "--headless"]
+    )
+
+    _validate_args(args)
+    scene = _obstacle_scene_from_args(args)
+
+    assert _uses_continuous_random_mode(args) is False
+    assert scene is not None
+    assert "fixed-scene:table" in {item.obstacle_id for item in scene.obstacles}
 
 
 def test_continuous_cli_is_default_and_headless_requires_a_finite_count() -> None:

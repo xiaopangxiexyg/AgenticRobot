@@ -21,8 +21,10 @@ from .dmtac_shadow_ports import (
 )
 from .motion_port import (
     REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
+    RealAgentJointTrajectory,
     RealAgentMotionActivation,
     RealAgentMotionMeasuredPoseCut,
+    RealAgentMotionMeasuredQposCut,
     RealAgentMotionOwnerCut,
     RealAgentMotionOwnerIdentity,
     RealAgentMotionPhase,
@@ -49,6 +51,7 @@ from .rm65_lower_assembly import (
     RM65SkillBackendFactory,
     RM65SkillTargetBuilderFactory,
     assemble_exclusive_rm65_skill_lower,
+    build_exclusive_rm65_skill_target_builder,
 )
 from .rm65_ports import (
     ExclusiveRM65SkillDeployPorts,
@@ -69,6 +72,7 @@ from .rm65_target_safety import (
     ExclusiveRM65SkillTargetSafetyRuntime,
     RM65SkillTargetSafetyBuilder,
 )
+from .rm65_urdf_grasp_planning import RM65UrdfGraspPlanningContext
 
 __all__ = [
     "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
@@ -91,8 +95,11 @@ __all__ = [
     "RM65SkillTargetBuilderFactory",
     "RM65SkillTargetSafetyBuilder",
     "RM65ToolTcpWorldFk",
+    "RM65UrdfGraspPlanningContext",
+    "RealAgentJointTrajectory",
     "RealAgentMotionActivation",
     "RealAgentMotionMeasuredPoseCut",
+    "RealAgentMotionMeasuredQposCut",
     "RealAgentMotionOwnerCut",
     "RealAgentMotionOwnerIdentity",
     "RealAgentMotionPhase",
@@ -121,6 +128,7 @@ __all__ = [
     "TerminalToolTcpVerificationStatus",
     "assemble_exclusive_rm65_skill_lower",
     "build_exclusive_rm65_skill_position_force_guard",
+    "build_exclusive_rm65_skill_target_builder",
     "capture_authoritative_shadow_state_from_backends",
     "read_measured_gripper_state_cut",
     "resolve_exclusive_rm65_skill_deployment_profile",

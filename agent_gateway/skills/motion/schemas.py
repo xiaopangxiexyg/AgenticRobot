@@ -27,6 +27,7 @@ from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1,
+    GRASP_APPROACH_SKILL_ID_V1,
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
     REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1,
     TCP_CARDINAL_STEP_SKILL_ID_V1,
@@ -221,7 +222,14 @@ def tcp_pose_target_schema_entry_v1(
     | None = None,
     min_speed_scale: float | None = None,
     max_speed_scale: float | None = None,
+    skill_id: str = TCP_POSE_TARGET_SKILL_ID_V1,
 ) -> AgentSkillSchemaEntry:
+    selected_skill_id = _required(skill_id, field_name="skill_id")
+    if selected_skill_id not in {
+        TCP_POSE_TARGET_SKILL_ID_V1,
+        GRASP_APPROACH_SKILL_ID_V1,
+    }:
+        raise ValueError("skill_id is not an absolute TCP-pose Skill.")
     components = _component_ids(allowed_component_ids)
     frames = _component_ids(allowed_reference_frame_ids)
     maximum_duration = (
@@ -287,7 +295,7 @@ def tcp_pose_target_schema_entry_v1(
         ],
     }
     return _schema_entry(
-        skill_id=TCP_POSE_TARGET_SKILL_ID_V1,
+        skill_id=selected_skill_id,
         skill_definition_hash=skill_definition_hash,
         parameter_schema=parameter_schema,
         parameter_profile_id=parameter_profile_id,

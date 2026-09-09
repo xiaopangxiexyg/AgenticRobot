@@ -1,23 +1,26 @@
 from types import SimpleNamespace
 
 from agent_gateway.profiles.real.motion_primitive_profiles import (
+    REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1,
     REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1,
     real_agent_motion_route_ids_v1,
 )
 from agent_gateway.profiles.real.rm65_composition import _route_ids
 from agent_gateway.profiles.real.session_authorization import (
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+    REAL_AGENT_GRASP_APPROACH_ACTION,
     REAL_AGENT_PRIMITIVE_ACTIONS,
     _requested_action_and_component_ids,
 )
 
 
 def test_standard_rm65_composition_authorizes_absolute_grasp_pose_route() -> None:
-    route_ids = real_agent_motion_route_ids_v1()
+    route_ids = real_agent_motion_route_ids_v1(include_grasp_approach=True)
 
     assert REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 in route_ids
+    assert REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1 in route_ids
     assert _route_ids() == route_ids
-    assert len(route_ids) == 11
+    assert len(route_ids) == 12
 
 
 def test_absolute_grasp_pose_route_has_an_exact_operator_action_class() -> None:
@@ -33,6 +36,16 @@ def test_absolute_grasp_pose_route_has_an_exact_operator_action_class() -> None:
     assert REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION in REAL_AGENT_PRIMITIVE_ACTIONS
     assert _requested_action_and_component_ids(request) == (
         REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+        ("right_arm",),
+    )
+
+    approach = SimpleNamespace(
+        skill_id="motion.approach_grasp_pose",
+        parameters=request.parameters,
+    )
+    assert REAL_AGENT_GRASP_APPROACH_ACTION in REAL_AGENT_PRIMITIVE_ACTIONS
+    assert _requested_action_and_component_ids(approach) == (
+        REAL_AGENT_GRASP_APPROACH_ACTION,
         ("right_arm",),
     )
 

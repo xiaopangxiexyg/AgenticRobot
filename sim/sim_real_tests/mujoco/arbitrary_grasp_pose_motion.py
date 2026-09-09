@@ -31,6 +31,7 @@ from robot_motion.path_planning import (
     plan_collision_aware_joint_path,
 )
 from robot_motion.position_control import ResampledMotionReference
+from robot_motion.rm65 import DEFAULT_GRASP_PATH_COLLISION_SCENE
 from robot_motion.rm65.grasp_reachability import (
     CollisionCandidateAssessment,
     CollisionCandidateStatus,
@@ -41,7 +42,11 @@ from robot_motion.rm65.grasp_reachability import (
     evaluate_grasp_pose_reachability,
 )
 from robot_motion.rm65.ik import RM65SingleArmIKConfig, build_rm65_single_arm_ik_solver
-from robot_motion.rm65.obstacle_collision import RM65ObstacleCollisionOracle
+from robot_motion.rm65.obstacle_collision import (
+    RM65_D405_ATTACHED_COLLISION_PROXIES,
+    RM65ObstacleCollisionOracle,
+    build_rm65_profile_obstacle_collision_oracle,
+)
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from robot_motion.shadow_execution import (
     AuthoritativeRobotStateSnapshot,
@@ -80,8 +85,9 @@ DEFAULT_IK_TARGET_UNMET_RETRY_LIMIT = 2
 OBSTACLE_SCENE_FRAME_ID = "rm65_scene_world"
 OBSTACLE_SCENE_FRAME_SPEC_HASH = "mujoco-desk-collision-world-v1"
 FINAL_OBSTACLE_EDGE_RESOLUTION_RAD = float(np.deg2rad(0.1))
-
-
+ADAPTIVE_OBSTACLE_REFINEMENT_DISTANCE_M = 0.03
+ADAPTIVE_SELF_COLLISION_REFINEMENT_DISTANCE_M = 0.03
+ZERO_DISTANCE_MESH_QUERY_PAIR_CLASSES = frozenset({"1:2", "1:4", "2:2", "4:4"})
 class ShadowMujocoInitializationError(RuntimeError):
     """Typed fail-closed rejection while cold-initializing the shadow scene."""
 
@@ -151,14 +157,14 @@ def _pair_has_contact(data: Any, collision: CollisionCheckResult) -> bool:
     return False
 
 
-def _recover_zero_distance_robot_self_query(
+def _recover_zero_distance_mesh_query(
     collision: CollisionCheckResult,
     *,
     pair_has_contact: bool,
     witness_distance_m: float,
     minimum_clearance_m: float,
 ) -> CollisionCheckResult:
-    """Recover only a proven separated robot-self mesh query false zero.
+    """Recover a zero-distance mesh query only with a separated full witness.
 
     A contact, a non-zero penetration result, an unknown pair, or a witness
     shorter than the configured clearance all remain blocked.  This keeps the
@@ -168,7 +174,7 @@ def _recover_zero_distance_robot_self_query(
     if (
         collision.safe
         or collision.minimum_distance_m != 0.0
-        or collision.pair_class != "2:2"
+        or collision.pair_class not in ZERO_DISTANCE_MESH_QUERY_PAIR_CLASSES
         or pair_has_contact
         or not math.isfinite(float(witness_distance_m))
         or float(witness_distance_m) < float(minimum_clearance_m)
@@ -194,7 +200,7 @@ def _recover_projector_zero_distance_result(
     if (
         collision.safe
         or collision.minimum_distance_m != 0.0
-        or collision.pair_class != "2:2"
+        or collision.pair_class not in ZERO_DISTANCE_MESH_QUERY_PAIR_CLASSES
         or collision.geom1_id is None
         or collision.geom2_id is None
     ):
@@ -202,7 +208,7 @@ def _recover_projector_zero_distance_result(
 
     # ``check_qpos`` deliberately uses ``mj_kinematics`` for speed and hence
     # does not populate MuJoCo's contact list.  Recompute a private full-data
-    # snapshot only for the suspicious exact-zero robot-self result, then use
+    # snapshot only for the suspicious exact-zero result, then use
     # the geom-distance witness to distinguish a separated mesh from contact.
     mujoco = projector.mujoco
     scratch = mujoco.MjData(projector.model)
@@ -223,7 +229,7 @@ def _recover_projector_zero_distance_result(
         fromto,
     )
     witness_distance = float(np.linalg.norm(fromto[:3] - fromto[3:]))
-    return _recover_zero_distance_robot_self_query(
+    return _recover_zero_distance_mesh_query(
         collision,
         pair_has_contact=False,
         witness_distance_m=witness_distance,
@@ -507,8 +513,26 @@ class _MujocoFclObstacleOracle:
         self._fcl_oracle = fcl_oracle
         self._projector = projector
         self._base_vector = control.scene.kinematic_controlled_qpos()
+        self._check_cache: dict[
+            tuple[tuple[str, tuple[int, ...], bytes], ...], JointConfigurationCheck
+        ] = {}
 
     def check(
+        self, qpos_by_component: Mapping[str, np.ndarray]
+    ) -> JointConfigurationCheck:
+        key = tuple(
+            (
+                str(component),
+                tuple(np.asarray(value).shape),
+                np.asarray(value, dtype=np.float64).tobytes(),
+            )
+            for component, value in sorted(qpos_by_component.items())
+        )
+        if key not in self._check_cache:
+            self._check_cache[key] = self._check_uncached(qpos_by_component)
+        return self._check_cache[key]
+
+    def _check_uncached(
         self, qpos_by_component: Mapping[str, np.ndarray]
     ) -> JointConfigurationCheck:
         fcl = self._fcl_oracle.check(qpos_by_component)
@@ -545,6 +569,23 @@ class _MujocoFclObstacleOracle:
             for value in (fcl.minimum_distance_m, mujoco_distance)
             if value is not None
         ]
+        minimum_distance = min(distances) if distances else None
+        closest_fcl_names = tuple(
+            str(value) for value in fcl.metadata.get("closest_geometry_names", ())
+        )
+        fixed_scene_is_nearest = any(
+            "table" in name or "camera_pole" in name for name in closest_fcl_names
+        )
+        adaptive_edge_distance = (
+            fcl.minimum_distance_m
+            if fixed_scene_is_nearest
+            else (
+                minimum_distance
+                if minimum_distance is not None
+                and minimum_distance <= ADAPTIVE_SELF_COLLISION_REFINEMENT_DISTANCE_M
+                else None
+            )
+        )
         return JointConfigurationCheck(
             safe=bool(mujoco.safe),
             collision_check_available=True,
@@ -553,9 +594,10 @@ class _MujocoFclObstacleOracle:
                 if mujoco.safe
                 else "mujoco_collision_blocked"
             ),
-            minimum_distance_m=min(distances) if distances else None,
+            minimum_distance_m=minimum_distance,
             metadata={
                 "collision_sources": ("pinocchio_fcl", "mujoco"),
+                "adaptive_edge_distance_m": adaptive_edge_distance,
                 "fcl_check": fcl.to_dict(),
                 "mujoco_check": payload,
             },
@@ -1089,6 +1131,26 @@ def build_obstacle_collision_oracle(
         solution_layout=control.retargeter.profile.solution_layout,
         expected_reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
         expected_reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
+        attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
+    )
+
+
+def build_path_obstacle_collision_oracle(
+    scene: ObstacleSceneSnapshot,
+    *,
+    use_profile_proxy_geometry: bool = True,
+    stop_at_first_clearance_violation: bool = False,
+) -> RM65ObstacleCollisionOracle:
+    """Bind the conservative strict proxy/table profile used for path search."""
+
+    return build_rm65_profile_obstacle_collision_oracle(
+        scene_profile=DEFAULT_GRASP_PATH_COLLISION_SCENE,
+        scene=scene,
+        expected_reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
+        expected_reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
+        attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
+        use_profile_proxy_geometry=use_profile_proxy_geometry,
+        stop_at_first_clearance_violation=stop_at_first_clearance_violation,
     )
 
 
@@ -1098,6 +1160,8 @@ def evaluate_motion_target_endpoint(
     *,
     config: RM65RandomGraspPoseReachabilityConfig | None = None,
     obstacle_oracle: RM65ObstacleCollisionOracle | None = None,
+    collision_checker: Callable[[IKCandidate, np.ndarray], CollisionCandidateAssessment]
+    | None = None,
 ) -> tuple[GraspReachabilityReceipt, ToolTcpFrameBinding, Any]:
     cfg = config or RM65RandomGraspPoseReachabilityConfig()
     solver = build_rm65_single_arm_ik_solver(
@@ -1134,6 +1198,11 @@ def evaluate_motion_target_endpoint(
             float(cfg.maximum_orientation_residual_deg)
         ),
     )
+    checker = collision_checker or _collision_checker(
+        control,
+        side=target.side,
+        obstacle_oracle=obstacle_oracle,
+    )
     receipt = evaluate_grasp_pose_reachability(
         solver_target,
         reference_frame_id=DEFAULT_REFERENCE_FRAME_ID,
@@ -1150,11 +1219,7 @@ def evaluate_motion_target_endpoint(
             origin_xyz_m=cfg.conservative_workspace_origin_m,
             maximum_radius_m=float(cfg.conservative_workspace_maximum_radius_m),
         ),
-        collision_checker=_collision_checker(
-            control,
-            side=target.side,
-            obstacle_oracle=obstacle_oracle,
-        ),
+        collision_checker=checker,
     )
     receipt = annotate_ik_search_exhaustion(
         receipt,
@@ -1229,6 +1294,75 @@ def _direct_joint_path_collision_assessment(
     return {
         "safe": True,
         "reason_code": "mujoco_direct_joint_path_collision_safe",
+        "collision_sample_count": sample_count,
+        "minimum_path_clearance_m": (
+            None if not math.isfinite(minimum_clearance_m) else minimum_clearance_m
+        ),
+    }
+
+
+def _direct_joint_path_oracle_assessment(
+    control: Any,
+    *,
+    side: str,
+    start_qpos_rad: np.ndarray,
+    target_qpos_rad: np.ndarray,
+    oracle: Any,
+) -> dict[str, object]:
+    """Densely check one joint segment with its bound URDF/FCL oracle."""
+
+    normalized_side = str(side).strip().lower()
+    if normalized_side not in SIDES:
+        raise ValueError(f"side must be one of {SIDES}")
+    start = np.asarray(start_qpos_rad, dtype=float).reshape(-1)
+    target = np.asarray(target_qpos_rad, dtype=float).reshape(-1)
+    if (
+        start.shape != (6,)
+        or target.shape != (6,)
+        or not np.all(np.isfinite(start))
+        or not np.all(np.isfinite(target))
+    ):
+        raise ValueError("direct path endpoints must be finite 6-vectors")
+    qpos_by_side = {
+        item: control.scene.get_arm_qpos(item).copy() for item in SIDES
+    }
+    maximum_joint_motion = float(np.max(np.abs(target - start)))
+    edge_samples = max(
+        1,
+        math.ceil(maximum_joint_motion / FINAL_OBSTACLE_EDGE_RESOLUTION_RAD),
+    )
+    sample_count = edge_samples + 1
+    minimum_clearance_m = math.inf
+    for index in range(sample_count):
+        progress = float(index) / float(edge_samples)
+        candidate = {item: values.copy() for item, values in qpos_by_side.items()}
+        candidate[normalized_side] = start + float(progress) * (target - start)
+        assessment = oracle.check(candidate)
+        if assessment.minimum_distance_m is not None:
+            minimum_clearance_m = min(
+                minimum_clearance_m, float(assessment.minimum_distance_m)
+            )
+        if not assessment.collision_check_available or not assessment.safe:
+            return {
+                "safe": False,
+                "reason_code": (
+                    "urdf_path_collision_blocked"
+                    if assessment.collision_check_available
+                    else "urdf_path_collision_check_unavailable"
+                ),
+                "blocked_sample_index": index,
+                "blocked_progress": float(progress),
+                "collision_sample_count": sample_count,
+                "minimum_path_clearance_m": (
+                    None
+                    if not math.isfinite(minimum_clearance_m)
+                    else minimum_clearance_m
+                ),
+                "blocked_collision": assessment.to_dict(),
+            }
+    return {
+        "safe": True,
+        "reason_code": "urdf_direct_joint_path_collision_safe",
         "collision_sample_count": sample_count,
         "minimum_path_clearance_m": (
             None if not math.isfinite(minimum_clearance_m) else minimum_clearance_m
@@ -1375,6 +1509,60 @@ def revalidate_obstacle_path(
             None if not math.isfinite(minimum_distance_m) else minimum_distance_m
         ),
     }
+
+
+def plan_revalidated_obstacle_aware_joint_path(
+    control: DeskTcpPositionControl,
+    *,
+    side: str,
+    target_qpos_rad: np.ndarray,
+    single_arm_solver: Any,
+    obstacle_oracle: Any,
+    final_obstacle_oracle: Any | None = None,
+    planner_config: JointPathPlannerConfig | None = None,
+) -> tuple[
+    JointPathPlanResult, dict[str, object] | None, tuple[dict[str, object], ...]
+]:
+    """Plan once with adaptive edge checks, then densely revalidate the result."""
+
+    path_config = planner_config or JointPathPlannerConfig(
+        adaptive_edge_resolution_rad=FINAL_OBSTACLE_EDGE_RESOLUTION_RAD,
+        adaptive_refinement_distance_m=ADAPTIVE_OBSTACLE_REFINEMENT_DISTANCE_M,
+    )
+    path = plan_obstacle_aware_joint_path(
+        control,
+        side=side,
+        target_qpos_rad=target_qpos_rad,
+        single_arm_solver=single_arm_solver,
+        obstacle_oracle=obstacle_oracle,
+        planner_config=path_config,
+    )
+    attempts: list[dict[str, object]] = [
+        {
+            "phase": "planning",
+            "edge_resolution_deg": math.degrees(path_config.edge_resolution_rad),
+            "adaptive_edge_resolution_deg": (
+                None
+                if path_config.adaptive_edge_resolution_rad is None
+                else math.degrees(path_config.adaptive_edge_resolution_rad)
+            ),
+            "path_status": path.status.value,
+            "path_reason": path.reason,
+        }
+    ]
+    if path.status is not JointPathStatus.PATH_FOUND:
+        return path, None, tuple(attempts)
+
+    final_check = revalidate_obstacle_path(
+        path.waypoints,
+        oracle=(
+            obstacle_oracle
+            if final_obstacle_oracle is None
+            else final_obstacle_oracle
+        ),
+    )
+    attempts[-1]["final_revalidation"] = final_check
+    return path, final_check, tuple(attempts)
 
 
 def select_random_reachable_demo_target(
@@ -1609,6 +1797,7 @@ def build_collision_checked_joint_fk_reference_plan(
     linear_speed_m_s: float,
     angular_speed_deg_s: float,
     minimum_duration_sec: float,
+    collision_oracle: Any | None = None,
 ) -> JointFkReferencePlan:
     """Build a reachable-by-construction direct path for the simulation viewer.
 
@@ -1644,11 +1833,21 @@ def build_collision_checked_joint_fk_reference_plan(
     initial_by_side = {item: control.scene.get_arm_qpos(item).copy() for item in SIDES}
     delta = target - start
     maximum_joint_motion_deg = float(np.max(np.abs(np.rad2deg(delta))))
-    path_collision = _direct_joint_path_collision_assessment(
-        control,
-        side=normalized_side,
-        start_qpos_rad=start,
-        target_qpos_rad=target,
+    path_collision = (
+        _direct_joint_path_collision_assessment(
+            control,
+            side=normalized_side,
+            start_qpos_rad=start,
+            target_qpos_rad=target,
+        )
+        if collision_oracle is None
+        else _direct_joint_path_oracle_assessment(
+            control,
+            side=normalized_side,
+            start_qpos_rad=start,
+            target_qpos_rad=target,
+            oracle=collision_oracle,
+        )
     )
     if not bool(path_collision["safe"]):
         return JointFkReferencePlan(
@@ -1759,6 +1958,7 @@ def build_collision_checked_multiwaypoint_joint_fk_reference_plan(
     linear_speed_m_s: float,
     angular_speed_deg_s: float,
     minimum_duration_sec: float,
+    collision_oracle: Any | None = None,
 ) -> JointFkReferencePlan:
     """Time-parameterize a validated waypoint path as C2 stop-at-waypoint segments."""
 
@@ -1787,6 +1987,7 @@ def build_collision_checked_multiwaypoint_joint_fk_reference_plan(
             linear_speed_m_s=linear_speed_m_s,
             angular_speed_deg_s=angular_speed_deg_s,
             minimum_duration_sec=segment_minimum_duration,
+            collision_oracle=collision_oracle,
         )
         segment_metadata.append(
             {"segment_index": segment_index, **dict(segment.metadata)}
@@ -1798,7 +1999,11 @@ def build_collision_checked_multiwaypoint_joint_fk_reference_plan(
                 qpos_rad=(),
                 metadata={
                     "planner": "multiwaypoint_joint_quintic_fk",
-                    "reason_code": "mujoco_waypoint_segment_collision_blocked",
+                    "reason_code": (
+                        "mujoco_waypoint_segment_collision_blocked"
+                        if collision_oracle is None
+                        else "urdf_waypoint_segment_collision_blocked"
+                    ),
                     "blocked_segment_index": segment_index,
                     "waypoint_count": len(waypoints),
                     "segment_count": segment_count,
@@ -1882,11 +2087,22 @@ def execute_grasp_motion(
     target_world_by_side[target.side] = target_world_active.copy()
     obstacle_oracle: RM65ObstacleCollisionOracle | None = None
     path_oracle: Any | None = None
+    path_revalidation_oracle: Any | None = None
     obstacle_initialization_error: dict[str, object] | None = None
     if obstacle_scene is not None:
         try:
             obstacle_oracle = build_obstacle_collision_oracle(control, obstacle_scene)
-            path_oracle = _MujocoFclObstacleOracle(control, obstacle_oracle)
+            path_oracle = _MujocoFclObstacleOracle(
+                control, build_path_obstacle_collision_oracle(obstacle_scene)
+            )
+            path_revalidation_oracle = _MujocoFclObstacleOracle(
+                control,
+                build_path_obstacle_collision_oracle(
+                    obstacle_scene,
+                    use_profile_proxy_geometry=False,
+                    stop_at_first_clearance_violation=True,
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - planner initialization fails closed
             obstacle_initialization_error = {
                 "reason_code": "obstacle_collision_oracle_initialization_failed",
@@ -1963,15 +2179,23 @@ def execute_grasp_motion(
             minimum_duration_sec=minimum_duration_sec,
         )
     else:
-        joint_path_result = plan_obstacle_aware_joint_path(
+        (
+            joint_path_result,
+            final_obstacle_revalidation,
+            planning_attempts,
+        ) = plan_revalidated_obstacle_aware_joint_path(
             control,
             side=target.side,
             target_qpos_rad=selected_qpos,
             single_arm_solver=endpoint_solver,
             obstacle_oracle=path_oracle,
+            final_obstacle_oracle=path_revalidation_oracle,
             planner_config=obstacle_planner_config,
         )
-        joint_path_search = joint_path_result.to_dict()
+        joint_path_search = {
+            **joint_path_result.to_dict(),
+            "planning_attempts": planning_attempts,
+        }
         if joint_path_result.status is not JointPathStatus.PATH_FOUND:
             return GraspMotionPlayback(
                 motion_status=_path_failure_motion_status(joint_path_result.status),
@@ -1988,10 +2212,8 @@ def execute_grasp_motion(
                     "path_preflight": joint_path_search,
                 },
             )
-        final_obstacle_revalidation = revalidate_obstacle_path(
-            joint_path_result.waypoints,
-            oracle=path_oracle,
-        )
+        if final_obstacle_revalidation is None:
+            raise RuntimeError("found obstacle path is missing final revalidation")
         if not bool(final_obstacle_revalidation["safe"]):
             return GraspMotionPlayback(
                 motion_status=(
@@ -2028,6 +2250,7 @@ def execute_grasp_motion(
             linear_speed_m_s=linear_speed_m_s,
             angular_speed_deg_s=angular_speed_deg_s,
             minimum_duration_sec=minimum_duration_sec,
+            collision_oracle=path_revalidation_oracle,
         )
     if joint_fk_plan.status == "collision_blocked":
         return GraspMotionPlayback(
@@ -2314,6 +2537,7 @@ __all__ = [
     "build_collision_checked_joint_fk_reference_plan",
     "build_collision_checked_multiwaypoint_joint_fk_reference_plan",
     "build_obstacle_collision_oracle",
+    "build_path_obstacle_collision_oracle",
     "build_shadow_initialized_control",
     "build_shadow_simulation_receipt_from_playback",
     "build_smooth_se3_trajectory",

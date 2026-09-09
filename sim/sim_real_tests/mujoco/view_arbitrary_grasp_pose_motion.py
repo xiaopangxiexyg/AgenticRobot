@@ -18,20 +18,32 @@ from typing import Any
 
 import numpy as np
 
+from robot_motion.path_planning import JointPathPlannerConfig
+from robot_motion.rm65 import (
+    DEFAULT_GRASP_PATH_COLLISION_SCENE,
+    build_dual_arm_scene_profile,
+)
+from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
 from robot_motion.scene_obstacles import (
     AxisAlignedBoxObstacle,
     ObstacleSceneSnapshot,
 )
-from sim.mujoco.control.desk_tcp_position import DeskTcpPositionControl
+from sim.mujoco.control.desk_tcp_position import (
+    DeskTcpPositionControl,
+    DeskTcpPositionControlConfig,
+)
 from sim.mujoco.replay.tcp_target_visualization import TcpTargetVisualizer
 from sim.mujoco.viewer import passive_viewer_handle
 
 from .arbitrary_grasp_pose_motion import (
+    ADAPTIVE_OBSTACLE_REFINEMENT_DISTANCE_M,
+    FINAL_OBSTACLE_EDGE_RESOLUTION_RAD,
     MOTION_STATUS_COMPLETED,
     OBSTACLE_SCENE_FRAME_ID,
     OBSTACLE_SCENE_FRAME_SPEC_HASH,
     GraspMotionPlayback,
     GraspMotionTarget,
+    _install_artifact_aware_collision_projector,
     execute_grasp_motion,
     pose_from_xyz_quat_xyzw,
     pose_from_xyz_rpy_deg,
@@ -45,6 +57,31 @@ from .continuous_random_grasp_pose_motion import (
     outcome_color_rgba,
     sample_random_joint_fk_target,
 )
+
+_FIXED_SCENE_REVIEW_TARGETS = {
+    "table-detour-left": (
+        "left",
+        (
+            0.3326665959418462,
+            1.067310700153167,
+            1.167898556601838,
+            1.4598493441606597,
+            1.1533466210452556,
+            -1.3030452467215032,
+        ),
+    ),
+    "camera-pole-detour-right": (
+        "right",
+        (
+            -1.62607846,
+            0.80142482,
+            -2.10686838,
+            2.21233844,
+            -0.67988682,
+            1.23517604,
+        ),
+    ),
+}
 
 
 def _sleep_with_viewer(duration_sec: float, *, viewer_handle: Any) -> bool:
@@ -70,6 +107,16 @@ def build_parser() -> argparse.ArgumentParser:
             "It must be accompanied by exactly one orientation option."
         ),
     )
+    parser.add_argument(
+        "--target-qpos-rad",
+        type=float,
+        nargs=6,
+        metavar=("Q1", "Q2", "Q3", "Q4", "Q5", "Q6"),
+        help=(
+            "Debug-only deterministic joint target. Its DMTAC TCP pose is "
+            "derived by FK and the endpoint is still collision checked."
+        ),
+    )
     orientation = parser.add_mutually_exclusive_group()
     orientation.add_argument(
         "--target-quat-xyzw",
@@ -93,6 +140,14 @@ def build_parser() -> argparse.ArgumentParser:
             "reachable joint-space target and replay it."
         ),
     )
+    parser.add_argument(
+        "--fixed-scene-review",
+        choices=tuple(_FIXED_SCENE_REVIEW_TARGETS),
+        help=(
+            "Replay a verified deterministic detour target with the fixed table "
+            "and camera poles enabled. The preset owns the arm side."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260830)
     parser.add_argument("--demo-max-trials", type=int, default=256)
     parser.add_argument("--demo-max-joint-offset-deg", type=float, default=55.0)
@@ -101,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--angular-speed-deg-s", type=float, default=45.0)
     parser.add_argument("--minimum-duration-sec", type=float, default=2.0)
     parser.add_argument("--terminal-hold-sec", type=float, default=1.5)
+    parser.add_argument("--left-initial-gripper-close", type=float)
+    parser.add_argument("--right-initial-gripper-close", type=float)
+    parser.add_argument("--planner-shortcut-attempts", type=int, default=8)
+    parser.add_argument("--planner-seed", type=int, default=0)
+    parser.add_argument("--planner-max-iterations", type=int, default=1200)
+    parser.add_argument("--planner-max-nodes", type=int, default=2400)
     parser.add_argument(
         "--obstacle-cube-world-m",
         type=float,
@@ -117,6 +178,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.02,
         help="Required FCL clearance from every configured planning cube.",
+    )
+    parser.add_argument(
+        "--include-fixed-scene-obstacles",
+        action="store_true",
+        help="Include the collision-profile table and all camera poles.",
     )
     parser.add_argument(
         "--random-position-min-m",
@@ -191,6 +257,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _validate_args(args: argparse.Namespace) -> None:
     has_xyz = args.target_xyz_m is not None
+    has_qpos = args.target_qpos_rad is not None
+    has_fixed_scene_review = args.fixed_scene_review is not None
     has_orientation = (
         args.target_quat_xyzw is not None or args.target_rpy_deg is not None
     )
@@ -198,6 +266,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "explicit target requires --target-xyz-m and exactly one of "
             "--target-quat-xyzw/--target-rpy-deg"
+        )
+    if has_qpos and (has_xyz or has_orientation or bool(args.single_reachable_demo)):
+        raise ValueError(
+            "--target-qpos-rad cannot accompany Cartesian target or demo options"
+        )
+    if has_fixed_scene_review and (
+        has_qpos or has_xyz or has_orientation or bool(args.single_reachable_demo)
+    ):
+        raise ValueError(
+            "--fixed-scene-review cannot accompany another target or demo option"
         )
     positive = (
         "demo_max_trials",
@@ -251,6 +329,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--random-sample-count must be non-negative")
     if int(args.raw_cartesian_probe_interval) < 1:
         raise ValueError("--raw-cartesian-probe-interval must be positive")
+    if int(args.planner_shortcut_attempts) < 0:
+        raise ValueError("--planner-shortcut-attempts must be non-negative")
+    if int(args.planner_max_iterations) < 1:
+        raise ValueError("--planner-max-iterations must be positive")
+    if int(args.planner_max_nodes) < 2:
+        raise ValueError("--planner-max-nodes must be at least 2")
+    for name in ("left_initial_gripper_close", "right_initial_gripper_close"):
+        value = getattr(args, name)
+        if value is not None and (
+            not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+        ):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite within [0, 1]")
     minimum = np.asarray(args.random_position_min_m, dtype=float).reshape(-1)
     maximum = np.asarray(args.random_position_max_m, dtype=float).reshape(-1)
     if (
@@ -273,16 +363,28 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _uses_continuous_random_mode(args: argparse.Namespace) -> bool:
-    return args.target_xyz_m is None and not bool(args.single_reachable_demo)
+    return (
+        args.target_xyz_m is None
+        and args.target_qpos_rad is None
+        and args.fixed_scene_review is None
+        and not bool(args.single_reachable_demo)
+    )
 
 
 def _obstacle_scene_from_args(
     args: argparse.Namespace,
 ) -> ObstacleSceneSnapshot | None:
     cubes = tuple(args.obstacle_cube_world_m or ())
-    if not cubes:
+    fixed = (
+        fixed_scene_aabb_obstacles(
+            build_dual_arm_scene_profile(DEFAULT_GRASP_PATH_COLLISION_SCENE)
+        )
+        if bool(args.include_fixed_scene_obstacles) or args.fixed_scene_review is not None
+        else ()
+    )
+    if not cubes and not fixed:
         return None
-    obstacles = tuple(
+    custom = tuple(
         AxisAlignedBoxObstacle(
             obstacle_id=f"cube-{index}",
             center_xyz_m=tuple(float(value) for value in cube[:3]),
@@ -290,6 +392,7 @@ def _obstacle_scene_from_args(
         )
         for index, cube in enumerate(cubes)
     )
+    obstacles = (*fixed, *custom)
     return ObstacleSceneSnapshot(
         reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
         reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
@@ -304,6 +407,38 @@ def _target_from_args(
     *,
     control: DeskTcpPositionControl,
 ) -> GraspMotionTarget:
+    joint_target: tuple[str, Sequence[float], str] | None = None
+    if args.fixed_scene_review is not None:
+        side, target_qpos = _FIXED_SCENE_REVIEW_TARGETS[str(args.fixed_scene_review)]
+        joint_target = (
+            side,
+            target_qpos,
+            f"fixed_scene_review:{args.fixed_scene_review}",
+        )
+    elif args.target_qpos_rad is not None:
+        joint_target = (
+            str(args.side),
+            args.target_qpos_rad,
+            "explicit_cli_joint_qpos_fk_debug",
+        )
+    if joint_target is not None:
+        side, target_qpos, source = joint_target
+        qpos = {
+            name: control.scene.get_arm_qpos(name).copy()
+            for name in ("left", "right")
+        }
+        qpos[side] = np.asarray(target_qpos, dtype=float)
+        world_from_dmtac = control.retargeter.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=qpos["left"], right_qpos=qpos["right"]
+        )[side]
+        return GraspMotionTarget(
+            side=side,
+            target_pose_base_from_dmtac_tcp=(
+                control.world_to_base_by_side[side] @ world_from_dmtac
+            ),
+            source=source,
+            known_qpos_rad=qpos[side],
+        )
     if args.target_xyz_m is None:
         return select_random_reachable_demo_target(
             control,
@@ -501,6 +636,16 @@ def _run_continuous_random(
             "minimum_duration_sec": float(args.minimum_duration_sec),
             "terminal_hold_sec": float(args.terminal_hold_sec),
             "obstacle_scene": obstacle_scene,
+            "obstacle_planner_config": JointPathPlannerConfig(
+                seed=int(args.planner_seed),
+                max_iterations=int(args.planner_max_iterations),
+                max_nodes=int(args.planner_max_nodes),
+                shortcut_attempts=int(args.planner_shortcut_attempts),
+                adaptive_edge_resolution_rad=FINAL_OBSTACLE_EDGE_RESOLUTION_RAD,
+                adaptive_refinement_distance_m=(
+                    ADAPTIVE_OBSTACLE_REFINEMENT_DISTANCE_M
+                ),
+            ),
         }
         if viewer_handle is None:
             playback = execute_grasp_motion(control, target, **execute_kwargs)
@@ -652,7 +797,13 @@ def _playback_in_viewer(
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     _validate_args(args)
-    control = DeskTcpPositionControl.build()
+    control = DeskTcpPositionControl.build(
+        config=DeskTcpPositionControlConfig(
+            left_initial_gripper_close=args.left_initial_gripper_close,
+            right_initial_gripper_close=args.right_initial_gripper_close,
+        )
+    )
+    _install_artifact_aware_collision_projector(control)
     repeats_completed = 0
     obstacle_scene = _obstacle_scene_from_args(args)
     try:
@@ -673,6 +824,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             minimum_duration_sec=float(args.minimum_duration_sec),
             terminal_hold_sec=float(args.terminal_hold_sec),
             obstacle_scene=obstacle_scene,
+            obstacle_planner_config=JointPathPlannerConfig(
+                seed=int(args.planner_seed),
+                max_iterations=int(args.planner_max_iterations),
+                max_nodes=int(args.planner_max_nodes),
+                shortcut_attempts=int(args.planner_shortcut_attempts),
+                adaptive_edge_resolution_rad=FINAL_OBSTACLE_EDGE_RESOLUTION_RAD,
+                adaptive_refinement_distance_m=(
+                    ADAPTIVE_OBSTACLE_REFINEMENT_DISTANCE_M
+                ),
+            ),
         )
         if not bool(args.headless) and playback.frame_count > 0:
             repeats_completed = _playback_in_viewer(

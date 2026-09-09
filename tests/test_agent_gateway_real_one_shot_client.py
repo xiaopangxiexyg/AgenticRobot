@@ -575,6 +575,23 @@ def test_camera_grasp_is_mutually_exclusive_with_direct_target(tmp_path) -> None
         raise AssertionError("camera and direct target modes must be exclusive")
 
 
+def test_grasp_approach_accepts_the_absolute_tcp_input_contract() -> None:
+    pose, proposal, delta = one_shot_client._absolute_tcp_input_from_args(
+        Namespace(
+            action="approach_grasp_pose",
+            target_xyz_m=(0.1, -0.2, 0.3),
+            target_quat_xyzw=(0.0, 0.0, 0.0, 2.0),
+            camera_grasp_proposal=None,
+            relative_delta_xyz_m=None,
+            speed_scale=0.25,
+        )
+    )
+
+    assert pose == (0.1, -0.2, 0.3, 0.0, 0.0, 0.0, 1.0)
+    assert proposal is None
+    assert delta is None
+
+
 def test_relative_delta_is_mutually_exclusive_with_direct_target() -> None:
     args = Namespace(
         action="move_tcp_to_pose",

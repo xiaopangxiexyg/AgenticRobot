@@ -16,6 +16,7 @@ from typing import Any
 from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
+    GRASP_APPROACH_SKILL_ID_V1,
     TCP_CARDINAL_STEP_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
@@ -34,7 +35,10 @@ from .grasp_pose_adapter import (
 from .motion_primitive_profiles import (
     REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
 )
-from .session_authorization import REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION
+from .session_authorization import (
+    REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+    REAL_AGENT_GRASP_APPROACH_ACTION,
+)
 
 _PREFIX = struct.Struct(">I")
 _CONFIRM_TOKEN = "EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE"
@@ -44,6 +48,7 @@ _ACTION_TO_SKILL_ID = {
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
+    REAL_AGENT_GRASP_APPROACH_ACTION: GRASP_APPROACH_SKILL_ID_V1,
 }
 _TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "timed_out"}
@@ -223,7 +228,11 @@ def _absolute_tcp_input_from_args(
     quaternion_value = getattr(args, "target_quat_xyzw", None)
     proposal_path = getattr(args, "camera_grasp_proposal", None)
     relative_delta_value = getattr(args, "relative_delta_xyz_m", None)
-    is_absolute = getattr(args, "action", None) == REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION
+    absolute_actions = {
+        REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+        REAL_AGENT_GRASP_APPROACH_ACTION,
+    }
+    is_absolute = getattr(args, "action", None) in absolute_actions
     if not is_absolute:
         if (
             xyz_value is not None
@@ -234,7 +243,7 @@ def _absolute_tcp_input_from_args(
         ):
             raise ValueError(
                 "absolute/relative target, proposal, and --speed-scale require "
-                f"--action {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION}."
+                "--action move_tcp_to_pose or approach_grasp_pose."
             )
         return None, None, None
     if proposal_path is not None:
@@ -265,7 +274,7 @@ def _absolute_tcp_input_from_args(
         return None, None, delta
     if xyz_value is None or quaternion_value is None:
         raise ValueError(
-            f"--action {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION} requires both "
+            f"--action {getattr(args, 'action', '')} requires both "
             "--target-xyz-m and --target-quat-xyzw, or one "
             "--camera-grasp-proposal/--relative-delta-xyz-m."
         )
@@ -369,7 +378,10 @@ def _parameters(
             "Real primitive observation does not exactly match the selected side."
         )
     properties = _schema_properties(schema_entry)
-    is_absolute = skill_id == TCP_POSE_TARGET_SKILL_ID_V1
+    is_absolute = skill_id in {
+        TCP_POSE_TARGET_SKILL_ID_V1,
+        GRASP_APPROACH_SKILL_ID_V1,
+    }
     if is_absolute:
         if not _pose_target_component_allowed(properties, expected_component):
             raise RuntimeError("Selected side is not allowed by the Skill schema.")
@@ -478,8 +490,9 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
     ) = _absolute_tcp_input_from_args(args)
     requested_timeout = getattr(args, "operation_timeout_sec", None)
     operation_timeout_sec = (
-        30.0
-        if requested_timeout is None and skill_id == TCP_POSE_TARGET_SKILL_ID_V1
+        (60.0 if skill_id == GRASP_APPROACH_SKILL_ID_V1 else 30.0)
+        if requested_timeout is None
+        and skill_id in {TCP_POSE_TARGET_SKILL_ID_V1, GRASP_APPROACH_SKILL_ID_V1}
         else (5.0 if requested_timeout is None else float(requested_timeout))
     )
     if not math.isfinite(operation_timeout_sec) or operation_timeout_sec <= 0.0:
@@ -527,7 +540,7 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         )
         requested_components = (
             tuple(parameters["pose_targets_by_component"])
-            if skill_id == TCP_POSE_TARGET_SKILL_ID_V1
+            if skill_id in {TCP_POSE_TARGET_SKILL_ID_V1, GRASP_APPROACH_SKILL_ID_V1}
             else (parameters["component_id"],)
         )
         if requested_components != (expected_component,):
@@ -631,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("X", "Y", "Z"),
         help=(
             "actual tool-TCP position in the Gateway-advertised canonical_station "
-            "frame; required only for --action move_tcp_to_pose"
+            "frame; required for absolute move/approach actions"
         ),
     )
     parser.add_argument(
@@ -641,7 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("QX", "QY", "QZ", "QW"),
         help=(
             "actual tool-TCP quaternion in canonical_station; required only for "
-            "--action move_tcp_to_pose"
+            "an absolute move/approach action"
         ),
     )
     parser.add_argument(
@@ -660,7 +673,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "translation in meters along canonical_station XYZ, resolved from "
             "the same fresh measured TCP snapshot while preserving its "
-            "orientation; only for --action move_tcp_to_pose and mutually "
+            "orientation; only for absolute move/approach actions and mutually "
             "exclusive with direct target/proposal inputs"
         ),
     )
@@ -670,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "fraction of the lower reviewed trajectory limits for "
-            "move_tcp_to_pose (default: 0.25)"
+            "absolute move/approach actions (default: 0.25)"
         ),
     )
     parser.add_argument("--timeout-sec", type=float, default=10.0)
@@ -679,8 +692,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "operation deadline (default: 30s for move_tcp_to_pose, 5s for "
-            "fixed primitives)"
+            "operation deadline (default: 60s for approach_grasp_pose, 30s "
+            "for move_tcp_to_pose, 5s for fixed primitives)"
         ),
     )
     parser.add_argument("--confirm", default="")

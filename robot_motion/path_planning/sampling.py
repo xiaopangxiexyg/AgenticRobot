@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -10,8 +11,8 @@ import numpy as np
 from .contracts import (
     JointConfigurationCheck,
     JointConfigurationOracle,
-    JointPathPlanResult,
     JointPathPlannerConfig,
+    JointPathPlanResult,
     JointPathStatus,
 )
 
@@ -157,23 +158,29 @@ def plan_collision_aware_joint_path(
             complete[component] = np.asarray(flat[offsets[component]], dtype=float).reshape(shapes[component]).copy()
         return complete
 
+    check_cache: dict[bytes, JointConfigurationCheck] = {}
+
     def check(flat: np.ndarray) -> JointConfigurationCheck:
+        key = np.asarray(flat, dtype=float).tobytes()
+        if key in check_cache:
+            return check_cache[key]
         try:
             answer = oracle.check(expand(flat))
         except Exception as exc:  # A collision backend failure must fail closed.
-            return JointConfigurationCheck(
+            answer = JointConfigurationCheck(
                 safe=False,
                 collision_check_available=False,
                 reason="collision_oracle_exception",
                 metadata={"exception_type": type(exc).__name__, "exception": str(exc)},
             )
         if not isinstance(answer, JointConfigurationCheck):
-            return JointConfigurationCheck(
+            answer = JointConfigurationCheck(
                 safe=False,
                 collision_check_available=False,
                 reason="collision_oracle_returned_invalid_type",
                 metadata={"returned_type": type(answer).__name__},
             )
+        check_cache[key] = answer
         return answer
 
     start_check = check(start_flat)
@@ -185,6 +192,8 @@ def plan_collision_aware_joint_path(
         "search_max_nodes": cfg.max_nodes,
         "extension_step_rad": cfg.extension_step_rad,
         "edge_resolution_rad": cfg.edge_resolution_rad,
+        "adaptive_edge_resolution_rad": cfg.adaptive_edge_resolution_rad,
+        "adaptive_refinement_distance_m": cfg.adaptive_refinement_distance_m,
         "shortcut_attempts": cfg.shortcut_attempts,
         "collision_scope": "complete_configuration",
         "inactive_components_frozen": True,
@@ -200,18 +209,82 @@ def plan_collision_aware_joint_path(
     if not target_check.safe:
         return _result(JointPathStatus.TARGET_BLOCKED, start, target, movable, resolved_scene_hash, "target_configuration_blocked", {**base_metadata, "start_check": start_check.to_dict(), "target_check": target_check.to_dict()})
 
-    def edge_safe(a: np.ndarray, b: np.ndarray) -> _EdgeResult:
+    def sample_edge(
+        a: np.ndarray,
+        b: np.ndarray,
+        *,
+        resolution_rad: float,
+    ) -> tuple[_EdgeResult, float | None]:
         delta = np.asarray(b, dtype=float) - np.asarray(a, dtype=float)
-        count = max(1, int(np.ceil(float(np.max(np.abs(delta))) / cfg.edge_resolution_rad)))
+        count = max(1, int(np.ceil(float(np.max(np.abs(delta))) / resolution_rad)))
+        minimum_distance_m = math.inf
         for sample_index in range(1, count + 1):
             alpha = float(sample_index) / float(count)
             candidate = np.asarray(a, dtype=float) + alpha * delta
             assessment = check(candidate)
             if not assessment.collision_check_available:
-                return _EdgeResult(False, False, {"edge_sample_index": sample_index, "edge_sample_count": count, "edge_alpha": alpha, "check": assessment.to_dict()})
+                return _EdgeResult(
+                    False,
+                    False,
+                    {
+                        "edge_sample_index": sample_index,
+                        "edge_sample_count": count,
+                        "edge_alpha": alpha,
+                        "check": assessment.to_dict(),
+                    },
+                ), None
             if not assessment.safe:
-                return _EdgeResult(False, True, {"edge_sample_index": sample_index, "edge_sample_count": count, "edge_alpha": alpha, "check": assessment.to_dict()})
-        return _EdgeResult(True, True)
+                return _EdgeResult(
+                    False,
+                    True,
+                    {
+                        "edge_sample_index": sample_index,
+                        "edge_sample_count": count,
+                        "edge_alpha": alpha,
+                        "check": assessment.to_dict(),
+                    },
+                ), None
+            adaptive_distance = assessment.metadata.get(
+                "adaptive_edge_distance_m", assessment.minimum_distance_m
+            )
+            if adaptive_distance is not None:
+                try:
+                    adaptive_distance = float(adaptive_distance)
+                except (TypeError, ValueError):
+                    adaptive_distance = math.nan
+                if not math.isfinite(adaptive_distance) or adaptive_distance < 0.0:
+                    return _EdgeResult(
+                        False,
+                        False,
+                        {
+                            "edge_sample_index": sample_index,
+                            "edge_sample_count": count,
+                            "edge_alpha": alpha,
+                            "reason": "invalid_adaptive_edge_distance",
+                        },
+                    ), None
+                minimum_distance_m = min(minimum_distance_m, adaptive_distance)
+        return _EdgeResult(True, True), (
+            minimum_distance_m if np.isfinite(minimum_distance_m) else None
+        )
+
+    def edge_safe(a: np.ndarray, b: np.ndarray) -> _EdgeResult:
+        edge, minimum_distance_m = sample_edge(
+            a, b, resolution_rad=cfg.edge_resolution_rad
+        )
+        if not edge.safe or cfg.adaptive_edge_resolution_rad is None:
+            return edge
+        if (
+            minimum_distance_m is None
+            or minimum_distance_m > cfg.adaptive_refinement_distance_m
+        ):
+            return edge
+        refined, _ = sample_edge(
+            a,
+            b,
+            resolution_rad=cfg.adaptive_edge_resolution_rad,
+        )
+        return refined
 
     if np.array_equal(start_flat, target_flat):
         return _result(JointPathStatus.PATH_FOUND, start, target, movable, resolved_scene_hash, "start_equals_target", {**base_metadata, "direct_path": True, "search_iterations": 0, "search_node_count": 1}, (expand(start_flat),))
@@ -325,7 +398,12 @@ def plan_collision_aware_joint_path(
         movable,
         resolved_scene_hash,
         "bounded_search_found_path",
-        {**search_metadata, "shortcut_revalidated": True, "unshortened_waypoint_count": len(found), "waypoint_count": len(shortened)},
+        {
+            **search_metadata,
+            "shortcut_revalidated": True,
+            "unshortened_waypoint_count": len(found),
+            "waypoint_count": len(shortened),
+        },
         tuple(expand(item) for item in shortened),
     )
 

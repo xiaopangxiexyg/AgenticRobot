@@ -56,7 +56,7 @@ lower domains must not import application/profile layers
 | 单源策略部署 | `teleop_runtime.deploy` | 既有 deploy safety/executor 与真实 backend | 不加载、不创建 |
 | 单源真人遥操 | canonical real-teleop frontend | 既有 real-teleop session、Rig 与真实 backend | 不加载、不创建 |
 | 单源 replay | `teleop_runtime.replay` | replay executor、`ReplayHardwareRig` 与真实 backend | 不加载、不创建 |
-| 单源 Agent-skill | 当前仅有 MuJoCo direct target；真机 target 暂缓 | target runtime 的 canonical safety、IK 与 dispatch | direct target 不加载、不创建 |
+| 单源 Agent-skill | MuJoCo direct target；独立 RM65 Skill profile 的真机 TCP primitive/URDF 避障抓取接近 | target runtime 的 canonical safety、IK 与 dispatch | direct target 不加载、不创建 |
 | 多源组合 | 显式 Control Station composition/Sim-HIL profile | 同一个 target runtime；composition 只产生 candidate | profile 显式加载并创建 |
 
 被动 observer、ControlTrace、difference 或 shadow 不会因为记录了 source/output 事实就变成多源控制；

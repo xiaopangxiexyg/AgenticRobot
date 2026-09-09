@@ -1,8 +1,9 @@
 """Capture RM65/DMTac state and run one simulation-first grasp acceptance.
 
 The default mode opens the assigned RM65 arms and DMTac grippers in
-observation-only mode, captures one causal state cut, initializes MuJoCo from
-that cut, and executes the registered joint trajectory only in MuJoCo.  The
+observation-only mode, captures one causal state cut, plans only against the
+selected RM65 URDF/FCL table and camera-pole scene, then initializes MuJoCo
+from that cut to execute the registered joint trajectory independently.  The
 explicit ``--execute-real`` mode closes that passive context after a completed
 MuJoCo receipt, starts the active RM65 lower owner, and replays the exact
 registered qpos trajectory through the existing checked dispatch path.  DMTac
@@ -180,12 +181,32 @@ def _pose_from_cli(args: argparse.Namespace) -> tuple[np.ndarray | None, str]:
     )
 
 
-def _scene_from_cli(args: argparse.Namespace):
+def _scene_from_cli(
+    args: argparse.Namespace,
+    *,
+    collision_scene_profile: str,
+):
+    from robot_motion.rm65 import build_dual_arm_scene_profile
+    from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
     from robot_motion.scene_obstacles import (
         AxisAlignedBoxObstacle,
         ObstacleSceneSnapshot,
     )
 
+    fixed_obstacles = fixed_scene_aabb_obstacles(
+        build_dual_arm_scene_profile(collision_scene_profile)
+    )
+    required_fixed_ids = {
+        "fixed-scene:camera_pole",
+        "fixed-scene:left_camera_pole",
+        "fixed-scene:right_camera_pole",
+        "fixed-scene:table",
+    }
+    if {item.obstacle_id for item in fixed_obstacles} != required_fixed_ids:
+        raise ValueError(
+            "real grasp planning collision profile must expose the table and "
+            "all three camera poles"
+        )
     if args.obstacle_json is not None:
         value = _load_json(args.obstacle_json)
         if not isinstance(value, Mapping):
@@ -196,10 +217,10 @@ def _scene_from_cli(args: argparse.Namespace):
             or scene.reference_frame_spec_hash != OBSTACLE_FRAME_SPEC_HASH
         ):
             raise ValueError(
-                "obstacle scene must use the RM65 MuJoCo planning frame "
+                "obstacle scene must use the RM65 collision-URDF world frame "
                 f"{OBSTACLE_FRAME_ID!r}/{OBSTACLE_FRAME_SPEC_HASH!r}"
             )
-        return scene
+        return replace(scene, obstacles=(*scene.obstacles, *fixed_obstacles))
     obstacles = tuple(
         AxisAlignedBoxObstacle(
             obstacle_id=f"cube-{index}",
@@ -212,7 +233,7 @@ def _scene_from_cli(args: argparse.Namespace):
         reference_frame_id=OBSTACLE_FRAME_ID,
         reference_frame_spec_hash=OBSTACLE_FRAME_SPEC_HASH,
         revision=int(args.obstacle_revision),
-        obstacles=obstacles,
+        obstacles=(*obstacles, *fixed_obstacles),
         minimum_clearance_m=float(args.obstacle_clearance_m),
     )
 
@@ -252,28 +273,29 @@ def _target_from_current(
     profile: Any,
     *,
     side: str,
+    target_builder: Any,
     translation_offset_m: Sequence[float] | None = None,
     tool_rotation_offset_rpy_deg: Sequence[float] | None = None,
 ):
-    from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
-        GraspMotionTarget,
-        build_shadow_initialized_control,
-    )
+    from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import GraspMotionTarget
 
-    control = build_shadow_initialized_control(
-        snapshot,
-        config=_simulation_config(profile, snapshot),
+    qpos = {
+        item: np.asarray(snapshot.qpos_by_side[item], dtype=float).copy()
+        for item in SIDES
+    }
+    target_builder.set_current_qpos_pair(
+        left_qpos=qpos["left"],
+        right_qpos=qpos["right"],
+        reset_tracking=True,
     )
-    try:
-        qpos = {side: control.scene.get_arm_qpos(side).copy() for side in SIDES}
-        world = control.retargeter.tool_tcp_world_targets_for_qpos_pair(
-            left_qpos=qpos["left"],
-            right_qpos=qpos["right"],
-        )
-        base_from_dmtac = control.world_to_base_by_side[side] @ world[side]
-        known_qpos = qpos[side]
-    finally:
-        control.close()
+    world = target_builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=qpos["left"],
+        right_qpos=qpos["right"],
+    )
+    base_from_dmtac = (
+        np.linalg.inv(profile.scene_world_from_arm_base_by_side[side]) @ world[side]
+    )
+    known_qpos = qpos[side]
     if translation_offset_m is not None:
         from scipy.spatial.transform import Rotation
 
@@ -322,7 +344,7 @@ def _build_shadow_control(profile: Any, snapshot: Any, scene: Any):
     """Build one configured MuJoCo control and bind the requested cube scene."""
 
     from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
-        build_obstacle_collision_oracle,
+        build_path_obstacle_collision_oracle,
         build_shadow_initialized_control,
     )
 
@@ -331,14 +353,34 @@ def _build_shadow_control(profile: Any, snapshot: Any, scene: Any):
         config=_simulation_config(profile, snapshot),
     )
     try:
-        control.shadow_obstacle_oracle = build_obstacle_collision_oracle(
-            control,
+        control.shadow_obstacle_oracle = build_path_obstacle_collision_oracle(
             scene,
+            use_profile_proxy_geometry=False,
+            stop_at_first_clearance_violation=True,
         )
         return control
     except BaseException:
         control.close()
         raise
+
+
+def _build_urdf_planning_context(
+    profile: Any,
+    snapshot: Any,
+    scene: Any,
+    *,
+    target_builder: Any,
+):
+    """Build an isolated URDF/FCL planner with no MuJoCo or device owner."""
+
+    from teleop_runtime.skill_deploy import RM65UrdfGraspPlanningContext
+
+    return RM65UrdfGraspPlanningContext(
+        profile=profile,
+        snapshot=snapshot,
+        obstacle_scene=scene,
+        target_builder=target_builder,
+    )
 
 
 def _build_identity(profile: Any):
@@ -1008,8 +1050,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-obstacle-detour",
         action="store_true",
         help=(
-            "Fail before simulation/real motion unless configured obstacles "
-            "block the direct joint path and the planner finds a detour."
+            "Fail before simulation/real motion unless the fixed table/poles "
+            "or configured obstacles block the direct joint path and the "
+            "planner finds a detour."
         ),
     )
     parser.add_argument("--linear-speed-m-s", type=float, default=0.12)
@@ -1111,17 +1154,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ERROR: choose --obstacle-json or --obstacle-cube-world-m", file=sys.stderr
         )
         return 2
-    if args.require_obstacle_detour and not (
-        args.obstacle_json is not None or args.obstacle_cube_world_m
-    ):
-        print(
-            "ERROR: --require-obstacle-detour needs at least one obstacle",
-            file=sys.stderr,
-        )
-        return 2
     try:
         pose, orientation_format = _pose_from_cli(args)
-        scene = _scene_from_cli(args)
+        from robot_motion.rm65 import DEFAULT_GRASP_PATH_COLLISION_SCENE
         from teleop_runtime.skill_deploy.rm65_profile import (
             ExclusiveRM65SkillDeploymentProfile,
             resolve_exclusive_rm65_skill_deployment_profile,
@@ -1141,6 +1176,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     / f"agent_primitive_{args.side}_relative_tight_v1.json"
                 ),
             )
+        )
+        scene = _scene_from_cli(
+            args,
+            collision_scene_profile=DEFAULT_GRASP_PATH_COLLISION_SCENE,
         )
         context = _SnapshotContext(
             profile=profile,
@@ -1174,6 +1213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 snapshot,
                 profile,
                 side=args.side,
+                target_builder=context.lower.target_builder,
                 translation_offset_m=args.target_offset_xyz_m,
                 tool_rotation_offset_rpy_deg=args.target_offset_rpy_deg,
             )
@@ -1239,10 +1279,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             trajectory_builder=lambda snap: build_registered_tcp_obstacle_trajectory(
                 snap,
                 request,
-                control_factory=lambda state, obstacle: _build_shadow_control(
+                planning_context_factory=lambda state, obstacle: _build_urdf_planning_context(
                     profile,
                     state,
                     obstacle,
+                    target_builder=context.lower.target_builder,
                 ),
             ),
             simulation_control_factory=lambda snap: _build_shadow_control(

@@ -18,15 +18,22 @@ from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleControlEvidence,
     StationLifecycleExecutionCompletion,
 )
+from agent_gateway.skills.motion.definition import GRASP_APPROACH_SKILL_ID_V1
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import (
     pose_matrix_to_xyzquat,
     xyzquat_to_pose_matrix,
 )
 from teleop_runtime.skill_deploy.motion_port import (
+    REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD,
+    RealAgentJointTrajectory,
     RealAgentMotionActivation,
+    RealAgentMotionMeasuredQposCut,
     RealAgentMotionPhase,
     RealAgentMotionPort,
+)
+from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65GraspTrajectoryPlanningError,
 )
 
 from .motion_primitive_profiles import (
@@ -81,6 +88,7 @@ class RealAgentPrimitiveSkillLifecycle:
         | RealAgentTcpPoseTargetProfile,
         request: AgentSkillRequest,
         operation: AgentSkillOperation,
+        grasp_trajectory_planner: Callable[..., object] | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -103,6 +111,10 @@ class RealAgentPrimitiveSkillLifecycle:
             raise TypeError("profile must be a real primitive profile.")
         if not callable(clock) or not callable(sleep):
             raise TypeError("clock and sleep must be callable.")
+        if route.skill_id == GRASP_APPROACH_SKILL_ID_V1 and not callable(
+            grasp_trajectory_planner
+        ):
+            raise TypeError("grasp approach Route requires its URDF/FCL planner.")
         checks = (
             (request.request_id, "request_id"),
             (operation.operation_id, "operation_id"),
@@ -142,11 +154,13 @@ class RealAgentPrimitiveSkillLifecycle:
         self.profile = profile
         self.request = request
         self.operation = operation
+        self.grasp_trajectory_planner = grasp_trajectory_planner
         self.clock = clock
         self.sleep = sleep
         self.lower_operation_id = "real-agent-motion:" + operation.operation_id
         self.target_resolution: MotionPrimitiveTargetResolution | None = None
         self.target_pose: tuple[float, ...] | None = None
+        self._planned_joint_trajectory: RealAgentJointTrajectory | None = None
         self._closed = False
 
     def _validate_call(
@@ -168,12 +182,31 @@ class RealAgentPrimitiveSkillLifecycle:
             raise RuntimeError("No lower measured TCP-pose cut is available.")
         if self.profile.component_id not in cut.pose_world_by_component:
             raise RuntimeError("Measured TCP-pose cut omits the selected component.")
-        age_ms = max(0.0, (float(now) - cut.measured_at) * 1_000.0)
+        if cut.measured_at > now or cut.available_at > now:
+            if wait_for_fresh:
+                return None
+            raise RuntimeError("Lower measured TCP-pose cut is from the future.")
+        age_ms = (float(now) - cut.measured_at) * 1_000.0
         if age_ms > self.contract_bundle.convergence_profile.max_measurement_age_ms:
             if wait_for_fresh:
                 return None
             raise RuntimeError("Lower measured TCP-pose cut is stale.")
         return cut
+
+    def _measured_qpos_problem(
+        self,
+        *,
+        cut: RealAgentMotionMeasuredQposCut | None,
+        now: float,
+    ) -> str | None:
+        if cut is None:
+            return "unavailable"
+        if cut.measured_at > now or cut.available_at > now:
+            return "from_future"
+        age_ms = (now - cut.measured_at) * 1_000.0
+        if age_ms > self.contract_bundle.convergence_profile.max_measurement_age_ms:
+            return "stale"
+        return None
 
     def _resolve_target(self, measured_pose: tuple[float, ...]) -> tuple[
         MotionPrimitiveTargetResolution,
@@ -226,7 +259,7 @@ class RealAgentPrimitiveSkillLifecycle:
                     + frame_resolution.semantic_content_hash,
                 ),
             )
-            return resolution, self.profile.skill_id + "@1", target_hash
+            return resolution, self.route.skill_id + "@1", target_hash
         reference_frame = self.contract_bundle.frame_graph.frame_by_id[
             self.profile.reference_frame_id
         ]
@@ -293,6 +326,162 @@ class RealAgentPrimitiveSkillLifecycle:
             )
         )
         resolution, primitive_id, primitive_hash = self._resolve_target(measured_pose)
+        joint_trajectory = None
+        planning_evidence: tuple[str, ...] = ()
+        if self.route.skill_id == GRASP_APPROACH_SKILL_ID_V1:
+            qpos_cut = self.port.latest_measured_qpos()
+            qpos_problem = self._measured_qpos_problem(cut=qpos_cut, now=now)
+            if qpos_problem is not None:
+                reason = f"grasp_path_measured_qpos_{qpos_problem}"
+                hold = self.request_hold(
+                    operation=operation,
+                    reason=reason,
+                )
+                return StationLifecycleActivationEvidence(
+                    succeeded=False,
+                    status=reason,
+                    lower_operation_id=self.lower_operation_id,
+                    evidence_refs=tuple(
+                        sorted(
+                            {
+                                *cut.evidence_refs,
+                                *(() if qpos_cut is None else qpos_cut.evidence_refs),
+                                *hold.evidence_refs,
+                            }
+                        )
+                    ),
+                    lower_hold_confirmed=hold.lower_hold_confirmed,
+                )
+            assert qpos_cut is not None
+            assert self.grasp_trajectory_planner is not None
+            try:
+                joint_trajectory = self.grasp_trajectory_planner(
+                    qpos_by_side=qpos_cut.qpos_by_side,
+                    side=self.profile.side,
+                    target_tool_tcp_world=xyzquat_to_pose_matrix(
+                        resolution.target_pose,
+                        name="real_agent_grasp_approach_target",
+                    ),
+                    speed_scale=float(self.request.parameters.get("speed_scale", 1.0)),
+                )
+            except RM65GraspTrajectoryPlanningError as exc:
+                hold = self.request_hold(
+                    operation=operation,
+                    reason=exc.reason_code,
+                )
+                return StationLifecycleActivationEvidence(
+                    succeeded=False,
+                    status=exc.reason_code,
+                    lower_operation_id=self.lower_operation_id,
+                    evidence_refs=tuple(
+                        sorted(
+                            {
+                                *cut.evidence_refs,
+                                *qpos_cut.evidence_refs,
+                                *hold.evidence_refs,
+                            }
+                        )
+                    ),
+                    lower_hold_confirmed=hold.lower_hold_confirmed,
+                )
+            planning_evidence = joint_trajectory.evidence_refs
+            if cancel_requested():
+                hold = self.request_hold(
+                    operation=operation,
+                    reason="cancelled_after_grasp_planning_before_activation",
+                )
+                return StationLifecycleActivationEvidence(
+                    succeeded=False,
+                    status="real_primitive_cancelled_before_activation",
+                    lower_operation_id=self.lower_operation_id,
+                    evidence_refs=tuple(
+                        sorted(
+                            {
+                                *cut.evidence_refs,
+                                *qpos_cut.evidence_refs,
+                                *planning_evidence,
+                                *hold.evidence_refs,
+                            }
+                        )
+                    ),
+                    lower_hold_confirmed=hold.lower_hold_confirmed,
+                )
+            latest_qpos = self.port.latest_measured_qpos()
+            now = float(self.clock())
+            postplan_qpos_problem = self._measured_qpos_problem(
+                cut=latest_qpos,
+                now=now,
+            )
+            if postplan_qpos_problem is not None:
+                reason = (
+                    "grasp_path_postplan_measured_qpos_"
+                    + postplan_qpos_problem
+                )
+                hold = self.request_hold(operation=operation, reason=reason)
+                return StationLifecycleActivationEvidence(
+                    succeeded=False,
+                    status=reason,
+                    lower_operation_id=self.lower_operation_id,
+                    evidence_refs=tuple(
+                        sorted(
+                            {
+                                *cut.evidence_refs,
+                                *qpos_cut.evidence_refs,
+                                *(
+                                    ()
+                                    if latest_qpos is None
+                                    else latest_qpos.evidence_refs
+                                ),
+                                *planning_evidence,
+                                *hold.evidence_refs,
+                            }
+                        )
+                    ),
+                    lower_hold_confirmed=hold.lower_hold_confirmed,
+                )
+            assert latest_qpos is not None
+            if any(
+                float(
+                    abs(
+                        latest_qpos.qpos_by_side[side]
+                        - joint_trajectory.qpos_by_side[side][0]
+                    ).max()
+                )
+                > REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD
+                for side in ("left", "right")
+            ):
+                hold = self.request_hold(
+                    operation=operation,
+                    reason="grasp_path_start_state_drift",
+                )
+                return StationLifecycleActivationEvidence(
+                    succeeded=False,
+                    status="grasp_path_start_state_drift",
+                    lower_operation_id=self.lower_operation_id,
+                    evidence_refs=tuple(
+                        sorted(
+                            {
+                                *cut.evidence_refs,
+                                *latest_qpos.evidence_refs,
+                                *planning_evidence,
+                                *hold.evidence_refs,
+                            }
+                        )
+                    ),
+                    lower_hold_confirmed=hold.lower_hold_confirmed,
+                )
+            if now + float(joint_trajectory.time_from_start_sec[-1]) >= operation.deadline_at:
+                hold = self.request_hold(
+                    operation=operation,
+                    reason="grasp_path_exceeds_operation_deadline",
+                )
+                return StationLifecycleActivationEvidence(
+                    succeeded=False,
+                    status="grasp_path_exceeds_operation_deadline",
+                    lower_operation_id=self.lower_operation_id,
+                    evidence_refs=tuple(sorted({*cut.evidence_refs, *planning_evidence, *hold.evidence_refs})),
+                    lower_hold_confirmed=hold.lower_hold_confirmed,
+                )
         grant_id, grant_hash = _grant_hash(request.skill_execution_grant_id)
         activation = RealAgentMotionActivation(
             operation_id=operation.operation_id,
@@ -320,15 +509,25 @@ class RealAgentPrimitiveSkillLifecycle:
                 if isinstance(self.profile, RealAgentTcpPoseTargetProfile)
                 else 1.0
             ),
+            joint_trajectory=joint_trajectory,
         )
         snapshot = self.port.submit_activation(activation)
+        self._planned_joint_trajectory = joint_trajectory
         self.target_resolution = resolution
         self.target_pose = resolution.target_pose
-        evidence = {
+        activation_evidence = {
             *cut.evidence_refs,
             *resolution.evidence_refs,
-            snapshot.evidence_ref,
+            *planning_evidence,
         }
+        latest_snapshot_ref = snapshot.evidence_ref
+
+        def current_activation_evidence() -> set[str]:
+            return {
+                *activation_evidence,
+                latest_snapshot_ref,
+            }
+
         while float(self.clock()) < operation.deadline_at:
             if cancel_requested():
                 hold = self.request_hold(
@@ -339,11 +538,18 @@ class RealAgentPrimitiveSkillLifecycle:
                     succeeded=False,
                     status="real_primitive_activation_preempted",
                     lower_operation_id=self.lower_operation_id,
-                    evidence_refs=tuple(sorted({*evidence, *hold.evidence_refs})),
+                    evidence_refs=tuple(
+                        sorted(
+                            {
+                                *current_activation_evidence(),
+                                *hold.evidence_refs,
+                            }
+                        )
+                    ),
                     lower_hold_confirmed=hold.lower_hold_confirmed,
                 )
             snapshot = self.port.snapshot()
-            evidence.add(snapshot.evidence_ref)
+            latest_snapshot_ref = snapshot.evidence_ref
             if (
                 snapshot.operation_id == operation.operation_id
                 and snapshot.phase == RealAgentMotionPhase.ACTIVE
@@ -352,7 +558,7 @@ class RealAgentPrimitiveSkillLifecycle:
                     succeeded=True,
                     status="real_primitive_lower_owner_activated",
                     lower_operation_id=self.lower_operation_id,
-                    evidence_refs=tuple(sorted(evidence)),
+                    evidence_refs=tuple(sorted(current_activation_evidence())),
                     lower_hold_confirmed=False,
                 )
             if snapshot.phase in {
@@ -363,7 +569,7 @@ class RealAgentPrimitiveSkillLifecycle:
                     succeeded=False,
                     status="real_primitive_activation_failed_closed",
                     lower_operation_id=self.lower_operation_id,
-                    evidence_refs=tuple(sorted(evidence)),
+                    evidence_refs=tuple(sorted(current_activation_evidence())),
                     lower_hold_confirmed=bool(
                         snapshot.phase == RealAgentMotionPhase.HELD
                         and snapshot.hold_succeeded
@@ -378,7 +584,14 @@ class RealAgentPrimitiveSkillLifecycle:
             succeeded=False,
             status="real_primitive_activation_deadline_exceeded",
             lower_operation_id=self.lower_operation_id,
-            evidence_refs=tuple(sorted({*evidence, *hold.evidence_refs})),
+            evidence_refs=tuple(
+                sorted(
+                    {
+                        *current_activation_evidence(),
+                        *hold.evidence_refs,
+                    }
+                )
+            ),
             lower_hold_confirmed=hold.lower_hold_confirmed,
         )
 
@@ -497,7 +710,19 @@ class RealAgentPrimitiveSkillLifecycle:
                 reason_code="real_primitive_target_not_resolved",
                 evidence_refs={self.port.snapshot().evidence_ref},
             )
-        evidence = set(self.target_resolution.evidence_refs)
+        base_evidence = set(self.target_resolution.evidence_refs)
+        if self._planned_joint_trajectory is not None:
+            base_evidence.update(self._planned_joint_trajectory.evidence_refs)
+        latest_snapshot_ref: str | None = None
+        latest_cut_evidence: tuple[str, ...] = ()
+
+        def current_evidence() -> set[str]:
+            return {
+                *base_evidence,
+                *(() if latest_snapshot_ref is None else (latest_snapshot_ref,)),
+                *latest_cut_evidence,
+            }
+
         stable_count = 0
         last_revision: int | None = None
         latest_cut = None
@@ -505,19 +730,19 @@ class RealAgentPrimitiveSkillLifecycle:
             if cancel_requested():
                 return self._failed_execution(
                     reason_code="real_primitive_cancelled",
-                    evidence_refs=evidence,
+                    evidence_refs=current_evidence(),
                 )
             snapshot = self.port.snapshot()
-            evidence.add(snapshot.evidence_ref)
+            latest_snapshot_ref = snapshot.evidence_ref
             if snapshot.phase == RealAgentMotionPhase.FAULTED:
                 return self._failed_execution(
                     reason_code="real_primitive_lower_fault",
-                    evidence_refs=evidence,
+                    evidence_refs=current_evidence(),
                 )
             if snapshot.phase != RealAgentMotionPhase.ACTIVE:
                 return self._failed_execution(
                     reason_code="real_primitive_lower_not_active",
-                    evidence_refs=evidence,
+                    evidence_refs=current_evidence(),
                 )
             cut = self._latest_measured(
                 now=float(self.clock()),
@@ -536,7 +761,7 @@ class RealAgentPrimitiveSkillLifecycle:
             if cut.revision != last_revision:
                 latest_cut = cut
                 last_revision = cut.revision
-                evidence.update(cut.evidence_refs)
+                latest_cut_evidence = cut.evidence_refs
                 measured_pose = tuple(
                     float(value)
                     for value in pose_matrix_to_xyzquat(
@@ -545,8 +770,19 @@ class RealAgentPrimitiveSkillLifecycle:
                     )
                 )
                 translation, rotation = _pose_error(measured_pose, self.target_pose)
+                planned_trajectory_elapsed = True
+                if self.route.skill_id == GRASP_APPROACH_SKILL_ID_V1:
+                    trajectory = self._planned_joint_trajectory
+                    planned_trajectory_elapsed = bool(
+                        trajectory is not None
+                        and snapshot.activated_at is not None
+                        and float(self.clock())
+                        >= snapshot.activated_at
+                        + float(trajectory.time_from_start_sec[-1])
+                    )
                 if (
                     snapshot.dispatch_count > 0
+                    and planned_trajectory_elapsed
                     and translation
                     <= self.contract_bundle.convergence_profile.translation_tolerance_m
                     and rotation
@@ -562,6 +798,7 @@ class RealAgentPrimitiveSkillLifecycle:
                         operation=operation,
                         reason="real_primitive_terminal_target_reached",
                     )
+                    evidence = current_evidence()
                     evidence.update(hold.evidence_refs)
                     if not hold.lower_hold_confirmed:
                         return StationLifecycleExecutionCompletion(
@@ -587,7 +824,7 @@ class RealAgentPrimitiveSkillLifecycle:
             self.sleep(self.contract_bundle.convergence_profile.poll_interval_sec)
         return self._failed_execution(
             reason_code="real_primitive_deadline_exceeded",
-            evidence_refs=evidence,
+            evidence_refs=current_evidence(),
         )
 
     def close(self) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import MISSING, fields
+from dataclasses import MISSING, fields, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +9,7 @@ import pytest
 from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.real_teleop.agent_motion_port import (
+    RealAgentJointTrajectory,
     RealAgentMotionActivation,
     RealAgentMotionMeasuredPoseCut,
     RealAgentMotionOwnerIdentity,
@@ -189,6 +190,105 @@ def test_owner_activation_builds_through_coupled_target_solver() -> None:
     )
     assert observed.dispatch_count == 1
     assert observed.last_command_at == 1.2
+
+
+def test_preplanned_joint_path_uses_control_clock_and_freezes_inactive_arm() -> None:
+    trajectory = RealAgentJointTrajectory(
+        time_from_start_sec=np.array([0.0, 0.1, 0.2]),
+        qpos_by_side={
+            "left": np.array([[1.0] * 6, [1.0] * 6, [1.0] * 6]),
+            "right": np.array([[0.0] * 6, [0.1] * 6, [0.2] * 6]),
+        },
+        planner_evidence_refs=("urdf-fcl-path:test",),
+    )
+    # The certified grasp path must be consumed directly in Active control.
+    # A dynamic target solve here can monopolize the process long enough to
+    # starve the independent RM65 measurement/force-watchdog threads.
+    builder = _TargetBuilder(fail=True)
+    port = _port(builder)
+    port.publish_measured_qpos_pair(
+        qpos_by_side={
+            "left": trajectory.qpos_by_side["left"][0],
+            "right": trajectory.qpos_by_side["right"][0],
+        },
+        measured_at=1.0,
+        available_at=1.0,
+        source_evidence_refs=("hardware-qpos-cut:preplanned-start",),
+    )
+    port.submit_activation(replace(_activation(), joint_trajectory=trajectory))
+    port.apply_owner_requests(session=_Session(TeleopRunState.ARMED), now=1.0)
+
+    command = port.command_for_observation(
+        TeleopObservation(timestamp=1.15),
+        1.15,
+    )
+
+    assert isinstance(command, TeleopCommand)
+    np.testing.assert_allclose(command.commands["left_arm"].value, 1.0)
+    np.testing.assert_allclose(command.commands["right_arm"].value, 0.15)
+    operation = command.metadata["real_agent_motion_operation"]
+    assert operation["trajectory_sample_index"] == 1
+    assert operation["trajectory_next_sample_index"] == 2
+    assert operation["trajectory_interpolation_alpha"] == pytest.approx(0.5)
+    assert operation["joint_trajectory_hash"] == trajectory.semantic_content_hash
+    assert builder.targets == []
+
+
+def test_preplanned_joint_path_rechecks_start_at_owner_activation() -> None:
+    initial = {
+        "left": np.ones(6, dtype=float),
+        "right": np.zeros(6, dtype=float),
+    }
+    trajectory = RealAgentJointTrajectory(
+        time_from_start_sec=np.array([0.0, 0.1]),
+        qpos_by_side={
+            side: np.stack([qpos, qpos]) for side, qpos in initial.items()
+        },
+        planner_evidence_refs=("urdf-fcl-path:activation-race",),
+    )
+    port = _port()
+    port.publish_measured_qpos_pair(
+        qpos_by_side=initial,
+        measured_at=1.0,
+        available_at=1.0,
+        source_evidence_refs=("hardware-qpos-cut:planned-start",),
+    )
+    port.submit_activation(replace(_activation(), joint_trajectory=trajectory))
+    moved = {side: qpos.copy() for side, qpos in initial.items()}
+    moved["right"][0] += 0.02
+    port.publish_measured_qpos_pair(
+        qpos_by_side=moved,
+        measured_at=1.01,
+        available_at=1.01,
+        source_evidence_refs=("hardware-qpos-cut:changed-before-activation",),
+    )
+    session = _Session(TeleopRunState.ARMED)
+
+    snapshot = port.apply_owner_requests(session=session, now=1.02)
+
+    assert snapshot.phase == RealAgentMotionPhase.HELD
+    assert snapshot.dispatch_count == 0
+    assert snapshot.hold_succeeded is True
+    assert snapshot.hold_reason == (
+        "preplanned trajectory start changed before activation"
+    )
+    assert len(session.holds) == 1
+
+
+def test_preplanned_joint_path_cannot_move_unauthorized_inactive_arm() -> None:
+    trajectory = RealAgentJointTrajectory(
+        time_from_start_sec=np.array([0.0, 0.1]),
+        qpos_by_side={
+            "left": np.array([[0.0] * 6, [0.01] * 6]),
+            "right": np.array([[0.0] * 6, [0.01] * 6]),
+        },
+        planner_evidence_refs=("urdf-fcl-path:invalid-inactive-motion",),
+    )
+
+    with pytest.raises(ValueError, match="unauthorized inactive arm"):
+        _port().submit_activation(
+            replace(_activation(), joint_trajectory=trajectory)
+        )
 
 
 def test_owner_activation_converts_tcp_target_before_solver_boundary() -> None:
