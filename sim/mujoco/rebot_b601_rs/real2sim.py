@@ -15,6 +15,33 @@ from robot_motion.rebot_b601_rs.mit import _six_finite, _six_non_negative
 
 
 @dataclass(frozen=True)
+class B601SimStartupProfile:
+    """Explicit simulation lock gains and admission envelope, not hardware defaults."""
+
+    lock_kp_nm_per_rad: tuple[float, ...]
+    lock_kd_nm_s_per_rad: tuple[float, ...]
+    freeze_sec: float = 0.1
+    rise_time_sec: float = 0.1
+    max_lock_error_rad: float = 0.02
+    settled_velocity_rad_s: float = 0.02
+
+    def __post_init__(self) -> None:
+        for name in ("lock_kp_nm_per_rad", "lock_kd_nm_s_per_rad"):
+            object.__setattr__(
+                self, name, _six_non_negative(getattr(self, name), name=name)
+            )
+        for name in (
+            "freeze_sec",
+            "rise_time_sec",
+            "max_lock_error_rad",
+            "settled_velocity_rad_s",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+
+
+@dataclass(frozen=True)
 class B601Real2SimControllerProfile:
     """Host-held feedforward plus local zero-reference velocity damping.
 

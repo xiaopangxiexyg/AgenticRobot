@@ -27,7 +27,7 @@ from sim.contracts import TimingSpec
 from sim.mujoco.viewer import MujocoPassiveViewerSession
 
 from .mit_driver import B601MujocoEffortDriver, default_b601_mit_profile
-from .real2sim import B601Real2SimControllerProfile
+from .real2sim import B601Real2SimControllerProfile, B601SimStartupProfile
 from .scene import B601_RS_PHYSICS_HZ, build_b601_mujoco_scene
 
 DEFAULT_HAPTIC_ANCHOR_QPOS = (0.15, 1.0, 1.1, 0.1, -0.15, 0.2)
@@ -87,6 +87,18 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=20.0,
         help="Host torque rate for --real2sim-controller only.",
+    )
+    parser.add_argument(
+        "--startup-lock-kp",
+        nargs=6,
+        type=float,
+        help="Explicit six-joint simulation lock Kp; requires Kd and real2sim.",
+    )
+    parser.add_argument(
+        "--startup-lock-kd",
+        nargs=6,
+        type=float,
+        help="Explicit six-joint simulation lock Kd.",
     )
     return parser
 
@@ -162,6 +174,7 @@ def run_haptic_fixture_demo(
     viewer: bool = False,
     real2sim_controller: bool = False,
     host_hz: float = 20.0,
+    startup_profile: B601SimStartupProfile | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
@@ -171,6 +184,8 @@ def run_haptic_fixture_demo(
         )
     if not isinstance(viewer, bool):
         raise TypeError("viewer must be a bool")
+    if startup_profile is not None and not real2sim_controller:
+        raise ValueError("startup_profile requires real2sim_controller")
     duration = float(duration_sec)
     if not math.isfinite(duration) or duration <= 0.0:
         raise ValueError("duration_sec must be finite and positive")
@@ -296,6 +311,7 @@ def run_haptic_fixture_demo(
         real2sim_profile=(
             B601Real2SimControllerProfile() if real2sim_controller else None
         ),
+        startup_profile=startup_profile,
     )
     driver.reset(initial_qpos)
 
@@ -330,6 +346,13 @@ def run_haptic_fixture_demo(
     minimum_rotation_metric = initial_rotation_metric
     final_tick = None
     viewer_closed_early = False
+    phase_transitions = [
+        {
+            "phase": driver.execution_metadata["sim_control_phase"],
+            "time_sec": 0.0,
+            "reason": None,
+        }
+    ]
     try:
         for step in range(requested_steps):
             reference = None
@@ -390,6 +413,17 @@ def run_haptic_fixture_demo(
                     fixture_limited_ticks += 1
 
             final_tick = driver.step_physics(reference)
+            if (
+                not phase_transitions
+                or phase_transitions[-1]["phase"] != final_tick.control_phase
+            ):
+                phase_transitions.append(
+                    {
+                        "phase": final_tick.control_phase,
+                        "time_sec": final_tick.physics_time_sec,
+                        "reason": final_tick.phase_reason,
+                    }
+                )
             if final_tick.plant_advanced:
                 advanced_ticks += 1
             if (
@@ -440,6 +474,7 @@ def run_haptic_fixture_demo(
     run_completed = advanced_ticks == requested_steps and not viewer_closed_early
     common_pass = bool(
         run_completed
+        and final_tick.control_phase == "ACTIVE"
         and not final_tick.driver_faulted
         and final_tick.state_valid
         and final_tick.state_within_limits
@@ -532,6 +567,8 @@ def run_haptic_fixture_demo(
             ),
             "viewer_closed_early": viewer_closed_early,
             "driver_faulted": final_tick.driver_faulted,
+            "phase_transitions": phase_transitions,
+            "final_control_phase": final_tick.control_phase,
             "fault_reason": final_tick.fault_reason,
             "state_valid": final_tick.state_valid,
             "state_within_limits": final_tick.state_within_limits,
@@ -571,7 +608,21 @@ def run_haptic_fixture_demo(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    startup = None
+    if args.startup_lock_kp is not None or args.startup_lock_kd is not None:
+        if (
+            not args.real2sim_controller
+            or args.startup_lock_kp is None
+            or args.startup_lock_kd is None
+        ):
+            parser.error(
+                "startup lock requires --real2sim-controller and both --startup-lock-kp/--startup-lock-kd"
+            )
+        startup = B601SimStartupProfile(
+            tuple(args.startup_lock_kp), tuple(args.startup_lock_kd)
+        )
     code, payload = run_haptic_fixture_demo(
         source_root=args.rebot_source_root,
         fixture_name=args.fixture,
@@ -579,6 +630,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         viewer=bool(args.viewer),
         real2sim_controller=args.real2sim_controller,
         host_hz=args.host_hz,
+        startup_profile=startup,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return code

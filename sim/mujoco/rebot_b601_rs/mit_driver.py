@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 
 import numpy as np
@@ -23,7 +23,7 @@ from robot_motion.rebot_b601_rs.model import (
 from sim.contracts import TimingSpec
 from sim.mujoco.scene import MujocoScene
 
-from .real2sim import B601Real2SimControllerProfile
+from .real2sim import B601Real2SimControllerProfile, B601SimStartupProfile
 from .scene import (
     _B601_RS_GRIPPER_LOCK_SOLREF,
     B601_RS_COMMAND_HZ,
@@ -157,6 +157,10 @@ class B601EffortTick:
     plant_advanced: bool
     host_torque_updated: bool = False
     driver_damping_torque_nm: tuple[float, ...] = _ZERO_SIX
+    host_command_torque_nm: tuple[float, ...] = _ZERO_SIX
+    driver_position_torque_nm: tuple[float, ...] = _ZERO_SIX
+    control_phase: str = "ACTIVE"
+    phase_reason: str | None = None
 
 
 class B601MujocoEffortDriver:
@@ -184,6 +188,7 @@ class B601MujocoEffortDriver:
         state_limit_tolerance_rad: float = 1e-4,
         gravity_parity_tolerance_nm: float = 1e-9,
         real2sim_profile: B601Real2SimControllerProfile | None = None,
+        startup_profile: B601SimStartupProfile | None = None,
     ) -> None:
         if not isinstance(scene, MujocoScene):
             raise TypeError("scene must be a MujocoScene")
@@ -201,6 +206,12 @@ class B601MujocoEffortDriver:
                     "real2sim_profile requires explicit gravity compensation"
                 )
         self.real2sim_profile = real2sim_profile
+        if startup_profile is not None:
+            if not isinstance(startup_profile, B601SimStartupProfile):
+                raise TypeError("startup_profile must be a B601SimStartupProfile")
+            if real2sim_profile is None:
+                raise ValueError("startup_profile requires real2sim_profile")
+        self.startup_profile = startup_profile
         if real2sim_profile is not None:
             self.execution_mode = "rebot_b601_rs_mujoco_host_zoh_local_damping"
             self.robot_dynamics = "unchanged_urdf_unidentified_motor_plant"
@@ -401,7 +412,22 @@ class B601MujocoEffortDriver:
                 ),
                 "metadata": dict(self.profile.metadata),
             },
-            "final_effort_conditioning": "clip_then_slew_then_clip",
+            "final_effort_conditioning": (
+                "clip_then_slew_then_clip"
+                if self.real2sim_profile is None
+                else "host_clip_slew_clip_then_local_feedback_then_total_clip"
+            ),
+            "sim_control_phase": self._control_phase,
+            "startup_profile": None
+            if self.startup_profile is None
+            else asdict(self.startup_profile),
+            "startup_anchor_qpos_rad": tuple(float(v) for v in self._lock_anchor),
+            "startup_model": (
+                "ideal_complete_send_live_state_only"
+                if self.startup_profile is not None
+                else None
+            ),
+            "protective_hold_model": "live_feedback_only_no_cached_transport_recovery",
             "startup_torque_seed": (
                 "controller_gravity_before_first_step"
                 if self.real2sim_profile is not None
@@ -459,6 +485,12 @@ class B601MujocoEffortDriver:
         self._last_receive_timestamp_sec = None
         self._fault_reason = None
         self._host_breakdown = None
+        self._control_phase = "ENABLED_UNARMED" if self.startup_profile else "ACTIVE"
+        self._phase_reason = None
+        self._lock_anchor = qpos.copy()
+        self._lock_fraction = 1.0 if self.startup_profile else 0.0
+        self._lock_started_at = None
+        self._ramp_started_at = None
         self._verify_gravity_configuration(qpos)
         self._verified_gravity_mps2 = np.asarray(
             self.scene.model.opt.gravity,
@@ -469,6 +501,8 @@ class B601MujocoEffortDriver:
         if np.any(np.abs(initial_torque) > torque_limit + 1e-12):
             raise ValueError("gravity torque exceeds the configured effort limit")
         self._last_applied_torque = initial_torque.copy()
+        self._host_command_torque = initial_torque.copy()
+        self._host_command_time_sec = 0.0
         self.scene.data.ctrl[self._actuator_ids] = initial_torque
         self.scene.forward()
 
@@ -487,15 +521,21 @@ class B601MujocoEffortDriver:
         qpos = self._measured_qpos()
         qvel = self._measured_qvel()
         qacc = self._measured_qacc()
+        if self.startup_profile is not None and due and self._fault_reason is None:
+            self._advance_startup(qpos, qvel)
 
         if reference is not None:
             if not isinstance(reference, B601MitReference):
                 raise TypeError("reference must be a B601MitReference")
             if self._fault_reason is not None:
                 rejection_reason = "driver_fault_latched"
+            elif self._control_phase in {"PROTECTIVE_HOLD", "DISABLED"}:
+                rejection_reason = "lifecycle_latched"
             elif not reference.valid:
                 rejection_reason = "invalid_sample"
                 self._deactivate_reference(qpos)
+                if self.startup_profile is not None:
+                    self.request_protective_hold("invalid_sample")
             elif reference.frame_id != B601_RS_JOINT_MIT_FRAME:
                 # A frame mismatch on the intended wired path is a local
                 # configuration/command-contract error, not packet jitter.
@@ -503,6 +543,8 @@ class B601MujocoEffortDriver:
                 # the backend-owned gravity and zero-velocity damping fallback.
                 rejection_reason = "unexpected_frame"
                 self._deactivate_reference(qpos)
+                if self.startup_profile is not None:
+                    self.request_protective_hold("unexpected_frame")
             elif not due:
                 rejection_reason = "command_before_deadline"
             else:
@@ -526,6 +568,8 @@ class B601MujocoEffortDriver:
             and active_age + 1e-12 >= self.command_timeout_sec
         ):
             self._deactivate_reference(qpos)
+            if self.startup_profile is not None:
+                self.request_protective_hold("reference_timeout")
             reference_timed_out = True
             active_age = None
 
@@ -544,17 +588,49 @@ class B601MujocoEffortDriver:
         plant_advanced = False
         host_torque_updated = False
         driver_damping = np.zeros(6)
+        driver_position = np.zeros(6)
         active_reference = self._active_reference
 
-        if self._fault_reason is None:
+        if self._fault_reason is None and self._control_phase != "DISABLED":
             control_reference = active_reference or self._hold_reference()
             try:
                 # A revoked reference invalidates the host cache even off cadence.
                 # Ideal mode keeps its original physics-rate software controller.
                 if self.real2sim_profile is None or due or self._host_breakdown is None:
+                    compute_profile = self.profile
+                    if self.real2sim_profile is not None:
+                        if self._control_phase == "PROTECTIVE_HOLD":
+                            compute_profile = replace(
+                                self.profile,
+                                position_kp_nm_per_rad=_ZERO_SIX,
+                                damping_kd_nm_s_per_rad=tuple(
+                                    0.0 if kd > 0.0 else 1.0
+                                    for kd in self.real2sim_profile.driver_kd_nm_s_per_rad
+                                ),
+                            )
+                        elif self._lock_fraction > 0.0:
+                            active_weight = 1.0 - self._lock_fraction
+                            compute_profile = replace(
+                                self.profile,
+                                position_kp_nm_per_rad=tuple(
+                                    active_weight * v
+                                    for v in self.profile.position_kp_nm_per_rad
+                                ),
+                                damping_kd_nm_s_per_rad=tuple(
+                                    active_weight * v
+                                    for v in self.profile.damping_kd_nm_s_per_rad
+                                ),
+                            )
+                            control_reference = replace(
+                                control_reference,
+                                joint_torque_overlay_nm=tuple(
+                                    active_weight * v
+                                    for v in control_reference.joint_torque_overlay_nm
+                                ),
+                            )
                     self._host_breakdown = compute_b601_mit_torque(
                         control_reference,
-                        self.profile,
+                        compute_profile,
                         measured_qpos_rad=qpos,
                         measured_qvel_rad_s=qvel,
                         gravity_torque_nm=self._controller_gravity(qpos, qvel),
@@ -562,38 +638,70 @@ class B601MujocoEffortDriver:
                     host_torque_updated = True
                 breakdown = self._host_breakdown
                 requested = np.asarray(breakdown.requested_torque_nm, dtype=float)
+                torque_limit = np.asarray(self.profile.max_abs_torque_nm, dtype=float)
                 if self.real2sim_profile is not None:
+                    if host_torque_updated:
+                        host_clipped = np.clip(requested, -torque_limit, torque_limit)
+                        torque_limited = not np.array_equal(requested, host_clipped)
+                        dt = self.physics_time_sec - self._host_command_time_sec
+                        maximum_delta = (
+                            np.asarray(self.profile.max_torque_rate_nm_s) * dt
+                        )
+                        self._host_command_torque = np.clip(
+                            self._host_command_torque
+                            + np.clip(
+                                host_clipped - self._host_command_torque,
+                                -maximum_delta,
+                                maximum_delta,
+                            ),
+                            -torque_limit,
+                            torque_limit,
+                        )
+                        self._host_command_time_sec = self.physics_time_sec
+                        slew_limited = not np.array_equal(
+                            host_clipped, self._host_command_torque
+                        )
                     driver_damping = (
                         -np.asarray(
                             self.real2sim_profile.driver_kd_nm_s_per_rad,
                         )
                         * qvel
                     )
-                    requested = requested + driver_damping
-                torque_limit = np.asarray(
-                    self.profile.max_abs_torque_nm,
-                    dtype=float,
-                )
+                    if self.startup_profile is not None and self._lock_fraction > 0.0:
+                        weight = self._lock_fraction
+                        driver_position = (
+                            weight
+                            * np.asarray(self.startup_profile.lock_kp_nm_per_rad)
+                            * (self._lock_anchor - qpos)
+                        )
+                        kd = np.asarray(self.real2sim_profile.driver_kd_nm_s_per_rad)
+                        kd = kd + weight * (
+                            np.asarray(self.startup_profile.lock_kd_nm_s_per_rad) - kd
+                        )
+                        driver_damping = -kd * qvel
+                    # Local motor feedback bypasses the host feedforward slew.
+                    requested = (
+                        self._host_command_torque + driver_damping + driver_position
+                    )
                 clipped = np.clip(requested, -torque_limit, torque_limit)
-                torque_limited = not np.array_equal(requested, clipped)
-                maximum_delta = (
-                    np.asarray(self.profile.max_torque_rate_nm_s, dtype=float)
-                    * self.timing.physics_timestep_sec
-                )
-                delta = np.clip(
-                    clipped - self._last_applied_torque,
-                    -maximum_delta,
-                    maximum_delta,
-                )
-                applied_torque = np.clip(
-                    self._last_applied_torque + delta,
-                    -torque_limit,
-                    torque_limit,
-                )
-                slew_limited = not np.array_equal(
-                    clipped,
-                    applied_torque,
-                )
+                torque_limited |= not np.array_equal(requested, clipped)
+                applied_torque = clipped
+                if self.real2sim_profile is None:
+                    maximum_delta = (
+                        np.asarray(self.profile.max_torque_rate_nm_s, dtype=float)
+                        * self.timing.physics_timestep_sec
+                    )
+                    delta = np.clip(
+                        clipped - self._last_applied_torque,
+                        -maximum_delta,
+                        maximum_delta,
+                    )
+                    applied_torque = np.clip(
+                        self._last_applied_torque + delta,
+                        -torque_limit,
+                        torque_limit,
+                    )
+                    slew_limited = not np.array_equal(clipped, applied_torque)
                 if not np.all(np.isfinite(applied_torque)):
                     self._fault_reason = "non_finite_computed_torque"
             except (ArithmeticError, RuntimeError, ValueError) as exc:
@@ -669,6 +777,78 @@ class B601MujocoEffortDriver:
             plant_advanced=plant_advanced,
             host_torque_updated=host_torque_updated,
             driver_damping_torque_nm=tuple(float(v) for v in driver_damping),
+            host_command_torque_nm=tuple(
+                float(v)
+                for v in (
+                    self._host_command_torque
+                    if self.real2sim_profile is not None
+                    else applied_torque
+                )
+            ),
+            driver_position_torque_nm=tuple(float(v) for v in driver_position),
+            control_phase=self._control_phase,
+            phase_reason=self._phase_reason,
+        )
+
+    def request_protective_hold(self, reason: str = "operator_stop") -> None:
+        """Latch a live-feedback, six-axis draggable simulation hold.
+
+        Non-finite plant faults still freeze the existing simulator; no cached
+        sensor/transport recovery is claimed here. Reset explicitly rearms.
+        """
+        if self.real2sim_profile is None:
+            raise ValueError("protective hold requires real2sim_profile")
+        if self._control_phase == "DISABLED":
+            return
+        self._control_phase = "PROTECTIVE_HOLD"
+        self._phase_reason = reason
+        self._lock_fraction = 0.0
+        self._deactivate_reference(self._measured_qpos())
+
+    def request_disable(self) -> None:
+        """Explicitly remove all six simulated actuator efforts until reset."""
+        if self.real2sim_profile is None:
+            raise ValueError("disable lifecycle requires real2sim_profile")
+        self._control_phase = "DISABLED"
+        self._phase_reason = "explicit_disable"
+        self._lock_fraction = 0.0
+        self._deactivate_reference(self._measured_qpos())
+        self._host_command_torque[:] = 0.0
+        self._last_applied_torque[:] = 0.0
+        self.scene.data.ctrl[self._actuator_ids] = 0.0
+
+    def _advance_startup(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
+        profile = self.startup_profile
+        if self._control_phase in {"ACTIVE", "PROTECTIVE_HOLD", "DISABLED"}:
+            return
+        if self._control_phase == "ENABLED_UNARMED":
+            self._control_phase = "LOCKING"
+            self._lock_started_at = self.physics_time_sec
+            return
+        if np.any(np.abs(qpos - self._lock_anchor) > profile.max_lock_error_rad):
+            self.request_protective_hold("startup_lock_displacement")
+            return
+        if self._control_phase == "LOCKING":
+            self._control_phase = "LOCKED"
+            return
+        if self._control_phase == "LOCKED":
+            if self.physics_time_sec - self._lock_started_at < profile.freeze_sec:
+                return
+            if np.any(np.abs(qvel) > profile.settled_velocity_rad_s):
+                self.request_protective_hold("startup_not_settled")
+                return
+            self._control_phase = "GRAVITY_RAMP"
+            self._ramp_started_at = self.physics_time_sec
+            return
+        elapsed = self.physics_time_sec - self._ramp_started_at
+        fraction = max(
+            0.0, min(1.0, (elapsed - profile.rise_time_sec) / profile.rise_time_sec)
+        )
+        self._lock_fraction = 1.0 - fraction
+        self._control_phase = (
+            "ACTIVE"
+            if fraction >= 1.0
+            else ("HANDOFF" if elapsed >= profile.rise_time_sec else "GRAVITY_RAMP")
         )
 
     def _verify_effort_scene(self) -> np.ndarray:

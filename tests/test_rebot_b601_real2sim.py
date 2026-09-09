@@ -8,7 +8,10 @@ from robot_motion.rebot_b601_rs import B601MitReference, B601PinocchioModel
 from sim.contracts import TimingSpec
 from sim.mujoco.rebot_b601_rs import build_b601_mujoco_scene
 from sim.mujoco.rebot_b601_rs.mit_driver import B601MujocoEffortDriver
-from sim.mujoco.rebot_b601_rs.real2sim import B601Real2SimControllerProfile
+from sim.mujoco.rebot_b601_rs.real2sim import (
+    B601Real2SimControllerProfile,
+    B601SimStartupProfile,
+)
 
 pytestmark = [pytest.mark.contract, pytest.mark.optional]
 SOURCE = Path(__file__).resolve().parents[1] / "hardware/reBotArm_control_py"
@@ -173,3 +176,145 @@ def test_opt_in_fixture_preserves_effect_and_guard_results(host_hz, expected_cod
     else:
         assert report["simulation_acceptance"]["advanced_physics_ticks"] == 1500
         assert report["effect_acceptance"]["passed"]
+
+
+def test_local_feedback_bypasses_host_slew_but_retains_total_limit(driver):
+    driver.profile = replace(driver.profile, max_torque_rate_nm_s=(1e-6,) * 6)
+    driver.step_physics(reference(driver))
+    driver.scene.data.qvel[driver._qvel_addresses[0]] = 0.01
+    driver.scene.forward()
+    tick = driver.step_physics()
+    assert not tick.host_torque_updated
+    assert tick.driver_damping_torque_nm[0] == pytest.approx(-0.002)
+    assert tick.applied_torque_nm[0] - tick.host_command_torque_nm[0] == pytest.approx(
+        -0.002
+    )
+    assert abs(tick.driver_damping_torque_nm[0]) > 100 * 1e-6 * 0.001
+
+
+@pytest.fixture
+def startup_driver(driver):
+    # Raw model equilibrium isolates lifecycle from unidentified gravity biases.
+    controller = replace(
+        driver.real2sim_profile,
+        gravity_joint_scales=(1.0,) * 6,
+        gravity_joint_bias_nm=(0.0,) * 6,
+    )
+    return B601MujocoEffortDriver(
+        driver.scene,
+        driver.pinocchio_model,
+        timing=driver.timing,
+        enable_gravity_compensation=True,
+        real2sim_profile=controller,
+        startup_profile=B601SimStartupProfile(
+            lock_kp_nm_per_rad=(2.0,) * 6,
+            lock_kd_nm_s_per_rad=controller.driver_kd_nm_s_per_rad,
+        ),
+    )
+
+
+def test_startup_reaches_active_with_full_gravity_from_first_lock(startup_driver):
+    driver = startup_driver
+    assert driver.execution_metadata["sim_control_phase"] == "ENABLED_UNARMED"
+    phases = []
+    for i in range(451):
+        tick = driver.step_physics(reference(driver, i) if driver.command_due else None)
+        assert not tick.driver_faulted
+        if not phases or phases[-1] != tick.control_phase:
+            phases.append(tick.control_phase)
+        if tick.control_phase == "LOCKING":
+            np.testing.assert_allclose(
+                tick.host_command_torque_nm,
+                driver._gravity_torque(np.array(tick.control_qpos)),
+                atol=1e-9,
+            )
+    assert phases == ["LOCKING", "LOCKED", "GRAVITY_RAMP", "HANDOFF", "ACTIVE"]
+    np.testing.assert_allclose(tick.driver_position_torque_nm, np.zeros(6))
+
+
+def test_lock_uses_current_anchor_not_active_reference(startup_driver):
+    driver = startup_driver
+    command = reference(driver)
+    shifted = list(command.qpos_rad)
+    shifted[0] += 0.1
+    driver.step_physics(replace(command, qpos_rad=tuple(shifted)))
+    driver.scene.data.qpos[driver._qpos_addresses[0]] += 0.001
+    driver.scene.forward()
+    tick = driver.step_physics()
+    assert tick.control_phase == "LOCKING"
+    assert tick.driver_position_torque_nm[0] == pytest.approx(-0.002)
+    assert tick.torque_breakdown.position_torque_nm == (0.0,) * 6
+
+
+def test_lock_excursion_enters_latched_draggable_hold(startup_driver):
+    driver = startup_driver
+    driver.step_physics(reference(driver))
+    driver.scene.data.qpos[driver._qpos_addresses[0]] += 0.03
+    driver.scene.forward()
+    # Reach the next host admission cut without fabricating a new reference.
+    for _ in range(50):
+        tick = driver.step_physics()
+        if tick.driver_faulted:
+            break
+    assert not tick.driver_faulted
+    assert tick.control_phase == "PROTECTIVE_HOLD"
+    assert tick.phase_reason == "startup_lock_displacement"
+    np.testing.assert_allclose(tick.driver_position_torque_nm, np.zeros(6))
+    assert (
+        driver.step_physics(reference(driver, 2)).rejection_reason
+        == "lifecycle_latched"
+    )
+
+
+def test_protective_hold_and_explicit_disable_remain_latched(startup_driver):
+    driver = startup_driver
+    driver.step_physics(reference(driver))
+    driver.request_protective_hold("duration_complete")
+    tick = driver.step_physics(reference(driver, 1))
+    assert tick.control_phase == "PROTECTIVE_HOLD"
+    assert tick.rejection_reason == "lifecycle_latched"
+    assert any(abs(v) > 0.1 for v in tick.applied_torque_nm)
+    np.testing.assert_allclose(tick.torque_breakdown.position_torque_nm, np.zeros(6))
+    np.testing.assert_allclose(tick.driver_position_torque_nm, np.zeros(6))
+    driver.request_disable()
+    driver.request_protective_hold()
+    tick = driver.step_physics(reference(driver, 2))
+    assert tick.control_phase == "DISABLED"
+    assert tick.rejection_reason == "lifecycle_latched"
+    np.testing.assert_allclose(tick.applied_torque_nm, np.zeros(6))
+    driver.reset()
+    assert driver.execution_metadata["sim_control_phase"] == "ENABLED_UNARMED"
+
+
+def test_startup_fixture_reports_protective_hold_as_not_accepted():
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+
+    code, report = run_haptic_fixture_demo(
+        source_root=SOURCE,
+        fixture_name="pose-6d",
+        real2sim_controller=True,
+        host_hz=500.0,
+        startup_profile=B601SimStartupProfile(
+            lock_kp_nm_per_rad=(2.0,) * 6,
+            lock_kd_nm_s_per_rad=B601Real2SimControllerProfile().driver_kd_nm_s_per_rad,
+        ),
+    )
+    acceptance = report["simulation_acceptance"]
+    assert code == 3
+    assert not acceptance["passed"]
+    assert acceptance["run_completed"]
+    assert not acceptance["driver_faulted"]
+    assert acceptance["final_control_phase"] == "PROTECTIVE_HOLD"
+    assert acceptance["phase_transitions"][-1]["reason"] == "startup_not_settled"
+
+
+def test_bad_reference_during_lock_cannot_rearm_it(startup_driver):
+    driver = startup_driver
+    driver.step_physics(reference(driver))
+    tick = driver.step_physics(reference(driver, 1, "wrong/frame"))
+    assert tick.control_phase == "PROTECTIVE_HOLD"
+    assert tick.driver_position_torque_nm == (0.0,) * 6
+    assert (
+        driver.step_physics(reference(driver, 2)).rejection_reason
+        == "lifecycle_latched"
+    )
