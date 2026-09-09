@@ -365,6 +365,9 @@ def run_haptic_fixture_demo(
     next_sequence = 0
     command_count = 0
     advanced_ticks = 0
+    power_channels: dict[str, dict[str, float | int]] = {}
+    held_nominal_damping = np.zeros(6)
+    sampled_damping_peak_power = 0.0
     fixture_limited_ticks = 0
     overlay_limited_ticks = 0
     torque_limited_ticks = 0
@@ -408,6 +411,21 @@ def run_haptic_fixture_demo(
                     qvel_rad_s=qvel,
                 )
                 timestamp = driver.physics_time_sec
+                if fixture_name in POSE_FIXTURES:
+                    # Diagnostic only: unclipped -J.T D J dq, sampled and held
+                    # at the host rate. It is not a decomposition of the final
+                    # limited/slewed actuator force and never enters control.
+                    jacobian = model.arm_jacobian(qpos)
+                    damping_diagonal = np.asarray((
+                        *fixture.translational_damping_n_s_per_m,
+                        *fixture.rotational_damping_nm_s_per_rad,
+                    ))
+                    held_nominal_damping = -jacobian.T @ (
+                        damping_diagonal * (jacobian @ qvel)
+                    )
+                    sampled_damping_peak_power = max(
+                        sampled_damping_peak_power, float(held_nominal_damping @ qvel)
+                    )
                 reference = B601MitReference(
                     sequence=next_sequence,
                     source_timestamp_sec=timestamp,
@@ -461,6 +479,22 @@ def run_haptic_fixture_demo(
                 )
             if final_tick.plant_advanced:
                 advanced_ticks += 1
+                if (
+                    final_tick.control_phase == "ACTIVE"
+                    and not final_tick.driver_faulted
+                ):
+                    channels = {
+                        "applied_total": final_tick.applied_torque_nm,
+                        "nominal_motor_local_damping": final_tick.driver_damping_torque_nm,
+                    }
+                    if fixture_name in POSE_FIXTURES:
+                        channels["held_nominal_cartesian_damping"] = held_nominal_damping
+                    for name, torque in channels.items():
+                        _accumulate_power(
+                            power_channels, name,
+                            float(np.dot(torque, final_tick.control_qvel)),
+                            driver.timing.physics_timestep_sec,
+                        )
             if (
                 final_tick.torque_breakdown is not None
                 and final_tick.torque_breakdown.overlay_limited
@@ -591,6 +625,18 @@ def run_haptic_fixture_demo(
             "minimum_metric": minimum_metric,
             "maximum_metric": maximum_metric,
         },
+        "power_diagnostics": {
+            "quadrature": "left_rectangle_tau_dot_control_qvel_times_physics_dt",
+            "scope": "ACTIVE_nonfaulted_advanced_ticks_only",
+            "terminal_fault_tick_excluded": final_tick.driver_faulted,
+            "positive_work_means": "mechanical_energy_delivered_to_arm",
+            "nominal_damping_scope": "pose_fixture_unclipped_before_startup_blending_host_hold",
+            "local_damping_scope": "pre_total_actuator_saturation_component_not_actual_split",
+            "nominal_sampled_peak_power_w": sampled_damping_peak_power,
+            "channels": power_channels,
+            "passivity_claim": False,
+            "hardware_claim": False,
+        },
         "simulation_acceptance": {
             "passed": accepted,
             "run_completed": run_completed,
@@ -640,6 +686,22 @@ def run_haptic_fixture_demo(
         ),
     }
     return (0 if accepted else 3), payload
+
+
+def _accumulate_power(
+    channels: dict[str, dict[str, float | int]], name: str, power_w: float, dt: float,
+) -> None:
+    """Keep signed work separate from positive delivery and absorption magnitudes."""
+    record = channels.setdefault(name, {
+        "sample_count": 0, "net_work_j": 0.0,
+        "delivered_work_j": 0.0, "absorbed_work_j": 0.0,
+        "peak_positive_power_w": 0.0,
+    })
+    record["sample_count"] += 1
+    record["net_work_j"] += power_w * dt
+    record["delivered_work_j"] += max(0.0, power_w) * dt
+    record["absorbed_work_j"] += max(0.0, -power_w) * dt
+    record["peak_positive_power_w"] = max(record["peak_positive_power_w"], power_w)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

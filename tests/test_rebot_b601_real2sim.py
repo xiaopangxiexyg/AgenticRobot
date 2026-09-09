@@ -478,3 +478,45 @@ def test_long_run_clock_roundoff_does_not_allow_foreign_step(startup_driver):
     tick = driver.step_physics()
     assert tick.fault_reason == "physics_clock_desynchronized"
     assert not tick.plant_advanced
+
+
+def test_power_diagnostic_separates_delivered_and_absorbed_work():
+    from sim.mujoco.rebot_b601_rs.haptic_demo import _accumulate_power
+
+    channels = {}
+    _accumulate_power(channels, "probe", -2.0, 0.1)
+    _accumulate_power(channels, "probe", 3.0, 0.1)
+    r = channels["probe"]
+    assert r["sample_count"] == 2
+    assert r["net_work_j"] == pytest.approx(0.1)
+    assert r["delivered_work_j"] == pytest.approx(0.3)
+    assert r["absorbed_work_j"] == pytest.approx(0.2)
+    assert r["peak_positive_power_w"] == 3.0
+
+
+@pytest.mark.parametrize("host_hz, expected_code", [(125.0, 3), (500.0, 0)])
+def test_power_observer_exposes_held_damping_without_changing_acceptance(host_hz, expected_code):
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+
+    code, report = run_haptic_fixture_demo(
+        source_root=SOURCE, fixture_name="pose-6d", host_hz=host_hz,
+        real2sim_controller=True,
+        startup_profile=B601SimStartupProfile(
+            lock_kp_nm_per_rad=(50, 150, 150, 50, 50, 50),
+            lock_kd_nm_s_per_rad=(3, 10, 10, 5, 4, 4),
+        ),
+    )
+    assert code == expected_code
+    diagnostic = report["power_diagnostics"]
+    assert not diagnostic["passivity_claim"]
+    assert diagnostic["nominal_sampled_peak_power_w"] <= 1e-12
+    channels = diagnostic["channels"]
+    assert channels["nominal_motor_local_damping"]["delivered_work_j"] == 0.0
+    for record in channels.values():
+        assert record["sample_count"] > 0
+        assert record["net_work_j"] == pytest.approx(
+            record["delivered_work_j"] - record["absorbed_work_j"]
+        )
+    if host_hz == 125.0:
+        # Each host sample is dissipative; the held torque need not stay so.
+        assert channels["held_nominal_cartesian_damping"]["delivered_work_j"] > 0.0

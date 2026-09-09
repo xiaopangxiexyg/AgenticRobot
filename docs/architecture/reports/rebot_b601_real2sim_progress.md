@@ -292,3 +292,45 @@ printf '%s\n' 'shell remains active'
 验证：上述七个 B601/边界测试文件 **131 passed**（35.83 s）；Ruff、资源 audit、
 `git diff --check` 通过。新增倍率非法值、CLI 传递、零增益不冒充效果验收、墙约束，
 以及长时正常时钟/外部一步污染回归。10 秒 6D CLI 实验为独立的离线效果证据。
+
+## M1 采样保持功率诊断
+
+基线 `e81dc0070fc07f6ace81e1864a7d24241209b89d`；后继分支
+`codex/b601-real2sim-energy-diagnostics`。现有 demo JSON 增加 `power_diagnostics`，
+不新增入口、控制增益或驱动器状态，也不改变任何命令或验收判定。
+
+统计仅包含 ACTIVE、确实推进且未 fault 的 physics tick；末次 fault tick 排除并显式标记。
+使用步前速度和该步实际 actuator force 的左矩形积分 `sum(tau · dq * dt)`，记录净功、
+正功、吸收功的正幅值、峰值正功率及样本数。只读对照通道为：
+
+- `applied_total`：实际执行器总力矩，不把其正功直接判作不稳定，因为包含重力和弹簧。
+- `nominal_motor_local_damping`：本地 `-Kd*dq`，位于总 actuator saturation 之前；
+  不是限幅后的可加分解。
+- `held_nominal_cartesian_damping`：仅 pose fixture，采样时计算无裁剪的
+  `-J(q_sample)^T D J(q_sample) dq_sample`，在 host tick 间保持。使用实际配置的 D，
+  不含 startup blending、fixture clipping 或 feedforward slew；**此 torque 只用于观测，
+  从不写入控制指令**，不能冒充实际末端阻尼输出。
+
+固定原有 6D fixture、operator profile、官方 startup gains、1.5 s：
+
+| host Hz | ACTIVE 有效样本 | 名义保持阻尼正功 J | 名义保持阻尼净功 J | 结果 |
+| --- | --- | --- | --- | --- |
+| 20 | 50 | 0 | -0.00068034 | 加速度保护，统计被截断 |
+| 125 | 24 | 0.00027350 | +0.00003228 | 加速度保护，统计被截断 |
+| 500 | 1200 | 0 | -0.00923137 | 原有 fixture PASS |
+
+三组采样瞬间的名义阻尼均无正功率，本地阻尼均无正功。125 Hz 保持期间却出现正功，
+说明“采样瞬间耗能”并不保证保持期间耗能。20 Hz 在观测窗口未出现同样证据，不能
+将其失败也归因为已证实的阻尼注能。各组持续时间不同，不应直接比较总功大小。
+
+这些通道不是完整储能函数，也未分离限幅后各力矩项，不是 energy tank、passivity observer
+或稳定性证明；JSON 中 `passivity_claim=false`、`hardware_claim=false`。
+下一步需把限幅/slew/重力/弹簧的影响继续分开，任何能量约束控制设计应另行验证，
+不能用这份 observer 的净功直接控制或重新使能机械臂。
+
+前序命令无需修改即可得到附加诊断。仅仿真，待合并；未改真机代码、环境或总路线图。
+
+验证：同上七个 B601/边界测试文件 **134 passed**（33.21 s），Ruff、资源 audit、
+`git diff --check` 通过。新增 signed/positive/absorbed work 恒等式、本地阻尼非正功和
+125 Hz 保持期间正功回归。固定同一外部 vendor 路径的 500 Hz 前后 CLI 对照中，
+移除新增 `power_diagnostics` 后整份 JSON 完全一致，确认本次观测没有改变原有输出。
