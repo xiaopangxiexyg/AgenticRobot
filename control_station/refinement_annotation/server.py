@@ -208,7 +208,7 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
         dataset_root: object,
         annotator_id: object,
         second_review: object = False,
-    ) -> tuple[Path, str]:
+    ) -> tuple[Path, str, bool]:
         dataset_text = str(dataset_root or "").strip()
         annotator_text = str(annotator_id or "").strip()
         if not dataset_text:
@@ -229,7 +229,11 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
             raise RefinementAnnotationApplicationError(
                 "标注员 ID 不能为空。"
             )
-        return candidate, annotator_text
+        if not isinstance(second_review, bool):
+            raise RefinementAnnotationApplicationError(
+                "二次复核模式必须是 JSON 布尔值。"
+            )
+        return candidate, annotator_text, second_review
 
     def _workspace_result(
         self,
@@ -253,9 +257,12 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
         annotator_id: object,
         second_review: object = False,
     ) -> dict[str, Any]:
-        candidate, annotator_text = self._validated_workspace_inputs(
-            dataset_root=dataset_root,
-            annotator_id=annotator_id,
+        candidate, annotator_text, second_review_enabled = (
+            self._validated_workspace_inputs(
+                dataset_root=dataset_root,
+                annotator_id=annotator_id,
+                second_review=second_review,
+            )
         )
         with self._application_lock:
             current = self._annotation_application
@@ -265,9 +272,7 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
                     and current.annotator_id == annotator_text
                     and current.annotation_mode
                     == (
-                        "SECOND_REVIEW"
-                        if bool(second_review)
-                        else "STANDARD"
+                        "SECOND_REVIEW" if second_review_enabled else "STANDARD"
                     )
                 ):
                     return self._workspace_result(current)
@@ -278,14 +283,14 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
             application = RefinementAnnotationApplication(
                 candidate,
                 annotator_id=annotator_text,
-                second_review=bool(second_review),
+                second_review=second_review_enabled,
                 allowed_source_roots=self._allowed_source_roots,
                 defer_initial_refresh=True,
             )
             self._annotation_application = application
             self._suggested_dataset_root = str(candidate)
             self._suggested_annotator_id = annotator_text
-            self._suggested_second_review = bool(second_review)
+            self._suggested_second_review = second_review_enabled
             return self._workspace_result(application)
 
     def switch_workspace(
@@ -297,9 +302,12 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
     ) -> dict[str, Any]:
         """Switch datasets without dropping the old lock on target failure."""
 
-        candidate, annotator_text = self._validated_workspace_inputs(
-            dataset_root=dataset_root,
-            annotator_id=annotator_id,
+        candidate, annotator_text, second_review_enabled = (
+            self._validated_workspace_inputs(
+                dataset_root=dataset_root,
+                annotator_id=annotator_id,
+                second_review=second_review,
+            )
         )
         old_application: RefinementAnnotationApplication | None = None
         with self._application_lock:
@@ -308,7 +316,7 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
                 application = RefinementAnnotationApplication(
                     candidate,
                     annotator_id=annotator_text,
-                    second_review=bool(second_review),
+                    second_review=second_review_enabled,
                     allowed_source_roots=self._allowed_source_roots,
                     defer_initial_refresh=True,
                 )
@@ -318,9 +326,7 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
                 and current.annotator_id == annotator_text
                 and current.annotation_mode
                 == (
-                    "SECOND_REVIEW"
-                    if bool(second_review)
-                    else "STANDARD"
+                    "SECOND_REVIEW" if second_review_enabled else "STANDARD"
                 )
             ):
                 return self._workspace_result(current)
@@ -335,7 +341,7 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
                 application = RefinementAnnotationApplication(
                     candidate,
                     annotator_id=annotator_text,
-                    second_review=bool(second_review),
+                    second_review=second_review_enabled,
                     allowed_source_roots=self._allowed_source_roots,
                     defer_initial_refresh=True,
                 )
@@ -343,7 +349,7 @@ class _AnnotationHttpServer(ThreadingHTTPServer):
                 self._annotation_application = application
             self._suggested_dataset_root = str(candidate)
             self._suggested_annotator_id = annotator_text
-            self._suggested_second_review = bool(second_review)
+            self._suggested_second_review = second_review_enabled
             result = self._workspace_result(application)
         if old_application is not None:
             old_application.close()
@@ -835,7 +841,32 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
 
     def do_HEAD(self) -> None:  # noqa: N802
-        self.do_GET()
+        path = urlsplit(self.path).path
+        try:
+            if self._serve_static(path) or self._serve_media(path):
+                return
+            self._send_bytes(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "HEAD is supported only for static and media routes.",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                "application/json; charset=utf-8",
+                extra_headers=(("Allow", "GET"),),
+            )
+        except _CLIENT_DISCONNECT_ERRORS:
+            return
+        except (
+            OSError,
+            RefinementAnnotationApplicationError,
+            StageAnnotationStoreError,
+            ValueError,
+        ) as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
 
     def do_PUT(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path

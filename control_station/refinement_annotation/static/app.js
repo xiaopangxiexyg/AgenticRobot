@@ -114,12 +114,30 @@ function legacyEpisodeStatus(item) {
   const add = (code, label, tone, priority) => {
     badges.push({code, label, tone, priority});
   };
+  const failureStageCount = Number(item.failure_stage_count) || 0;
+  const failureAttemptCount = Number(item.failure_attempt_count) || 0;
   if (item.whole_episode_abnormal) {
     add(
       "WHOLE_EPISODE_ABNORMAL",
       `整条异常${item.whole_episode_abnormal_reason ? ` · ${item.whole_episode_abnormal_reason}` : ""}`,
       "CRITICAL",
       10,
+    );
+  }
+  if (failureStageCount > 0) {
+    add(
+      "ANNOTATED_FAILURE",
+      `失败阶段标注 ×${failureStageCount}`,
+      "FAILURE",
+      18,
+    );
+  }
+  if (failureAttemptCount > 0) {
+    add(
+      "FAILURE_ATTEMPT",
+      `原始失败 Attempt ×${failureAttemptCount}`,
+      "FAILURE",
+      19,
     );
   }
   if (item.review_state === "PENDING" || item.needs_second_review) {
@@ -152,11 +170,16 @@ function legacyEpisodeStatus(item) {
       70,
     );
   }
-  if (item.has_draft) add("LOCAL_DRAFT", "有未封存草稿", "DRAFT", 30);
+  if (item.draft_requires_seal) {
+    add("LOCAL_DRAFT", "有未封存草稿", "DRAFT", 30);
+  }
   badges.sort((left, right) => left.priority - right.priority);
   const attentionLevel = item.whole_episode_abnormal || detailState === "ERROR"
     ? "CRITICAL"
-    : item.review_state === "PENDING" || detailState === "STALE"
+    : item.review_state === "PENDING"
+      || detailState === "STALE"
+      || failureStageCount > 0
+      || failureAttemptCount > 0
       ? "WARNING"
       : "NONE";
   return {
@@ -169,7 +192,11 @@ function legacyEpisodeStatus(item) {
         ? "待二次复核"
         : detailState === "STALE"
           ? "详细标注需重做"
-          : "状态正常",
+          : failureStageCount > 0
+            ? "失败阶段标注"
+            : failureAttemptCount > 0
+              ? "含失败 Attempt"
+              : "状态正常",
     badges,
   };
 }
@@ -194,10 +221,13 @@ function annotationSummarySignature(item) {
     latest_annotation_mode: item.latest_annotation_mode,
     whole_episode_abnormal: item.whole_episode_abnormal,
     whole_episode_abnormal_reason: item.whole_episode_abnormal_reason,
+    failure_stage_count: item.failure_stage_count,
+    failure_attempt_count: item.failure_attempt_count,
     detail_annotation_complete: item.detail_annotation_complete,
     detail_annotation_state: item.detail_annotation_state,
     annotation_status: item.annotation_status || null,
     has_draft: item.has_draft,
+    draft_requires_seal: item.draft_requires_seal,
   });
 }
 
@@ -210,6 +240,8 @@ function badgeClassForStatus(code, tone) {
     DETAIL_PENDING: "detail-pending",
     DETAIL_STALE: "detail-stale",
     DETAIL_ERROR: "summary-error",
+    ANNOTATED_FAILURE: "failure",
+    FAILURE_ATTEMPT: "failure",
     COARSE_SEALED: "sealed",
     COARSE_PENDING: "pending",
     LOCAL_DRAFT: "draft",
@@ -572,6 +604,8 @@ function updateEpisodeNavigation() {
       "DETAIL_COMPLETE",
       "DETAIL_STALE",
       "DETAIL_ERROR",
+      "ANNOTATED_FAILURE",
+      "FAILURE_ATTEMPT",
     ].includes(String(badge.code)))
     .map((badge) => String(badge.label));
   status.textContent = labels.join(" / ") || "—";
@@ -585,8 +619,15 @@ function updateEpisodeNavigation() {
     projectedStatus?.badges?.some(
       (badge) => badge.code === "DETAIL_COMPLETE",
     ) ? "detail-complete" : "",
+    projectedStatus?.badges?.some(
+      (badge) => badge.code === "ANNOTATED_FAILURE"
+        || badge.code === "FAILURE_ATTEMPT",
+    ) && ["失败阶段标注", "含失败 Attempt"].includes(
+      projectedStatus?.primary_label,
+    ) ? "failure" : "",
   ].filter(Boolean).join(" ");
-  status.title = labels.join("；") || "当前 Episode 无整条异常、复核或详细标注状态";
+  status.title = labels.join("；")
+    || "当前 Episode 无整条异常、复核、失败或详细标注状态";
   for (const id of ["previous-episode", "previous-episode-collapsed"]) {
     $(id).disabled = !hasSelection || index <= 0;
   }
@@ -2656,7 +2697,16 @@ async function loadEpisodes({
       const byId = new Map(
         state.episodes.map((value) => [value.episode_uuid, value]),
       );
-      for (const item of payload.episodes) byId.set(item.episode_uuid, item);
+      // A lightweight catalog poll intentionally omits expensive annotation
+      // summaries. If its revision is unchanged, retain the already hydrated
+      // row instead of regressing it to loading and rereading remote files.
+      for (const item of payload.episodes) {
+        const existing = byId.get(item.episode_uuid);
+        byId.set(
+          item.episode_uuid,
+          existing ? {...item, ...existing} : item,
+        );
+      }
       state.episodes = Array.from(byId.values()).sort(
         compareEpisodeOrder,
       );
@@ -2840,11 +2890,19 @@ function renderEpisodeRow(item) {
   }
   if (episodeRowSignatures.get(item.episode_uuid) === signature) return button;
 
+  const hasFailureStatus = (status.badges || []).some(
+    (value) => value.code === "ANNOTATED_FAILURE"
+      || value.code === "FAILURE_ATTEMPT",
+  );
   button.className = [
     "episode-item",
     item.episode_uuid === state.selectedEpisode ? "active" : "",
     status.attention_level === "CRITICAL" ? "attention-critical" : "",
     status.attention_level === "WARNING" ? "attention-warning" : "",
+    hasFailureStatus
+      && ["失败阶段标注", "含失败 Attempt"].includes(status.primary_label)
+      ? "attention-failure"
+      : "",
   ].filter(Boolean).join(" ");
   button.title = `${item.episode_uuid} · ${status.primary_label || "状态未知"}`;
   button.dataset.episodeUuid = item.episode_uuid;
@@ -3038,6 +3096,10 @@ async function selectEpisode(episodeUuid) {
         whole_episode_abnormal: payload.episode.whole_episode_abnormal,
         whole_episode_abnormal_reason:
           payload.episode.whole_episode_abnormal_reason,
+        failure_stage_count: payload.episode.failure_stage_count,
+        failure_attempt_count: payload.episode.failure_attempt_count,
+        has_draft: payload.episode.has_draft,
+        draft_requires_seal: payload.episode.draft_requires_seal,
         detail_annotation_complete:
           payload.episode.detail_annotation_complete === true
           || payload.episode.detail_annotation?.resolution_level
@@ -4553,6 +4615,11 @@ $("refresh-episodes").addEventListener(
   "click",
   () => loadEpisodes({force: true}),
 );
+window.addEventListener("beforeunload", (event) => {
+  if (!hasUnsavedDraftChanges() && !state.volatilePostSealDraft) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 $("draft-warning-save").addEventListener(
   "click",
   () => settleDraftTransition("seal"),

@@ -778,6 +778,22 @@ class RefinementAnnotationApplication:
                     "whole_episode_abnormal_reason": summary[
                         "whole_episode_abnormal_reason"
                     ],
+                    "failure_stage_count": summary.get(
+                        "failure_stage_count",
+                        0,
+                    ),
+                    "failure_attempt_count": summary.get(
+                        "failure_attempt_count",
+                        getattr(item, "failure_attempt_count", 0),
+                    ),
+                    "has_draft": summary.get(
+                        "has_draft",
+                        getattr(item, "has_draft", False),
+                    ),
+                    "draft_requires_seal": summary.get(
+                        "draft_requires_seal",
+                        False,
+                    ),
                     "detail_annotation_complete": summary[
                         "detail_annotation_complete"
                     ],
@@ -861,33 +877,38 @@ class RefinementAnnotationApplication:
     ) -> tuple[tuple[DetailProfileSelection, ...], str | None]:
         return self._detail_annotations.profile_selections(item)
 
-    def _persisted_detail_profile_selection_id(
+    def _persisted_draft_for_summary(
         self,
         item: ProgressAnnotationWorkItem,
-    ) -> str | None:
-        """Read the optional selector for sidebar status without an Episode lock.
+    ) -> Mapping[str, Any] | None:
+        """Read a small draft for sidebar status without an Episode lock.
 
         The visible Episode summary is deliberately a read-only batch path and
         cannot acquire an editing lock for every row.  Drafts are atomically
-        replaced by :class:`DatasetStageAnnotationWorkspace`, so reading this
-        small selector directly is safe and keeps the summary consistent with
-        an explicit coarse-only choice across process restarts.  A missing or
-        legacy/malformed draft preserves the historical ``None`` resolution.
+        replaced by :class:`DatasetStageAnnotationWorkspace`, so a direct read
+        is safe. Invalid persisted data must remain visible as a row-level
+        summary error instead of being misreported as no draft.
         """
 
+        path = self.workspace.draft_path(episode_uuid=item.episode_uuid)
         try:
-            payload = json.loads(
-                self.workspace.draft_path(
-                    episode_uuid=item.episode_uuid,
-                ).read_text(encoding="utf-8")
-            )
-        except (
-            FileNotFoundError,
-            OSError,
-            UnicodeError,
-            json.JSONDecodeError,
-        ):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
             return None
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RefinementAnnotationApplicationError(
+                f"Cannot load stage annotation draft {path}: {exc}"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise RefinementAnnotationApplicationError(
+                f"Stage annotation draft {path} must contain a JSON object."
+            )
+        return payload
+
+    @staticmethod
+    def _detail_profile_selection_id_from_draft(
+        payload: object,
+    ) -> str | None:
         if not isinstance(payload, Mapping):
             return None
         value = payload.get("detail_profile_selection_id")
@@ -1727,6 +1748,7 @@ class RefinementAnnotationApplication:
                     f"storage may be disconnected or unreadable: {exc}"
                 ) from exc
         draft = stored_draft
+        draft_exists = stored_draft is not None
         if stored_draft is not None:
             self._mark_item_has_draft(episode_uuid)
         draft_persistence_state = "BOOTSTRAP_UNEDITED"
@@ -1794,6 +1816,8 @@ class RefinementAnnotationApplication:
                         "the dataset storage is writable and connected: "
                         f"{exc}"
                     ) from exc
+                draft_exists = True
+                self._mark_item_has_draft(episode_uuid)
             draft = adjusted_draft
         latest_annotation_set = annotation_sets[-1] if annotation_sets else None
         annotation_summary = self._summarize_annotation_sets(annotation_sets)
@@ -1959,13 +1983,15 @@ class RefinementAnnotationApplication:
         )
         annotation_status = build_episode_status_payload(
             annotation_summary,
-            has_draft=item.has_draft,
+            draft_requires_seal=draft_requires_seal,
             detail_state=detail_status.state,
             recording_pause_count=len(item.recording_pause_segments),
+            failure_attempt_count=item.failure_attempt_count,
         )
         step_by_id = item.progress.profile.step_by_id
         return {
             **item.summary_payload(),
+            "has_draft": draft_exists,
             "annotation_set_count": len(annotation_sets),
             "needs_second_review": annotation_summary.needs_second_review,
             "review_state": annotation_summary.review_state,
@@ -1976,6 +2002,7 @@ class RefinementAnnotationApplication:
             "whole_episode_abnormal_reason": (
                 annotation_summary.whole_episode_abnormal_reason
             ),
+            "failure_stage_count": annotation_summary.failure_stage_count,
             "annotation_status": annotation_status,
             "annotation_summary_loaded": True,
             "annotation_mode": self.annotation_mode,
@@ -2090,10 +2117,27 @@ class RefinementAnnotationApplication:
             )
         detail_annotation_complete: bool | None = None
         detail_annotation_state: str | None = None
+        draft_exists: bool | None = None
+        draft_requires_seal: bool | None = None
         if load_annotations and annotation_summary is not None:
             if annotation_sets is None:
                 annotation_sets = self._sealed_annotation_sets(item)
-            selection_id = self._persisted_detail_profile_selection_id(item)
+            stored_draft = self._persisted_draft_for_summary(item)
+            draft_exists = stored_draft is not None
+            draft_requires_seal = bool(
+                stored_draft is not None
+                and (
+                    not annotation_sets
+                    or not self._draft_matches_annotation_set(
+                        item,
+                        stored_draft,
+                        annotation_sets[-1],
+                    )
+                )
+            )
+            selection_id = self._detail_profile_selection_id_from_draft(
+                stored_draft,
+            )
             detail_status = self._detail_annotations.status(
                 item,
                 annotation_sets,
@@ -2108,6 +2152,7 @@ class RefinementAnnotationApplication:
             latest_annotation_mode = None
             whole_episode_abnormal = None
             whole_episode_abnormal_reason = None
+            failure_stage_count = None
         else:
             set_count = annotation_summary.annotation_set_count
             needs_second_review = annotation_summary.needs_second_review
@@ -2121,8 +2166,13 @@ class RefinementAnnotationApplication:
             whole_episode_abnormal_reason = (
                 annotation_summary.whole_episode_abnormal_reason
             )
+            failure_stage_count = annotation_summary.failure_stage_count
         return {
             **item.summary_payload(),
+            "has_draft": (
+                item.has_draft if draft_exists is None else draft_exists
+            ),
+            "draft_requires_seal": draft_requires_seal,
             "annotation_set_count": set_count,
             "needs_second_review": needs_second_review,
             "review_state": review_state,
@@ -2131,14 +2181,16 @@ class RefinementAnnotationApplication:
             "whole_episode_abnormal_reason": (
                 whole_episode_abnormal_reason
             ),
+            "failure_stage_count": failure_stage_count,
             "detail_annotation_complete": detail_annotation_complete,
             "detail_annotation_state": detail_annotation_state,
             "annotation_summary_loaded": annotation_summary is not None,
             "annotation_status": build_episode_status_payload(
                 annotation_summary,
-                has_draft=item.has_draft,
+                draft_requires_seal=bool(draft_requires_seal),
                 detail_state=detail_annotation_state,
                 recording_pause_count=len(item.recording_pause_segments),
+                failure_attempt_count=item.failure_attempt_count,
             ),
         }
 
