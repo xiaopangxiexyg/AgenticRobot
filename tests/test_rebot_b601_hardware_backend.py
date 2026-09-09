@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from collections import Counter
 from pathlib import Path
@@ -200,6 +201,131 @@ def _socketcan_frame(arbitration_id: int, *, data_length: int = 8) -> bytes:
         data_length,
         b"\x00" * 8,
     )
+
+
+@pytest.fixture
+def passive_receiver(monkeypatch):
+    class Receiver:
+        def __init__(self):
+            self.now = 0.0
+            self.packets = []
+            self.closed = False
+
+        def bind(self, address):
+            assert address == ("can-test",)
+
+        def settimeout(self, value):
+            assert value > 0
+
+        def recv(self, size):
+            self.now += 0.1
+            if self.packets:
+                packet = self.packets.pop(0)
+                if isinstance(packet, BaseException):
+                    raise packet
+                return packet
+            raise frequency_probe.socket.timeout()
+
+        def close(self):
+            self.closed = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    receiver = Receiver()
+    receiver.packets = []
+    monkeypatch.setattr(frequency_probe.socket, "socket", lambda *args: receiver)
+    monkeypatch.setattr(frequency_probe.time, "monotonic", lambda: receiver.now)
+    monkeypatch.setattr(frequency_probe.time, "monotonic_ns", lambda: int(receiver.now * 1e9))
+    monkeypatch.setattr(frequency_probe.time, "time_ns", lambda: 1_000_000_000 + int(receiver.now * 1e9))
+
+    def no_backend(*args, **kwargs):
+        pytest.fail("passive capture must not construct the motor backend")
+
+    monkeypatch.setattr(frequency_probe, "B601RSBackend", no_backend)
+    return receiver
+
+
+def test_passive_raw_capture_keeps_bytes_clocks_and_malformed_frames(tmp_path, passive_receiver):
+    packet = _socketcan_frame((2 << 24) | (3 << 8) | 0xFD | frequency_probe._CAN_EFF_FLAG)
+    passive_receiver.packets = [packet, b"bad"]
+    path = tmp_path / "capture.jsonl"
+    result = frequency_probe._read_only_capture("can-test", 0.5, raw_output=path)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["kind"] for r in records] == ["header", "frame", "frame", "end"]
+    assert records[1]["socket_frame_hex"] == packet.hex()
+    assert records[2]["socket_frame_hex"] == b"bad".hex()
+    assert records[1]["receive_monotonic_ns"] <= records[1]["clock_pair_end_monotonic_ns"]
+    assert records[1]["observe_realtime_ns"] == records[1]["receive_monotonic_ns"] + 1_000_000_000
+    assert records[-1]["received_frame_count"] == 2
+    assert result["malformed_frame_count"] == 1
+    assert not result["freshness_verified"]
+    assert not result["motion_commands_sent"]
+    assert passive_receiver.closed
+
+
+def test_passive_raw_capture_never_overwrites_existing_evidence(tmp_path, passive_receiver):
+    path = tmp_path / "capture.jsonl"
+    path.write_text("existing evidence")
+    with pytest.raises(FileExistsError):
+        frequency_probe._read_only_capture("can-test", 0.5, raw_output=path)
+    assert path.read_text() == "existing evidence"
+    assert passive_receiver.closed
+
+
+def test_interrupted_raw_capture_has_no_success_footer(tmp_path, passive_receiver):
+    passive_receiver.packets = [KeyboardInterrupt()]
+    path = tmp_path / "capture.jsonl"
+    with pytest.raises(KeyboardInterrupt):
+        frequency_probe._read_only_capture("can-test", 0.5, raw_output=path)
+    assert [json.loads(x)["kind"] for x in path.read_text().splitlines()] == ["header"]
+    assert passive_receiver.closed
+
+
+def test_empty_raw_capture_is_not_promoted_to_feedback(tmp_path, passive_receiver):
+    result = frequency_probe._read_only_capture("can-test", 0.5, raw_output=tmp_path / "empty.jsonl")
+    assert result["frame_count"] == 0
+    assert not result["freshness_verified"]
+
+
+@pytest.mark.parametrize("mode", ["offline", "gravity-offline", "position", "mit-tx-disabled"])
+def test_raw_output_rejects_other_modes_before_io(mode, tmp_path, monkeypatch):
+    monkeypatch.setattr(frequency_probe.socket, "socket", lambda *args: pytest.fail("no I/O expected"))
+    assert frequency_probe.main(["--mode", mode, "--raw-output", str(tmp_path / "raw")]) == 2
+
+
+def test_raw_and_summary_output_cannot_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr(frequency_probe.socket, "socket", lambda *args: pytest.fail("no I/O expected"))
+    path = str(tmp_path / "capture")
+    assert frequency_probe.main(["--raw-output", path, "--output", path]) == 2
+
+
+def test_passive_bind_error_closes_socket_and_does_not_create_raw_file(tmp_path, passive_receiver, monkeypatch):
+    def fail_bind(address):
+        raise OSError("interface unavailable")
+
+    monkeypatch.setattr(passive_receiver, "bind", fail_bind)
+    path = tmp_path / "raw.jsonl"
+    with pytest.raises(frequency_probe.FrequencyProbeError, match="cannot open passive"):
+        frequency_probe._read_only_capture("can-test", 0.5, raw_output=path)
+    assert passive_receiver.closed
+    assert not path.exists()
+
+
+def test_passive_cli_writes_summary_and_raw_separately(tmp_path, passive_receiver):
+    path = tmp_path / "raw.jsonl"
+    summary = tmp_path / "summary.json"
+    assert frequency_probe.main([
+        "--mode", "read-only", "--channel", "can-test", "--duration-sec", "0.5",
+        "--raw-output", str(path), "--output", str(summary),
+    ]) == 0
+    result = json.loads(summary.read_text())
+    assert result["raw_capture"]["completed"]
+    assert result["frame_count"] == 0
+    assert not result["motion_commands_sent"]
 
 
 def test_passive_probe_classifies_robstride_operation_status_id_without_payload_decode() -> None:

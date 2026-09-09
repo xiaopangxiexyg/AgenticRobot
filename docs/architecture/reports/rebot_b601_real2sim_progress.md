@@ -481,3 +481,28 @@ print(json.dumps(report, indent=2))
 125 Hz / 10 s CLI PASS；Ruff、资源 audit、`git diff --check` 通过。纯数据检查覆盖
 重复时间/序号、J7 混入、缺维、非有限和负驱动增益，并拒绝给旧格式伪造拟合资格。
 候选待合并，未 push、安装或执行真机操作；原始现场数据仍在原路径，未纳入提交。
+
+## M2 首轮现场采集能力验证（被动接收）
+
+操作者确认没有更新的合格记录，转入真机采集准备。本批基于 `73e3d4ef`，分支
+`codex/b601-passive-capture-clocks`；只扩展现有 frequency probe 的 read-only 模式，
+不修改控制、保护保持、重力参数或总路线图。
+
+新增可选 `--raw-output`：独占创建 JSONL，保存完整 SocketCAN 原始字节（包括无法解码的帧），
+及主机 `receive_monotonic_ns / observe_realtime_ns / clock_pair_end_monotonic_ns`。
+墙钟读取发生在两个单调时钟读取之间；这是 userspace recv 后观察，不是电机采样时间，
+也不是内核接收时间。其他进程的本机 TX 回显可能被接收，不能冒充本 probe 的发送回执。
+成功结束有 end 记录；Ctrl-C 留存部分文件但不写成功尾记录。拒绝覆盖旧 raw 文件，
+拒绝 raw 与 summary 同路径，拒绝在非 read-only 模式使用该参数。
+
+第一轮现场只被动监听 15 s，不构造 MotorBridge backend，不发送 CAN，不改变主动上报、
+电机使能或现有 protective hold。操作者无需推动机械臂；保持可靠支撑，不为采集退出既有
+保护程序。采集始终前台，实际命令和详细输出追加到固定 command_and_output.log，
+raw/summary 每轮放入独立目录。零帧只证明该时段没有观察到流量，不能证明断连或反馈新鲜。
+先核验收到的帧和时间基准，再决定是否需要显式开启遥测及受控无接触采集。
+本轮不能代替配对 command/feedback 记录、动态激励或定量辨识。
+
+离线验证：hardware backend、active report、low gain probe 三文件 **183 passed**，
+全部使用假 transport；覆盖接收中断、空流、bind 失败关闭 socket、原始帧保留和 CLI 隔离。
+资源 audit 和 diff 检查通过；Ruff 无新增问题，frequency probe 原有 EXE001、UP041、
+RUF046 三项保持未动。候选待合并，未 push、安装或执行任何真实 CAN 操作。
