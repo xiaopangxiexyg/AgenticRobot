@@ -188,6 +188,40 @@ def plan_point_grasp_skill_definition_v2() -> SkillDefinition:
     )
 
 
+def plan_point_grasp_skill_definition_v3() -> SkillDefinition:
+    """Describe optional finite-time arm IK annotations on live proposals."""
+
+    return SkillDefinition(
+        skill_id=PLAN_POINT_GRASP_SKILL_ID_V1,
+        skill_version="3",
+        skill_kind="inspection",
+        summary=(
+            "Plan ranked DMTAC M tool_tcp pose proposals from one live, "
+            "deployment-bound aligned RGB-D frame and optionally annotate "
+            "each proposal with bounded arm IK reachability without selecting "
+            "a proposal or moving the robot."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "registered_aligned_rgbd_role.clicked_region.bounded_candidates."
+            "optional_arm_ik_reachability.v3"
+        ),
+        execution_result_semantics_id=(
+            "station_bound_ranked_unprivileged_tool_tcp_proposals."
+            "optional_finite_time_arm_ik_annotations.v3"
+        ),
+        task_outcome_semantics_id="passive_point_grasp_planning.v1",
+        entry_predicate_ids=(
+            "trusted_live_rgbd_binding_available.v1",
+            "point_grasp_models_available.v1",
+            "deployment_arm_ik_evaluator_available.v1",
+        ),
+        task_outcome_predicate_ids=("point_grasp_candidates_generated.v1",),
+    )
+
+
 def render_point_grasp_candidate_skill_definition_v1() -> SkillDefinition:
     """Describe one optional view of one retained point-grasp proposal."""
 
@@ -231,5 +265,6 @@ __all__ = [
     "localize_objects_skill_definition_v1",
     "plan_point_grasp_skill_definition_v1",
     "plan_point_grasp_skill_definition_v2",
+    "plan_point_grasp_skill_definition_v3",
     "render_point_grasp_candidate_skill_definition_v1",
 ]

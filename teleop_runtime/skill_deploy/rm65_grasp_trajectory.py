@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import pairwise
@@ -28,9 +30,9 @@ from robot_motion.rm65.dual_arm_target_solver import (
     BimanualPoseTarget,
     BimanualPoseTargetSource,
 )
-from robot_motion.rm65.obstacle_collision import RM65ObstacleCollisionOracle
 from robot_motion.rm65.obstacle_collision import (
     RM65_D405_ATTACHED_COLLISION_PROXIES,
+    RM65ObstacleCollisionOracle,
 )
 from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
@@ -84,6 +86,72 @@ class RM65GraspTrajectoryPlanningConfig:
         object.__setattr__(self, "maximum_endpoint_solve_cycles", cycles)
 
 
+@dataclass(frozen=True)
+class RM65GraspReachabilityConfig:
+    """Finite endpoint-IK budget used only for optional candidate annotation."""
+
+    time_budget_ms: float = 1_000.0
+    max_solve_cycles: int = 120
+    standard_position_tolerance_m: float = 0.003
+    standard_orientation_tolerance_deg: float = 1.0
+    basic_position_tolerance_m: float = 0.05
+    basic_orientation_tolerance_deg: float = 20.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "time_budget_ms",
+            "standard_position_tolerance_m",
+            "standard_orientation_tolerance_deg",
+            "basic_position_tolerance_m",
+            "basic_orientation_tolerance_deg",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+            object.__setattr__(self, name, value)
+        cycles = int(self.max_solve_cycles)
+        if isinstance(self.max_solve_cycles, bool) or cycles < 1:
+            raise ValueError("max_solve_cycles must be positive.")
+        object.__setattr__(self, "max_solve_cycles", cycles)
+        if (
+            self.standard_position_tolerance_m >= self.basic_position_tolerance_m
+            or self.standard_orientation_tolerance_deg
+            >= self.basic_orientation_tolerance_deg
+        ):
+            raise ValueError("Standard reachability tolerances must be stricter.")
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                field_name: getattr(self, field_name)
+                for field_name in self.__dataclass_fields__
+            }
+            | {
+                "evaluation_scope": (
+                    "finite_time_endpoint_ik_not_path_or_grasp_success"
+                )
+            },
+            domain="dexteleop.real_skill.rm65_grasp_reachability.v1",
+        )
+
+
+@dataclass(frozen=True)
+class RM65GraspReachabilityResult:
+    classification: str
+    position_residual_m: float
+    orientation_residual_deg: float
+    solve_cycles: int
+    elapsed_ms: float
+    termination_reason: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            field_name: getattr(self, field_name)
+            for field_name in self.__dataclass_fields__
+        }
+
+
 class RM65GraspJointTrajectoryPlanner:
     """Resolve endpoint IK, plan around fixed table/poles, then time-sample qpos."""
 
@@ -96,6 +164,7 @@ class RM65GraspJointTrajectoryPlanner:
         | None,
         config: RM65GraspTrajectoryPlanningConfig | None = None,
         planner_config: JointPathPlannerConfig | None = None,
+        reachability_config: RM65GraspReachabilityConfig | None = None,
     ) -> None:
         if not isinstance(profile, ResolvedExclusiveRM65SkillDeploymentProfile):
             raise TypeError("profile must be resolved and typed.")
@@ -114,6 +183,8 @@ class RM65GraspJointTrajectoryPlanner:
         self.target_builder = planning_target_builder
         self.target_envelope_filter = target_envelope_filter
         self.config = config or RM65GraspTrajectoryPlanningConfig()
+        self.reachability_config = reachability_config or RM65GraspReachabilityConfig()
+        self._solver_lock = threading.Lock()
         self.planner_config = planner_config or JointPathPlannerConfig(
             shortcut_attempts=8,
             adaptive_edge_resolution_rad=self.config.final_edge_resolution_rad,
@@ -170,7 +241,7 @@ class RM65GraspJointTrajectoryPlanner:
             projected = self.target_envelope_filter(
                 {name: np.asarray(value, dtype=float).copy() for name, value in solver_targets.items()}
             )
-        except Exception as exc:  # noqa: BLE001 - convert to a zero-motion reason.
+        except Exception as exc:
             raise RM65GraspTrajectoryPlanningError(
                 f"{phase}_safety_envelope_unavailable",
                 details={
@@ -203,6 +274,20 @@ class RM65GraspJointTrajectoryPlanner:
             )
 
     def _endpoint_qpos(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        target_tool_tcp_world: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        with self._solver_lock:
+            return self._endpoint_qpos_locked(
+                qpos_by_side=qpos_by_side,
+                side=side,
+                target_tool_tcp_world=target_tool_tcp_world,
+            )
+
+    def _endpoint_qpos_locked(
         self,
         *,
         qpos_by_side: Mapping[str, np.ndarray],
@@ -287,6 +372,117 @@ class RM65GraspJointTrajectoryPlanner:
                 "last_qpos_by_side": last_qpos,
             },
         )
+
+    def assess_endpoint_ik(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        target_tool_tcp_world: np.ndarray,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> RM65GraspReachabilityResult:
+        """Classify one endpoint using the lower solver, without path planning."""
+
+        if side not in _SIDES:
+            raise ValueError("side must be left or right.")
+        target_pose = np.asarray(target_tool_tcp_world, dtype=float)
+        if target_pose.shape != (4, 4) or not np.all(np.isfinite(target_pose)):
+            raise ValueError("target_tool_tcp_world must be one finite 4x4 pose.")
+        config = self.reachability_config
+        with self._solver_lock:
+            self.target_builder.set_current_qpos_pair(
+                left_qpos=qpos_by_side["left"],
+                right_qpos=qpos_by_side["right"],
+                reset_tracking=True,
+            )
+            solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
+                left_qpos=qpos_by_side["left"],
+                right_qpos=qpos_by_side["right"],
+            )
+            solver_targets[side] = (
+                self.target_builder.solver_world_target_from_tool_tcp_world_target(
+                    side=side,
+                    tool_tcp_world_target=target_pose,
+                )
+            )
+            inactive = "right" if side == "left" else "left"
+            source = BimanualPoseTargetSource(
+                command_type="tcp_pose",
+                value=target_pose,
+                frame_name=self.profile.station_world_frame_id,
+                metadata={"planner": "real_grasp_reachability"},
+            )
+            started = float(monotonic())
+            deadline = started + config.time_budget_ms / 1_000.0
+            best: tuple[float, float, float] | None = None
+            cycles = 0
+            termination = "cycle_budget_exhausted"
+            for cycle in range(config.max_solve_cycles):
+                if cycle > 0 and float(monotonic()) >= deadline:
+                    termination = "time_budget_exhausted"
+                    break
+                result = self.target_builder.solve_target_pair(
+                    BimanualPoseTarget(
+                        timestamp=(
+                            float(cycle) / self.profile.position_profile.rates.ik_hz
+                        ),
+                        target_pose_by_side=solver_targets,
+                        active_sides=(side,),
+                        hard_hold_inactive_sides=True,
+                        source_by_side={side: source, inactive: None},
+                    )
+                )
+                cycles = cycle + 1
+                candidate = {
+                    name: np.asarray(result.side_results[name].qpos, dtype=float).copy()
+                    for name in _SIDES
+                }
+                candidate[inactive] = np.asarray(
+                    qpos_by_side[inactive], dtype=float
+                ).copy()
+                tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=candidate["left"],
+                    right_qpos=candidate["right"],
+                )[side]
+                position, orientation = pose_delta_metrics(tcp, target_pose)
+                normalized_error = max(
+                    position / config.basic_position_tolerance_m,
+                    orientation / config.basic_orientation_tolerance_deg,
+                )
+                if best is None or normalized_error < best[0]:
+                    best = (normalized_error, position, orientation)
+                if (
+                    position <= config.standard_position_tolerance_m
+                    and orientation <= config.standard_orientation_tolerance_deg
+                ):
+                    elapsed_ms = max(0.0, (float(monotonic()) - started) * 1_000.0)
+                    return RM65GraspReachabilityResult(
+                        classification="standard_reachable",
+                        position_residual_m=position,
+                        orientation_residual_deg=orientation,
+                        solve_cycles=cycles,
+                        elapsed_ms=elapsed_ms,
+                        termination_reason="standard_tolerance_met",
+                    )
+            if best is None:
+                raise RuntimeError("RM65 reachability solver produced no candidate.")
+            if float(monotonic()) >= deadline:
+                termination = "time_budget_exhausted"
+            _normalized, position, orientation = best
+            classification = (
+                "basically_reachable"
+                if position <= config.basic_position_tolerance_m
+                and orientation <= config.basic_orientation_tolerance_deg
+                else "difficult_to_reach"
+            )
+            return RM65GraspReachabilityResult(
+                classification=classification,
+                position_residual_m=position,
+                orientation_residual_deg=orientation,
+                solve_cycles=cycles,
+                elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
+                termination_reason=termination,
+            )
 
     def _revalidate(self, waypoints: tuple[Mapping[str, np.ndarray], ...]) -> dict[str, object]:
         checks = 0
@@ -459,6 +655,8 @@ class RM65GraspJointTrajectoryPlanner:
 
 __all__ = [
     "RM65GraspJointTrajectoryPlanner",
+    "RM65GraspReachabilityConfig",
+    "RM65GraspReachabilityResult",
     "RM65GraspTrajectoryPlanningConfig",
     "RM65GraspTrajectoryPlanningError",
 ]

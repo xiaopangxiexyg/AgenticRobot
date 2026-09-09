@@ -13,6 +13,7 @@ from .definition import (
     localize_objects_skill_definition_v1,
     plan_point_grasp_skill_definition_v1,
     plan_point_grasp_skill_definition_v2,
+    plan_point_grasp_skill_definition_v3,
     render_point_grasp_candidate_skill_definition_v1,
 )
 from .schemas import (
@@ -39,6 +40,7 @@ __all__ = [
     "localize_objects_skill_definition_v1",
     "plan_point_grasp_skill_definition_v1",
     "plan_point_grasp_skill_definition_v2",
+    "plan_point_grasp_skill_definition_v3",
     "render_point_grasp_candidate_skill_definition_v1",
     "validate_capture_depth_result_for_parameters_v2",
     "validate_capture_depth_result_v2",

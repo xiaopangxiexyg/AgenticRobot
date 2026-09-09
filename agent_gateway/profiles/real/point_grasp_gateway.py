@@ -6,7 +6,7 @@ import hashlib
 import io
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -320,6 +320,13 @@ class StationBoundPointGraspProvider:
         perception_provider: RealSenseAgentPerceptionProvider,
         frame_binding: RealPerceptionFrameBinding,
         current_station_revision: Callable[[], int],
+        arm_reachability_evaluator: (
+            Callable[
+                [tuple[np.ndarray, ...]],
+                tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]],
+            ]
+            | None
+        ) = None,
     ) -> None:
         if not isinstance(registration, StationBoundPointGraspRegistration):
             raise TypeError("registration must be typed.")
@@ -329,6 +336,15 @@ class StationBoundPointGraspProvider:
             raise TypeError("frame_binding must be typed.")
         if not callable(current_station_revision):
             raise TypeError("current_station_revision must be callable.")
+        reachability_profile = registration.profile.arm_reachability_profile
+        if (reachability_profile is None) != (arm_reachability_evaluator is None):
+            raise ValueError(
+                "Arm reachability registration and evaluator must be supplied together."
+            )
+        if arm_reachability_evaluator is not None and not callable(
+            arm_reachability_evaluator
+        ):
+            raise TypeError("arm_reachability_evaluator must be callable or None.")
         for name in ("start", "close", "plan"):
             if not callable(getattr(planner, name, None)):
                 raise TypeError(f"planner must expose {name}().")
@@ -357,6 +373,7 @@ class StationBoundPointGraspProvider:
         self.perception_provider = perception_provider
         self.frame_binding = frame_binding
         self._current_station_revision = current_station_revision
+        self.arm_reachability_evaluator = arm_reachability_evaluator
         self._lock = threading.Lock()
         self._started = False
 
@@ -456,6 +473,26 @@ class StationBoundPointGraspProvider:
                         ),
                     }
                 )
+            reachability_context = None
+            if request.parameters.get("include_arm_reachability", False):
+                if self.arm_reachability_evaluator is None:
+                    raise RuntimeError("Arm reachability evaluator is unavailable.")
+                reachability_context, annotations = self.arm_reachability_evaluator(
+                    tuple(
+                        np.asarray(
+                            candidate["T_reference_from_tool_tcp"],
+                            dtype=np.float64,
+                        ).reshape(4, 4)
+                        for candidate in candidates
+                    )
+                )
+                if len(annotations) != len(candidates):
+                    raise RuntimeError(
+                        "Arm reachability evaluator returned the wrong candidate count."
+                    )
+                reachability_context = dict(reachability_context)
+                for candidate, annotation in zip(candidates, annotations, strict=True):
+                    candidate["arm_reachability"] = dict(annotation)
             if self._current_station_revision() != expected_revision:
                 raise RuntimeError(
                     "Station revision changed before point-grasp result commit."
@@ -510,6 +547,8 @@ class StationBoundPointGraspProvider:
                 ),
                 "downstream_control_effects": "forbidden",
             }
+            if reachability_context is not None:
+                result["arm_reachability_context"] = reachability_context
             return PreparedPointGrasp(result, annotated)
 
 

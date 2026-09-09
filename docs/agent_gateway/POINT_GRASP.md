@@ -215,6 +215,18 @@ capture group、相机/Station frame identity 和三个齐次矩阵共同闭合�
 measured qpos 和既有 coupled FK owner 发布。render 请求只读取已经发布的不可变 pose cut，调用方
 不能注入相机位姿。默认 mount URDF 为：
 
+该组合还可额外传入 `--enable-point-grasp-arm-reachability`，此时注册显式升级的
+`perception.plan_point_grasp@3`；未传入时仍注册原样的 v2，Definition、Schema、Route、Profile 与
+Binding hash 均不改变。v3 请求增加必填布尔量 `include_arm_reachability`：为 `false` 时不调用 IK，
+结果仍不带可达性字段；为 `true` 时，从同一份新鲜双臂 measured-qpos 快照出发，经现有 FrameGraph
+把 `canonical_station` 候选转换到 `dual_arm_solver_world`，再由 lower RM65 target-builder 在每个候选
+1 秒 wall-clock 搜索预算且最多 120 个 solve cycle 内评估；观察到截止时间后不再启动新 cycle，但不会
+抢占一个正在运行的 lower solve，其完整耗时会写入结果。结果按同一个 IK 解的成对残差分为
+`standard_reachable`（3 mm、1°以内）、`basically_reachable`（5 cm、20°以内）和
+`difficult_to_reach`，同时返回实际残差、cycle 数和终止原因。该字段只用于筛选提示，不改变模型分数、
+候选顺序或选择权；它也不检查整条路径，不证明无碰撞、可执行或抓取成功。qpos 不存在、过期或帧身份
+不一致时整个带注释请求 fail closed，而不是把未知状态误报为不可达。
+
 ```text
 assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf
 ```

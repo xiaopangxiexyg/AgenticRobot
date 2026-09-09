@@ -306,6 +306,9 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # Combined real-RM65 deployment resolves the reviewed v4 fixed camera
         # chains and measured wrist-camera FK only at the concrete profile edge.
         "agent_gateway/profiles/real/rm65_camera_geometry.py": ["numpy"],
+        # Optional grasp reachability converts Station candidates and checks
+        # finite endpoint-IK residuals only at the concrete RM65 profile edge.
+        "agent_gateway/profiles/real/rm65_grasp_reachability.py": ["numpy"],
         # Concrete perception frame binding uses NumPy only to apply the
         # reviewed scene-to-station transform.  Gateway core remains neutral.
         "agent_gateway/profiles/real/perception_frames.py": ["numpy"],

@@ -21,12 +21,17 @@ from agent_gateway.protocol.skill_registration import SkillRegistrationTemplate
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
 from agent_gateway.skills.perception.definition import (
     plan_point_grasp_skill_definition_v2,
+    plan_point_grasp_skill_definition_v3,
 )
 from agent_gateway.skills.perception.point_grasp_schemas import (
     point_grasp_schema_entry_v2,
+    point_grasp_schema_entry_v3,
     validate_point_grasp_parameters_v2,
+    validate_point_grasp_parameters_v3,
     validate_point_grasp_result_for_parameters_v2,
+    validate_point_grasp_result_for_parameters_v3,
     validate_point_grasp_result_v2,
+    validate_point_grasp_result_v3,
 )
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -43,6 +48,9 @@ REAL_STATION_POINT_GRASP_ROUTE_ID_V2 = (
 REAL_STATION_POINT_GRASP_EXECUTOR_ID_V2 = (
     "control-station.real-passive-station-point-grasp.v2"
 )
+REAL_STATION_POINT_GRASP_EXECUTOR_ID_V3 = (
+    "control-station.real-passive-station-point-grasp.v3"
+)
 REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2 = "annotated_grasp_proposals"
 
 
@@ -50,6 +58,81 @@ def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"{field_name} must be a non-empty trimmed string.")
     return value
+
+
+@dataclass(frozen=True)
+class StationPointGraspArmReachabilityProfile:
+    """Trusted RM65 endpoint-IK classification bounds for optional v3 output."""
+
+    arm_side: str
+    evaluator_profile_id: str
+    evaluator_profile_hash: str
+    solver_reference_frame_id: str
+    solver_reference_frame_spec_hash: str
+    frame_graph_hash: str
+    time_budget_ms: float = 1_000.0
+    max_solve_cycles: int = 120
+    max_measured_qpos_age_ms: float = 200.0
+    standard_position_tolerance_m: float = 0.003
+    standard_orientation_tolerance_deg: float = 1.0
+    basic_position_tolerance_m: float = 0.05
+    basic_orientation_tolerance_deg: float = 20.0
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "evaluator_profile_id",
+            "evaluator_profile_hash",
+            "solver_reference_frame_id",
+            "solver_reference_frame_spec_hash",
+            "frame_graph_hash",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), field_name=field_name),
+            )
+        side = str(self.arm_side).strip().lower()
+        if side not in {"left", "right"}:
+            raise ValueError("arm_side must be left or right.")
+        object.__setattr__(self, "arm_side", side)
+        for field_name in (
+            "time_budget_ms",
+            "max_measured_qpos_age_ms",
+            "standard_position_tolerance_m",
+            "standard_orientation_tolerance_deg",
+            "basic_position_tolerance_m",
+            "basic_orientation_tolerance_deg",
+        ):
+            value = float(getattr(self, field_name))
+            if not 0.0 < value < float("inf"):
+                raise ValueError(f"{field_name} must be finite and positive.")
+            object.__setattr__(self, field_name, value)
+        cycles = int(self.max_solve_cycles)
+        if isinstance(self.max_solve_cycles, bool) or cycles < 1:
+            raise ValueError("max_solve_cycles must be positive.")
+        object.__setattr__(self, "max_solve_cycles", cycles)
+        if (
+            self.standard_position_tolerance_m >= self.basic_position_tolerance_m
+            or self.standard_orientation_tolerance_deg
+            >= self.basic_orientation_tolerance_deg
+        ):
+            raise ValueError("Standard reachability tolerances must be stricter.")
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                field_name: getattr(self, field_name)
+                for field_name in self.__dataclass_fields__
+            }
+            | {
+                "evaluation_scope": (
+                    "finite_time_endpoint_ik_not_path_or_grasp_success"
+                ),
+                "candidate_order_effect": "annotation_only_order_unchanged",
+            },
+            domain="dexteleop.agent_skill.station_point_grasp_arm_reachability.v1",
+        )
 
 
 @dataclass(frozen=True)
@@ -68,6 +151,7 @@ class StationBoundPointGraspProfile:
     model_profile_id: str
     model_profile_hash: str
     inference_implementation_hash: str
+    arm_reachability_profile: StationPointGraspArmReachabilityProfile | None = None
     max_candidates: int = 5
     max_annotated_bytes: int = 16 * 1024 * 1024
     profile_id: str = "real-live-station-bound-dmtac-m-point-grasp-v2"
@@ -94,6 +178,16 @@ class StationBoundPointGraspProfile:
             )
         if self.backend_id not in {"vgn", "graspnet"}:
             raise ValueError("Station point-grasp backend is unsupported.")
+        if self.arm_reachability_profile is not None and not isinstance(
+            self.arm_reachability_profile,
+            StationPointGraspArmReachabilityProfile,
+        ):
+            raise TypeError("arm_reachability_profile must be typed or None.")
+        if (
+            self.arm_reachability_profile is not None
+            and self.arm_reachability_profile.frame_graph_hash != self.frame_graph_hash
+        ):
+            raise ValueError("Arm reachability frame graph differs from point-grasp.")
         sources = tuple(self.aligned_rgbd_sources)
         if not sources:
             raise ValueError("At least one aligned RGB-D source is required.")
@@ -137,30 +231,43 @@ class StationBoundPointGraspProfile:
 
     @property
     def semantic_content_hash(self) -> str:
+        payload = {
+            "profile_id": self.profile_id,
+            "aligned_rgbd_sources": self.aligned_rgbd_sources,
+            "source_binding_hash": self.source_binding_hash,
+            "frame_binding_hash": self.frame_binding_hash,
+            "frame_graph_hash": self.frame_graph_hash,
+            "source_frame_id": self.source_frame_id,
+            "source_frame_spec_hash": self.source_frame_spec_hash,
+            "reference_frame_id": self.reference_frame_id,
+            "reference_frame_spec_hash": self.reference_frame_spec_hash,
+            "backend_id": self.backend_id,
+            "model_profile_id": self.model_profile_id,
+            "model_profile_hash": self.model_profile_hash,
+            "inference_implementation_hash": self.inference_implementation_hash,
+            "max_candidates": self.max_candidates,
+            "max_annotated_bytes": self.max_annotated_bytes,
+            "input": "deployment_owned_single_live_aligned_rgbd_frame",
+            "output": "station_bound_ranked_unprivileged_tool_tcp_proposals",
+            "collision_scope": "visible_scene_only_not_full_scene_or_robot_safety",
+            "selection_authority": "none",
+            "downstream_control_effects": "forbidden",
+        }
+        if self.arm_reachability_profile is None:
+            return canonical_content_hash(
+                payload,
+                domain="dexteleop.agent_skill.station_point_grasp_profile.v2",
+            )
+        payload["arm_reachability_profile_hash"] = (
+            self.arm_reachability_profile.semantic_content_hash
+        )
+        payload["output"] = (
+            "station_bound_ranked_unprivileged_tool_tcp_proposals_with_optional_"
+            "finite_time_arm_ik_annotations"
+        )
         return canonical_content_hash(
-            {
-                "profile_id": self.profile_id,
-                "aligned_rgbd_sources": self.aligned_rgbd_sources,
-                "source_binding_hash": self.source_binding_hash,
-                "frame_binding_hash": self.frame_binding_hash,
-                "frame_graph_hash": self.frame_graph_hash,
-                "source_frame_id": self.source_frame_id,
-                "source_frame_spec_hash": self.source_frame_spec_hash,
-                "reference_frame_id": self.reference_frame_id,
-                "reference_frame_spec_hash": self.reference_frame_spec_hash,
-                "backend_id": self.backend_id,
-                "model_profile_id": self.model_profile_id,
-                "model_profile_hash": self.model_profile_hash,
-                "inference_implementation_hash": self.inference_implementation_hash,
-                "max_candidates": self.max_candidates,
-                "max_annotated_bytes": self.max_annotated_bytes,
-                "input": "deployment_owned_single_live_aligned_rgbd_frame",
-                "output": "station_bound_ranked_unprivileged_tool_tcp_proposals",
-                "collision_scope": "visible_scene_only_not_full_scene_or_robot_safety",
-                "selection_authority": "none",
-                "downstream_control_effects": "forbidden",
-            },
-            domain="dexteleop.agent_skill.station_point_grasp_profile.v2",
+            payload,
+            domain="dexteleop.agent_skill.station_point_grasp_profile.v3",
         )
 
 
@@ -184,9 +291,16 @@ class StationBoundPointGraspBinding:
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
+        if self.deployment_binding_version not in {"2", "3"}:
+            raise ValueError("deployment_binding_version must be 2 or 3.")
 
     @property
     def semantic_content_hash(self) -> str:
+        domain = (
+            "dexteleop.agent_skill.station_point_grasp_deployment.v3"
+            if self.deployment_binding_version == "3"
+            else "dexteleop.agent_skill.station_point_grasp_deployment.v2"
+        )
         return canonical_content_hash(
             {
                 field_name: getattr(self, field_name)
@@ -200,7 +314,7 @@ class StationBoundPointGraspBinding:
                 "selection_authority": "none",
                 "downstream_control_effects": "forbidden",
             },
-            domain="dexteleop.agent_skill.station_point_grasp_deployment.v2",
+            domain=domain,
         )
 
     def to_ref(self) -> SkillDeploymentBindingRef:
@@ -242,6 +356,7 @@ def build_station_bound_point_grasp_registration(
     station_manifest_hash: str,
     execution_manifest_hash: str,
     current_mode: str = "real_observe",
+    arm_reachability_profile: StationPointGraspArmReachabilityProfile | None = None,
 ) -> StationBoundPointGraspRegistration:
     """Build one closed, proposal-only live point-grasp registration."""
 
@@ -267,16 +382,54 @@ def build_station_bound_point_grasp_registration(
         model_profile_id=model_profile_id,
         model_profile_hash=model_profile_hash,
         inference_implementation_hash=inference_implementation_hash,
+        arm_reachability_profile=arm_reachability_profile,
+        profile_id=(
+            "real-live-station-bound-dmtac-m-point-grasp-v3"
+            if arm_reachability_profile is not None
+            else "real-live-station-bound-dmtac-m-point-grasp-v2"
+        ),
     )
-    definition = plan_point_grasp_skill_definition_v2()
-    schema = point_grasp_schema_entry_v2(
-        skill_definition_hash=definition.semantic_content_hash,
-        parameter_profile_id=profile.profile_id,
-        parameter_profile_hash=profile.semantic_content_hash,
-        roles=tuple(profile.source_by_role),
-        max_candidates=profile.max_candidates,
-        backend_id=profile.backend_id,
-    )
+    if arm_reachability_profile is None:
+        definition = plan_point_grasp_skill_definition_v2()
+        schema = point_grasp_schema_entry_v2(
+            skill_definition_hash=definition.semantic_content_hash,
+            parameter_profile_id=profile.profile_id,
+            parameter_profile_hash=profile.semantic_content_hash,
+            roles=tuple(profile.source_by_role),
+            max_candidates=profile.max_candidates,
+            backend_id=profile.backend_id,
+        )
+    else:
+        definition = plan_point_grasp_skill_definition_v3()
+        reachability = arm_reachability_profile
+        schema = point_grasp_schema_entry_v3(
+            skill_definition_hash=definition.semantic_content_hash,
+            parameter_profile_id=profile.profile_id,
+            parameter_profile_hash=profile.semantic_content_hash,
+            roles=tuple(profile.source_by_role),
+            max_candidates=profile.max_candidates,
+            backend_id=profile.backend_id,
+            arm_side=reachability.arm_side,
+            evaluator_profile_id=reachability.evaluator_profile_id,
+            evaluator_profile_hash=reachability.evaluator_profile_hash,
+            candidate_reference_frame_id=profile.reference_frame_id,
+            solver_reference_frame_id=reachability.solver_reference_frame_id,
+            solver_reference_frame_spec_hash=(
+                reachability.solver_reference_frame_spec_hash
+            ),
+            frame_graph_hash=reachability.frame_graph_hash,
+            time_budget_ms=reachability.time_budget_ms,
+            max_solve_cycles=reachability.max_solve_cycles,
+            max_measured_qpos_age_ms=reachability.max_measured_qpos_age_ms,
+            standard_position_tolerance_m=(reachability.standard_position_tolerance_m),
+            standard_orientation_tolerance_deg=(
+                reachability.standard_orientation_tolerance_deg
+            ),
+            basic_position_tolerance_m=reachability.basic_position_tolerance_m,
+            basic_orientation_tolerance_deg=(
+                reachability.basic_orientation_tolerance_deg
+            ),
+        )
     io_contract = SkillIOContract(
         skill_id=definition.skill_id,
         skill_version=definition.skill_version,
@@ -307,7 +460,7 @@ def build_station_bound_point_grasp_registration(
         skill_version=definition.skill_version,
         skill_definition_hash=definition.semantic_content_hash,
         route_id=REAL_STATION_POINT_GRASP_ROUTE_ID_V2,
-        route_version="2",
+        route_version=definition.skill_version,
         parameter_schema_hash=schema.parameter_schema_hash,
         execution_result_schema_hash=schema.execution_result_schema_hash,
         task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -340,7 +493,69 @@ def build_station_bound_point_grasp_registration(
         station_manifest_hash=station_manifest_hash,
         execution_manifest_hash=execution_manifest_hash,
         profile_hash=profile.semantic_content_hash,
+        executor_id=(
+            REAL_STATION_POINT_GRASP_EXECUTOR_ID_V3
+            if arm_reachability_profile is not None
+            else REAL_STATION_POINT_GRASP_EXECUTOR_ID_V2
+        ),
+        deployment_binding_version=definition.skill_version,
     )
+    common_result_validation = {
+        "source_by_role": profile.source_by_role,
+        "dimensions_by_role": profile.dimensions_by_role,
+        "source_binding_hash": profile.source_binding_hash,
+        "frame_binding_hash": profile.frame_binding_hash,
+        "frame_graph_hash": profile.frame_graph_hash,
+        "source_frame_id": profile.source_frame_id,
+        "source_frame_spec_hash": profile.source_frame_spec_hash,
+        "reference_frame_id": profile.reference_frame_id,
+        "reference_frame_spec_hash": profile.reference_frame_spec_hash,
+        "backend_id": profile.backend_id,
+        "model_profile_id": profile.model_profile_id,
+        "model_profile_hash": profile.model_profile_hash,
+        "inference_implementation_hash": profile.inference_implementation_hash,
+        "max_candidates": profile.max_candidates,
+    }
+    if arm_reachability_profile is None:
+        parameter_validator = lambda payload: validate_point_grasp_parameters_v2(
+            payload,
+            dimensions_by_role=profile.dimensions_by_role,
+            max_candidates=profile.max_candidates,
+        )
+        result_validator = lambda payload: validate_point_grasp_result_v2(
+            payload, **common_result_validation
+        )
+        result_for_parameters_validator = validate_point_grasp_result_for_parameters_v2
+    else:
+        reachability = arm_reachability_profile
+        parameter_validator = lambda payload: validate_point_grasp_parameters_v3(
+            payload,
+            dimensions_by_role=profile.dimensions_by_role,
+            max_candidates=profile.max_candidates,
+        )
+        result_validator = lambda payload: validate_point_grasp_result_v3(
+            payload,
+            **common_result_validation,
+            arm_side=reachability.arm_side,
+            evaluator_profile_id=reachability.evaluator_profile_id,
+            evaluator_profile_hash=reachability.evaluator_profile_hash,
+            solver_reference_frame_id=reachability.solver_reference_frame_id,
+            solver_reference_frame_spec_hash=(
+                reachability.solver_reference_frame_spec_hash
+            ),
+            time_budget_ms=reachability.time_budget_ms,
+            max_solve_cycles=reachability.max_solve_cycles,
+            max_measured_qpos_age_ms=reachability.max_measured_qpos_age_ms,
+            standard_position_tolerance_m=(reachability.standard_position_tolerance_m),
+            standard_orientation_tolerance_deg=(
+                reachability.standard_orientation_tolerance_deg
+            ),
+            basic_position_tolerance_m=reachability.basic_position_tolerance_m,
+            basic_orientation_tolerance_deg=(
+                reachability.basic_orientation_tolerance_deg
+            ),
+        )
+        result_for_parameters_validator = validate_point_grasp_result_for_parameters_v3
     validator = AgentSkillPayloadValidatorSet(
         validator_id="dexteleop.agent_skill.validator.station_point_grasp:"
         + runtime_session_id,
@@ -351,31 +566,9 @@ def build_station_bound_point_grasp_registration(
         parameter_schema_hash=route.parameter_schema_hash,
         execution_result_schema_hash=route.execution_result_schema_hash,
         task_evaluation_schema_hash=route.task_evaluation_schema_hash,
-        validate_parameters=lambda payload: validate_point_grasp_parameters_v2(
-            payload,
-            dimensions_by_role=profile.dimensions_by_role,
-            max_candidates=profile.max_candidates,
-        ),
-        validate_execution_result=lambda payload: validate_point_grasp_result_v2(
-            payload,
-            source_by_role=profile.source_by_role,
-            dimensions_by_role=profile.dimensions_by_role,
-            source_binding_hash=profile.source_binding_hash,
-            frame_binding_hash=profile.frame_binding_hash,
-            frame_graph_hash=profile.frame_graph_hash,
-            source_frame_id=profile.source_frame_id,
-            source_frame_spec_hash=profile.source_frame_spec_hash,
-            reference_frame_id=profile.reference_frame_id,
-            reference_frame_spec_hash=profile.reference_frame_spec_hash,
-            backend_id=profile.backend_id,
-            model_profile_id=profile.model_profile_id,
-            model_profile_hash=profile.model_profile_hash,
-            inference_implementation_hash=profile.inference_implementation_hash,
-            max_candidates=profile.max_candidates,
-        ),
-        validate_execution_result_for_parameters=(
-            validate_point_grasp_result_for_parameters_v2
-        ),
+        validate_parameters=parameter_validator,
+        validate_execution_result=result_validator,
+        validate_execution_result_for_parameters=result_for_parameters_validator,
         validate_task_evaluation=validate_no_task_evaluation_v1,
     )
     availability_hash = canonical_content_hash(
@@ -385,7 +578,11 @@ def build_station_bound_point_grasp_registration(
             "deployment_binding_hash": binding.semantic_content_hash,
             "profile_hash": profile.semantic_content_hash,
         },
-        domain="dexteleop.agent_skill.station_point_grasp_availability.v2",
+        domain=(
+            "dexteleop.agent_skill.station_point_grasp_availability.v3"
+            if arm_reachability_profile is not None
+            else "dexteleop.agent_skill.station_point_grasp_availability.v2"
+        ),
     )
     return StationBoundPointGraspRegistration(
         profile=profile,
@@ -398,10 +595,12 @@ def build_station_bound_point_grasp_registration(
 
 __all__ = [
     "REAL_STATION_POINT_GRASP_EXECUTOR_ID_V2",
+    "REAL_STATION_POINT_GRASP_EXECUTOR_ID_V3",
     "REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2",
     "REAL_STATION_POINT_GRASP_ROUTE_ID_V2",
     "StationBoundPointGraspBinding",
     "StationBoundPointGraspProfile",
     "StationBoundPointGraspRegistration",
+    "StationPointGraspArmReachabilityProfile",
     "build_station_bound_point_grasp_registration",
 ]

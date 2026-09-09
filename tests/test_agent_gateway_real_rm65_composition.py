@@ -38,6 +38,9 @@ from robot_motion.rm65 import (
 from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
 from teleop_runtime.interfaces import EffectorBackend
 from teleop_runtime.skill_deploy import rm65_profile as profile_module
+from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65GraspReachabilityResult,
+)
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
     assemble_exclusive_rm65_skill_lower,
 )
@@ -528,6 +531,14 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
             session.contract_bundle.route_manifest.explicit_exclusions
         )
         assert composition.station_point_grasp_registration is not None
+        assert (
+            composition.station_point_grasp_registration.skill.definition.skill_version
+            == "2"
+        )
+        assert (
+            composition.station_point_grasp_registration.profile.arm_reachability_profile
+            is None
+        )
         assert composition.station_point_grasp_render_registration is not None
         assert tuple(
             composition.station_point_grasp_registration.profile.source_by_role
@@ -553,6 +564,104 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         }
         assert session.owns_artifact_store is False
         assert composition.resources.artifact_store is session.artifact_store
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+        assert guard.starts == 0
+    finally:
+        assert session.artifact_store is not None
+        session.artifact_store.close()
+
+
+def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lower, guard = _lower(monkeypatch)
+    localizer = _Localizer()
+    planner = _PointGraspPlanner(localizer)
+
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower,
+        socket_path=REPO_ROOT / "temp/test-real-rm65-grasp-reachability.sock",
+        authorized_side="right",
+        authorized_action="move_tcp_to_pose",
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test",
+        client_uid=1000,
+        runtime_session_id="real-rm65:grasp-reachability-test",
+        control_domain_id="exclusive-real-skill:grasp-reachability-test",
+        embodiment_instance_id="dual-rm65:grasp-reachability-test",
+        camera_config_path=(
+            REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
+        ),
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+        artifact_root=tmp_path,
+        camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        object_localizer=localizer,
+        point_grasp_planner=planner,
+        enable_point_grasp_arm_reachability=True,
+        clock=lambda: 10.0,
+    )
+    session = composition.deployment.gateway_session
+    try:
+        registration = composition.station_point_grasp_registration
+        assert registration is not None
+        assert registration.skill.definition.skill_version == "3"
+        reachability = registration.profile.arm_reachability_profile
+        assert reachability is not None
+        assert reachability.arm_side == "right"
+        assert reachability.solver_reference_frame_id == (
+            RM65_SKILL_EXECUTION_FRAME_ID_V1
+        )
+        assert session.station_point_grasp_provider is not None
+        assert callable(session.station_point_grasp_provider.arm_reachability_evaluator)
+        lower.target_builder.tool_tcp_world_targets_for_qpos_pair = lambda **_kwargs: {
+            "left": np.eye(4),
+            "right": np.eye(4),
+        }
+        evaluator = session.station_point_grasp_provider.arm_reachability_evaluator
+        session.port.publish_measured_qpos_pair(
+            qpos_by_side={
+                "left": np.zeros(6),
+                "right": np.zeros(6),
+            },
+            measured_at=9.0,
+            available_at=9.01,
+            source_evidence_refs=("measured-qpos:stale-test",),
+        )
+        with pytest.raises(RuntimeError, match="measured qpos is stale"):
+            evaluator((np.eye(4),))
+
+        session.port.publish_measured_qpos_pair(
+            qpos_by_side={
+                "left": np.zeros(6),
+                "right": np.zeros(6),
+            },
+            measured_at=9.95,
+            available_at=9.96,
+            source_evidence_refs=("measured-qpos:test",),
+        )
+        captured = []
+
+        def assess(**kwargs):
+            captured.append(kwargs)
+            return RM65GraspReachabilityResult(
+                classification="standard_reachable",
+                position_residual_m=0.0,
+                orientation_residual_deg=0.0,
+                solve_cycles=1,
+                elapsed_ms=1.0,
+                termination_reason="standard_tolerance_met",
+            )
+
+        evaluator.planner.assess_endpoint_ik = assess
+        context, annotations = evaluator((np.eye(4),))
+        np.testing.assert_allclose(
+            captured[0]["target_tool_tcp_world"],
+            lower.profile.scene_world_from_canonical_station,
+        )
+        assert context["candidate_reference_frame_id"] == "canonical_station"
+        assert context["measured_qpos_age_ms"] == pytest.approx(50.0)
+        assert annotations[0]["classification"] == "standard_reachable"
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())
         assert guard.starts == 0
     finally:

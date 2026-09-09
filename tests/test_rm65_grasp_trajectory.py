@@ -43,6 +43,7 @@ from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
 )
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspJointTrajectoryPlanner,
+    RM65GraspReachabilityConfig,
     RM65GraspTrajectoryPlanningError,
 )
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
@@ -57,10 +58,24 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 pytestmark = [pytest.mark.integration, pytest.mark.contract]
 SAFE_QPOS = {
     "left": np.array(
-        [1.5853514942, 0.1381550277, 2.1352611562, 0.0699109098, -0.7493894092, -0.0572276017]
+        [
+            1.5853514942,
+            0.1381550277,
+            2.1352611562,
+            0.0699109098,
+            -0.7493894092,
+            -0.0572276017,
+        ]
     ),
     "right": np.array(
-        [-1.4983346097, 0.0517420315, 2.1069143897, 0.0504173256, -0.6155243686, -0.0529943045]
+        [
+            -1.4983346097,
+            0.0517420315,
+            2.1069143897,
+            0.0504173256,
+            -0.6155243686,
+            -0.0529943045,
+        ]
     ),
 }
 
@@ -175,8 +190,29 @@ def _field_trace_mujoco_expectation(
     )
 
 
-def test_urdf_grasp_planner_handles_hold_and_moving_paths_without_mujoco() -> None:
-    profile = resolve_exclusive_rm65_skill_deployment_profile(
+class _ReachabilityBuilder:
+    def __init__(self, realized_pose: np.ndarray) -> None:
+        self.realized_pose = np.asarray(realized_pose, dtype=float)
+
+    def set_current_qpos_pair(self, **_kwargs) -> None:
+        return None
+
+    def solver_world_targets_for_qpos_pair(self, **_kwargs):
+        return {"left": np.eye(4), "right": np.eye(4)}
+
+    def solver_world_target_from_tool_tcp_world_target(self, **kwargs):
+        return np.asarray(kwargs["tool_tcp_world_target"], dtype=float)
+
+    def solve_target_pair(self, _target):
+        side = type("Side", (), {"qpos": np.zeros(6)})
+        return type("Result", (), {"side_results": {"left": side, "right": side}})
+
+    def tool_tcp_world_targets_for_qpos_pair(self, **_kwargs):
+        return {"left": np.eye(4), "right": self.realized_pose.copy()}
+
+
+def _real_profile():
+    return resolve_exclusive_rm65_skill_deployment_profile(
         ExclusiveRM65SkillDeploymentProfile(
             arm_ip_assignment_path=(
                 REPO_ROOT / "teleop_runtime/configs/hardware/rm65_arm_ips/latest.json"
@@ -194,6 +230,10 @@ def test_urdf_grasp_planner_handles_hold_and_moving_paths_without_mujoco() -> No
             ),
         )
     )
+
+
+def test_urdf_grasp_planner_handles_hold_and_moving_paths_without_mujoco() -> None:
+    profile = _real_profile()
     builder = build_exclusive_rm65_skill_target_builder(profile)
     planner = RM65GraspJointTrajectoryPlanner(
         profile=profile,
@@ -213,6 +253,11 @@ def test_urdf_grasp_planner_handles_hold_and_moving_paths_without_mujoco() -> No
         target_tool_tcp_world=current_target,
         speed_scale=0.25,
     )
+    current_reachability = planner.assess_endpoint_ik(
+        qpos_by_side=SAFE_QPOS,
+        side="right",
+        target_tool_tcp_world=current_target,
+    )
 
     moved_qpos = {side: values.copy() for side, values in SAFE_QPOS.items()}
     moved_qpos["right"][0] += 0.04
@@ -228,6 +273,7 @@ def test_urdf_grasp_planner_handles_hold_and_moving_paths_without_mujoco() -> No
     )
 
     assert hold.time_from_start_sec.tolist() == [0.0, 0.25]
+    assert current_reachability.classification == "standard_reachable"
     assert moving.time_from_start_sec.size > 2
     assert np.all(np.diff(moving.time_from_start_sec) > 0.0)
     np.testing.assert_allclose(
@@ -436,3 +482,74 @@ def test_field_trace_grasp_trajectory_executes_as_exact_qpos_in_mujoco() -> None
     assert receipt.exact_planned_qpos_execution_confirmed is True
     assert receipt.model_identity_confirmed is True
     assert receipt.terminal_hold_confirmed is True
+
+
+@pytest.mark.parametrize(
+    ("translation_m", "rotation_deg", "expected"),
+    [
+        (0.001, 0.5, "standard_reachable"),
+        (0.03, 10.0, "basically_reachable"),
+        (0.06, 25.0, "difficult_to_reach"),
+    ],
+)
+def test_reachability_classification_uses_one_solution_residual_pair(
+    translation_m: float,
+    rotation_deg: float,
+    expected: str,
+) -> None:
+    profile = _real_profile()
+    initial_builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=initial_builder,
+        target_envelope_filter=None,
+        reachability_config=RM65GraspReachabilityConfig(max_solve_cycles=1),
+    )
+    realized = np.eye(4)
+    realized[0, 3] = translation_m
+    angle = np.deg2rad(rotation_deg)
+    realized[:2, :2] = ((np.cos(angle), -np.sin(angle)), (np.sin(angle), np.cos(angle)))
+    planner.target_builder = _ReachabilityBuilder(realized)
+
+    result = planner.assess_endpoint_ik(
+        qpos_by_side={side: np.zeros(6) for side in ("left", "right")},
+        side="right",
+        target_tool_tcp_world=np.eye(4),
+        monotonic=lambda: 0.0,
+    )
+
+    assert result.classification == expected
+    assert result.position_residual_m == pytest.approx(translation_m)
+    assert result.orientation_residual_deg == pytest.approx(rotation_deg)
+    assert result.solve_cycles == 1
+
+
+def test_reachability_stops_on_wall_time_budget_and_returns_best_basic_solution() -> (
+    None
+):
+    profile = _real_profile()
+    initial_builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=initial_builder,
+        target_envelope_filter=None,
+        reachability_config=RM65GraspReachabilityConfig(
+            time_budget_ms=1_000.0,
+            max_solve_cycles=120,
+        ),
+    )
+    realized = np.eye(4)
+    realized[0, 3] = 0.03
+    planner.target_builder = _ReachabilityBuilder(realized)
+    times = iter((0.0, 2.0, 2.0, 2.0))
+
+    result = planner.assess_endpoint_ik(
+        qpos_by_side={side: np.zeros(6) for side in ("left", "right")},
+        side="right",
+        target_tool_tcp_world=np.eye(4),
+        monotonic=lambda: next(times),
+    )
+
+    assert result.classification == "basically_reachable"
+    assert result.termination_reason == "time_budget_exhausted"
+    assert result.solve_cycles == 1

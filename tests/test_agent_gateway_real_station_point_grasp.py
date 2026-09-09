@@ -25,6 +25,7 @@ from agent_gateway.profiles.real.realsense_perception import (
 )
 from agent_gateway.profiles.real.station_point_grasp_deployment import (
     REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2,
+    StationPointGraspArmReachabilityProfile,
     build_station_bound_point_grasp_registration,
 )
 from agent_gateway.profiles.real.station_point_grasp_render_deployment import (
@@ -214,7 +215,7 @@ def _frame_binding():
     )
 
 
-def _provider_stack(*, revision=None):
+def _provider_stack(*, revision=None, arm_reachability_evaluator=None):
     source = _Source()
     binding = RealPerceptionSourceBinding(
         camera_sources={"front": source},
@@ -237,6 +238,18 @@ def _provider_stack(*, revision=None):
     frame_binding = _frame_binding()
     localizer = _Localizer()
     planner = _Planner(localizer, revision=revision if revision.get("mutate") else None)
+    reachability_profile = (
+        None
+        if arm_reachability_evaluator is None
+        else StationPointGraspArmReachabilityProfile(
+            arm_side="right",
+            evaluator_profile_id="rm65.reachability:test",
+            evaluator_profile_hash="rm65-reachability-profile:test",
+            solver_reference_frame_id=frame_binding.source_frame_id,
+            solver_reference_frame_spec_hash=frame_binding.source_frame_spec_hash,
+            frame_graph_hash=frame_binding.frame_graph.semantic_content_hash,
+        )
+    )
     registration = build_station_bound_point_grasp_registration(
         aligned_rgbd_source_catalog=tuple(
             dict(item) for item in perception.aligned_rgbd_source_catalog()
@@ -257,6 +270,7 @@ def _provider_stack(*, revision=None):
         target_binding_id="real-realsense-only:test",
         station_manifest_hash="station:test",
         execution_manifest_hash="execution:test",
+        arm_reachability_profile=reachability_profile,
     )
     provider = StationBoundPointGraspProvider(
         planner=planner,
@@ -264,18 +278,22 @@ def _provider_stack(*, revision=None):
         perception_provider=perception,
         frame_binding=frame_binding,
         current_station_revision=lambda: revision["value"],
+        arm_reachability_evaluator=arm_reachability_evaluator,
     )
     return source, revision, planner, registration, provider
 
 
-def _request():
+def _request(*, include_arm_reachability=None):
+    parameters = {
+        "role": "main",
+        # Wire decoding freezes JSON arrays before provider validation.
+        "target_pixel_uv": (1, 1),
+        "max_candidates": 2,
+    }
+    if include_arm_reachability is not None:
+        parameters["include_arm_reachability"] = include_arm_reachability
     return SimpleNamespace(
-        parameters={
-            "role": "main",
-            # Wire decoding freezes JSON arrays before provider validation.
-            "target_pixel_uv": (1, 1),
-            "max_candidates": 2,
-        },
+        parameters=parameters,
         input_artifact_bindings=(),
         expected_station_revision=7,
     )
@@ -319,6 +337,89 @@ def test_station_point_grasp_route_is_live_bound_read_only_and_proposal_only() -
         _request().parameters,
         prepared.execution_result,
     )
+
+
+def test_station_point_grasp_v3_reachability_is_request_gated_and_annotation_only() -> (
+    None
+):
+    calls = []
+
+    def evaluate(candidates):
+        calls.append(candidates)
+        profile = registration.profile.arm_reachability_profile
+        assert profile is not None
+        context = {
+            "arm_side": profile.arm_side,
+            "evaluator_profile_id": profile.evaluator_profile_id,
+            "evaluator_profile_hash": profile.evaluator_profile_hash,
+            "candidate_reference_frame_id": registration.profile.reference_frame_id,
+            "solver_reference_frame_id": profile.solver_reference_frame_id,
+            "solver_reference_frame_spec_hash": (
+                profile.solver_reference_frame_spec_hash
+            ),
+            "frame_graph_hash": profile.frame_graph_hash,
+            "time_budget_ms": profile.time_budget_ms,
+            "max_solve_cycles": profile.max_solve_cycles,
+            "max_measured_qpos_age_ms": profile.max_measured_qpos_age_ms,
+            "standard_position_tolerance_m": (profile.standard_position_tolerance_m),
+            "standard_orientation_tolerance_deg": (
+                profile.standard_orientation_tolerance_deg
+            ),
+            "basic_position_tolerance_m": profile.basic_position_tolerance_m,
+            "basic_orientation_tolerance_deg": (
+                profile.basic_orientation_tolerance_deg
+            ),
+            "measured_qpos_revision": 4,
+            "measured_qpos_at": 9.95,
+            "measured_qpos_age_ms": 50.0,
+            "evaluation_scope": ("finite_time_endpoint_ik_not_path_or_grasp_success"),
+            "candidate_order_effect": "annotation_only_order_unchanged",
+        }
+        annotation = {
+            "classification": "standard_reachable",
+            "position_residual_m": 0.001,
+            "orientation_residual_deg": 0.5,
+            "solve_cycles": 2,
+            "elapsed_ms": 4.0,
+            "termination_reason": "standard_tolerance_met",
+        }
+        return context, tuple(annotation for _candidate in candidates)
+
+    _source, _revision, _planner, registration, provider = _provider_stack(
+        arm_reachability_evaluator=evaluate
+    )
+    assert registration.skill.definition.skill_version == "3"
+
+    disabled_request = _request(include_arm_reachability=False)
+    disabled = provider.plan_request(disabled_request).execution_result
+    assert calls == []
+    assert "arm_reachability_context" not in disabled
+    assert "arm_reachability" not in disabled["candidates"][0]
+    registration.payload_validator.validate_execution_result(disabled)
+    registration.payload_validator.validate_execution_result_for_parameters(
+        disabled_request.parameters, disabled
+    )
+
+    enabled_request = _request(include_arm_reachability=True)
+    enabled = provider.plan_request(enabled_request).execution_result
+    assert len(calls) == 1
+    np.testing.assert_allclose(
+        calls[0][0],
+        np.asarray(enabled["candidates"][0]["T_reference_from_tool_tcp"]).reshape(4, 4),
+    )
+    assert enabled["candidates"][0]["arm_reachability"]["classification"] == (
+        "standard_reachable"
+    )
+    registration.payload_validator.validate_parameters(enabled_request.parameters)
+    registration.payload_validator.validate_execution_result(enabled)
+    registration.payload_validator.validate_execution_result_for_parameters(
+        enabled_request.parameters, enabled
+    )
+
+    with pytest.raises(ValueError, match="does not match the request"):
+        registration.payload_validator.validate_execution_result_for_parameters(
+            disabled_request.parameters, enabled
+        )
 
 
 def test_station_point_grasp_fails_if_revision_changes_during_inference() -> None:

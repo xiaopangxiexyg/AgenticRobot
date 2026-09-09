@@ -149,6 +149,9 @@ def assemble_exclusive_real_agent_primitive_deployment(
         StationBoundPointGraspRenderRegistration | None
     ) = None,
     station_point_grasp_planner: object | None = None,
+    station_point_grasp_reachability_evaluator_factory: (
+        Callable[[RealAgentMotionPort], Callable[..., object]] | None
+    ) = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
     perception_provider_factory: (
         Callable[
@@ -194,6 +197,11 @@ def assemble_exclusive_real_agent_primitive_deployment(
             lambda: revision_tracker.current_revision,
         )
     )
+    station_point_grasp_reachability_evaluator = (
+        None
+        if station_point_grasp_reachability_evaluator_factory is None
+        else station_point_grasp_reachability_evaluator_factory(port)
+    )
     control_runtime = ExclusiveRealSkillControlRuntime(
         motion_port=port,
         observation_provider=observation_provider,
@@ -216,6 +224,9 @@ def assemble_exclusive_real_agent_primitive_deployment(
         perception_provider=perception_provider,
         localization_provider=localization_provider,
         station_point_grasp_planner=station_point_grasp_planner,
+        station_point_grasp_reachability_evaluator=(
+            station_point_grasp_reachability_evaluator
+        ),
         grasp_trajectory_planner=grasp_trajectory_planner,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
@@ -249,6 +260,9 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         StationBoundPointGraspRenderRegistration | None
     ) = None,
     station_point_grasp_planner: object | None = None,
+    station_point_grasp_reachability_evaluator_factory: (
+        Callable[[RealAgentMotionPort], Callable[..., object]] | None
+    ) = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
     perception_provider_factory: (
         Callable[
@@ -296,6 +310,9 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
             station_point_grasp_render_registration
         ),
         station_point_grasp_planner=station_point_grasp_planner,
+        station_point_grasp_reachability_evaluator_factory=(
+            station_point_grasp_reachability_evaluator_factory
+        ),
         grasp_trajectory_planner=grasp_trajectory_planner,
         perception_provider_factory=perception_provider_factory,
         artifact_store=artifact_store,

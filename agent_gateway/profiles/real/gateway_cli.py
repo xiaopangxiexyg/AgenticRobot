@@ -115,6 +115,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Station XYZ axes on point-grasp renderings"
         ),
     )
+    parser.add_argument(
+        "--enable-point-grasp-arm-reachability",
+        action="store_true",
+        help=(
+            "register point-grasp v3 with optional finite-time RM65 endpoint-IK "
+            "annotations; candidate ordering remains unchanged"
+        ),
+    )
     parser.add_argument("--object-localization-asset-bundle", type=Path)
     parser.add_argument("--object-localization-device", default="cuda")
     parser.add_argument(
@@ -589,6 +597,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-point-grasp requires the composed camera options")
     if args.debug_render_object_coordinates and not args.enable_point_grasp:
         parser.error("--debug-render-object-coordinates requires --enable-point-grasp")
+    if args.enable_point_grasp_arm_reachability and not args.enable_point_grasp:
+        parser.error(
+            "--enable-point-grasp-arm-reachability requires --enable-point-grasp"
+        )
     camera_mount_urdf_arg = _effective_camera_mount_urdf(args)
     point_grasp_values = (
         args.object_localization_asset_bundle,
@@ -791,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
+        enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
     )
 
     motion_trace: SkillMotionTraceRecorder | None = None

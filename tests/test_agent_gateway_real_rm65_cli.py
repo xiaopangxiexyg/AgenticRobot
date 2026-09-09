@@ -175,6 +175,23 @@ def test_object_coordinate_render_debug_is_explicit_and_default_off() -> None:
     assert enabled.debug_render_object_coordinates is True
 
 
+def test_point_grasp_arm_reachability_is_explicit_and_default_off() -> None:
+    parser = gateway_cli.build_parser()
+    default = parser.parse_args(
+        _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    )
+    enabled = parser.parse_args(
+        [
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-point-grasp",
+            "--enable-point-grasp-arm-reachability",
+        ]
+    )
+
+    assert default.enable_point_grasp_arm_reachability is False
+    assert enabled.enable_point_grasp_arm_reachability is True
+
+
 def test_motion_trace_is_explicit_and_preallocated_duration_is_bounded() -> None:
     parser = gateway_cli.build_parser()
     default = parser.parse_args(
@@ -357,6 +374,30 @@ def test_cli_rejects_object_coordinate_debug_without_point_grasp(
     )
     argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
     argv.append("--debug-render-object-coordinates")
+
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main(argv)
+
+    assert captured.value.code == 2
+    assert called is False
+
+
+def test_cli_rejects_arm_reachability_without_point_grasp(monkeypatch) -> None:
+    called = False
+
+    def should_not_resolve(profile):
+        del profile
+        nonlocal called
+        called = True
+        raise AssertionError("reachability validation must precede profile resolution")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        should_not_resolve,
+    )
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    argv.append("--enable-point-grasp-arm-reachability")
 
     with pytest.raises(SystemExit) as captured:
         gateway_cli.main(argv)
@@ -692,7 +733,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
                     "latest_measurement_age_sec": 0.01,
                     "latest_available_age_sec": 0.005,
                     "source_sequence_by_side": {"left": 10, "right": 11},
-                }
+                },
             ),
         ),
         deployment=SimpleNamespace(
@@ -786,7 +827,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             "exception_type": "RuntimeError",
             "message": "point-grasp inference failed",
             "failed_at": 10.25,
-        }
+        },
     ]
     assert captured["lower"] is lower
     assert captured["authorized_side"] == "right"

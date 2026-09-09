@@ -982,6 +982,7 @@ def assemble_real_agent_primitive_gateway_session(
     perception_provider: RealSenseAgentPerceptionProvider | None = None,
     localization_provider: ObjectLocalizationProvider | None = None,
     station_point_grasp_planner: object | None = None,
+    station_point_grasp_reachability_evaluator: Callable[..., object] | None = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
@@ -1038,6 +1039,15 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError("Localization registration requires its exact provider.")
     if grasp_enabled != (station_point_grasp_planner is not None):
         raise ValueError("Point-grasp registration requires its exact planner.")
+    point_grasp_registration = contract_bundle.station_point_grasp_registration
+    reachability_registered = bool(
+        point_grasp_registration is not None
+        and point_grasp_registration.profile.arm_reachability_profile is not None
+    )
+    if reachability_registered != callable(station_point_grasp_reachability_evaluator):
+        raise ValueError(
+            "Point-grasp arm reachability registration requires its exact evaluator."
+        )
     grasp_approach_enabled = any(
         entry.route.skill_id == GRASP_APPROACH_SKILL_ID_V1
         for entry in contract_bundle.route_manifest.skill_routes
@@ -1229,6 +1239,7 @@ def assemble_real_agent_primitive_gateway_session(
                 perception_provider=perception_provider,
                 frame_binding=frame_binding,
                 current_station_revision=lambda: producer.current_station_revision,
+                arm_reachability_evaluator=(station_point_grasp_reachability_evaluator),
             )
             station_point_grasp_executor = build_station_bound_point_grasp_executor(
                 registration=point_grasp_registration,

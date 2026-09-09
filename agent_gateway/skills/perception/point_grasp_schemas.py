@@ -33,6 +33,14 @@ def _vector_schema(length: int) -> dict[str, Any]:
     }
 
 
+def _mutable_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _mutable_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_json(item) for item in value]
+    return value
+
+
 def point_grasp_schema_entry_v1(
     *,
     skill_definition_hash: str,
@@ -427,6 +435,165 @@ def point_grasp_schema_entry_v2(
         parameter_schema=parameter_schema,
         execution_result_schema=result_schema,
         task_evaluation_schema=task_schema,
+        parameter_profiles=(profile,),
+    )
+
+
+def point_grasp_schema_entry_v3(
+    *,
+    skill_definition_hash: str,
+    parameter_profile_id: str,
+    parameter_profile_hash: str,
+    roles: tuple[str, ...],
+    max_candidates: int,
+    backend_id: str,
+    arm_side: str,
+    evaluator_profile_id: str,
+    evaluator_profile_hash: str,
+    candidate_reference_frame_id: str,
+    solver_reference_frame_id: str,
+    solver_reference_frame_spec_hash: str,
+    frame_graph_hash: str,
+    time_budget_ms: float,
+    max_solve_cycles: int,
+    max_measured_qpos_age_ms: float,
+    standard_position_tolerance_m: float,
+    standard_orientation_tolerance_deg: float,
+    basic_position_tolerance_m: float,
+    basic_orientation_tolerance_deg: float,
+) -> AgentSkillSchemaEntry:
+    """Build v3 with request-gated, annotation-only arm IK reachability."""
+
+    base = point_grasp_schema_entry_v2(
+        skill_definition_hash=skill_definition_hash,
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+        roles=roles,
+        max_candidates=max_candidates,
+        backend_id=backend_id,
+    )
+    parameter_schema = _mutable_json(base.parameter_schema)
+    parameter_schema["properties"]["include_arm_reachability"] = {"type": "boolean"}
+    parameter_schema["required"].append("include_arm_reachability")
+
+    annotation_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": [
+                    "standard_reachable",
+                    "basically_reachable",
+                    "difficult_to_reach",
+                ],
+            },
+            "position_residual_m": {"type": "number", "minimum": 0},
+            "orientation_residual_deg": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 180,
+            },
+            "solve_cycles": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": max_solve_cycles,
+            },
+            "elapsed_ms": {"type": "number", "minimum": 0},
+            "termination_reason": {
+                "type": "string",
+                "enum": [
+                    "standard_tolerance_met",
+                    "time_budget_exhausted",
+                    "cycle_budget_exhausted",
+                ],
+            },
+        },
+        "required": [
+            "classification",
+            "position_residual_m",
+            "orientation_residual_deg",
+            "solve_cycles",
+            "elapsed_ms",
+            "termination_reason",
+        ],
+    }
+    result_schema = _mutable_json(base.execution_result_schema)
+    result_schema["properties"]["arm_reachability_context"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "arm_side": {"const": arm_side},
+            "evaluator_profile_id": {"const": evaluator_profile_id},
+            "evaluator_profile_hash": {"const": evaluator_profile_hash},
+            "candidate_reference_frame_id": {"const": candidate_reference_frame_id},
+            "solver_reference_frame_id": {"const": solver_reference_frame_id},
+            "solver_reference_frame_spec_hash": {
+                "const": solver_reference_frame_spec_hash
+            },
+            "frame_graph_hash": {"const": frame_graph_hash},
+            "time_budget_ms": {"const": time_budget_ms},
+            "max_solve_cycles": {"const": max_solve_cycles},
+            "max_measured_qpos_age_ms": {"const": max_measured_qpos_age_ms},
+            "standard_position_tolerance_m": {"const": standard_position_tolerance_m},
+            "standard_orientation_tolerance_deg": {
+                "const": standard_orientation_tolerance_deg
+            },
+            "basic_position_tolerance_m": {"const": basic_position_tolerance_m},
+            "basic_orientation_tolerance_deg": {
+                "const": basic_orientation_tolerance_deg
+            },
+            "measured_qpos_revision": {"type": "integer", "minimum": 0},
+            "measured_qpos_at": {"type": "number"},
+            "measured_qpos_age_ms": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": max_measured_qpos_age_ms,
+            },
+            "evaluation_scope": {
+                "const": "finite_time_endpoint_ik_not_path_or_grasp_success"
+            },
+            "candidate_order_effect": {"const": "annotation_only_order_unchanged"},
+        },
+        "required": [
+            "arm_side",
+            "evaluator_profile_id",
+            "evaluator_profile_hash",
+            "candidate_reference_frame_id",
+            "solver_reference_frame_id",
+            "solver_reference_frame_spec_hash",
+            "frame_graph_hash",
+            "time_budget_ms",
+            "max_solve_cycles",
+            "max_measured_qpos_age_ms",
+            "standard_position_tolerance_m",
+            "standard_orientation_tolerance_deg",
+            "basic_position_tolerance_m",
+            "basic_orientation_tolerance_deg",
+            "measured_qpos_revision",
+            "measured_qpos_at",
+            "measured_qpos_age_ms",
+            "evaluation_scope",
+            "candidate_order_effect",
+        ],
+    }
+    result_schema["properties"]["candidates"]["items"]["properties"][
+        "arm_reachability"
+    ] = annotation_schema
+    profile = SkillParameterProfileRef(
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+        parameter_schema_hash=agent_skill_schema_document_hash(
+            parameter_schema, schema_kind="parameter"
+        ),
+    )
+    return AgentSkillSchemaEntry(
+        skill_id=PLAN_POINT_GRASP_SKILL_ID_V1,
+        skill_version="3",
+        skill_definition_hash=skill_definition_hash,
+        parameter_schema=parameter_schema,
+        execution_result_schema=result_schema,
+        task_evaluation_schema=_mutable_json(base.task_evaluation_schema),
         parameter_profiles=(profile,),
     )
 
@@ -1113,13 +1280,259 @@ def validate_point_grasp_result_for_parameters_v2(
         raise ValueError("Station point-grasp result exceeds the requested bound.")
 
 
+def validate_point_grasp_parameters_v3(
+    payload: Mapping[str, Any],
+    *,
+    dimensions_by_role: Mapping[str, tuple[int, int]],
+    max_candidates: int,
+) -> None:
+    """Validate v3 while preserving the exact v2 request when disabled."""
+
+    expected = {
+        "role",
+        "target_pixel_uv",
+        "max_candidates",
+        "include_arm_reachability",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected:
+        raise ValueError("Station point-grasp v3 parameter fields changed.")
+    if not isinstance(payload["include_arm_reachability"], bool):
+        raise TypeError("include_arm_reachability must be boolean.")
+    validate_point_grasp_parameters_v2(
+        {key: payload[key] for key in expected - {"include_arm_reachability"}},
+        dimensions_by_role=dimensions_by_role,
+        max_candidates=max_candidates,
+    )
+
+
+def _finite_nonnegative(value: object, *, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+    ):
+        raise ValueError(f"{field} must be finite and non-negative.")
+    return float(value)
+
+
+def validate_point_grasp_result_v3(
+    payload: Mapping[str, Any],
+    *,
+    source_by_role: Mapping[str, str],
+    dimensions_by_role: Mapping[str, tuple[int, int]],
+    source_binding_hash: str,
+    frame_binding_hash: str,
+    frame_graph_hash: str,
+    source_frame_id: str,
+    source_frame_spec_hash: str,
+    reference_frame_id: str,
+    reference_frame_spec_hash: str,
+    backend_id: str,
+    model_profile_id: str,
+    model_profile_hash: str,
+    inference_implementation_hash: str,
+    max_candidates: int,
+    arm_side: str,
+    evaluator_profile_id: str,
+    evaluator_profile_hash: str,
+    solver_reference_frame_id: str,
+    solver_reference_frame_spec_hash: str,
+    time_budget_ms: float,
+    max_solve_cycles: int,
+    max_measured_qpos_age_ms: float,
+    standard_position_tolerance_m: float,
+    standard_orientation_tolerance_deg: float,
+    basic_position_tolerance_m: float,
+    basic_orientation_tolerance_deg: float,
+) -> None:
+    """Validate optional reachability without changing proposal order/authority."""
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("Station point-grasp v3 result must be a mapping.")
+    context = payload.get("arm_reachability_context")
+    candidate_payloads = payload.get("candidates")
+    if not isinstance(candidate_payloads, (list, tuple)):
+        raise TypeError("Station point-grasp v3 candidates are invalid.")
+    annotation_presence = tuple(
+        isinstance(candidate, Mapping) and "arm_reachability" in candidate
+        for candidate in candidate_payloads
+    )
+    annotated = bool(context is not None)
+    if annotation_presence and any(annotation_presence) != all(annotation_presence):
+        raise ValueError("Arm reachability annotations must cover every candidate.")
+    if bool(annotation_presence and all(annotation_presence)) != annotated:
+        raise ValueError("Arm reachability context and annotations must agree.")
+
+    base_payload = dict(payload)
+    base_payload.pop("arm_reachability_context", None)
+    base_candidates = []
+    for candidate in candidate_payloads:
+        if not isinstance(candidate, Mapping):
+            raise TypeError("Station point-grasp v3 candidate must be a mapping.")
+        base_candidate = dict(candidate)
+        base_candidate.pop("arm_reachability", None)
+        base_candidates.append(base_candidate)
+    base_payload["candidates"] = base_candidates
+    validate_point_grasp_result_v2(
+        base_payload,
+        source_by_role=source_by_role,
+        dimensions_by_role=dimensions_by_role,
+        source_binding_hash=source_binding_hash,
+        frame_binding_hash=frame_binding_hash,
+        frame_graph_hash=frame_graph_hash,
+        source_frame_id=source_frame_id,
+        source_frame_spec_hash=source_frame_spec_hash,
+        reference_frame_id=reference_frame_id,
+        reference_frame_spec_hash=reference_frame_spec_hash,
+        backend_id=backend_id,
+        model_profile_id=model_profile_id,
+        model_profile_hash=model_profile_hash,
+        inference_implementation_hash=inference_implementation_hash,
+        max_candidates=max_candidates,
+    )
+    if not annotated:
+        return
+    assert isinstance(context, Mapping)
+    expected_context = {
+        "arm_side",
+        "evaluator_profile_id",
+        "evaluator_profile_hash",
+        "candidate_reference_frame_id",
+        "solver_reference_frame_id",
+        "solver_reference_frame_spec_hash",
+        "frame_graph_hash",
+        "time_budget_ms",
+        "max_solve_cycles",
+        "max_measured_qpos_age_ms",
+        "standard_position_tolerance_m",
+        "standard_orientation_tolerance_deg",
+        "basic_position_tolerance_m",
+        "basic_orientation_tolerance_deg",
+        "measured_qpos_revision",
+        "measured_qpos_at",
+        "measured_qpos_age_ms",
+        "evaluation_scope",
+        "candidate_order_effect",
+    }
+    if set(context) != expected_context:
+        raise ValueError("Arm reachability context fields changed.")
+    expected_values = {
+        "arm_side": arm_side,
+        "evaluator_profile_id": evaluator_profile_id,
+        "evaluator_profile_hash": evaluator_profile_hash,
+        "candidate_reference_frame_id": reference_frame_id,
+        "solver_reference_frame_id": solver_reference_frame_id,
+        "solver_reference_frame_spec_hash": solver_reference_frame_spec_hash,
+        "frame_graph_hash": frame_graph_hash,
+        "time_budget_ms": time_budget_ms,
+        "max_solve_cycles": max_solve_cycles,
+        "max_measured_qpos_age_ms": max_measured_qpos_age_ms,
+        "standard_position_tolerance_m": standard_position_tolerance_m,
+        "standard_orientation_tolerance_deg": standard_orientation_tolerance_deg,
+        "basic_position_tolerance_m": basic_position_tolerance_m,
+        "basic_orientation_tolerance_deg": basic_orientation_tolerance_deg,
+        "evaluation_scope": "finite_time_endpoint_ik_not_path_or_grasp_success",
+        "candidate_order_effect": "annotation_only_order_unchanged",
+    }
+    for field, expected in expected_values.items():
+        if context[field] != expected:
+            raise ValueError(f"Arm reachability {field} changed.")
+    revision = context["measured_qpos_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("measured_qpos_revision must be non-negative.")
+    _finite_nonnegative(context["measured_qpos_at"], field="measured_qpos_at")
+    age_ms = _finite_nonnegative(
+        context["measured_qpos_age_ms"], field="measured_qpos_age_ms"
+    )
+    if age_ms > max_measured_qpos_age_ms:
+        raise ValueError("Arm reachability used stale measured qpos.")
+
+    annotation_fields = {
+        "classification",
+        "position_residual_m",
+        "orientation_residual_deg",
+        "solve_cycles",
+        "elapsed_ms",
+        "termination_reason",
+    }
+    for candidate in candidate_payloads:
+        annotation = candidate["arm_reachability"]
+        if not isinstance(annotation, Mapping) or set(annotation) != annotation_fields:
+            raise ValueError("Arm reachability annotation fields changed.")
+        position = _finite_nonnegative(
+            annotation["position_residual_m"], field="position_residual_m"
+        )
+        orientation = _finite_nonnegative(
+            annotation["orientation_residual_deg"],
+            field="orientation_residual_deg",
+        )
+        if orientation > 180.0:
+            raise ValueError("orientation_residual_deg exceeds 180 degrees.")
+        cycles = annotation["solve_cycles"]
+        if (
+            isinstance(cycles, bool)
+            or not isinstance(cycles, int)
+            or not 1 <= cycles <= max_solve_cycles
+        ):
+            raise ValueError("solve_cycles is outside the profile bound.")
+        _finite_nonnegative(annotation["elapsed_ms"], field="elapsed_ms")
+        classification = annotation["classification"]
+        standard = (
+            position <= standard_position_tolerance_m
+            and orientation <= standard_orientation_tolerance_deg
+        )
+        basic = (
+            position <= basic_position_tolerance_m
+            and orientation <= basic_orientation_tolerance_deg
+        )
+        expected_classification = (
+            "standard_reachable"
+            if standard
+            else "basically_reachable"
+            if basic
+            else "difficult_to_reach"
+        )
+        if classification != expected_classification:
+            raise ValueError(
+                "Arm reachability classification disagrees with residuals."
+            )
+        reason = annotation["termination_reason"]
+        if classification == "standard_reachable":
+            if reason != "standard_tolerance_met":
+                raise ValueError("Standard reachability has the wrong termination.")
+        elif reason not in {"time_budget_exhausted", "cycle_budget_exhausted"}:
+            raise ValueError("Non-standard reachability has the wrong termination.")
+
+
+def validate_point_grasp_result_for_parameters_v3(
+    parameters: Mapping[str, Any], result: Mapping[str, Any]
+) -> None:
+    base_parameters = {
+        key: value
+        for key, value in parameters.items()
+        if key != "include_arm_reachability"
+    }
+    validate_point_grasp_result_for_parameters_v2(base_parameters, result)
+    requested = parameters.get("include_arm_reachability")
+    if not isinstance(requested, bool):
+        raise TypeError("include_arm_reachability must be boolean.")
+    present = "arm_reachability_context" in result
+    if present != requested:
+        raise ValueError("Arm reachability output does not match the request.")
+
+
 __all__ = [
     "point_grasp_schema_entry_v1",
     "point_grasp_schema_entry_v2",
+    "point_grasp_schema_entry_v3",
     "validate_point_grasp_parameters_v1",
     "validate_point_grasp_parameters_v2",
+    "validate_point_grasp_parameters_v3",
     "validate_point_grasp_result_for_parameters_v1",
     "validate_point_grasp_result_for_parameters_v2",
+    "validate_point_grasp_result_for_parameters_v3",
     "validate_point_grasp_result_v1",
     "validate_point_grasp_result_v2",
+    "validate_point_grasp_result_v3",
 ]

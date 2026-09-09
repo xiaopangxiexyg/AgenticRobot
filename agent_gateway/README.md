@@ -647,6 +647,17 @@ Station, arm-base, and live pose-cut disagreement is rejected before a rendered
 candidate is returned. This profile connects both arms and requires startup
 HOLD even when a client invokes only read-only Skills.
 
+Adding `--enable-point-grasp-arm-reachability` upgrades only this combined
+profile to `perception.plan_point_grasp@3`. Its request-gated annotation runs
+the existing lower RM65 endpoint IK from one fresh measured-qpos snapshot and
+classifies each unchanged candidate as standard (3 mm/1 degree), basic
+(5 cm/20 degrees), or difficult within a 1 second/120-cycle per-candidate
+search budget. No new cycle starts after the wall-clock deadline is observed;
+one in-flight lower solve is not preempted and its full duration is reported.
+Omitting the flag preserves the exact v2 contracts and hashes; setting
+`include_arm_reachability=false` on v3 performs no IK. The annotation is not
+path planning, collision clearance, motion admission, or grasp-success proof.
+
 The CLI is a concrete lower deployment leaf, not an Agent API. All files and
 the selected side/action are trusted operator inputs. The process exposes no
 transport until optional cameras have passed consecutive-frame freshness

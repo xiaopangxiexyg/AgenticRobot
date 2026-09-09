@@ -34,6 +34,7 @@ from teleop_runtime.skill_deploy import (
 )
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspJointTrajectoryPlanner,
+    RM65GraspReachabilityConfig,
 )
 
 from .exclusive_application import (
@@ -78,8 +79,10 @@ from .rm65_camera_geometry import (
     RM65RgbCameraGeometry,
     build_rm65_rgb_camera_geometry,
 )
+from .rm65_grasp_reachability import RM65PointGraspReachabilityAdapter
 from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
+    StationPointGraspArmReachabilityProfile,
     build_station_bound_point_grasp_registration,
 )
 from .station_point_grasp_render_deployment import (
@@ -237,6 +240,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
     debug_render_object_coordinates: bool = False,
+    enable_point_grasp_arm_reachability: bool = False,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> ExclusiveRM65AgentPrimitiveComposition:
@@ -246,6 +250,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("lower must be an ExclusiveRM65SkillLowerAssembly.")
     if not isinstance(debug_render_object_coordinates, bool):
         raise TypeError("debug_render_object_coordinates must be bool.")
+    if not isinstance(enable_point_grasp_arm_reachability, bool):
+        raise TypeError("enable_point_grasp_arm_reachability must be bool.")
     side = str(authorized_side).strip().lower()
     if side not in {"left", "right"}:
         raise ValueError("authorized_side must be left or right.")
@@ -325,6 +331,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise ValueError(
             "Debug object-coordinate rendering requires point-grasp resources."
         )
+    if enable_point_grasp_arm_reachability and not grasp_enabled:
+        raise ValueError("Point-grasp arm reachability requires point-grasp resources.")
     if (
         grasp_enabled
         and getattr(point_grasp_planner, "point_segmenter", None)
@@ -555,6 +563,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     station_point_grasp_render_registration = None
     artifact_store = None
     provider_factory = None
+    arm_reachability_profile = None
+    reachability_config = (
+        RM65GraspReachabilityConfig() if enable_point_grasp_arm_reachability else None
+    )
     resources: object = lower.ports
     if perception_enabled:
         assert camera_config_path is not None
@@ -684,7 +696,43 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     station_manifest_hash=station_manifest_hash,
                     execution_manifest_hash=execution_manifest_hash,
                     current_mode="real_active",
+                    arm_reachability_profile=(
+                        StationPointGraspArmReachabilityProfile(
+                            arm_side=side,
+                            evaluator_profile_id=(
+                                "rm65.lower_endpoint_ik_reachability.v1"
+                            ),
+                            evaluator_profile_hash=(
+                                reachability_config.semantic_content_hash
+                            ),
+                            solver_reference_frame_id=execution_frame.frame_id,
+                            solver_reference_frame_spec_hash=(
+                                execution_frame.semantic_content_hash
+                            ),
+                            frame_graph_hash=frame_graph.semantic_content_hash,
+                            time_budget_ms=reachability_config.time_budget_ms,
+                            max_solve_cycles=reachability_config.max_solve_cycles,
+                            max_measured_qpos_age_ms=float(maximum_age_ms),
+                            standard_position_tolerance_m=(
+                                reachability_config.standard_position_tolerance_m
+                            ),
+                            standard_orientation_tolerance_deg=(
+                                reachability_config.standard_orientation_tolerance_deg
+                            ),
+                            basic_position_tolerance_m=(
+                                reachability_config.basic_position_tolerance_m
+                            ),
+                            basic_orientation_tolerance_deg=(
+                                reachability_config.basic_orientation_tolerance_deg
+                            ),
+                        )
+                        if reachability_config is not None
+                        else None
+                    ),
                 )
+            )
+            arm_reachability_profile = (
+                station_point_grasp_registration.profile.arm_reachability_profile
             )
             station_point_grasp_render_registration = (
                 build_station_bound_point_grasp_render_registration(
@@ -745,7 +793,21 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             target_envelope_filter=(
                 lower.target_builder.pre_ik_target_safety_filter
             ),
+            reachability_config=reachability_config,
         )
+
+        def reachability_evaluator_factory(port):
+            if arm_reachability_profile is None:
+                raise RuntimeError("Arm reachability profile is unavailable.")
+            return RM65PointGraspReachabilityAdapter(
+                profile=arm_reachability_profile,
+                planner=grasp_trajectory_planner,
+                motion_port=port,
+                frame_graph=frame_graph,
+                candidate_reference_frame_id=station_frame.frame_id,
+                clock=clock,
+            )
+
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
             target_builder=lower.target_builder,
             rm65_ports=lower.ports,
@@ -763,6 +825,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 station_point_grasp_render_registration
             ),
             station_point_grasp_planner=point_grasp_planner,
+            station_point_grasp_reachability_evaluator_factory=(
+                reachability_evaluator_factory
+                if arm_reachability_profile is not None
+                else None
+            ),
             grasp_trajectory_planner=grasp_trajectory_planner,
             perception_provider_factory=provider_factory,
             measured_qpos_observer=(
