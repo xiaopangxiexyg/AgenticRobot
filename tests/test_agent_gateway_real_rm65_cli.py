@@ -613,7 +613,9 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
                     emergency_stop_receipt=None,
                 ),
                 executors_by_skill_id={
-                    "motion.step_tcp_cardinal": SimpleNamespace(),
+                    "motion.step_tcp_cardinal": SimpleNamespace()
+                },
+                passive_read_executors_by_skill_id={
                     "perception.capture_rgb": camera_executor,
                     "perception.plan_point_grasp": point_grasp_executor,
                 },

@@ -25,9 +25,11 @@ from teleop_runtime.skill_deploy import (
     REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
     ExclusiveRM65SkillDeployPorts,
     ExclusiveRM65SkillPortProfile,
+    RealSkillMotionObservationUnavailable,
     build_exclusive_rm65_skill_position_force_guard,
 )
 from teleop_runtime.skill_deploy.rm65_ports import (
+    RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES,
     _next_periodic_measurement_deadline,
 )
 
@@ -325,7 +327,10 @@ def test_rm65_ports_reject_stale_hardware_cut() -> None:
     ports, _, _ = _ports(age_sec=1.0)
     ports.start()
 
-    with pytest.raises(RuntimeError, match="coherence_diagnostic") as captured:
+    with pytest.raises(
+        RealSkillMotionObservationUnavailable,
+        match="coherence_diagnostic",
+    ) as captured:
         ports.observe()
 
     assert '"concurrently_refreshed_sides":["left","right"]' in str(captured.value)
@@ -505,6 +510,88 @@ def test_background_sampler_keeps_control_observe_nonblocking_during_read() -> N
     assert dict(cut.source_sequence_by_side) == {"left": 4, "right": 5}
 
 
+def test_background_sampler_recovers_after_one_222ms_coherence_loss() -> None:
+    ports, _, _ = _ports(
+        background_measurement_sampling=True,
+        state_refresh_hz=100.0,
+        max_measurement_age_sec=0.2,
+    )
+    ports.clock = time.time
+
+    class _OneSlowDualReader:
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        def snapshot(
+            self,
+            _now: float,
+            *,
+            cut_after_refresh: bool,
+            concurrent_refresh_sides: tuple[str, ...] = (),
+        ):
+            assert cut_after_refresh is True
+            assert concurrent_refresh_sides == ("left", "right")
+            self.call_count += 1
+            if self.call_count == 2:
+                right_measured_at = time.time()
+                time.sleep(0.222)
+                left_measured_at = time.time()
+            else:
+                left_measured_at = right_measured_at = time.time()
+            return {
+                side: {
+                    "hardware_qpos": np.full(
+                        6, 0.1 if side == "left" else 0.2
+                    ),
+                    "hardware_measurement_timestamp": (
+                        left_measured_at if side == "left" else right_measured_at
+                    ),
+                    "hardware_measurement_sequence": (
+                        self.call_count * 2
+                        if side == "left"
+                        else self.call_count * 2 + 1
+                    ),
+                    "hardware_measurement_valid": True,
+                    "hardware_read_success": True,
+                    "hardware_read_phase_timing": {
+                        "sdk_call_wall_ms": (
+                            222.0
+                            if self.call_count == 2 and side == "left"
+                            else 4.0
+                        )
+                    },
+                }
+                for side in ("left", "right")
+            }
+
+    ports.arm_state_reader = _OneSlowDualReader()
+    ports.start()
+    deadline = time.monotonic() + 2.0
+    snapshot = ports.measurement_sampler_snapshot()
+    while (
+        (
+            snapshot["transient_failure_count"] < 1
+            or snapshot["sample_count"] < 2
+            or snapshot["consecutive_transient_failures"] != 0
+        )
+        and snapshot["fault"] is None
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
+        snapshot = ports.measurement_sampler_snapshot()
+
+    assert snapshot["fault"] is None
+    assert snapshot["thread_alive"] is True
+    assert snapshot["sample_count"] >= 2
+    assert snapshot["transient_failure_count"] == 1
+    assert snapshot["consecutive_transient_failures"] == 0
+    assert "right RM65 hardware qpos cut is stale" in str(
+        snapshot["last_transient_failure"]
+    )
+    assert snapshot["latest_measurement_age_sec"] < 0.2
+    ports.close()
+
+
 def test_background_sampler_latches_real_measurement_stall() -> None:
     ports, _, _ = _ports(
         background_measurement_sampling=True,
@@ -526,6 +613,15 @@ def test_background_sampler_latches_real_measurement_stall() -> None:
 
     assert snapshot["fault"] is not None
     assert "stale" in str(snapshot["fault"])
+    assert snapshot["transient_failure_count"] == (
+        RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES + 1
+    )
+    assert snapshot["consecutive_transient_failures"] == (
+        RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES + 1
+    )
+    assert snapshot["max_consecutive_recoverable_transient_failures"] == (
+        RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES
+    )
 
 
 def test_rm65_ports_use_checked_dispatch_and_lower_hold() -> None:

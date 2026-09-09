@@ -382,13 +382,13 @@ def _stopped_payload(
         and gateway_emergency_stop_receipt.proves_motion_or_hold
     )
     passive_read_failures = []
-    for skill_id, executor in (
-        composition.deployment.gateway_session.executors_by_skill_id.items()
-    ):
+    for (
+        skill_id,
+        executor,
+    ) in composition.deployment.gateway_session.passive_read_executors_by_skill_id.items():
         diagnostics = getattr(executor, "failure_diagnostics", ())
         passive_read_failures.extend(
-            {"skill_id": skill_id, **dict(diagnostic)}
-            for diagnostic in diagnostics
+            {"skill_id": skill_id, **dict(diagnostic)} for diagnostic in diagnostics
         )
     return {
         "event": "gateway_stopped",

@@ -539,6 +539,14 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         )
         assert session.station_point_grasp_executor is not None
         assert session.station_point_grasp_render_executor is not None
+        assert set(session.passive_read_executors_by_skill_id) == {
+            "state.read_tcp_pose",
+            "perception.capture_rgb",
+            "perception.capture_depth",
+            "perception.localize_objects",
+            "perception.plan_point_grasp",
+            "perception.render_point_grasp_candidate",
+        }
         assert session.owns_artifact_store is False
         assert composition.resources.artifact_store is session.artifact_store
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())

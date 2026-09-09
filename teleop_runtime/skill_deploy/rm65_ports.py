@@ -44,8 +44,13 @@ from .control_runtime import (
     RealSkillMotionEmergencyStopReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
+    RealSkillMotionObservationUnavailable,
 )
 from .motion_port import REAL_AGENT_MOTION_COMMAND_METADATA_KEY
+
+# The fourth consecutive coherent-cut availability loss becomes a permanent
+# sampler fault. Active or pending motion still fails closed on the first loss.
+RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES = 3
 
 
 def _next_periodic_measurement_deadline(
@@ -259,6 +264,9 @@ class ExclusiveRM65SkillDeployPorts:
         self._latest_observation_cut: RealSkillMotionObservationCut | None = None
         self._measurement_fault: str | None = None
         self._measurement_sample_count = 0
+        self._measurement_transient_failure_count = 0
+        self._measurement_consecutive_transient_failures = 0
+        self._last_measurement_transient_failure: str | None = None
 
     @property
     def resources_started(self) -> bool:
@@ -465,6 +473,32 @@ class ExclusiveRM65SkillDeployPorts:
             try:
                 cut = self._read_hardware_cut()
                 self._publish_measurement_sample(cut)
+            except RealSkillMotionObservationUnavailable as exc:
+                diagnostic = f"{type(exc).__name__}: {exc}"[:4096]
+                with self._measurement_lock:
+                    self._measurement_transient_failure_count += 1
+                    self._measurement_consecutive_transient_failures += 1
+                    consecutive = self._measurement_consecutive_transient_failures
+                    self._last_measurement_transient_failure = diagnostic
+                    if (
+                        consecutive
+                        > RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES
+                    ):
+                        self._measurement_fault = (
+                            diagnostic
+                            + "; max_recoverable_transient_failures="
+                            + str(
+                                RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES
+                            )
+                            + "; consecutive_transient_failures="
+                            + str(consecutive)
+                        )
+                if (
+                    consecutive
+                    > RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES
+                ):
+                    self._measurement_stop.set()
+                    return
             except Exception as exc:  # noqa: BLE001 - consumed fail-closed by owner.
                 with self._measurement_lock:
                     self._measurement_fault = (
@@ -472,6 +506,9 @@ class ExclusiveRM65SkillDeployPorts:
                     )
                 self._measurement_stop.set()
                 return
+            else:
+                with self._measurement_lock:
+                    self._measurement_consecutive_transient_failures = 0
             # Do not burst through missed deadlines after a slow SDK read.
             deadline = _next_periodic_measurement_deadline(
                 previous_deadline=deadline,
@@ -544,6 +581,11 @@ class ExclusiveRM65SkillDeployPorts:
             cut = self._latest_observation_cut
             fault = self._measurement_fault
             count = self._measurement_sample_count
+            transient_count = self._measurement_transient_failure_count
+            consecutive_transient = (
+                self._measurement_consecutive_transient_failures
+            )
+            last_transient = self._last_measurement_transient_failure
         now = float(self.clock())
         return {
             "enabled": self.profile.background_measurement_sampling,
@@ -553,6 +595,12 @@ class ExclusiveRM65SkillDeployPorts:
             ),
             "sample_count": count,
             "fault": fault,
+            "transient_failure_count": transient_count,
+            "consecutive_transient_failures": consecutive_transient,
+            "max_consecutive_recoverable_transient_failures": (
+                RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES
+            ),
+            "last_transient_failure": last_transient,
             "latest_measurement_age_sec": (
                 None if cut is None else max(0.0, now - cut.measured_at)
             ),
@@ -581,7 +629,7 @@ class ExclusiveRM65SkillDeployPorts:
         age_sec = max(0.0, float(self.clock()) - cut.measured_at)
         if age_sec > self.profile.max_measurement_age_sec:
             diagnostic = self.measurement_sampler_snapshot()
-            raise RuntimeError(
+            raise RealSkillMotionObservationUnavailable(
                 f"RM65 sampled hardware qpos cut is stale: {age_sec:.6f}s; "
                 "sampler_diagnostic="
                 + json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
@@ -680,7 +728,7 @@ class ExclusiveRM65SkillDeployPorts:
                     "concurrently_refreshed_sides": ["left", "right"],
                     "hardware_read_phase_timing_by_side": timing_by_side,
                 }
-                raise RuntimeError(
+                raise RealSkillMotionObservationUnavailable(
                     f"{side} RM65 hardware qpos cut is stale: {age_sec:.6f}s; "
                     "coherence_diagnostic="
                     + json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
