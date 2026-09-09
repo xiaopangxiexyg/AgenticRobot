@@ -7,7 +7,8 @@ sensor, or a hardware-readiness claim.
 
 The software owns the complete low-gain torque composition:
 
-``tau = gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq) + J.T F``
+``tau_i = gravity_scale * gravity_joint_scales[i] * g_i(q)
+         + kp_i * (q_ref_i - q_i) + kd_i * (dq_ref_i - dq_i) + (J.T F)_i``
 
 During startup, the complete scaled gravity vector is present from the first
 post-enable lock frame.  The final total-torque conditioner is the only
@@ -161,6 +162,7 @@ CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
 FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
 DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
+_ONE_SIX = (1.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = _ALL_JOINTS
 _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3", "joint4")
@@ -1403,6 +1405,10 @@ def fit_gravity_calibration(
         }
     try:
         nominal_scale = _positive(profile.get("gravity_scale"), name="gravity_scale")
+        nominal_joint_scales = _non_negative_six(
+            profile.get("gravity_joint_scales", _ONE_SIX),
+            name="gravity_joint_scales",
+        )
         software_kp = _six(
             profile.get("software_kp_nm_per_rad"),
             name="software_kp_nm_per_rad",
@@ -1565,8 +1571,13 @@ def fit_gravity_calibration(
         "model": model,
         "reasons": tuple(fit_reasons),
         "nominal_gravity_scale": nominal_scale,
+        "nominal_gravity_joint_scales": nominal_joint_scales,
         "gravity_scale_correction": delta_scale,
         "effective_gravity_scale": nominal_scale + delta_scale,
+        "effective_gravity_multipliers": tuple(
+            (nominal_scale + delta_scale) * value
+            for value in nominal_joint_scales
+        ),
         "joint_bias_nm": tuple(float(value) for value in bias),
         "payload_mass_kg": (
             float(payload_parameters[0]) if model == "global-scale-payload" else None
@@ -1909,8 +1920,14 @@ def _run_gravity_calibration_fit(
         "activation": "candidate_only_until_independent_validation",
         "model": fit.get("model"),
         "nominal_gravity_scale": fit.get("nominal_gravity_scale"),
+        "nominal_gravity_joint_scales": fit.get(
+            "nominal_gravity_joint_scales"
+        ),
         "gravity_scale_correction": fit.get("gravity_scale_correction"),
         "effective_gravity_scale": fit.get("effective_gravity_scale"),
+        "effective_gravity_multipliers": fit.get(
+            "effective_gravity_multipliers"
+        ),
         "joint_bias_nm": fit.get("joint_bias_nm"),
         "payload_mass_kg": fit.get("payload_mass_kg"),
         "payload_first_moment_kg_m": fit.get("payload_first_moment_kg_m"),
@@ -2022,6 +2039,19 @@ def _six(values: Sequence[float], *, name: str) -> tuple[float, ...]:
         raise ValueError(f"{name} must contain six finite values") from exc
     if len(normalized) != 6:
         raise ValueError(f"{name} must contain six finite values")
+    return normalized
+
+
+def _non_negative_six(
+    values: Sequence[float],
+    *,
+    name: str,
+) -> tuple[float, ...]:
+    """Return six finite non-negative values without a tuning upper bound."""
+
+    normalized = _six(values, name=name)
+    if any(value < 0.0 for value in normalized):
+        raise ValueError(f"{name} must contain six non-negative finite values")
     return normalized
 
 
@@ -3002,6 +3032,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
             "--target-kd"
         )
     _non_negative(args.gravity_scale, name="gravity_scale")
+    _non_negative_six(
+        getattr(args, "gravity_joint_scales", _ONE_SIX),
+        name="gravity_joint_scales",
+    )
     _bounded(
         args.torque_limit_scale,
         name="torque_limit_scale",
@@ -4264,13 +4298,22 @@ def compute_software_torque_breakdown(
     measured_qvel_rad_s: Sequence[float],
     profile: B601MitControlProfile,
     gravity_scale: float,
+    gravity_joint_scales: Sequence[float] = _ONE_SIX,
 ) -> B601MitTorqueBreakdown:
     """Compose gravity, joint PD, and bounded overlay torque in software."""
 
     scale = _non_negative(gravity_scale, name="gravity_scale")
+    joint_scales = _non_negative_six(
+        gravity_joint_scales,
+        name="gravity_joint_scales",
+    )
     gravity = tuple(
-        scale * float(value)
-        for value in model.arm_generalized_gravity(measured_qpos_rad)
+        scale * joint_scale * float(value)
+        for joint_scale, value in zip(
+            joint_scales,
+            model.arm_generalized_gravity(measured_qpos_rad),
+            strict=True,
+        )
     )
     return compute_b601_mit_torque(
         reference,
@@ -4289,6 +4332,7 @@ def compute_software_torque(
     measured_qvel_rad_s: Sequence[float],
     profile: B601MitControlProfile,
     gravity_scale: float,
+    gravity_joint_scales: Sequence[float] = _ONE_SIX,
 ) -> tuple[float, ...]:
     """Compatibility wrapper returning only the requested total torque."""
 
@@ -4299,6 +4343,7 @@ def compute_software_torque(
         measured_qvel_rad_s=measured_qvel_rad_s,
         profile=profile,
         gravity_scale=gravity_scale,
+        gravity_joint_scales=gravity_joint_scales,
     ).requested_torque_nm
 
 
@@ -4788,6 +4833,7 @@ def _send_fault_hold_command(
     command_position_limits_rad: Sequence[tuple[float, float]],
     rate_hz: float,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
+    gravity_joint_scales: Sequence[float] = _ONE_SIX,
 ) -> tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
     """Send one bounded all-arm gravity/damping MIT frame.
 
@@ -4811,6 +4857,7 @@ def _send_fault_hold_command(
         measured_qvel_rad_s=measured_qvel_rad_s,
         profile=profile,
         gravity_scale=gravity_scale,
+        gravity_joint_scales=gravity_joint_scales,
     )
     conditioned, _torque_limited, _slew_limited = condition_torque(
         breakdown.requested_torque_nm,
@@ -4929,6 +4976,7 @@ def _run_latched_fault_hold(
     cached_gravity_tau_nm: tuple[float, ...] | None = None,
     degraded_entry_reason: str | None = None,
     degraded_telemetry: dict[str, object] | None = None,
+    gravity_joint_scales: Sequence[float] = _ONE_SIX,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -5232,6 +5280,7 @@ def _run_latched_fault_hold(
                     command_position_limits_rad=command_limits,
                     rate_hz=rate_hz,
                     driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                    gravity_joint_scales=gravity_joint_scales,
                 ),
                 context="fault hold entry",
             )
@@ -5438,6 +5487,7 @@ def _run_latched_fault_hold(
                     command_position_limits_rad=command_limits,
                     rate_hz=rate_hz,
                     driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                    gravity_joint_scales=gravity_joint_scales,
                 ),
                 context="live protective hold",
             )
@@ -5511,6 +5561,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     driver_kd_nm_s_per_rad = (
         _non_negative(getattr(args, "driver_kd", 0.0), name="driver_kd"),
     ) * 6
+    gravity_joint_scales = _non_negative_six(
+        getattr(args, "gravity_joint_scales", _ONE_SIX),
+        name="gravity_joint_scales",
+    )
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
     model, position_limits = _resolve_model_and_limits(source_root)
@@ -5914,6 +5968,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             measured_qvel_rad_s=arming_qvel,
             profile=startup_lock_profile,
             gravity_scale=args.gravity_scale,
+            gravity_joint_scales=gravity_joint_scales,
         )
         lock_tau, _lock_torque_limited, _lock_slew_limited = condition_torque(
             lock_breakdown.requested_torque_nm,
@@ -6056,6 +6111,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 measured_qvel_rad_s=arming_settle_last_qvel,
                 profile=startup_lock_profile,
                 gravity_scale=args.gravity_scale,
+                gravity_joint_scales=gravity_joint_scales,
             )
             lock_tau, _lock_torque_limited, _lock_slew_limited = condition_torque(
                 lock_breakdown.requested_torque_nm,
@@ -6613,6 +6669,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 measured_qvel_rad_s=qvel,
                 profile=profile,
                 gravity_scale=args.gravity_scale,
+                gravity_joint_scales=gravity_joint_scales,
             )
             # Gravity is present at its requested scale from the first active
             # frame.  The total-torque conditioner below is the single startup
@@ -6643,6 +6700,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 measured_qvel_rad_s=qvel,
                 profile=startup_lock_profile,
                 gravity_scale=args.gravity_scale,
+                gravity_joint_scales=gravity_joint_scales,
             )
             effective_handoff_fraction = (
                 1.0 - replay_lock_fraction
@@ -7009,6 +7067,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             cached_gravity_tau_nm=last_verified_gravity_tau,
                             degraded_entry_reason=degraded_entry_reason,
                             degraded_telemetry=protective_hold_degraded,
+                            gravity_joint_scales=gravity_joint_scales,
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
@@ -7471,11 +7530,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
             "gravity_scale": args.gravity_scale,
+            "gravity_joint_scales": gravity_joint_scales,
+            "effective_gravity_multipliers": tuple(
+                args.gravity_scale * value for value in gravity_joint_scales
+            ),
             "gravity_ramp": {
                 "type": "full_vector_immediate_with_total_torque_slew",
                 "duration_sec": args.torque_rise_time_sec,
                 "applies_to": "complete_six_joint_gravity_vector",
                 "scalar_gravity_at_first_active_frame": args.gravity_scale,
+                "joint_multipliers_at_first_active_frame": gravity_joint_scales,
                 "independent_scalar_ramp": False,
                 "non_gravity_terms_scaled": False,
             },
@@ -7819,6 +7883,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--gravity-scale", type=float, default=_DEFAULT_GRAVITY_SCALE)
+    parser.add_argument(
+        "--gravity-joint-scales",
+        type=float,
+        nargs=6,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        default=_ONE_SIX,
+        help=(
+            "explicit joint1..joint6 multipliers applied after --gravity-scale; "
+            "defaults to six 1.0 values and is intended for reversible, "
+            "evidence-backed gravity calibration trials"
+        ),
+    )
     parser.add_argument(
         "--torque-limit-scale",
         type=float,

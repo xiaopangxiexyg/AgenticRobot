@@ -523,7 +523,8 @@ printf '%s\n' 'shell remains active'
 ```
 
 本入口正常 active 控制默认由软件按
-`tau = gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
+`tau_i = gravity_scale*gravity_joint_scales[i]*g_i(q) + Kp_i*(q_ref_i-q_i) + Kd_i*(dq_ref_i-dq_i) + (J^T F)_i`
+组合重力前馈、
 位置项、基于 `mechPos (0x7019)` 的有限差分阻尼和可选末端 overlay。启动和
 `startup-replay` 的临时锁例外地使用驱动器本地 MIT Kp/Kd：主机前馈不重复临时位置或
 阻尼项，完整六轴重力从首个锁帧进入。交接时本地 Kp 回到零、本地 Kd 回到 active driver
@@ -535,6 +536,19 @@ Kd，软件最终 profile 同步接管。`--torque-rise-time-sec` 决定主机�
 `--gravity-scale 0.95`、`--torque-limit-scale 0.25`，而 `0.5/0.15` 只提供半重力并把
 J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令配置，不是代码或测试中的
 固定数值限制。
+`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 是显式、可回退的逐关节重力比例；默认六项
+均为 `1.0`，所以旧命令和模型结果不变。该向量在全局 `--gravity-scale` 之后生效，并贯穿
+启动锁、ACTIVE、正常 protective hold 以及从最后完整命令恢复的 degraded hold；不能只在
+ACTIVE 中临时修正，否则第一次 Ctrl-C 或一般异常会产生力矩跳变。每个值只要求有限且
+非负，不把常规调参范围写成代码硬限制；实际总输出仍受现有 URDF effort 比例、驱动器
+`0x700B` 回读限矩和 slew conditioner 约束。结果 JSON 的 `profile.gravity_joint_scales` 与
+`profile.effective_gravity_multipliers` 会记录本次真实配置。
+
+逐关节比例必须作为候选对照而不是静默默认值。Seeed 的 RS 实机报告曾得到 J2/J3 约
+`0.948/0.952` 的有效重力比例；本机第 10 个无接触窗口也观察到 J2 在正重力方向发生延迟
+breakaway，位置锁最终提供约 `-0.268 N·m` 修正，方向和量级均支持先测试 J2 `0.95`。
+因此第一轮只显式传入 `1 0.95 1 1 1 1`，J3 仍保持 `1.0`；只有多个不同力臂姿态均减少
+前 5 秒和 20 秒漂移、且没有反向抬升，才考虑成为后续配置候选。省略该参数即完整回退。
 进入最终 active 后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；vendor `kd`
 默认也是零。只有上述有明确起止状态的临时启动锁允许非零 vendor Kp。
 为避免 20 Hz 有限差分阻尼产生阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度
@@ -581,8 +595,10 @@ protective-hold，第二次 Ctrl-C 或 SIGUSR1 才请求全臂失能。
 2. 每次完整的 `R` 记录直接归约成一个静态残差观测。命令提供的姿态距离容差只用于识别
    近似重复姿态并平均，操作者不需要判断或标记接近方向，也不需要反复返回同一姿态。
    旧文件中没有方向标签的完整 `R` 窗口同样可用，只要非零 Kp、稳定性和限幅检查通过。
-3. 以 `r = position_tau`、`g0 = gravity_tau / gravity_scale` 拟合有效重力修正。第一轮使用
-   `global-scale`，直接求出可回填到 `--gravity-scale` 的有效重力比例。若独立验证
+3. 以 `r = position_tau`、`g0 = gravity_tau / gravity_scale` 拟合有效重力修正；这里的
+   `g0` 已包含本次显式 `gravity_joint_scales`，拟合产物会原样记录该向量以及最终六轴有效
+   multiplier。第一轮使用 `global-scale`，直接求出可与同一逐关节向量共同回填的
+   `--gravity-scale` 有效比例。若独立验证
    仍有明显姿态相关残差且确认末端存在未建模负载，再显式选择
    `global-scale-payload`；它用 FK/Jacobian 回归非负负载质量和末端坐标系下的一阶矩，
    不修改 URDF。所有模型的输出都是“有效重力 overlay”，不是未经力矩比例/电流标定的真实

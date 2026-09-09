@@ -99,10 +99,10 @@ wrench 通过 `J.T @ wrench` 映射为 B601 力矩。B601 的低带宽 probe 只
 正常软件请求力矩为：
 
 ```text
-tau_request = gravity_scale * g(q)
-            + Kp * (q_ref - q)
-            + Kd * (dq_ref - dq)
-            + J(q).T @ wrench_overlay
+tau_request[i] = gravity_scale * gravity_joint_scales[i] * g_i(q)
+               + Kp_i * (q_ref_i - q_i)
+               + Kd_i * (dq_ref_i - dq_i)
+               + (J(q).T @ wrench_overlay)_i
 ```
 
 然后按以下顺序处理：
@@ -112,6 +112,11 @@ tau_request = gravity_scale * g(q)
 2. 再按上一帧和 `--torque-rise-time-sec` 形成的 torque slew envelope 限制变化率。
 3. 最后调用 upstream 同序的
    `send_mit(position, velocity, kp, kd, feedforward_tau)`。
+
+`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 默认全为 `1.0`，只在操作者显式传参时改变
+各关节模型重力；它不是 URDF 修改，也没有隐式标定激活。该向量必须一致用于启动锁、
+ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结果 profile；省略参数
+即可回退到原始模型。当前有直接数据支持的第一轮候选只把 J2 设为 `0.95`，其余保持 `1.0`。
 
 重要 owner 规则：
 
