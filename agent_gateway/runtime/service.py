@@ -1058,6 +1058,13 @@ class AgentGatewayService:
                 progress_summary={"phase": "running"},
             )
         else:
+            # A real station receipt already carries the lower lifecycle's
+            # fail-closed reason (for example ``ik_search_exhausted`` or
+            # ``path_start_collision_blocked``).  Preserve that exact status
+            # on the terminal operation so clients can distinguish safe
+            # planning rejection classes without consulting process-local
+            # state.  Fake/null ports retain their deliberately generic
+            # projection below.
             projection = self.operation_store.transition_worker_projection(
                 operation_id=normalized_id,
                 expected_operation_hash=activated.semantic_content_hash,
@@ -1065,7 +1072,7 @@ class AgentGatewayService:
                 reason_code=(
                     "fake_or_null_activation_rejected"
                     if executor_no_io
-                    else "station_activation_rejected"
+                    else receipt.status
                 ),
                 current_station_revision=revision,
                 updated_at=finished_at,

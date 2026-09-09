@@ -931,7 +931,7 @@ def test_exact_gateway_session_launches_one_fail_closed_station_worker(
     assert terminal["accepted"]
     assert terminal["operation"]["status"] == "failed"
     assert terminal["operation"]["reason_code"] == (
-        "station_activation_rejected"
+        "fake_activation_rejected_under_hold"
     )
     assert lifecycle.closed
 
