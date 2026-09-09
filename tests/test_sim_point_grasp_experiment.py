@@ -186,7 +186,6 @@ def test_upward_tcp_selection_matches_mujoco_world_up(arm_side: str) -> None:
             cube_spawn_yaw_jitter_rad=math.pi / 4.0,
         ),
         include_training_reward_state=False,
-        use_model_cache=False,
     )
     try:
         env.reset(seed=0)
@@ -349,7 +348,6 @@ def test_mujoco_three_camera_overlay_does_not_advance_simulation(
             cube_spawn_yaw_jitter_rad=0.0,
         ),
         include_training_reward_state=False,
-        use_model_cache=False,
     )
     renderer = MujocoCameraRenderer(env.kernel.scene, width=640, height=480)
     try:
@@ -438,7 +436,6 @@ def test_mujoco_pose_action_moves_only_selected_arm_and_gripper(
             max_episode_steps=20,
         ),
         include_training_reward_state=False,
-        use_model_cache=False,
     )
     try:
         env.reset(seed=0)

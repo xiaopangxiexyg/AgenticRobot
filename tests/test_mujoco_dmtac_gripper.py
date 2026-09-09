@@ -49,10 +49,10 @@ from sim.mujoco.adapters import (
     MujocoPositionExecutionConfig,
     MujocoPositionExecutionRig,
 )
+from sim.mujoco.artifacts import ModelArtifactCache
 from sim.mujoco.deploy import MujocoDeployConfig, MujocoDeployRuntime
 from sim.mujoco.deploy.pose_resolution import MujocoCoupledPoseToQposResolver
 from sim.mujoco.ik import RM65CanonicalIK
-from sim.mujoco.scene import MujocoScene
 from teleop_runtime.action.human_proposal import HumanCommandEmission
 
 CONTRACT_PATH = "sim/configs/rm65_bimanual_physics_v1.json"
@@ -88,7 +88,7 @@ def _scene():
     )
     arm_profile = rm65_bimanual_udp_feedback_profile()
     gripper_profile = identified_bimanual_dmtac_gripper_profile()
-    scene = MujocoScene.from_contract(
+    scene, _model_artifact = ModelArtifactCache().load_scene(
         contract,
         position_actuation_profile=arm_profile,
         gripper_actuation_profile=gripper_profile,
@@ -100,7 +100,7 @@ def _cad_scene():
     contract = SimulationContract.load(CONTRACT_PATH)
     arm_profile = rm65_bimanual_udp_feedback_profile()
     gripper_profile = cad_bimanual_dmtac_gripper_profile()
-    scene = MujocoScene.from_contract(
+    scene, _model_artifact = ModelArtifactCache().load_scene(
         contract,
         position_actuation_profile=arm_profile,
         gripper_actuation_profile=gripper_profile,

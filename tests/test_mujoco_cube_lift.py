@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from sim.mujoco.artifacts import ModelArtifactCache
 from sim.mujoco.diagnostics.cube_lift import build_arg_parser
 from sim.mujoco.scene import MujocoScene
 from sim.mujoco.tasks.cube_lift import (
@@ -17,6 +18,12 @@ from sim.mujoco.tasks.cube_lift import (
 
 
 TASK_CONFIG_PATH = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
+
+
+def _cached_cube_lift_env() -> CubeLiftEnv:
+    config = CubeLiftTaskConfig.load(TASK_CONFIG_PATH)
+    scene, _model_artifact = ModelArtifactCache().load_scene(config.base_contract())
+    return CubeLiftEnv(config, scene=scene)
 
 
 def test_cube_lift_cli_parses_random_viewer_options_without_launching_gui() -> None:
@@ -133,7 +140,7 @@ def test_cube_lift_env_has_gymnasium_reset_step_contract() -> None:
 @pytest.mark.optional
 def test_cube_lift_reset_and_action_trace_are_deterministic() -> None:
     pytest.importorskip("gymnasium")
-    env = CubeLiftEnv(TASK_CONFIG_PATH)
+    env = _cached_cube_lift_env()
     actions = (
         np.asarray((0.2, -0.1, 0.0, 0.1, 0.0, -0.1, 0.25), dtype=np.float32),
         np.asarray((-0.1, 0.2, 0.1, 0.0, -0.2, 0.0, -0.25), dtype=np.float32),
@@ -159,7 +166,7 @@ def test_cube_lift_reset_and_action_trace_are_deterministic() -> None:
 @pytest.mark.optional
 def test_cube_lift_holds_left_home_and_maps_right_delta_action() -> None:
     pytest.importorskip("gymnasium")
-    env = CubeLiftEnv(TASK_CONFIG_PATH)
+    env = _cached_cube_lift_env()
     try:
         env.reset(seed=3)
         left_before = env.scene.get_arm_qpos("left")
@@ -191,7 +198,7 @@ def test_cube_lift_holds_left_home_and_maps_right_delta_action() -> None:
 @pytest.mark.optional
 def test_cube_lift_success_and_out_of_bounds_termination_predicates() -> None:
     pytest.importorskip("gymnasium")
-    env = CubeLiftEnv(TASK_CONFIG_PATH)
+    env = _cached_cube_lift_env()
     try:
         env.reset(seed=5)
         lifted_qpos = env.scene.freejoint_qpos(env.config.object_freejoint_name)
@@ -259,7 +266,7 @@ def test_normal_v2_lift_requires_bilateral_finger_contact() -> None:
 def test_cube_lift_hundred_random_headless_resets_remain_finite() -> None:
     pytest.importorskip("gymnasium")
     rng = np.random.default_rng(20260715)
-    env = CubeLiftEnv(TASK_CONFIG_PATH)
+    env = _cached_cube_lift_env()
     try:
         for episode_index in range(100):
             _observation, _info = env.reset(seed=episode_index)
