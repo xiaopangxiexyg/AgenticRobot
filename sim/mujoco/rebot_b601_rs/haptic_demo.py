@@ -83,6 +83,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Use operator compensation and local Kd on the ideal plant.",
     )
     parser.add_argument(
+        "--gravity-control-baseline", choices=("operator", "raw-model"),
+        default="operator",
+        help="Real2sim controller-side gravity baseline only; never changes the plant.",
+    )
+    parser.add_argument(
         "--host-hz",
         type=float,
         default=20.0,
@@ -193,6 +198,7 @@ def run_haptic_fixture_demo(
     fixture_stiffness_scale: float = 1.0,
     fixture_damping_scale: float = 1.0,
     torque_rise_time_sec: float | None = None,
+    controller_profile: B601Real2SimControllerProfile | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
@@ -204,6 +210,11 @@ def run_haptic_fixture_demo(
         raise TypeError("viewer must be a bool")
     if startup_profile is not None and not real2sim_controller:
         raise ValueError("startup_profile requires real2sim_controller")
+    if controller_profile is not None:
+        if not isinstance(controller_profile, B601Real2SimControllerProfile):
+            raise TypeError("controller_profile must be a B601Real2SimControllerProfile")
+        if not real2sim_controller:
+            raise ValueError("controller_profile requires real2sim_controller")
     duration = float(duration_sec)
     if not math.isfinite(duration) or duration <= 0.0:
         raise ValueError("duration_sec must be finite and positive")
@@ -362,7 +373,8 @@ def run_haptic_fixture_demo(
             else None
         ),
         real2sim_profile=(
-            B601Real2SimControllerProfile() if real2sim_controller else None
+            (controller_profile or B601Real2SimControllerProfile())
+            if real2sim_controller else None
         ),
         startup_profile=startup_profile,
     )
@@ -725,6 +737,11 @@ def _accumulate_power(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    controller = None
+    if args.gravity_control_baseline == "raw-model":
+        if not args.real2sim_controller:
+            parser.error("raw-model gravity baseline requires --real2sim-controller")
+        controller = B601Real2SimControllerProfile.raw_model_baseline()
     startup = None
     if args.startup_lock_kp is not None or args.startup_lock_kd is not None:
         if (
@@ -749,6 +766,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fixture_stiffness_scale=args.fixture_stiffness_scale,
         fixture_damping_scale=args.fixture_damping_scale,
         torque_rise_time_sec=args.torque_rise_time_sec,
+        controller_profile=controller,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return code

@@ -414,3 +414,70 @@ printf '%s\n' 'shell remains active'
 验证：七个 B601/边界测试文件 **141 passed**（38.68 s），新增参数非法值、CLI 转发及
 10 s `pose-6d` PASS / `pose-ry` 效果 FAIL 的回归；Ruff、资源 audit、文档 Bash 语法和
 `git diff --check` 通过。归一化参数只控制已有变化率，不改变完整的启动阶段时长。
+
+## M1 重力基线与故障回归、M2 证据准备
+
+基线 `b549688ac1d0f4fa6bf8da7d89f4662d91a9050a`，后继分支
+`codex/b601-real2sim-replay-evidence`。本批不把 M1 全部或 M2 定量辨识标为完成。
+
+### Y 轴瞬态定位
+
+新增纯 controller 工厂 `B601Real2SimControllerProfile.raw_model_baseline()` 和现有 demo
+参数 `--gravity-control-baseline raw-model`，必须显式开启 real2sim。默认仍为 operator。
+raw-model 仅移除重力校正，保留本地 Kd，不改变 URDF、plant 或验收门限。API 可接收
+显式 controller profile，不再依赖进程内替换来做对照。
+
+同一 10 s `pose-ry`，原始重力控制在 125 Hz（normalization=5 s）和 500 Hz（默认）均 PASS。
+125 Hz 初始/最大角误差约 0.014996 rad，最终约 0.002442 rad；500 Hz 最终约 1.65e-7 rad。
+这支持“控制标定与未辨识 plant 不匹配参与了超调”，不支持删除真实 bias 或反写假质量。
+前节仅仿真命令加 `--gravity-control-baseline raw-model --fixture pose-ry` 可复现。
+
+新增 ACTIVE 阶段 invalid/wrong-frame/dropout/duplicate 回归：不推进 accepted sequence，
+不刷新 watchdog，最终锁存 protective hold；新合法 reference 不能自行重新使能。
+这是指令通道回归，**不是**传感器坏帧、真实电机失效或 CAN partial-send 仿真。
+
+### 当前真机证据限制（高严重度、高置信度）
+
+现有 `real2sim.py` 的纯函数 `audit_b601_probe_trace(payload)` 仅审查既有
+startup-replay/gravity-calibration JSON，不导入硬件、不打开 CAN、不拟合或回放。
+检查六轴顺序、非空样本、严格递增的 sequence/反馈观察时间、完整有限的六轴数据和
+非负驱动增益。返回 poll cadence、FD 速度摘要、freshness 缺口、声明身份及来源终止状态。
+当前格式缺少逐样本发送时间/回执，因此格式检查通过仍是 `QUALITATIVE_TRACE_ONLY`，
+绝不升级成 `quantitative_paired_replay_ready=true`。声明身份不冒充已与资产比对验证。
+
+| 现场记录 | 样本数 | 未验证 freshness | 观察跨度 | poll 中位间隔 |
+| --- | --- | --- | --- | --- |
+| `/tmp/b601-rs-j2-bias-minus010-r1/result.json` | 867 | 867（100%） | 43.463 s | 0.050161 s |
+| `/tmp/b601-rs-j2-gravity-scale-095-20260909-173751/b601_j2_gravity_scale_095_startup_replay.json` | 2151 | 2151（100%） | 107.875 s | 0.050157 s |
+
+粒度是六轴主机观察＋控制记录，不是电机独立采样。顶层 FAIL 来自操作者终止，不能单独
+证明样本无效；其时间/来源缺口也不能因为曾通过 startup replay 就忽略。第一组全为
+WAITING_FOR_R，第二组含 RAMP_IN/RELOCKED/HANDOFF/SECOND_ACTIVE。未改写任何原始字段。
+
+关联 raw log **有** TX/RX 证据：第一组 `motorbridge_raw.log` 跨约 1555.285 s，第二组
+`motorbridge_robstride_startup_raw.log` 跨约 126.245 s。raw 使用 `unix_time_ns`，JSON
+使用主机 monotonic 观察时刻；两种时钟映射和逐样本归属尚未验证，不能仅凭文件名/PID
+将全部 raw 帧当成同一个可拟合窗口。这些 raw 文件保留，未复制到 Git。
+
+定量 M2 尚需：可核验的反馈新鲜度、command/feedback 时间对齐、明确的无接触区间和
+负载条件、fit/held-out 分离。旧记录可能含人手外力，不能独立将其分离为摩擦/重力误差。
+按 data-quality Skill 的用途边界检查，将证据和 Python 检查保留在现有模块/Markdown，
+不另建 notebook/HTML 报告体系。下面只读取旧文件，不连接设备：
+
+```python
+import json
+from sim.mujoco.rebot_b601_rs.real2sim import audit_b601_probe_trace
+
+with open("/tmp/b601-rs-j2-bias-minus010-r1/result.json") as stream:
+    report = audit_b601_probe_trace(json.load(stream))
+print(json.dumps(report, indent=2))
+```
+
+需现场补充：是否已有更新的带时间对齐、无接触标注的记录，以及其负载/采集条件。
+若没有，应先安排采集能力验证，再准备前台真机采集命令；不得直接重放旧 torque 或
+自动使能电机。此处只暂停依赖真实数据的辨识路径，不声称数字孪生或 HITL 已完成。
+
+本批验证：七个 B601/边界测试文件 **157 passed**（46.31 s），原始重力基线 Y 轴
+125 Hz / 10 s CLI PASS；Ruff、资源 audit、`git diff --check` 通过。纯数据检查覆盖
+重复时间/序号、J7 混入、缺维、非有限和负驱动增益，并拒绝给旧格式伪造拟合资格。
+候选待合并，未 push、安装或执行真机操作；原始现场数据仍在原路径，未纳入提交。

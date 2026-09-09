@@ -557,3 +557,130 @@ def test_power_observer_exposes_held_damping_without_changing_acceptance(host_hz
     if host_hz == 125.0:
         # Each host sample is dissipative; the held torque need not stay so.
         assert channels["held_nominal_cartesian_damping"]["delivered_work_j"] > 0.0
+
+
+def test_raw_gravity_baseline_preserves_local_damping():
+    raw = B601Real2SimControllerProfile.raw_model_baseline()
+    operator = B601Real2SimControllerProfile()
+    assert raw.driver_kd_nm_s_per_rad == operator.driver_kd_nm_s_per_rad
+    np.testing.assert_array_equal(raw.compensate(np.ones(6), np.ones(6)), np.ones(6))
+    assert raw.calibration_source != operator.calibration_source
+
+
+def test_raw_baseline_requires_real2sim_before_loading_model():
+    from sim.mujoco.rebot_b601_rs.haptic_demo import main, run_haptic_fixture_demo
+
+    with pytest.raises(ValueError, match="requires real2sim"):
+        run_haptic_fixture_demo(
+            source_root="missing", fixture_name="pose-ry",
+            controller_profile=B601Real2SimControllerProfile.raw_model_baseline(),
+        )
+    with pytest.raises(SystemExit) as error:
+        main(["--rebot-source-root", "missing", "--gravity-control-baseline", "raw-model"])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("host_hz, rise", [(125.0, 5.0), (500.0, None)])
+def test_raw_gravity_removes_y_axis_overshoot_in_fixed_fixture(host_hz, rise):
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+
+    code, report = run_haptic_fixture_demo(
+        source_root=SOURCE, fixture_name="pose-ry", real2sim_controller=True,
+        host_hz=host_hz, duration_sec=10, torque_rise_time_sec=rise,
+        controller_profile=B601Real2SimControllerProfile.raw_model_baseline(),
+        startup_profile=B601SimStartupProfile(
+            lock_kp_nm_per_rad=(50, 150, 150, 50, 50, 50),
+            lock_kd_nm_s_per_rad=(3, 10, 10, 5, 4, 4),
+        ),
+    )
+    assert code == 0
+    assert report["effect_acceptance"]["rotation_passed"]
+
+
+@pytest.fixture
+def probe_trace():
+    return {
+        "mode": "startup-replay", "status": "FAIL",
+        "active_joint_names": [f"joint{i}" for i in range(1, 7)],
+        "config_sha256": "a" * 64, "urdf_sha256": "b" * 64,
+        "freshness_verified": False,
+        "samples": [
+            {
+                "sequence": i, "feedback_timestamp_sec": 10.0 + 0.05 * i,
+                "freshness_verified": False,
+                **{key: [0.0] * 6 for key in (
+                    "qpos_rad", "qvel_fd_rad_s", "conditioned_tau_nm", "dispatch_qref_rad",
+                    "vendor_kp_nm_per_rad", "vendor_kd_nm_s_per_rad",
+                )},
+            } for i in range(3)
+        ],
+    }
+
+
+def test_existing_probe_trace_never_fabricates_replay_qualification(probe_trace):
+    from sim.mujoco.rebot_b601_rs.real2sim import audit_b601_probe_trace
+
+    result = audit_b601_probe_trace(probe_trace)
+    assert result["sample_count"] == result["unverified_sample_count"] == 3
+    assert result["poll_interval_sec"]["median"] == pytest.approx(0.05)
+    assert result["source_termination_status"] == "FAIL"
+    assert not result["quantitative_paired_replay_ready"]
+    probe_trace["freshness_verified"] = True
+    for row in probe_trace["samples"]:
+        row["freshness_verified"] = True
+    result = audit_b601_probe_trace(probe_trace)
+    assert result["unverified_sample_count"] == 0
+    assert not result["quantitative_paired_replay_ready"]
+    assert not result["identity_verified_against_assets"]
+
+
+@pytest.mark.parametrize("corruption", ["j7", "empty", "timestamp", "sequence", "nan", "partial", "negative_kd"])
+def test_probe_trace_rejects_corrupt_or_ambiguous_rows(probe_trace, corruption):
+    from sim.mujoco.rebot_b601_rs.real2sim import audit_b601_probe_trace
+
+    row = probe_trace["samples"][1]
+    if corruption == "j7":
+        probe_trace["active_joint_names"][-1] = "joint7"
+    elif corruption == "empty":
+        probe_trace["samples"] = []
+    elif corruption == "timestamp":
+        row["feedback_timestamp_sec"] = 10.0
+    elif corruption == "sequence":
+        row["sequence"] = 0
+    elif corruption == "nan":
+        row["qpos_rad"][0] = float("nan")
+    elif corruption == "partial":
+        row["conditioned_tau_nm"].pop()
+    else:
+        row["vendor_kd_nm_s_per_rad"][0] = -1.0
+    with pytest.raises(ValueError):
+        audit_b601_probe_trace(probe_trace)
+
+
+@pytest.mark.parametrize("failure", ["invalid", "wrong_frame", "dropout", "duplicate"])
+def test_active_reference_failure_never_rearms_or_refreshes_watchdog(startup_driver, failure):
+    driver = startup_driver
+    for i in range(301):
+        tick = driver.step_physics(reference(driver, i) if driver.command_due else None)
+    assert tick.control_phase == "ACTIVE"
+    last_sequence = driver._last_accepted_sequence
+    last_acceptance_time = driver._accepted_at_physics_time_sec
+    changed_q = list(driver._measured_qpos())
+    changed_q[0] += 0.1
+    for _ in range(201):
+        command = None
+        if failure == "invalid":
+            command = replace(reference(driver, 999), valid=False)
+        elif failure == "wrong_frame":
+            command = reference(driver, 999, "wrong/frame")
+        elif failure == "duplicate" and driver.command_due:
+            command = replace(reference(driver, last_sequence), qpos_rad=tuple(changed_q))
+        tick = driver.step_physics(command)
+        assert not tick.driver_faulted
+        assert driver._last_accepted_sequence == last_sequence
+        assert driver._accepted_at_physics_time_sec in (last_acceptance_time, None)
+        if tick.control_phase == "PROTECTIVE_HOLD":
+            break
+    assert tick.control_phase == "PROTECTIVE_HOLD"
+    assert driver._active_reference is None
+    assert driver.step_physics(reference(driver, 1000)).rejection_reason == "lifecycle_latched"
