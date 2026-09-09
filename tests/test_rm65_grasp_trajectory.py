@@ -41,6 +41,7 @@ from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
     MujocoShadowCompatibilityExpectation,
     execute_registered_shadow_trajectory,
 )
+from teleop_runtime.skill_deploy.motion_port import RealAgentJointTrajectory
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspJointTrajectoryPlanner,
     RM65GraspReachabilityConfig,
@@ -49,6 +50,7 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
     build_exclusive_rm65_skill_target_builder,
 )
+from teleop_runtime.skill_deploy.rm65_ports import RM65SkillTargetBuilder
 from teleop_runtime.skill_deploy.rm65_profile import (
     ExclusiveRM65SkillDeploymentProfile,
     resolve_exclusive_rm65_skill_deployment_profile,
@@ -232,6 +234,26 @@ def _real_profile():
     )
 
 
+@pytest.fixture(scope="module")
+def field_trace_plan() -> tuple[RealAgentJointTrajectory, RM65SkillTargetBuilder]:
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    trajectory = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+    )(
+        qpos_by_side=FIELD_TRACE_QPOS,
+        side="right",
+        target_tool_tcp_world=xyzquat_to_pose_matrix(
+            FIELD_TRACE_TARGET_XYZQUAT,
+            name="field_trace_grasp_target",
+        ),
+        speed_scale=0.2,
+    )
+    return trajectory, builder
+
+
 def test_urdf_grasp_planner_handles_hold_and_moving_paths_without_mujoco() -> None:
     profile = _real_profile()
     builder = build_exclusive_rm65_skill_target_builder(profile)
@@ -330,41 +352,13 @@ def test_dense_grasp_path_cannot_bypass_tcp_safety_envelope() -> None:
     assert raised.value.details["modified_sides"] == ("right",)
 
 
-def test_field_trace_grasp_target_is_fully_planned_before_motion() -> None:
-    profile = resolve_exclusive_rm65_skill_deployment_profile(
-        ExclusiveRM65SkillDeploymentProfile(
-            arm_ip_assignment_path=(
-                REPO_ROOT / "teleop_runtime/configs/hardware/rm65_arm_ips/latest.json"
-            ),
-            tool_profile_path_by_side={
-                side: (
-                    REPO_ROOT
-                    / f"hardware/rm65/utils/configs/calibrations/rm65_{side}_DMTAC_M.json"
-                )
-                for side in ("left", "right")
-            },
-            envelope_profile_path=(
-                REPO_ROOT
-                / "teleop_runtime/configs/skill_deploy/agent_primitive_right_relative_tight_v1.json"
-            ),
-        )
-    )
-    builder = build_exclusive_rm65_skill_target_builder(profile)
-    planner = RM65GraspJointTrajectoryPlanner(
-        profile=profile,
-        planning_target_builder=builder,
-        target_envelope_filter=builder.pre_ik_target_safety_filter,
-    )
+def test_field_trace_grasp_target_is_fully_planned_before_motion(
+    field_trace_plan: tuple[RealAgentJointTrajectory, RM65SkillTargetBuilder],
+) -> None:
+    trajectory, builder = field_trace_plan
     target = xyzquat_to_pose_matrix(
         FIELD_TRACE_TARGET_XYZQUAT,
         name="field_trace_grasp_target",
-    )
-
-    trajectory = planner(
-        qpos_by_side=FIELD_TRACE_QPOS,
-        side="right",
-        target_tool_tcp_world=target,
-        speed_scale=0.2,
     )
 
     final_tcp = builder.tool_tcp_world_targets_for_qpos_pair(
@@ -396,39 +390,10 @@ def test_field_trace_grasp_target_is_fully_planned_before_motion() -> None:
     not DEFAULT_INSPIRE_V3_DUAL_ARM_URDF.is_file(),
     reason="local canonical Inspire-v3 MuJoCo asset is unavailable",
 )
-def test_field_trace_grasp_trajectory_executes_as_exact_qpos_in_mujoco() -> None:
-    profile = resolve_exclusive_rm65_skill_deployment_profile(
-        ExclusiveRM65SkillDeploymentProfile(
-            arm_ip_assignment_path=(
-                REPO_ROOT / "teleop_runtime/configs/hardware/rm65_arm_ips/latest.json"
-            ),
-            tool_profile_path_by_side={
-                side: (
-                    REPO_ROOT
-                    / f"hardware/rm65/utils/configs/calibrations/rm65_{side}_DMTAC_M.json"
-                )
-                for side in ("left", "right")
-            },
-            envelope_profile_path=(
-                REPO_ROOT
-                / "teleop_runtime/configs/skill_deploy/agent_primitive_right_relative_tight_v1.json"
-            ),
-        )
-    )
-    builder = build_exclusive_rm65_skill_target_builder(profile)
-    planned = RM65GraspJointTrajectoryPlanner(
-        profile=profile,
-        planning_target_builder=builder,
-        target_envelope_filter=builder.pre_ik_target_safety_filter,
-    )(
-        qpos_by_side=FIELD_TRACE_QPOS,
-        side="right",
-        target_tool_tcp_world=xyzquat_to_pose_matrix(
-            FIELD_TRACE_TARGET_XYZQUAT,
-            name="field_trace_grasp_target",
-        ),
-        speed_scale=0.2,
-    )
+def test_field_trace_grasp_trajectory_executes_as_exact_qpos_in_mujoco(
+    field_trace_plan: tuple[RealAgentJointTrajectory, RM65SkillTargetBuilder],
+) -> None:
+    planned, _builder = field_trace_plan
     obstacle_scene = ObstacleSceneSnapshot(
         reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
         reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
