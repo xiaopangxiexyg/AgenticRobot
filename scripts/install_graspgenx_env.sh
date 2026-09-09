@@ -60,13 +60,17 @@ while (($#)); do
   esac
 done
 
-for command in git uv sha256sum; do
-  command -v "$command" >/dev/null || {
-    echo "Required command is unavailable: $command" >&2
+command -v git >/dev/null || {
+  echo "Required command is unavailable: git" >&2
+  exit 1
+}
+if ((VERIFY_ONLY == 0)); then
+  command -v uv >/dev/null || {
+    echo "Required command is unavailable: uv" >&2
     exit 1
   }
-done
-git lfs version >/dev/null
+  git lfs version >/dev/null
+fi
 
 BUNDLE_ROOT="$ASSET_ROOT/perception/graspgenx-point-grasp"
 CHECKPOINT_ROOT="$BUNDLE_ROOT/checkpoints"

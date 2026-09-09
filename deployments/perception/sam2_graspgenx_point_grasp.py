@@ -297,13 +297,16 @@ class Sam2GraspGenXPointGraspPlanner:
             raise ValueError("DMTAC M gripper width must be in (0, 0.070].")
         if not 0.0 < float(max_click_distance_m) <= 0.200:
             raise ValueError("max_click_distance_m must be in (0, 0.200].")
+        threshold = float(score_threshold)
+        if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
+            raise ValueError("score_threshold must be finite and in [-1, 1].")
         self.model_spec = model_spec
         self.point_segmenter = point_segmenter
         self.client = client
         self.planner = planner
         self.num_grasps = int(num_grasps)
         self.server_top_k = int(server_top_k)
-        self.score_threshold = float(score_threshold)
+        self.score_threshold = threshold
         self.max_gripper_width_m = float(max_gripper_width_m)
         self.max_click_distance_m = float(max_click_distance_m)
         self._lock = threading.RLock()

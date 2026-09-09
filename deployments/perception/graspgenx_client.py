@@ -225,8 +225,8 @@ class GraspGenXClient:
         if isinstance(top_k, bool) or not 1 <= int(top_k) <= 1_000:
             raise ValueError("top_k must be in [1, 1000].")
         threshold = float(score_threshold)
-        if not math.isfinite(threshold) or threshold < -1.0:
-            raise ValueError("score_threshold must be finite and at least -1.0.")
+        if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
+            raise ValueError("score_threshold must be finite and in [-1, 1].")
         params = self._validated_sweep_volume(sweep_volume_params)
         with self._lock:
             response = self._request(

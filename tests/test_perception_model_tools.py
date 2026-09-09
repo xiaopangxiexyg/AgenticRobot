@@ -20,6 +20,7 @@ INSTALLER = REPO_ROOT / "scripts" / "install_perception_models.sh"
 POINT_GRASP_INSTALLER = REPO_ROOT / "scripts" / "install_point_grasp_models.sh"
 POINT_GRASP_ENV_INSTALLER = REPO_ROOT / "scripts" / "install_point_grasp_env.sh"
 GRASPGENX_INSTALLER = REPO_ROOT / "scripts" / "install_graspgenx_env.sh"
+GRASPGENX_SERVER = REPO_ROOT / "scripts" / "run_graspgenx_server.sh"
 
 
 def test_perception_model_installer_is_executable_and_documents_fixed_inputs() -> None:
@@ -89,6 +90,30 @@ def test_graspgenx_installer_uses_isolated_asset_environment() -> None:
     assert '"$SOURCE_ROOT[serve]"' not in source
     assert "PyOpenGL" in source
     assert 'PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}"' in source
+
+
+def test_graspgenx_server_launcher_is_loopback_only_and_asset_bound() -> None:
+    assert GRASPGENX_SERVER.stat().st_mode & 0o111
+    completed = subprocess.run(
+        ["bash", str(GRASPGENX_SERVER), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "never connects to a robot" in completed.stdout
+    source = GRASPGENX_SERVER.read_text(encoding="utf-8")
+    assert "--verify-only" in source
+    assert 'HOST="127.0.0.1"' in source
+    assert "host must be loopback" in source
+    assert 'PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}"' in source
+    rejected = subprocess.run(
+        ["bash", str(GRASPGENX_SERVER), "--host", "0.0.0.0"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode == 2
+    assert "host must be loopback" in rejected.stderr
 
 
 def test_point_grasp_image_cli_is_offline_and_has_no_gateway_dependency() -> None:

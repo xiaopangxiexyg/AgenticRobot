@@ -41,6 +41,7 @@ from .perception_application import (
     assemble_camera_only_real_perception_composition,
 )
 from .perception_frames import build_real_perception_station_frame_binding
+from .point_grasp_deployment import SUPPORTED_POINT_GRASP_BACKEND_IDS
 from .realsense_perception import build_real_perception_source_binding
 
 
@@ -115,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--point-grasp-backend",
-        choices=("vgn", "graspnet", "graspgenx"),
+        choices=tuple(sorted(SUPPORTED_POINT_GRASP_BACKEND_IDS)),
         default="vgn",
     )
     parser.add_argument(

@@ -181,6 +181,36 @@ def test_client_sends_dmtac_sweep_volume_and_sorts_top_k() -> None:
     np.testing.assert_allclose(grasps[0], second)
 
 
+def test_client_start_requires_health_and_infer_object_metadata() -> None:
+    socket = _FakeSocket(
+        [
+            pack_graspgenx_message({"status": "ok"}),
+            pack_graspgenx_message(
+                {"actions": ["health", "metadata", "infer_object"]}
+            ),
+        ]
+    )
+    client = GraspGenXClient(context=_FakeContext(socket))
+
+    client.start()
+
+    assert [unpack_graspgenx_message(payload)["action"] for payload in socket.sent] == [
+        "health",
+        "metadata",
+    ]
+
+
+def test_client_rejects_score_threshold_outside_confidence_range() -> None:
+    client = GraspGenXClient(context=_FakeContext(_FakeSocket([])))
+
+    with pytest.raises(ValueError, match="score_threshold"):
+        client.infer_object(
+            np.zeros((16, 3), dtype=np.float32),
+            sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+            score_threshold=1.01,
+        )
+
+
 def test_client_rejects_non_rigid_server_pose() -> None:
     malformed = np.eye(4, dtype=np.float32)
     malformed[0, 0] = 2.0
@@ -216,6 +246,20 @@ def test_model_spec_verifies_all_four_checkpoint_files(tmp_path: Path) -> None:
     checkpoint.write_bytes(b"changed")
     with pytest.raises(ValueError, match="generator_checkpoint hash mismatch"):
         GraspGenXPointGraspModelSpec.from_asset_bundle(bundle)
+
+
+def test_planner_rejects_non_finite_score_threshold(tmp_path: Path) -> None:
+    mask = np.ones((4, 4), dtype=bool)
+
+    with pytest.raises(ValueError, match="score_threshold"):
+        Sam2GraspGenXPointGraspPlanner(
+            model_spec=_model_spec(tmp_path),
+            point_segmenter=_Segmenter(mask),
+            client=_PlannerClient(
+                np.eye(4, dtype=np.float64)[None], np.asarray((0.9,))
+            ),
+            score_threshold=float("nan"),
+        )
 
 
 def test_planner_converts_gripper_base_pose_to_calibrated_dmtac_tcp(

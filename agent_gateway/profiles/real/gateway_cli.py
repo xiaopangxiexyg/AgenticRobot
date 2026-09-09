@@ -49,6 +49,7 @@ from teleop_runtime.skill_deploy.motion_trace import (
 )
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
+from .point_grasp_deployment import SUPPORTED_POINT_GRASP_BACKEND_IDS
 from .rm65_composition import (
     ExclusiveRM65AgentPrimitiveComposition,
     assemble_exclusive_rm65_agent_primitive_composition,
@@ -130,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-localization-device", default="cuda")
     parser.add_argument(
         "--point-grasp-backend",
-        choices=("vgn", "graspnet", "graspgenx"),
+        choices=tuple(sorted(SUPPORTED_POINT_GRASP_BACKEND_IDS)),
         default="vgn",
     )
     parser.add_argument("--point-grasp-asset-bundle", type=Path)

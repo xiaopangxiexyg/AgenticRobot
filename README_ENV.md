@@ -34,7 +34,7 @@ MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server
 | GraspGenX | `model/perception/graspgenx` |
 | PointNet2 CUDA 扩展 | `model/perception/graspnet-baseline/pointnet2` |
 
-这四个目录都是 Git submodule；PointNet2 属于 GraspNet 源码，且没有独立权重。
+这些目录都是 Git submodule；PointNet2 属于 GraspNet 源码，且没有独立权重。
 
 ### 0.2 权重在哪里？
 

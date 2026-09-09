@@ -147,6 +147,13 @@ PyOpenGL/pyrender 版本互斥，因此本服务不安装未使用的渲染、�
 模型服务只应绑定 loopback；启动命令见 `scripts/run_graspgenx_server.sh`。服务健康后，在
 `real-perception` 或 `real-rm65` 的原启动命令中增加：
 
+```bash
+bash scripts/run_graspgenx_server.sh \
+  --asset-root "${DEXTELEOP_ASSET_ROOT}" \
+  --host 127.0.0.1 \
+  --port 5556
+```
+
 ```text
 --point-grasp-backend graspgenx
 --point-grasp-asset-bundle /absolute/path/to/assets/perception/graspgenx-point-grasp
