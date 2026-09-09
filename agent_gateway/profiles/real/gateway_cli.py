@@ -155,6 +155,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SKILL_MOTION_TRACE_MAX_DURATION_SEC,
         help="fixed preallocated trace duration (default: 120s)",
     )
+    parser.add_argument(
+        "--debug-motion-skill",
+        action="store_true",
+        help=(
+            "debug only: add bounded IK phase profiling to the existing "
+            "preallocated motion trace; requires --motion-trace-root"
+        ),
+    )
     parser.add_argument("--authorized-side", choices=("left", "right"), required=True)
     parser.add_argument(
         "--authorized-action",
@@ -563,6 +571,8 @@ def main(argv: list[str] | None = None) -> int:
         or args.motion_trace_max_duration_sec <= 0.0
     ):
         parser.error("--motion-trace-max-duration-sec must be positive and finite")
+    if args.debug_motion_skill and args.motion_trace_root is None:
+        parser.error("--debug-motion-skill requires --motion-trace-root")
 
     socket_path = _absolute_socket_path(parser, args.socket_path)
     camera_registry_arg = _effective_camera_registry(args)
@@ -663,7 +673,10 @@ def main(argv: list[str] | None = None) -> int:
                 "tool_tcp pose [0, 0, 0.14, 0, 0, 0] for --authorized-side; "
                 "candidate geometry cannot be reinterpreted for another tool"
             )
-    lower = assemble_exclusive_rm65_skill_lower(profile=resolved)
+    lower_kwargs: dict[str, object] = {"profile": resolved}
+    if args.debug_motion_skill:
+        lower_kwargs["debug_motion_skill"] = True
+    lower = assemble_exclusive_rm65_skill_lower(**lower_kwargs)
     camera_config = (
         None
         if args.camera_config is None
@@ -807,6 +820,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     "collision_scene_profile": args.collision_scene_profile,
                     "lower_profile_hash": resolved.semantic_content_hash,
+                    "debug_motion_skill": args.debug_motion_skill,
                 },
             )
         )

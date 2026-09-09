@@ -24,7 +24,6 @@ from teleop_runtime.skill_deploy.rm65_profile import (
     resolve_exclusive_rm65_skill_deployment_profile,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -164,6 +163,8 @@ def test_lower_assembly_reuses_one_profile_and_starts_no_resources(
     assert target_config.inactive_side_hold_execution_cap_enabled is True
     assert target_config.inactive_side_hold_execution_release_enabled is False
     assert target_config.output_command_type == "joint_vector"
+    assert target_config.debug_profile is False
+    assert target_config.debug_profile_print_every == 0
 
     assert [config.side for config in backend_configs] == ["left", "right"]
     for config in backend_configs:
@@ -199,6 +200,35 @@ def test_lower_assembly_reuses_one_profile_and_starts_no_resources(
     assert guard_inputs == [assembly.arm_backends]
     assert all(backend.starts == 0 for backend in assembly.arm_backends.values())
     assert force_guard.starts == 0
+
+
+def test_lower_assembly_enables_bounded_motion_debug_without_stdout(
+    monkeypatch,
+) -> None:
+    profile = _resolved(monkeypatch)
+    target_configs = []
+
+    assemble_exclusive_rm65_skill_lower(
+        profile=profile,
+        debug_motion_skill=True,
+        backend_factory=lambda config: _Backend(config),
+        target_builder_factory=lambda config: (
+            target_configs.append(config) or _TargetBuilder()
+        ),
+        force_guard_factory=lambda backends: _ForceGuard(),
+    )
+
+    assert len(target_configs) == 1
+    assert target_configs[0].debug_profile is True
+    assert target_configs[0].debug_profile_print_every == 0
+
+
+def test_lower_assembly_rejects_non_boolean_motion_debug(monkeypatch) -> None:
+    with pytest.raises(TypeError, match="debug_motion_skill must be bool"):
+        assemble_exclusive_rm65_skill_lower(
+            profile=_resolved(monkeypatch),
+            debug_motion_skill=1,
+        )
 
 
 def test_lower_assembly_rejects_unreviewed_policy_source_clock(

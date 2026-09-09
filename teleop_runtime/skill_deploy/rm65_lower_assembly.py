@@ -82,7 +82,11 @@ class ExclusiveRM65SkillLowerAssembly:
 
 def _target_builder_config(
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
+    *,
+    debug_motion_skill: bool = False,
 ) -> DualArmCollisionAwareRetargeterConfig:
+    if not isinstance(debug_motion_skill, bool):
+        raise TypeError("debug_motion_skill must be bool.")
     position = profile.position_profile
     ik = position.ik_execution
     tuning = with_rm65_position_ik_objective(
@@ -136,6 +140,10 @@ def _target_builder_config(
         inactive_side_hold_execution_cap_enabled=True,
         inactive_side_hold_execution_release_enabled=False,
         output_command_type="joint_vector",
+        debug_profile=debug_motion_skill,
+        # The bounded trace consumes the profile metadata.  Per-frame stdout
+        # would perturb the same real-time path that this mode is measuring.
+        debug_profile_print_every=0,
     )
 
 
@@ -224,6 +232,7 @@ def _default_force_guard_factory(
 def assemble_exclusive_rm65_skill_lower(
     *,
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
+    debug_motion_skill: bool = False,
     backend_factory: RM65SkillBackendFactory = RM65ArmBackend,
     target_builder_factory: RM65SkillTargetBuilderFactory = (
         DualArmCollisionAwareRetargeter
@@ -237,6 +246,8 @@ def assemble_exclusive_rm65_skill_lower(
 
     if not isinstance(profile, ResolvedExclusiveRM65SkillDeploymentProfile):
         raise TypeError("profile must be resolved and typed.")
+    if not isinstance(debug_motion_skill, bool):
+        raise TypeError("debug_motion_skill must be bool.")
     for name, factory in (
         ("backend_factory", backend_factory),
         ("target_builder_factory", target_builder_factory),
@@ -244,7 +255,12 @@ def assemble_exclusive_rm65_skill_lower(
     ):
         if not callable(factory):
             raise TypeError(f"{name} must be callable.")
-    target_builder = target_builder_factory(_target_builder_config(profile))
+    target_builder = target_builder_factory(
+        _target_builder_config(
+            profile,
+            debug_motion_skill=debug_motion_skill,
+        )
+    )
     backends = {
         side: backend_factory(_backend_config(profile, side=side))
         for side in ("left", "right")
