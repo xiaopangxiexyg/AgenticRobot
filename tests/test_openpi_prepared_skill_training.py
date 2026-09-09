@@ -2063,6 +2063,16 @@ def test_stage3_by_date_profile_preserves_validated_training_contract() -> None:
     assert profile["openpi_final_mask_root_layout"] == (
         "source_dataset_id_partitioned_v1"
     )
+    assert profile["openpi_quantile_semantic_bounds"] == {
+        "schema": "dexteleop.openpi_quantile_semantic_bounds.v1",
+        "components": {"actions": ["right.end_effector.target"]},
+    }
+    assert "20260910_by_date_v2_semantic_bounds" in profile[
+        "openpi_assets_base_dir"
+    ]
+    assert "20260910_by_date_v2_semantic_bounds" in profile[
+        "organized_dataset_root"
+    ]
     background = profile["openpi_wrist_background_augmentation"]
     assert background["mask_source"] == "wrist_final_keep_mask_paths"
     assert background["wrist_depth_mask_paths_fallback_allowed"] is False

@@ -2040,7 +2040,7 @@
   "expected_total_raw_episode_count": 2067,
   "expected_total_raw_frame_count": 672236,
   "openpi_asset_id": "writing_stage3_all_valid_all_view_h32_absolute_non_rtc_100k_by_date_v1",
-  "openpi_assets_base_dir": "/home/user/zc/openpi_stage3_model_rtc_runs/20260910_by_date_v1/artifacts/assets",
+  "openpi_assets_base_dir": "/home/user/zc/openpi_stage3_model_rtc_runs/20260910_by_date_v2_semantic_bounds/artifacts/assets",
   "openpi_base_config": "writing-all-view-h32-absolute-standard-v1",
   "openpi_checkout": "/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/openpi",
   "openpi_checkpoint_base_dir": "/home/user/zc/checkpoints/openpi",
@@ -2056,6 +2056,14 @@
   "openpi_source_identity_sha256": "ef63808e0ab7be279baee6dcb3f4c543018b172a78570c693a39d886106eeff2",
   "openpi_source_revision": "359f1ced5c68faeba3167a859a42153d36ab1fd2",
   "openpi_state_augmentation_from_config": "writing-all-view-h32-absolute-standard-v1",
+  "openpi_quantile_semantic_bounds": {
+    "schema": "dexteleop.openpi_quantile_semantic_bounds.v1",
+    "components": {
+      "actions": [
+        "right.end_effector.target"
+      ]
+    }
+  },
   "openpi_training_mode": "standard_non_rtc_v1",
   "openpi_weight_loader_params_path": "/home/user/zc/openpi/pi05_base_para/params",
   "openpi_wrist_background_augmentation": {
@@ -2072,7 +2080,7 @@
     "wrist_depth_mask_paths_fallback_allowed": false,
     "wrist_pair_mode": "shared_scene_family"
   },
-  "organized_dataset_root": "/home/user/zc/openpi_stage3_model_rtc_runs/20260910_by_date_v1/prepared/writing_stage3_all_valid_all_view_h32_absolute_non_rtc_100k_by_date_v1",
+  "organized_dataset_root": "/home/user/zc/openpi_stage3_model_rtc_runs/20260910_by_date_v2_semantic_bounds/prepared/writing_stage3_all_valid_all_view_h32_absolute_non_rtc_100k_by_date_v1",
   "profile_id": "writing_stage3_all_valid_all_view_h32_absolute_non_rtc_100k_by_date_v1",
   "require_no_abnormal_intervals": true,
   "right_wrist_intrinsics_overrides": {},
