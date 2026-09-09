@@ -133,6 +133,14 @@ suite. An incapable sandbox therefore fails immediately instead of running the
 remaining modules and reporting predictable transport errors at the end.
 It assigns every discovered `tests/test_*.py` module exactly once using a
 checked-in sparse timing profile plus a deterministic source-size fallback.
+Modules remain the isolation unit unless the full profile explicitly registers
+an oversized module for top-level-function splitting. For such a module the
+planner parses the source without importing it, assigns every statically
+discovered top-level `test_*` function exactly once, and fails closed on test
+classes or dynamic collection hooks. Parameterized functions remain a single
+target, so their complete case matrix stays together. The manifest records both
+source modules and exact pytest targets; this allows the current temp pipeline
+to share six-shard capacity without reducing test coverage or physics work.
 The sparse full-suite weights come from testcase durations in a complete,
 socket-capable green Run and cover only modules that contributed at least five
 seconds there. Refresh them only from another exact green full-suite artifact;
@@ -146,9 +154,9 @@ identities, and writes `full-acceptance.xml` plus `shard-plan.json` under a new
 artifact root. Set
 `DEXTELEOP_FULL_ACCEPTANCE_SHARDS=1` for serial reproduction. Explicit five-
 and six-shard runs are supported only on hosts whose CPU and memory headroom
-has been validated; values above six are rejected because the measured suite
-is already limited by its slowest module. Keep the deterministic default
-instead of deriving this setting automatically from `nproc`. Harness callers
+has been validated; values above six remain outside the measured concurrency
+and memory budget. Keep the deterministic default instead of deriving this
+setting automatically from `nproc`. Harness callers
 may set new absolute `DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT` and
 `DEXTELEOP_FULL_ACCEPTANCE_JUNIT` paths so the aggregate evidence remains in
 the protected Run directory. Explicit test targets are rejected because this
