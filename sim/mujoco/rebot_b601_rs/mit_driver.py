@@ -871,7 +871,10 @@ class B601MujocoEffortDriver:
             self._control_phase = "LOCKED"
             return
         if self._control_phase == "LOCKED":
-            if self.physics_time_sec - self._lock_started_at < profile.freeze_sec:
+            if (
+                self.physics_time_sec + 1e-12
+                < self._lock_started_at + profile.freeze_sec
+            ):
                 return
             if np.any(np.abs(qvel) > profile.settled_velocity_rad_s):
                 self.request_protective_hold("startup_not_settled")
@@ -880,14 +883,26 @@ class B601MujocoEffortDriver:
             self._ramp_started_at = self.physics_time_sec
             return
         elapsed = self.physics_time_sec - self._ramp_started_at
-        fraction = max(
-            0.0, min(1.0, (elapsed - profile.rise_time_sec) / profile.rise_time_sec)
+        # Use the same clock tolerance as command admission. Subtracting decimal
+        # durations can leave a nominal deadline one ULP short and delay the
+        # handoff by a whole host tick. State guards above still apply first.
+        complete = elapsed + 1e-12 >= 2.0 * profile.rise_time_sec
+        fraction = (
+            1.0
+            if complete
+            else max(
+                0.0, min(1.0, (elapsed - profile.rise_time_sec) / profile.rise_time_sec)
+            )
         )
         self._lock_fraction = 1.0 - fraction
         self._control_phase = (
             "ACTIVE"
             if fraction >= 1.0
-            else ("HANDOFF" if elapsed >= profile.rise_time_sec else "GRAVITY_RAMP")
+            else (
+                "HANDOFF"
+                if elapsed + 1e-12 >= profile.rise_time_sec
+                else "GRAVITY_RAMP"
+            )
         )
 
     def _verify_effort_scene(self) -> np.ndarray:

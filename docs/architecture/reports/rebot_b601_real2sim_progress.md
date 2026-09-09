@@ -184,3 +184,40 @@ Kd=`3 10 10 5 4 4`，原有 1 kHz physics、操作员重力 profile 和相同保
 本批验证：同上七个 B601/边界测试文件共 **115 passed**（30.09 s），Ruff、资源 audit、
 `git diff --check` 通过。新增覆盖官方增益完成启动、disable/fault/reset 清除 native bias、
 以及本地弹簧与主机前馈叠加后的实际总力矩限幅。未修改任何硬件阈值或环境包。
+
+## M1 交接时间边界与低频闭环隔离
+
+后继基线 `d3d266d5bf25ed141c39ee51d2653e4ea20793db`，工作分支
+`codex/b601-real2sim-handoff-timing`；上一候选保持不可变。本批仅修复仿真状态机时间比较。
+
+原 `elapsed = 0.3 - 0.1` 得到略小于 0.2 的浮点值，使 handoff fraction 略小于 1。
+此时本地锁增益已经接近零，但 phase 仍停在 HANDOFF；20 Hz 下直到 0.35 s 才再次
+判定，错误延长了启动锁检查期。现复用既有 command cadence 的 `1e-12 s` 数值容差，
+freeze/ramp/handoff 在对应 host deadline 正确推进。位置、速度、加速度阈值完全不变；
+完成交接的 tick 仍先检查启动位移，不能凭到时跳过保护。
+
+### 20 Hz 对照（1 kHz physics，1.5 s，无真机）
+
+采用上一节官方 YAML 启动增益。通过进程内测试替换，仅将 demo 的末端 torque overlay
+置零或把控制补偿 scale/bias 还原；不修改 plant、不改变本地 Kd、不放宽保护。
+“完成”只代表数值运行完成，overlay 关闭的对照不承担末端恢复效果验收。
+
+| 控制补偿 | 末端 overlay | 运行完成 | 峰值速度 rad/s | 峰值加速度 rad/s² |
+| --- | --- | --- | --- | --- |
+| 操作员 profile | 关闭 | 是 | 0.35217 | 2.24652 |
+| 操作员 profile | 开启 | 否：J6 acceleration guard | 1.33080 | 637.11025 |
+| 原始重力 scale=1/bias=0 | 关闭 | 是 | 0.000213 | 0.52973 |
+| 原始重力 scale=1/bias=0 | 开启 | 否：J6 acceleration guard | 1.36156 | 640.49287 |
+
+四组均在 0.300 s 进入 ACTIVE。剩余失败发生在 ACTIVE，而非 startup lock：当前
+fixture 的末端弹簧/阻尼在 host tick 计算，然后 ZOH 50 ms。偏置不是这次失稳的必要条件。
+同时，操作员补偿在未辨识的 ideal plant 上明显漂移，也不能称作真实重力平衡的数字孪生。
+
+下一步需分别验证低频末端反馈的离散控制稳定域，以及用实测数据辨识 plant；不能通过
+把控制偏置反向写入 URDF 来“制造平衡”，也不能把 host 20 Hz 悄悄改成仿真 1 kHz
+末端反馈并声称真机等价。目前 20 Hz 6D force overlay 仍为 NOT_ACCEPTED，停止于仿真；
+没有新增真机运行命令，也没有调整真机参数。总路线图未修改。
+
+本批验证：同上七个测试文件 **118 passed**（34.35 s），新增 20/500 Hz 准时交接和
+deadline 上位移保护不被跳过的回归检查；Ruff、资源 audit、`git diff --check` 通过。
+交付状态为待合并，依赖上一候选；未 merge、push、安装或触发硬件。

@@ -246,6 +246,31 @@ def test_lock_uses_current_anchor_not_active_reference(startup_driver):
     assert tick.torque_breakdown.position_torque_nm == (0.0,) * 6
 
 
+@pytest.mark.parametrize("host_hz", [20.0, 500.0])
+def test_startup_deadline_does_not_slip_one_host_tick(startup_driver, host_hz):
+    driver = startup_driver
+    driver.timing = TimingSpec(command_hz=host_hz, physics_hz=1000.0)
+    for i in range(301):
+        tick = driver.step_physics(reference(driver, i) if driver.command_due else None)
+        assert not tick.driver_faulted
+        if i < 300:
+            assert tick.control_phase != "ACTIVE"
+    assert tick.physics_time_sec == pytest.approx(0.3)
+    assert tick.control_phase == "ACTIVE"
+    assert driver._lock_fraction == 0.0
+
+
+def test_startup_deadline_still_checks_lock_displacement(startup_driver):
+    driver = startup_driver
+    for i in range(300):
+        driver.step_physics(reference(driver, i) if driver.command_due else None)
+    driver.scene.data.qpos[driver._qpos_addresses[0]] += 0.03
+    driver.scene.forward()
+    tick = driver.step_physics(reference(driver, 300))
+    assert tick.control_phase == "PROTECTIVE_HOLD"
+    assert tick.phase_reason == "startup_lock_displacement"
+
+
 def test_lock_excursion_enters_latched_draggable_hold(startup_driver):
     driver = startup_driver
     driver.step_physics(reference(driver))
