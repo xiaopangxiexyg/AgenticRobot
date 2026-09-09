@@ -1,22 +1,21 @@
 # B601-RS 硬件开发交接说明
 
-> 版本：2026-09-08。本文是 B601-RS 当前代码、真机 commissioning、重力采集和
+> 版本：2026-09-09。本文是 B601-RS 当前代码、真机 commissioning、重力采集和
 > Harness/Git 交接的统一入口。它描述可复核的实现和流程，不授予新的使能、运动或
 > 合并权限。任何真机动作仍须由现场操作者在确认机械支撑和物理急停后前台执行。
 
 ## 0. 先看结论
 
 - 当前候选位于
-  `/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260906-b601-gravity-startup-handoff-r1/AgenticRobot`，分支为
-  `task/AR-20260906-b601-gravity-startup-handoff-r1`。
-- 本文初稿曾以 `7fb67ccb611dfd40a043e5a25123e0a2537639ae`（tree
-  `d809c202755a11cc52ba9fe201c89d9a22da901e`）为基线；这两个值只用于历史 provenance，
-  不是当前候选的永久身份。任何文档、代码或合并提交都会使旧 pin 失效；交接、验收和
-  集成前必须按本文第 12 节重新读取候选的实际 `HEAD`、`HEAD^{tree}` 和 clean 状态。
-- 候选尚未合并到 `AgenticRobot-development-mainline`。当前 development checkout
-  的现场 HEAD 为 `c0140d0fbf362bf9b3e94e840548a007b0a0039f`；使用
-  `git merge-base --is-ancestor <candidate> <development>` 重新确认，不得凭分支名推断
-  “已合并”。
+  `/home/zc/HandMotion/Developing/temp/worktrees/root-b601-gravity-calibration-runtime-20260908`，
+  分支为 `task/root/b601-gravity-calibration-runtime-20260908`。默认重力 profile 的代码
+  checkpoint 为 `70fcb2a7ba690cbc733c586b11633738b9f1b8b1`；本文的最终交接提交和 tree 以分支
+  description、交接消息及现场 `git rev-parse` 为准，不能在被提交的文档中自引用其 SHA。
+- 候选尚未合并到 `AgenticRobot-development-mainline`，也未 push、未安装。截至本次交接，
+  development 为 `028b6d28fb9056843959cceb074af8f0a6b3898a`，不包含上述候选；共同祖先为
+  `ef54a901bb5df92d9926c7c47ef7def5c1ddfdf5`。development 在本候选六个声明路径上没有
+  自共同祖先以来的改动，三方 merge preview 未见文本冲突；这只是当前只读检查，不是
+  合并授权或最终语义评审。
 - 外部 reBotArm 源码当前 pin 为 commit
   `5ba28acef46237eb6a7560658bbc43b06cf8a259`、tree
   `ddd34d2b400b3987d4875bd6a99bd29b74d39dac`；
@@ -29,10 +28,14 @@
   未记录版本的本地模型副本。
 - 已完成的代码重点是：六轴 gravity+damping protective hold、启动锁到最终控制器的
   连续 handoff、J2/J3/J4 编码器边界兼容、J4/J5/J6 反馈工作余量、qvel/qacc/非有限值
-  guard，以及交互式多姿态重力
-  残差采集和离线 candidate fit。
-- 当前可以继续做正式采集和离线拟合；不能宣称重力参数、摩擦、真实力矩比例、高带宽
-  触觉或最终 `HARDWARE_PASS` 已完成标定。
+  guard、原始 RobStride 帧诊断、交互式多姿态残差采集、startup replay、离线 candidate
+  fit，以及逐关节重力 scale/offset/bias/Coulomb 和 driver Kd 配置。
+- 操作者已确认下列正常重力补偿 profile 的真机手感合理，因此它已成为 enabled gravity
+  mode 的程序默认值：软件 `kp/kd=0/0`，driver Kd=`0.2 0.3 0.2 0.15 0.1 0.05`，全局
+  scale=`1.0`，joint scale=`1 0.95 1 1 1 1`，offset 全零，bias=
+  `0 -0.105 -0.1 -0.05 0 0 N.m`，Coulomb 全零。
+- 当前状态是“独立候选已准备交接”，不是“已合并/已安装/最终硬件通过”。逐关节 offset
+  和 Coulomb 仍为零；没有独立力矩传感器标定，也没有高带宽触觉或系统级 `HARDWARE_PASS`。
 
 ## 1. 任务目标与明确非目标
 
@@ -522,36 +525,38 @@ test 当成每次合并后的真机必需步骤。合并后的直接 Python 运�
 
 ### 12.4 当前分支元数据注意事项
 
-本次核查发现分支描述仍记录旧 tip `292dbfa69dfa903455e60a825ebdfd2ab16605b9`，且状态
-`awaiting-human-validation` 不被当前 inventory 识别。新增本文并提交后，必须把 branch
-description 的 `tip`、`write-scope`（加入本文）、`state`、`validation` 更新为实际值；不要
-把旧描述复制给下一位开发者。当前候选与依赖分支
-`task/AR-20260906-b601-gravity-startup-protective-stop-r0` 在三条 B601 路径上有
-inventory exact-overlap，这是因为候选有序地包含该依赖的已验证基线；它不是允许同时编辑
-同一路径的授权。集成前仍须固定两个实际 SHA、检查 ancestry 和组合 diff，不能编辑或清理
-依赖 worktree。
+当前独立分支 owner 为 `codex-root`，声明范围是 backend、probe、两份 focused test 和两份
+B601 文档；排除 development merge、push、install 和 agent 真机动作。交接文档提交后，
+branch description 必须更新为 exact tip、`ready-for-integration` 和本节验证结果。候选包含
+此前多个 B601 安全修复 checkpoint，不能只摘取最后一个默认值提交而漏掉其依赖链。集成前
+固定完整候选 tip、development tip 和 vendor/MotorBridge 输入；不得编辑、reset、clean、
+stash、删除或移动任何同伴 worktree。
 
 ## 13. 可直接复用的验证命令
 
-以下命令均为离线/只读，不能连接 CAN。
+13.1/13.2 是离线检查；13.3 会只读连接 CAN 但不切 mode、不使能、不发控制帧；13.4 是
+明确的真机运动采集，只有现场操作者批准后才能运行。
 
 ### 13.1 当前候选的 focused tests
 
 ```bash
-WT=/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260906-b601-gravity-startup-handoff-r1/AgenticRobot
-PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
-cd "$WT"
-bash scripts/run_pytest.sh tests/test_rebot_b601_low_gain_probe.py
+cd /home/zc/HandMotion/Developing/temp/worktrees/root-b601-gravity-calibration-runtime-20260908
+/home/zc/anaconda3/envs/dexteleop310/bin/python3.10 -m pytest -q \
+  tests/test_rebot_b601_hardware_backend.py \
+  tests/test_rebot_b601_low_gain_probe.py
+/home/zc/anaconda3/envs/dexteleop310/bin/python3.10 -m ruff check \
+  scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  tests/test_rebot_b601_low_gain_probe.py
 git diff --check
 git status --short --branch
 ```
 
-当前核实结果：`93 passed`。测试只覆盖纯 helper、状态机、拟合和故障路径，不打开 CAN。
+当前核实结果：`167 passed`、Ruff PASS、diff-check PASS。测试不打开 CAN。
 
 ### 13.2 CLI/语法检查
 
 ```bash
-WT=/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260906-b601-gravity-startup-handoff-r1/AgenticRobot
+WT=/home/zc/HandMotion/Developing/temp/worktrees/root-b601-gravity-calibration-runtime-20260908
 PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
 cd "$WT"
 env PYTHONDONTWRITEBYTECODE=1 "$PY" \
@@ -561,14 +566,14 @@ env PYTHONDONTWRITEBYTECODE=1 "$PY" -m py_compile \
 ```
 
 全 B601 套件可按项目 wrapper 运行；若出现 MuJoCo URDF 缺失，先检查
-`git submodule status hardware/reBotArm_control_py`。当前已知历史结果是 `179 passed,
+`git submodule status hardware/reBotArm_control_py`。此前较宽候选运行结果是 `206 passed,
 71 skipped, 3 failed`，3 个失败均源于任务 worktree 的 nested vendor submodule 未初始化，
-不是代码行为通过；应记录为环境 blocker，不得改写成 PASS。
+不是本轮 exact tip 的全量 PASS；应记录为历史环境证据，不得改写成当前全绿。
 
 ### 13.3 只读 feedback stability
 
 ```bash
-WT=/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260906-b601-gravity-startup-handoff-r1/AgenticRobot
+WT=/home/zc/HandMotion/Developing/temp/worktrees/root-b601-gravity-calibration-runtime-20260908
 PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
 CFG=/home/zc/HandMotion/Developing/reBotArm_control_py/config/rebotarm_rs.yaml
 SRC=/home/zc/HandMotion/Developing/reBotArm_control_py
@@ -599,7 +604,7 @@ printf '%s\n' '[B601] shell remains active'
 先完成 round-trip，再运行下面的两批命令；训练和验证只改变输出文件，不改变控制参数。
 
 ```bash
-WT=/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260906-b601-gravity-startup-handoff-r1/AgenticRobot
+WT=/home/zc/HandMotion/Developing/temp/worktrees/root-b601-gravity-calibration-runtime-20260908
 PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
 CFG=/home/zc/HandMotion/Developing/reBotArm_control_py/config/rebotarm_rs.yaml
 SRC=/home/zc/HandMotion/Developing/reBotArm_control_py
@@ -748,17 +753,106 @@ vendor：commit/tree=<...> config_sha256=<...> firmware/model/IDs=<...>
 
 ## 16. 下一位接手者的最短路线
 
+### 16.1 当前交接包
+
+| 项目 | 固定内容 |
+| --- | --- |
+| AgenticRobot worktree | `/home/zc/HandMotion/Developing/temp/worktrees/root-b601-gravity-calibration-runtime-20260908` |
+| branch | `task/root/b601-gravity-calibration-runtime-20260908` |
+| 默认 profile 代码 checkpoint | `70fcb2a7ba690cbc733c586b11633738b9f1b8b1` |
+| development（本次只读快照） | `028b6d28fb9056843959cceb074af8f0a6b3898a` |
+| merge base | `ef54a901bb5df92d9926c7c47ef7def5c1ddfdf5` |
+| MotorBridge candidate | `0c8980afeeaf74bbd6d7329027d0af4a998b77e9`，tree `b34e138748ba4d21113a2653ed53fcce6a602571` |
+| MotorBridge ABI SHA-256 | `85466a8e78532fa8194e01e59d056b36eeaea1e68c8c290cdfcb78c24dc1497f` |
+| reBotArm vendor | `5ba28acef46237eb6a7560658bbc43b06cf8a259`，tree `ddd34d2b400b3987d4875bd6a99bd29b74d39dac` |
+| YAML SHA-256 | `be51e877050cc4716188fca3b4f2a41109682513c7715c71594066a133ba5cf9` |
+
+当前 worktree 除历史保留的
+`.playwright-cli/page-2026-09-08T10-30-40-740Z.yml` 外没有源码修改；该文件不属于 B601，
+不得删除或提交来制造“全净”。交接文档提交后应以最新 `git rev-parse HEAD`、tree 和 branch
+description 替换上表的代码 checkpoint 进行最终集成 pin。
+
+### 16.2 本轮实现完成项
+
+1. 六轴同步 enable/dispatch/receipt，J7 明确排除；部分发送不冒充完整成功。
+2. 驱动器本地临时锁完成 `ENABLED_UNARMED → LOCKING → LOCKED → GRAVITY_RAMP →
+   HANDOFF → ACTIVE`，完整重力从首个锁帧参与，总力矩只经过一层 slew。
+3. 第一次 Ctrl-C、普通异常和 duration 完成优先进入 J1--J6 gravity+damping protective
+   hold；反馈/模型暂时不可用时使用最后完整补偿缓存和既有 motor-local Kd。只有第二次
+   Ctrl-C/SIGUSR1，或 live 与 cached 完整六轴发送均失败，才允许最终全失能。
+4. J2/J3 零位负零窗口、J4 精确 `+/-pi/2` 与 J4--J6 `0.1 rad` 只读工作余量已经分离；
+   出站命令仍使用 nominal URDF 包络。
+5. 单帧有限但不可信的 qpos 跳变先隔离，下一帧恢复则继续；非有限值、连续异常和无法
+   建立可信控制状态进入 protective/degraded 路径，不能靠放宽运动阈值掩盖坏帧。
+6. MotorBridge `robstride-startup`/type-17 被动原始帧记录不增加 CAN 请求；host-id 相关
+   ABI、参数 ID、raw float bits 和关节诊断用于定位偶发 J4 参数响应异常。
+7. `gravity-calibration`、`startup-replay` 和离线 fit 均保留；静态 R 窗口不能分离重力
+   bias 与静摩擦的限制已经记录。
+8. 重力运行时支持六轴 `scale/offset/bias/Coulomb`，Coulomb 只在有限差分速度超过显式
+   threshold 后按方向生效；所有项贯穿 startup、ACTIVE、protective hold 和缓存补偿。
+9. `--driver-kd` 兼容一个共享值或六个独立 J1--J6 值；软件 Kd 与 driver Kd 不允许同时
+   成为 damping owner。
+10. 操作者确认的默认正常重力 profile 已写入程序；省略相应 CLI 时使用第 0 节列出的
+    数值，结果 JSON 的 `profile` 记录最终生效向量。
+
+相关 checkpoint 顺序：
+
 ```text
-1. 重新 inventory 所有 B601 worktree，修正 branch description 的 stale tip/state
-2. 固定候选 HEAD/tree、vendor commit/tree、YAML SHA，确认 clean
-3. 运行 focused low-gain tests + diff-check + CLI/py_compile
-4. 在唯一 CAN owner、承托和急停条件下做 driver torque-limit round-trip
-5. 运行 read-only feedback-stability，先复核边界、qvel/qacc 和日志
-6. 运行 training/validation 两批交互式 gravity-calibration
-7. 运行 gravity-calibration-fit，只产出 candidate overlay/report
-8. 独立 review 训练/验证残差和启动下坠记录，再决定是否另立接入任务
-9. 如需合并，按 exact commit/tree 的 Harness/Git handoff 交接；合并后重新验证
-10. overlay 接入必须有单独批准、回滚文件和再次的 no-touch/多姿态真机验收
+6dd00466 passive startup diagnostics
+55b76fe6 continuous startup replay
+97473f0e stable driver-local startup lock
+f803708f reversible per-joint gravity scale
+ffc2bbd2 gravity offset/bias/Coulomb runtime terms
+77ab9834 independent per-joint driver Kd
+70fcb2a7 operator-validated gravity defaults
+```
+
+### 16.3 验证与证据边界
+
+- 当前代码离线验证：
+  `python3.10 -m pytest -q tests/test_rebot_b601_hardware_backend.py tests/test_rebot_b601_low_gain_probe.py`
+  得到 `167 passed`；Ruff、`py_compile` 和 `git diff --check` 通过。
+- `/tmp/b601-rs-j2-gravity-scale-095-20260909-173751/`：J2 scale `0.95` 的完整 startup
+  replay 状态机通过，约 20 Hz，无 torque/slew limit；最终顶层 `FAIL/operator_interrupt`
+  是第二次 Ctrl-C 的记账，不抹去 replay 子结果和完整 cleanup。
+  JSON/runtime/raw SHA-256 分别为 `381f3be1829ae72a07982a1611762d77a653d97c2c67470a55604263edbb4d68`、
+  `7e70afccaaaf3e5ca6da8bd1977f70848429bda230ae99eeb9693dedcfd21ba4`、
+  `dc8027306559cfec7b91a5d266a0bf5bd3cf5db467873fcaa72554583a3d5224`。
+- `/tmp/b601-rs-j2-bias-minus010-r1/result.json`：机器证据确认实际下发 profile 为
+  driver Kd `0.2 0.3 0.2 0.15 0.1 0.05`、joint scale `1 0.95 1 1 1 1`、bias
+  `0 -0.105 -0.1 -0.05 0 0`，protective hold 和最终六轴 cleanup 完整。该次没有按 R，
+  所以 `startup_replay.status=FAIL`；它不能冒充 replay 验收。操作者另行确认这组正常重力
+  补偿配置的手感合理，这是默认值的人工验收来源。
+  JSON/runtime/raw SHA-256 分别为 `55f2d0575350e9233ff062dddf4b256b082f8005e7429b355c04b7f0c4cfd582`、
+  `92a190c930de0f596d80e0e3ad28d795719f82bc182664d0cc03606c6b587f9b`、
+  `4d2802bcc33b15fdedaee88c2cc985a941ad35fdafc373ba4ba8d26e3146a796`。
+- 默认值提交本身只改变“省略参数时取什么值”，尚未在 exact handoff commit 上做一次
+  省略所有重力 profile 参数的等价真机重放。若集成前要求严格机器可重放证据，应补这一
+  次短 no-touch 运行，而不是重新标定全部参数。
+- 旧静态 calibration 窗口和官方 PD sweep 可作为诊断/先验，但不能证明本机 offset、
+  Coulomb、MIT Kp 力矩比例或 payload 已被独立辨识。
+
+### 16.4 仍未完成或不得扩张的结论
+
+- 未实现自动双向低速 sweep 来分离 `k/bias/Coulomb`；当前 Coulomb 默认全零。
+- 未对新增默认 profile 做多负载、多温度、末端工具变化和全工作空间定量验收。
+- 未完成高带宽末端触觉、passivity、力传感器闭环或系统级 teleoperation 验收。
+- 未修改 URDF/YAML/固件持久参数；不得把 runtime bias 反写成虚假的 link mass 或 joint
+  zero。
+- 未合并 development、未 push、未安装，也没有授权 agent 运行真机。
+
+### 16.5 下一位接手者的最短路线
+
+```text
+1. 读取本文、branch description 和当前 HEAD/tree；保留无关 untracked 文件
+2. 复跑 167 项 focused tests、Ruff、py_compile 和 diff-check
+3. 只读确认 development 与候选的共同祖先、声明路径差异和 merge preview
+4. 若用户要求严格 premerge 真机证据，在承托/急停/唯一 CAN owner 下用默认参数省略方式
+   做一次短 startup-replay/no-touch 等价验证；不要重复大规模静态窗口采集
+5. 获得明确合并授权后才创建隔离 integration composition；合并固定提交并复跑验证
+6. 合并后可直接使用目标 Python 环境运行，不再套 Harness runtime；Harness 只用于尚未合并
+   composition 的受控验收
+7. 新 payload、摩擦辨识或 protective-hold 独立大阻尼属于下一任务，不能夹带进本次合并
 ```
 
 关联的细节文档：
