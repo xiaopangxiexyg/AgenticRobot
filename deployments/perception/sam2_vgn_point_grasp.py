@@ -41,6 +41,10 @@ DEFAULT_DMTAC_M_URDF_SHA256 = (
 DMTAC_M_MAX_VISIBLE_COLLISION_POINTS = 400
 DMTAC_M_TARGET_OPENING_CENTER_MAX_SHIFT_M = 0.035
 DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M = 0.050
+# VGN trains each continuous XYZ coordinate against its independently rounded
+# voxel index.  The largest valid three-dimensional translation error is
+# therefore the half-voxel diagonal, not one half voxel on a single axis.
+VGN_TARGET_CAPTURE_SNAP_MAX_M = math.sqrt(3.0) * (0.30 / 40 / 2.0)
 PARALLEL_JAW_TCP_UPWARD_SELECTION_V1 = "maximize_reference_plus_z_dot_tool_tcp_plus_y"
 
 
@@ -321,6 +325,13 @@ class Sam2VgnPointGraspPlanner:
                         DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
                         DMTAC_M_PALM_FROM_TOOL_TCP_Z_M + DMTAC_M_FINGER_LENGTH_M,
                     ],
+                    "target_capture_snap_max_m": (
+                        VGN_TARGET_CAPTURE_SNAP_MAX_M
+                    ),
+                    "target_capture_snap_policy": (
+                        "translate_tcp_by_at_most_vgn_half_voxel_diagonal_into_"
+                        "physical_region"
+                    ),
                     "model_grasp_width_axis": "+y",
                     "tool_tcp_width_axis": "+x",
                     "tool_tcp_approach_axis": "+z",
@@ -446,6 +457,7 @@ class Sam2VgnPointGraspPlanner:
         )
         with self._lock:
             grasps, scores = self._detect(tsdf)
+        filter_summary: dict[str, int | float | None] = {}
         candidates = self._rank(
             grasps,
             scores,
@@ -456,10 +468,13 @@ class Sam2VgnPointGraspPlanner:
             depth=depth,
             intrinsics=values,
             maximum=int(max_candidates),
+            filter_summary=filter_summary,
         )
         if not candidates:
             raise RuntimeError(
-                "No visible collision-free DMTAC M grasp was found near the clicked region."
+                "No visible collision-free DMTAC M grasp was found near the "
+                "clicked region; filter_summary="
+                + json.dumps(filter_summary, sort_keys=True, separators=(",", ":"))
             )
         rows, columns = np.nonzero(mask)
         return PointGraspResult(
@@ -623,6 +638,25 @@ class Sam2VgnPointGraspPlanner:
     ) -> bool:
         """Require the robust target center to lie between the physical fingers."""
 
+        center = self._target_center_in_tcp(
+            camera_from_tcp,
+            target_points_camera,
+        )
+        half_opening = self.max_gripper_width_m / 2.0
+        half_height = DMTAC_M_PAD_HEIGHT_M / 2.0
+        palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
+        fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
+        return bool(
+            abs(center[0]) <= half_opening
+            and abs(center[1]) <= half_height
+            and palm_z <= center[2] <= fingertip_z
+        )
+
+    @staticmethod
+    def _target_center_in_tcp(
+        camera_from_tcp: np.ndarray,
+        target_points_camera: np.ndarray,
+    ) -> np.ndarray:
         points = np.asarray(target_points_camera, dtype=np.float64)
         if (
             points.ndim != 2
@@ -636,16 +670,46 @@ class Sam2VgnPointGraspPlanner:
         tcp_from_camera = np.linalg.inv(camera_from_tcp)
         local = points @ tcp_from_camera[:3, :3].T + tcp_from_camera[:3, 3]
         low, high = np.percentile(local, (5.0, 95.0), axis=0)
-        center = (low + high) * 0.5
+        return (low + high) * 0.5
+
+    def _snap_tcp_to_target_capture_region(
+        self,
+        camera_from_tcp: np.ndarray,
+        target_points_camera: np.ndarray,
+    ) -> tuple[np.ndarray | None, float]:
+        """Correct at most the VGN half-voxel diagonal of quantization.
+
+        The reviewed VGN source rounds all three continuous training-label
+        coordinates independently to the 7.5 mm voxel grid.  Its strict 3-D
+        translation error bound is therefore ``sqrt(3) * 3.75 mm``.  SAM2's
+        robust target center and the physical DMTAC M capture boundary are
+        continuous, so move the TCP within that model-derived bound, not the
+        boundary.  Existing capture and visible-collision checks are rerun on
+        the corrected physical pose; larger corrections remain rejected.
+        """
+
+        pose = np.asarray(camera_from_tcp, dtype=np.float64).reshape(4, 4)
+        center = self._target_center_in_tcp(pose, target_points_camera)
         half_opening = self.max_gripper_width_m / 2.0
         half_height = DMTAC_M_PAD_HEIGHT_M / 2.0
         palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
         fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
-        return bool(
-            abs(center[0]) <= half_opening
-            and abs(center[1]) <= half_height
-            and palm_z <= center[2] <= fingertip_z
-        )
+        lower = np.asarray((-half_opening, -half_height, palm_z), dtype=np.float64)
+        upper = np.asarray((half_opening, half_height, fingertip_z), dtype=np.float64)
+        if np.all(center >= lower) and np.all(center <= upper):
+            return pose.copy(), 0.0
+
+        # Pull a boundary correction one nanometer into the physical volume so
+        # recomputing robust percentiles cannot fail on floating-point noise.
+        target_center = np.clip(center, lower + 1e-9, upper - 1e-9)
+        correction_tcp = center - target_center
+        correction_m = float(np.linalg.norm(correction_tcp))
+        maximum_correction_m = VGN_TARGET_CAPTURE_SNAP_MAX_M
+        if correction_m > maximum_correction_m + 1e-12:
+            return None, correction_m
+        corrected = pose.copy()
+        corrected[:3, 3] += corrected[:3, :3] @ correction_tcp
+        return corrected, correction_m
 
     def _rank(
         self,
@@ -659,6 +723,7 @@ class Sam2VgnPointGraspPlanner:
         depth: np.ndarray,
         intrinsics: Mapping[str, float],
         maximum: int,
+        filter_summary: dict[str, int | float | None] | None = None,
     ) -> tuple[PointGraspCandidate, ...]:
         # VGN uses +Y as jaw width and +Z as approach, with its origin at the
         # palm/finger boundary. DMTAC M uses +X as jaw width and +Z as
@@ -675,10 +740,46 @@ class Sam2VgnPointGraspPlanner:
         )
         base_from_camera = base_from_cube @ np.linalg.inv(camera_from_cube)
         ranked = []
+        counts: dict[str, int | float | None] = {
+            "detected": 0,
+            "min_detected_width_m": None,
+            "max_detected_width_m": None,
+            "width_min_m": 0.005,
+            "width_max_m": self.max_gripper_width_m,
+            "width_valid": 0,
+            "target_capture_valid": 0,
+            "min_target_capture_violation_m": None,
+            "min_target_capture_snap_m": None,
+            "target_capture_snap_limit_m": VGN_TARGET_CAPTURE_SNAP_MAX_M,
+            "closest_target_center_tcp_x_m": None,
+            "closest_target_center_tcp_y_m": None,
+            "closest_target_center_tcp_z_m": None,
+            "click_distance_valid": 0,
+            "visible_collision_valid": 0,
+            "min_click_distance_m": None,
+            "max_click_distance_m": self.max_click_distance_m,
+            "min_visible_collision_points": None,
+            "visible_collision_limit": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
+            "unique_returned": 0,
+        }
         for grasp, raw_score in zip(grasps, scores, strict=True):
+            counts["detected"] = int(counts["detected"]) + 1
             width = float(grasp.width)
+            previous_min_width = counts["min_detected_width_m"]
+            previous_max_width = counts["max_detected_width_m"]
+            counts["min_detected_width_m"] = (
+                width
+                if previous_min_width is None
+                else min(float(previous_min_width), width)
+            )
+            counts["max_detected_width_m"] = (
+                width
+                if previous_max_width is None
+                else max(float(previous_max_width), width)
+            )
             if not 0.005 <= width <= self.max_gripper_width_m:
                 continue
+            counts["width_valid"] = int(counts["width_valid"]) + 1
             cube_from_grasp = np.asarray(grasp.pose.as_matrix(), dtype=np.float64)
             camera_from_tcp = camera_from_cube @ cube_from_grasp @ grasp_from_tcp
             camera_from_tcp = self._center_tcp_on_target(
@@ -690,19 +791,84 @@ class Sam2VgnPointGraspPlanner:
                 camera_from_tcp,
                 base_from_tcp,
             )
+            target_center_tcp = self._target_center_in_tcp(
+                camera_from_tcp,
+                target_points_camera,
+            )
+            half_opening = self.max_gripper_width_m / 2.0
+            half_height = DMTAC_M_PAD_HEIGHT_M / 2.0
+            palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
+            fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
+            capture_violation = max(
+                0.0,
+                abs(float(target_center_tcp[0])) - half_opening,
+                abs(float(target_center_tcp[1])) - half_height,
+                palm_z - float(target_center_tcp[2]),
+                float(target_center_tcp[2]) - fingertip_z,
+            )
+            previous_capture_violation = counts["min_target_capture_violation_m"]
+            if (
+                previous_capture_violation is None
+                or capture_violation < float(previous_capture_violation)
+            ):
+                counts["min_target_capture_violation_m"] = capture_violation
+                counts["closest_target_center_tcp_x_m"] = float(
+                    target_center_tcp[0]
+                )
+                counts["closest_target_center_tcp_y_m"] = float(
+                    target_center_tcp[1]
+                )
+                counts["closest_target_center_tcp_z_m"] = float(
+                    target_center_tcp[2]
+                )
+            snapped_camera_from_tcp, capture_snap_m = (
+                self._snap_tcp_to_target_capture_region(
+                    camera_from_tcp,
+                    target_points_camera,
+                )
+            )
+            previous_capture_snap = counts["min_target_capture_snap_m"]
+            counts["min_target_capture_snap_m"] = (
+                capture_snap_m
+                if previous_capture_snap is None
+                else min(float(previous_capture_snap), capture_snap_m)
+            )
+            if snapped_camera_from_tcp is None:
+                continue
+            camera_from_tcp = snapped_camera_from_tcp
+            base_from_tcp = base_from_camera @ camera_from_tcp
             if not self._target_center_inside_capture_region(
                 camera_from_tcp,
                 target_points_camera,
             ):
-                continue
+                raise AssertionError(
+                    "Bounded target-capture correction did not enter the physical region."
+                )
+            counts["target_capture_valid"] = int(counts["target_capture_valid"]) + 1
             distance = float(np.linalg.norm(camera_from_tcp[:3, 3] - target_camera))
+            previous_distance = counts["min_click_distance_m"]
+            counts["min_click_distance_m"] = (
+                distance
+                if previous_distance is None
+                else min(float(previous_distance), distance)
+            )
             if distance > self.max_click_distance_m:
                 continue
-            collision_free = self._visible_collision_free(
+            counts["click_distance_valid"] = int(counts["click_distance_valid"]) + 1
+            collision_points = self._visible_collision_point_count(
                 camera_from_tcp, width, depth, intrinsics
             )
-            if not collision_free:
+            previous_collision_points = counts["min_visible_collision_points"]
+            counts["min_visible_collision_points"] = (
+                collision_points
+                if previous_collision_points is None
+                else min(int(previous_collision_points), collision_points)
+            )
+            if collision_points > DMTAC_M_MAX_VISIBLE_COLLISION_POINTS:
                 continue
+            counts["visible_collision_valid"] = (
+                int(counts["visible_collision_valid"]) + 1
+            )
             model_score = min(1.0, max(0.0, float(raw_score)))
             score = model_score * math.exp(-distance / 0.05)
             ranked.append(
@@ -723,6 +889,9 @@ class Sam2VgnPointGraspPlanner:
             selected.append(item)
             if len(selected) == maximum:
                 break
+        counts["unique_returned"] = len(selected)
+        if filter_summary is not None:
+            filter_summary.update(counts)
         return tuple(
             PointGraspCandidate(
                 score=float(score),
@@ -743,6 +912,23 @@ class Sam2VgnPointGraspPlanner:
         depth: np.ndarray,
         intrinsics: Mapping[str, float],
     ) -> bool:
+        return (
+            Sam2VgnPointGraspPlanner._visible_collision_point_count(
+                camera_from_tcp,
+                width,
+                depth,
+                intrinsics,
+            )
+            <= DMTAC_M_MAX_VISIBLE_COLLISION_POINTS
+        )
+
+    @staticmethod
+    def _visible_collision_point_count(
+        camera_from_tcp: np.ndarray,
+        width: float,
+        depth: np.ndarray,
+        intrinsics: Mapping[str, float],
+    ) -> int:
         step = max(1, int(math.sqrt(depth.size / 100_000)))
         rows, columns = np.nonzero(depth[::step, ::step] > 0)
         rows = rows * step
@@ -772,9 +958,8 @@ class Sam2VgnPointGraspPlanner:
             & (local[:, 2] <= palm_z)
             & (np.abs(local[:, 0]) < width / 2.0 + finger)
         )
-        return (
-            int(np.count_nonzero(within_height & (forward & (left | right) | palm)))
-            <= DMTAC_M_MAX_VISIBLE_COLLISION_POINTS
+        return int(
+            np.count_nonzero(within_height & (forward & (left | right) | palm))
         )
 
 
@@ -786,6 +971,7 @@ __all__ = [
     "POINT_GRASP_ASSET_SCHEMA_V1",
     "VGN_GIT_URL",
     "VGN_REVIEWED_REVISION",
+    "VGN_TARGET_CAPTURE_SNAP_MAX_M",
     "PointGraspCandidate",
     "PointGraspResult",
     "Sam2VgnPointGraspPlanner",

@@ -54,6 +54,15 @@ class RealSkillControlLifecycle(str, Enum):
     CLOSED = "closed"
 
 
+class RealSkillMotionObservationUnavailable(RuntimeError):
+    """A valid lower measurement could not form one fresh coherent cut.
+
+    This type is reserved for transient availability loss.  Invalid,
+    non-authoritative, regressed, or permanently failed measurements remain
+    ordinary runtime faults and must never be treated as skippable.
+    """
+
+
 class RealSkillMotionTargetSynchronizer(Protocol):
     """Lower numerical port that aligns the coupled target solver."""
 
@@ -342,6 +351,9 @@ class ExclusiveRealSkillControlRuntime:
         self._expired_reference_skip_count = 0
         self._consecutive_expired_reference_skips = 0
         self._latest_expired_measurement_age_sec: float | None = None
+        self._transient_observation_skip_count = 0
+        self._consecutive_transient_observation_skips = 0
+        self._last_transient_observation_error: str | None = None
         self._motion_trace_sink: RealSkillControlTraceSink | None = None
         self._motion_trace_error_count = 0
         self._last_motion_trace_error: str | None = None
@@ -372,6 +384,15 @@ class ExclusiveRealSkillControlRuntime:
                 ),
                 "latest_expired_measurement_age_sec": (
                     self._latest_expired_measurement_age_sec
+                ),
+                "transient_observation_skip_count": (
+                    self._transient_observation_skip_count
+                ),
+                "consecutive_transient_observation_skips": (
+                    self._consecutive_transient_observation_skips
+                ),
+                "last_transient_observation_error": (
+                    self._last_transient_observation_error
                 ),
                 "max_measurement_age_sec": self._max_measurement_age_sec,
                 "last_published_source_sequence_by_side": dict(
@@ -511,7 +532,43 @@ class ExclusiveRealSkillControlRuntime:
             RealSkillControlLifecycle.CLOSED,
         }:
             raise RuntimeError("exclusive Skill runtime is not active.")
-        cut = self._observation_provider()
+        try:
+            cut = self._observation_provider()
+        except RealSkillMotionObservationUnavailable as exc:
+            snapshot = self.motion_port.snapshot()
+            lifecycle = self.lifecycle
+            if (
+                lifecycle
+                not in {
+                    RealSkillControlLifecycle.RUNNING,
+                    RealSkillControlLifecycle.HOLD,
+                }
+                or snapshot.phase
+                not in {
+                    RealAgentMotionPhase.INACTIVE,
+                    RealAgentMotionPhase.HELD,
+                }
+            ):
+                raise
+            diagnostic = f"{type(exc).__name__}: {exc}"[:512]
+            with self._lock:
+                self._transient_observation_skip_count += 1
+                self._consecutive_transient_observation_skips += 1
+                self._last_transient_observation_error = diagnostic
+            if trace is not None:
+                trace.port_snapshot = snapshot
+                trace.outcome = "transient_observation_unavailable"
+                trace.error = diagnostic
+            return RealSkillControlStep(
+                lifecycle=lifecycle,
+                port_snapshot=snapshot,
+                command_present=False,
+                dispatch_attempted=False,
+                dispatch_succeeded=False,
+                dispatch_evidence_refs=(),
+            )
+        with self._lock:
+            self._consecutive_transient_observation_skips = 0
         if trace is not None:
             trace.observation_completed_monotonic = time.monotonic()
             trace.cut = cut
@@ -792,5 +849,6 @@ __all__ = [
     "RealSkillMotionEmergencyStopReceipt",
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
+    "RealSkillMotionObservationUnavailable",
     "RealSkillMotionTargetSynchronizer",
 ]

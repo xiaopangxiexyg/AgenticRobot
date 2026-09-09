@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +46,7 @@ from deployments.perception.sam2_vgn_point_grasp import (
     DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
     VGN_GIT_URL,
     VGN_REVIEWED_REVISION,
+    VGN_TARGET_CAPTURE_SNAP_MAX_M,
     PointGraspCandidate,
     PointGraspResult,
     Sam2VgnPointGraspPlanner,
@@ -679,6 +681,51 @@ def test_vgn_rejects_remote_candidate_whose_target_is_outside_dmtac_capture_regi
     )
 
 
+def test_vgn_rank_snaps_field_diagonal_quantization_error_into_capture_region() -> None:
+    planner = object.__new__(Sam2VgnPointGraspPlanner)
+    planner.cube_size_m = 0.30
+    planner.resolution = 40
+    planner.max_gripper_width_m = 0.070
+    planner.max_click_distance_m = 0.080
+    grasp = SimpleNamespace(
+        width=0.05,
+        pose=SimpleNamespace(as_matrix=lambda: np.eye(4)),
+    )
+    # The real wrist-camera run reported the robust target center at TCP
+    # +Z=0.012798318520719228 m: 5.797318520719234 mm beyond the unchanged
+    # physical fingertip boundary.  VGN rounds all three continuous position
+    # coordinates to a voxel index during training, so the strict translation
+    # error bound is the half-voxel diagonal rather than one half voxel.
+    target = np.asarray([0.0, 0.0, 0.05579731852071923], dtype=np.float64)
+    target_points = np.tile(target, (16, 1))
+    filter_summary = {}
+
+    candidates = planner._rank(
+        [grasp],
+        np.asarray([0.9]),
+        base_from_cube=np.eye(4),
+        camera_from_cube=np.eye(4),
+        target_camera=target,
+        target_points_camera=target_points,
+        depth=np.zeros((10, 12), dtype=np.float32),
+        intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
+        maximum=1,
+        filter_summary=filter_summary,
+    )
+
+    assert len(candidates) == 1
+    corrected = np.asarray(candidates[0].camera_from_tcp).reshape(4, 4)
+    assert corrected[2, 3] == pytest.approx(0.04879631952071923)
+    assert planner._target_center_inside_capture_region(corrected, target_points)
+    assert filter_summary["min_target_capture_violation_m"] == pytest.approx(
+        0.005797318520719234
+    )
+    assert filter_summary["min_target_capture_snap_m"] == pytest.approx(
+        0.005797319520719234
+    )
+    assert filter_summary["target_capture_valid"] == 1
+
+
 def test_vgn_rank_rejects_near_click_outside_physical_capture_region() -> None:
     planner = object.__new__(Sam2VgnPointGraspPlanner)
     planner.max_gripper_width_m = 0.070
@@ -686,7 +733,7 @@ def test_vgn_rank_rejects_near_click_outside_physical_capture_region() -> None:
     good = np.eye(4, dtype=np.float64)
     good[:3, 3] = [0.0, -0.020, -0.030999]
     bad = np.eye(4, dtype=np.float64)
-    bad[:3, 3] = [0.0, -0.075, -0.030999]
+    bad[:3, 3] = [0.0, -0.085, -0.030999]
     grasps = [
         SimpleNamespace(
             width=0.05,
@@ -695,6 +742,7 @@ def test_vgn_rank_rejects_near_click_outside_physical_capture_region() -> None:
         for pose in (good, bad)
     ]
 
+    filter_summary = {}
     candidates = planner._rank(
         grasps,
         np.asarray([0.8, 0.9]),
@@ -705,10 +753,94 @@ def test_vgn_rank_rejects_near_click_outside_physical_capture_region() -> None:
         depth=np.zeros((10, 12), dtype=np.float32),
         intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
         maximum=5,
+        filter_summary=filter_summary,
     )
 
     assert len(candidates) == 1
     assert candidates[0].model_score == pytest.approx(0.8)
+    assert filter_summary == {
+        "detected": 2,
+        "min_detected_width_m": pytest.approx(0.05),
+        "max_detected_width_m": pytest.approx(0.05),
+        "width_min_m": pytest.approx(0.005),
+        "width_max_m": pytest.approx(0.070),
+        "width_valid": 2,
+        "target_capture_valid": 1,
+        "min_target_capture_violation_m": pytest.approx(0.0),
+        "min_target_capture_snap_m": pytest.approx(0.0),
+        "target_capture_snap_limit_m": pytest.approx(
+            VGN_TARGET_CAPTURE_SNAP_MAX_M
+        ),
+        "closest_target_center_tcp_x_m": pytest.approx(0.0),
+        "closest_target_center_tcp_y_m": pytest.approx(0.0),
+        "closest_target_center_tcp_z_m": pytest.approx(-0.012),
+        "click_distance_valid": 1,
+        "visible_collision_valid": 1,
+        "min_click_distance_m": pytest.approx(0.012),
+        "max_click_distance_m": pytest.approx(0.080),
+        "min_visible_collision_points": 0,
+        "visible_collision_limit": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
+        "unique_returned": 1,
+    }
+
+
+def test_vgn_empty_result_reports_each_filter_stage_without_relaxing_it() -> None:
+    planner = object.__new__(Sam2VgnPointGraspPlanner)
+    planner._started = True
+    planner._closed = False
+    planner._lock = threading.RLock()
+    planner.point_segmenter = SimpleNamespace(
+        segment_point=lambda image, *, pixel_uv: np.ones(
+            (image.height, image.width), dtype=bool
+        )
+    )
+    planner.cube_size_m = 0.30
+    planner.resolution = 40
+    planner.max_gripper_width_m = 0.070
+    planner.max_click_distance_m = 0.080
+    planner._detect = lambda _tsdf: ([], np.asarray([], dtype=np.float64))
+
+    with pytest.raises(RuntimeError) as error:
+        planner.plan(
+            Image.new("RGB", (12, 10)),
+            np.full((10, 12), 0.5, dtype=np.float32),
+            pixel_uv=(6, 5),
+            intrinsics={
+                "width": 12,
+                "height": 10,
+                "fx": 10.0,
+                "fy": 10.0,
+                "cx": 6.0,
+                "cy": 5.0,
+            },
+            base_from_camera=np.eye(4),
+            max_candidates=5,
+        )
+    summary = json.loads(str(error.value).split("filter_summary=", maxsplit=1)[1])
+    assert summary == {
+        "detected": 0,
+        "min_detected_width_m": None,
+        "max_detected_width_m": None,
+        "width_min_m": 0.005,
+        "width_max_m": 0.070,
+        "width_valid": 0,
+        "target_capture_valid": 0,
+        "min_target_capture_violation_m": None,
+        "min_target_capture_snap_m": None,
+        "target_capture_snap_limit_m": pytest.approx(
+            VGN_TARGET_CAPTURE_SNAP_MAX_M
+        ),
+        "closest_target_center_tcp_x_m": None,
+        "closest_target_center_tcp_y_m": None,
+        "closest_target_center_tcp_z_m": None,
+        "click_distance_valid": 0,
+        "visible_collision_valid": 0,
+        "min_click_distance_m": None,
+        "max_click_distance_m": 0.080,
+        "min_visible_collision_points": None,
+        "visible_collision_limit": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
+        "unique_returned": 0,
+    }
 
 
 def test_graspnet_point_conditioned_workspace_crops_unrelated_scene_points() -> None:

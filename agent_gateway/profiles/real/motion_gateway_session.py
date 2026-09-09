@@ -653,6 +653,28 @@ class RealAgentPrimitiveGatewaySession:
         if not isinstance(self.hardware_view_provider, HardwareViewProvider):
             raise TypeError("Real hardware view provider must be typed.")
 
+    @property
+    def passive_read_executors_by_skill_id(
+        self,
+    ) -> Mapping[str, PassiveReadSkillExecutor]:
+        """Return the live read-only executors under their public Skill ids."""
+
+        executors = {
+            "state.read_tcp_pose": self.state_executor,
+            "perception.capture_rgb": self.rgb_executor,
+            "perception.capture_depth": self.depth_executor,
+            "perception.localize_objects": self.localization_executor,
+            "perception.plan_point_grasp": self.station_point_grasp_executor,
+            "perception.render_point_grasp_candidate": (
+                self.station_point_grasp_render_executor
+            ),
+        }
+        return {
+            skill_id: executor
+            for skill_id, executor in executors.items()
+            if executor is not None
+        }
+
     def wire_adapter(
         self,
         *,

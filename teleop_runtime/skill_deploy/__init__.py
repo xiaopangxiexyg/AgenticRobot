@@ -10,6 +10,7 @@ from .control_runtime import (
     RealSkillMotionEmergencyStopReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
+    RealSkillMotionObservationUnavailable,
     RealSkillMotionTargetSynchronizer,
 )
 from .dmtac_shadow_ports import (
@@ -108,6 +109,7 @@ __all__ = [
     "RealSkillMotionEmergencyStopReceipt",
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
+    "RealSkillMotionObservationUnavailable",
     "RealSkillMotionTargetSynchronizer",
     "RegisteredTrajectoryAuthorityConsumptionReceipt",
     "RegisteredTrajectoryAuthorityConsumptionStatus",

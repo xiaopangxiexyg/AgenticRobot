@@ -24,6 +24,7 @@ from teleop_runtime.skill_deploy import (
     RealSkillMotionDispatchReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
+    RealSkillMotionObservationUnavailable,
 )
 
 
@@ -272,6 +273,143 @@ def test_motion_trace_failure_isolated_from_control_cycle() -> None:
     timing = runtime.control_cycle_snapshot()
     assert timing["motion_trace_error_count"] == 1
     assert "synthetic trace failure" in timing["last_motion_trace_error"]
+
+
+def test_transient_observation_loss_is_no_dispatch_skip_when_inactive_or_held() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    dispatched: list[TeleopCommand] = []
+    outcomes: list[object] = [
+        RealSkillMotionObservationUnavailable("one slow coherent read"),
+        _observation_cut(),
+        RealSkillMotionObservationUnavailable("one slow read while held"),
+    ]
+
+    def observe() -> RealSkillMotionObservationCut:
+        value = outcomes.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        assert isinstance(value, RealSkillMotionObservationCut)
+        return value
+
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=observe,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: (
+            dispatched.append(command)
+            or RealSkillMotionDispatchReceipt(
+                succeeded=True,
+                evidence_refs=("unexpected-dispatch:transient",),
+            )
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-hold:transient",),
+        ),
+    )
+    runtime.start()
+
+    inactive_skip = runtime.step(now=2.0)
+    recovered = runtime.step(now=2.01)
+    runtime.fail_closed("candidate_review_hold", now=2.02)
+    held_skip = runtime.step(now=2.03)
+
+    assert inactive_skip.port_snapshot.phase == RealAgentMotionPhase.INACTIVE
+    assert held_skip.port_snapshot.phase == RealAgentMotionPhase.HELD
+    assert recovered.command_present is False
+    assert dispatched == []
+    assert builder.sync_count == 1
+    timing = runtime.control_cycle_snapshot()
+    assert timing["transient_observation_skip_count"] == 2
+    assert timing["consecutive_transient_observation_skips"] == 1
+    assert timing["last_transient_observation_error"] == (
+        "RealSkillMotionObservationUnavailable: one slow read while held"
+    )
+
+
+def test_transient_observation_loss_propagates_before_pending_activation() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    dispatched: list[TeleopCommand] = []
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=lambda: (_ for _ in ()).throw(
+            RealSkillMotionObservationUnavailable("pending cut unavailable")
+        ),
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: (
+            dispatched.append(command)
+            or RealSkillMotionDispatchReceipt(
+                succeeded=True,
+                evidence_refs=("unexpected-dispatch:pending",),
+            )
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-hold:pending",),
+        ),
+    )
+    runtime.start()
+    port.submit_activation(_activation(suffix="pending-transient"))
+
+    with pytest.raises(
+        RealSkillMotionObservationUnavailable,
+        match="pending cut unavailable",
+    ):
+        runtime.step(now=2.0)
+
+    assert dispatched == []
+    assert port.snapshot().phase == RealAgentMotionPhase.PENDING_ACTIVATION
+
+
+def test_transient_observation_loss_propagates_during_active_motion() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    dispatched: list[TeleopCommand] = []
+    observations: list[object] = [
+        _observation_cut(),
+        RealSkillMotionObservationUnavailable("active cut unavailable"),
+    ]
+
+    def observe() -> RealSkillMotionObservationCut:
+        value = observations.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        assert isinstance(value, RealSkillMotionObservationCut)
+        return value
+
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=observe,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: (
+            dispatched.append(command)
+            or RealSkillMotionDispatchReceipt(
+                succeeded=True,
+                evidence_refs=("rm65-dispatch:active-transient",),
+            )
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-hold:active-transient",),
+        ),
+    )
+    runtime.start()
+    port.submit_activation(_activation(suffix="active-transient"))
+    first = runtime.step(now=2.0)
+
+    with pytest.raises(
+        RealSkillMotionObservationUnavailable,
+        match="active cut unavailable",
+    ):
+        runtime.step(now=2.01)
+
+    assert first.port_snapshot.phase == RealAgentMotionPhase.ACTIVE
+    assert len(dispatched) == 1
 
 
 def test_reused_hardware_source_sequence_does_not_publish_fake_measurements() -> None:
