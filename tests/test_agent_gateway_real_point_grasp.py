@@ -39,6 +39,7 @@ from deployments.perception.sam2_graspnet_point_grasp import (
     GRASPNET_REVIEWED_REVISION,
     GraspNetPointGraspModelSpec,
     Sam2GraspNetPointGraspPlanner,
+    _normalize_graspnet_rigid_matrix,
 )
 from deployments.perception.sam2_vgn_point_grasp import (
     DEFAULT_DMTAC_M_URDF,
@@ -426,6 +427,139 @@ def test_graspnet_manifest_requires_project_authorization_acknowledgement(
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="authorization acknowledgement"):
         GraspNetPointGraspModelSpec.from_asset_bundle(tmp_path)
+
+
+def test_graspnet_float32_rotation_is_normalized_before_candidate_publication() -> None:
+    # Captured from candidate 0 of the bounded 2026-09-09 wrist-right run.  The
+    # model-quality rotation is valid at GraspNet's float32 boundary but exceeds
+    # the CoordinateFrameGraph 1e-9 rigid-pose contract.
+    pose = np.asarray(
+        [
+            [
+                -0.17259738000158176,
+                0.18359564713816373,
+                0.9677307159760798,
+                -0.13079618433586204,
+            ],
+            [
+                0.04199108059770058,
+                -0.9802105728615037,
+                0.19345253616022093,
+                -0.07363994251000638,
+            ],
+            [
+                0.9840969607643857,
+                0.07402546072335396,
+                0.16147240422405731,
+                0.1374787059167376,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    before_error = np.max(np.abs(pose[:3, :3].T @ pose[:3, :3] - np.eye(3)))
+    assert 1e-9 < before_error < 1e-5
+
+    normalized = _normalize_graspnet_rigid_matrix(
+        pose,
+        field_name="GraspNet camera_from_grasp",
+    )
+
+    np.testing.assert_array_equal(normalized[:3, 3], pose[:3, 3])
+    np.testing.assert_array_equal(normalized[3], pose[3])
+    np.testing.assert_allclose(
+        normalized[:3, :3].T @ normalized[:3, :3],
+        np.eye(3),
+        atol=1e-12,
+        rtol=0.0,
+    )
+    assert np.linalg.det(normalized[:3, :3]) == pytest.approx(1.0, abs=1e-12)
+    assert np.max(np.abs(normalized[:3, :3] - pose[:3, :3])) < 1e-6
+
+
+def test_graspnet_rank_publishes_strict_rigid_candidate_from_float32_rotation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint-rs.tar"
+    checkpoint.write_bytes(b"graspnet")
+    planner = Sam2GraspNetPointGraspPlanner(
+        model_spec=GraspNetPointGraspModelSpec(
+            model_profile_id="graspnet:test",
+            checkpoint_path=checkpoint,
+            checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            source_revision=GRASPNET_REVIEWED_REVISION,
+            model_type="realsense",
+            license_acknowledgement=(GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2),
+        ),
+        point_segmenter=SimpleNamespace(
+            segment_point=lambda *_args, **_kwargs: None,
+            semantic_content_hash="sam:test",
+        ),
+        device="cuda",
+    )
+    raw_rotation = np.asarray(
+        [
+            [-0.17259738000158176, 0.18359564713816373, 0.9677307159760798],
+            [0.04199108059770058, -0.9802105728615037, 0.19345253616022093],
+            [0.9840969607643857, 0.07402546072335396, 0.16147240422405731],
+        ],
+        dtype=np.float64,
+    )
+    prediction = np.zeros((1, 17), dtype=np.float64)
+    prediction[0, 0] = 0.9
+    prediction[0, 1] = 0.05
+    prediction[0, 3] = 0.03
+    prediction[0, 4:13] = raw_rotation.reshape(-1)
+    prediction[0, 13:16] = [0.0, 0.0, 0.5]
+    prediction[0, 16] = -1
+
+    candidates = planner._rank(
+        prediction,
+        target_points=np.asarray(
+            [[0.0, -0.01, 0.49], [0.0, 0.01, 0.51]],
+            dtype=np.float32,
+        ),
+        target_camera=np.asarray([0.0, 0.0, 0.5]),
+        base_from_camera=np.eye(4),
+        depth=np.zeros((10, 12), dtype=np.float32),
+        intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
+        maximum=1,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].model_score == pytest.approx(0.9)
+    assert candidates[0].gripper_width_m == pytest.approx(0.05)
+    camera = np.asarray(candidates[0].camera_from_tcp).reshape(4, 4)
+    reference = np.asarray(candidates[0].base_from_tcp).reshape(4, 4)
+    for pose in (camera, reference):
+        np.testing.assert_allclose(
+            pose[:3, :3].T @ pose[:3, :3],
+            np.eye(3),
+            atol=1e-12,
+            rtol=0.0,
+        )
+        assert np.linalg.det(pose[:3, :3]) == pytest.approx(1.0, abs=1e-12)
+    np.testing.assert_allclose(reference, camera, atol=1e-12, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "rotation",
+    (
+        np.diag((-1.0, 1.0, 1.0)),
+        np.diag((1.01, 1.0, 1.0)),
+    ),
+)
+def test_graspnet_rotation_normalization_rejects_invalid_model_geometry(
+    rotation: np.ndarray,
+) -> None:
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = rotation
+
+    with pytest.raises(ValueError, match="right-handed and orthonormal"):
+        _normalize_graspnet_rigid_matrix(
+            pose,
+            field_name="GraspNet camera_from_grasp",
+        )
 
 
 def test_graspnet_candidate_axes_are_mapped_to_dmtac_tool_tcp(tmp_path: Path) -> None:
