@@ -933,6 +933,10 @@ def test_exact_gateway_session_launches_one_fail_closed_station_worker(
     assert terminal["operation"]["reason_code"] == (
         "fake_activation_rejected_under_hold"
     )
+    assert terminal["operation"]["progress_summary"] == {
+        "phase": "failed",
+        "lower_hold_confirmed": True,
+    }
     assert lifecycle.closed
 
     refreshed = facade.get_observation_snapshot()

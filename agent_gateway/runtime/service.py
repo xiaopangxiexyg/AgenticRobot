@@ -1077,7 +1077,12 @@ class AgentGatewayService:
                 current_station_revision=revision,
                 updated_at=finished_at,
                 execution_receipt_refs=execution_receipt_refs,
-                progress_summary={"phase": "failed"},
+                progress_summary={
+                    "phase": "failed",
+                    "lower_hold_confirmed": bool(
+                        not executor_no_io and receipt.proves_motion_or_hold
+                    ),
+                },
             )
         if not projection.accepted:
             return AgentGatewayOperationOutcome(
