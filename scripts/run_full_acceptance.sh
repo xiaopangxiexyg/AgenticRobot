@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the complete non-hardware suite in deterministic, module-isolated shards.
+# Run the complete non-hardware suite in deterministic, target-isolated shards.
+# Modules remain the default target; explicitly registered oversized modules
+# are split only across statically discovered top-level test functions.
 # Mutable pytest/runtime state stays shard-private.  The content-addressed
 # MuJoCo model cache is shared only within this exact Run: its implementation
 # owns process locking, atomic publication, and hash validation, so identical

@@ -69,6 +69,9 @@ def test_plan_is_deterministic_complete_and_weighted(tmp_path: Path) -> None:
     first_manifest = json.loads((first / "shard-plan.json").read_text())
     second_manifest = json.loads((second / "shard-plan.json").read_text())
     assert first_manifest == second_manifest
+    assert first_manifest["schema"] == "dexteleop.pytest-shard-plan.v2"
+    assert first_manifest["file_count"] == len(sizes)
+    assert first_manifest["target_count"] == len(sizes)
     planned = [
         module for shard in first_manifest["shards"] for module in shard["test_modules"]
     ]
@@ -82,34 +85,96 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     module = _load_sharding_module()
 
     assert module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"] == pytest.approx(
-        125.900
+        131.879
     )
     assert module.FULL_WEIGHTS[
         "tests/test_replay_position_admittance_active_pipeline.py"
-    ] == pytest.approx(105.122)
+    ] == pytest.approx(106.650)
     assert module.FULL_WEIGHTS["tests/test_mujoco_fast_runtime.py"] == pytest.approx(
-        55.686
+        58.974
     )
     assert module.FULL_WEIGHTS["tests/test_rm65_grasp_trajectory.py"] == pytest.approx(
-        36.847
+        39.908
     )
     assert module.FULL_WEIGHTS[
         "tests/test_mujoco_formal_compound_authority.py"
-    ] == pytest.approx(6.222)
-    assert module.FULL_WEIGHTS["tests/test_mujoco_dmtac_gripper.py"] == pytest.approx(
-        5.250
+    ] == pytest.approx(5.863)
+    assert (
+        module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"]
+        > module.FULL_WEIGHTS[
+            "tests/test_replay_position_admittance_active_pipeline.py"
+        ]
     )
-    assert module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"] > module.FULL_WEIGHTS[
-        "tests/test_replay_position_admittance_active_pipeline.py"
-    ]
-    assert module.FULL_WEIGHTS["tests/test_sim_point_grasp_experiment.py"] == pytest.approx(
-        16.611
-    )
+    assert module.FULL_WEIGHTS[
+        "tests/test_sim_point_grasp_experiment.py"
+    ] == pytest.approx(16.246)
     assert module.FULL_WEIGHTS["tests/test_mujoco_cube_lift.py"] == pytest.approx(
-        11.343
+        11.573
     )
-    assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] > 10.0
-    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 9.0
+    assert module.FULL_WEIGHTS["tests/test_rebot_b601_real2sim.py"] == pytest.approx(
+        21.898
+    )
+    assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] > 14.0
+    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 6.0
+
+
+def test_full_plan_splits_registered_large_module_without_losing_tests(
+    tmp_path: Path,
+) -> None:
+    module = _load_sharding_module()
+    repository = tmp_path / "checkout"
+    tests_root = repository / "tests"
+    tests_root.mkdir(parents=True)
+    split_path = tests_root / "test_mujoco_temp_pipeline.py"
+    registered = module.FULL_SPLIT_NODE_WEIGHTS["tests/test_mujoco_temp_pipeline.py"]
+    test_names = sorted(registered) + ["test_new_profile_is_still_collected"]
+    split_path.write_text(
+        "\n\n".join(f"def {name}():\n    pass" for name in test_names) + "\n",
+        encoding="utf-8",
+    )
+    (tests_root / "test_small.py").write_text(
+        "def test_small():\n    pass\n", encoding="utf-8"
+    )
+
+    shards = module.plan_shards(repository, tests_root, 2, "full")
+    targets = [target for shard in shards for target, _path, _weight in shard]
+
+    assert len(targets) == len(set(targets)) == len(test_names) + 1
+    assert {
+        target.split("::", 1)[1]
+        for target in targets
+        if target.startswith("tests/test_mujoco_temp_pipeline.py::")
+    } == set(test_names)
+    assert "tests/test_small.py" in targets
+
+
+@pytest.mark.parametrize(
+    "unsupported_source",
+    (
+        "class TestGenerated:\n    def test_member(self):\n        pass\n",
+        """def pytest_generate_tests(metafunc):
+    pass
+
+def test_static():
+    pass
+""",
+    ),
+    ids=("test-class", "collection-hook"),
+)
+def test_full_plan_rejects_unsupported_split_module_collection(
+    tmp_path: Path,
+    unsupported_source: str,
+) -> None:
+    module = _load_sharding_module()
+    repository = tmp_path / "checkout"
+    tests_root = repository / "tests"
+    tests_root.mkdir(parents=True)
+    (tests_root / "test_mujoco_temp_pipeline.py").write_text(
+        unsupported_source, encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="unsupported collection"):
+        module.plan_shards(repository, tests_root, 1, "full")
 
 
 def test_socket_preflight_reports_the_blocked_transport(
