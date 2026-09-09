@@ -155,6 +155,24 @@ def test_exclusive_hitl_virtual_policy_and_devices_switch_through_mujoco(
         exclusive_hitl_enabled=True,
     )
     app = None
+
+    def step_until_proposal_admitted():
+        last_cycle = None
+        for _ in range(10):
+            assert app is not None
+            due = app.next_decision_at
+            if due is not None:
+                time.sleep(max(0.0, due - app.clock()))
+            last_cycle = app.step()
+            status = last_cycle.composition_step.status
+            if status == "proposal_admitted":
+                return last_cycle
+            assert status == "no_action"
+        pytest.fail(
+            "asynchronous allocation context produced no admitted proposal; "
+            f"last_cycle={last_cycle!r}"
+        )
+
     try:
         started = _execute(
             controller,
@@ -232,10 +250,7 @@ def test_exclusive_hitl_virtual_policy_and_devices_switch_through_mujoco(
             atol=1e-8,
         )
 
-        due = app.next_decision_at
-        if due is not None:
-            time.sleep(max(0.0, due - app.clock()))
-        human_cycle = app.step()
+        human_cycle = step_until_proposal_admitted()
         human_publication = human_cycle.composition_step
         assert human_publication.status == "proposal_admitted"
         assert set(human_publication.selected_mode_by_component.values()) == {
@@ -278,10 +293,7 @@ def test_exclusive_hitl_virtual_policy_and_devices_switch_through_mujoco(
             "allocation_override_mode"
         ] == "base_only"
 
-        due = app.next_decision_at
-        if due is not None:
-            time.sleep(max(0.0, due - app.clock()))
-        resumed_cycle = app.step()
+        resumed_cycle = step_until_proposal_admitted()
         resumed_publication = resumed_cycle.composition_step
         assert resumed_publication.status == "proposal_admitted"
         assert set(resumed_publication.selected_mode_by_component.values()) == {
