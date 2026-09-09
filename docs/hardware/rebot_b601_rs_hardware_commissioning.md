@@ -110,9 +110,11 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   `mechPos(0x7019)` 返回一个有限但物理上不可能的巨大数值，
   backend 也会将该关节标为 `valid=false, stale=true`，并在错误中保留关节名、motor/feedback
   ID、参数 ID、原始值、可用时的 IEEE-754 单精度位模式和接纳区间；坏帧不会被任何 backend 消费者误当成完整状态。出站 MIT/
-  POS_VEL 仍只使用严格 URDF 包络。active probe 的 vendor Kp 固定为零；当真实反馈位于
-  J4/J5/J6 工作余量时，软件位置项和 `g(q)` 使用真实接纳姿态，编码进 MIT 帧的无效位置参考
-  则夹在 nominal 命令包络内。读侧余量不能用于放宽 slow-step 或其他规划命令。active probe 会把每关节
+  POS_VEL 仍只使用严格 URDF 包络。临时启动/回放锁之外的 active probe vendor Kp 固定为零；当真实反馈位于
+  J4/J5/J6 工作余量时，软件位置项和 `g(q)` 使用真实接纳姿态，编码进 MIT 帧的位置参考
+  则夹在 nominal 命令包络内。临时锁若遇到这种夹紧，必须把对应关节的 vendor Kp 置零，只保留
+  重力前馈和本地 Kd，不能让夹紧后的参考主动把关节拉向 URDF 边界。读侧余量不能用于放宽
+  slow-step 或其他规划命令。active probe 会把每关节
   backend 诊断写入 `motion_guard.rejected_sample.backend_joint_diagnostics`，随后复用上一份
   已验证的六轴重力缓存进入 `PROTECTIVE_HOLD`；只有已配置 driver Kd 时，反馈不可信的
   降级阶段才仍有电机本地阻尼。终端会用完整分隔线分别显示 `PROTECTIVE HOLD DEGRADED`、
@@ -366,14 +368,20 @@ slow-step 目标或单关节增益覆盖。`hold` 从使能后的当前姿态开
 ENABLED_UNARMED → LOCKING → LOCKED → GRAVITY_RAMP (total-torque slew) → HANDOFF → ACTIVE
 ```
 
-`LOCKING` 立即捕获新鲜的 `q0`，用 pinned YAML 的 MIT Kp/Kd 构建软件侧全六关节位置锁，
-首帧和后续锁帧都经过最终总力矩/变化率包络；`LOCKED` 阶段在四个连续反馈样本期间继续
-发送固定 `q_ref=q0` 的锁帧。完整六轴的目标重力从首个锁帧开始就进入力矩组合，启动阶段
-唯一的渐变是最终总力矩的 slew 包络；不再把重力先乘一个从零开始的独立比例后再做一次
-slew，避免补偿空窗造成末端缓慢下坠。重力与临时关节锁保持连续后，再用同样的
-`--torque-rise-time-sec` 把临时关节锁平滑交给最终控制器，`pose-hold/cartesian-hold`
-的末端弹簧在 `HANDOFF` 中逐步成为位置恢复主体。启动阶段不依赖未受软件包络约束的
-vendor Kp；MIT 帧的 vendor Kp 保持为零。`LOCKED` 的过渡检查使用本次运行的
+`LOCKING` 立即捕获新鲜的 `q0`，把 pinned YAML 的 MIT Kp/Kd 交给电机本地 MIT 闭环建立
+六轴同步发送的临时位置锁；主机只发送经过最终总力矩/变化率包络的重力和任务前馈。若某
+关节的接纳反馈位于 nominal URDF 命令包络外，该关节仍同步发送，但本地 Kp 被置零，只保留
+重力和本地 Kd，避免编码参考夹回边界后产生主动运动。`LOCKED` 阶段
+在四个连续反馈样本期间继续发送固定 `q_ref=q0` 的锁帧。临时位置与阻尼项不再经过约
+20 Hz 的主机有限差分和力矩 slew，避免所需制动力矩反转时实际命令仍滞后并向机械臂注入
+能量。使用该锁止路径必须先通过 `--apply-driver-torque-limits` 把缩放后的 URDF effort
+写入并回读 `0x700B`，由驱动器约束完整 MIT 位置、阻尼和前馈合力矩。
+
+完整六轴的目标重力从首个锁帧开始就进入力矩组合；不再把重力先乘一个从零开始的独立
+比例后再做一次 slew。重力与临时关节锁保持连续后，再用同样的
+`--torque-rise-time-sec` 把本地 Kp 平滑撤到零、把本地 Kd 交接到 active driver Kd，
+`pose-hold/cartesian-hold` 的末端弹簧在 `HANDOFF` 中逐步成为位置恢复主体。交接完成后
+vendor Kp 严格为零。`LOCKED` 的过渡检查使用本次运行的
 `--velocity-abort-rad-s`，以容纳使能瞬态中仍在正常运动包络内的反馈变化；它不复用
 仅用于首次 protective-hold admission 的严格 `--fault-hold-max-velocity-rad-s`。
 
@@ -399,16 +407,26 @@ operation-control 和 type-2 operation-status 帧，便于离线核对命令与�
 FIRST_ACTIVE → WAITING_FOR_R → RAMP_IN → RELOCKED → HANDOFF → SECOND_ACTIVE
 ```
 
-`RAMP_IN` 使用 `--torque-rise-time-sec` 把既有 YAML-derived 软件 startup lock 从零平滑加入；
-`RELOCKED` 使用既有 `--freeze-sec` 保持；`HANDOFF` 再用同一 rise time 把 lock 平滑撤去。
-完整重力向量在全部阶段保持比例 `1.0`，vendor Kp 始终为零，显式 driver Kd 保持不变，所有
-力矩继续经过同一个绝对值和变化率 conditioner。该模式不自动判断“已经稳定”，避免增加会被
+`RAMP_IN` 使用 `--torque-rise-time-sec` 把 YAML-derived 电机本地 MIT Kp/Kd 从 active
+`Kp=0`/所选 driver Kd 平滑加入；`RELOCKED` 使用既有 `--freeze-sec` 保持；`HANDOFF` 再用
+同一 rise time 平滑回到 active `Kp=0`/所选 driver Kd。完整重力向量在全部阶段保持比例
+`1.0`，主机临时 Kp/Kd 始终为零，前馈力矩继续经过同一个绝对值和变化率 conditioner，
+完整电机输出由已回读的 `0x700B` 约束。该模式不自动判断“已经稳定”，避免增加会被
 静摩擦误导的速度/持续时间阈值；`R` 只选择回放参考，不是安全按钮。
+每个样本同时记录实际 vendor Kp/Kd、参与位置锁的关节和因 nominal 命令边界而取消 Kp 的
+关节；边界取消不是失败，也不会改变该姿态下的 `g(q)`。
 
 结果 JSON 的 `startup_replay` 保存 R 时参考、每次状态转换的 q/有限差分速度、第二次 ACTIVE
 和最终位置相对参考的六轴差值；`samples[]` 同时保存 `startup_replay_state` 和
 `startup_replay_lock_fraction`。`displacement_gate_rad` 仍为 `null`，完成回放只代表证据完整，
 不代表重力模型已经通过验收。持续时间到期和首次 Ctrl-C 仍进入既有六轴 protective hold。
+
+2026-09-09 的首个回放候选曾把 YAML Kp/Kd 作为约 20 Hz 主机软件 PD，再把位置/有限差分
+阻尼力矩送入持续 slew conditioner。实测所需制动力矩反向后，conditioned torque 多帧仍保留
+旧符号，J2 在 `RELOCKED` 内从约 `0.36 rad` 发散并往复运动；完整 type-1/type-17 证据排除
+了部分发送和浮点坏帧。当前实现禁止这条结构：临时 host Kp/Kd 为零，YAML MIT 增益只在
+驱动器本地执行，完整输出必须由回读后的 `0x700B` 约束。该修复不修改 gravity vector、
+标定窗口或离线拟合语义；回放真机复验通过前仍不能声称重力模型已经验收。
 
 ### 异常时的 protective hold（全臂可拖动重力保持）
 
@@ -504,20 +522,21 @@ fi
 printf '%s\n' 'shell remains active'
 ```
 
-本入口默认由软件按
+本入口正常 active 控制默认由软件按
 `tau = gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
-位置项、基于 `mechPos (0x7019)` 的有限差分阻尼和可选末端 overlay。启动时 YAML MIT
-Kp/Kd 只作为临时软件位置锁；完整六轴重力从首个锁帧进入，并由最终总力矩 slew 包络
-平滑达到可用幅值，避免重复衰减造成 J2/J3/J4 补偿比例失衡。重力与临时锁连续后，
-位置、阻尼和末端阻抗项一起交给最终 profile。`--torque-rise-time-sec` 决定总力矩 slew
-以及锁到最终控制器的交接时间；现场可按机械支撑和急停条件配置，不写成固定验收数值。
+位置项、基于 `mechPos (0x7019)` 的有限差分阻尼和可选末端 overlay。启动和
+`startup-replay` 的临时锁例外地使用驱动器本地 MIT Kp/Kd：主机前馈不重复临时位置或
+阻尼项，完整六轴重力从首个锁帧进入。交接时本地 Kp 回到零、本地 Kd 回到 active driver
+Kd，软件最终 profile 同步接管。`--torque-rise-time-sec` 决定主机前馈 slew 以及本地锁到
+最终控制器的交接时间；现场可按机械支撑和急停条件配置，不写成固定验收数值。
 因此，要求“重力补偿”时不能把 `--gravity-scale` 或 `--torque-limit-scale` 当成阻抗首测的
 低增益参数：前者为模型重力的比例，后者同时限制软件输出和可选的 `0x700B` 驱动器总力矩。
 它们必须由当前姿态的模型力矩、负载和机械支撑共同确定；例如此前有效记录使用过
 `--gravity-scale 0.95`、`--torque-limit-scale 0.25`，而 `0.5/0.15` 只提供半重力并把
 J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令配置，不是代码或测试中的
 固定数值限制。
-然后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；vendor `kd` 默认也是零。
+进入最终 active 后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；vendor `kd`
+默认也是零。只有上述有明确起止状态的临时启动锁允许非零 vendor Kp。
 为避免 20 Hz 有限差分阻尼产生阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度
 耗散交给电机内部环；driver `kp` 仍固定为零，因此末端 `J^T wrench` 仍是唯一最终位置
 恢复项。非零 driver Kd 只有在
@@ -812,8 +831,9 @@ printf '%s\n' 'shell remains active'
 
 这一档把所有 host 有限差分阻尼设为零，由六轴 driver Kd 提供电机局部连续耗散；这些数值
 只是针对已观察到的 20 Hz 阶梯和腕部静摩擦死区的下一档 commissioning 配置，不是代码
-默认值或测试契约。启动锁仍暂时使用 YAML MIT Kp/Kd，但只在软件总力矩包络内生效；交接
-完成后 driver Kp 始终为零，旋转刚度仍在末端 6D spring 中，经完整 `J^T` 调节所有关节。
+默认值或测试契约。启动锁仍暂时使用 YAML MIT Kp/Kd，但在电机本地闭环内生效并由
+`0x700B` 约束完整输出；交接完成后 driver Kp 始终为零，旋转刚度仍在末端 6D spring 中，
+经完整 `J^T` 调节所有关节。
 
 第一档只验收 `pose-hold`：观察任意当前姿态是否成为末端零误差锚点，轻微的末端平移或旋转
 扰动是否产生反向、耗散且受限的恢复 wrench；ID7 夹爪不参与。`active_joint_names` 必须正好
@@ -1046,11 +1066,12 @@ Kd 作为速度耗散，但这些调参值不属于代码契约；ID7 仍不参�
 可用于检查解码和时间邻近关系，但在缺少源序号时仍不能声称逐命令严格配对。
 
 另外，`compute_b601_mit_torque()` 若已经组合软件 damping，再同时给驱动器非零 Kd，会重复
-计算阻尼。当前只允许一种明确拆分：软件 Kd 为零，driver Kp 为零，driver Kd 单独拥有
-电机局部速度耗散，软件拥有 gravity 和 `J^T wrench`，驱动器 `0x700B` 拥有最终总力矩
-绝对上限。非零 driver Kp、软件与驱动器双重 Kd、以及把约 20 Hz host loop 宣称为高频
-haptic 仍然禁止。真正高带宽 task-space impedance 仍需可验证 freshness 的异步 q/dq
-解码路径。
+计算阻尼。正常 active 只允许一种明确拆分：软件 Kd 为零，driver Kp 为零，driver Kd 单独
+拥有电机局部速度耗散，软件拥有 gravity 和 `J^T wrench`，驱动器 `0x700B` 拥有最终总力矩
+绝对上限。只有上述临时启动/回放锁可使用非零 driver Kp；其 host Kp/Kd 必须为零，并在
+退出时连续恢复 active 增益。除此之外的非零 driver Kp、软件与驱动器双重 Kd、以及把约
+20 Hz host loop 宣称为高频 haptic 仍然禁止。真正高带宽 task-space impedance 仍需可验证
+freshness 的异步 q/dq 解码路径。
 
 ## 操作者手动 enabled 位置频率入口（本轮不执行）
 

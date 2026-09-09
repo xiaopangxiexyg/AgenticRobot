@@ -115,10 +115,15 @@ tau_request = gravity_scale * g(q)
 
 重要 owner 规则：
 
-- 发给 vendor 的 MIT `kp` 始终为零，避免 vendor 位置环和软件弹簧叠加。
+- 最终 active、protective hold 和 degraded hold 的 vendor MIT `kp` 始终为零。只有边界明确的
+  `LOCKING/LOCKED/HANDOFF` 与 startup-replay `RAMP_IN/RELOCKED/HANDOFF` 临时锁允许
+  使用 YAML MIT Kp；该 Kp 在电机本地闭环执行，退出临时状态时连续回到零。若接纳反馈
+  位于 nominal URDF 命令包络外，对应关节的临时 Kp 必须置零，只保留重力和本地 Kd，避免
+  被夹紧的编码参考成为主动回拉命令。
 - `pose-hold` 的位置恢复只能来自末端 6D spring 经完整 Jacobian 转置映射；软件关节 Kp
   应为零。`cartesian-hold` 同理，只产生平移 overlay。
-- 软件 Kd 和 driver Kd 只能有一个实际阻尼 owner。`--driver-kd > 0` 时必须
+- 软件 Kd 和 driver Kd 只能有一个实际阻尼 owner。临时锁期间 YAML Kd 由电机本地拥有，
+  主机临时 Kd 为零；交接时本地 Kd 连续回到 active driver Kd。`--driver-kd > 0` 时必须
   `--kd 0`、不使用非零 `--target-kd`，并且先完成六轴 `0x700B` 临时 torque-limit
   round-trip；driver Kd 只提供电机局部速度耗散，不提供位置锁。
 - 未选择 driver Kd 时，软件 Kd 由 host 计算；20 Hz 反馈的有限差分量化可能产生阶梯感，
@@ -155,15 +160,16 @@ feedback warmup
 | 状态 | 实际动作 | 诊断重点 |
 | --- | --- | --- |
 | `ENABLED_UNARMED` | 已使能但尚未交给最终控制器 | post-enable q、qvel、ID 和 receipt |
-| `LOCKING` | 用当前使能后 q 建立完整六轴临时参考；软件 startup Kp/Kd 来自 pinned YAML MIT 参数，vendor Kp 仍为零 | 首锁帧是否完整、是否出现方向反转 |
-| `LOCKED` | 连续默认 4 个 feedback/control 样本重复发送当前锁参考 | qvel、dt、位置限位、torque slew |
+| `LOCKING` | 用当前使能后 q 建立完整六轴临时参考；pinned YAML MIT Kp/Kd 由电机本地闭环执行，主机临时 Kp/Kd 为零 | 首锁帧是否完整、driver total-torque limit 是否已回读、是否出现方向反转 |
+| `LOCKED` | 连续默认 4 个 feedback/control 样本重复发送当前锁参考 | qvel、dt、位置限位、driver Kp/Kd 与前馈力矩证据 |
 | `GRAVITY_RAMP` | 语义上进入重力阶段；完整 `gravity_scale*g(q)` 从首个控制帧请求，不能再用第二个标量把重力削半 | 若仍下坠，先看模型重力、torque limit、slew、driver Kd 和 q 方向 |
 | `HANDOFF` | 同一时长把临时 joint lock 平滑交给最终 controller；末端阻抗项与其他最终项一起交接 | startup lock 与 final controller 是否连续 |
 | `ACTIVE` | 正常 `hold`/`slow-step`/Cartesian/pose 或 calibration 控制 | 逐周期 q、qvel、qacc、tau 和 receipt |
 
-当前实现不把重力再独立衰减一次；`--torque-rise-time-sec` 是总力矩 slew 和 lock-to-final
-handoff 的时间。若现场观察到刚使能轻微前倾，应从 JSON/log 对比 `gravity_target_tau_nm`、
-`startup_lock_*_tau_nm`、`conditioned_tau_nm`、`slew_limited` 和 `gravity_scale`：
+当前实现不把重力再独立衰减一次；`--torque-rise-time-sec` 是主机前馈 torque slew 和
+driver-local lock-to-final handoff 的时间。若现场观察到刚使能轻微前倾，应从 JSON/log 对比
+`gravity_target_tau_nm`、`vendor_kp_nm_per_rad`、`vendor_kd_nm_s_per_rad`、
+`conditioned_tau_nm`、`slew_limited` 和 `gravity_scale`：
 
 - `gravity_scale < 1` 或 URDF effort ceiling/scale 不足会产生真实重力残差；
 - slew 在首帧限制的是总力矩，不是把某一关节单独压低；
@@ -288,9 +294,10 @@ URDF 继续定义 nominal 模型、规划和出站命令边界，但它不是这
 
 每个证据 JSON 同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
 `boundary_normalized_joint_names`。出站 reference 和 torque envelope 仍按有效 nominal limit
-约束；slow-step 不能借用读侧余量。active probe 的 vendor Kp 固定为零，因此位于读侧余量
-时，软件位置/重力计算保留真实姿态，而编码到 MIT 帧的无效位置 reference 夹回 nominal
-范围，不把读侧余量变成 driver 位置命令。J4 源 URDF 的 `-1.57/1.57` 是两位小数记录，
+约束；slow-step 不能借用读侧余量。临时锁之外的 active probe vendor Kp 固定为零，因此位于读侧余量
+时，软件位置/重力计算保留真实姿态，而编码到 MIT 帧的位置 reference 夹回 nominal
+范围。临时锁必须额外取消该关节的 vendor Kp，确保读侧余量不会变成 driver 位置命令；
+实际取消项进入 startup diagnostics 和逐样本证据。J4 源 URDF 的 `-1.57/1.57` 是两位小数记录，
 不能把它误读成比 `±90°` 更窄的真实机械边界。
 
 ### 8.2 运动 guard 的顺序
@@ -711,7 +718,7 @@ AgenticRobot：HEAD=<full sha> TREE=<full sha> clean=<yes/no>
 vendor：commit/tree=<...> config_sha256=<...> firmware/model/IDs=<...>
 命令：<完整可复制命令>
 输出：json=<absolute path> log=<absolute path>
-控制：mode=<...> active_joint_names=joint1..joint6 vendor_kp=0
+控制：mode=<...> active_joint_names=joint1..joint6 active_vendor_kp=0 temporary_lock_vendor_kp=<...>
 启动：state_history=<...> arming_settle=<...> handoff=<...>
 保护：first Ctrl-C=<hold/degraded> second Ctrl-C/SIGUSR1=<safe_stop>
 频率：feedback/compute/tx 的 count、observed Hz、p95/p99、deadline miss

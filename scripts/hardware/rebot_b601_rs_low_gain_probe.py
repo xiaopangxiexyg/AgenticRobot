@@ -24,12 +24,15 @@ complete current ``base_link_T_gripper_end`` transform and adds a bounded 6D
 restoring wrench through the same ``J.T @ wrench`` path.  Both task-space modes
 keep software joint stiffness at zero so there is only one spring owner.
 
-The dispatched RobStride MIT ``kp`` is always zero.  By default ``kd`` is also
-zero and the software owns all damping.  An explicit driver ``kd`` may instead
-provide motor-local damping while software damping is disabled; that path
-requires verified volatile driver torque limits on all six joints.  The host
-still applies its final absolute torque and slew-rate bounds to the gravity and
-task-space wrench it owns before calling :meth:`B601RSBackend.send_mit`.
+The dispatched RobStride MIT ``kp`` is zero in the final active and protective
+controllers.  The temporary startup/replay lock is the one explicit exception:
+it applies the pinned YAML MIT Kp/Kd in the drive's local loop while the host
+sends only gravity/task feedforward.  An explicit active driver ``kd`` may
+instead provide motor-local damping while software damping is disabled.  Both
+paths require verified volatile driver torque limits on all six joints.  The
+host still applies its final absolute torque and slew-rate bounds to the
+gravity and task-space wrench it owns before calling
+:meth:`B601RSBackend.send_mit`.
 Feedback uses the existing explicit ``mechPos`` request path; its source
 freshness remains unverified by MotorBridge 0.4.9 and is reported as such.
 
@@ -50,10 +53,10 @@ asking the operator to recreate an interior pose.  After the ordinary startup
 has reached ACTIVE, the arm remains in the same gravity/damping controller and
 may settle naturally.  The operator then presses ``R`` once without touching
 the arm.  The current six-joint pose is captured, the existing bounded startup
-software lock is ramped in, held for ``--freeze-sec``, and ramped back out to
-the same gravity/damping controller.  Gravity remains fully present throughout
-the replay.  The transition records measured displacement but adds no numeric
-acceptance gate and sends no extra CAN requests.
+driver-local MIT lock is ramped in, held for ``--freeze-sec``, and ramped back
+out to the same gravity/damping controller.  Gravity remains fully present
+throughout the replay.  The transition records measured displacement but adds
+no numeric acceptance gate and sends no extra CAN requests.
 
 Reaching ``--duration-sec`` ends the active experiment, but does not authorize
 drive disable.  Like the first Ctrl-C or an ordinary handled control fault, it
@@ -92,14 +95,17 @@ references are still bounded by the effective nominal limits without applying
 this feedback projection.
 
 After MIT mode setup and enable, the active path captures a fresh post-enable
-snapshot and immediately sends a bounded, all-six-joint software position lock
-at that snapshot.  The lock frame is repeated while the feedback gate is
-checked, then the complete gravity vector is ramped in with the lock gains
-still active.  A second, same-duration handoff ramps the temporary joint lock
-out while the requested final controller (including pose impedance) ramps in.
-This closes the enable-to-control torque gap without adding an unbounded vendor
-position loop: the startup gains are read from the pinned YAML MIT configuration
-and remain inside the existing final software torque conditioner.
+snapshot and immediately sends a bounded, all-six-joint driver-local position
+lock at that snapshot.  The lock frame is repeated while the feedback gate is
+checked, then the complete gravity vector is present while the lock remains
+active.  A second, same-duration handoff ramps the temporary joint lock out
+while the requested final controller (including pose impedance) ramps in.  The
+pinned YAML MIT gains are never recomputed as a delayed 20 Hz host PD term, and
+the complete motor output is bounded by the verified volatile driver limit.
+If an admitted feedback position is outside the stricter nominal command
+envelope, that joint keeps gravity and driver-local damping but its temporary
+position Kp is suppressed; a clamped reference can therefore never pull it
+toward a URDF boundary.
 """
 
 from __future__ import annotations
@@ -487,9 +493,10 @@ class StartupReplayCapture:
 
     The operator selects the naturally settled pose by pressing ``R``.  No
     automatic stationarity threshold is introduced.  The existing startup
-    software lock is then mixed in and back out with the configured torque rise
-    duration while gravity remains at full scale.  ``locked_duration_sec`` is
-    the existing ``--freeze-sec`` interval, not a new hidden timing constant.
+    driver-local MIT lock is then mixed in and back out with the configured
+    torque rise duration while gravity remains at full scale.
+    ``locked_duration_sec`` is the existing ``--freeze-sec`` interval, not a
+    new hidden timing constant.
     """
 
     transition_duration_sec: float
@@ -2123,12 +2130,14 @@ def clamp_reference_qpos_to_command_limits(
 ) -> tuple[float, ...]:
     """Clamp an inert vendor reference to the unchanged command envelope.
 
-    The commissioning path always sends vendor Kp=0 and computes any position
-    term in software before dispatch.  A feedback pose inside the wider
-    read-side operating envelope may therefore be used by FK/gravity while the
-    encoded vendor q reference remains inside the nominal URDF command limits.
-    This helper must not be used to make a planned position command appear
-    valid; slow-step planning is checked against the nominal limits first.
+    The final active and protective controllers send vendor Kp=0, so a
+    feedback pose inside the wider read-side operating envelope may be used by
+    FK/gravity while the encoded vendor q reference remains inside the nominal
+    URDF command limits.  A temporary driver-local position lock is different:
+    its caller must suppress Kp for every joint whose measured lock reference
+    needs this clamp.  This helper must not be used to make a planned position
+    command appear valid; slow-step planning is checked against the nominal
+    limits first.
     """
 
     qpos = _six(qpos_rad, name="reference_qpos_rad")
@@ -2930,6 +2939,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
             "mode must be hold, slow-step, cartesian-hold, pose-hold, or "
             "gravity-calibration or startup-replay"
         )
+    if not getattr(args, "apply_driver_torque_limits", False):
+        raise LowGainProbeError(
+            "enabled startup uses a driver-local MIT position lock and requires "
+            "--apply-driver-torque-limits so 0x700B bounds the complete motor torque"
+        )
     _positive(args.rate_hz, name="rate_hz")
     _positive(args.duration_sec, name="duration_sec")
     _positive(args.warmup_sec, name="warmup_sec")
@@ -3704,6 +3718,10 @@ def build_startup_diagnostic_observation(
     qvel_fd_rad_s: Sequence[float] | None,
     torque_breakdown: B601MitTorqueBreakdown | None = None,
     conditioned_tau_nm: Sequence[float] | None = None,
+    dispatch_qpos_rad: Sequence[float] | None = None,
+    vendor_kp_nm_per_rad: Sequence[float] | None = None,
+    vendor_kd_nm_s_per_rad: Sequence[float] | None = None,
+    position_lock_suppressed_joint_names: Sequence[str] = (),
 ) -> dict[str, object]:
     """Build one bounded startup trace entry from already available values."""
 
@@ -3734,6 +3752,27 @@ def build_startup_diagnostic_observation(
             "damping_tau_nm": torque_breakdown.damping_torque_nm,
             "requested_tau_nm": torque_breakdown.requested_torque_nm,
             "conditioned_tau_nm": conditioned,
+            "dispatch_qpos_rad": (
+                None
+                if dispatch_qpos_rad is None
+                else _six(dispatch_qpos_rad, name="startup_dispatch_qpos_rad")
+            ),
+            "vendor_kp_nm_per_rad": (
+                None
+                if vendor_kp_nm_per_rad is None
+                else _six(vendor_kp_nm_per_rad, name="startup_vendor_kp_nm_per_rad")
+            ),
+            "vendor_kd_nm_s_per_rad": (
+                None
+                if vendor_kd_nm_s_per_rad is None
+                else _six(
+                    vendor_kd_nm_s_per_rad,
+                    name="startup_vendor_kd_nm_s_per_rad",
+                )
+            ),
+            "position_lock_suppressed_joint_names": tuple(
+                str(name) for name in position_lock_suppressed_joint_names
+            ),
         }
     return {
         "phase": normalized_phase,
@@ -3828,11 +3867,15 @@ def build_startup_lock_profile(
     torque_rise_time_sec: float,
     velocity_limit_rad_s: float,
 ) -> B601MitControlProfile:
-    """Build the temporary all-joint lock from the pinned YAML MIT gains.
+    """Build the startup feedforward envelope around a driver-local MIT lock.
 
-    The gains are configuration inputs, not probe constants.  They are used as
-    software gains so the same absolute and slew conditioners bound the startup
-    lock as the final impedance command; the vendor MIT ``kp`` remains zero.
+    The pinned YAML values are motor-local MIT gains.  Applying them again as a
+    20 Hz host PD loop makes the position and finite-difference damping terms
+    pass through the feedforward torque slew limiter.  A requested braking
+    torque can then lag behind the motion and inject energy.  Keep host
+    position and damping gains at zero during the temporary lock; the caller
+    sends the YAML gains to the drive and sends only bounded gravity/overlay
+    feedforward through this profile.
     """
 
     kp = _six(mit_kp_nm_per_rad, name="mit_kp_nm_per_rad")
@@ -3845,9 +3888,9 @@ def build_startup_lock_profile(
     rise_time = _positive(torque_rise_time_sec, name="torque_rise_time_sec")
     velocity_limit = _positive(velocity_limit_rad_s, name="velocity_limit_rad_s")
     return B601MitControlProfile(
-        name="b601_rs_startup_yaml_mit_position_lock",
-        position_kp_nm_per_rad=kp,
-        damping_kd_nm_s_per_rad=kd,
+        name="b601_rs_driver_local_mit_position_lock",
+        position_kp_nm_per_rad=_ZERO_SIX,
+        damping_kd_nm_s_per_rad=_ZERO_SIX,
         max_abs_torque_nm=limits,
         max_torque_rate_nm_s=tuple(value / rise_time for value in limits),
         max_abs_overlay_torque_nm=_ZERO_SIX,
@@ -3855,10 +3898,156 @@ def build_startup_lock_profile(
         max_abs_state_velocity_rad_s=(velocity_limit,) * 6,
         metadata={
             "gain_source": "rebotarm_rs_yaml.MIT",
-            "torque_owner": "software_startup_lock",
-            "vendor_kp": "zero",
-            "vendor_kd": "optional_driver_damping_only",
+            "torque_owner": "driver_local_startup_lock_plus_software_feedforward",
+            "vendor_kp_nm_per_rad": kp,
+            "vendor_kd_nm_s_per_rad": kd,
+            "software_position_stiffness_disabled": True,
+            "software_damping_disabled": True,
         },
+    )
+
+
+def blend_driver_local_lock_gains(
+    *,
+    lock_kp_nm_per_rad: Sequence[float],
+    lock_kd_nm_s_per_rad: Sequence[float],
+    active_kd_nm_s_per_rad: Sequence[float],
+    lock_fraction: float,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Blend one driver-local MIT lock without a host-side delayed PD term."""
+
+    lock_kp = np.asarray(
+        _six(lock_kp_nm_per_rad, name="lock_kp_nm_per_rad"),
+        dtype=float,
+    )
+    lock_kd = np.asarray(
+        _six(lock_kd_nm_s_per_rad, name="lock_kd_nm_s_per_rad"),
+        dtype=float,
+    )
+    active_kd = np.asarray(
+        _six(active_kd_nm_s_per_rad, name="active_kd_nm_s_per_rad"),
+        dtype=float,
+    )
+    if np.any(lock_kp < 0.0) or np.any(lock_kd < 0.0) or np.any(active_kd < 0.0):
+        raise ValueError("driver-local MIT gains must be non-negative")
+    fraction = _bounded(
+        lock_fraction,
+        name="driver_local_lock_fraction",
+        lower=0.0,
+        upper=1.0,
+    )
+    kp = fraction * lock_kp
+    kd = active_kd + fraction * (lock_kd - active_kd)
+    return (
+        tuple(float(value) for value in kp),
+        tuple(float(value) for value in kd),
+    )
+
+
+@dataclass(frozen=True)
+class DriverLocalLockCommand:
+    """One MIT command-side view of the temporary driver-local lock."""
+
+    reference_qpos_rad: tuple[float, ...]
+    reference_qvel_rad_s: tuple[float, ...]
+    kp_nm_per_rad: tuple[float, ...]
+    kd_nm_s_per_rad: tuple[float, ...]
+    position_lock_joint_names: tuple[str, ...]
+    position_lock_suppressed_joint_names: tuple[str, ...]
+
+
+def resolve_driver_local_lock_command(
+    *,
+    lock_reference_qpos_rad: Sequence[float],
+    active_reference_qpos_rad: Sequence[float],
+    active_reference_qvel_rad_s: Sequence[float],
+    position_limits_rad: Sequence[tuple[float, float]],
+    lock_kp_nm_per_rad: Sequence[float],
+    lock_kd_nm_s_per_rad: Sequence[float],
+    active_kd_nm_s_per_rad: Sequence[float],
+    lock_fraction: float,
+) -> DriverLocalLockCommand:
+    """Resolve a continuous local lock without turning read margin into motion.
+
+    The backend must encode every q reference inside the nominal URDF command
+    envelope.  When an admitted measured lock pose lies outside that envelope,
+    clamping it while keeping Kp nonzero would create an unintended position
+    command.  Such a joint therefore retains the blended local damping and
+    gravity feedforward but has position Kp suppressed for the temporary lock.
+    This uses the existing command boundary and introduces no new threshold.
+    """
+
+    lock_reference = _six(
+        lock_reference_qpos_rad,
+        name="driver_local_lock_reference_qpos_rad",
+    )
+    active_reference = _six(
+        active_reference_qpos_rad,
+        name="driver_local_active_reference_qpos_rad",
+    )
+    active_velocity = _six(
+        active_reference_qvel_rad_s,
+        name="driver_local_active_reference_qvel_rad_s",
+    )
+    limits = tuple(
+        (
+            _finite(lower, name="position_limit_lower"),
+            _finite(upper, name="position_limit_upper"),
+        )
+        for lower, upper in position_limits_rad
+    )
+    if len(limits) != 6 or any(lower >= upper for lower, upper in limits):
+        raise ValueError("position_limits_rad must contain six valid intervals")
+    fraction = _bounded(
+        lock_fraction,
+        name="driver_local_lock_fraction",
+        lower=0.0,
+        upper=1.0,
+    )
+    kp, kd = blend_driver_local_lock_gains(
+        lock_kp_nm_per_rad=lock_kp_nm_per_rad,
+        lock_kd_nm_s_per_rad=lock_kd_nm_s_per_rad,
+        active_kd_nm_s_per_rad=active_kd_nm_s_per_rad,
+        lock_fraction=fraction,
+    )
+    if fraction == 0.0:
+        return DriverLocalLockCommand(
+            reference_qpos_rad=clamp_reference_qpos_to_command_limits(
+                active_reference,
+                position_limits_rad=limits,
+            ),
+            reference_qvel_rad_s=active_velocity,
+            kp_nm_per_rad=kp,
+            kd_nm_s_per_rad=kd,
+            position_lock_joint_names=(),
+            position_lock_suppressed_joint_names=(),
+        )
+
+    dispatch_qpos = clamp_reference_qpos_to_command_limits(
+        lock_reference,
+        position_limits_rad=limits,
+    )
+    position_lock_joint_names: list[str] = []
+    suppressed_joint_names: list[str] = []
+    safe_kp = list(kp)
+    for index, (joint_name, value, (lower, upper)) in enumerate(
+        zip(_ALL_JOINTS, lock_reference, limits, strict=True)
+    ):
+        if lower <= value <= upper:
+            position_lock_joint_names.append(joint_name)
+        else:
+            safe_kp[index] = 0.0
+            suppressed_joint_names.append(joint_name)
+    active_share = 1.0 - fraction
+    return DriverLocalLockCommand(
+        reference_qpos_rad=dispatch_qpos,
+        reference_qvel_rad_s=tuple(
+            active_share * value for value in active_velocity
+        ),
+        kp_nm_per_rad=tuple(safe_kp),
+        kd_nm_s_per_rad=kd,
+        position_lock_joint_names=tuple(position_lock_joint_names),
+        position_lock_suppressed_joint_names=tuple(suppressed_joint_names),
     )
 
 
@@ -5395,9 +5584,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         position_limits_rad=position_limits,
         feedback_position_limits_rad=feedback_position_limits,
     )
+    startup_lock_vendor_kp_nm_per_rad = tuple(
+        joint.mit_kp for joint in config.joints
+    )
+    startup_lock_vendor_kd_nm_s_per_rad = tuple(
+        joint.mit_kd for joint in config.joints
+    )
     startup_lock_profile = build_startup_lock_profile(
-        mit_kp_nm_per_rad=tuple(joint.mit_kp for joint in config.joints),
-        mit_kd_nm_s_per_rad=tuple(joint.mit_kd for joint in config.joints),
+        mit_kp_nm_per_rad=startup_lock_vendor_kp_nm_per_rad,
+        mit_kd_nm_s_per_rad=startup_lock_vendor_kd_nm_s_per_rad,
         torque_limits_nm=torque_limits,
         torque_rise_time_sec=args.torque_rise_time_sec,
         velocity_limit_rad_s=args.velocity_abort_rad_s,
@@ -5485,6 +5680,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     }
     startup_lock_first_receipt: B601CommandReceipt | None = None
     startup_lock_commands = 0
+    startup_lock_position_joint_names: tuple[str, ...] = ()
+    startup_lock_position_suppressed_joint_names: tuple[str, ...] = ()
+    startup_lock_first_command_vendor_kp_nm_per_rad: tuple[float, ...] | None = None
+    startup_lock_first_command_vendor_kd_nm_s_per_rad: tuple[float, ...] | None = None
     arming_settle_torque_commands = 0
     startup_state_history: list[str] = []
     arming_settle_required_samples = _DEFAULT_ARMING_SETTLE_SAMPLES
@@ -5723,20 +5922,39 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             max_rate_nm_s=startup_lock_profile.max_torque_rate_nm_s,
             dt_sec=arm_dt,
         )
+        startup_driver_command = resolve_driver_local_lock_command(
+            lock_reference_qpos_rad=lock_reference.qpos_rad,
+            active_reference_qpos_rad=lock_reference.qpos_rad,
+            active_reference_qvel_rad_s=lock_reference.qvel_rad_s,
+            position_limits_rad=position_limits,
+            lock_kp_nm_per_rad=startup_lock_vendor_kp_nm_per_rad,
+            lock_kd_nm_s_per_rad=startup_lock_vendor_kd_nm_s_per_rad,
+            active_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+            lock_fraction=1.0,
+        )
+        startup_lock_position_joint_names = (
+            startup_driver_command.position_lock_joint_names
+        )
+        startup_lock_position_suppressed_joint_names = (
+            startup_driver_command.position_lock_suppressed_joint_names
+        )
+        startup_lock_first_command_vendor_kp_nm_per_rad = (
+            startup_driver_command.kp_nm_per_rad
+        )
+        startup_lock_first_command_vendor_kd_nm_s_per_rad = (
+            startup_driver_command.kd_nm_s_per_rad
+        )
         startup_lock_dispatch_reference = build_reference(
             sequence=lock_reference.sequence,
             timestamp_sec=lock_reference.source_timestamp_sec,
-            qpos_rad=clamp_reference_qpos_to_command_limits(
-                lock_reference.qpos_rad,
-                position_limits_rad=position_limits,
-            ),
-            qvel_rad_s=lock_reference.qvel_rad_s,
+            qpos_rad=startup_driver_command.reference_qpos_rad,
+            qvel_rad_s=startup_driver_command.reference_qvel_rad_s,
             joint_torque_overlay_nm=lock_reference.joint_torque_overlay_nm,
         )
         startup_lock_first_receipt = backend.send_mit(
             startup_lock_dispatch_reference,
-            kp=_ZERO_SIX,
-            kd=driver_kd_nm_s_per_rad,
+            kp=startup_driver_command.kp_nm_per_rad,
+            kd=startup_driver_command.kd_nm_s_per_rad,
             tau_nm=lock_tau,
             torque_limits_nm=torque_limits,
             joint_names=active_joint_names,
@@ -5754,6 +5972,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 qvel_fd_rad_s=arming_qvel,
                 torque_breakdown=lock_breakdown,
                 conditioned_tau_nm=lock_tau,
+                dispatch_qpos_rad=startup_driver_command.reference_qpos_rad,
+                vendor_kp_nm_per_rad=startup_driver_command.kp_nm_per_rad,
+                vendor_kd_nm_s_per_rad=startup_driver_command.kd_nm_s_per_rad,
+                position_lock_suppressed_joint_names=(
+                    startup_driver_command.position_lock_suppressed_joint_names
+                ),
             )
         )
         startup_lock_commands = 1
@@ -5840,20 +6064,27 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 max_rate_nm_s=startup_lock_profile.max_torque_rate_nm_s,
                 dt_sec=settle_dt,
             )
+            settle_driver_command = resolve_driver_local_lock_command(
+                lock_reference_qpos_rad=lock_reference.qpos_rad,
+                active_reference_qpos_rad=lock_reference.qpos_rad,
+                active_reference_qvel_rad_s=lock_reference.qvel_rad_s,
+                position_limits_rad=position_limits,
+                lock_kp_nm_per_rad=startup_lock_vendor_kp_nm_per_rad,
+                lock_kd_nm_s_per_rad=startup_lock_vendor_kd_nm_s_per_rad,
+                active_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                lock_fraction=1.0,
+            )
             lock_dispatch_reference = build_reference(
                 sequence=lock_reference.sequence,
                 timestamp_sec=lock_reference.source_timestamp_sec,
-                qpos_rad=clamp_reference_qpos_to_command_limits(
-                    lock_reference.qpos_rad,
-                    position_limits_rad=position_limits,
-                ),
-                qvel_rad_s=lock_reference.qvel_rad_s,
+                qpos_rad=settle_driver_command.reference_qpos_rad,
+                qvel_rad_s=settle_driver_command.reference_qvel_rad_s,
                 joint_torque_overlay_nm=lock_reference.joint_torque_overlay_nm,
             )
             lock_receipt = backend.send_mit(
                 lock_dispatch_reference,
-                kp=_ZERO_SIX,
-                kd=driver_kd_nm_s_per_rad,
+                kp=settle_driver_command.kp_nm_per_rad,
+                kd=settle_driver_command.kd_nm_s_per_rad,
                 tau_nm=lock_tau,
                 torque_limits_nm=torque_limits,
                 joint_names=active_joint_names,
@@ -5871,6 +6102,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     qvel_fd_rad_s=arming_settle_last_qvel,
                     torque_breakdown=lock_breakdown,
                     conditioned_tau_nm=lock_tau,
+                    dispatch_qpos_rad=settle_driver_command.reference_qpos_rad,
+                    vendor_kp_nm_per_rad=settle_driver_command.kp_nm_per_rad,
+                    vendor_kd_nm_s_per_rad=settle_driver_command.kd_nm_s_per_rad,
+                    position_lock_suppressed_joint_names=(
+                        settle_driver_command.position_lock_suppressed_joint_names
+                    ),
                 )
             )
             startup_lock_commands += 1
@@ -6413,6 +6650,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 and startup_replay_capture.reference_qpos_rad is not None
                 else handoff_fraction
             )
+            driver_lock_fraction = 1.0 - effective_handoff_fraction
+            driver_command = resolve_driver_local_lock_command(
+                lock_reference_qpos_rad=lock_reference_qpos,
+                active_reference_qpos_rad=reference.qpos_rad,
+                active_reference_qvel_rad_s=reference.qvel_rad_s,
+                position_limits_rad=position_limits,
+                lock_kp_nm_per_rad=startup_lock_vendor_kp_nm_per_rad,
+                lock_kd_nm_s_per_rad=startup_lock_vendor_kd_nm_s_per_rad,
+                active_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                lock_fraction=driver_lock_fraction,
+            )
             torque_breakdown = blend_startup_lock_torque_breakdown(
                 startup_lock_torque_breakdown,
                 target_torque_breakdown,
@@ -6432,20 +6680,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             dispatch_reference = build_reference(
                 sequence=reference.sequence,
                 timestamp_sec=reference.source_timestamp_sec,
-                qpos_rad=clamp_reference_qpos_to_command_limits(
-                    reference.qpos_rad,
-                    position_limits_rad=position_limits,
-                ),
-                qvel_rad_s=reference.qvel_rad_s,
+                qpos_rad=driver_command.reference_qpos_rad,
+                qvel_rad_s=driver_command.reference_qvel_rad_s,
                 joint_torque_overlay_nm=reference.joint_torque_overlay_nm,
             )
             receipt = backend.send_mit(
                 dispatch_reference,
-                # Driver Kp stays zero so the end-effector spring remains the
-                # sole position-restoring owner.  Optional driver Kd supplies
-                # only motor-local damping behind verified 0x700B bounds.
-                kp=_ZERO_SIX,
-                kd=driver_kd_nm_s_per_rad,
+                # The temporary lock runs in the drive's high-rate MIT loop.
+                # Once its fraction reaches zero, vendor Kp is again zero and
+                # the final controller is the sole position-restoring owner.
+                kp=driver_command.kp_nm_per_rad,
+                kd=driver_command.kd_nm_s_per_rad,
                 tau_nm=conditioned_tau,
                 torque_limits_nm=torque_limits,
                 joint_names=active_joint_names,
@@ -6481,6 +6726,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         else None
                     ),
                     "startup_replay_lock_fraction": replay_lock_fraction,
+                    "driver_local_lock_fraction": driver_lock_fraction,
+                    "driver_local_position_lock_joint_names": (
+                        driver_command.position_lock_joint_names
+                    ),
+                    "driver_local_position_lock_suppressed_joint_names": (
+                        driver_command.position_lock_suppressed_joint_names
+                    ),
+                    "vendor_kp_nm_per_rad": driver_command.kp_nm_per_rad,
+                    "vendor_kd_nm_s_per_rad": driver_command.kd_nm_s_per_rad,
                     "calibration_state": (
                         calibration_capture.state
                         if calibration_capture is not None
@@ -6970,6 +7224,29 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "startup_lock_software_kd_nm_s_per_rad": (
                 startup_lock_profile.damping_kd_nm_s_per_rad
             ),
+            "startup_lock_vendor_kp_nm_per_rad": (
+                startup_lock_vendor_kp_nm_per_rad
+            ),
+            "startup_lock_vendor_kd_nm_s_per_rad": (
+                startup_lock_vendor_kd_nm_s_per_rad
+            ),
+            "startup_lock_position_joint_names": (
+                startup_lock_position_joint_names
+            ),
+            "startup_lock_position_suppressed_joint_names": (
+                startup_lock_position_suppressed_joint_names
+            ),
+            "startup_lock_first_command_vendor_kp_nm_per_rad": (
+                startup_lock_first_command_vendor_kp_nm_per_rad
+            ),
+            "startup_lock_first_command_vendor_kd_nm_s_per_rad": (
+                startup_lock_first_command_vendor_kd_nm_s_per_rad
+            ),
+            "startup_lock_command_boundary_semantics": (
+                "nonzero vendor Kp only where the measured lock reference is "
+                "inside the nominal URDF command envelope; other joints keep "
+                "gravity and driver-local damping"
+            ),
             "vendor_kp_nm_per_rad": _ZERO_SIX,
             "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
             "gravity_ramp_duration_sec": args.torque_rise_time_sec,
@@ -7005,6 +7282,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "gravity_fraction_during_replay": 1.0,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
             "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "active_vendor_kp_nm_per_rad": _ZERO_SIX,
+            "active_vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "lock_vendor_kp_nm_per_rad": (
+                startup_lock_vendor_kp_nm_per_rad
+                if startup_replay_capture is not None
+                else None
+            ),
+            "lock_vendor_kd_nm_s_per_rad": (
+                startup_lock_vendor_kd_nm_s_per_rad
+                if startup_replay_capture is not None
+                else None
+            ),
             "lock_gain_source": "rebotarm_rs_yaml.MIT",
             "software_lock_kp_nm_per_rad": (
                 startup_lock_profile.position_kp_nm_per_rad
@@ -7203,7 +7492,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 "software_kp_nm_per_rad": startup_lock_profile.position_kp_nm_per_rad,
                 "software_kd_nm_s_per_rad": startup_lock_profile.damping_kd_nm_s_per_rad,
                 "gain_source": "rebotarm_rs_yaml.MIT",
-                "vendor_kp_nm_per_rad": _ZERO_SIX,
+                "vendor_kp_nm_per_rad": startup_lock_vendor_kp_nm_per_rad,
+                "vendor_kd_nm_s_per_rad": startup_lock_vendor_kd_nm_s_per_rad,
+                "execution_loop": "driver_local_mit",
+                "command_boundary_semantics": (
+                    "position Kp suppressed per joint when the measured lock "
+                    "reference is outside the nominal URDF command envelope"
+                ),
             },
         },
         "slow_step_response": slow_step_response,
@@ -7347,14 +7642,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "A complete six-joint MIT command is retried once; only failure of both live and cached complete-frame dispatch, absence of any verified cache, or an explicit second stop request permits full safe_stop.",
             "Protective hold has software Kp=0 and one derivative owner per joint: explicit driver Kd suppresses the default software damping for that joint; no two damping terms are stacked.",
             "J2 feedback readings in [-1e-2, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Separately, real J4-J6 feedback is admitted within 0.1 rad of each nominal URDF boundary without projection, so FK and gravity follow the measured pose.",
-            "All outgoing MIT/POS_VEL references remain inside the nominal URDF command envelope. In this probe vendor Kp is zero, so a feedback-following MIT reference is clamped only for encoding after the software position/gravity torque has already been computed from the real accepted pose.",
+            "All outgoing MIT/POS_VEL references remain inside the nominal URDF command envelope. Final active and protective controllers use vendor Kp=0, so their feedback-following reference may be clamped only for encoding after software position/gravity computation. During a temporary driver-local lock, any joint whose measured reference needs that clamp instead has vendor Kp suppressed while gravity and local damping remain active.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
-            "After enable, the active path captures a fresh q0 and immediately sends an all-six-joint bounded software position lock at q0; lock frames continue during the four-sample arming-settle gate.",
+            "After enable, the active path captures a fresh q0 and immediately sends an all-six-joint driver-local MIT lock; lock frames continue during the four-sample arming-settle gate, while host position and finite-difference damping terms remain zero.",
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "pose-hold anchors the complete fresh post-enable FK transform and applies bounded world-aligned force and torque through the same J.T wrench path.",
-            "Software composes gravity, position, optional finite-difference damping, and a bounded J.T wrench overlay; vendor MIT kp remains zero, while explicit vendor kd may own motor-local damping behind verified 0x700B limits.",
-            "Startup keeps the YAML-derived software joint lock while the requested complete six-joint gravity vector is present from the first lock frame, then linearly hands position/damping/pose terms over to the final controller; every frame remains under the same final absolute and slew-rate conditioner.",
+            "Software composes gravity, final-controller position, optional finite-difference damping, and a bounded J.T wrench overlay; vendor MIT Kp is zero outside the temporary startup/replay lock, while explicit active vendor Kd may own motor-local damping behind verified 0x700B limits.",
+            "Startup keeps the YAML-derived Kp/Kd in the driver-local MIT loop while the requested complete six-joint gravity vector is present from the first lock frame, then linearly hands the local gains and final software controller over together. Host feedforward remains under the final absolute and slew-rate conditioner, and verified 0x700B limits bound the complete motor output.",
             "When explicitly requested, the probe temporarily mirrors every arm joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies every readback before enable, and restores every original value after full safe_stop.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
