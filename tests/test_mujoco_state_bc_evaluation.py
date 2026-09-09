@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +43,17 @@ class _HoldCurrentStatePolicy:
         return np.asarray(state, dtype=np.float32).copy()
 
 
+class _IncrementingClock:
+    def __init__(self, value: float = 10.0, step: float = 0.001) -> None:
+        self.value = float(value)
+        self.step = float(step)
+
+    def __call__(self) -> float:
+        current = self.value
+        self.value += self.step
+        return current
+
+
 @dataclass
 class _MujocoEpisodeContext:
     target: object
@@ -71,6 +81,7 @@ def _build_context() -> _MujocoEpisodeContext:
         MujocoDeploymentObservationConfig,
     )
 
+    clock = _IncrementingClock()
     config = MujocoSimHILTargetConfig(
         task_config_path=Path(
             "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json"
@@ -122,6 +133,7 @@ def _build_context() -> _MujocoEpisodeContext:
             policy_action_ingress=ingress,
         ),
         prepared_target=prepared,
+        clock=clock,
     )
     observation_source = MujocoDeploymentObservationAdapter(
         prepared.scene,
@@ -138,7 +150,7 @@ def _build_context() -> _MujocoEpisodeContext:
             },
             pose_frame_contract=runtime_contract,
         ),
-        clock=time.monotonic,
+        clock=clock,
     )
     adapter = StatePolicyAdapter(
         model=_HoldCurrentStatePolicy(),
@@ -157,7 +169,7 @@ def _build_context() -> _MujocoEpisodeContext:
             action_maximum_hold_sec=0.25,
             extend_final_keyframe_to_maximum_hold=True,
         ),
-        monotonic_clock=time.monotonic,
+        monotonic_clock=clock,
     )
     initial = np.concatenate(
         (
@@ -187,7 +199,7 @@ def _build_context() -> _MujocoEpisodeContext:
                 hands_enabled=True,
             )
         ),
-        clock=time.monotonic,
+        clock=clock,
     )
     return _MujocoEpisodeContext(
         target=target,

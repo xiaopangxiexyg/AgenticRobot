@@ -76,6 +76,7 @@ def build_mujoco_policy_skill_motion_target(
     execution_observation_sink: ExecutionObservationSink | None = None,
     trace_sink: Callable[[Any], None] | None = None,
     tcp_pose_envelope_runtime: Any | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> MujocoPolicySkillMotionTarget:
     """Build a no-composition target for one already-selected policy source.
 
@@ -180,7 +181,7 @@ def build_mujoco_policy_skill_motion_target(
                 scene,
                 prepared.task_config,
                 hand_specs,
-                now=time.monotonic(),
+                now=clock(),
             )
         )
         return apply_canonical_keyframe_safety(
@@ -278,6 +279,7 @@ def build_mujoco_policy_skill_motion_target(
             else None
         ),
         trace_sink=trace_sink,
+        clock=clock,
     )
     return MujocoPolicySkillMotionTarget(
         task_config=prepared.task_config,
