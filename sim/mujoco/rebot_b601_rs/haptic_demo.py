@@ -23,9 +23,11 @@ from robot_motion.rebot_b601_rs import (
     B601VirtualWall,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
+from sim.contracts import TimingSpec
 from sim.mujoco.viewer import MujocoPassiveViewerSession
 
 from .mit_driver import B601MujocoEffortDriver, default_b601_mit_profile
+from .real2sim import B601Real2SimControllerProfile
 from .scene import B601_RS_PHYSICS_HZ, build_b601_mujoco_scene
 
 DEFAULT_HAPTIC_ANCHOR_QPOS = (0.15, 1.0, 1.1, 0.1, -0.15, 0.2)
@@ -74,6 +76,17 @@ def _parser() -> argparse.ArgumentParser:
         "--viewer",
         action="store_true",
         help="Open the passive MuJoCo viewer and pace physics in real time.",
+    )
+    parser.add_argument(
+        "--real2sim-controller",
+        action="store_true",
+        help="Use operator compensation and local Kd on the ideal plant.",
+    )
+    parser.add_argument(
+        "--host-hz",
+        type=float,
+        default=20.0,
+        help="Host torque rate for --real2sim-controller only.",
     )
     return parser
 
@@ -147,11 +160,15 @@ def run_haptic_fixture_demo(
     fixture_name: str,
     duration_sec: float = DEFAULT_HAPTIC_DURATION_SEC,
     viewer: bool = False,
+    real2sim_controller: bool = False,
+    host_hz: float = 20.0,
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
     if fixture_name not in {"spring", "wall", *POSE_FIXTURES}:
-        raise ValueError("fixture_name must name a supported spring, wall, or pose fixture")
+        raise ValueError(
+            "fixture_name must name a supported spring, wall, or pose fixture"
+        )
     if not isinstance(viewer, bool):
         raise TypeError("viewer must be a bool")
     duration = float(duration_sec)
@@ -251,6 +268,9 @@ def run_haptic_fixture_demo(
     base_profile = default_b601_mit_profile(scene)
     profile = replace(
         base_profile,
+        damping_kd_nm_s_per_rad=(
+            (0.0,) * 6 if real2sim_controller else base_profile.damping_kd_nm_s_per_rad
+        ),
         max_abs_overlay_torque_nm=(DEFAULT_MAX_OVERLAY_TORQUE_NM,) * 6,
         max_abs_state_acceleration_rad_s2=(250.0,) * 6,
         metadata={
@@ -264,6 +284,18 @@ def run_haptic_fixture_demo(
         model,
         profile=profile,
         enable_gravity_compensation=True,
+        timing=(
+            TimingSpec(
+                command_hz=host_hz,
+                physics_hz=B601_RS_PHYSICS_HZ,
+                parameter_source="explicit_host_rate_diagnostic",
+            )
+            if real2sim_controller
+            else None
+        ),
+        real2sim_profile=(
+            B601Real2SimControllerProfile() if real2sim_controller else None
+        ),
     )
     driver.reset(initial_qpos)
 
@@ -439,8 +471,12 @@ def run_haptic_fixture_demo(
             "maximum_growth_tolerance_m": 0.002,
         }
     else:
-        translation_required = fixture_name.startswith("pose-t") or fixture_name == "pose-6d"
-        rotation_required = fixture_name.startswith("pose-r") or fixture_name == "pose-6d"
+        translation_required = (
+            fixture_name.startswith("pose-t") or fixture_name == "pose-6d"
+        )
+        rotation_required = (
+            fixture_name.startswith("pose-r") or fixture_name == "pose-6d"
+        )
         translation_pass = bool(
             not translation_required
             or (
@@ -517,6 +553,12 @@ def run_haptic_fixture_demo(
         },
         "driver": driver.execution_metadata,
         "fidelity": (
+            "Opt-in host-ZOH/local-damping diagnostic on an unidentified ideal plant. "
+            "Fixture acceptance is not real2sim fidelity acceptance. "
+            if real2sim_controller
+            else ""
+        )
+        + (
             "offline deterministic ideal-generalized-effort MuJoCo acceptance; "
             "validates frame math, J-transpose direction, bounded software "
             "overlay, gravity/damping composition and closed-loop fixture effect; "
@@ -535,6 +577,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         fixture_name=args.fixture,
         duration_sec=args.duration_sec,
         viewer=bool(args.viewer),
+        real2sim_controller=args.real2sim_controller,
+        host_hz=args.host_hz,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return code

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
 
 import numpy as np
 
@@ -22,6 +23,7 @@ from robot_motion.rebot_b601_rs.model import (
 from sim.contracts import TimingSpec
 from sim.mujoco.scene import MujocoScene
 
+from .real2sim import B601Real2SimControllerProfile
 from .scene import (
     _B601_RS_GRIPPER_LOCK_SOLREF,
     B601_RS_COMMAND_HZ,
@@ -153,6 +155,8 @@ class B601EffortTick:
     driver_faulted: bool
     fault_reason: str | None
     plant_advanced: bool
+    host_torque_updated: bool = False
+    driver_damping_torque_nm: tuple[float, ...] = _ZERO_SIX
 
 
 class B601MujocoEffortDriver:
@@ -179,6 +183,7 @@ class B601MujocoEffortDriver:
         command_timeout_sec: float = _DEFAULT_COMMAND_TIMEOUT_SEC,
         state_limit_tolerance_rad: float = 1e-4,
         gravity_parity_tolerance_nm: float = 1e-9,
+        real2sim_profile: B601Real2SimControllerProfile | None = None,
     ) -> None:
         if not isinstance(scene, MujocoScene):
             raise TypeError("scene must be a MujocoScene")
@@ -186,6 +191,20 @@ class B601MujocoEffortDriver:
             raise TypeError("pinocchio_model must be a B601PinocchioModel")
         if not isinstance(enable_gravity_compensation, bool):
             raise TypeError("enable_gravity_compensation must be a bool")
+        if real2sim_profile is not None:
+            if not isinstance(real2sim_profile, B601Real2SimControllerProfile):
+                raise TypeError(
+                    "real2sim_profile must be a B601Real2SimControllerProfile"
+                )
+            if not enable_gravity_compensation:
+                raise ValueError(
+                    "real2sim_profile requires explicit gravity compensation"
+                )
+        self.real2sim_profile = real2sim_profile
+        if real2sim_profile is not None:
+            self.execution_mode = "rebot_b601_rs_mujoco_host_zoh_local_damping"
+            self.robot_dynamics = "unchanged_urdf_unidentified_motor_plant"
+        self._host_breakdown: B601MitTorqueBreakdown | None = None
         resolved_timing = timing or default_b601_mit_timing()
         if not isinstance(resolved_timing, TimingSpec):
             raise TypeError("timing must be a TimingSpec")
@@ -217,6 +236,7 @@ class B601MujocoEffortDriver:
 
         self.scene = scene
         self.pinocchio_model = pinocchio_model
+        self._urdf_sha256 = sha256(pinocchio_model.urdf_path.read_bytes()).hexdigest()
         self.timing = resolved_timing
         self.enable_gravity_compensation = enable_gravity_compensation
         self.command_timeout_sec = self._positive(
@@ -262,6 +282,10 @@ class B601MujocoEffortDriver:
         self._actuator_ids = _effort_actuator_ids(scene)
         self._gripper_equality_ids = self._verify_effort_scene()
         resolved_profile = profile or default_b601_mit_profile(scene)
+        if real2sim_profile is not None and profile is None:
+            resolved_profile = replace(
+                resolved_profile, damping_kd_nm_s_per_rad=_ZERO_SIX
+            )
         if not isinstance(resolved_profile, B601MitControlProfile):
             raise TypeError("profile must be a B601MitControlProfile")
         self._verify_profile(resolved_profile)
@@ -329,9 +353,7 @@ class B601MujocoEffortDriver:
             "network_transport": "out_of_scope",
             "timestamp_contract": "host_local_monotonic_observability",
             "watchdog_clock": "driver_owned_local_acceptance_time",
-            "stale_sample_action": (
-                "reject_without_preemption_until_local_watchdog"
-            ),
+            "stale_sample_action": ("reject_without_preemption_until_local_watchdog"),
             "unexpected_frame_action": (
                 "deactivate_reference_keep_local_gravity_and_damping"
             ),
@@ -352,7 +374,11 @@ class B601MujocoEffortDriver:
                 _AUXILIARY_VELOCITY_TOLERANCE_RAD_S
             ),
             "gravity_parity_tolerance_nm": self.gravity_parity_tolerance_nm,
-            "damping_owner": "software_mit_profile_only",
+            "damping_owner": (
+                "software_mit_profile_only"
+                if self.real2sim_profile is None
+                else "host_software_pd_plus_physics_rate_driver_kd_no_passive_damping"
+            ),
             "gripper": "fixed_open_continuous_joint_equality",
             "profile": {
                 "name": self.profile.name,
@@ -377,7 +403,9 @@ class B601MujocoEffortDriver:
             },
             "final_effort_conditioning": "clip_then_slew_then_clip",
             "startup_torque_seed": (
-                "gravity_equilibrium_before_first_step"
+                "controller_gravity_before_first_step"
+                if self.real2sim_profile is not None
+                else "gravity_equilibrium_before_first_step"
                 if self.enable_gravity_compensation
                 else "zero"
             ),
@@ -389,6 +417,19 @@ class B601MujocoEffortDriver:
                 "measured_qpos_qvel_qacc_are_post_step"
             ),
             "hardware_safety_claim": False,
+            "real2sim_controller": (
+                None
+                if self.real2sim_profile is None
+                else self.real2sim_profile.metadata()
+            ),
+            "host_torque_hz": (
+                float(self.timing.physics_hz)
+                if self.real2sim_profile is None
+                else float(self.timing.command_hz)
+            ),
+            "local_damping_hz": float(self.timing.physics_hz),
+            "urdf_sha256": self._urdf_sha256,
+            "local_damping_fidelity": "physics_cadence_approximation_not_identified_motor_loop",
         }
 
     def reset(
@@ -417,12 +458,13 @@ class B601MujocoEffortDriver:
         self._last_source_timestamp_sec = None
         self._last_receive_timestamp_sec = None
         self._fault_reason = None
+        self._host_breakdown = None
         self._verify_gravity_configuration(qpos)
         self._verified_gravity_mps2 = np.asarray(
             self.scene.model.opt.gravity,
             dtype=float,
         ).copy()
-        initial_torque = self._gravity_torque(qpos)
+        initial_torque = self._controller_gravity(qpos, np.zeros(6))
         torque_limit = np.asarray(self.profile.max_abs_torque_nm, dtype=float)
         if np.any(np.abs(initial_torque) > torque_limit + 1e-12):
             raise ValueError("gravity torque exceeds the configured effort limit")
@@ -500,19 +542,34 @@ class B601MujocoEffortDriver:
         torque_limited = False
         slew_limited = False
         plant_advanced = False
+        host_torque_updated = False
+        driver_damping = np.zeros(6)
         active_reference = self._active_reference
 
         if self._fault_reason is None:
             control_reference = active_reference or self._hold_reference()
             try:
-                breakdown = compute_b601_mit_torque(
-                    control_reference,
-                    self.profile,
-                    measured_qpos_rad=qpos,
-                    measured_qvel_rad_s=qvel,
-                    gravity_torque_nm=self._gravity_torque(qpos),
-                )
+                # A revoked reference invalidates the host cache even off cadence.
+                # Ideal mode keeps its original physics-rate software controller.
+                if self.real2sim_profile is None or due or self._host_breakdown is None:
+                    self._host_breakdown = compute_b601_mit_torque(
+                        control_reference,
+                        self.profile,
+                        measured_qpos_rad=qpos,
+                        measured_qvel_rad_s=qvel,
+                        gravity_torque_nm=self._controller_gravity(qpos, qvel),
+                    )
+                    host_torque_updated = True
+                breakdown = self._host_breakdown
                 requested = np.asarray(breakdown.requested_torque_nm, dtype=float)
+                if self.real2sim_profile is not None:
+                    driver_damping = (
+                        -np.asarray(
+                            self.real2sim_profile.driver_kd_nm_s_per_rad,
+                        )
+                        * qvel
+                    )
+                    requested = requested + driver_damping
                 torque_limit = np.asarray(
                     self.profile.max_abs_torque_nm,
                     dtype=float,
@@ -610,6 +667,8 @@ class B601MujocoEffortDriver:
             driver_faulted=self._fault_reason is not None,
             fault_reason=self._fault_reason,
             plant_advanced=plant_advanced,
+            host_torque_updated=host_torque_updated,
+            driver_damping_torque_nm=tuple(float(v) for v in driver_damping),
         )
 
     def _verify_effort_scene(self) -> np.ndarray:
@@ -826,6 +885,15 @@ class B601MujocoEffortDriver:
             auxiliary_joint_positions=B601_RS_GRIPPER_OPEN_QPOS,
         )
 
+    def _controller_gravity(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
+        if self.real2sim_profile is None:
+            return self._gravity_torque(qpos)
+        profile = self.real2sim_profile
+        gravity = self._gravity_torque(
+            qpos + np.asarray(profile.gravity_joint_offsets_rad)
+        )
+        return profile.compensate(gravity, qvel)
+
     def _rejection_reason(self, reference: B601MitReference) -> str | None:
         if (
             self._last_accepted_sequence is not None
@@ -863,6 +931,7 @@ class B601MujocoEffortDriver:
         )
 
     def _deactivate_reference(self, qpos: np.ndarray) -> None:
+        self._host_breakdown = None
         self._hold_qpos = qpos.copy()
         self._active_reference = None
         self._accepted_at_physics_time_sec = None
