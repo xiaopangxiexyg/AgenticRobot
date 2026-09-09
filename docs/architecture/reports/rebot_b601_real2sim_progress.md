@@ -138,3 +138,49 @@ fi
 printf 'simulation exit code: %s\nlog: %s\n' "$STATUS" "$LOG"
 printf '%s\n' 'shell remains active'
 ```
+
+## M1 后继修复：驱动器本地反馈的数值积分
+
+基线 `a295cddca0323fad7c17fe1ca911300c39ad3bd9` 保持不变，后继在
+`codex/b601-real2sim-local-servo` 开发。仅修改仿真驱动、测试和本进度页；不修改总路线图、
+URDF、硬件控制或操作员标定 profile。待合并，未 push、安装或运行真机。
+
+### 原因及修复
+
+之前将本地 Kp/Kd 在 Python 中计算成外部 `ctrl` 力矩，`implicitfast` 无法将这个外部
+速度反馈的导数纳入隐式积分。因此把官方 YAML 的启动增益直接代入会造成数值不稳定，
+不能据此判定官方增益不适用，更不能通过放宽速度/加速度门限解决。
+
+现在 real2sim 路径使用 MuJoCo 原生 affine actuator bias：
+`tau = host_feedforward + Kp*(q_anchor-q) - Kd*dq`。主机前馈仍按原 host cadence
+执行 clip/slew/clip；本地反馈不经过主机 slew。执行器 `forcerange` 限制三项总和，
+不会突破 profile 或原始执行器范围，receipt 读取实际 `actuator_force`。
+disable、数值故障和 reset 同时清除 ctrl 与 native bias，避免 ctrl=0 后仍残留制动/弹簧。
+原 ideal-effort 分支不变，plant 被动阻尼仍为零，不重复计入驱动器阻尼。
+
+依据：[MuJoCo actuator force model](https://mujoco.readthedocs.io/en/latest/computation.html)
+和 [affine bias / implicit integration](https://mujoco.readthedocs.io/en/latest/XMLreference.html)。
+这只是理想电机局部伺服的数值表达，不代表已辨识 RobStride 带宽、摩擦、延迟或量化。
+
+### 离线对照与尚存问题
+
+使用 pinned vendor `5ba28ace` YAML 的 Kp=`50 150 150 50 50 50`、
+Kd=`3 10 10 5 4 4`，原有 1 kHz physics、操作员重力 profile 和相同保护阈值：
+
+- 修复前、500 Hz host：J6 加速度约 524.97 rad/s²，保护停止，未完成启动。
+- 修复后、500 Hz host：1.5 s 6D fixture PASS，约 0.302 s 进入 ACTIVE。
+- 修复后、20 Hz host：完成启动锁，但交接阶段 0.35 s 因
+  `startup_lock_displacement` 进入 PROTECTIVE_HOLD；无数值故障，fixture 仍不通过。
+- 先前 Kp=2、弱 Kd 的 `startup_not_settled` 负例继续保留，不自动提升增益或放宽门限。
+
+因此本修复解决了高本地增益的积分缺陷，不宣称 20 Hz 主机下的 6D 阻抗已通过。
+下一步需隔离交接时序、低频 fixture 前馈和 plant/profile 不匹配的影响，再决定修复，
+不能把仿真 500 Hz 通过当作真机 CAN 已达到该频率。真实动态辨识仍需暂停并由操作者采集。
+
+仅仿真复现可使用本页前台命令模板，将 WT 改为 `/tmp/b601-real2sim-local-servo`，
+启动 Kp/Kd 改为上述 YAML 六轴值；保留固定命令/输出 log。500 Hz 是仿真实验设置，
+该命令不能移用于真机。旧候选仍可直接用于修复前对照。
+
+本批验证：同上七个 B601/边界测试文件共 **115 passed**（30.09 s），Ruff、资源 audit、
+`git diff --check` 通过。新增覆盖官方增益完成启动、disable/fault/reset 清除 native bias、
+以及本地弹簧与主机前馈叠加后的实际总力矩限幅。未修改任何硬件阈值或环境包。

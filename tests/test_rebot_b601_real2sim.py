@@ -318,3 +318,68 @@ def test_bad_reference_during_lock_cannot_rearm_it(startup_driver):
         driver.step_physics(reference(driver, 2)).rejection_reason
         == "lifecycle_latched"
     )
+
+
+def test_vendor_local_gains_complete_startup_without_relaxing_guards():
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+    from sim.mujoco.rebot_b601_rs.scene import (
+        B601_RS_PROVISIONAL_POSITION_KP,
+        B601_RS_PROVISIONAL_POSITION_KV,
+    )
+
+    # Existing seeds match the pinned vendor YAML; they are not plant ID.
+    code, report = run_haptic_fixture_demo(
+        source_root=SOURCE,
+        fixture_name="pose-6d",
+        real2sim_controller=True,
+        host_hz=500.0,
+        startup_profile=B601SimStartupProfile(
+            lock_kp_nm_per_rad=B601_RS_PROVISIONAL_POSITION_KP,
+            lock_kd_nm_s_per_rad=B601_RS_PROVISIONAL_POSITION_KV,
+        ),
+    )
+    acceptance = report["simulation_acceptance"]
+    assert code == 0
+    assert acceptance["passed"]
+    assert acceptance["final_control_phase"] == "ACTIVE"
+    assert not acceptance["driver_faulted"]
+
+
+@pytest.mark.parametrize("stop", ["disable", "fault", "reset"])
+def test_native_feedback_is_cleared_on_stop_or_reset(startup_driver, stop):
+    driver = startup_driver
+    driver.step_physics(reference(driver))
+    ids = driver._actuator_ids
+    assert np.any(driver.scene.model.actuator_biasprm[ids] != 0.0)
+    if stop == "disable":
+        driver.request_disable()
+    elif stop == "fault":
+        driver.scene.data.qvel[driver._qvel_addresses[0]] = 100.0
+        assert driver.step_physics().driver_faulted
+    else:
+        driver.reset()
+    np.testing.assert_array_equal(driver.scene.model.actuator_biasprm[ids], 0.0)
+    # A nonzero velocity must not resurrect a disabled native brake or spring.
+    if stop != "reset":
+        driver.scene.forward()
+        np.testing.assert_array_equal(driver.scene.data.actuator_force[ids], 0.0)
+
+
+def test_native_total_force_limit_includes_local_spring(startup_driver):
+    driver = startup_driver
+    driver.profile = replace(driver.profile, max_abs_torque_nm=(0.001,) * 6)
+    driver.scene.data.qpos[driver._qpos_addresses[0]] += 0.001
+    driver.scene.forward()
+    tick = driver.step_physics(reference(driver))
+    assert tick.torque_limited
+    np.testing.assert_allclose(
+        tick.applied_torque_nm,
+        np.clip(
+            np.array(tick.host_command_torque_nm)
+            + np.array(tick.driver_position_torque_nm)
+            + np.array(tick.driver_damping_torque_nm),
+            -0.001,
+            0.001,
+        ),
+        atol=1e-12,
+    )

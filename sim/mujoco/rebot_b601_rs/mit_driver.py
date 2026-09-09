@@ -370,6 +370,11 @@ class B601MujocoEffortDriver:
             ),
             "plant_step_owner": "exclusive_driver_mj_step",
             "actuator_semantics": "ideal_generalized_joint_effort_nm",
+            "local_feedback_integration": (
+                "none"
+                if self.real2sim_profile is None
+                else "mujoco_native_affine_bias_with_total_force_limit"
+            ),
             "robstride_internal_mit_fidelity": "not_claimed",
             "gravity_mps2": tuple(
                 float(value) for value in self.scene.model.opt.gravity
@@ -473,6 +478,7 @@ class B601MujocoEffortDriver:
         self.scene.data.qpos[self._qpos_addresses] = qpos
         self.scene.data.qvel[self._qvel_addresses] = 0.0
         self.scene.data.ctrl[:] = 0.0
+        self._clear_actuator_effort()
         self._initialize_gripper_open()
         self.scene.forward()
         self._physics_tick = 0
@@ -589,6 +595,8 @@ class B601MujocoEffortDriver:
         host_torque_updated = False
         driver_damping = np.zeros(6)
         driver_position = np.zeros(6)
+        local_kp = np.zeros(6)
+        local_kd = np.zeros(6)
         active_reference = self._active_reference
 
         if self._fault_reason is None and self._control_phase != "DISABLED":
@@ -661,24 +669,20 @@ class B601MujocoEffortDriver:
                         slew_limited = not np.array_equal(
                             host_clipped, self._host_command_torque
                         )
-                    driver_damping = (
-                        -np.asarray(
-                            self.real2sim_profile.driver_kd_nm_s_per_rad,
-                        )
-                        * qvel
+                    local_kd = np.asarray(
+                        self.real2sim_profile.driver_kd_nm_s_per_rad
                     )
                     if self.startup_profile is not None and self._lock_fraction > 0.0:
                         weight = self._lock_fraction
-                        driver_position = (
-                            weight
-                            * np.asarray(self.startup_profile.lock_kp_nm_per_rad)
-                            * (self._lock_anchor - qpos)
+                        local_kd = local_kd + weight * (
+                            np.asarray(self.startup_profile.lock_kd_nm_s_per_rad)
+                            - local_kd
                         )
-                        kd = np.asarray(self.real2sim_profile.driver_kd_nm_s_per_rad)
-                        kd = kd + weight * (
-                            np.asarray(self.startup_profile.lock_kd_nm_s_per_rad) - kd
+                        local_kp = weight * np.asarray(
+                            self.startup_profile.lock_kp_nm_per_rad
                         )
-                        driver_damping = -kd * qvel
+                    driver_position = local_kp * (self._lock_anchor - qpos)
+                    driver_damping = -local_kd * qvel
                     # Local motor feedback bypasses the host feedforward slew.
                     requested = (
                         self._host_command_torque + driver_damping + driver_position
@@ -718,15 +722,41 @@ class B601MujocoEffortDriver:
         if self._fault_reason is None:
             self._last_applied_torque = applied_torque.copy()
             self.scene.data.ctrl[self._actuator_ids] = applied_torque
+            if self.real2sim_profile is not None:
+                # Native affine feedback lets implicitfast account for the
+                # motor's velocity derivative; explicit ctrl PD does not.
+                model = self.scene.model
+                ids = self._actuator_ids
+                model.actuator_biastype[ids] = self.scene.mujoco.mjtBias.mjBIAS_AFFINE
+                model.actuator_biasprm[ids, :] = 0.0
+                model.actuator_biasprm[ids, 0] = local_kp * self._lock_anchor
+                model.actuator_biasprm[ids, 1] = -local_kp
+                model.actuator_biasprm[ids, 2] = -local_kd
+                force_limit = np.minimum(
+                    self.profile.max_abs_torque_nm,
+                    model.actuator_ctrlrange[ids, 1],
+                )
+                model.actuator_forcerange[ids, 0] = -force_limit
+                model.actuator_forcerange[ids, 1] = force_limit
+                self.scene.data.ctrl[ids] = (
+                    self._host_command_torque
+                    if self._control_phase != "DISABLED"
+                    else 0.0
+                )
             self.scene.mujoco.mj_step(self.scene.model, self.scene.data)
+            if self.real2sim_profile is not None:
+                applied_torque = self.scene.data.actuator_force[
+                    self._actuator_ids
+                ].copy()
+                self._last_applied_torque = applied_torque.copy()
             self._physics_tick += 1
             plant_advanced = True
             self._latch_state_fault_if_needed()
             if self._fault_reason is not None:
-                self.scene.data.ctrl[self._actuator_ids] = 0.0
+                self._clear_actuator_effort()
         else:
             self._last_applied_torque = np.zeros(6, dtype=float)
-            self.scene.data.ctrl[self._actuator_ids] = 0.0
+            self._clear_actuator_effort()
 
         measured_qpos = self._measured_qpos()
         measured_qvel = self._measured_qvel()
@@ -815,7 +845,16 @@ class B601MujocoEffortDriver:
         self._deactivate_reference(self._measured_qpos())
         self._host_command_torque[:] = 0.0
         self._last_applied_torque[:] = 0.0
+        self._clear_actuator_effort()
+
+    def _clear_actuator_effort(self) -> None:
+        """Zero control AND native feedback; ctrl=0 alone is not disabled."""
         self.scene.data.ctrl[self._actuator_ids] = 0.0
+        if self.real2sim_profile is not None:
+            self.scene.model.actuator_biasprm[self._actuator_ids, :] = 0.0
+            self.scene.model.actuator_biastype[self._actuator_ids] = (
+                self.scene.mujoco.mjtBias.mjBIAS_NONE
+            )
 
     def _advance_startup(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
         profile = self.startup_profile
