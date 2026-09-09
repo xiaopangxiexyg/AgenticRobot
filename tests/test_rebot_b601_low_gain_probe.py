@@ -3403,9 +3403,17 @@ def test_parser_help_is_read_only() -> None:
     assert "--support-joint" not in parser.format_help()
     assert args.target_kp is None
     assert args.target_kd is None
-    assert args.gravity_joint_scales == pytest.approx((1.0,) * 6)
+    assert args.kp == pytest.approx(0.0)
+    assert args.kd == pytest.approx(0.0)
+    assert args.driver_kd is None
+    assert args.gravity_scale == pytest.approx(1.0)
+    assert args.gravity_joint_scales == pytest.approx(
+        (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
+    )
     assert args.gravity_joint_offsets_rad == pytest.approx((0.0,) * 6)
-    assert args.gravity_joint_bias_nm == pytest.approx((0.0,) * 6)
+    assert args.gravity_joint_bias_nm == pytest.approx(
+        (0.0, -0.105, -0.1, -0.05, 0.0, 0.0)
+    )
     assert args.gravity_coulomb_friction_nm == pytest.approx((0.0,) * 6)
     assert args.gravity_coulomb_velocity_threshold_rad_s == pytest.approx(0.0)
     assert args.apply_driver_torque_limits is False
@@ -3566,9 +3574,9 @@ def test_startup_replay_cli_requires_gravity_only_observation_profile() -> None:
     ]
 
     with pytest.raises(probe.LowGainProbeError, match="requires --kp 0"):
-        probe._validate_cli(parser.parse_args(base))
+        probe._validate_cli(parser.parse_args([*base, "--kp", "0.5"]))
 
-    args = parser.parse_args([*base, "--kp", "0"])
+    args = parser.parse_args(base)
     probe._validate_cli(args)
     qref, qvel_ref, done = probe.plan_reference(
         (0.1,) * 6,

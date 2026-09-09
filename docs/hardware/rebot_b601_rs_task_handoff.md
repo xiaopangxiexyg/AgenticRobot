@@ -115,15 +115,15 @@ tau_request[i] = gravity_scale * gravity_joint_scales[i] * g_i(q + offset)
 3. 最后调用 upstream 同序的
    `send_mit(position, velocity, kp, kd, feedforward_tau)`。
 
-`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 默认全为 `1.0`，只在操作者显式传参时改变
-各关节模型重力；它不是 URDF 修改，也没有隐式标定激活。该向量必须一致用于启动锁、
-ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结果 profile；省略参数
-即可回退到原始模型。当前有直接数据支持的第一轮候选只把 J2 设为 `0.95`，其余保持 `1.0`。
+`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 的操作者真机验证默认值为
+`1 0.95 1 1 1 1`。它不是 URDF 修改，也没有隐式标定激活。该向量必须一致用于启动锁、
+ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结果 profile。
 `--gravity-joint-offsets-rad`、`--gravity-joint-bias-nm`、
-`--gravity-coulomb-friction-nm` 默认也全为零。Coulomb 方向只在有限差分速度绝对值超过
+`--gravity-coulomb-friction-nm` 的默认值分别为全零、`0 -0.105 -0.1 -0.05 0 0` 和
+全零。Coulomb 方向只在有限差分速度绝对值超过
 `--gravity-coulomb-velocity-threshold-rad-s` 时取正或负，否则为零；这避免静止量化噪声
 驱动完整摩擦力矩反复换向。所有项贯穿启动、ACTIVE、protective hold 和缓存补偿，并记录
-在结果 profile；它们是显式候选参数，不修改 URDF、不隐式激活标定。
+在结果 profile；它们组成默认 runtime profile，但不修改 URDF、不隐式改写模型文件。
 
 重要 owner 规则：
 
@@ -135,10 +135,11 @@ ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结�
 - `pose-hold` 的位置恢复只能来自末端 6D spring 经完整 Jacobian 转置映射；软件关节 Kp
   应为零。`cartesian-hold` 同理，只产生平移 overlay。
 - 软件 Kd 和 driver Kd 只能有一个实际阻尼 owner。临时锁期间 YAML Kd 由电机本地拥有，
-  主机临时 Kd 为零；交接时本地 Kd 连续回到 active driver Kd。`--driver-kd` 接受一个
-  六轴共用值或按 J1--J6 顺序给出的六项；任一项非零时必须
+  主机临时 Kd 为零；交接时本地 Kd 连续回到 active driver Kd。`--driver-kd` 的已验证
+  默认值为 `0.2 0.3 0.2 0.15 0.1 0.05`，也接受一个六轴共用值；任一项非零时必须
   `--kd 0`、不使用非零 `--target-kd`，并且先完成六轴 `0x700B` 临时 torque-limit
-  round-trip；driver Kd 只提供电机局部速度耗散，不提供位置锁。
+  round-trip；driver Kd 只提供电机局部速度耗散，不提供位置锁。正常重力补偿的软件
+  `kp/kd` 默认均为零；需要固定参考采样的 `gravity-calibration` 必须显式选择非零 `--kp`。
 - 未选择 driver Kd 时，软件 Kd 由 host 计算；20 Hz 反馈的有限差分量化可能产生阶梯感，
   这是连续性 commissioning 的观察项，不应通过叠加两个 Kd 解决。
 - active path 的单帧有限差分 qvel/qacc 越限先隔离，不下发、不更新控制历史或安全缓存；

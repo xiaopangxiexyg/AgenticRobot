@@ -536,8 +536,8 @@ Kd，软件最终 profile 同步接管。`--torque-rise-time-sec` 决定主机�
 `--gravity-scale 0.95`、`--torque-limit-scale 0.25`，而 `0.5/0.15` 只提供半重力并把
 J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令配置，不是代码或测试中的
 固定数值限制。
-`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 是显式、可回退的逐关节重力比例；默认六项
-均为 `1.0`，所以旧命令和模型结果不变。该向量在全局 `--gravity-scale` 之后生效，并贯穿
+`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 是显式、可回退的逐关节重力比例。经操作者
+真机验证后，默认值为 `1 0.95 1 1 1 1`。该向量在全局 `--gravity-scale` 之后生效，并贯穿
 启动锁、ACTIVE、正常 protective hold 以及从最后完整命令恢复的 degraded hold；不能只在
 ACTIVE 中临时修正，否则第一次 Ctrl-C 或一般异常会产生力矩跳变。每个值只要求有限且
 非负，不把常规调参范围写成代码硬限制；实际总输出仍受现有 URDF effort 比例、驱动器
@@ -545,25 +545,28 @@ ACTIVE 中临时修正，否则第一次 Ctrl-C 或一般异常会产生力矩�
 `profile.effective_gravity_multipliers` 会记录本次真实配置。
 
 `--gravity-joint-offsets-rad`、`--gravity-joint-bias-nm` 和
-`--gravity-coulomb-friction-nm` 同样按 J1--J6 顺序显式给出，默认均为六个零，因而不改变
-旧命令。offset 只改变 Pinocchio 重力求值姿态 `q+offset`；bias 是有符号常值力矩；Coulomb
+`--gravity-coulomb-friction-nm` 同样按 J1--J6 顺序显式给出。默认 offset 和 friction 均为
+六个零，默认 bias 为 `0 -0.105 -0.1 -0.05 0 0 N·m`。offset 只改变 Pinocchio 重力求值
+姿态 `q+offset`；bias 是有符号常值力矩；Coulomb
 项的幅值必须非负，方向来自 `mechPos` 有限差分速度。为防止零速量化噪声让非零摩擦项
 逐帧换向，`--gravity-coulomb-velocity-threshold-rad-s` 定义方向为零的速度区间，默认零且
 只有启用非零摩擦项时才有实际影响。这些配置和比例一样贯穿启动、ACTIVE 与 protective
-hold，并完整写入结果 `profile`；省略全部新增参数即可回退到原始 URDF 重力模型。
+hold，并完整写入结果 `profile`；省略参数时使用上述默认值。
 
-逐关节比例必须作为候选对照而不是静默默认值。Seeed 的 RS 实机报告曾得到 J2/J3 约
+这些参数现在组成操作者确认的默认重力补偿 profile；原始 URDF 模型不再是省略参数时的
+默认行为。Seeed 的 RS 实机报告曾得到 J2/J3 约
 `0.948/0.952` 的有效重力比例；本机第 10 个无接触窗口也观察到 J2 在正重力方向发生延迟
 breakaway，位置锁最终提供约 `-0.268 N·m` 修正，方向和量级均支持先测试 J2 `0.95`。
-因此第一轮只显式传入 `1 0.95 1 1 1 1`，J3 仍保持 `1.0`；只有多个不同力臂姿态均减少
-前 5 秒和 20 秒漂移、且没有反向抬升，才考虑成为后续配置候选。省略该参数即完整回退。
-进入最终 active 后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；vendor `kd`
-默认也是零。只有上述有明确起止状态的临时启动锁允许非零 vendor Kp。
+最终采用的默认比例保持 `1 0.95 1 1 1 1`，J3 仍为 `1.0`；配合上述 J2--J4 bias 使用。
+要回退原始模型，需显式传入六个 scale `1`、六个 offset/bias/friction `0`。
+进入最终 active 后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；只有上述有明确
+起止状态的临时启动锁允许非零 vendor Kp。
 为避免 20 Hz 有限差分阻尼产生阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度
-耗散交给电机内部环。`--driver-kd 0.6` 仍表示六轴共用一个值；也可以按 J1--J6 顺序
-直接给出六项，例如 `--driver-kd 0.4 0.6 0.6 0.3 0.25 0.2`。driver `kp` 仍固定为零，
+耗散交给电机内部环。正常重力补偿的已验证默认值按 J1--J6 为
+`0.2 0.3 0.2 0.15 0.1 0.05`；显式单值仍表示六轴共用。driver `kp` 仍固定为零，
 因此末端 `J^T wrench` 仍是唯一最终位置
-恢复项。非零 driver Kd 只有在
+恢复项。正常重力补偿的软件默认值为 `--kp 0 --kd 0`；`gravity-calibration` 若要在按下
+`R` 后用位置残差采样，必须为该采集显式选择经过审核的非零 `--kp`。非零 driver Kd 只有在
 `--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
 位置误差、非有限差分或部分发送会结束 ACTIVE 阶段并优先进入 protective/degraded hold；

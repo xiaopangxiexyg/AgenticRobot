@@ -211,9 +211,14 @@ _DEFAULT_RATE_HZ = 20.0
 _DEFAULT_DURATION_SEC = 8.0
 _DEFAULT_WARMUP_SEC = 2.0
 _DEFAULT_FREEZE_SEC = 1.0
-_DEFAULT_KP = 0.5
-_DEFAULT_KD = 0.5
+_DEFAULT_KP = 0.0
+_DEFAULT_KD = 0.0
+_DEFAULT_DRIVER_KD = (0.2, 0.3, 0.2, 0.15, 0.1, 0.05)
 _DEFAULT_GRAVITY_SCALE = 1.0
+_DEFAULT_GRAVITY_JOINT_SCALES = (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
+_DEFAULT_GRAVITY_JOINT_OFFSETS_RAD = _ZERO_SIX
+_DEFAULT_GRAVITY_JOINT_BIAS_NM = (0.0, -0.105, -0.1, -0.05, 0.0, 0.0)
+_DEFAULT_GRAVITY_COULOMB_FRICTION_NM = _ZERO_SIX
 _DEFAULT_TORQUE_LIMIT_SCALE = 0.25
 _DEFAULT_TORQUE_RISE_TIME_SEC = 1.0
 _DEFAULT_STEP_RAD = 0.05
@@ -2902,10 +2907,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 _positive(value, name=name)
         return
     if args.mode == "feedback-stability":
-        if any(
+        driver_kd_arg = getattr(args, "driver_kd", None)
+        if driver_kd_arg is not None and any(
             value > 0.0
             for value in _one_or_six_non_negative(
-                getattr(args, "driver_kd", 0.0),
+                driver_kd_arg,
                 name="driver_kd",
             )
         ):
@@ -3036,9 +3042,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         ),
         name="protective_hold_kd",
     )
-    driver_kd = _one_or_six_non_negative(
-        getattr(args, "driver_kd", 0.0),
-        name="driver_kd",
+    driver_kd_arg = getattr(args, "driver_kd", None)
+    driver_kd = (
+        _DEFAULT_DRIVER_KD
+        if driver_kd_arg is None
+        else _one_or_six_non_negative(driver_kd_arg, name="driver_kd")
     )
     if any(value > 0.0 for value in driver_kd) and not args.apply_driver_torque_limits:
         raise LowGainProbeError(
@@ -3059,19 +3067,27 @@ def _validate_cli(args: argparse.Namespace) -> None:
         )
     _non_negative(args.gravity_scale, name="gravity_scale")
     _non_negative_six(
-        getattr(args, "gravity_joint_scales", _ONE_SIX),
+        getattr(args, "gravity_joint_scales", _DEFAULT_GRAVITY_JOINT_SCALES),
         name="gravity_joint_scales",
     )
     _six(
-        getattr(args, "gravity_joint_offsets_rad", _ZERO_SIX),
+        getattr(
+            args,
+            "gravity_joint_offsets_rad",
+            _DEFAULT_GRAVITY_JOINT_OFFSETS_RAD,
+        ),
         name="gravity_joint_offsets_rad",
     )
     _six(
-        getattr(args, "gravity_joint_bias_nm", _ZERO_SIX),
+        getattr(args, "gravity_joint_bias_nm", _DEFAULT_GRAVITY_JOINT_BIAS_NM),
         name="gravity_joint_bias_nm",
     )
     _non_negative_six(
-        getattr(args, "gravity_coulomb_friction_nm", _ZERO_SIX),
+        getattr(
+            args,
+            "gravity_coulomb_friction_nm",
+            _DEFAULT_GRAVITY_COULOMB_FRICTION_NM,
+        ),
         name="gravity_coulomb_friction_nm",
     )
     _non_negative(
@@ -5666,24 +5682,34 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
     _validate_cli(args)
-    driver_kd_nm_s_per_rad = _one_or_six_non_negative(
-        getattr(args, "driver_kd", 0.0),
-        name="driver_kd",
+    driver_kd_arg = getattr(args, "driver_kd", None)
+    driver_kd_nm_s_per_rad = (
+        _DEFAULT_DRIVER_KD
+        if driver_kd_arg is None
+        else _one_or_six_non_negative(driver_kd_arg, name="driver_kd")
     )
     gravity_joint_scales = _non_negative_six(
-        getattr(args, "gravity_joint_scales", _ONE_SIX),
+        getattr(args, "gravity_joint_scales", _DEFAULT_GRAVITY_JOINT_SCALES),
         name="gravity_joint_scales",
     )
     gravity_joint_offsets_rad = _six(
-        getattr(args, "gravity_joint_offsets_rad", _ZERO_SIX),
+        getattr(
+            args,
+            "gravity_joint_offsets_rad",
+            _DEFAULT_GRAVITY_JOINT_OFFSETS_RAD,
+        ),
         name="gravity_joint_offsets_rad",
     )
     gravity_joint_bias_nm = _six(
-        getattr(args, "gravity_joint_bias_nm", _ZERO_SIX),
+        getattr(args, "gravity_joint_bias_nm", _DEFAULT_GRAVITY_JOINT_BIAS_NM),
         name="gravity_joint_bias_nm",
     )
     gravity_coulomb_friction_nm = _non_negative_six(
-        getattr(args, "gravity_coulomb_friction_nm", _ZERO_SIX),
+        getattr(
+            args,
+            "gravity_coulomb_friction_nm",
+            _DEFAULT_GRAVITY_COULOMB_FRICTION_NM,
+        ),
         name="gravity_coulomb_friction_nm",
     )
     gravity_coulomb_velocity_threshold_rad_s = _non_negative(
@@ -8025,10 +8051,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         nargs="+",
         metavar="KD",
-        default=(0.0,),
+        default=None,
         help=(
             "one shared or six joint1..joint6 motor-local MIT damping gains; "
-            "requires --apply-driver-torque-limits and adds no position stiffness"
+            "defaults to 0.2 0.3 0.2 0.15 0.1 0.05 in enabled gravity modes"
         ),
     )
     parser.add_argument(
@@ -8056,10 +8082,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         nargs=6,
         metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
-        default=_ONE_SIX,
+        default=_DEFAULT_GRAVITY_JOINT_SCALES,
         help=(
             "explicit joint1..joint6 multipliers applied after --gravity-scale; "
-            "defaults to six 1.0 values and is intended for reversible, "
+            "defaults to 1 0.95 1 1 1 1 and is intended for reversible, "
             "evidence-backed gravity calibration trials"
         ),
     )
@@ -8068,7 +8094,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         nargs=6,
         metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
-        default=_ZERO_SIX,
+        default=_DEFAULT_GRAVITY_JOINT_OFFSETS_RAD,
         help="joint1..joint6 offsets used only when evaluating g(q + offset)",
     )
     parser.add_argument(
@@ -8076,7 +8102,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         nargs=6,
         metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
-        default=_ZERO_SIX,
+        default=_DEFAULT_GRAVITY_JOINT_BIAS_NM,
         help="signed joint1..joint6 constant torque added to gravity compensation",
     )
     parser.add_argument(
@@ -8084,7 +8110,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         nargs=6,
         metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
-        default=_ZERO_SIX,
+        default=_DEFAULT_GRAVITY_COULOMB_FRICTION_NM,
         help=(
             "non-negative joint1..joint6 Coulomb magnitudes applied with the "
             "measured finite-difference velocity direction"
