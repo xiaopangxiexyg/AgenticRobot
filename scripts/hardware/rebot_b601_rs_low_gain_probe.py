@@ -7,7 +7,9 @@ sensor, or a hardware-readiness claim.
 
 The software owns the complete low-gain torque composition:
 
-``tau_i = gravity_scale * gravity_joint_scales[i] * g_i(q)
+``tau_i = gravity_scale * gravity_joint_scales[i] * g_i(q + gravity_joint_offsets)
+         + gravity_joint_bias_nm[i]
+         + gravity_coulomb_friction_nm[i] * direction_i
          + kp_i * (q_ref_i - q_i) + kd_i * (dq_ref_i - dq_i) + (J.T F)_i``
 
 During startup, the complete scaled gravity vector is present from the first
@@ -3036,6 +3038,22 @@ def _validate_cli(args: argparse.Namespace) -> None:
         getattr(args, "gravity_joint_scales", _ONE_SIX),
         name="gravity_joint_scales",
     )
+    _six(
+        getattr(args, "gravity_joint_offsets_rad", _ZERO_SIX),
+        name="gravity_joint_offsets_rad",
+    )
+    _six(
+        getattr(args, "gravity_joint_bias_nm", _ZERO_SIX),
+        name="gravity_joint_bias_nm",
+    )
+    _non_negative_six(
+        getattr(args, "gravity_coulomb_friction_nm", _ZERO_SIX),
+        name="gravity_coulomb_friction_nm",
+    )
+    _non_negative(
+        getattr(args, "gravity_coulomb_velocity_threshold_rad_s", 0.0),
+        name="gravity_coulomb_velocity_threshold_rad_s",
+    )
     _bounded(
         args.torque_limit_scale,
         name="torque_limit_scale",
@@ -4299,6 +4317,10 @@ def compute_software_torque_breakdown(
     profile: B601MitControlProfile,
     gravity_scale: float,
     gravity_joint_scales: Sequence[float] = _ONE_SIX,
+    gravity_joint_offsets_rad: Sequence[float] = _ZERO_SIX,
+    gravity_joint_bias_nm: Sequence[float] = _ZERO_SIX,
+    gravity_coulomb_friction_nm: Sequence[float] = _ZERO_SIX,
+    gravity_coulomb_velocity_threshold_rad_s: float = 0.0,
 ) -> B601MitTorqueBreakdown:
     """Compose gravity, joint PD, and bounded overlay torque in software."""
 
@@ -4307,19 +4329,45 @@ def compute_software_torque_breakdown(
         gravity_joint_scales,
         name="gravity_joint_scales",
     )
+    joint_offsets = _six(
+        gravity_joint_offsets_rad,
+        name="gravity_joint_offsets_rad",
+    )
+    joint_bias = _six(gravity_joint_bias_nm, name="gravity_joint_bias_nm")
+    coulomb_friction = _non_negative_six(
+        gravity_coulomb_friction_nm,
+        name="gravity_coulomb_friction_nm",
+    )
+    coulomb_threshold = _non_negative(
+        gravity_coulomb_velocity_threshold_rad_s,
+        name="gravity_coulomb_velocity_threshold_rad_s",
+    )
+    measured_qpos = _six(measured_qpos_rad, name="measured_qpos_rad")
+    measured_qvel = _six(measured_qvel_rad_s, name="measured_qvel_rad_s")
+    model_qpos = tuple(
+        value + offset
+        for value, offset in zip(measured_qpos, joint_offsets, strict=True)
+    )
+    coulomb_direction = tuple(
+        1.0 if velocity > coulomb_threshold else -1.0 if velocity < -coulomb_threshold else 0.0
+        for velocity in measured_qvel
+    )
     gravity = tuple(
-        scale * joint_scale * float(value)
-        for joint_scale, value in zip(
+        scale * joint_scale * float(value) + bias + friction * direction
+        for joint_scale, value, bias, friction, direction in zip(
             joint_scales,
-            model.arm_generalized_gravity(measured_qpos_rad),
+            model.arm_generalized_gravity(model_qpos),
+            joint_bias,
+            coulomb_friction,
+            coulomb_direction,
             strict=True,
         )
     )
     return compute_b601_mit_torque(
         reference,
         profile,
-        measured_qpos_rad=measured_qpos_rad,
-        measured_qvel_rad_s=measured_qvel_rad_s,
+        measured_qpos_rad=measured_qpos,
+        measured_qvel_rad_s=measured_qvel,
         gravity_torque_nm=gravity,
     )
 
@@ -4333,6 +4381,10 @@ def compute_software_torque(
     profile: B601MitControlProfile,
     gravity_scale: float,
     gravity_joint_scales: Sequence[float] = _ONE_SIX,
+    gravity_joint_offsets_rad: Sequence[float] = _ZERO_SIX,
+    gravity_joint_bias_nm: Sequence[float] = _ZERO_SIX,
+    gravity_coulomb_friction_nm: Sequence[float] = _ZERO_SIX,
+    gravity_coulomb_velocity_threshold_rad_s: float = 0.0,
 ) -> tuple[float, ...]:
     """Compatibility wrapper returning only the requested total torque."""
 
@@ -4344,6 +4396,12 @@ def compute_software_torque(
         profile=profile,
         gravity_scale=gravity_scale,
         gravity_joint_scales=gravity_joint_scales,
+        gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+        gravity_joint_bias_nm=gravity_joint_bias_nm,
+        gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+        gravity_coulomb_velocity_threshold_rad_s=(
+            gravity_coulomb_velocity_threshold_rad_s
+        ),
     ).requested_torque_nm
 
 
@@ -4834,6 +4892,10 @@ def _send_fault_hold_command(
     rate_hz: float,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
     gravity_joint_scales: Sequence[float] = _ONE_SIX,
+    gravity_joint_offsets_rad: Sequence[float] = _ZERO_SIX,
+    gravity_joint_bias_nm: Sequence[float] = _ZERO_SIX,
+    gravity_coulomb_friction_nm: Sequence[float] = _ZERO_SIX,
+    gravity_coulomb_velocity_threshold_rad_s: float = 0.0,
 ) -> tuple[B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
     """Send one bounded all-arm gravity/damping MIT frame.
 
@@ -4858,6 +4920,12 @@ def _send_fault_hold_command(
         profile=profile,
         gravity_scale=gravity_scale,
         gravity_joint_scales=gravity_joint_scales,
+        gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+        gravity_joint_bias_nm=gravity_joint_bias_nm,
+        gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+        gravity_coulomb_velocity_threshold_rad_s=(
+            gravity_coulomb_velocity_threshold_rad_s
+        ),
     )
     conditioned, _torque_limited, _slew_limited = condition_torque(
         breakdown.requested_torque_nm,
@@ -4977,6 +5045,10 @@ def _run_latched_fault_hold(
     degraded_entry_reason: str | None = None,
     degraded_telemetry: dict[str, object] | None = None,
     gravity_joint_scales: Sequence[float] = _ONE_SIX,
+    gravity_joint_offsets_rad: Sequence[float] = _ZERO_SIX,
+    gravity_joint_bias_nm: Sequence[float] = _ZERO_SIX,
+    gravity_coulomb_friction_nm: Sequence[float] = _ZERO_SIX,
+    gravity_coulomb_velocity_threshold_rad_s: float = 0.0,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -5281,6 +5353,12 @@ def _run_latched_fault_hold(
                     rate_hz=rate_hz,
                     driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                     gravity_joint_scales=gravity_joint_scales,
+                    gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+                    gravity_joint_bias_nm=gravity_joint_bias_nm,
+                    gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+                    gravity_coulomb_velocity_threshold_rad_s=(
+                        gravity_coulomb_velocity_threshold_rad_s
+                    ),
                 ),
                 context="fault hold entry",
             )
@@ -5488,6 +5566,12 @@ def _run_latched_fault_hold(
                     rate_hz=rate_hz,
                     driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                     gravity_joint_scales=gravity_joint_scales,
+                    gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+                    gravity_joint_bias_nm=gravity_joint_bias_nm,
+                    gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+                    gravity_coulomb_velocity_threshold_rad_s=(
+                        gravity_coulomb_velocity_threshold_rad_s
+                    ),
                 ),
                 context="live protective hold",
             )
@@ -5564,6 +5648,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     gravity_joint_scales = _non_negative_six(
         getattr(args, "gravity_joint_scales", _ONE_SIX),
         name="gravity_joint_scales",
+    )
+    gravity_joint_offsets_rad = _six(
+        getattr(args, "gravity_joint_offsets_rad", _ZERO_SIX),
+        name="gravity_joint_offsets_rad",
+    )
+    gravity_joint_bias_nm = _six(
+        getattr(args, "gravity_joint_bias_nm", _ZERO_SIX),
+        name="gravity_joint_bias_nm",
+    )
+    gravity_coulomb_friction_nm = _non_negative_six(
+        getattr(args, "gravity_coulomb_friction_nm", _ZERO_SIX),
+        name="gravity_coulomb_friction_nm",
+    )
+    gravity_coulomb_velocity_threshold_rad_s = _non_negative(
+        getattr(args, "gravity_coulomb_velocity_threshold_rad_s", 0.0),
+        name="gravity_coulomb_velocity_threshold_rad_s",
     )
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
@@ -5969,6 +6069,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             profile=startup_lock_profile,
             gravity_scale=args.gravity_scale,
             gravity_joint_scales=gravity_joint_scales,
+            gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+            gravity_joint_bias_nm=gravity_joint_bias_nm,
+            gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+            gravity_coulomb_velocity_threshold_rad_s=(
+                gravity_coulomb_velocity_threshold_rad_s
+            ),
         )
         lock_tau, _lock_torque_limited, _lock_slew_limited = condition_torque(
             lock_breakdown.requested_torque_nm,
@@ -6112,6 +6218,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 profile=startup_lock_profile,
                 gravity_scale=args.gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
+                gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+                gravity_joint_bias_nm=gravity_joint_bias_nm,
+                gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+                gravity_coulomb_velocity_threshold_rad_s=(
+                    gravity_coulomb_velocity_threshold_rad_s
+                ),
             )
             lock_tau, _lock_torque_limited, _lock_slew_limited = condition_torque(
                 lock_breakdown.requested_torque_nm,
@@ -6670,6 +6782,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 profile=profile,
                 gravity_scale=args.gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
+                gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+                gravity_joint_bias_nm=gravity_joint_bias_nm,
+                gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+                gravity_coulomb_velocity_threshold_rad_s=(
+                    gravity_coulomb_velocity_threshold_rad_s
+                ),
             )
             # Gravity is present at its requested scale from the first active
             # frame.  The total-torque conditioner below is the single startup
@@ -6701,6 +6819,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 profile=startup_lock_profile,
                 gravity_scale=args.gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
+                gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+                gravity_joint_bias_nm=gravity_joint_bias_nm,
+                gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+                gravity_coulomb_velocity_threshold_rad_s=(
+                    gravity_coulomb_velocity_threshold_rad_s
+                ),
             )
             effective_handoff_fraction = (
                 1.0 - replay_lock_fraction
@@ -7068,6 +7192,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             degraded_entry_reason=degraded_entry_reason,
                             degraded_telemetry=protective_hold_degraded,
                             gravity_joint_scales=gravity_joint_scales,
+                            gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+                            gravity_joint_bias_nm=gravity_joint_bias_nm,
+                            gravity_coulomb_friction_nm=(
+                                gravity_coulomb_friction_nm
+                            ),
+                            gravity_coulomb_velocity_threshold_rad_s=(
+                                gravity_coulomb_velocity_threshold_rad_s
+                            ),
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
@@ -7531,6 +7663,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
             "gravity_scale": args.gravity_scale,
             "gravity_joint_scales": gravity_joint_scales,
+            "gravity_joint_offsets_rad": gravity_joint_offsets_rad,
+            "gravity_joint_bias_nm": gravity_joint_bias_nm,
+            "gravity_coulomb_friction_nm": gravity_coulomb_friction_nm,
+            "gravity_coulomb_velocity_threshold_rad_s": (
+                gravity_coulomb_velocity_threshold_rad_s
+            ),
+            "gravity_compensation_formula": (
+                "scale*joint_scale*g(q+offset)+bias+friction*direction(qvel)"
+            ),
             "effective_gravity_multipliers": tuple(
                 args.gravity_scale * value for value in gravity_joint_scales
             ),
@@ -7893,6 +8034,42 @@ def build_parser() -> argparse.ArgumentParser:
             "explicit joint1..joint6 multipliers applied after --gravity-scale; "
             "defaults to six 1.0 values and is intended for reversible, "
             "evidence-backed gravity calibration trials"
+        ),
+    )
+    parser.add_argument(
+        "--gravity-joint-offsets-rad",
+        type=float,
+        nargs=6,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        default=_ZERO_SIX,
+        help="joint1..joint6 offsets used only when evaluating g(q + offset)",
+    )
+    parser.add_argument(
+        "--gravity-joint-bias-nm",
+        type=float,
+        nargs=6,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        default=_ZERO_SIX,
+        help="signed joint1..joint6 constant torque added to gravity compensation",
+    )
+    parser.add_argument(
+        "--gravity-coulomb-friction-nm",
+        type=float,
+        nargs=6,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        default=_ZERO_SIX,
+        help=(
+            "non-negative joint1..joint6 Coulomb magnitudes applied with the "
+            "measured finite-difference velocity direction"
+        ),
+    )
+    parser.add_argument(
+        "--gravity-coulomb-velocity-threshold-rad-s",
+        type=float,
+        default=0.0,
+        help=(
+            "non-negative absolute velocity below which the Coulomb direction "
+            "is zero; relevant only when a friction magnitude is non-zero"
         ),
     )
     parser.add_argument(

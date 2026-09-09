@@ -773,6 +773,50 @@ def test_startup_lock_host_breakdown_contains_gravity_only() -> None:
     assert breakdown.requested_torque_nm == breakdown.gravity_torque_nm
 
 
+def test_gravity_compensation_applies_offset_bias_and_directional_friction() -> None:
+    class FakeModel:
+        def __init__(self) -> None:
+            self.qpos: tuple[float, ...] | None = None
+
+        def arm_generalized_gravity(self, qpos_rad):
+            self.qpos = tuple(qpos_rad)
+            return (1.0, -2.0, 3.0, -4.0, 5.0, -6.0)
+
+    model = FakeModel()
+    profile = probe.build_software_profile(
+        kp=0.0,
+        kd=0.0,
+        torque_limits_nm=(20.0,) * 6,
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+    reference = probe.build_reference(
+        sequence=1,
+        timestamp_sec=1.0,
+        qpos_rad=(0.0,) * 6,
+    )
+
+    breakdown = probe.compute_software_torque_breakdown(
+        model,
+        reference=reference,
+        measured_qpos_rad=(0.1,) * 6,
+        measured_qvel_rad_s=(0.03, -0.03, 0.01, -0.01, 0.0, 0.02),
+        profile=profile,
+        gravity_scale=0.5,
+        gravity_joint_scales=(1.0, 0.5, 1.0, 0.5, 1.0, 0.5),
+        gravity_joint_offsets_rad=(0.01, -0.02, 0.03, -0.04, 0.05, -0.06),
+        gravity_joint_bias_nm=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        gravity_coulomb_friction_nm=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        gravity_coulomb_velocity_threshold_rad_s=0.02,
+    )
+
+    assert model.qpos == pytest.approx((0.11, 0.08, 0.13, 0.06, 0.15, 0.04))
+    assert breakdown.gravity_torque_nm == pytest.approx(
+        (0.61, -0.32, 1.8, -0.6, 3.0, -0.9)
+    )
+    assert breakdown.requested_torque_nm == breakdown.gravity_torque_nm
+
+
 def test_driver_local_lock_gain_blend_has_clean_active_endpoints() -> None:
     lock_kp = (50.0, 150.0, 150.0, 50.0, 50.0, 50.0)
     lock_kd = (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
@@ -2086,7 +2130,7 @@ def test_fault_hold_uses_real_feedback_for_gravity_and_nominal_dispatch_referenc
         model,
         qpos_rad=observed,
         measured_qpos_rad=observed,
-        measured_qvel_rad_s=(0.0,) * 6,
+        measured_qvel_rad_s=(0.03, -0.03, 0.0, 0.0, 0.0, 0.0),
         profile=profile,
         gravity_scale=1.0,
         previous_tau=(0.0,) * 6,
@@ -2094,10 +2138,16 @@ def test_fault_hold_uses_real_feedback_for_gravity_and_nominal_dispatch_referenc
         command_position_limits_rad=_fault_hold_limits(),
         rate_hz=20.0,
         gravity_joint_scales=(1.0, 0.95, 1.0, 1.0, 1.0, 1.0),
+        gravity_joint_offsets_rad=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        gravity_joint_bias_nm=(0.01,) * 6,
+        gravity_coulomb_friction_nm=(0.02,) * 6,
+        gravity_coulomb_velocity_threshold_rad_s=0.02,
     )
 
-    assert model.gravity_qpos == [observed]
-    assert gravity_tau == pytest.approx((0.1, 0.19, 0.3, 0.4, 0.5, 0.6))
+    assert model.gravity_qpos == [
+        pytest.approx(tuple(value + 0.01 * index for index, value in enumerate(observed, 1)))
+    ]
+    assert gravity_tau == pytest.approx((0.13, 0.18, 0.31, 0.41, 0.51, 0.61))
     assert backend.reference is not None
     assert backend.reference.qpos_rad == pytest.approx((*observed[:5], 3.14))
 
@@ -3354,6 +3404,10 @@ def test_parser_help_is_read_only() -> None:
     assert args.target_kp is None
     assert args.target_kd is None
     assert args.gravity_joint_scales == pytest.approx((1.0,) * 6)
+    assert args.gravity_joint_offsets_rad == pytest.approx((0.0,) * 6)
+    assert args.gravity_joint_bias_nm == pytest.approx((0.0,) * 6)
+    assert args.gravity_coulomb_friction_nm == pytest.approx((0.0,) * 6)
+    assert args.gravity_coulomb_velocity_threshold_rad_s == pytest.approx(0.0)
     assert args.apply_driver_torque_limits is False
     calibration_args = parser.parse_args(
         [
@@ -3394,14 +3448,54 @@ def test_parser_help_is_read_only() -> None:
             "1",
             "1",
             "1",
+            "--gravity-joint-offsets-rad",
+            "0",
+            "-0.06",
+            "0.02",
+            "0",
+            "0",
+            "0",
+            "--gravity-joint-bias-nm",
+            "0",
+            "-0.70",
+            "0.12",
+            "0",
+            "0",
+            "0",
+            "--gravity-coulomb-friction-nm",
+            "0",
+            "0.53",
+            "0.49",
+            "0",
+            "0",
+            "0",
+            "--gravity-coulomb-velocity-threshold-rad-s",
+            "0.02",
         ]
     )
     probe._validate_cli(calibrated_args)
     assert calibrated_args.gravity_joint_scales == pytest.approx(
         (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
     )
+    assert calibrated_args.gravity_joint_offsets_rad == pytest.approx(
+        (0.0, -0.06, 0.02, 0.0, 0.0, 0.0)
+    )
+    assert calibrated_args.gravity_joint_bias_nm == pytest.approx(
+        (0.0, -0.70, 0.12, 0.0, 0.0, 0.0)
+    )
+    assert calibrated_args.gravity_coulomb_friction_nm == pytest.approx(
+        (0.0, 0.53, 0.49, 0.0, 0.0, 0.0)
+    )
+    assert calibrated_args.gravity_coulomb_velocity_threshold_rad_s == pytest.approx(
+        0.02
+    )
 
     calibrated_args.gravity_joint_scales[1] = -0.1
+    with pytest.raises(ValueError, match="six non-negative"):
+        probe._validate_cli(calibrated_args)
+
+    calibrated_args.gravity_joint_scales[1] = 0.95
+    calibrated_args.gravity_coulomb_friction_nm[1] = -0.1
     with pytest.raises(ValueError, match="six non-negative"):
         probe._validate_cli(calibrated_args)
 

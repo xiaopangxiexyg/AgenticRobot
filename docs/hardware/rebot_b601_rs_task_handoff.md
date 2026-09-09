@@ -99,7 +99,9 @@ wrench 通过 `J.T @ wrench` 映射为 B601 力矩。B601 的低带宽 probe 只
 正常软件请求力矩为：
 
 ```text
-tau_request[i] = gravity_scale * gravity_joint_scales[i] * g_i(q)
+tau_request[i] = gravity_scale * gravity_joint_scales[i] * g_i(q + offset)
+               + gravity_joint_bias_nm[i]
+               + gravity_coulomb_friction_nm[i] * direction(dq_i)
                + Kp_i * (q_ref_i - q_i)
                + Kd_i * (dq_ref_i - dq_i)
                + (J(q).T @ wrench_overlay)_i
@@ -117,6 +119,11 @@ tau_request[i] = gravity_scale * gravity_joint_scales[i] * g_i(q)
 各关节模型重力；它不是 URDF 修改，也没有隐式标定激活。该向量必须一致用于启动锁、
 ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结果 profile；省略参数
 即可回退到原始模型。当前有直接数据支持的第一轮候选只把 J2 设为 `0.95`，其余保持 `1.0`。
+`--gravity-joint-offsets-rad`、`--gravity-joint-bias-nm`、
+`--gravity-coulomb-friction-nm` 默认也全为零。Coulomb 方向只在有限差分速度绝对值超过
+`--gravity-coulomb-velocity-threshold-rad-s` 时取正或负，否则为零；这避免静止量化噪声
+驱动完整摩擦力矩反复换向。所有项贯穿启动、ACTIVE、protective hold 和缓存补偿，并记录
+在结果 profile；它们是显式候选参数，不修改 URDF、不隐式激活标定。
 
 重要 owner 规则：
 

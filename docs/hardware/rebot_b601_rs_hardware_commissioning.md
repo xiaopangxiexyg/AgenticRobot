@@ -523,7 +523,7 @@ printf '%s\n' 'shell remains active'
 ```
 
 本入口正常 active 控制默认由软件按
-`tau_i = gravity_scale*gravity_joint_scales[i]*g_i(q) + Kp_i*(q_ref_i-q_i) + Kd_i*(dq_ref_i-dq_i) + (J^T F)_i`
+`tau_i = gravity_scale*gravity_joint_scales[i]*g_i(q+offset) + bias_i + friction_i*direction(dq_i) + Kp_i*(q_ref_i-q_i) + Kd_i*(dq_ref_i-dq_i) + (J^T F)_i`
 组合重力前馈、
 位置项、基于 `mechPos (0x7019)` 的有限差分阻尼和可选末端 overlay。启动和
 `startup-replay` 的临时锁例外地使用驱动器本地 MIT Kp/Kd：主机前馈不重复临时位置或
@@ -543,6 +543,14 @@ ACTIVE 中临时修正，否则第一次 Ctrl-C 或一般异常会产生力矩�
 非负，不把常规调参范围写成代码硬限制；实际总输出仍受现有 URDF effort 比例、驱动器
 `0x700B` 回读限矩和 slew conditioner 约束。结果 JSON 的 `profile.gravity_joint_scales` 与
 `profile.effective_gravity_multipliers` 会记录本次真实配置。
+
+`--gravity-joint-offsets-rad`、`--gravity-joint-bias-nm` 和
+`--gravity-coulomb-friction-nm` 同样按 J1--J6 顺序显式给出，默认均为六个零，因而不改变
+旧命令。offset 只改变 Pinocchio 重力求值姿态 `q+offset`；bias 是有符号常值力矩；Coulomb
+项的幅值必须非负，方向来自 `mechPos` 有限差分速度。为防止零速量化噪声让非零摩擦项
+逐帧换向，`--gravity-coulomb-velocity-threshold-rad-s` 定义方向为零的速度区间，默认零且
+只有启用非零摩擦项时才有实际影响。这些配置和比例一样贯穿启动、ACTIVE 与 protective
+hold，并完整写入结果 `profile`；省略全部新增参数即可回退到原始 URDF 重力模型。
 
 逐关节比例必须作为候选对照而不是静默默认值。Seeed 的 RS 实机报告曾得到 J2/J3 约
 `0.948/0.952` 的有效重力比例；本机第 10 个无接触窗口也观察到 J2 在正重力方向发生延迟
