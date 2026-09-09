@@ -221,3 +221,74 @@ fixture 的末端弹簧/阻尼在 host tick 计算，然后 ZOH 50 ms。偏置�
 本批验证：同上七个测试文件 **118 passed**（34.35 s），新增 20/500 Hz 准时交接和
 deadline 上位移保护不被跳过的回归检查；Ruff、资源 audit、`git diff --check` 通过。
 交付状态为待合并，依赖上一候选；未 merge、push、安装或触发硬件。
+
+## M1 可复现实验参数与长时验证（2026-09-10）
+
+基线 `99a211fc92f3a9ecd46ca4bada274bfd4504ec1c`，后继分支
+`codex/b601-real2sim-gain-experiments`。现有 haptic demo 增加
+`--fixture-stiffness-scale` 与 `--fixture-damping-scale`，默认都为 1。
+倍率同时作用于平移/旋转对应项，不改变 motor-local Kd、标定补偿、力矩限幅或
+速度/加速度/效果验收门限。JSON `fixture_contract` 记录倍率及实际增益。
+两者需有限非负；虚拟墙保持原有“刚度/阻尼不能同时为零”的约束。
+关闭 spring/pose 增益可用于无 overlay 对照，但不冒充效果 PASS。
+
+固定 operator gravity profile、官方启动锁增益、1 kHz physics 和 pose-6d 初始扰动，
+对照 1.5 s 的结果如下（倍率实验最初通过进程内替换构造参数进行，现在可由 CLI 复现）：
+
+| host Hz | stiffness scale | damping scale | 结果 |
+| --- | --- | --- | --- |
+| 20 | 1 | 1 | J6 acceleration guard，约 637.11 rad/s² |
+| 20 | 1 | 0.1 | J6 acceleration guard，约 442.11 rad/s² |
+| 20 | 0.25 | 0.1 | J6 velocity guard，约 2.018 rad/s |
+| 20 | 0.1 | 0.1 | J6 velocity guard，约 2.005 rad/s |
+| 50 | 1 | 1 | J6 acceleration guard，约 332.04 rad/s² |
+| 125 | 1 | 1 | J6 acceleration guard，约 517.94 rad/s² |
+| 250 | 1 | 1 | J6 acceleration guard，约 254.86 rad/s² |
+| 500 | 1 | 1 | PASS |
+
+上述有限对照不是完整稳定域，更不能将“500 Hz 通过”解释为实机最低频率。
+下一步低频控制实验应分析 sampled feedback 的能量与局部阻尼作用，不能仅继续放宽阈值。
+
+### 长时钟误差修复
+
+500 Hz / 10 s 原先在第 7981 个物理步报 `physics_clock_desynchronized`，当时运动已基本
+静止。根因是 MuJoCo 累加 dt 的舍入误差超过固定容差，而调度器使用 tick*dt。
+现用浮点求和误差界 `gamma_n * abs(time)`，并将容差硬封顶为四分之一个 physics tick；
+不会接受外部多推进一个完整物理步。新增 10,000 步回归，随后主动外部 step 必须拒绝。
+本修复不涉及真机 timestamp、CAN freshness 或 watchdog，也不放宽运动安全阈值。
+
+修复后同一 500 Hz / 10 s 实验完整运行 10,000 ticks，simulation/effect PASS，未触发保护。
+完整 JSON：开发机 `/tmp/b601-gains-500hz-10s-corrected.json`，该文件是本机运行证据，
+不是 Git 资产。可使用下列仅仿真、前台命令重现；不启动 CAN、不发送真机命令：
+
+```bash
+WT=/tmp/b601-real2sim-gain-experiments
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python
+LOG=/tmp/b601-real2sim-command-and-output.log
+ARGS=( "$PY" -m sim.mujoco.rebot_b601_rs.haptic_demo
+  --rebot-source-root hardware/reBotArm_control_py
+  --fixture pose-6d --real2sim-controller --host-hz 500 --duration-sec 10
+  --fixture-stiffness-scale 1 --fixture-damping-scale 1
+  --startup-lock-kp 50 150 150 50 50 50
+  --startup-lock-kd 3 10 10 5 4 4 )
+printf '%s\n' 'SIMULATION ONLY; foreground run'
+if (
+  cd "$WT" || exit 2
+  printf 'command:'
+  printf ' %q' "${ARGS[@]}"
+  printf '\n'
+  PYTHONDONTWRITEBYTECODE=1 "${ARGS[@]}"
+) >> "$LOG" 2>&1; then
+  STATUS=0
+else
+  STATUS=$?
+fi
+printf 'simulation exit code: %s\nlog: %s\n' "$STATUS" "$LOG"
+printf '%s\n' 'shell remains active'
+```
+
+本批仍待合并，前序候选保留。没有改 URDF、总路线图、真机实现或 Python 环境。
+
+验证：上述七个 B601/边界测试文件 **131 passed**（35.83 s）；Ruff、资源 audit、
+`git diff --check` 通过。新增倍率非法值、CLI 传递、零增益不冒充效果验收、墙约束，
+以及长时正常时钟/外部一步污染回归。10 秒 6D CLI 实验为独立的离线效果证据。

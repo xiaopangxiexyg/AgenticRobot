@@ -1271,9 +1271,17 @@ class B601MujocoEffortDriver:
 
     def _latch_state_fault_if_needed(self) -> bool:
         expected_time_sec = self.physics_time_sec
-        time_tolerance_sec = max(
-            1e-12,
-            10.0 * np.finfo(float).eps * max(1.0, abs(expected_time_sec)),
+        # MuJoCo repeatedly adds dt, whereas the scheduler multiplies tick*dt.
+        # Bound summation roundoff (gamma_n * sum(abs(dt))) rather than treating
+        # accumulated rounding as a foreign step. Never tolerate a full tick.
+        n_eps = self._physics_tick * np.finfo(float).eps
+        roundoff = (
+            n_eps / (1.0 - n_eps) * abs(expected_time_sec)
+            if n_eps < 1.0 else math.inf
+        )
+        time_tolerance_sec = min(
+            self.timing.physics_timestep_sec / 4.0,
+            max(1e-12, roundoff),
         )
         if self._fault_reason is None and not math.isclose(
             float(self.scene.data.time),

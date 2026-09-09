@@ -89,6 +89,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Host torque rate for --real2sim-controller only.",
     )
     parser.add_argument(
+        "--fixture-stiffness-scale", type=float, default=1.0,
+        help="Offline fixture stiffness multiplier; does not relax acceptance or limits.",
+    )
+    parser.add_argument(
+        "--fixture-damping-scale", type=float, default=1.0,
+        help="Offline fixture damping multiplier; local motor Kd stays unchanged.",
+    )
+    parser.add_argument(
         "--startup-lock-kp",
         nargs=6,
         type=float,
@@ -175,6 +183,8 @@ def run_haptic_fixture_demo(
     real2sim_controller: bool = False,
     host_hz: float = 20.0,
     startup_profile: B601SimStartupProfile | None = None,
+    fixture_stiffness_scale: float = 1.0,
+    fixture_damping_scale: float = 1.0,
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
@@ -189,6 +199,23 @@ def run_haptic_fixture_demo(
     duration = float(duration_sec)
     if not math.isfinite(duration) or duration <= 0.0:
         raise ValueError("duration_sec must be finite and positive")
+    for name, value in (
+        ("fixture_stiffness_scale", fixture_stiffness_scale),
+        ("fixture_damping_scale", fixture_damping_scale),
+    ):
+        if isinstance(value, bool) or not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    stiffness = tuple(
+        v * fixture_stiffness_scale for v in DEFAULT_SPRING_STIFFNESS_N_PER_M
+    )
+    damping = tuple(
+        v * fixture_damping_scale for v in DEFAULT_SPRING_DAMPING_N_S_PER_M
+    )
+    if (
+        fixture_name == "wall"
+        and fixture_stiffness_scale == fixture_damping_scale == 0.0
+    ):
+        raise ValueError("wall stiffness or damping must be positive")
 
     model = B601PinocchioModel.from_rebot_source_root(source_root)
     initial_qpos = np.asarray(DEFAULT_HAPTIC_INITIAL_QPOS, dtype=float)
@@ -224,14 +251,14 @@ def run_haptic_fixture_demo(
     if fixture_name == "spring":
         fixture = B601TranslationalVirtualSpring(
             anchor_position_m=tuple(float(value) for value in anchor_position),
-            stiffness_n_per_m=DEFAULT_SPRING_STIFFNESS_N_PER_M,
-            damping_n_s_per_m=DEFAULT_SPRING_DAMPING_N_S_PER_M,
+            stiffness_n_per_m=stiffness,
+            damping_n_s_per_m=damping,
             max_abs_force_n=(DEFAULT_MAX_FORCE_N,) * 3,
         )
         fixture_contract: dict[str, object] = {
             "anchor_position_m": [float(value) for value in anchor_position],
-            "stiffness_n_per_m": list(DEFAULT_SPRING_STIFFNESS_N_PER_M),
-            "damping_n_s_per_m": list(DEFAULT_SPRING_DAMPING_N_S_PER_M),
+            "stiffness_n_per_m": list(stiffness),
+            "damping_n_s_per_m": list(damping),
             "max_abs_force_n": [DEFAULT_MAX_FORCE_N] * 3,
         }
     elif fixture_name == "wall":
@@ -240,8 +267,8 @@ def run_haptic_fixture_demo(
         fixture = B601VirtualWall(
             normal=tuple(float(value) for value in wall_normal),
             offset_m=wall_offset,
-            stiffness_n_per_m=180.0,
-            damping_n_s_per_m=12.0,
+            stiffness_n_per_m=180.0 * fixture_stiffness_scale,
+            damping_n_s_per_m=12.0 * fixture_damping_scale,
             max_force_n=DEFAULT_MAX_FORCE_N,
         )
         fixture_contract = {
@@ -255,25 +282,33 @@ def run_haptic_fixture_demo(
     else:
         fixture = B601PoseVirtualSpring(
             anchor_pose=anchor_pose,
-            translational_stiffness_n_per_m=DEFAULT_SPRING_STIFFNESS_N_PER_M,
-            translational_damping_n_s_per_m=DEFAULT_SPRING_DAMPING_N_S_PER_M,
-            rotational_stiffness_nm_per_rad=(8.0,) * 3,
-            rotational_damping_nm_s_per_rad=(0.8,) * 3,
+            translational_stiffness_n_per_m=stiffness,
+            translational_damping_n_s_per_m=damping,
+            rotational_stiffness_nm_per_rad=(8.0 * fixture_stiffness_scale,) * 3,
+            rotational_damping_nm_s_per_rad=(0.8 * fixture_damping_scale,) * 3,
             max_abs_force_n=(DEFAULT_MAX_FORCE_N,) * 3,
             max_abs_torque_nm=(0.5,) * 3,
         )
         fixture_contract = {
             "anchor_source": "current_fk_before_disturbance",
             "anchor_pose": np.asarray(anchor_pose, dtype=float).tolist(),
-            "translational_stiffness_n_per_m": list(DEFAULT_SPRING_STIFFNESS_N_PER_M),
-            "translational_damping_n_s_per_m": list(DEFAULT_SPRING_DAMPING_N_S_PER_M),
-            "rotational_stiffness_nm_per_rad": [8.0] * 3,
-            "rotational_damping_nm_s_per_rad": [0.8] * 3,
+            "translational_stiffness_n_per_m": list(stiffness),
+            "translational_damping_n_s_per_m": list(damping),
+            "rotational_stiffness_nm_per_rad": list(
+                fixture.rotational_stiffness_nm_per_rad
+            ),
+            "rotational_damping_nm_s_per_rad": list(
+                fixture.rotational_damping_nm_s_per_rad
+            ),
             "max_abs_force_n": [DEFAULT_MAX_FORCE_N] * 3,
             "max_abs_torque_nm": [0.5] * 3,
             "disturbance": disturbance_contract,
         }
 
+    fixture_contract.update(
+        stiffness_scale=fixture_stiffness_scale,
+        damping_scale=fixture_damping_scale,
+    )
     scene = build_b601_mujoco_scene(
         source_root,
         initial_arm_qpos=initial_qpos,
@@ -631,6 +666,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         real2sim_controller=args.real2sim_controller,
         host_hz=args.host_hz,
         startup_profile=startup,
+        fixture_stiffness_scale=args.fixture_stiffness_scale,
+        fixture_damping_scale=args.fixture_damping_scale,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return code

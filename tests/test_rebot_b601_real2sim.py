@@ -408,3 +408,73 @@ def test_native_total_force_limit_includes_local_spring(startup_driver):
         ),
         atol=1e-12,
     )
+
+
+@pytest.mark.parametrize("field", ["fixture_stiffness_scale", "fixture_damping_scale"])
+@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf"), True])
+def test_fixture_gain_scales_reject_invalid_values_before_loading_model(field, value):
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+
+    with pytest.raises(ValueError, match=field):
+        run_haptic_fixture_demo(
+            source_root="not-a-vendor-checkout", fixture_name="pose-6d", **{field: value}
+        )
+
+
+@pytest.mark.parametrize("fixture_name", ["spring", "pose-6d"])
+def test_zero_fixture_gains_are_reported_without_false_effect_acceptance(fixture_name):
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+
+    code, report = run_haptic_fixture_demo(
+        source_root=SOURCE,
+        fixture_name=fixture_name,
+        fixture_stiffness_scale=0.0,
+        fixture_damping_scale=0.0,
+        duration_sec=0.02,
+    )
+    assert code == 3
+    assert not report["simulation_acceptance"]["passed"]
+    assert report["fixture_contract"]["stiffness_scale"] == 0.0
+    assert report["fixture_contract"]["damping_scale"] == 0.0
+    assert report["simulation_acceptance"]["run_completed"]
+
+
+def test_fixture_gain_cli_forwards_explicit_scales(monkeypatch, capsys):
+    from sim.mujoco.rebot_b601_rs import haptic_demo
+
+    captured = {}
+
+    def run(**kwargs):
+        captured.update(kwargs)
+        return 3, {"diagnostic": True}
+
+    monkeypatch.setattr(haptic_demo, "run_haptic_fixture_demo", run)
+    assert haptic_demo.main([
+        "--rebot-source-root", "vendor", "--fixture-stiffness-scale", "0.25",
+        "--fixture-damping-scale", "0.1",
+    ]) == 3
+    assert captured["fixture_stiffness_scale"] == 0.25
+    assert captured["fixture_damping_scale"] == 0.1
+    assert '"diagnostic": true' in capsys.readouterr().out
+
+
+def test_wall_rejects_both_zero_gains_before_model_load():
+    from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+
+    with pytest.raises(ValueError, match="wall stiffness or damping"):
+        run_haptic_fixture_demo(
+            source_root="not-a-vendor-checkout", fixture_name="wall",
+            fixture_stiffness_scale=0.0, fixture_damping_scale=0.0,
+        )
+
+
+def test_long_run_clock_roundoff_does_not_allow_foreign_step(startup_driver):
+    driver = startup_driver
+    for i in range(10000):
+        tick = driver.step_physics(reference(driver, i) if driver.command_due else None)
+        assert not tick.driver_faulted
+    assert driver.scene.data.time != driver.physics_time_sec
+    driver.scene.mujoco.mj_step(driver.scene.model, driver.scene.data)
+    tick = driver.step_physics()
+    assert tick.fault_reason == "physics_clock_desynchronized"
+    assert not tick.plant_advanced
