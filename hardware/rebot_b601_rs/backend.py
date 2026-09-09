@@ -15,17 +15,21 @@ request before polling; this is needed by the commissioning loop because a
 RobStride bus does not necessarily populate the cache until a request frame is
 sent.  On the pinned firmware the resulting compact type-0x18 position stream
 is not decoded by MotorBridge 0.4.9, so an active caller also reads
-``mechPos`` (0x7019) through the vendor parameter API.  This position-only
-fallback is explicit in each observation; velocity/torque consumers must still
-require their corresponding fields.  MotorBridge 0.4.9 does not expose the
-source timestamp or a receive sequence for a RobStride frame, so neither path
-claims verified per-frame freshness.  The distinction is part of the public
-state contract and must be closed before hardware haptic acceptance.
+``mechPos`` (0x7019) through the vendor parameter API.  When the installed
+MotorBridge exposes it, the host-id-qualified parameter ABI is preferred so a
+response for another device cannot be accepted as this joint's value.  This
+position-only fallback is explicit in each observation; velocity/torque
+consumers must still require their corresponding fields.  MotorBridge 0.4.9
+does not expose the source timestamp or a receive sequence for a RobStride
+frame, so neither path claims verified per-frame freshness.  The distinction
+is part of the public state contract and must be closed before hardware haptic
+acceptance.
 """
 
 from __future__ import annotations
 
 import math
+import struct
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -84,6 +88,15 @@ def _finite_float(value: object, *, name: str) -> float:
     if not math.isfinite(normalized):
         raise ValueError(f"{name} must be finite")
     return normalized
+
+
+def _float32_bits(value: float) -> int | None:
+    """Return the wire-level IEEE-754 single-precision bits when representable."""
+
+    try:
+        return struct.unpack("<I", struct.pack("<f", value))[0]
+    except (OverflowError, struct.error):
+        return None
 
 
 def _positive_float(value: object, *, name: str) -> float:
@@ -201,6 +214,14 @@ class B601RSBackendConfig:
     the URDF position limits.  A motion-capable caller should supply limits
     obtained from the same pinned URDF before invoking a command method.
 
+    ``feedback_position_limits_rad`` is a separate, read-side admission
+    envelope.  It may be slightly wider than the command envelope when a
+    measured encoder boundary compatibility window has been independently
+    documented (for example the B601 J2/J3/J4 zero/nominal-boundary
+    observations).  It never relaxes an outgoing reference check.  When it is
+    omitted, the command position limits are also used for feedback admission
+    when available.
+
     ``feedback_timeout_sec`` bounds the active RobStride ``mechPos`` parameter
     read, while both timeout values remain explicit configuration declarations
     for the later guarded control loop.  This adapter does not infer freshness
@@ -217,6 +238,7 @@ class B601RSBackendConfig:
     allow_active_reporting: bool = False
     position_limits_rad: tuple[tuple[float, float], ...] | None = None
     source_config: str | None = None
+    feedback_position_limits_rad: tuple[tuple[float, float], ...] | None = None
 
     def __post_init__(self) -> None:
         channel = str(self.channel).strip()
@@ -248,22 +270,29 @@ class B601RSBackendConfig:
             raise TypeError("allow_motion must be a bool")
         if not isinstance(self.allow_active_reporting, bool):
             raise TypeError("allow_active_reporting must be a bool")
-        if self.position_limits_rad is not None:
+        for field_name in ("position_limits_rad", "feedback_position_limits_rad"):
+            raw_limits = getattr(self, field_name)
+            if raw_limits is None:
+                continue
             try:
                 limits = tuple(
                     tuple(float(value) for value in pair)
-                    for pair in self.position_limits_rad
+                    for pair in raw_limits
                 )
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    "position_limits_rad must contain six (lower, upper) pairs"
+                    f"{field_name} must contain six (lower, upper) pairs"
                 ) from exc
             if len(limits) != 6 or any(len(pair) != 2 for pair in limits):
-                raise ValueError("position_limits_rad must contain six (lower, upper) pairs")
+                raise ValueError(
+                    f"{field_name} must contain six (lower, upper) pairs"
+                )
             for lower, upper in limits:
                 if not math.isfinite(lower) or not math.isfinite(upper) or lower >= upper:
-                    raise ValueError("position_limits_rad must contain finite increasing pairs")
-            object.__setattr__(self, "position_limits_rad", limits)
+                    raise ValueError(
+                        f"{field_name} must contain finite increasing pairs"
+                    )
+            object.__setattr__(self, field_name, limits)
         if self.source_config is not None:
             source = str(self.source_config).strip()
             object.__setattr__(self, "source_config", source or None)
@@ -276,6 +305,7 @@ class B601RSBackendConfig:
         allow_motion: bool = False,
         allow_active_reporting: bool = False,
         position_limits_rad: tuple[tuple[float, float], ...] | None = None,
+        feedback_position_limits_rad: tuple[tuple[float, float], ...] | None = None,
     ) -> "B601RSBackendConfig":
         """Load the explicit RS YAML without importing or connecting hardware."""
 
@@ -294,6 +324,7 @@ class B601RSBackendConfig:
             allow_motion=allow_motion,
             allow_active_reporting=allow_active_reporting,
             position_limits_rad=position_limits_rad,
+            feedback_position_limits_rad=feedback_position_limits_rad,
             source_config=str(config_path),
         )
 
@@ -305,6 +336,7 @@ class B601RSBackendConfig:
         allow_motion: bool = False,
         allow_active_reporting: bool = False,
         position_limits_rad: tuple[tuple[float, float], ...] | None = None,
+        feedback_position_limits_rad: tuple[tuple[float, float], ...] | None = None,
         source_config: str | None = None,
     ) -> "B601RSBackendConfig":
         data = _mapping(payload, name="B601-RS config")
@@ -372,6 +404,7 @@ class B601RSBackendConfig:
             allow_motion=allow_motion,
             allow_active_reporting=allow_active_reporting,
             position_limits_rad=position_limits_rad,
+            feedback_position_limits_rad=feedback_position_limits_rad,
             source_config=source_config,
         )
 
@@ -805,6 +838,11 @@ class B601RSBackend:
         errors: list[str] = [*request_errors]
         if poll_error:
             errors.append(poll_error)
+        feedback_limits = (
+            self.config.feedback_position_limits_rad
+            if self.config.feedback_position_limits_rad is not None
+            else self.config.position_limits_rad
+        )
         for joint in self.config.joints:
             motor = self._motors[joint.name]
             raw_state_error: str | None = None
@@ -821,20 +859,77 @@ class B601RSBackend:
             # backend observation remains receive-only.
             live_position: float | None = None
             position_error: str | None = None
+            position_source = "vendor_motor_state_cache"
             if request_feedback and joint.vendor == "robstride":
                 try:
-                    read_position = getattr(motor, "robstride_get_param_f32")
                     timeout_ms = max(
                         1,
                         int(round(self.config.feedback_timeout_sec * 1000.0)),
                     )
+                    read_position_host = getattr(
+                        motor,
+                        "robstride_get_param_f32_host_id",
+                        None,
+                    )
+                    if callable(read_position_host):
+                        # MotorBridge exposes a host-id-qualified ABI for
+                        # RobStride parameter reads.  Prefer it when present:
+                        # a shared CAN host can otherwise accept a stale or
+                        # mismatched parameter response as this motor's value.
+                        raw_position = read_position_host(
+                            B601_RS_MECH_POS_PARAM_ID,
+                            joint.feedback_id,
+                            timeout_ms,
+                        )
+                        position_source = (
+                            "robstride_mech_pos_parameter_host_id"
+                        )
+                    else:
+                        read_position = getattr(
+                            motor,
+                            "robstride_get_param_f32",
+                        )
+                        raw_position = read_position(
+                            B601_RS_MECH_POS_PARAM_ID,
+                            timeout_ms,
+                        )
+                        position_source = "robstride_mech_pos_parameter"
                     live_position = _finite_float(
-                        read_position(B601_RS_MECH_POS_PARAM_ID, timeout_ms),
+                        raw_position,
                         name=f"{joint.name}.mechPos",
                     )
                 except Exception as exc:  # vendor errors become an invalid snapshot
                     position_error = (
-                        f"{joint.name}.mechPos(0x{B601_RS_MECH_POS_PARAM_ID:x}): {exc}"
+                        f"{joint.name}.mechPos(0x{B601_RS_MECH_POS_PARAM_ID:x}, "
+                        f"host_id=0x{joint.feedback_id:02x}): {exc}"
+                    )
+
+            # Keep the read-side admission envelope separate from the
+            # outgoing command envelope.  A finite IEEE-754 value can still
+            # be an impossible encoder position (for example a corrupted
+            # parameter response); reject it here, before any consumer can
+            # treat the snapshot as valid or use it for gravity/FK/dispatch.
+            if (
+                position_error is None
+                and feedback_limits is not None
+                and live_position is not None
+            ):
+                lower, upper = feedback_limits[
+                    B601_RS_ARM_JOINT_NAMES.index(joint.name)
+                ]
+                if not lower <= live_position <= upper:
+                    raw_bits = _float32_bits(live_position)
+                    raw_bits_text = (
+                        f" raw_f32_bits=0x{raw_bits:08x}"
+                        if raw_bits is not None
+                        else ""
+                    )
+                    position_error = (
+                        f"{joint.name}: mechPos(0x{B601_RS_MECH_POS_PARAM_ID:04x}) "
+                        f"raw={live_position!r} motor_id={joint.motor_id} "
+                        f"feedback_id={joint.feedback_id} source={position_source} "
+                        f"{raw_bits_text} outside feedback "
+                        f"acceptance limits [{lower!r}, {upper!r}]"
                     )
 
             if raw_state is None and live_position is None:
@@ -862,12 +957,15 @@ class B601RSBackend:
                     )
                 )
                 continue
+            position = live_position
             if raw_state is None:
                 errors.extend(
                     error
                     for error in (raw_state_error, poll_error)
                     if error and error not in errors
                 )
+                if position_error and position_error not in errors:
+                    errors.append(position_error)
                 observations.append(
                     B601JointState(
                         name=joint.name,
@@ -875,17 +973,21 @@ class B601RSBackend:
                         feedback_id=joint.feedback_id,
                         arbitration_id=None,
                         status_code=None,
-                        position_rad=live_position,
+                        position_rad=position,
                         velocity_reported=None,
                         torque_reported_nm=None,
                         observed_at_sec=now,
                         sample_sequence=self._state_sequence,
-                        valid=not request_errors and poll_error is None,
-                        stale=bool(
-                            request_errors or poll_error
+                        valid=(
+                            not request_errors
+                            and poll_error is None
+                            and position_error is None
                         ),
-                        error=poll_error,
-                        position_source="robstride_mech_pos_parameter",
+                        stale=bool(
+                            request_errors or poll_error or position_error
+                        ),
+                        error=position_error or poll_error or raw_state_error,
+                        position_source=position_source,
                     )
                 )
                 continue
@@ -897,6 +999,11 @@ class B601RSBackend:
                     getattr(raw_state, "pos"), name=f"{joint.name}.pos"
                 )
                 position = cached_position if live_position is None else live_position
+                position_source = (
+                    position_source
+                    if live_position is not None
+                    else "vendor_motor_state_cache"
+                )
                 velocity = _finite_float(getattr(raw_state, "vel"), name=f"{joint.name}.vel")
                 torque = _finite_float(getattr(raw_state, "torq"), name=f"{joint.name}.torq")
                 state_error: str | None = None
@@ -904,6 +1011,32 @@ class B601RSBackend:
                     state_error = f"{joint.name}: feedback can_id={can_id} expected {joint.motor_id}"
                 elif status_code != 0:
                     state_error = f"{joint.name}: vendor status_code={status_code}"
+                if (
+                    position_error is None
+                    and feedback_limits is not None
+                    and position is not None
+                ):
+                    lower, upper = feedback_limits[
+                        B601_RS_ARM_JOINT_NAMES.index(joint.name)
+                    ]
+                    if not lower <= position <= upper:
+                        source_label = (
+                            f"mechPos(0x{B601_RS_MECH_POS_PARAM_ID:04x})"
+                            if live_position is not None
+                            else "vendor_state.pos"
+                        )
+                        raw_bits = _float32_bits(position)
+                        raw_bits_text = (
+                            f" raw_f32_bits=0x{raw_bits:08x}"
+                            if raw_bits is not None
+                            else ""
+                        )
+                        position_error = (
+                            f"{joint.name}: {source_label} raw={position!r} "
+                            f"motor_id={joint.motor_id} feedback_id={joint.feedback_id} "
+                            f"{raw_bits_text} outside feedback acceptance limits "
+                            f"[{lower!r}, {upper!r}]"
+                        )
                 if state_error:
                     errors.append(state_error)
                 if position_error:
@@ -935,11 +1068,7 @@ class B601RSBackend:
                             or request_errors
                         ),
                         error=state_error or position_error or poll_error,
-                        position_source=(
-                            "robstride_mech_pos_parameter"
-                            if live_position is not None
-                            else "vendor_motor_state_cache"
-                        ),
+                        position_source=position_source,
                     )
                 )
             except (AttributeError, TypeError, ValueError) as exc:

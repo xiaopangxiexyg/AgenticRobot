@@ -48,7 +48,7 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   保持锁存，`close()` 拒绝释放 backend，避免把不确定的设备上报状态隐藏在析构中；
 - 低增益 probe 的所有正常阻抗/重力模式都固定使用 joint1..joint6；`--joint` 只决定
   slow-step 目标或单关节增益覆盖，不缩小使能和 MIT dispatch 集合。异常路径只有在
-  last-safe 快照通过新鲜度、限位、速度和小 rebase 检查后才锁存 J2/J3，否则直接全部
+  last-safe 快照通过新鲜度、限位、速度和小 rebase 检查后才锁存六个 arm 关节，否则直接全部
   arm `safe_stop`。这个保护保持不包含 ID7 夹爪；
 - 任何 motion-capable caller 都必须先从同一 pinned URDF 提供六关节 position limits；本轮
   位置频率 probe 会在 enable 前从 `--rebot-source-root`（默认由 config 路径推导）解析并
@@ -78,18 +78,53 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   MIT/POS_VEL 控制帧，也不改变运行前已经存在的电机状态；`CAPTURED` 只表示采样完成，
   不能解读为力控或硬件通过。该结果用于判断 `last-safe` 速度门是否被反馈量化噪声触发，
   不允许据此直接放宽保护阈值。
-- 反馈进入限位/速度/阻抗计算前，只有 joint2 与 joint3 的窄边界
-  `-5e-4 <= q < 0 rad` 会被表示为合法的 `0 rad`。这是对已标零后编码器量化负零的
-  反馈表示归一化，不修改 pinned URDF 的 `[0, 3.14]` 位置限位，也不改变出站参考、
-  torque/slew 包络或更负值的 fail-closed 行为；例如 `q < -5e-4 rad` 仍会被原有限位门
-  拒绝。JSON 样本同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
-  `boundary_normalized_joint_names`，便于复核实际读数。
+- 反馈进入限位/速度/阻抗计算前，J2 的已观测零位/启动边界
+  `-1e-2 <= q < 0 rad`、J3 的已观测边界 `-3e-3 <= q < 0 rad` 会被表示为合法的
+  `0 rad`。J4 的运行坐标额定边界按权威 `+/-pi/2` 表示（源 URDF 的
+  `-1.57/1.57` 仅是两位小数的记录），并额外接纳
+  `-pi/2-0.001 <= q < -pi/2 rad`，投影到精确的 `-pi/2`。这些都是反馈状态的
+  有界投影，不修改源 URDF 或真实机械硬限位。J4/J5/J6 另有独立的反馈工作包络：
+  在 nominal URDF 上下界外各接纳 `0.1 rad`，真实反馈不做投影，仍进入 FK 和重力计算；
+  这不是自动规划或位置命令范围。超过工作包络的读数仍 fail-closed。JSON 样本同时保留 `raw_qpos_rad`、归一化后的
+  `qpos_rad` 和 `boundary_normalized_joint_names`，便于复核实际读数。
+- J2 的 `-1e-2 rad` 是只读接纳下限，不是常规工作范围：两次零位只读捕获曾观察到
+  `-4.943/-4.517 mrad`，2026-09-08 使用 host-id 限定反馈的启动锁/重力交接又观察到
+  连贯的 `-7.627 mrad` 边界瞬态，因此仅对 J2 保留到 `-10 mrad` 的整值余量。J2/J3
+  不额外扩展一般工作包络；比各自下限更负的反馈仍 fail-closed。
 - active low-gain probe 用相邻 normalized q 与精确 host receive `dt` 计算 qvel，再用连续
-  qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0`、非有限值、
-  qvel 或 qacc 越限都在任何 MIT dispatch 前拒绝。JSON 的 `motion_guard.rejected_sample`
-  独立保存 offending joint、raw/normalized q、previous/current qvel、qacc、dt、seq/timestamp，
-  并标记 `command_dispatched=false`、`eligible_for_last_safe=false`。默认
+  qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0` 和非有限值
+  立即拒绝。有限但 qvel 或 qacc 越限的第一帧在任何 MIT dispatch 前隔离：不更新
+  `previous_q`、feedback timestamp、qvel history、`final_q`、fault snapshot 或 `last-safe`，
+  电机继续保持上一份完整命令和已配置的 driver Kd。下一帧以最后可信位置和跨过异常帧的
+  总 `dt` 重新计算；恢复正常则继续 ACTIVE/标定，连续第二帧仍越限才进入 protective hold。
+  这不是把 `12.6 rad/s` 当成合法拖动，也不改变 CLI 配置的速度/加速度阈值。JSON 的
+  `motion_guard.rejected_sample` 独立保存 offending joint、raw/normalized q、previous/current
+  qvel、qacc、dt、seq/timestamp，并标记 `command_dispatched=false`、
+  `eligible_for_last_safe=false`；确认策略和隔离/恢复/连续中止计数也一并保存。默认
   `--acceleration-abort-rad-s2 4.0` 只是待真机整定的 commissioning seed，不是已认证上限。
+  位置限位和 motion guard 都先于更新 `final_q`、当前故障快照和 `last-safe`；被拒绝的
+  反馈只进入 evidence，不会被用于重力、阻抗或保护保持计算。
+- 反馈接纳现在在 wired backend 入口再次执行：`feedback_position_limits_rad` 是只读的
+  接纳包络，默认回退到严格的 `position_limits_rad`；probe 显式加入 J2/J3/J4
+  已批准的边界窗口，以及 J4/J5/J6 各 `0.1 rad` 的反馈工作余量。这样即使
+  `mechPos(0x7019)` 返回一个有限但物理上不可能的巨大数值，
+  backend 也会将该关节标为 `valid=false, stale=true`，并在错误中保留关节名、motor/feedback
+  ID、参数 ID、原始值、可用时的 IEEE-754 单精度位模式和接纳区间；坏帧不会被任何 backend 消费者误当成完整状态。出站 MIT/
+  POS_VEL 仍只使用严格 URDF 包络。临时启动/回放锁之外的 active probe vendor Kp 固定为零；当真实反馈位于
+  J4/J5/J6 工作余量时，软件位置项和 `g(q)` 使用真实接纳姿态，编码进 MIT 帧的位置参考
+  则夹在 nominal 命令包络内。临时锁若遇到这种夹紧，必须把对应关节的 vendor Kp 置零，只保留
+  重力前馈和本地 Kd，不能让夹紧后的参考主动把关节拉向 URDF 边界。读侧余量不能用于放宽
+  slow-step 或其他规划命令。active probe 会把每关节
+  backend 诊断写入 `motion_guard.rejected_sample.backend_joint_diagnostics`，随后复用上一份
+  已验证的六轴重力缓存进入 `PROTECTIVE_HOLD`；只有已配置 driver Kd 时，反馈不可信的
+  降级阶段才仍有电机本地阻尼。终端会用完整分隔线分别显示 `PROTECTIVE HOLD DEGRADED`、
+  `LATCHED` 和 `RECOVERED`，并明确当前六轴仍使能、控制能力和再次 Ctrl-C/SIGUSR1 的
+  全失能含义。只有完整缓存发送也失败或操作者第二次
+  Ctrl-C/SIGUSR1 才允许全臂失能。
+- 若安装的 MotorBridge 提供 `robstride_get_param_f32_host_id()`，backend 会优先使用带
+  `feedback_id/host_id` 的参数读取 ABI；旧版本没有该入口时才回退到未限定 host 的兼容调用。
+  这缩小了共享 CAN 队列中把其他设备的参数响应当成当前关节的机会，但仍不把返回值视为已验证
+  的设备时间戳/序列；读侧数值包络和上一份安全缓存仍是必须的第二道边界。
 - 2026-09-04 的人工单轴扰动被原 `0.03 rad/s` 正常控制门在 `0.098028 rad/s` 中止；
   操作者于 2026-09-06 补充确认中止前的单轴人工扰动已经验收。正常控制 qvel 默认值和
   后续人工单轴 commissioning 值据此调整为 `0.12 rad/s`，为已观察值保留约 22% 裕量。
@@ -330,61 +365,150 @@ slow-step 目标或单关节增益覆盖。`hold` 从使能后的当前姿态开
 末端模式的最终位置恢复由末端阻抗经完整 Jacobian 转置完成。使能后的启动状态机为：
 
 ```text
-ENABLED_UNARMED → LOCKING → LOCKED → GRAVITY_RAMP → HANDOFF → ACTIVE
+ENABLED_UNARMED → LOCKING → LOCKED → GRAVITY_RAMP (total-torque slew) → HANDOFF → ACTIVE
 ```
 
-`LOCKING` 立即捕获新鲜的 `q0`，用 pinned YAML 的 MIT Kp/Kd 构建软件侧全六关节位置锁，
-首帧和后续锁帧都经过最终总力矩/变化率包络；`LOCKED` 阶段在四个连续反馈样本期间继续
-发送固定 `q_ref=q0` 的锁帧。随后完整六轴重力向量统一爬升，重力达到目标后再用同样的
-`--torque-rise-time-sec` 把临时关节锁平滑交给最终控制器，`pose-hold/cartesian-hold`
-的末端弹簧在 `HANDOFF` 中逐步成为位置恢复主体。启动阶段不依赖未受软件包络约束的
-vendor Kp；MIT 帧的 vendor Kp 保持为零。
+`LOCKING` 立即捕获新鲜的 `q0`，把 pinned YAML 的 MIT Kp/Kd 交给电机本地 MIT 闭环建立
+六轴同步发送的临时位置锁；主机只发送经过最终总力矩/变化率包络的重力和任务前馈。若某
+关节的接纳反馈位于 nominal URDF 命令包络外，该关节仍同步发送，但本地 Kp 被置零，只保留
+重力和本地 Kd，避免编码参考夹回边界后产生主动运动。`LOCKED` 阶段
+在四个连续反馈样本期间继续发送固定 `q_ref=q0` 的锁帧。临时位置与阻尼项不再经过约
+20 Hz 的主机有限差分和力矩 slew，避免所需制动力矩反转时实际命令仍滞后并向机械臂注入
+能量。使用该锁止路径必须先通过 `--apply-driver-torque-limits` 把缩放后的 URDF effort
+写入并回读 `0x700B`，由驱动器约束完整 MIT 位置、阻尼和前馈合力矩。
 
-### 异常时的 protective hold（锁存，不是普通回零）
+完整六轴的目标重力从首个锁帧开始就进入力矩组合；不再把重力先乘一个从零开始的独立
+比例后再做一次 slew。重力与临时关节锁保持连续后，再用同样的
+`--torque-rise-time-sec` 把本地 Kp 平滑撤到零、把本地 Kd 交接到 active driver Kd，
+`pose-hold/cartesian-hold` 的末端弹簧在 `HANDOFF` 中逐步成为位置恢复主体。交接完成后
+vendor Kp 严格为零。`LOCKED` 的过渡检查使用本次运行的
+`--velocity-abort-rad-s`，以容纳使能瞬态中仍在正常运动包络内的反馈变化；它不复用
+仅用于首次 protective-hold admission 的严格 `--fault-hold-max-velocity-rad-s`。
 
-这条路径借鉴 reBot 官方的故障处置边界：通信异常不尝试回零而立即失能；普通退出才
-允许平滑回零。我们的特殊需求是在满足更严格的 admission 条件时，把 `joint2`/`joint3`
-锁在故障前最后一个安全姿态，同时把 `joint1`/`joint4`/`joint5`/`joint6` 失能。
-夹爪 ID7 不在当前 backend 的注册范围内，不能把下面的“全臂失能”理解成夹爪也已失能。
+每次运行还会把启动专项证据写入结果 JSON 的 `startup_diagnostics`。它保存使能前反馈、
+`ENABLED_UNARMED`、首个 `LOCKING` 命令、各个 `LOCKED_SETTLE` 样本以及首次
+`ACTIVE` 的位置差，并在普通逐周期 `samples[].vendor_status` 中保留 MotorBridge 已经接收的
+operation-status 缓存速度/力矩。该观测完全被动，不增加 CAN 请求，不参与控制或安全判定；
+由于 pinned ABI 没有源时间戳和命令-响应关联，它明确标为 unverified。若同时使用包含
+`robstride-startup` 调试模式的 MotorBridge，原始日志会在既有 type-17 帧之外记录 type-1
+operation-control 和 type-2 operation-status 帧，便于离线核对命令与解码。这里不在 20 Hz 控制循环中同步追加
+`iqf (0x701A)`/`torque_fdb (0x302C)` 读取，避免把每周期六次位置读取扩成十八次并降低控制节拍。
+`startup_diagnostics.displacement_gate_rad=null`：位移只作为测量证据，不新增脱离实际硬件依据的
+数值型通过阈值。
+
+### 连续使能的启动交接回放
+
+`startup-replay` 用于区分“从零位边界进入自由空间平衡”和“非边界姿态下仍有重力模型偏差”。
+它先完整执行普通启动状态机，然后保持 gravity+damping，让机械臂在软承托和物理急停保护下
+自行稳定。操作者确认机械臂已经停止后，只按一次 `R`，不拖动机械臂。程序捕获当前六轴
+姿态，并在同一次使能会话内自动执行：
+
+```text
+FIRST_ACTIVE → WAITING_FOR_R → RAMP_IN → RELOCKED → HANDOFF → SECOND_ACTIVE
+```
+
+`RAMP_IN` 使用 `--torque-rise-time-sec` 把 YAML-derived 电机本地 MIT Kp/Kd 从 active
+`Kp=0`/所选 driver Kd 平滑加入；`RELOCKED` 使用既有 `--freeze-sec` 保持；`HANDOFF` 再用
+同一 rise time 平滑回到 active `Kp=0`/所选 driver Kd。完整重力向量在全部阶段保持比例
+`1.0`，主机临时 Kp/Kd 始终为零，前馈力矩继续经过同一个绝对值和变化率 conditioner，
+完整电机输出由已回读的 `0x700B` 约束。该模式不自动判断“已经稳定”，避免增加会被
+静摩擦误导的速度/持续时间阈值；`R` 只选择回放参考，不是安全按钮。
+每个样本同时记录实际 vendor Kp/Kd、参与位置锁的关节和因 nominal 命令边界而取消 Kp 的
+关节；边界取消不是失败，也不会改变该姿态下的 `g(q)`。
+
+结果 JSON 的 `startup_replay` 保存 R 时参考、每次状态转换的 q/有限差分速度、第二次 ACTIVE
+和最终位置相对参考的六轴差值；`samples[]` 同时保存 `startup_replay_state` 和
+`startup_replay_lock_fraction`。`displacement_gate_rad` 仍为 `null`，完成回放只代表证据完整，
+不代表重力模型已经通过验收。持续时间到期和首次 Ctrl-C 仍进入既有六轴 protective hold。
+
+2026-09-09 的首个回放候选曾把 YAML Kp/Kd 作为约 20 Hz 主机软件 PD，再把位置/有限差分
+阻尼力矩送入持续 slew conditioner。实测所需制动力矩反向后，conditioned torque 多帧仍保留
+旧符号，J2 在 `RELOCKED` 内从约 `0.36 rad` 发散并往复运动；完整 type-1/type-17 证据排除
+了部分发送和浮点坏帧。当前实现禁止这条结构：临时 host Kp/Kd 为零，YAML MIT 增益只在
+驱动器本地执行，完整输出必须由回读后的 `0x700B` 约束。该修复不修改 gravity vector、
+标定窗口或离线拟合语义；回放真机复验通过前仍不能声称重力模型已经验收。
+
+### 异常时的 protective hold（全臂可拖动重力保持）
+
+这条路径不是把某几个关节强制锁死，也不是回到预设姿态。第一次 Ctrl-C 或可处理的控制
+错误会让 `joint1..joint6` 继续保持 MIT 使能，在当前姿态持续计算完整六轴重力补偿，并叠加
+一档可拖动的移动阻尼；夹爪 ID7 不在当前 backend 注册范围内，因此不参与这条控制链。软件
+Kp 为零，不存在固定位置弹簧。现场人员可以在保持重力平衡的同时拖动整条机械臂。
 
 状态转换固定为：
 
 ```text
 ACTIVE
-  ├─ 正常结束 ──> active-set 短暂保持 ──> 全部 arm safe_stop
-  ├─ Ctrl+C/异常且 admission 通过
-  │                 └─> PROTECTIVE_HOLD（只发 joint2/joint3）
-  │                       ├─ SIGUSR1 ──> 全部 arm safe_stop
-  │                       └─ hold dispatch/非保持失能失败
-  │                                      └─> 全部 arm safe_stop
-  └─ 无法证明当前 q 新鲜/合法 ─────────────> 全部 arm safe_stop
+  ├─ --duration-sec 到期 ──> PROTECTIVE_HOLD（不会定时失能）
+  ├─ 第一次 Ctrl+C ──> PROTECTIVE_HOLD（joint1..joint6 重力+阻尼，允许拖动）
+  ├─ 控制/位置错误且当前 q 完整合法 ──> PROTECTIVE_HOLD（同一全臂控制）
+  └─ 当前 RX/计算已不可用但存在已验证缓存 ──> DEGRADED_HOLD（缓存重力+电机阻尼）
+
+PROTECTIVE_HOLD
+  ├─ RX/数值/运动监视/模型异常 ──> DEGRADED_HOLD
+  ├─ 完整六轴发送失败 ──> 同一有界命令立即重试一次
+  └─ 再次 Ctrl-C/SIGUSR1 ──> 全部 arm safe_stop
+
+DEGRADED_HOLD
+  ├─ 完整合法反馈和实时重力发送恢复 ──> PROTECTIVE_HOLD
+  ├─ 缓存六轴发送失败 ──> 立即重试一次
+  └─ live 与缓存命令都持续无法完整发送 ──> 全部 arm safe_stop
 ```
 
 进入 `PROTECTIVE_HOLD` 前，程序必须同时证明：
 
-1. `last_safe_q` 是六关节完整、有限、在 pinned URDF position limits 内的快照；
-2. 快照年龄是本进程单调时钟测得且不超过 `--fault-hold-max-age-sec`（默认
-   `0.15 s`）；MotorBridge 0.4.9 没有设备源时间戳，所以 JSON 仍明确标记
-   `freshness_verified=false`，不能把它宣传成 vendor freshness；
-3. 快照的六关节有限差分速度均不超过 `--fault-hold-max-velocity-rad-s`（默认
-   `0.02 rad/s`），保持参考的 `qvel` 永远是全零；
-4. 如果故障样本仍有完整 q，则故障样本本身也必须在 limits 内、速度不超过同一阈值，
-   且 joint2/joint3 相对 `last_safe_q` 的 rebase 不超过
-   `--fault-hold-max-rebase-rad`（默认 `0.05 rad`）。超出即禁止保持；
-5. 只有通过上述检查后才会发送第一帧；发送的是固定 `last_safe_q`、零 qvel、vendor
-   `kp=0`，并继续经过软件 torque absolute limit 和 torque slew limit。若本次运行显式
-   选择 driver Kd，保护保持沿用同一 Kd 和已经回读的 `0x700B` 总力矩上限。q 绝不由
-   错误/陈旧样本补零，也不使用最后一次 command 代替最后一次合法状态。
+1. 对明确的运行中 operator Ctrl-C，优先使用六关节完整、有限、在 pinned URDF position
+   limits 内且未过期的 `last_safe_q`；若它已过期但当前故障帧完整合法，则使用当前故障 q。
+   对普通控制/位置错误，直接使用该错误循环刚收到的完整故障快照，避免过期的
+   `last_safe_q` 把可处理的错误升级为全臂失能。如果异常发生时当前帧已经缺失或不可用，
+   但此前至少有一帧完整六轴发送成功，则使用与该完整发送配对的最后合法 q 和纯重力项
+   直接进入 `DEGRADED_HOLD`；此路径不把过期 q 当成实时测量值，也不启用位置弹簧；
+2. 首帧快照年龄按本进程单调时钟测量，并受 `--fault-hold-max-age-sec` 约束；MotorBridge
+   0.4.9 没有设备源时间戳，所以 JSON 仍明确标记 `freshness_verified=false`，不能宣传成
+   vendor freshness；
+3. 首帧 admission 仍使用 `--fault-hold-max-velocity-rad-s` 的静止候选门，普通故障入口
+   则使用本次运行的 `--velocity-abort-rad-s`。启动 `LOCKED` settle 也使用后者，以区分
+   使能瞬态与首次 Ctrl-C 的静止快照要求。这些门只决定是否能安全进入保持，不限制进入
+   保持后的正常人工拖动；保持阶段按 `--velocity-abort-rad-s` 和
+   `--acceleration-abort-rad-s2` 监视真正不可处理的运动；
+4. 只有通过上述检查后才发送第一帧。发送集始终是完整 `joint1..joint6`，vendor `kp=0`。
+   protective-hold profile 的软件 Kp=0；未选择非零 driver Kd 时，软件使用
+   `--protective-hold-kd`（默认 `1.0 N·m·s/rad`）作为中等阻尼；显式选择 driver Kd 时，
+   该关节由 driver 单独负责阻尼，软件 Kd 自动为零。两条路径都继续经过现有软件绝对力矩和
+   slew 包络，以及已回读的 `0x700B` 总力矩上限（如有）；
+5. 保持循环每次读取完整反馈，检查有限性、反馈工作包络、时间推进、运动监视和 MIT 发送
+   回执。当前反馈 q 成为下一帧参考并重新计算 `g(q)`；它不会与首次 q 比较，也不会触发
+   `max-rebase` 漂移失能。这样既能抑制重力下坠，又不会因为有意拖动而与操作者对抗。
 
-第一帧保持成功后，程序先对非保持 arm 关节发逐关节 `safe_stop`；该 receipt 不完整时
-立即回退到全部 arm `safe_stop`，不继续假设“部分失能”已经成立。之后每一个保持周期都会
-重新读取完整反馈：反馈不完整/失效、主机观测不再推进、任一关节超出 limits、有限差分速度
-超过阈值，或 joint2/joint3 偏离固定参考超过 `max-rebase`，都会停止继续发保持帧并回退到
-全部 arm `safe_stop`。通过监视时，固定参考仍是故障前的 `last_safe_q`；当前测量 q 只用于
-计算受限的重力/阻尼力矩，绝不用于更新参考。保持没有时间自动释放，也不会因为 EOF、普通
-cleanup 或 `close()` 释放；操作者必须在另一终端显式发送 `SIGUSR1`，并确认返回的
-`full_disable_receipt.completed=true`。如果没有可证明的新鲜安全 q，程序直接采用官方通信
-故障同类的“无回零立即失能”fallback。
+`DEGRADED_HOLD` 的缓存只在一帧 `joint1..joint6` 命令完整成功后更新，并且只保存该帧对应
+的合法 q 与纯重力项。它不保存或重放关节位置项、末端 `J^T F` overlay，也不重放基于旧
+速度的软件阻尼；因此一个坏反馈、越限值或异常 overlay 不会污染降级命令。缓存重力仍走
+原有绝对力矩和变化率包络，vendor Kp 始终为零。由于主机无法在 RX 不可信时重新计算速度，
+此阶段只有显式配置且已通过驱动器力矩上限回读的非零 driver Kd 能继续提供“大阻尼”；若
+driver Kd 为零，程序会明确记录 `motor_local_damping_available=false`，此时只能诚实声称缓存
+重力保持，不能声称仍有软件大阻尼。
+
+以下异常本身都只是进入或维持 `DEGRADED_HOLD` 的理由，不再单独授权失能：feedback 再次
+缺失、invalid/stale 或 vendor 状态异常；当前观测越过反馈工作包络；主机观测时间不推进或
+`dt<=0`；有限差分速度/加速度非有限或超过配置监视值；FK、Jacobian、gravity、阻抗、功率
+一致性或总力矩组合异常。坏样本不进入缓存，程序继续轮询恢复。MIT 部分发送、驱动器拒绝
+或发送异常则先对同一有界完整六轴命令立即重试一次；若 live 命令仍失败，再尝试纯重力
+缓存命令。只有缓存命令也无法在重试后完整覆盖 J1--J6，才说明主机已经无法可靠维持这个
+控制状态，允许全臂失能。这里的“一次重试”是发送完整性判定策略，不是现场调参阈值。
+
+保持没有时间自动释放，也不会因为 EOF、普通 cleanup 或 `close()` 释放。操作者必须在另一
+终端显式发送 `SIGUSR1`，或在前台再次按 Ctrl-C，并确认返回的
+`full_disable_receipt.completed=true`。除此之外，全臂失能只允许发生在从未形成任何完整
+命令缓存，或 live 与缓存六轴命令都经过立即重试仍无法完整发送的情况下。需要注意，
+`safe_stop()` 仍是 vendor 的逐关节 disable，不是原子六轴动作；失能后重载机械臂可能下坠，
+所以机械承托和物理急停仍是最终安全边界，软件不能宣称总线失联后仍可维持重力补偿。
+
+`--duration-sec` 只限定 `GRAVITY_RAMP/HANDOFF/ACTIVE` 主控制与采集阶段，不是失能倒计时。
+到期时程序输出 `CONTROL DURATION COMPLETE`，将这次到期视为第一次保护事件并进入上述全臂重力加阻尼
+保持；随后一次 Ctrl-C 或 SIGUSR1 才是最终失能请求。历史参数 `--freeze-sec` 仍为命令行
+兼容项，但 duration 到期不再执行“短暂 freeze 后 safe_stop”。若到期时正处于一个标定
+记录窗口，该窗口会立即标为 incomplete，整次标定 acceptance 为 FAIL；此前已完整结束的
+窗口仍保留为独立证据。
 
 释放命令示例（不会让交接 shell 退出）：
 
@@ -398,24 +522,198 @@ fi
 printf '%s\n' 'shell remains active'
 ```
 
-本入口默认由软件按
-`tau = alpha(t)*gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
-位置项、基于 `mechPos (0x7019)` 的有限差分阻尼和可选末端 overlay。启动时 YAML MIT
-Kp/Kd 只作为临时软件位置锁，`alpha(t)` 从 0 到 1 同比例缩放完整六轴重力向量，避免
-逐轴 slew 造成 J2/J3/J4 补偿比例失衡；重力完成后，位置、阻尼和末端阻抗项一起平滑
-交给最终 profile。`--torque-rise-time-sec` 同时决定重力爬升、锁到最终控制器的交接时间，
-以及最终总力矩 slew 包络的时间基准；现场可按机械支撑和急停条件配置，不写成固定验收数值。
-然后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；vendor `kd` 默认也是零。
+本入口正常 active 控制默认由软件按
+`tau_i = gravity_scale*gravity_joint_scales[i]*g_i(q+offset) + bias_i + friction_i*direction(dq_i) + Kp_i*(q_ref_i-q_i) + Kd_i*(dq_ref_i-dq_i) + (J^T F)_i`
+组合重力前馈、
+位置项、基于 `mechPos (0x7019)` 的有限差分阻尼和可选末端 overlay。启动和
+`startup-replay` 的临时锁例外地使用驱动器本地 MIT Kp/Kd：主机前馈不重复临时位置或
+阻尼项，完整六轴重力从首个锁帧进入。交接时本地 Kp 回到零、本地 Kd 回到 active driver
+Kd，软件最终 profile 同步接管。`--torque-rise-time-sec` 决定主机前馈 slew 以及本地锁到
+最终控制器的交接时间；现场可按机械支撑和急停条件配置，不写成固定验收数值。
+因此，要求“重力补偿”时不能把 `--gravity-scale` 或 `--torque-limit-scale` 当成阻抗首测的
+低增益参数：前者为模型重力的比例，后者同时限制软件输出和可选的 `0x700B` 驱动器总力矩。
+它们必须由当前姿态的模型力矩、负载和机械支撑共同确定；例如此前有效记录使用过
+`--gravity-scale 0.95`、`--torque-limit-scale 0.25`，而 `0.5/0.15` 只提供半重力并把
+J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令配置，不是代码或测试中的
+固定数值限制。
+`--gravity-joint-scales J1 J2 J3 J4 J5 J6` 是显式、可回退的逐关节重力比例。经操作者
+真机验证后，默认值为 `1 0.95 1 1 1 1`。该向量在全局 `--gravity-scale` 之后生效，并贯穿
+启动锁、ACTIVE、正常 protective hold 以及从最后完整命令恢复的 degraded hold；不能只在
+ACTIVE 中临时修正，否则第一次 Ctrl-C 或一般异常会产生力矩跳变。每个值只要求有限且
+非负，不把常规调参范围写成代码硬限制；实际总输出仍受现有 URDF effort 比例、驱动器
+`0x700B` 回读限矩和 slew conditioner 约束。结果 JSON 的 `profile.gravity_joint_scales` 与
+`profile.effective_gravity_multipliers` 会记录本次真实配置。
+
+`--gravity-joint-offsets-rad`、`--gravity-joint-bias-nm` 和
+`--gravity-coulomb-friction-nm` 同样按 J1--J6 顺序显式给出。默认 offset 和 friction 均为
+六个零，默认 bias 为 `0 -0.105 -0.1 -0.05 0 0 N·m`。offset 只改变 Pinocchio 重力求值
+姿态 `q+offset`；bias 是有符号常值力矩；Coulomb
+项的幅值必须非负，方向来自 `mechPos` 有限差分速度。为防止零速量化噪声让非零摩擦项
+逐帧换向，`--gravity-coulomb-velocity-threshold-rad-s` 定义方向为零的速度区间，默认零且
+只有启用非零摩擦项时才有实际影响。这些配置和比例一样贯穿启动、ACTIVE 与 protective
+hold，并完整写入结果 `profile`；省略参数时使用上述默认值。
+
+这些参数现在组成操作者确认的默认重力补偿 profile；原始 URDF 模型不再是省略参数时的
+默认行为。Seeed 的 RS 实机报告曾得到 J2/J3 约
+`0.948/0.952` 的有效重力比例；本机第 10 个无接触窗口也观察到 J2 在正重力方向发生延迟
+breakaway，位置锁最终提供约 `-0.268 N·m` 修正，方向和量级均支持先测试 J2 `0.95`。
+最终采用的默认比例保持 `1 0.95 1 1 1 1`，J3 仍为 `1.0`；配合上述 J2--J4 bias 使用。
+要回退原始模型，需显式传入六个 scale `1`、六个 offset/bias/friction `0`。
+进入最终 active 后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；只有上述有明确
+起止状态的临时启动锁允许非零 vendor Kp。
 为避免 20 Hz 有限差分阻尼产生阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度
-耗散交给电机内部环；driver `kp` 仍固定为零，因此末端 `J^T wrench` 仍是唯一最终位置
-恢复项。非零 driver Kd 只有在
+耗散交给电机内部环。正常重力补偿的已验证默认值按 J1--J6 为
+`0.2 0.3 0.2 0.15 0.1 0.05`；显式单值仍表示六轴共用。driver `kp` 仍固定为零，
+因此末端 `J^T wrench` 仍是唯一最终位置
+恢复项。正常重力补偿的软件默认值为 `--kp 0 --kd 0`；`gravity-calibration` 若要在按下
+`R` 后用位置残差采样，必须为该采集显式选择经过审核的非零 `--kp`。非零 driver Kd 只有在
 `--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
-加速度、位置误差、非有限差分、部分发送或 cleanup 不完整会立即结束本次运行。由于当前
+位置误差、非有限差分或部分发送会结束 ACTIVE 阶段并优先进入 protective/degraded hold；
+单个有限的速度/加速度越限帧按上述两帧确认策略先隔离。上述路径都不直接失能；只有明确
+最终停止或 live 与缓存完整六轴发送都失败才允许
+safe_stop。由于当前
 `mechPos` 是同步参数读取且 MotorBridge 没有源序号/时间戳，本探针的默认 20 Hz
 只是低速 commissioning 节拍，不是高频 haptic loop，也不声明 freshness、力传感器
 或真实重力参数已验收。Pinocchio 重力模型使用中性辅助夹爪坐标，实际夹爪负载和
 摩擦仍须后续标定。
+
+### 交互式多姿态重力残差采集
+
+`gravity-calibration` 独立于已经验收的 `hold`、`pose-hold` 和 protective-hold。
+它完成同一套 `LOCKING → GRAVITY_RAMP → HANDOFF → ACTIVE` 启动后，首先进入
+`FREE_DRAG`：六个 arm 关节保持实时模型重力补偿和命令指定的单一阻尼 owner，每周期
+使用当前反馈作为参考，因此软件位置力矩为零。操作者可在此阶段安全拖动到待测姿态。
+
+拖到目标姿态后应先完全松手，确认机械臂和反馈已经静止，然后按一次 `R`（无需 Enter）。
+程序用收到 `R` 按键的同一合法反馈帧捕获六关节参考并进入 `SETTLING`；此时参考已经固定，
+但尚未计入正式样本。`--calibration-settling-sec`（默认 2 秒）让非零 `--kp` 在固定
+参考下自然建立可观测的位置残差；稳定阶段结束后才进入 `RECORDING`，其长度由
+`--calibration-duration-sec`（默认 20 秒）决定。窗口结束后自动回到 `FREE_DRAG`，不失能、
+不重新执行启动过程，操作者可换到下一姿态再次按 `R`。记录期间再次按 `R` 不重置窗口。
+`R` 只控制采集，不是安全按钮；任意阶段第一次 Ctrl-C 仍进入全臂重力加阻尼
+protective-hold，第二次 Ctrl-C 或 SIGUSR1 才请求全臂失能。
+如果命令使用 `--kp 0`，捕获的参考位置不会产生位置残差力矩：这类窗口可用于检查姿态、
+漂移和模型重力输出，但不能据此反推缺失的静态重力力矩，也不构成已经求解出的重力参数。
+当前样本可包含未验证 freshness 的 vendor operation-status 缓存力矩，但仍不含经过标定并与
+命令严格关联的关节实测力矩或电流，因此不能单独完成质量/质心辨识。
+
+### 离线归约、姿态去重和拟合
+
+真机采集完成后，不要直接把所有 20 Hz 帧当作独立姿态，也不要把第 1～4 组 `--kp 0`
+窗口送入拟合。使用同一探针的无硬件模式 `gravity-calibration-fit` 完成以下步骤：
+
+1. 只提取完整 `RECORDING` 区间；每个区间用 q、速度、重力项和位置项的中位数归约为一个
+   带 MAD 的姿态观测。含非有限值、绝对力矩限幅或 slew 限幅的窗口会被标为无效。
+2. 每次完整的 `R` 记录直接归约成一个静态残差观测。命令提供的姿态距离容差只用于识别
+   近似重复姿态并平均，操作者不需要判断或标记接近方向，也不需要反复返回同一姿态。
+   旧文件中没有方向标签的完整 `R` 窗口同样可用，只要非零 Kp、稳定性和限幅检查通过。
+3. 以 `r = position_tau`、`g0 = gravity_tau / gravity_scale` 拟合有效重力修正；这里的
+   `g0` 已包含本次显式 `gravity_joint_scales`，拟合产物会原样记录该向量以及最终六轴有效
+   multiplier。第一轮使用 `global-scale`，直接求出可与同一逐关节向量共同回填的
+   `--gravity-scale` 有效比例。若独立验证
+   仍有明显姿态相关残差且确认末端存在未建模负载，再显式选择
+   `global-scale-payload`；它用 FK/Jacobian 回归非负负载质量和末端坐标系下的一阶矩，
+   不修改 URDF。所有模型的输出都是“有效重力 overlay”，不是未经力矩比例/电流标定的真实
+   质量/质心测量。
+4. 对姿态候选按回归矩阵秩、奇异值和对数体积贪心选择；达到所需信息量后停止，不再用
+   同一姿态追加大量重复窗口。至少保留一组未参与拟合的独立验证姿态。
+
+拟合只写入带 `b601.gravity-calibration-overlay.v1` schema 的候选 JSON，并绑定数据集 SHA、
+URDF SHA、配置 SHA、选中姿态、秩/条件数和训练/验证残差。`activation` 明确为
+`candidate_only_until_independent_validation`；在验证通过前不会自动改变 URDF 或运行时模型。
+没有非零软件 Kp、没有有效姿态或没有独立验证数据时，报告为 `CANDIDATE/FAIL`，即使采集
+文件本身的控制状态为 `OK` 也不能宣称完成标定。
+
+下面是正式的两批采集和离线拟合命令模板。先完成驱动器限幅 round-trip，再分别采集训练
+姿态和独立验证姿态；`duration-sec` 只是本批次的最长人工操作时间，到达时会进入
+protective-hold，不会自动全臂失能。每个窗口的操作顺序为：拖到姿态、完全松手、按 `R`、
+等待终端提示 `RECORDING` 后保持不触碰。建议训练批次使用 6～8 个不同姿态各记录一次，
+验证批次使用 3～4 个全新姿态各记录一次；
+J2 约 1.9～2.1 rad 的区域必须覆盖一次，但不得为了覆盖它主动越过机械安全范围。
+
+```bash
+WT=/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260906-b601-gravity-startup-handoff-r1/AgenticRobot
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
+CFG=/home/zc/HandMotion/Developing/reBotArm_control_py/config/rebotarm_rs.yaml
+SRC=/home/zc/HandMotion/Developing/reBotArm_control_py
+OUT_DIR=/tmp/b601-rs-gravity-calibration-r1
+mkdir -p "$OUT_DIR"
+
+cd "$WT" || exit 86
+env PYTHONDONTWRITEBYTECODE=1 "$PY" \
+  scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  --mode gravity-calibration \
+  --config "$CFG" \
+  --rebot-source-root "$SRC" \
+  --duration-sec 900 \
+  --warmup-sec 2 \
+  --freeze-sec 1 \
+  --rate-hz 20 \
+  --calibration-settling-sec 2 \
+  --calibration-duration-sec 20 \
+  --kp 5.0 \
+  --kd 0 \
+  --driver-kd 1.0 \
+  --gravity-scale 1.0 \
+  --torque-limit-scale 0.40 \
+  --apply-driver-torque-limits \
+  --torque-rise-time-sec 0.5 \
+  --velocity-abort-rad-s 5 \
+  --acceleration-abort-rad-s2 40 \
+  --max-error-rad 2 \
+  --allow-motion \
+  --auto-disable \
+  --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
+  --fault-hold-max-age-sec 0.15 \
+  --fault-hold-max-velocity-rad-s 0.02 \
+  --fault-hold-max-rebase-rad 0.05 \
+  --output "$OUT_DIR/b601_gravity_calibration_train.json" \
+  --log "$OUT_DIR/b601_gravity_calibration_train.log"
+```
+
+运行验证批次时保持完全相同的参数，只把输出改为
+`b601_gravity_calibration_validation.json` 和对应 `.log`；不要把训练姿态复制到验证批次。
+完成两批采集并执行第二次 Ctrl-C 让 protective-hold 正常收尾后，运行以下无硬件拟合：
+
+```bash
+env PYTHONDONTWRITEBYTECODE=1 "$PY" \
+  scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  --mode gravity-calibration-fit \
+  --config "$CFG" \
+  --rebot-source-root "$SRC" \
+  --calibration-input "$OUT_DIR/b601_gravity_calibration_train.json" \
+  --calibration-validation-input "$OUT_DIR/b601_gravity_calibration_validation.json" \
+  --calibration-model global-scale \
+  --calibration-pose-tolerance-rad 0.08 \
+  --calibration-max-poses 12 \
+  --calibration-max-velocity-rad-s 0.03 \
+  --calibration-max-position-span-rad 0.02 \
+  --calibration-overlay-output "$OUT_DIR/b601_gravity_overlay_candidate.json" \
+  --calibration-report-output "$OUT_DIR/b601_gravity_calibration_report.json" \
+  --output "$OUT_DIR/b601_gravity_calibration_fit.json" \
+  --log "$OUT_DIR/b601_gravity_calibration_fit.log"
+```
+
+只有拟合报告显示完整秩、没有无效窗口、训练与独立验证残差均下降，且人工复核无启动前倾、
+反向抬升、饱和或异常停机，才可另行批准 overlay 的运行时接入。该命令不会自动写回 URDF
+或配置；`activation` 保持 candidate-only，失败结果仍会写报告供排查。
+
+终端只显示 `FREE_DRAG`、`SETTLING`、`RECORDING #N`、`COMPLETE #N` 和原有安全状态。
+JSON 的 `gravity_calibration.records` 保存触发索引、稳定阶段索引、正式记录起止 sample
+index、实际持续时间和完成原因；每帧额外保存 `calibration_state`、
+`calibration_record_index` 和窗口内时间。完整 q、有限差分速度/加速度、重力项、位置残差
+项、请求/限幅后力矩仍保存在 `samples`，因此可以按每个 record 的
+`[sample_start_index, sample_end_index)` 精确提取稳定窗口，而无需把临时残差阈值写进代码
+或测试。
+
+`gravity_calibration.acceptance_status` 只有在至少存在一个完整窗口、且所有已触发窗口都
+完整结束时才为 `PASS`；零完整窗口或任何 incomplete 窗口都会使标定整体验收失败。这里的
+失败不会丢弃完整窗口，也不会授权全臂失能。
+
+该模式必须在具有 controlling terminal 的前台运行；程序在连接 backend 前建立单键输入，
+无法取得终端时不会打开 CAN 或改变电机状态。退出正常控制路径时会先恢复终端属性，再进入
+既有 protective-hold/cleanup。不要使用后台运行、管道吞掉控制终端或自动发送按键。
 
 运行前必须确认：机械臂处于当前安全、可支撑且有足够间隙的姿态；不得为了探针主动
 移动到示例姿态。操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，
@@ -562,8 +860,9 @@ printf '%s\n' 'shell remains active'
 
 这一档把所有 host 有限差分阻尼设为零，由六轴 driver Kd 提供电机局部连续耗散；这些数值
 只是针对已观察到的 20 Hz 阶梯和腕部静摩擦死区的下一档 commissioning 配置，不是代码
-默认值或测试契约。启动锁仍暂时使用 YAML MIT Kp/Kd，但只在软件总力矩包络内生效；交接
-完成后 driver Kp 始终为零，旋转刚度仍在末端 6D spring 中，经完整 `J^T` 调节所有关节。
+默认值或测试契约。启动锁仍暂时使用 YAML MIT Kp/Kd，但在电机本地闭环内生效并由
+`0x700B` 约束完整输出；交接完成后 driver Kp 始终为零，旋转刚度仍在末端 6D spring 中，
+经完整 `J^T` 调节所有关节。
 
 第一档只验收 `pose-hold`：观察任意当前姿态是否成为末端零误差锚点，轻微的末端平移或旋转
 扰动是否产生反向、耗散且受限的恢复 wrench；ID7 夹爪不参与。`active_joint_names` 必须正好
@@ -575,7 +874,7 @@ printf '%s\n' 'shell remains active'
 运动中止阈值、但高于更严格的 `--fault-hold-max-velocity-rad-s` 时，该帧不会替换
 `last_safe`，但也不会单独中止正常 hold。JSON 的 `fault_hold_candidate_admission` 会记录
 拒绝次数与最后原因。若随后发生真实故障，保护保持仍会重新验证当前帧、旧 `last_safe`
-的年龄和 J2/J3 rebase；任一条件不满足仍立即执行六关节 `safe_stop`，不得通过提高故障
+的年龄和反馈边界 rebase；任一条件不满足仍立即执行六关节 `safe_stop`，不得通过提高故障
 保持速度阈值绕过。
 `--acceleration-abort-rad-s2` 又是独立于 qvel 和 fault-hold stationarity 的第三层；不得因
 放宽正常人工推动的 qvel 阈值而同步放宽 qacc 或 `0.02 rad/s` 的保护保持静止门。首次恢复
@@ -789,12 +1088,19 @@ Kd 作为速度耗散，但这些调参值不属于代码契约；ID7 仍不参�
 在 `0x701B` 的真实设备量纲、符号和 freshness 经独立验证前，控制侧仍应使用新鲜位置的
 有界差分速度。当前不能用约 20 Hz 的同步参数读取直接闭合 125 Hz 重力/阻尼控制。
 
+启动诊断可设置 `MOTORBRIDGE_DEBUG_MODE=robstride-startup` 和
+`MOTORBRIDGE_DEBUG_LOG=<path>`，被动保存 type-1 operation-control、type-2 operation-status
+与 type-17 参数帧；
+它不读取 `0x701A/0x302C`，也不改变控制总线负载。原始 type-2 与 JSON 中的 vendor cache
+可用于检查解码和时间邻近关系，但在缺少源序号时仍不能声称逐命令严格配对。
+
 另外，`compute_b601_mit_torque()` 若已经组合软件 damping，再同时给驱动器非零 Kd，会重复
-计算阻尼。当前只允许一种明确拆分：软件 Kd 为零，driver Kp 为零，driver Kd 单独拥有
-电机局部速度耗散，软件拥有 gravity 和 `J^T wrench`，驱动器 `0x700B` 拥有最终总力矩
-绝对上限。非零 driver Kp、软件与驱动器双重 Kd、以及把约 20 Hz host loop 宣称为高频
-haptic 仍然禁止。真正高带宽 task-space impedance 仍需可验证 freshness 的异步 q/dq
-解码路径。
+计算阻尼。正常 active 只允许一种明确拆分：软件 Kd 为零，driver Kp 为零，driver Kd 单独
+拥有电机局部速度耗散，软件拥有 gravity 和 `J^T wrench`，驱动器 `0x700B` 拥有最终总力矩
+绝对上限。只有上述临时启动/回放锁可使用非零 driver Kp；其 host Kp/Kd 必须为零，并在
+退出时连续恢复 active 增益。除此之外的非零 driver Kp、软件与驱动器双重 Kd、以及把约
+20 Hz host loop 宣称为高频 haptic 仍然禁止。真正高带宽 task-space impedance 仍需可验证
+freshness 的异步 q/dq 解码路径。
 
 ## 操作者手动 enabled 位置频率入口（本轮不执行）
 
@@ -803,6 +1109,10 @@ haptic 仍然禁止。真正高带宽 task-space impedance 仍需可验证 fresh
 会在每次 active poll 前对六个 arm 电机请求反馈并读取 `mechPos (0x7019)`，设置 POS_VEL、
 使能所选 arm 电机、发送保持当前位置的命令，并在退出时显式失能。反馈/参数读取不是运动
 命令；由于 MotorBridge 缺少源序号，输出仍会标记 feedback freshness 未验证。
+
+该独立 frequency probe 当前不复用 low-gain probe 的重力缓存或 protective-hold，duration/
+异常退出仍会直接对所选关节执行 `safe_stop`。因此它不能用于无机械承托的负载机械臂；本节
+继续标记“本轮不执行”，直到另一个明确范围为它设计并验证等价的全臂保持退出链。
 
 ```bash
 export REBOT_RS_CONFIG=/path/to/reBotArm_control_py/config/rebotarm_rs.yaml

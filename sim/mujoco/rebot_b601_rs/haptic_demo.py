@@ -23,9 +23,11 @@ from robot_motion.rebot_b601_rs import (
     B601VirtualWall,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
+from sim.contracts import TimingSpec
 from sim.mujoco.viewer import MujocoPassiveViewerSession
 
 from .mit_driver import B601MujocoEffortDriver, default_b601_mit_profile
+from .real2sim import B601Real2SimControllerProfile, B601SimStartupProfile
 from .scene import B601_RS_PHYSICS_HZ, build_b601_mujoco_scene
 
 DEFAULT_HAPTIC_ANCHOR_QPOS = (0.15, 1.0, 1.1, 0.1, -0.15, 0.2)
@@ -74,6 +76,49 @@ def _parser() -> argparse.ArgumentParser:
         "--viewer",
         action="store_true",
         help="Open the passive MuJoCo viewer and pace physics in real time.",
+    )
+    parser.add_argument(
+        "--real2sim-controller",
+        action="store_true",
+        help="Use operator compensation and local Kd on the ideal plant.",
+    )
+    parser.add_argument(
+        "--gravity-control-baseline", choices=("operator", "raw-model"),
+        default="operator",
+        help="Real2sim controller-side gravity baseline only; never changes the plant.",
+    )
+    parser.add_argument(
+        "--host-hz",
+        type=float,
+        default=20.0,
+        help="Host torque rate for --real2sim-controller only.",
+    )
+    parser.add_argument(
+        "--torque-rise-time-sec", type=float,
+        help=(
+            "Simulation rate normalization: URDF effort ceiling divided by this time. "
+            "Not the startup handoff duration; omission preserves the driver default."
+        ),
+    )
+    parser.add_argument(
+        "--fixture-stiffness-scale", type=float, default=1.0,
+        help="Offline fixture stiffness multiplier; does not relax acceptance or limits.",
+    )
+    parser.add_argument(
+        "--fixture-damping-scale", type=float, default=1.0,
+        help="Offline fixture damping multiplier; local motor Kd stays unchanged.",
+    )
+    parser.add_argument(
+        "--startup-lock-kp",
+        nargs=6,
+        type=float,
+        help="Explicit six-joint simulation lock Kp; requires Kd and real2sim.",
+    )
+    parser.add_argument(
+        "--startup-lock-kd",
+        nargs=6,
+        type=float,
+        help="Explicit six-joint simulation lock Kd.",
     )
     return parser
 
@@ -147,16 +192,55 @@ def run_haptic_fixture_demo(
     fixture_name: str,
     duration_sec: float = DEFAULT_HAPTIC_DURATION_SEC,
     viewer: bool = False,
+    real2sim_controller: bool = False,
+    host_hz: float = 20.0,
+    startup_profile: B601SimStartupProfile | None = None,
+    fixture_stiffness_scale: float = 1.0,
+    fixture_damping_scale: float = 1.0,
+    torque_rise_time_sec: float | None = None,
+    controller_profile: B601Real2SimControllerProfile | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
     if fixture_name not in {"spring", "wall", *POSE_FIXTURES}:
-        raise ValueError("fixture_name must name a supported spring, wall, or pose fixture")
+        raise ValueError(
+            "fixture_name must name a supported spring, wall, or pose fixture"
+        )
     if not isinstance(viewer, bool):
         raise TypeError("viewer must be a bool")
+    if startup_profile is not None and not real2sim_controller:
+        raise ValueError("startup_profile requires real2sim_controller")
+    if controller_profile is not None:
+        if not isinstance(controller_profile, B601Real2SimControllerProfile):
+            raise TypeError("controller_profile must be a B601Real2SimControllerProfile")
+        if not real2sim_controller:
+            raise ValueError("controller_profile requires real2sim_controller")
     duration = float(duration_sec)
     if not math.isfinite(duration) or duration <= 0.0:
         raise ValueError("duration_sec must be finite and positive")
+    if torque_rise_time_sec is not None and (
+        isinstance(torque_rise_time_sec, bool)
+        or not math.isfinite(torque_rise_time_sec)
+        or torque_rise_time_sec <= 0.0
+    ):
+        raise ValueError("torque_rise_time_sec must be finite and positive")
+    for name, value in (
+        ("fixture_stiffness_scale", fixture_stiffness_scale),
+        ("fixture_damping_scale", fixture_damping_scale),
+    ):
+        if isinstance(value, bool) or not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    stiffness = tuple(
+        v * fixture_stiffness_scale for v in DEFAULT_SPRING_STIFFNESS_N_PER_M
+    )
+    damping = tuple(
+        v * fixture_damping_scale for v in DEFAULT_SPRING_DAMPING_N_S_PER_M
+    )
+    if (
+        fixture_name == "wall"
+        and fixture_stiffness_scale == fixture_damping_scale == 0.0
+    ):
+        raise ValueError("wall stiffness or damping must be positive")
 
     model = B601PinocchioModel.from_rebot_source_root(source_root)
     initial_qpos = np.asarray(DEFAULT_HAPTIC_INITIAL_QPOS, dtype=float)
@@ -192,14 +276,14 @@ def run_haptic_fixture_demo(
     if fixture_name == "spring":
         fixture = B601TranslationalVirtualSpring(
             anchor_position_m=tuple(float(value) for value in anchor_position),
-            stiffness_n_per_m=DEFAULT_SPRING_STIFFNESS_N_PER_M,
-            damping_n_s_per_m=DEFAULT_SPRING_DAMPING_N_S_PER_M,
+            stiffness_n_per_m=stiffness,
+            damping_n_s_per_m=damping,
             max_abs_force_n=(DEFAULT_MAX_FORCE_N,) * 3,
         )
         fixture_contract: dict[str, object] = {
             "anchor_position_m": [float(value) for value in anchor_position],
-            "stiffness_n_per_m": list(DEFAULT_SPRING_STIFFNESS_N_PER_M),
-            "damping_n_s_per_m": list(DEFAULT_SPRING_DAMPING_N_S_PER_M),
+            "stiffness_n_per_m": list(stiffness),
+            "damping_n_s_per_m": list(damping),
             "max_abs_force_n": [DEFAULT_MAX_FORCE_N] * 3,
         }
     elif fixture_name == "wall":
@@ -208,8 +292,8 @@ def run_haptic_fixture_demo(
         fixture = B601VirtualWall(
             normal=tuple(float(value) for value in wall_normal),
             offset_m=wall_offset,
-            stiffness_n_per_m=180.0,
-            damping_n_s_per_m=12.0,
+            stiffness_n_per_m=180.0 * fixture_stiffness_scale,
+            damping_n_s_per_m=12.0 * fixture_damping_scale,
             max_force_n=DEFAULT_MAX_FORCE_N,
         )
         fixture_contract = {
@@ -223,34 +307,49 @@ def run_haptic_fixture_demo(
     else:
         fixture = B601PoseVirtualSpring(
             anchor_pose=anchor_pose,
-            translational_stiffness_n_per_m=DEFAULT_SPRING_STIFFNESS_N_PER_M,
-            translational_damping_n_s_per_m=DEFAULT_SPRING_DAMPING_N_S_PER_M,
-            rotational_stiffness_nm_per_rad=(8.0,) * 3,
-            rotational_damping_nm_s_per_rad=(0.8,) * 3,
+            translational_stiffness_n_per_m=stiffness,
+            translational_damping_n_s_per_m=damping,
+            rotational_stiffness_nm_per_rad=(8.0 * fixture_stiffness_scale,) * 3,
+            rotational_damping_nm_s_per_rad=(0.8 * fixture_damping_scale,) * 3,
             max_abs_force_n=(DEFAULT_MAX_FORCE_N,) * 3,
             max_abs_torque_nm=(0.5,) * 3,
         )
         fixture_contract = {
             "anchor_source": "current_fk_before_disturbance",
             "anchor_pose": np.asarray(anchor_pose, dtype=float).tolist(),
-            "translational_stiffness_n_per_m": list(DEFAULT_SPRING_STIFFNESS_N_PER_M),
-            "translational_damping_n_s_per_m": list(DEFAULT_SPRING_DAMPING_N_S_PER_M),
-            "rotational_stiffness_nm_per_rad": [8.0] * 3,
-            "rotational_damping_nm_s_per_rad": [0.8] * 3,
+            "translational_stiffness_n_per_m": list(stiffness),
+            "translational_damping_n_s_per_m": list(damping),
+            "rotational_stiffness_nm_per_rad": list(
+                fixture.rotational_stiffness_nm_per_rad
+            ),
+            "rotational_damping_nm_s_per_rad": list(
+                fixture.rotational_damping_nm_s_per_rad
+            ),
             "max_abs_force_n": [DEFAULT_MAX_FORCE_N] * 3,
             "max_abs_torque_nm": [0.5] * 3,
             "disturbance": disturbance_contract,
         }
 
+    fixture_contract.update(
+        stiffness_scale=fixture_stiffness_scale,
+        damping_scale=fixture_damping_scale,
+    )
     scene = build_b601_mujoco_scene(
         source_root,
         initial_arm_qpos=initial_qpos,
         gravity_mps2=(0.0, 0.0, -9.81),
         actuation_mode="effort",
     )
-    base_profile = default_b601_mit_profile(scene)
+    base_profile = (
+        default_b601_mit_profile(scene)
+        if torque_rise_time_sec is None
+        else default_b601_mit_profile(scene, torque_rise_time_sec=torque_rise_time_sec)
+    )
     profile = replace(
         base_profile,
+        damping_kd_nm_s_per_rad=(
+            (0.0,) * 6 if real2sim_controller else base_profile.damping_kd_nm_s_per_rad
+        ),
         max_abs_overlay_torque_nm=(DEFAULT_MAX_OVERLAY_TORQUE_NM,) * 6,
         max_abs_state_acceleration_rad_s2=(250.0,) * 6,
         metadata={
@@ -264,6 +363,20 @@ def run_haptic_fixture_demo(
         model,
         profile=profile,
         enable_gravity_compensation=True,
+        timing=(
+            TimingSpec(
+                command_hz=host_hz,
+                physics_hz=B601_RS_PHYSICS_HZ,
+                parameter_source="explicit_host_rate_diagnostic",
+            )
+            if real2sim_controller
+            else None
+        ),
+        real2sim_profile=(
+            (controller_profile or B601Real2SimControllerProfile())
+            if real2sim_controller else None
+        ),
+        startup_profile=startup_profile,
     )
     driver.reset(initial_qpos)
 
@@ -282,6 +395,9 @@ def run_haptic_fixture_demo(
     next_sequence = 0
     command_count = 0
     advanced_ticks = 0
+    power_channels: dict[str, dict[str, float | int]] = {}
+    held_nominal_damping = np.zeros(6)
+    sampled_damping_peak_power = 0.0
     fixture_limited_ticks = 0
     overlay_limited_ticks = 0
     torque_limited_ticks = 0
@@ -298,6 +414,13 @@ def run_haptic_fixture_demo(
     minimum_rotation_metric = initial_rotation_metric
     final_tick = None
     viewer_closed_early = False
+    phase_transitions = [
+        {
+            "phase": driver.execution_metadata["sim_control_phase"],
+            "time_sec": 0.0,
+            "reason": None,
+        }
+    ]
     try:
         for step in range(requested_steps):
             reference = None
@@ -318,6 +441,21 @@ def run_haptic_fixture_demo(
                     qvel_rad_s=qvel,
                 )
                 timestamp = driver.physics_time_sec
+                if fixture_name in POSE_FIXTURES:
+                    # Diagnostic only: unclipped -J.T D J dq, sampled and held
+                    # at the host rate. It is not a decomposition of the final
+                    # limited/slewed actuator force and never enters control.
+                    jacobian = model.arm_jacobian(qpos)
+                    damping_diagonal = np.asarray((
+                        *fixture.translational_damping_n_s_per_m,
+                        *fixture.rotational_damping_nm_s_per_rad,
+                    ))
+                    held_nominal_damping = -jacobian.T @ (
+                        damping_diagonal * (jacobian @ qvel)
+                    )
+                    sampled_damping_peak_power = max(
+                        sampled_damping_peak_power, float(held_nominal_damping @ qvel)
+                    )
                 reference = B601MitReference(
                     sequence=next_sequence,
                     source_timestamp_sec=timestamp,
@@ -358,8 +496,35 @@ def run_haptic_fixture_demo(
                     fixture_limited_ticks += 1
 
             final_tick = driver.step_physics(reference)
+            if (
+                not phase_transitions
+                or phase_transitions[-1]["phase"] != final_tick.control_phase
+            ):
+                phase_transitions.append(
+                    {
+                        "phase": final_tick.control_phase,
+                        "time_sec": final_tick.physics_time_sec,
+                        "reason": final_tick.phase_reason,
+                    }
+                )
             if final_tick.plant_advanced:
                 advanced_ticks += 1
+                if (
+                    final_tick.control_phase == "ACTIVE"
+                    and not final_tick.driver_faulted
+                ):
+                    channels = {
+                        "applied_total": final_tick.applied_torque_nm,
+                        "nominal_motor_local_damping": final_tick.driver_damping_torque_nm,
+                    }
+                    if fixture_name in POSE_FIXTURES:
+                        channels["held_nominal_cartesian_damping"] = held_nominal_damping
+                    for name, torque in channels.items():
+                        _accumulate_power(
+                            power_channels, name,
+                            float(np.dot(torque, final_tick.control_qvel)),
+                            driver.timing.physics_timestep_sec,
+                        )
             if (
                 final_tick.torque_breakdown is not None
                 and final_tick.torque_breakdown.overlay_limited
@@ -408,6 +573,7 @@ def run_haptic_fixture_demo(
     run_completed = advanced_ticks == requested_steps and not viewer_closed_early
     common_pass = bool(
         run_completed
+        and final_tick.control_phase == "ACTIVE"
         and not final_tick.driver_faulted
         and final_tick.state_valid
         and final_tick.state_within_limits
@@ -439,8 +605,12 @@ def run_haptic_fixture_demo(
             "maximum_growth_tolerance_m": 0.002,
         }
     else:
-        translation_required = fixture_name.startswith("pose-t") or fixture_name == "pose-6d"
-        rotation_required = fixture_name.startswith("pose-r") or fixture_name == "pose-6d"
+        translation_required = (
+            fixture_name.startswith("pose-t") or fixture_name == "pose-6d"
+        )
+        rotation_required = (
+            fixture_name.startswith("pose-r") or fixture_name == "pose-6d"
+        )
         translation_pass = bool(
             not translation_required
             or (
@@ -485,6 +655,18 @@ def run_haptic_fixture_demo(
             "minimum_metric": minimum_metric,
             "maximum_metric": maximum_metric,
         },
+        "power_diagnostics": {
+            "quadrature": "left_rectangle_tau_dot_control_qvel_times_physics_dt",
+            "scope": "ACTIVE_nonfaulted_advanced_ticks_only",
+            "terminal_fault_tick_excluded": final_tick.driver_faulted,
+            "positive_work_means": "mechanical_energy_delivered_to_arm",
+            "nominal_damping_scope": "pose_fixture_unclipped_before_startup_blending_host_hold",
+            "local_damping_scope": "pre_total_actuator_saturation_component_not_actual_split",
+            "nominal_sampled_peak_power_w": sampled_damping_peak_power,
+            "channels": power_channels,
+            "passivity_claim": False,
+            "hardware_claim": False,
+        },
         "simulation_acceptance": {
             "passed": accepted,
             "run_completed": run_completed,
@@ -496,6 +678,8 @@ def run_haptic_fixture_demo(
             ),
             "viewer_closed_early": viewer_closed_early,
             "driver_faulted": final_tick.driver_faulted,
+            "phase_transitions": phase_transitions,
+            "final_control_phase": final_tick.control_phase,
             "fault_reason": final_tick.fault_reason,
             "state_valid": final_tick.state_valid,
             "state_within_limits": final_tick.state_within_limits,
@@ -517,6 +701,12 @@ def run_haptic_fixture_demo(
         },
         "driver": driver.execution_metadata,
         "fidelity": (
+            "Opt-in host-ZOH/local-damping diagnostic on an unidentified ideal plant. "
+            "Fixture acceptance is not real2sim fidelity acceptance. "
+            if real2sim_controller
+            else ""
+        )
+        + (
             "offline deterministic ideal-generalized-effort MuJoCo acceptance; "
             "validates frame math, J-transpose direction, bounded software "
             "overlay, gravity/damping composition and closed-loop fixture effect; "
@@ -528,13 +718,55 @@ def run_haptic_fixture_demo(
     return (0 if accepted else 3), payload
 
 
+def _accumulate_power(
+    channels: dict[str, dict[str, float | int]], name: str, power_w: float, dt: float,
+) -> None:
+    """Keep signed work separate from positive delivery and absorption magnitudes."""
+    record = channels.setdefault(name, {
+        "sample_count": 0, "net_work_j": 0.0,
+        "delivered_work_j": 0.0, "absorbed_work_j": 0.0,
+        "peak_positive_power_w": 0.0,
+    })
+    record["sample_count"] += 1
+    record["net_work_j"] += power_w * dt
+    record["delivered_work_j"] += max(0.0, power_w) * dt
+    record["absorbed_work_j"] += max(0.0, -power_w) * dt
+    record["peak_positive_power_w"] = max(record["peak_positive_power_w"], power_w)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    controller = None
+    if args.gravity_control_baseline == "raw-model":
+        if not args.real2sim_controller:
+            parser.error("raw-model gravity baseline requires --real2sim-controller")
+        controller = B601Real2SimControllerProfile.raw_model_baseline()
+    startup = None
+    if args.startup_lock_kp is not None or args.startup_lock_kd is not None:
+        if (
+            not args.real2sim_controller
+            or args.startup_lock_kp is None
+            or args.startup_lock_kd is None
+        ):
+            parser.error(
+                "startup lock requires --real2sim-controller and both --startup-lock-kp/--startup-lock-kd"
+            )
+        startup = B601SimStartupProfile(
+            tuple(args.startup_lock_kp), tuple(args.startup_lock_kd)
+        )
     code, payload = run_haptic_fixture_demo(
         source_root=args.rebot_source_root,
         fixture_name=args.fixture,
         duration_sec=args.duration_sec,
         viewer=bool(args.viewer),
+        real2sim_controller=args.real2sim_controller,
+        host_hz=args.host_hz,
+        startup_profile=startup,
+        fixture_stiffness_scale=args.fixture_stiffness_scale,
+        fixture_damping_scale=args.fixture_damping_scale,
+        torque_rise_time_sec=args.torque_rise_time_sec,
+        controller_profile=controller,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return code

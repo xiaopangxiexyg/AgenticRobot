@@ -8,6 +8,7 @@
 - [有界规则式数采计划与运行权限边界](./rule_based_collection.md)
 - [Embodiment runtime provider 当前接口合同](./embodiment_runtime_provider_contract.md)
 - [reBot B601 HITL 拓扑与厂商源码边界](./rebot_b601_hitl_topology.md)
+- [ReBot B601-RS / RM65 Real2Sim 与 HITL 分阶段路线图](./plans/rebot_b601_rm65_real2sim_hitl_roadmap.md)
 - [Quest 与机器人静态配对姿态采集边界](./quest_future_visualization.md)
 
 其中运行域边界页区分 deploy、human teleop、replay 的默认单源直通模式与显式多源

@@ -25,6 +25,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -229,7 +230,9 @@ def _per_id_summary(
     }
 
 
-def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
+def _read_only_capture(
+    channel: str, duration_sec: float, *, raw_output: Path | None = None,
+) -> dict[str, object]:
     if not channel.strip():
         raise ValueError("channel must not be empty")
     if not math.isfinite(duration_sec) or duration_sec <= 0.0:
@@ -255,13 +258,26 @@ def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
     short_stream_frame_counts: Counter[int] = Counter()
     started = time.monotonic()
     deadline = started + duration_sec
+    receiver = None
     try:
         receiver = socket.socket(socket.AF_CAN, socket.SOCK_RAW, _CAN_RAW)
         receiver.bind((channel,))
         receiver.settimeout(min(0.2, max(0.01, duration_sec)))
     except OSError as exc:
+        if receiver is not None:
+            receiver.close()
         raise FrequencyProbeError(f"cannot open passive SocketCAN receiver on {channel}: {exc}") from exc
-    with receiver:
+    with receiver, (
+        raw_output.open("x", encoding="utf-8")
+        if raw_output is not None else nullcontext(None)
+    ) as raw_writer:
+        if raw_writer is not None:
+            raw_writer.write(json.dumps({
+                "kind": "header", "format": "b601_socketcan_rx_v1", "channel": channel,
+                "timestamp_semantics": "userspace_after_recv_not_motor_acquisition",
+                "clock_pair_semantics": "realtime_read_between_receive_and_end_monotonic_ns",
+                "transmit_capability_used": False,
+            }) + "\n")
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
@@ -274,6 +290,17 @@ def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
             except OSError as exc:
                 raise FrequencyProbeError(f"SocketCAN receive failed on {channel}: {exc}") from exc
             received_at = time.monotonic()
+            if raw_writer is not None:
+                received_ns = time.monotonic_ns()
+                realtime_ns = time.time_ns()
+                clock_pair_end_ns = time.monotonic_ns()
+                raw_writer.write(json.dumps({
+                    "kind": "frame",
+                    "receive_monotonic_ns": received_ns,
+                    "observe_realtime_ns": realtime_ns,
+                    "clock_pair_end_monotonic_ns": clock_pair_end_ns,
+                    "socket_frame_hex": raw.hex(),
+                }) + "\n")
             try:
                 decoded = decode_can_frame(raw)
             except ValueError:
@@ -300,6 +327,11 @@ def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
                         short_stream_frame_counts[identity.communication_type] += 1
             else:
                 standard_count += 1
+        if raw_writer is not None:
+            raw_writer.write(json.dumps({
+                "kind": "end", "completed": True,
+                "received_frame_count": sum(counts.values()) + malformed_count,
+            }) + "\n")
     ended = time.monotonic()
     feedback_stats = ledger.summarize()["feedback"].as_dict()
     result = {
@@ -345,6 +377,12 @@ def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
             short_stream_frame_counts=short_stream_frame_counts,
         )
     )
+    if raw_output is not None:
+        result["raw_capture"] = {
+            "path": str(raw_output.resolve()), "format": "b601_socketcan_rx_v1",
+            "completed": True, "hardware_acquisition_time_verified": False,
+            "scope": "receive_observations_only_not_dispatch_receipts",
+        }
     return result
 
 
@@ -946,6 +984,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable", action="store_true")
     parser.add_argument("--auto-disable", action="store_true")
     parser.add_argument("--output", type=Path, help="write JSON outside the source worktree")
+    parser.add_argument(
+        "--raw-output", type=Path,
+        help="New JSONL file for raw RX frames and host clocks; read-only mode only, never overwrites.",
+    )
     parser.add_argument("--json", action="store_true", help="retain machine-readable JSON output (default)")
     return parser
 
@@ -955,8 +997,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if not math.isfinite(args.duration_sec) or args.duration_sec <= 0.0:
             raise ValueError("duration_sec must be positive")
+        if args.raw_output is not None:
+            if args.mode != "read-only":
+                raise ValueError("--raw-output is supported only in read-only mode")
+            args.raw_output = args.raw_output.expanduser().resolve()
+            if args.output is not None and args.output.expanduser().resolve() == args.raw_output:
+                raise ValueError("--output and --raw-output must be distinct paths")
         if args.mode == "read-only":
-            payload = _read_only_capture(args.channel, args.duration_sec)
+            if args.raw_output is None:
+                payload = _read_only_capture(args.channel, args.duration_sec)
+            else:
+                payload = _read_only_capture(
+                    args.channel, args.duration_sec, raw_output=args.raw_output,
+                )
         elif args.mode == "offline":
             payload = _offline_capture(args.duration_sec, args.target_hz)
         elif args.mode == "gravity-offline":

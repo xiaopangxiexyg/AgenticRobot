@@ -1,0 +1,508 @@
+# B601 Real2Sim 开发进度
+
+> 总目标与阶段门禁见 [总路线图](../plans/rebot_b601_rm65_real2sim_hitl_roadmap.md)。
+> 本文持续记录批次、验证和缺口；进度变化不再写入总路线图。
+
+## 1. M0/M1 首个增量：host ZOH 与局部阻尼（2026-09-09）
+
+本批提供可运行的控制侧诊断切片，M0/M1 尚未整体完成。开发基线为路线图候选
+`618d2a366517c478a5d6b879b2a4f5aa2d2c21d3`；核对时本地 development 为 `015d44b4`，
+尚未包含该候选。后续集成须显式携带重力候选和路线图依赖，不将用户推测的合并状态作为证据。
+
+- `sim/mujoco/rebot_b601_rs/real2sim.py` 提供不可变 controller profile，集中 gravity
+  scale/offset/bias/Coulomb 和逐关节 driver Kd；不改 URDF、passive damping、friction 或 armature。
+- `B601MujocoEffortDriver(real2sim_profile=...)` 在 host command cadence 计算软件 torque，
+  tick 间 ZOH；局部 `-Kd*dq` 每 physics tick 更新，再共同经过既有 clip/slew/clip。
+  未传 profile 时保持原有 physics-rate 软件 MIT 行为。显式提供的软件 PD profile 仍有效，
+  默认软件 damping 在此 opt-in 模式为零，避免默认重复阻尼。
+- gravity parity 继续比较原始 plant 重力；控制补偿只影响 controller。固定打开的仿真夹爪
+  仍参与同一模型计算，尚未证明与真实夹爪姿态/负载等价。
+- tick 区分 `host_torque_updated`、保持的 `torque_breakdown` 和
+  `driver_damping_torque_nm`；后者加到 host requested torque 后才最终限幅。metadata 记录
+  URDF SHA-256、参数来源、两个 cadence 和未建模项。
+- wrong-frame/invalid reference 与 watchdog 撤销会立即清空 host cache。原有 stale-sequence
+  拒绝且等待 watchdog 的语义保留；第 8 节最终契约仍须闭合。
+- 本地阻尼以 physics cadence 计算是显式近似；总 torque 的 physics-rate slew 是现有仿真
+  保护机制，不代表 RobStride 内部 slew。启动锁、反馈坏帧隔离、cache degraded hold 和六轴
+  CAN partial-send 尚未仿真，不能称为真机 runtime 完整等价。
+
+现有入口新增可选 `--real2sim-controller --host-hz`，不创建第二个生产入口。以下命令只运行
+MuJoCo，前台输出完整 JSON，stdout/stderr 可按现场规范重定向到固定 log：
+
+```bash
+# 从本增量工作树运行；Python 使用已配置的项目环境。
+python -m sim.mujoco.rebot_b601_rs.haptic_demo \
+  --rebot-source-root hardware/reBotArm_control_py \
+  --fixture pose-6d --real2sim-controller --host-hz 20
+```
+
+首次实跑此命令在 52 个 physics tick 后触发 J6 acceleration guard（约
+468.57 rad/s²，既有 fixture 限值 250 rad/s²），返回 fixture FAIL；预期命令 30 次、实际 2 次。
+这一失败没有通过放宽阈值处理。它说明真机选择的补偿/Kd 与原 ideal plant、现有 fixture gains
+和 20 Hz host 组合尚不通过效果验收，不能推断为真实电机失控或宣称 Real2Sim 已通过。
+
+相同 6D fixture 的离线对照如下。这里只改变 host cadence 和是否添加局部 Kd，没有改变
+速度/加速度保护阈值，也没有改变 MuJoCo plant：
+
+| host Hz | 局部 Kd | 结果 | physics ticks |
+| --- | --- | --- | --- |
+| 20 | 当前逐关节配置 | J6 acceleration guard | 52 |
+| 500 | 当前逐关节配置 | fixture PASS | 1500 |
+| 20 | 零 | J6 velocity guard | 26 |
+| 500 | 零 | fixture PASS | 1500 |
+
+这支持继续研究低 host cadence 下的控制带宽与执行器响应，不支持仅靠放宽阈值解决。
+500 Hz 是仿真对照配置，不是已证实的真机 host 能力。
+
+接下来先离线分解 host 延迟、局部 Kd、fixture gains 和 plant 缺失项的影响，再做启动/保护
+状态机等价。物理辨识需要新增真机数据时暂停开发的相关路径，并提供现场前台采集命令；
+当前无需执行任何真机命令。
+
+本批验证：B601 real2sim、ideal MIT、MuJoCo haptics/position、纯 haptics、submodule 和
+control-composition 边界共 103 passed；changed-file Ruff、CLI `--help`、资源 audit 和
+`git diff --check` 通过。测试使用固定 vendor gitlink 与既有 dexteleop310 环境，没有修改环境。
+下一批仍在 M1：补充 startup/protective-hold 的离线状态机等价；M2 物理参数辨识未开始。
+
+## 2. M1 后续增量：前馈/局部反馈分层与仿真生命周期
+
+基线：`6aa74d2b982a7e0ea86f7929e28f691422ac46eb`。该基线正在集成，本增量使用独立后续
+分支，不改变前批 commit/tree。本次将第 1 节从总路线图完整迁到本文；以后批次进度只维护本文。
+
+### 实现与复核
+
+1. 对照真机 `build_startup_lock_profile`、`resolve_driver_local_lock_command` 和
+   `build_protective_hold_profile` 后修正仿真 conditioning：host feedforward 在实际 host 更新
+   dt 上 clip/slew/clip，局部 Kp/Kd 在 physics tick 更新并绕过 host slew，最后总 torque
+   仍受 actuator/profile 绝对限制。第 1 节“总 torque 在 physics rate 做 slew”仅描述旧基线。
+   未启用 Real2Sim 的 ideal MIT 分支保持原算法。
+2. `B601SimStartupProfile` 要求显式六轴 lock Kp/Kd；freeze、handoff 时长和 settling 门禁为
+   仿真配置，不宣称厂商默认值。reset 从当前合法 q 建立固定 anchor，外部 reference 不能改变它。
+3. 原 driver 内推进 `ENABLED_UNARMED -> LOCKING -> LOCKED -> GRAVITY_RAMP -> HANDOFF ->
+   ACTIVE`。局部位置 Kp 衰减到零，局部 Kd 混合到 active 配置，host PD/overlay 随 handoff
+   接入；重力从第一帧完整参与。`GRAVITY_RAMP` 保留阶段名，但不再次从零缩放重力。
+4. lock 位移超界、freeze 结束未静止、startup 中 invalid/wrong-frame/watchdog，以及显式
+   `request_protective_hold(reason)` 均可锁存到 live-feedback gravity+damping。software Kp、
+   driver position Kp 和 overlay 请求归零；driver Kd 非零关节不重复加软件阻尼，driver Kd
+   为零的关节使用真机 helper 同样的 software damping seed 1.0。
+5. hold 拒绝新运动 reference。`request_disable()` 清除六轴 actuator effort，随后 hold
+   请求不能反向使能；只有显式 reset 创建新仿真 epoch。前馈的有界 slew 转换可能保留短暂
+   旧 torque 分量，因此“撤销 reference”不等于瞬时跳变总 torque。
+6. tick 增加 host-conditioned torque、driver position torque、phase/reason；现有 demo
+   增加显式 startup Kp/Kd 参数及 phase timeline。只有最终 ACTIVE 且原数值/效果条件通过，
+   才报告 fixture acceptance；处于 protective hold 不冒充成功。
+
+### 仿真结果和限制
+
+- 原始 URDF 平衡、补偿 scale=1/bias=0 的隔离测试覆盖完整 startup 到 ACTIVE、首帧重力、
+  anchor、hold 和 disable；这不是默认真机 profile 的启动手感验收。
+- 当前补偿 profile、500 Hz host、六轴 Kp=2、Kd=`0.2 0.3 0.2 0.15 0.1 0.05` 的 6D demo
+  完成 1500 ticks；0.1 秒因 `startup_not_settled` 进入 PROTECTIVE_HOLD，无 driver 数值故障，
+  fixture exit code=3。未放宽 settling/velocity/acceleration 门禁。
+- LOCKING -> LOCKED 只模拟一次完整成功的 actuator 更新；没有 CAN partial-send、enable
+  ACK、接收缓存、坏帧隔离或设备源 timestamp。cached/degraded hold 尚未实现。
+- 非有限状态或数值/位置/速度/加速度 guard 仍采用现有仿真 fault latch：清 torque 并冻结
+  受影响 plant；不使用非法状态继续 gravity hold。
+- hold/disable 是模拟 API，不是信号处理器；没有改变真机 Ctrl-C/SIGUSR1 行为，仿真代码
+  不导入硬件 probe。reset 仍用既有 gravity seed，完整真机零 torque arming 时序未建模。
+- M1 尚未整体完成，M2 参数辨识未开始；下一批先补充反馈故障与降级模式的明确仿真契约。
+
+### 前台复现（仅仿真）
+
+本批验证：110 passed（B601 Real2Sim、ideal MIT、MuJoCo haptics/position、纯 haptics、
+submodule 和 control-composition 边界）；changed-file Ruff、CLI help、文档 Bash 语法、
+资源 audit 和 `git diff --check` 通过。未运行真机，未改动 Python 环境。
+
+此命令预期重现上述 protective hold，exit code=3 表示 fixture 未通过。命令和完整 JSON
+写入固定日志，Python 在前台运行，shell 保持存活。路径需随最终部署位置更新。
+
+```bash
+WT=/tmp/b601-real2sim-lifecycle
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python
+LOG=/tmp/b601-real2sim-command-and-output.log
+ARGS=( "$PY" -m sim.mujoco.rebot_b601_rs.haptic_demo
+  --rebot-source-root hardware/reBotArm_control_py
+  --fixture pose-6d --real2sim-controller --host-hz 500
+  --startup-lock-kp 2 2 2 2 2 2
+  --startup-lock-kd 0.2 0.3 0.2 0.15 0.1 0.05 )
+if (
+  cd "$WT" || exit 2
+  printf 'command:'
+  printf ' %q' "${ARGS[@]}"
+  printf '\n'
+  PYTHONDONTWRITEBYTECODE=1 "${ARGS[@]}"
+) >> "$LOG" 2>&1; then
+  STATUS=0
+else
+  STATUS=$?
+fi
+printf 'simulation exit code: %s\nlog: %s\n' "$STATUS" "$LOG"
+printf '%s\n' 'shell remains active'
+```
+
+## M1 后继修复：驱动器本地反馈的数值积分
+
+基线 `a295cddca0323fad7c17fe1ca911300c39ad3bd9` 保持不变，后继在
+`codex/b601-real2sim-local-servo` 开发。仅修改仿真驱动、测试和本进度页；不修改总路线图、
+URDF、硬件控制或操作员标定 profile。待合并，未 push、安装或运行真机。
+
+### 原因及修复
+
+之前将本地 Kp/Kd 在 Python 中计算成外部 `ctrl` 力矩，`implicitfast` 无法将这个外部
+速度反馈的导数纳入隐式积分。因此把官方 YAML 的启动增益直接代入会造成数值不稳定，
+不能据此判定官方增益不适用，更不能通过放宽速度/加速度门限解决。
+
+现在 real2sim 路径使用 MuJoCo 原生 affine actuator bias：
+`tau = host_feedforward + Kp*(q_anchor-q) - Kd*dq`。主机前馈仍按原 host cadence
+执行 clip/slew/clip；本地反馈不经过主机 slew。执行器 `forcerange` 限制三项总和，
+不会突破 profile 或原始执行器范围，receipt 读取实际 `actuator_force`。
+disable、数值故障和 reset 同时清除 ctrl 与 native bias，避免 ctrl=0 后仍残留制动/弹簧。
+原 ideal-effort 分支不变，plant 被动阻尼仍为零，不重复计入驱动器阻尼。
+
+依据：[MuJoCo actuator force model](https://mujoco.readthedocs.io/en/latest/computation.html)
+和 [affine bias / implicit integration](https://mujoco.readthedocs.io/en/latest/XMLreference.html)。
+这只是理想电机局部伺服的数值表达，不代表已辨识 RobStride 带宽、摩擦、延迟或量化。
+
+### 离线对照与尚存问题
+
+使用 pinned vendor `5ba28ace` YAML 的 Kp=`50 150 150 50 50 50`、
+Kd=`3 10 10 5 4 4`，原有 1 kHz physics、操作员重力 profile 和相同保护阈值：
+
+- 修复前、500 Hz host：J6 加速度约 524.97 rad/s²，保护停止，未完成启动。
+- 修复后、500 Hz host：1.5 s 6D fixture PASS，约 0.302 s 进入 ACTIVE。
+- 修复后、20 Hz host：完成启动锁，但交接阶段 0.35 s 因
+  `startup_lock_displacement` 进入 PROTECTIVE_HOLD；无数值故障，fixture 仍不通过。
+- 先前 Kp=2、弱 Kd 的 `startup_not_settled` 负例继续保留，不自动提升增益或放宽门限。
+
+因此本修复解决了高本地增益的积分缺陷，不宣称 20 Hz 主机下的 6D 阻抗已通过。
+下一步需隔离交接时序、低频 fixture 前馈和 plant/profile 不匹配的影响，再决定修复，
+不能把仿真 500 Hz 通过当作真机 CAN 已达到该频率。真实动态辨识仍需暂停并由操作者采集。
+
+仅仿真复现可使用本页前台命令模板，将 WT 改为 `/tmp/b601-real2sim-local-servo`，
+启动 Kp/Kd 改为上述 YAML 六轴值；保留固定命令/输出 log。500 Hz 是仿真实验设置，
+该命令不能移用于真机。旧候选仍可直接用于修复前对照。
+
+本批验证：同上七个 B601/边界测试文件共 **115 passed**（30.09 s），Ruff、资源 audit、
+`git diff --check` 通过。新增覆盖官方增益完成启动、disable/fault/reset 清除 native bias、
+以及本地弹簧与主机前馈叠加后的实际总力矩限幅。未修改任何硬件阈值或环境包。
+
+## M1 交接时间边界与低频闭环隔离
+
+后继基线 `d3d266d5bf25ed141c39ee51d2653e4ea20793db`，工作分支
+`codex/b601-real2sim-handoff-timing`；上一候选保持不可变。本批仅修复仿真状态机时间比较。
+
+原 `elapsed = 0.3 - 0.1` 得到略小于 0.2 的浮点值，使 handoff fraction 略小于 1。
+此时本地锁增益已经接近零，但 phase 仍停在 HANDOFF；20 Hz 下直到 0.35 s 才再次
+判定，错误延长了启动锁检查期。现复用既有 command cadence 的 `1e-12 s` 数值容差，
+freeze/ramp/handoff 在对应 host deadline 正确推进。位置、速度、加速度阈值完全不变；
+完成交接的 tick 仍先检查启动位移，不能凭到时跳过保护。
+
+### 20 Hz 对照（1 kHz physics，1.5 s，无真机）
+
+采用上一节官方 YAML 启动增益。通过进程内测试替换，仅将 demo 的末端 torque overlay
+置零或把控制补偿 scale/bias 还原；不修改 plant、不改变本地 Kd、不放宽保护。
+“完成”只代表数值运行完成，overlay 关闭的对照不承担末端恢复效果验收。
+
+| 控制补偿 | 末端 overlay | 运行完成 | 峰值速度 rad/s | 峰值加速度 rad/s² |
+| --- | --- | --- | --- | --- |
+| 操作员 profile | 关闭 | 是 | 0.35217 | 2.24652 |
+| 操作员 profile | 开启 | 否：J6 acceleration guard | 1.33080 | 637.11025 |
+| 原始重力 scale=1/bias=0 | 关闭 | 是 | 0.000213 | 0.52973 |
+| 原始重力 scale=1/bias=0 | 开启 | 否：J6 acceleration guard | 1.36156 | 640.49287 |
+
+四组均在 0.300 s 进入 ACTIVE。剩余失败发生在 ACTIVE，而非 startup lock：当前
+fixture 的末端弹簧/阻尼在 host tick 计算，然后 ZOH 50 ms。偏置不是这次失稳的必要条件。
+同时，操作员补偿在未辨识的 ideal plant 上明显漂移，也不能称作真实重力平衡的数字孪生。
+
+下一步需分别验证低频末端反馈的离散控制稳定域，以及用实测数据辨识 plant；不能通过
+把控制偏置反向写入 URDF 来“制造平衡”，也不能把 host 20 Hz 悄悄改成仿真 1 kHz
+末端反馈并声称真机等价。目前 20 Hz 6D force overlay 仍为 NOT_ACCEPTED，停止于仿真；
+没有新增真机运行命令，也没有调整真机参数。总路线图未修改。
+
+本批验证：同上七个测试文件 **118 passed**（34.35 s），新增 20/500 Hz 准时交接和
+deadline 上位移保护不被跳过的回归检查；Ruff、资源 audit、`git diff --check` 通过。
+交付状态为待合并，依赖上一候选；未 merge、push、安装或触发硬件。
+
+## M1 可复现实验参数与长时验证（2026-09-10）
+
+基线 `99a211fc92f3a9ecd46ca4bada274bfd4504ec1c`，后继分支
+`codex/b601-real2sim-gain-experiments`。现有 haptic demo 增加
+`--fixture-stiffness-scale` 与 `--fixture-damping-scale`，默认都为 1。
+倍率同时作用于平移/旋转对应项，不改变 motor-local Kd、标定补偿、力矩限幅或
+速度/加速度/效果验收门限。JSON `fixture_contract` 记录倍率及实际增益。
+两者需有限非负；虚拟墙保持原有“刚度/阻尼不能同时为零”的约束。
+关闭 spring/pose 增益可用于无 overlay 对照，但不冒充效果 PASS。
+
+固定 operator gravity profile、官方启动锁增益、1 kHz physics 和 pose-6d 初始扰动，
+对照 1.5 s 的结果如下（倍率实验最初通过进程内替换构造参数进行，现在可由 CLI 复现）：
+
+| host Hz | stiffness scale | damping scale | 结果 |
+| --- | --- | --- | --- |
+| 20 | 1 | 1 | J6 acceleration guard，约 637.11 rad/s² |
+| 20 | 1 | 0.1 | J6 acceleration guard，约 442.11 rad/s² |
+| 20 | 0.25 | 0.1 | J6 velocity guard，约 2.018 rad/s |
+| 20 | 0.1 | 0.1 | J6 velocity guard，约 2.005 rad/s |
+| 50 | 1 | 1 | J6 acceleration guard，约 332.04 rad/s² |
+| 125 | 1 | 1 | J6 acceleration guard，约 517.94 rad/s² |
+| 250 | 1 | 1 | J6 acceleration guard，约 254.86 rad/s² |
+| 500 | 1 | 1 | PASS |
+
+上述有限对照不是完整稳定域，更不能将“500 Hz 通过”解释为实机最低频率。
+下一步低频控制实验应分析 sampled feedback 的能量与局部阻尼作用，不能仅继续放宽阈值。
+
+### 长时钟误差修复
+
+500 Hz / 10 s 原先在第 7981 个物理步报 `physics_clock_desynchronized`，当时运动已基本
+静止。根因是 MuJoCo 累加 dt 的舍入误差超过固定容差，而调度器使用 tick*dt。
+现用浮点求和误差界 `gamma_n * abs(time)`，并将容差硬封顶为四分之一个 physics tick；
+不会接受外部多推进一个完整物理步。新增 10,000 步回归，随后主动外部 step 必须拒绝。
+本修复不涉及真机 timestamp、CAN freshness 或 watchdog，也不放宽运动安全阈值。
+
+修复后同一 500 Hz / 10 s 实验完整运行 10,000 ticks，simulation/effect PASS，未触发保护。
+完整 JSON：开发机 `/tmp/b601-gains-500hz-10s-corrected.json`，该文件是本机运行证据，
+不是 Git 资产。可使用下列仅仿真、前台命令重现；不启动 CAN、不发送真机命令：
+
+```bash
+WT=/tmp/b601-real2sim-gain-experiments
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python
+LOG=/tmp/b601-real2sim-command-and-output.log
+ARGS=( "$PY" -m sim.mujoco.rebot_b601_rs.haptic_demo
+  --rebot-source-root hardware/reBotArm_control_py
+  --fixture pose-6d --real2sim-controller --host-hz 500 --duration-sec 10
+  --fixture-stiffness-scale 1 --fixture-damping-scale 1
+  --startup-lock-kp 50 150 150 50 50 50
+  --startup-lock-kd 3 10 10 5 4 4 )
+printf '%s\n' 'SIMULATION ONLY; foreground run'
+if (
+  cd "$WT" || exit 2
+  printf 'command:'
+  printf ' %q' "${ARGS[@]}"
+  printf '\n'
+  PYTHONDONTWRITEBYTECODE=1 "${ARGS[@]}"
+) >> "$LOG" 2>&1; then
+  STATUS=0
+else
+  STATUS=$?
+fi
+printf 'simulation exit code: %s\nlog: %s\n' "$STATUS" "$LOG"
+printf '%s\n' 'shell remains active'
+```
+
+本批仍待合并，前序候选保留。没有改 URDF、总路线图、真机实现或 Python 环境。
+
+验证：上述七个 B601/边界测试文件 **131 passed**（35.83 s）；Ruff、资源 audit、
+`git diff --check` 通过。新增倍率非法值、CLI 传递、零增益不冒充效果验收、墙约束，
+以及长时正常时钟/外部一步污染回归。10 秒 6D CLI 实验为独立的离线效果证据。
+
+## M1 采样保持功率诊断
+
+基线 `e81dc0070fc07f6ace81e1864a7d24241209b89d`；后继分支
+`codex/b601-real2sim-energy-diagnostics`。现有 demo JSON 增加 `power_diagnostics`，
+不新增入口、控制增益或驱动器状态，也不改变任何命令或验收判定。
+
+统计仅包含 ACTIVE、确实推进且未 fault 的 physics tick；末次 fault tick 排除并显式标记。
+使用步前速度和该步实际 actuator force 的左矩形积分 `sum(tau · dq * dt)`，记录净功、
+正功、吸收功的正幅值、峰值正功率及样本数。只读对照通道为：
+
+- `applied_total`：实际执行器总力矩，不把其正功直接判作不稳定，因为包含重力和弹簧。
+- `nominal_motor_local_damping`：本地 `-Kd*dq`，位于总 actuator saturation 之前；
+  不是限幅后的可加分解。
+- `held_nominal_cartesian_damping`：仅 pose fixture，采样时计算无裁剪的
+  `-J(q_sample)^T D J(q_sample) dq_sample`，在 host tick 间保持。使用实际配置的 D，
+  不含 startup blending、fixture clipping 或 feedforward slew；**此 torque 只用于观测，
+  从不写入控制指令**，不能冒充实际末端阻尼输出。
+
+固定原有 6D fixture、operator profile、官方 startup gains、1.5 s：
+
+| host Hz | ACTIVE 有效样本 | 名义保持阻尼正功 J | 名义保持阻尼净功 J | 结果 |
+| --- | --- | --- | --- | --- |
+| 20 | 50 | 0 | -0.00068034 | 加速度保护，统计被截断 |
+| 125 | 24 | 0.00027350 | +0.00003228 | 加速度保护，统计被截断 |
+| 500 | 1200 | 0 | -0.00923137 | 原有 fixture PASS |
+
+三组采样瞬间的名义阻尼均无正功率，本地阻尼均无正功。125 Hz 保持期间却出现正功，
+说明“采样瞬间耗能”并不保证保持期间耗能。20 Hz 在观测窗口未出现同样证据，不能
+将其失败也归因为已证实的阻尼注能。各组持续时间不同，不应直接比较总功大小。
+
+这些通道不是完整储能函数，也未分离限幅后各力矩项，不是 energy tank、passivity observer
+或稳定性证明；JSON 中 `passivity_claim=false`、`hardware_claim=false`。
+下一步需把限幅/slew/重力/弹簧的影响继续分开，任何能量约束控制设计应另行验证，
+不能用这份 observer 的净功直接控制或重新使能机械臂。
+
+前序命令无需修改即可得到附加诊断。仅仿真，待合并；未改真机代码、环境或总路线图。
+
+验证：同上七个 B601/边界测试文件 **134 passed**（33.21 s），Ruff、资源 audit、
+`git diff --check` 通过。新增 signed/positive/absorbed work 恒等式、本地阻尼非正功和
+125 Hz 保持期间正功回归。固定同一外部 vendor 路径的 500 Hz 前后 CLI 对照中，
+移除新增 `power_diagnostics` 后整份 JSON 完全一致，确认本次观测没有改变原有输出。
+
+## M1 主机前馈变化率隔离与 125 Hz 验证
+
+基线 `e2e47c63fade534130b651d4fb619e6ff41090ea`，后继分支
+`codex/b601-real2sim-feedforward-rate`。核实时本地 development 为 `24aa543b`，
+尚不包含该基线；本批仍是有序后继候选，不声称已完成合并。
+
+复用已有 `default_b601_mit_profile(..., torque_rise_time_sec=...)`，仅在现有 demo
+开放同名 CLI/API 参数。省略时原样使用驱动器默认 0.05 s，不复制默认常量。
+其语义是 `max_torque_rate = URDF effort ceiling / torque_rise_time_sec`，**不是启动锁
+交接时长**。real2sim 下限制 host feedforward；motor-local Kp/Kd 不经过它。
+profile 已有 metadata 与六轴实际变化率数值继续作为 JSON 证据来源。
+参数必须有限且大于零；未改刚度、阻尼、URDF、力矩绝对上限和运动/效果门限。
+
+### 1.5 s 对照
+
+以下 rate scale 是相对原默认变化率的实验记法（不是新 CLI 参数），对应 normalization
+时间分别为 0.05、0.5、5 s。实际实验通过已有 profile 构造参数完成。
+
+| host Hz | rate scale | 结果 | 已执行 ticks | slew 受限 ticks |
+| --- | --- | --- | --- | --- |
+| 20 | 1 | J6 acceleration guard | 351 | 0 |
+| 20 | 0.1 | 同上 | 351 | 0 |
+| 20 | 0.01 | J2 velocity guard | 1150 | 16 |
+| 125 | 1 | J6 acceleration guard | 329 | 8 |
+| 125 | 0.1 | J6 acceleration guard | 337 | 10 |
+| 125 | 0.01 | PASS | 1500 | 155 |
+| 500 | 1 / 0.1 / 0.01 | 均 PASS | 各 1500 | 21 / 21 / 29 |
+
+20 Hz 原配置在失败前没有触发 slew，不能解释为 slew 延迟导致这次失败；强行进一步
+降低变化率也只是把失败换成 J2 速度保护。125 Hz 则得到一个可继续验证的有限候选。
+
+### 10 s 方向验证
+
+固定 operator gravity、官方启动锁参数，125 Hz、normalization=5 s：
+`pose-6d/pose-tx/pose-ty/pose-tz/pose-rx/pose-rz` 六项 PASS；
+`pose-ry` 完整运行且无 driver fault，但效果 FAIL。绕 Y 的最大角误差约 0.016606 rad，
+初始约 0.014996 rad，比例约 1.107，超过既有 1.10 的峰值增长指标；最终误差已收敛。
+原默认 500 Hz 在同一 10 s `pose-ry` 对照中也因同一峰值指标 FAIL（约 0.016593 rad）。
+因此不能把此项全部归因于低频，也不能四舍五入或放宽指标来判 PASS。
+
+这把“125 Hz 下完全不可运行”细化为“特定前馈变化率下，多数固定扰动通过，单轴效果仍有缺口”。
+它不是全工作空间稳定域、真机参数建议或 HARDWARE_PASS。20 Hz 仍不通过。
+下一步应隔离标定/plant 不匹配对 Y 轴瞬态的影响，并继续 M1 故障路径与 M2 数据契约，
+不应围绕单个姿态继续盲目压低变化率。
+
+仅仿真前台复现（Python 日志与命令写同一固定文件）：
+
+```bash
+WT=/tmp/b601-real2sim-feedforward-rate
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python
+LOG=/tmp/b601-real2sim-command-and-output.log
+ARGS=( "$PY" -m sim.mujoco.rebot_b601_rs.haptic_demo
+  --rebot-source-root hardware/reBotArm_control_py
+  --fixture pose-6d --real2sim-controller --host-hz 125 --duration-sec 10
+  --torque-rise-time-sec 5
+  --startup-lock-kp 50 150 150 50 50 50
+  --startup-lock-kd 3 10 10 5 4 4 )
+printf '%s\n' 'SIMULATION ONLY; foreground run'
+if (
+  cd "$WT" || exit 2
+  printf 'command:'
+  printf ' %q' "${ARGS[@]}"
+  printf '\n'
+  PYTHONDONTWRITEBYTECODE=1 "${ARGS[@]}"
+) >> "$LOG" 2>&1; then
+  STATUS=0
+else
+  STATUS=$?
+fi
+printf 'simulation exit code: %s\nlog: %s\n' "$STATUS" "$LOG"
+printf '%s\n' 'shell remains active'
+```
+
+把 fixture 改成 `pose-ry` 应返回 exit 3，保留失败供后续定位。未运行真机、未修改环境、
+总路线图或先前待合并候选；本批依赖基线并等待合并。
+
+验证：七个 B601/边界测试文件 **141 passed**（38.68 s），新增参数非法值、CLI 转发及
+10 s `pose-6d` PASS / `pose-ry` 效果 FAIL 的回归；Ruff、资源 audit、文档 Bash 语法和
+`git diff --check` 通过。归一化参数只控制已有变化率，不改变完整的启动阶段时长。
+
+## M1 重力基线与故障回归、M2 证据准备
+
+基线 `b549688ac1d0f4fa6bf8da7d89f4662d91a9050a`，后继分支
+`codex/b601-real2sim-replay-evidence`。本批不把 M1 全部或 M2 定量辨识标为完成。
+
+### Y 轴瞬态定位
+
+新增纯 controller 工厂 `B601Real2SimControllerProfile.raw_model_baseline()` 和现有 demo
+参数 `--gravity-control-baseline raw-model`，必须显式开启 real2sim。默认仍为 operator。
+raw-model 仅移除重力校正，保留本地 Kd，不改变 URDF、plant 或验收门限。API 可接收
+显式 controller profile，不再依赖进程内替换来做对照。
+
+同一 10 s `pose-ry`，原始重力控制在 125 Hz（normalization=5 s）和 500 Hz（默认）均 PASS。
+125 Hz 初始/最大角误差约 0.014996 rad，最终约 0.002442 rad；500 Hz 最终约 1.65e-7 rad。
+这支持“控制标定与未辨识 plant 不匹配参与了超调”，不支持删除真实 bias 或反写假质量。
+前节仅仿真命令加 `--gravity-control-baseline raw-model --fixture pose-ry` 可复现。
+
+新增 ACTIVE 阶段 invalid/wrong-frame/dropout/duplicate 回归：不推进 accepted sequence，
+不刷新 watchdog，最终锁存 protective hold；新合法 reference 不能自行重新使能。
+这是指令通道回归，**不是**传感器坏帧、真实电机失效或 CAN partial-send 仿真。
+
+### 当前真机证据限制（高严重度、高置信度）
+
+现有 `real2sim.py` 的纯函数 `audit_b601_probe_trace(payload)` 仅审查既有
+startup-replay/gravity-calibration JSON，不导入硬件、不打开 CAN、不拟合或回放。
+检查六轴顺序、非空样本、严格递增的 sequence/反馈观察时间、完整有限的六轴数据和
+非负驱动增益。返回 poll cadence、FD 速度摘要、freshness 缺口、声明身份及来源终止状态。
+当前格式缺少逐样本发送时间/回执，因此格式检查通过仍是 `QUALITATIVE_TRACE_ONLY`，
+绝不升级成 `quantitative_paired_replay_ready=true`。声明身份不冒充已与资产比对验证。
+
+| 现场记录 | 样本数 | 未验证 freshness | 观察跨度 | poll 中位间隔 |
+| --- | --- | --- | --- | --- |
+| `/tmp/b601-rs-j2-bias-minus010-r1/result.json` | 867 | 867（100%） | 43.463 s | 0.050161 s |
+| `/tmp/b601-rs-j2-gravity-scale-095-20260909-173751/b601_j2_gravity_scale_095_startup_replay.json` | 2151 | 2151（100%） | 107.875 s | 0.050157 s |
+
+粒度是六轴主机观察＋控制记录，不是电机独立采样。顶层 FAIL 来自操作者终止，不能单独
+证明样本无效；其时间/来源缺口也不能因为曾通过 startup replay 就忽略。第一组全为
+WAITING_FOR_R，第二组含 RAMP_IN/RELOCKED/HANDOFF/SECOND_ACTIVE。未改写任何原始字段。
+
+关联 raw log **有** TX/RX 证据：第一组 `motorbridge_raw.log` 跨约 1555.285 s，第二组
+`motorbridge_robstride_startup_raw.log` 跨约 126.245 s。raw 使用 `unix_time_ns`，JSON
+使用主机 monotonic 观察时刻；两种时钟映射和逐样本归属尚未验证，不能仅凭文件名/PID
+将全部 raw 帧当成同一个可拟合窗口。这些 raw 文件保留，未复制到 Git。
+
+定量 M2 尚需：可核验的反馈新鲜度、command/feedback 时间对齐、明确的无接触区间和
+负载条件、fit/held-out 分离。旧记录可能含人手外力，不能独立将其分离为摩擦/重力误差。
+按 data-quality Skill 的用途边界检查，将证据和 Python 检查保留在现有模块/Markdown，
+不另建 notebook/HTML 报告体系。下面只读取旧文件，不连接设备：
+
+```python
+import json
+from sim.mujoco.rebot_b601_rs.real2sim import audit_b601_probe_trace
+
+with open("/tmp/b601-rs-j2-bias-minus010-r1/result.json") as stream:
+    report = audit_b601_probe_trace(json.load(stream))
+print(json.dumps(report, indent=2))
+```
+
+需现场补充：是否已有更新的带时间对齐、无接触标注的记录，以及其负载/采集条件。
+若没有，应先安排采集能力验证，再准备前台真机采集命令；不得直接重放旧 torque 或
+自动使能电机。此处只暂停依赖真实数据的辨识路径，不声称数字孪生或 HITL 已完成。
+
+本批验证：七个 B601/边界测试文件 **157 passed**（46.31 s），原始重力基线 Y 轴
+125 Hz / 10 s CLI PASS；Ruff、资源 audit、`git diff --check` 通过。纯数据检查覆盖
+重复时间/序号、J7 混入、缺维、非有限和负驱动增益，并拒绝给旧格式伪造拟合资格。
+候选待合并，未 push、安装或执行真机操作；原始现场数据仍在原路径，未纳入提交。
+
+## M2 首轮现场采集能力验证（被动接收）
+
+操作者确认没有更新的合格记录，转入真机采集准备。本批基于 `73e3d4ef`，分支
+`codex/b601-passive-capture-clocks`；只扩展现有 frequency probe 的 read-only 模式，
+不修改控制、保护保持、重力参数或总路线图。
+
+新增可选 `--raw-output`：独占创建 JSONL，保存完整 SocketCAN 原始字节（包括无法解码的帧），
+及主机 `receive_monotonic_ns / observe_realtime_ns / clock_pair_end_monotonic_ns`。
+墙钟读取发生在两个单调时钟读取之间；这是 userspace recv 后观察，不是电机采样时间，
+也不是内核接收时间。其他进程的本机 TX 回显可能被接收，不能冒充本 probe 的发送回执。
+成功结束有 end 记录；Ctrl-C 留存部分文件但不写成功尾记录。拒绝覆盖旧 raw 文件，
+拒绝 raw 与 summary 同路径，拒绝在非 read-only 模式使用该参数。
+
+第一轮现场只被动监听 15 s，不构造 MotorBridge backend，不发送 CAN，不改变主动上报、
+电机使能或现有 protective hold。操作者无需推动机械臂；保持可靠支撑，不为采集退出既有
+保护程序。采集始终前台，实际命令和详细输出追加到固定 command_and_output.log，
+raw/summary 每轮放入独立目录。零帧只证明该时段没有观察到流量，不能证明断连或反馈新鲜。
+先核验收到的帧和时间基准，再决定是否需要显式开启遥测及受控无接触采集。
+本轮不能代替配对 command/feedback 记录、动态激励或定量辨识。
+
+离线验证：hardware backend、active report、low gain probe 三文件 **183 passed**，
+全部使用假 transport；覆盖接收中断、空流、bind 失败关闭 socket、原始帧保留和 CLI 隔离。
+资源 audit 和 diff 检查通过；Ruff 无新增问题，frequency probe 原有 EXE001、UP041、
+RUF046 三项保持未动。候选待合并，未 push、安装或执行任何真实 CAN 操作。

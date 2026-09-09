@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import io
+import math
+import os
+import pty
+import termios
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,6 +40,548 @@ def test_condition_torque_rejects_nonpositive_dt() -> None:
             max_rate_nm_s=(1.0,) * 6,
             dt_sec=0.0,
         )
+
+
+def test_gravity_calibration_capture_repeats_free_drag_and_fixed_windows() -> None:
+    capture = probe.GravityCalibrationCapture(20.0)
+    first_pose = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    moved_pose = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
+
+    assert capture.reference(first_pose) == first_pose
+    first = capture.trigger(
+        first_pose,
+        elapsed_sec=5.0,
+        sample_start_index=12,
+    )
+    assert first is not None
+    assert first["index"] == 1
+    assert capture.state == "RECORDING"
+    assert capture.reference(moved_pose) == first_pose
+    assert (
+        capture.trigger(moved_pose, elapsed_sec=6.0, sample_start_index=13)
+        is None
+    )
+    assert capture.complete_if_due(elapsed_sec=24.99, sample_end_index=410) is None
+
+    completed = capture.complete_if_due(elapsed_sec=25.0, sample_end_index=412)
+    assert completed is first
+    assert completed["completed"] is True
+    assert completed["completion_reason"] == "duration_complete"
+    assert completed["sample_end_index"] == 412
+    assert completed["observed_duration_sec"] == pytest.approx(20.0)
+    assert capture.state == "FREE_DRAG"
+    assert capture.reference(moved_pose) == moved_pose
+
+    second = capture.trigger(
+        moved_pose,
+        elapsed_sec=30.0,
+        sample_start_index=500,
+    )
+    assert second is not None
+    assert second["index"] == 2
+    interrupted = capture.interrupt(
+        elapsed_sec=34.0,
+        sample_end_index=580,
+        reason="operator_interrupt",
+    )
+    assert interrupted is second
+    assert interrupted["completed"] is False
+    assert interrupted["completion_reason"] == "operator_interrupt"
+    assert capture.state == "FREE_DRAG"
+
+    acceptance = probe.evaluate_gravity_calibration_capture(capture)
+    assert acceptance["status"] == "FAIL"
+    assert acceptance["completed_record_count"] == 1
+    assert acceptance["incomplete_record_count"] == 1
+
+
+def test_gravity_calibration_acceptance_requires_a_complete_window() -> None:
+    capture = probe.GravityCalibrationCapture(20.0)
+
+    acceptance = probe.evaluate_gravity_calibration_capture(capture)
+
+    assert acceptance == {
+        "status": "FAIL",
+        "completed_record_count": 0,
+        "incomplete_record_count": 0,
+        "reasons": ("no complete calibration recording window",),
+    }
+
+
+def test_gravity_calibration_acceptance_passes_only_complete_windows() -> None:
+    capture = probe.GravityCalibrationCapture(20.0)
+    capture.trigger((0.0,) * 6, elapsed_sec=1.0, sample_start_index=0)
+    capture.complete_if_due(elapsed_sec=21.0, sample_end_index=400)
+
+    acceptance = probe.evaluate_gravity_calibration_capture(capture)
+
+    assert acceptance == {
+        "status": "PASS",
+        "completed_record_count": 1,
+        "incomplete_record_count": 0,
+        "reasons": (),
+    }
+
+
+def test_gravity_calibration_capture_has_settling_before_recording() -> None:
+    capture = probe.GravityCalibrationCapture(
+        2.0,
+        settling_duration_sec=1.0,
+    )
+    record = capture.trigger(
+        (0.1,) * 6,
+        elapsed_sec=5.0,
+        sample_start_index=10,
+    )
+    assert record is not None
+    assert capture.state == "SETTLING"
+    assert record["sample_start_index"] is None
+    assert capture.start_recording_if_due(
+        elapsed_sec=5.99,
+        sample_start_index=20,
+    ) is None
+    started = capture.start_recording_if_due(
+        elapsed_sec=6.0,
+        sample_start_index=30,
+    )
+    assert started is record
+    assert capture.state == "RECORDING"
+    assert record["sample_start_index"] == 30
+    completed = capture.complete_if_due(elapsed_sec=8.0, sample_end_index=70)
+    assert completed is record
+    assert record["recording_duration_sec"] == pytest.approx(2.0)
+
+
+def _synthetic_calibration_payload(*, software_kp: float = 5.0) -> dict[str, object]:
+    gravity_vectors = (
+        (0.0, 2.0, 4.0, 1.0, 0.1, -0.1),
+        (0.0, 3.0, 2.0, 1.5, -0.2, 0.2),
+    )
+    references = (
+        (0.0, 0.8, 0.9, 0.1, 0.0, 0.0),
+        (0.2, 1.2, 0.6, 0.4, 0.1, -0.2),
+    )
+    # residual = 0.1 * nominal gravity + a fixed joint bias
+    bias = np.asarray((0.0, 0.05, -0.03, 0.02, 0.01, -0.01))
+    samples: list[dict[str, object]] = []
+    records: list[dict[str, object]] = []
+    for pose_index, (gravity, reference) in enumerate(
+        zip(gravity_vectors, references, strict=True)
+    ):
+        residual = 0.1 * (np.asarray(gravity) / 0.5) + bias
+        start = len(samples)
+        for _offset in range(3):
+            samples.append(
+                {
+                    "elapsed_sec": float(len(samples)) * 0.05,
+                    "qpos_rad": reference,
+                    "qref_rad": reference,
+                    "qvel_fd_rad_s": (0.0,) * 6,
+                    "gravity_tau_nm": gravity,
+                    "position_tau_nm": tuple(residual),
+                    "requested_tau_nm": gravity,
+                    "conditioned_tau_nm": gravity,
+                    "torque_limited": False,
+                    "slew_limited": False,
+                }
+            )
+        records.append(
+            {
+                "index": len(records) + 1,
+                "completed": True,
+                "sample_start_index": start,
+                "sample_end_index": len(samples),
+                "reference_qpos_rad": reference,
+            }
+        )
+    return {
+        "mode": "gravity-calibration",
+        "profile": {
+            "gravity_scale": 0.5,
+            "software_kp_nm_per_rad": (software_kp,) * 6,
+        },
+        "gravity_calibration": {"records": records},
+        "samples": samples,
+    }
+
+
+def test_calibration_window_reduction_and_r_only_fit() -> None:
+    payload = _synthetic_calibration_payload()
+    reduced = probe.reduce_gravity_calibration_windows(payload)
+    assert reduced["completed_record_count"] == 2
+    assert all(window["valid"] for window in reduced["windows"])
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale-joint-bias",
+    )
+    assert fit["status"] == "PASS"
+    assert fit["gravity_scale_correction"] == pytest.approx(0.1, abs=1e-10)
+    assert fit["nominal_gravity_joint_scales"] == pytest.approx((1.0,) * 6)
+    assert fit["effective_gravity_multipliers"] == pytest.approx((0.6,) * 6)
+    assert fit["joint_bias_nm"] == pytest.approx(
+        (0.0, 0.05, -0.03, 0.02, 0.01, -0.01),
+        abs=1e-10,
+    )
+    assert fit["pairing"]["pair_count"] == 0
+    assert fit["single_window_observation_count"] == 2
+
+
+def test_calibration_validation_uses_independent_r_windows() -> None:
+    payload = _synthetic_calibration_payload()
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale-joint-bias",
+    )
+
+    validation = probe.evaluate_gravity_calibration_model(
+        fit,
+        payload,
+        pose_tolerance_rad=0.01,
+    )
+
+    assert validation["status"] == "PASS"
+    assert validation["observation_count"] == 2
+    assert validation["pairing"]["pair_count"] == 0
+    assert validation["residual_reduced"] is True
+
+
+def test_calibration_fit_rejects_zero_kp_residual_observation() -> None:
+    payload = _synthetic_calibration_payload(software_kp=0.0)
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale",
+    )
+    assert fit["status"] == "FAIL"
+    assert "software Kp is zero" in fit["reasons"][0]
+
+
+def test_formal_fit_does_not_require_operator_direction_labels() -> None:
+    payload = _synthetic_calibration_payload()
+
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale",
+    )
+
+    assert fit["status"] == "PASS"
+    assert fit["pairing"]["pair_count"] == 0
+    assert fit["observation_semantics"] == (
+        "each R capture is reduced independently; nearby repeats may be averaged"
+    )
+
+
+def test_pose_selection_deduplicates_repeated_reference_windows() -> None:
+    observations = [
+        {
+            "reference_qpos_rad": (0.0,) * 6,
+            "gravity_tau_nm": (3.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        },
+        {
+            "reference_qpos_rad": (0.01,) * 6,
+            "gravity_tau_nm": (1.0, 0.1, 0.0, 0.0, 0.0, 0.0),
+        },
+        {
+            "reference_qpos_rad": (0.4,) * 6,
+            "gravity_tau_nm": (2.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+        },
+    ]
+
+    selection = probe.select_calibration_poses(
+        observations,
+        model="global-scale",
+        pose_tolerance_rad=0.08,
+    )
+
+    assert len(selection["selected_indices"]) == 2
+    assert selection["duplicate_rejected_indices"] == (1,)
+    assert selection["rejected_indices"] == (1,)
+
+
+def test_global_scale_payload_fit_recovers_mass_and_first_moment(tmp_path) -> None:
+    class FakePayloadModel:
+        urdf_path = tmp_path / "payload.urdf"
+        gravity_mps2 = (0.0, 0.0, -9.81)
+
+        def forward_kinematics(self, qpos_rad: object) -> np.ndarray:
+            q = np.asarray(qpos_rad, dtype=float)
+            a, b, c = 0.2 * q[0], -0.1 * q[1], 0.15 * q[2]
+            ca, sa = np.cos(a), np.sin(a)
+            cb, sb = np.cos(b), np.sin(b)
+            cc, sc = np.cos(c), np.sin(c)
+            rx = np.asarray(((1.0, 0.0, 0.0), (0.0, ca, -sa), (0.0, sa, ca)))
+            ry = np.asarray(((cb, 0.0, sb), (0.0, 1.0, 0.0), (-sb, 0.0, cb)))
+            rz = np.asarray(((cc, -sc, 0.0), (sc, cc, 0.0), (0.0, 0.0, 1.0)))
+            transform = np.eye(4)
+            transform[:3, :3] = rx @ ry @ rz
+            return transform
+
+        def arm_jacobian(self, qpos_rad: object) -> np.ndarray:
+            q = np.asarray(qpos_rad, dtype=float)
+            jacobian = np.asarray(
+                (
+                    (1.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+                    (0.2, 1.0, 0.1, 0.2, 0.3, 0.4),
+                    (0.3, 0.2, 1.0, 0.1, 0.2, 0.3),
+                    (0.4, 0.3, 0.2, 1.0, 0.1, 0.2),
+                    (0.5, 0.4, 0.3, 0.2, 1.0, 0.1),
+                    (0.6, 0.5, 0.4, 0.3, 0.2, 1.0),
+                )
+            )
+            for index in range(6):
+                jacobian += (0.03 * q[index]) * np.roll(
+                    np.eye(6),
+                    index,
+                    axis=1,
+                )
+            return jacobian
+
+    model = FakePayloadModel()
+    model.urdf_path.write_text("<robot name='payload'/>", encoding="utf-8")
+    payload_params = np.asarray((0.4, 0.02, -0.01, 0.03))
+    samples: list[dict[str, object]] = []
+    records: list[dict[str, object]] = []
+    for pose_index in range(8):
+        reference = (
+            0.1 + 0.2 * pose_index,
+            0.5 + 0.1 * pose_index,
+            1.0 + 0.07 * pose_index,
+            0.2 + 0.05 * pose_index,
+            -0.3 + 0.08 * pose_index,
+            0.1 - 0.03 * pose_index,
+        )
+        gravity = np.asarray(
+            (
+                1.0 + 0.3 * pose_index,
+                2.0 - 0.2 * pose_index,
+                3.0 + 0.4 * pose_index,
+                0.5 + 0.2 * pose_index,
+                -0.1 + 0.1 * pose_index,
+                0.3 - 0.15 * pose_index,
+            )
+        )
+        residual = 0.2 * gravity + probe.payload_gravity_torque_regressor(
+            model,
+            reference,
+        ) @ payload_params
+        start = len(samples)
+        for _offset in range(3):
+            samples.append(
+                {
+                    "elapsed_sec": len(samples) * 0.05,
+                    "qpos_rad": reference,
+                    "qref_rad": reference,
+                    "qvel_fd_rad_s": (0.0,) * 6,
+                    "gravity_tau_nm": tuple(gravity),
+                    "position_tau_nm": tuple(residual),
+                    "requested_tau_nm": tuple(gravity),
+                    "conditioned_tau_nm": tuple(gravity),
+                    "torque_limited": False,
+                    "slew_limited": False,
+                }
+            )
+        records.append(
+            {
+                "index": len(records) + 1,
+                "completed": True,
+                "sample_start_index": start,
+                "sample_end_index": len(samples),
+                "reference_qpos_rad": reference,
+            }
+        )
+    payload = {
+        "mode": "gravity-calibration",
+        "profile": {
+            "gravity_scale": 1.0,
+            "software_kp_nm_per_rad": (5.0,) * 6,
+        },
+        "gravity_calibration": {"records": records},
+        "samples": samples,
+    }
+
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale-payload",
+        kinematic_model=model,
+    )
+
+    assert fit["status"] == "PASS"
+    assert fit["fit"]["rank"] == 5
+    assert fit["gravity_scale_correction"] == pytest.approx(0.2)
+    assert fit["payload_mass_kg"] == pytest.approx(0.4)
+    assert fit["payload_first_moment_kg_m"] == pytest.approx(
+        (0.02, -0.01, 0.03)
+    )
+    assert fit["single_window_observation_count"] == 8
+
+
+def test_enabled_shutdown_always_attempts_hold_before_disable() -> None:
+    assert (
+        probe.resolve_shutdown_action(
+            enabled=True,
+            full_disable_requested=False,
+        )
+        == "protective_hold"
+    )
+    assert (
+        probe.resolve_shutdown_action(
+            enabled=True,
+            full_disable_requested=True,
+        )
+        == "safe_stop"
+    )
+    assert (
+        probe.resolve_shutdown_action(
+            enabled=False,
+            full_disable_requested=False,
+        )
+        == "safe_stop"
+    )
+
+
+def test_protective_hold_notice_is_high_visibility_and_log_safe() -> None:
+    notice = probe._protective_hold_notice(
+        "protective hold degraded",
+        "ARM STATE: joint1..joint6 remain ENABLED.",
+        "DAMPING: UNAVAILABLE while feedback is untrusted.",
+    )
+
+    lines = notice.splitlines()
+    assert lines[0] == "=" * 72
+    assert lines[-1] == "=" * 72
+    assert "[B601] !!! PROTECTIVE HOLD DEGRADED !!!" in lines
+    assert "[B601] ARM STATE: joint1..joint6 remain ENABLED." in lines
+    assert "[B601] DAMPING: UNAVAILABLE while feedback is untrusted." in lines
+    assert "\x1b" not in notice
+
+
+def test_duration_completion_latches_hold_and_interrupts_active_record() -> None:
+    stop = {"requested": False, "full_disable_requested": False}
+    capture = probe.GravityCalibrationCapture(20.0)
+    record = capture.trigger((0.0,) * 6, elapsed_sec=285.0, sample_start_index=10)
+
+    reason = probe.complete_active_duration(
+        stop=stop,
+        calibration_capture=capture,
+        elapsed_sec=300.0,
+        sample_end_index=310,
+    )
+
+    assert reason == "duration_complete"
+    assert stop == {"requested": True, "full_disable_requested": False}
+    assert record is not None
+    assert record["completed"] is False
+    assert record["completion_reason"] == "probe_duration_complete"
+    assert capture.state == "FREE_DRAG"
+
+
+def test_operator_key_reader_reads_r_without_enter_and_restores_terminal() -> None:
+    master_fd, slave_fd = pty.openpty()
+    tty_path = Path(os.ttyname(slave_fd))
+    original = termios.tcgetattr(slave_fd)
+    reader = probe.OperatorKeyReader(tty_path)
+    try:
+        os.write(master_fd, b"R")
+        assert reader.poll_record_request() is True
+        assert reader.poll_record_request() is False
+    finally:
+        reader.close()
+        restored = termios.tcgetattr(slave_fd)
+        os.close(master_fd)
+        os.close(slave_fd)
+
+    assert restored == original
+
+
+def test_operator_key_reader_ignores_non_r_calibration_keys() -> None:
+    master_fd, slave_fd = pty.openpty()
+    tty_path = Path(os.ttyname(slave_fd))
+    reader = probe.OperatorKeyReader(tty_path)
+    try:
+        os.write(master_fd, b"pN")
+        assert reader.poll_record_request() is False
+        os.write(master_fd, b"R")
+        assert reader.poll_record_request() is True
+    finally:
+        reader.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+def test_startup_replay_ramps_lock_in_holds_and_hands_back_out() -> None:
+    capture = probe.StartupReplayCapture(
+        transition_duration_sec=0.5,
+        locked_duration_sec=1.0,
+    )
+    reference = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    zero_velocity = (0.0,) * 6
+
+    event = capture.trigger(
+        reference,
+        zero_velocity,
+        elapsed_sec=3.0,
+        sample_index=60,
+    )
+
+    assert event is not None
+    assert event["state"] == "RAMP_IN"
+    assert capture.lock_fraction(3.0) == 0.0
+    assert capture.lock_fraction(3.25) == pytest.approx(0.5)
+    assert capture.advance(
+        reference,
+        zero_velocity,
+        elapsed_sec=3.5,
+        sample_index=70,
+    )[0]["state"] == "RELOCKED"
+    assert capture.lock_fraction(3.5) == 1.0
+    assert capture.advance(
+        reference,
+        zero_velocity,
+        elapsed_sec=4.5,
+        sample_index=90,
+    )[0]["state"] == "HANDOFF"
+    assert capture.lock_fraction(4.75) == pytest.approx(0.5)
+    assert capture.advance(
+        (0.1, 0.21, 0.3, 0.4, 0.5, 0.6),
+        zero_velocity,
+        elapsed_sec=5.0,
+        sample_index=100,
+    )[0]["state"] == "SECOND_ACTIVE"
+    assert capture.lock_fraction(5.0) == 0.0
+
+    result = probe.evaluate_startup_replay_capture(
+        capture,
+        final_qpos_rad=(0.1, 0.22, 0.3, 0.4, 0.5, 0.6),
+        sample_count=102,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["reference_to_second_active_delta_rad"][1] == pytest.approx(0.01)
+    assert result["reference_to_final_delta_rad"][1] == pytest.approx(0.02)
+    assert result["second_active_observation_count"] == 1
+    assert result["displacement_gate_rad"] is None
+
+
+def test_startup_replay_without_r_is_incomplete_without_a_numeric_gate() -> None:
+    capture = probe.StartupReplayCapture(
+        transition_duration_sec=0.5,
+        locked_duration_sec=1.0,
+    )
+
+    result = probe.evaluate_startup_replay_capture(
+        capture,
+        final_qpos_rad=(0.0,) * 6,
+        sample_count=0,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["state"] == "WAITING_FOR_R"
+    assert result["displacement_gate_rad"] is None
+    assert result["reasons"] == ("operator did not trigger startup replay with R",)
 
 
 def test_shared_gravity_ramp_preserves_vector_and_keeps_damping_live() -> None:
@@ -77,7 +624,87 @@ def test_startup_handoff_uses_the_same_rise_time_after_gravity() -> None:
     assert probe.startup_handoff_fraction(elapsed_sec=2.0, rise_time_sec=0.5) == 1.0
 
 
-def test_startup_lock_profile_uses_per_joint_yaml_gains_and_final_bounds() -> None:
+def test_vendor_status_cache_diagnostics_is_passive_and_explicitly_unverified() -> None:
+    state = SimpleNamespace(
+        velocities_reported=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        torques_reported_nm=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        freshness_verified=False,
+    )
+
+    result = probe.vendor_status_cache_diagnostics(state)
+
+    assert result == {
+        "velocity_rad_s": (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        "torque_nm": (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        "complete": True,
+        "errors": (),
+        "freshness_verified": False,
+        "semantics": (
+            "passive_motorbridge_operation_status_cache_unverified; "
+            "no_extra_can_request; not command-response correlated"
+        ),
+    }
+
+
+def test_vendor_status_cache_diagnostics_does_not_fail_when_cache_is_absent() -> None:
+    result = probe.vendor_status_cache_diagnostics(SimpleNamespace())
+
+    assert result["complete"] is False
+    assert result["velocity_rad_s"] is None
+    assert result["torque_nm"] is None
+    assert result["errors"] == (
+        "vendor_status_velocity_rad_s: unavailable",
+        "vendor_status_torque_nm: unavailable",
+    )
+
+
+def test_startup_diagnostics_reports_observed_deltas_without_a_numeric_gate() -> None:
+    samples = [
+        {
+            "startup_state": "GRAVITY_RAMP",
+            "elapsed_sec": 0.25,
+            "qpos_rad": (0.0,) * 6,
+        },
+        {
+            "startup_state": "ACTIVE",
+            "elapsed_sec": 1.0,
+            "qpos_rad": (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        },
+    ]
+
+    result = probe.summarize_startup_diagnostics(
+        pre_enable_qpos_rad=(-0.1,) * 6,
+        lock_reference_qpos_rad=(0.0,) * 6,
+        pre_control_observations=({"phase": "PRE_ENABLE_FEEDBACK"},),
+        samples=samples,
+    )
+
+    assert result["acceptance_status"] == "CAPTURED"
+    assert result["extra_can_requests"] == 0
+    assert result["pre_enable_to_post_enable_delta_rad"] == pytest.approx((0.1,) * 6)
+    assert result["post_enable_to_first_active_delta_rad"] == pytest.approx(
+        (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    )
+    assert result["pre_enable_to_first_active_delta_rad"] == pytest.approx(
+        (0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
+    )
+    assert result["displacement_gate_rad"] is None
+
+
+def test_startup_diagnostics_is_incomplete_without_active_sample() -> None:
+    result = probe.summarize_startup_diagnostics(
+        pre_enable_qpos_rad=None,
+        lock_reference_qpos_rad=None,
+        pre_control_observations=(),
+        samples=(),
+    )
+
+    assert result["acceptance_status"] == "INCOMPLETE"
+    assert result["first_active_qpos_rad"] is None
+    assert result["displacement_gate_rad"] is None
+
+
+def test_startup_lock_profile_keeps_yaml_gains_driver_local() -> None:
     profile = probe.build_startup_lock_profile(
         mit_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
         mit_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
@@ -86,21 +713,329 @@ def test_startup_lock_profile_uses_per_joint_yaml_gains_and_final_bounds() -> No
         velocity_limit_rad_s=5.0,
     )
 
-    assert profile.position_kp_nm_per_rad == (50.0, 150.0, 150.0, 50.0, 50.0, 50.0)
-    assert profile.damping_kd_nm_s_per_rad == (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
+    assert profile.position_kp_nm_per_rad == (0.0,) * 6
+    assert profile.damping_kd_nm_s_per_rad == (0.0,) * 6
     assert profile.max_torque_rate_nm_s == (18.0, 18.0, 18.0, 7.0, 7.0, 7.0)
     assert profile.max_abs_overlay_torque_nm == (0.0,) * 6
     assert profile.metadata["gain_source"] == "rebotarm_rs_yaml.MIT"
+    assert profile.metadata["vendor_kp_nm_per_rad"] == (
+        50.0,
+        150.0,
+        150.0,
+        50.0,
+        50.0,
+        50.0,
+    )
+    assert profile.metadata["vendor_kd_nm_s_per_rad"] == (
+        3.0,
+        10.0,
+        10.0,
+        5.0,
+        4.0,
+        4.0,
+    )
 
 
-def test_startup_lock_blend_preserves_gravity_vector_and_handoffs_overlay() -> None:
+def test_startup_lock_host_breakdown_contains_gravity_only() -> None:
+    class FakeModel:
+        def arm_generalized_gravity(self, _qpos_rad):
+            return (1.0, -2.0, 3.0, -4.0, 5.0, -6.0)
+
+    profile = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
+        mit_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
+        torque_limits_nm=(9.0, 9.0, 9.0, 3.5, 3.5, 3.5),
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+    reference = probe.build_reference(
+        sequence=1,
+        timestamp_sec=1.0,
+        qpos_rad=(0.5,) * 6,
+        qvel_rad_s=(0.0,) * 6,
+    )
+
+    breakdown = probe.compute_software_torque_breakdown(
+        FakeModel(),
+        reference=reference,
+        measured_qpos_rad=(0.1,) * 6,
+        measured_qvel_rad_s=(2.0,) * 6,
+        profile=profile,
+        gravity_scale=0.8,
+        gravity_joint_scales=(1.0, 0.95, 1.0, 0.5, 1.2, 1.0),
+    )
+
+    assert breakdown.position_torque_nm == (0.0,) * 6
+    assert breakdown.damping_torque_nm == (0.0,) * 6
+    assert breakdown.gravity_torque_nm == pytest.approx(
+        (0.8, -1.52, 2.4, -1.6, 4.8, -4.8)
+    )
+    assert breakdown.requested_torque_nm == breakdown.gravity_torque_nm
+
+
+def test_gravity_compensation_applies_offset_bias_and_directional_friction() -> None:
+    class FakeModel:
+        def __init__(self) -> None:
+            self.qpos: tuple[float, ...] | None = None
+
+        def arm_generalized_gravity(self, qpos_rad):
+            self.qpos = tuple(qpos_rad)
+            return (1.0, -2.0, 3.0, -4.0, 5.0, -6.0)
+
+    model = FakeModel()
+    profile = probe.build_software_profile(
+        kp=0.0,
+        kd=0.0,
+        torque_limits_nm=(20.0,) * 6,
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+    reference = probe.build_reference(
+        sequence=1,
+        timestamp_sec=1.0,
+        qpos_rad=(0.0,) * 6,
+    )
+
+    breakdown = probe.compute_software_torque_breakdown(
+        model,
+        reference=reference,
+        measured_qpos_rad=(0.1,) * 6,
+        measured_qvel_rad_s=(0.03, -0.03, 0.01, -0.01, 0.0, 0.02),
+        profile=profile,
+        gravity_scale=0.5,
+        gravity_joint_scales=(1.0, 0.5, 1.0, 0.5, 1.0, 0.5),
+        gravity_joint_offsets_rad=(0.01, -0.02, 0.03, -0.04, 0.05, -0.06),
+        gravity_joint_bias_nm=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        gravity_coulomb_friction_nm=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        gravity_coulomb_velocity_threshold_rad_s=0.02,
+    )
+
+    assert model.qpos == pytest.approx((0.11, 0.08, 0.13, 0.06, 0.15, 0.04))
+    assert breakdown.gravity_torque_nm == pytest.approx(
+        (0.61, -0.32, 1.8, -0.6, 3.0, -0.9)
+    )
+    assert breakdown.requested_torque_nm == breakdown.gravity_torque_nm
+
+
+def test_driver_local_lock_gain_blend_has_clean_active_endpoints() -> None:
+    lock_kp = (50.0, 150.0, 150.0, 50.0, 50.0, 50.0)
+    lock_kd = (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
+    active_kd = (1.0,) * 6
+
+    active_kp, active_driver_kd = probe.blend_driver_local_lock_gains(
+        lock_kp_nm_per_rad=lock_kp,
+        lock_kd_nm_s_per_rad=lock_kd,
+        active_kd_nm_s_per_rad=active_kd,
+        lock_fraction=0.0,
+    )
+    halfway_kp, halfway_kd = probe.blend_driver_local_lock_gains(
+        lock_kp_nm_per_rad=lock_kp,
+        lock_kd_nm_s_per_rad=lock_kd,
+        active_kd_nm_s_per_rad=active_kd,
+        lock_fraction=0.5,
+    )
+    locked_kp, locked_kd = probe.blend_driver_local_lock_gains(
+        lock_kp_nm_per_rad=lock_kp,
+        lock_kd_nm_s_per_rad=lock_kd,
+        active_kd_nm_s_per_rad=active_kd,
+        lock_fraction=1.0,
+    )
+
+    assert active_kp == (0.0,) * 6
+    assert active_driver_kd == active_kd
+    assert halfway_kp == pytest.approx(tuple(value * 0.5 for value in lock_kp))
+    assert halfway_kd == pytest.approx(
+        tuple((start + end) * 0.5 for start, end in zip(active_kd, lock_kd))
+    )
+    assert locked_kp == lock_kp
+    assert locked_kd == lock_kd
+
+
+def test_driver_local_lock_command_has_continuous_gain_and_velocity_endpoints() -> None:
+    limits = ((-1.0, 1.0),) * 6
+    lock_reference = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    active_reference = (-0.1, -0.2, -0.3, -0.4, -0.5, -0.6)
+    active_velocity = (0.2,) * 6
+    lock_kp = (50.0, 150.0, 150.0, 50.0, 50.0, 50.0)
+    lock_kd = (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
+    active_kd = (1.0,) * 6
+
+    active = probe.resolve_driver_local_lock_command(
+        lock_reference_qpos_rad=lock_reference,
+        active_reference_qpos_rad=active_reference,
+        active_reference_qvel_rad_s=active_velocity,
+        position_limits_rad=limits,
+        lock_kp_nm_per_rad=lock_kp,
+        lock_kd_nm_s_per_rad=lock_kd,
+        active_kd_nm_s_per_rad=active_kd,
+        lock_fraction=0.0,
+    )
+    halfway = probe.resolve_driver_local_lock_command(
+        lock_reference_qpos_rad=lock_reference,
+        active_reference_qpos_rad=active_reference,
+        active_reference_qvel_rad_s=active_velocity,
+        position_limits_rad=limits,
+        lock_kp_nm_per_rad=lock_kp,
+        lock_kd_nm_s_per_rad=lock_kd,
+        active_kd_nm_s_per_rad=active_kd,
+        lock_fraction=0.5,
+    )
+    locked = probe.resolve_driver_local_lock_command(
+        lock_reference_qpos_rad=lock_reference,
+        active_reference_qpos_rad=active_reference,
+        active_reference_qvel_rad_s=active_velocity,
+        position_limits_rad=limits,
+        lock_kp_nm_per_rad=lock_kp,
+        lock_kd_nm_s_per_rad=lock_kd,
+        active_kd_nm_s_per_rad=active_kd,
+        lock_fraction=1.0,
+    )
+
+    assert active.reference_qpos_rad == active_reference
+    assert active.reference_qvel_rad_s == active_velocity
+    assert active.kp_nm_per_rad == (0.0,) * 6
+    assert active.kd_nm_s_per_rad == active_kd
+    assert active.position_lock_joint_names == ()
+    assert halfway.reference_qpos_rad == lock_reference
+    assert halfway.reference_qvel_rad_s == pytest.approx((0.1,) * 6)
+    assert halfway.kp_nm_per_rad == pytest.approx(
+        tuple(value * 0.5 for value in lock_kp)
+    )
+    assert halfway.position_lock_joint_names == tuple(probe._ALL_JOINTS)
+    assert locked.reference_qpos_rad == lock_reference
+    assert locked.reference_qvel_rad_s == (0.0,) * 6
+    assert locked.kp_nm_per_rad == lock_kp
+    assert locked.kd_nm_s_per_rad == lock_kd
+
+
+def test_driver_local_lock_suppresses_kp_when_reference_needs_urdf_clamp() -> None:
+    limits = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    command = probe.resolve_driver_local_lock_command(
+        lock_reference_qpos_rad=(0.0, -0.004, 0.5, -1.62, 0.0, 0.0),
+        active_reference_qpos_rad=(0.0,) * 6,
+        active_reference_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=limits,
+        lock_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
+        lock_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
+        active_kd_nm_s_per_rad=(1.0,) * 6,
+        lock_fraction=1.0,
+    )
+
+    assert command.reference_qpos_rad == pytest.approx(
+        (0.0, 0.0, 0.5, -math.pi / 2.0, 0.0, 0.0)
+    )
+    assert command.kp_nm_per_rad == (50.0, 0.0, 150.0, 0.0, 50.0, 50.0)
+    assert command.kd_nm_s_per_rad == (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
+    assert command.position_lock_joint_names == (
+        "joint1",
+        "joint3",
+        "joint5",
+        "joint6",
+    )
+    assert command.position_lock_suppressed_joint_names == ("joint2", "joint4")
+
+
+def test_gravity_calibration_active_endpoint_keeps_software_residual_semantics() -> None:
+    profile = probe.build_software_profile(
+        kp=5.0,
+        kd=0.0,
+        torque_limits_nm=(14.4, 14.4, 14.4, 5.6, 5.6, 5.6),
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+    command = probe.resolve_driver_local_lock_command(
+        lock_reference_qpos_rad=(0.0,) * 6,
+        active_reference_qpos_rad=(0.2,) * 6,
+        active_reference_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=((-1.0, 1.0),) * 6,
+        lock_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
+        lock_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
+        active_kd_nm_s_per_rad=(1.0,) * 6,
+        lock_fraction=0.0,
+    )
+
+    assert profile.position_kp_nm_per_rad == (5.0,) * 6
+    assert profile.damping_kd_nm_s_per_rad == (0.0,) * 6
+    assert command.reference_qpos_rad == (0.2,) * 6
+    assert command.kp_nm_per_rad == (0.0,) * 6
+    assert command.kd_nm_s_per_rad == (1.0,) * 6
+    assert command.position_lock_joint_names == ()
+
+
+def test_protective_hold_uses_zero_position_stiffness_and_one_damping_owner() -> None:
+    startup = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
+        mit_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
+        torque_limits_nm=(9.0, 9.0, 9.0, 3.5, 3.5, 3.5),
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+
+    hold = probe.build_protective_hold_profile(
+        startup,
+        driver_kd_nm_s_per_rad=(0.0, 0.5, 0.5, 0.0, 0.0, 0.5),
+    )
+
+    assert hold.position_kp_nm_per_rad == (0.0,) * 6
+    assert hold.damping_kd_nm_s_per_rad == (1.0, 0.0, 0.0, 1.0, 1.0, 0.0)
+    assert hold.max_abs_torque_nm == startup.max_abs_torque_nm
+    assert hold.max_torque_rate_nm_s == startup.max_torque_rate_nm_s
+    assert hold.metadata["software_damping_disabled_where_driver_kd_nonzero"] is True
+    assert hold.metadata["position_stiffness_disabled"] is True
+
+
+def test_protective_hold_uses_default_damping_without_driver_kd() -> None:
+    startup = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0,) * 6,
+        mit_kd_nm_s_per_rad=(3.0,) * 6,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=1.0,
+    )
+
+    hold = probe.build_protective_hold_profile(
+        startup,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+    )
+
+    assert hold.damping_kd_nm_s_per_rad == (1.0,) * 6
+
+
+def test_protective_hold_default_damping_can_be_selected_for_drag_test() -> None:
+    startup = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0,) * 6,
+        mit_kd_nm_s_per_rad=(3.0,) * 6,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=1.0,
+    )
+
+    hold = probe.build_protective_hold_profile(
+        startup,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+        default_damping_kd_nm_s_per_rad=1.4,
+    )
+
+    assert hold.position_kp_nm_per_rad == (0.0,) * 6
+    assert hold.damping_kd_nm_s_per_rad == (1.4,) * 6
+    assert hold.metadata["default_software_damping_kd_nm_s_per_rad"] == 1.4
+
+
+def test_startup_lock_blend_preserves_full_gravity_and_handoffs_final_terms() -> None:
     startup = probe.B601MitTorqueBreakdown(
-        position_torque_nm=(1.0,) * 6,
-        damping_torque_nm=(2.0,) * 6,
+        position_torque_nm=(0.0,) * 6,
+        damping_torque_nm=(0.0,) * 6,
         gravity_torque_nm=(4.0, -3.0, 2.0, -1.0, 0.5, -0.25),
         overlay_requested_nm=(0.0,) * 6,
         overlay_effective_nm=(0.0,) * 6,
-        requested_torque_nm=(7.0, 7.0, 7.0, 7.0, 7.5, 6.75),
+        requested_torque_nm=(4.0, -3.0, 2.0, -1.0, 0.5, -0.25),
         overlay_limited=False,
     )
     final = probe.B601MitTorqueBreakdown(
@@ -116,14 +1051,12 @@ def test_startup_lock_blend_preserves_gravity_vector_and_handoffs_overlay() -> N
     halfway = probe.blend_startup_lock_torque_breakdown(
         startup,
         final,
-        gravity_fraction=0.5,
+        gravity_fraction=1.0,
         handoff_fraction=0.5,
     )
-    assert halfway.position_torque_nm == pytest.approx((0.55,) * 6)
-    assert halfway.damping_torque_nm == pytest.approx((1.1,) * 6)
-    assert halfway.gravity_torque_nm == pytest.approx(
-        tuple(0.5 * value for value in startup.gravity_torque_nm)
-    )
+    assert halfway.position_torque_nm == pytest.approx((0.05,) * 6)
+    assert halfway.damping_torque_nm == pytest.approx((0.1,) * 6)
+    assert halfway.gravity_torque_nm == startup.gravity_torque_nm
     assert halfway.overlay_requested_nm == pytest.approx((0.15,) * 6)
     assert halfway.overlay_effective_nm == pytest.approx((0.125,) * 6)
     assert halfway.requested_torque_nm == pytest.approx(
@@ -147,6 +1080,7 @@ def test_startup_lock_blend_preserves_gravity_vector_and_handoffs_overlay() -> N
     )
     assert completed.position_torque_nm == final.position_torque_nm
     assert completed.damping_torque_nm == final.damping_torque_nm
+    assert completed.gravity_torque_nm == final.gravity_torque_nm
     assert completed.overlay_effective_nm == final.overlay_effective_nm
 
 
@@ -177,30 +1111,285 @@ def test_feedback_stability_summary_rejects_non_monotonic_time() -> None:
         )
 
 
-def test_feedback_boundary_normalization_is_narrow_and_preserves_raw_values() -> None:
-    raw = (0.1, -5.0e-4, -2.5e-4, -5.0e-6, 0.0, 0.0)
+def test_feedback_boundary_normalization_is_per_joint_and_preserves_raw_values() -> None:
+    raw = (0.1, -4.943e-3, -6.82e-4, -5.0e-6, 0.0, 0.0)
 
     normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
 
     assert normalized == (0.1, 0.0, 0.0, -5.0e-6, 0.0, 0.0)
     assert normalized_joint_names == ("joint2", "joint3")
-    assert raw[1:3] == (-5.0e-4, -2.5e-4)
+    assert raw[1:3] == (-4.943e-3, -6.82e-4)
 
 
 def test_feedback_boundary_normalization_does_not_admit_more_negative_values() -> None:
-    raw = (0.1, -5.0001e-4, 0.0, 0.0, 0.0, 0.0)
+    for index, value in ((1, -10.0001e-3), (2, -3.0001e-3)):
+        raw_values = [0.0] * 6
+        raw_values[index] = value
+        raw = tuple(raw_values)
+
+        normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+        assert normalized == raw
+        assert normalized_joint_names == ()
+        with pytest.raises(
+            probe.LowGainProbeError,
+            match="outside position acceptance limits",
+        ):
+            probe._validate_fault_hold_snapshot(
+                raw,
+                qvel_rad_s=(0.0,) * 6,
+                observed_age_sec=0.0,
+                position_limits_rad=_fault_hold_limits(),
+            )
+
+
+def test_feedback_boundary_normalization_admits_j3_and_keeps_other_joints_unchanged() -> None:
+    raw = (0.1, 0.0, -2.216e-3, -0.002, -0.003, -0.004)
+
+    normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+    assert normalized == (0.1, 0.0, 0.0, -0.002, -0.003, -0.004)
+    assert normalized_joint_names == ("joint3",)
+
+
+def test_feedback_admission_limits_separate_boundary_windows_and_wrist_margin() -> None:
+    strict = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+
+    admission = probe.build_feedback_admission_position_limits(strict)
+
+    assert admission[:1] == strict[:1]
+    assert admission[1] == pytest.approx((-0.01, 3.14))
+    assert admission[2] == pytest.approx((-0.003, 3.14))
+    assert admission[3] == pytest.approx(
+        (-math.pi / 2.0 - 0.1, math.pi / 2.0 + 0.1)
+    )
+    assert admission[4] == pytest.approx((-1.67, 1.67))
+    assert admission[5] == pytest.approx((-3.24, 3.24))
+
+
+def test_feedback_boundary_normalization_admits_observed_j2_startup_transient_only() -> None:
+    observed = -0.0076273283921182156
+    raw = (0.1, observed, 0.2, 0.3, 0.4, 0.5)
+
+    normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+    assert normalized == (0.1, 0.0, 0.2, 0.3, 0.4, 0.5)
+    assert normalized_joint_names == ("joint2",)
+
+    beyond = (0.1, -0.0100001, 0.2, 0.3, 0.4, 0.5)
+    unchanged, unchanged_joint_names = probe.normalize_feedback_boundary_qpos(beyond)
+    assert unchanged == beyond
+    assert unchanged_joint_names == ()
+
+
+def test_backend_feedback_diagnostics_preserve_bad_finite_position() -> None:
+    bad = 2.686622237168953e36
+    state = SimpleNamespace(
+        joints=(
+            SimpleNamespace(
+                name="joint4",
+                motor_id=4,
+                feedback_id=0xFD,
+                position_rad=bad,
+                position_source="robstride_mech_pos_parameter",
+                valid=False,
+                stale=True,
+                error="joint4: mechPos(0x7019) raw=2.686622237168953e+36",
+            ),
+        )
+    )
+
+    diagnostics = probe._backend_feedback_diagnostics(state)
+
+    assert diagnostics[0]["position_rad"] == bad
+    assert diagnostics[0]["motor_id"] == 4
+    assert "mechPos(0x7019)" in diagnostics[0]["error"]
+
+
+def test_feedback_boundary_normalization_admits_j4_precision_window_only() -> None:
+    j4_lower = -math.pi / 2.0
+    raw = (0.1, 0.2, 0.3, j4_lower - 0.001, -0.3, 0.4)
+
+    normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+    assert normalized[3] == pytest.approx(j4_lower)
+    assert normalized_joint_names == ("joint4",)
+    assert normalized[:3] == raw[:3]
+    assert normalized[4:] == raw[4:]
+
+
+def test_j4_operating_margin_does_not_project_real_position() -> None:
+    j4_lower = -math.pi / 2.0
+    raw = (0.1, 0.2, 0.3, j4_lower - 0.001 - 1e-9, -0.3, 0.4)
 
     normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
 
     assert normalized == raw
     assert normalized_joint_names == ()
-    with pytest.raises(probe.LowGainProbeError, match="outside URDF limits"):
-        probe._validate_fault_hold_snapshot(
-            raw,
-            qvel_rad_s=(0.0,) * 6,
-            observed_age_sec=0.0,
-            position_limits_rad=_fault_hold_limits(),
+    strict = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (j4_lower, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    admitted = probe._validate_in_limit_qpos(
+        raw,
+        position_limits_rad=probe.build_feedback_admission_position_limits(strict),
+        name="j4_operating_qpos_rad",
+    )
+    assert admitted[3] == pytest.approx(raw[3])
+
+
+def test_wrist_feedback_margin_admits_observed_j6_but_rejects_beyond_margin() -> None:
+    strict = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    admission = probe.build_feedback_admission_position_limits(strict)
+    observed = (0.1, 0.2, 0.3, 0.4, 0.5, 3.2327115535736084)
+
+    assert probe._validate_in_limit_qpos(
+        observed,
+        position_limits_rad=admission,
+        name="observed_j6_qpos_rad",
+    ) == observed
+    with pytest.raises(probe.LowGainProbeError, match="position acceptance limits"):
+        probe._validate_in_limit_qpos(
+            (*observed[:5], 3.240001),
+            position_limits_rad=admission,
+            name="beyond_j6_qpos_rad",
         )
+
+
+def test_feedback_reference_clamp_keeps_outgoing_command_limits_nominal() -> None:
+    strict = (
+        (-2.8, 2.8),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+
+    assert probe.clamp_reference_qpos_to_command_limits(
+        (0.0, 0.5, 0.5, -1.62, 1.63, 3.2327115535736084),
+        position_limits_rad=strict,
+    ) == pytest.approx((0.0, 0.5, 0.5, -math.pi / 2.0, 1.57, 3.14))
+
+
+def test_resolve_model_and_limits_uses_precise_j4_nominal_boundary(monkeypatch, tmp_path) -> None:
+    class FakeModel:
+        urdf_path = tmp_path / "b601.urdf"
+
+        @classmethod
+        def from_rebot_source_root(cls, source_root):
+            return cls()
+
+        def arm_position_limits(self):
+            return (
+                np.asarray((-2.8, 0.0, 0.0, -1.57, -1.57, -3.14)),
+                np.asarray((2.8, 3.14, 3.14, 1.57, 1.57, 3.14)),
+            )
+
+    monkeypatch.setattr(probe, "B601PinocchioModel", FakeModel)
+    _model, limits = probe._resolve_model_and_limits(tmp_path)
+
+    assert limits[3] == pytest.approx((-math.pi / 2.0, math.pi / 2.0))
+    assert limits[:3] == ((-2.8, 2.8), (0.0, 3.14), (0.0, 3.14))
+    assert limits[4:] == ((-1.57, 1.57), (-3.14, 3.14))
+
+
+def test_feedback_position_guard_records_out_of_limit_sample_without_dispatch() -> None:
+    raw = (0.1, 0.2, 0.3, 2.448736388725043e24, 0.5, 0.6)
+    rejection = probe.evaluate_feedback_position_guard(
+        sequence=742,
+        feedback_timestamp_sec=484802.391661432,
+        raw_qpos_rad=raw,
+        normalized_qpos_rad=raw,
+        position_limits_rad=(
+            (-2.8, 2.8),
+            (0.0, 3.14),
+            (0.0, 3.14),
+            (-1.57, 1.57),
+            (-1.57, 1.57),
+            (-3.14, 3.14),
+        ),
+        previous_qvel_rad_s=(0.0,) * 6,
+    )
+
+    assert rejection is not None
+    assert rejection["guard"] == "position_limits"
+    assert rejection["offending_joint"] == "joint4"
+    assert rejection["offending_joint_index"] == 3
+    assert rejection["observed_value"] == raw[3]
+    assert rejection["raw_qpos_rad"] == raw
+    assert rejection["normalized_qpos_rad"] == raw
+    assert rejection["sequence"] == 742
+    assert rejection["command_dispatched"] is False
+    assert rejection["eligible_for_last_safe"] is False
+    assert rejection["feedback_dt_sec"] is None
+
+
+def test_feedback_position_guard_accepts_only_the_pinned_position_limits() -> None:
+    assert (
+        probe.evaluate_feedback_position_guard(
+            sequence=1,
+            feedback_timestamp_sec=1.0,
+            raw_qpos_rad=(0.1, -4.0e-3, -2.0e-3, 0.0, 0.0, 0.0),
+            normalized_qpos_rad=(0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
+            position_limits_rad=(
+                (-2.8, 2.8),
+                (0.0, 3.14),
+                (0.0, 3.14),
+                (-1.57, 1.57),
+                (-1.57, 1.57),
+                (-3.14, 3.14),
+            ),
+        )
+        is None
+    )
+
+
+def test_motion_rejection_confirmation_quarantines_first_rejection() -> None:
+    rejection = {"reason": "velocity abort", "sequence": 10}
+
+    pending, action = probe.advance_motion_rejection_confirmation(None, rejection)
+
+    assert pending is rejection
+    assert action == "quarantine"
+
+
+def test_motion_rejection_confirmation_recovers_on_next_valid_frame() -> None:
+    pending, action = probe.advance_motion_rejection_confirmation(
+        {"reason": "velocity abort", "sequence": 10},
+        None,
+    )
+
+    assert pending is None
+    assert action == "recovered"
+
+
+def test_motion_rejection_confirmation_aborts_on_consecutive_rejection() -> None:
+    first = {"reason": "velocity abort", "sequence": 10}
+    second = {"reason": "acceleration abort", "sequence": 11}
+
+    pending, action = probe.advance_motion_rejection_confirmation(first, second)
+
+    assert pending is second
+    assert action == "abort"
 
 
 def test_feedback_stability_probe_never_enters_motion_path(tmp_path) -> None:
@@ -285,8 +1474,8 @@ def test_feedback_stability_probe_normalizes_only_admitted_j2_j3_boundary(tmp_pa
                 stale=False,
                 positions_rad=(
                     0.0,
-                    -2.5e-4,
-                    -5.0e-4,
+                    -4.517e-3,
+                    -2.216e-3,
                     0.0,
                     0.0,
                     0.0,
@@ -331,8 +1520,19 @@ def test_feedback_stability_probe_normalizes_only_admitted_j2_j3_boundary(tmp_pa
     assert result["status"] == "OK"
     boundary = result["feedback_boundary_normalization"]
     assert boundary["applied_sample_count"] == 3
-    assert boundary["applied_joint_counts"] == {"joint2": 3, "joint3": 3}
-    assert result["samples"][0]["raw_qpos_rad"][1:3] == (-2.5e-4, -5.0e-4)
+    assert boundary["applied_joint_counts"] == {
+        "joint2": 3,
+        "joint3": 3,
+        "joint4": 0,
+    }
+    assert boundary["intervals_rad"] == {
+        "joint2": (-1.0e-2, 0.0),
+        "joint3": (-3.0e-3, 0.0),
+        "joint4": pytest.approx(
+            (-math.pi / 2.0 - 1.0e-3, -math.pi / 2.0)
+        ),
+    }
+    assert result["samples"][0]["raw_qpos_rad"][1:3] == (-4.517e-3, -2.216e-3)
     assert result["samples"][0]["qpos_rad"][1:3] == (0.0, 0.0)
     assert result["samples"][0]["boundary_normalized_joint_names"] == (
         "joint2",
@@ -833,6 +2033,11 @@ def test_active_joint_resolution_always_uses_all_six_arm_joints() -> None:
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
 
+def test_protective_hold_uses_all_six_arm_joints_and_excludes_no_arm_joint() -> None:
+    assert probe._FAULT_HOLD_JOINTS == tuple(probe._ALL_JOINTS)
+    assert probe._NON_FAULT_HOLD_JOINTS == ()
+
+
 def test_hold_reference_uses_the_complete_settled_six_joint_snapshot() -> None:
     settled = (0.12, 0.34, 0.56, -0.21, 0.09, -0.45)
 
@@ -857,10 +2062,138 @@ def _fault_hold_limits() -> tuple[tuple[float, float], ...]:
         (-2.8, 2.8),
         (0.0, 3.14),
         (0.0, 3.14),
-        (-1.57, 1.57),
+        (-math.pi / 2.0, math.pi / 2.0),
         (-1.57, 1.57),
         (-3.14, 3.14),
     )
+
+
+def _fault_hold_command_receipt(
+    *,
+    accepted: bool,
+    sequence: int = 1,
+) -> probe.B601CommandReceipt:
+    sent = tuple(probe._ALL_JOINTS) if accepted else tuple(probe._ALL_JOINTS[:-1])
+    failed = () if accepted else (probe._ALL_JOINTS[-1],)
+    return probe.B601CommandReceipt(
+        sequence=sequence,
+        mode="mit",
+        frame_id="b601_rs/joint_mit_reference",
+        requested_at_sec=1.0,
+        completed_at_sec=1.0,
+        requested_joint_names=tuple(probe._ALL_JOINTS),
+        sent_joint_names=sent,
+        failed_joint_names=failed,
+        errors=() if accepted else ("simulated incomplete dispatch",),
+        accepted=accepted,
+    )
+
+
+def test_fault_hold_uses_real_feedback_for_gravity_and_nominal_dispatch_reference() -> None:
+    observed = (0.1, 0.7, 1.1, 0.0, -0.1, 3.2327115535736084)
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.gravity_qpos: list[tuple[float, ...]] = []
+
+        def arm_generalized_gravity(
+            self,
+            qpos_rad: object,
+        ) -> tuple[float, ...]:
+            self.gravity_qpos.append(tuple(qpos_rad))
+            return (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.reference: object | None = None
+
+        def send_mit(
+            self,
+            reference: object,
+            **_kwargs: object,
+        ) -> probe.B601CommandReceipt:
+            self.reference = reference
+            return _fault_hold_command_receipt(accepted=True)
+
+    model = FakeModel()
+    backend = FakeBackend()
+    profile = probe.build_software_profile(
+        kp=0.0,
+        kd=0.0,
+        torque_limits_nm=(5.0,) * 6,
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+
+    _receipt, _conditioned, gravity_tau = probe._send_fault_hold_command(
+        backend,
+        model,
+        qpos_rad=observed,
+        measured_qpos_rad=observed,
+        measured_qvel_rad_s=(0.03, -0.03, 0.0, 0.0, 0.0, 0.0),
+        profile=profile,
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(5.0,) * 6,
+        command_position_limits_rad=_fault_hold_limits(),
+        rate_hz=20.0,
+        gravity_joint_scales=(1.0, 0.95, 1.0, 1.0, 1.0, 1.0),
+        gravity_joint_offsets_rad=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        gravity_joint_bias_nm=(0.01,) * 6,
+        gravity_coulomb_friction_nm=(0.02,) * 6,
+        gravity_coulomb_velocity_threshold_rad_s=0.02,
+    )
+
+    assert model.gravity_qpos == [
+        pytest.approx(tuple(value + 0.01 * index for index, value in enumerate(observed, 1)))
+    ]
+    assert gravity_tau == pytest.approx((0.13, 0.18, 0.31, 0.41, 0.51, 0.61))
+    assert backend.reference is not None
+    assert backend.reference.qpos_rad == pytest.approx((*observed[:5], 3.14))
+
+
+class _FaultHoldBackend:
+    def __init__(
+        self,
+        *,
+        feedback: tuple[object, ...] = (),
+        cached_receipts: tuple[probe.B601CommandReceipt, ...] = (),
+        allow_safe_stop: bool = False,
+    ) -> None:
+        self.feedback = list(feedback)
+        self.cached_receipts = list(cached_receipts)
+        self.allow_safe_stop = allow_safe_stop
+        self.cached_dispatches: list[dict[str, object]] = []
+        self.safe_stop_names: list[tuple[str, ...]] = []
+
+    def poll_feedback(self, *, request_feedback: bool) -> object:
+        assert request_feedback is True
+        if not self.feedback:
+            raise AssertionError("unexpected feedback poll")
+        return self.feedback.pop(0)
+
+    def send_mit(
+        self,
+        reference: object,
+        **kwargs: object,
+    ) -> probe.B601CommandReceipt:
+        self.cached_dispatches.append({"reference": reference, **kwargs})
+        if not self.cached_receipts:
+            raise AssertionError("unexpected cached MIT dispatch")
+        return self.cached_receipts.pop(0)
+
+    def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+        self.safe_stop_names.append(tuple(joint_names))
+        if not self.allow_safe_stop:
+            raise AssertionError(f"unexpected safe_stop for {joint_names}")
+        return probe.B601ModeReceipt(
+            operation="full_safe_stop",
+            requested_joint_names=tuple(joint_names),
+            completed_joint_names=tuple(joint_names),
+            failed_joint_names=(),
+            errors=(),
+            completed=True,
+        )
 
 
 def test_fault_hold_snapshot_accepts_only_fresh_stationary_in_limit_state() -> None:
@@ -977,6 +2310,25 @@ def test_arming_settle_transition_accepts_stationary_feedback() -> None:
     assert qvel[2] == pytest.approx(0.002)
 
 
+def test_arming_settle_transition_accepts_bounded_enable_transient() -> None:
+    previous = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    current = (0.1, 0.7032942, 1.1, 0.0, -0.1, 0.2)
+
+    accepted, qvel = probe._validate_arming_settle_transition(
+        current,
+        previous_qpos_rad=previous,
+        current_timestamp_sec=1.05,
+        previous_timestamp_sec=1.0,
+        position_limits_rad=_fault_hold_limits(),
+        # Startup uses the normal motion watchdog (the command under test uses
+        # 5 rad/s), not the 0.02 rad/s protective-hold admission gate.
+        max_velocity_rad_s=5.0,
+    )
+
+    assert accepted == current
+    assert qvel[1] == pytest.approx(0.065884)
+
+
 def test_arming_settle_transition_rejects_motion() -> None:
     with pytest.raises(probe.LowGainProbeError, match="moving"):
         probe._validate_arming_settle_transition(
@@ -1012,35 +2364,132 @@ def test_fault_hold_snapshot_rejects_fault_position_without_velocity() -> None:
         )
 
 
-def test_protective_hold_feedback_rejects_drift_from_fixed_reference() -> None:
-    with pytest.raises(probe.LowGainProbeError, match="drift"):
+def test_protective_hold_feedback_allows_in_limit_manual_drag() -> None:
+    current = probe._validate_protective_hold_feedback(
+        (0.1, 0.76, 1.1, 0.0, -0.1, 0.2),
+        qvel_rad_s=(0.0, 0.4, 0.0, 0.0, 0.0, 0.0),
+        hold_qpos_rad=(0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+        observed_age_sec=0.0,
+        position_limits_rad=_fault_hold_limits(),
+        max_velocity_rad_s=1.0,
+    )
+
+    assert current == (0.1, 0.76, 1.1, 0.0, -0.1, 0.2)
+
+
+def test_protective_hold_feedback_rejects_motion_above_hold_monitor_limit() -> None:
+    with pytest.raises(probe.LowGainProbeError, match="velocity abort"):
         probe._validate_protective_hold_feedback(
             (0.1, 0.76, 1.1, 0.0, -0.1, 0.2),
-            qvel_rad_s=(0.0,) * 6,
+            qvel_rad_s=(0.0, 1.01, 0.0, 0.0, 0.0, 0.0),
             hold_qpos_rad=(0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
             observed_age_sec=0.0,
             position_limits_rad=_fault_hold_limits(),
+            max_velocity_rad_s=1.0,
         )
 
 
-def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
+def test_latched_protective_hold_references_current_pose_after_manual_drag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    q0 = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    q1 = (0.1, 0.71, 1.1, 0.0, -0.1, 0.2)
     command_qrefs: list[tuple[float, ...]] = []
+    measured_qvels: list[tuple[float, ...]] = []
 
     def fake_send_hold(
         _backend: object,
         _model: object,
         *,
         qpos_rad: tuple[float, ...],
-        measured_qpos_rad: tuple[float, ...],
         measured_qvel_rad_s: tuple[float, ...],
         **_kwargs: object,
-    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
-        assert measured_qpos_rad == q
-        assert measured_qvel_rad_s == (0.0,) * 6
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
         command_qrefs.append(qpos_rad)
+        measured_qvels.append(measured_qvel_rad_s)
+        receipt = probe.B601CommandReceipt(
+            sequence=len(command_qrefs),
+            mode="mit",
+            frame_id="b601_rs/joint_mit_reference",
+            requested_at_sec=1.0,
+            completed_at_sec=1.0,
+            requested_joint_names=tuple(probe._ALL_JOINTS),
+            sent_joint_names=tuple(probe._ALL_JOINTS),
+            failed_joint_names=(),
+            errors=(),
+            accepted=True,
+        )
+        return receipt, (0.0,) * 6, (0.0,) * 6
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.poll_count = 0
+
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            assert request_feedback is True
+            self.poll_count += 1
+            q = q0 if self.poll_count < 2 else q1
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            )
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            raise AssertionError(f"unexpected safe_stop for {joint_names}")
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        qpos_rad=q0,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q0,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=object(),
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=3,
+        operator_interrupt=True,
+        monitor_velocity_rad_s=1.0,
+    )
+
+    hold_count, _latest_tau, _first, non_hold, full, errors = result
+    assert hold_count == 3
+    assert command_qrefs[:2] == [q0, q0]
+    assert command_qrefs[2] == q1
+    assert measured_qvels[2][1] > 0.0
+    assert non_hold is None
+    assert full is None
+    assert errors == []
+
+
+def test_operator_interrupt_ignores_transient_fault_velocity_for_first_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    command_qrefs: list[tuple[float, ...]] = []
+    measured_qvels: list[tuple[float, ...]] = []
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        *,
+        qpos_rad: tuple[float, ...],
+        measured_qvel_rad_s: tuple[float, ...],
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        command_qrefs.append(qpos_rad)
+        measured_qvels.append(measured_qvel_rad_s)
         receipt = probe.B601CommandReceipt(
             sequence=len(command_qrefs),
             mode="mit",
@@ -1053,27 +2502,24 @@ def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
             errors=(),
             accepted=True,
         )
-        return receipt, (0.0,) * 6
+        return receipt, (0.0,) * 6, (0.0,) * 6
 
     class FakeBackend:
         def poll_feedback(self, *, request_feedback: bool) -> object:
             assert request_feedback is True
-            return type(
-                "State",
-                (),
-                {
-                    "valid": False,
-                    "stale": True,
-                    "positions_rad": None,
-                    "fault_reason": "simulated feedback loss",
-                },
-            )()
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            )
 
         def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
-            if joint_names == probe._NON_FAULT_HOLD_JOINTS:
-                operation = "safe_stop"
-            else:
-                operation = "full_safe_stop"
+            operation = (
+                "safe_stop"
+                if joint_names == probe._NON_FAULT_HOLD_JOINTS
+                else "full_safe_stop"
+            )
             return probe.B601ModeReceipt(
                 operation=operation,
                 requested_joint_names=tuple(joint_names),
@@ -1090,6 +2536,387 @@ def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
         qpos_rad=q,
         qvel_rad_s=(0.0,) * 6,
         observed_age_sec=0.01,
+        # This is the interrupted loop sample. It is intentionally too fast
+        # for the strict fault-snapshot gate, but is not used for the first
+        # operator-requested hold frame.
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.37,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=object(),
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=2,
+        operator_interrupt=True,
+    )
+
+    hold_count, _latest_tau, first_receipt, non_hold_receipt, full_receipt, errors = result
+    assert hold_count == 2
+    assert command_qrefs == [q, q]
+    assert measured_qvels == [(0.0,) * 6, (0.0,) * 6]
+    assert first_receipt is not None and first_receipt.accepted
+    assert non_hold_receipt is None
+    assert full_receipt is None
+    assert errors == []
+
+
+def test_latched_fault_hold_uses_explicit_protective_hold_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    profiles: list[object] = []
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        *,
+        profile: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        profiles.append(profile)
+        receipt = probe.B601CommandReceipt(
+            sequence=1,
+            mode="mit",
+            frame_id="b601_rs/joint_mit_reference",
+            requested_at_sec=1.0,
+            completed_at_sec=1.0,
+            requested_joint_names=("joint2", "joint3"),
+            sent_joint_names=("joint2", "joint3"),
+            failed_joint_names=(),
+            errors=(),
+            accepted=True,
+        )
+        return receipt, (0.0,) * 6, (0.0,) * 6
+
+    class FakeBackend:
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            raise AssertionError("max_iterations should stop before polling")
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            return probe.B601ModeReceipt(
+                operation="safe_stop",
+                requested_joint_names=tuple(joint_names),
+                completed_joint_names=tuple(joint_names),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+    final_profile = object()
+    startup_lock_profile = object()
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=final_profile,
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=1,
+        hold_profile=startup_lock_profile,
+        operator_interrupt=True,
+    )
+
+    hold_count, _latest_tau, _first, non_hold, full, errors = result
+    assert hold_count == 1
+    assert profiles == [startup_lock_profile]
+    assert non_hold is None
+    assert full is None
+    assert errors == []
+
+
+def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    current_qvel = (0.08, -0.12, 0.05, 0.03, -0.04, 0.06)
+    stale_q = (0.1, 0.65, 1.05, 0.0, -0.1, 0.2)
+    command_qrefs: list[tuple[float, ...]] = []
+    measured_qvels: list[tuple[float, ...]] = []
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        *,
+        qpos_rad: tuple[float, ...],
+        measured_qvel_rad_s: tuple[float, ...],
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        command_qrefs.append(qpos_rad)
+        measured_qvels.append(measured_qvel_rad_s)
+        receipt = probe.B601CommandReceipt(
+            sequence=len(command_qrefs),
+            mode="mit",
+            frame_id="b601_rs/joint_mit_reference",
+            requested_at_sec=1.0,
+            completed_at_sec=1.0,
+            requested_joint_names=("joint2", "joint3"),
+            sent_joint_names=("joint2", "joint3"),
+            failed_joint_names=(),
+            errors=(),
+            accepted=True,
+        )
+        return receipt, (0.0,) * 6, (0.0,) * 6
+
+    class FakeBackend:
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            assert request_feedback is True
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=current_q,
+                fault_reason=None,
+            )
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            operation = (
+                "safe_stop"
+                if joint_names == probe._NON_FAULT_HOLD_JOINTS
+                else "full_safe_stop"
+            )
+            return probe.B601ModeReceipt(
+                operation=operation,
+                requested_joint_names=tuple(joint_names),
+                completed_joint_names=tuple(joint_names),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        # The stationary candidate is stale and differs from the live fault
+        # frame.  A normal fault entry must use the live frame instead.
+        qpos_rad=stale_q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=current_q,
+        fault_qvel_rad_s=current_qvel,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=object(),
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": False, "full_disable_requested": False},
+        max_iterations=2,
+        fault_entry=True,
+        fault_entry_max_velocity_rad_s=0.5,
+    )
+
+    hold_count, _latest_tau, first_receipt, non_hold_receipt, full_receipt, errors = result
+    assert hold_count == 2
+    assert command_qrefs == [current_q, current_q]
+    assert measured_qvels == [current_qvel, (0.0,) * 6]
+    assert first_receipt is not None and first_receipt.accepted
+    assert non_hold_receipt is None
+    assert full_receipt is None
+    assert errors == []
+
+
+def test_latched_fault_hold_uses_cached_gravity_on_invalid_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    command_qrefs: list[tuple[float, ...]] = []
+    telemetry: dict[str, object] = {}
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        *,
+        qpos_rad: tuple[float, ...],
+        measured_qpos_rad: tuple[float, ...],
+        measured_qvel_rad_s: tuple[float, ...],
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        assert measured_qpos_rad == q
+        assert measured_qvel_rad_s == (0.0,) * 6
+        command_qrefs.append(qpos_rad)
+        return _fault_hold_command_receipt(accepted=True), gravity, gravity
+
+    backend = _FaultHoldBackend(
+        feedback=(
+            SimpleNamespace(
+                valid=False,
+                stale=True,
+                positions_rad=None,
+                fault_reason="simulated feedback loss",
+            ),
+        ),
+        cached_receipts=(_fault_hold_command_receipt(accepted=True, sequence=2),),
+    )
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=2,
+        driver_kd_nm_s_per_rad=(1.0,) * 6,
+        cached_gravity_tau_nm=gravity,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, first_receipt, non_hold_receipt, full_receipt, errors = result
+    assert hold_count == 2
+    assert command_qrefs == [q]
+    assert len(backend.cached_dispatches) == 1
+    assert backend.cached_dispatches[0]["kp"] == (0.0,) * 6
+    assert backend.cached_dispatches[0]["kd"] == (1.0,) * 6
+    assert backend.cached_dispatches[0]["tau_nm"] == gravity
+    assert backend.cached_dispatches[0]["joint_names"] == probe._ALL_JOINTS
+    assert first_receipt is not None and first_receipt.accepted
+    assert non_hold_receipt is None
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["entry_count"] == 1
+    assert telemetry["command_count"] == 2
+    assert telemetry["escalation_reason"] is None
+    terminal = capsys.readouterr().out
+    assert "!!! PROTECTIVE HOLD LATCHED !!!" in terminal
+    assert "CONTROL: live gravity compensation and damping are ACTIVE." in terminal
+    assert "!!! PROTECTIVE HOLD DEGRADED !!!" in terminal
+    assert "DAMPING: motor-local damping remains ACTIVE." in terminal
+    assert "REASON: fault hold: protective hold feedback is not complete" in terminal
+
+
+def test_degraded_fault_hold_recovers_live_gravity_without_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    telemetry: dict[str, object] = {}
+    live_dispatch_count = 0
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        nonlocal live_dispatch_count
+        live_dispatch_count += 1
+        return _fault_hold_command_receipt(
+            accepted=True,
+            sequence=live_dispatch_count,
+        ), gravity, gravity
+
+    backend = _FaultHoldBackend(
+        feedback=(
+            SimpleNamespace(
+                valid=False,
+                stale=True,
+                positions_rad=None,
+                fault_reason="simulated one-frame feedback loss",
+            ),
+            SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            ),
+        ),
+        cached_receipts=(_fault_hold_command_receipt(accepted=True, sequence=2),),
+    )
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=3,
+        driver_kd_nm_s_per_rad=(1.0,) * 6,
+        cached_gravity_tau_nm=gravity,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
+    assert hold_count == 3
+    assert live_dispatch_count == 2
+    assert len(backend.cached_dispatches) == 1
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["entry_count"] == 1
+    assert telemetry["recovery_count"] == 1
+
+
+def test_fault_hold_retries_one_incomplete_all_joint_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    attempts = 0
+    telemetry: dict[str, object] = {}
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        nonlocal attempts
+        attempts += 1
+        return (
+            _fault_hold_command_receipt(accepted=attempts > 1, sequence=attempts),
+            (0.0,) * 6,
+            (0.0,) * 6,
+        )
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        _FaultHoldBackend(),
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
         fault_qpos_rad=q,
         fault_qvel_rad_s=(0.0,) * 6,
         position_limits_rad=_fault_hold_limits(),
@@ -1102,20 +2929,196 @@ def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
         torque_limits_nm=(1.0,) * 6,
         rate_hz=20.0,
         stop={"requested": True, "full_disable_requested": False},
-        max_iterations=2,
+        max_iterations=1,
+        degraded_telemetry=telemetry,
     )
 
-    hold_count, _latest_tau, first_receipt, non_hold_receipt, full_receipt, errors = result
+    hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
     assert hold_count == 1
-    assert command_qrefs == [q]
-    assert first_receipt is not None and first_receipt.accepted
-    assert non_hold_receipt is not None and non_hold_receipt.completed
+    assert attempts == 2
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["tx_retry_count"] == 1
+    assert telemetry["tx_retry_recovered_count"] == 1
+
+
+def test_degraded_hold_disables_only_after_cached_frame_retry_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    telemetry: dict[str, object] = {}
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        return _fault_hold_command_receipt(accepted=True), gravity, gravity
+
+    backend = _FaultHoldBackend(
+        feedback=(
+            SimpleNamespace(
+                valid=False,
+                stale=True,
+                positions_rad=None,
+                fault_reason="simulated sustained feedback loss",
+            ),
+        ),
+        cached_receipts=(
+            _fault_hold_command_receipt(accepted=False, sequence=2),
+            _fault_hold_command_receipt(accepted=False, sequence=3),
+        ),
+        allow_safe_stop=True,
+    )
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=2,
+        cached_gravity_tau_nm=gravity,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
+    assert hold_count == 1
+    assert len(backend.cached_dispatches) == 2
+    assert backend.safe_stop_names == [tuple(probe._ALL_JOINTS)]
     assert full_receipt is not None and full_receipt.completed
-    assert any("feedback is not complete and valid" in error for error in errors)
+    assert errors
+    assert telemetry["escalation_reason"] == (
+        "live and cached all-six-joint hold dispatch failed after retry"
+    )
+
+
+@pytest.mark.parametrize(
+    ("degraded_entry_reason", "fault_entry", "fault_qpos", "fault_qvel"),
+    (
+        ("simulated missing active feedback", False, None, None),
+        (
+            None,
+            True,
+            (0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+            (1.0,) * 6,
+        ),
+    ),
+)
+def test_degraded_entry_uses_cached_gravity_when_live_entry_is_unavailable(
+    degraded_entry_reason: str | None,
+    fault_entry: bool,
+    fault_qpos: tuple[float, ...] | None,
+    fault_qvel: tuple[float, ...] | None,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    telemetry: dict[str, object] = {}
+    backend = _FaultHoldBackend(
+        cached_receipts=(_fault_hold_command_receipt(accepted=True),),
+    )
+
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=fault_qpos,
+        fault_qvel_rad_s=fault_qvel,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=1,
+        driver_kd_nm_s_per_rad=(1.0,) * 6,
+        cached_qpos_rad=q,
+        cached_gravity_tau_nm=gravity,
+        degraded_entry_reason=degraded_entry_reason,
+        fault_entry=fault_entry,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, first, _non_hold, full_receipt, errors = result
+    assert hold_count == 1
+    assert [item["tau_nm"] for item in backend.cached_dispatches] == [gravity]
+    assert first is not None and first.accepted
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["entry_count"] == 1
+
+
+def test_degraded_entry_without_driver_damping_reports_damping_unavailable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    backend = _FaultHoldBackend(
+        cached_receipts=(_fault_hold_command_receipt(accepted=True),),
+    )
+
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=None,
+        fault_qvel_rad_s=None,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=1,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+        cached_qpos_rad=q,
+        cached_gravity_tau_nm=gravity,
+        degraded_entry_reason="simulated unavailable feedback",
+    )
+
+    hold_count, _latest_tau, first, _non_hold, full_receipt, errors = result
+    assert hold_count == 1
+    assert first is not None and first.accepted
+    assert full_receipt is None
+    assert errors == []
+    terminal = capsys.readouterr().out
+    assert "!!! PROTECTIVE HOLD DEGRADED !!!" in terminal
+    assert "DAMPING: UNAVAILABLE while feedback is untrusted" in terminal
+    assert "!!! PROTECTIVE HOLD LATCHED !!!" in terminal
+    assert "CONTROL: DEGRADED cached gravity" in terminal
 
 
 def test_fault_hold_snapshot_rejects_out_of_limit_q() -> None:
-    with pytest.raises(probe.LowGainProbeError, match="outside URDF limits"):
+    with pytest.raises(
+        probe.LowGainProbeError,
+        match="outside position acceptance limits",
+    ):
         probe._validate_fault_hold_snapshot(
             (0.1, 3.2, 1.1, 0.0, -0.1, 0.2),
             qvel_rad_s=(0.0,) * 6,
@@ -1390,14 +3393,119 @@ def test_effort_limits_are_read_from_urdf_and_scaled(tmp_path) -> None:
 
 def test_parser_help_is_read_only() -> None:
     parser = probe.build_parser()
-    assert "--allow-motion" in parser.format_help()
+    help_text = parser.format_help()
+    assert "--allow-motion" in help_text
+    assert "duration completion itself enters" in help_text
+    assert "protective hold" in help_text
     assert tuple(B601_RS_ARM_JOINT_NAMES) == tuple(probe._ALL_JOINTS)
     args = parser.parse_args(["--config", "config.yaml", "--rebot-source-root", "source"])
     assert args.joint == "joint1"
     assert "--support-joint" not in parser.format_help()
     assert args.target_kp is None
     assert args.target_kd is None
+    assert args.kp == pytest.approx(0.0)
+    assert args.kd == pytest.approx(0.0)
+    assert args.driver_kd is None
+    assert args.gravity_scale == pytest.approx(1.0)
+    assert args.gravity_joint_scales == pytest.approx(
+        (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
+    )
+    assert args.gravity_joint_offsets_rad == pytest.approx((0.0,) * 6)
+    assert args.gravity_joint_bias_nm == pytest.approx(
+        (0.0, -0.105, -0.1, -0.05, 0.0, 0.0)
+    )
+    assert args.gravity_coulomb_friction_nm == pytest.approx((0.0,) * 6)
+    assert args.gravity_coulomb_velocity_threshold_rad_s == pytest.approx(0.0)
     assert args.apply_driver_torque_limits is False
+    calibration_args = parser.parse_args(
+        [
+            "--mode",
+            "gravity-calibration",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--allow-motion",
+            "--auto-disable",
+            "--apply-driver-torque-limits",
+            "--confirmation",
+            probe.CONFIRMATION,
+        ]
+    )
+    assert calibration_args.calibration_duration_sec == pytest.approx(20.0)
+    assert calibration_args.calibration_settling_sec == pytest.approx(2.0)
+    probe._validate_cli(calibration_args)
+
+    calibrated_args = parser.parse_args(
+        [
+            "--mode",
+            "hold",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--allow-motion",
+            "--auto-disable",
+            "--apply-driver-torque-limits",
+            "--confirmation",
+            probe.CONFIRMATION,
+            "--gravity-joint-scales",
+            "1",
+            "0.95",
+            "1",
+            "1",
+            "1",
+            "1",
+            "--gravity-joint-offsets-rad",
+            "0",
+            "-0.06",
+            "0.02",
+            "0",
+            "0",
+            "0",
+            "--gravity-joint-bias-nm",
+            "0",
+            "-0.70",
+            "0.12",
+            "0",
+            "0",
+            "0",
+            "--gravity-coulomb-friction-nm",
+            "0",
+            "0.53",
+            "0.49",
+            "0",
+            "0",
+            "0",
+            "--gravity-coulomb-velocity-threshold-rad-s",
+            "0.02",
+        ]
+    )
+    probe._validate_cli(calibrated_args)
+    assert calibrated_args.gravity_joint_scales == pytest.approx(
+        (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
+    )
+    assert calibrated_args.gravity_joint_offsets_rad == pytest.approx(
+        (0.0, -0.06, 0.02, 0.0, 0.0, 0.0)
+    )
+    assert calibrated_args.gravity_joint_bias_nm == pytest.approx(
+        (0.0, -0.70, 0.12, 0.0, 0.0, 0.0)
+    )
+    assert calibrated_args.gravity_coulomb_friction_nm == pytest.approx(
+        (0.0, 0.53, 0.49, 0.0, 0.0, 0.0)
+    )
+    assert calibrated_args.gravity_coulomb_velocity_threshold_rad_s == pytest.approx(
+        0.02
+    )
+
+    calibrated_args.gravity_joint_scales[1] = -0.1
+    with pytest.raises(ValueError, match="six non-negative"):
+        probe._validate_cli(calibrated_args)
+
+    calibrated_args.gravity_joint_scales[1] = 0.95
+    calibrated_args.gravity_coulomb_friction_nm[1] = -0.1
+    with pytest.raises(ValueError, match="six non-negative"):
+        probe._validate_cli(calibrated_args)
 
 
 def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
@@ -1449,6 +3557,62 @@ def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
         probe._validate_cli(driver_write_args)
 
 
+def test_startup_replay_cli_requires_gravity_only_observation_profile() -> None:
+    parser = probe.build_parser()
+    base = [
+        "--mode",
+        "startup-replay",
+        "--config",
+        "config.yaml",
+        "--rebot-source-root",
+        "source",
+        "--allow-motion",
+        "--auto-disable",
+        "--apply-driver-torque-limits",
+        "--confirmation",
+        probe.CONFIRMATION,
+    ]
+
+    with pytest.raises(probe.LowGainProbeError, match="requires --kp 0"):
+        probe._validate_cli(parser.parse_args([*base, "--kp", "0.5"]))
+
+    args = parser.parse_args(base)
+    probe._validate_cli(args)
+    qref, qvel_ref, done = probe.plan_reference(
+        (0.1,) * 6,
+        mode="startup-replay",
+        joint="joint1",
+        elapsed_sec=0.0,
+        step_rad=0.0,
+        step_speed_rad_s=0.1,
+        step_direction=1,
+        position_limits_rad=((-1.0, 1.0),) * 6,
+    )
+    assert qref == (0.1,) * 6
+    assert qvel_ref == (0.0,) * 6
+    assert done is True
+
+
+def test_enabled_mode_requires_verified_driver_torque_limits_for_startup_lock() -> None:
+    args = probe.build_parser().parse_args(
+        [
+            "--mode",
+            "hold",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--allow-motion",
+            "--auto-disable",
+            "--confirmation",
+            probe.CONFIRMATION,
+        ]
+    )
+
+    with pytest.raises(probe.LowGainProbeError, match="0x700B"):
+        probe._validate_cli(args)
+
+
 def test_driver_torque_limit_roundtrip_cli_requires_explicit_authority() -> None:
     parser = probe.build_parser()
     base = [
@@ -1486,6 +3650,7 @@ def _parse_cartesian_args(*extra: str) -> object:
             "source",
             "--allow-motion",
             "--auto-disable",
+            "--apply-driver-torque-limits",
             "--confirmation",
             probe.CONFIRMATION,
             *extra,
@@ -1519,7 +3684,9 @@ def _parse_pose_args(*extra: str) -> object:
 
 
 def test_pose_cli_uses_all_six_joints() -> None:
-    probe._validate_cli(_parse_pose_args())
+    args = _parse_pose_args()
+    args.apply_driver_torque_limits = True
+    probe._validate_cli(args)
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
 
@@ -1534,4 +3701,38 @@ def test_driver_damping_requires_verified_driver_torque_limits() -> None:
 
     args.kd = 1.0
     with pytest.raises(probe.LowGainProbeError, match="software --kd 0"):
+        probe._validate_cli(args)
+
+
+def test_driver_damping_accepts_explicit_six_joint_gains() -> None:
+    args = _parse_pose_args(
+        "--kd",
+        "0",
+        "--driver-kd",
+        "0.4",
+        "0.6",
+        "0.6",
+        "0.3",
+        "0.25",
+        "0.2",
+    )
+    args.apply_driver_torque_limits = True
+
+    probe._validate_cli(args)
+
+    assert probe._one_or_six_non_negative(args.driver_kd, name="driver_kd") == (
+        0.4,
+        0.6,
+        0.6,
+        0.3,
+        0.25,
+        0.2,
+    )
+
+
+def test_driver_damping_rejects_ambiguous_joint_count() -> None:
+    args = _parse_pose_args("--kd", "0", "--driver-kd", "0.4", "0.6")
+    args.apply_driver_torque_limits = True
+
+    with pytest.raises(ValueError, match="one or six"):
         probe._validate_cli(args)

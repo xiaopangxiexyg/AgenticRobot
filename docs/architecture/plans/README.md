@@ -16,6 +16,9 @@ consumer needs them.
 
 - [Target architecture](dexteleop_architecture_planning.md): cross-domain
   semantics, ownership invariants, and the control/data/training loop.
+- [ReBot B601-RS / RM65 Real2Sim and HITL roadmap](rebot_b601_rm65_real2sim_hitl_roadmap.md):
+  staged B601 digital-twin, bidirectional cross-embodiment teleoperation,
+  policy propagation, human residual, haptic feedback, and real-hardware gates.
 - [Control composition observability](dexteleop_control_composition_observability_plan.md):
   observability requirements and staged adoption for composed control.
 

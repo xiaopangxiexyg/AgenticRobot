@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +10,7 @@ import pytest
 
 from hardware.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
+    B601_RS_MECH_POS_PARAM_ID,
     B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID,
     B601_RS_POS_VEL_POS_KP_PARAM_ID,
     B601_RS_POS_VEL_VEL_KI_PARAM_ID,
@@ -198,6 +201,131 @@ def _socketcan_frame(arbitration_id: int, *, data_length: int = 8) -> bytes:
         data_length,
         b"\x00" * 8,
     )
+
+
+@pytest.fixture
+def passive_receiver(monkeypatch):
+    class Receiver:
+        def __init__(self):
+            self.now = 0.0
+            self.packets = []
+            self.closed = False
+
+        def bind(self, address):
+            assert address == ("can-test",)
+
+        def settimeout(self, value):
+            assert value > 0
+
+        def recv(self, size):
+            self.now += 0.1
+            if self.packets:
+                packet = self.packets.pop(0)
+                if isinstance(packet, BaseException):
+                    raise packet
+                return packet
+            raise frequency_probe.socket.timeout()
+
+        def close(self):
+            self.closed = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    receiver = Receiver()
+    receiver.packets = []
+    monkeypatch.setattr(frequency_probe.socket, "socket", lambda *args: receiver)
+    monkeypatch.setattr(frequency_probe.time, "monotonic", lambda: receiver.now)
+    monkeypatch.setattr(frequency_probe.time, "monotonic_ns", lambda: int(receiver.now * 1e9))
+    monkeypatch.setattr(frequency_probe.time, "time_ns", lambda: 1_000_000_000 + int(receiver.now * 1e9))
+
+    def no_backend(*args, **kwargs):
+        pytest.fail("passive capture must not construct the motor backend")
+
+    monkeypatch.setattr(frequency_probe, "B601RSBackend", no_backend)
+    return receiver
+
+
+def test_passive_raw_capture_keeps_bytes_clocks_and_malformed_frames(tmp_path, passive_receiver):
+    packet = _socketcan_frame((2 << 24) | (3 << 8) | 0xFD | frequency_probe._CAN_EFF_FLAG)
+    passive_receiver.packets = [packet, b"bad"]
+    path = tmp_path / "capture.jsonl"
+    result = frequency_probe._read_only_capture("can-test", 0.5, raw_output=path)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["kind"] for r in records] == ["header", "frame", "frame", "end"]
+    assert records[1]["socket_frame_hex"] == packet.hex()
+    assert records[2]["socket_frame_hex"] == b"bad".hex()
+    assert records[1]["receive_monotonic_ns"] <= records[1]["clock_pair_end_monotonic_ns"]
+    assert records[1]["observe_realtime_ns"] == records[1]["receive_monotonic_ns"] + 1_000_000_000
+    assert records[-1]["received_frame_count"] == 2
+    assert result["malformed_frame_count"] == 1
+    assert not result["freshness_verified"]
+    assert not result["motion_commands_sent"]
+    assert passive_receiver.closed
+
+
+def test_passive_raw_capture_never_overwrites_existing_evidence(tmp_path, passive_receiver):
+    path = tmp_path / "capture.jsonl"
+    path.write_text("existing evidence")
+    with pytest.raises(FileExistsError):
+        frequency_probe._read_only_capture("can-test", 0.5, raw_output=path)
+    assert path.read_text() == "existing evidence"
+    assert passive_receiver.closed
+
+
+def test_interrupted_raw_capture_has_no_success_footer(tmp_path, passive_receiver):
+    passive_receiver.packets = [KeyboardInterrupt()]
+    path = tmp_path / "capture.jsonl"
+    with pytest.raises(KeyboardInterrupt):
+        frequency_probe._read_only_capture("can-test", 0.5, raw_output=path)
+    assert [json.loads(x)["kind"] for x in path.read_text().splitlines()] == ["header"]
+    assert passive_receiver.closed
+
+
+def test_empty_raw_capture_is_not_promoted_to_feedback(tmp_path, passive_receiver):
+    result = frequency_probe._read_only_capture("can-test", 0.5, raw_output=tmp_path / "empty.jsonl")
+    assert result["frame_count"] == 0
+    assert not result["freshness_verified"]
+
+
+@pytest.mark.parametrize("mode", ["offline", "gravity-offline", "position", "mit-tx-disabled"])
+def test_raw_output_rejects_other_modes_before_io(mode, tmp_path, monkeypatch):
+    monkeypatch.setattr(frequency_probe.socket, "socket", lambda *args: pytest.fail("no I/O expected"))
+    assert frequency_probe.main(["--mode", mode, "--raw-output", str(tmp_path / "raw")]) == 2
+
+
+def test_raw_and_summary_output_cannot_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr(frequency_probe.socket, "socket", lambda *args: pytest.fail("no I/O expected"))
+    path = str(tmp_path / "capture")
+    assert frequency_probe.main(["--raw-output", path, "--output", path]) == 2
+
+
+def test_passive_bind_error_closes_socket_and_does_not_create_raw_file(tmp_path, passive_receiver, monkeypatch):
+    def fail_bind(address):
+        raise OSError("interface unavailable")
+
+    monkeypatch.setattr(passive_receiver, "bind", fail_bind)
+    path = tmp_path / "raw.jsonl"
+    with pytest.raises(frequency_probe.FrequencyProbeError, match="cannot open passive"):
+        frequency_probe._read_only_capture("can-test", 0.5, raw_output=path)
+    assert passive_receiver.closed
+    assert not path.exists()
+
+
+def test_passive_cli_writes_summary_and_raw_separately(tmp_path, passive_receiver):
+    path = tmp_path / "raw.jsonl"
+    summary = tmp_path / "summary.json"
+    assert frequency_probe.main([
+        "--mode", "read-only", "--channel", "can-test", "--duration-sec", "0.5",
+        "--raw-output", str(path), "--output", str(summary),
+    ]) == 0
+    result = json.loads(summary.read_text())
+    assert result["raw_capture"]["completed"]
+    assert result["frame_count"] == 0
+    assert not result["motion_commands_sent"]
 
 
 def test_passive_probe_classifies_robstride_operation_status_id_without_payload_decode() -> None:
@@ -424,6 +552,117 @@ def test_active_feedback_poll_uses_mech_pos_when_motor_state_cache_is_empty() ->
         joint.position_source == "robstride_mech_pos_parameter"
         for joint in state.joints
     )
+
+
+def test_active_feedback_prefers_host_qualified_mech_pos_when_available() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+
+    backend.connect()
+    _populate_states(controller)
+    motor = controller.motors[4]
+
+    def host_read(param_id: int, host_id: int, timeout_ms: int) -> float:
+        motor._call("robstride_get_param_f32_host_id", param_id, host_id, timeout_ms)
+        assert param_id == B601_RS_MECH_POS_PARAM_ID
+        assert host_id == 0xFD
+        assert timeout_ms == 100
+        return float(motor.position_param)
+
+    motor.robstride_get_param_f32_host_id = host_read  # type: ignore[attr-defined]
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is True
+    assert state.joint("joint4").position_source == (
+        "robstride_mech_pos_parameter_host_id"
+    )
+    assert (
+        "robstride_get_param_f32_host_id",
+        (B601_RS_MECH_POS_PARAM_ID, 0xFD, 100),
+    ) in motor.calls
+
+
+def test_active_feedback_rejects_finite_mech_pos_outside_read_admission_envelope() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        B601RSBackendConfig(
+            channel="can0",
+            rate_hz=500.0,
+            joints=_joint_configs(),
+            position_limits_rad=((-3.0, 3.0),) * 6,
+            feedback_position_limits_rad=((-3.0, 3.0),) * 6,
+        ),
+        controller_factory=lambda _channel: controller,
+    )
+
+    backend.connect()
+    _populate_states(controller)
+    corrupted_position = 2.686622237168953e36
+    controller.motors[4].position_param = corrupted_position
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is False
+    assert state.stale is True
+    assert state.positions_rad is None
+    joint = state.joint("joint4")
+    assert joint.valid is False
+    assert joint.stale is True
+    assert joint.position_rad == corrupted_position
+    assert joint.position_source == "robstride_mech_pos_parameter"
+    assert f"mechPos(0x{B601_RS_MECH_POS_PARAM_ID:04x})" in (joint.error or "")
+    assert repr(corrupted_position) in (joint.error or "")
+    assert "raw_f32_bits=0x7c015b2d" in (joint.error or "")
+    assert "motor_id=4" in (joint.error or "")
+    assert "outside feedback acceptance limits" in (joint.error or "")
+
+
+def test_feedback_admission_window_does_not_relax_outgoing_position_limits() -> None:
+    controller = _FakeController()
+    strict_limits = (
+        (-3.0, 3.0),
+        (0.0, 3.14),
+        (0.0, 3.14),
+        (-math.pi / 2.0, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    feedback_limits = (
+        (-3.0, 3.0),
+        (-0.01, 3.14),
+        (-0.003, 3.14),
+        (-math.pi / 2.0 - 0.001, math.pi / 2.0),
+        (-1.57, 1.57),
+        (-3.14, 3.14),
+    )
+    backend = B601RSBackend(
+        B601RSBackendConfig(
+            channel="can0",
+            rate_hz=500.0,
+            joints=_joint_configs(),
+            allow_motion=True,
+            position_limits_rad=strict_limits,
+            feedback_position_limits_rad=feedback_limits,
+        ),
+        controller_factory=lambda _channel: controller,
+    )
+
+    backend.connect()
+    _populate_states(controller)
+    controller.motors[2].position_param = -0.004
+    controller.motors[3].position_param = -0.002
+    controller.motors[4].position_param = -math.pi / 2.0 - 0.0005
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is True
+    assert state.positions_rad is not None
+    assert state.positions_rad[1:4] == pytest.approx(
+        (-0.004, -0.002, -math.pi / 2.0 - 0.0005)
+    )
+    with pytest.raises(ValueError, match=r"qpos_rad\[1\].*joint2"):
+        backend.send_position_velocity(state.positions_rad)
 
 
 def test_active_feedback_request_failure_is_invalid_and_fail_closed() -> None:
