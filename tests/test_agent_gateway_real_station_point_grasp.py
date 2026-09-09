@@ -23,6 +23,9 @@ from agent_gateway.profiles.real.realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
 )
+from agent_gateway.profiles.real.rm65_grasp_reachability import (
+    RM65PointGraspReachabilityAdapter,
+)
 from agent_gateway.profiles.real.station_point_grasp_deployment import (
     REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2,
     StationPointGraspArmReachabilityProfile,
@@ -41,6 +44,9 @@ from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
     LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,
     POINT_GRASP_ANNOTATED_SCHEMA_ID_V1,
+)
+from deployments.perception.sam2_graspnet_point_grasp import (
+    _normalize_graspnet_rigid_matrix,
 )
 from deployments.perception.sam2_vgn_point_grasp import (
     PointGraspCandidate,
@@ -420,6 +426,99 @@ def test_station_point_grasp_v3_reachability_is_request_gated_and_annotation_onl
         registration.payload_validator.validate_execution_result_for_parameters(
             disabled_request.parameters, enabled
         )
+
+
+def test_rm65_reachability_adapter_accepts_normalized_graspnet_candidate() -> None:
+    binding = _frame_binding()
+    raw_pose = np.asarray(
+        [
+            [
+                -0.17259738000158176,
+                0.18359564713816373,
+                0.9677307159760798,
+                -0.13079618433586204,
+            ],
+            [
+                0.04199108059770058,
+                -0.9802105728615037,
+                0.19345253616022093,
+                -0.07363994251000638,
+            ],
+            [
+                0.9840969607643857,
+                0.07402546072335396,
+                0.16147240422405731,
+                0.1374787059167376,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    normalized = _normalize_graspnet_rigid_matrix(
+        raw_pose,
+        field_name="GraspNet camera_from_grasp",
+    )
+
+    class _MotionPort:
+        @staticmethod
+        def latest_measured_qpos():
+            return SimpleNamespace(
+                qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
+                revision=4,
+                measured_at=9.95,
+            )
+
+    class _ReachabilityPlanner:
+        @staticmethod
+        def assess_endpoint_ik(**kwargs):
+            np.testing.assert_allclose(
+                kwargs["target_tool_tcp_world"][:3, :3].T
+                @ kwargs["target_tool_tcp_world"][:3, :3],
+                np.eye(3),
+                atol=1e-12,
+                rtol=0.0,
+            )
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "classification": "standard_reachable",
+                    "position_residual_m": 0.001,
+                    "orientation_residual_deg": 0.5,
+                    "solve_cycles": 1,
+                    "elapsed_ms": 1.0,
+                    "termination_reason": "standard_tolerance_met",
+                }
+            )
+
+    profile = SimpleNamespace(
+        solver_reference_frame_id=binding.source_frame_id,
+        solver_reference_frame_spec_hash=binding.source_frame_spec_hash,
+        frame_graph_hash=binding.frame_graph.semantic_content_hash,
+        arm_side="right",
+        evaluator_profile_id="rm65.reachability:test",
+        evaluator_profile_hash="rm65-reachability-profile:test",
+        time_budget_ms=20.0,
+        max_solve_cycles=2,
+        max_measured_qpos_age_ms=200.0,
+        standard_position_tolerance_m=0.005,
+        standard_orientation_tolerance_deg=2.0,
+        basic_position_tolerance_m=0.010,
+        basic_orientation_tolerance_deg=5.0,
+    )
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = profile
+    adapter.planner = _ReachabilityPlanner()
+    adapter.motion_port = _MotionPort()
+    adapter.frame_graph = binding.frame_graph
+    adapter.candidate_reference_frame_id = binding.reference_frame_id
+    adapter.clock = lambda: 10.0
+    adapter.monotonic = lambda: 1.0
+
+    with pytest.raises(ValueError, match="rotation must be orthonormal"):
+        adapter((raw_pose,))
+    context, annotations = adapter((normalized,))
+
+    assert context["candidate_order_effect"] == "annotation_only_order_unchanged"
+    assert annotations[0]["classification"] == "standard_reachable"
 
 
 def test_station_point_grasp_fails_if_revision_changes_during_inference() -> None:
