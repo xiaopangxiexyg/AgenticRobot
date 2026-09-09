@@ -87,6 +87,23 @@ def test_gui_can_choose_dataset_and_annotator_after_start(
             _read_json(f"{url}api/episodes")
         assert missing_workspace.value.code == 400
 
+        with pytest.raises(HTTPError) as invalid_mode:
+            _post_json(
+                f"{url}api/workspace",
+                {
+                    "dataset_root": str(tmp_path.resolve()),
+                    "annotator_id": "fixture",
+                    "second_review": "false",
+                },
+            )
+        assert invalid_mode.value.code == 400
+        assert "必须是 JSON 布尔值" in json.loads(
+            invalid_mode.value.read()
+        )["error"]
+        assert _read_json(f"{url}api/workspace")["workspace"][
+            "configured"
+        ] is False
+
         opened = _post_json(
             f"{url}api/workspace",
             {
@@ -204,6 +221,8 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "function switchWorkspace" in app_source
         assert "function hasUnsavedDraftChanges" in app_source
         assert "function ensureAnnotationsSealedBeforeTransition" in app_source
+        assert 'window.addEventListener("beforeunload"' in app_source
+        assert "state.volatilePostSealDraft" in app_source
         assert "function publishCurrentAnnotations" in app_source
         assert "function requestJsonWithProgress" in app_source
         assert "function renderCatalogScanProgress" in app_source
@@ -233,6 +252,10 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "annotationSummarySignature(updated)" in app_source
         assert "详细标注需重做" in app_source
         assert ".episode-item.attention-critical" in style_source
+        assert ".episode-item.attention-failure" in style_source
+        assert '"ANNOTATED_FAILURE"' in app_source
+        assert '"FAILURE_ATTEMPT"' in app_source
+        assert ".collapsed-episode-status.failure" in style_source
         assert "content-visibility: auto" in style_source
         assert "/api/reflow-capture-end-step/" in app_source
         assert "function timelineCoverageGaps" in app_source
@@ -303,6 +326,7 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         )[1].split("\n    }", 1)[0]
         assert "state.episodeRenderLimit," in episodes_changed
         assert "inFlightEpisodeSummaryIds.has(episodeUuid)" in app_source
+        assert "existing ? {...item, ...existing} : item" in app_source
         assert "workspaceGeneration !== state.workspaceGeneration" in app_source
         assert "function cancelPendingSeek" in app_source
         assert "scheduleSeek(timestamp)" in app_source
@@ -333,6 +357,36 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
             open_browser=False,
         )
         concurrent.close()
+    finally:
+        gui.close()
+
+
+def test_head_api_request_does_not_open_or_lock_episode(tmp_path: Path) -> None:
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    gui = RefinementAnnotationGui(
+        tmp_path,
+        annotator_id="fixture",
+        open_browser=False,
+    )
+    try:
+        url = gui.start()
+        application = gui.server.require_application()
+        assert application._active_episode_uuid is None
+
+        request = Request(
+            f"{url}api/episode/{quote(episode_uuid)}",
+            method="HEAD",
+        )
+        with pytest.raises(HTTPError) as rejected:
+            urlopen(request, timeout=3.0)
+        assert rejected.value.code == 405
+        assert rejected.value.headers["Allow"] == "GET"
+        assert application._active_episode_uuid is None
+
+        static_request = Request(f"{url}app.js", method="HEAD")
+        with urlopen(static_request, timeout=3.0) as response:
+            assert response.status == 200
+            assert response.read() == b""
     finally:
         gui.close()
 
@@ -1881,6 +1935,64 @@ def test_http_episode_open_reports_operation_progress(tmp_path: Path) -> None:
         assert progress["error"] is None
     finally:
         gui.close()
+
+
+def test_episode_status_separates_unsealed_draft_from_sealed_cache(
+    tmp_path: Path,
+) -> None:
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+    )
+    try:
+        initial = application.list_episodes(
+            include_annotation_summaries=False,
+        )["episodes"][0]
+        assert initial["failure_attempt_count"] == 1
+        assert {
+            badge["code"]
+            for badge in initial["annotation_status"]["badges"]
+        } >= {"FAILURE_ATTEMPT", "STATUS_LOADING"}
+
+        draft = application.episode_detail(episode_uuid)["draft"]
+        application.save_draft(episode_uuid, draft)
+        unsealed = application.episode_annotation_summaries(
+            (episode_uuid,)
+        )["summaries"][0]
+        assert unsealed["has_draft"] is True
+        assert unsealed["draft_requires_seal"] is True
+        assert "LOCAL_DRAFT" in {
+            badge["code"]
+            for badge in unsealed["annotation_status"]["badges"]
+        }
+
+        application.commit(episode_uuid, draft)
+        sealed = application.episode_annotation_summaries(
+            (episode_uuid,)
+        )["summaries"][0]
+        assert sealed["has_draft"] is True
+        assert sealed["draft_requires_seal"] is False
+        badge_codes = {
+            badge["code"]
+            for badge in sealed["annotation_status"]["badges"]
+        }
+        assert "LOCAL_DRAFT" not in badge_codes
+        assert badge_codes >= {"ANNOTATED_FAILURE", "FAILURE_ATTEMPT"}
+        assert sealed["failure_stage_count"] == 1
+        assert sealed["failure_attempt_count"] == 1
+
+        application.workspace.draft_path(
+            episode_uuid=episode_uuid,
+        ).write_text("{broken", encoding="utf-8")
+        corrupt = application.episode_annotation_summaries((episode_uuid,))
+        assert corrupt["summaries"] == []
+        assert corrupt["errors"][0]["episode_uuid"] == episode_uuid
+        assert "Cannot load stage annotation draft" in corrupt["errors"][0][
+            "error"
+        ]
+    finally:
+        application.close()
 
 
 def test_failure_retry_draft_commits_one_exact_failed_stage(

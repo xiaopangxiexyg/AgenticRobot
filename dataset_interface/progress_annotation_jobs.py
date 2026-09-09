@@ -190,6 +190,17 @@ class ProgressAnnotationWorkItem:
             return "front"
         return next(iter(sorted(self.video_paths)))
 
+    @property
+    def failure_attempt_count(self) -> int:
+        """Count immutable capture Attempts that ended in Failure."""
+
+        return sum(
+            1
+            for attempt in getattr(self.progress.timeline, "attempts", ())
+            if str(getattr(attempt, "outcome", "")).upper() == "FAILURE"
+            or getattr(attempt, "failure_fact_id", None) is not None
+        )
+
     def summary_payload(self) -> dict[str, Any]:
         source_binding = getattr(self.progress, "source_binding", None)
         stage_count = (
@@ -228,6 +239,7 @@ class ProgressAnnotationWorkItem:
             "recording_scope": self.progress.binding.recording_scope,
             "termination_cause": self.progress.timeline.termination_cause,
             "full_task_outcome": self.progress.timeline.full_task_outcome,
+            "failure_attempt_count": self.failure_attempt_count,
             "source_batch_id": getattr(
                 source_binding,
                 "source_batch_id",

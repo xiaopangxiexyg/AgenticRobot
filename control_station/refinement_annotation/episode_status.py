@@ -20,6 +20,7 @@ class EpisodeAnnotationSummary:
     latest_annotation_mode: str | None
     whole_episode_abnormal: bool
     whole_episode_abnormal_reason: str | None
+    failure_stage_count: int = 0
 
     @property
     def needs_second_review(self) -> bool:
@@ -45,6 +46,17 @@ def summarize_annotation_sets(
         )
     )
     episode_abnormal = None if latest is None else latest.bundle.episode_abnormal
+    failure_stage_count = (
+        0
+        if latest is None
+        else len(
+            {
+                occurrence.coarse_attempt_id
+                for occurrence in latest.bundle.occurrences
+                if occurrence.outcome == "FAILURE"
+            }
+        )
+    )
     return EpisodeAnnotationSummary(
         annotation_set_count=len(values),
         review_state=review_state,
@@ -53,15 +65,17 @@ def summarize_annotation_sets(
         whole_episode_abnormal_reason=(
             None if episode_abnormal is None else episode_abnormal.reason_code
         ),
+        failure_stage_count=failure_stage_count,
     )
 
 
 def build_episode_status_payload(
     summary: EpisodeAnnotationSummary | None,
     *,
-    has_draft: bool,
+    draft_requires_seal: bool,
     detail_state: str | None,
     recording_pause_count: int = 0,
+    failure_attempt_count: int = 0,
 ) -> dict[str, Any]:
     """Build an additive, versioned status model while old fields remain valid."""
 
@@ -78,16 +92,41 @@ def build_episode_status_payload(
         )
 
     if summary is None:
+        if failure_attempt_count > 0:
+            add_badge(
+                "FAILURE_ATTEMPT",
+                f"原始失败 Attempt ×{failure_attempt_count}",
+                "FAILURE",
+                19,
+            )
+            attention_level = "WARNING"
+            attention_required: bool | None = True
+            primary_label = "含失败 Attempt"
+        else:
+            attention_level = "LOADING"
+            attention_required = None
+            primary_label = "状态读取中"
         add_badge("STATUS_LOADING", "状态读取中", "LOADING", 90)
-        attention_level = "LOADING"
-        attention_required: bool | None = None
-        primary_label = "状态读取中"
     else:
         if summary.whole_episode_abnormal:
             label = "整条异常"
             if summary.whole_episode_abnormal_reason:
                 label += f" · {summary.whole_episode_abnormal_reason}"
             add_badge("WHOLE_EPISODE_ABNORMAL", label, "CRITICAL", 10)
+        if summary.failure_stage_count > 0:
+            add_badge(
+                "ANNOTATED_FAILURE",
+                f"失败阶段标注 ×{summary.failure_stage_count}",
+                "FAILURE",
+                18,
+            )
+        if failure_attempt_count > 0:
+            add_badge(
+                "FAILURE_ATTEMPT",
+                f"原始失败 Attempt ×{failure_attempt_count}",
+                "FAILURE",
+                19,
+            )
         if summary.needs_second_review:
             add_badge("SECOND_REVIEW_PENDING", "待二次复核", "WARNING", 20)
         elif summary.review_state == "COMPLETED":
@@ -112,13 +151,15 @@ def build_episode_status_payload(
             )
         else:
             add_badge("COARSE_PENDING", "待粗标注", "INFO", 35)
-        if has_draft:
+        if draft_requires_seal:
             add_badge("LOCAL_DRAFT", "有未封存草稿", "DRAFT", 30)
 
         attention_required = bool(
             summary.whole_episode_abnormal
             or summary.needs_second_review
             or normalized_detail_state in {"STALE", "ERROR"}
+            or summary.failure_stage_count > 0
+            or failure_attempt_count > 0
         )
         if summary.whole_episode_abnormal:
             attention_level = "CRITICAL"
@@ -132,6 +173,12 @@ def build_episode_status_payload(
         elif normalized_detail_state == "STALE":
             attention_level = "WARNING"
             primary_label = "详细标注需重做"
+        elif summary.failure_stage_count > 0:
+            attention_level = "WARNING"
+            primary_label = "失败阶段标注"
+        elif failure_attempt_count > 0:
+            attention_level = "WARNING"
+            primary_label = "含失败 Attempt"
         else:
             attention_level = "NONE"
             primary_label = "状态正常"
@@ -148,6 +195,10 @@ def build_episode_status_payload(
     return {
         "schema": EPISODE_STATUS_SCHEMA,
         "loaded": summary is not None,
+        "failure_stage_count": (
+            0 if summary is None else summary.failure_stage_count
+        ),
+        "failure_attempt_count": max(0, int(failure_attempt_count)),
         "attention_level": attention_level,
         "attention_required": attention_required,
         "primary_label": primary_label,

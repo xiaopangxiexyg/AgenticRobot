@@ -386,6 +386,7 @@ h3 { margin-bottom: 7px; font-size: 15px; }
 .collapsed-episode-status.review { color: #ffd18b; }
 .collapsed-episode-status.review-complete { color: #8fe4bf; }
 .collapsed-episode-status.detail-complete { color: #9edcff; }
+.collapsed-episode-status.failure { color: #ffb9ad; font-weight: 700; }
 .panel-note, .hint, .tool-card p, .commit-panel p {
   color: var(--muted);
   font-size: 12px;
@@ -418,6 +419,10 @@ h3 { margin-bottom: 7px; font-size: 15px; }
   border-left: 4px solid #e6a84a;
   background: linear-gradient(90deg, #302517 0, #11171c 34%);
 }
+.episode-item.attention-failure {
+  border-left-color: #d85d4e;
+  background: linear-gradient(90deg, #351d1a 0, #11171c 34%);
+}
 .episode-item strong, .episode-item small { display: block; }
 .episode-item small { margin-top: 4px; color: var(--muted); }
 .episode-item .episode-attention-line {
@@ -425,6 +430,7 @@ h3 { margin-bottom: 7px; font-size: 15px; }
   font-weight: 700;
 }
 .episode-item.attention-critical .episode-attention-line { color: #ffadb4; }
+.episode-item.attention-failure .episode-attention-line { color: #ffb9ad; }
 .episode-badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
 .badge, .count-badge {
   border-radius: 999px;
@@ -437,6 +443,11 @@ h3 { margin-bottom: 7px; font-size: 15px; }
 .badge.sealed { background: #173f35; color: #8fe4bf; }
 .badge.review { background: #593a16; color: #ffd18b; }
 .badge.abnormal { background: #682a31; color: #ffd5d8; }
+.badge.failure {
+  border: 1px solid #a54d43;
+  background: #6a3430;
+  color: #ffd0c8;
+}
 .badge.review-complete { background: #173f35; color: #8fe4bf; }
 .badge.detail-complete { background: #1d3e52; color: #9edcff; }
 .badge.detail-pending { background: #313745; color: #c8d7ff; }

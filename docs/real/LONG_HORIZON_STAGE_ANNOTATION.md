@@ -155,15 +155,18 @@ coarse profile 采集的 Episode（包括只从 `right_write` 开始的窗口）
 `control_station.refinement_annotation.detail_annotation` 模块；GUI application 只协调
 Episode lock、draft 和封存。粗标注重封存后，旧 overlay 会显示为“详细标注需重做”，
 而不是与“尚未配置 detail profile”混为同一个布尔值。左侧栏使用版本化的 additive
-`annotation_status` 投影突出“整条异常”“待二次复核”和“详细标注需重做”，同时继续
-返回旧的 `review_state`、`whole_episode_abnormal` 和 `detail_annotation_complete` 字段，
-因此旧 GUI/数据集仍按原语义工作。
+`annotation_status` 投影突出“整条异常”“待二次复核”“详细标注需重做”、原始失败
+Attempt 数和最新版本的失败阶段标注数，同时继续返回旧的 `review_state`、
+`whole_episode_abnormal` 和 `detail_annotation_complete` 字段，因此旧 GUI/数据集仍按
+原语义工作。原始失败计数直接来自不可变 Progress timeline；标注失败计数只读取最新
+stage annotation set，两者不会混成“整条异常”。
 
 大数据集仍按页加载，只有可见 Episode 才读取精确状态；摘要批次并行覆盖远程文件系统
 延迟，服务端对象/摘要缓存都有上限。浏览器复用既有 Episode 行，只更新状态确实变化的
-行，并降低不可变摘要的重复检查频率。`RETROSPECTIVE_MIGRATED` 工作区轮询使用固定次数
-的目录 metadata probe，只有检测到变化或到达保守复核周期才枚举完整历史 Episode；
-初次接入和检测到变化后的完整合同校验不省略。
+行；目录 revision 未变化时，4 秒轻量轮询保留已经读取的精确摘要，不会把行退回
+“状态读取中”并重复访问远程文件。`RETROSPECTIVE_MIGRATED` 工作区轮询使用固定次数的
+目录 metadata probe，只有检测到变化或到达保守复核周期才枚举完整历史 Episode；初次
+接入和检测到变化后的完整合同校验不省略。
 
 ## 2. 时间轴语义
 
@@ -330,11 +333,12 @@ Episode 列表每 4 秒重新读取一次，只会增量显示已经完成正式
 会显示红色离线状态并冻结标注操作；连接恢复后自动解锁。
 
 左侧 Episode 区可收起。展开态显示 Episode 编号、时长、帧数、封存版本、整条异常、
-待二次复核和二次复核完成状态；这些 annotation 摘要只对当前可见行按需读取，避免大
-数据集启动时扫描每个 annotation bundle。完整 UUID 保留在悬停信息中；收起态显示当前
-Episode 编号、列表位置以及整条异常/复核状态，展开态和收起态都可以用“上一条/下一条”
-切换。浏览器会记住该布局偏好；若刷新后处于收起态且尚未选择 Episode，点击“下一条”
-会从列表第一条开始。
+待二次复核、二次复核完成、原始失败 Attempt、最新失败阶段标注和真正尚未封存的草稿；
+与最新不可变版本一致的本地工作缓存不会误报为未封存。这些 annotation 摘要只对当前
+可见行按需读取，避免大数据集启动时扫描每个 annotation bundle。完整 UUID 保留在悬停
+信息中；收起态显示当前 Episode 编号、列表位置以及异常/复核/失败状态，展开态和收起态
+都可以用“上一条/下一条”切换。浏览器会记住该布局偏好；若刷新后处于收起态且尚未选择
+Episode，点击“下一条”会从列表第一条开始。
 
 ## 5. 封存与回退
 
@@ -357,7 +361,9 @@ meta/progress/stage_annotations/<episode_uuid>/<annotation_set_id>/
 
 为了兼容已经存在的数据，服务端仍可读取旧的 mutable draft 文件，并会在成功封存后
 缓存最近发布状态；但 GUI 不再允许标注员把“只保存草稿”当作完成操作。切换 Episode
-或数据集时，有修改就直接要求封存、放弃或取消。
+或数据集时，有修改就直接要求封存、放弃或取消。关闭标签页、刷新或离开页面时，如果
+仍有仅存在于浏览器内的修改或封存后尚未补写成功的工作草稿，浏览器也会触发离开确认；
+该确认不会替代不可变封存。
 
 数据集位于 SSHFS 等远程文件系统时，封存发布仍遵守同一不可变、manifest 最后写入的
 协议。对可证明可重入的瞬时 I/O 故障，应用只使用同一个 `annotation_set_id` 做一次短暂
