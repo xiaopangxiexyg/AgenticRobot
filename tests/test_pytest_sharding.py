@@ -88,12 +88,26 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
         "tests/test_replay_position_admittance_active_pipeline.py"
     ] == pytest.approx(105.122)
     assert module.FULL_WEIGHTS["tests/test_mujoco_fast_runtime.py"] == pytest.approx(
-        59.190
+        55.686
+    )
+    assert module.FULL_WEIGHTS["tests/test_rm65_grasp_trajectory.py"] == pytest.approx(
+        36.847
+    )
+    assert module.FULL_WEIGHTS[
+        "tests/test_mujoco_formal_compound_authority.py"
+    ] == pytest.approx(6.222)
+    assert module.FULL_WEIGHTS["tests/test_mujoco_dmtac_gripper.py"] == pytest.approx(
+        5.250
     )
     assert module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"] > module.FULL_WEIGHTS[
         "tests/test_replay_position_admittance_active_pipeline.py"
     ]
-    assert module.FULL_WEIGHTS["tests/test_sim_point_grasp_experiment.py"] > 30.0
+    assert module.FULL_WEIGHTS["tests/test_sim_point_grasp_experiment.py"] == pytest.approx(
+        16.611
+    )
+    assert module.FULL_WEIGHTS["tests/test_mujoco_cube_lift.py"] == pytest.approx(
+        11.343
+    )
     assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] > 10.0
     assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 9.0
 
