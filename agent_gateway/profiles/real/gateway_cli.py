@@ -23,7 +23,10 @@ from agent_gateway.transport.unix_transport import (
     validate_agent_gateway_unix_server_preflight,
 )
 from deployments.perception import (
+    GraspGenXClient,
+    GraspGenXPointGraspModelSpec,
     GraspNetPointGraspModelSpec,
+    Sam2GraspGenXPointGraspPlanner,
     Sam2GraspNetPointGraspPlanner,
     Sam2GroundingDinoLocalizer,
     Sam2GroundingDinoModelSpec,
@@ -126,10 +129,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-localization-asset-bundle", type=Path)
     parser.add_argument("--object-localization-device", default="cuda")
     parser.add_argument(
-        "--point-grasp-backend", choices=("vgn", "graspnet"), default="vgn"
+        "--point-grasp-backend",
+        choices=("vgn", "graspnet", "graspgenx"),
+        default="vgn",
     )
     parser.add_argument("--point-grasp-asset-bundle", type=Path)
     parser.add_argument("--point-grasp-device", default="cuda")
+    parser.add_argument("--graspgenx-host", default="127.0.0.1")
+    parser.add_argument("--graspgenx-port", type=int, default=5556)
+    parser.add_argument("--graspgenx-timeout-ms", type=int, default=120_000)
     parser.add_argument(
         "--camera-mount-urdf",
         type=Path,
@@ -757,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
                     point_segmenter=object_localizer,
                     device=args.point_grasp_device,
                 )
-            else:
+            elif args.point_grasp_backend == "graspnet":
                 point_grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(
                     point_grasp_bundle
                 )
@@ -765,6 +773,19 @@ def main(argv: list[str] | None = None) -> int:
                     model_spec=point_grasp_spec,
                     point_segmenter=object_localizer,
                     device=args.point_grasp_device,
+                )
+            else:
+                point_grasp_spec = GraspGenXPointGraspModelSpec.from_asset_bundle(
+                    point_grasp_bundle
+                )
+                point_grasp_planner = Sam2GraspGenXPointGraspPlanner(
+                    model_spec=point_grasp_spec,
+                    point_segmenter=object_localizer,
+                    client=GraspGenXClient(
+                        host=args.graspgenx_host,
+                        port=args.graspgenx_port,
+                        timeout_ms=args.graspgenx_timeout_ms,
+                    ),
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid point-grasp model bundle: {error}")

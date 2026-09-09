@@ -1,0 +1,32 @@
+{
+  "schema_version": "dexteleop.perception_graspgenx_point_grasp_assets.v1",
+  "model_profile_id": "graspgenx-release-dmtac-m-sweep-volume-v1",
+  "source": {
+    "git_url": "https://github.com/NVlabs/GraspGenX.git",
+    "revision": "b9429097728cb1c430dd78b92edf17ba318aad03",
+    "license": "Apache-2.0"
+  },
+  "checkpoint_repository": {
+    "git_url": "https://huggingface.co/adithyamurali/GraspGenXModel",
+    "revision": "7c834043c11a11417e31d6d5ea9355801e40a2c1",
+    "license": "NVIDIA-Open-Model-License"
+  },
+  "files": {
+    "generator_config": {
+      "relative_path": "checkpoints/release/gen/config.yaml",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "generator_checkpoint": {
+      "relative_path": "checkpoints/release/gen/epoch_736.pth",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "discriminator_config": {
+      "relative_path": "checkpoints/release/dis/config.yaml",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "discriminator_checkpoint": {
+      "relative_path": "checkpoints/release/dis/epoch_1056.pth",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}

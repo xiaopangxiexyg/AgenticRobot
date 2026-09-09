@@ -1,10 +1,11 @@
-# SAM2 + VGN/GraspNet 点击引导 DMTAC M 抓姿
+# SAM2 + VGN/GraspNet/GraspGenX 点击引导 DMTAC M 抓姿
 
 离线 CLI 接受一对像素对齐的 RGB-D 单帧、点击像素、显式本地标定，返回最多
 5 个已排序的 DMTAC M `tool_tcp` 抓姿。每个候选同时包含 `T_camera_from_tcp`、
 `T_base_from_tcp`、建议开口宽度、模型分数、到点击区域的距离和单帧可见点云碰撞近似结果；
-`selected_ordinal=0` 是当前最佳候选，`backend_id` 明确报告 `vgn` 或 `graspnet`，并输出一张标注
-JPEG 文件。VGN 是默认后端；GraspNet 仅在操作者持有相应授权并提供显式 acknowledgement 时可选。
+`selected_ordinal=0` 是当前最佳候选，`backend_id` 明确报告 `vgn`、`graspnet` 或
+`graspgenx`，并输出一张标注 JPEG 文件。VGN 仍是默认后端；GraspGenX 是显式启用的更新方案，
+GraspNet 则仅在操作者持有相应授权并提供显式 acknowledgement 时可选。
 
 标注 JPEG 不再只画 TCP 十字。它按 DMTAC M 的 10 mm 指厚、25.5 mm 指高、50 mm 指长和
 10 mm 掌部近似包络绘制双指/掌部线框，并绘制 TCP `+X/+Y/+Z` 三轴；几何以实际 `tool_tcp`
@@ -24,6 +25,9 @@ owner、碰撞场景和安全门禁。
 - 可选的 [GraspNet baseline](https://github.com/graspnet/graspnet-baseline.git) 先用 SAM2 点击 mask
   的米制三维包围盒加 12 cm margin 限定推理工作区，再生成 6DoF 二指抓姿；候选随后仍用
   SAM2 目标表面距离、点击距离和 DMTAC M 几何过滤，完整对齐深度仍用于碰撞门禁；
+- 可选的 [GraspGenX](https://github.com/NVlabs/GraspGenX) 直接消费 SAM2 mask 内的米制局部点云，
+  并用 DMTAC M 的 open/mid sweep-volume 条件生成跨夹爪 6DoF 候选；GPU 模型位于独立服务进程，
+  主 Skill 进程只保留 loopback client，候选仍经过点击归属、实际 TCP 变换和完整可见深度碰撞过滤；
 第三方源码以 `model/perception/` 下的 Git submodule 进入父仓；固定 revision、
 `dexteleop310` 环境安装、CUDA 架构和只读验证统一见
 [`README_ENV.md`](../../README_ENV.md) 的环境与复现指南，本页不重复通用安装命令。该 Skill 只使用
@@ -33,7 +37,7 @@ VGN 的 headless 网络部分，不要求 ROS；选择 GraspNet 时仍需其 man
 权重不提交 Git；本地 manifest 的 SHA-256 只证明文件与该 manifest 一致，不证明 checkpoint 已经由
 项目审核。使用者必须单独确认模型资产的许可与来源边界。
 
-## 准备 VGN/GraspNet 后端权重
+## 准备 VGN/GraspNet/GraspGenX 后端权重
 
 项目级基础/感知资产包的下载、解压和 `DEXTELEOP_ASSET_ROOT` 配置统一见项目根
 [`README.md`](../../README.md) 的“运行资产”章节。以下命令假定共享根已经按该章节配置；本页只
@@ -56,6 +60,7 @@ localizer bundle 仍按现有严格 manifest 一起验证。
 
 - [VGN point-grasp asset manifest](./examples/sam2_vgn_point_grasp_asset_manifest.example.json)
 - [GraspNet point-grasp local manifest](./examples/graspnet_point_grasp_local_manifest.example.json)
+- [GraspGenX point-grasp asset manifest](./examples/graspgenx_point_grasp_asset_manifest.example.json)
 - [固定相机显式标定模板](./examples/point_grasp_fixed_camera_calibration.example.json)
 
 VGN 官方仓库 README 的模型包：
@@ -123,6 +128,37 @@ sha256sum "${GRASPNET_BUNDLE}/checkpoint-rs.tar"
 manifest 还固定源码 commit、`realsense` 模型类型和项目授权 acknowledgement，任一字段不匹配
 都会 fail closed。`gdown` 只用于下载，不是运行依赖，也不会由安装脚本安装。
 
+## GraspGenX 更新后端
+
+GraspGenX 源码固定在 `model/perception/graspgenx`，generator/discriminator 权重和其独立 venv
+统一位于 `assets/perception/graspgenx-point-grasp`。安装器自动下载官方 Hugging Face 模型仓、
+生成四个文件的真实 SHA-256 manifest，并保持主 `dexteleop310` 不变：
+
+```bash
+bash scripts/install_graspgenx_env.sh
+bash scripts/install_graspgenx_env.sh --verify-only
+```
+
+安装器只在该 bundle 的 `runtime/.venv` 中安装在线 ZMQ 推理链，不会修改共享
+`dexteleop310`。默认由 `uv --torch-backend auto` 选择 PyTorch wheel；已明确 CUDA
+版本的 GPU 主机可传入例如 `--torch-backend cu126`。上游完整依赖中的
+PyOpenGL/pyrender 版本互斥，因此本服务不安装未使用的渲染、训练和端到端仿真依赖。
+
+模型服务只应绑定 loopback；启动命令见 `scripts/run_graspgenx_server.sh`。服务健康后，在
+`real-perception` 或 `real-rm65` 的原启动命令中增加：
+
+```text
+--point-grasp-backend graspgenx
+--point-grasp-asset-bundle /absolute/path/to/assets/perception/graspgenx-point-grasp
+--graspgenx-host 127.0.0.1
+--graspgenx-port 5556
+--graspgenx-timeout-ms 120000
+```
+
+GraspGenX 不进入当前 in-process 离线图片 CLI；这是有意的环境隔离。真实 RGB-D 仍由同一个
+Gateway provider 在一次 retained frame 读取中送入 SAM2 和 GraspGenX，不改变现有同帧深度、
+Station frame 或 Artifact lineage 语义。
+
 ## 本地 RGB-D 端到端推理
 
 RGB 必须是 JPEG/PNG。深度必须是与 RGB 同宽高、C-order、`float32` 的二维 NPY，单位米，0 表示
@@ -178,7 +214,7 @@ python -m deployments.perception.point_grasp_image_cli \
 生产 `real-perception` 默认仍不加载抓姿模型。只有同时显式启用共享 SAM2 localizer 与
 `--enable-point-grasp`，并提供经过 manifest/hash 校验的 point-grasp bundle，才注册
 `perception.plan_point_grasp@2`。VGN 是默认 backend；GraspNet 仍要求其资产 manifest 中的项目授权
-acknowledgement。启动事务先启动并 admit 相机，再启动共享 localizer，最后启动 planner；关闭顺序
+acknowledgement；GraspGenX 需要预先启动 loopback 服务。启动事务先启动并 admit 相机，再启动共享 localizer，最后启动 planner；关闭顺序
 相反。任一步失败都会清理已尝试资源，Skill 调用本身不会启动、重置或关闭设备/模型。
 
 v2 请求只有三个字段：已注册的对齐 depth `role`、`target_pixel_uv` 和 `max_candidates`。provider
@@ -273,6 +309,10 @@ GraspNet 输出第 3 列的 grasp depth 不能丢弃：实现按官方 0.060 m �
 `depth - 0.060` 平移到 DMTAC 掌/指边界，再继续平移到实际 `tool_tcp`；同时使用 SAM2 目标点云沿开口轴的 5%/95% 分位
 中点做最多 0.020 m 的居中校正，并沿指高轴做最多 0.030 m 的同类居中校正。三项语义均纳入
 planner semantic content hash。
+GraspGenX 与 DMTAC M 已共享 +Z 接近、+X 闭合的模型基座约定；适配器使用 open
+`(70,25.5,50) mm`、mid `(35,25.5,50) mm` 的内部 sweep-volume，二者中心均在掌/指边界前
+25 mm，并把模型基座沿 +Z 平移 42.999 mm 得到实际 `tool_tcp`。建议开口宽度由点击 mask 点云在
+候选 +X 轴的 5%/95% 范围加 6 mm 余量得到，超过 70 mm 时拒绝，不会截断成伪可抓取宽度。
 可见点云碰撞门禁使用 DMTAC M 的指体/掌体近似包络；落入该实体包络的采样点不超过 400 个时
 判为通过，达到 401 个时拒绝。该阈值属于部署实现语义并纳入 planner semantic content hash。
 
@@ -336,6 +376,8 @@ registry。生产 Skill 只广告当前部署已经具备可信 RGB 和相机 po
   标定校验和正式下游规划；
 - GraspNet 本身不理解点击语义；SAM2 mask 同时限定其局部三维推理工作区并参与后置表面距离
   过滤。单帧遮挡、仿真到真实的域差异和后置过滤仍可能导致无候选或错误候选；
+- GraspGenX 当前使用 DMTAC M 的参数化 sweep-volume，而不是上游 gripper asset 中不存在的
+  DMTAC 模型；零样本跨夹爪能力必须通过本项目离线数据和 sim 评估，不能仅凭上游声明视为真机有效；
 - 离线 v1 接受固定相机显式外参；生产 v2 只公开部署已绑定的静态 depth 相机，尚不支持腕部相机
   的动态 FK 外参；
 - 未下载 checkpoint 时只能完成合同/单元测试，不能声称真实模型端到端验证通过。
