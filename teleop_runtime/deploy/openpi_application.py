@@ -397,7 +397,6 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     artifact_path = args.policy_artifact_json
-    prepared_resolution = None
     if args.checkpoint_dir is not None:
         artifact_path = _artifact_path_from_checkpoint(args.checkpoint_dir)
     if args.prepared_training_profile is not None:
@@ -460,35 +459,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
-    if (
-        args.rtc_profile
-        == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
-        and policy_artifact is not None
-        and policy_artifact.model_continuation is not None
-        and normalize_model_continuation_contract(
-            policy_artifact.model_continuation
-        ).conditioning_origin
-        == MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
-    ):
-        from deployments.openpi.training import (
-            verify_openpi_model_rtc_checkpoint,
-        )
-
-        evidence = verify_openpi_model_rtc_checkpoint(
-            artifact_path.parent
-            if prepared_resolution is None
-            else prepared_resolution.checkpoint_dir
-        )
-        expected_checkpoint_artifact = (
-            policy_artifact
-            if prepared_resolution is None
-            else prepared_resolution.checkpoint_artifact
-        )
-        if evidence.artifact.to_dict() != expected_checkpoint_artifact.to_dict():
-            parser.error(
-                "Verified trained model-RTC artifact differs from the "
-                "requested policy artifact."
-            )
     if args.contract_check_only:
         if policy_artifact is None:
             parser.error(

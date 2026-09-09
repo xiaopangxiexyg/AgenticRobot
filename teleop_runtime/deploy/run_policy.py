@@ -625,24 +625,6 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     _register_deployment_cli_args(parser)
 
 
-def _validate_model_rtc_executor_compatibility(
-    *,
-    rtc_profile_id: str,
-    arm_control_mode: str,
-    send_actions: bool,
-) -> None:
-    if (
-        str(rtc_profile_id) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
-        and str(arm_control_mode) == RM65_ARM_CONTROL_MODE_POSITION
-        and bool(send_actions)
-    ):
-        raise ValueError(
-            "conditioned Model-RTC typed canonical actions currently require "
-            "--arm-execution-profile impedance_40hz; the position executor "
-            "accepts only legacy filtered-vector actions."
-        )
-
-
 def validate_args(
     args: argparse.Namespace,
     *,
@@ -1120,11 +1102,6 @@ def validate_args(
                 "RTC-3c position cadence is fixed at 60 Hz reference / "
                 "120 Hz command."
             )
-    _validate_model_rtc_executor_compatibility(
-        rtc_profile_id=rtc_profile_id,
-        arm_control_mode=args.arm_control_mode,
-        send_actions=bool(args.send_actions),
-    )
     if args.arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION and float(
         args.arm_control_hz
     ) < float(args.position_reference_hz):
@@ -1811,22 +1788,6 @@ def _rtc_action_preparer_for_profile(
         deploy_session_contract=deploy_session_contract,
         safety_filter=safety_filter,
     )
-
-
-def _position_executor_for_prepared_action(
-    *,
-    rtc_profile_id: str,
-    send_actions: bool,
-    position_deploy_executor: Any | None,
-) -> Any | None:
-    """Keep passive typed Model-RTC out of the legacy vector planner."""
-
-    if (
-        str(rtc_profile_id) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
-        and not bool(send_actions)
-    ):
-        return None
-    return position_deploy_executor
 
 
 def _prepared_action_last_action(
@@ -3431,11 +3392,7 @@ def main(
             )
         return outcome
 
-    prepared_action_position_executor = _position_executor_for_prepared_action(
-        rtc_profile_id=str(args.rtc_profile),
-        send_actions=send_actions,
-        position_deploy_executor=position_deploy_executor,
-    )
+    prepared_action_position_executor = position_deploy_executor
     prepared_action_executor = PreparedActionExecutor(
         position_deploy_executor=prepared_action_position_executor,
         send_actions=send_actions,
@@ -5985,7 +5942,9 @@ def main(
                         loop_target_hz,
                         1.0 / max(0.001, float(args.policy_qpos_init_dt_sec)),
                     )
-                sleep_time = (1.0 / loop_target_hz) - (time.time() - loop_started_at)
+                sleep_time = (1.0 / loop_target_hz) - (
+                    time.monotonic() - control_loop_started_at
+                )
                 if sleep_time > 0.0:
                     time.sleep(sleep_time)
     except KeyboardInterrupt:

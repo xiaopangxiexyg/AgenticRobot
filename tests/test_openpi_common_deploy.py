@@ -3,12 +3,35 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 
+from dataset_contracts import (
+    MODEL_CONTINUATION_FLOW_INPAINT_V1,
+    MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
+    MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,
+    RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
+    STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+    TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
+    ModelContinuationDataContract,
+    ModelContinuationDataContractV2,
+    ModelContinuationRuntimeContractV2,
+    ModelContinuationTrainingContractV2,
+    PolicyArtifactContract,
+    PolicyCameraInput,
+    PolicyCameraInputContract,
+)
+from dataset_contracts.pose_chunk import PoseActionChunkContract
+from dataset_contracts.pose_training import PoseTrainingDataContract
+from dataset_contracts.v22 import (
+    DiscreteCategory,
+    DiscreteTokenSpec,
+    EndEffectorSpec,
+    PolicyIOLayout,
+)
 from deployments.client import (
     DeployPolicyContract,
     LoadedPolicy,
@@ -27,32 +50,15 @@ from deployments.openpi.client import (
     deployment_observation_to_openpi,
 )
 from deployments.openpi.client import real as openpi_real_launcher
-from dataset_contracts.v22 import DiscreteCategory, DiscreteTokenSpec, EndEffectorSpec, PolicyIOLayout
-from dataset_contracts import (
-    MODEL_CONTINUATION_FLOW_INPAINT_V1,
-    MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
-    MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,
-    RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
-    STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
-    TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
-    ModelContinuationDataContract,
-    ModelContinuationDataContractV2,
-    ModelContinuationRuntimeContractV2,
-    PolicyArtifactContract,
-    PolicyCameraInput,
-    PolicyCameraInputContract,
-)
-from dataset_contracts.pose_chunk import PoseActionChunkContract
-from dataset_contracts.pose_training import PoseTrainingDataContract
-from teleop_runtime.deploy.actions import normalize_policy_output
-from teleop_runtime.deploy import camera_runtime, cli as deploy_cli
-from teleop_runtime.deploy.observation import DeploymentObservation
-from teleop_runtime.deploy import run_policy
-from teleop_runtime.deploy.schema import ACTION_DIM, OBSERVATION_STATE_DIM
 from robot_motion.deploy import (
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
 )
+from teleop_runtime.deploy import camera_runtime, run_policy
+from teleop_runtime.deploy import cli as deploy_cli
+from teleop_runtime.deploy.actions import normalize_policy_output
+from teleop_runtime.deploy.observation import DeploymentObservation
+from teleop_runtime.deploy.schema import ACTION_DIM, OBSERVATION_STATE_DIM
 
 
 def _server_metadata() -> dict:
@@ -859,7 +865,7 @@ class OpenPICommonDeployTest(unittest.TestCase):
         self.assertEqual(wrapped_result, "wrapped-adapter")
         self.assertEqual(creator.call_count, 1)
 
-    def test_openpi_real_launcher_forwards_model_rtc_through_loaded_policy(
+    def test_openpi_real_launcher_accepts_trained_rtc_artifact_without_local_checkpoint(
         self,
     ) -> None:
         layout = PolicyIOLayout.legacy_v21_q6()
@@ -904,9 +910,14 @@ class OpenPICommonDeployTest(unittest.TestCase):
                 ),
             ),
             model_continuation=ModelContinuationDataContractV2(
-                conditioning_origin=MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
-                runtime=ModelContinuationRuntimeContractV2.from_v1(
-                    legacy_continuation
+                conditioning_origin=MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
+                runtime=ModelContinuationRuntimeContractV2.from_v1(legacy_continuation),
+                training=ModelContinuationTrainingContractV2(
+                    prefix_source_kinds=(
+                        TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
+                    ),
+                    projection_implementation_id="fixture-teacher-v1",
+                    projection_parameters_hash="sha256:" + "c" * 64,
                 ),
             ),
         )

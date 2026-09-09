@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from dataclasses import replace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -21,6 +23,7 @@ from robot_motion.deploy import (
     ActionSafetyFilterConfig,
     CanonicalDeployActionPipeline,
     CanonicalPolicyActionResult,
+    FilteredNormalizedAction,
     PolicyDeployRuntime,
     PolicyDeployRuntimeConfig,
     ResolvedDeploySessionContract,
@@ -29,19 +32,13 @@ from robot_motion.deploy import (
     build_canonical_policy_action,
     build_deployment_observation,
 )
-from robot_motion.rm65 import (
-    RM65_ARM_CONTROL_MODE_IMPEDANCE,
-    RM65_ARM_CONTROL_MODE_POSITION,
-)
 from teleop_runtime.deploy.action_execution import PreparedActionExecutor
 from teleop_runtime.deploy.hand_backend_config import HAND_BACKEND_DMTAC_GRIPPER
 from teleop_runtime.deploy.run_policy import (
     _ModelRtcCanonicalActionPreparer,
-    _position_executor_for_prepared_action,
     _prepared_action_last_action,
     _rtc_action_preparer_for_profile,
     _runtime_end_effector_safety_capability,
-    _validate_model_rtc_executor_compatibility,
 )
 
 
@@ -404,6 +401,66 @@ def test_model_rtc_preparer_converts_frames_and_applies_measured_safety() -> Non
     assert execution.mode == "dry_run"
     assert execution.dispatch_attempted is False
 
+    position_executor = Mock()
+    position_executor.submit.return_value = 9
+    position_execution = PreparedActionExecutor(
+        position_deploy_executor=position_executor,
+        send_actions=False,
+        arm_backends={},
+        hand_backends={},
+        active_sides=("left", "right"),
+        position_worker_binding=None,
+        submit_legacy_owner_state=lambda **_kwargs: None,
+    ).execute(
+        prepared,
+        observation,
+        policy_name="model-rtc-test",
+    )
+    assert position_execution.accepted is True
+    assert position_execution.mode == "position_dry_run_queue"
+    assert position_execution.position_source_index == 9
+    filtered = position_executor.submit.call_args.args[0]
+    assert isinstance(filtered, FilteredNormalizedAction)
+    assert filtered.faults == []
+    for side in ("left", "right"):
+        np.testing.assert_allclose(
+            filtered.action.vector[ACTION_ARM_POSE_SLICES[side]],
+            safe_action.arm_pose_by_side[side],
+        )
+        spec = filtered.action.metadata["arm_action_specs_by_side"][side]
+        assert spec["reference_frame"] == f"{side}_arm_base"
+        assert spec["controlled_frame"] == "tool_tcp"
+    assert set(
+        position_executor.submit.call_args.kwargs["discrete_command"].commands
+    ) == {
+        "left_hand",
+        "right_hand",
+    }
+
+    inconsistent = replace(
+        prepared,
+        safety_result=replace(
+            prepared.safety_result,
+            status="hold",
+            safe_action=None,
+        ),
+        faults=(),
+    )
+    with pytest.raises(RuntimeError, match="no executable safe action"):
+        PreparedActionExecutor(
+            position_deploy_executor=position_executor,
+            send_actions=False,
+            arm_backends={},
+            hand_backends={},
+            active_sides=("left", "right"),
+            position_worker_binding=None,
+            submit_legacy_owner_state=lambda **_kwargs: None,
+        ).execute(
+            inconsistent,
+            observation,
+            policy_name="model-rtc-test",
+        )
+
 
 def test_only_conditioned_model_rtc_selects_typed_preparation() -> None:
     layout = _layout()
@@ -429,41 +486,4 @@ def test_only_conditioned_model_rtc_selects_typed_preparation() -> None:
             safety_filter=safety_filter,
         ),
         _ModelRtcCanonicalActionPreparer,
-    )
-
-
-def test_model_rtc_position_executor_combination_fails_closed() -> None:
-    _validate_model_rtc_executor_compatibility(
-        rtc_profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
-        arm_control_mode=RM65_ARM_CONTROL_MODE_IMPEDANCE,
-        send_actions=True,
-    )
-    _validate_model_rtc_executor_compatibility(
-        rtc_profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
-        arm_control_mode=RM65_ARM_CONTROL_MODE_POSITION,
-        send_actions=False,
-    )
-    with pytest.raises(ValueError, match="impedance_40hz"):
-        _validate_model_rtc_executor_compatibility(
-            rtc_profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
-            arm_control_mode=RM65_ARM_CONTROL_MODE_POSITION,
-            send_actions=True,
-        )
-
-    legacy_position_executor = object()
-    assert (
-        _position_executor_for_prepared_action(
-            rtc_profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
-            send_actions=False,
-            position_deploy_executor=legacy_position_executor,
-        )
-        is None
-    )
-    assert (
-        _position_executor_for_prepared_action(
-            rtc_profile_id=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
-            send_actions=False,
-            position_deploy_executor=legacy_position_executor,
-        )
-        is legacy_position_executor
     )
