@@ -3,6 +3,9 @@
 > 版本：2026-09-09。本文是 B601-RS 当前代码、真机 commissioning、重力采集和
 > Harness/Git 交接的统一入口。它描述可复核的实现和流程，不授予新的使能、运动或
 > 合并权限。任何真机动作仍须由现场操作者在确认机械支撑和物理急停后前台执行。
+> B601 Real2Sim、双向 ReBot/RM65 遥操、policy 传导和人工实时干预的长期阶段目标见
+> [`../architecture/plans/rebot_b601_rm65_real2sim_hitl_roadmap.md`](../architecture/plans/rebot_b601_rm65_real2sim_hitl_roadmap.md)；
+> 路线图不替代本文的当前候选和真机证据。
 
 ## 0. 先看结论
 
