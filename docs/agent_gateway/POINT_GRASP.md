@@ -154,6 +154,19 @@ bash scripts/run_graspgenx_server.sh \
   --port 5556
 ```
 
+模型加载完成后，可在第二个终端运行不读取相机、不连接机械臂的 GPU smoke。它复用正式
+`GraspGenXClient`、DMTac M sweep-volume 和协议校验，向服务发送一个确定性的 50 mm 合成方块：
+
+```bash
+"${DEXTELEOP_ASSET_ROOT}/perception/graspgenx-point-grasp/runtime/.venv/bin/python" \
+  scripts/smoke_graspgenx_inference.py \
+  --host 127.0.0.1 \
+  --port 5556
+```
+
+退出码为 0 且 JSON 中 `status` 为 `passed` 才表示 checkpoint 加载、CUDA 模型执行、
+DMTac 条件推理和客户端返回校验均已完成。该 smoke 不替代真实同帧 RGB-D 抓姿质量验收。
+
 ```text
 --point-grasp-backend graspgenx
 --point-grasp-asset-bundle /absolute/path/to/assets/perception/graspgenx-point-grasp

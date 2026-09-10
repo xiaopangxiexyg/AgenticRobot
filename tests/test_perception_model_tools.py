@@ -21,6 +21,7 @@ POINT_GRASP_INSTALLER = REPO_ROOT / "scripts" / "install_point_grasp_models.sh"
 POINT_GRASP_ENV_INSTALLER = REPO_ROOT / "scripts" / "install_point_grasp_env.sh"
 GRASPGENX_INSTALLER = REPO_ROOT / "scripts" / "install_graspgenx_env.sh"
 GRASPGENX_SERVER = REPO_ROOT / "scripts" / "run_graspgenx_server.sh"
+GRASPGENX_SMOKE = REPO_ROOT / "scripts" / "smoke_graspgenx_inference.py"
 
 
 def test_perception_model_installer_is_executable_and_documents_fixed_inputs() -> None:
@@ -114,6 +115,31 @@ def test_graspgenx_server_launcher_is_loopback_only_and_asset_bound() -> None:
     )
     assert rejected.returncode == 2
     assert "host must be loopback" in rejected.stderr
+
+
+def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> None:
+    assert GRASPGENX_SMOKE.stat().st_mode & 0o111
+    completed = subprocess.run(
+        [sys.executable, str(GRASPGENX_SMOKE), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "never reads cameras or connects to robot hardware" in completed.stdout
+    source = GRASPGENX_SMOKE.read_text(encoding="utf-8")
+    assert "GraspGenXClient" in source
+    assert "DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1" in source
+    assert "robot_motion" not in source
+    rejected = subprocess.run(
+        [sys.executable, str(GRASPGENX_SMOKE), "--host", "0.0.0.0"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd="/tmp",
+    )
+    assert rejected.returncode == 1
+    assert "must use a loopback endpoint" in rejected.stderr
+    assert "ModuleNotFoundError" not in rejected.stderr
 
 
 def test_point_grasp_image_cli_is_offline_and_has_no_gateway_dependency() -> None:

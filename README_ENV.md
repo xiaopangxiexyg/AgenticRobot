@@ -65,6 +65,10 @@ bash scripts/install_graspgenx_env.sh
 bash scripts/install_graspgenx_env.sh --verify-only
 ```
 
+服务启动后的 GPU 推理复验使用 `scripts/smoke_graspgenx_inference.py`；它只发送合成方块点云，
+不会读取相机或连接机械臂。完整两终端命令见
+[`docs/agent_gateway/POINT_GRASP.md`](docs/agent_gateway/POINT_GRASP.md#graspgenx-更新后端)。
+
 ### 0.3 新机器如何一键安装？
 
 先取得包含权重的 assets，再在 AgenticRobot 根目录运行一条命令。RTX 4090 使用 `8.9`；其他 GPU
