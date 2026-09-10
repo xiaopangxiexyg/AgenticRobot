@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,126 @@ from robot_motion.rebot_b601_rs import B601_RS_JOINT_MIT_FRAME, B601MitReference
 from scripts.hardware import rebot_b601_rs_frequency_probe as frequency_probe
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+@pytest.fixture
+def paired_rig(monkeypatch):
+    rig = SimpleNamespace(now=0.0, calls=[], closed=[], fail=None, rx_error=False, nonfinite=False)
+
+    class Motor:
+        def __init__(self, index):
+            self.index = index
+
+        def robstride_get_param_f32(self, param, timeout_ms):
+            assert param == 0x7019 and timeout_ms == 500
+            rig.calls.append(self.index)
+            rig.now += 0.5
+            if rig.fail is not None and self.index == 2:
+                raise rig.fail
+            return math.nan if rig.nonfinite else self.index * 0.01
+
+        def close(self):
+            rig.closed.append(self.index)
+
+    class Controller:
+        def __init__(self, channel):
+            assert channel == "can-test"
+
+        def add_robstride_motor(self, index, host, model):
+            assert host == 0xFD
+            assert model == ("rs-06" if index <= 3 else "rs-00")
+            return Motor(index)
+
+        def close(self):
+            rig.closed.append("controller")
+
+    def capture(channel, duration, *, raw_output, ready, stop):
+        if rig.rx_error:
+            raise OSError("RX bind failed")
+        ready.set()
+        assert stop.wait(5.0)
+        return {"raw_capture": {"completed": True}, "freshness_verified": False}
+
+    monkeypatch.setitem(sys.modules, "motorbridge", SimpleNamespace(Controller=Controller))
+    monkeypatch.setattr(frequency_probe, "_read_only_capture", capture)
+    monkeypatch.setattr(frequency_probe.time, "monotonic", lambda: rig.now)
+    monkeypatch.setattr(frequency_probe.time, "monotonic_ns", lambda: int(rig.now * 1e9))
+    return rig
+
+
+def test_paired_capture_brackets_all_six_reads_and_joins(tmp_path, paired_rig):
+    result = frequency_probe._paired_capture("can-test", 3.0, tmp_path / "raw.jsonl")
+    assert result["status"] == "OK"
+    assert paired_rig.calls == list(range(1, 7))
+    assert paired_rig.closed == [6, 5, 4, 3, 2, 1, "controller"]
+    assert not result["motion_commands_sent"]
+    assert not result["freshness_verified"]
+    for sample in result["parameter_samples"]:
+        assert sample["request_end_monotonic_ns"] > sample["request_start_monotonic_ns"]
+
+
+@pytest.mark.parametrize("failure,status", [(RuntimeError("read failed"), "ERROR"), (KeyboardInterrupt(), "INTERRUPTED")])
+def test_paired_capture_retains_partial_samples_and_closes(tmp_path, paired_rig, failure, status):
+    paired_rig.fail = failure
+    result = frequency_probe._paired_capture("can-test", 3.0, tmp_path / "raw.jsonl")
+    assert result["status"] == status
+    assert len(result["parameter_samples"]) == 2
+    assert result["parameter_samples"][0]["completed"]
+    assert not result["parameter_samples"][1]["completed"]
+    assert paired_rig.closed[-1] == "controller"
+    assert paired_rig.calls == [1, 2]
+
+
+def test_paired_capture_rx_failure_prevents_sdk_reads(tmp_path, paired_rig):
+    paired_rig.rx_error = True
+    result = frequency_probe._paired_capture("can-test", 3.0, tmp_path / "raw.jsonl")
+    assert result["status"] == "ERROR"
+    assert paired_rig.calls == []
+
+
+def test_paired_capture_rejects_nonfinite_and_stops_reads(tmp_path, paired_rig):
+    paired_rig.nonfinite = True
+    result = frequency_probe._paired_capture("can-test", 3.0, tmp_path / "raw")
+    assert result["status"] == "ERROR"
+    assert paired_rig.calls == [1]
+    assert not result["parameter_samples"][0]["completed"]
+
+
+def test_paired_cli_preserves_existing_summary(tmp_path, monkeypatch):
+    path = tmp_path / "summary"
+    path.write_text("previous evidence")
+    monkeypatch.setattr(frequency_probe, "_paired_capture", lambda *a: pytest.fail("unexpected IO"))
+    assert frequency_probe.main([
+        "--mode", "read-paired", "--raw-output", str(tmp_path / "raw"),
+        "--output", str(path), "--confirmation", "B601_RS_PAIRED_STATIC_READ_ONLY",
+    ]) == 2
+    assert path.read_text() == "previous evidence"
+
+
+@pytest.mark.parametrize("flag", ["--enable", "--allow-motion", "--auto-disable"])
+def test_paired_cli_rejects_motion_flags_before_io(tmp_path, monkeypatch, flag):
+    monkeypatch.setattr(frequency_probe, "_paired_capture", lambda *a: pytest.fail("unexpected IO"))
+    assert frequency_probe.main([
+        "--mode", "read-paired", "--raw-output", str(tmp_path / "raw"),
+        "--output", str(tmp_path / "summary"),
+        "--confirmation", "B601_RS_PAIRED_STATIC_READ_ONLY", flag,
+    ]) == 2
+
+
+def test_paired_cli_requires_confirmation_before_io(tmp_path, monkeypatch):
+    monkeypatch.setattr(frequency_probe, "_paired_capture", lambda *a: pytest.fail("unexpected IO"))
+    assert frequency_probe.main(["--mode", "read-paired"]) == 2
+
+
+def test_paired_cli_writes_interrupted_partial_result(tmp_path, paired_rig):
+    paired_rig.fail = KeyboardInterrupt()
+    path = tmp_path / "summary.json"
+    assert frequency_probe.main([
+        "--mode", "read-paired", "--channel", "can-test",
+        "--raw-output", str(tmp_path / "raw.jsonl"), "--output", str(path),
+        "--confirmation", "B601_RS_PAIRED_STATIC_READ_ONLY",
+    ]) == 130
+    assert json.loads(path.read_text())["status"] == "INTERRUPTED"
 
 
 def _joint_configs() -> tuple[B601JointConfig, ...]:

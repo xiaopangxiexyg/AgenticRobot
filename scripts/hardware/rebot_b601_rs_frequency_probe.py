@@ -4,6 +4,8 @@
 The default ``read-only`` mode opens a passive SocketCAN receive socket only.
 It does not construct MotorBridge, request feedback, enable a motor, or send a
 position/MIT frame.  ``offline`` provides deterministic smoke evidence.
+``read-paired`` adds explicitly confirmed six-axis mechPos parameter reads
+while a joined in-process receiver records raw CAN; it never enables motors.
 ``gravity-offline`` measures the existing Pinocchio gravity plus MIT torque
 composition path without opening CAN.
 ``position-tx-disabled`` measures only the POS_VEL dispatch clock after an
@@ -25,9 +27,10 @@ import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, Thread
 
 # ``python scripts/hardware/...`` places the script directory, rather than the
 # repository root, on ``sys.path``.  Keep the documented direct invocation
@@ -232,6 +235,7 @@ def _per_id_summary(
 
 def _read_only_capture(
     channel: str, duration_sec: float, *, raw_output: Path | None = None,
+    ready: Event | None = None, stop: Event | None = None,
 ) -> dict[str, object]:
     if not channel.strip():
         raise ValueError("channel must not be empty")
@@ -278,7 +282,9 @@ def _read_only_capture(
                 "clock_pair_semantics": "realtime_read_between_receive_and_end_monotonic_ns",
                 "transmit_capability_used": False,
             }) + "\n")
-        while True:
+        if ready is not None:
+            ready.set()
+        while stop is None or not stop.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 break
@@ -927,6 +933,93 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
     return result
 
 
+def _paired_capture(channel: str, duration_sec: float, raw_output: Path) -> dict[str, object]:
+    """Bracket vendor reads while one joined receiver records raw observations."""
+    if not channel.strip() or not math.isfinite(duration_sec) or duration_sec < 3.0:
+        raise ValueError("paired capture requires a channel and at least 3 seconds")
+    from motorbridge import Controller
+
+    ready, stop = Event(), Event()
+    captures: list[dict[str, object]] = []
+    errors: list[Exception] = []
+
+    def receive() -> None:
+        try:
+            captures.append(_read_only_capture(
+                channel, duration_sec + 2.0, raw_output=raw_output, ready=ready, stop=stop,
+            ))
+        except Exception as exc:  # noqa: BLE001 - propagate thread faults to foreground owner
+            errors.append(exc)
+        finally:
+            ready.set()
+
+    worker = Thread(target=receive, name="b601-passive-rx", daemon=False)
+    samples: list[dict[str, object]] = []
+    failure: str | None = None
+    interrupted = False
+    worker.start()
+    try:
+        if not ready.wait(2.0):
+            raise FrequencyProbeError("passive receiver did not become ready")
+        if errors:
+            raise FrequencyProbeError(f"passive receiver failed: {errors[0]}")
+        with ExitStack() as stack:
+            controller = Controller(channel)
+            # Controller.__exit__ calls shutdown(), which disables devices.
+            # Only release handles here; this observer must not alter drive state.
+            stack.callback(controller.close)
+            motors = []
+            for motor_id in range(1, 7):
+                motor = controller.add_robstride_motor(
+                    motor_id, 0xFD, "rs-06" if motor_id <= 3 else "rs-00",
+                )
+                stack.callback(motor.close)
+                motors.append(motor)
+            deadline = time.monotonic() + duration_sec
+            while time.monotonic() < deadline:
+                for motor_id, motor in enumerate(motors, 1):
+                    if time.monotonic() >= deadline:
+                        break
+                    if errors or not worker.is_alive():
+                        raise FrequencyProbeError("passive receiver stopped during parameter reads")
+                    before = time.monotonic_ns()
+                    sample: dict[str, object] = {
+                        "seq": len(samples), "motor_id": motor_id,
+                        "request_start_monotonic_ns": before, "completed": False,
+                    }
+                    samples.append(sample)
+                    try:
+                        value = motor.robstride_get_param_f32(0x7019, timeout_ms=500)
+                    finally:
+                        sample["request_end_monotonic_ns"] = time.monotonic_ns()
+                    if not math.isfinite(value):
+                        raise FrequencyProbeError(f"non-finite mechPos for joint{motor_id}")
+                    sample.update(mechpos_rad=value, completed=True)
+                    # Static reference reads are not a high-rate feedback benchmark.
+                    stop.wait(0.05)
+    except KeyboardInterrupt:
+        interrupted = True
+        failure = "operator interrupted paired capture"
+    except Exception as exc:  # noqa: BLE001 - retain partial read evidence, report failure
+        failure = str(exc)
+    finally:
+        stop.set()
+        worker.join()
+    if errors and failure is None:
+        failure = f"passive receiver failed: {errors[0]}"
+    if failure is None and (not captures or {s["motor_id"] for s in samples} != set(range(1, 7))):
+        failure = "incomplete six-axis paired capture"
+    return {
+        "status": "INTERRUPTED" if interrupted else "ERROR" if failure else "OK",
+        "error": failure, "mode": "read-paired", "motion_commands_sent": False,
+        "motors_enabled_by_probe": False,
+        "freshness_verified": False,
+        "pairing_semantics": "host_request_windows_not_motor_sample_timestamps",
+        "static_decode_validation_passed": False,
+        "parameter_samples": samples, "passive_capture": captures[0] if captures else None,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -937,6 +1030,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=(
             "read-only",
+            "read-paired",
             "offline",
             "gravity-offline",
             "position-tx-disabled",
@@ -986,7 +1080,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, help="write JSON outside the source worktree")
     parser.add_argument(
         "--raw-output", type=Path,
-        help="New JSONL file for raw RX frames and host clocks; read-only mode only, never overwrites.",
+        help="New JSONL raw RX file for read-only/read-paired; never overwrites.",
     )
     parser.add_argument("--json", action="store_true", help="retain machine-readable JSON output (default)")
     return parser
@@ -997,13 +1091,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if not math.isfinite(args.duration_sec) or args.duration_sec <= 0.0:
             raise ValueError("duration_sec must be positive")
+        if args.mode == "read-paired":
+            if args.confirmation != "B601_RS_PAIRED_STATIC_READ_ONLY":
+                raise ValueError("read-paired requires --confirmation B601_RS_PAIRED_STATIC_READ_ONLY")
+            if args.raw_output is None or args.output is None:
+                raise ValueError("read-paired requires --raw-output and --output")
+            if args.enable or args.allow_motion or args.auto_disable:
+                raise ValueError("read-paired rejects motion and disable flags")
+            if args.output.expanduser().exists():
+                raise ValueError("read-paired summary output already exists")
+            if args.duration_sec < 3.0:
+                raise ValueError("read-paired requires at least 3 seconds for six-axis reads")
         if args.raw_output is not None:
-            if args.mode != "read-only":
+            if args.mode not in ("read-only", "read-paired"):
                 raise ValueError("--raw-output is supported only in read-only mode")
             args.raw_output = args.raw_output.expanduser().resolve()
             if args.output is not None and args.output.expanduser().resolve() == args.raw_output:
                 raise ValueError("--output and --raw-output must be distinct paths")
-        if args.mode == "read-only":
+        if args.mode == "read-paired":
+            payload = _paired_capture(args.channel, args.duration_sec, args.raw_output)
+        elif args.mode == "read-only":
             if args.raw_output is None:
                 payload = _read_only_capture(args.channel, args.duration_sec)
             else:
@@ -1027,6 +1134,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
         return 2
     exit_code = 0
+    if args.mode == "read-paired":
+        exit_code = {"OK": 0, "ERROR": 2, "INTERRUPTED": 130}[payload["status"]]
     status = "OK"
     if payload.get("acceptance_status") == "FAIL":
         status = "FAIL"
@@ -1035,7 +1144,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     encoded = json.dumps(payload, indent=2, sort_keys=True)
     print(encoded)
     if args.output is not None:
-        args.output.expanduser().resolve().write_text(encoded + "\n", encoding="utf-8")
+        with args.output.expanduser().resolve().open(
+            "x" if args.mode == "read-paired" else "w", encoding="utf-8",
+        ) as output:
+            output.write(encoded + "\n")
     return exit_code
 
 

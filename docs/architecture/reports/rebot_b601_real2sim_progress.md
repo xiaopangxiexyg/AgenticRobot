@@ -506,3 +506,36 @@ raw/summary 每轮放入独立目录。零帧只证明该时段没有观察到�
 全部使用假 transport；覆盖接收中断、空流、bind 失败关闭 socket、原始帧保留和 CLI 隔离。
 资源 audit 和 diff 检查通过；Ruff 无新增问题，frequency probe 原有 EXE001、UP041、
 RUF046 三项保持未动。候选待合并，未 push、安装或执行任何真实 CAN 操作。
+
+## M2 静态配对采集准备
+
+后继 `codex/b601-paired-capture` 基于 `3951ea18`，仍只修改原 probe、对应测试和本进度文档。
+操作者确认首轮条件为失能静置、无人手接触、默认原装末端且无额外负载；默认末端质量
+不能按零负载质量处理。15 s raw 有 4197 帧，ID 1–7 均约 40 Hz，J7 保留但不参与六轴验证。
+六轴首个大端 uint16 字段均仅变化一个计数。后续 mechPos 读取与 raw 相隔约九小时，
+故 ±4π 映射只有静态数值相近的初步证据，不是同步解码 PASS。
+
+现有入口新增 `read-paired`，显式确认 `B601_RS_PAIRED_STATIC_READ_ONLY`，要求 raw 和 summary
+分别写新文件；拒绝 enable/allow-motion/auto-disable。一个前台 Python 进程中，主线程经
+MotorBridge 0.4.9 串行读取 ID 1–6 的 0x7019（500 ms timeout，读间隔至少 50 ms），
+非 daemon 接收线程复用被动接收路径；启动接收成功后才开始请求。每次读取保存同一
+monotonic 时钟域中的 start/end、序号、motor id、成功值或未完成标记。
+这不是高频控制测试，也没有解码 type-24 到控制状态。SDK 读取超时不自动重试。
+
+接收失败、非有限读取和 Ctrl-C 都停止后续请求，释放 motor/controller 句柄，停止并 join
+接收线程。部分参数记录写 ERROR/INTERRUPTED summary，不能因 raw 正常关闭而冒充配对成功。
+host request window 不是总线精确 TX receipt 或电机采样时间；SDK 响应关联、内核排队、
+并行其他请求及源 freshness 仍需结合 raw 审查，不自动认定两条记录已配对。
+
+重要二次复核：已安装 Python Controller.__exit__ 会 shutdown，v0.4.9 Rust CoreController
+shutdown 会 disable devices。因此不使用 Controller 上下文管理器，改用 ExitStack 仅调用
+Motor.close 和 Controller.close；对应 free/Drop 释放资源并停止 SDK polling，不执行 shutdown。
+此前 CLI 参数读取发生在操作者已失能状态，但不能把它泛化成“退出不改变驱动状态”的入口。
+
+现场仍须失能、有支撑、无接触、默认末端且无额外负载，先做同姿态静态对照。
+不安排运动、不修改主动上报周期、SDK 安装、URDF、控制或保护保持。候选待合并。
+
+验证：三文件 hardware backend / active report / low gain probe **194 passed**（1.18 s），
+假 SDK 不提供 enable、disable 或 shutdown，覆盖六轴读取、时间窗、异常/中断留存、
+非有限拒绝、接收启动失败、覆盖拒绝和 CLI 授权。Ruff 无新增问题（沿用前三项基线），
+diff 检查和资源 audit 通过。真实配对采集尚未执行，未合并、push 或安装。
