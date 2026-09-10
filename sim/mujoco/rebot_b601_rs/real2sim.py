@@ -93,6 +93,31 @@ def audit_b601_probe_trace(payload: Mapping[str, object]) -> dict[str, object]:
 
 
 @dataclass(frozen=True)
+class B601Real2SimPlantProfile:
+    """Explicit experimental plant terms, never inferred from controller gains."""
+
+    name: str = "b601_provisional_plant"
+    parameter_source: str = "unidentified_simulation_experiment"
+    damping_nm_s_per_rad: tuple[float, ...] = (0.0,) * 6
+    frictionloss_nm: tuple[float, ...] = (0.0,) * 6
+    armature_kg_m2: tuple[float, ...] = (0.0,) * 6
+
+    def __post_init__(self) -> None:
+        for name in ("name", "parameter_source"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        for name in ("damping_nm_s_per_rad", "frictionloss_nm", "armature_kg_m2"):
+            object.__setattr__(self, name, _six_non_negative(getattr(self, name), name=name))
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            **asdict(self), "identification_status": "provisional_not_hardware_identified",
+            "friction_model": "mujoco_joint_dry_friction_constraint",
+            "urdf_mass_com_inertia_modified": False, "hardware_safety_claim": False,
+        }
+
+
+@dataclass(frozen=True)
 class B601SimStartupProfile:
     """Explicit simulation lock gains and admission envelope, not hardware defaults."""
 

@@ -576,3 +576,50 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 含 21 个新增离线用例；CLI 测试明确禁止 socket/backend 构造，并检查已有输出不被覆盖。
 Ruff 无新增问题（既有 EXE001/UP041/RUF046 不动），diff 检查、资源 audit 通过。
 只读检查与真实文件离线审查不等于硬件力控验收。候选待合并，未 push、安装或触发硬件。
+
+## M2 Plant 参数入口与物理回归（非辨识结果）
+
+后继 `codex/b601-plant-profile` 基于 `1e2d5a8e`。总路线图保持不变：B601 real2sim →
+ReBot real 到 RM65 sim 遥操 → RM65 policy 到 ReBot sim → 同一 execution cut 人工 residual →
+分阶段真机验收。当前仍不宣布 M1/M2 整体完成，不越过真实数据和角色决策门禁。
+
+现有 `real2sim.py` 新增显式 `B601Real2SimPlantProfile`，包含六轴独立的
+`damping_nm_s_per_rad`、`frictionloss_nm`、`armature_kg_m2`，使用已有六轴非负有限校验。
+必须有非空 name/parameter_source，metadata 固定声明 provisional_not_hardware_identified，
+不能仅传入参数就自称完成物理辨识。省略 profile 时维持已有默认零被动项。
+
+参数在已有 scene 的 MJCF 编译前写入 J1–J6，禁止用于尚未验证的 position 模式；
+不修改厂商 URDF/mesh、body mass/COM/inertia、J7、夹爪约束、控制增益、力矩限幅或 slew。
+同一 profile 显式交给 effort driver 作为期望契约；compiled dof 系数与声明不符即拒绝，
+没有 profile 时仍拒绝隐藏的非零被动项。scene 负责物理值，driver 不再次施加这些项。
+重力标定 bias/scale 和 driver Kd 仍属于独立 controller profile。
+
+MuJoCo 官方定义（经 Context7 核对）：关节 frictionloss 是有界干摩擦约束，不是简单
+`-sign(dq)*C` 前馈；armature 增加广义惯量；黏性 damping 进入 passive force。
+来源：https://github.com/google-deepmind/mujoco/blob/main/doc/computation/index.rst
+因此不把现有 controller Coulomb 补偿项复制为 plant 的已辨识摩擦。
+
+API 用法：在构建 scene 与 driver 时传入同一个显式 profile；以下系数保持零，仅演示入口，
+不是已辨识默认值或真机调参建议：
+
+```python
+from sim.mujoco.rebot_b601_rs.real2sim import B601Real2SimPlantProfile
+
+plant = B601Real2SimPlantProfile(parameter_source="explicit_simulation_baseline")
+scene = build_b601_mujoco_scene(source_root, actuation_mode="effort", plant_profile=plant)
+driver = B601MujocoEffortDriver(scene, pinocchio_model, plant_profile=plant)
+```
+
+物理回归验证：armature 只增加预期的质量矩阵对角项；黏性阻尼力等于 `-D*dq` 且耗散；
+干摩擦使小外加力矩下的关节速度明显低于零摩擦 baseline；静态重力、body mass/inertia 和
+driver Kd 公式保持独立。测试系数仅为可辨别效果的合成参数，不推断为这台机械臂参数。
+同一 source gitlink 在隔离 worktree 中按固定 5ba28ace materialize；共享资产只读，未安装环境。
+
+剩余实际门禁：需要带命令/力矩时间窗、无接触与负载标注的动态采集以及 held-out 数据，
+才能选择非零 plant 系数；现有失能静置只支持静态及时序检查。sensor/transport delay、
+量化及高带宽触觉仍未建模/验证，不因为本入口完成而改写 evidence 状态。
+
+验证：real2sim、MuJoCo MIT/haptics/基础 scene、submodule 和 composition boundary 六文件
+**150 passed**（47.08 s）；Ruff、资源 audit、diff 检查通过。早期新增测试误把已有
+execution_metadata property 当作方法调用，修正测试调用后重跑完整上述集合通过，未改验收要求。
+本批只修改五个声明路径，无硬件操作，候选待合并，未 push 或安装。

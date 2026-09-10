@@ -10,11 +10,98 @@ from sim.mujoco.rebot_b601_rs import build_b601_mujoco_scene
 from sim.mujoco.rebot_b601_rs.mit_driver import B601MujocoEffortDriver
 from sim.mujoco.rebot_b601_rs.real2sim import (
     B601Real2SimControllerProfile,
+    B601Real2SimPlantProfile,
     B601SimStartupProfile,
 )
 
 pytestmark = [pytest.mark.contract, pytest.mark.optional]
 SOURCE = Path(__file__).resolve().parents[1] / "hardware/reBotArm_control_py"
+
+
+@pytest.mark.parametrize("field", ["damping_nm_s_per_rad", "frictionloss_nm", "armature_kg_m2"])
+@pytest.mark.parametrize("values", [(-0.01,) * 6, (float("nan"),) * 6, (1.0,) * 7])
+def test_plant_profile_rejects_invalid_coefficients(field, values):
+    with pytest.raises((TypeError, ValueError)):
+        B601Real2SimPlantProfile(**{field: values})
+
+
+def test_explicit_plant_terms_are_compiled_once_and_do_not_change_gravity():
+    pytest.importorskip("mujoco")
+    profile = B601Real2SimPlantProfile(
+        damping_nm_s_per_rad=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        frictionloss_nm=(0.001,) * 6,
+        armature_kg_m2=(0.002,) * 6,
+    )
+    baseline = build_b601_mujoco_scene(SOURCE, actuation_mode="effort", gravity_mps2=(0, 0, -9.81))
+    scene = build_b601_mujoco_scene(SOURCE, actuation_mode="effort", gravity_mps2=(0, 0, -9.81), plant_profile=profile)
+    dofs = [scene.joint_dof_addr(f"joint{i}") for i in range(1, 7)]
+    np.testing.assert_array_equal(scene.model.dof_damping[dofs], profile.damping_nm_s_per_rad)
+    np.testing.assert_array_equal(scene.model.dof_frictionloss[dofs], profile.frictionloss_nm)
+    np.testing.assert_array_equal(scene.model.dof_armature[dofs], profile.armature_kg_m2)
+    np.testing.assert_array_equal(scene.model.body_mass, baseline.model.body_mass)
+    np.testing.assert_array_equal(scene.model.body_inertia, baseline.model.body_inertia)
+    np.testing.assert_allclose(scene.data.qfrc_bias, baseline.data.qfrc_bias, atol=1e-12)
+    masses = []
+    for candidate in (baseline, scene):
+        matrix = np.empty((candidate.model.nv, candidate.model.nv))
+        candidate.mujoco.mj_fullM(candidate.model, candidate.data, matrix)
+        masses.append(matrix)
+    expected = np.zeros(scene.model.nv)
+    expected[dofs] = profile.armature_kg_m2
+    np.testing.assert_allclose(masses[1] - masses[0], np.diag(expected), atol=1e-12)
+    scene.data.qvel[dofs] = (0.1, -0.1, 0.2, -0.2, 0.3, -0.3)
+    scene.forward()
+    np.testing.assert_allclose(
+        scene.data.qfrc_passive[dofs],
+        -np.asarray(profile.damping_nm_s_per_rad) * scene.data.qvel[dofs], atol=1e-12,
+    )
+    assert np.dot(scene.data.qfrc_passive, scene.data.qvel) < 0
+
+
+def test_driver_requires_matching_declared_plant_and_keeps_controller_separate():
+    pytest.importorskip("mujoco")
+    pytest.importorskip("pinocchio")
+    model = B601PinocchioModel.from_rebot_source_root(SOURCE)
+    plant = B601Real2SimPlantProfile(damping_nm_s_per_rad=(0.01,) * 6)
+    scene = build_b601_mujoco_scene(SOURCE, actuation_mode="effort", gravity_mps2=(0, 0, -9.81), plant_profile=plant)
+    with pytest.raises(ValueError, match="zero passive"):
+        B601MujocoEffortDriver(scene, model)
+    with pytest.raises(ValueError, match="declared"):
+        B601MujocoEffortDriver(scene, model, plant_profile=B601Real2SimPlantProfile())
+    controller = B601Real2SimControllerProfile.raw_model_baseline()
+    driver = B601MujocoEffortDriver(
+        scene, model, enable_gravity_compensation=True,
+        real2sim_profile=controller, plant_profile=plant,
+    )
+    first = driver.step_physics(reference(driver))
+    assert not first.driver_faulted
+    np.testing.assert_allclose(
+        first.driver_damping_torque_nm,
+        -np.asarray(controller.driver_kd_nm_s_per_rad) * first.control_qvel,
+    )
+    assert driver.execution_metadata["plant_profile"]["identification_status"] == "provisional_not_hardware_identified"
+    driver.reset()
+    np.testing.assert_array_equal(scene.model.dof_damping[driver._qvel_addresses], plant.damping_nm_s_per_rad)
+
+
+def test_plant_profile_is_not_implicitly_enabled_for_position_mode():
+    pytest.importorskip("mujoco")
+    with pytest.raises(ValueError, match="effort"):
+        build_b601_mujoco_scene(SOURCE, plant_profile=B601Real2SimPlantProfile())
+
+
+def test_plant_dry_friction_opposes_small_external_joint_torque():
+    pytest.importorskip("mujoco")
+    speeds = []
+    for plant in (None, B601Real2SimPlantProfile(frictionloss_nm=(0.1,) * 6)):
+        scene = build_b601_mujoco_scene(SOURCE, actuation_mode="effort", plant_profile=plant)
+        joint = scene.joint_dof_addr("joint1")
+        scene.data.qfrc_applied[joint] = 0.01
+        for _ in range(100):
+            scene.mujoco.mj_step(scene.model, scene.data)
+        speeds.append(abs(scene.data.qvel[joint]))
+    assert speeds[0] > 1e-5
+    assert speeds[1] < speeds[0] * 0.1
 
 
 def test_profile_compensation_and_input_validation():
