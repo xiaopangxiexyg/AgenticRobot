@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from agent_gateway.profiles.real import realsense_perception
+from agent_gateway.profiles.real import perception_cli, realsense_perception
 from agent_gateway.profiles.real.perception_application import (
     CameraOnlyRealPerceptionApplicationState,
     assemble_camera_only_real_perception_composition,
@@ -250,3 +250,23 @@ def test_real_perception_cli_is_discoverable_without_importing_hardware() -> Non
     assert "--graspgenx-mode" in result.stdout
     assert "--graspgenx-source-root" in result.stdout
     assert "--allow-local-image-root" not in result.stdout
+
+
+def test_real_perception_graspgenx_mode_defaults_to_in_process() -> None:
+    argv = [
+        "--socket-path",
+        "/tmp/agenticrobot-real-perception-test.sock",
+        "--camera-config",
+        str(REPO_ROOT / "pyproject.toml"),
+        "--camera-registry",
+        str(REPO_ROOT / "pyproject.toml"),
+        "--artifact-root",
+        "/tmp",
+    ]
+    parsed = perception_cli.build_parser().parse_args(argv)
+
+    assert parsed.graspgenx_mode == "in-process"
+    assert perception_cli._graspgenx_mode_was_explicit(argv) is False
+    assert perception_cli._graspgenx_mode_was_explicit(
+        [*argv, "--graspgenx-mode=in-process"]
+    ) is True

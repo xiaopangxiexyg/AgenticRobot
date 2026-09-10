@@ -62,8 +62,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=("service", "in-process"),
-        default="service",
-        help="use the loopback service or load the compatible model in this process",
+        default="in-process",
+        help=(
+            "load the compatible model in this process by default; use service "
+            "to call the loopback server"
+        ),
     )
     parser.add_argument(
         "--asset-bundle",

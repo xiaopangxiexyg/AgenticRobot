@@ -14,6 +14,7 @@ from PIL import Image
 
 from deployments.perception import localize_image_cli, point_grasp_image_cli
 from deployments.perception.sam2_grounding_dino import GroundedObjectDetection
+from scripts import smoke_graspgenx_inference
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "scripts" / "install_perception_models.sh"
@@ -134,7 +135,14 @@ def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> Non
     assert "DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1" in source
     assert "robot_motion" not in source
     rejected = subprocess.run(
-        [sys.executable, str(GRASPGENX_SMOKE), "--host", "0.0.0.0"],
+        [
+            sys.executable,
+            str(GRASPGENX_SMOKE),
+            "--mode",
+            "service",
+            "--host",
+            "0.0.0.0",
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -143,6 +151,14 @@ def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> Non
     assert rejected.returncode == 1
     assert "must use a loopback endpoint" in rejected.stderr
     assert "ModuleNotFoundError" not in rejected.stderr
+
+
+def test_graspgenx_gpu_smoke_defaults_to_in_process() -> None:
+    assert smoke_graspgenx_inference._parse_args([]).mode == "in-process"
+    assert (
+        smoke_graspgenx_inference._parse_args(["--mode", "service"]).mode
+        == "service"
+    )
 
 
 def test_point_grasp_image_cli_is_offline_and_has_no_gateway_dependency() -> None:

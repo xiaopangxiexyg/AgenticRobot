@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -23,6 +24,7 @@ from agent_gateway.transport.unix_transport import (
     validate_agent_gateway_unix_server_preflight,
 )
 from deployments.perception import (
+    GRASPGENX_DEFAULT_MODE,
     GraspGenXClient,
     GraspGenXInProcessBackend,
     GraspGenXPointGraspModelSpec,
@@ -143,10 +145,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--graspgenx-mode",
         choices=("service", "in-process"),
-        default="service",
+        default=GRASPGENX_DEFAULT_MODE,
         help=(
-            "GraspGenX execution mode; service uses the loopback ZMQ server, "
-            "in-process loads the compatible model into this Gateway"
+            "GraspGenX execution mode; in-process loads the compatible model "
+            "into this Gateway by default, service uses the loopback ZMQ server"
         ),
     )
     parser.add_argument(
@@ -273,6 +275,22 @@ def _effective_camera_mount_urdf(args: argparse.Namespace) -> Path | None:
     if args.enable_point_grasp:
         return DEFAULT_RM65_CAMERA_MOUNT_URDF
     return None
+
+
+def _graspgenx_mode_was_explicit(argv: list[str] | None) -> bool:
+    """Return whether the caller explicitly selected a GraspGenX mode.
+
+    The default is intentionally in-process, but that default must stay inert
+    for VGN/GraspNet and camera-only launches.  Only an explicit mode flag is
+    therefore validated against the selected point-grasp backend.
+    """
+
+    tokens = sys.argv[1:] if argv is None else argv
+    return any(
+        token == "--graspgenx-mode"
+        or token.startswith("--graspgenx-mode=")
+        for token in tokens
+    )
 
 
 def _absolute_socket_path(
@@ -749,8 +767,13 @@ def main(argv: list[str] | None = None) -> int:
             flag="--motion-trace-root",
         )
     )
-    if args.graspgenx_mode != "service" and (
-        not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"
+    if (
+        _graspgenx_mode_was_explicit(argv)
+        and args.graspgenx_mode != "service"
+        and (
+            not args.enable_point_grasp
+            or args.point_grasp_backend != "graspgenx"
+        )
     ):
         parser.error(
             "--graspgenx-mode applies only to an enabled "

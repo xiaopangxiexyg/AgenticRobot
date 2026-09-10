@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 from deployments.perception.graspgenx_client import (
+    GRASPGENX_DEFAULT_MODE,
     GraspGenXClient,
     GraspGenXInferenceBackend,
     GraspGenXInProcessBackend,
@@ -107,6 +108,10 @@ class _DuckBackend:
 
     def infer_object(self, point_cloud, **kwargs):
         return self.grasps.copy(), self.scores.copy()
+
+
+def test_graspgenx_default_mode_is_in_process() -> None:
+    assert GRASPGENX_DEFAULT_MODE == "in-process"
 
 
 def _sha256(path: Path) -> str:

@@ -2,12 +2,11 @@
 
 本文是环境依赖、安装细节和复现约束的权威说明；可直接复制的最短安装/检查命令见
 [`docs/setup/README.md`](./docs/setup/README.md)。项目主环境统一使用 Python 3.10 conda 环境
-`dexteleop310`；SAM2、Grounding DINO、VGN、GraspNet 作为抓姿扩展安装到同一个环境。GraspGenX
-默认因其上游 PyTorch 约束和完整 GPU 服务栈使用
-`assets/perception/graspgenx-point-grasp/runtime/.venv` 独立运行，AgenticRobot 只通过本机
-loopback 轻量 client 调用，不修改 `dexteleop310`。若 Gateway 使用与 GraspGenX 官方依赖
-兼容的独立 Python 环境，也支持显式 in-process direct Python backend；它不改变 Gateway
-Skill 或下游运动语义。RPent
+`dexteleop310`；SAM2、Grounding DINO、VGN、GraspNet 作为抓姿扩展安装到同一个环境。选择
+GraspGenX 时真实 Gateway CLI 默认使用 in-process direct Python backend，但要求 Gateway 所在
+Python 环境满足官方 PyTorch 约束；`assets/perception/graspgenx-point-grasp/runtime/.venv`
+保留为显式 service 备选，不修改 `dexteleop310`。两种模式都不改变 Gateway Skill 或下游运动语义。
+RPent
 属于独立的上层项目环境，不是本仓抓姿/仿真运行的前置条件。`core`、`test`、`dataset`、
 `annotation`、`sim`、`model`、`openpi`、
 `vla_scratch`、`hardware` 是依赖分组，不是九个 conda 环境。其中 `annotation` 还支持
@@ -68,8 +67,9 @@ bash scripts/install_graspgenx_env.sh
 bash scripts/install_graspgenx_env.sh --verify-only
 ```
 
-服务启动后的 GPU 推理复验使用 `scripts/smoke_graspgenx_inference.py`；它只发送合成方块点云，
-不会读取相机或连接机械臂。完整两终端命令见
+GPU 推理复验使用 `scripts/smoke_graspgenx_inference.py`；默认直接运行 in-process，只有显式
+加 `--mode service` 才调用 loopback 服务。它只发送合成方块点云，不会读取相机或连接机械臂。
+完整命令见
 [`docs/agent_gateway/POINT_GRASP.md`](docs/agent_gateway/POINT_GRASP.md#graspgenx-更新后端)。
 
 ### 0.3 新机器如何一键安装？

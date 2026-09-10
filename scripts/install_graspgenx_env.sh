@@ -16,7 +16,7 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/install_graspgenx_env.sh [OPTIONS]
 
-Install the isolated GraspGenX inference service and its reviewed weights.
+Install the isolated GraspGenX inference runtime and its reviewed weights.
 This script never modifies dexteleop310.
 
 Options:

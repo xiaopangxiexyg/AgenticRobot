@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import stat
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -20,6 +21,7 @@ from agent_gateway.transport.unix_transport import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from deployments.perception import (
+    GRASPGENX_DEFAULT_MODE,
     GraspGenXClient,
     GraspGenXInProcessBackend,
     GraspGenXPointGraspModelSpec,
@@ -133,10 +135,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--graspgenx-mode",
         choices=("service", "in-process"),
-        default="service",
+        default=GRASPGENX_DEFAULT_MODE,
         help=(
-            "GraspGenX execution mode; service uses the loopback ZMQ server, "
-            "in-process loads the compatible model into this Gateway"
+            "GraspGenX execution mode; in-process loads the compatible model "
+            "into this Gateway by default, service uses the loopback ZMQ server"
         ),
     )
     parser.add_argument(
@@ -190,6 +192,17 @@ def _runtime_session_id(value: str | None) -> str:
     return value or "dexteleop-real-perception:" + uuid.uuid4().hex
 
 
+def _graspgenx_mode_was_explicit(argv: list[str] | None) -> bool:
+    """Keep the in-process default inert unless GraspGenX is selected."""
+
+    tokens = sys.argv[1:] if argv is None else argv
+    return any(
+        token == "--graspgenx-mode"
+        or token.startswith("--graspgenx-mode=")
+        for token in tokens
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -218,8 +231,13 @@ def main(argv: list[str] | None = None) -> int:
         args.artifact_root,
         flag="--artifact-root",
     )
-    if args.graspgenx_mode != "service" and (
-        not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"
+    if (
+        _graspgenx_mode_was_explicit(argv)
+        and args.graspgenx_mode != "service"
+        and (
+            not args.enable_point_grasp
+            or args.point_grasp_backend != "graspgenx"
+        )
     ):
         parser.error(
             "--graspgenx-mode applies only to an enabled "

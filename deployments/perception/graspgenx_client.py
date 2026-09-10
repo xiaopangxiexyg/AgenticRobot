@@ -25,6 +25,7 @@ import zmq
 GRASPGENX_DEFAULT_HOST = "127.0.0.1"
 GRASPGENX_DEFAULT_PORT = 5556
 GRASPGENX_DEFAULT_TIMEOUT_MS = 120_000
+GRASPGENX_DEFAULT_MODE = "in-process"
 GRASPGENX_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 GRASPGENX_INPROCESS_BACKEND_ID = "graspgenx-inprocess-v1"
 _GRASPGENX_IMPORT_LOCK = threading.RLock()
@@ -353,7 +354,7 @@ class GraspGenXInProcessBackend:
     def __init__(
         self,
         *,
-        model_spec: object,
+        model_spec: Any,
         source_root: str | Path | None = None,
         device: str = "cuda",
         use_tensorrt: bool = False,
@@ -364,10 +365,8 @@ class GraspGenXInProcessBackend:
         ):
             raise TypeError("model_spec must expose semantic_content_hash.")
         try:
-            bundle_root = Path(getattr(model_spec, "bundle_root")).resolve(strict=True)
-            checkpoint_root = Path(
-                getattr(model_spec, "checkpoint_root")
-            ).resolve(strict=True)
+            bundle_root = Path(model_spec.bundle_root).resolve(strict=True)
+            checkpoint_root = Path(model_spec.checkpoint_root).resolve(strict=True)
         except (AttributeError, OSError, TypeError, ValueError) as exc:
             raise TypeError(
                 "model_spec must expose existing bundle_root and checkpoint_root."
@@ -660,12 +659,13 @@ class GraspGenXInProcessBackend:
 
 __all__ = [
     "GRASPGENX_DEFAULT_HOST",
+    "GRASPGENX_DEFAULT_MODE",
     "GRASPGENX_DEFAULT_PORT",
     "GRASPGENX_DEFAULT_TIMEOUT_MS",
     "GRASPGENX_INPROCESS_BACKEND_ID",
     "GraspGenXClient",
-    "GraspGenXInferenceBackend",
     "GraspGenXInProcessBackend",
+    "GraspGenXInferenceBackend",
     "pack_graspgenx_message",
     "unpack_graspgenx_message",
 ]
