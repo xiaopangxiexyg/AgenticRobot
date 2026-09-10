@@ -443,6 +443,250 @@ def test_enabled_shutdown_always_attempts_hold_before_disable() -> None:
     )
 
 
+@pytest.fixture
+def startup_recovery(monkeypatch):
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    clock = [10.0]
+    stop = {"requested": True, "full_disable_requested": False}
+
+    class Backend:
+        calls = 0
+        dt = 0.05
+        states = (q, q)
+        stale = False
+        valid = True
+        full_stop_during_read = False
+
+        def poll_feedback(self, *, request_feedback):
+            assert request_feedback
+            value = self.states[self.calls]
+            self.calls += 1
+            clock[0] += self.dt
+            if self.full_stop_during_read:
+                stop["full_disable_requested"] = True
+            if isinstance(value, Exception):
+                raise value
+            return SimpleNamespace(
+                valid=self.valid, stale=self.stale, positions_rad=value
+            )
+
+        def send_mit(self, *args, **kwargs):
+            pytest.fail("feedback recovery must not issue torque or position commands")
+
+        def safe_stop(self, *args, **kwargs):
+            pytest.fail("feedback recovery must not disable the arm")
+
+    backend = Backend()
+    monkeypatch.setattr(probe.time, "monotonic", lambda: clock[0])
+
+    def recover():
+        return probe._recover_startup_hold_snapshot(
+            backend,
+            pre_enable_qpos_rad=q,
+            position_limits_rad=_fault_hold_limits(),
+            max_age_sec=0.15,
+            max_velocity_rad_s=0.02,
+            max_rebase_rad=0.05,
+            stop=stop,
+        )
+
+    return backend, stop, recover
+
+
+def test_startup_recovery_reads_current_pose_despite_first_interrupt(startup_recovery):
+    backend, _stop, recover = startup_recovery
+    current = (0.1, 0.701, 1.1, 0.0, -0.1, 0.2)
+    backend.states = [current, current]
+    q, velocity, observed = recover()
+    assert q == current
+    assert velocity == (0.0,) * 6
+    assert observed == pytest.approx(10.1)
+    assert backend.calls == 2
+
+
+@pytest.mark.parametrize("fault", [
+    "stale", "invalid", "nan", "incomplete", "out_of_range", "moving",
+    "displaced", "slow", "zero_dt", "negative_dt", "rx_error",
+])
+def test_startup_recovery_rejects_untrusted_samples(startup_recovery, fault):
+    backend, _stop, recover = startup_recovery
+    q = backend.states[0]
+    if fault == "stale":
+        backend.stale = True
+    elif fault == "invalid":
+        backend.valid = False
+    elif fault == "nan":
+        backend.states = [q, (float("nan"), *q[1:])]
+    elif fault == "incomplete":
+        backend.states = [q, q[:5]]
+    elif fault == "out_of_range":
+        backend.states = [q, (20.0, *q[1:])]
+    elif fault == "moving":
+        backend.states = [q, (q[0] + 0.01, *q[1:])]
+    elif fault == "displaced":
+        moved = (q[0] + 0.1, *q[1:])
+        backend.states = [moved, moved]
+    elif fault == "slow":
+        backend.dt = 0.1
+    elif fault == "zero_dt":
+        backend.dt = 0.0
+    elif fault == "negative_dt":
+        backend.dt = -0.01
+    else:
+        backend.states = [q, OSError("CAN unavailable")]
+    with pytest.raises((probe.LowGainProbeError, ValueError, OSError)):
+        recover()
+
+
+@pytest.mark.parametrize("during_read", [False, True])
+def test_startup_recovery_respects_explicit_full_stop(startup_recovery, during_read):
+    backend, stop, recover = startup_recovery
+    backend.full_stop_during_read = during_read
+    stop["full_disable_requested"] = not during_read
+    with pytest.raises(probe.LowGainProbeError, match="cancelled by full disable"):
+        recover()
+    assert backend.calls == int(during_read)
+
+
+def test_hold_entry_does_not_send_after_explicit_full_stop(monkeypatch):
+    stopped = []
+
+    class Backend:
+        def safe_stop(self, *, joint_names):
+            stopped.append(joint_names)
+            return probe.B601ModeReceipt(
+                operation="safe_stop", requested_joint_names=joint_names,
+                completed_joint_names=joint_names, failed_joint_names=(),
+                errors=(), completed=True,
+            )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("full stop must precede any hold frame")
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", forbidden)
+    monkeypatch.setattr(probe, "_send_cached_fault_hold_command", forbidden)
+    result = probe._run_latched_fault_hold(
+        Backend(), object(), qpos_rad=None, qvel_rad_s=None,
+        observed_age_sec=0.0, fault_qpos_rad=None, fault_qvel_rad_s=None,
+        position_limits_rad=_fault_hold_limits(), max_age_sec=0.15,
+        max_velocity_rad_s=0.02, max_rebase_rad=0.05,
+        profile=object(), gravity_scale=1.0, previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6, rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": True},
+    )
+    assert result[0] == 0
+    assert result[4].completed
+    assert stopped == [probe._ALL_JOINTS]
+
+
+@pytest.mark.parametrize("failure", ["interrupt", "first_rx_error", "persistent_rx_error"])
+def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_path, failure):
+    import signal
+
+    events = []
+    handlers = {}
+    clock = [10.0]
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("test fixture\n")
+    config = SimpleNamespace(
+        channel="fake-no-hardware",
+        joints=[SimpleNamespace(mit_kp=1.0, mit_kd=0.1) for _ in range(6)],
+    )
+
+    def receipt():
+        return probe.B601ModeReceipt(
+            operation="safe_stop",
+            requested_joint_names=probe._ALL_JOINTS,
+            completed_joint_names=probe._ALL_JOINTS, failed_joint_names=(),
+            errors=(), completed=True,
+        )
+
+    class Backend:
+        enabled = False
+        reads = 0
+
+        def connect(self):
+            pass
+
+        def poll_feedback(self, **kwargs):
+            self.reads += 1
+            clock[0] += 0.05
+            events.append("read")
+            if self.enabled and (
+                failure == "persistent_rx_error"
+                or (failure == "first_rx_error" and self.reads == 2)
+            ):
+                raise OSError("injected RX failure")
+            return SimpleNamespace(
+                valid=True, stale=False, positions_rad=q, sequence=self.reads,
+                receive_timestamp_sec=clock[0], joints=(),
+            )
+
+        def safe_stop(self, **kwargs):
+            events.append("disable")
+            return receipt()
+
+        def enable(self, **kwargs):
+            self.enabled = True
+            events.append("enable")
+            if failure == "interrupt":
+                handlers[signal.SIGINT](signal.SIGINT, None)
+            return receipt()
+
+        def apply_temporary_driver_torque_limits(self, *args, **kwargs):
+            return SimpleNamespace(completed=True)
+
+        def restore_driver_torque_limits(self):
+            events.append("restore")
+            return SimpleNamespace(completed=True)
+
+        def prepare_mit_mode(self, **kwargs):
+            return receipt()
+
+        def close(self):
+            events.append("close")
+
+    def hold(backend, model, **kwargs):
+        assert kwargs["stop"]["requested"] is True
+        assert kwargs["qpos_rad"] == q
+        assert kwargs["qvel_rad_s"] == (0.0,) * 6
+        assert kwargs["cached_gravity_tau_nm"] is None
+        assert kwargs["hold_profile"].position_kp_nm_per_rad == (0.0,) * 6
+        assert kwargs["driver_kd_nm_s_per_rad"] == probe._DEFAULT_DRIVER_KD
+        assert kwargs["gravity_joint_bias_nm"] == probe._DEFAULT_GRAVITY_JOINT_BIAS_NM
+        events.append("hold")
+        # The real unbounded hold is separately tested. Simulate its explicit
+        # final operator stop, never a timer-based or implicit release.
+        kwargs["stop"]["full_disable_requested"] = True
+        return 1, (0.0,) * 6, None, None, backend.safe_stop(), []
+
+    monkeypatch.setattr(probe.signal, "signal", lambda signum, handler: handlers.update({signum: handler}))
+    monkeypatch.setattr(probe.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(probe, "B601RSBackend", lambda config: Backend())
+    monkeypatch.setattr(probe.B601RSBackendConfig, "from_rs_yaml", lambda *a, **kw: config)
+    monkeypatch.setattr(probe, "_resolve_model_and_limits", lambda root: (SimpleNamespace(urdf_path=config_path), _fault_hold_limits()))
+    monkeypatch.setattr(probe, "_resolve_effort_limits", lambda *a, **kw: (1.0,) * 6)
+    monkeypatch.setattr(probe, "_drive_enable_countdown", lambda stop: True)
+    monkeypatch.setattr(probe, "_operator_notice", lambda message: None)
+    monkeypatch.setattr(probe, "_run_latched_fault_hold", hold)
+    args = probe.build_parser().parse_args([
+        "--mode", "hold", "--config", str(config_path),
+        "--rebot-source-root", str(tmp_path), "--allow-motion", "--auto-disable",
+        "--apply-driver-torque-limits", "--confirmation", probe.CONFIRMATION,
+    ])
+    with pytest.raises(probe.LowGainProbeError, match="operator interrupt|injected RX failure"):
+        probe.run_probe(args)
+    after_enable = events[events.index("enable") + 1:]
+    if failure == "persistent_rx_error":
+        assert "hold" not in after_enable
+        assert after_enable.index("read") < after_enable.index("disable")
+    else:
+        assert after_enable.index("hold") < after_enable.index("disable")
+        assert after_enable.count("read") >= 2
+    assert after_enable[-2:] == ["restore", "close"]
+
+
 def test_protective_hold_notice_is_high_visibility_and_log_safe() -> None:
     notice = probe._protective_hold_notice(
         "protective hold degraded",

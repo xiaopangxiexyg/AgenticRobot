@@ -2852,6 +2852,64 @@ def _validate_protective_hold_feedback(
     return current
 
 
+def _recover_startup_hold_snapshot(
+    backend: B601RSBackend,
+    *,
+    pre_enable_qpos_rad: Sequence[float],
+    position_limits_rad: Sequence[tuple[float, float]],
+    max_age_sec: float,
+    max_velocity_rad_s: float,
+    max_rebase_rad: float,
+    stop: dict[str, bool],
+) -> tuple[tuple[float, ...], tuple[float, ...], float]:
+    """Read two bounded host-observed samples, never invent a startup cache.
+
+    Only used before a complete gravity command exists. No enable or command
+    is issued here. MotorBridge source freshness remains unverified; limiting
+    the entire read window must not be described as a source timestamp check.
+    """
+    started = time.monotonic()
+    observations: list[tuple[tuple[float, ...], float]] = []
+    for _ in range(2):
+        if stop.get("full_disable_requested", False):
+            raise LowGainProbeError("startup recovery cancelled by full disable")
+        state = backend.poll_feedback(request_feedback=True)
+        observed = time.monotonic()
+        if stop.get("full_disable_requested", False):
+            raise LowGainProbeError("startup recovery cancelled by full disable")
+        if not state.valid or getattr(state, "stale", False):
+            raise LowGainProbeError("startup recovery requires valid feedback")
+        elapsed = observed - started
+        if not math.isfinite(elapsed) or not 0.0 <= elapsed <= max_age_sec:
+            raise LowGainProbeError("startup recovery read window expired")
+        q = _validate_in_limit_qpos(
+            state.positions_rad,
+            position_limits_rad=position_limits_rad,
+            name="startup_recovery_qpos_rad",
+        )
+        observations.append((q, observed))
+    (previous, previous_time), (current, current_time) = observations
+    dt = _positive(current_time - previous_time, name="startup_recovery_dt")
+    velocity = tuple((q - old) / dt for q, old in zip(current, previous, strict=True))
+    admitted = _validate_fault_hold_snapshot(
+        current,
+        qvel_rad_s=velocity,
+        observed_age_sec=current_time - started,
+        position_limits_rad=position_limits_rad,
+        max_age_sec=max_age_sec,
+        max_velocity_rad_s=max_velocity_rad_s,
+    )
+    baseline = _validate_in_limit_qpos(
+        pre_enable_qpos_rad,
+        position_limits_rad=position_limits_rad,
+        name="startup_recovery_pre_enable_qpos_rad",
+    )
+    rebase_limit = _positive(max_rebase_rad, name="startup_recovery_max_rebase_rad")
+    if any(abs(q - old) > rebase_limit for q, old in zip(admitted, baseline, strict=True)):
+        raise LowGainProbeError("startup recovery displacement exceeds rebase limit")
+    return admitted, velocity, current_time
+
+
 def resolve_active_joint_names() -> tuple[str, ...]:
     """Return the complete B601 arm command set used by impedance modes."""
 
@@ -5288,6 +5346,10 @@ def _run_latched_fault_hold(
             context=context,
         )
 
+    if stop.get("full_disable_requested", False):
+        full_disable_fallback()
+        return 0, latest_tau, None, None, full_disable_receipt, errors
+
     try:
         cache_source_q = cached_qpos_rad if cached_qpos_rad is not None else qpos_rad
         if cache_source_q is not None:
@@ -7080,6 +7142,47 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             )
             protective_hold_remains_latched = False
             if shutdown_action == "protective_hold":
+                # Enable can finish before the first admitted state or MIT
+                # receipt exists. Try bounded fresh acquisition, rather than
+                # immediately disabling or treating pre-enable q as current.
+                if (
+                    last_verified_gravity_tau is None
+                    and pre_enable_q is not None
+                    and (
+                        last_safe_q is None
+                        or last_safe_observed_at_sec is None
+                        or time.monotonic() - last_safe_observed_at_sec
+                        > args.fault_hold_max_age_sec
+                    )
+                ):
+                    try:
+                        (
+                            last_safe_q,
+                            last_safe_qvel,
+                            last_safe_observed_at_sec,
+                        ) = _recover_startup_hold_snapshot(
+                            backend,
+                            pre_enable_qpos_rad=pre_enable_q,
+                            position_limits_rad=feedback_position_limits,
+                            max_age_sec=args.fault_hold_max_age_sec,
+                            max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
+                            max_rebase_rad=args.fault_hold_max_rebase_rad,
+                            stop=stop,
+                        )
+                        # The startup fault consumes the first protective
+                        # event too; the next Ctrl-C must request full stop.
+                        stop["requested"] = True
+                        _operator_notice(
+                            "[B601] STARTUP RECOVERY: validated current feedback; "
+                            "attempting gravity/damping hold, not position lock."
+                        )
+                    except (
+                        LowGainProbeError, B601HardwareError, OSError, TypeError, ValueError
+                    ) as exc:
+                        last_safe_q = None
+                        last_safe_qvel = None
+                        last_safe_observed_at_sec = None
+                        cleanup_errors.append(f"startup hold recovery: {exc}")
                 # A complete current fault sample is preferred for a normal
                 # control/position error.  An explicit operator interrupt
                 # normally remains anchored to the previously admitted
