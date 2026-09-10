@@ -334,6 +334,23 @@ URDF placement，同时保留现场已验证的左右腕相机 serial 绑定。�
 失败诊断同时保留两臂 measurement age、timestamp span 和各自 SDK read-phase timing，不能靠放宽
 阈值掩盖慢读取或控制器异常。
 
+组合 profile 还发布一对职责分离的下游 Route。`perception.plan_grasp_approach@1` 只接受当前 session
+仍保留的 `point_grasp_operation_id`、`candidate_ordinal` 和 `speed_scale`，从该不可变候选恢复真实
+DMTAC tool-TCP 目标，再绑定一份新鲜 measured-qpos。它依次经过当前部署的 TCP envelope、endpoint
+IK、生产 URDF/FCL 场景和完整关节路径规划；不会接受调用方回传的矩阵、轨迹或坐标身份。结果明确为
+`path_found` 或 `rejected`，并保留候选/backend/model、Station/frame/tool/calibration、qpos 和 planner
+证据。该 Skill 是只读感知/评估：不 mint motion Grant、不 dispatch，也不会因路径失败请求 HOLD；
+`motion_or_hold_performed` 恒为 `false`。
+
+只有 `path_found` 才返回最长存活 30 秒的 session-local `grasp_approach_plan_id` 和
+`grasp_approach_plan_hash`。操作者或上层 Agent 检查结果后，必须另行显式调用
+`motion.execute_grasp_approach_plan@1`；执行参数只能引用同一个 component 和精确 plan ID/hash，不能
+改目标或轨迹。执行 Route 不重新规划，并在 PENDING-to-ACTIVE 前重新检查计划寿命、qpos 新鲜度、
+起点漂移和取消状态；计划最多消费一次。执行失败才按 motion 域规则进入 HOLD。这样候选质量、完整
+路径可行性和是否运动成为三个独立决策，不会把 endpoint reachability 或单帧可见碰撞标志误当作
+可执行证明，也不会因为某个候选超出当前 envelope 就自动放宽安全边界。Gateway 启动时需显式授权
+独立 action `execute_grasp_approach_plan`；它与兼容 action `approach_grasp_pose` 不互相授权。
+
 原有 `perception.plan_point_grasp@1` 与上文离线 CLI 保持兼容：它允许调用方提供本地 RGB-D、内参和
 标定，因此其 `base` 输出不能被称为 deployment-trusted Station pose，也不会由生产
 `real-perception` profile 发布。

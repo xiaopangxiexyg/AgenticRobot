@@ -14,7 +14,7 @@
 
 ### 感知与抓姿扩展资产（可选）
 
-运行 `SAM2 + Grounding DINO` 物体定位 Skill 或 VGN/GraspNet 点击抓姿 Skill 时，再下载
+运行 `SAM2 + Grounding DINO` 物体定位 Skill 或 GraspGenX/VGN/GraspNet 点击抓姿 Skill 时，再下载
 [`感知/抓姿 assets.zip`](https://disk.pku.edu.cn/link/AA6DAAF3490F7645A18F32230527E5480B)，并按压缩包说明把可选
 `perception/` bundle 放入同一个共享资产根。各 bundle 的精确文件、manifest 和上游权重来源见
 [`SAM2_GROUNDING_DINO.md`](./docs/agent_gateway/SAM2_GROUNDING_DINO.md) 和
@@ -35,7 +35,8 @@ python scripts/dev_local_resources.py audit
 |---|---|
 | RM65 基础模型 | `rm65_inspire_tac/`、`rm65_inspire_gripper_v3/` |
 | SAM2 + Grounding DINO | `perception/sam2_grounding_dino/` |
-| 默认 VGN 点击抓姿 | `perception/sam2_vgn_point_grasp/` |
+| 默认 GraspGenX 点击抓姿 | `perception/graspgenx-point-grasp/` |
+| 兼容 VGN 点击抓姿 | `perception/sam2_vgn_point_grasp/` |
 | 可选 GraspNet 点击抓姿 | `perception/graspnet-point-grasp/` |
 
 需要重新发布经审核的完整资产包时，在包含 `assets/` 的父目录打包整个目录并记录 SHA-256；不要只
@@ -79,14 +80,17 @@ python -m deployments.perception.localize_image_cli \
 Gateway 的启动与 Artifact 上传边界见
 [`SAM2_GROUNDING_DINO.md`](./docs/agent_gateway/SAM2_GROUNDING_DINO.md)。
 
-## 3. SAM2 + VGN/GraspNet 点击抓姿 Skill（可选）
+## 3. SAM2 + GraspGenX/VGN/GraspNet 点击抓姿 Skill（可选）
 
-用一张本地 RGB-D 做真实 GPU 端到端推理：
+生产 Gateway 默认通过独立 loopback service 使用 GraspGenX；安装、启动和 GPU smoke 命令见
+[`POINT_GRASP.md`](./docs/agent_gateway/POINT_GRASP.md)。下面的本地图片入口有意只支持 VGN/GraspNet，
+用于不启动相机或机械臂的离线验证。显式选择 VGN 的完整命令为：
 
 ```bash
 export POINT_GRASP_BUNDLE="${DEXTELEOP_ASSET_ROOT}/perception/sam2_vgn_point_grasp"
 python -m deployments.perception.point_grasp_image_cli \
   --sam2-asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
+  --point-grasp-backend vgn \
   --point-grasp-asset-bundle "${POINT_GRASP_BUNDLE}" \
   --input-rgb /absolute/path/to/frame.png \
   --input-depth /absolute/path/to/aligned_depth_m_float32.npy \
@@ -104,9 +108,9 @@ python -m deployments.perception.point_grasp_image_cli \
     "${DEXTELEOP_ASSET_ROOT}/perception/graspnet-point-grasp"
 ```
 
-深度必须为对齐 RGB 的 C-order `float32` H×W NPY，单位米。该入口目前仅为离线/仿真能力，
+深度必须为对齐 RGB 的 C-order `float32` H×W NPY，单位米。该入口仅为离线/仿真能力，
 不注册 real Gateway Route；标定文件格式、权重包提取方式、当前 simulation 使用的 DMTAC M
-URDF，以及单视角碰撞检查局限见
+URDF、GraspGenX service，以及候选生成与完整路径规划/显式执行的权限边界见
 [`POINT_GRASP.md`](./docs/agent_gateway/POINT_GRASP.md)。
 
 DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy deploy、replay、simulation

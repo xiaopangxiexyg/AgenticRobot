@@ -493,8 +493,9 @@ or connect a robot backend.
 
 `--enable-object-localization` adds the supplied-image localization Route after
 loading its reviewed model bundle. `--enable-point-grasp` is a separate,
-default-off module and requires that same localizer plus a reviewed VGN (default)
-or GraspNet bundle:
+default-off module and requires that same localizer plus a reviewed point-grasp
+bundle. GraspGenX through its isolated loopback service is the default; VGN and
+GraspNet are explicit compatibility choices:
 
 ```bash
 python -m agent_gateway real-perception \
@@ -505,7 +506,9 @@ python -m agent_gateway real-perception \
   --enable-object-localization \
   --object-localization-asset-bundle /absolute/assets/perception/sam2_grounding_dino \
   --enable-point-grasp \
-  --point-grasp-asset-bundle /absolute/assets/perception/sam2_vgn_point_grasp
+  --point-grasp-asset-bundle /absolute/assets/perception/graspgenx-point-grasp \
+  --graspgenx-host 127.0.0.1 \
+  --graspgenx-port 5556
 ```
 
 The live `perception.plan_point_grasp@2` request contains only a registered
@@ -518,7 +521,7 @@ or execute motion. Its visible-scene collision flag is not a complete
 scene/robot/path safety proof. The caller-calibrated v1 Route remains available
 only to the separate offline tooling.
 
-The DMTAC M adapter distinguishes the VGN/GraspNet palm-finger boundary from
+The DMTAC M adapter distinguishes each model's grasp frame from
 the calibrated actual `tool_tcp`. The current zero-translation 4B2 proxy
 attachment has a 97.001 mm internal boundary marker, while the selected DMTAC
 M TCP is 140 mm from the flange; the adapter explicitly locks the resulting
@@ -631,10 +634,11 @@ python -m agent_gateway real-rm65 \
   --artifact-root /absolute/private/artifact_cache \
   --enable-point-grasp \
   --object-localization-asset-bundle /absolute/assets/perception/sam2_grounding_dino \
-  --point-grasp-backend vgn \
-  --point-grasp-asset-bundle /absolute/assets/perception/sam2_vgn_point_grasp \
+  --point-grasp-asset-bundle /absolute/assets/perception/graspgenx-point-grasp \
+  --graspgenx-host 127.0.0.1 \
+  --graspgenx-port 5556 \
   --authorized-side right \
-  --authorized-actions move_tcp_to_pose approach_grasp_pose \
+  --authorized-actions move_tcp_to_pose execute_grasp_approach_plan \
   --confirm AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES
 ```
 
@@ -657,6 +661,26 @@ one in-flight lower solve is not preempted and its full duration is reported.
 Omitting the flag preserves the exact v2 contracts and hashes; setting
 `include_arm_reachability=false` on v3 performs no IK. The annotation is not
 path planning, collision clearance, motion admission, or grasp-success proof.
+
+The combined point-grasp profile also publishes a paired contract for the
+preferred downstream flow. `perception.plan_grasp_approach@1` accepts only a
+retained point-grasp operation ID, candidate ordinal, and speed scale. It binds
+the candidate to a fresh measured-qpos cut, applies the deployed TCP envelope,
+endpoint IK, production URDF/FCL scene, and full joint-path planner, then returns
+either `path_found` or a bounded rejection reason. This inspection Route cannot
+dispatch motion or request HOLD. A successful result contains an immutable,
+session-local plan ID/hash with a maximum 30-second lifetime.
+
+Motion remains a separate decision. `motion.execute_grasp_approach_plan@1`
+accepts only the advertised component ID and that exact plan ID/hash. It cannot
+replace the target pose or trajectory, replans nothing, rechecks freshness and
+start drift at activation, and consumes the plan at most once. Thus a generated
+candidate, endpoint reachability annotation, and full-path result are three
+different evidence levels; only an explicitly authorized execution request can
+move the arm. A target outside the configured envelope remains a rejected path
+assessment and is not a reason to widen the envelope automatically. Its operator
+action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
+`approach_grasp_pose` action does not authorize this Route, and vice versa.
 
 The CLI is a concrete lower deployment leaf, not an Agent API. All files and
 the selected side/action are trusted operator inputs. The process exposes no
@@ -719,8 +743,8 @@ reviewed profile. The request still passes the lower TCP envelope, coupled IK,
 collision/jump/singularity gates, dispatch admission, convergence evaluation,
 and terminal HOLD proof.
 
-For a grasp approach that must route around the deployed URDF table and three
-camera poles, authorize and call `approach_grasp_pose` instead:
+For compatibility, a caller that already owns and reviews a raw canonical-Station
+tool pose may still authorize and call the combined `approach_grasp_pose` action:
 
 ```bash
 python -m agent_gateway.profiles.real.one_shot_client \
@@ -748,10 +772,13 @@ distinct zero-motion failures. Activation and completion evidence retain the
 immutable trajectory identity plus the latest measured/lower state and terminal
 HOLD without accumulating an unbounded per-poll or per-frame reference list.
 MuJoCo replay and terminal review are acceptance-test tools only; this
-production Skill imports and starts neither.
+production Skill imports and starts neither. New point-grasp clients should use
+the paired planning/execution Routes above so path feasibility can be inspected
+without first entering a motion Skill.
 
-A grasp generator that consumes the real Station-aware Depth v2 output may use
-the same action without manually converting camera coordinates. It writes one
+A legacy grasp generator that consumes the real Station-aware Depth v2 output
+may use the same compatibility action without manually converting camera
+coordinates. It writes one
 bounded UTF-8 JSON proposal and passes its absolute path instead of the direct
 `--target-*` arguments:
 

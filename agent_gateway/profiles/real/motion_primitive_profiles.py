@@ -32,6 +32,7 @@ from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorSet,
 )
 from agent_gateway.skills.motion.definition import (
+    EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
@@ -67,6 +68,14 @@ from robot_motion.primitives import (
 )
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
+from .grasp_approach_plan import (
+    REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_EXECUTOR_ID_V1,
+    REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ROUTE_ID_V1,
+    REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1,
+    RealGraspApproachPlanProfile,
+    RealGraspApproachPlanRegistration,
+    build_real_grasp_approach_plan_registration,
+)
 from .localization_deployment import RealObjectLocalizationRegistration
 from .observation_gateway import (
     RealTcpPoseObserveAttachmentSpec,
@@ -155,13 +164,17 @@ REAL_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1 = {
 def real_agent_motion_route_ids_v1(
     *,
     include_grasp_approach: bool = False,
+    include_grasp_approach_plan: bool = False,
 ) -> tuple[str, ...]:
     """Return the single authoritative real-motion Route allowlist."""
 
     optional_routes = (
-        (REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1,)
-        if include_grasp_approach
-        else ()
+        *((REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1,) if include_grasp_approach else ()),
+        *(
+            (REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ROUTE_ID_V1,)
+            if include_grasp_approach_plan
+            else ()
+        ),
     )
     return tuple(
         sorted(
@@ -568,6 +581,7 @@ class RealAgentPrimitiveContractBundle:
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
     ) = None
+    grasp_approach_plan_registration: RealGraspApproachPlanRegistration | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -582,8 +596,27 @@ class RealAgentPrimitiveContractBundle:
             entry.route.skill_id == GRASP_APPROACH_SKILL_ID_V1
             for entry in self.route_manifest.skill_routes
         )
+        grasp_approach_plan_enabled = self.grasp_approach_plan_registration is not None
+        paired_plan_routes_present = (
+            any(
+                entry.route.skill_id == EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1
+                for entry in self.route_manifest.skill_routes
+            ),
+            any(
+                entry.route.route_id == REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1
+                for entry in self.route_manifest.skill_routes
+            ),
+        )
+        if paired_plan_routes_present != (
+            grasp_approach_plan_enabled,
+            grasp_approach_plan_enabled,
+        ):
+            raise ValueError("Paired grasp-approach planning Routes must coexist.")
         expected_binding_count = (
-            10 + int(pose_target_enabled) + int(grasp_approach_enabled)
+            10
+            + int(pose_target_enabled)
+            + int(grasp_approach_enabled)
+            + int(grasp_approach_plan_enabled)
         )
         if (
             len(self.orientation_profiles) != 3
@@ -592,8 +625,8 @@ class RealAgentPrimitiveContractBundle:
             raise ValueError(
                 "Real primitive bundle requires one generic cardinal, six "
                 "fixed-cardinal and three orientation bindings, plus exactly one "
-                "absolute-pose and grasp-approach binding when their lower "
-                "envelopes authorize them."
+                "absolute-pose, legacy grasp-approach, and paired-plan execution "
+                "binding when their lower envelopes authorize them."
             )
         for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
             self.route_manifest.route(skill_id, "1")
@@ -637,6 +670,16 @@ class RealAgentPrimitiveContractBundle:
             != execution_frame
         ):
             raise ValueError("Real absolute-pose profile frame bindings disagree.")
+        if self.grasp_approach_plan_registration is not None:
+            plan_profile = self.grasp_approach_plan_registration.profile
+            if (
+                plan_profile.reference_frame_id,
+                plan_profile.reference_frame_spec_hash,
+            ) != public_frame or (
+                plan_profile.execution_reference_frame_id,
+                plan_profile.execution_reference_frame_spec_hash,
+            ) != execution_frame:
+                raise ValueError("Grasp-approach plan profile frame bindings disagree.")
         if any(
             (
                 profile.reference_frame_id,
@@ -669,10 +712,15 @@ class RealAgentPrimitiveContractBundle:
             and self.perception_capture is None
         ):
             raise ValueError("Real point-grasp Routes require perception capture.")
+        if grasp_approach_plan_enabled and not all(
+            item is not None for item in optional_grasp
+        ):
+            raise ValueError("Grasp-approach planning requires retained point grasps.")
         expected_route_count = (
             (11 + int(pose_target_enabled) + int(grasp_approach_enabled))
             + (2 if self.perception_capture is not None else 0)
             + (3 if self.localization_registration is not None else 0)
+            + (2 if grasp_approach_plan_enabled else 0)
         )
         if len(self.route_manifest.skill_routes) != expected_route_count:
             raise ValueError("Real perception registration and manifest disagree.")
@@ -699,11 +747,13 @@ def _payload_validator(
     route: SkillExecutionRoute,
     profile: RealAgentTcpCardinalStepProfile
     | RealAgentTcpFixedOrientationProfile
-    | RealAgentTcpPoseTargetProfile,
+    | RealAgentTcpPoseTargetProfile
+    | RealGraspApproachPlanProfile,
     fixed_cardinal_direction: str | None = None,
 ) -> AgentSkillPayloadValidatorSet:
     cardinal = isinstance(profile, RealAgentTcpCardinalStepProfile)
     pose_target = isinstance(profile, RealAgentTcpPoseTargetProfile)
+    plan_execution = isinstance(profile, RealGraspApproachPlanProfile)
     parameter_fields = (
         {
             "component_id",
@@ -728,16 +778,24 @@ def _payload_validator(
                 "calibration_hash",
             }
             if pose_target
-            else {
-                "component_id",
-                "reference_frame_id",
-                "reference_frame_spec_hash",
-                "controlled_frame_id",
-                "frame_graph_hash",
-                "tool_config_hash",
-                "calibration_hash",
-                "primitive_hash",
-            }
+            else (
+                {
+                    "component_id",
+                    "grasp_approach_plan_id",
+                    "grasp_approach_plan_hash",
+                }
+                if plan_execution
+                else {
+                    "component_id",
+                    "reference_frame_id",
+                    "reference_frame_spec_hash",
+                    "controlled_frame_id",
+                    "frame_graph_hash",
+                    "tool_config_hash",
+                    "calibration_hash",
+                    "primitive_hash",
+                }
+            )
         )
     )
 
@@ -751,6 +809,19 @@ def _payload_validator(
             or not parameter_fields <= payload_fields <= allowed_parameter_fields
         ):
             raise ValueError("Real primitive parameters do not match the exact schema.")
+        if plan_execution:
+            if payload["component_id"] != profile.component_id:
+                raise ValueError("Grasp-approach plan component mismatch.")
+            plan_hash = payload["grasp_approach_plan_hash"]
+            if (
+                not isinstance(plan_hash, str)
+                or len(plan_hash) != 64
+                or any(char not in "0123456789abcdef" for char in plan_hash)
+                or payload["grasp_approach_plan_id"]
+                != "real-grasp-approach-plan:" + plan_hash
+            ):
+                raise ValueError("Grasp-approach plan ID/hash mismatch.")
+            return
         validation_kwargs: dict[str, Any] = {
             "schema_kind": (
                 "cardinal_tcp_step"
@@ -1001,6 +1072,34 @@ def build_real_agent_primitive_contract_bundle(
         calibration_hash=attachment.calibration_hash,
         convergence_profile_hash=convergence.semantic_content_hash,
     )
+    grasp_approach_plan_enabled = bool(
+        station_point_grasp_registration is not None
+        and any(
+            REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ROUTE_ID_V1 in ref.allowed_route_ids
+            for ref in refs
+        )
+    )
+    grasp_approach_plan_registration = (
+        build_real_grasp_approach_plan_registration(
+            point_grasp_registration=station_point_grasp_registration,
+            component_id=component_id,
+            side=side,
+            reference_frame_id=primitive_frame.frame_id,
+            reference_frame_spec_hash=primitive_frame.semantic_content_hash,
+            execution_reference_frame_id=port_config.execution_frame_id,
+            execution_reference_frame_spec_hash=(port_config.execution_frame_spec_hash),
+            frame_graph_hash=frame_graph.semantic_content_hash,
+            tool_config_hash=attachment.tool_config_hash,
+            calibration_hash=attachment.calibration_hash,
+            convergence_profile_hash=convergence.semantic_content_hash,
+            safety_envelope_refs=refs,
+            max_measured_qpos_age_ms=convergence.max_measurement_age_ms,
+            min_speed_scale=pose_target_profile.min_speed_scale,
+            max_speed_scale=pose_target_profile.max_speed_scale,
+        )
+        if grasp_approach_plan_enabled
+        else None
+    )
     pose_target_definition = tcp_pose_target_skill_definition_v1(
         controlled_component_ids=(component_id,),
     )
@@ -1167,8 +1266,12 @@ def build_real_agent_primitive_contract_bundle(
         REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 in ref.allowed_route_ids for ref in refs
     )
     grasp_approach_enabled = any(
-        REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1 in ref.allowed_route_ids
-        for ref in refs
+        REAL_AGENT_GRASP_APPROACH_ROUTE_ID_V1 in ref.allowed_route_ids for ref in refs
+    )
+    execute_grasp_approach_plan_route = (
+        None
+        if grasp_approach_plan_registration is None
+        else grasp_approach_plan_registration.execute_skill.routes[0]
     )
     fixed_cardinal_routes = tuple(
         route_for(
@@ -1204,6 +1307,11 @@ def build_real_agent_primitive_contract_bundle(
     all_routes = (
         *((pose_target_route,) if pose_target_enabled else ()),
         *((grasp_approach_route,) if grasp_approach_enabled else ()),
+        *(
+            ()
+            if execute_grasp_approach_plan_route is None
+            else (execute_grasp_approach_plan_route,)
+        ),
         cardinal_route,
         *fixed_cardinal_routes,
         *orientation_routes,
@@ -1211,6 +1319,7 @@ def build_real_agent_primitive_contract_bundle(
     expected_route_ids = set(
         real_agent_motion_route_ids_v1(
             include_grasp_approach=grasp_approach_enabled,
+            include_grasp_approach_plan=grasp_approach_plan_enabled,
         )
     )
     if not pose_target_enabled:
@@ -1248,6 +1357,16 @@ def build_real_agent_primitive_contract_bundle(
             if grasp_approach_enabled
             else {}
         ),
+        **(
+            {
+                execute_grasp_approach_plan_route.semantic_content_hash: (
+                    grasp_approach_plan_registration.profile
+                )
+            }
+            if execute_grasp_approach_plan_route is not None
+            and grasp_approach_plan_registration is not None
+            else {}
+        ),
         cardinal_route.semantic_content_hash: cardinal_profile,
         **{
             route.semantic_content_hash: cardinal_profile
@@ -1279,6 +1398,15 @@ def build_real_agent_primitive_contract_bundle(
                 )
             }
             if grasp_approach_enabled
+            else {}
+        ),
+        **(
+            {
+                execute_grasp_approach_plan_route.semantic_content_hash: (
+                    REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_EXECUTOR_ID_V1
+                )
+            }
+            if execute_grasp_approach_plan_route is not None
             else {}
         ),
         cardinal_route.semantic_content_hash: REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
@@ -1366,6 +1494,8 @@ def build_real_agent_primitive_contract_bundle(
                 station_point_grasp_render_registration.skill,
             )
         )
+    if grasp_approach_plan_registration is not None:
+        perception_registrations.append(grasp_approach_plan_registration.skill)
     perception_registrations = tuple(perception_registrations)
     tcp_pose_definition = tcp_pose_observe.definition_catalog.skill_definitions[0]
     tcp_pose_schema = tcp_pose_observe.schema_catalog.schema_entries[0]
@@ -1377,6 +1507,11 @@ def build_real_agent_primitive_contract_bundle(
             tcp_pose_definition,
             *((pose_target_definition,) if pose_target_enabled else ()),
             *((grasp_approach_definition,) if grasp_approach_enabled else ()),
+            *(
+                ()
+                if grasp_approach_plan_registration is None
+                else (grasp_approach_plan_registration.execute_skill.definition,)
+            ),
             cardinal_definition,
             *fixed_cardinal_definitions,
             *orientation_definitions,
@@ -1390,6 +1525,11 @@ def build_real_agent_primitive_contract_bundle(
             tcp_pose_schema,
             *((pose_target_schema,) if pose_target_enabled else ()),
             *((grasp_approach_schema,) if grasp_approach_enabled else ()),
+            *(
+                ()
+                if grasp_approach_plan_registration is None
+                else (grasp_approach_plan_registration.execute_skill.schema_entry,)
+            ),
             cardinal_schema,
             *fixed_cardinal_schemas,
             *orientation_schemas,
@@ -1465,6 +1605,15 @@ def build_real_agent_primitive_contract_bundle(
                     availability_hash=availability_hash,
                 )
             )
+    if grasp_approach_plan_registration is not None:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=grasp_approach_plan_registration.skill.routes[0],
+                deployment_binding=(grasp_approach_plan_registration.binding.to_ref()),
+                evaluation_plan_hash=None,
+                availability_hash=(grasp_approach_plan_registration.availability_hash),
+            )
+        )
     artifact_contract_by_skill = {
         (item.definition.skill_id, item.definition.skill_version): item.io_contract
         for item in perception_registrations
@@ -1556,6 +1705,17 @@ def build_real_agent_primitive_contract_bundle(
             *(
                 (
                     _payload_validator(
+                        route=execute_grasp_approach_plan_route,
+                        profile=grasp_approach_plan_registration.profile,
+                    ),
+                )
+                if execute_grasp_approach_plan_route is not None
+                and grasp_approach_plan_registration is not None
+                else ()
+            ),
+            *(
+                (
+                    _payload_validator(
                         route=grasp_approach_route,
                         profile=pose_target_profile,
                     ),
@@ -1596,6 +1756,11 @@ def build_real_agent_primitive_contract_bundle(
                     station_point_grasp_render_registration.payload_validator,
                 )
             ),
+            *(
+                ()
+                if grasp_approach_plan_registration is None
+                else (grasp_approach_plan_registration.payload_validator,)
+            ),
         ),
     )
     return RealAgentPrimitiveContractBundle(
@@ -1618,6 +1783,7 @@ def build_real_agent_primitive_contract_bundle(
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration
         ),
+        grasp_approach_plan_registration=grasp_approach_plan_registration,
     )
 
 

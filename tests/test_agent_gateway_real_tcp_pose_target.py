@@ -8,6 +8,7 @@ from agent_gateway.profiles.real.motion_primitive_profiles import (
 from agent_gateway.profiles.real.rm65_composition import _route_ids
 from agent_gateway.profiles.real.session_authorization import (
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
+    REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
     REAL_AGENT_PRIMITIVE_ACTIONS,
     _requested_action_and_component_ids,
@@ -46,6 +47,20 @@ def test_absolute_grasp_pose_route_has_an_exact_operator_action_class() -> None:
     assert REAL_AGENT_GRASP_APPROACH_ACTION in REAL_AGENT_PRIMITIVE_ACTIONS
     assert _requested_action_and_component_ids(approach) == (
         REAL_AGENT_GRASP_APPROACH_ACTION,
+        ("right_arm",),
+    )
+
+    execute_plan = SimpleNamespace(
+        skill_id="motion.execute_grasp_approach_plan",
+        parameters={
+            "component_id": "right_arm",
+            "grasp_approach_plan_id": "real-grasp-approach-plan:" + "a" * 64,
+            "grasp_approach_plan_hash": "a" * 64,
+        },
+    )
+    assert REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION in REAL_AGENT_PRIMITIVE_ACTIONS
+    assert _requested_action_and_component_ids(execute_plan) == (
+        REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION,
         ("right_arm",),
     )
 

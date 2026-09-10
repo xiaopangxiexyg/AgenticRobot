@@ -51,6 +51,7 @@ from agent_gateway.runtime.station_operation_worker import (
 )
 from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
 from agent_gateway.skills.motion.definition import (
+    EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     GRASP_APPROACH_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
@@ -70,6 +71,11 @@ from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPort,
 )
 
+from .grasp_approach_plan import (
+    BoundedRealGraspApproachPlanStore,
+    RealGraspApproachPlanProvider,
+    build_real_grasp_approach_plan_executor,
+)
 from .localization_gateway import (
     ObjectLocalizationProvider,
     build_real_object_localization_executor,
@@ -135,8 +141,7 @@ class RealAgentDomainEmergencyStopPort:
         lower = self._emergency_stop(normalized_reason)
         if not isinstance(lower, RealSkillMotionEmergencyStopReceipt):
             raise TypeError(
-                "lower emergency_stop must return "
-                "RealSkillMotionEmergencyStopReceipt."
+                "lower emergency_stop must return RealSkillMotionEmergencyStopReceipt."
             )
         with self._lock:
             sequence = self._next_sequence
@@ -154,7 +159,9 @@ class RealAgentDomainEmergencyStopPort:
             completed_at=float(self._clock()),
             call_sequence=sequence,
             lower_operation_id=(
-                None if operation is None else "real-agent-motion:" + operation.operation_id
+                None
+                if operation is None
+                else "real-agent-motion:" + operation.operation_id
             ),
             evidence_refs=lower.evidence_refs,
             proves_motion_or_hold=lower.succeeded,
@@ -602,6 +609,9 @@ class RealAgentPrimitiveGatewaySession:
     station_point_grasp_executor: PassiveReadSkillExecutor | None
     station_point_grasp_render_provider: StationBoundPointGraspRenderProvider | None
     station_point_grasp_render_executor: PassiveReadSkillExecutor | None
+    grasp_approach_plan_store: BoundedRealGraspApproachPlanStore | None
+    grasp_approach_plan_provider: RealGraspApproachPlanProvider | None
+    grasp_approach_plan_executor: PassiveReadSkillExecutor | None
     artifact_store: RecoverableAgentArtifactStore | None
     owns_artifact_store: bool
     hardware_view_provider: HardwareViewProvider
@@ -612,6 +622,7 @@ class RealAgentPrimitiveGatewaySession:
         init=False,
     )
     _artifact_store_closed: bool = field(default=False, init=False)
+    _grasp_approach_plan_store_closed: bool = field(default=False, init=False)
     _closed_executor_ids: set[int] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
@@ -620,9 +631,7 @@ class RealAgentPrimitiveGatewaySession:
             in self.contract_bundle.route_manifest.supported_transport_features
         )
         if advertised != (self.emergency_stop_port is not None):
-            raise ValueError(
-                "Real emergency-stop feature and profile port must match."
-            )
+            raise ValueError("Real emergency-stop feature and profile port must match.")
         enabled = self.contract_bundle.perception_capture is not None
         if enabled != (self.perception_provider is not None):
             raise ValueError("Real perception registration and provider disagree.")
@@ -647,6 +656,20 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError(
                 "Real point-grasp registration and runtime resources disagree."
             )
+        grasp_plan_enabled = (
+            self.contract_bundle.grasp_approach_plan_registration is not None
+        )
+        if grasp_plan_enabled != all(
+            item is not None
+            for item in (
+                self.grasp_approach_plan_store,
+                self.grasp_approach_plan_provider,
+                self.grasp_approach_plan_executor,
+            )
+        ):
+            raise ValueError(
+                "Grasp-approach plan registration and runtime resources disagree."
+            )
         if self.owns_artifact_store and self.artifact_store is None:
             raise ValueError("Owned Artifact store must be present.")
         if not isinstance(self.state_executor, PassiveReadSkillExecutor):
@@ -669,6 +692,7 @@ class RealAgentPrimitiveGatewaySession:
             "perception.render_point_grasp_candidate": (
                 self.station_point_grasp_render_executor
             ),
+            "perception.plan_grasp_approach": self.grasp_approach_plan_executor,
         }
         return {
             skill_id: executor
@@ -770,6 +794,7 @@ class RealAgentPrimitiveGatewaySession:
                     self.localization_executor,
                     self.station_point_grasp_executor,
                     self.station_point_grasp_render_executor,
+                    self.grasp_approach_plan_executor,
                 )
             )
             if not passive_reads_settled:
@@ -809,6 +834,12 @@ class RealAgentPrimitiveGatewaySession:
             ):
                 self.artifact_store.close()
                 self._artifact_store_closed = True
+            if (
+                self.grasp_approach_plan_store is not None
+                and not self._grasp_approach_plan_store_closed
+            ):
+                self.grasp_approach_plan_store.close()
+                self._grasp_approach_plan_store_closed = True
             return outcome
 
 
@@ -1018,9 +1049,7 @@ def assemble_real_agent_primitive_gateway_session(
         in contract_bundle.route_manifest.supported_transport_features
     )
     if emergency_stop_advertised != (emergency_stop is not None):
-        raise ValueError(
-            "Real emergency-stop feature and lower callback must match."
-        )
+        raise ValueError("Real emergency-stop feature and lower callback must match.")
     perception_enabled = contract_bundle.perception_capture is not None
     if perception_enabled != isinstance(
         perception_provider,
@@ -1055,6 +1084,13 @@ def assemble_real_agent_primitive_gateway_session(
     if grasp_approach_enabled != callable(grasp_trajectory_planner):
         raise ValueError(
             "Grasp approach Route requires exactly one URDF/FCL trajectory planner."
+        )
+    grasp_approach_plan_enabled = (
+        contract_bundle.grasp_approach_plan_registration is not None
+    )
+    if grasp_approach_plan_enabled and not callable(grasp_trajectory_planner):
+        raise ValueError(
+            "Grasp-approach planning requires the exact URDF/FCL trajectory planner."
         )
     if max_session_admissions_per_route is not None and (
         isinstance(max_session_admissions_per_route, bool)
@@ -1108,6 +1144,13 @@ def assemble_real_agent_primitive_gateway_session(
     execution_port_by_route_hash[state_entry.route.semantic_content_hash] = (
         state_executor
     )
+    grasp_approach_plan_store = (
+        BoundedRealGraspApproachPlanStore(
+            max_retained_plans=max_retained_operations,
+        )
+        if grasp_approach_plan_enabled
+        else None
+    )
     motion_entries = tuple(
         entry
         for entry in contract_bundle.route_manifest.skill_routes
@@ -1116,7 +1159,14 @@ def assemble_real_agent_primitive_gateway_session(
     for entry in motion_entries:
         route = entry.route
         binding = contract_bundle.binding_for_skill(route.skill_id)
-        if route.skill_id in {
+        if route.skill_id == EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1:
+            registration = contract_bundle.grasp_approach_plan_registration
+            if registration is None:
+                raise RuntimeError(
+                    "Plan execution Route exists without its paired registration."
+                )
+            profile = registration.profile
+        elif route.skill_id in {
             TCP_POSE_TARGET_SKILL_ID_V1,
             GRASP_APPROACH_SKILL_ID_V1,
         }:
@@ -1151,6 +1201,11 @@ def assemble_real_agent_primitive_gateway_session(
                 grasp_trajectory_planner=(
                     grasp_trajectory_planner
                     if _route.skill_id == GRASP_APPROACH_SKILL_ID_V1
+                    else None
+                ),
+                grasp_approach_plan_store=(
+                    grasp_approach_plan_store
+                    if _route.skill_id == EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1
                     else None
                 ),
                 clock=clock,
@@ -1193,6 +1248,8 @@ def assemble_real_agent_primitive_gateway_session(
     station_point_grasp_executor = None
     station_point_grasp_render_provider = None
     station_point_grasp_render_executor = None
+    grasp_approach_plan_provider = None
+    grasp_approach_plan_executor = None
     if perception_provider is not None and artifact_store is not None:
         registration = contract_bundle.perception_capture
         assert registration is not None
@@ -1270,6 +1327,34 @@ def assemble_real_agent_primitive_gateway_session(
                     clock=clock,
                 )
             )
+            plan_registration = contract_bundle.grasp_approach_plan_registration
+            if plan_registration is not None:
+                assert grasp_approach_plan_store is not None
+                assert grasp_trajectory_planner is not None
+                grasp_approach_plan_provider = RealGraspApproachPlanProvider(
+                    registration=plan_registration,
+                    point_grasp_registration=point_grasp_registration,
+                    point_grasp_executor=station_point_grasp_executor,
+                    motion_port=port,
+                    frame_graph=contract_bundle.frame_graph,
+                    grasp_trajectory_planner=grasp_trajectory_planner,
+                    plan_store=grasp_approach_plan_store,
+                    runtime_session_id=(contract_bundle.attachment.runtime_session_id),
+                    current_station_revision=(
+                        lambda: producer.current_station_revision
+                    ),
+                    clock=clock,
+                )
+                grasp_approach_plan_executor = build_real_grasp_approach_plan_executor(
+                    registration=plan_registration,
+                    provider=grasp_approach_plan_provider,
+                    runtime_session_id=(contract_bundle.attachment.runtime_session_id),
+                    current_station_revision=(
+                        lambda: producer.current_station_revision
+                    ),
+                    max_retained_operations=max_retained_operations,
+                    clock=clock,
+                )
             execution_port_by_route_hash.update(
                 {
                     localization_registration.skill.routes[
@@ -1281,6 +1366,15 @@ def assemble_real_agent_primitive_gateway_session(
                     render_registration.skill.routes[
                         0
                     ].semantic_content_hash: station_point_grasp_render_executor,
+                    **(
+                        {}
+                        if plan_registration is None
+                        else {
+                            plan_registration.skill.routes[0].semantic_content_hash: (
+                                grasp_approach_plan_executor
+                            )
+                        }
+                    ),
                 }
             )
     registry = SkillExecutorRegistry(
@@ -1410,6 +1504,9 @@ def assemble_real_agent_primitive_gateway_session(
         station_point_grasp_executor=station_point_grasp_executor,
         station_point_grasp_render_provider=station_point_grasp_render_provider,
         station_point_grasp_render_executor=station_point_grasp_render_executor,
+        grasp_approach_plan_store=grasp_approach_plan_store,
+        grasp_approach_plan_provider=grasp_approach_plan_provider,
+        grasp_approach_plan_executor=grasp_approach_plan_executor,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
         hardware_view_provider=hardware_view_provider,
