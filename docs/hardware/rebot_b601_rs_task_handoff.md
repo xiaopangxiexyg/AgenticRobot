@@ -909,3 +909,22 @@ local-resource audit 通过。故障注入覆盖使能返回时的第一次 Ctrl
 控制进程；若要求无支撑并覆盖持续失联，需要另行确定驱动器本地保持/制动方案及其
 硬件证据，不能仅靠放宽软件阈值实现。真机仍由操作者前台执行，详细输出写 log/JSON，
 不得用 timeout、后台运行或关闭终端代替显式最终停止。
+
+## 18. 末端六轴人工采集引导候选（2026-09-10，离线验证）
+
+`pose-hold` 新增可选的 `--guided-pose-axis-protocol`。它只在 startup handoff 完成、状态
+进入 `ACTIVE` 后开始，在前台终端依次提示：静置基线、`+/-X`、`+/-Y`、`+/-Z`、
+`+/-Rx`、`+/-Ry`、`+/-Rz`，且每个动作后都有明确的松手回中采集阶段。坐标约定固定为
+base/world-aligned 的 X 前、Y 左、Z 上，旋转遵循右手定则。
+
+该协议是**操作员驱动的采集标记层**：不会生成末端增量、关节轨迹或新的 `qref`，不会
+改变现有 `J.T @ wrench`、重力、阻尼、力矩调理、启动倒计时和 protective hold 路径。
+每个已发送控制样本增加 guide phase、phase index 和 phase elapsed；结果 JSON 另记录完整
+schedule、transition events、开始/完成时间以及 `operator_only_no_automatic_reference`
+语义。引导目标必须严格小于既有平移/旋转 abort envelope，运行时长必须覆盖 startup
+handoff 与完整引导，否则使能前 fail closed。
+
+默认操作目标为每个平移方向 `0.03 m`、每个旋转方向 `8 deg`；静置 `5 s`，每个动作
+`6 s`，每次回中 `4 s`，完整采集 `125 s`。这些值只用于终端提示和证据标签，并不是
+位置命令或对实际位移达成的声明。当前候选没有运行真机；真机采集仍须操作者前台执行，
+观察异常立即第一次 Ctrl-C 进入重力/阻尼保持，确认安全后再次 Ctrl-C 全失能。

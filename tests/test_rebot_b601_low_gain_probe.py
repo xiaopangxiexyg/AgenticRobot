@@ -2061,6 +2061,99 @@ def test_pose_hold_reference_never_adds_joint_motion() -> None:
     assert done is True
 
 
+def test_pose_axis_guide_has_settle_signed_axes_and_recovery_order() -> None:
+    phases = probe.build_pose_axis_guide_phases(
+        translation_m=0.03,
+        rotation_rad=math.radians(8.0),
+        settle_sec=5.0,
+        action_sec=6.0,
+        rest_sec=4.0,
+    )
+
+    assert len(phases) == 25
+    assert phases[0].name == "SETTLE"
+    assert [phase.name for phase in phases[1::2]] == [
+        "TRANSLATION_X_POSITIVE",
+        "TRANSLATION_X_NEGATIVE",
+        "TRANSLATION_Y_POSITIVE",
+        "TRANSLATION_Y_NEGATIVE",
+        "TRANSLATION_Z_POSITIVE",
+        "TRANSLATION_Z_NEGATIVE",
+        "ROTATION_RX_POSITIVE",
+        "ROTATION_RX_NEGATIVE",
+        "ROTATION_RY_POSITIVE",
+        "ROTATION_RY_NEGATIVE",
+        "ROTATION_RZ_POSITIVE",
+        "ROTATION_RZ_NEGATIVE",
+    ]
+    assert all(phase.kind == "rest" for phase in phases[2::2])
+    assert sum(phase.duration_sec for phase in phases) == pytest.approx(125.0)
+
+
+def test_pose_axis_guide_labels_samples_and_emits_each_transition_once() -> None:
+    phases = (
+        probe.PoseAxisGuidePhase("SETTLE", "settle", 2.0),
+        probe.PoseAxisGuidePhase(
+            "TRANSLATION_X_POSITIVE",
+            "translation",
+            3.0,
+            axis="X",
+            direction=1,
+            target_amplitude=0.03,
+            target_unit="m",
+        ),
+        probe.PoseAxisGuidePhase(
+            "REST_AFTER_TRANSLATION_X_POSITIVE",
+            "rest",
+            1.0,
+            axis="X",
+        ),
+    )
+    guide = probe.PoseAxisOperatorGuide(phases)
+
+    first = guide.start(elapsed_sec=10.0, sample_index=20)
+    assert guide.sample_metadata(elapsed_sec=11.5) == {
+        "phase": "SETTLE",
+        "phase_index": 0,
+        "phase_elapsed_sec": pytest.approx(1.5),
+    }
+    transitions = guide.advance(elapsed_sec=12.0, sample_index=25)
+    assert len(transitions) == 1
+    assert transitions[0]["phase"]["name"] == "TRANSLATION_X_POSITIVE"
+    assert guide.advance(elapsed_sec=12.1, sample_index=26) == ()
+    transitions = guide.advance(elapsed_sec=16.0, sample_index=40)
+    assert [event["state"] for event in transitions] == ["PHASE", "COMPLETE"]
+    assert guide.completed is True
+    assert guide.sample_metadata(elapsed_sec=16.0)["phase"] == "COMPLETE"
+    assert len(guide.events) == 4
+    assert first is guide.events[0]
+
+
+def test_pose_axis_guide_terminal_notices_are_operator_only() -> None:
+    phase = probe.PoseAxisGuidePhase(
+        "ROTATION_RZ_NEGATIVE",
+        "rotation",
+        6.0,
+        axis="RZ",
+        direction=-1,
+        target_amplitude=math.radians(8.0),
+        target_unit="rad",
+    )
+    event = {
+        "state": "PHASE",
+        "phase_index": 7,
+        "phase": phase.as_dict(),
+    }
+
+    notice = probe.format_pose_axis_guide_notice(event, phase_count=25)
+
+    assert "[CAPTURE 8/25]" in notice
+    assert "rotate -RZ" in notice
+    assert "8 deg" in notice
+    assert "move slowly" in notice
+    assert set(event) == {"state", "phase_index", "phase"}
+
+
 def test_cartesian_impedance_overlay_restores_toward_anchor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3932,6 +4025,72 @@ def test_pose_cli_uses_all_six_joints() -> None:
     args.apply_driver_torque_limits = True
     probe._validate_cli(args)
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
+
+
+def test_guided_pose_axis_cli_requires_pose_mode_and_complete_safe_envelope() -> None:
+    valid = _parse_pose_args(
+        "--apply-driver-torque-limits",
+        "--guided-pose-axis-protocol",
+        "--duration-sec",
+        "180",
+        "--torque-rise-time-sec",
+        "0.5",
+        "--cartesian-max-displacement-m",
+        "0.06",
+        "--rotational-max-displacement-rad",
+        "0.35",
+    )
+    probe._validate_cli(valid)
+
+    assert valid.guided_pose_translation_m == pytest.approx(0.03)
+    assert valid.guided_pose_rotation_rad == pytest.approx(math.radians(8.0))
+
+    wrong_mode = _parse_cartesian_args("--guided-pose-axis-protocol")
+    with pytest.raises(probe.LowGainProbeError, match="requires --mode pose-hold"):
+        probe._validate_cli(wrong_mode)
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            ("--cartesian-max-displacement-m", "0.03"),
+            "translation target must remain strictly below",
+        ),
+        (
+            (
+                "--cartesian-max-displacement-m",
+                "0.06",
+                "--rotational-max-displacement-rad",
+                str(math.radians(8.0)),
+            ),
+            "rotation target must remain strictly below",
+        ),
+        (
+            (
+                "--cartesian-max-displacement-m",
+                "0.06",
+                "--rotational-max-displacement-rad",
+                "0.35",
+                "--duration-sec",
+                "125",
+            ),
+            "must cover startup handoff",
+        ),
+    ],
+)
+def test_guided_pose_axis_cli_fails_closed(
+    extra: tuple[str, ...],
+    message: str,
+) -> None:
+    args = _parse_pose_args(
+        "--apply-driver-torque-limits",
+        "--guided-pose-axis-protocol",
+        *extra,
+    )
+
+    with pytest.raises(probe.LowGainProbeError, match=message):
+        probe._validate_cli(args)
 
 
 def test_driver_damping_requires_verified_driver_torque_limits() -> None:
