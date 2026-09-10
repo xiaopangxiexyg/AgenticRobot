@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 import sys
 from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +33,107 @@ from robot_motion.rebot_b601_rs import B601_RS_JOINT_MIT_FRAME, B601MitReference
 from scripts.hardware import rebot_b601_rs_frequency_probe as frequency_probe
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+@pytest.fixture
+def audit_evidence():
+    frames, samples = [], []
+    for motor in range(1, 7):
+        base = motor * 100
+        samples.append({"seq": motor - 1, "motor_id": motor, "completed": True,
+                        "request_start_monotonic_ns": base + 10,
+                        "request_end_monotonic_ns": base + 50, "mechpos_rad": float(motor)})
+        for offset, cid, payload in (
+            (20, (17 << 24) | (0xFD << 8) | motor, bytes.fromhex("1970000000000000")),
+            (30, (17 << 24) | (motor << 8) | 0xFD, bytes.fromhex("19700000") + struct.pack("<f", motor)),
+            (40, (24 << 24) | (motor << 8) | 0xFD, bytes(8)),
+        ):
+            frames.append({"kind": "frame", "receive_monotonic_ns": base + offset,
+                           "clock_pair_end_monotonic_ns": base + offset + 1,
+                           "socket_frame_hex": struct.pack("=IB3x8s", cid | 0x80000000, 8, payload).hex()})
+    records = [{"kind": "header", "format": "b601_socketcan_rx_v1", "channel": "can-test"},
+               *frames, {"kind": "end", "completed": True, "received_frame_count": len(frames)}]
+    summary = {"mode": "read-paired", "status": "OK", "motion_commands_sent": False,
+               "motors_enabled_by_probe": False, "parameter_samples": samples,
+               "passive_capture": {"frame_count": len(frames), "channel": "can-test"}}
+    return summary, records
+
+
+def test_offline_pair_audit_matches_without_promoting_freshness(audit_evidence):
+    original = deepcopy(audit_evidence)
+    report = frequency_probe.audit_paired_capture(*audit_evidence)
+    assert report["host_pairing_passed"] and report["matched_read_count"] == 6
+    assert not report["freshness_verified"]
+    assert not report["static_decode_validation_passed"]
+    assert not report["quantitative_replay_ready"]
+    assert audit_evidence == original
+
+
+def test_offline_pair_audit_inventories_other_stream_host_without_using_it_as_reply(audit_evidence):
+    summary, records = audit_evidence
+    raw = bytearray.fromhex(records[3]["socket_frame_hex"])
+    raw[0] = 0xFE
+    records[3]["socket_frame_hex"] = raw.hex()
+    report = frequency_probe.audit_paired_capture(summary, records)
+    assert report["host_pairing_passed"]
+    assert report["mixed_stream_host_ids"]
+    assert report["stream_frames_by_host"] == {"0xfe": 1, "0xfd": 5}
+
+
+@pytest.mark.parametrize("fault", [
+    "wrong_motor", "wrong_host", "wrong_param", "wrong_value", "short_frame", "rtr",
+    "duplicate_rx", "missing_rx", "truncated", "overlap", "nan", "bad_seq", "j7",
+    "incomplete", "wrong_channel", "reverse_clock", "unexpected_tx", "response_before_request",
+])
+def test_offline_pair_audit_fails_closed(audit_evidence, fault):
+    summary, records = audit_evidence
+    sample = summary["parameter_samples"][0]
+    raw = bytearray.fromhex(records[2]["socket_frame_hex"])
+    if fault == "wrong_motor": raw[1] = 2
+    elif fault == "wrong_host": raw[0] = 0xFE
+    elif fault == "wrong_param": raw[8] = 0x1B
+    elif fault == "wrong_value": raw[12:16] = struct.pack("<f", 99)
+    elif fault == "short_frame": raw[4] = 4
+    elif fault == "rtr": raw[3] |= 0x40
+    elif fault == "unexpected_tx": raw[3] = 0x83
+    elif fault == "duplicate_rx":
+        extra = deepcopy(records[2])
+        extra["receive_monotonic_ns"] += 1
+        extra["clock_pair_end_monotonic_ns"] += 1
+        records.insert(3, extra)
+    elif fault == "missing_rx": records.pop(2)
+    elif fault == "truncated": records.pop()
+    elif fault == "overlap": summary["parameter_samples"][1]["request_start_monotonic_ns"] = 110
+    elif fault == "nan": sample["mechpos_rad"] = math.nan
+    elif fault == "bad_seq": sample["seq"] = True
+    elif fault == "j7": sample["motor_id"] = 7
+    elif fault == "incomplete": sample["completed"] = False
+    elif fault == "wrong_channel": records[0]["channel"] = "other"
+    elif fault == "reverse_clock": records[2]["receive_monotonic_ns"] = 1
+    elif fault == "response_before_request":
+        records[1]["socket_frame_hex"], records[2]["socket_frame_hex"] = records[2]["socket_frame_hex"], records[1]["socket_frame_hex"]
+    if fault in {"wrong_motor", "wrong_host", "wrong_param", "wrong_value", "short_frame", "rtr", "unexpected_tx"}:
+        records[2]["socket_frame_hex"] = raw.hex()
+    if fault in {"duplicate_rx", "missing_rx"}:
+        records[-1]["received_frame_count"] = len(records) - 2
+        summary["passive_capture"]["frame_count"] = len(records) - 2
+    report = frequency_probe.audit_paired_capture(summary, records)
+    assert report["status"] == "FAIL" and report["issues"]
+    assert not report["host_pairing_passed"]
+
+
+def test_audit_cli_never_opens_transport(tmp_path, audit_evidence, monkeypatch):
+    summary, records = audit_evidence
+    source, raw, output = (tmp_path / name for name in ("summary.json", "raw.jsonl", "audit.json"))
+    source.write_text(json.dumps(summary))
+    raw.write_text("\n".join(map(json.dumps, records)))
+    monkeypatch.setattr(frequency_probe.socket, "socket", lambda *a: pytest.fail("opened CAN"))
+    monkeypatch.setattr(frequency_probe, "B601RSBackend", lambda *a: pytest.fail("opened backend"))
+    args = ["--mode", "audit-paired", "--input-summary", str(source), "--input-raw", str(raw), "--output", str(output)]
+    assert frequency_probe.main(args) == 0
+    result = json.loads(output.read_text())
+    assert result["matched_read_count"] == 6 and result["input_sha256"]["raw"]
+    assert frequency_probe.main(args) == 2
 
 
 @pytest.fixture
