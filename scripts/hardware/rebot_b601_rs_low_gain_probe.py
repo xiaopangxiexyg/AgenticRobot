@@ -26,6 +26,8 @@ does not command orientation.  The separate ``pose-hold`` mode anchors the
 complete current ``base_link_T_gripper_end`` transform and adds a bounded 6D
 restoring wrench through the same ``J.T @ wrench`` path.  Both task-space modes
 keep software joint stiffness at zero so there is only one spring owner.
+An optional pose-axis guide prints operator-only acquisition phases and labels
+samples; it never changes either task-space anchor or any motion reference.
 
 The dispatched RobStride MIT ``kp`` is zero in the final active and protective
 controllers.  The temporary startup/replay lock is the one explicit exception:
@@ -250,6 +252,11 @@ _DEFAULT_ROTATIONAL_STIFFNESS_NM_PER_RAD = 0.5
 _DEFAULT_ROTATIONAL_DAMPING_NM_S_PER_RAD = 0.05
 _DEFAULT_ROTATIONAL_MAX_TORQUE_NM = 0.25
 _DEFAULT_ROTATIONAL_MAX_DISPLACEMENT_RAD = math.radians(5.0)
+_DEFAULT_GUIDED_POSE_TRANSLATION_M = 0.03
+_DEFAULT_GUIDED_POSE_ROTATION_RAD = math.radians(8.0)
+_DEFAULT_GUIDED_POSE_SETTLE_SEC = 5.0
+_DEFAULT_GUIDED_POSE_ACTION_SEC = 6.0
+_DEFAULT_GUIDED_POSE_REST_SEC = 4.0
 
 
 class LowGainProbeError(RuntimeError):
@@ -304,6 +311,232 @@ class OperatorKeyReader:
                 termios.tcsetattr(fd, termios.TCSADRAIN, saved_attributes)
         with contextlib.suppress(OSError):
             os.close(fd)
+
+
+@dataclass(frozen=True)
+class PoseAxisGuidePhase:
+    """One operator-only acquisition interval; it never produces a command."""
+
+    name: str
+    kind: str
+    duration_sec: float
+    axis: str | None = None
+    direction: int | None = None
+    target_amplitude: float | None = None
+    target_unit: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "duration_sec": self.duration_sec,
+            "axis": self.axis,
+            "direction": self.direction,
+            "target_amplitude": self.target_amplitude,
+            "target_unit": self.target_unit,
+        }
+
+
+def build_pose_axis_guide_phases(
+    *,
+    translation_m: float,
+    rotation_rad: float,
+    settle_sec: float,
+    action_sec: float,
+    rest_sec: float,
+) -> tuple[PoseAxisGuidePhase, ...]:
+    """Build the fixed, base-frame acquisition order without motion output."""
+
+    translation = _positive(translation_m, name="guided_pose_translation_m")
+    rotation = _positive(rotation_rad, name="guided_pose_rotation_rad")
+    settle = _positive(settle_sec, name="guided_pose_settle_sec")
+    action = _positive(action_sec, name="guided_pose_action_sec")
+    rest = _positive(rest_sec, name="guided_pose_rest_sec")
+    phases = [
+        PoseAxisGuidePhase(
+            name="SETTLE",
+            kind="settle",
+            duration_sec=settle,
+        )
+    ]
+    for kind, axes, amplitude, unit in (
+        ("translation", ("X", "Y", "Z"), translation, "m"),
+        ("rotation", ("RX", "RY", "RZ"), rotation, "rad"),
+    ):
+        for axis in axes:
+            for direction, suffix in ((1, "POSITIVE"), (-1, "NEGATIVE")):
+                action_name = f"{kind.upper()}_{axis}_{suffix}"
+                phases.append(
+                    PoseAxisGuidePhase(
+                        name=action_name,
+                        kind=kind,
+                        duration_sec=action,
+                        axis=axis,
+                        direction=direction,
+                        target_amplitude=amplitude,
+                        target_unit=unit,
+                    )
+                )
+                phases.append(
+                    PoseAxisGuidePhase(
+                        name=f"REST_AFTER_{action_name}",
+                        kind="rest",
+                        duration_sec=rest,
+                        axis=axis,
+                    )
+                )
+    return tuple(phases)
+
+
+@dataclass
+class PoseAxisOperatorGuide:
+    """Time-label operator motion while leaving the control reference untouched."""
+
+    phases: tuple[PoseAxisGuidePhase, ...]
+    started_elapsed_sec: float | None = None
+    phase_index: int | None = None
+    completed_elapsed_sec: float | None = None
+    events: list[dict[str, object]] = field(default_factory=list)
+
+    @property
+    def total_duration_sec(self) -> float:
+        return sum(phase.duration_sec for phase in self.phases)
+
+    @property
+    def completed(self) -> bool:
+        return self.completed_elapsed_sec is not None
+
+    def start(self, *, elapsed_sec: float, sample_index: int) -> dict[str, object]:
+        if self.started_elapsed_sec is not None:
+            raise ValueError("pose-axis operator guide has already started")
+        if not self.phases:
+            raise ValueError("pose-axis operator guide requires at least one phase")
+        self.started_elapsed_sec = _non_negative(
+            elapsed_sec,
+            name="guided_pose_started_elapsed_sec",
+        )
+        self.phase_index = 0
+        return self._append_event(elapsed_sec=elapsed_sec, sample_index=sample_index)
+
+    def advance(
+        self,
+        *,
+        elapsed_sec: float,
+        sample_index: int,
+    ) -> tuple[dict[str, object], ...]:
+        if self.started_elapsed_sec is None or self.phase_index is None:
+            return ()
+        elapsed = _non_negative(elapsed_sec, name="guided_pose_elapsed_sec")
+        relative = elapsed - self.started_elapsed_sec
+        if relative < 0.0:
+            raise ValueError("pose-axis guide time precedes its start")
+        emitted: list[dict[str, object]] = []
+        while self.phase_index < len(self.phases):
+            boundary = sum(
+                phase.duration_sec for phase in self.phases[: self.phase_index + 1]
+            )
+            if relative < boundary:
+                break
+            self.phase_index += 1
+            if self.phase_index == len(self.phases):
+                self.completed_elapsed_sec = elapsed
+                event = {
+                    "state": "COMPLETE",
+                    "phase_index": None,
+                    "elapsed_sec": elapsed,
+                    "sample_index": int(sample_index),
+                }
+                self.events.append(event)
+                emitted.append(event)
+                break
+            emitted.append(
+                self._append_event(
+                    elapsed_sec=elapsed,
+                    sample_index=sample_index,
+                )
+            )
+        return tuple(emitted)
+
+    def sample_metadata(self, *, elapsed_sec: float) -> dict[str, object]:
+        if self.started_elapsed_sec is None:
+            return {
+                "phase": "WAITING_FOR_ACTIVE",
+                "phase_index": None,
+                "phase_elapsed_sec": None,
+            }
+        if self.completed or self.phase_index == len(self.phases):
+            return {
+                "phase": "COMPLETE",
+                "phase_index": None,
+                "phase_elapsed_sec": None,
+            }
+        if self.phase_index is None:
+            raise ValueError("started pose-axis guide is missing its phase index")
+        phase_started = self.started_elapsed_sec + sum(
+            phase.duration_sec for phase in self.phases[: self.phase_index]
+        )
+        return {
+            "phase": self.phases[self.phase_index].name,
+            "phase_index": self.phase_index,
+            "phase_elapsed_sec": max(0.0, float(elapsed_sec) - phase_started),
+        }
+
+    def _append_event(
+        self,
+        *,
+        elapsed_sec: float,
+        sample_index: int,
+    ) -> dict[str, object]:
+        if self.phase_index is None or self.phase_index >= len(self.phases):
+            raise ValueError("pose-axis guide has no active phase")
+        event = {
+            "state": "PHASE",
+            "phase_index": self.phase_index,
+            "phase": self.phases[self.phase_index].as_dict(),
+            "elapsed_sec": float(elapsed_sec),
+            "sample_index": int(sample_index),
+        }
+        self.events.append(event)
+        return event
+
+
+def format_pose_axis_guide_notice(
+    event: Mapping[str, object],
+    *,
+    phase_count: int,
+) -> str:
+    """Render one concise foreground instruction from guide-only metadata."""
+
+    if event.get("state") == "COMPLETE":
+        return (
+            "[B601] [CAPTURE COMPLETE] sequence finished; hands off. "
+            "Wait for duration completion or press Ctrl-C for protective hold."
+        )
+    phase = event.get("phase")
+    if not isinstance(phase, Mapping):
+        raise TypeError("pose-axis guide event is missing phase metadata")
+    index = int(event["phase_index"]) + 1
+    duration = float(phase["duration_sec"])
+    prefix = f"[B601] [CAPTURE {index}/{phase_count}]"
+    kind = phase["kind"]
+    if kind == "settle":
+        return f"{prefix} SETTLE {duration:g}s: hands off; collecting baseline."
+    if kind == "rest":
+        return f"{prefix} REST {duration:g}s: release the arm; collecting recovery."
+    axis = str(phase["axis"])
+    direction = "+" if int(phase["direction"]) > 0 else "-"
+    amplitude = float(phase["target_amplitude"])
+    unit = str(phase["target_unit"])
+    action = "translate" if kind == "translation" else "rotate"
+    target = (
+        f"{amplitude:g} {unit}"
+        if kind == "translation"
+        else f"{math.degrees(amplitude):g} deg ({amplitude:g} {unit})"
+    )
+    return (
+        f"{prefix} {action} {direction}{axis} toward {target} "
+        f"for {duration:g}s; move slowly, hold briefly, then release."
+    )
 
 
 @dataclass
@@ -3257,6 +3490,34 @@ def _validate_cli(args: argparse.Namespace) -> None:
         ),
         name="rotational_max_displacement_rad",
     )
+    if getattr(args, "guided_pose_axis_protocol", False):
+        if args.mode != "pose-hold":
+            raise LowGainProbeError(
+                "--guided-pose-axis-protocol requires --mode pose-hold"
+            )
+        guide_phases = build_pose_axis_guide_phases(
+            translation_m=args.guided_pose_translation_m,
+            rotation_rad=args.guided_pose_rotation_rad,
+            settle_sec=args.guided_pose_settle_sec,
+            action_sec=args.guided_pose_action_sec,
+            rest_sec=args.guided_pose_rest_sec,
+        )
+        if args.guided_pose_translation_m >= args.cartesian_max_displacement_m:
+            raise LowGainProbeError(
+                "guided translation target must remain strictly below "
+                "--cartesian-max-displacement-m"
+            )
+        if args.guided_pose_rotation_rad >= args.rotational_max_displacement_rad:
+            raise LowGainProbeError(
+                "guided rotation target must remain strictly below "
+                "--rotational-max-displacement-rad"
+            )
+        guide_duration_sec = sum(phase.duration_sec for phase in guide_phases)
+        if args.duration_sec < args.torque_rise_time_sec + guide_duration_sec:
+            raise LowGainProbeError(
+                "--duration-sec must cover startup handoff plus the complete "
+                f"guided acquisition ({args.torque_rise_time_sec + guide_duration_sec:g}s)"
+            )
     if args.mode == "slow-step" and args.step_rad <= 0.0:
         raise ValueError("slow-step mode requires step_rad > 0")
 
@@ -5978,6 +6239,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         if args.mode == "startup-replay"
         else None
     )
+    pose_axis_guide = (
+        PoseAxisOperatorGuide(
+            build_pose_axis_guide_phases(
+                translation_m=args.guided_pose_translation_m,
+                rotation_rad=args.guided_pose_rotation_rad,
+                settle_sec=args.guided_pose_settle_sec,
+                action_sec=args.guided_pose_action_sec,
+                rest_sec=args.guided_pose_rest_sec,
+            )
+        )
+        if args.guided_pose_axis_protocol
+        else None
+    )
     operator_keys: OperatorKeyReader | None = None
     calibration_ready = False
     startup_replay_ready = False
@@ -6721,6 +6995,37 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 set_startup_state("HANDOFF")
             else:
                 set_startup_state("ACTIVE")
+            if (
+                pose_axis_guide is not None
+                and handoff_fraction >= 1.0
+                and pose_axis_guide.started_elapsed_sec is None
+            ):
+                _operator_notice(
+                    "[B601] [CAPTURE GUIDE] operator-driven acquisition only; the probe "
+                    "does not command these motions. Frame: +X forward, +Y left, "
+                    "+Z up; rotations follow the right-hand rule."
+                )
+                guide_event = pose_axis_guide.start(
+                    elapsed_sec=elapsed,
+                    sample_index=len(samples),
+                )
+                _operator_notice(
+                    format_pose_axis_guide_notice(
+                        guide_event,
+                        phase_count=len(pose_axis_guide.phases),
+                    )
+                )
+            if pose_axis_guide is not None:
+                for guide_event in pose_axis_guide.advance(
+                    elapsed_sec=elapsed,
+                    sample_index=len(samples),
+                ):
+                    _operator_notice(
+                        format_pose_axis_guide_notice(
+                            guide_event,
+                            phase_count=len(pose_axis_guide.phases),
+                        )
+                    )
             if calibration_capture is not None:
                 if handoff_fraction >= 1.0 and not calibration_ready:
                     if operator_keys is None:
@@ -6998,6 +7303,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             torque_limit_count += int(torque_limited)
             slew_limit_count += int(slew_limited)
             overlay_limit_count += int(torque_breakdown.overlay_limited)
+            operator_guide_sample = (
+                pose_axis_guide.sample_metadata(elapsed_sec=elapsed)
+                if pose_axis_guide is not None
+                else None
+            )
             samples.append(
                 {
                     "sequence": state.sequence,
@@ -7021,6 +7331,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         else None
                     ),
                     "startup_replay_lock_fraction": replay_lock_fraction,
+                    "operator_guide_phase": (
+                        operator_guide_sample["phase"]
+                        if operator_guide_sample is not None
+                        else None
+                    ),
+                    "operator_guide_phase_index": (
+                        operator_guide_sample["phase_index"]
+                        if operator_guide_sample is not None
+                        else None
+                    ),
+                    "operator_guide_phase_elapsed_sec": (
+                        operator_guide_sample["phase_elapsed_sec"]
+                        if operator_guide_sample is not None
+                        else None
+                    ),
                     "driver_local_lock_fraction": driver_lock_fraction,
                     "driver_local_position_lock_joint_names": (
                         driver_command.position_lock_joint_names
@@ -7655,6 +7980,53 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 "operator_observed_before_R; no automatic stationarity threshold"
             ),
             **startup_replay_acceptance,
+        },
+        "operator_guidance": {
+            "enabled": pose_axis_guide is not None,
+            "schema": (
+                "b601.pose-axis-operator-guide.v1"
+                if pose_axis_guide is not None
+                else None
+            ),
+            "status": (
+                "NOT_APPLICABLE"
+                if pose_axis_guide is None
+                else ("PASS" if pose_axis_guide.completed else "INCOMPLETE")
+            ),
+            "motion_source": "operator_only_no_automatic_reference",
+            "frame": "base_link_world_aligned_at_gripper_end_anchor",
+            "axis_convention": (
+                "+X forward, +Y left, +Z up; right-hand-rule rotations"
+            ),
+            "started_elapsed_sec": (
+                pose_axis_guide.started_elapsed_sec
+                if pose_axis_guide is not None
+                else None
+            ),
+            "completed_elapsed_sec": (
+                pose_axis_guide.completed_elapsed_sec
+                if pose_axis_guide is not None
+                else None
+            ),
+            "total_duration_sec": (
+                pose_axis_guide.total_duration_sec
+                if pose_axis_guide is not None
+                else None
+            ),
+            "phases": (
+                tuple(phase.as_dict() for phase in pose_axis_guide.phases)
+                if pose_axis_guide is not None
+                else ()
+            ),
+            "events": (
+                tuple(pose_axis_guide.events)
+                if pose_axis_guide is not None
+                else ()
+            ),
+            "acceptance_semantics": (
+                "guide completion labels the acquisition sequence only; it does "
+                "not establish force calibration or hardware acceptance"
+            ),
         },
         "motors_enabled_by_probe": enabled,
         "motion_commands_sent": commands_sent > 0,
@@ -8348,6 +8720,44 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=_DEFAULT_ROTATIONAL_MAX_DISPLACEMENT_RAD,
         help="orientation-error-norm abort threshold for pose-hold",
+    )
+    parser.add_argument(
+        "--guided-pose-axis-protocol",
+        action="store_true",
+        help=(
+            "print and record an operator-only +/-XYZ and +/-RxRyRz acquisition "
+            "sequence in pose-hold; never generates a motion reference"
+        ),
+    )
+    parser.add_argument(
+        "--guided-pose-translation-m",
+        type=float,
+        default=_DEFAULT_GUIDED_POSE_TRANSLATION_M,
+        help="operator target displacement printed for each translation phase",
+    )
+    parser.add_argument(
+        "--guided-pose-rotation-rad",
+        type=float,
+        default=_DEFAULT_GUIDED_POSE_ROTATION_RAD,
+        help="operator target rotation printed for each rotation phase",
+    )
+    parser.add_argument(
+        "--guided-pose-settle-sec",
+        type=float,
+        default=_DEFAULT_GUIDED_POSE_SETTLE_SEC,
+        help="hands-off baseline interval after pose-hold becomes ACTIVE",
+    )
+    parser.add_argument(
+        "--guided-pose-action-sec",
+        type=float,
+        default=_DEFAULT_GUIDED_POSE_ACTION_SEC,
+        help="foreground acquisition interval for each signed pose axis",
+    )
+    parser.add_argument(
+        "--guided-pose-rest-sec",
+        type=float,
+        default=_DEFAULT_GUIDED_POSE_REST_SEC,
+        help="hands-off recovery interval after each signed pose axis",
     )
     parser.add_argument("--allow-motion", action="store_true")
     parser.add_argument(
