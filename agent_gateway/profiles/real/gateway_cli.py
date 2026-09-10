@@ -52,7 +52,10 @@ from teleop_runtime.skill_deploy.motion_trace import (
 )
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
-from .point_grasp_deployment import SUPPORTED_POINT_GRASP_BACKEND_IDS
+from .point_grasp_deployment import (
+    DEFAULT_POINT_GRASP_BACKEND_ID,
+    SUPPORTED_POINT_GRASP_BACKEND_IDS,
+)
 from .rm65_composition import (
     ExclusiveRM65AgentPrimitiveComposition,
     assemble_exclusive_rm65_agent_primitive_composition,
@@ -135,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--point-grasp-backend",
         choices=tuple(sorted(SUPPORTED_POINT_GRASP_BACKEND_IDS)),
-        default="vgn",
+        default=DEFAULT_POINT_GRASP_BACKEND_ID,
     )
     parser.add_argument("--point-grasp-asset-bundle", type=Path)
     parser.add_argument("--point-grasp-device", default="cuda")
@@ -147,8 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("service", "in-process"),
         default=GRASPGENX_DEFAULT_MODE,
         help=(
-            "GraspGenX execution mode; in-process loads the compatible model "
-            "into this Gateway by default, service uses the loopback ZMQ server"
+            "GraspGenX execution mode; service uses the isolated loopback ZMQ "
+            "runtime by default, in-process requires a compatible Gateway Python"
         ),
     )
     parser.add_argument(

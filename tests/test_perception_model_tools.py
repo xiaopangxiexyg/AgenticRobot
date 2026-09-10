@@ -153,11 +153,11 @@ def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> Non
     assert "ModuleNotFoundError" not in rejected.stderr
 
 
-def test_graspgenx_gpu_smoke_defaults_to_in_process() -> None:
-    assert smoke_graspgenx_inference._parse_args([]).mode == "in-process"
+def test_graspgenx_gpu_smoke_defaults_to_isolated_service() -> None:
+    assert smoke_graspgenx_inference._parse_args([]).mode == "service"
     assert (
-        smoke_graspgenx_inference._parse_args(["--mode", "service"]).mode
-        == "service"
+        smoke_graspgenx_inference._parse_args(["--mode", "in-process"]).mode
+        == "in-process"
     )
 
 

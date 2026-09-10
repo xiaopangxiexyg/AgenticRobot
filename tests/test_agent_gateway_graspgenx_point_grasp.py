@@ -8,6 +8,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from agent_gateway.profiles.real.point_grasp_deployment import (
+    DEFAULT_POINT_GRASP_BACKEND_ID,
+)
 from deployments.perception.graspgenx_client import (
     GRASPGENX_DEFAULT_MODE,
     GraspGenXClient,
@@ -110,8 +113,9 @@ class _DuckBackend:
         return self.grasps.copy(), self.scores.copy()
 
 
-def test_graspgenx_default_mode_is_in_process() -> None:
-    assert GRASPGENX_DEFAULT_MODE == "in-process"
+def test_graspgenx_default_mode_is_isolated_service() -> None:
+    assert DEFAULT_POINT_GRASP_BACKEND_ID == "graspgenx"
+    assert GRASPGENX_DEFAULT_MODE == "service"
 
 
 def _sha256(path: Path) -> str:

@@ -252,7 +252,7 @@ def test_real_perception_cli_is_discoverable_without_importing_hardware() -> Non
     assert "--allow-local-image-root" not in result.stdout
 
 
-def test_real_perception_graspgenx_mode_defaults_to_in_process() -> None:
+def test_real_perception_defaults_to_graspgenx_isolated_service() -> None:
     argv = [
         "--socket-path",
         "/tmp/agenticrobot-real-perception-test.sock",
@@ -265,7 +265,8 @@ def test_real_perception_graspgenx_mode_defaults_to_in_process() -> None:
     ]
     parsed = perception_cli.build_parser().parse_args(argv)
 
-    assert parsed.graspgenx_mode == "in-process"
+    assert parsed.point_grasp_backend == "graspgenx"
+    assert parsed.graspgenx_mode == "service"
     assert perception_cli._graspgenx_mode_was_explicit(argv) is False
     assert perception_cli._graspgenx_mode_was_explicit(
         [*argv, "--graspgenx-mode=in-process"]

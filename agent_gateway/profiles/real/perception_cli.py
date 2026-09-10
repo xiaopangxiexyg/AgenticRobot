@@ -44,7 +44,10 @@ from .perception_application import (
     assemble_camera_only_real_perception_composition,
 )
 from .perception_frames import build_real_perception_station_frame_binding
-from .point_grasp_deployment import SUPPORTED_POINT_GRASP_BACKEND_IDS
+from .point_grasp_deployment import (
+    DEFAULT_POINT_GRASP_BACKEND_ID,
+    SUPPORTED_POINT_GRASP_BACKEND_IDS,
+)
 from .realsense_perception import build_real_perception_source_binding
 
 
@@ -120,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--point-grasp-backend",
         choices=tuple(sorted(SUPPORTED_POINT_GRASP_BACKEND_IDS)),
-        default="vgn",
+        default=DEFAULT_POINT_GRASP_BACKEND_ID,
     )
     parser.add_argument(
         "--point-grasp-asset-bundle",
@@ -137,8 +140,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("service", "in-process"),
         default=GRASPGENX_DEFAULT_MODE,
         help=(
-            "GraspGenX execution mode; in-process loads the compatible model "
-            "into this Gateway by default, service uses the loopback ZMQ server"
+            "GraspGenX execution mode; service uses the isolated loopback ZMQ "
+            "runtime by default, in-process requires a compatible Gateway Python"
         ),
     )
     parser.add_argument(

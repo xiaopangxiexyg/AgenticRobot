@@ -62,10 +62,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=("service", "in-process"),
-        default="in-process",
+        default="service",
         help=(
-            "load the compatible model in this process by default; use service "
-            "to call the loopback server"
+            "call the isolated loopback service by default; use in-process only "
+            "from a compatible GraspGenX Python environment"
         ),
     )
     parser.add_argument(
