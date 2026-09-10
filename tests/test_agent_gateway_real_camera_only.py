@@ -247,4 +247,6 @@ def test_real_perception_cli_is_discoverable_without_importing_hardware() -> Non
     assert "--enable-point-grasp" in result.stdout
     assert "--point-grasp-backend" in result.stdout
     assert "graspgenx" in result.stdout
+    assert "--graspgenx-mode" in result.stdout
+    assert "--graspgenx-source-root" in result.stdout
     assert "--allow-local-image-root" not in result.stdout

@@ -41,10 +41,11 @@ def _bounded_float(*, minimum: float, maximum: float):
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Send a deterministic synthetic cube to a running loopback "
-            "GraspGenX service. This smoke never reads cameras or connects "
-            "to robot hardware."
-        )
+            "Run a deterministic synthetic cube through the loopback service "
+            "or direct GraspGenX backend. This smoke never reads cameras or "
+            "connects to robot hardware."
+        ),
+        epilog="This smoke never reads cameras or connects to robot hardware.",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
@@ -58,6 +59,25 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--planner", choices=("graspmoe", "diffusion"), default="graspmoe"
     )
+    parser.add_argument(
+        "--mode",
+        choices=("service", "in-process"),
+        default="service",
+        help="use the loopback service or load the compatible model in this process",
+    )
+    parser.add_argument(
+        "--asset-bundle",
+        type=Path,
+        default=None,
+        help="GraspGenX asset bundle required by --mode in-process",
+    )
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=None,
+        help="optional GraspGenX source checkout for --mode in-process",
+    )
+    parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--num-points",
         type=_bounded_int(minimum=16, maximum=1_000_000),
@@ -99,9 +119,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     repo_root = str(REPO_ROOT)
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-    from deployments.perception.graspgenx_client import GraspGenXClient
+    from deployments.perception.graspgenx_client import (
+        GraspGenXClient,
+        GraspGenXInProcessBackend,
+    )
     from deployments.perception.sam2_graspgenx_point_grasp import (
         DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+        GraspGenXPointGraspModelSpec,
     )
 
     points = _cube_surface_points(
@@ -109,15 +133,26 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         edge_m=args.cube_edge_m,
         seed=args.seed,
     )
-    client = GraspGenXClient(
-        host=args.host,
-        port=args.port,
-        timeout_ms=args.timeout_ms,
-    )
+    if args.mode == "service":
+        backend = GraspGenXClient(
+            host=args.host,
+            port=args.port,
+            timeout_ms=args.timeout_ms,
+        )
+    else:
+        if args.asset_bundle is None:
+            raise ValueError("--mode in-process requires --asset-bundle")
+        backend = GraspGenXInProcessBackend(
+            model_spec=GraspGenXPointGraspModelSpec.from_asset_bundle(
+                args.asset_bundle
+            ),
+            source_root=args.source_root,
+            device=args.device,
+        )
     try:
-        client.start()
+        backend.start()
         started = time.perf_counter()
-        grasps, scores = client.infer_object(
+        grasps, scores = backend.infer_object(
             points,
             sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
             planner=args.planner,
@@ -127,7 +162,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
         elapsed_seconds = time.perf_counter() - started
     finally:
-        client.close()
+        backend.close()
 
     if len(grasps) == 0:
         raise RuntimeError("GraspGenX returned no candidate for the smoke object.")
@@ -142,7 +177,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     return {
         "schema": SCHEMA_VERSION,
         "status": "passed",
-        "server": client.address,
+        "backend": backend.backend_id,
+        "server": getattr(backend, "address", None),
         "planner": args.planner,
         "input": {
             "shape": "cube_surface",

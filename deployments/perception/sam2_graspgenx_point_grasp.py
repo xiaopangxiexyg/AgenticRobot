@@ -22,7 +22,7 @@ from .dmtac_grasp_overlay import (
     DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
     DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
 )
-from .graspgenx_client import GraspGenXClient
+from .graspgenx_client import GraspGenXInferenceBackend
 from .sam2_vgn_point_grasp import (
     DEFAULT_DMTAC_M_URDF,
     DEFAULT_DMTAC_M_URDF_SHA256,
@@ -273,7 +273,7 @@ class Sam2GraspGenXPointGraspPlanner:
         *,
         model_spec: GraspGenXPointGraspModelSpec,
         point_segmenter: object,
-        client: GraspGenXClient,
+        client: GraspGenXInferenceBackend,
         planner: str = "graspmoe",
         num_grasps: int = 200,
         server_top_k: int = 100,
@@ -285,8 +285,10 @@ class Sam2GraspGenXPointGraspPlanner:
             raise TypeError("model_spec must be typed.")
         if not callable(getattr(point_segmenter, "segment_point", None)):
             raise TypeError("point_segmenter must expose segment_point().")
-        if not isinstance(client, GraspGenXClient):
-            raise TypeError("client must be a GraspGenXClient.")
+        if not isinstance(client, GraspGenXInferenceBackend):
+            raise TypeError(
+                "client must implement the GraspGenX inference backend contract."
+            )
         if planner not in {"graspmoe", "diffusion"}:
             raise ValueError("planner must be 'graspmoe' or 'diffusion'.")
         if isinstance(num_grasps, bool) or not 1 <= int(num_grasps) <= 1_000:

@@ -3,8 +3,11 @@
 本文是环境依赖、安装细节和复现约束的权威说明；可直接复制的最短安装/检查命令见
 [`docs/setup/README.md`](./docs/setup/README.md)。项目主环境统一使用 Python 3.10 conda 环境
 `dexteleop310`；SAM2、Grounding DINO、VGN、GraspNet 作为抓姿扩展安装到同一个环境。GraspGenX
-因其上游 PyTorch 约束和完整 GPU 服务栈使用 `assets/perception/graspgenx-point-grasp/runtime/.venv`
-独立运行，AgenticRobot 只通过本机 loopback 轻量 client 调用，不修改 `dexteleop310`。RPent
+默认因其上游 PyTorch 约束和完整 GPU 服务栈使用
+`assets/perception/graspgenx-point-grasp/runtime/.venv` 独立运行，AgenticRobot 只通过本机
+loopback 轻量 client 调用，不修改 `dexteleop310`。若 Gateway 使用与 GraspGenX 官方依赖
+兼容的独立 Python 环境，也支持显式 in-process direct Python backend；它不改变 Gateway
+Skill 或下游运动语义。RPent
 属于独立的上层项目环境，不是本仓抓姿/仿真运行的前置条件。`core`、`test`、`dataset`、
 `annotation`、`sim`、`model`、`openpi`、
 `vla_scratch`、`hardware` 是依赖分组，不是九个 conda 环境。其中 `annotation` 还支持
@@ -51,7 +54,7 @@ MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server
 每个目录还需对应的 `manifest.json` 及真实 SHA-256。使用 worktree 默认 assets 映射时，根就是本仓
 `assets/`；下载和解压规则以项目根 [`README.md`](./README.md) 的“运行资产”章节为准。
 
-GraspGenX 是例外的一键下载型可选服务。下面的命令会固定官方源码/模型 revision，下载约
+GraspGenX 是例外的一键下载型可选后端。下面的命令会固定官方源码/模型 revision，下载约
 1.7 GB 的 generator/discriminator 权重，生成真实 hash manifest，并在同一 asset bundle 内创建
 隔离 venv；不会安装到或更新 `dexteleop310`：
 

@@ -1,6 +1,10 @@
 """Local perception-model adapters with no Agent Gateway ownership."""
 
-from .graspgenx_client import GraspGenXClient
+from .graspgenx_client import (
+    GraspGenXClient,
+    GraspGenXInferenceBackend,
+    GraspGenXInProcessBackend,
+)
 from .sam2_graspgenx_point_grasp import (
     GraspGenXPointGraspModelSpec,
     Sam2GraspGenXPointGraspPlanner,
@@ -23,6 +27,8 @@ from .sam2_vgn_point_grasp import (
 __all__ = [
     "DMTAC_M_MAX_VISIBLE_COLLISION_POINTS",
     "GraspGenXClient",
+    "GraspGenXInferenceBackend",
+    "GraspGenXInProcessBackend",
     "GraspGenXPointGraspModelSpec",
     "GraspNetPointGraspModelSpec",
     "GroundedObjectDetection",

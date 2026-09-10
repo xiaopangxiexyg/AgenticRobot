@@ -130,9 +130,11 @@ manifest 还固定源码 commit、`realsense` 模型类型和项目授权 acknow
 
 ## GraspGenX 更新后端
 
-GraspGenX 源码固定在 `model/perception/graspgenx`，generator/discriminator 权重和其独立 venv
-统一位于 `assets/perception/graspgenx-point-grasp`。安装器自动下载官方 Hugging Face 模型仓、
-生成四个文件的真实 SHA-256 manifest，并保持主 `dexteleop310` 不变：
+GraspGenX 源码固定在 `model/perception/graspgenx`，generator/discriminator 权重和其运行时
+统一位于 `assets/perception/graspgenx-point-grasp`。默认的 service 模式使用 bundle 内独立
+venv；可选的 in-process 模式则要求 Gateway 所在 Python 环境本身兼容 GraspGenX。安装器自动
+下载官方 Hugging Face 模型仓、生成四个文件的真实 SHA-256 manifest，并保持主
+`dexteleop310` 不变：
 
 ```bash
 bash scripts/install_graspgenx_env.sh
@@ -144,8 +146,8 @@ bash scripts/install_graspgenx_env.sh --verify-only
 版本的 GPU 主机可传入例如 `--torch-backend cu126`。上游完整依赖中的
 PyOpenGL/pyrender 版本互斥，因此本服务不安装未使用的渲染、训练和端到端仿真依赖。
 
-模型服务只应绑定 loopback；启动命令见 `scripts/run_graspgenx_server.sh`。服务健康后，在
-`real-perception` 或 `real-rm65` 的原启动命令中增加：
+模型服务只应绑定 loopback；service 模式启动命令见 `scripts/run_graspgenx_server.sh`。服务健康
+后，在 `real-perception` 或 `real-rm65` 的原启动命令中增加：
 
 ```bash
 bash scripts/run_graspgenx_server.sh \
@@ -153,6 +155,22 @@ bash scripts/run_graspgenx_server.sh \
   --host 127.0.0.1 \
   --port 5556
 ```
+
+如果已准备好与 GraspGenX 官方依赖兼容的 Gateway Python 环境，可不启动上述服务，在原
+`real-perception` 或 `real-rm65` 命令中选择 direct Python backend：
+
+```text
+--point-grasp-backend graspgenx
+--graspgenx-mode in-process
+--point-grasp-asset-bundle /absolute/path/to/assets/perception/graspgenx-point-grasp
+--graspgenx-source-root /absolute/path/to/model/perception/graspgenx
+--point-grasp-device cuda
+```
+
+in-process 会在 Gateway 的 `start()` 阶段加载一次 generator/discriminator，按 sweep-volume
+缓存 sampler，并在同一进程内串行调用模型。它不改变 SAM2 mask、DMTAC M TCP 变换、可见深度
+碰撞过滤、RM65 可达性或下游运动权限。当前官方 checkpoint 要求 PyTorch <2.7；不要把它直接
+安装或升级到项目的 `dexteleop310`，应先用兼容的独立 Gateway 环境完成 GPU smoke 和仿真回归。
 
 模型加载完成后，可在第二个终端运行不读取相机、不连接机械臂的 GPU smoke。它复用正式
 `GraspGenXClient`、DMTac M sweep-volume 和协议校验，向服务发送一个确定性的 50 mm 合成方块：
@@ -166,6 +184,20 @@ bash scripts/run_graspgenx_server.sh \
 
 退出码为 0 且 JSON 中 `status` 为 `passed` 才表示 checkpoint 加载、CUDA 模型执行、
 DMTac 条件推理和客户端返回校验均已完成。该 smoke 不替代真实同帧 RGB-D 抓姿质量验收。
+
+同一个 smoke 也可以直接验证 in-process backend；此时不需要运行服务：
+
+```bash
+PYTHONPATH="${PWD}/model/perception/graspgenx:${PYTHONPATH:-}" \
+  "${DEXTELEOP_ASSET_ROOT}/perception/graspgenx-point-grasp/runtime/.venv/bin/python" \
+  scripts/smoke_graspgenx_inference.py \
+  --mode in-process \
+  --asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/graspgenx-point-grasp" \
+  --source-root "${PWD}/model/perception/graspgenx"
+```
+
+该命令只验证 GraspGenX direct Python backend，不读取相机、不连接机械臂，也不替代 Gateway
+启动和真实 RGB-D 验收。
 
 ```text
 --point-grasp-backend graspgenx

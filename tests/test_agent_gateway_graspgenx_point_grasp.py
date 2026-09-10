@@ -10,6 +10,8 @@ from PIL import Image
 
 from deployments.perception.graspgenx_client import (
     GraspGenXClient,
+    GraspGenXInferenceBackend,
+    GraspGenXInProcessBackend,
     pack_graspgenx_message,
     unpack_graspgenx_message,
 )
@@ -87,6 +89,26 @@ class _PlannerClient(GraspGenXClient):
         return self.grasps.copy(), self.scores.copy()
 
 
+class _DuckBackend:
+    backend_id = "duck-backend-v1"
+    semantic_config = {"backend": backend_id}
+
+    def __init__(self, grasps: np.ndarray, scores: np.ndarray) -> None:
+        self.grasps = grasps
+        self.scores = scores
+        self.started = False
+        self.closed = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def infer_object(self, point_cloud, **kwargs):
+        return self.grasps.copy(), self.scores.copy()
+
+
 def _sha256(path: Path) -> str:
     import hashlib
 
@@ -132,6 +154,123 @@ def _asset_bundle(tmp_path: Path) -> Path:
 
 def _model_spec(tmp_path: Path) -> GraspGenXPointGraspModelSpec:
     return GraspGenXPointGraspModelSpec.from_asset_bundle(_asset_bundle(tmp_path))
+
+
+def test_inprocess_backend_is_a_planner_backend_without_loading_on_init(
+    tmp_path: Path,
+) -> None:
+    backend = GraspGenXInProcessBackend(
+        model_spec=_model_spec(tmp_path),
+        source_root=tmp_path / "missing-source",
+    )
+
+    assert isinstance(backend, GraspGenXInferenceBackend)
+    assert backend.semantic_config["backend"] == "graspgenx-inprocess-v1"
+    with pytest.raises(FileNotFoundError, match="source_root"):
+        backend.start()
+
+
+def test_inprocess_backend_rejects_cpu_before_touching_model(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        GraspGenXInProcessBackend(model_spec=_model_spec(tmp_path), device="cpu")
+
+
+def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class _Cuda:
+        class _Context:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def device(self, _device):
+            return self._Context()
+
+    class _Torch:
+        cuda = _Cuda()
+
+    class _Params:
+        @classmethod
+        def coerce(cls, value):
+            assert value["gripper_type"] == 0
+            return cls()
+
+        def cache_key(self):
+            return "test"
+
+    class _Sampler:
+        calls = 0
+
+        @classmethod
+        def from_sweep_volume(cls, cfg, params, *, model):
+            assert cfg == "cfg"
+            assert isinstance(params, _Params)
+            assert model == "model"
+            cls.calls += 1
+            return "sampler"
+
+    runner_calls = []
+    first = np.eye(4, dtype=np.float64)
+    second = np.eye(4, dtype=np.float64)
+    second[0, 3] = 0.01
+
+    def _runner(points, sampler, **kwargs):
+        runner_calls.append((points.copy(), sampler, kwargs))
+        return np.stack((first, second)), np.asarray((0.2, 0.9)), [], None
+
+    backend = GraspGenXInProcessBackend(model_spec=_model_spec(tmp_path))
+    monkeypatch.setattr(
+        backend,
+        "_load_runtime",
+        lambda: (
+            _Torch(),
+            "cuda",
+            "cfg",
+            "model",
+            _Sampler,
+            _Params,
+            _runner,
+            False,
+        ),
+    )
+    backend.start()
+
+    points = np.zeros((16, 3), dtype=np.float32)
+    grasps, scores = backend.infer_object(
+        points,
+        sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+        score_threshold=0.3,
+        top_k=1,
+    )
+
+    assert _Sampler.calls == 1
+    assert len(runner_calls) == 1
+    assert runner_calls[0][2]["topk_num_grasps"] == -1
+    assert scores.tolist() == pytest.approx([0.9])
+    np.testing.assert_allclose(grasps[0], second)
+    backend.close()
+
+
+def test_planner_accepts_any_backend_implementing_the_inference_contract(
+    tmp_path: Path,
+) -> None:
+    backend = _DuckBackend(
+        np.eye(4, dtype=np.float64)[None],
+        np.asarray((0.9,), dtype=np.float64),
+    )
+
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(np.ones((4, 4), dtype=bool)),
+        client=backend,
+    )
+
+    assert isinstance(planner.client, GraspGenXInferenceBackend)
+    assert planner.semantic_content_hash
 
 
 def test_numpy_codec_matches_upstream_msgpack_numpy_shape() -> None:

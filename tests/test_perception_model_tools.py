@@ -128,6 +128,9 @@ def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> Non
     assert "never reads cameras or connects to robot hardware" in completed.stdout
     source = GRASPGENX_SMOKE.read_text(encoding="utf-8")
     assert "GraspGenXClient" in source
+    assert "GraspGenXInProcessBackend" in source
+    assert "--mode" in completed.stdout
+    assert "--asset-bundle" in completed.stdout
     assert "DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1" in source
     assert "robot_motion" not in source
     rejected = subprocess.run(
