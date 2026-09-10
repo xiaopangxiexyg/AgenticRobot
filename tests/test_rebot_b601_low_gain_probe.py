@@ -756,6 +756,20 @@ def test_operator_key_reader_ignores_non_r_calibration_keys() -> None:
         os.close(slave_fd)
 
 
+def test_operator_key_reader_returns_one_normalized_key_batch() -> None:
+    master_fd, slave_fd = pty.openpty()
+    tty_path = Path(os.ttyname(slave_fd))
+    reader = probe.OperatorKeyReader(tty_path)
+    try:
+        os.write(master_fd, b"AnD")
+        assert reader.poll_keys() == frozenset({"a", "n", "d"})
+        assert reader.poll_keys() == frozenset()
+    finally:
+        reader.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
 def test_startup_replay_ramps_lock_in_holds_and_hands_back_out() -> None:
     capture = probe.StartupReplayCapture(
         transition_duration_sec=0.5,
@@ -2152,6 +2166,153 @@ def test_pose_axis_guide_terminal_notices_are_operator_only() -> None:
     assert "8 deg" in notice
     assert "move slowly" in notice
     assert set(event) == {"state", "phase_index", "phase"}
+
+
+def test_interactive_pose_axis_actions_use_fixed_signed_order() -> None:
+    actions = probe.build_interactive_pose_axis_actions(
+        translation_m=0.03,
+        rotation_rad=math.radians(8.0),
+    )
+
+    assert len(actions) == 12
+    assert [action.name for action in actions] == [
+        "TRANSLATION_X_POSITIVE",
+        "TRANSLATION_X_NEGATIVE",
+        "TRANSLATION_Y_POSITIVE",
+        "TRANSLATION_Y_NEGATIVE",
+        "TRANSLATION_Z_POSITIVE",
+        "TRANSLATION_Z_NEGATIVE",
+        "ROTATION_RX_POSITIVE",
+        "ROTATION_RX_NEGATIVE",
+        "ROTATION_RY_POSITIVE",
+        "ROTATION_RY_NEGATIVE",
+        "ROTATION_RZ_POSITIVE",
+        "ROTATION_RZ_NEGATIVE",
+    ]
+    assert all(action.duration_sec == 0.0 for action in actions)
+
+
+def test_interactive_pose_axis_guide_gates_anchor_and_manual_states() -> None:
+    actions = probe.build_interactive_pose_axis_actions(
+        translation_m=0.03,
+        rotation_rad=math.radians(8.0),
+    )
+    guide = probe.InteractivePoseAxisOperatorGuide(actions)
+    qpos = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    stationary = (0.0,) * 6
+    moving = (0.0, 0.0, 0.03, 0.0, 0.0, 0.0)
+    pose = np.eye(4)
+    pose[0, 3] = 0.4
+
+    positioning = guide.activate(elapsed_sec=1.0, sample_index=10)
+    assert positioning["state"] == "POSITIONING"
+    rejected = guide.handle_keys(
+        frozenset({"a"}),
+        qpos_rad=qpos,
+        qvel_rad_s=moving,
+        pose=pose,
+        elapsed_sec=2.0,
+        sample_index=20,
+        stationarity_limit_rad_s=0.02,
+    )
+    assert rejected[0]["event"] == "REJECTED"
+    assert guide.state == "POSITIONING"
+
+    # A and N in one input batch capture only the anchor; they cannot skip READY.
+    anchored = guide.handle_keys(
+        frozenset({"a", "n"}),
+        qpos_rad=qpos,
+        qvel_rad_s=stationary,
+        pose=pose,
+        elapsed_sec=3.0,
+        sample_index=30,
+        stationarity_limit_rad_s=0.02,
+    )
+    assert anchored[0]["event"] == "ANCHOR_CAPTURED"
+    assert guide.state == "READY"
+    assert guide.anchor_qpos_rad == qpos
+    assert guide.anchor_pose == tuple(tuple(value for value in row) for row in pose)
+
+    assert guide.handle_keys(
+        frozenset({"n"}),
+        qpos_rad=qpos,
+        qvel_rad_s=stationary,
+        pose=pose,
+        elapsed_sec=4.0,
+        sample_index=40,
+        stationarity_limit_rad_s=0.02,
+    )[0]["state"] == "ACTION"
+    assert guide.handle_keys(
+        frozenset({"d"}),
+        qpos_rad=qpos,
+        qvel_rad_s=moving,
+        pose=pose,
+        elapsed_sec=5.0,
+        sample_index=50,
+        stationarity_limit_rad_s=0.02,
+    )[0]["state"] == "REST"
+    rejected_rest = guide.handle_keys(
+        frozenset({"r"}),
+        qpos_rad=qpos,
+        qvel_rad_s=moving,
+        pose=pose,
+        elapsed_sec=6.0,
+        sample_index=60,
+        stationarity_limit_rad_s=0.02,
+    )
+    assert rejected_rest[0]["event"] == "REJECTED"
+    assert guide.state == "REST"
+    advanced = guide.handle_keys(
+        frozenset({"r"}),
+        qpos_rad=qpos,
+        qvel_rad_s=stationary,
+        pose=pose,
+        elapsed_sec=7.0,
+        sample_index=70,
+        stationarity_limit_rad_s=0.02,
+    )
+    assert advanced[0]["state"] == "READY"
+    assert guide.action_index == 1
+
+
+def test_interactive_pose_axis_guide_completes_only_after_stationary_rest() -> None:
+    action = probe.PoseAxisGuidePhase(
+        "TRANSLATION_X_POSITIVE",
+        "translation",
+        0.0,
+        axis="X",
+        direction=1,
+        target_amplitude=0.03,
+        target_unit="m",
+    )
+    guide = probe.InteractivePoseAxisOperatorGuide((action,))
+    qpos = (0.0,) * 6
+    qvel = (0.0,) * 6
+    pose = np.eye(4)
+    guide.activate(elapsed_sec=0.0, sample_index=0)
+    for key, elapsed in (("a", 1.0), ("n", 2.0), ("d", 3.0), ("r", 4.0)):
+        guide.handle_keys(
+            frozenset({key}),
+            qpos_rad=qpos,
+            qvel_rad_s=qvel,
+            pose=pose,
+            elapsed_sec=elapsed,
+            sample_index=int(elapsed * 10),
+            stationarity_limit_rad_s=0.02,
+        )
+
+    assert guide.completed is True
+    assert guide.completed_elapsed_sec == pytest.approx(4.0)
+    assert guide.sample_metadata(elapsed_sec=4.0) == {
+        "phase": "COMPLETE",
+        "phase_index": 1,
+        "phase_elapsed_sec": pytest.approx(0.0),
+        "state": "COMPLETE",
+    }
+    assert "protective hold" in probe.format_interactive_pose_axis_notice(
+        guide.events[-1],
+        action_count=1,
+    )
 
 
 def test_cartesian_impedance_overlay_restores_toward_anchor(
@@ -4090,6 +4251,48 @@ def test_guided_pose_axis_cli_fails_closed(
     )
 
     with pytest.raises(probe.LowGainProbeError, match=message):
+        probe._validate_cli(args)
+
+
+def test_interactive_pose_axis_cli_uses_timeout_not_timed_schedule() -> None:
+    args = _parse_pose_args(
+        "--apply-driver-torque-limits",
+        "--interactive-pose-axis-protocol",
+        "--duration-sec",
+        "1",
+        "--cartesian-max-displacement-m",
+        "0.06",
+        "--rotational-max-displacement-rad",
+        "0.35",
+    )
+
+    probe._validate_cli(args)
+
+
+def test_pose_axis_protocols_are_mutually_exclusive() -> None:
+    args = _parse_pose_args(
+        "--apply-driver-torque-limits",
+        "--guided-pose-axis-protocol",
+        "--interactive-pose-axis-protocol",
+        "--duration-sec",
+        "180",
+        "--cartesian-max-displacement-m",
+        "0.06",
+        "--rotational-max-displacement-rad",
+        "0.35",
+    )
+
+    with pytest.raises(probe.LowGainProbeError, match="mutually exclusive"):
+        probe._validate_cli(args)
+
+
+def test_interactive_pose_axis_cli_requires_pose_mode() -> None:
+    args = _parse_cartesian_args("--interactive-pose-axis-protocol")
+
+    with pytest.raises(
+        probe.LowGainProbeError,
+        match="--interactive-pose-axis-protocol requires --mode pose-hold",
+    ):
         probe._validate_cli(args)
 
 

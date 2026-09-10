@@ -287,17 +287,27 @@ class OperatorKeyReader:
     def poll_record_request(self) -> bool:
         """Return whether ``R`` was pressed in the next non-blocking key batch."""
 
+        return "r" in self.poll_keys()
+
+    def poll_keys(self) -> frozenset[str]:
+        """Return one normalized non-blocking key batch from the terminal.
+
+        A batch is intentionally consumed once.  Stateful operator protocols
+        must perform at most one transition for the returned set so buffered or
+        repeated bytes cannot skip multiple control states in one servo tick.
+        """
+
         if self._fd is None:
-            return False
+            return frozenset()
         try:
             pressed = os.read(self._fd, 64)
         except BlockingIOError:
-            return False
+            return frozenset()
         except OSError as exc:
             raise LowGainProbeError(
                 "failed to read the operator terminal"
             ) from exc
-        return ord("r") in pressed.lower()
+        return frozenset(chr(value).lower() for value in pressed if value < 128)
 
     def close(self) -> None:
         fd = self._fd
@@ -537,6 +547,315 @@ def format_pose_axis_guide_notice(
         f"{prefix} {action} {direction}{axis} toward {target} "
         f"for {duration:g}s; move slowly, hold briefly, then release."
     )
+
+
+def build_interactive_pose_axis_actions(
+    *,
+    translation_m: float,
+    rotation_rad: float,
+) -> tuple[PoseAxisGuidePhase, ...]:
+    """Build the manual signed-axis order without time-driven transitions."""
+
+    translation = _positive(translation_m, name="guided_pose_translation_m")
+    rotation = _positive(rotation_rad, name="guided_pose_rotation_rad")
+    actions: list[PoseAxisGuidePhase] = []
+    for kind, axes, amplitude, unit in (
+        ("translation", ("X", "Y", "Z"), translation, "m"),
+        ("rotation", ("RX", "RY", "RZ"), rotation, "rad"),
+    ):
+        for axis in axes:
+            for direction, suffix in ((1, "POSITIVE"), (-1, "NEGATIVE")):
+                actions.append(
+                    PoseAxisGuidePhase(
+                        name=f"{kind.upper()}_{axis}_{suffix}",
+                        kind=kind,
+                        # Interactive action duration is operator-owned.  Zero
+                        # is evidence of that contract, not a timed phase.
+                        duration_sec=0.0,
+                        axis=axis,
+                        direction=direction,
+                        target_amplitude=amplitude,
+                        target_unit=unit,
+                    )
+                )
+    return tuple(actions)
+
+
+@dataclass
+class InteractivePoseAxisOperatorGuide:
+    """Gate an operator-driven pose-axis capture without commanding motion."""
+
+    actions: tuple[PoseAxisGuidePhase, ...]
+    state: str = "WAITING_FOR_ACTIVE"
+    action_index: int | None = None
+    started_elapsed_sec: float | None = None
+    state_started_elapsed_sec: float | None = None
+    completed_elapsed_sec: float | None = None
+    anchor_qpos_rad: tuple[float, ...] | None = None
+    anchor_pose: tuple[tuple[float, ...], ...] | None = None
+    anchor_elapsed_sec: float | None = None
+    anchor_sample_index: int | None = None
+    events: list[dict[str, object]] = field(default_factory=list)
+
+    @property
+    def completed(self) -> bool:
+        return self.state == "COMPLETE"
+
+    @property
+    def current_action(self) -> PoseAxisGuidePhase | None:
+        if self.action_index is None or self.action_index >= len(self.actions):
+            return None
+        return self.actions[self.action_index]
+
+    def activate(self, *, elapsed_sec: float, sample_index: int) -> dict[str, object]:
+        if self.state != "WAITING_FOR_ACTIVE":
+            raise ValueError("interactive pose-axis guide has already been activated")
+        if not self.actions:
+            raise ValueError("interactive pose-axis guide requires at least one action")
+        elapsed = _non_negative(elapsed_sec, name="interactive_guide_elapsed_sec")
+        self.started_elapsed_sec = elapsed
+        return self._transition(
+            "POSITIONING",
+            elapsed_sec=elapsed,
+            sample_index=sample_index,
+            event_type="STATE",
+        )
+
+    def handle_keys(
+        self,
+        keys: frozenset[str],
+        *,
+        qpos_rad: Sequence[float],
+        qvel_rad_s: Sequence[float],
+        pose: Sequence[Sequence[float]],
+        elapsed_sec: float,
+        sample_index: int,
+        stationarity_limit_rad_s: float,
+    ) -> tuple[dict[str, object], ...]:
+        """Consume one key batch and perform no more than one state transition."""
+
+        if not keys or self.state in ("WAITING_FOR_ACTIVE", "COMPLETE"):
+            return ()
+        elapsed = _non_negative(elapsed_sec, name="interactive_guide_elapsed_sec")
+        limit = _non_negative(
+            stationarity_limit_rad_s,
+            name="interactive_guide_stationarity_limit_rad_s",
+        )
+        qpos = _six(qpos_rad, name="interactive_guide_qpos_rad")
+        qvel = _six(qvel_rad_s, name="interactive_guide_qvel_rad_s")
+        max_velocity = max(abs(value) for value in qvel)
+
+        if self.state == "POSITIONING" and "a" in keys:
+            if max_velocity > limit:
+                return (
+                    self._reject(
+                        key="A",
+                        reason="arm_not_stationary",
+                        max_velocity_rad_s=max_velocity,
+                        stationarity_limit_rad_s=limit,
+                        elapsed_sec=elapsed,
+                        sample_index=sample_index,
+                    ),
+                )
+            pose_array = np.asarray(pose, dtype=float)
+            if pose_array.shape != (4, 4) or not np.all(np.isfinite(pose_array)):
+                raise LowGainProbeError(
+                    "interactive pose-axis anchor FK returned an invalid transform"
+                )
+            self.anchor_qpos_rad = qpos
+            self.anchor_pose = tuple(
+                tuple(float(value) for value in row) for row in pose_array
+            )
+            self.anchor_elapsed_sec = elapsed
+            self.anchor_sample_index = int(sample_index)
+            self.action_index = 0
+            return (
+                self._transition(
+                    "READY",
+                    elapsed_sec=elapsed,
+                    sample_index=sample_index,
+                    event_type="ANCHOR_CAPTURED",
+                    extra={
+                        "anchor_qpos_rad": self.anchor_qpos_rad,
+                        "anchor_pose": self.anchor_pose,
+                        "max_velocity_rad_s": max_velocity,
+                        "stationarity_limit_rad_s": limit,
+                    },
+                ),
+            )
+        if self.state == "READY" and "n" in keys:
+            return (
+                self._transition(
+                    "ACTION",
+                    elapsed_sec=elapsed,
+                    sample_index=sample_index,
+                    event_type="STATE",
+                ),
+            )
+        if self.state == "ACTION" and "d" in keys:
+            return (
+                self._transition(
+                    "REST",
+                    elapsed_sec=elapsed,
+                    sample_index=sample_index,
+                    event_type="STATE",
+                ),
+            )
+        if self.state == "REST" and "r" in keys:
+            if max_velocity > limit:
+                return (
+                    self._reject(
+                        key="R",
+                        reason="arm_not_stationary",
+                        max_velocity_rad_s=max_velocity,
+                        stationarity_limit_rad_s=limit,
+                        elapsed_sec=elapsed,
+                        sample_index=sample_index,
+                    ),
+                )
+            if self.action_index is None:
+                raise ValueError("interactive REST state has no action index")
+            self.action_index += 1
+            if self.action_index >= len(self.actions):
+                self.completed_elapsed_sec = elapsed
+                return (
+                    self._transition(
+                        "COMPLETE",
+                        elapsed_sec=elapsed,
+                        sample_index=sample_index,
+                        event_type="COMPLETE",
+                    ),
+                )
+            return (
+                self._transition(
+                    "READY",
+                    elapsed_sec=elapsed,
+                    sample_index=sample_index,
+                    event_type="STATE",
+                ),
+            )
+        return ()
+
+    def sample_metadata(self, *, elapsed_sec: float) -> dict[str, object]:
+        action = self.current_action
+        phase = self.state if action is None else f"{self.state}_{action.name}"
+        return {
+            "phase": phase,
+            "phase_index": self.action_index,
+            "phase_elapsed_sec": (
+                None
+                if self.state_started_elapsed_sec is None
+                else max(0.0, float(elapsed_sec) - self.state_started_elapsed_sec)
+            ),
+            "state": self.state,
+        }
+
+    def _transition(
+        self,
+        state: str,
+        *,
+        elapsed_sec: float,
+        sample_index: int,
+        event_type: str,
+        extra: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        self.state = state
+        self.state_started_elapsed_sec = float(elapsed_sec)
+        event: dict[str, object] = {
+            "event": event_type,
+            "state": state,
+            "action_index": self.action_index,
+            "action": (
+                self.current_action.as_dict()
+                if self.current_action is not None
+                else None
+            ),
+            "elapsed_sec": float(elapsed_sec),
+            "sample_index": int(sample_index),
+        }
+        if extra is not None:
+            event.update(extra)
+        self.events.append(event)
+        return event
+
+    def _reject(
+        self,
+        *,
+        key: str,
+        reason: str,
+        max_velocity_rad_s: float,
+        stationarity_limit_rad_s: float,
+        elapsed_sec: float,
+        sample_index: int,
+    ) -> dict[str, object]:
+        event = {
+            "event": "REJECTED",
+            "state": self.state,
+            "action_index": self.action_index,
+            "action": (
+                self.current_action.as_dict()
+                if self.current_action is not None
+                else None
+            ),
+            "key": key,
+            "reason": reason,
+            "max_velocity_rad_s": float(max_velocity_rad_s),
+            "stationarity_limit_rad_s": float(stationarity_limit_rad_s),
+            "elapsed_sec": float(elapsed_sec),
+            "sample_index": int(sample_index),
+        }
+        self.events.append(event)
+        return event
+
+
+def format_interactive_pose_axis_notice(
+    event: Mapping[str, object],
+    *,
+    action_count: int,
+) -> str:
+    """Render one concise instruction for the manual capture state machine."""
+
+    if event.get("event") == "REJECTED":
+        return (
+            f"[B601] [{event['key']} REJECTED] arm is still moving: "
+            f"max |dq|={float(event['max_velocity_rad_s']):.4f} rad/s > "
+            f"{float(event['stationarity_limit_rad_s']):.4f}; release, wait, retry."
+        )
+    state = str(event["state"])
+    if state == "POSITIONING":
+        return (
+            "[B601] [POSITIONING] gravity+damping only; move to a suitable pose, "
+            "release and wait until still, then press A to capture the impedance anchor."
+        )
+    if state == "COMPLETE":
+        return (
+            "[B601] [CAPTURE COMPLETE] all 12 signed axes recorded; "
+            "entering gravity/damping protective hold."
+        )
+    action = event.get("action")
+    if not isinstance(action, Mapping):
+        raise TypeError("interactive pose-axis event is missing action metadata")
+    index = int(event["action_index"]) + 1
+    axis = str(action["axis"])
+    direction = "+" if int(action["direction"]) > 0 else "-"
+    kind = str(action["kind"])
+    amplitude = float(action["target_amplitude"])
+    target = (
+        f"{amplitude:g} m"
+        if kind == "translation"
+        else f"{math.degrees(amplitude):g} deg ({amplitude:g} rad)"
+    )
+    prefix = f"[B601] [AXIS {index}/{action_count}] {direction}{axis} target {target}"
+    if state == "READY":
+        return f"{prefix}: press N to begin recording this action."
+    if state == "ACTION":
+        return f"{prefix}: move slowly and hold briefly; press D when done."
+    if state == "REST":
+        return (
+            f"{prefix}: release the arm, wait until still, then press R "
+            "to accept recovery and continue."
+        )
+    raise ValueError(f"unknown interactive pose-axis state: {state}")
 
 
 @dataclass
@@ -3490,18 +3809,27 @@ def _validate_cli(args: argparse.Namespace) -> None:
         ),
         name="rotational_max_displacement_rad",
     )
-    if getattr(args, "guided_pose_axis_protocol", False):
-        if args.mode != "pose-hold":
-            raise LowGainProbeError(
-                "--guided-pose-axis-protocol requires --mode pose-hold"
-            )
-        guide_phases = build_pose_axis_guide_phases(
-            translation_m=args.guided_pose_translation_m,
-            rotation_rad=args.guided_pose_rotation_rad,
-            settle_sec=args.guided_pose_settle_sec,
-            action_sec=args.guided_pose_action_sec,
-            rest_sec=args.guided_pose_rest_sec,
+    guided_pose_axis_protocol = getattr(args, "guided_pose_axis_protocol", False)
+    interactive_pose_axis_protocol = getattr(
+        args,
+        "interactive_pose_axis_protocol",
+        False,
+    )
+    if guided_pose_axis_protocol and interactive_pose_axis_protocol:
+        raise LowGainProbeError(
+            "--guided-pose-axis-protocol and --interactive-pose-axis-protocol "
+            "are mutually exclusive"
         )
+    if guided_pose_axis_protocol or interactive_pose_axis_protocol:
+        if args.mode != "pose-hold":
+            selected_protocol = (
+                "--guided-pose-axis-protocol"
+                if guided_pose_axis_protocol
+                else "--interactive-pose-axis-protocol"
+            )
+            raise LowGainProbeError(
+                f"{selected_protocol} requires --mode pose-hold"
+            )
         if args.guided_pose_translation_m >= args.cartesian_max_displacement_m:
             raise LowGainProbeError(
                 "guided translation target must remain strictly below "
@@ -3512,6 +3840,14 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 "guided rotation target must remain strictly below "
                 "--rotational-max-displacement-rad"
             )
+    if guided_pose_axis_protocol:
+        guide_phases = build_pose_axis_guide_phases(
+            translation_m=args.guided_pose_translation_m,
+            rotation_rad=args.guided_pose_rotation_rad,
+            settle_sec=args.guided_pose_settle_sec,
+            action_sec=args.guided_pose_action_sec,
+            rest_sec=args.guided_pose_rest_sec,
+        )
         guide_duration_sec = sum(phase.duration_sec for phase in guide_phases)
         if args.duration_sec < args.torque_rise_time_sec + guide_duration_sec:
             raise LowGainProbeError(
@@ -6252,6 +6588,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         if args.guided_pose_axis_protocol
         else None
     )
+    interactive_pose_axis_guide = (
+        InteractivePoseAxisOperatorGuide(
+            build_interactive_pose_axis_actions(
+                translation_m=args.guided_pose_translation_m,
+                rotation_rad=args.guided_pose_rotation_rad,
+            )
+        )
+        if args.interactive_pose_axis_protocol
+        else None
+    )
     operator_keys: OperatorKeyReader | None = None
     calibration_ready = False
     startup_replay_ready = False
@@ -6276,7 +6622,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         lambda signum, frame: _signal_handler(stop, signum, frame),
     )
     try:
-        if calibration_capture is not None or startup_replay_capture is not None:
+        if (
+            calibration_capture is not None
+            or startup_replay_capture is not None
+            or interactive_pose_axis_guide is not None
+        ):
             # Establish the interactive input path before opening the backend or
             # changing any drive state.
             operator_keys = OperatorKeyReader()
@@ -6717,7 +7067,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     damping_n_s_per_m=(args.cartesian_damping_n_s_per_m,) * 3,
                     max_abs_force_n=(args.cartesian_max_force_n,) * 3,
                 )
-            else:
+            elif interactive_pose_axis_guide is None:
                 pose_anchor = tuple(
                     tuple(float(value) for value in row)
                     for row in arming_transform
@@ -7026,6 +7376,86 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             phase_count=len(pose_axis_guide.phases),
                         )
                     )
+            if (
+                interactive_pose_axis_guide is not None
+                and handoff_fraction >= 1.0
+            ):
+                if interactive_pose_axis_guide.state == "WAITING_FOR_ACTIVE":
+                    if operator_keys is None:
+                        raise LowGainProbeError(
+                            "interactive pose-axis operator terminal is unavailable"
+                        )
+                    operator_keys.flush()
+                    _operator_notice(
+                        "[B601] [INTERACTIVE CAPTURE] operator motion only; no "
+                        "automatic pose reference. Frame: +X forward, +Y left, "
+                        "+Z up; rotations follow the right-hand rule."
+                    )
+                    interactive_event = interactive_pose_axis_guide.activate(
+                        elapsed_sec=elapsed,
+                        sample_index=len(samples),
+                    )
+                    _operator_notice(
+                        format_interactive_pose_axis_notice(
+                            interactive_event,
+                            action_count=len(interactive_pose_axis_guide.actions),
+                        )
+                    )
+                keys = operator_keys.poll_keys() if operator_keys is not None else frozenset()
+                anchor_transform: Sequence[Sequence[float]] = (
+                    pose_anchor if pose_anchor is not None else np.eye(4)
+                )
+                if (
+                    interactive_pose_axis_guide.state == "POSITIONING"
+                    and "a" in keys
+                ):
+                    anchor_transform = np.asarray(
+                        model.forward_kinematics(q),
+                        dtype=float,
+                    )
+                interactive_events = interactive_pose_axis_guide.handle_keys(
+                    keys,
+                    qpos_rad=q,
+                    qvel_rad_s=qvel,
+                    pose=anchor_transform,
+                    elapsed_sec=elapsed,
+                    sample_index=len(samples),
+                    stationarity_limit_rad_s=args.fault_hold_max_velocity_rad_s,
+                )
+                for interactive_event in interactive_events:
+                    if interactive_event.get("event") == "ANCHOR_CAPTURED":
+                        pose_anchor = interactive_pose_axis_guide.anchor_pose
+                        if pose_anchor is None:
+                            raise LowGainProbeError(
+                                "interactive pose-axis anchor event has no pose"
+                            )
+                        pose_spring = B601PoseVirtualSpring(
+                            anchor_pose=pose_anchor,
+                            translational_stiffness_n_per_m=(
+                                args.cartesian_stiffness_n_per_m,
+                            )
+                            * 3,
+                            translational_damping_n_s_per_m=(
+                                args.cartesian_damping_n_s_per_m,
+                            )
+                            * 3,
+                            rotational_stiffness_nm_per_rad=(
+                                args.rotational_stiffness_nm_per_rad,
+                            )
+                            * 3,
+                            rotational_damping_nm_s_per_rad=(
+                                args.rotational_damping_nm_s_per_rad,
+                            )
+                            * 3,
+                            max_abs_force_n=(args.cartesian_max_force_n,) * 3,
+                            max_abs_torque_nm=(args.rotational_max_torque_nm,) * 3,
+                        )
+                    _operator_notice(
+                        format_interactive_pose_axis_notice(
+                            interactive_event,
+                            action_count=len(interactive_pose_axis_guide.actions),
+                        )
+                    )
             if calibration_capture is not None:
                 if handoff_fraction >= 1.0 and not calibration_ready:
                     if operator_keys is None:
@@ -7133,6 +7563,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 qref = startup_replay_capture.reference(q)
                 qvel_ref = _ZERO_SIX
                 step_done = True
+            elif interactive_pose_axis_guide is not None:
+                # The drive-local position gain is zero after startup handoff.
+                # Keep the nominal reference co-located with fresh feedback so
+                # this protocol never introduces a hidden joint-space target;
+                # only the explicitly armed task-space spring adds an overlay.
+                qref = q
+                qvel_ref = _ZERO_SIX
+                step_done = True
             else:
                 qref, qvel_ref, step_done = plan_reference(
                     initial_q,
@@ -7176,15 +7614,24 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 )
             elif args.mode == "pose-hold":
                 if pose_spring is None:
-                    raise LowGainProbeError("Pose impedance spring was not armed")
-                joint_torque_overlay_nm, pose_audit = compute_pose_impedance_overlay(
-                    model,
-                    pose_spring,
-                    qpos_rad=q,
-                    qvel_rad_s=qvel,
-                    max_displacement_m=args.cartesian_max_displacement_m,
-                    max_rotation_rad=args.rotational_max_displacement_rad,
-                )
+                    if interactive_pose_axis_guide is None:
+                        raise LowGainProbeError("Pose impedance spring was not armed")
+                    pose_audit = {
+                        "enabled": False,
+                        "state": "awaiting_operator_anchor",
+                        "motion_source": "gravity_and_damping_only",
+                    }
+                else:
+                    joint_torque_overlay_nm, pose_audit = (
+                        compute_pose_impedance_overlay(
+                            model,
+                            pose_spring,
+                            qpos_rad=q,
+                            qvel_rad_s=qvel,
+                            max_displacement_m=args.cartesian_max_displacement_m,
+                            max_rotation_rad=args.rotational_max_displacement_rad,
+                        )
+                    )
             reference = build_reference(
                 sequence=state.sequence,
                 timestamp_sec=state.receive_timestamp_sec,
@@ -7306,7 +7753,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             operator_guide_sample = (
                 pose_axis_guide.sample_metadata(elapsed_sec=elapsed)
                 if pose_axis_guide is not None
-                else None
+                else (
+                    interactive_pose_axis_guide.sample_metadata(elapsed_sec=elapsed)
+                    if interactive_pose_axis_guide is not None
+                    else None
+                )
             )
             samples.append(
                 {
@@ -7343,6 +7794,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     ),
                     "operator_guide_phase_elapsed_sec": (
                         operator_guide_sample["phase_elapsed_sec"]
+                        if operator_guide_sample is not None
+                        else None
+                    ),
+                    "operator_guide_state": (
+                        operator_guide_sample.get("state")
                         if operator_guide_sample is not None
                         else None
                     ),
@@ -7416,17 +7872,33 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             if completed_at > next_deadline:
                 schedule_overruns += 1
                 next_deadline = completed_at
+            if (
+                interactive_pose_axis_guide is not None
+                and interactive_pose_axis_guide.completed
+            ):
+                break
         if stop_reason is None:
-            control_completion_reason = complete_active_duration(
-                stop=stop,
-                calibration_capture=calibration_capture,
-                elapsed_sec=last_control_elapsed_sec,
-                sample_end_index=len(samples),
-            )
-            _operator_notice(
-                "[B601] CONTROL DURATION COMPLETE: entering protective hold; "
-                "Ctrl-C or SIGUSR1 requests final full disable."
-            )
+            if (
+                interactive_pose_axis_guide is not None
+                and interactive_pose_axis_guide.completed
+            ):
+                stop["requested"] = True
+                control_completion_reason = "operator_guidance_complete"
+                _operator_notice(
+                    "[B601] INTERACTIVE CAPTURE COMPLETE: entering protective hold; "
+                    "Ctrl-C or SIGUSR1 requests final full disable."
+                )
+            else:
+                control_completion_reason = complete_active_duration(
+                    stop=stop,
+                    calibration_capture=calibration_capture,
+                    elapsed_sec=last_control_elapsed_sec,
+                    sample_end_index=len(samples),
+                )
+                _operator_notice(
+                    "[B601] CONTROL DURATION COMPLETE: entering protective hold; "
+                    "Ctrl-C or SIGUSR1 requests final full disable."
+                )
     except LowGainProbeError as exc:
         primary_error = exc
     except (B601HardwareError, OSError, TypeError, ValueError) as exc:
@@ -7523,6 +7995,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     )
                 )
                 duration_complete = control_completion_reason == "duration_complete"
+                operator_guidance_complete = (
+                    control_completion_reason == "operator_guidance_complete"
+                )
+                planned_completion = duration_complete or operator_guidance_complete
                 protective_hold_entry_reason = (
                     control_completion_reason
                     or stop_reason
@@ -7551,7 +8027,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 # admission as a handled position error instead of dropping
                 # the whole arm immediately.
                 degraded_entry_reason: str | None = None
-                if (operator_interrupt or duration_complete) and safe_snapshot_available:
+                if (operator_interrupt or planned_completion) and safe_snapshot_available:
                     fault_entry = False
                     can_attempt_hold = True
                 elif fault_snapshot_available:
@@ -7607,8 +8083,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         hold_qvel = fault_qvel_for_hold
                         hold_age_sec = fault_age_sec
                         protective_hold_reference_source = (
-                            "current_snapshot_after_stale_duration_last_safe"
-                            if duration_complete
+                            "current_snapshot_after_stale_planned_completion_last_safe"
+                            if planned_completion
                             else (
                                 "current_fault_snapshot"
                                 if not operator_interrupt
@@ -7620,8 +8096,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         hold_qvel = last_safe_qvel
                         hold_age_sec = safe_age_sec
                         protective_hold_reference_source = (
-                            "duration_complete_last_safe_snapshot"
-                            if duration_complete
+                            "planned_completion_last_safe_snapshot"
+                            if planned_completion
                             else "last_safe_snapshot"
                         )
                     if hold_age_sec is None:
@@ -7660,7 +8136,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             # needs a new monitoring baseline on the first hold
                             # feedback sample.
                             operator_interrupt=(
-                                operator_interrupt or duration_complete
+                                operator_interrupt or planned_completion
                             ),
                             fault_entry=fault_entry,
                             fault_entry_max_velocity_rad_s=args.velocity_abort_rad_s,
@@ -7813,11 +8289,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         active_joint_names=active_joint_names,
     )
     response_passed = bool(slow_step_response["passed"])
+    operator_guidance_passed = (
+        (pose_axis_guide is None or pose_axis_guide.completed)
+        and (
+            interactive_pose_axis_guide is None
+            or interactive_pose_axis_guide.completed
+        )
+    )
     acceptance_passed = (
         control_passed
         and response_passed
         and calibration_passed
         and startup_replay_passed
+        and operator_guidance_passed
     )
     max_abs_requested = max(
         (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
@@ -7833,6 +8317,85 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         pre_control_observations=startup_diagnostic_observations,
         samples=samples,
     )
+    if interactive_pose_axis_guide is not None:
+        operator_guidance_payload: dict[str, object] = {
+            "enabled": True,
+            "schema": "b601.interactive-pose-axis-operator-guide.v1",
+            "protocol": "interactive",
+            "status": (
+                "PASS" if interactive_pose_axis_guide.completed else "INCOMPLETE"
+            ),
+            "motion_source": "operator_only_no_automatic_reference",
+            "frame": "base_link_world_aligned_at_operator_captured_gripper_end_anchor",
+            "axis_convention": (
+                "+X forward, +Y left, +Z up; right-hand-rule rotations"
+            ),
+            "interaction": (
+                "POSITIONING -> A stationary anchor -> per-axis "
+                "N ACTION -> D REST -> R stationary advance -> COMPLETE"
+            ),
+            "stationarity_limit_rad_s": args.fault_hold_max_velocity_rad_s,
+            "started_elapsed_sec": interactive_pose_axis_guide.started_elapsed_sec,
+            "completed_elapsed_sec": (
+                interactive_pose_axis_guide.completed_elapsed_sec
+            ),
+            "total_duration_sec": None,
+            "anchor_qpos_rad": interactive_pose_axis_guide.anchor_qpos_rad,
+            "anchor_pose": interactive_pose_axis_guide.anchor_pose,
+            "anchor_elapsed_sec": interactive_pose_axis_guide.anchor_elapsed_sec,
+            "anchor_sample_index": interactive_pose_axis_guide.anchor_sample_index,
+            "final_state": interactive_pose_axis_guide.state,
+            "phases": tuple(
+                action.as_dict() for action in interactive_pose_axis_guide.actions
+            ),
+            "events": tuple(interactive_pose_axis_guide.events),
+            "acceptance_semantics": (
+                "completion proves the operator-gated acquisition sequence only; "
+                "it does not establish force calibration or hardware acceptance"
+            ),
+        }
+    elif pose_axis_guide is not None:
+        operator_guidance_payload = {
+            "enabled": True,
+            "schema": "b601.pose-axis-operator-guide.v1",
+            "protocol": "timed",
+            "status": "PASS" if pose_axis_guide.completed else "INCOMPLETE",
+            "motion_source": "operator_only_no_automatic_reference",
+            "frame": "base_link_world_aligned_at_gripper_end_anchor",
+            "axis_convention": (
+                "+X forward, +Y left, +Z up; right-hand-rule rotations"
+            ),
+            "started_elapsed_sec": pose_axis_guide.started_elapsed_sec,
+            "completed_elapsed_sec": pose_axis_guide.completed_elapsed_sec,
+            "total_duration_sec": pose_axis_guide.total_duration_sec,
+            "phases": tuple(phase.as_dict() for phase in pose_axis_guide.phases),
+            "events": tuple(pose_axis_guide.events),
+            "acceptance_semantics": (
+                "guide completion labels the acquisition sequence only; it does "
+                "not establish force calibration or hardware acceptance"
+            ),
+        }
+    else:
+        operator_guidance_payload = {
+            "enabled": False,
+            "schema": None,
+            "protocol": None,
+            "status": "NOT_APPLICABLE",
+            "motion_source": "operator_only_no_automatic_reference",
+            "frame": "base_link_world_aligned_at_gripper_end_anchor",
+            "axis_convention": (
+                "+X forward, +Y left, +Z up; right-hand-rule rotations"
+            ),
+            "started_elapsed_sec": None,
+            "completed_elapsed_sec": None,
+            "total_duration_sec": None,
+            "phases": (),
+            "events": (),
+            "acceptance_semantics": (
+                "guide completion labels the acquisition sequence only; it does "
+                "not establish force calibration or hardware acceptance"
+            ),
+        }
     return {
         "status": "OK" if acceptance_passed else "FAIL",
         "mode": args.mode,
@@ -7981,53 +8544,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             ),
             **startup_replay_acceptance,
         },
-        "operator_guidance": {
-            "enabled": pose_axis_guide is not None,
-            "schema": (
-                "b601.pose-axis-operator-guide.v1"
-                if pose_axis_guide is not None
-                else None
-            ),
-            "status": (
-                "NOT_APPLICABLE"
-                if pose_axis_guide is None
-                else ("PASS" if pose_axis_guide.completed else "INCOMPLETE")
-            ),
-            "motion_source": "operator_only_no_automatic_reference",
-            "frame": "base_link_world_aligned_at_gripper_end_anchor",
-            "axis_convention": (
-                "+X forward, +Y left, +Z up; right-hand-rule rotations"
-            ),
-            "started_elapsed_sec": (
-                pose_axis_guide.started_elapsed_sec
-                if pose_axis_guide is not None
-                else None
-            ),
-            "completed_elapsed_sec": (
-                pose_axis_guide.completed_elapsed_sec
-                if pose_axis_guide is not None
-                else None
-            ),
-            "total_duration_sec": (
-                pose_axis_guide.total_duration_sec
-                if pose_axis_guide is not None
-                else None
-            ),
-            "phases": (
-                tuple(phase.as_dict() for phase in pose_axis_guide.phases)
-                if pose_axis_guide is not None
-                else ()
-            ),
-            "events": (
-                tuple(pose_axis_guide.events)
-                if pose_axis_guide is not None
-                else ()
-            ),
-            "acceptance_semantics": (
-                "guide completion labels the acquisition sequence only; it does "
-                "not establish force calibration or hardware acceptance"
-            ),
-        },
+        "operator_guidance": operator_guidance_payload,
         "motors_enabled_by_probe": enabled,
         "motion_commands_sent": commands_sent > 0,
         "commands_sent": commands_sent,
@@ -8286,8 +8803,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "pose_impedance": {
             "enabled": args.mode == "pose-hold",
+            "armed": pose_spring is not None,
             "translation_only": False,
-            "anchor_source": "fresh_post_enable_fk",
+            "anchor_source": (
+                "operator_A_captured_fresh_fk"
+                if interactive_pose_axis_guide is not None
+                else "fresh_post_enable_fk"
+            ),
             "anchor_pose": pose_anchor,
             "translational_stiffness_n_per_m": (
                 args.cartesian_stiffness_n_per_m,
@@ -8727,6 +9249,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "print and record an operator-only +/-XYZ and +/-RxRyRz acquisition "
             "sequence in pose-hold; never generates a motion reference"
+        ),
+    )
+    parser.add_argument(
+        "--interactive-pose-axis-protocol",
+        action="store_true",
+        help=(
+            "wait for operator A anchor capture, then gate each manual signed-axis "
+            "record with N/D/R; never generates a motion reference"
         ),
     )
     parser.add_argument(
