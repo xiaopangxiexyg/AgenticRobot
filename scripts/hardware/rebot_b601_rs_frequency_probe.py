@@ -933,6 +933,102 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
     return result
 
 
+def audit_paired_capture(summary: dict, records: list[dict]) -> dict[str, object]:
+    """Audit host-observed type-17 pairing only; never construct a transport."""
+    issues: list[str] = []
+    matched = 0
+    streams: Counter[int] = Counter()
+    stream_hosts: Counter[str] = Counter()
+    sample_counts: Counter[int] = Counter()
+
+    def require(condition: bool, reason: str) -> None:
+        if not condition:
+            raise ValueError(reason)
+
+    def integer(value: object) -> bool:
+        return type(value) is int and value >= 0
+
+    try:
+        require(summary["mode"] == "read-paired" and summary["status"] == "OK", "capture is not complete OK read-paired evidence")
+        require(summary["motion_commands_sent"] is False and summary["motors_enabled_by_probe"] is False, "capture does not declare no motion/enable")
+        require(len(records) >= 2, "missing raw header/footer")
+        require(records[0]["kind"] == "header" and records[0]["format"] == "b601_socketcan_rx_v1", "unsupported raw header")
+        require(records[-1]["kind"] == "end" and records[-1]["completed"] is True, "missing complete raw footer")
+        frames = records[1:-1]
+        require(integer(records[-1]["received_frame_count"]) and records[-1]["received_frame_count"] == len(frames), "raw footer count mismatch")
+        passive = summary["passive_capture"]
+        require(passive["frame_count"] == len(frames) and passive["channel"] == records[0]["channel"], "summary/raw capture mismatch")
+        parameters = []
+        last_time = -1
+        for index, row in enumerate(frames):
+            require(row["kind"] == "frame", "unexpected raw record kind")
+            timestamp = row["receive_monotonic_ns"]
+            end = row["clock_pair_end_monotonic_ns"]
+            require(integer(timestamp) and timestamp > last_time, "non-increasing raw receive clock")
+            require(integer(end) and end >= timestamp, "invalid host clock bracket")
+            last_time = timestamp
+            raw = bytes.fromhex(row["socket_frame_hex"])
+            require(len(raw) == 16, "non-classic SocketCAN frame")
+            raw_id = struct.unpack_from("=I", raw)[0]
+            require(not raw_id & 0x60000000, "RTR/error frame present")
+            frame = decode_can_frame(raw)
+            require(frame.extended and frame.data_length == 8, "non-extended or short payload")
+            identity = decode_robstride_extended_id(frame)
+            if identity.communication_type == 17:
+                parameters.append((index, timestamp, identity.extra_data, identity.node_id, raw[8:16]))
+            elif identity.communication_type == 24:
+                # Reporting host IDs can differ from the parameter-read host.
+                # Inventory them; never use these frames to satisfy a read.
+                require(1 <= (identity.extra_data & 0xFF) <= 7, "unexpected stream motor")
+                streams[identity.extra_data & 0xFF] += 1
+                stream_hosts[f"0x{identity.node_id:02x}"] += 1
+            else:
+                raise ValueError(f"unexpected communication type {identity.communication_type}")
+        samples = summary["parameter_samples"]
+        require(isinstance(samples, list) and bool(samples), "empty parameter samples")
+        used: set[int] = set()
+        previous_end = -1
+        for seq, sample in enumerate(samples):
+            motor = sample["motor_id"]
+            start, end = sample["request_start_monotonic_ns"], sample["request_end_monotonic_ns"]
+            value = sample["mechpos_rad"]
+            require(integer(sample["seq"]) and sample["seq"] == seq, "invalid sample sequence")
+            require(integer(motor) and 1 <= motor <= 6, "sample is not J1-J6")
+            require(sample["completed"] is True, "incomplete parameter read")
+            require(integer(start) and integer(end) and previous_end < start <= end, "invalid/overlapping request window")
+            require(type(value) in (int, float) and math.isfinite(value), "non-finite/non-numeric mechPos")
+            previous_end = end
+            sample_counts[motor] += 1
+            window = [r for r in parameters if start <= r[1] <= end]
+            tx = [r for r in window if r[2:4] == (0xFD, motor) and r[4] == bytes.fromhex("1970000000000000")]
+            rx = [r for r in window if r[2:4] == (motor, 0xFD) and r[4][:4] == bytes.fromhex("19700000")]
+            if len(tx) != 1 or len(rx) != 1:
+                issues.append(f"seq={seq}: expected one request/response, observed {len(tx)}/{len(rx)}")
+                continue
+            if tx[0][1] >= rx[0][1] or struct.unpack("<f", rx[0][4][4:])[0] != value:
+                issues.append(f"seq={seq}: response order/value mismatch")
+                continue
+            used.update((tx[0][0], rx[0][0]))
+            matched += 1
+        if len(used) != len(parameters):
+            issues.append("unmatched or extraneous type-17 frames")
+        if set(sample_counts) != set(range(1, 7)) or not set(range(1, 7)) <= set(streams):
+            issues.append("missing six-axis sample/stream coverage")
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        issues.append(f"invalid evidence: {exc}")
+    return {
+        "status": "FAIL" if issues else "OK", "mode": "audit-paired",
+        "host_pairing_passed": not issues, "matched_read_count": matched,
+        "samples_by_motor": dict(sample_counts), "stream_frames_by_motor": dict(streams),
+        "stream_frames_by_host": dict(stream_hosts),
+        "mixed_stream_host_ids": len(stream_hosts) > 1,
+        "issues": issues, "freshness_verified": False,
+        "static_decode_validation_passed": False, "quantitative_replay_ready": False,
+        "scope": "host_observed_request_response_consistency_only",
+        "motion_commands_sent": False,
+    }
+
+
 def _paired_capture(channel: str, duration_sec: float, raw_output: Path) -> dict[str, object]:
     """Bracket vendor reads while one joined receiver records raw observations."""
     if not channel.strip() or not math.isfinite(duration_sec) or duration_sec < 3.0:
@@ -1031,6 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "read-only",
             "read-paired",
+            "audit-paired",
             "offline",
             "gravity-offline",
             "position-tx-disabled",
@@ -1040,6 +1137,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="read-only",
     )
     parser.add_argument("--channel", default="can0")
+    parser.add_argument("--input-summary", type=Path, help="Existing paired summary for offline audit")
+    parser.add_argument("--input-raw", type=Path, help="Existing raw JSONL for offline audit")
     parser.add_argument("--duration-sec", "--duration", type=float, default=3.0)
     parser.add_argument("--target-hz", type=float, default=500.0)
     parser.add_argument(
@@ -1091,6 +1190,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if not math.isfinite(args.duration_sec) or args.duration_sec <= 0.0:
             raise ValueError("duration_sec must be positive")
+        if args.mode == "audit-paired":
+            if args.input_summary is None or args.input_raw is None:
+                raise ValueError("audit-paired requires --input-summary and --input-raw")
+            if args.enable or args.allow_motion or args.auto_disable:
+                raise ValueError("audit-paired rejects motion/disable flags")
+            if args.output is not None and args.output.expanduser().exists():
+                raise ValueError("audit output already exists")
+        elif args.input_summary is not None or args.input_raw is not None:
+            raise ValueError("audit inputs require audit-paired mode")
         if args.mode == "read-paired":
             if args.confirmation != "B601_RS_PAIRED_STATIC_READ_ONLY":
                 raise ValueError("read-paired requires --confirmation B601_RS_PAIRED_STATIC_READ_ONLY")
@@ -1108,7 +1216,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.raw_output = args.raw_output.expanduser().resolve()
             if args.output is not None and args.output.expanduser().resolve() == args.raw_output:
                 raise ValueError("--output and --raw-output must be distinct paths")
-        if args.mode == "read-paired":
+        if args.mode == "audit-paired":
+            summary_bytes = args.input_summary.expanduser().read_bytes()
+            raw_bytes = args.input_raw.expanduser().read_bytes()
+            payload = audit_paired_capture(
+                json.loads(summary_bytes), [json.loads(line) for line in raw_bytes.splitlines()],
+            )
+            payload["input_sha256"] = {
+                "summary": hashlib.sha256(summary_bytes).hexdigest(),
+                "raw": hashlib.sha256(raw_bytes).hexdigest(),
+            }
+        elif args.mode == "read-paired":
             payload = _paired_capture(args.channel, args.duration_sec, args.raw_output)
         elif args.mode == "read-only":
             if args.raw_output is None:
@@ -1136,6 +1254,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     exit_code = 0
     if args.mode == "read-paired":
         exit_code = {"OK": 0, "ERROR": 2, "INTERRUPTED": 130}[payload["status"]]
+    if args.mode == "audit-paired" and payload["status"] != "OK":
+        exit_code = 1
     status = "OK"
     if payload.get("acceptance_status") == "FAIL":
         status = "FAIL"
@@ -1145,7 +1265,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(encoded)
     if args.output is not None:
         with args.output.expanduser().resolve().open(
-            "x" if args.mode == "read-paired" else "w", encoding="utf-8",
+            "x" if args.mode in ("read-paired", "audit-paired") else "w", encoding="utf-8",
         ) as output:
             output.write(encoded + "\n")
     return exit_code

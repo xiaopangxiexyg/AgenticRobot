@@ -539,3 +539,40 @@ Motor.close 和 Controller.close；对应 free/Drop 释放资源并停止 SDK po
 假 SDK 不提供 enable、disable 或 shutdown，覆盖六轴读取、时间窗、异常/中断留存、
 非有限拒绝、接收启动失败、覆盖拒绝和 CLI 授权。Ruff 无新增问题（沿用前三项基线），
 diff 检查和资源 audit 通过。真实配对采集尚未执行，未合并、push 或安装。
+
+## M2 配对证据离线回归
+
+后继 `codex/b601-paired-audit` 基于 `9e57409b`。现有 frequency probe 新增纯函数
+`audit_paired_capture(summary, records)` 和 `audit-paired --input-summary ... --input-raw ...`。
+不新建 CLI，不打开 CAN、不构造 MotorBridge、不修改采集及控制路径。
+输出存在时拒绝覆盖；输入 SHA-256 绑定被审查的具体文件，不修改原始证据。
+
+审查范围：完整 header/footer、计数和 channel 一致、经典扩展数据帧、递增接收时钟、
+请求窗口不重叠、完整有限六轴样本、唯一 type-17 请求与响应、0x7019 参数及原始 float32
+与 SDK 数值精确相等。缺失、重复、顺序倒置、错误主机/电机/参数、额外未归属 type-17、
+RTR/error/控制帧或不完整文件均返回 FAIL。每次读取的原始帧只允许匹配一次。
+
+type-24 只统计电机及主机分布，不参与 type-17 匹配，也不解码关节角度。本轮真实文件
+暴露了先前“所有上报都发往 0xFD”的错误假设：实际 4166 帧发往 0xFD，34 帧发往 0xFE。
+参数请求/响应仍全部使用 0xFD，不能将旁路上报地址差异直接解释为参数配对失败。
+审查结果显式保留 mixed_stream_host_ids，不猜测其固件原因、不修改主机配置。
+
+输入 `/tmp/b601-rs-commissioning/paired-static-oQLlXd/`：六轴各 43 次、共 258 次全部匹配，
+原始 4716 帧中 type-17 为 516、type-24 为 4200。结果为 host_pairing_passed=true，
+但 freshness_verified/static_decode_validation_passed/quantitative_replay_ready 均为 false。
+同目录 audit_v1.json 保存了错误地址假设导致的初版 FAIL；audit_v2.json 是修正后的结果，
+两份均保留用于追溯，未改写 raw.jsonl 或 summary.json。
+
+复现（纯离线，可在当前 checkout 执行，不使用任何硬件参数）：
+
+```bash
+python scripts/hardware/rebot_b601_rs_frequency_probe.py \
+  --mode audit-paired \
+  --input-summary /tmp/b601-rs-commissioning/paired-static-oQLlXd/summary.json \
+  --input-raw /tmp/b601-rs-commissioning/paired-static-oQLlXd/raw.jsonl
+```
+
+验证：hardware backend / active report / low gain probe 三文件 **215 passed**（1.19 s），
+含 21 个新增离线用例；CLI 测试明确禁止 socket/backend 构造，并检查已有输出不被覆盖。
+Ruff 无新增问题（既有 EXE001/UP041/RUF046 不动），diff 检查、资源 audit 通过。
+只读检查与真实文件离线审查不等于硬件力控验收。候选待合并，未 push、安装或触发硬件。
