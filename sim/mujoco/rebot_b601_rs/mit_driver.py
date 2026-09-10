@@ -23,7 +23,11 @@ from robot_motion.rebot_b601_rs.model import (
 from sim.contracts import TimingSpec
 from sim.mujoco.scene import MujocoScene
 
-from .real2sim import B601Real2SimControllerProfile, B601SimStartupProfile
+from .real2sim import (
+    B601Real2SimControllerProfile,
+    B601Real2SimPlantProfile,
+    B601SimStartupProfile,
+)
 from .scene import (
     _B601_RS_GRIPPER_LOCK_SOLREF,
     B601_RS_COMMAND_HZ,
@@ -189,6 +193,7 @@ class B601MujocoEffortDriver:
         gravity_parity_tolerance_nm: float = 1e-9,
         real2sim_profile: B601Real2SimControllerProfile | None = None,
         startup_profile: B601SimStartupProfile | None = None,
+        plant_profile: B601Real2SimPlantProfile | None = None,
     ) -> None:
         if not isinstance(scene, MujocoScene):
             raise TypeError("scene must be a MujocoScene")
@@ -206,6 +211,9 @@ class B601MujocoEffortDriver:
                     "real2sim_profile requires explicit gravity compensation"
                 )
         self.real2sim_profile = real2sim_profile
+        if plant_profile is not None and not isinstance(plant_profile, B601Real2SimPlantProfile):
+            raise TypeError("plant_profile must be a B601Real2SimPlantProfile")
+        self.plant_profile = plant_profile
         if startup_profile is not None:
             if not isinstance(startup_profile, B601SimStartupProfile):
                 raise TypeError("startup_profile must be a B601SimStartupProfile")
@@ -215,6 +223,8 @@ class B601MujocoEffortDriver:
         if real2sim_profile is not None:
             self.execution_mode = "rebot_b601_rs_mujoco_host_zoh_local_damping"
             self.robot_dynamics = "unchanged_urdf_unidentified_motor_plant"
+        if plant_profile is not None:
+            self.robot_dynamics = "urdf_with_explicit_provisional_joint_plant_terms"
         self._host_breakdown: B601MitTorqueBreakdown | None = None
         resolved_timing = timing or default_b601_mit_timing()
         if not isinstance(resolved_timing, TimingSpec):
@@ -353,9 +363,13 @@ class B601MujocoEffortDriver:
 
     @property
     def execution_metadata(self) -> dict[str, object]:
+        controller_metadata = self.real2sim_profile.metadata() if self.real2sim_profile else None
+        if controller_metadata is not None and self.plant_profile is not None:
+            controller_metadata["plant"] = "urdf_plus_declared_provisional_joint_terms"
         return {
             "execution_mode": self.execution_mode,
             "robot_dynamics": self.robot_dynamics,
+            "plant_profile": self.plant_profile.metadata() if self.plant_profile else None,
             "command_hz": float(self.timing.command_hz),
             "physics_hz": float(self.timing.physics_hz),
             "command_hold": "zero_order_hold_between_reference_ticks",
@@ -391,6 +405,8 @@ class B601MujocoEffortDriver:
             ),
             "gravity_parity_tolerance_nm": self.gravity_parity_tolerance_nm,
             "damping_owner": (
+                "explicit_mujoco_passive_plus_separate_host_and_driver_feedback"
+                if self.plant_profile is not None else
                 "software_mit_profile_only"
                 if self.real2sim_profile is None
                 else "host_software_pd_plus_physics_rate_driver_kd_no_passive_damping"
@@ -448,11 +464,7 @@ class B601MujocoEffortDriver:
                 "measured_qpos_qvel_qacc_are_post_step"
             ),
             "hardware_safety_claim": False,
-            "real2sim_controller": (
-                None
-                if self.real2sim_profile is None
-                else self.real2sim_profile.metadata()
-            ),
+            "real2sim_controller": controller_metadata,
             "host_torque_hz": (
                 float(self.timing.physics_hz)
                 if self.real2sim_profile is None
@@ -1011,14 +1023,19 @@ class B601MujocoEffortDriver:
         )
         if not np.allclose(joint_stiffness, 0.0, atol=1e-15, rtol=0.0):
             raise ValueError("B601 software MIT requires zero passive joint stiffness")
-        for attribute in ("dof_damping", "dof_frictionloss", "dof_armature"):
+        for attribute, field in (
+            ("dof_damping", "damping_nm_s_per_rad"),
+            ("dof_frictionloss", "frictionloss_nm"),
+            ("dof_armature", "armature_kg_m2"),
+        ):
             values = np.asarray(
                 getattr(self.scene.model, attribute)[self._qvel_addresses],
                 dtype=float,
             )
-            if not np.allclose(values, 0.0, atol=1e-15, rtol=0.0):
+            expected = getattr(self.plant_profile, field) if self.plant_profile else 0.0
+            if not np.allclose(values, expected, atol=1e-15, rtol=0.0):
                 raise ValueError(
-                    f"B601 software MIT damping requires zero passive {attribute}"
+                    f"B601 plant requires {'declared' if self.plant_profile else 'zero passive'} {attribute}"
                 )
         equality_type = np.asarray(self.scene.model.eq_type, dtype=np.int32)
         equality_joint = np.asarray(self.scene.model.eq_obj1id, dtype=np.int32)

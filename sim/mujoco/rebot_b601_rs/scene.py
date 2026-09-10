@@ -26,6 +26,8 @@ from sim.mujoco.urdf import (
     parse_urdf,
 )
 
+from .real2sim import B601Real2SimPlantProfile
+
 B601_RS_SIM_ARM_KEY = "b601_rs"
 B601_RS_SIM_EFFECTOR_NAME = "b601_handle"
 B601_RS_PHYSICS_HZ = 1000.0
@@ -274,6 +276,7 @@ def _mjcf_xml_from_model(
     timestep: float,
     gravity: np.ndarray,
     actuation_mode: B601ActuationMode,
+    plant_profile: B601Real2SimPlantProfile | None = None,
 ) -> str:
     xml_text = convert_urdf_to_mjcf_xml(
         model,
@@ -291,6 +294,21 @@ def _mjcf_xml_from_model(
     else:
         _add_ideal_effort_actuators(root, model)
         _add_fixed_open_gripper_constraints(root)
+    if plant_profile is not None:
+        if not isinstance(plant_profile, B601Real2SimPlantProfile):
+            raise TypeError("plant_profile must be a B601Real2SimPlantProfile")
+        if actuation_mode != "effort":
+            raise ValueError("plant_profile requires effort actuation")
+        for index, name in enumerate(B601_RS_ARM_JOINT_NAMES):
+            joint = root.find(f".//worldbody//joint[@name='{name}']")
+            if joint is None:
+                raise B601ModelError(f"missing plant joint {name}")
+            for attribute, values in (
+                ("damping", plant_profile.damping_nm_s_per_rad),
+                ("frictionloss", plant_profile.frictionloss_nm),
+                ("armature", plant_profile.armature_kg_m2),
+            ):
+                joint.set(attribute, repr(values[index]))
     ET.indent(root, space="  ")
     return ET.tostring(root, encoding="unicode")
 
@@ -301,6 +319,7 @@ def build_b601_mjcf_xml(
     timestep_sec: float = 1.0 / B601_RS_PHYSICS_HZ,
     gravity_mps2: Sequence[float] = (0.0, 0.0, 0.0),
     actuation_mode: B601ActuationMode = "position",
+    plant_profile: B601Real2SimPlantProfile | None = None,
 ) -> str:
     """Return in-memory MJCF without modifying or copying upstream assets."""
 
@@ -317,6 +336,7 @@ def build_b601_mjcf_xml(
         timestep=timestep,
         gravity=gravity,
         actuation_mode=mode,
+        plant_profile=plant_profile,
     )
 
 
@@ -338,6 +358,7 @@ def build_b601_mujoco_scene(
     gravity_mps2: Sequence[float] = (0.0, 0.0, 0.0),
     initial_arm_qpos: Sequence[float] = B601_RS_DEFAULT_ARM_QPOS,
     actuation_mode: B601ActuationMode = "position",
+    plant_profile: B601Real2SimPlantProfile | None = None,
 ) -> MujocoScene:
     """Compile the B601 plant and wrap it in the generic scene facade."""
 
@@ -362,6 +383,7 @@ def build_b601_mujoco_scene(
         timestep=timestep,
         gravity=gravity,
         actuation_mode=mode,
+        plant_profile=plant_profile,
     )
     model = mujoco.MjModel.from_xml_string(xml_text)
     data = mujoco.MjData(model)
