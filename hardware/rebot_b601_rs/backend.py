@@ -15,15 +15,19 @@ request before polling; this is needed by the commissioning loop because a
 RobStride bus does not necessarily populate the cache until a request frame is
 sent.  On the pinned firmware the resulting compact type-0x18 position stream
 is not decoded by MotorBridge 0.4.9, so an active caller also reads
-``mechPos`` (0x7019) through the vendor parameter API.  When the installed
-MotorBridge exposes it, the host-id-qualified parameter ABI is preferred so a
-response for another device cannot be accepted as this joint's value.  This
-position-only fallback is explicit in each observation; velocity/torque
-consumers must still require their corresponding fields.  MotorBridge 0.4.9
-does not expose the source timestamp or a receive sequence for a RobStride
-frame, so neither path claims verified per-frame freshness.  The distinction
-is part of the public state contract and must be closed before hardware haptic
-acceptance.
+``mechPos`` (0x7019) through the vendor parameter API.  A motion-authorized
+backend additionally requires MotorBridge to advertise strict RobStride
+parameter-reply correlation.  This rejects failed or mismatched type-17
+replies and quarantines replies that arrive without a matching pending request.
+The wire protocol has no transaction token, so this capability cannot prove
+freshness between otherwise identical consecutive requests by itself.
+Read-only diagnostics remain available without that capability, while every
+motion-start path fails closed.  The position-only fallback is explicit in
+each observation; velocity/torque consumers must still require their
+corresponding fields.  MotorBridge does not expose the source timestamp or a
+receive sequence for a RobStride frame, so neither path claims verified
+per-frame freshness.  The distinction is part of the public state contract
+and must be closed before hardware haptic acceptance.
 """
 
 from __future__ import annotations
@@ -52,6 +56,9 @@ B601_RS_TORQUE_LIMIT_PARAM_ID = 0x700B
 B601_RS_TORQUE_LIMIT_MAX_NM = 60.0
 B601_RS_TORQUE_LIMIT_VERIFY_ABS_TOL_NM = 1e-4
 B601_RS_MECH_POS_PARAM_ID = 0x7019
+_B601_RS_PARAMETER_REPLY_CORRELATION_CAPABILITY = (
+    "parameter_reply_correlation_v1"
+)
 # RobStride POS_VEL parameter IDs used by the pinned reBotArm
 # ``JointGroup._write_pv_params`` implementation.  Keep these explicit so a
 # future vendor/runtime update cannot silently turn mode preparation into a
@@ -139,6 +146,62 @@ def _mapping(value: object, *, name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be a mapping")
     return value
+
+
+def _motorbridge_runtime_evidence(source: object) -> dict[str, object]:
+    """Inspect MotorBridge ABI capabilities without trusting its version alone."""
+
+    provider = getattr(source, "abi_capabilities", None)
+    if not callable(provider):
+        provider = getattr(source, "motorbridge_abi_capabilities", None)
+    if not callable(provider):
+        return {
+            "verified": False,
+            "abi_version": None,
+            "robstride_features": (),
+            "error": "MotorBridge ABI capability metadata is unavailable",
+        }
+    try:
+        capabilities = provider()
+    except Exception as exc:  # noqa: BLE001 - vendor metadata is an admission boundary
+        return {
+            "verified": False,
+            "abi_version": None,
+            "robstride_features": (),
+            "error": f"MotorBridge ABI capability query failed: {exc}",
+        }
+    if not isinstance(capabilities, Mapping):
+        return {
+            "verified": False,
+            "abi_version": None,
+            "robstride_features": (),
+            "error": "MotorBridge ABI capabilities must be a mapping",
+        }
+
+    abi = capabilities.get("abi")
+    abi_version = abi.get("version") if isinstance(abi, Mapping) else None
+    features = capabilities.get("features")
+    robstride = features.get("robstride") if isinstance(features, Mapping) else None
+    if isinstance(robstride, Sequence) and not isinstance(robstride, (str, bytes)):
+        robstride_features = tuple(
+            str(feature) for feature in robstride if isinstance(feature, str)
+        )
+    else:
+        robstride_features = ()
+    verified = (
+        _B601_RS_PARAMETER_REPLY_CORRELATION_CAPABILITY in robstride_features
+    )
+    return {
+        "verified": verified,
+        "abi_version": None if abi_version is None else str(abi_version),
+        "robstride_features": robstride_features,
+        "error": None
+        if verified
+        else (
+            "MotorBridge does not advertise required RobStride capability "
+            f"{_B601_RS_PARAMETER_REPLY_CORRELATION_CAPABILITY!r}"
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -617,6 +680,7 @@ class B601RSBackend:
         self._driver_torque_limit_original_nm: dict[str, float] = {}
         self._driver_torque_limit_applied_nm: dict[str, float | None] = {}
         self._active_report_joint_names: set[str] = set()
+        self._motorbridge_runtime_evidence: dict[str, object] | None = None
 
     @property
     def connected(self) -> bool:
@@ -668,14 +732,45 @@ class B601RSBackend:
             if name in self._active_report_joint_names
         )
 
+    @property
+    def motorbridge_runtime_evidence(self) -> Mapping[str, object] | None:
+        """Return immutable-value evidence used by the motion admission gate."""
+
+        if self._motorbridge_runtime_evidence is None:
+            return None
+        return dict(self._motorbridge_runtime_evidence)
+
+    @property
+    def parameter_reply_correlation_verified(self) -> bool:
+        """Whether the connected runtime proves strict type-17 correlation."""
+
+        return bool(
+            self._motorbridge_runtime_evidence
+            and self._motorbridge_runtime_evidence.get("verified") is True
+        )
+
     def connect(self) -> None:
         """Open CAN and register the six motors, without sending commands."""
 
         if self.connected:
             return
-        factory = self._controller_factory or self._default_controller_factory
         try:
-            controller = factory(self.config.channel)
+            if self._controller_factory is None:
+                module = self._load_motorbridge_module()
+                runtime_evidence = _motorbridge_runtime_evidence(module)
+                if self.config.allow_motion:
+                    self._require_verified_parameter_reply_correlation(
+                        runtime_evidence
+                    )
+                controller_type = module.Controller
+                controller = controller_type(self.config.channel)
+            else:
+                controller = self._controller_factory(self.config.channel)
+                runtime_evidence = _motorbridge_runtime_evidence(controller)
+                if self.config.allow_motion:
+                    self._require_verified_parameter_reply_correlation(
+                        runtime_evidence
+                    )
             add_motor = getattr(controller, "add_robstride_motor")
             motors = {
                 joint.name: add_motor(joint.motor_id, joint.feedback_id, joint.model)
@@ -695,17 +790,36 @@ class B601RSBackend:
             raise
         self._controller = controller
         self._motors = motors
+        self._motorbridge_runtime_evidence = runtime_evidence
 
     @staticmethod
-    def _default_controller_factory(channel: str) -> object:
+    def _load_motorbridge_module() -> object:
         try:
             module = import_module("motorbridge")
-            controller_type = getattr(module, "Controller")
+            controller_type = module.Controller
         except (ModuleNotFoundError, AttributeError) as exc:
             raise B601HardwareDependencyError(
                 "motorbridge.Controller is unavailable"
             ) from exc
-        return controller_type(channel)
+        if not callable(controller_type):
+            raise B601HardwareDependencyError(
+                "motorbridge.Controller is not callable"
+            )
+        return module
+
+    @staticmethod
+    def _require_verified_parameter_reply_correlation(
+        evidence: Mapping[str, object],
+    ) -> None:
+        if evidence.get("verified") is True:
+            return
+        version = evidence.get("abi_version")
+        detail = evidence.get("error") or "capability verification failed"
+        raise B601HardwareDependencyError(
+            "motion-capable B601 backend requires a MotorBridge runtime with "
+            "strict RobStride type-17 parameter-reply correlation; "
+            f"abi_version={version!r}: {detail}"
+        )
 
     def close(self) -> None:
         """Release the vendor handle without implicit disable or command I/O."""
@@ -723,6 +837,7 @@ class B601RSBackend:
         controller = self._controller
         self._controller = None
         self._motors = {}
+        self._motorbridge_runtime_evidence = None
         self._enabled_joint_names.clear()
         self._disabled_joint_names.clear()
         if controller is None:
@@ -740,6 +855,11 @@ class B601RSBackend:
         if not self.config.allow_motion:
             raise B601MotionAuthorizationError(
                 "motion command rejected: construct the backend with allow_motion=True"
+            )
+        if not self.parameter_reply_correlation_verified:
+            raise B601HardwareDependencyError(
+                "motion command rejected: strict RobStride type-17 parameter-reply "
+                "correlation was not verified at connect"
             )
 
     def _require_active_reporting_authorized(self) -> None:
