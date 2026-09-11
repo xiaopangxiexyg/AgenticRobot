@@ -20,6 +20,7 @@ from hardware.rebot_b601_rs import (
     B601_RS_POS_VEL_VEL_KP_PARAM_ID,
     B601_RS_TORQUE_LIMIT_PARAM_ID,
     B601ActiveReportAuthorizationError,
+    B601HardwareDependencyError,
     B601HardwareError,
     B601JointConfig,
     B601ModeReceipt,
@@ -391,6 +392,14 @@ class _FakeController:
     def __init__(self) -> None:
         self.motors: dict[int, _FakeMotor] = {}
         self.calls: list[str] = []
+        self.robstride_capabilities = ["parameter_reply_correlation_v1"]
+
+    def motorbridge_abi_capabilities(self) -> dict[str, object]:
+        return {
+            "schema": 1,
+            "abi": {"name": "motor_abi", "version": "test"},
+            "features": {"robstride": list(self.robstride_capabilities)},
+        }
 
     def add_robstride_motor(self, motor_id: int, feedback_id: int, model: str) -> _FakeMotor:
         del feedback_id, model
@@ -715,6 +724,82 @@ def test_prepare_mit_mode_mirrors_rebot_transition_and_never_enables() -> None:
         for motor in controller.motors.values()
         for call in motor.calls
     )
+
+
+def test_motion_connect_rejects_runtime_without_strict_parameter_correlation() -> None:
+    controller = _FakeController()
+    controller.robstride_capabilities.clear()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+
+    with pytest.raises(
+        B601HardwareDependencyError,
+        match="strict RobStride type-17 parameter-reply correlation",
+    ):
+        backend.connect()
+
+    assert backend.connected is False
+    assert backend.motorbridge_runtime_evidence is None
+    assert controller.calls == ["close"]
+    assert controller.motors == {}
+
+
+def test_default_motion_connect_checks_capability_before_opening_transport(
+    monkeypatch,
+) -> None:
+    opened_channels: list[str] = []
+
+    class Controller:
+        def __init__(self, channel: str) -> None:
+            opened_channels.append(channel)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "motorbridge",
+        SimpleNamespace(
+            Controller=Controller,
+            abi_capabilities=lambda: {
+                "schema": 1,
+                "abi": {"name": "motor_abi", "version": "0.5.3"},
+                "features": {"robstride": ["param_f32_host_id"]},
+            },
+        ),
+    )
+    backend = B601RSBackend(_config(allow_motion=True))
+
+    with pytest.raises(B601HardwareDependencyError, match="abi_version='0.5.3'"):
+        backend.connect()
+
+    assert opened_channels == []
+    assert backend.connected is False
+
+
+def test_read_only_connect_remains_available_without_strict_parameter_correlation() -> None:
+    controller = _FakeController()
+    controller.robstride_capabilities.clear()
+    backend = B601RSBackend(
+        _config(),
+        controller_factory=lambda _channel: controller,
+    )
+
+    backend.connect()
+    _populate_states(controller)
+    state = backend.poll_feedback()
+
+    assert state.valid is True
+    assert backend.parameter_reply_correlation_verified is False
+    assert backend.motorbridge_runtime_evidence == {
+        "verified": False,
+        "abi_version": "test",
+        "robstride_features": (),
+        "error": (
+            "MotorBridge does not advertise required RobStride capability "
+            "'parameter_reply_correlation_v1'"
+        ),
+    }
+    assert backend.safe_stop(joint_names=("joint6",)).completed is True
 
 
 def test_connect_and_poll_do_not_request_feedback_or_enable() -> None:
