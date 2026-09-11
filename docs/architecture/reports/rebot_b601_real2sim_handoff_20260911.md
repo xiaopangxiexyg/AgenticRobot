@@ -472,3 +472,331 @@ MotorBridge 集成结果的 94 项 workspace tests 和严格 cargo clippy --work
 - control-composition 合同：control_composition/README.md
 
 最终提醒：当前最重要的产出不是扩大真机运动范围，而是把 B601 的模型、反馈 admission、控制生命周期、时序证据和 provisional Real2Sim plant 变成可复现的底层能力；在此基础上再逐步接入 RM65 sim、policy 和 human residual。任何真机动作都必须保持当前位置起步、低增益、前台、可立即停止，并保留重力补偿 protective hold 回退。
+
+---
+
+## 17. 2026-09-11 跨项目状态刷新
+
+本节是对上面原有交接内容的补充和覆盖性说明。若本节与旧候选描述冲突，以本节的
+当前 checkout、当前 Harness 状态和当前远端复核为准；旧章节中的现场历史证据仍保留，
+但不应被重新解释为当前代码或当前部署状态。
+
+### 17.1 当前任务和 Git 身份
+
+本次任务使用的完整任务信息如下：
+
+| 字段 | 当前值 |
+| --- | --- |
+| Task ID | AR-20260911-b601-handoff-doc-r0 |
+| Task root | /home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260911-b601-handoff-doc-r0 |
+| AgenticRobot worktree | /home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260911-b601-handoff-doc-r0/AgenticRobot |
+| branch | task/AR-20260911-b601-handoff-doc-r0 |
+| base/current HEAD | 82e1facb250412219736c7c54ada017cb7c96e88 |
+| HEAD tree | 6641d723642dbd8c985981ecda80c48924df261a |
+| declared write scope | docs/architecture/reports/rebot_b601_real2sim_handoff_20260911.md |
+| task tree before this update | clean |
+| parallel active Task | AR-20260910-openpi-by-date-training-profiles-r0，仅修改 OpenPI training profile，路径不重叠 |
+
+当前 HEAD 的主要相关提交链是：
+
+~~~text
+82e1facb  Merge commit 'fc0d0a45...' into the current development snapshot
+80984895  fix: canonicalize runtime paths under symlink tmpdirs
+c8b48c16  Merge GraspGenX point-grasp planning and execution split
+454c3336  feat(agent-gateway): split grasp planning from execution
+16765c9b  fix(perception): default to isolated GraspGenX service
+fc0d0a45  fix: gate B601 motion on verified parameter replies
+c641df56  feat(b601): visualize signed pose axes in mujoco
+b895118a  feat(b601): add interactive pose capture protocol
+da0e0d5d  feat(b601): guide foreground pose-axis capture
+~~~
+
+canonical AgenticRobot development checkout 为
+/home/zc/HandMotion/Developing/AgenticRobot-development-mainline，当前本地
+development 相对 origin/development 领先 11 个提交；这不等于已经 push。
+RPent correction 的当前本地 checkout 为
+/home/zc/HandMotion/Developing/RPent-correction，HEAD 为
+307c0e7b2c1e6440fbf914c614ca099d6b1009ca，tree 为
+096cb218eb1c850b07593ac455052f2a26a94c94，相对
+origin/correction=bdb636b8cc577d234412d27053f8cc30d3617ad4 领先 3 个提交。
+
+Harness 检查显示当前 writer lease 仍属于本任务，但当前进程看到共享 Git metadata
+为只读，因而 inspect/writer status 可能是 ATTENTION。这是挂载/执行上下文限制，
+不是可以绕过 writer 或直接修改共享 worktree 的理由。提交前需要在允许 Git metadata
+写入的执行上下文重新运行 inspect、conflicts 和 writer status。
+
+### 17.2 B601 当前代码结论
+
+当前 B601 仍是一条底层 local wired path，不能变成第二个 policy 或 HITL runtime。应
+保持以下单向 ownership：
+
+~~~text
+B601 feedback/source
+    -> admission + frame/sequence/freshness metadata
+    -> robot_motion FK/Jacobian/gravity/torque composition
+    -> one target safety/limit/dispatch owner
+    -> MotorBridge/CAN or MuJoCo backend
+~~~
+
+当前 HEAD 中 hardware/rebot_b601_rs/backend.py 的 type-17 修复具体带来：
+
+- motion-authorized backend 在 connect() 时要求 MotorBridge 宣布
+  parameter_reply_correlation_v1；
+- 失败、错参数、错设备或没有 pending request 的 type-17 reply 不得被接受为目标参数；
+- 没有该能力的 runtime 仍可支持 read-only diagnostics，但不能进入 motion path；
+- 主动 feedback request 对 RobStride 优先读取 mechPos (0x7019)，优先采用
+  host-id-qualified API，并将非有限/越界值作为无效 snapshot；
+- MotorBridge 仍未提供 vendor source timestamp 或 receive sequence，因此
+  freshness_verified=false 不能因为 type-17 correlation 通过而变为 true；
+- CAN 按关节顺序发送仍不是总线原子事务，partial send 和 cleanup 不完整必须留在 receipt
+  和最终结论中。
+
+需要避免的错误等式是：
+
+~~~text
+type-17 reply correlation
+    != device-source freshness
+    != atomic six-joint command receipt
+    != hardware haptic acceptance
+~~~
+
+当前 B601 运行时补偿基线仍为：
+
+~~~text
+software Kp/Kd       = 0 / 0
+driver Kd J1..J6     = 0.20, 0.30, 0.20, 0.15, 0.10, 0.05
+global gravity scale = 1.0
+joint gravity scale  = 1.0, 0.95, 1.0, 1.0, 1.0, 1.0
+joint offset [rad]   = 0, 0, 0, 0, 0, 0
+joint bias [N.m]     = 0, -0.105, -0.1, -0.05, 0, 0
+Coulomb [N.m]        = 0, 0, 0, 0, 0, 0
+~~~
+
+这是操作者确认过的 runtime compensation/手感基线，不是独立 plant identification。
+不能把它反写为 URDF mass/COM/inertia/friction，也不能根据仿真单一 fixture 结果改变
+真机限幅。
+
+### 17.3 B601 证据的当前解释
+
+progress/report 中的各批结果必须带着原配置和证据等级阅读：
+
+| 结果/观察 | 允许的表述 | 不允许的表述 |
+| --- | --- | --- |
+| native actuator bias 修复后 500 Hz host 的仿真 6D fixture 可运行 | MuJoCo 中的积分/执行器表达得到修复 | RobStride/CAN 真机已达到 500 Hz |
+| 20 Hz 下出现 acceleration、velocity 或 startup displacement guard | host ZOH、slew、fixture 和未建模 plant/controller mismatch 仍需拆分 | 放宽 gate 或把 physics rate 改名为真实反馈频率 |
+| 125 Hz 多数固定扰动可完成但 pose-ry effect 失败，500 Hz 同一 pose-ry 也失败 | 低频不是唯一原因，Y 轴瞬态涉及 plant/profile/标定不匹配 | 四舍五入或改阈值后写成全 6D 通过 |
+| raw-model baseline 的 pose-ry 改善 | 支持“runtime gravity compensation 与理想 plant 不匹配参与了瞬态”的假设 | 删除 bias、改 URDF 或声称已辨识 |
+| sampled power 出现正累计 work | 保持期间可能注入能量，需继续分析 | 这是 passivity/stability proof |
+| paired audit 的 host pairing 通过 | 请求/响应在特定 raw record 中可静态匹配 | 反馈 freshness、动态 replay 或 hardware PASS |
+| B601 test collection 通过 | 软件 contract/fake/sim regression 通过 | 真机行为自动通过 |
+
+当前阶段应继续记为：M0/M1 有多个已集成切片但未整体结束；M2 有 passive capture、
+paired audit 和 provisional plant 入口但没有合格的动态辨识结果；M3--M8 和 H1--H8
+仍不能被压缩为一个“B601 已完成”。
+
+### 17.4 当前抓姿和规划/执行链
+
+GraspGenX 相关代码已经连接为以下路径：
+
+~~~text
+same retained RGB-D frame
+    -> SAM2 mask/click localization
+    -> aligned depth + intrinsics + frame conversion
+    -> GraspGenX candidate generation
+    -> DMTAC M geometry/depth/collision admission
+    -> candidate/render review
+    -> perception.plan_grasp_approach@1
+    -> plan identity/TTL/start-state checks
+    -> one-use execution authorization
+    -> motion.execute_grasp_approach_plan@1
+    -> lower RM65 safety/IK/FCL/dispatch owner
+~~~
+
+当前实现的关键事实：
+
+- GraspGenX 是 point-grasp backend 的默认候选生成器；VGN/GraspNet 是显式兼容选项。
+- perception.plan_grasp_approach@1 是只读规划结果，负责把候选转换为与当前
+  measured qpos、TCP envelope、IK、生产 URDF/FCL scene 和轨迹条件一致的计划。
+- motion.execute_grasp_approach_plan@1 是执行类 Skill，要求一次性 plan、lineage、
+  dynamic token、plan lifetime、fresh qpos 和 start drift 都再次通过。
+- 当前 terminal 不控制夹爪，不做闭合/抬升/抓取效果确认，也不提供正式 post-grasp
+  verification 或 replan mapping。
+- 可见点云碰撞近似、模型分数和 endpoint IK 结果都不是整条路径无碰撞证明。
+- --include-arm-reachability 只增加每个候选的有限时间 endpoint IK annotation，
+  不 filter、reorder、select，也不改变 motion authorization；默认仍关闭。
+
+这意味着应把“候选生成”“候选可达性提示”“整条路径规划”“动态执行”“物体是否真正
+被抓住”作为五个不同证据层，不要让其中一个层级替代另一个层级。
+
+### 17.5 GraspGenX 默认模式的矛盾
+
+当前源码需要按下面的事实理解：
+
+~~~text
+deployments/perception/graspgenx_client.py:
+    GRASPGENX_DEFAULT_MODE = "service"
+
+agent_gateway/profiles/real/gateway_cli.py:
+    --graspgenx-mode {service,in-process}
+    default=GRASPGENX_DEFAULT_MODE
+
+agent_gateway/profiles/real/perception_cli.py:
+    --graspgenx-mode {service,in-process}
+    default=GRASPGENX_DEFAULT_MODE
+
+RPent/scripts/run_agentic_robot_manual_grasp.py:
+    --graspgenx-mode default="service"
+    _gateway_command(..., graspgenx_mode="service")
+~~~
+
+历史提交 d1bc8585 曾将默认设为 in-process，但后续 16765c9b 又将默认恢复为
+isolated service。部分 gateway docstring 仍然写着“default is intentionally in-process”，
+因此不能只读注释。当前准确状态是：
+
+~~~text
+backend default        = graspgenx
+execution mode default = service
+in-process              = explicit option, implemented but not default
+no-service default      = not yet complete/verified
+~~~
+
+如果项目目标仍是“无需启动 GraspGenX 服务的 in-process 默认”，下一项实现不能只改一个
+常量；应同时完成：
+
+1. AgenticRobot 和 RPent 的 argparse 默认、helper 默认、help、docstring、result JSON、
+   tests 和文档统一。
+2. 精确 materialize GraspGenX source revision
+   b9429097728cb1c430dd78b92edf17ba318aad03，记录 parent gitlink 与 child tree。
+3. 准备 generator/discriminator 两组 config/checkpoint 的真实 SHA-256 manifest；拒绝
+   全零占位或缺失文件。
+4. 为 Gateway 主解释器提供已验证的官方包、CUDA、PyTorch 和其它依赖闭包。当前实现要求
+   CUDA device，PyTorch 版本范围为 >=2.1,<2.7；不能把 service bundle 的独立
+   .venv 路径直接当作 Gateway runtime。
+5. 运行不启动 server 的 direct GPU smoke，再运行 Gateway lifecycle/infer/close 和
+   same-frame RGB-D read-only smoke。
+6. 默认 in-process 路径不能偷偷连接 127.0.0.1:5556、启动服务、退回别的 backend
+   或在模型错误时伪装成功；service 只能作为明确选择的兼容模式。
+7. 将 source/checkpoint/profile/environment identity 写入结果，失败时 fail closed。
+
+在这些条件未满足前，最终运行命令应显式写出 --graspgenx-mode service 或显式写出
+--graspgenx-mode in-process，不能省略 mode 后让接手者猜测。
+
+### 17.6 远端同步的真实状态
+
+之前已获得明确授权，向 user@192.168.70.116 执行了 tracked-project、
+--no-delete 的同步。目标和结果为：
+
+| 仓库 | 目标目录 | 同步结果 |
+| --- | --- | --- |
+| AgenticRobot | /home/user/zc/AgenticRobot-graspgenx-plan-execute-20260911 | 目标已有内容；复核约 4,963 files，0 files transferred，约 157,499,752 bytes；无删除 |
+| RPent | /home/user/zc/RPent-correction-graspgenx-plan-execute-20260911 | 378 regular files transferred，约 3,319,094 bytes；无删除 |
+
+关键文件用 remote_sync_check.sh 复核为 sync-check=ok。该结果只证明目标文件与
+本地选择的 tracked snapshot 对齐，不证明远端环境完成。
+
+远端只读环境为：
+
+~~~text
+host   = user-B650M-AORUS-PRO-AX
+python = /home/user/miniconda3/envs/agenticrobot-point-grasp-ccbf8869/bin/python
+version= 3.10.20
+GPU    = NVIDIA GeForce RTX 4090, driver 570.211.01, 49140 MiB
+nvcc   = absent
+~~~
+
+已发现的远端资源/配置包括：
+
+~~~text
+/home/user/zc/AgenticRobot-point-grasp-resources-ccbf8869/assets/perception/sam2_grounding_dino
+/home/user/zc/AgenticRobot/teleop_runtime/configs/hardware/rm65_arm_ips/latest.json
+/home/user/zc/AgenticRobot/hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json
+/home/user/zc/AgenticRobot/hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json
+/home/user/zc/AgenticRobot/assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf
+~~~
+
+新同步目录中的以下 tracked configs 也已经核对到：
+
+~~~text
+teleop_runtime/configs/skill_deploy/agent_primitive_right_relative_tight_v1.json
+teleop_runtime/configs/devices/agent_gateway_realsense.json
+robot_motion/configs/rm65_camera_registry_v4.json
+~~~
+
+当时未发现：
+
+~~~text
+/home/user/zc/AgenticRobot-point-grasp-resources-ccbf8869/assets/perception/graspgenx-point-grasp
+~~~
+
+并且同步后的普通文件不包含 .git；本地 superproject 中 GraspGenX gitlink 是未初始化
+状态。因此远端不能直接证明 source revision、checkpoint 或 in-process dependency closure。
+这也是为什么“代码同步完成”和“可以直接运行无服务默认版本”必须分开汇报。
+
+### 17.7 旧远端 manual grasp 负例的交接价值
+
+旧命令曾使用不存在的候选目录，之后又在一次实际运行中观察到：
+
+~~~text
+candidate 0 endpoint IK: difficult_to_reach
+motion planning: target_safety_envelope_blocked
+retry after Gateway close: Real motion owner is not RUNNING/READY
+motion_command_dispatched: false
+hold_confirmed: true
+safe_shutdown: true
+~~~
+
+该负例应按以下方式使用：
+
+- 目录不存在首先是同步/路径问题，不是模型或运动算法问题；不能靠在命令里追加
+  exit 1 解决。
+- difficult_to_reach 是有限时间端点 IK 标注，不是整条路径失败证明。
+- target_safety_envelope_blocked 是 target safety/path admission 的拒绝，不应触发
+  自动放宽 envelope、自动更换候选或自动重发。
+- Gateway close 后旧 socket/session 不可继续使用；必须重新启动、重新 discovery、
+  重新取得 fresh observation 和重新规划。
+- motion_command_dispatched=false、hold_confirmed=true、safe_shutdown=true 说明该次
+  没有实际下发运动且 lower hold/cleanup 有安全证据，但不代表抓取成功或候选质量通过。
+
+### 17.8 本次交接后可执行的最短路线
+
+~~~text
+1. 任务根 source task.env，重查 inspect/conflicts/writer/scope
+2. 记录当前 AgenticRobot/RPent exact SHA/tree 和 submodule state
+3. 复跑 B601 changed-file 与 GraspGenX plan/execute contract tests
+4. 仅做离线或 MuJoCo smoke；不启动真实设备
+5. 先闭合 GraspGenX in-process source/checkpoint/Gateway env/default 证据
+6. 再做 camera-only/read-only same-frame RGB-D 与 endpoint/path 规划验证
+7. 获取新的具体授权后才做远端资源写入或真实 motion
+8. 真实 motion 结束后逐项核对 hold、disable、restore、cleanup receipt
+~~~
+
+交接时不要把以下事项混在一个“完成”字段里：
+
+~~~text
+source sync
+    != submodule materialization
+    != model/environment readiness
+    != camera-only inference
+    != path plan
+    != motion execution
+    != grasp success
+~~~
+
+### 17.9 后续报告必须回答的问题
+
+任何接手者提交下一批结果时，至少回答：
+
+- 运行的是哪个完整 AgenticRobot HEAD/tree、RPent HEAD/tree、vendor child commit/tree？
+- 是 canonical checkout、Task worktree 还是远端 snapshot？是否 clean？
+- GraspGenX 是 service 还是 in-process？是否真的启动了 server？Python、CUDA、checkpoint
+  manifest 和 source identity 是什么？
+- 当前 candidate 是哪个 operation/ordinal？是否包含 reachability annotation？它是否只
+  是 endpoint IK 提示？
+- path plan 是否由当前 fresh qpos 和同一 retained frame 产生？plan 是否过期或被拒绝？
+- 是否调用了 motion execute？是否真的 dispatch？是否控制了夹爪？
+- B601 结果属于 offline、sim、read-only、bounded commissioning 还是 hardware/system？
+- 是否有完整 command、JSON、log、raw evidence、receipt、人工观察和 cleanup？
+- 哪些结果是未验证、环境失败、路径失败、模型失败、safety blocked 或资源缺失？
+
+最后的默认判断规则是：证据不足时降低结论等级，不扩大实现含义；安全路径拒绝时保留
+拒绝，不用放宽门槛换取绿色结果。
