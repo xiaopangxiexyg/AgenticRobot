@@ -173,6 +173,31 @@ in-process 会在 Gateway 的 `start()` 阶段加载一次 generator/discriminat
 碰撞过滤、RM65 可达性或下游运动权限。当前官方 checkpoint 要求 PyTorch <2.7；不要把它直接
 安装或升级到项目的 `dexteleop310`，应先用兼容的独立 Gateway 环境完成 GPU smoke 和仿真回归。
 
+### in-process runtime contract 与环境预检
+
+`deployments/perception/graspgenx_runtime_contract.py` 定义了可导入、可验证的 in-process
+运行时合同 `graspgenx-inprocess-runtime.v1`。任何 Gateway Python 在加载模型前必须通过该合同，
+检查项为：受审 Python 版本（3.10/3.11）、`torch>=2.1,<2.7`、CUDA 可用性与设备序号、
+GraspGenX source checkout 的 Git HEAD 等于 manifest 中受审 revision（默认
+`model/perception/graspgenx` submodule）、受审 asset bundle 与 `gen/`、`dis/` checkpoint 布局。
+`GraspGenXInProcessBackend.start()` 在导入任何上游包之前执行该验证；任一检查失败即以完整的
+typed receipt 摘要 fail closed，不会退化为 service 或继续加载。receipt（schema
+`dexteleop.perception.graspgenx_runtime_receipt.v1`）记录每个检查的 expected/observed/detail，
+可通过 backend 的 `runtime_receipt` 属性取用。
+
+不加载权重的环境预检命令（同样不读相机、不连机械臂）：
+
+```bash
+PYTHONPATH="${PWD}/model/perception/graspgenx:${PYTHONPATH:-}" \
+  python scripts/smoke_graspgenx_inference.py \
+  --mode in-process --verify-only \
+  --asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/graspgenx-point-grasp"
+```
+
+退出码为 0 且输出 JSON `status=passed` 表示当前解释器满足 in-process 合同；`status=failed`
+时按 `checks` 中的逐项 detail 诊断依赖冲突。该预检只证明环境兼容性，不证明模型加载、推理质量、
+相机或机械臂可用，也不改变默认 `service` 模式；组合运行前仍须完成下文 GPU smoke 与仿真回归。
+
 若选择 service 模式，模型加载完成后，可在第二个终端运行不读取相机、不连接机械臂的 GPU smoke。
 它复用正式 `GraspGenXClient`、DMTac M sweep-volume 和协议校验，向服务发送一个确定性的 50 mm
 合成方块：

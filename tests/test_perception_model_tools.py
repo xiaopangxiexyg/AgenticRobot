@@ -130,8 +130,10 @@ def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> Non
     source = GRASPGENX_SMOKE.read_text(encoding="utf-8")
     assert "GraspGenXClient" in source
     assert "GraspGenXInProcessBackend" in source
+    assert "verify_graspgenx_inprocess_runtime" in source
     assert "--mode" in completed.stdout
     assert "--asset-bundle" in completed.stdout
+    assert "--verify-only" in completed.stdout
     assert "DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1" in source
     assert "robot_motion" not in source
     rejected = subprocess.run(
@@ -151,6 +153,41 @@ def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> Non
     assert rejected.returncode == 1
     assert "must use a loopback endpoint" in rejected.stderr
     assert "ModuleNotFoundError" not in rejected.stderr
+
+
+def test_graspgenx_gpu_smoke_verify_only_requires_inprocess_bundle() -> None:
+    assert smoke_graspgenx_inference._parse_args([]).verify_only is False
+    assert (
+        smoke_graspgenx_inference._parse_args(
+            ["--mode", "in-process", "--verify-only"]
+        ).verify_only
+        is True
+    )
+    rejected = subprocess.run(
+        [sys.executable, str(GRASPGENX_SMOKE), "--verify-only"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd="/tmp",
+    )
+    assert rejected.returncode == 1
+    assert "applies only to --mode in-process" in rejected.stderr
+
+    missing_bundle = subprocess.run(
+        [
+            sys.executable,
+            str(GRASPGENX_SMOKE),
+            "--mode",
+            "in-process",
+            "--verify-only",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd="/tmp",
+    )
+    assert missing_bundle.returncode == 1
+    assert "--verify-only requires --asset-bundle" in missing_bundle.stderr
 
 
 def test_graspgenx_gpu_smoke_defaults_to_isolated_service() -> None:

@@ -19,6 +19,12 @@ from deployments.perception.graspgenx_client import (
     pack_graspgenx_message,
     unpack_graspgenx_message,
 )
+from deployments.perception.graspgenx_runtime_contract import (
+    GRASPGENX_INPROCESS_RUNTIME_CONTRACT_ID,
+    GraspGenXRuntimeCheck,
+    GraspGenXRuntimeReceipt,
+    verify_graspgenx_inprocess_runtime,
+)
 from deployments.perception.sam2_graspgenx_point_grasp import (
     DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
     GRASPGENX_CHECKPOINT_REVIEWED_REVISION,
@@ -165,8 +171,27 @@ def _model_spec(tmp_path: Path) -> GraspGenXPointGraspModelSpec:
     return GraspGenXPointGraspModelSpec.from_asset_bundle(_asset_bundle(tmp_path))
 
 
+def _receipt(*, passed: bool, failed_name: str | None = None) -> GraspGenXRuntimeReceipt:
+    return GraspGenXRuntimeReceipt(
+        contract_id=GRASPGENX_INPROCESS_RUNTIME_CONTRACT_ID,
+        device="cuda",
+        source_root="/tmp/graspgenx-source",
+        model_spec_hash="0" * 64,
+        checks=(
+            GraspGenXRuntimeCheck(
+                name=failed_name or "python_version",
+                status=passed,
+                expected="expected",
+                observed="observed",
+                detail="" if passed else "stubbed failure",
+            ),
+        ),
+    )
+
+
 def test_inprocess_backend_is_a_planner_backend_without_loading_on_init(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     backend = GraspGenXInProcessBackend(
         model_spec=_model_spec(tmp_path),
@@ -175,8 +200,43 @@ def test_inprocess_backend_is_a_planner_backend_without_loading_on_init(
 
     assert isinstance(backend, GraspGenXInferenceBackend)
     assert backend.semantic_config["backend"] == "graspgenx-inprocess-v1"
-    with pytest.raises(FileNotFoundError, match="source_root"):
+    assert (
+        backend.semantic_config["runtime_contract"]
+        == GRASPGENX_INPROCESS_RUNTIME_CONTRACT_ID
+    )
+    assert backend._runtime_verifier is verify_graspgenx_inprocess_runtime
+    monkeypatch.setattr(
+        backend,
+        "_runtime_verifier",
+        lambda **_kwargs: _receipt(passed=False, failed_name="source_root"),
+    )
+
+    with pytest.raises(RuntimeError, match="runtime contract .*source_root"):
         backend.start()
+    assert backend.runtime_receipt is not None
+    assert not backend.runtime_receipt.passed
+
+
+def test_inprocess_backend_start_fails_closed_on_contract_receipt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    backend = GraspGenXInProcessBackend(model_spec=_model_spec(tmp_path))
+    monkeypatch.setattr(
+        backend,
+        "_runtime_verifier",
+        lambda **_kwargs: _receipt(passed=False, failed_name="torch_version"),
+    )
+
+    with pytest.raises(RuntimeError, match="torch_version"):
+        backend.start()
+    assert backend.runtime_receipt is not None
+    assert backend.runtime_receipt.failed_checks[0].name == "torch_version"
+    with pytest.raises(RuntimeError, match="not running"):
+        backend.infer_object(
+            np.zeros((16, 3), dtype=np.float32),
+            sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+        )
 
 
 def test_inprocess_backend_rejects_cpu_before_touching_model(tmp_path: Path) -> None:
@@ -233,6 +293,9 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
 
     backend = GraspGenXInProcessBackend(model_spec=_model_spec(tmp_path))
     monkeypatch.setattr(
+        backend, "_runtime_verifier", lambda **_kwargs: _receipt(passed=True)
+    )
+    monkeypatch.setattr(
         backend,
         "_load_runtime",
         lambda: (
@@ -247,6 +310,7 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
         ),
     )
     backend.start()
+    assert backend.runtime_receipt is not None and backend.runtime_receipt.passed
 
     points = np.zeros((16, 3), dtype=np.float32)
     grasps, scores = backend.infer_object(
