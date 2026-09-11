@@ -346,6 +346,14 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert '"failure-trigger-track"' in app_source
         assert "POST_CAPTURE_REFINED" in app_source
         assert "nearestSampleIndex(proposed)" in app_source
+        assert "function snapTimelineBoundaryTimestamp" in app_source
+        assert app_source.count("snapTimelineBoundaryTimestamp(") >= 4
+        assert (
+            "Math.min(realDelta, DISPLAY_GAP_DURATION_SEC)" in app_source
+        )
+        assert "displayDuration: displayDelta" in app_source
+        assert "function compressedGapTitle" in app_source
+        assert "相邻样本间隔" in app_source
         assert "EPISODE_PANEL_STORAGE_KEY" in app_source
         assert "var(--coarse-bg" in style_source
         assert ".dataset-browser-card" in style_source
@@ -784,6 +792,50 @@ def test_pause_aware_detail_exposes_break_and_does_not_bootstrap_pause_tail(
             for value in detail["annotation_status"]["badges"]
         }
         assert "COLLECTION_PAUSED" in status_codes
+
+        accepted = application.save_draft(episode_uuid, detail["draft"])
+        assert max(
+            value["end_at"]
+            for value in accepted["occurrences"]
+            if value["progress_step_id"] == "a"
+        ) == 2.0
+
+        invalid = json.loads(json.dumps(detail["draft"]))
+        invalid_boundary = next(
+            value
+            for value in invalid["occurrences"]
+            if value["progress_step_id"] == "a" and value["end_at"] == 2.0
+        )
+        invalid_boundary["end_at"] = 3.0
+        with pytest.raises(
+            RefinementAnnotationApplicationError,
+            match="falls inside the unobserved collection gap",
+        ):
+            application.save_draft(episode_uuid, invalid)
+
+        # A draft saved by the previous GUI remains recoverable: opening is
+        # read-compatible, while the next save remains fail closed until the
+        # operator moves the named boundary to a valid anchor.
+        application.workspace.save_draft(
+            episode_uuid=episode_uuid,
+            draft=invalid,
+        )
+        application.close()
+        application = RefinementAnnotationApplication(
+            tmp_path,
+            annotator_id="fixture",
+        )
+        reopened = application.episode_detail(episode_uuid)
+        assert max(
+            value["end_at"]
+            for value in reopened["draft"]["occurrences"]
+            if value["progress_step_id"] == "a"
+        ) == 3.0
+        with pytest.raises(
+            RefinementAnnotationApplicationError,
+            match="falls inside the unobserved collection gap",
+        ):
+            application.save_draft(episode_uuid, reopened["draft"])
     finally:
         application.close()
 
