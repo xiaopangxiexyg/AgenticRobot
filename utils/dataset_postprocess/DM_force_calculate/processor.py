@@ -1010,7 +1010,7 @@ def _merge_stream_results_into_manifests(
         previous_stream_paths = _manifest_stream_paths(config.output_root, previous_manifest)
         side = manifest_tasks[0].side
         episode_index = manifest_tasks[0].episode_index
-        relative_dir = str(manifest_path.parent.relative_to(config.output_root))
+        relative_dir = str(manifest_path.parent.resolve().relative_to(config.output_root))
         streams: dict[str, dict[str, Any]] = {}
         frame_count = 0
         first_task = manifest_tasks[0]
@@ -1020,11 +1020,15 @@ def _merge_stream_results_into_manifests(
             frame_count = max(frame_count, written_frames)
             stream_spec = dict(result.stream_spec)
             stream_spec.update({
-                "path": str(task.output_stream_path.relative_to(config.output_root)),
+                "path": str(
+                    task.output_stream_path.resolve().relative_to(config.output_root)
+                ),
                 "dtype": FORCE_DTYPE,
                 "shape": list(FORCE_SHAPE),
                 "frame_count": written_frames,
-                "source_path": str(task.source_stream_path.relative_to(config.dataset_root)),
+                "source_path": str(
+                    task.source_stream_path.resolve().relative_to(config.dataset_root)
+                ),
                 "source_dtype": task.source_dtype,
                 "source_shape": list(task.source_shape),
                 "source_compression": task.to_dict().get("source_compression", "none"),
@@ -1043,7 +1047,11 @@ def _merge_stream_results_into_manifests(
             "processing": {
                 "created_at": _timestamp_now(),
                 "source_dataset_root": str(config.dataset_root),
-                "source_manifest_path": str(first_task.source_manifest_path.relative_to(config.dataset_root)),
+                "source_manifest_path": str(
+                    first_task.source_manifest_path.resolve().relative_to(
+                        config.dataset_root
+                    )
+                ),
                 "backend": config.backend,
                 "mode": config.mode,
                 "processor_revision": DM_FORCE_PROCESSOR_REVISION,
@@ -1086,7 +1094,9 @@ def _write_summary(
         "processed": sum(1 for result in results if result.status == "processed"),
         "skipped": sum(1 for result in results if result.status.startswith("skipped")),
         "failed": sum(1 for result in results if result.status == "failed"),
-        "output_manifests": [str(path.relative_to(config.output_root)) for path in manifests],
+        "output_manifests": [
+            str(path.resolve().relative_to(config.output_root)) for path in manifests
+        ],
         "elapsed_sec": float(elapsed_sec),
         "worker_config": config.to_worker_dict(),
         "stream_results": [result.to_dict() for result in results],

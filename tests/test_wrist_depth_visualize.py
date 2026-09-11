@@ -98,7 +98,10 @@ class WristDepthMaskVisualizationTest(unittest.TestCase):
                 np.asarray([[1, 0], [0, 1]], dtype=np.uint8),
             )
             direct_manifest_stream = load_mask_stream(root / left_rel)
-            self.assertEqual(direct_manifest_stream.stream_path, root / left_rel.parent / "stream.bitpack.bin")
+            self.assertEqual(
+                direct_manifest_stream.stream_path,
+                (root / left_rel.parent / "stream.bitpack.bin").resolve(),
+            )
 
     def test_direct_bitpack_stream_uses_explicit_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

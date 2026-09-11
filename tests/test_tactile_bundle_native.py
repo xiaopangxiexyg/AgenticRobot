@@ -235,11 +235,11 @@ class NativeTactileBundleTest(unittest.TestCase):
             )
             self.assertEqual(
                 store.dataset_locator_path,
-                storage / expected_relative,
+                (storage / expected_relative).resolve(),
             )
             self.assertEqual(
                 store.bundle_dataset_root,
-                storage / "datasets" / store.dataset_identity.dataset_uuid,
+                (storage / "datasets" / store.dataset_identity.dataset_uuid).resolve(),
             )
             payload = json.loads(
                 store.dataset_locator_path.read_text(encoding="utf-8")
@@ -858,7 +858,7 @@ class NativeTactileBundleTest(unittest.TestCase):
 
             report = materialize_tactile_bundle(core, storage)
 
-            self.assertEqual(report.target_path, core / "tactile")
+            self.assertEqual(report.target_path, (core / "tactile").resolve())
             self.assertTrue(report.receipt_path.is_file())
             receipt = json.loads(report.receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(
