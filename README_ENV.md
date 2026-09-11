@@ -2,7 +2,12 @@
 
 本文是环境依赖、安装细节和复现约束的权威说明；可直接复制的最短安装/检查命令见
 [`docs/setup/README.md`](./docs/setup/README.md)。项目主环境统一使用 Python 3.10 conda 环境
-`dexteleop310`；SAM2、Grounding DINO、VGN、GraspNet 作为抓姿扩展安装到同一个环境。RPent
+`dexteleop310`；SAM2、Grounding DINO、VGN、GraspNet 作为抓姿扩展安装到同一个环境。启用
+point-grasp 时真实 Gateway CLI 默认选择 GraspGenX，并通过
+`assets/perception/graspgenx-point-grasp/runtime/.venv` 内的隔离 loopback service 推理，
+不修改 `dexteleop310`。只有 Gateway 本身运行在满足官方 PyTorch 约束的独立环境中时，才应显式
+选择 in-process 模式。两种模式都不改变 Gateway Skill 或下游运动语义。
+RPent
 属于独立的上层项目环境，不是本仓抓姿/仿真运行的前置条件。`core`、`test`、`dataset`、
 `annotation`、`sim`、`model`、`openpi`、
 `vla_scratch`、`hardware` 是依赖分组，不是九个 conda 环境。其中 `annotation` 还支持
@@ -29,9 +34,10 @@ MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server
 | Grounding DINO | `model/perception/GroundingDINO` |
 | VGN | `model/perception/vgn` |
 | GraspNet baseline | `model/perception/graspnet-baseline` |
+| GraspGenX | `model/perception/graspgenx` |
 | PointNet2 CUDA 扩展 | `model/perception/graspnet-baseline/pointnet2` |
 
-这四个目录都是 Git submodule；PointNet2 属于 GraspNet 源码，且没有独立权重。
+这些目录都是 Git submodule；PointNet2 属于 GraspNet 源码，且没有独立权重。
 
 ### 0.2 权重在哪里？
 
@@ -43,9 +49,30 @@ MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server
 | Grounding DINO | `perception/sam2_grounding_dino/groundingdino_swint_ogc.pth` |
 | VGN | `perception/sam2_vgn_point_grasp/vgn_conv.pth` |
 | GraspNet | `perception/graspnet-point-grasp/checkpoint-rs.tar` |
+| GraspGenX | `perception/graspgenx-point-grasp/checkpoints/release/{gen,dis}/`；同一 bundle 内另含 `manifest.json` 和 `runtime/.venv` |
 
 每个目录还需对应的 `manifest.json` 及真实 SHA-256。使用 worktree 默认 assets 映射时，根就是本仓
 `assets/`；下载和解压规则以项目根 [`README.md`](./README.md) 的“运行资产”章节为准。
+
+GraspGenX 是例外的一键下载型可选后端。下面的命令会固定官方源码/模型 revision，下载约
+1.7 GB 的 generator/discriminator 权重，生成真实 hash manifest，并在同一 asset bundle 内创建
+隔离 venv；不会安装到或更新 `dexteleop310`：
+
+```bash
+bash scripts/install_graspgenx_env.sh
+
+# 已确认 GPU 主机需要的 CUDA wheel 系列时（示例）：
+# bash scripts/install_graspgenx_env.sh --torch-backend cu126
+
+# 已安装机器的只读复验：
+bash scripts/install_graspgenx_env.sh --verify-only
+```
+
+GPU 推理复验使用 `scripts/smoke_graspgenx_inference.py`；默认调用已启动的 loopback service，
+只有在兼容的独立 Python 环境中显式加 `--mode in-process` 才直接加载模型。它只发送合成方块
+点云，不会读取相机或连接机械臂。
+完整命令见
+[`docs/agent_gateway/POINT_GRASP.md`](docs/agent_gateway/POINT_GRASP.md#graspgenx-更新后端)。
 
 ### 0.3 新机器如何一键安装？
 

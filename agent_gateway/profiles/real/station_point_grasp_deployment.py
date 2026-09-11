@@ -42,6 +42,8 @@ from dataset_contracts.perception_artifacts import (
     POINT_GRASP_ANNOTATED_SCHEMA_ID_V1,
 )
 
+from .point_grasp_deployment import SUPPORTED_POINT_GRASP_BACKEND_IDS
+
 REAL_STATION_POINT_GRASP_ROUTE_ID_V2 = (
     "real.realsense.local_model.perception.plan_point_grasp"
 )
@@ -176,7 +178,7 @@ class StationBoundPointGraspProfile:
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
-        if self.backend_id not in {"vgn", "graspnet"}:
+        if self.backend_id not in SUPPORTED_POINT_GRASP_BACKEND_IDS:
             raise ValueError("Station point-grasp backend is unsupported.")
         if self.arm_reachability_profile is not None and not isinstance(
             self.arm_reachability_profile,

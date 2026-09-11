@@ -12,6 +12,7 @@ from agent_gateway.runtime.access_policy import (
     issue_skill_execution_grant,
 )
 from agent_gateway.skills.motion.definition import (
+    EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
     GRASP_APPROACH_SKILL_ID_V1,
@@ -24,14 +25,13 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .motion_gateway_session import RealAgentPrimitiveGatewaySession
 
-REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN = (
-    "AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES"
-)
+REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN = "AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES"
 # Compatibility name used by the existing composition API. Its value is the
 # persistent-session token; the retired one-shot token is intentionally invalid.
 REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN = REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
 REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION = "move_tcp_to_pose"
 REAL_AGENT_GRASP_APPROACH_ACTION = "approach_grasp_pose"
+REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION = "execute_grasp_approach_plan"
 REAL_AGENT_PRIMITIVE_ACTIONS = (
     "forward",
     "backward",
@@ -44,6 +44,7 @@ REAL_AGENT_PRIMITIVE_ACTIONS = (
     "level_forward_right_30",
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
     REAL_AGENT_GRASP_APPROACH_ACTION,
+    REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION,
 )
 _FIXED_SKILL_ID_BY_ACTION = {
     **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
@@ -52,6 +53,9 @@ _FIXED_SKILL_ID_BY_ACTION = {
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
     REAL_AGENT_GRASP_APPROACH_ACTION: GRASP_APPROACH_SKILL_ID_V1,
+    REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION: (
+        EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1
+    ),
 }
 _ACTION_BY_FIXED_SKILL_ID = {
     skill_id: action for action, skill_id in _FIXED_SKILL_ID_BY_ACTION.items()
@@ -72,14 +76,13 @@ def _requested_action_and_component_ids(
     """
 
     parameters = request.parameters
-    fixed_cardinal_action = (
-        FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
-            request.skill_id
-        )
+    fixed_cardinal_action = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
+        request.skill_id
     )
-    if fixed_cardinal_action is not None and parameters.get(
-        "direction"
-    ) != fixed_cardinal_action:
+    if (
+        fixed_cardinal_action is not None
+        and parameters.get("direction") != fixed_cardinal_action
+    ):
         return None, ()
     if request.skill_id in {
         TCP_POSE_TARGET_SKILL_ID_V1,
@@ -101,10 +104,7 @@ def _requested_action_and_component_ids(
     requested_action = (
         parameters.get("direction")
         if request.skill_id == "motion.step_tcp_cardinal"
-        else (
-            fixed_cardinal_action
-            or _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id)
-        )
+        else (fixed_cardinal_action or _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id))
     )
     component_id = parameters.get("component_id")
     return (
@@ -188,10 +188,7 @@ class RealAgentPrimitiveSessionAuthorization:
                     "client_id": self.client_id,
                     "confirmation": REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
                 },
-                domain=(
-                    "dexteleop.real_agent_motion."
-                    "operator_session_confirmation.v1"
-                ),
+                domain=("dexteleop.real_agent_motion.operator_session_confirmation.v1"),
             )
         )
 
@@ -222,9 +219,7 @@ class RealAgentPrimitiveSessionAuthorization:
             return None
         if request.skill_execution_grant_id is not None:
             return None
-        requested_action, component_ids = _requested_action_and_component_ids(
-            request
-        )
+        requested_action, component_ids = _requested_action_and_component_ids(request)
         if requested_action not in self.authorized_actions:
             return None
         if component_ids != (f"{self.side}_arm",):
@@ -261,6 +256,7 @@ class RealAgentPrimitiveSessionAuthorization:
 
 __all__ = [
     "REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION",
+    "REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ACTION",
     "REAL_AGENT_GRASP_APPROACH_ACTION",
     "REAL_AGENT_PRIMITIVE_ACTIONS",
     "REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN",

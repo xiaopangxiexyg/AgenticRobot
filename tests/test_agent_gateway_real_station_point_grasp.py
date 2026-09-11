@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -343,6 +344,14 @@ def test_station_point_grasp_route_is_live_bound_read_only_and_proposal_only() -
         _request().parameters,
         prepared.execution_result,
     )
+
+
+def test_station_point_grasp_profile_accepts_graspgenx_backend() -> None:
+    _source, _revision, _planner, registration, _provider = _provider_stack()
+
+    profile = replace(registration.profile, backend_id="graspgenx")
+
+    assert profile.backend_id == "graspgenx"
 
 
 def test_station_point_grasp_v3_reachability_is_request_gated_and_annotation_only() -> (

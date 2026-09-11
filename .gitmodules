@@ -16,3 +16,6 @@
 [submodule "model/perception/graspnet-baseline"]
 	path = model/perception/graspnet-baseline
 	url = https://github.com/graspnet/graspnet-baseline.git
+[submodule "model/perception/graspgenx"]
+	path = model/perception/graspgenx
+	url = https://github.com/NVlabs/GraspGenX.git

@@ -119,8 +119,11 @@ def _public_tool_profiles(lower: ExclusiveRM65SkillLowerAssembly) -> dict[str, o
     }
 
 
-def _route_ids() -> tuple[str, ...]:
-    return real_agent_motion_route_ids_v1(include_grasp_approach=True)
+def _route_ids(*, include_grasp_approach_plan: bool = False) -> tuple[str, ...]:
+    return real_agent_motion_route_ids_v1(
+        include_grasp_approach=True,
+        include_grasp_approach_plan=include_grasp_approach_plan,
+    )
 
 
 @dataclass(frozen=True)
@@ -447,9 +450,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 else "synchronous_authoritative_dual_hardware_qpos"
             ),
             "state_refresh_hz": lower.ports.profile.state_refresh_hz,
-            "max_measurement_age_sec": (
-                lower.ports.profile.max_measurement_age_sec
-            ),
+            "max_measurement_age_sec": (lower.ports.profile.max_measurement_age_sec),
         },
         domain="dexteleop.real_skill.rm65_source_binding.v1",
     )
@@ -551,7 +552,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         schema="dexteleop.deployment_safety_envelope.v1",
         content_hash=envelope_profile.semantic_content_hash,
         constraint_set_hash=constraint_set_hash,
-        allowed_route_ids=_route_ids(),
+        allowed_route_ids=_route_ids(
+            include_grasp_approach_plan=grasp_enabled,
+        ),
     )
     perception_source_binding = None
     perception_frame_binding = None
@@ -790,9 +793,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             planning_target_builder=build_exclusive_rm65_skill_target_builder(
                 lower.profile
             ),
-            target_envelope_filter=(
-                lower.target_builder.pre_ik_target_safety_filter
-            ),
+            target_envelope_filter=(lower.target_builder.pre_ik_target_safety_filter),
             reachability_config=reachability_config,
         )
 

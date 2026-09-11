@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from agent_gateway.profiles.real import realsense_perception
+from agent_gateway.profiles.real import perception_cli, realsense_perception
 from agent_gateway.profiles.real.perception_application import (
     CameraOnlyRealPerceptionApplicationState,
     assemble_camera_only_real_perception_composition,
@@ -246,4 +246,28 @@ def test_real_perception_cli_is_discoverable_without_importing_hardware() -> Non
     assert "--enable-object-localization" in result.stdout
     assert "--enable-point-grasp" in result.stdout
     assert "--point-grasp-backend" in result.stdout
+    assert "graspgenx" in result.stdout
+    assert "--graspgenx-mode" in result.stdout
+    assert "--graspgenx-source-root" in result.stdout
     assert "--allow-local-image-root" not in result.stdout
+
+
+def test_real_perception_defaults_to_graspgenx_isolated_service() -> None:
+    argv = [
+        "--socket-path",
+        "/tmp/agenticrobot-real-perception-test.sock",
+        "--camera-config",
+        str(REPO_ROOT / "pyproject.toml"),
+        "--camera-registry",
+        str(REPO_ROOT / "pyproject.toml"),
+        "--artifact-root",
+        "/tmp",
+    ]
+    parsed = perception_cli.build_parser().parse_args(argv)
+
+    assert parsed.point_grasp_backend == "graspgenx"
+    assert parsed.graspgenx_mode == "service"
+    assert perception_cli._graspgenx_mode_was_explicit(argv) is False
+    assert perception_cli._graspgenx_mode_was_explicit(
+        [*argv, "--graspgenx-mode=in-process"]
+    ) is True

@@ -14,8 +14,15 @@ from agent_gateway.profiles.real.gateway_cli import (
     DEFAULT_RM65_CAMERA_MOUNT_URDF,
     DEFAULT_RM65_CAMERA_REGISTRY_V4,
 )
+from agent_gateway.profiles.real.grasp_approach_plan import (
+    RealGraspApproachPlan,
+    RealGraspApproachPlanLookupError,
+)
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1,
+)
+from agent_gateway.profiles.real.motion_primitive_skill import (
+    RealAgentPrimitiveSkillLifecycle,
 )
 from agent_gateway.profiles.real.one_shot_authorization import (
     REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
@@ -28,6 +35,7 @@ from agent_gateway.profiles.real.rm65_composition import (
     RM65_SKILL_STATION_FRAME_ID_V1,
     assemble_exclusive_rm65_agent_primitive_composition,
 )
+from agent_gateway.protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from dataset_contracts.pose_frames import load_pose_frame_contract
 from robot_motion.primitives import level_tcp_orientation
 from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose_matrix
@@ -36,8 +44,13 @@ from robot_motion.rm65 import (
     load_world_from_arm_base_transforms,
 )
 from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
+from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.interfaces import EffectorBackend
 from teleop_runtime.skill_deploy import rm65_profile as profile_module
+from teleop_runtime.skill_deploy.motion_port import (
+    RealAgentJointTrajectory,
+    RealAgentMotionPhase,
+)
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspReachabilityResult,
 )
@@ -522,6 +535,8 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         }
         assert routes["perception.plan_point_grasp"] == "read_only"
         assert routes["perception.render_point_grasp_candidate"] == "read_only"
+        assert routes["perception.plan_grasp_approach"] == "read_only"
+        assert routes["motion.execute_grasp_approach_plan"] == "motion"
         assert routes["motion.move_tcp_to_pose"] == "motion"
         assert "own_domain_emergency_stop_v1" in (
             session.contract_bundle.route_manifest.supported_transport_features
@@ -561,11 +576,223 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
             "perception.localize_objects",
             "perception.plan_point_grasp",
             "perception.render_point_grasp_candidate",
+            "perception.plan_grasp_approach",
         }
         assert session.owns_artifact_store is False
         assert composition.resources.artifact_store is session.artifact_store
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())
         assert guard.starts == 0
+    finally:
+        assert session.artifact_store is not None
+        session.artifact_store.close()
+
+
+def test_preplanned_grasp_execution_consumes_exact_path_without_replanning(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lower, _guard = _lower(monkeypatch)
+    localizer = _Localizer()
+    point_grasp_planner = _PointGraspPlanner(localizer)
+    now = [10.0]
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower,
+        socket_path=REPO_ROOT / "temp/test-real-rm65-grasp-plan-execution.sock",
+        authorized_side="right",
+        authorized_action="execute_grasp_approach_plan",
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test",
+        client_uid=1000,
+        runtime_session_id="real-rm65:grasp-plan-execution-test",
+        control_domain_id="exclusive-real-skill:grasp-plan-execution-test",
+        embodiment_instance_id="dual-rm65:grasp-plan-execution-test",
+        camera_config_path=(
+            REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
+        ),
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+        artifact_root=tmp_path,
+        camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        object_localizer=localizer,
+        point_grasp_planner=point_grasp_planner,
+        clock=lambda: now[0],
+    )
+    session = composition.deployment.gateway_session
+    try:
+        registration = session.contract_bundle.grasp_approach_plan_registration
+        store = session.grasp_approach_plan_store
+        assert registration is not None
+        assert store is not None
+        lower.target_builder.tool_tcp_world_targets_for_qpos_pair = lambda **_kwargs: {
+            "left": np.eye(4, dtype=float),
+            "right": np.eye(4, dtype=float),
+        }
+        qpos_by_side = {
+            "left": np.zeros(6, dtype=float),
+            "right": np.zeros(6, dtype=float),
+        }
+        session.port.publish_measured_qpos_pair(
+            qpos_by_side=qpos_by_side,
+            measured_at=now[0],
+            available_at=now[0],
+            source_evidence_refs=("measured-qpos:grasp-plan-execution-test",),
+        )
+        qpos_cut = session.port.latest_measured_qpos()
+        assert qpos_cut is not None
+        trajectory = RealAgentJointTrajectory(
+            time_from_start_sec=np.array([0.0, 0.5], dtype=float),
+            qpos_by_side={
+                side: np.stack((qpos_by_side[side], qpos_by_side[side]))
+                for side in ("left", "right")
+            },
+            planner_evidence_refs=("rm65-production-urdf-fcl-path:execution-test",),
+        )
+        target_execution = np.eye(4, dtype=float)
+        target_reference, _resolution = composition.frame_graph.transform_pose_matrix(
+            target_execution,
+            source_reference_frame_id=registration.profile.execution_reference_frame_id,
+            target_reference_frame_id=registration.profile.reference_frame_id,
+        )
+        plan = RealGraspApproachPlan(
+            runtime_session_id=registration.binding.runtime_session_id,
+            profile_hash=registration.profile.semantic_content_hash,
+            planning_operation_id="grasp-plan-operation:execution-test",
+            planning_request_hash="1" * 64,
+            point_grasp_operation_id="point-grasp-operation:execution-test",
+            point_grasp_request_hash="2" * 64,
+            point_grasp_result_hash="3" * 64,
+            point_grasp_candidate_hash="4" * 64,
+            source_station_revision=0,
+            component_id=registration.profile.component_id,
+            side=registration.profile.side,
+            target_pose_reference=target_reference,
+            target_pose_execution=target_execution,
+            speed_scale=0.2,
+            measured_qpos_revision=qpos_cut.revision,
+            measured_qpos_hash=qpos_cut.semantic_content_hash,
+            measured_qpos_at=qpos_cut.measured_at,
+            trajectory=trajectory,
+            created_at=now[0],
+            expires_at=now[0] + 30.0,
+            evidence_refs=(
+                *qpos_cut.evidence_refs,
+                *trajectory.evidence_refs,
+                "point-grasp-receipt:execution-test",
+            ),
+        )
+        store.put(plan, now=now[0])
+
+        entry = session.contract_bundle.route_manifest.route(
+            "motion.execute_grasp_approach_plan",
+            "1",
+        )
+        route = entry.route
+        binding = session.contract_bundle.binding_for_skill(route.skill_id)
+        request = AgentSkillRequest(
+            client_id="rpent:test",
+            request_id="grasp-plan-execution-request:test",
+            idempotency_key="grasp-plan-execution-idempotency:test",
+            client_sequence=1,
+            runtime_session_id=registration.binding.runtime_session_id,
+            skill_route_manifest_hash=(
+                session.contract_bundle.route_manifest.semantic_content_hash
+            ),
+            expected_station_revision=0,
+            skill_id=route.skill_id,
+            skill_version=route.skill_version,
+            skill_definition_hash=route.skill_definition_hash,
+            route_id=route.route_id,
+            route_version=route.route_version,
+            route_hash=route.semantic_content_hash,
+            deployment_binding_hash=binding.semantic_content_hash,
+            parameter_profile_id=registration.profile.parameter_profile_id,
+            parameter_profile_hash=registration.profile.semantic_content_hash,
+            parameters={
+                "component_id": registration.profile.component_id,
+                "grasp_approach_plan_id": plan.plan_id,
+                "grasp_approach_plan_hash": plan.semantic_content_hash,
+            },
+            observation_snapshot_id="observation:grasp-plan-execution-test",
+            requested_mode="real_active",
+            requested_timeout_ms=5_000,
+            skill_execution_grant_id="agent-skill-grant:" + "5" * 64,
+        )
+        operation = AgentSkillOperation(
+            operation_id="grasp-plan-execution-operation:test",
+            request_hash=request.semantic_content_hash,
+            runtime_session_id=request.runtime_session_id,
+            status="admitted",
+            reason_code="admitted",
+            station_revision_at_admission=0,
+            current_station_revision=0,
+            started_at=now[0],
+            updated_at=now[0],
+            deadline_at=now[0] + 5.0,
+        )
+
+        class _Owner:
+            def __init__(self) -> None:
+                self.state_machine = SimpleNamespace(state=TeleopRunState.ARMED)
+
+            def hold_hardware(
+                self,
+                _reason,
+                *,
+                require_home_recalibration=False,
+            ) -> bool:
+                del require_home_recalibration
+                self.state_machine.state = TeleopRunState.DEBUG_ONLY
+                return True
+
+        owner = _Owner()
+        replanning_calls = 0
+
+        def forbidden_replan(**_kwargs):
+            nonlocal replanning_calls
+            replanning_calls += 1
+            raise AssertionError("The execution Skill must not invoke a planner.")
+
+        def apply_lower_owner(duration: float) -> None:
+            now[0] += duration
+            session.port.apply_owner_requests(session=owner, now=now[0])
+
+        lifecycle = RealAgentPrimitiveSkillLifecycle(
+            port=session.port,
+            contract_bundle=session.contract_bundle,
+            route=route,
+            binding=binding,
+            profile=registration.profile,
+            request=request,
+            operation=operation,
+            grasp_trajectory_planner=forbidden_replan,
+            grasp_approach_plan_store=store,
+            clock=lambda: now[0],
+            sleep=apply_lower_owner,
+        )
+
+        activation = lifecycle.activate(
+            request=request,
+            operation=operation,
+            cancel_requested=lambda: False,
+        )
+
+        assert activation.succeeded is True
+        assert session.port.snapshot().phase == RealAgentMotionPhase.ACTIVE
+        assert replanning_calls == 0
+        assert lifecycle._planned_joint_trajectory is trajectory
+        with pytest.raises(
+            RealGraspApproachPlanLookupError,
+            match="grasp_path_plan_already_consumed",
+        ):
+            store.reserve(
+                plan_id=plan.plan_id,
+                plan_hash=plan.semantic_content_hash,
+                operation_id="grasp-plan-execution-operation:replay",
+                runtime_session_id=registration.binding.runtime_session_id,
+                profile_hash=registration.profile.semantic_content_hash,
+                component_id=registration.profile.component_id,
+                expected_station_revision=0,
+                now=now[0],
+            )
     finally:
         assert session.artifact_store is not None
         session.artifact_store.close()

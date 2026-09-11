@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -23,7 +24,12 @@ from agent_gateway.transport.unix_transport import (
     validate_agent_gateway_unix_server_preflight,
 )
 from deployments.perception import (
+    GRASPGENX_DEFAULT_MODE,
+    GraspGenXClient,
+    GraspGenXInProcessBackend,
+    GraspGenXPointGraspModelSpec,
     GraspNetPointGraspModelSpec,
+    Sam2GraspGenXPointGraspPlanner,
     Sam2GraspNetPointGraspPlanner,
     Sam2GroundingDinoLocalizer,
     Sam2GroundingDinoModelSpec,
@@ -46,6 +52,10 @@ from teleop_runtime.skill_deploy.motion_trace import (
 )
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
+from .point_grasp_deployment import (
+    DEFAULT_POINT_GRASP_BACKEND_ID,
+    SUPPORTED_POINT_GRASP_BACKEND_IDS,
+)
 from .rm65_composition import (
     ExclusiveRM65AgentPrimitiveComposition,
     assemble_exclusive_rm65_agent_primitive_composition,
@@ -126,10 +136,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-localization-asset-bundle", type=Path)
     parser.add_argument("--object-localization-device", default="cuda")
     parser.add_argument(
-        "--point-grasp-backend", choices=("vgn", "graspnet"), default="vgn"
+        "--point-grasp-backend",
+        choices=tuple(sorted(SUPPORTED_POINT_GRASP_BACKEND_IDS)),
+        default=DEFAULT_POINT_GRASP_BACKEND_ID,
     )
     parser.add_argument("--point-grasp-asset-bundle", type=Path)
     parser.add_argument("--point-grasp-device", default="cuda")
+    parser.add_argument("--graspgenx-host", default="127.0.0.1")
+    parser.add_argument("--graspgenx-port", type=int, default=5556)
+    parser.add_argument("--graspgenx-timeout-ms", type=int, default=120_000)
+    parser.add_argument(
+        "--graspgenx-mode",
+        choices=("service", "in-process"),
+        default=GRASPGENX_DEFAULT_MODE,
+        help=(
+            "GraspGenX execution mode; service uses the isolated loopback ZMQ "
+            "runtime by default, in-process requires a compatible Gateway Python"
+        ),
+    )
+    parser.add_argument(
+        "--graspgenx-source-root",
+        type=Path,
+        default=None,
+        help=(
+            "optional absolute GraspGenX source checkout for in-process mode; "
+            "defaults to model/perception/graspgenx"
+        ),
+    )
     parser.add_argument(
         "--camera-mount-urdf",
         type=Path,
@@ -245,6 +278,22 @@ def _effective_camera_mount_urdf(args: argparse.Namespace) -> Path | None:
     if args.enable_point_grasp:
         return DEFAULT_RM65_CAMERA_MOUNT_URDF
     return None
+
+
+def _graspgenx_mode_was_explicit(argv: list[str] | None) -> bool:
+    """Return whether the caller explicitly selected a GraspGenX mode.
+
+    The default is intentionally in-process, but that default must stay inert
+    for VGN/GraspNet and camera-only launches.  Only an explicit mode flag is
+    therefore validated against the selected point-grasp backend.
+    """
+
+    tokens = sys.argv[1:] if argv is None else argv
+    return any(
+        token == "--graspgenx-mode"
+        or token.startswith("--graspgenx-mode=")
+        for token in tokens
+    )
 
 
 def _absolute_socket_path(
@@ -721,6 +770,18 @@ def main(argv: list[str] | None = None) -> int:
             flag="--motion-trace-root",
         )
     )
+    if (
+        _graspgenx_mode_was_explicit(argv)
+        and args.graspgenx_mode != "service"
+        and (
+            not args.enable_point_grasp
+            or args.point_grasp_backend != "graspgenx"
+        )
+    ):
+        parser.error(
+            "--graspgenx-mode applies only to an enabled "
+            "--point-grasp-backend graspgenx"
+        )
     object_localizer = None
     point_grasp_planner = None
     camera_mount_urdf = None
@@ -757,7 +818,7 @@ def main(argv: list[str] | None = None) -> int:
                     point_segmenter=object_localizer,
                     device=args.point_grasp_device,
                 )
-            else:
+            elif args.point_grasp_backend == "graspnet":
                 point_grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(
                     point_grasp_bundle
                 )
@@ -765,6 +826,37 @@ def main(argv: list[str] | None = None) -> int:
                     model_spec=point_grasp_spec,
                     point_segmenter=object_localizer,
                     device=args.point_grasp_device,
+                )
+            else:
+                point_grasp_spec = GraspGenXPointGraspModelSpec.from_asset_bundle(
+                    point_grasp_bundle
+                )
+                graspgenx_source_root = (
+                    None
+                    if args.graspgenx_source_root is None
+                    else _absolute_managed_directory(
+                        parser,
+                        args.graspgenx_source_root,
+                        flag="--graspgenx-source-root",
+                    )
+                )
+                graspgenx_backend = (
+                    GraspGenXClient(
+                        host=args.graspgenx_host,
+                        port=args.graspgenx_port,
+                        timeout_ms=args.graspgenx_timeout_ms,
+                    )
+                    if args.graspgenx_mode == "service"
+                    else GraspGenXInProcessBackend(
+                        model_spec=point_grasp_spec,
+                        source_root=graspgenx_source_root,
+                        device=args.point_grasp_device,
+                    )
+                )
+                point_grasp_planner = Sam2GraspGenXPointGraspPlanner(
+                    model_spec=point_grasp_spec,
+                    point_segmenter=object_localizer,
+                    client=graspgenx_backend,
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid point-grasp model bundle: {error}")

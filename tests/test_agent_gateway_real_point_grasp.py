@@ -176,6 +176,26 @@ def test_point_grasp_registration_is_passive_and_has_two_inputs() -> None:
     registration.payload_validator.validate_parameters(_parameters(None, None))
 
 
+def test_point_grasp_registration_accepts_graspgenx_backend() -> None:
+    registration = build_real_point_grasp_registration(
+        backend_id="graspgenx",
+        model_profile_id="graspgenx:test",
+        model_profile_hash="graspgenx-model:test",
+        inference_implementation_hash="graspgenx-planner:test",
+        local_path_enabled=False,
+        runtime_session_id="session:graspgenx-test",
+        control_domain_id="domain:test",
+        target_binding_id="target:test",
+        station_manifest_hash="station:test",
+        execution_manifest_hash="execution:test",
+    )
+
+    assert registration.profile.backend_id == "graspgenx"
+    assert registration.skill.schema_entry.execution_result_schema["properties"][
+        "backend_id"
+    ] == {"const": "graspgenx"}
+
+
 def test_point_grasp_local_rgbd_produces_camera_and_base_tcp_poses(
     tmp_path: Path,
 ) -> None:

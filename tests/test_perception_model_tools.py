@@ -14,11 +14,15 @@ from PIL import Image
 
 from deployments.perception import localize_image_cli, point_grasp_image_cli
 from deployments.perception.sam2_grounding_dino import GroundedObjectDetection
+from scripts import smoke_graspgenx_inference
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "scripts" / "install_perception_models.sh"
 POINT_GRASP_INSTALLER = REPO_ROOT / "scripts" / "install_point_grasp_models.sh"
 POINT_GRASP_ENV_INSTALLER = REPO_ROOT / "scripts" / "install_point_grasp_env.sh"
+GRASPGENX_INSTALLER = REPO_ROOT / "scripts" / "install_graspgenx_env.sh"
+GRASPGENX_SERVER = REPO_ROOT / "scripts" / "run_graspgenx_server.sh"
+GRASPGENX_SMOKE = REPO_ROOT / "scripts" / "smoke_graspgenx_inference.py"
 
 
 def test_perception_model_installer_is_executable_and_documents_fixed_inputs() -> None:
@@ -67,6 +71,94 @@ def test_point_grasp_environment_installer_composes_base_and_model_installers() 
     assert "scripts/install_conda_env.sh" in source
     assert "scripts/install_point_grasp_models.sh" in source
     assert "model/perception/graspnet-baseline" in source
+
+
+def test_graspgenx_installer_uses_isolated_asset_environment() -> None:
+    assert GRASPGENX_INSTALLER.stat().st_mode & 0o111
+    completed = subprocess.run(
+        ["bash", str(GRASPGENX_INSTALLER), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "never modifies dexteleop310" in completed.stdout
+    assert "--verify-only" in completed.stdout
+    source = GRASPGENX_INSTALLER.read_text(encoding="utf-8")
+    assert "assets/perception/graspgenx-point-grasp" not in source
+    assert 'BUNDLE_ROOT="$ASSET_ROOT/perception/graspgenx-point-grasp"' in source
+    assert 'VENV_ROOT="$BUNDLE_ROOT/runtime/.venv"' in source
+    assert "adithyamurali/GraspGenXModel" in source
+    assert "--torch-backend" in completed.stdout
+    assert '"$SOURCE_ROOT[serve]"' not in source
+    assert "PyOpenGL" in source
+    assert 'PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}"' in source
+
+
+def test_graspgenx_server_launcher_is_loopback_only_and_asset_bound() -> None:
+    assert GRASPGENX_SERVER.stat().st_mode & 0o111
+    completed = subprocess.run(
+        ["bash", str(GRASPGENX_SERVER), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "never connects to a robot" in completed.stdout
+    source = GRASPGENX_SERVER.read_text(encoding="utf-8")
+    assert "--verify-only" in source
+    assert 'HOST="127.0.0.1"' in source
+    assert "host must be loopback" in source
+    assert 'PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}"' in source
+    rejected = subprocess.run(
+        ["bash", str(GRASPGENX_SERVER), "--host", "0.0.0.0"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode == 2
+    assert "host must be loopback" in rejected.stderr
+
+
+def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> None:
+    assert GRASPGENX_SMOKE.stat().st_mode & 0o111
+    completed = subprocess.run(
+        [sys.executable, str(GRASPGENX_SMOKE), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "never reads cameras or connects to robot hardware" in completed.stdout
+    source = GRASPGENX_SMOKE.read_text(encoding="utf-8")
+    assert "GraspGenXClient" in source
+    assert "GraspGenXInProcessBackend" in source
+    assert "--mode" in completed.stdout
+    assert "--asset-bundle" in completed.stdout
+    assert "DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1" in source
+    assert "robot_motion" not in source
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(GRASPGENX_SMOKE),
+            "--mode",
+            "service",
+            "--host",
+            "0.0.0.0",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd="/tmp",
+    )
+    assert rejected.returncode == 1
+    assert "must use a loopback endpoint" in rejected.stderr
+    assert "ModuleNotFoundError" not in rejected.stderr
+
+
+def test_graspgenx_gpu_smoke_defaults_to_isolated_service() -> None:
+    assert smoke_graspgenx_inference._parse_args([]).mode == "service"
+    assert (
+        smoke_graspgenx_inference._parse_args(["--mode", "in-process"]).mode
+        == "in-process"
+    )
 
 
 def test_point_grasp_image_cli_is_offline_and_has_no_gateway_dependency() -> None:

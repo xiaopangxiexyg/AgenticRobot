@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import stat
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -20,7 +21,12 @@ from agent_gateway.transport.unix_transport import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from deployments.perception import (
+    GRASPGENX_DEFAULT_MODE,
+    GraspGenXClient,
+    GraspGenXInProcessBackend,
+    GraspGenXPointGraspModelSpec,
     GraspNetPointGraspModelSpec,
+    Sam2GraspGenXPointGraspPlanner,
     Sam2GraspNetPointGraspPlanner,
     Sam2GroundingDinoLocalizer,
     Sam2GroundingDinoModelSpec,
@@ -38,6 +44,10 @@ from .perception_application import (
     assemble_camera_only_real_perception_composition,
 )
 from .perception_frames import build_real_perception_station_frame_binding
+from .point_grasp_deployment import (
+    DEFAULT_POINT_GRASP_BACKEND_ID,
+    SUPPORTED_POINT_GRASP_BACKEND_IDS,
+)
 from .realsense_perception import build_real_perception_source_binding
 
 
@@ -112,16 +122,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--point-grasp-backend",
-        choices=("vgn", "graspnet"),
-        default="vgn",
+        choices=tuple(sorted(SUPPORTED_POINT_GRASP_BACKEND_IDS)),
+        default=DEFAULT_POINT_GRASP_BACKEND_ID,
     )
     parser.add_argument(
         "--point-grasp-asset-bundle",
         type=Path,
         default=None,
-        help="absolute path to the reviewed VGN or GraspNet asset bundle",
+        help="absolute path to the reviewed VGN, GraspNet, or GraspGenX asset bundle",
     )
     parser.add_argument("--point-grasp-device", default="cuda")
+    parser.add_argument("--graspgenx-host", default="127.0.0.1")
+    parser.add_argument("--graspgenx-port", type=int, default=5556)
+    parser.add_argument("--graspgenx-timeout-ms", type=int, default=120_000)
+    parser.add_argument(
+        "--graspgenx-mode",
+        choices=("service", "in-process"),
+        default=GRASPGENX_DEFAULT_MODE,
+        help=(
+            "GraspGenX execution mode; service uses the isolated loopback ZMQ "
+            "runtime by default, in-process requires a compatible Gateway Python"
+        ),
+    )
+    parser.add_argument(
+        "--graspgenx-source-root",
+        type=Path,
+        default=None,
+        help=(
+            "optional absolute GraspGenX source checkout for in-process mode; "
+            "defaults to model/perception/graspgenx"
+        ),
+    )
     return parser
 
 
@@ -164,6 +195,17 @@ def _runtime_session_id(value: str | None) -> str:
     return value or "dexteleop-real-perception:" + uuid.uuid4().hex
 
 
+def _graspgenx_mode_was_explicit(argv: list[str] | None) -> bool:
+    """Keep the in-process default inert unless GraspGenX is selected."""
+
+    tokens = sys.argv[1:] if argv is None else argv
+    return any(
+        token == "--graspgenx-mode"
+        or token.startswith("--graspgenx-mode=")
+        for token in tokens
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -192,6 +234,18 @@ def main(argv: list[str] | None = None) -> int:
         args.artifact_root,
         flag="--artifact-root",
     )
+    if (
+        _graspgenx_mode_was_explicit(argv)
+        and args.graspgenx_mode != "service"
+        and (
+            not args.enable_point_grasp
+            or args.point_grasp_backend != "graspgenx"
+        )
+    ):
+        parser.error(
+            "--graspgenx-mode applies only to an enabled "
+            "--point-grasp-backend graspgenx"
+        )
     object_localizer = None
     if args.enable_object_localization:
         if args.object_localization_asset_bundle is None:
@@ -239,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
                     point_segmenter=object_localizer,
                     device=args.point_grasp_device,
                 )
-            else:
+            elif args.point_grasp_backend == "graspnet":
                 point_grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(
                     point_grasp_bundle
                 )
@@ -247,6 +301,37 @@ def main(argv: list[str] | None = None) -> int:
                     model_spec=point_grasp_spec,
                     point_segmenter=object_localizer,
                     device=args.point_grasp_device,
+                )
+            else:
+                point_grasp_spec = GraspGenXPointGraspModelSpec.from_asset_bundle(
+                    point_grasp_bundle
+                )
+                graspgenx_source_root = (
+                    None
+                    if args.graspgenx_source_root is None
+                    else _absolute_directory(
+                        parser,
+                        args.graspgenx_source_root,
+                        flag="--graspgenx-source-root",
+                    )
+                )
+                graspgenx_backend = (
+                    GraspGenXClient(
+                        host=args.graspgenx_host,
+                        port=args.graspgenx_port,
+                        timeout_ms=args.graspgenx_timeout_ms,
+                    )
+                    if args.graspgenx_mode == "service"
+                    else GraspGenXInProcessBackend(
+                        model_spec=point_grasp_spec,
+                        source_root=graspgenx_source_root,
+                        device=args.point_grasp_device,
+                    )
+                )
+                point_grasp_planner = Sam2GraspGenXPointGraspPlanner(
+                    model_spec=point_grasp_spec,
+                    point_segmenter=object_localizer,
+                    client=graspgenx_backend,
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid point-grasp model bundle: {error}")

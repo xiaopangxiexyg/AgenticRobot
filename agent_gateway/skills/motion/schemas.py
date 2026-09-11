@@ -23,6 +23,7 @@ from agent_gateway.protocol.skill_catalog import (
 )
 from agent_gateway.skills.motion.definition import (
     CARDINAL_TCP_STEP_DIRECTIONS_V1,
+    EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
@@ -94,10 +95,11 @@ def _pose_schema(
         if len(workspace_bounds) != 6:
             raise ValueError("workspace_bounds must contain xyz min/max pairs.")
         values = tuple(
-            _finite(item, field_name="workspace_bound")
-            for item in workspace_bounds
+            _finite(item, field_name="workspace_bound") for item in workspace_bounds
         )
-        if not (values[0] < values[1] and values[2] < values[3] and values[4] < values[5]):
+        if not (
+            values[0] < values[1] and values[2] < values[3] and values[4] < values[5]
+        ):
             raise ValueError("Each workspace minimum must be below its maximum.")
         xyz = (
             {"type": "number", "minimum": values[0], "maximum": values[1]},
@@ -105,8 +107,7 @@ def _pose_schema(
             {"type": "number", "minimum": values[4], "maximum": values[5]},
         )
     quaternion = tuple(
-        {"type": "number", "minimum": -1.0, "maximum": 1.0}
-        for _ in range(4)
+        {"type": "number", "minimum": -1.0, "maximum": 1.0} for _ in range(4)
     )
     return {
         "type": "array",
@@ -126,8 +127,10 @@ def _poses_by_component_schema(
     ]
     | None = None,
 ) -> dict[str, Any]:
-    bounds = {} if workspace_bounds_by_component is None else dict(
-        workspace_bounds_by_component
+    bounds = (
+        {}
+        if workspace_bounds_by_component is None
+        else dict(workspace_bounds_by_component)
     )
     unknown = sorted(set(bounds) - set(component_ids))
     if unknown:
@@ -303,6 +306,45 @@ def tcp_pose_target_schema_entry_v1(
     )
 
 
+def grasp_approach_plan_execution_schema_entry_v1(
+    *,
+    skill_definition_hash: str,
+    parameter_profile_id: str,
+    parameter_profile_hash: str,
+    allowed_component_ids: tuple[str, ...],
+) -> AgentSkillSchemaEntry:
+    """Build the motion schema that accepts only one immutable plan reference."""
+
+    components = _component_ids(allowed_component_ids)
+    parameter_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "component_id": {"type": "string", "enum": list(components)},
+            "grasp_approach_plan_id": {
+                "type": "string",
+                "pattern": "^real-grasp-approach-plan:[0-9a-f]{64}$",
+            },
+            "grasp_approach_plan_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+        },
+        "required": [
+            "component_id",
+            "grasp_approach_plan_id",
+            "grasp_approach_plan_hash",
+        ],
+    }
+    return _schema_entry(
+        skill_id=EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1,
+        skill_definition_hash=skill_definition_hash,
+        parameter_schema=parameter_schema,
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+    )
+
+
 def cardinal_tcp_step_schema_entry_v1(
     *,
     skill_definition_hash: str,
@@ -334,8 +376,7 @@ def cardinal_tcp_step_schema_entry_v1(
     components = _component_ids(allowed_component_ids)
     frames = _component_ids(allowed_reference_frame_ids)
     directions = tuple(
-        _required(value, field_name="allowed_direction")
-        for value in allowed_directions
+        _required(value, field_name="allowed_direction") for value in allowed_directions
     )
     if not directions or len(set(directions)) != len(directions):
         raise ValueError("allowed_directions must be non-empty and unique.")
@@ -427,13 +468,9 @@ def fixed_cardinal_tcp_step_schema_entry_v1(
 
     selected_skill_id = _required(skill_id, field_name="skill_id")
     try:
-        direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
-            selected_skill_id
-        ]
+        direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[selected_skill_id]
     except KeyError as exc:
-        raise ValueError(
-            "skill_id is not a fixed cardinal TCP-step Skill."
-        ) from exc
+        raise ValueError("skill_id is not a fixed cardinal TCP-step Skill.") from exc
     return cardinal_tcp_step_schema_entry_v1(
         skill_id=selected_skill_id,
         skill_definition_hash=skill_definition_hash,
@@ -757,9 +794,7 @@ def validate_agent_motion_parameters_v1(
     schema_kind: str,
     parameters: Mapping[str, Any],
     allowed_component_ids: tuple[str, ...] = (),
-    allowed_cardinal_directions: tuple[
-        str, ...
-    ] = CARDINAL_TCP_STEP_DIRECTIONS_V1,
+    allowed_cardinal_directions: tuple[str, ...] = CARDINAL_TCP_STEP_DIRECTIONS_V1,
     limits: InlineTcpTrajectoryLimits | None = None,
     speed_scale_bounds: tuple[float, float] | None = None,
 ) -> None:
@@ -774,9 +809,7 @@ def validate_agent_motion_parameters_v1(
     ):
         raise ValueError("controlled_frame_id must be exactly 'tool_tcp'.")
     if schema_kind == "registered_tcp_pose_trajectory":
-        forbidden = {"waypoints", "path", "file_path", "raw_actions"} & set(
-            parameters
-        )
+        forbidden = {"waypoints", "path", "file_path", "raw_actions"} & set(parameters)
         if forbidden:
             raise ValueError(
                 "Registered real trajectory parameters cannot carry inline/path "
@@ -852,9 +885,7 @@ def validate_agent_motion_parameters_v1(
                 field_name="speed_scale_bounds[1]",
             )
             if not 0.0 < minimum <= maximum <= 1.0:
-                raise ValueError(
-                    "speed_scale_bounds must satisfy 0 < min <= max <= 1."
-                )
+                raise ValueError("speed_scale_bounds must satisfy 0 < min <= max <= 1.")
             speed_scale = _finite(
                 parameters["speed_scale"],
                 field_name="speed_scale",
@@ -885,7 +916,11 @@ def validate_agent_motion_parameters_v1(
         if not isinstance(waypoint, Mapping):
             raise TypeError(f"waypoints[{index}] must be an object.")
         timestamp = waypoint.get("timestamp_ms")
-        if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, int)
+            or timestamp < 0
+        ):
             raise ValueError(f"waypoints[{index}].timestamp_ms must be non-negative.")
         poses = _poses_by_component(
             waypoint.get("pose_targets_by_component"),
@@ -911,7 +946,10 @@ def validate_agent_motion_parameters_v1(
                         f"Inline trajectory translation step exceeds profile for "
                         f"{component_id}."
                     )
-                if _quaternion_distance(previous_pose, pose) > limits.max_rotation_step_rad:
+                if (
+                    _quaternion_distance(previous_pose, pose)
+                    > limits.max_rotation_step_rad
+                ):
                     raise ValueError(
                         f"Inline trajectory rotation step exceeds profile for "
                         f"{component_id}."
@@ -941,10 +979,8 @@ def validate_agent_motion_route_schema_v1(
         raise ValueError("Route and motion schema Skill identities must match.")
     schema_hashes_match = (
         route.parameter_schema_hash == schema_entry.parameter_schema_hash,
-        route.execution_result_schema_hash
-        == schema_entry.execution_result_schema_hash,
-        route.task_evaluation_schema_hash
-        == schema_entry.task_evaluation_schema_hash,
+        route.execution_result_schema_hash == schema_entry.execution_result_schema_hash,
+        route.task_evaluation_schema_hash == schema_entry.task_evaluation_schema_hash,
     )
     if not all(schema_hashes_match):
         raise ValueError("Route does not bind the exact motion schema hashes.")
@@ -961,6 +997,7 @@ def validate_agent_motion_route_schema_v1(
 __all__ = [
     "AGENT_MOTION_SCHEMA_KINDS_V1",
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
+    "EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1",
     "FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1",
@@ -976,6 +1013,7 @@ __all__ = [
     "fixed_cardinal_tcp_step_schema_entry_v1",
     "fixed_level_tcp_orientation_schema_entry_v1",
     "fixed_level_tcp_orientation_skill_definition_v1",
+    "grasp_approach_plan_execution_schema_entry_v1",
     "inline_tcp_trajectory_schema_entry_v1",
     "registered_tcp_trajectory_schema_entry_v1",
     "tcp_pose_target_schema_entry_v1",

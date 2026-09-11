@@ -47,6 +47,8 @@ REAL_POINT_GRASP_EXECUTOR_ID_V1 = "real-passive-point-grasp-planner.v1"
 REAL_POINT_GRASP_RGB_SLOT_ID_V1 = "rgb_image"
 REAL_POINT_GRASP_DEPTH_SLOT_ID_V1 = "aligned_depth_m"
 REAL_POINT_GRASP_OUTPUT_SLOT_ID_V1 = "annotated_grasps"
+SUPPORTED_POINT_GRASP_BACKEND_IDS = frozenset({"vgn", "graspnet", "graspgenx"})
+DEFAULT_POINT_GRASP_BACKEND_ID = "graspgenx"
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -79,7 +81,7 @@ class RealPointGraspProfile:
             object.__setattr__(
                 self, field, _required(getattr(self, field), field_name=field)
             )
-        if self.backend_id not in {"vgn", "graspnet"}:
+        if self.backend_id not in SUPPORTED_POINT_GRASP_BACKEND_IDS:
             raise ValueError("point-grasp backend_id is unsupported.")
         if not isinstance(self.local_path_enabled, bool):
             raise TypeError("local_path_enabled must be boolean.")
@@ -317,11 +319,13 @@ def build_real_point_grasp_registration(
 
 
 __all__ = [
+    "DEFAULT_POINT_GRASP_BACKEND_ID",
     "REAL_POINT_GRASP_DEPTH_SLOT_ID_V1",
     "REAL_POINT_GRASP_EXECUTOR_ID_V1",
     "REAL_POINT_GRASP_OUTPUT_SLOT_ID_V1",
     "REAL_POINT_GRASP_RGB_SLOT_ID_V1",
     "REAL_POINT_GRASP_ROUTE_ID_V1",
+    "SUPPORTED_POINT_GRASP_BACKEND_IDS",
     "RealPointGraspProfile",
     "RealPointGraspRegistration",
     "build_real_point_grasp_registration",
