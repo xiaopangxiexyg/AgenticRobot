@@ -235,9 +235,10 @@ Progress Step 内的前一或后一有效阶段，不会产生未标注时间空
 猜测覆盖更新后的边界。
 
 标注视频与时间轴以 Parquet 中正式接受的 sample timestamp 对齐，而不是按 Episode
-首尾 wall time 做简单线性映射。相邻正式样本之间超过 1 秒的 Hold/Pause 空洞只在
-GUI 显示轴压缩为 1 秒，并用灰色斜纹标出；视频、Parquet、原始时间戳、阶段 annotation
-时间和训练索引均不修改。
+首尾 wall time 做简单线性映射。短 Hold/Pause 空洞按实际时长显示，长空洞在 GUI
+显示轴最多占 1 秒，并用黄色竖纹标出；视频、Parquet、原始时间戳、阶段 annotation
+时间和训练索引均不修改。拖动阶段边界时只允许落在正式 sample 或记录明确的暂停
+起止边缘；服务端会拒绝暂停空洞内部无法观测、也没有事实依据的任意时间点。
 
 ## 3. Failure 与训练排除
 
@@ -426,7 +427,7 @@ Episode：
 
 1. 完整成功；
 2. 操作阶段失败、约 20 秒 wall-time Hold/Pause 后 Retry 成功；暂停期间不生成正式
-   sample，用于验证 GUI 的 1 秒显示压缩和视频帧对齐；
+   sample，用于验证 GUI 的最长 1 秒显示压缩、边界吸附和视频帧对齐；
 3. 在中间阶段截断；
 4. 从 `RECOVERY_FROM_FAILURE` 的中间 fine stage 进入。
 

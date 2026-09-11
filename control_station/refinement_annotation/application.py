@@ -209,6 +209,55 @@ def _equal_active_time_splits(
     return tuple(zip(boundaries, boundaries[1:]))
 
 
+def _validate_boundaries_outside_unobserved_gaps(
+    item: ProgressAnnotationWorkItem,
+    continuity: EpisodeSampleContinuity,
+    boundaries: Sequence[tuple[str, object]],
+) -> None:
+    """Reject editable boundaries inside gaps that have no recorded sample."""
+
+    samples = continuity.sample_axis.cut_times
+    if len(samples) < 2 or not continuity.break_indices:
+        return
+    pause_edges = tuple(
+        edge
+        for pause in item.recording_pause_segments
+        for edge in (pause.start_timestamp, pause.end_timestamp)
+    )
+    tolerance = 1e-7
+    for field, raw_timestamp in boundaries:
+        try:
+            timestamp = float(raw_timestamp)
+        except (TypeError, ValueError):
+            # The owning annotation contract reports malformed timestamps.
+            continue
+        if not math.isfinite(timestamp):
+            continue
+        for index in continuity.break_indices:
+            if index <= 0 or index >= len(samples):
+                continue
+            left = samples[index - 1]
+            right = samples[index]
+            if not left + tolerance < timestamp < right - tolerance:
+                continue
+            if any(
+                left - tolerance <= edge <= right + tolerance
+                and math.isclose(
+                    timestamp,
+                    edge,
+                    rel_tol=0.0,
+                    abs_tol=tolerance,
+                )
+                for edge in pause_edges
+            ):
+                break
+            raise RefinementAnnotationApplicationError(
+                f"Annotation boundary {field} falls inside the unobserved "
+                f"collection gap ({left}, {right}). Move it to a recorded "
+                "sample or an explicit pause edge."
+            )
+
+
 class RefinementAnnotationApplicationError(ValueError):
     """Raised when a UI request cannot preserve annotation semantics."""
 
@@ -1780,6 +1829,7 @@ class RefinementAnnotationApplication:
                 draft,
                 sample_axis=sample_axis,
                 allow_legacy_adjacent_recoverable_failures=True,
+                allow_legacy_unobserved_gap_boundaries=True,
             )
         review_label_auto_cleared = bool(
             self.annotation_mode == "SECOND_REVIEW"
@@ -4602,6 +4652,7 @@ class RefinementAnnotationApplication:
         *,
         sample_axis: Any | None = None,
         allow_legacy_adjacent_recoverable_failures: bool = False,
+        allow_legacy_unobserved_gap_boundaries: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(draft, Mapping):
             raise RefinementAnnotationApplicationError(
@@ -4733,6 +4784,39 @@ class RefinementAnnotationApplication:
             raise RefinementAnnotationApplicationError(
                 "Abnormal/whole-Episode/coarse-boundary tools require the "
                 "explicit privileged-tools switch."
+            )
+        continuity = self._sample_continuity(item)
+        if sample_axis is None:
+            sample_axis = continuity.sample_axis
+        boundary_values = [
+            (f"occurrences[{index}].{field}", value.get(field))
+            for index, value in enumerate(occurrences)
+            for field in ("start_at", "end_at")
+        ]
+        boundary_values.extend(
+            (
+                f"progress_boundary_overrides[{index}].corrected_effective_at",
+                value.get("corrected_effective_at"),
+            )
+            for index, value in enumerate(overrides)
+        )
+        if isinstance(detail_overlay, Mapping):
+            detail_occurrences = detail_overlay.get("occurrences", ())
+            if isinstance(detail_occurrences, (list, tuple)):
+                boundary_values.extend(
+                    (
+                        f"detail_overlay.occurrences[{index}].{field}",
+                        value.get(field),
+                    )
+                    for index, value in enumerate(detail_occurrences)
+                    if isinstance(value, Mapping)
+                    for field in ("start_at", "end_at")
+                )
+        if not allow_legacy_unobserved_gap_boundaries:
+            _validate_boundaries_outside_unobserved_gaps(
+                item,
+                continuity,
+                boundary_values,
             )
         failure_triggers = self._normalize_failure_triggers(
             item,

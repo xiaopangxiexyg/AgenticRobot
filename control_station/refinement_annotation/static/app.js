@@ -78,6 +78,8 @@ const EPISODE_PANEL_STORAGE_KEY =
 const DEFAULT_CAMERA_STORAGE_KEY =
   "dexteleop.annotation.default_camera";
 const DISPLAY_GAP_THRESHOLD_SEC = 1.0;
+// Preserve short pauses at their real visual duration while bounding long
+// no-sample spans so one operator hold cannot consume the whole timeline.
 const DISPLAY_GAP_DURATION_SEC = 1.0;
 const STEP_COLOR_FAMILIES = [
   {hue: 176, saturation: 63, coarseLightness: 60},
@@ -1085,7 +1087,7 @@ function buildTimelineMap() {
     const continuityBreak = explicitBreaks.has(index);
     const compressed = continuityBreak || realDelta > DISPLAY_GAP_THRESHOLD_SEC;
     const displayDelta = compressed
-      ? DISPLAY_GAP_DURATION_SEC
+      ? Math.max(nominal, Math.min(realDelta, DISPLAY_GAP_DURATION_SEC))
       : Math.max(realDelta, nominal);
     const displayStart = display[index - 1];
     display.push(displayStart + displayDelta);
@@ -1098,6 +1100,7 @@ function buildTimelineMap() {
         realStart: real[index - 1],
         realEnd: real[index],
         realDuration: realDelta,
+        displayDuration: displayDelta,
         displayStart,
         displayEnd: displayStart + displayDelta,
         continuityBreak,
@@ -1111,6 +1114,21 @@ function buildTimelineMap() {
     compressedGaps,
     displayDuration: Math.max(display[display.length - 1] || nominal, nominal),
   };
+}
+
+function compressedGapTitle(gap) {
+  const reason = gap.pause
+    ? gap.pause.reason || (gap.pause.reasons || []).join(", ") || "未记录原因"
+    : "未记录原因";
+  const pauseDuration = gap.pause
+    ? Number(gap.pause.end_timestamp) - Number(gap.pause.start_timestamp)
+    : null;
+  const duration = Number.isFinite(pauseDuration) && pauseDuration > 0
+    ? `暂停 ${formatTime(pauseDuration)}，相邻样本间隔 ${formatTime(gap.realDuration)}`
+    : `相邻样本间隔 ${formatTime(gap.realDuration)}`;
+  return gap.continuityBreak
+    ? `采集暂停/连续性中断：${reason}；${duration}，时间轴显示 ${formatTime(gap.displayDuration)}`
+    : `无样本间隔：${duration}，时间轴显示 ${formatTime(gap.displayDuration)}`;
 }
 
 function segmentAtOrBefore(values, target) {
@@ -1176,6 +1194,49 @@ function nearestSampleIndex(timestamp) {
     < Math.abs(timestamp - timestamps[left])
     ? right
     : left;
+}
+
+function snapTimelineBoundaryTimestamp(proposed, lower, upper) {
+  const timestamps = sampleTimestamps();
+  const minimum = Number(lower);
+  const maximum = Number(upper);
+  const target = Number(proposed);
+  if (
+    !timestamps.length
+    || !Number.isFinite(target)
+    || !Number.isFinite(minimum)
+    || !Number.isFinite(maximum)
+    || minimum > maximum
+  ) return null;
+
+  const candidates = [];
+  const first = firstSampleIndexAtOrAfter(minimum);
+  const last = lastSampleIndexAtOrBefore(maximum);
+  if (
+    first <= last
+    && timestamps[first] >= minimum
+    && timestamps[last] <= maximum
+  ) {
+    const nearest = clamp(nearestSampleIndex(target), first, last);
+    candidates.push(timestamps[nearest]);
+  }
+
+  // A pause edge is an authoritative wall-clock fact even when recording was
+  // already stopped and no sample exists exactly at that instant.
+  for (const pause of state.detail?.recording_pause_segments || []) {
+    for (const value of [pause.start_timestamp, pause.end_timestamp]) {
+      const timestamp = Number(value);
+      if (
+        Number.isFinite(timestamp)
+        && timestamp >= minimum
+        && timestamp <= maximum
+      ) candidates.push(timestamp);
+    }
+  }
+  candidates.sort((left, right) =>
+    Math.abs(left - target) - Math.abs(right - target) || left - right
+  );
+  return candidates[0] ?? null;
 }
 
 function lastSampleIndexAtOrBefore(timestamp) {
@@ -1463,7 +1524,12 @@ function coarseBoundaryLimits(transition) {
 function applyCoarseBoundaryCorrection(transition, proposed) {
   const limits = coarseBoundaryLimits(transition);
   if (!limits) return null;
-  const corrected = clamp(Number(proposed), limits.lower, limits.upper);
+  const corrected = snapTimelineBoundaryTimestamp(
+    proposed,
+    limits.lower,
+    limits.upper,
+  );
+  if (corrected === null) return null;
   state.draft.progress_boundary_overrides =
     (state.draft.progress_boundary_overrides || []).filter(
       (value) => value.source_advance_fact_id !== transition.advance_fact_id,
@@ -2051,9 +2117,7 @@ function renderDetailAnnotation() {
       `compressed-gap${gap.continuityBreak ? " collection-pause" : ""}`,
     );
     setPosition(marker, gap.realStart, gap.realEnd);
-    marker.title = gap.pause
-      ? `采集暂停：${gap.pause.reason || (gap.pause.reasons || []).join(", ") || "未记录原因"}`
-      : "样本连续性中断";
+    marker.title = compressedGapTitle(gap);
     track.appendChild(marker);
   }
   for (let index = 1; index < values.length; index += 1) {
@@ -2096,11 +2160,12 @@ function renderDetailAnnotation() {
         0.02,
         episodeDuration() / Math.max(10000, state.detail.frame_count * 20),
       );
-      const timestamp = clamp(
+      const timestamp = snapTimelineBoundaryTimestamp(
         timelineAtRatio(ratio),
         state.dragging.left.start_at + minimum,
         state.dragging.right.end_at - minimum,
       );
+      if (timestamp === null) return;
       state.dragging.left.end_at = timestamp;
       state.dragging.right.start_at = timestamp;
       handle.style.left = timelineRatio(timestamp) * 100 + "%";
@@ -3353,12 +3418,7 @@ function renderTimeline() {
         `compressed-gap${gap.continuityBreak ? " collection-pause" : ""}`,
       );
       setPosition(marker, gap.realStart, gap.realEnd);
-      const reason = gap.pause
-        ? gap.pause.reason || (gap.pause.reasons || []).join(", ") || "未记录原因"
-        : "未记录原因";
-      marker.title = gap.continuityBreak
-        ? `采集暂停/连续性中断：${reason}；真实 ${formatTime(gap.realDuration)}，标注显示为 1 秒`
-        : `无样本间隔：真实 ${formatTime(gap.realDuration)}，标注显示为 1 秒`;
+      marker.title = compressedGapTitle(gap);
       track.appendChild(marker);
     }
   }
@@ -3644,11 +3704,12 @@ function renderTimeline() {
       const rect = state.dragging.rect;
       const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
       const minimum = Math.max(0.02, episodeDuration() / Math.max(10000, state.detail.frame_count * 20));
-      const timestamp = clamp(
+      const timestamp = snapTimelineBoundaryTimestamp(
         timelineAtRatio(ratio),
         state.dragging.left.start_at + minimum,
         state.dragging.right.end_at - minimum,
       );
+      if (timestamp === null) return;
       state.dragging.left.end_at = timestamp;
       state.dragging.right.start_at = timestamp;
       state.dragging.handle.style.left = `${timelineRatio(timestamp) * 100}%`;
