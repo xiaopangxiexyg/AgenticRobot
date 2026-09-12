@@ -680,3 +680,29 @@ P2 的下一步仍是测量而非实现新的控制器：先在集成后的 exac
 receive-age、完整率和 cadence，并与独立 0x7019 静态基线比较。只有该证据通过后，才把接收
 delay/jitter/dropout 写入 Real2Sim observation/transport profile。armature、被动阻尼、摩擦和
 低通带宽仍需安全动态采集及 held-out 验证；官方场景或示例不能代替本机辨识结果。
+
+## P2.1 主动上报传输验收（2026-09-12）
+
+合并后的主动上报探针已在现场以前台、无运动方式完成一次 30 秒传输验收。运行时 AgenticRobot
+代码为 `b7e07a840fbc82f5e50c6645fd57549458049106`，原始结果保存在
+`/tmp/b601-rs-commissioning/active-report-postmerge-QyJiU5/result.json`，完整命令和终端输出保存在
+同目录的 `command_and_output.log`。本次只切换并关闭 active-report 配置，没有调用电机使能、失能、
+位置或力矩命令；六个目标关节的清理 receipt 均完整，`cleanup_errors=[]`。
+
+验收结果：
+
+- `stream_transport_acceptance=PASS`、`acceptance_passed=true`，目标 40 Hz，最小允许 36 Hz；
+- J1--J6 分别观测到约 39.97--39.98 Hz，每关节 1199--1200 个样本，p99 间隔约
+  25.08--25.10 ms，未出现短 active-report 帧；
+- 主机反馈 ID 为配置的 `0xFD`，active-report 捕获为 8394 帧，另有 4 个 type-2
+  operation-status 候选帧；后者不替代 type-24 cadence 验收；
+- 原始捕获还记录到 J7 约 39.98 Hz，但 J7 是夹爪、在 B601 六轴 backend 之外，不纳入本次
+  acceptance 或 cleanup 覆盖范围；该观察只保留在原始证据中。
+
+证据边界保持不变：`motion_commands_sent=false`、`motors_enabled_by_probe=false`、
+`control_feedback_admission=NOT_ADMITTED`，且 `freshness_verified=false`、
+`motorbridge_state_observation_metadata_available=false`。因此本结果只证明 type-24 帧能够按
+约 40 Hz 到达主机，不能证明 payload 已解码为同帧、带源序号/源时间戳的关节状态，也不能证明
+高频位置、重力/阻抗或 haptic 闭环可用。下一步仍需在 MotorBridge 暴露实际 firmware 的
+decoded sequence/receive-age 后，做 P2 decoded-observation 验收，再将实测 delay/jitter/dropout
+写入 Real2Sim transport profile。
