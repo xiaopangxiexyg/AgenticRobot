@@ -26,8 +26,8 @@ owner、碰撞场景和安全门禁。
   的米制三维包围盒加 12 cm margin 限定推理工作区，再生成 6DoF 二指抓姿；候选随后仍用
   SAM2 目标表面距离、点击距离和 DMTAC M 几何过滤，完整对齐深度仍用于碰撞门禁；
 - 默认的 [GraspGenX](https://github.com/NVlabs/GraspGenX) 直接消费 SAM2 mask 内的米制局部点云，
-  并用 DMTAC M 的 open/mid sweep-volume 条件生成跨夹爪 6DoF 候选；默认通过隔离的 loopback
-  service 加载 GPU 模型，in-process 仅供兼容的独立 Gateway Python 环境显式选择，候选仍经过
+  并用 DMTAC M 的 open/mid sweep-volume 条件生成跨夹爪 6DoF 候选；默认在兼容的独立 Gateway
+  Python 环境内直接加载 GPU 模型，隔离的 loopback service 保留为显式兼容选项，候选仍经过
   点击归属、实际 TCP 变换和完整可见深度碰撞过滤；
 第三方源码以 `model/perception/` 下的 Git submodule 进入父仓；固定 revision、
 `dexteleop310` 环境安装、CUDA 架构和只读验证统一见
@@ -132,9 +132,10 @@ manifest 还固定源码 commit、`realsense` 模型类型和项目授权 acknow
 ## GraspGenX 更新后端
 
 GraspGenX 源码固定在 `model/perception/graspgenx`，generator/discriminator 权重和其运行时
-统一位于 `assets/perception/graspgenx-point-grasp`。默认 service 模式使用 bundle 内独立 venv；
-in-process 模式要求 Gateway 所在 Python 环境本身兼容 GraspGenX，必须显式选择。安装器自动
-下载官方 Hugging Face 模型仓、生成四个文件的真实 SHA-256 manifest，并保持主
+统一位于 `assets/perception/graspgenx-point-grasp`。默认 in-process 模式要求 Gateway 所在
+Python 环境本身兼容 GraspGenX；service 模式显式使用 bundle 内独立 venv。generator 和
+discriminator 必须先从已复验的本地 asset bundle 传入；安装器默认不访问 Hugging Face，
+只核对固定 revision、四个已物化文件并生成真实 SHA-256 manifest，同时保持主
 `dexteleop310` 不变：
 
 ```bash
@@ -143,9 +144,11 @@ bash scripts/install_graspgenx_env.sh --verify-only
 ```
 
 安装器只在该 bundle 的 `runtime/.venv` 中安装 GraspGenX 推理链和 service 备选，不会修改共享
-`dexteleop310`。默认由 `uv --torch-backend auto` 选择 PyTorch wheel；已明确 CUDA
-版本的 GPU 主机可传入例如 `--torch-backend cu126`。上游完整依赖中的
-PyOpenGL/pyrender 版本互斥，因此本服务不安装未使用的渲染、训练和端到端仿真依赖。
+`dexteleop310`。Python 包默认使用唯一的清华 PyPI 镜像，并在正式安装前对完整依赖闭包执行
+`uv --dry-run`；镜像缺包或不可用时立即停止，禁止自动回退其他索引。已验证的 GPU 组合为
+`torch==2.6.0`、`torchvision==0.21.0` 和 PyPI CUDA 12.4 runtime。上游完整依赖中的
+PyOpenGL/pyrender 版本互斥，因此本服务不安装未使用的渲染、训练和端到端仿真依赖。只有明确
+要求从官方模型仓重新拉取权重时才传 `--allow-checkpoint-download`。
 
 service 模式的模型服务只应绑定 loopback；启动命令见 `scripts/run_graspgenx_server.sh`。服务健康
 后，在 `real-perception` 或 `real-rm65` 的原启动命令中增加：
@@ -157,12 +160,11 @@ bash scripts/run_graspgenx_server.sh \
   --port 5556
 ```
 
-如果已准备好与 GraspGenX 官方依赖兼容的 Gateway Python 环境，可不启动上述服务，在原
-`real-perception` 或 `real-rm65` 命令中选择 direct Python backend：
+准备好与 GraspGenX 官方依赖兼容的 Gateway Python 环境后，不需要启动上述服务；原
+`real-perception` 或 `real-rm65` 命令默认选择 direct Python backend：
 
 ```text
 --point-grasp-backend graspgenx
---graspgenx-mode in-process
 --point-grasp-asset-bundle /absolute/path/to/assets/perception/graspgenx-point-grasp
 --graspgenx-source-root /absolute/path/to/model/perception/graspgenx
 --point-grasp-device cuda
@@ -172,6 +174,31 @@ in-process 会在 Gateway 的 `start()` 阶段加载一次 generator/discriminat
 缓存 sampler，并在同一进程内串行调用模型。它不改变 SAM2 mask、DMTAC M TCP 变换、可见深度
 碰撞过滤、RM65 可达性或下游运动权限。当前官方 checkpoint 要求 PyTorch <2.7；不要把它直接
 安装或升级到项目的 `dexteleop310`，应先用兼容的独立 Gateway 环境完成 GPU smoke 和仿真回归。
+
+### in-process runtime contract 与环境预检
+
+`deployments/perception/graspgenx_runtime_contract.py` 定义了可导入、可验证的 in-process
+运行时合同 `graspgenx-inprocess-runtime.v1`。任何 Gateway Python 在加载模型前必须通过该合同，
+检查项为：受审 Python 版本（3.10/3.11）、`torch>=2.1,<2.7`、CUDA 可用性与设备序号、
+GraspGenX source checkout 的 Git HEAD 等于 manifest 中受审 revision（默认
+`model/perception/graspgenx` submodule）、受审 asset bundle 与 `gen/`、`dis/` checkpoint 布局。
+`GraspGenXInProcessBackend.start()` 在导入任何上游包之前执行该验证；任一检查失败即以完整的
+typed receipt 摘要 fail closed，不会退化为 service 或继续加载。receipt（schema
+`dexteleop.perception.graspgenx_runtime_receipt.v1`）记录每个检查的 expected/observed/detail，
+可通过 backend 的 `runtime_receipt` 属性取用。
+
+不加载权重的环境预检命令（同样不读相机、不连机械臂）：
+
+```bash
+PYTHONPATH="${PWD}/model/perception/graspgenx:${PYTHONPATH:-}" \
+  python scripts/smoke_graspgenx_inference.py \
+  --mode in-process --verify-only \
+  --asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/graspgenx-point-grasp"
+```
+
+退出码为 0 且输出 JSON `status=passed` 表示当前解释器满足 in-process 合同；`status=failed`
+时按 `checks` 中的逐项 detail 诊断依赖冲突。该预检只证明环境兼容性，不证明模型加载、推理质量、
+相机或机械臂可用；组合运行前仍须完成下文 GPU smoke 与仿真回归。
 
 若选择 service 模式，模型加载完成后，可在第二个终端运行不读取相机、不连接机械臂的 GPU smoke。
 它复用正式 `GraspGenXClient`、DMTac M sweep-volume 和协议校验，向服务发送一个确定性的 50 mm
@@ -188,7 +215,7 @@ in-process 会在 Gateway 的 `start()` 阶段加载一次 generator/discriminat
 退出码为 0 且 JSON 中 `status` 为 `passed` 才表示 checkpoint 加载、CUDA 模型执行、
 DMTac 条件推理和客户端返回校验均已完成。该 smoke 不替代真实同帧 RGB-D 抓姿质量验收。
 
-显式的 in-process backend 不需要运行服务，可在兼容环境中直接验证：
+默认的 in-process backend 不需要运行服务，可在兼容环境中直接验证：
 
 ```bash
 PYTHONPATH="${PWD}/model/perception/graspgenx:${PYTHONPATH:-}" \
@@ -267,8 +294,8 @@ python -m deployments.perception.point_grasp_image_cli \
 
 生产 `real-perception` 默认仍不加载抓姿模型。只有同时显式启用共享 SAM2 localizer 与
 `--enable-point-grasp`，并提供经过 manifest/hash 校验的 point-grasp bundle，才注册
-`perception.plan_point_grasp@2`。GraspGenX 是默认 backend，并默认要求预先启动隔离 loopback
-service；只有显式指定 `--graspgenx-mode in-process` 才在兼容的 Gateway Python 中直接加载模型。
+`perception.plan_point_grasp@2`。GraspGenX 是默认 backend，并默认在通过运行时合同的 Gateway
+Python 中直接加载模型；只有显式指定 `--graspgenx-mode service` 才连接预先启动的隔离 loopback service。
 VGN 是显式兼容选项；GraspNet 仍要求其资产 manifest 中的项目授权 acknowledgement。启动事务先启动并 admit 相机，再启动共享
 localizer，最后启动 planner；关闭顺序
 相反。任一步失败都会清理已尝试资源，Skill 调用本身不会启动、重置或关闭设备/模型。

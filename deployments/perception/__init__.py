@@ -6,6 +6,11 @@ from .graspgenx_client import (
     GraspGenXInferenceBackend,
     GraspGenXInProcessBackend,
 )
+from .graspgenx_runtime_contract import (
+    GRASPGENX_INPROCESS_RUNTIME_CONTRACT_ID,
+    GraspGenXRuntimeReceipt,
+    verify_graspgenx_inprocess_runtime,
+)
 from .sam2_graspgenx_point_grasp import (
     GraspGenXPointGraspModelSpec,
     Sam2GraspGenXPointGraspPlanner,
@@ -28,10 +33,12 @@ from .sam2_vgn_point_grasp import (
 __all__ = [
     "DMTAC_M_MAX_VISIBLE_COLLISION_POINTS",
     "GRASPGENX_DEFAULT_MODE",
+    "GRASPGENX_INPROCESS_RUNTIME_CONTRACT_ID",
     "GraspGenXClient",
     "GraspGenXInProcessBackend",
     "GraspGenXInferenceBackend",
     "GraspGenXPointGraspModelSpec",
+    "GraspGenXRuntimeReceipt",
     "GraspNetPointGraspModelSpec",
     "GroundedObjectDetection",
     "Sam2GraspGenXPointGraspPlanner",
@@ -40,4 +47,5 @@ __all__ = [
     "Sam2GroundingDinoModelSpec",
     "Sam2VgnPointGraspPlanner",
     "VgnPointGraspModelSpec",
+    "verify_graspgenx_inprocess_runtime",
 ]

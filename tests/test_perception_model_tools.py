@@ -88,7 +88,14 @@ def test_graspgenx_installer_uses_isolated_asset_environment() -> None:
     assert 'BUNDLE_ROOT="$ASSET_ROOT/perception/graspgenx-point-grasp"' in source
     assert 'VENV_ROOT="$BUNDLE_ROOT/runtime/.venv"' in source
     assert "adithyamurali/GraspGenXModel" in source
-    assert "--torch-backend" in completed.stdout
+    assert "--package-index" in completed.stdout
+    assert "--allow-checkpoint-download" in completed.stdout
+    assert "checkpoints must already" in completed.stdout
+    assert "https://pypi.tuna.tsinghua.edu.cn/simple" in source
+    assert "--dry-run" in source
+    assert "--no-config" in source
+    assert "--torch-backend" not in source
+    assert "ALLOW_CHECKPOINT_DOWNLOAD=0" in source
     assert '"$SOURCE_ROOT[serve]"' not in source
     assert "PyOpenGL" in source
     assert 'PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}"' in source
@@ -130,8 +137,10 @@ def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> Non
     source = GRASPGENX_SMOKE.read_text(encoding="utf-8")
     assert "GraspGenXClient" in source
     assert "GraspGenXInProcessBackend" in source
+    assert "verify_graspgenx_inprocess_runtime" in source
     assert "--mode" in completed.stdout
     assert "--asset-bundle" in completed.stdout
+    assert "--verify-only" in completed.stdout
     assert "DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1" in source
     assert "robot_motion" not in source
     rejected = subprocess.run(
@@ -153,11 +162,52 @@ def test_graspgenx_gpu_smoke_is_non_hardware_and_reuses_client_contract() -> Non
     assert "ModuleNotFoundError" not in rejected.stderr
 
 
-def test_graspgenx_gpu_smoke_defaults_to_isolated_service() -> None:
-    assert smoke_graspgenx_inference._parse_args([]).mode == "service"
+def test_graspgenx_gpu_smoke_verify_only_requires_inprocess_bundle() -> None:
+    assert smoke_graspgenx_inference._parse_args([]).verify_only is False
     assert (
-        smoke_graspgenx_inference._parse_args(["--mode", "in-process"]).mode
-        == "in-process"
+        smoke_graspgenx_inference._parse_args(
+            ["--mode", "in-process", "--verify-only"]
+        ).verify_only
+        is True
+    )
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(GRASPGENX_SMOKE),
+            "--mode",
+            "service",
+            "--verify-only",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd="/tmp",
+    )
+    assert rejected.returncode == 1
+    assert "applies only to --mode in-process" in rejected.stderr
+
+    missing_bundle = subprocess.run(
+        [
+            sys.executable,
+            str(GRASPGENX_SMOKE),
+            "--mode",
+            "in-process",
+            "--verify-only",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd="/tmp",
+    )
+    assert missing_bundle.returncode == 1
+    assert "--verify-only requires --asset-bundle" in missing_bundle.stderr
+
+
+def test_graspgenx_gpu_smoke_defaults_to_inprocess() -> None:
+    assert smoke_graspgenx_inference._parse_args([]).mode == "in-process"
+    assert (
+        smoke_graspgenx_inference._parse_args(["--mode", "service"]).mode
+        == "service"
     )
 
 

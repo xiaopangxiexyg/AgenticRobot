@@ -1,9 +1,9 @@
 """GraspGenX inference backends for the point-grasp planner.
 
-The loopback client keeps the GPU stack in a separate asset-contained
-environment, while the optional in-process adapter imports the official
-package lazily into a compatible Gateway environment. Neither backend owns
-robot or motion resources.
+The default in-process adapter imports the official package lazily into a
+compatible Gateway environment.  The loopback client remains an explicit
+compatibility option that keeps the GPU stack in a separate asset-contained
+environment.  Neither backend owns robot or motion resources.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import importlib
 import math
 import os
-import re
 import sys
 import threading
 from collections.abc import Mapping
@@ -22,10 +21,17 @@ import msgpack
 import numpy as np
 import zmq
 
+from .graspgenx_runtime_contract import (
+    GRASPGENX_DEVICE_PATTERN,
+    GRASPGENX_INPROCESS_RUNTIME_CONTRACT_ID,
+    GraspGenXRuntimeReceipt,
+    verify_graspgenx_inprocess_runtime,
+)
+
 GRASPGENX_DEFAULT_HOST = "127.0.0.1"
 GRASPGENX_DEFAULT_PORT = 5556
 GRASPGENX_DEFAULT_TIMEOUT_MS = 120_000
-GRASPGENX_DEFAULT_MODE = "service"
+GRASPGENX_DEFAULT_MODE = "in-process"
 GRASPGENX_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 GRASPGENX_INPROCESS_BACKEND_ID = "graspgenx-inprocess-v1"
 _GRASPGENX_IMPORT_LOCK = threading.RLock()
@@ -337,11 +343,15 @@ class GraspGenXClient:
 class GraspGenXInProcessBackend:
     """Direct GraspGenX model adapter for a compatible Gateway process.
 
-    The official GraspGenX source is imported lazily from ``source_root`` and
-    the reviewed checkpoint bundle is loaded once during :meth:`start`. The
-    model is shared by all sweep-volume samplers, matching the existing ZMQ
-    server. Inference is serialized because the upstream sampler mutates the
-    model's sampling count and is not a documented re-entrant API.
+    The official GraspGenX source is imported lazily from ``source_root``
+    and the reviewed checkpoint bundle is loaded once during :meth:`start`.
+    Before any import, :meth:`start` verifies the Gateway environment
+    against ``graspgenx_runtime_contract`` (Python, Torch, CUDA, source
+    revision, asset manifest, checkpoint layout) and fails closed with the
+    typed receipt summary. The model is shared by all sweep-volume
+    samplers, matching the existing ZMQ server. Inference is serialized
+    because the upstream sampler mutates the model's sampling count and
+    is not a documented re-entrant API.
 
     This adapter intentionally supports CUDA only. The reviewed upstream
     loader calls ``model.cuda()`` and the sampler's gripper conditioning also
@@ -374,7 +384,7 @@ class GraspGenXInProcessBackend:
         if not bundle_root.is_dir() or not checkpoint_root.is_dir():
             raise ValueError("model_spec asset roots must be existing directories.")
         normalized_device = str(device).strip()
-        if not re.fullmatch(r"cuda(?::[0-9]+)?", normalized_device):
+        if not GRASPGENX_DEVICE_PATTERN.fullmatch(normalized_device):
             raise ValueError(
                 "GraspGenX in-process backend requires a CUDA device such as 'cuda'."
             )
@@ -398,6 +408,8 @@ class GraspGenXInProcessBackend:
         self.device = normalized_device
         self.use_tensorrt = use_tensorrt
         self.tensorrt_precision = tensorrt_precision
+        self._runtime_verifier = verify_graspgenx_inprocess_runtime
+        self._runtime_receipt: GraspGenXRuntimeReceipt | None = None
         self._lock = threading.RLock()
         self._started = False
         self._closed = False
@@ -415,6 +427,7 @@ class GraspGenXInProcessBackend:
     def semantic_config(self) -> Mapping[str, object]:
         return {
             "backend": self.backend_id,
+            "runtime_contract": GRASPGENX_INPROCESS_RUNTIME_CONTRACT_ID,
             "model_spec_hash": str(self.model_spec.semantic_content_hash),
             "device": self.device,
             "use_tensorrt": self.use_tensorrt,
@@ -422,6 +435,13 @@ class GraspGenXInProcessBackend:
                 self.tensorrt_precision if self.use_tensorrt else None
             ),
         }
+
+    @property
+    def runtime_receipt(self) -> GraspGenXRuntimeReceipt | None:
+        """The runtime-contract receipt from the last :meth:`start`."""
+
+        with self._lock:
+            return self._runtime_receipt
 
     @staticmethod
     def _temporary_environment(
@@ -472,20 +492,6 @@ class GraspGenXInProcessBackend:
                         "GraspGenX package was not imported from the requested source_root."
                     )
                 torch = importlib.import_module("torch")
-                torch_version = re.match(
-                    r"^(?P<major>[0-9]+)\.(?P<minor>[0-9]+)",
-                    str(torch.__version__),
-                )
-                if (
-                    torch_version is None
-                    or int(torch_version.group("major")) != 2
-                    or not 1 <= int(torch_version.group("minor")) < 7
-                ):
-                    raise RuntimeError(
-                        "Official GraspGenX in-process inference requires "
-                        "torch>=2.1,<2.7; found "
-                        f"{torch.__version__}."
-                    )
                 grasp_server = importlib.import_module("graspgenx.grasp_server")
                 checkpoint_io = importlib.import_module(
                     "graspgenx.utils.checkpoint_io"
@@ -493,10 +499,6 @@ class GraspGenXInProcessBackend:
                 samplers = importlib.import_module("graspgenx.samplers")
                 serving_types = importlib.import_module("graspgenx.serving.types")
                 device_obj = torch.device(self.device)
-                if not torch.cuda.is_available():
-                    raise RuntimeError(
-                        "GraspGenX in-process backend requires torch.cuda.is_available()."
-                    )
                 gen_dir = self.checkpoint_root / "gen"
                 dis_dir = self.checkpoint_root / "dis"
                 cfg = checkpoint_io.load_model_cfg(str(gen_dir), str(dis_dir))
@@ -544,6 +546,17 @@ class GraspGenXInProcessBackend:
                 raise RuntimeError("Closed GraspGenX backend cannot restart.")
             if self._started:
                 return
+            receipt = self._runtime_verifier(
+                model_spec=self.model_spec,
+                source_root=self.source_root,
+                device=self.device,
+            )
+            self._runtime_receipt = receipt
+            if not receipt.passed:
+                raise RuntimeError(
+                    "GraspGenX in-process runtime contract verification failed: "
+                    f"{receipt.failure_summary()}"
+                )
             runtime = self._load_runtime()
             (
                 self._torch,

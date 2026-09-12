@@ -62,10 +62,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=("service", "in-process"),
-        default="service",
+        default="in-process",
         help=(
-            "call the isolated loopback service by default; use in-process only "
-            "from a compatible GraspGenX Python environment"
+            "load GraspGenX in-process by default from a compatible Python "
+            "environment; service explicitly selects the isolated loopback runtime"
         ),
     )
     parser.add_argument(
@@ -79,6 +79,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="optional GraspGenX source checkout for --mode in-process",
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help=(
+            "verify the in-process runtime contract (Python, Torch, CUDA, source "
+            "revision, asset manifest, checkpoint layout) without loading model "
+            "weights; requires --mode in-process and --asset-bundle"
+        ),
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -126,10 +135,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         GraspGenXClient,
         GraspGenXInProcessBackend,
     )
+    from deployments.perception.graspgenx_runtime_contract import (
+        verify_graspgenx_inprocess_runtime,
+    )
     from deployments.perception.sam2_graspgenx_point_grasp import (
         DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
         GraspGenXPointGraspModelSpec,
     )
+
+    if args.verify_only:
+        if args.mode != "in-process":
+            raise ValueError("--verify-only applies only to --mode in-process")
+        if args.asset_bundle is None:
+            raise ValueError("--verify-only requires --asset-bundle")
+        receipt = verify_graspgenx_inprocess_runtime(
+            model_spec=GraspGenXPointGraspModelSpec.from_asset_bundle(
+                args.asset_bundle
+            ),
+            source_root=args.source_root,
+            device=args.device,
+        )
+        return receipt.to_mapping()
 
     points = _cube_surface_points(
         count=args.num_points,
@@ -223,6 +249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
     print(json.dumps(result, indent=2))
+    if result.get("status") == "failed":
+        return 1
     return 0
 
 

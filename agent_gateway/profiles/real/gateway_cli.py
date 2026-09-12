@@ -150,8 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("service", "in-process"),
         default=GRASPGENX_DEFAULT_MODE,
         help=(
-            "GraspGenX execution mode; service uses the isolated loopback ZMQ "
-            "runtime by default, in-process requires a compatible Gateway Python"
+            "GraspGenX execution mode; in-process is the default and requires a "
+            "compatible Gateway Python, while service explicitly uses loopback ZMQ"
         ),
     )
     parser.add_argument(

@@ -54,23 +54,21 @@ MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server
 每个目录还需对应的 `manifest.json` 及真实 SHA-256。使用 worktree 默认 assets 映射时，根就是本仓
 `assets/`；下载和解压规则以项目根 [`README.md`](./README.md) 的“运行资产”章节为准。
 
-GraspGenX 是例外的一键下载型可选后端。下面的命令会固定官方源码/模型 revision，下载约
-1.7 GB 的 generator/discriminator 权重，生成真实 hash manifest，并在同一 asset bundle 内创建
-隔离 venv；不会安装到或更新 `dexteleop310`：
+GraspGenX 的 generator/discriminator 权重也必须先从已复验的本地 asset bundle 传入；安装器
+默认不会访问 Hugging Face。下面的命令会核对固定的官方源码/模型 revision，确认四个权重已
+物化而不是 Git LFS 指针，并在同一 asset bundle 内创建隔离 venv；不会安装到或更新
+`dexteleop310`。Python 包默认且仅从清华 PyPI 镜像解析，镜像缺包时会在安装前停止：
 
 ```bash
 bash scripts/install_graspgenx_env.sh
-
-# 已确认 GPU 主机需要的 CUDA wheel 系列时（示例）：
-# bash scripts/install_graspgenx_env.sh --torch-backend cu126
 
 # 已安装机器的只读复验：
 bash scripts/install_graspgenx_env.sh --verify-only
 ```
 
-GPU 推理复验使用 `scripts/smoke_graspgenx_inference.py`；默认调用已启动的 loopback service，
-只有在兼容的独立 Python 环境中显式加 `--mode in-process` 才直接加载模型。它只发送合成方块
-点云，不会读取相机或连接机械臂。
+GPU 推理复验使用 `scripts/smoke_graspgenx_inference.py`；默认直接在兼容的 Python 环境中
+加载 in-process backend，只有显式加 `--mode service` 才调用已启动的 loopback service。它只
+发送合成方块点云，不会读取相机或连接机械臂。
 完整命令见
 [`docs/agent_gateway/POINT_GRASP.md`](docs/agent_gateway/POINT_GRASP.md#graspgenx-更新后端)。
 
