@@ -503,6 +503,12 @@ def test_gui_writer_configuration_is_staged_then_committed_to_live_args(
     )
     options = build.extension._configuration_options
     selected = dict(build.extension._selected_configuration)
+    trajectory_options = {
+        value["value"]: value["label"] for value in options["trajectory_ids"]
+    }
+    assert trajectory_options["digit_1_v1"] == "数字 1"
+    assert trajectory_options["greek_alpha_v1"] == "希腊字母 Α · alpha"
+    assert trajectory_options["greek_omega_v1"] == "希腊字母 Ω · omega"
     assert selected["writing_speed_m_s"] == pytest.approx(0.01)
     assert selected["tactile_bundle_min_free_gb"] == 0.0
     assert selected["writer_workers"] == 4
@@ -927,6 +933,39 @@ def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     assert "--collection-progress-entry-step right_write" in output
     assert "--collection-progress-entry-stage right_write.pen_down" in output
     assert "--camera-frame-max-age-sec 0.25" in output
+
+
+def test_launcher_accepts_greek_trajectory_catalog_id(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+    result = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--trajectory",
+            "greek_omega_v1",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--rule-writing-trajectory greek_omega_v1" in result.stdout
 
 
 def test_launcher_full_replay_mode_uses_complete_episode_progress_without_detail(

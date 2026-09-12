@@ -31,6 +31,71 @@ def test_digit_catalog_contains_nine_verified_one_stroke_paths() -> None:
         assert spec.bounding_height == pytest.approx(1.0)
 
 
+def test_greek_catalog_contains_complete_verified_one_stroke_alphabet() -> None:
+    names = (
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+        "epsilon",
+        "zeta",
+        "eta",
+        "theta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+        "xi",
+        "omicron",
+        "pi",
+        "rho",
+        "sigma",
+        "tau",
+        "upsilon",
+        "phi",
+        "chi",
+        "psi",
+        "omega",
+    )
+    symbols = tuple("ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ")
+    ids = available_fixed_trajectory_ids(family="greek")
+
+    assert ids == tuple(f"greek_{name}_v1" for name in names)
+    for trajectory_id, name, symbol in zip(ids, names, symbols, strict=True):
+        spec = get_fixed_trajectory(trajectory_id)
+        assert spec.symbol == symbol
+        assert spec.metadata["latin_name"] == name
+        assert spec.stroke_count == 1
+        assert len(spec.points) >= 2
+        assert spec.bounding_height == pytest.approx(1.0)
+
+
+def test_every_greek_trajectory_reuses_size_direction_and_boundary_contract() -> None:
+    boundary = {"right": _pose(0.2, -0.1, 0.4)}
+
+    for trajectory_id in available_fixed_trajectory_ids(family="greek"):
+        targets = build_fixed_trajectory_targets(
+            boundary,
+            trajectory_id,
+            scale_m=0.06,
+            linear_speed_m_s=0.03,
+            direction="right",
+        )
+        positions = np.stack(
+            [
+                np.asarray(target.pose_by_side["right"], dtype=float)[:3, 3]
+                for target in targets
+            ]
+        )
+        np.testing.assert_allclose(targets[0].pose_by_side["right"], boundary["right"])
+        np.testing.assert_allclose(positions[:, 2], 0.4)
+        assert targets[0].metadata["family"] == "greek"
+        assert targets[0].metadata["size_m"] == pytest.approx(0.06)
+        assert targets[0].metadata["direction"] == "right"
+        assert targets[-1].timestamp > targets[0].timestamp
+
+
 def test_fixed_trajectory_anchors_first_point_and_holds_other_side() -> None:
     boundary = {
         "left": _pose(-0.1, 0.2, 0.3),

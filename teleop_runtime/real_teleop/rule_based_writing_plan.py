@@ -59,6 +59,7 @@ from robot_motion.replay import (
     RuleBasedSegmentStopCondition,
     available_fixed_trajectory_ids,
     build_fixed_trajectory_targets,
+    get_fixed_trajectory,
     replay_action_metadata,
     replay_end_effector_targets_at_index,
 )
@@ -1452,6 +1453,19 @@ def _configuration_option_entry(
     }
 
 
+def _fixed_trajectory_option(trajectory_id: str) -> dict[str, str]:
+    spec = get_fixed_trajectory(trajectory_id)
+    if spec.family == "digit":
+        label = f"数字 {spec.symbol}"
+    elif spec.family == "greek":
+        latin_name = str(spec.metadata.get("latin_name", "")).strip()
+        suffix = f" · {latin_name}" if latin_name else ""
+        label = f"希腊字母 {spec.symbol}{suffix}"
+    else:
+        label = f"{spec.symbol} · {spec.trajectory_id}"
+    return {"value": spec.trajectory_id, "label": label}
+
+
 def _rule_configuration_options(
     args: argparse.Namespace,
     *,
@@ -1544,7 +1558,7 @@ def _rule_configuration_options(
     options = {
         "source_candidates_by_phase": source_options,
         "trajectory_ids": [
-            {"value": value, "label": value.replace("digit_", "数字 ").replace("_v1", "")}
+            _fixed_trajectory_option(value)
             for value in available_fixed_trajectory_ids()
         ],
         "directions": [
