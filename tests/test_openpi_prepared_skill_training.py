@@ -2009,3 +2009,74 @@ def test_prepared_profile_rejects_unknown_skill_catalog(tmp_path: Path) -> None:
         assert "Unsupported Skill projection catalog id" in str(exc)
     else:
         raise AssertionError("Unknown catalog id was accepted.")
+
+
+def test_stage3_by_date_profile_preserves_validated_training_contract() -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "deployments/openpi/configs/training"
+        / "writing_stage3_all_valid_all_view_h32_absolute_non_rtc_100k_by_date_v1.json"
+    )
+    profile = _load_profile(profile_path)
+
+    assert profile["profile_id"].endswith("_by_date_v1")
+    assert profile["source_snapshot"]["fixed_dataset_root"] == (
+        "/home/user/zc/datasets/RealmanDMTAC/by-date"
+    )
+    assert profile["source_snapshot"]["selected_annotation_count"] == 2014
+    assert profile["source_snapshot"]["h32_eligible_count"] == 1936
+    assert len(profile["annotation_selection"]) == 2014
+    assert tuple(profile["camera_selection"]) == (
+        "front",
+        "left_wrist",
+        "right_wrist",
+    )
+    assert profile["action_horizon"] == 32
+    assert profile["action_pose_mode"] == "absolute"
+    assert profile["target_skill_id"] == "writing.write_with_brush"
+    assert profile["skill_projection_catalog_id"] == (
+        "writing_four_stage_subtasks_v2"
+    )
+    assert profile["expected_total_raw_episode_count"] == 2067
+    assert profile["expected_total_eligible_episode_count"] == 1936
+    assert profile["expected_complete_h32_window_count"] == 118828
+    assert profile["expected_openpi_quality_valid_window_count"] == 85089
+    assert profile["complete_horizon_window_exclusions"] == []
+    assert [source["expected_eligible_episode_count"] for source in profile["sources"]] == [
+        186,
+        344,
+        246,
+        289,
+        322,
+        513,
+        36,
+    ]
+    assert all(
+        source["dataset_root"].startswith(
+            "/home/user/zc/datasets/RealmanDMTAC/by-date/"
+        )
+        for source in profile["sources"]
+    )
+    assert profile["openpi_final_mask_root"].endswith(
+        "/masks/stage3-r2/derived/final_keep_masks"
+    )
+    assert profile["openpi_final_mask_root_layout"] == (
+        "source_dataset_id_partitioned_v1"
+    )
+    assert profile["openpi_quantile_semantic_bounds"] == {
+        "schema": "dexteleop.openpi_quantile_semantic_bounds.v1",
+        "components": {"actions": ["right.end_effector.target"]},
+    }
+    assert "20260910_by_date_v2_semantic_bounds" in profile[
+        "openpi_assets_base_dir"
+    ]
+    assert "20260910_by_date_v2_semantic_bounds" in profile[
+        "organized_dataset_root"
+    ]
+    background = profile["openpi_wrist_background_augmentation"]
+    assert background["mask_source"] == "wrist_final_keep_mask_paths"
+    assert background["wrist_depth_mask_paths_fallback_allowed"] is False
+    assert background["strict_media_integrity"] is True
+    assert profile["openpi_training_mode"] == "standard_non_rtc_v1"
+    assert profile["openpi_num_train_steps"] == 100000
+    assert profile["openpi_num_workers"] == 2
