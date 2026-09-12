@@ -1164,6 +1164,16 @@ remote_dataset_camera_training_validity.sh
 remote_dataset_tactile_storage.sh
 ```
 
+只读文本查看可加 `remote_view.sh --compact`：保留完整 `[target]`、解析后的路径、
+类型、文件字节数与权限、正文及范围说明，省略重复请求路径和详细元数据；默认仍展示
+详细元数据。目录列表和非普通文件信息不精简，敏感路径及非文本文件的拒绝规则不变。
+
+文本先按 `--head` / `--tail` 选择行，再用 `--max-bytes` 限制正文展示字节数。
+末尾 `selected_bytes_omitted` 只计算所选行中因字节上限未展示的部分；为 0 不表示
+已读完整文件。目录末尾报告列表行数上限（包含 `ls` 的汇总行），不承诺完整列举。
+正常达到展示上限不再造成 broken pipe 失败，真实读取或展示错误仍返回非零。
+字节限制可能切断多字节字符；读取增长中的日志也不是一致性快照。
+
 示例：
 
 ```bash

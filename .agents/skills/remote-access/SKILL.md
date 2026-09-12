@@ -46,6 +46,8 @@ inventory, GPU or CUDA diagnostics are needed. Unchecked fields are not healthy
 by implication. Avoid unrelated inventories on each SSH call; required identity,
 sync and safety checks still apply. Bound logs with supported `--head`, `--tail`
 or `--max-bytes`, disclose partial evidence, and never infer success from omissions.
+For text inspection use `remote_view.sh --compact`; omit it when full file metadata
+is needed. Its omitted-byte count covers selected lines, not the whole file.
 
 ## Guardrails
 
