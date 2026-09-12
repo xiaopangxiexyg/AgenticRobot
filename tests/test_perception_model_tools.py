@@ -88,7 +88,14 @@ def test_graspgenx_installer_uses_isolated_asset_environment() -> None:
     assert 'BUNDLE_ROOT="$ASSET_ROOT/perception/graspgenx-point-grasp"' in source
     assert 'VENV_ROOT="$BUNDLE_ROOT/runtime/.venv"' in source
     assert "adithyamurali/GraspGenXModel" in source
-    assert "--torch-backend" in completed.stdout
+    assert "--package-index" in completed.stdout
+    assert "--allow-checkpoint-download" in completed.stdout
+    assert "checkpoints must already" in completed.stdout
+    assert "https://pypi.tuna.tsinghua.edu.cn/simple" in source
+    assert "--dry-run" in source
+    assert "--no-config" in source
+    assert "--torch-backend" not in source
+    assert "ALLOW_CHECKPOINT_DOWNLOAD=0" in source
     assert '"$SOURCE_ROOT[serve]"' not in source
     assert "PyOpenGL" in source
     assert 'PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}"' in source

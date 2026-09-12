@@ -133,8 +133,9 @@ manifest 还固定源码 commit、`realsense` 模型类型和项目授权 acknow
 
 GraspGenX 源码固定在 `model/perception/graspgenx`，generator/discriminator 权重和其运行时
 统一位于 `assets/perception/graspgenx-point-grasp`。默认 in-process 模式要求 Gateway 所在
-Python 环境本身兼容 GraspGenX；service 模式显式使用 bundle 内独立 venv。安装器自动
-下载官方 Hugging Face 模型仓、生成四个文件的真实 SHA-256 manifest，并保持主
+Python 环境本身兼容 GraspGenX；service 模式显式使用 bundle 内独立 venv。generator 和
+discriminator 必须先从已复验的本地 asset bundle 传入；安装器默认不访问 Hugging Face，
+只核对固定 revision、四个已物化文件并生成真实 SHA-256 manifest，同时保持主
 `dexteleop310` 不变：
 
 ```bash
@@ -143,9 +144,11 @@ bash scripts/install_graspgenx_env.sh --verify-only
 ```
 
 安装器只在该 bundle 的 `runtime/.venv` 中安装 GraspGenX 推理链和 service 备选，不会修改共享
-`dexteleop310`。默认由 `uv --torch-backend auto` 选择 PyTorch wheel；已明确 CUDA
-版本的 GPU 主机可传入例如 `--torch-backend cu126`。上游完整依赖中的
-PyOpenGL/pyrender 版本互斥，因此本服务不安装未使用的渲染、训练和端到端仿真依赖。
+`dexteleop310`。Python 包默认使用唯一的清华 PyPI 镜像，并在正式安装前对完整依赖闭包执行
+`uv --dry-run`；镜像缺包或不可用时立即停止，禁止自动回退其他索引。已验证的 GPU 组合为
+`torch==2.6.0`、`torchvision==0.21.0` 和 PyPI CUDA 12.4 runtime。上游完整依赖中的
+PyOpenGL/pyrender 版本互斥，因此本服务不安装未使用的渲染、训练和端到端仿真依赖。只有明确
+要求从官方模型仓重新拉取权重时才传 `--allow-checkpoint-download`。
 
 service 模式的模型服务只应绑定 loopback；启动命令见 `scripts/run_graspgenx_server.sh`。服务健康
 后，在 `real-perception` 或 `real-rm65` 的原启动命令中增加：

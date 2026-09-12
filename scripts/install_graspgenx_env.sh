@@ -5,8 +5,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_ROOT="$REPO_ROOT/model/perception/graspgenx"
 ASSET_ROOT="${DEXTELEOP_ASSET_ROOT:-$REPO_ROOT/assets}"
 PYTHON_BIN="python3.10"
-TORCH_BACKEND="auto"
+PACKAGE_INDEX="${GRASPGENX_PACKAGE_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 VERIFY_ONLY=0
+ALLOW_CHECKPOINT_DOWNLOAD=0
 
 SOURCE_REVISION="b9429097728cb1c430dd78b92edf17ba318aad03"
 CHECKPOINT_REVISION="7c834043c11a11417e31d6d5ea9355801e40a2c1"
@@ -16,15 +17,19 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/install_graspgenx_env.sh [OPTIONS]
 
-Install the isolated GraspGenX inference runtime and its reviewed weights.
+Install the isolated GraspGenX inference runtime around reviewed local weights.
 This script never modifies dexteleop310.
 
 Options:
   --asset-root PATH  Shared AgenticRobot asset root (default: assets/ or
                      DEXTELEOP_ASSET_ROOT).
   --python PATH      Python 3.10/3.11 interpreter used by uv (default: python3.10).
-  --torch-backend B  uv PyTorch backend, for example auto, cpu, or cu126
-                     (default: auto).
+  --package-index U  Single Python package index used by uv (default: Tsinghua
+                     PyPI mirror or GRASPGENX_PACKAGE_INDEX).
+  --allow-checkpoint-download
+                     Explicitly allow cloning/pulling the pinned Hugging Face
+                     checkpoint repository. By default checkpoints must already
+                     be transferred into the asset bundle.
   --verify-only      Verify the existing source, environment, weights, and manifest.
   -h, --help         Show this help.
 EOF
@@ -40,9 +45,13 @@ while (($#)); do
       PYTHON_BIN="$2"
       shift 2
       ;;
-    --torch-backend)
-      TORCH_BACKEND="$2"
+    --package-index)
+      PACKAGE_INDEX="$2"
       shift 2
+      ;;
+    --allow-checkpoint-download)
+      ALLOW_CHECKPOINT_DOWNLOAD=1
+      shift
       ;;
     --verify-only)
       VERIFY_ONLY=1
@@ -77,7 +86,14 @@ CHECKPOINT_ROOT="$BUNDLE_ROOT/checkpoints"
 GRIPPER_CFG_ROOT="$BUNDLE_ROOT/gripper_descriptions"
 VENV_ROOT="$BUNDLE_ROOT/runtime/.venv"
 MANIFEST_PATH="$BUNDLE_ROOT/manifest.json"
-export UV_CACHE_DIR="${UV_CACHE_DIR:-$BUNDLE_ROOT/runtime/uv-cache}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$BUNDLE_ROOT/runtime/uv-cache-tuna}"
+
+CHECKPOINT_FILES=(
+  "release/gen/config.yaml"
+  "release/gen/epoch_736.pth"
+  "release/dis/config.yaml"
+  "release/dis/epoch_1056.pth"
+)
 
 if [[ ! -d "$SOURCE_ROOT/.git" && ! -f "$SOURCE_ROOT/.git" ]]; then
   if ((VERIFY_ONLY)); then
@@ -101,20 +117,66 @@ if ((VERIFY_ONLY == 0)); then
     exit 1
   fi
   if [[ ! -d "$CHECKPOINT_ROOT/.git" ]]; then
+    if ((ALLOW_CHECKPOINT_DOWNLOAD == 0)); then
+      echo "GraspGenX checkpoint checkout is missing: $CHECKPOINT_ROOT" >&2
+      echo "Transfer the pinned checkout and four LFS objects from the reviewed local asset bundle, or explicitly pass --allow-checkpoint-download." >&2
+      exit 1
+    fi
     GIT_LFS_SKIP_SMUDGE=1 git clone "$CHECKPOINT_URL" "$CHECKPOINT_ROOT"
-  fi
-  if [[ -n "$(git -C "$CHECKPOINT_ROOT" status --porcelain)" ]]; then
-    echo "Refusing to modify a dirty GraspGenX checkpoint checkout." >&2
-    exit 1
   fi
   observed_checkpoint_revision="$(git -C "$CHECKPOINT_ROOT" rev-parse HEAD)"
   if [[ "$observed_checkpoint_revision" != "$CHECKPOINT_REVISION" ]]; then
+    if ((ALLOW_CHECKPOINT_DOWNLOAD == 0)); then
+      echo "GraspGenX checkpoint revision mismatch: $observed_checkpoint_revision" >&2
+      echo "Transfer the pinned revision instead of fetching from a fallback source." >&2
+      exit 1
+    fi
+    if [[ -n "$(git -C "$CHECKPOINT_ROOT" status --porcelain)" ]]; then
+      echo "Refusing to modify a dirty GraspGenX checkpoint checkout." >&2
+      exit 1
+    fi
     GIT_LFS_SKIP_SMUDGE=1 git -C "$CHECKPOINT_ROOT" fetch origin \
       "$CHECKPOINT_REVISION" --depth 1
     GIT_LFS_SKIP_SMUDGE=1 git -C "$CHECKPOINT_ROOT" checkout --detach \
       "$CHECKPOINT_REVISION"
   fi
-  git -C "$CHECKPOINT_ROOT" lfs pull --include='release/gen/config.yaml,release/gen/epoch_736.pth,release/dis/config.yaml,release/dis/epoch_1056.pth' --exclude=''
+  if ((ALLOW_CHECKPOINT_DOWNLOAD)); then
+    git -C "$CHECKPOINT_ROOT" lfs pull --include='release/gen/config.yaml,release/gen/epoch_736.pth,release/dis/config.yaml,release/dis/epoch_1056.pth' --exclude=''
+  fi
+
+  for relative_path in "${CHECKPOINT_FILES[@]}"; do
+    checkpoint_path="$CHECKPOINT_ROOT/$relative_path"
+    [[ -f "$checkpoint_path" ]] || {
+      echo "Required transferred GraspGenX checkpoint is missing: $checkpoint_path" >&2
+      exit 1
+    }
+    if head -n 1 "$checkpoint_path" | grep -Fxq 'version https://git-lfs.github.com/spec/v1'; then
+      echo "Transferred GraspGenX checkpoint is still an LFS pointer: $checkpoint_path" >&2
+      echo "Materialize it from the reviewed local asset bundle before installing the environment." >&2
+      exit 1
+    fi
+  done
+
+  # A bundle checkout reconstructed before Git LFS is configured can report
+  # correctly materialized objects as modified. Normalize only when the clean
+  # filter maps every required file to the exact blob already recorded at HEAD.
+  git -C "$CHECKPOINT_ROOT" lfs install --local >/dev/null
+  if [[ -n "$(git -C "$CHECKPOINT_ROOT" status --porcelain)" ]]; then
+    for relative_path in "${CHECKPOINT_FILES[@]}"; do
+      head_blob="$(git -C "$CHECKPOINT_ROOT" rev-parse "HEAD:$relative_path")"
+      clean_blob="$(git -C "$CHECKPOINT_ROOT" hash-object --path "$relative_path" "$relative_path")"
+      if [[ "$head_blob" != "$clean_blob" ]]; then
+        echo "Refusing non-canonical transferred checkpoint content: $relative_path" >&2
+        exit 1
+      fi
+    done
+    git -C "$CHECKPOINT_ROOT" add -- "${CHECKPOINT_FILES[@]}"
+  fi
+  if ! git -C "$CHECKPOINT_ROOT" diff --cached --quiet || \
+    [[ -n "$(git -C "$CHECKPOINT_ROOT" status --porcelain)" ]]; then
+    echo "Refusing to modify a dirty GraspGenX checkpoint checkout." >&2
+    exit 1
+  fi
 
   if [[ ! -x "$VENV_ROOT/bin/python" ]]; then
     uv venv --python "$PYTHON_BIN" "$VENV_ROOT"
@@ -122,33 +184,56 @@ if ((VERIFY_ONLY == 0)); then
 
   # The reviewed upstream revision cannot be installed from its full dependency
   # metadata: it pins PyOpenGL 3.1.5 while pyrender pins PyOpenGL 3.1.0. Neither
-  # renderer is imported by the params-only ZMQ inference path. Install that
-  # path's explicit closure. The launcher imports the pinned source submodule
+  # renderer is imported by the reviewed inference path. Install that path's
+  # explicit closure. The launcher imports the pinned source submodule
   # through PYTHONPATH, avoiding both the conflict and build artifacts in that
   # read-only source checkout.
-  uv pip install \
-    --python "$VENV_ROOT/bin/python" \
-    --torch-backend "$TORCH_BACKEND" \
-    'torch>=2.1,<2.7' \
-    'h5py' \
-    'hydra-core' \
-    'numpy==1.26.4' \
-    'webdataset' \
-    'scikit-learn' \
-    'scipy' \
-    'trimesh==4.5.3' \
-    'diffusers==0.11.1' \
-    'timm==1.0.15' \
-    'huggingface-hub==0.25.2' \
-    'addict' \
-    'imageio' \
-    'tqdm' \
-    'pyyaml' \
-    'yourdfpy==0.0.56' \
-    'pyzmq' \
-    'msgpack' \
-    'msgpack-numpy' \
+  packages=(
+    'torch==2.6.0'
+    'torchvision==0.21.0'
+    'h5py'
+    'hydra-core'
+    'numpy==1.26.4'
+    'webdataset'
+    'scikit-learn'
+    'scipy'
+    'trimesh==4.5.3'
+    'diffusers==0.11.1'
+    'timm==1.0.15'
+    'huggingface-hub==0.25.2'
+    'addict'
+    'imageio'
+    'tqdm'
+    'pyyaml'
+    'yourdfpy==0.0.56'
+    'pyzmq'
+    'msgpack'
+    'msgpack-numpy'
     'setuptools>=45,<78'
+  )
+
+  # Ignore ambient pip/uv indexes and user configuration so package resolution
+  # cannot silently fall back away from the reviewed single mirror. Resolve the
+  # full closure first; if the mirror is incomplete, stop before installation so
+  # the operator can provide the missing wheels explicitly.
+  unset UV_INDEX UV_INDEX_URL UV_EXTRA_INDEX_URL
+  unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL
+  if ! uv --no-config pip install \
+    --dry-run \
+    --no-cache \
+    --python "$VENV_ROOT/bin/python" \
+    --default-index "$PACKAGE_INDEX" \
+    --index-strategy first-index \
+    "${packages[@]}"; then
+    echo "GraspGenX package mirror preflight failed; installation is paused." >&2
+    echo "Provide the missing wheels manually instead of falling back to another index." >&2
+    exit 1
+  fi
+  uv --no-config pip install \
+    --python "$VENV_ROOT/bin/python" \
+    --default-index "$PACKAGE_INDEX" \
+    --index-strategy first-index \
+    "${packages[@]}"
 
   "$VENV_ROOT/bin/python" - "$BUNDLE_ROOT" "$SOURCE_REVISION" \
     "$CHECKPOINT_REVISION" <<'PY'
