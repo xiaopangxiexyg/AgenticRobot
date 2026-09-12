@@ -180,7 +180,7 @@ required event 的 observed rate 不低于目标的 95%，且超过 `2 * period`
    空反馈/错误 status 的 fail-closed 行为；默认 `poll_feedback()` 不调用
    `request_feedback`、mode、enable 或 send。
 4. **P2.1 主动上报传输**：仅由操作者在前台运行下方 no-motion active-report probe。它只
-   切换 type-24 上报配置并被动统计 type-2 完整帧，必须自动关闭且逐设备通过。该 PASS 仍
+   切换 type-24 上报配置并被动统计 type-24 active-report 完整帧，必须自动关闭且逐设备通过。该 PASS 仍
    固定为 `control_feedback_admission=NOT_ADMITTED`，不能进入阻抗/力控状态反馈。
 5. **P2.5 失能 TX 上限**：仅由操作者运行 `position-tx-disabled`。确认 preflight/final
    `safe_stop` 均完整、`motors_enabled_by_probe=false`，再检查 `compute/tx` 是否通过；该
@@ -296,9 +296,9 @@ printf '%s\n' 'shell remains active'
 运行时会先显示 `[REPORT] 3/2/1/ENABLE STREAM`；这里的 `ENABLE STREAM` 只表示开启遥测上报，
 不是电机使能。只有以下条件全部满足，`stream_transport_acceptance` 才是 `PASS`：
 
-- ID1--6 都收到不少于 `--minimum-sample-count` 个完整 type-2 operation-status frame；
+- ID1--6 都收到不少于 `--minimum-sample-count` 个完整 type-24 active-report frame；
 - 每个设备的 observed Hz 不低于目标的 90%，且 p99 interval 不超过 `2 / target_hz`；
-- host/feedback ID 包含 YAML 声明的 `0xFD`，且没有短 type-2 frame；
+- host/feedback ID 包含 YAML 声明的 `0xFD`，且没有短 type-24 active-report frame；
 - enable 和 cleanup receipt 都完整，没有 cleanup error。
 
 即使上述全部通过，输出仍必须是 `freshness_verified=false`、
