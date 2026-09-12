@@ -10,7 +10,7 @@ description: Coordinate standalone Git worktrees, ownership, handoffs, authorize
 
 创建、交接、集成或收尾时读取
 [Git 工作流](../../../docs/development/git-workflow.md) 的相关章节。
-AgenticRobot 版本化维护这份通用流程；工具也可对其他 Git 仓库运行。
+本流程由 AgenticRobot 维护并适用于本仓库；其他仓库使用各自的开发规则。
 
 1. 用 `git worktree list --porcelain` 发现所有者；检查相关工作区和语义范围。
    用 `scripts/worktree_inventory.py <repo> --branch <branch>` 检查指定候选，
