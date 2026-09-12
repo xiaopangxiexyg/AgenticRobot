@@ -190,10 +190,13 @@ def _run_active_report_probe(args: argparse.Namespace) -> dict[str, object]:
         "motors_enabled_by_probe": False,
         "mode_transition_called": False,
         "active_report_commands_sent": enable_attempted,
+        "motorbridge_state_observation_metadata_available": (
+            backend.state_observation_metadata_verified
+        ),
         "freshness_verified": False,
         "freshness_semantics": (
-            "socket_receive_time_only; payload_not_admitted; "
-            "source_timestamp_and_sequence_unavailable"
+            "socket_receive_time_only; decoded_state_observation_not_sampled; "
+            "device_source_timestamp_unavailable"
         ),
         "interrupted": interrupted,
         "errors": tuple(errors),
@@ -202,6 +205,7 @@ def _run_active_report_probe(args: argparse.Namespace) -> dict[str, object]:
             "This foreground probe configures RobStride active reporting and passively times complete type-2 operation-status frames.",
             "It does not enable motors, change control mode, or send position/MIT references.",
             "A transport PASS does not admit q/dq/tau into the control loop and is not haptic hardware acceptance.",
+            "MotorBridge observation metadata availability is reported separately; this raw transport probe does not consume it.",
         ),
     }
     if enable_receipt is not None:

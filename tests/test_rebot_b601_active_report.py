@@ -81,6 +81,7 @@ class _FakeBackend:
         self.config = config
         self.connected = False
         self.calls: list[tuple[str, object]] = []
+        self.state_observation_metadata_verified = True
 
     def connect(self) -> None:
         self.calls.append(("connect", None))
@@ -162,6 +163,7 @@ def test_probe_pass_is_transport_only_and_always_cleans_up(
     assert result["control_feedback_admission"] == "NOT_ADMITTED"
     assert result["motion_commands_sent"] is False
     assert result["motors_enabled_by_probe"] is False
+    assert result["motorbridge_state_observation_metadata_available"] is True
     assert backend.calls == [
         ("connect", None),
         ("set_active_reporting", (True, ("joint1", "joint2"))),

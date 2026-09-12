@@ -623,3 +623,60 @@ driver Kd 公式保持独立。测试系数仅为可辨别效果的合成参数�
 **150 passed**（47.08 s）；Ruff、资源 audit、diff 检查通过。早期新增测试误把已有
 execution_metadata property 当作方法调用，修正测试调用后重跑完整上述集合通过，未改验收要求。
 本批只修改五个声明路径，无硬件操作，候选待合并，未 push 或安装。
+
+## P0/P1：依赖物化与主机接收观测契约（2026-09-12）
+
+本批不修改总路线图，也不开始 P2 真机辨识。P0 在隔离 Task 工作树中按 AgenticRobot
+记录的 gitlink 物化 `hardware/reBotArm_control_py`，精确提交为
+`5ba28acef46237eb6a7560658bbc43b06cf8a259`。物化不产生源码差异，也不把本机外部 checkout
+写进项目配置；其作用是让模型、动力学和 MuJoCo 离线测试实际加载固定的厂商资产，而不是因
+空 gitlink 静默 skip。完整 B601 离线集合在该依赖上为 **469 passed**。
+
+P1 分成两个保持旧路径不变的增量候选：
+
+- MotorBridge 为每个被接受的 RobStride type-2 operation-status 帧记录单电机递增
+  `status_sequence` 和主机单调时钟 `receive_age_ns`，通过新增 C ABI、Python 与 C++ API
+  暴露；旧 `MotorState` 布局和 `get_state()` 不变。sequence 与对应 state/接收时刻在同一
+  锁内提交，之后才发布给等待者，避免先看到序号、后看到旧状态。
+- AgenticRobot 新增显式 `poll_feedback(require_host_freshness=True)`。该路径只消费上述已解码
+  operation-status observation，不与 0x7019 参数读取混合；要求 MotorBridge 能力标记，拒绝
+  空缓存、非整数/非正序号、负年龄以及超过 `feedback_timeout_sec` 的帧。默认 cache 路径和
+  `request_feedback=True` 兼容路径保持原行为。
+- `host_receive_freshness_verified` 与既有 `freshness_verified` 分开：前者只能证明指定帧最近被
+  本机接收，后者继续为 false，因为当前协议栈没有设备采样时间戳。active-report 原始传输
+  probe 仍为 `control_feedback_admission=NOT_ADMITTED`，不会因能力存在就把 raw cadence 冒充
+  可控状态。
+- 本批只构建、测试和检查本地隔离候选；没有打开 CAN、改变 active-report、使能、失能或发送
+  任何位置/力矩命令，也没有安装到共享 Python 环境。
+
+离线证据：MotorBridge Rust `33 passed`，Python API `3 passed`，全部 C++ example 编译通过；
+MotorBridge release ABI 与 AgenticRobot 的能力协商 smoke PASS；AgenticRobot 聚焦测试
+`104 passed`，物化 vendor 后的完整 B601 离线集合为 `471 passed`。精确提交、Task profile
+和集成顺序由 Harness handoff 记录；两份增量在真正集成前均视为待集成，不能据此运行真机。
+
+## P2 及后续官方能力复用清单（调研，不代表已接入）
+
+Seeed 官方 Wiki 将 Wiki 作为 demo 使用说明的单一事实源；本地固定的官方 SDK 则作为代码
+级依赖。后续按下表处理，先复用和薄适配，不复制一套平行实现：
+
+| 能力 | 官方现有实现 | 本项目处理 |
+| --- | --- | --- |
+| FK、完整 pose IK、Jacobian/Pinocchio 模型 | 固定 SDK 的 `kinematics/` 与 `example/sim/fk_sim.py`、`ik_sim.py` | 继续由 `robot_motion.rebot_b601_rs` 薄封装并交叉验证，不另写求解器 |
+| SE(3) 测地线、minimum-jerk、CLIK | 固定 SDK 的 `trajectory/`、`traj_sim.py`、`RebotArmEndPose` | 复用数学实现；跨机器人 residual 仍由既有 `control_composition` 和 target safety 所有者处理 |
+| 重力和逆动力学 | 固定 SDK 的 `dynamics.compute_generalized_gravity` 与 `GravityCompensation` | 继续复用模型计算；操作者 scale/bias/driver-Kd 保持独立 controller profile，不反写 URDF |
+| RS 电机组、MIT/POS_VEL 参数与模式准备 | 固定 SDK 的 `RebotArm` / `JointGroup` 与 RS YAML | 由现有硬件 backend 薄适配并保留逐关节 receipt/protective hold，不复制寄存器表或启动顺序 |
+| RS MuJoCo 模型、physics/kinematic 模式、Fake Driver | Seeed Wiki 指向的 `ReBot_Arm_web_RS`，包含 RS MJCF、`mujoco_sync.py`、100 Hz Fake Driver 与 250 Hz MuJoCo sync | 先作为有提交身份的 upstream reference/runtime；核对 license、frame、joint order 和惯性后，只引入确有证据的资产/参数或 adapter，不把整套 ROS/Web 栈再嵌入当前包 |
+| 接触、桌面物体和物理抓取 | 官方 RS MuJoCo physics scene | 后续接触阶段优先比较并复用 scene/contact 定义；kinematic 模式只做显示/接口检查，不能作为重力、增益、接触或力反馈验收 |
+| 125 Hz MIT 在线参考与安全回零 | 官方 RS Web/ROS2 控制栈已有速度、加速度、jerk 限制和安全状态机 | 作为行为与参数来源核对；不得替换本项目已验证的完整六轴 gravity+damping protective hold，也不得把 Web 显示滤波带入控制环 |
+
+调研来源：
+
+- Seeed B601-RS Pinocchio/MeshCat：<https://wiki.seeedstudio.com/rebot_arm_b601_rs_pinocchio_meshcat/>
+- Seeed B601-RS Web/ROS2/MuJoCo 开发指南：<https://wiki.seeedstudio.com/rebot_arm_b601_rs_web_simulator_developer_guide/>
+- 固定官方 SDK：<https://github.com/Seeed-Projects/reBotArm_control_py>
+
+P2 的下一步仍是测量而非实现新的控制器：先在集成后的 exact MotorBridge/AgenticRobot 组合上
+执行无运动、前台、可中断的 active-report decoded observation 验收，记录 J1-J6 的 sequence、
+receive-age、完整率和 cadence，并与独立 0x7019 静态基线比较。只有该证据通过后，才把接收
+delay/jitter/dropout 写入 Real2Sim observation/transport profile。armature、被动阻尼、摩擦和
+低通带宽仍需安全动态采集及 held-out 验证；官方场景或示例不能代替本机辨识结果。
