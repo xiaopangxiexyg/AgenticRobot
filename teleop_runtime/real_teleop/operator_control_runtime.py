@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 import inspect
 import json
 from pathlib import Path
@@ -229,6 +230,29 @@ class _LegacyFunctionProxy:
         return getattr(self._namespace[self._name], attribute)
 
 
+@dataclass(frozen=True)
+class _TrackerSideHomeRequest:
+    from_hold: bool
+    source: str
+    kind: str
+    deadline: float = 0.0
+
+
+@dataclass
+class _TrackerSideHomeGate:
+    """Canonical lifecycle state for the one-time tracker-side Home gate."""
+
+    initial_check_completed: bool = False
+    pending_request: _TrackerSideHomeRequest | None = None
+    pending_confirmation: _TrackerSideHomeRequest | None = None
+    final_recheck_required: bool = False
+    confirmation_counter: int = 0
+    confirmation_token: str = ""
+    confirmation_message: str = ""
+    confirmation_result: str = ""
+    swap_available: bool = False
+
+
 class RealTeleopControlInput:
     def __init__(
         self,
@@ -258,27 +282,12 @@ class RealTeleopControlInput:
             "operator_lateral_axis": "+Y=left",
             "basis": "vive_virtual_desk_before_post_yaw",
             "message": "等待左右 wrist tracker 和 VIVE desk 坐标系。",
-            "confirmation_required": False,
-            "confirmation_token": "",
-            "session_check_completed": False,
-            "monitoring_active": True,
         }
         # The left/right spatial check is a startup admission guard, not a
         # runtime safety monitor.  Once the first Home has either passed the
         # check or received explicit operator confirmation, keep that result
         # for this GUI/controller lifetime and stop evaluating tracker sides.
-        self._tracker_side_initial_check_completed = False
-        self._tracker_side_confirmation_pending = False
-        self._tracker_side_confirmation_token_counter = 0
-        self._tracker_side_confirmation_from_hold = False
-        self._tracker_side_confirmation_request_kind = "normal"
-        self._tracker_side_request_pending = False
-        self._tracker_side_request_from_hold = False
-        self._tracker_side_request_source = ""
-        self._tracker_side_request_kind = "normal"
-        self._tracker_side_request_deadline = 0.0
-        self._tracker_side_guard_request_active = False
-        self._tracker_side_override_granted = False
+        self._tracker_side_gate = _TrackerSideHomeGate()
         self._hold_requested = False
         self._hold_active = False
         self._hardware_hold_confirmed = False
@@ -1080,9 +1089,10 @@ class RealTeleopControlInput:
             # C is the unconditional route to regular Hold, including while
             # an Init operation is active.
             controls.append("two_pedal_c")
+        tracker_side_gate = self._tracker_side_gate_state()
         tracker_side_gate_pending = bool(
-            getattr(self, "_tracker_side_confirmation_pending", False)
-            or getattr(self, "_tracker_side_request_pending", False)
+            tracker_side_gate.pending_confirmation is not None
+            or tracker_side_gate.pending_request is not None
         )
         if tracker_side_gate_pending:
             controls = [
@@ -1090,7 +1100,7 @@ class RealTeleopControlInput:
                 for control in controls
                 if control not in {"p", "two_pedal_b"}
             ]
-        if bool(getattr(self, "_tracker_side_confirmation_pending", False)):
+        if tracker_side_gate.pending_confirmation is not None:
             controls.extend(
                 (
                     "tracker_side_confirm_continue",
@@ -1222,7 +1232,7 @@ class RealTeleopControlInput:
             capture_prep_total_sec=DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
             capture_waiting_for_samples=False,
             special_arm_control_mode=self._gui_control_state().special_arm_control_mode,
-            tracker_side_check=dict(self._tracker_side_check),
+            tracker_side_check=self._tracker_side_check_payload(),
             **self._foot_pad_test_ui_state(),
         )
         self.ui.start()
@@ -2990,21 +3000,36 @@ class RealTeleopControlInput:
         self._pose_snapshot_requested = False
         return requested
 
-    def _clear_tracker_side_confirmation(self) -> None:
-        """Return tracker-side confirmation metadata to its idle state."""
+    def _tracker_side_gate_state(self) -> _TrackerSideHomeGate:
+        # Some dependency-light tests instantiate this adapter via ``__new__``.
+        # Keep those tests focused on behavior instead of constructor details.
+        gate = getattr(self, "_tracker_side_gate", None)
+        if gate is None:
+            gate = _TrackerSideHomeGate()
+            self._tracker_side_gate = gate
+        return gate
 
-        self._tracker_side_confirmation_pending = False
-        self._tracker_side_confirmation_from_hold = False
-        self._tracker_side_confirmation_request_kind = "normal"
+    def _tracker_side_check_payload(self) -> dict[str, object]:
+        """Project observations and the canonical gate into the UI contract."""
 
-    def _clear_tracker_side_request(self) -> None:
-        """Return the fresh-check request metadata to its idle state."""
-
-        self._tracker_side_request_pending = False
-        self._tracker_side_request_from_hold = False
-        self._tracker_side_request_source = ""
-        self._tracker_side_request_kind = "normal"
-        self._tracker_side_request_deadline = 0.0
+        gate = self._tracker_side_gate_state()
+        payload = dict(self._tracker_side_check)
+        payload.update(
+            {
+                "home_request_pending": gate.pending_request is not None,
+                "confirmation_required": gate.pending_confirmation is not None,
+                "confirmation_token": gate.confirmation_token,
+                "confirmation_result": gate.confirmation_result,
+                "session_check_completed": gate.initial_check_completed,
+                "monitoring_active": not gate.initial_check_completed,
+            }
+        )
+        if gate.initial_check_completed:
+            payload["warning_required"] = False
+        if gate.confirmation_message:
+            payload["confirmation_message"] = gate.confirmation_message
+            payload["swap_available"] = gate.swap_available
+        return payload
 
     def _queue_runtime_home_request(
         self,
@@ -3022,26 +3047,18 @@ class RealTeleopControlInput:
             and self._two_pedal_fast_home_deadline <= 0.0
         ):
             self._two_pedal_fast_home_deadline = time.time() + 1.0
-        self._tracker_side_guard_request_active = not bool(
-            self._tracker_side_initial_check_completed
-        )
+        gate = self._tracker_side_gate_state()
+        gate.final_recheck_required = not gate.initial_check_completed
 
     def _complete_initial_tracker_side_check(self, *, result: str) -> None:
         """Latch the one-time tracker-side admission result for this GUI."""
 
-        self._tracker_side_initial_check_completed = True
-        self._tracker_side_guard_request_active = False
-        self._tracker_side_override_granted = False
-        self._tracker_side_check.update(
-            {
-                "warning_required": False,
-                "home_request_pending": False,
-                "confirmation_required": False,
-                "confirmation_result": str(result),
-                "session_check_completed": True,
-                "monitoring_active": False,
-            }
-        )
+        gate = self._tracker_side_gate_state()
+        gate.initial_check_completed = True
+        gate.pending_request = None
+        gate.pending_confirmation = None
+        gate.final_recheck_required = False
+        gate.confirmation_result = str(result)
 
     def _supersede_tracker_side_home_gate(self, *, reason: str) -> None:
         """Give a later non-interactive Home request sole ownership.
@@ -3051,28 +3068,21 @@ class RealTeleopControlInput:
         later transition or make the main loop select the wrong Home path.
         """
 
+        gate = self._tracker_side_gate_state()
         had_pending_gate = bool(
-            self._tracker_side_confirmation_pending
-            or self._tracker_side_request_pending
-            or self._tracker_side_guard_request_active
-            or self._tracker_side_override_granted
+            gate.pending_confirmation is not None
+            or gate.pending_request is not None
+            or gate.final_recheck_required
         )
         if had_pending_gate:
             self._calibration_requested = False
             self._calibration_request_from_hold = False
-        self._clear_tracker_side_confirmation()
-        self._clear_tracker_side_request()
-        self._tracker_side_guard_request_active = False
-        self._tracker_side_override_granted = False
+        gate.pending_confirmation = None
+        gate.pending_request = None
+        gate.final_recheck_required = False
         self._two_pedal_fast_home_requested = False
         self._two_pedal_fast_home_deadline = 0.0
-        self._tracker_side_check.update(
-            {
-                "home_request_pending": False,
-                "confirmation_required": False,
-                "confirmation_result": str(reason),
-            }
-        )
+        gate.confirmation_result = str(reason)
         if had_pending_gate:
             _log(
                 "InputMapping",
@@ -3101,11 +3111,15 @@ class RealTeleopControlInput:
         source: str,
         request_kind: str = "normal",
     ) -> None:
-        self._tracker_side_confirmation_pending = True
-        self._tracker_side_confirmation_from_hold = bool(from_hold)
-        self._tracker_side_confirmation_request_kind = str(request_kind)
-        self._tracker_side_confirmation_token_counter += 1
-        token = f"tracker-side-{self._tracker_side_confirmation_token_counter}"
+        gate = self._tracker_side_gate_state()
+        gate.pending_request = None
+        gate.pending_confirmation = _TrackerSideHomeRequest(
+            from_hold=bool(from_hold),
+            source=str(source),
+            kind=str(request_kind),
+        )
+        gate.confirmation_counter += 1
+        gate.confirmation_token = f"tracker-side-{gate.confirmation_counter}"
         warning_message = str(
             self._tracker_side_check.get("message")
             or "Tracker 左右位置检查未通过。"
@@ -3116,16 +3130,9 @@ class RealTeleopControlInput:
             "是否仍要忽略此警告并继续本次 runtime Home？\n\n"
             f"{correction_hint}"
         )
-        self._tracker_side_check.update(
-            {
-                "home_request_pending": False,
-                "confirmation_required": True,
-                "confirmation_token": token,
-                "confirmation_message": confirmation_message,
-                "confirmation_result": "pending",
-                "swap_available": self._tracker_side_swap_available(),
-            }
-        )
+        gate.confirmation_message = confirmation_message
+        gate.confirmation_result = "pending"
+        gate.swap_available = self._tracker_side_swap_available()
         _log(
             "InputMapping",
             "runtime Home blocked for tracker-side confirmation: "
@@ -3133,7 +3140,7 @@ class RealTeleopControlInput:
         )
         if self.ui is not None:
             self.ui.publish(
-                tracker_side_check=dict(self._tracker_side_check),
+                tracker_side_check=self._tracker_side_check_payload(),
                 stage="确认 Tracker 左右位置",
                 active_controls=self._current_active_controls(),
                 control_hint=(
@@ -3162,6 +3169,7 @@ class RealTeleopControlInput:
     ) -> None:
         """Gate an explicit runtime-Home request on the latest side check."""
 
+        gate = self._tracker_side_gate_state()
         if self._calibration_requested:
             _log(
                 "InputMapping",
@@ -3180,7 +3188,7 @@ class RealTeleopControlInput:
                     gripper_control_enabled=self.gripper_control_enabled(),
                 )
             return
-        if self._tracker_side_confirmation_pending:
+        if gate.pending_confirmation is not None:
             if source == "terminal" and self.ui is None:
                 self._confirm_tracker_side_warning()
             elif source == "terminal":
@@ -3189,21 +3197,12 @@ class RealTeleopControlInput:
                     "terminal Home confirmation ignored while Web GUI confirmation is pending",
                 )
             return
-        if self._tracker_side_request_pending:
+        if gate.pending_request is not None:
             return
 
-        self._tracker_side_guard_request_active = False
-        self._tracker_side_override_granted = False
+        gate.final_recheck_required = False
         from_hold = bool(self._hold_active)
-        if self._tracker_side_initial_check_completed:
-            self._tracker_side_check.update(
-                {
-                    "home_request_pending": False,
-                    "confirmation_required": False,
-                    "session_check_completed": True,
-                    "monitoring_active": False,
-                }
-            )
+        if gate.initial_check_completed:
             self._queue_runtime_home_request(
                 from_hold=from_hold,
                 request_kind=request_kind,
@@ -3220,12 +3219,8 @@ class RealTeleopControlInput:
         status = str(self._tracker_side_check.get("status", "unavailable"))
         dual_side = set(self.components.active_sides) == {"left", "right"}
         if dual_side and status != "correct":
-            self._tracker_side_request_pending = True
-            self._tracker_side_request_from_hold = from_hold
-            self._tracker_side_request_source = str(source)
-            self._tracker_side_request_kind = str(request_kind)
             request_time = time.time() if now is None else float(now)
-            self._tracker_side_request_deadline = (
+            deadline = (
                 self._two_pedal_fast_home_deadline
                 if (
                     str(request_kind) == "two_pedal_fast"
@@ -3233,13 +3228,13 @@ class RealTeleopControlInput:
                 )
                 else request_time + DEFAULT_RUNTIME_HOME_FRESH_DATA_TIMEOUT_SEC
             )
-            self._tracker_side_check.update(
-                {
-                    "home_request_pending": True,
-                    "confirmation_required": False,
-                    "confirmation_result": "waiting_for_fresh_check",
-                }
+            gate.pending_request = _TrackerSideHomeRequest(
+                from_hold=from_hold,
+                source=str(source),
+                kind=str(request_kind),
+                deadline=deadline,
             )
+            gate.confirmation_result = "waiting_for_fresh_check"
             message = (
                 "Home 请求已暂缓：正在等待左右 Tracker 同时在线、数据新鲜，"
                 "并完成左右空间位置检查。"
@@ -3247,7 +3242,7 @@ class RealTeleopControlInput:
             _log("InputMapping", message)
             if self.ui is not None:
                 self.ui.publish(
-                    tracker_side_check=dict(self._tracker_side_check),
+                    tracker_side_check=self._tracker_side_check_payload(),
                     stage="等待 Tracker 左右检查",
                     active_controls=self._current_active_controls(),
                     control_hint=message,
@@ -3256,36 +3251,29 @@ class RealTeleopControlInput:
                 self.ui.append_message("InputMapping", message)
             return
 
-        self._tracker_side_check["home_request_pending"] = False
         self._queue_runtime_home_request(
             from_hold=from_hold,
             request_kind=request_kind,
         )
 
     def _confirm_tracker_side_warning(self) -> None:
-        if not self._tracker_side_confirmation_pending:
+        gate = self._tracker_side_gate_state()
+        request = gate.pending_confirmation
+        if request is None:
             return
-        from_hold = bool(self._tracker_side_confirmation_from_hold)
-        request_kind = str(self._tracker_side_confirmation_request_kind)
-        self._clear_tracker_side_confirmation()
-        self._clear_tracker_side_request()
+        gate.pending_confirmation = None
+        gate.pending_request = None
+        request_kind = request.kind
         if request_kind == "two_pedal_fast":
             # Operator deliberation in the mandatory warning popup is not a
             # failed stability acquisition.  Start the one-second switching
             # budget when they explicitly continue.
             self._two_pedal_fast_home_deadline = time.time() + 1.0
-        self._tracker_side_check.update(
-            {
-                "home_request_pending": False,
-                "confirmation_required": False,
-                "confirmation_result": "continued",
-            }
-        )
         self._complete_initial_tracker_side_check(
             result="continued_for_gui_session"
         )
         self._queue_runtime_home_request(
-            from_hold=from_hold,
+            from_hold=request.from_hold,
             request_kind=request_kind,
         )
         message = (
@@ -3295,32 +3283,26 @@ class RealTeleopControlInput:
         _log("InputMapping", message)
         if self.ui is not None:
             self.ui.publish(
-                tracker_side_check=dict(self._tracker_side_check),
+                tracker_side_check=self._tracker_side_check_payload(),
                 active_controls=self._current_active_controls(),
                 control_hint=message,
             )
             self.ui.append_message("InputMapping", message)
 
     def _cancel_tracker_side_warning(self) -> None:
-        if not self._tracker_side_confirmation_pending:
+        gate = self._tracker_side_gate_state()
+        request = gate.pending_confirmation
+        if request is None:
             return
-        request_kind = str(self._tracker_side_confirmation_request_kind)
-        self._clear_tracker_side_confirmation()
-        self._clear_tracker_side_request()
-        self._tracker_side_guard_request_active = False
-        self._tracker_side_override_granted = False
+        gate.pending_confirmation = None
+        gate.pending_request = None
+        gate.final_recheck_required = False
+        gate.confirmation_result = "cancelled"
         self._two_pedal_fast_home_requested = False
         self._two_pedal_fast_home_deadline = 0.0
-        if request_kind == "two_pedal_fast":
+        if request.kind == "two_pedal_fast":
             self._two_pedal_transition_target_fixed_side = None
             self._clear_two_pedal_alert()
-        self._tracker_side_check.update(
-            {
-                "home_request_pending": False,
-                "confirmation_required": False,
-                "confirmation_result": "cancelled",
-            }
-        )
         message = (
             "已取消本次 runtime Home；请确认 Tracker 佩戴。"
             f"{self._tracker_side_correction_hint()}"
@@ -3328,66 +3310,34 @@ class RealTeleopControlInput:
         _log("InputMapping", message)
         if self.ui is not None:
             self.ui.publish(
-                tracker_side_check=dict(self._tracker_side_check),
+                tracker_side_check=self._tracker_side_check_payload(),
                 active_controls=self._current_active_controls(),
                 control_hint=message,
             )
             self.ui.append_message("InputMapping", message)
 
     def _update_tracker_side_check(self, payload: Mapping[str, object]) -> None:
-        if self._tracker_side_initial_check_completed:
-            self._tracker_side_check.update(
-                {
-                    "warning_required": False,
-                    "home_request_pending": False,
-                    "confirmation_required": False,
-                    "session_check_completed": True,
-                    "monitoring_active": False,
-                }
-            )
+        gate = self._tracker_side_gate_state()
+        if gate.initial_check_completed:
             return
         next_payload = dict(payload)
-        next_payload.update(
-            {
-                "session_check_completed": False,
-                "monitoring_active": True,
-            }
-        )
-        if self._tracker_side_confirmation_pending:
+        confirmation = gate.pending_confirmation
+        if confirmation is not None:
             if bool(next_payload.get("warning_required", False)):
-                next_payload.update(
-                    {
-                        "confirmation_required": True,
-                        "confirmation_token": self._tracker_side_check.get(
-                            "confirmation_token", ""
-                        ),
-                        "confirmation_message": (
-                            f"{next_payload.get('message', '')}\n\n"
-                            "是否仍要忽略此警告并继续本次 runtime Home？\n\n"
-                            f"{self._tracker_side_correction_hint()}"
-                        ),
-                        "confirmation_result": "pending",
-                        "swap_available": self._tracker_side_swap_available(),
-                    }
+                gate.confirmation_message = (
+                    f"{next_payload.get('message', '')}\n\n"
+                    "是否仍要忽略此警告并继续本次 runtime Home？\n\n"
+                    f"{self._tracker_side_correction_hint()}"
                 )
+                gate.confirmation_result = "pending"
+                gate.swap_available = self._tracker_side_swap_available()
             elif str(next_payload.get("status", "")) == "correct":
-                resolved_request_kind = str(
-                    self._tracker_side_confirmation_request_kind
-                )
-                self._clear_tracker_side_confirmation()
-                if resolved_request_kind == "two_pedal_fast":
+                gate.pending_confirmation = None
+                gate.confirmation_result = "resolved"
+                if confirmation.kind == "two_pedal_fast":
                     self._two_pedal_transition_target_fixed_side = None
                     self._two_pedal_fast_home_deadline = 0.0
                     self._clear_two_pedal_alert()
-                next_payload.update(
-                    {
-                        "confirmation_required": False,
-                        "confirmation_token": self._tracker_side_check.get(
-                            "confirmation_token", ""
-                        ),
-                        "confirmation_result": "resolved",
-                    }
-                )
                 if self.ui is not None:
                     self.ui.append_message(
                         "InputMapping",
@@ -3402,46 +3352,29 @@ class RealTeleopControlInput:
                 previous["live_status"] = next_payload.get("status", "")
                 previous["live_message"] = next_payload.get("message", "")
                 next_payload = previous
-        else:
-            next_payload.setdefault("confirmation_required", False)
-            next_payload.setdefault(
-                "confirmation_token",
-                self._tracker_side_check.get("confirmation_token", ""),
-            )
         self._tracker_side_check = next_payload
-        if self._tracker_side_request_pending:
+        request = gate.pending_request
+        if request is not None:
             status = str(self._tracker_side_check.get("status", "unavailable"))
             if bool(self._tracker_side_check.get("warning_required", False)):
-                from_hold = bool(self._tracker_side_request_from_hold)
-                source = str(self._tracker_side_request_source or "runtime")
-                request_kind = str(self._tracker_side_request_kind)
-                self._clear_tracker_side_request()
                 self._begin_tracker_side_confirmation(
-                    from_hold=from_hold,
-                    source=source,
-                    request_kind=request_kind,
+                    from_hold=request.from_hold,
+                    source=request.source or "runtime",
+                    request_kind=request.kind,
                 )
                 return
             if status == "correct":
-                from_hold = bool(self._tracker_side_request_from_hold)
-                request_kind = str(self._tracker_side_request_kind)
-                self._clear_tracker_side_request()
-                self._tracker_side_check.update(
-                    {
-                        "home_request_pending": False,
-                        "confirmation_required": False,
-                        "confirmation_result": "check_passed",
-                    }
-                )
+                gate.pending_request = None
+                gate.confirmation_result = "check_passed"
                 self._queue_runtime_home_request(
-                    from_hold=from_hold,
-                    request_kind=request_kind,
+                    from_hold=request.from_hold,
+                    request_kind=request.kind,
                 )
                 message = "Tracker 左右位置检查通过；继续本次 runtime Home。"
                 _log("InputMapping", message)
                 if self.ui is not None:
                     self.ui.publish(
-                        tracker_side_check=dict(self._tracker_side_check),
+                        tracker_side_check=self._tracker_side_check_payload(),
                         stage="即将开始 runtime Home",
                         active_controls=["q"],
                         control_hint=message,
@@ -3449,40 +3382,32 @@ class RealTeleopControlInput:
                     )
                     self.ui.append_message("InputMapping", message)
                 return
-            self._tracker_side_check["home_request_pending"] = True
         if self.ui is not None:
             self.ui.publish(
-                tracker_side_check=dict(self._tracker_side_check),
+                tracker_side_check=self._tracker_side_check_payload(),
                 active_controls=self._current_active_controls(),
             )
 
     def _poll_tracker_side_request_timeout(self, *, now: float) -> None:
+        gate = self._tracker_side_gate_state()
+        request = gate.pending_request
         if (
-            not self._tracker_side_request_pending
-            or self._tracker_side_request_deadline <= 0.0
-            or float(now) < self._tracker_side_request_deadline
+            request is None
+            or request.deadline <= 0.0
+            or float(now) < request.deadline
         ):
             return
-        request_kind = str(self._tracker_side_request_kind)
-        request_from_hold = bool(self._tracker_side_request_from_hold)
-        self._clear_tracker_side_request()
-        self._tracker_side_guard_request_active = False
-        self._tracker_side_override_granted = False
+        gate.pending_request = None
+        gate.final_recheck_required = False
         self._two_pedal_fast_home_requested = False
         self._two_pedal_fast_home_deadline = 0.0
         self._two_pedal_transition_target_fixed_side = None
-        self._tracker_side_check.update(
-            {
-                "home_request_pending": False,
-                "confirmation_required": False,
-                "confirmation_result": (
-                    "two_pedal_tracker_timeout"
-                    if request_kind == "two_pedal_fast"
-                    else "runtime_home_tracker_timeout"
-                ),
-            }
+        gate.confirmation_result = (
+            "two_pedal_tracker_timeout"
+            if request.kind == "two_pedal_fast"
+            else "runtime_home_tracker_timeout"
         )
-        if request_kind == "two_pedal_fast":
+        if request.kind == "two_pedal_fast":
             message = (
                 "双踏板切换失败：1 秒内未获得新鲜且可判定的左右 Tracker；"
                 "本次切换已取消。"
@@ -3495,7 +3420,7 @@ class RealTeleopControlInput:
             )
             if self.ui is not None:
                 self.ui.publish(
-                    tracker_side_check=dict(self._tracker_side_check),
+                    tracker_side_check=self._tracker_side_check_payload(),
                     active_controls=self._current_active_controls(),
                 )
                 self.ui.append_message("TwoPedal", message)
@@ -3504,7 +3429,7 @@ class RealTeleopControlInput:
         message = (
             "恢复遥操已取消：1 秒内未获得新鲜且可判定的左右 Tracker；"
             "机械臂保持 Hold，可恢复 VIVE 后重新点击“开始遥操”。"
-            if request_from_hold
+            if request.from_hold
             else (
                 "开始遥操已取消：1 秒内未获得新鲜且可判定的左右 Tracker；"
                 "已回到未遥操状态，可恢复 VIVE 后重新点击“开始遥操”。"
@@ -3516,20 +3441,13 @@ class RealTeleopControlInput:
     def _final_tracker_side_home_admission(self) -> bool:
         """Recheck the fresh side relation immediately before Home capture."""
 
-        if self._tracker_side_initial_check_completed:
-            self._tracker_side_guard_request_active = False
-            self._tracker_side_override_granted = False
+        gate = self._tracker_side_gate_state()
+        if gate.initial_check_completed:
+            gate.final_recheck_required = False
             return True
-        if not self._tracker_side_guard_request_active:
+        if not gate.final_recheck_required:
             return True
-        self._tracker_side_guard_request_active = False
-        override_granted = bool(self._tracker_side_override_granted)
-        self._tracker_side_override_granted = False
-        if override_granted:
-            self._complete_initial_tracker_side_check(
-                result="continued_for_gui_session"
-            )
-            return True
+        gate.final_recheck_required = False
         if set(self.components.active_sides) != {"left", "right"}:
             self._complete_initial_tracker_side_check(result="not_required")
             return True
@@ -3548,7 +3466,7 @@ class RealTeleopControlInput:
         _log("InputMapping", message)
         if self.ui is not None:
             self.ui.publish(
-                tracker_side_check=dict(self._tracker_side_check),
+                tracker_side_check=self._tracker_side_check_payload(),
                 active_controls=self._current_active_controls(),
                 control_hint=message,
                 home_ready=False,
@@ -3644,10 +3562,11 @@ class RealTeleopControlInput:
         if not self._teleop_started or not self.hardware_hold_confirmed():
             return False
         self._request_calibration_with_tracker_side_guard(source="hitl")
+        gate = self._tracker_side_gate_state()
         return bool(
             self._calibration_requested
-            or self._tracker_side_request_pending
-            or self._tracker_side_confirmation_pending
+            or gate.pending_request is not None
+            or gate.pending_confirmation is not None
         )
 
     def consume_two_pedal_fast_home_target(
@@ -3669,8 +3588,7 @@ class RealTeleopControlInput:
             self._two_pedal_fast_home_requested = False
             self._calibration_requested = False
             self._calibration_request_from_hold = False
-            self._tracker_side_guard_request_active = False
-            self._tracker_side_override_granted = False
+            self._tracker_side_gate_state().final_recheck_required = False
             self._two_pedal_transition_target_fixed_side = None
             self._two_pedal_fast_home_deadline = 0.0
             self._publish_two_pedal_alert(
@@ -5544,19 +5462,13 @@ class RealTeleopControlInput:
         self._calibration_requested = False
         self._calibration_request_from_hold = False
         self._last_calibration_started_from_hold = False
-        self._clear_tracker_side_confirmation()
-        self._clear_tracker_side_request()
-        self._tracker_side_guard_request_active = False
-        self._tracker_side_override_granted = False
+        gate = self._tracker_side_gate_state()
+        gate.pending_confirmation = None
+        gate.pending_request = None
+        gate.final_recheck_required = False
         self._two_pedal_fast_home_requested = False
         self._two_pedal_fast_home_deadline = 0.0
         self._two_pedal_fast_home_timeout_sec = 1.0
-        self._tracker_side_check.update(
-            {
-                "home_request_pending": False,
-                "confirmation_required": False,
-            }
-        )
         if self._teleop_started:
             self._hold_active = True
             self._hardware_hold_confirmed = preserve_hardware_hold_receipt
@@ -6070,17 +5982,12 @@ class RealTeleopControlInput:
                     "已开始遥操准备，运行中不能互换 VIVE tracker。",
                 )
             return
-        if self._tracker_side_confirmation_pending:
+        gate = self._tracker_side_gate_state()
+        if gate.pending_confirmation is not None:
             self._cancel_tracker_side_warning()
-        elif self._tracker_side_request_pending:
-            self._clear_tracker_side_request()
-            self._tracker_side_check.update(
-                {
-                    "home_request_pending": False,
-                    "confirmation_required": False,
-                    "confirmation_result": "cancelled_for_tracker_swap",
-                }
-            )
+        elif gate.pending_request is not None:
+            gate.pending_request = None
+            gate.confirmation_result = "cancelled_for_tracker_swap"
         self.args.swap_operator_sides = not bool(
             getattr(self.args, "swap_operator_sides", False)
         )
@@ -6119,7 +6026,7 @@ class RealTeleopControlInput:
         if channels is None:
             source = _vive_pose_source_from_components(self.components)
             channels = {} if source is None else source.get_latest_channels()
-        if not self._tracker_side_initial_check_completed:
+        if not self._tracker_side_gate_state().initial_check_completed:
             self._update_tracker_side_check(
                 evaluate_tracker_side_assignment(
                     channels,

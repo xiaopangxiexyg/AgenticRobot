@@ -3582,16 +3582,6 @@ def test_control_lifecycle_state_survives_ui_transport_failure(
     control._last_calibration_started_from_hold = False
     control._calibration_requested = False
     control._calibration_request_from_hold = False
-    control._tracker_side_confirmation_pending = False
-    control._tracker_side_confirmation_from_hold = False
-    control._tracker_side_confirmation_request_kind = "normal"
-    control._tracker_side_request_pending = False
-    control._tracker_side_request_from_hold = False
-    control._tracker_side_request_source = ""
-    control._tracker_side_request_kind = "normal"
-    control._tracker_side_request_deadline = 0.0
-    control._tracker_side_guard_request_active = False
-    control._tracker_side_override_granted = False
     control._two_pedal_fast_home_requested = False
     control._two_pedal_fast_home_deadline = 0.0
     control._two_pedal_fast_home_timeout_sec = 1.0
@@ -4148,9 +4138,6 @@ def test_control_input_poll_keeps_input_and_publish_order_without_hardware() -> 
     control._camera_visualization_toggle_requested = False
     control._tactile_visualization_toggle_requested = False
     control._ik_debug_log_toggle_requested = False
-    control._tracker_side_request_pending = False
-    control._tracker_side_request_kind = "normal"
-    control._tracker_side_request_deadline = 0.0
     control._q6_hold_recalibration_gesture = SimpleNamespace()
     control._handle_foot_pad_special_arm_event = (
         lambda event, *, now: events.append(f"foot_pad.route:{event}")
