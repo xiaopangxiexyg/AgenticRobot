@@ -790,6 +790,17 @@ ssh -L 127.0.0.1:8080:127.0.0.1:8080 dex-remote
 [result] output path / log path / exit code
 ```
 
+`[target]` 表示请求的 SSH 目标和配置参数，不单独证明已连接的远端身份。
+连接失败时也可能已经打印该行；需要结合身份检查、实际输出和退出状态判断。
+
+只需核对远端工作目录和 Python 时，可用 `remote_env.sh -H HOST --summary`
+（可结合 `--project`、`--env`、`--python`）。它保留完整 wrapper/target header、
+远端 hostname、实际工作目录、Python 可执行路径和版本；省略 shell/PATH 展示，
+不查询全部 conda 环境、GPU 或 CUDA，并输出明确的检查范围说明。
+激活环境、路径检查和 Python 版本查询失败仍返回失败；摘要不是 GPU/CUDA 或
+整体环境就绪的证据。需要这些诊断时去掉 `--summary`，默认完整输出保持不变。
+该选项不缓存身份、不改变安全检查或授权，也不创建另一份审计日志。
+
 ## SSH 实现建议
 
 建议集中实现公共 SSH 参数：
@@ -1152,6 +1163,16 @@ remote_dataset_camera_promotion.sh
 remote_dataset_camera_training_validity.sh
 remote_dataset_tactile_storage.sh
 ```
+
+只读文本查看可加 `remote_view.sh --compact`：保留完整 `[target]`、解析后的路径、
+类型、文件字节数与权限、正文及范围说明，省略重复请求路径和详细元数据；默认仍展示
+详细元数据。目录列表和非普通文件信息不精简，敏感路径及非文本文件的拒绝规则不变。
+
+文本先按 `--head` / `--tail` 选择行，再用 `--max-bytes` 限制正文展示字节数。
+末尾 `selected_bytes_omitted` 只计算所选行中因字节上限未展示的部分；为 0 不表示
+已读完整文件。目录末尾报告列表行数上限（包含 `ls` 的汇总行），不承诺完整列举。
+正常达到展示上限不再造成 broken pipe 失败，真实读取或展示错误仍返回非零。
+字节限制可能切断多字节字符；读取增长中的日志也不是一致性快照。
 
 示例：
 

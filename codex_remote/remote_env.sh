@@ -8,6 +8,7 @@ source "$SCRIPT_DIR/remote_common.sh"
 PROJECT=""
 ENV_NAME=""
 PYTHON_BIN="python"
+SUMMARY=false
 
 usage() {
   cat <<'EOF'
@@ -19,6 +20,7 @@ Options:
       --project DIR       Remote project directory to cd into before checks.
       --env NAME_OR_DIR   Conda/micromamba env name, or venv directory.
       --python PYTHON     Python executable after env activation. Default: python.
+      --summary           Check only host, cwd and Python; omit environment inventories.
 
 Safety: L1, remote read-only.
 EOF
@@ -47,6 +49,10 @@ while [[ $# -gt 0 ]]; do
       PYTHON_BIN="$2"
       shift 2
       ;;
+    --summary)
+      SUMMARY=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -61,12 +67,13 @@ finalize_common_ssh
 assert_python_bin_name "$PYTHON_BIN"
 print_wrapper_header "L1" "$PROJECT" "$ENV_NAME"
 
-remote_bash "$PROJECT" "$ENV_NAME" "$PYTHON_BIN" <<'REMOTE'
+remote_bash "$PROJECT" "$ENV_NAME" "$PYTHON_BIN" "$SUMMARY" <<'REMOTE'
 set -Eeuo pipefail
 
 project=$1
 env_name=$2
 python_bin=$3
+summary=$4
 
 resolve_remote_path() {
   local value="$1"
@@ -130,10 +137,17 @@ activate_env "$env_name"
 
 printf '[remote] hostname=%s\n' "$(hostname)"
 printf '[remote] pwd=%s\n' "$PWD"
-printf '[remote] shell=%s\n' "${SHELL:-unknown}"
-printf '[remote] path=%s\n' "$PATH"
+if [[ "$summary" != "true" ]]; then
+  printf '[remote] shell=%s\n' "${SHELL:-unknown}"
+  printf '[remote] path=%s\n' "$PATH"
+fi
 printf '[python] executable=%s\n' "$(command -v "$python_bin" 2>/dev/null || printf '%s' "$python_bin")"
 "$python_bin" --version 2>&1 | sed 's/^/[python] version=/'
+
+if [[ "$summary" == "true" ]]; then
+  printf '[scope] summary: shell/PATH omitted; conda inventory, GPU and CUDA not checked\n'
+  exit 0
+fi
 
 if command -v conda >/dev/null 2>&1; then
   conda info --envs 2>/dev/null | sed 's/^/[conda] /' || true

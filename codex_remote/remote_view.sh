@@ -9,6 +9,7 @@ REMOTE_PATH=""
 HEAD_LINES=120
 TAIL_LINES=""
 MAX_BYTES=20000
+COMPACT=false
 
 usage() {
   cat <<'EOF'
@@ -22,6 +23,7 @@ Options:
       --head N         Show first N lines for text files. Default: 120.
       --tail N         Show last N lines for text files.
       --max-bytes N    Cap displayed text bytes. Default: 20000.
+      --compact        Omit repeated file metadata; retain target, resolved path and scope.
 
 Safety: L1, remote read-only. Refuses common secret/key paths.
 EOF
@@ -56,6 +58,10 @@ while [[ $# -gt 0 ]]; do
       MAX_BYTES="$2"
       shift 2
       ;;
+    --compact)
+      COMPACT=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -75,15 +81,18 @@ fi
 
 finalize_common_ssh
 print_wrapper_header "L1"
-printf '[view] path=%s\n' "$REMOTE_PATH"
+if [[ "$COMPACT" != "true" ]]; then
+  printf '[view] path=%s\n' "$REMOTE_PATH"
+fi
 
-remote_bash "$REMOTE_PATH" "$HEAD_LINES" "$TAIL_LINES" "$MAX_BYTES" <<'REMOTE'
+remote_bash "$REMOTE_PATH" "$HEAD_LINES" "$TAIL_LINES" "$MAX_BYTES" "$COMPACT" <<'REMOTE'
 set -Eeuo pipefail
 
 path_arg=$1
 head_lines=$2
 tail_lines=$3
 max_bytes=$4
+compact=$5
 
 resolve_remote_path() {
   local value="$1"
@@ -145,7 +154,12 @@ printf '[remote] resolved=%s\n' "$path"
 
 if [[ -d "$path" ]]; then
   printf '[remote] type=directory\n'
-  ls -la "$path" | head -n "$head_lines"
+  # Drain the listing so an intentional display limit cannot cause SIGPIPE.
+  ls -la "$path" | {
+    head -n "$head_lines"
+    cat >/dev/null
+    printf '[view] listing_line_limit=%s\n' "$head_lines"
+  }
   exit 0
 fi
 
@@ -156,9 +170,13 @@ if [[ ! -f "$path" ]]; then
 fi
 
 printf '[remote] type=file\n'
-ls -lh "$path"
-if command -v file >/dev/null 2>&1; then
-  file "$path" || true
+if [[ "$compact" == "true" ]]; then
+  stat -L -c '[file] bytes=%s mode=%A' -- "$path"
+else
+  ls -lh "$path"
+  if command -v file >/dev/null 2>&1; then
+    file "$path" || true
+  fi
 fi
 
 if ! is_text_file "$path"; then
@@ -167,10 +185,22 @@ if ! is_text_file "$path"; then
 fi
 
 printf '\n[content]\n'
+bounded_text() {
+  # Consume the rest of the selected lines, preserving upstream read failures.
+  head -c "$max_bytes"
+  local omitted
+  omitted=$(wc -c)
+  printf '\n[view] selection=%s lines=%s max_bytes=%s selected_bytes_omitted=%s\n' \
+    "$selection" "$line_limit" "$max_bytes" "$omitted"
+}
+
 if [[ -n "$tail_lines" ]]; then
-  tail -n "$tail_lines" "$path" | head -c "$max_bytes"
+  selection=tail
+  line_limit=$tail_lines
+  tail -n "$tail_lines" "$path" | bounded_text
 else
-  sed -n "1,${head_lines}p" "$path" | head -c "$max_bytes"
+  selection=head
+  line_limit=$head_lines
+  head -n "$head_lines" "$path" | bounded_text
 fi
-printf '\n'
 REMOTE
