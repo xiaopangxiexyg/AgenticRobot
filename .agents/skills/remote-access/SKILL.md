@@ -56,6 +56,8 @@ is needed. Its omitted-byte count covers selected lines, not the whole file.
   disconnect, or a transport response.
 - Do not reuse a prior target's path, environment, device conclusions, safety
   token, or write scope after the target changes.
+- Treat an unknown SSH host key as an onboarding boundary. Do not weaken normal
+  wrapper host-key checking to make a connection succeed.
 - Keep host-specific configuration and credentials outside the repository;
   copying them between trusted development machines is a separate, explicit
   local-resource or provisioning operation.

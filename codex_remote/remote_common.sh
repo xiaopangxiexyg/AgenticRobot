@@ -7,9 +7,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   exit 1
 fi
 
-REMOTE_HOST="${REMOTE_HOST:-}"
-REMOTE_USER="${REMOTE_USER:-}"
-REMOTE_PORT="${REMOTE_PORT:-}"
+# The execution target must come from this invocation. Ambient target values can
+# silently redirect an otherwise identical command to another machine.
+REMOTE_HOST=""
+REMOTE_USER=""
+REMOTE_PORT=""
 KEY_FILE="${KEY_FILE:-$HOME/.ssh/id_ed25519}"
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-5}"
 COMMON_ARGC=0
@@ -137,7 +139,7 @@ build_ssh_args() {
     -o BatchMode=yes
     -o NumberOfPasswordPrompts=0
     -o ConnectTimeout="$CONNECT_TIMEOUT"
-    -o StrictHostKeyChecking=accept-new
+    -o StrictHostKeyChecking=yes
     -o ServerAliveInterval=10
     -o ServerAliveCountMax=3
   )
@@ -185,7 +187,7 @@ build_rsync_rsh() {
   rsh+=" -o BatchMode=yes"
   rsh+=" -o NumberOfPasswordPrompts=0"
   rsh+=" -o ConnectTimeout=$(shell_single_quote "$CONNECT_TIMEOUT")"
-  rsh+=" -o StrictHostKeyChecking=accept-new"
+  rsh+=" -o StrictHostKeyChecking=yes"
   rsh+=" -o ServerAliveInterval=10"
   rsh+=" -o ServerAliveCountMax=3"
 

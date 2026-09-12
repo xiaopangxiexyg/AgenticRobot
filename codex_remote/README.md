@@ -70,6 +70,10 @@ Codex 的所有决策、文件编辑和命令发起都发生在本地；远程�
 ssh user@REMOTE_IP
 ```
 
+普通 `codex_remote` wrapper 只连接已经记录在本机 `known_hosts` 中的目标，
+未知或变化的 host key 会失败。首次接入应通过上面的 SSH 初始化流程核对并建立
+信任；不要在普通执行、同步或设备 wrapper 中临时放宽 host-key 校验。
+
 建议在 `~/.ssh/config` 中配置固定别名：
 
 ```text
