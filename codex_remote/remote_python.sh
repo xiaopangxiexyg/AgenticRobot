@@ -11,10 +11,6 @@ PYTHON_BIN="python"
 TIMEOUT_SEC=""
 LOG_DIR=""
 DRY_RUN=false
-ALLOW_CONTROL_RISK=false
-DRY_CONTROL_OK=false
-REQUIRE_SAFETY_OK=""
-SAFETY_MAX_AGE=60
 REMOTE_ARGS=()
 
 usage() {
@@ -30,18 +26,10 @@ Options:
       --timeout SEC       Wrap the remote program with timeout when available.
       --log-dir DIR       Remote directory for tee'd logs.
       --dry-run           Print the remote command without executing it.
-      --allow-control-risk
-                          Allow hardware/control-looking commands, but only with
-                          --require-safety-ok.
-      --dry-control-ok    Allow hardware/control-looking commands only when
-                          explicit dry-run/no-motion markers are present.
-      --require-safety-ok PATH
-                          Require a fresh remote_safety_check token before running.
-      --safety-max-age SEC
-                          Max age for safety token. Default: 60.
   --                     Everything after -- is passed to python -u.
 
-Safety: L3, remote process execution.
+Safety: L3, non-control remote process execution. Control/device actions require
+a purpose-built wrapper.
 EOF
   common_ssh_usage
 }
@@ -82,23 +70,8 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=true
       shift
       ;;
-    --allow-control-risk)
-      ALLOW_CONTROL_RISK=true
-      shift
-      ;;
-    --dry-control-ok)
-      DRY_CONTROL_OK=true
-      shift
-      ;;
-    --require-safety-ok)
-      [[ $# -ge 2 ]] || die "$1 requires a value"
-      REQUIRE_SAFETY_OK="$2"
-      shift 2
-      ;;
-    --safety-max-age)
-      [[ $# -ge 2 ]] || die "$1 requires a value"
-      SAFETY_MAX_AGE="$2"
-      shift 2
+    --allow-control-risk|--dry-control-ok|--require-safety-ok|--safety-max-age)
+      die "$1 is no longer supported by generic L3 wrappers; use a purpose-built wrapper for control/device actions"
       ;;
     --)
       shift
@@ -119,16 +92,15 @@ done
 if [[ -n "$TIMEOUT_SEC" && ! "$TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
   die "timeout must be a number: $TIMEOUT_SEC"
 fi
-[[ "$SAFETY_MAX_AGE" =~ ^[0-9]+$ ]] || die "safety max age must be a number: $SAFETY_MAX_AGE"
 assert_python_bin_name "$PYTHON_BIN"
 if [[ "$DRY_RUN" != "true" ]]; then
-  assert_control_risk_allowed "$ALLOW_CONTROL_RISK" "$DRY_CONTROL_OK" "$REQUIRE_SAFETY_OK" "${REMOTE_ARGS[@]}"
+  assert_no_control_risk "${REMOTE_ARGS[@]}"
 fi
 
 finalize_common_ssh
 print_wrapper_header "L3" "$PROJECT" "$ENV_NAME"
 
-remote_bash "$PROJECT" "$ENV_NAME" "$PYTHON_BIN" "$TIMEOUT_SEC" "$LOG_DIR" "$DRY_RUN" "$REQUIRE_SAFETY_OK" "$SAFETY_MAX_AGE" "${REMOTE_ARGS[@]}" <<'REMOTE'
+remote_bash "$PROJECT" "$ENV_NAME" "$PYTHON_BIN" "$TIMEOUT_SEC" "$LOG_DIR" "$DRY_RUN" "${REMOTE_ARGS[@]}" <<'REMOTE'
 set -Eeuo pipefail
 
 project=$1
@@ -137,9 +109,7 @@ python_bin=$3
 timeout_sec=$4
 log_dir=$5
 dry_run=$6
-safety_token=$7
-safety_max_age=$8
-shift 8
+shift 6
 
 resolve_remote_path() {
   local value="$1"
@@ -185,30 +155,6 @@ activate_env() {
   return 3
 }
 
-check_safety_token() {
-  local token_path="$1"
-  local max_age="$2"
-  local now created age
-
-  [[ -n "$token_path" ]] || return 0
-  token_path="$(resolve_remote_path "$token_path")"
-  case "$token_path" in
-    /tmp/codex_*|"$HOME"/.cache/codex_remote_safety/*) ;;
-    *) printf 'Refusing safety token path outside /tmp/codex_* or ~/.cache/codex_remote_safety/: %s\n' "$token_path" >&2; exit 5 ;;
-  esac
-  [[ -f "$token_path" ]] || { printf 'Safety token does not exist: %s\n' "$token_path" >&2; exit 5; }
-  created="$(sed -n 's/^created_at=//p' "$token_path" | head -n 1)"
-  [[ "$created" =~ ^[0-9]+$ ]] || { printf 'Safety token missing numeric created_at: %s\n' "$token_path" >&2; exit 5; }
-  grep -Eq '^guard_checks=[1-9][0-9]*$' "$token_path" || { printf 'Safety token has no hardware/control guard checks: %s\n' "$token_path" >&2; exit 5; }
-  now="$(date +%s)"
-  age=$((now - created))
-  if (( age < 0 || age > max_age )); then
-    printf 'Safety token is stale: %ss old, max %ss (%s)\n' "$age" "$max_age" "$token_path" >&2
-    exit 5
-  fi
-  printf '[check] safety_token=%s age=%ss\n' "$token_path" "$age"
-}
-
 if [[ -n "$project" ]]; then
   project="$(resolve_remote_path "$project")"
   [[ -d "$project" ]] || { printf 'Project directory does not exist: %s\n' "$project" >&2; exit 3; }
@@ -216,7 +162,6 @@ if [[ -n "$project" ]]; then
 fi
 
 activate_env "$env_name"
-check_safety_token "$safety_token" "$safety_max_age"
 
 cmd=("$python_bin" -u "$@")
 if [[ -n "$timeout_sec" ]]; then

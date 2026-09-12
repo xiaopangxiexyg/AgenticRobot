@@ -45,6 +45,7 @@ Options:
 This script is run on the main machine. It exports a local directory with NFS,
 then uses SSH to mount it on a remote Ubuntu/Linux machine.
 If passwordless SSH to the remote is not ready, setup_ssh_passwordless.sh is run.
+The host key must already be verified and present in known_hosts.
 EOF
 }
 
@@ -133,7 +134,7 @@ build_ssh_command() {
   fi
   SSH_COMMAND+=(
     -p "$REMOTE_PORT"
-    -o StrictHostKeyChecking=accept-new
+    -o StrictHostKeyChecking=yes
     -o BatchMode=yes
     -o NumberOfPasswordPrompts=0
     "$(remote_target)"
@@ -168,7 +169,7 @@ show_recorded_mounts() {
         -p "$remote_port"
         -o BatchMode=yes
         -o ConnectTimeout=3
-        -o StrictHostKeyChecking=accept-new
+        -o StrictHostKeyChecking=yes
         -o NumberOfPasswordPrompts=0
         "${remote_user}@${remote_host}"
       )

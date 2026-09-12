@@ -7,9 +7,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   exit 1
 fi
 
-REMOTE_HOST="${REMOTE_HOST:-}"
-REMOTE_USER="${REMOTE_USER:-}"
-REMOTE_PORT="${REMOTE_PORT:-}"
+# The execution target must come from this invocation. Ambient target values can
+# silently redirect an otherwise identical command to another machine.
+REMOTE_HOST=""
+REMOTE_USER=""
+REMOTE_PORT=""
 KEY_FILE="${KEY_FILE:-$HOME/.ssh/id_ed25519}"
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-5}"
 COMMON_ARGC=0
@@ -116,11 +118,19 @@ Common SSH options:
 EOF
 }
 
-finalize_common_ssh() {
-  require_cmd ssh
-  require_cmd sed
+validate_ssh_identity() {
+  if [[ -z "$REMOTE_HOST" || "$REMOTE_HOST" == -* || "$REMOTE_HOST" == *@* || "$REMOTE_HOST" == */* || "$REMOTE_HOST" =~ [[:space:]] || "$REMOTE_HOST" =~ [[:cntrl:]] ]]; then
+    die "unsafe or invalid SSH host: target must be a single host or alias and cannot begin with '-'"
+  fi
+  if [[ -n "$REMOTE_USER" ]] &&
+    { [[ "$REMOTE_USER" == -* || "$REMOTE_USER" == *@* || "$REMOTE_USER" == *:* || "$REMOTE_USER" == */* ]] || [[ "$REMOTE_USER" =~ [[:space:]] || "$REMOTE_USER" =~ [[:cntrl:]] ]]; }; then
+    die "unsafe or invalid SSH user: value cannot contain separators or whitespace or begin with '-'"
+  fi
+}
 
+finalize_common_ssh() {
   [[ -n "$REMOTE_HOST" ]] || die "missing -H/--host"
+  validate_ssh_identity
   if [[ -n "$REMOTE_PORT" && ! "$REMOTE_PORT" =~ ^[0-9]+$ ]]; then
     die "SSH port must be a number: $REMOTE_PORT"
   fi
@@ -129,6 +139,8 @@ finalize_common_ssh() {
   fi
 
   KEY_FILE="$(expand_local_path "$KEY_FILE")"
+  require_cmd ssh
+  require_cmd sed
 }
 
 build_ssh_args() {
@@ -137,7 +149,7 @@ build_ssh_args() {
     -o BatchMode=yes
     -o NumberOfPasswordPrompts=0
     -o ConnectTimeout="$CONNECT_TIMEOUT"
-    -o StrictHostKeyChecking=accept-new
+    -o StrictHostKeyChecking=yes
     -o ServerAliveInterval=10
     -o ServerAliveCountMax=3
   )
@@ -185,7 +197,7 @@ build_rsync_rsh() {
   rsh+=" -o BatchMode=yes"
   rsh+=" -o NumberOfPasswordPrompts=0"
   rsh+=" -o ConnectTimeout=$(shell_single_quote "$CONNECT_TIMEOUT")"
-  rsh+=" -o StrictHostKeyChecking=accept-new"
+  rsh+=" -o StrictHostKeyChecking=yes"
   rsh+=" -o ServerAliveInterval=10"
   rsh+=" -o ServerAliveCountMax=3"
 
@@ -203,6 +215,10 @@ print_wrapper_header() {
   local safety="$1"
   local project="${2:-}"
   local env_name="${3:-}"
+
+  if [[ "$project" =~ [[:cntrl:]] || "$env_name" =~ [[:cntrl:]] ]]; then
+    die "audit fields cannot contain control characters"
+  fi
 
   printf '[local] wrapper=%s safety=%s\n' "$(basename "$0")" "$safety"
   printf '[target] host=%s' "$(remote_target)"
@@ -362,28 +378,11 @@ assert_python_bin_name() {
   die "--python must point to a Python interpreter, not: $python_bin"
 }
 
-assert_control_risk_allowed() {
-  local allow_control_risk="$1"
-  local dry_control_ok="$2"
-  local safety_token="$3"
-  shift 3
-
+assert_no_control_risk() {
   control_risk_detected "$@" || return 0
 
-  if [[ "$dry_control_ok" == "true" ]]; then
-    assert_dry_run_control_args "$@"
-    warn "Control-risk command allowed only because explicit dry-control checks passed."
-    return 0
-  fi
-
-  if [[ "$allow_control_risk" == "true" ]]; then
-    [[ -n "$safety_token" ]] || die "control-risk command requires --require-safety-ok TOKEN_PATH"
-    warn "Control-risk command allowed; remote safety token will be checked before execution."
-    return 0
-  fi
-
-  printf 'Refusing command because it looks like it may affect real hardware/control:\n' >&2
+  printf 'Refusing a control-risk command through a generic L3 wrapper:\n' >&2
   print_control_risk_matches "$@"
-  printf 'Use a purpose-built safe wrapper, or pass --allow-control-risk with --require-safety-ok after a fresh remote_safety_check.\n' >&2
+  printf 'Use a purpose-built wrapper that constrains the exact action. Preflight evidence does not grant control permission.\n' >&2
   exit 5
 }

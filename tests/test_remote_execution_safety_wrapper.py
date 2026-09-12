@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _executable(path: Path, body: str) -> None:
+    path.write_text("#!/usr/bin/env bash\nset -Eeuo pipefail\n" + body)
+    path.chmod(0o755)
+
+
+@pytest.fixture
+def wrapper_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "ssh-calls"
+    _executable(
+        bin_dir / "ssh",
+        'printf "%s\\0" "$@" > "$SSH_CAPTURE"\nexec bash -c "${!#}"\n',
+    )
+    environment = os.environ.copy()
+    for name in ("REMOTE_HOST", "REMOTE_USER", "REMOTE_PORT", "KEY_FILE"):
+        environment.pop(name, None)
+    environment.update(
+        PATH=f"{bin_dir}:{environment['PATH']}",
+        SSH_CAPTURE=str(calls),
+        KEY_FILE=str(tmp_path / "absent-key"),
+    )
+    return environment, calls
+
+
+def _run(
+    environment: dict[str, str], wrapper: str, *args: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(ROOT / "codex_remote" / wrapper), *args],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+@pytest.mark.parametrize("wrapper", ["remote_python.sh", "remote_module.sh", "remote_pytest.sh"])
+def test_generic_execution_rejects_control_authority_overrides(
+    wrapper_environment: tuple[dict[str, str], Path], wrapper: str
+) -> None:
+    environment, calls = wrapper_environment
+    result = _run(
+        environment,
+        wrapper,
+        "-H",
+        "trusted-target",
+        "--allow-control-risk",
+        "--",
+        "harmless",
+    )
+    assert result.returncode != 0
+    assert "no longer supported by generic L3 wrappers" in result.stderr
+    assert not calls.exists()
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "argument"),
+    [
+        ("remote_python.sh", "robot_motion/replay.py"),
+        ("remote_module.sh", "robot_motion.replay"),
+        ("remote_pytest.sh", "tests/test_robot_motion.py"),
+    ],
+)
+def test_generic_execution_rejects_control_risk_before_ssh(
+    wrapper_environment: tuple[dict[str, str], Path], wrapper: str, argument: str
+) -> None:
+    environment, calls = wrapper_environment
+    result = _run(environment, wrapper, "-H", "trusted-target", "--", argument)
+    assert result.returncode == 5
+    assert "Refusing a control-risk command through a generic L3 wrapper" in result.stderr
+    assert not calls.exists()
+
+
+def test_preflight_cannot_write_an_authority_token(
+    wrapper_environment: tuple[dict[str, str], Path], tmp_path: Path
+) -> None:
+    environment, calls = wrapper_environment
+    result = _run(
+        environment,
+        "remote_safety_check.sh",
+        "-H",
+        "trusted-target",
+        "--token-path",
+        str(tmp_path / "authority-token"),
+    )
+    assert result.returncode != 0
+    assert "preflight evidence cannot authorize a later action" in result.stderr
+    assert not calls.exists()
+
+
+def test_arm_dry_run_only_previews_the_remote_program(
+    wrapper_environment: tuple[dict[str, str], Path]
+) -> None:
+    environment, calls = wrapper_environment
+    result = _run(
+        environment,
+        "remote_arm_dry_run.sh",
+        "-H",
+        "trusted-target",
+        "--script",
+        "tools/would_move_dry_run.py",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "tools/would_move_dry_run.py --dry-run" in result.stdout
+    assert "[result] dry-run only" in result.stdout
+    transport = calls.read_bytes().split(b"\0")
+    assert b"StrictHostKeyChecking=yes" in transport
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("-H", "trusted\x1b[31m"), ("-u", "robot\x07")],
+)
+def test_control_characters_are_rejected_before_ssh(
+    wrapper_environment: tuple[dict[str, str], Path], option: str, value: str
+) -> None:
+    environment, calls = wrapper_environment
+    arguments = ["-H", "trusted-target"] if option == "-u" else []
+    result = _run(
+        environment,
+        "remote_python.sh",
+        *arguments,
+        option,
+        value,
+        "--dry-run",
+        "--",
+        "--version",
+    )
+    assert result.returncode != 0
+    assert "unsafe or invalid SSH" in result.stderr
+    assert not calls.exists()

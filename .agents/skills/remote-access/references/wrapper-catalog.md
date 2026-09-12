@@ -47,7 +47,8 @@ this does not extend its authority or replace fresh checks.
   source.
 - Dry-run arm checks: `remote_arm_dry_run.sh`; do not disable its dry-run
   behavior.
-- Control-risk preflight: `remote_safety_check.sh`.
+- Control-risk preflight evidence: `remote_safety_check.sh`. It is read-only
+  and does not authorize a later action.
 
 Use dataset-specific wrappers only for the exact documented dataset audit,
 quarantine, promotion, or storage task. Do not reinterpret them as arbitrary
