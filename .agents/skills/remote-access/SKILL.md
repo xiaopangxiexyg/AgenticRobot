@@ -8,53 +8,44 @@ description: Use AgenticRobot codex_remote wrappers for remote inspection, trans
 Own the remote operation; local semantics remain with the domain Skills named
 in the repository's `AGENTS.md`.
 
-Use the reviewed `codex_remote/` wrappers as the execution boundary. Inspect
-`--help` when arguments are unknown, changed, or rejected; reuse already checked
-arguments for the same wrapper version. Read
-[the wrapper catalog](references/wrapper-catalog.md) when the choice or effect
-class is unclear. Before changing a wrapper, inspect that wrapper, its shared
-helper and tests, and only the relevant section of
-[the remote design](../../../codex_remote/README.md).
+Use reviewed `codex_remote/` wrappers. Inspect `--help` for unknown, changed, or
+rejected arguments; reuse checked arguments for the same version. Read
+[the catalog](references/wrapper-catalog.md) only when wrapper choice or effect
+class is unclear. For maintenance, apply `codex_remote/AGENTS.md` and inspect
+the affected wrapper, helper, tests and relevant
+[design section](../../../codex_remote/README.md).
 
 ## Workflow
 
-1. **Fix the context.** Record the exact SSH target, repository path or runtime
-   surface, intended effect, local/remote write scope, and timeout or stop
-   condition. Distinguish the SSH host from a robot/controller address. State
-   this once for a bounded batch; subsequent commentary may refer to that target
-   and state only changed scope, process, or timeout. Re-expand when the binding
-   is unclear or changes, and in requests for device/motion authority. This is
-   prose reuse only: keep explicit command targets and wrapper audit output.
-2. **Select the narrow wrapper.** Use the known dedicated wrapper or consult the
-   catalog. Separate read-only observation, result transfer, process execution,
-   device-state change, and real motion.
-3. **Verify identity.** Pass `-H/--host` explicitly. For a non-default target,
-   run the identity wrapper before process, device, or hardware work. Never
-   fall back to another target after failure.
-4. **Apply the operation contract.**
-   - Run relevant read-only diagnostics through the corresponding wrapper.
-   - State target and write scope before non-motion transfer.
-   - State process and timeout before remote execution.
-   - Require explicit current-request authority before device-state changes or
-     motion.
-   - Run a fresh safety preflight and pass its bounded token only to the exact
-     authorized control-risk command.
-5. **Keep code ownership local.** When confirmed no-delete realtime sync is
-   active, edit locally and use the remote only for the environment, devices,
-   drivers, GPU, or execution evidence it owns. Verify sync when freshness is
-   material.
-6. **Collect bounded evidence.** Remote output does not imply local
-   materialization. Inspect or retrieve named results intentionally and report
-   the exact target, command class, boundary reached, and remaining unverified
-   state.
+1. State the exact SSH target, project/runtime surface, intended effect,
+   local/remote write scope and timeout/stop condition once per bounded batch.
+   Distinguish SSH hosts from robot/controller addresses. Subsequent commentary
+   may reference this binding and report changes. Re-expand unclear or changed
+   bindings and requests for device/motion authority; prose reuse grants no
+   additional authority.
+2. Pass `-H/--host` explicitly on every call and preserve wrapper audit output.
+   For non-default targets, run the identity wrapper before process, device or
+   hardware work. A printed `[target]` is not identity verification. Never fall
+   back to another target after failure.
+3. Select the narrow wrapper for observation, transfer, process execution,
+   device changes or motion. Before transfer, state target and write scope;
+   before execution, state process and timeout (the batch statement may suffice).
+   Device changes and motion require explicit current-request authority.
+   Control-risk commands require fresh safety preflight and its bounded token
+   for the exact authorized command.
+4. With confirmed no-delete realtime sync, edit locally, verify sync when
+   freshness matters, and use the remote for its environment/devices/execution.
+   Inspect or retrieve named outputs deliberately; they do not imply local
+   materialization.
+5. Report results, errors, exit status and unverified state without repeating
+   unchanged connection metadata or full argv. Final handoffs must independently
+   identify the exact target, command class and boundary reached.
 
-Use focused diagnostics for the current question; do not repeat full environment
-inventories merely because another command uses SSH. Required identity, sync,
-and safety checks still apply. Bound log reads with supported `--head`, `--tail`,
-or `--max-bytes`; disclose partial evidence. Summarize results without copying
-unchanged connection metadata or full argv already shown by the tool. Keep
-errors, exit status, and unresolved facts visible; never infer success from
-omitted output. Final handoffs must identify the exact target independently.
+For cwd/Python checks use `remote_env.sh --summary`; omit it when PATH, conda
+inventory, GPU or CUDA diagnostics are needed. Unchecked fields are not healthy
+by implication. Avoid unrelated inventories on each SSH call; required identity,
+sync and safety checks still apply. Bound logs with supported `--head`, `--tail`
+or `--max-bytes`, disclose partial evidence, and never infer success from omissions.
 
 ## Guardrails
 
@@ -66,6 +57,5 @@ omitted output. Final handoffs must identify the exact target independently.
 - Keep host-specific configuration and credentials outside the repository;
   copying them between trusted development machines is a separate, explicit
   local-resource or provisioning operation.
-- Necessary wrapper maintenance follows the task's authorized scope. Apply
-  `codex_remote/AGENTS.md` before editing; preserve fail-closed defaults and
-  obtain an explicit decision for changes to allowed effects or safety policy.
+- Preserve fail-closed defaults; changes to allowed effects or safety policy
+  require an explicit decision.

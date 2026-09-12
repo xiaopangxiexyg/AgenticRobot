@@ -790,6 +790,17 @@ ssh -L 127.0.0.1:8080:127.0.0.1:8080 dex-remote
 [result] output path / log path / exit code
 ```
 
+`[target]` 表示请求的 SSH 目标和配置参数，不单独证明已连接的远端身份。
+连接失败时也可能已经打印该行；需要结合身份检查、实际输出和退出状态判断。
+
+只需核对远端工作目录和 Python 时，可用 `remote_env.sh -H HOST --summary`
+（可结合 `--project`、`--env`、`--python`）。它保留完整 wrapper/target header、
+远端 hostname、实际工作目录、Python 可执行路径和版本；省略 shell/PATH 展示，
+不查询全部 conda 环境、GPU 或 CUDA，并输出明确的检查范围说明。
+激活环境、路径检查和 Python 版本查询失败仍返回失败；摘要不是 GPU/CUDA 或
+整体环境就绪的证据。需要这些诊断时去掉 `--summary`，默认完整输出保持不变。
+该选项不缓存身份、不改变安全检查或授权，也不创建另一份审计日志。
+
 ## SSH 实现建议
 
 建议集中实现公共 SSH 参数：
