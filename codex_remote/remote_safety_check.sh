@@ -9,8 +9,6 @@ PROJECT=""
 ARM_IP=""
 ARM_PORTS=()
 REQUIRED_DEVICES=()
-NO_TOKEN=false
-TOKEN_PATH="/tmp/codex_remote_safety_ok"
 
 usage() {
   cat <<'EOF'
@@ -23,10 +21,9 @@ Options:
       --arm-ip HOST        Robot/controller IP or hostname to ping.
       --arm-port PORT      TCP port to check. Can be repeated.
       --require-device DEV Device node that must exist. Can be repeated.
-      --token-path PATH    Remote safety-ok token path. Default: /tmp/codex_remote_safety_ok.
-      --no-token           Do not write a remote safety-ok token.
 
-Safety: L1/L2. Read-only checks, plus optional token file write.
+Safety: L1/L2. Read-only preflight evidence; it does not authorize a later
+device or motion action.
 EOF
   common_ssh_usage
 }
@@ -59,12 +56,9 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --token-path)
-      [[ $# -ge 2 ]] || die "$1 requires a value"
-      TOKEN_PATH="$2"
-      shift 2
+      die "--token-path is no longer supported; preflight evidence cannot authorize a later action"
       ;;
     --no-token)
-      NO_TOKEN=true
       shift
       ;;
     -h|--help)
@@ -87,15 +81,13 @@ fi
 finalize_common_ssh
 print_wrapper_header "L1/L2" "$PROJECT"
 
-remote_bash "$PROJECT" "$ARM_IP" "$NO_TOKEN" "$TOKEN_PATH" "${#ARM_PORTS[@]}" "${ARM_PORTS[@]}" "${#REQUIRED_DEVICES[@]}" "${REQUIRED_DEVICES[@]}" <<'REMOTE'
+remote_bash "$PROJECT" "$ARM_IP" "${#ARM_PORTS[@]}" "${ARM_PORTS[@]}" "${#REQUIRED_DEVICES[@]}" "${REQUIRED_DEVICES[@]}" <<'REMOTE'
 set -Eeuo pipefail
 
 project=$1
 arm_ip=$2
-no_token=$3
-token_path=$4
-port_count=$5
-shift 5
+port_count=$3
+shift 3
 
 arm_ports=()
 for ((i = 0; i < port_count; i++)); do
@@ -203,29 +195,5 @@ if [[ "$failures" -ne 0 ]]; then
   exit 5
 fi
 
-if [[ "$no_token" != "true" ]]; then
-  token_path="$(resolve_remote_path "$token_path")"
-  if [[ "$guard_checks" -eq 0 ]]; then
-    printf 'Refusing to write safety token because no hardware/control guard checks were requested.\n' >&2
-    printf 'Use --no-token for informational checks, or add --arm-ip/--require-device.\n' >&2
-    exit 5
-  fi
-  case "$token_path" in
-    /tmp/codex_*|"$HOME"/.cache/codex_remote_safety/*) ;;
-    *) printf 'Refusing safety token path outside /tmp/codex_* or ~/.cache/codex_remote_safety/: %s\n' "$token_path" >&2; exit 5 ;;
-  esac
-  mkdir -p "$(dirname "$token_path")"
-  {
-    printf 'created_at=%s\n' "$(date +%s)"
-    printf 'host=%s\n' "$(hostname)"
-    printf 'user=%s\n' "$(id -un)"
-    printf 'guard_checks=%s\n' "$guard_checks"
-    printf 'arm_ip=%s\n' "$arm_ip"
-    printf 'project=%s\n' "${resolved_project:-}"
-  } > "$token_path"
-  chmod 600 "$token_path"
-  printf '[result] safety_token=%s\n' "$token_path"
-fi
-
-printf '[result] safety check passed\n'
+printf '[result] safety preflight passed checks=%s\n' "$guard_checks"
 REMOTE

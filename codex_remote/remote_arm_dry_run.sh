@@ -28,7 +28,9 @@ Options:
                           --check-only, --check_only. Default: --dry-run.
   --                     Extra arguments passed to the script.
 
-Safety: L3. This wrapper always appends a dry-run flag and never sends motion commands itself.
+Safety: L3. This wrapper previews the exact remote Python command. It does not
+execute the target script, because a wrapper cannot prove that script honors a
+dry-run flag.
 EOF
   common_ssh_usage
 }
@@ -96,7 +98,7 @@ if [[ -n "$REMOTE_PORT" ]]; then cmd+=(-p "$REMOTE_PORT"); fi
 if [[ -n "$KEY_FILE" ]]; then cmd+=(-k "$KEY_FILE"); fi
 if [[ -n "$PROJECT" ]]; then cmd+=(--project "$PROJECT"); fi
 if [[ -n "$ENV_NAME" ]]; then cmd+=(--env "$ENV_NAME"); fi
-cmd+=(--python "$PYTHON_BIN" --dry-control-ok -- "$SCRIPT_PATH")
+cmd+=(--python "$PYTHON_BIN" --dry-run -- "$SCRIPT_PATH")
 if [[ -n "$DRY_FLAG" ]]; then cmd+=("$DRY_FLAG"); fi
 cmd+=("${EXTRA_ARGS[@]}")
 

@@ -364,28 +364,11 @@ assert_python_bin_name() {
   die "--python must point to a Python interpreter, not: $python_bin"
 }
 
-assert_control_risk_allowed() {
-  local allow_control_risk="$1"
-  local dry_control_ok="$2"
-  local safety_token="$3"
-  shift 3
-
+assert_no_control_risk() {
   control_risk_detected "$@" || return 0
 
-  if [[ "$dry_control_ok" == "true" ]]; then
-    assert_dry_run_control_args "$@"
-    warn "Control-risk command allowed only because explicit dry-control checks passed."
-    return 0
-  fi
-
-  if [[ "$allow_control_risk" == "true" ]]; then
-    [[ -n "$safety_token" ]] || die "control-risk command requires --require-safety-ok TOKEN_PATH"
-    warn "Control-risk command allowed; remote safety token will be checked before execution."
-    return 0
-  fi
-
-  printf 'Refusing command because it looks like it may affect real hardware/control:\n' >&2
+  printf 'Refusing a control-risk command through a generic L3 wrapper:\n' >&2
   print_control_risk_matches "$@"
-  printf 'Use a purpose-built safe wrapper, or pass --allow-control-risk with --require-safety-ok after a fresh remote_safety_check.\n' >&2
+  printf 'Use a purpose-built wrapper that constrains the exact action. Preflight evidence does not grant control permission.\n' >&2
   exit 5
 }

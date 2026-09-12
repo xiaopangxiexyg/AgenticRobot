@@ -138,12 +138,14 @@ ssh dex-remote 'cd ~/DexTeleop && source ~/anaconda3/etc/profile.d/conda.sh && c
 而应该封装成：
 
 ```bash
-./remote_python.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- teleop_runtime/replay/arm_init/dry_run.py
-./remote_module.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- sim.mujoco.replay.runner
+./remote_python.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- tools/inspect_dataset.py
+./remote_module.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- tools.report_environment
 ./remote_pytest.sh -H dex-remote --project ~/DexTeleop --env dexteleop310 -- tests/test_xxx.py -q
 ```
 
-远程 Python 进程运行在远程电脑上，因此可以访问远程电脑的真实硬件。
+远程 Python 进程运行在远程电脑上，因此技术上可能访问真实硬件。通用 Python、
+module 和 pytest wrapper 只允许 L3 非控制执行；关键词检查只是误调用防线，不能证明
+任意代码没有设备副作用。设备或运动动作必须进入限制具体动作的专用 wrapper。
 
 ### 3.1 远端受保护 Harness
 
@@ -229,7 +231,7 @@ Codex / wrapper
 ./remote_lsusb.sh -H dex-remote
 ./remote_camera_snapshot.sh -H dex-remote --device /dev/video0 --out ./debug/latest.jpg
 ./remote_arm_ping.sh -H dex-remote --ip 192.168.1.18
-./remote_arm_dry_run.sh -H dex-remote --config configs/arm.yaml
+./remote_arm_dry_run.sh -H dex-remote --project '~/DexTeleop' --script tools/arm_dry_run.py -- --config configs/arm.yaml
 ```
 
 ## 安全限制
@@ -625,7 +627,6 @@ USB、串口、HID 和低层设备控制。
 --workspace
 --dry-run
 --confirm-motion
---require-safety-ok
 ```
 
 默认 `speed-scale` 应很低，例如 `0.1` 或更低。
@@ -643,12 +644,12 @@ USB、串口、HID 和低层设备控制。
 | `remote_power_state.sh` | L1 | 检查电源/使能状态 |
 | `remote_workspace_check.sh` | L1 | 检查工作空间配置 |
 
-推荐机制：
+边界：
 
 ```text
-remote_safety_check.sh 生成 safety token 或 safety-ok 文件。
-高风险 wrapper 要求该文件在短时间内存在，例如 30 秒内。
-高风险 wrapper 仍然要求 --confirm-motion。
+remote_safety_check.sh 只输出当次只读预检证据，不生成动作许可。
+高风险 wrapper 必须自己限制动作类型、目标和参数，并重新检查当前安全状态。
+高风险 wrapper 仍然要求与精确动作绑定的显式确认；普通预检不能替代它。
 ```
 
 ### remote_vive
@@ -694,7 +695,6 @@ replay 的默认行为必须是 dry-run；真实运动应要求：
 ```text
 --confirm-motion
 --speed-scale
---require-safety-ok
 ```
 
 ### remote_network
@@ -959,7 +959,6 @@ remote_proc/remote_kill_safe.sh
   -H dex-remote \
   --arm-ip 192.168.1.18 \
   --speed-scale 0.1 \
-  --require-safety-ok \
   --confirm-motion
 ```
 
@@ -996,7 +995,8 @@ python -u teleop_runtime/replay/arm_init/dry_run.py --config configs/arm.yaml
 2. L0-L1 可以直接运行。
 3. L2-L3 运行前说明影响范围。
 4. L4-L5 必须请求人工确认。
-5. 真实运动必须先跑 remote_safety_check。
+5. 真实运动必须使用专用 wrapper，并在同一动作边界内重新检查安全状态；
+   remote_safety_check 的只读结果本身不构成许可。
 6. 不自动执行 reboot/shutdown/udev reload/USB reset/机械臂运动。
 7. 不同步密钥、token、.codex、.ssh。
 8. 远程失败时先收集 debug bundle，再修改代码。
@@ -1100,7 +1100,7 @@ remote_arm_replay
 [ ] 参数 quote 可处理空格和 ~。
 [ ] 有 --dry-run 或等价检查模式。
 [ ] L4/L5 有显式确认参数。
-[ ] 真机运动接入 remote_safety_check。
+[ ] 真机运动由专用 wrapper 限制精确动作，并在执行边界重新检查安全状态。
 ```
 
 补充开发要求：
@@ -1108,7 +1108,7 @@ remote_arm_replay
 ```text
 [ ] 使用 remote_common.sh 中的共享 SSH 参数解析，除非有明确理由。
 [ ] 输出包含 [local]、[target]、[run] 或 [check]、[result] 等可审计行。
-[ ] 对 ambiguous input、未知操作等级、缺失远程路径、过期 safety token 采用 fail closed。
+[ ] 对 ambiguous input、未知操作等级、缺失远程路径和控制风险通用执行采用 fail closed。
 [ ] 不隐藏关键命令输出；长输出应给出日志路径、有限输出或 debug bundle。
 [ ] 修改 wrapper 行为或安全策略前，先说明安全影响并保持窄范围改动。
 ```
@@ -1266,21 +1266,22 @@ remote_python.sh / remote_module.sh / remote_pytest.sh
   如果出现 replay、trajectory、motion、arm、robot、gripper、servo、confirm-motion 等控制风险词，默认拒绝运行。
   只打印命令的 wrapper --dry-run 不受影响。
   --python 只能指向 basename 类似 python、python3、pypy 的解释器，避免 wrapper 被误用成任意命令启动器。
+  关键词检查只能发现部分明显风险；调用方仍必须根据代码真实副作用分类，未知情况按较高风险处理。
 
 真实控制风险调用
-  必须显式传入 --allow-control-risk。
-  同时必须传入 --require-safety-ok TOKEN_PATH。
-  远程执行前会检查 token 是否存在、是否新鲜、是否来自带硬件/控制检查的 remote_safety_check。
+  不能通过上述通用 L3 wrapper 执行，也不存在命令行绕过参数。
+  必须使用限制了具体动作、目标和参数的专用 wrapper，并取得当前请求对精确动作的授权。
 
 dry-run 控制调用
   应优先使用 remote_arm_dry_run.sh。
   该 wrapper 只接受 basename 明确包含 dry/check/validate/simulate/noop 的脚本。
   dry-run 标志只能是白名单参数，例如 --dry-run、--no-motion、--simulate。
   如果额外参数包含 --confirm-motion、--no-dry-run、--real*、--live*、--execute* 等，会直接拒绝。
+  它只预览最终远程命令，不执行目标 Python；不能用脚本名或 dry-run 参数证明脚本无运动副作用。
 
 remote_safety_check.sh
-  默认 token 只能写到 /tmp/codex_* 或 ~/.cache/codex_remote_safety/。
-  不允许空检查生成 token；必须至少检查 --arm-ip 或 --require-device。
+  只运行身份、路径、设备存在性与网络可达性的只读预检。
+  不生成 token，也不能授权后续设备或运动动作。
 
 remote_rsync_project.sh --delete
   即使传了 --yes，真实删除模式也必须额外传入 --confirm-delete RESOLVED_REMOTE_PATH。
@@ -1325,14 +1326,16 @@ remote_dataset_tactile_storage.sh
 
 ```bash
 ./remote_safety_check.sh -H dex-remote --arm-ip 192.168.1.18 --require-device /dev/video0
-./remote_module.sh \
+./remote_arm_dry_run.sh \
   -H dex-remote \
   --project '~/DexTeleop' \
   --env dexteleop310 \
-  --allow-control-risk \
-  --require-safety-ok /tmp/codex_remote_safety_ok \
-  -- sim.mujoco.replay.runner --dry-run
+  --script tools/arm_dry_run.py \
+  -- --config configs/arm.yaml
 ```
+
+第二步只显示命令，不执行目标脚本。真实动作必须另行使用与该动作语义匹配的专用
+wrapper；本示例不授予也不演示真机运动。
 
 ### VSCode Codex 插件使用
 

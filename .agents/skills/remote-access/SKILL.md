@@ -31,8 +31,10 @@ the affected wrapper, helper, tests and relevant
    device changes or motion. Before transfer, state target and write scope;
    before execution, state process and timeout (the batch statement may suffice).
    Device changes and motion require explicit current-request authority.
-   Control-risk commands require fresh safety preflight and its bounded token
-   for the exact authorized command.
+   Generic L3 execution must reject control-risk commands. A safety preflight
+   supplies current read-only evidence but never grants action authority; any
+   device or motion action needs a purpose-built wrapper that constrains the
+   exact authorized effect.
 4. With confirmed no-delete realtime sync, edit locally, verify sync when
    freshness matters, and use the remote for its environment/devices/execution.
    Inspect or retrieve named outputs deliberately; they do not imply local
@@ -51,7 +53,8 @@ is needed. Its omitted-byte count covers selected lines, not the whole file.
 
 ## Guardrails
 
-- Do not add `--allow-control-risk` merely to make a generic command run.
+- Do not route device or motion work through a generic Python/module/test
+  wrapper. Keyword screening is defense in depth, not proof that code is safe.
 - Do not infer safe realized motion from process exit, SDK acceptance, timeout,
   disconnect, or a transport response.
 - Do not reuse a prior target's path, environment, device conclusions, safety
