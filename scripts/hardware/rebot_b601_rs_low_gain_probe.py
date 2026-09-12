@@ -81,6 +81,13 @@ motor-local damping remains active when configured.  A second Ctrl-C/SIGUSR1,
 or repeated inability to dispatch both live and cached complete six-joint
 frames, requests the full six-joint safe stop.
 
+Protective-hold recovery is deliberately probationary: the first feedback
+frame after a degraded interval is only a timing baseline, and live recovery
+is announced only after several consecutive valid frames.  This prevents one
+accidental good frame from making a fault appear recovered while the arm is
+still moving.  The degraded cache is transport-only (software Kp remains
+zero); it is never promoted to a new position-lock reference.
+
 This module is motion-capable only after all of ``--allow-motion``,
 ``--auto-disable`` and the exact confirmation string are supplied.  The
 ``feedback-stability`` mode is a separate observation-only path: it uses the
@@ -236,6 +243,7 @@ _DEFAULT_MAX_ERROR_RAD = 0.15
 _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
 _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
 _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
+_DEFAULT_PROTECTIVE_HOLD_RECOVERY_SAMPLES = 3
 _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD = 1.0
 _DEFAULT_CALIBRATION_DURATION_SEC = 20.0
 _DEFAULT_CALIBRATION_SETTLING_SEC = 2.0
@@ -5728,6 +5736,7 @@ def _run_latched_fault_hold(
     rate_hz: float,
     stop: dict[str, bool],
     max_iterations: int | None = None,
+    recovery_samples_required: int = _DEFAULT_PROTECTIVE_HOLD_RECOVERY_SAMPLES,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
     hold_profile: B601MitControlProfile | None = None,
     operator_interrupt: bool = False,
@@ -5771,6 +5780,11 @@ def _run_latched_fault_hold(
     neither the live nor cached all-six-joint frame can be sent completely.
     The loop has no time-based release.
 
+    After a degraded interval, the first valid frame establishes a new
+    monitoring baseline.  ``recovery_samples_required`` subsequent valid live
+    frames are required before the hold is reported as recovered; this is a
+    state-transition guard, not a position-lock or motion threshold.
+
     max_iterations exists only for bounded offline tests; production calls
     leave it as None and therefore remain latched until release.
     """
@@ -5797,6 +5811,12 @@ def _run_latched_fault_hold(
             name="protective_hold_acceleration_limit_rad_s2",
         )
     )
+    if (
+        isinstance(recovery_samples_required, bool)
+        or not isinstance(recovery_samples_required, int)
+        or recovery_samples_required <= 0
+    ):
+        raise ValueError("recovery_samples_required must be a positive integer")
     hold_commands = 0
     first_hold_receipt: B601CommandReceipt | None = None
     non_hold_disable_receipt: B601ModeReceipt | None = None
@@ -5810,6 +5830,15 @@ def _run_latched_fault_hold(
     telemetry.setdefault("tx_retry_count", 0)
     telemetry.setdefault("tx_retry_recovered_count", 0)
     telemetry.setdefault("escalation_reason", None)
+    telemetry.setdefault(
+        "recovery_samples_required",
+        recovery_samples_required,
+    )
+    telemetry.setdefault("recovery_candidate_count", 0)
+    telemetry.setdefault("recovery_candidate_reset_count", 0)
+    telemetry.setdefault("last_recovery_reset_reason", None)
+    telemetry.setdefault("state", "LIVE")
+    telemetry.setdefault("last_transition", "entry")
     driver_damping_available = any(
         value > 0.0
         for value in _six(
@@ -5819,6 +5848,29 @@ def _run_latched_fault_hold(
     )
     telemetry["motor_local_damping_available"] = driver_damping_available
     degraded_active = False
+    recovery_candidate_count = 0
+
+    def reset_recovery_candidates(reason: str) -> None:
+        nonlocal recovery_candidate_count
+        if recovery_candidate_count:
+            telemetry["recovery_candidate_reset_count"] = int(
+                telemetry["recovery_candidate_reset_count"]
+            ) + 1
+        recovery_candidate_count = 0
+        telemetry["recovery_candidate_count"] = 0
+        telemetry["last_recovery_reset_reason"] = reason
+
+    def record_recovery_candidate() -> None:
+        nonlocal recovery_candidate_count
+        if not degraded_active:
+            return
+        recovery_candidate_count += 1
+        telemetry["recovery_candidate_count"] = recovery_candidate_count
+        if recovery_candidate_count >= recovery_samples_required:
+            record_recovery()
+        else:
+            telemetry["state"] = "RECOVERY_PENDING"
+            telemetry["last_transition"] = "recovery_candidate"
 
     def record_degraded(category: str, detail: str) -> None:
         nonlocal degraded_active
@@ -5828,8 +5880,12 @@ def _run_latched_fault_hold(
         reason_counts[category] = int(reason_counts.get(category, 0)) + 1
         telemetry["last_reason"] = detail
         if degraded_active:
+            reset_recovery_candidates(category)
             return
         degraded_active = True
+        telemetry["state"] = "DEGRADED"
+        telemetry["last_transition"] = "degraded"
+        reset_recovery_candidates(category)
         telemetry["entry_count"] = int(telemetry["entry_count"]) + 1
         damping_note = (
             "DAMPING: motor-local damping remains ACTIVE."
@@ -5852,10 +5908,14 @@ def _run_latched_fault_hold(
         )
 
     def record_recovery() -> None:
-        nonlocal degraded_active
+        nonlocal degraded_active, recovery_candidate_count
         if not degraded_active:
             return
         degraded_active = False
+        recovery_candidate_count = 0
+        telemetry["recovery_candidate_count"] = 0
+        telemetry["state"] = "LIVE"
+        telemetry["last_transition"] = "recovered"
         telemetry["recovery_count"] = int(telemetry["recovery_count"]) + 1
         _operator_notice(
             _protective_hold_notice(
@@ -6150,7 +6210,15 @@ def _run_latched_fault_hold(
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
     monitor_observed_at = time.monotonic() - max(0.0, observed_age_sec)
-    monitor_baseline_pending = operator_interrupt or fault_entry
+    # A degraded entry has no finite observation age.  Treat the first live
+    # frame as a measured baseline instead of subtracting infinity from the
+    # monotonic clock and manufacturing an immediate second failure.
+    monitor_baseline_pending = (
+        operator_interrupt
+        or fault_entry
+        or degraded_entry_reason is not None
+        or degraded_active
+    )
     monitor_previous_qvel = _six(
         measured_qvel,
         name="fault_measured_qvel_rad_s",
@@ -6165,6 +6233,7 @@ def _run_latched_fault_hold(
             tuple[float, ...],
         ] | None = None
         cycle_failures: tuple[str, ...] = ()
+        baseline_sample = False
         try:
             state = backend.poll_feedback(request_feedback=True)
             observed_at = time.monotonic()
@@ -6182,6 +6251,7 @@ def _run_latched_fault_hold(
                 name="protective_hold_feedback_qpos_rad",
             )
             if monitor_baseline_pending:
+                baseline_sample = True
                 # The first post-interrupt sample spans the transition from
                 # the active loop to protective hold. It is a measured-state
                 # baseline only; deriving velocity over that transition would
@@ -6287,7 +6357,15 @@ def _run_latched_fault_hold(
             )
             monitor_observed_at = observed_at
             telemetry["command_count"] = int(telemetry["command_count"]) + 1
-            record_recovery()
+            if degraded_active:
+                if baseline_sample:
+                    telemetry["state"] = "RECOVERY_BASELINE"
+                    telemetry["last_transition"] = "recovery_baseline"
+                    reset_recovery_candidates("baseline_sample")
+                else:
+                    record_recovery_candidate()
+            else:
+                telemetry["state"] = "LIVE"
         else:
             detail = (
                 f"fault hold: {cycle_error}"
@@ -6327,6 +6405,18 @@ def _run_latched_fault_hold(
     if stop.get("full_disable_requested", False):
         telemetry["escalation_reason"] = "explicit second stop request"
         full_disable_fallback()
+        if full_disable_receipt is not None and full_disable_receipt.completed:
+            telemetry["state"] = "FULL_DISABLE"
+            telemetry["last_transition"] = "full_disable"
+    elif degraded_active:
+        telemetry["state"] = (
+            "RECOVERY_PENDING"
+            if recovery_candidate_count
+            else "DEGRADED"
+        )
+    else:
+        telemetry["state"] = "LIVE"
+    telemetry["recovery_candidate_count"] = recovery_candidate_count
     return (
         hold_commands,
         latest_tau,
