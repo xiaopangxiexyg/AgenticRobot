@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from teleop_runtime.real_teleop.side_mapping import (
     build_vive_tracker_configs_for_args,
     opposite_side,
+    resolve_active_arm_ip_by_side,
     resolve_logical_side_assignments,
     tracker_legacy_index_for_source_side,
     tracker_name_for_source_side,
@@ -55,3 +58,14 @@ def test_extracted_side_mapping_keeps_arm_and_operator_swaps_independent() -> No
         ("tracker-aux", None, "auxiliary", "auxiliary_tracker_pose", 2),
     ]
     assert configs[-1].critical is False
+
+
+def test_active_arm_endpoint_resolution_rejects_shared_physical_arm() -> None:
+    args = SimpleNamespace(
+        swap_arm_sides=False,
+        left_arm_ip="192.168.1.20",
+        right_arm_ip="192.168.1.20",
+    )
+
+    with pytest.raises(ValueError, match="must use distinct endpoints"):
+        resolve_active_arm_ip_by_side(args, ("left", "right"))

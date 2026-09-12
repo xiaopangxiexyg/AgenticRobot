@@ -251,9 +251,18 @@ def test_gripper_input_selection_prefers_q6_and_falls_back_to_angle_trigger() ->
     assert args.gripper_input_source == "q6"
     assert args.q6_startup_error == ""
 
-    args.gripper_angle_trigger = True
-    real_teleop._resolve_gripper_input_source(args, ("left", "right"))
-    assert args.gripper_input_source == "angle_trigger"
+    angle_args = SimpleNamespace(
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_angle_trigger=True,
+    )
+    with patch(
+        "hardware.teleop_hand.q6_assignment.scan_q6_devices",
+        side_effect=pytest.fail,
+    ):
+        real_teleop._resolve_gripper_input_source(angle_args, ("left", "right"))
+    assert angle_args.gripper_input_source == "angle_trigger"
 
 
 def test_gripper_input_source_cli_selector_preserves_legacy_flag_and_default() -> None:
@@ -541,6 +550,40 @@ def test_gui_required_q6_assignment_failure_isolated_for_runtime_retry() -> None
 
     assert args.gripper_input_source == "angle_trigger"
     assert "missing latest assignment" in args.q6_startup_error
+
+
+def test_default_q6_assignment_merges_preflight_provenance_for_missing_side() -> None:
+    args = SimpleNamespace(
+        active_sides=("left", "right"),
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="q6",
+        q6_default_config=True,
+        q6_config="latest",
+        q6_config_required=True,
+        q6_config_loaded_ports={"left": "/dev/q6-preflight-left"},
+        left_hand_port="/dev/q6-preflight-left",
+        right_hand_port="",
+    )
+    with patch.object(
+        cli_runtime_config,
+        "load_latest_q6_ports",
+        return_value={"right": "/dev/q6-default-right"},
+    ) as load_latest:
+        real_teleop._apply_default_q6_ports(args)
+
+    load_latest.assert_called_once_with(
+        active_sides=("right",),
+        config="latest",
+        allow_missing=False,
+    )
+    assert args.q6_config_loaded_ports == {
+        "left": "/dev/q6-preflight-left",
+        "right": "/dev/q6-default-right",
+    }
+    assert args.left_hand_port == "/dev/q6-preflight-left"
+    assert args.right_hand_port == "/dev/q6-default-right"
 
 
 def test_runtime_reconnect_promotes_angle_trigger_to_q6_atomically() -> None:

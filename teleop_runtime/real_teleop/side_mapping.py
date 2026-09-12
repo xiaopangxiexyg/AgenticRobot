@@ -1,8 +1,8 @@
-"""Pure logical-side and Vive tracker mapping for the real-teleop entrypoint.
+"""Pure logical-side, arm-endpoint, and tracker mapping for real teleoperation.
 
-The module maps parsed command-line assignments into ``ViveTrackerConfig``
-objects only.  It deliberately does not start sources or mutate live runtime
-objects, so tracker transport/lifecycle remains owned by the entrypoint.
+The module resolves parsed command-line assignments without starting sources or
+mutating live runtime objects. Device transport and lifecycle remain owned by
+the real-teleop application.
 """
 
 from __future__ import annotations
@@ -17,6 +17,34 @@ def resolve_logical_side_assignments(args: argparse.Namespace) -> dict[str, tupl
         "left_arm_ip": ("right" if args.swap_arm_sides else "left", args.left_arm_ip),
         "right_arm_ip": ("left" if args.swap_arm_sides else "right", args.right_arm_ip),
     }
+
+
+def resolve_active_arm_ip_by_side(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> dict[str, tuple[str, str]]:
+    """Resolve active logical arms and reject shared physical endpoints."""
+
+    logical_ip_by_side = {
+        logical_side: (source_name, arm_ip)
+        for source_name, (logical_side, arm_ip) in resolve_logical_side_assignments(args).items()
+        if logical_side in active_sides and arm_ip
+    }
+    owners_by_endpoint: dict[str, tuple[str, str]] = {}
+    for logical_side, (source_name, arm_ip) in logical_ip_by_side.items():
+        endpoint = str(arm_ip).strip().lower()
+        previous = owners_by_endpoint.get(endpoint)
+        if previous is not None and previous[0] != logical_side:
+            previous_side, previous_source = previous
+            raise ValueError(
+                "Active logical RM65 arms must use distinct endpoints; "
+                f"logical_{previous_side} ({previous_source}) and "
+                f"logical_{logical_side} ({source_name}) both resolve to "
+                f"{str(arm_ip)!r}. Refusing to bind two logical sides to one "
+                "physical arm."
+            )
+        owners_by_endpoint[endpoint] = (logical_side, source_name)
+    return logical_ip_by_side
 
 
 def opposite_side(side: str) -> str:
@@ -100,6 +128,7 @@ def build_vive_tracker_configs_for_args(
 __all__ = [
     "build_vive_tracker_configs_for_args",
     "opposite_side",
+    "resolve_active_arm_ip_by_side",
     "resolve_logical_side_assignments",
     "tracker_legacy_index_for_source_side",
     "tracker_name_for_source_side",

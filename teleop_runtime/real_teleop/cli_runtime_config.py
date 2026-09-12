@@ -47,31 +47,9 @@ from .gripper_policy import (
 )
 from .hand_config import dmtac_sides as _dmtac_sides
 from .side_mapping import (
+    resolve_active_arm_ip_by_side as _resolve_active_arm_ip_by_side,
     resolve_logical_side_assignments as _resolve_logical_side_assignments,
 )
-
-
-def _validate_unique_active_arm_endpoints(
-    logical_ip_by_side: Mapping[str, tuple[str, str]],
-) -> None:
-    """Reject two active logical arms bound to the same RM65 endpoint."""
-
-    owners_by_endpoint: dict[str, tuple[str, str]] = {}
-    for logical_side, (source_name, arm_ip) in logical_ip_by_side.items():
-        endpoint = str(arm_ip or "").strip().lower()
-        if not endpoint:
-            continue
-        previous = owners_by_endpoint.get(endpoint)
-        if previous is not None and previous[0] != str(logical_side):
-            previous_side, previous_source = previous
-            raise ValueError(
-                "Active logical RM65 arms must use distinct endpoints; "
-                f"logical_{previous_side} ({previous_source}) and "
-                f"logical_{logical_side} ({source_name}) both resolve to "
-                f"{str(arm_ip)!r}. Refusing to bind two logical sides to one "
-                "physical arm."
-            )
-        owners_by_endpoint[endpoint] = (str(logical_side), str(source_name))
 
 
 def _apply_default_q6_ports(
@@ -79,7 +57,8 @@ def _apply_default_q6_ports(
     *,
     parser: argparse.ArgumentParser | None = None,
 ) -> None:
-    args.q6_config_loaded_ports = {}
+    resolved_ports = dict(getattr(args, "q6_config_loaded_ports", {}) or {})
+    args.q6_config_loaded_ports = resolved_ports
     if not _dmtac_sides(args, _active_sides_from_args(args)):
         return
     if str(getattr(args, "gripper_input_source", "q6")) != "q6":
@@ -115,7 +94,7 @@ def _apply_default_q6_ports(
         if parser is not None:
             parser.error(message)
         raise RuntimeError(message) from exc
-    args.q6_config_loaded_ports = dict(loaded_ports)
+    resolved_ports.update(dict(loaded_ports))
     for side, port in loaded_ports.items():
         if side in missing_sides and port:
             setattr(args, f"{side}_hand_port", str(port))
@@ -420,16 +399,10 @@ def _save_explicit_arm_ips_latest(
 
 
 def _validate_required_arm_ips(args: argparse.Namespace, active_sides: tuple[str, ...]) -> None:
-    logical_ip_by_side: dict[str, tuple[str, str]] = {}
-    for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items():
-        # ``active_sides`` is the authority for this runtime.  A command may
-        # deliberately carry both saved/configured IPs while operating one
-        # arm; inactive-side values are retained as configuration context and
-        # must not turn into a startup error.
-        if logical_side not in active_sides or not arm_ip:
-            continue
-        logical_ip_by_side[logical_side] = (source_name, arm_ip)
-    _validate_unique_active_arm_endpoints(logical_ip_by_side)
+    # ``active_sides`` is the authority for this runtime. A command may carry
+    # both saved/configured IPs while operating one arm; inactive-side values
+    # remain inert configuration context.
+    logical_ip_by_side = _resolve_active_arm_ip_by_side(args, active_sides)
     missing = [side for side in active_sides if side not in logical_ip_by_side]
     if missing:
         raise ValueError(
