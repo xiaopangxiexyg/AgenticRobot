@@ -31,7 +31,7 @@ def _joints() -> tuple[B601JointConfig, ...]:
 
 def _capture(*, joint2_hz: float = 125.0) -> dict[str, object]:
     return {
-        "robstride_operation_status_per_device_feedback": {
+        "robstride_active_report_per_device_feedback": {
             "1": {
                 "sample_count": 100,
                 "observed_hz": 125.0,
@@ -43,8 +43,8 @@ def _capture(*, joint2_hz: float = 125.0) -> dict[str, object]:
                 "p99_interval_sec": 0.009,
             },
         },
-        "robstride_operation_status_frames_by_host_id": {"0xfd": 200},
-        "robstride_short_operation_status_frame_count": 0,
+        "robstride_active_report_frames_by_host_id": {"0xfd": 200},
+        "robstride_short_active_report_frame_count": 0,
     }
 
 
@@ -74,6 +74,58 @@ def test_active_report_acceptance_fails_slow_or_missing_device() -> None:
     assert acceptance.devices[2].passed is False
     assert any("joint2: observed_hz=20.000" in reason for reason in acceptance.reasons)
     assert any("joint3: no complete" in reason for reason in acceptance.reasons)
+
+
+def test_active_report_acceptance_does_not_use_operation_status_as_active_report() -> None:
+    operation_status_only = {
+        "robstride_operation_status_per_device_feedback": {
+            "1": {
+                "sample_count": 100,
+                "observed_hz": 125.0,
+                "p99_interval_sec": 0.009,
+            },
+            "2": {
+                "sample_count": 100,
+                "observed_hz": 125.0,
+                "p99_interval_sec": 0.009,
+            },
+        },
+        "robstride_operation_status_frames_by_host_id": {"0xfd": 200},
+        "robstride_short_operation_status_frame_count": 0,
+    }
+
+    acceptance = evaluate_active_report_capture(
+        operation_status_only,
+        _joints(),
+        ("joint1", "joint2"),
+        target_hz=125.0,
+    )
+
+    assert acceptance.passed is False
+    assert all(device.passed is False for device in acceptance.devices)
+    assert all(
+        any("no complete type-24 active-report" in reason for reason in device.reasons)
+        for device in acceptance.devices
+    )
+
+
+def test_active_report_acceptance_rejects_short_active_report_frames() -> None:
+    capture = _capture()
+    capture["robstride_short_active_report_frame_count"] = 1
+
+    acceptance = evaluate_active_report_capture(
+        capture,
+        _joints(),
+        ("joint1", "joint2"),
+        target_hz=125.0,
+    )
+
+    assert acceptance.passed is False
+    assert acceptance.short_active_report_frame_count == 1
+    assert all(
+        any("short type-24 active-report" in reason for reason in device.reasons)
+        for device in acceptance.devices
+    )
 
 
 class _FakeBackend:
@@ -164,6 +216,7 @@ def test_probe_pass_is_transport_only_and_always_cleans_up(
     assert result["motion_commands_sent"] is False
     assert result["motors_enabled_by_probe"] is False
     assert result["motorbridge_state_observation_metadata_available"] is True
+    assert "type-24 active-report" in result["notes"][0]
     assert backend.calls == [
         ("connect", None),
         ("set_active_reporting", (True, ("joint1", "joint2"))),
