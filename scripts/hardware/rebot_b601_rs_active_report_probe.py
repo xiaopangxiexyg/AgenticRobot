@@ -202,7 +202,7 @@ def _run_active_report_probe(args: argparse.Namespace) -> dict[str, object]:
         "errors": tuple(errors),
         "cleanup_errors": tuple(cleanup_errors),
         "notes": (
-            "This foreground probe configures RobStride active reporting and passively times complete type-2 operation-status frames.",
+            "This foreground probe configures RobStride active reporting and passively times complete type-24 active-report frames.",
             "It does not enable motors, change control mode, or send position/MIT references.",
             "A transport PASS does not admit q/dq/tau into the control loop and is not haptic hardware acceptance.",
             "MotorBridge observation metadata availability is reported separately; this raw transport probe does not consume it.",

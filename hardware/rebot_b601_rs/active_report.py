@@ -1,9 +1,10 @@
 """Fail-closed acceptance for B601 RobStride active-report transport timing.
 
 The evaluator consumes the existing passive SocketCAN capture summary.  It
-only judges whether complete type-2 operation-status frames arrived at the
-requested cadence for each selected device.  It deliberately does not decode
-or admit those frames as control state.
+only judges whether complete type-24 active-report frames arrived at the
+requested cadence for each selected device.  Type-2 operation-status frames
+are tracked separately and cannot satisfy this gate.  The evaluator
+deliberately does not decode or admit either stream as control state.
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ class B601ActiveReportAcceptance:
     minimum_observed_hz: float
     maximum_p99_interval_sec: float
     minimum_sample_count: int
-    short_operation_status_frame_count: int
+    short_active_report_frame_count: int
     expected_feedback_ids: tuple[int, ...]
     observed_feedback_ids: tuple[int, ...]
     devices: tuple[B601ActiveReportDeviceAcceptance, ...]
@@ -75,8 +76,8 @@ class B601ActiveReportAcceptance:
             "minimum_observed_hz": self.minimum_observed_hz,
             "maximum_p99_interval_sec": self.maximum_p99_interval_sec,
             "minimum_sample_count": self.minimum_sample_count,
-            "short_operation_status_frame_count": (
-                self.short_operation_status_frame_count
+            "short_active_report_frame_count": (
+                self.short_active_report_frame_count
             ),
             "expected_feedback_ids": self.expected_feedback_ids,
             "observed_feedback_ids": self.observed_feedback_ids,
@@ -95,7 +96,7 @@ def evaluate_active_report_capture(
     maximum_p99_factor: float = 2.0,
     minimum_sample_count: int = 10,
 ) -> B601ActiveReportAcceptance:
-    """Evaluate type-2 receive cadence for every selected motor."""
+    """Evaluate type-24 active-report cadence for every selected motor."""
 
     target = _positive(target_hz, name="target_hz")
     rate_ratio = _positive(minimum_rate_ratio, name="minimum_rate_ratio")
@@ -118,22 +119,22 @@ def evaluate_active_report_capture(
         raise ValueError(f"unknown selected joints: {sorted(unknown)}")
 
     raw_per_device = capture.get(
-        "robstride_operation_status_per_device_feedback",
+        "robstride_active_report_per_device_feedback",
         {},
     )
-    raw_hosts = capture.get("robstride_operation_status_frames_by_host_id", {})
+    raw_hosts = capture.get("robstride_active_report_frames_by_host_id", {})
     if not isinstance(raw_per_device, Mapping) or not isinstance(raw_hosts, Mapping):
-        raise TypeError("capture summary has malformed operation-status mappings")
-    short_count = int(capture.get("robstride_short_operation_status_frame_count", 0))
+        raise TypeError("capture summary has malformed active-report mappings")
+    short_count = int(capture.get("robstride_short_active_report_frame_count", 0))
     if short_count < 0:
-        raise ValueError("short operation-status frame count must be non-negative")
+        raise ValueError("short active-report frame count must be non-negative")
 
     observed_feedback_ids: set[int] = set()
     for raw_host in raw_hosts:
         try:
             observed_feedback_ids.add(int(str(raw_host), 0))
         except ValueError as exc:
-            raise ValueError(f"invalid operation-status host id: {raw_host}") from exc
+            raise ValueError(f"invalid active-report host id: {raw_host}") from exc
 
     minimum_hz = target * rate_ratio
     maximum_p99 = p99_factor / target
@@ -147,7 +148,7 @@ def evaluate_active_report_capture(
             sample_count = 0
             observed_hz = None
             p99_interval = None
-            reasons.append("no complete type-2 operation-status frames observed")
+            reasons.append("no complete type-24 active-report frames observed")
         else:
             sample_count = int(raw_stats.get("sample_count", 0))
             observed_raw = raw_stats.get("observed_hz")
@@ -175,7 +176,7 @@ def evaluate_active_report_capture(
             reasons.append(f"expected feedback_id=0x{joint.feedback_id:02x} not observed")
         if short_count:
             reasons.append(
-                f"capture contains {short_count} short operation-status frame(s)"
+                f"capture contains {short_count} short type-24 active-report frame(s)"
             )
         device = B601ActiveReportDeviceAcceptance(
             joint_name=name,
@@ -199,7 +200,7 @@ def evaluate_active_report_capture(
         minimum_observed_hz=minimum_hz,
         maximum_p99_interval_sec=maximum_p99,
         minimum_sample_count=minimum_sample_count,
-        short_operation_status_frame_count=short_count,
+        short_active_report_frame_count=short_count,
         expected_feedback_ids=expected_feedback_ids,
         observed_feedback_ids=tuple(sorted(observed_feedback_ids)),
         devices=tuple(devices),
