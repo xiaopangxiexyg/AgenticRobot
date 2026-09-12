@@ -23,6 +23,7 @@ from hardware.rebot_b601_rs import (
     B601HardwareDependencyError,
     B601HardwareError,
     B601JointConfig,
+    B601JointState,
     B601ModeReceipt,
     B601MotionAuthorizationError,
     B601RSBackend,
@@ -327,6 +328,7 @@ class _FakeMotor:
     def __init__(self, motor_id: int, *, state: object | None = None) -> None:
         self.motor_id = motor_id
         self.state = state
+        self.observation: object | None = None
         self.position_param: float | None = None
         self.parameter_values: dict[int, float] = {}
         self.write_without_effect: set[int] = set()
@@ -344,6 +346,10 @@ class _FakeMotor:
     def get_state(self) -> object | None:
         self._call("get_state")
         return self.state
+
+    def robstride_get_state_observation(self) -> object | None:
+        self._call("robstride_get_state_observation")
+        return self.observation
 
     def request_feedback(self) -> None:
         self._call("request_feedback")
@@ -392,7 +398,10 @@ class _FakeController:
     def __init__(self) -> None:
         self.motors: dict[int, _FakeMotor] = {}
         self.calls: list[str] = []
-        self.robstride_capabilities = ["parameter_reply_correlation_v1"]
+        self.robstride_capabilities = [
+            "parameter_reply_correlation_v1",
+            "state_observation_metadata_v1",
+        ]
 
     def motorbridge_abi_capabilities(self) -> dict[str, object]:
         return {
@@ -820,6 +829,191 @@ def test_connect_and_poll_do_not_request_feedback_or_enable() -> None:
     assert state.freshness_semantics == "poll_observation_unverified"
     assert state.positions_rad == pytest.approx(tuple(0.1 * index for index in range(1, 7)))
     assert all(call[0] == "get_state" for motor in controller.motors.values() for call in motor.calls)
+
+
+def test_host_fresh_poll_uses_operation_status_sequence_and_receive_age() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(),
+        controller_factory=lambda _channel: controller,
+        clock=lambda: 10.0,
+    )
+
+    backend.connect()
+    _populate_states(controller)
+    for index, motor in controller.motors.items():
+        motor.observation = SimpleNamespace(
+            state=motor.state,
+            status_sequence=20 + index,
+            receive_age_ns=5_000_000,
+        )
+
+    state = backend.poll_feedback(require_host_freshness=True)
+
+    assert state.valid is True
+    assert state.stale is False
+    assert state.freshness_verified is False
+    assert state.host_receive_freshness_verified is True
+    assert state.freshness_semantics == (
+        "host_receive_sequence_and_age_verified; "
+        "device_source_timestamp_unavailable"
+    )
+    assert state.velocity_semantics == (
+        "robstride_operation_status_host_receive_verified"
+    )
+    assert state.positions_rad == pytest.approx(
+        tuple(0.1 * index for index in range(1, 7))
+    )
+    for index, joint in enumerate(state.joints, start=1):
+        assert joint.status_sequence == 20 + index
+        assert joint.receive_age_sec == pytest.approx(0.005)
+        assert joint.observed_at_sec == pytest.approx(9.995)
+        assert joint.host_receive_freshness_verified is True
+        assert joint.position_source == "robstride_operation_status_cache"
+    assert all(
+        motor.calls == [("robstride_get_state_observation", ())]
+        for motor in controller.motors.values()
+    )
+
+
+def test_host_fresh_poll_rejects_operation_status_older_than_timeout() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(),
+        controller_factory=lambda _channel: controller,
+        clock=lambda: 10.0,
+    )
+
+    backend.connect()
+    _populate_states(controller)
+    for index, motor in controller.motors.items():
+        motor.observation = SimpleNamespace(
+            state=motor.state,
+            status_sequence=index,
+            receive_age_ns=(200_000_000 if index == 6 else 5_000_000),
+        )
+
+    state = backend.poll_feedback(require_host_freshness=True)
+
+    assert state.valid is False
+    assert state.stale is True
+    assert state.host_receive_freshness_verified is False
+    assert state.joint("joint6").valid is False
+    assert state.joint("joint6").host_receive_freshness_verified is False
+    assert "receive age 0.200000s exceeds feedback timeout 0.100000s" in (
+        state.fault_reason or ""
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("status_sequence", 1.5, "status_sequence must be a positive integer"),
+        ("receive_age_ns", -1, "receive_age_ns must be non-negative"),
+    ),
+)
+def test_host_fresh_poll_rejects_malformed_observation_metadata(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(),
+        controller_factory=lambda _channel: controller,
+        clock=lambda: 10.0,
+    )
+
+    backend.connect()
+    _populate_states(controller)
+    for index, motor in controller.motors.items():
+        fields = {
+            "state": motor.state,
+            "status_sequence": index,
+            "receive_age_ns": 5_000_000,
+        }
+        if index == 6:
+            fields[field] = value
+        motor.observation = SimpleNamespace(**fields)
+
+    state = backend.poll_feedback(require_host_freshness=True)
+
+    assert state.valid is False
+    assert state.stale is True
+    assert state.host_receive_freshness_verified is False
+    assert state.joint("joint6").valid is False
+    assert message in (state.fault_reason or "")
+
+
+@pytest.mark.parametrize("value", (1.0, 1.5, "1", "1.5", True, 0, -1))
+def test_joint_state_rejects_invalid_status_sequence(value: object) -> None:
+    with pytest.raises(ValueError, match="status_sequence must be a positive integer"):
+        B601JointState(
+            name="joint1",
+            motor_id=1,
+            feedback_id=0xFD,
+            arbitration_id=None,
+            status_code=0,
+            position_rad=0.0,
+            velocity_reported=0.0,
+            torque_reported_nm=0.0,
+            observed_at_sec=0.0,
+            sample_sequence=0,
+            valid=True,
+            stale=False,
+            status_sequence=value,
+        )
+
+
+def test_joint_state_preserves_positive_integer_status_sequence() -> None:
+    state = B601JointState(
+        name="joint1",
+        motor_id=1,
+        feedback_id=0xFD,
+        arbitration_id=None,
+        status_code=0,
+        position_rad=0.0,
+        velocity_reported=0.0,
+        torque_reported_nm=0.0,
+        observed_at_sec=0.0,
+        sample_sequence=0,
+        valid=True,
+        stale=False,
+        status_sequence=7,
+    )
+
+    assert state.status_sequence == 7
+    assert type(state.status_sequence) is int
+
+
+def test_host_fresh_poll_requires_advertised_motorbridge_capability() -> None:
+    controller = _FakeController()
+    controller.robstride_capabilities.remove("state_observation_metadata_v1")
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+    backend.connect()
+
+    with pytest.raises(
+        B601HardwareDependencyError,
+        match="state_observation_metadata_v1",
+    ):
+        backend.poll_feedback(require_host_freshness=True)
+
+    assert controller.calls == [f"add:{index}" for index in range(1, 7)]
+    assert all(not motor.calls for motor in controller.motors.values())
+
+
+def test_feedback_paths_cannot_be_mixed_in_one_poll() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+    backend.connect()
+
+    with pytest.raises(ValueError, match="separate feedback paths"):
+        backend.poll_feedback(
+            request_feedback=True,
+            require_host_freshness=True,
+        )
+
+    assert controller.calls == [f"add:{index}" for index in range(1, 7)]
 
 
 def test_active_feedback_poll_requests_each_configured_arm_joint() -> None:

@@ -13,9 +13,8 @@ The default feedback path intentionally uses the vendor cache as a *poll
 observation*.  An active caller may opt in to an explicit vendor feedback
 request before polling; this is needed by the commissioning loop because a
 RobStride bus does not necessarily populate the cache until a request frame is
-sent.  On the pinned firmware the resulting compact type-0x18 position stream
-is not decoded by MotorBridge 0.4.9, so an active caller also reads
-``mechPos`` (0x7019) through the vendor parameter API.  A motion-authorized
+sent.  That compatibility path also reads ``mechPos`` (0x7019) through the
+vendor parameter API.  A motion-authorized
 backend additionally requires MotorBridge to advertise strict RobStride
 parameter-reply correlation.  This rejects failed or mismatched type-17
 replies and quarantines replies that arrive without a matching pending request.
@@ -24,10 +23,15 @@ freshness between otherwise identical consecutive requests by itself.
 Read-only diagnostics remain available without that capability, while every
 motion-start path fails closed.  The position-only fallback is explicit in
 each observation; velocity/torque consumers must still require their
-corresponding fields.  MotorBridge does not expose the source timestamp or a
-receive sequence for a RobStride frame, so neither path claims verified
-per-frame freshness.  The distinction is part of the public state contract
-and must be closed before hardware haptic acceptance.
+corresponding fields.
+
+Newer MotorBridge runtimes may separately advertise
+``state_observation_metadata_v1``.  An explicit
+``require_host_freshness=True`` poll then consumes only decoded RobStride
+operation-status state carrying a per-motor receive sequence and monotonic
+receive age.  The legacy path remains unchanged.  Host receive freshness is
+reported separately from device-source freshness because RobStride still does
+not provide a device sampling timestamp through this stack.
 """
 
 from __future__ import annotations
@@ -59,6 +63,7 @@ B601_RS_MECH_POS_PARAM_ID = 0x7019
 _B601_RS_PARAMETER_REPLY_CORRELATION_CAPABILITY = (
     "parameter_reply_correlation_v1"
 )
+_B601_RS_STATE_OBSERVATION_CAPABILITY = "state_observation_metadata_v1"
 # RobStride POS_VEL parameter IDs used by the pinned reBotArm
 # ``JointGroup._write_pv_params`` implementation.  Keep these explicit so a
 # future vendor/runtime update cannot silently turn mode preparation into a
@@ -491,6 +496,9 @@ class B601JointState:
     error: str | None = None
     frame_id: str = B601_RS_FEEDBACK_FRAME
     position_source: str = "vendor_motor_state_cache"
+    status_sequence: int | None = None
+    receive_age_sec: float | None = None
+    host_receive_freshness_verified: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", str(self.name).strip())
@@ -520,6 +528,19 @@ class B601JointState:
             raise TypeError("valid and stale must be bools")
         object.__setattr__(self, "error", None if self.error is None else str(self.error))
         object.__setattr__(self, "position_source", str(self.position_source))
+        if self.status_sequence is not None and (
+            isinstance(self.status_sequence, bool)
+            or not isinstance(self.status_sequence, int)
+            or self.status_sequence <= 0
+        ):
+            raise ValueError("status_sequence must be a positive integer")
+        if self.receive_age_sec is not None:
+            age = _finite_float(self.receive_age_sec, name="receive_age_sec")
+            if age < 0.0:
+                raise ValueError("receive_age_sec must be non-negative")
+            object.__setattr__(self, "receive_age_sec", age)
+        if not isinstance(self.host_receive_freshness_verified, bool):
+            raise TypeError("host_receive_freshness_verified must be a bool")
 
 
 @dataclass(frozen=True)
@@ -535,6 +556,7 @@ class B601HardwareState:
     freshness_semantics: str = "poll_observation_unverified"
     velocity_semantics: str = "vendor_reported_unverified"
     fault_reason: str | None = None
+    host_receive_freshness_verified: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.sequence, bool) or int(self.sequence) < 0:
@@ -555,6 +577,8 @@ class B601HardwareState:
             raise TypeError("valid and stale must be bools")
         if not isinstance(self.freshness_verified, bool):
             raise TypeError("freshness_verified must be a bool")
+        if not isinstance(self.host_receive_freshness_verified, bool):
+            raise TypeError("host_receive_freshness_verified must be a bool")
         object.__setattr__(self, "freshness_semantics", str(self.freshness_semantics))
         object.__setattr__(self, "velocity_semantics", str(self.velocity_semantics))
         object.__setattr__(
@@ -749,6 +773,17 @@ class B601RSBackend:
             and self._motorbridge_runtime_evidence.get("verified") is True
         )
 
+    @property
+    def state_observation_metadata_verified(self) -> bool:
+        """Whether the runtime exposes RobStride host receive metadata."""
+
+        features = (
+            self._motorbridge_runtime_evidence.get("robstride_features", ())
+            if self._motorbridge_runtime_evidence
+            else ()
+        )
+        return _B601_RS_STATE_OBSERVATION_CAPABILITY in features
+
     def connect(self) -> None:
         """Open CAN and register the six motors, without sending commands."""
 
@@ -918,7 +953,12 @@ class B601RSBackend:
                     f"limit for {name}: {value:.6f} not in [{lower:.6f}, {upper:.6f}]"
                 )
 
-    def poll_feedback(self, *, request_feedback: bool = False) -> B601HardwareState:
+    def poll_feedback(
+        self,
+        *,
+        request_feedback: bool = False,
+        require_host_freshness: bool = False,
+    ) -> B601HardwareState:
         """Observe six joints, optionally requesting a fresh vendor snapshot.
 
         The default is deliberately receive-only: it consumes the MotorBridge
@@ -926,15 +966,29 @@ class B601RSBackend:
         loop can pass ``request_feedback=True`` to issue one explicit
         ``Motor.request_feedback()`` per configured arm joint before calling
         ``Controller.poll_feedback_once()``.  For RobStride, the active path
-        then reads ``mechPos`` (0x7019), because MotorBridge 0.4.9 does not
-        decode the firmware's compact type-0x18 position stream.  This remains
-        an observation request, not a motion command, and the returned state
-        still reports ``freshness_verified=False`` because MotorBridge 0.4.9
-        exposes neither a source timestamp nor a receive sequence.
+        then reads ``mechPos`` (0x7019) through the compatibility parameter
+        path.  This remains an observation request, not a motion command.
+
+        ``require_host_freshness=True`` is a separate fail-closed path for an
+        already configured operation-status stream.  It requires MotorBridge's
+        receive-sequence/age capability, does not issue parameter reads, and
+        rejects cached frames older than ``feedback_timeout_sec``.  It still
+        cannot claim device-source timestamp freshness.
         """
 
         if not isinstance(request_feedback, bool):
             raise TypeError("request_feedback must be a bool")
+        if not isinstance(require_host_freshness, bool):
+            raise TypeError("require_host_freshness must be a bool")
+        if request_feedback and require_host_freshness:
+            raise ValueError(
+                "request_feedback and require_host_freshness are separate feedback paths"
+            )
+        if require_host_freshness and not self.state_observation_metadata_verified:
+            raise B601HardwareDependencyError(
+                "host-fresh B601 feedback requires MotorBridge RobStride capability "
+                f"{_B601_RS_STATE_OBSERVATION_CAPABILITY!r}"
+            )
 
         controller = self._require_connected()
         now = _finite_float(self._clock(), name="clock")
@@ -966,20 +1020,70 @@ class B601RSBackend:
         for joint in self.config.joints:
             motor = self._motors[joint.name]
             raw_state_error: str | None = None
-            try:
-                raw_state = getattr(motor, "get_state")()
-            except Exception as exc:
-                raw_state = None
-                raw_state_error = f"{joint.name}.get_state: {exc}"
+            status_sequence: int | None = None
+            receive_age_sec: float | None = None
+            host_receive_freshness_verified = False
+            observed_at = now
+            if require_host_freshness:
+                try:
+                    raw_observation = motor.robstride_get_state_observation()
+                    if raw_observation is None:
+                        raw_state = None
+                        raw_state_error = (
+                            f"{joint.name}: operation-status cache is empty"
+                        )
+                    else:
+                        raw_state = raw_observation.state
+                        raw_sequence = raw_observation.status_sequence
+                        if (
+                            isinstance(raw_sequence, bool)
+                            or not isinstance(raw_sequence, int)
+                            or raw_sequence <= 0
+                        ):
+                            raise ValueError(
+                                "status_sequence must be a positive integer"
+                            )
+                        status_sequence = raw_sequence
+                        raw_age_ns = raw_observation.receive_age_ns
+                        if (
+                            isinstance(raw_age_ns, bool)
+                            or not isinstance(raw_age_ns, int)
+                            or raw_age_ns < 0
+                        ):
+                            raise ValueError("receive_age_ns must be non-negative")
+                        receive_age_sec = raw_age_ns / 1_000_000_000.0
+                        observed_at = now - receive_age_sec
+                        if receive_age_sec > self.config.feedback_timeout_sec:
+                            raw_state_error = (
+                                f"{joint.name}: operation-status receive age "
+                                f"{receive_age_sec:.6f}s exceeds feedback timeout "
+                                f"{self.config.feedback_timeout_sec:.6f}s"
+                            )
+                        else:
+                            host_receive_freshness_verified = True
+                except Exception as exc:  # noqa: BLE001 - vendor observation boundary
+                    raw_state = None
+                    raw_state_error = (
+                        f"{joint.name}.robstride_get_state_observation: {exc}"
+                    )
+            else:
+                try:
+                    raw_state = motor.get_state()
+                except Exception as exc:  # noqa: BLE001 - vendor observation boundary
+                    raw_state = None
+                    raw_state_error = f"{joint.name}.get_state: {exc}"
 
-            # RobStride firmware may emit compact type-0x18 position reports
-            # that MotorBridge 0.4.9 does not decode into MotorState.  The
-            # pinned reBotArm implementation therefore reads mechPos (0x7019)
-            # explicitly.  Keep this extra request opt-in so the default
-            # backend observation remains receive-only.
+            # The pinned reBotArm compatibility implementation reads mechPos
+            # (0x7019) explicitly. Keep this request opt-in; the host-fresh
+            # operation-status path above never mixes that parameter value
+            # with metadata belonging to a different frame.
             live_position: float | None = None
             position_error: str | None = None
-            position_source = "vendor_motor_state_cache"
+            position_source = (
+                "robstride_operation_status_cache"
+                if require_host_freshness
+                else "vendor_motor_state_cache"
+            )
             if request_feedback and joint.vendor == "robstride":
                 try:
                     timeout_ms = max(
@@ -1069,11 +1173,14 @@ class B601RSBackend:
                         position_rad=None,
                         velocity_reported=None,
                         torque_reported_nm=None,
-                        observed_at_sec=now,
+                        observed_at_sec=observed_at,
                         sample_sequence=self._state_sequence,
                         valid=False,
                         stale=True,
                         error=error,
+                        status_sequence=status_sequence,
+                        receive_age_sec=receive_age_sec,
+                        host_receive_freshness_verified=False,
                     )
                 )
                 continue
@@ -1096,7 +1203,7 @@ class B601RSBackend:
                         position_rad=position,
                         velocity_reported=None,
                         torque_reported_nm=None,
-                        observed_at_sec=now,
+                        observed_at_sec=observed_at,
                         sample_sequence=self._state_sequence,
                         valid=(
                             not request_errors
@@ -1108,6 +1215,9 @@ class B601RSBackend:
                         ),
                         error=position_error or poll_error or raw_state_error,
                         position_source=position_source,
+                        status_sequence=status_sequence,
+                        receive_age_sec=receive_age_sec,
+                        host_receive_freshness_verified=False,
                     )
                 )
                 continue
@@ -1119,15 +1229,12 @@ class B601RSBackend:
                     getattr(raw_state, "pos"), name=f"{joint.name}.pos"
                 )
                 position = cached_position if live_position is None else live_position
-                position_source = (
-                    position_source
-                    if live_position is not None
-                    else "vendor_motor_state_cache"
-                )
                 velocity = _finite_float(getattr(raw_state, "vel"), name=f"{joint.name}.vel")
                 torque = _finite_float(getattr(raw_state, "torq"), name=f"{joint.name}.torq")
                 state_error: str | None = None
-                if can_id != joint.motor_id:
+                if raw_state_error:
+                    state_error = raw_state_error
+                elif can_id != joint.motor_id:
                     state_error = f"{joint.name}: feedback can_id={can_id} expected {joint.motor_id}"
                 elif status_code != 0:
                     state_error = f"{joint.name}: vendor status_code={status_code}"
@@ -1161,7 +1268,7 @@ class B601RSBackend:
                     errors.append(state_error)
                 if position_error:
                     errors.append(position_error)
-                if raw_state_error:
+                if raw_state_error and raw_state_error != state_error:
                     errors.append(raw_state_error)
                 observations.append(
                     B601JointState(
@@ -1173,7 +1280,7 @@ class B601RSBackend:
                         position_rad=position,
                         velocity_reported=velocity,
                         torque_reported_nm=torque,
-                        observed_at_sec=now,
+                        observed_at_sec=observed_at,
                         sample_sequence=self._state_sequence,
                         valid=(
                             state_error is None
@@ -1189,6 +1296,14 @@ class B601RSBackend:
                         ),
                         error=state_error or position_error or poll_error,
                         position_source=position_source,
+                        status_sequence=status_sequence,
+                        receive_age_sec=receive_age_sec,
+                        host_receive_freshness_verified=(
+                            host_receive_freshness_verified
+                            and state_error is None
+                            and position_error is None
+                            and poll_error is None
+                        ),
                     )
                 )
             except (AttributeError, TypeError, ValueError) as exc:
@@ -1204,14 +1319,24 @@ class B601RSBackend:
                         position_rad=None,
                         velocity_reported=None,
                         torque_reported_nm=None,
-                        observed_at_sec=now,
+                        observed_at_sec=observed_at,
                         sample_sequence=self._state_sequence,
                         valid=False,
                         stale=True,
                         error=error,
+                        status_sequence=status_sequence,
+                        receive_age_sec=receive_age_sec,
+                        host_receive_freshness_verified=False,
                     )
                 )
         valid = not errors and all(joint.valid for joint in observations)
+        host_receive_freshness_verified = bool(
+            require_host_freshness
+            and valid
+            and all(
+                joint.host_receive_freshness_verified for joint in observations
+            )
+        )
         state = B601HardwareState(
             sequence=self._state_sequence,
             receive_timestamp_sec=now,
@@ -1219,9 +1344,19 @@ class B601RSBackend:
             valid=valid,
             stale=not valid,
             freshness_verified=False,
-            freshness_semantics="poll_observation_unverified",
-            velocity_semantics="vendor_reported_unverified",
+            freshness_semantics=(
+                "host_receive_sequence_and_age_verified; "
+                "device_source_timestamp_unavailable"
+                if host_receive_freshness_verified
+                else "poll_observation_unverified"
+            ),
+            velocity_semantics=(
+                "robstride_operation_status_host_receive_verified"
+                if host_receive_freshness_verified
+                else "vendor_reported_unverified"
+            ),
             fault_reason="; ".join(errors) if errors else None,
+            host_receive_freshness_verified=host_receive_freshness_verified,
         )
         self._last_state = state
         self._last_fault_reason = state.fault_reason
