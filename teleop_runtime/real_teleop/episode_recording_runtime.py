@@ -66,10 +66,18 @@ class _PreparedDatasetRecorder:
 
 
 @dataclass(frozen=True)
+class _DatasetSelectionTransaction:
+    previous_recorder: Any | None
+    on_commit: Callable[[Mapping[str, Any]], None]
+    on_complete: Callable[[], None]
+    on_failure: Callable[[BaseException], None]
+
+
+@dataclass(frozen=True)
 class _PreparedDatasetSelection:
     recorder: Any | None
     args_snapshot: Mapping[str, Any]
-    previous_recorder: Any | None
+    transaction: _DatasetSelectionTransaction
 
 
 @dataclass(frozen=True)
@@ -277,10 +285,7 @@ def build_episode_recording_runtime(
     episode_stop_recorder: Any | None = None
     episode_stop_frame_count = 0
     episode_stop_reason = ""
-    dataset_selection_previous: Any | None = None
-    dataset_selection_on_commit: Callable[[Mapping[str, Any]], None] | None = None
-    dataset_selection_on_complete: Callable[[], None] | None = None
-    dataset_selection_on_failure: Callable[[BaseException], None] | None = None
+    dataset_selection_transaction: _DatasetSelectionTransaction | None = None
     dataset_selection_cleanup: _DatasetSelectionCleanup | None = None
     finalize_failure_count = 0
     debug_episode_quarantined = False
@@ -1099,9 +1104,10 @@ def build_episode_recording_runtime(
                 value.recorder.close()
             except BaseException:
                 pass
-        if runtime_closing and value.previous_recorder is not None:
+        previous_recorder = value.transaction.previous_recorder
+        if runtime_closing and previous_recorder is not None:
             try:
-                value.previous_recorder.close()
+                previous_recorder.close()
             except BaseException:
                 pass
 
@@ -1178,9 +1184,7 @@ def build_episode_recording_runtime(
         control plane.
         """
 
-        nonlocal dataset_recorder
-        nonlocal dataset_selection_previous, dataset_selection_on_commit
-        nonlocal dataset_selection_on_complete, dataset_selection_on_failure
+        nonlocal dataset_recorder, dataset_selection_transaction
         refresh_runtime_views()
         if collection_transition_active():
             active_kind = collection_control_plane.active_kind or "collection_transition"
@@ -1206,6 +1210,13 @@ def build_episode_recording_runtime(
             if not callable(callback):
                 raise TypeError(f"dataset selection {label} must be callable")
 
+        transaction = _DatasetSelectionTransaction(
+            previous_recorder=dataset_recorder,
+            on_commit=on_commit,
+            on_complete=on_complete,
+            on_failure=on_failure,
+        )
+
         staged_args = copy.copy(args)
         vars(staged_args).clear()
         vars(staged_args).update(dict(selected_args_snapshot))
@@ -1218,7 +1229,7 @@ def build_episode_recording_runtime(
                 getattr(staged_args, "ignore_tactile", ()) or ()
             ),
         )
-        existing_recorder = dataset_recorder
+        existing_recorder = transaction.previous_recorder
 
         def prepare_selection() -> _PreparedDatasetSelection:
             try:
@@ -1246,7 +1257,7 @@ def build_episode_recording_runtime(
                 return _PreparedDatasetSelection(
                     recorder=candidate,
                     args_snapshot=dict(vars(staged_args)),
-                    previous_recorder=existing_recorder,
+                    transaction=transaction,
                 )
             except BaseException:
                 if runtime_closing:
@@ -1256,15 +1267,16 @@ def build_episode_recording_runtime(
                         pass
                 raise
 
-        dataset_selection_previous = existing_recorder
-        dataset_selection_on_commit = on_commit
-        dataset_selection_on_complete = on_complete
-        dataset_selection_on_failure = on_failure
-        selection_generation = collection_control_plane.submit(
-            "prepare_selection",
-            prepare_selection,
-            discard_value=discard_prepared_dataset_selection,
-        )
+        dataset_selection_transaction = transaction
+        try:
+            selection_generation = collection_control_plane.submit(
+                "prepare_selection",
+                prepare_selection,
+                discard_value=discard_prepared_dataset_selection,
+            )
+        except BaseException:
+            dataset_selection_transaction = None
+            raise
         # A live old recorder remains recoverable but is no longer observable
         # by finalize/progress/status consumers while the candidate owns the
         # selection transaction.  Global startup remains lazy, while this
@@ -2309,17 +2321,14 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_recorder
-        nonlocal dataset_selection_previous, dataset_selection_on_commit
-        nonlocal dataset_selection_on_complete, dataset_selection_on_failure
-        previous_recorder = dataset_selection_previous
-        commit_callback = dataset_selection_on_commit
-        complete_callback = dataset_selection_on_complete
-        failure_callback = dataset_selection_on_failure
-        dataset_selection_previous = None
-        dataset_selection_on_commit = None
-        dataset_selection_on_complete = None
-        dataset_selection_on_failure = None
+        nonlocal dataset_recorder, dataset_selection_transaction
+        transaction = dataset_selection_transaction
+        dataset_selection_transaction = None
+        if transaction is None:
+            raise RuntimeError(
+                "dataset selection completion has no owning transaction"
+            )
+        previous_recorder = transaction.previous_recorder
 
         def republish_previous() -> None:
             nonlocal dataset_recorder
@@ -2329,16 +2338,15 @@ def build_episode_recording_runtime(
 
         def publish_failure(failure: BaseException) -> None:
             republish_previous()
-            if failure_callback is not None:
-                try:
-                    failure_callback(failure)
-                except BaseException as callback_error:
-                    _log(
-                        "Dataset",
-                        "dataset selection rollback callback failed: "
-                        f"{type(callback_error).__name__}: {callback_error}",
-                        now=now,
-                    )
+            try:
+                transaction.on_failure(failure)
+            except BaseException as callback_error:
+                _log(
+                    "Dataset",
+                    "dataset selection rollback callback failed: "
+                    f"{type(callback_error).__name__}: {callback_error}",
+                    now=now,
+                )
             _log(
                 "Dataset",
                 "dataset selection writer replacement failed; previous "
@@ -2348,10 +2356,8 @@ def build_episode_recording_runtime(
             )
 
         def publish_completion_callback() -> None:
-            if complete_callback is None:
-                return
             try:
-                complete_callback()
+                transaction.on_complete()
             except Exception as exc:  # noqa: BLE001 - selection is committed.
                 _log(
                     "Dataset",
@@ -2376,9 +2382,7 @@ def build_episode_recording_runtime(
 
         prepared = result.value
         try:
-            if commit_callback is None:
-                raise RuntimeError("dataset selection commit callback is unavailable")
-            commit_callback(prepared.args_snapshot)
+            transaction.on_commit(prepared.args_snapshot)
             if prepared.recorder is not None:
                 # The recorder was constructed from a private staged namespace
                 # so its ready handshake could not expose draft configuration.
@@ -2429,7 +2433,7 @@ def build_episode_recording_runtime(
             schedule_dataset_selection_cleanup(
                 previous_recorder,
                 cleanup_kind="retire_selection_previous",
-                on_complete=complete_callback,
+                on_complete=transaction.on_complete,
             )
         except BaseException as exc:
             # The new candidate is already ready and authoritative. Failure to
