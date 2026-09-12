@@ -1,6 +1,6 @@
-"""Pure Control Station policy for RealTeleop progress operator intents.
+"""Pure Control Station policy for RealTeleop progress presentation.
 
-This module owns UI-facing intent vocabulary and availability only.  It does
+This module owns UI-facing event vocabulary and availability only.  It does
 not import collection runtime objects, mutate a progress reducer, pause a
 writer, or request robot Hold.
 """
@@ -9,16 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Protocol
 
 from dataset_contracts.progress_profile import TaskProgressProfileV1
-
-
-ProgressOperatorIntentKind = Literal[
-    "ADVANCE_PROGRESS",
-    "UNDO_LAST_ADVANCE",
-    "REPORT_FAILURE",
-]
 
 PROGRESS_ADVANCE_EVENT = "progress_advance"
 PROGRESS_UNDO_EVENT = "progress_undo"
@@ -82,90 +75,6 @@ class ProgressProfileOption:
 
 
 @dataclass(frozen=True)
-class ProgressProfileSelectionIntent:
-    """Typed application configuration intent; not an online progress fact."""
-
-    intent_id: str
-    profile_id: str
-
-    def __post_init__(self) -> None:
-        for name in ("intent_id", "profile_id"):
-            value = str(getattr(self, name)).strip()
-            if not value:
-                raise ValueError(f"{name} must be non-empty.")
-            object.__setattr__(self, name, value)
-
-
-@dataclass(frozen=True)
-class ProgressEntryStepSelectionIntent:
-    """Typed idle selection for the next Episode's coarse entry step."""
-
-    intent_id: str
-    progress_step_id: str
-
-    def __post_init__(self) -> None:
-        for name in ("intent_id", "progress_step_id"):
-            value = str(getattr(self, name)).strip()
-            if not value:
-                raise ValueError(f"{name} must be non-empty.")
-            object.__setattr__(self, name, value)
-
-
-@dataclass(frozen=True)
-class ProgressArmControlModeSelectionIntent:
-    """Typed idle-time selection for profile arm-control enforcement."""
-
-    intent_id: str
-    mode: str
-
-    def __post_init__(self) -> None:
-        intent_id = str(self.intent_id).strip()
-        if not intent_id:
-            raise ValueError("intent_id must be non-empty.")
-        object.__setattr__(self, "intent_id", intent_id)
-        object.__setattr__(
-            self,
-            "mode",
-            normalize_progress_arm_control_mode(self.mode),
-        )
-
-
-@dataclass(frozen=True)
-class ProgressOperatorIntent:
-    """One typed operator request emitted by a Control Station adapter."""
-
-    intent_id: str
-    kind: ProgressOperatorIntentKind
-    target_progress_step_id: str | None = None
-
-    def __post_init__(self) -> None:
-        intent_id = str(self.intent_id).strip()
-        kind = str(self.kind).strip().upper()
-        target = (
-            None
-            if self.target_progress_step_id is None
-            else str(self.target_progress_step_id).strip()
-        )
-        if not intent_id:
-            raise ValueError("intent_id must be non-empty.")
-        if kind not in {
-            "ADVANCE_PROGRESS",
-            "UNDO_LAST_ADVANCE",
-            "REPORT_FAILURE",
-        }:
-            raise ValueError(f"Unsupported progress operator intent {kind!r}.")
-        if kind != "ADVANCE_PROGRESS" and target is not None:
-            raise ValueError(
-                "Only ADVANCE_PROGRESS may select a target progress step."
-            )
-        if target == "":
-            raise ValueError("target_progress_step_id must be non-empty.")
-        object.__setattr__(self, "intent_id", intent_id)
-        object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "target_progress_step_id", target)
-
-
-@dataclass(frozen=True)
 class ProgressControlAvailability:
     """Rebuildable UI-facing availability derived from canonical state."""
 
@@ -220,97 +129,6 @@ def available_progress_controls(
     if state.can_undo_last_advance:
         controls.append(PROGRESS_UNDO_EVENT)
     return tuple(controls)
-
-
-def progress_intent_from_event(
-    event: str,
-    *,
-    intent_id: str,
-) -> ProgressOperatorIntent | None:
-    """Translate one accepted Control Station event into a typed intent."""
-
-    normalized = str(event).strip()
-    event_name, separator, suffix = normalized.partition(":")
-    if event_name == PROGRESS_ADVANCE_EVENT:
-        if separator and not suffix.strip():
-            return None
-        return ProgressOperatorIntent(
-            intent_id=intent_id,
-            kind="ADVANCE_PROGRESS",
-            target_progress_step_id=(suffix if separator else None),
-        )
-    if event_name == PROGRESS_UNDO_EVENT and not separator:
-        return ProgressOperatorIntent(
-            intent_id=intent_id,
-            kind="UNDO_LAST_ADVANCE",
-        )
-    if event_name == PROGRESS_FAILURE_EVENT and not separator:
-        return ProgressOperatorIntent(
-            intent_id=intent_id,
-            kind="REPORT_FAILURE",
-        )
-    return None
-
-
-def progress_profile_selection_intent_from_event(
-    event: str,
-    *,
-    intent_id: str,
-) -> ProgressProfileSelectionIntent | None:
-    """Translate an admitted profile-selection event into a typed intent."""
-
-    event_name, separator, suffix = str(event).strip().partition(":")
-    if (
-        event_name != PROGRESS_PROFILE_SELECT_EVENT
-        or not separator
-        or not suffix.strip()
-    ):
-        return None
-    return ProgressProfileSelectionIntent(
-        intent_id=intent_id,
-        profile_id=suffix,
-    )
-
-
-def progress_entry_step_selection_intent_from_event(
-    event: str,
-    *,
-    intent_id: str,
-) -> ProgressEntryStepSelectionIntent | None:
-    """Translate a next-Episode coarse entry selection into a typed intent."""
-
-    event_name, separator, suffix = str(event).strip().partition(":")
-    if (
-        event_name != PROGRESS_ENTRY_STEP_SELECT_EVENT
-        or not separator
-        or not suffix.strip()
-    ):
-        return None
-    return ProgressEntryStepSelectionIntent(
-        intent_id=intent_id,
-        progress_step_id=suffix,
-    )
-
-
-def progress_arm_control_mode_selection_intent_from_event(
-    event: str,
-    *,
-    intent_id: str,
-) -> ProgressArmControlModeSelectionIntent | None:
-    event_name, separator, suffix = str(event).strip().partition(":")
-    if (
-        event_name != PROGRESS_ARM_CONTROL_MODE_SELECT_EVENT
-        or not separator
-        or not suffix.strip()
-    ):
-        return None
-    try:
-        return ProgressArmControlModeSelectionIntent(
-            intent_id=intent_id,
-            mode=suffix,
-        )
-    except ValueError:
-        return None
 
 
 def build_progress_ui_payload(
@@ -640,31 +458,22 @@ def build_real_teleop_progress_ui_payload(
 
 
 __all__ = [
+    "PROGRESS_ADVANCE_EVENT",
     "PROGRESS_ARM_CONTROL_MODES",
     "PROGRESS_ARM_CONTROL_MODE_IGNORE",
     "PROGRESS_ARM_CONTROL_MODE_PROFILE",
     "PROGRESS_ARM_CONTROL_MODE_SELECT_EVENT",
     "PROGRESS_ARM_CONTROL_MODE_STRICT",
-    "PROGRESS_ADVANCE_EVENT",
     "PROGRESS_ENTRY_STEP_SELECT_EVENT",
     "PROGRESS_FAILURE_EVENT",
     "PROGRESS_PROFILE_SELECT_EVENT",
     "PROGRESS_UNDO_EVENT",
     "ProgressControlAvailability",
-    "ProgressArmControlModeSelectionIntent",
-    "ProgressEntryStepSelectionIntent",
-    "ProgressOperatorIntent",
-    "ProgressOperatorIntentKind",
     "ProgressProfileOption",
-    "ProgressProfileSelectionIntent",
     "ProgressUiEpisodeView",
     "ProgressUiStateView",
     "available_progress_controls",
     "build_progress_ui_payload",
     "build_real_teleop_progress_ui_payload",
-    "progress_intent_from_event",
-    "progress_arm_control_mode_selection_intent_from_event",
-    "progress_entry_step_selection_intent_from_event",
     "normalize_progress_arm_control_mode",
-    "progress_profile_selection_intent_from_event",
 ]

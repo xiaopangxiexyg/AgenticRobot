@@ -9,15 +9,21 @@ concrete RealTeleop implementation.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
-import uuid
+from typing import Any, Protocol, cast, runtime_checkable
 
-from .progress import (
-    ProgressControlAvailability,
-    ProgressOperatorIntent,
-)
+from .progress import ProgressControlAvailability
+
+
+@runtime_checkable
+class ProgressCommandView(Protocol):
+    """Validated command fields consumed by the Station workflow."""
+
+    command_id: str
+    kind: str
+    target_progress_step_id: str | None
 
 
 class ProgressEffectRequestPort(Protocol):
@@ -149,9 +155,9 @@ class RealTeleopProgressWorkflow:
             failure_promotes_existing_hold=promotion_available,
         )
 
-    def handle_operator_intent(
+    def handle_command(
         self,
-        intent: ProgressOperatorIntent,
+        command: ProgressCommandView,
         *,
         now: float,
         request_application_hold: Callable[[str], None],
@@ -159,8 +165,8 @@ class RealTeleopProgressWorkflow:
         application_held: bool = False,
         promotable_hold_pause: _PromotableHoldPauseView | None = None,
     ) -> ProgressWorkflowResult:
-        if not isinstance(intent, ProgressOperatorIntent):
-            raise TypeError("intent must be ProgressOperatorIntent.")
+        if not isinstance(command, ProgressCommandView):
+            raise TypeError("command must satisfy ProgressCommandView.")
         episode = self._episode()
         if episode is None:
             return ProgressWorkflowResult(
@@ -173,27 +179,27 @@ class RealTeleopProgressWorkflow:
             and self._matches_promotable_hold(promotable_hold_pause)
         )
         if application_held and (
-            intent.kind != "REPORT_FAILURE" or not promotion_available
+            command.kind != "REPORT_FAILURE" or not promotion_available
         ):
             raise RuntimeError(
                 "While application Hold is active, only a Failure promotion "
                 "bound to that same uninterrupted Hold/Pause is allowed."
             )
-        if intent.kind == "ADVANCE_PROGRESS":
+        if command.kind == "ADVANCE_PROGRESS":
             result = episode.advance(
-                intent_id=intent.intent_id,
+                intent_id=command.command_id,
                 effective_at=now,
-                target_progress_step_id=intent.target_progress_step_id,
+                target_progress_step_id=command.target_progress_step_id,
             )
             return ProgressWorkflowResult(True, result.state.phase)
-        if intent.kind == "UNDO_LAST_ADVANCE":
+        if command.kind == "UNDO_LAST_ADVANCE":
             result = episode.undo_last_advance(
-                intent_id=intent.intent_id,
+                intent_id=command.command_id,
                 effective_at=now,
             )
             return ProgressWorkflowResult(True, result.state.phase)
-        if intent.kind != "REPORT_FAILURE":
-            raise ValueError(f"Unsupported progress intent {intent.kind!r}.")
+        if command.kind != "REPORT_FAILURE":
+            raise ValueError(f"Unsupported progress command {command.kind!r}.")
 
         # Direct Failure fsyncs before requesting effects. A promoted Hold
         # instead binds already-applied exact effects and records its later
@@ -203,7 +209,7 @@ class RealTeleopProgressWorkflow:
         if promotion_available:
             assert promotable_hold_pause is not None
             effect_request = episode.report_failure(
-                intent_id=intent.intent_id,
+                intent_id=command.command_id,
                 effective_at=(
                     promotable_hold_pause.formal_capture_pause_effective_at
                 ),
@@ -212,7 +218,7 @@ class RealTeleopProgressWorkflow:
             )
         else:
             effect_request = episode.report_failure(
-                intent_id=intent.intent_id,
+                intent_id=command.command_id,
                 effective_at=now,
             )
         self.recorder.drain_accepted_sample_receipts()
@@ -452,8 +458,9 @@ class RealTeleopProgressWorkflow:
 
 
 __all__ = [
-    "ProgressWorkflowResult",
+    "ProgressCommandView",
     "ProgressEffectRequestPort",
+    "ProgressWorkflowResult",
     "RealTeleopProgressEpisodePort",
     "RealTeleopProgressRecorderPort",
     "RealTeleopProgressWorkflow",
