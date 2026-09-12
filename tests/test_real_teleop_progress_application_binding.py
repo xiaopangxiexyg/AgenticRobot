@@ -5,22 +5,26 @@ from types import SimpleNamespace
 
 import pytest
 
-import control_station.real_teleop_application as real_teleop_application
+from control_station import real_teleop_application
 from control_station.real_teleop.progress import (
     PROGRESS_ARM_CONTROL_MODES as STATION_ARM_CONTROL_MODES,
-    ProgressOperatorIntent,
+)
+from control_station.real_teleop.progress import (
     normalize_progress_arm_control_mode as normalize_station_arm_control_mode,
 )
 from control_station.real_teleop_application import (
     build_real_teleop_progress_application,
-    progress_command_from_intent,
+)
+from teleop_runtime.real_teleop.progress_contracts import (
+    PROGRESS_ARM_CONTROL_MODES as RUNTIME_ARM_CONTROL_MODES,
 )
 from teleop_runtime.real_teleop.progress_contracts import (
     ProgressArmControlModeSelectionCommand,
     ProgressEntryStepSelectionCommand,
-    PROGRESS_ARM_CONTROL_MODES as RUNTIME_ARM_CONTROL_MODES,
     ProgressMutationCommand,
     ProgressProfileSelectionCommand,
+)
+from teleop_runtime.real_teleop.progress_contracts import (
     normalize_progress_arm_control_mode as normalize_runtime_arm_control_mode,
 )
 from teleop_runtime.real_teleop.startup_progress_runtime import (
@@ -28,18 +32,26 @@ from teleop_runtime.real_teleop.startup_progress_runtime import (
 )
 
 
-def test_station_intent_is_adapted_to_one_ui_neutral_runtime_command() -> None:
-    intent = ProgressOperatorIntent(
-        intent_id="station:advance:7",
-        kind="ADVANCE_PROGRESS",
-        target_progress_step_id="place",
+def test_station_command_reaches_workflow_without_translation() -> None:
+    application = build_real_teleop_progress_application(SimpleNamespace())
+    command = application.command_from_event(
+        event="progress_failure",
+        command_id="station:failure:7",
+    )
+    assert isinstance(command, ProgressMutationCommand)
+
+    workflow = application.build_progress_workflow(
+        SimpleNamespace(active_progress_episode=None)
+    )
+    result = workflow.handle_command(
+        command,
+        now=1.0,
+        request_application_hold=lambda _reason: None,
+        pause_formal_capture=lambda _now, _reason: False,
     )
 
-    assert progress_command_from_intent(intent) == ProgressMutationCommand(
-        command_id="station:advance:7",
-        kind="ADVANCE_PROGRESS",
-        target_progress_step_id="place",
-    )
+    assert not result.handled
+    assert result.phase == "ABSENT"
 
 
 def test_station_progress_application_returns_only_lower_commands() -> None:

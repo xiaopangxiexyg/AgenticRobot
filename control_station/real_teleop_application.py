@@ -15,6 +15,10 @@ from collection_runtime.progress.profiles import (
     DatasetProgressProfileAdmission,
     inspect_dataset_progress_profile,
 )
+from teleop_runtime.real_teleop.hitl_terminal import (
+    HITLTerminalClutchInput,
+    validate_hitl_terminal_keys,
+)
 from teleop_runtime.real_teleop.progress_adapter import (
     dataset_recorder_matches_progress_selection,
     list_real_teleop_managed_progress_profile_selections,
@@ -33,69 +37,23 @@ from teleop_runtime.real_teleop.progress_contracts import (
     PromotableHoldPause,
     RealTeleopProgressWorkflowPort,
 )
-from teleop_runtime.real_teleop.hitl_terminal import (
-    HITLTerminalClutchInput,
-    validate_hitl_terminal_keys,
-)
 
-from .real_teleop.progress import (
-    PROGRESS_ADVANCE_EVENT,
-    PROGRESS_FAILURE_EVENT,
-    PROGRESS_UNDO_EVENT,
-    ProgressControlAvailability,
-    ProgressOperatorIntent,
-    ProgressProfileOption,
-    available_progress_controls,
-    build_real_teleop_progress_ui_payload,
-    progress_arm_control_mode_selection_intent_from_event,
-    progress_entry_step_selection_intent_from_event,
-    progress_intent_from_event,
-    progress_profile_selection_intent_from_event,
-)
-from .real_teleop.progress_workflow import RealTeleopProgressWorkflow
 from .real_teleop.hitl_application import (
     build_exclusive_hitl_real_teleop_extension,
 )
-
-
-class StationProgressWorkflowAdapter:
-    """Expose a lower command port around the Station-owned coordinator."""
-
-    def __init__(self, recorder: object) -> None:
-        self._workflow = RealTeleopProgressWorkflow(recorder=recorder)
-
-    def handle_command(
-        self,
-        command: ProgressMutationCommand,
-        **kwargs: object,
-    ):
-        if not isinstance(command, ProgressMutationCommand):
-            raise TypeError("command must be ProgressMutationCommand.")
-        return self._workflow.handle_operator_intent(
-            ProgressOperatorIntent(
-                intent_id=command.command_id,
-                kind=command.kind,
-                target_progress_step_id=command.target_progress_step_id,
-            ),
-            **kwargs,
-        )
-
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._workflow, attribute)
-
-
-def progress_command_from_intent(
-    intent: ProgressOperatorIntent,
-) -> ProgressMutationCommand:
-    """Adapt a Station-owned intent to the lower real-teleop command."""
-
-    if not isinstance(intent, ProgressOperatorIntent):
-        raise TypeError("intent must be ProgressOperatorIntent.")
-    return ProgressMutationCommand(
-        command_id=intent.intent_id,
-        kind=intent.kind,
-        target_progress_step_id=intent.target_progress_step_id,
-    )
+from .real_teleop.progress import (
+    PROGRESS_ADVANCE_EVENT,
+    PROGRESS_ARM_CONTROL_MODE_SELECT_EVENT,
+    PROGRESS_ENTRY_STEP_SELECT_EVENT,
+    PROGRESS_FAILURE_EVENT,
+    PROGRESS_PROFILE_SELECT_EVENT,
+    PROGRESS_UNDO_EVENT,
+    ProgressControlAvailability,
+    ProgressProfileOption,
+    available_progress_controls,
+    build_real_teleop_progress_ui_payload,
+)
+from .real_teleop.progress_workflow import RealTeleopProgressWorkflow
 
 
 @lru_cache(maxsize=32)
@@ -333,7 +291,7 @@ class StationProgressApplication:
         self,
         recorder: object,
     ) -> RealTeleopProgressWorkflowPort:
-        return StationProgressWorkflowAdapter(recorder)
+        return RealTeleopProgressWorkflow(recorder=recorder)
 
     def command_from_event(
         self,
@@ -341,41 +299,56 @@ class StationProgressApplication:
         event: str,
         command_id: str,
     ) -> ProgressApplicationCommand | None:
-        progress_intent = progress_intent_from_event(event, intent_id=command_id)
-        if progress_intent is not None:
-            return progress_command_from_intent(progress_intent)
-        profile_selection_intent = progress_profile_selection_intent_from_event(
-            event,
-            intent_id=command_id,
-        )
-        if profile_selection_intent is not None:
+        event_name, separator, suffix = str(event).strip().partition(":")
+        if event_name == PROGRESS_ADVANCE_EVENT:
+            if separator and not suffix.strip():
+                return None
+            return ProgressMutationCommand(
+                command_id=command_id,
+                kind="ADVANCE_PROGRESS",
+                target_progress_step_id=(suffix if separator else None),
+            )
+        if event_name == PROGRESS_UNDO_EVENT and not separator:
+            return ProgressMutationCommand(
+                command_id=command_id,
+                kind="UNDO_LAST_ADVANCE",
+            )
+        if event_name == PROGRESS_FAILURE_EVENT and not separator:
+            return ProgressMutationCommand(
+                command_id=command_id,
+                kind="REPORT_FAILURE",
+            )
+        if (
+            event_name == PROGRESS_PROFILE_SELECT_EVENT
+            and separator
+            and suffix.strip()
+        ):
             return ProgressProfileSelectionCommand(
-                command_id=profile_selection_intent.intent_id,
-                profile_id=profile_selection_intent.profile_id,
+                command_id=command_id,
+                profile_id=suffix,
             )
-        entry_step_selection_intent = (
-            progress_entry_step_selection_intent_from_event(
-                event,
-                intent_id=command_id,
-            )
-        )
-        if entry_step_selection_intent is not None:
+        if (
+            event_name == PROGRESS_ENTRY_STEP_SELECT_EVENT
+            and separator
+            and suffix.strip()
+        ):
             return ProgressEntryStepSelectionCommand(
-                command_id=entry_step_selection_intent.intent_id,
-                progress_step_id=entry_step_selection_intent.progress_step_id,
+                command_id=command_id,
+                progress_step_id=suffix,
             )
-        arm_control_mode_selection_intent = (
-            progress_arm_control_mode_selection_intent_from_event(
-                event,
-                intent_id=command_id,
-            )
-        )
-        if arm_control_mode_selection_intent is None:
+        if (
+            event_name != PROGRESS_ARM_CONTROL_MODE_SELECT_EVENT
+            or not separator
+            or not suffix.strip()
+        ):
             return None
-        return ProgressArmControlModeSelectionCommand(
-            command_id=arm_control_mode_selection_intent.intent_id,
-            mode=arm_control_mode_selection_intent.mode,
-        )
+        try:
+            return ProgressArmControlModeSelectionCommand(
+                command_id=command_id,
+                mode=suffix,
+            )
+        except ValueError:
+            return None
 
     def build_startup_progress_ui_payload(
         self,
@@ -609,9 +582,7 @@ def build_real_teleop_progress_application(
 
 __all__ = [
     "StationProgressApplication",
-    "StationProgressWorkflowAdapter",
     "build_real_teleop_progress_application",
     "build_real_teleop_startup_progress_ui_payload",
     "list_real_teleop_managed_progress_profile_options",
-    "progress_command_from_intent",
 ]

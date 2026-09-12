@@ -1,31 +1,33 @@
 from __future__ import annotations
 
-from collections import deque
 import inspect
+from collections import deque
 from pathlib import Path
 
 import pytest
 
 from collection_runtime.sample_acceptance import AcceptedSampleReceipt
-from control_station.real_teleop.progress import ProgressOperatorIntent
-from dataset_contracts.episode_identity import EpisodeCaptureIdentity
-from dataset_contracts.progress_profile import (
-    ProgressStepDefinitionV1,
-    TaskProgressProfileV1,
+from control_station.real_teleop.progress_workflow import (
+    RealTeleopProgressWorkflow,
 )
+from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.progress_facts import (
     AttemptFailureEventV1,
     HoldPauseEffectReceiptV1,
 )
-from teleop_runtime.real_teleop.progress_adapter import RealTeleopProgressEpisode
-from teleop_runtime.real_teleop.progress_contracts import PromotableHoldPause
+from dataset_contracts.progress_profile import (
+    ProgressStepDefinitionV1,
+    TaskProgressProfileV1,
+)
 from teleop_runtime.real_teleop.control_loop import (
     _build_promotable_progress_hold_pause,
     _consume_manual_episode_stop_request,
     run_real_teleop_control_loop,
 )
-from control_station.real_teleop.progress_workflow import (
-    RealTeleopProgressWorkflow,
+from teleop_runtime.real_teleop.progress_adapter import RealTeleopProgressEpisode
+from teleop_runtime.real_teleop.progress_contracts import (
+    ProgressMutationCommand,
+    PromotableHoldPause,
 )
 
 
@@ -114,8 +116,8 @@ def test_multi_step_advance_and_fresh_online_undo(tmp_path: Path) -> None:
         "pause_formal_capture": lambda _now, _reason: False,
     }
 
-    result = workflow.handle_operator_intent(
-        ProgressOperatorIntent("advance-1", "ADVANCE_PROGRESS"),
+    result = workflow.handle_command(
+        ProgressMutationCommand("advance-1", "ADVANCE_PROGRESS"),
         now=11.0,
         **callbacks,
     )
@@ -123,8 +125,8 @@ def test_multi_step_advance_and_fresh_online_undo(tmp_path: Path) -> None:
     assert episode.state.current_progress_step_id == "place"
     assert workflow.availability().can_undo_last_advance
 
-    workflow.handle_operator_intent(
-        ProgressOperatorIntent("undo-1", "UNDO_LAST_ADVANCE"),
+    workflow.handle_command(
+        ProgressMutationCommand("undo-1", "UNDO_LAST_ADVANCE"),
         now=12.0,
         **callbacks,
     )
@@ -148,8 +150,8 @@ def test_failure_pause_resume_retry_uses_first_accepted_sample(tmp_path: Path) -
         recorder.is_paused = True
         return True
 
-    failed = workflow.handle_operator_intent(
-        ProgressOperatorIntent("failure-1", "REPORT_FAILURE"),
+    failed = workflow.handle_command(
+        ProgressMutationCommand("failure-1", "REPORT_FAILURE"),
         now=13.0,
         request_application_hold=request_hold,
         pause_formal_capture=pause_capture,
@@ -201,8 +203,11 @@ def test_failure_while_formal_capture_is_already_paused_is_idempotent(
     recorder.is_paused = True
     workflow = RealTeleopProgressWorkflow(recorder=recorder)
 
-    failed = workflow.handle_operator_intent(
-        ProgressOperatorIntent("failure-during-modality-pause", "REPORT_FAILURE"),
+    failed = workflow.handle_command(
+        ProgressMutationCommand(
+            "failure-during-modality-pause",
+            "REPORT_FAILURE",
+        ),
         now=15.0,
         request_application_hold=lambda _reason: None,
         pause_formal_capture=lambda _now, _reason: False,
@@ -286,8 +291,8 @@ def test_existing_manual_hold_is_promoted_without_moving_pause_cut(
     )
     calls = {"hold": 0, "pause_reasons": []}
 
-    result = workflow.handle_operator_intent(
-        ProgressOperatorIntent("promote-hold", "REPORT_FAILURE"),
+    result = workflow.handle_command(
+        ProgressMutationCommand("promote-hold", "REPORT_FAILURE"),
         now=40.5,
         application_held=True,
         promotable_hold_pause=candidate,
@@ -350,8 +355,8 @@ def test_hold_progress_controls_fail_closed_without_same_episode_cut(
     assert held.application_held
     assert not held.failure_promotes_existing_hold
     with pytest.raises(RuntimeError, match="same uninterrupted Hold"):
-        workflow.handle_operator_intent(
-            ProgressOperatorIntent("bad-promotion", "REPORT_FAILURE"),
+        workflow.handle_command(
+            ProgressMutationCommand("bad-promotion", "REPORT_FAILURE"),
             now=50.2,
             application_held=True,
             promotable_hold_pause=wrong_episode,
@@ -436,8 +441,8 @@ def test_failure_outbox_replays_until_both_effects_are_applied(
     def request_hold(_reason: str) -> None:
         effect_state["hold_requests"] += 1
 
-    failed = workflow.handle_operator_intent(
-        ProgressOperatorIntent("failure-partial", "REPORT_FAILURE"),
+    failed = workflow.handle_command(
+        ProgressMutationCommand("failure-partial", "REPORT_FAILURE"),
         now=20.0,
         request_application_hold=request_hold,
         pause_formal_capture=lambda _now, _reason: True,
@@ -482,8 +487,8 @@ def test_retry_ignores_stale_receipt_and_rejects_wrong_episode(
     def request_hold(_reason: str) -> None:
         hold["active"] = True
 
-    workflow.handle_operator_intent(
-        ProgressOperatorIntent("failure-stale", "REPORT_FAILURE"),
+    workflow.handle_command(
+        ProgressMutationCommand("failure-stale", "REPORT_FAILURE"),
         now=30.0,
         request_application_hold=request_hold,
         pause_formal_capture=lambda _now, _reason: True,

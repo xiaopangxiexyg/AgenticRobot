@@ -1,39 +1,32 @@
 from __future__ import annotations
 
-from pathlib import Path
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import teleop_runtime.real_teleop.operator_control_runtime as operator_runtime
 from control_station.real_teleop.progress import (
-    ProgressArmControlModeSelectionIntent,
     ProgressControlAvailability,
-    ProgressEntryStepSelectionIntent,
-    ProgressOperatorIntent,
     ProgressProfileOption,
-    ProgressProfileSelectionIntent,
     available_progress_controls,
     build_progress_ui_payload,
     build_real_teleop_progress_ui_payload,
-    progress_profile_selection_intent_from_event,
-    progress_arm_control_mode_selection_intent_from_event,
-    progress_entry_step_selection_intent_from_event,
-    progress_intent_from_event,
 )
 from control_station.real_teleop_application import (
     build_real_teleop_progress_application,
 )
-from control_station.web.calibration_web_ui import CalibrationWebUi, _HTML_PAGE
+from control_station.web.calibration_web_ui import _HTML_PAGE, CalibrationWebUi
 from teleop_runtime.real_teleop.operator_control_runtime import (
     RealTeleopControlInput,
 )
 from teleop_runtime.real_teleop.progress_contracts import (
     ProgressArmControlModeSelectionCommand,
     ProgressEntryStepSelectionCommand,
+    ProgressMutationCommand,
     ProgressProfileSelectionCommand,
 )
-import teleop_runtime.real_teleop.operator_control_runtime as operator_runtime
 
 
 def test_progress_controls_require_active_attempt() -> None:
@@ -91,66 +84,71 @@ def test_progress_controls_require_active_attempt() -> None:
     ) == ("progress_failure",)
 
 
-def test_progress_event_mapping_is_typed_and_dataset_neutral() -> None:
-    assert progress_intent_from_event(
-        "progress_advance:regrasp",
-        intent_id="intent-1",
-    ) == ProgressOperatorIntent(
-        intent_id="intent-1",
+def test_progress_event_mapping_emits_canonical_commands() -> None:
+    application = build_real_teleop_progress_application(SimpleNamespace())
+
+    assert application.command_from_event(
+        event="progress_advance:regrasp",
+        command_id="intent-1",
+    ) == ProgressMutationCommand(
+        command_id="intent-1",
         kind="ADVANCE_PROGRESS",
         target_progress_step_id="regrasp",
     )
-    assert progress_intent_from_event(
-        "progress_failure",
-        intent_id="intent-2",
-    ) == ProgressOperatorIntent(
-        intent_id="intent-2",
+    assert application.command_from_event(
+        event="progress_failure",
+        command_id="intent-2",
+    ) == ProgressMutationCommand(
+        command_id="intent-2",
         kind="REPORT_FAILURE",
     )
-    assert progress_intent_from_event("episode_stop", intent_id="intent-3") is None
-    assert progress_intent_from_event(
-        "progress_advance:",
-        intent_id="intent-empty-target",
+    assert application.command_from_event(
+        event="episode_stop",
+        command_id="intent-3",
     ) is None
-    assert progress_profile_selection_intent_from_event(
-        "progress_profile_select:fixture-profile",
-        intent_id="select-1",
-    ) == ProgressProfileSelectionIntent(
-        intent_id="select-1",
+    assert application.command_from_event(
+        event="progress_advance:",
+        command_id="intent-empty-target",
+    ) is None
+    assert application.command_from_event(
+        event="progress_profile_select:fixture-profile",
+        command_id="select-1",
+    ) == ProgressProfileSelectionCommand(
+        command_id="select-1",
         profile_id="fixture-profile",
     )
-    assert progress_profile_selection_intent_from_event(
-        "progress_profile_select:",
-        intent_id="select-empty",
+    assert application.command_from_event(
+        event="progress_profile_select:",
+        command_id="select-empty",
     ) is None
-    assert progress_entry_step_selection_intent_from_event(
-        "progress_entry_step_select:write",
-        intent_id="entry-1",
-    ) == ProgressEntryStepSelectionIntent(
-        intent_id="entry-1",
+    assert application.command_from_event(
+        event="progress_entry_step_select:write",
+        command_id="entry-1",
+    ) == ProgressEntryStepSelectionCommand(
+        command_id="entry-1",
         progress_step_id="write",
     )
-    assert progress_entry_step_selection_intent_from_event(
-        "progress_entry_step_select:",
-        intent_id="entry-empty",
+    assert application.command_from_event(
+        event="progress_entry_step_select:",
+        command_id="entry-empty",
     ) is None
-    assert progress_arm_control_mode_selection_intent_from_event(
-        "progress_arm_control_mode_select:strict_profile",
-        intent_id="arm-mode-1",
-    ) == ProgressArmControlModeSelectionIntent(
-        intent_id="arm-mode-1",
+    assert application.command_from_event(
+        event="progress_arm_control_mode_select:strict_profile",
+        command_id="arm-mode-1",
+    ) == ProgressArmControlModeSelectionCommand(
+        command_id="arm-mode-1",
         mode="strict_profile",
     )
-    assert progress_arm_control_mode_selection_intent_from_event(
-        "progress_arm_control_mode_select:invalid",
-        intent_id="arm-mode-invalid",
+    assert application.command_from_event(
+        event="progress_arm_control_mode_select:invalid",
+        command_id="arm-mode-invalid",
     ) is None
 
 
-def test_non_advance_intent_cannot_smuggle_target() -> None:
+def test_non_advance_command_cannot_smuggle_target() -> None:
     with pytest.raises(ValueError, match="Only ADVANCE_PROGRESS"):
-        ProgressOperatorIntent(
-            intent_id="intent-invalid",
+        ProgressMutationCommand(
+            command_id="intent-invalid",
             kind="REPORT_FAILURE",
             target_progress_step_id="other",
         )
