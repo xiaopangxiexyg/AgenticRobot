@@ -118,11 +118,19 @@ Common SSH options:
 EOF
 }
 
-finalize_common_ssh() {
-  require_cmd ssh
-  require_cmd sed
+validate_ssh_identity() {
+  if [[ -z "$REMOTE_HOST" || "$REMOTE_HOST" == -* || "$REMOTE_HOST" == *@* || "$REMOTE_HOST" == */* || "$REMOTE_HOST" =~ [[:space:]] ]]; then
+    die "unsafe or invalid SSH host: target must be a single host or alias and cannot begin with '-'"
+  fi
+  if [[ -n "$REMOTE_USER" ]] &&
+    { [[ "$REMOTE_USER" == -* || "$REMOTE_USER" == *@* || "$REMOTE_USER" == *:* || "$REMOTE_USER" == */* ]] || [[ "$REMOTE_USER" =~ [[:space:]] ]]; }; then
+    die "unsafe or invalid SSH user: value cannot contain separators or whitespace or begin with '-'"
+  fi
+}
 
+finalize_common_ssh() {
   [[ -n "$REMOTE_HOST" ]] || die "missing -H/--host"
+  validate_ssh_identity
   if [[ -n "$REMOTE_PORT" && ! "$REMOTE_PORT" =~ ^[0-9]+$ ]]; then
     die "SSH port must be a number: $REMOTE_PORT"
   fi
@@ -131,6 +139,8 @@ finalize_common_ssh() {
   fi
 
   KEY_FILE="$(expand_local_path "$KEY_FILE")"
+  require_cmd ssh
+  require_cmd sed
 }
 
 build_ssh_args() {
@@ -205,6 +215,10 @@ print_wrapper_header() {
   local safety="$1"
   local project="${2:-}"
   local env_name="${3:-}"
+
+  if [[ "$project" =~ [[:cntrl:]] || "$env_name" =~ [[:cntrl:]] ]]; then
+    die "audit fields cannot contain control characters"
+  fi
 
   printf '[local] wrapper=%s safety=%s\n' "$(basename "$0")" "$safety"
   printf '[target] host=%s' "$(remote_target)"
