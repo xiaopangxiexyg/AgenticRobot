@@ -327,7 +327,9 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         item["value"]
         for item in options["source_candidates_by_phase"]["pen_down"]
     ] == ["down"]
-    assert len(options["trajectory_ids"]) == 9
+    assert [item["value"] for item in options["trajectory_ids"]] == list(
+        writing_plan.available_fixed_trajectory_ids()
+    )
     assert {item["value"] for item in options["directions"]} == {
         "up",
         "right",

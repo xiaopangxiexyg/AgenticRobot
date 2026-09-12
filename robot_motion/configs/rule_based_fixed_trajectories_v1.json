@@ -65,6 +65,198 @@
       "symbol": "9",
       "stroke_count": 1,
       "points": [[-0.16, 0.62], [-0.08, 0.85], [0.12, 1.0], [0.3, 0.88], [0.32, 0.65], [0.22, 0.48], [0.0, 0.45], [-0.18, 0.58], [-0.18, 0.78], [-0.04, 0.92], [0.15, 0.83], [0.26, 0.62], [0.26, 0.3], [0.18, 0.08], [0.0, 0.0], [-0.2, 0.04]]
+    },
+    {
+      "trajectory_id": "greek_alpha_v1",
+      "family": "greek",
+      "symbol": "Α",
+      "latin_name": "alpha",
+      "stroke_count": 1,
+      "points": [[-0.45, 0.0], [0.0, 1.0], [0.45, 0.0], [0.22, 0.48], [-0.22, 0.48]]
+    },
+    {
+      "trajectory_id": "greek_beta_v1",
+      "family": "greek",
+      "symbol": "Β",
+      "latin_name": "beta",
+      "stroke_count": 1,
+      "points": [[-0.35, 0.0], [-0.35, 1.0], [0.05, 1.0], [0.35, 0.9], [0.35, 0.72], [0.05, 0.55], [-0.35, 0.55], [0.08, 0.55], [0.4, 0.42], [0.4, 0.18], [0.1, 0.0], [-0.35, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_gamma_v1",
+      "family": "greek",
+      "symbol": "Γ",
+      "latin_name": "gamma",
+      "stroke_count": 1,
+      "points": [[0.4, 1.0], [-0.35, 1.0], [-0.35, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_delta_v1",
+      "family": "greek",
+      "symbol": "Δ",
+      "latin_name": "delta",
+      "stroke_count": 1,
+      "points": [[-0.45, 0.0], [0.0, 1.0], [0.45, 0.0], [-0.45, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_epsilon_v1",
+      "family": "greek",
+      "symbol": "Ε",
+      "latin_name": "epsilon",
+      "stroke_count": 1,
+      "points": [[0.4, 1.0], [-0.35, 1.0], [-0.35, 0.0], [0.4, 0.0], [-0.35, 0.0], [-0.35, 0.5], [0.25, 0.5]]
+    },
+    {
+      "trajectory_id": "greek_zeta_v1",
+      "family": "greek",
+      "symbol": "Ζ",
+      "latin_name": "zeta",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [0.4, 1.0], [-0.35, 0.0], [0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_eta_v1",
+      "family": "greek",
+      "symbol": "Η",
+      "latin_name": "eta",
+      "stroke_count": 1,
+      "points": [[-0.38, 1.0], [-0.38, 0.0], [-0.38, 0.5], [0.38, 0.5], [0.38, 1.0], [0.38, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_theta_v1",
+      "family": "greek",
+      "symbol": "Θ",
+      "latin_name": "theta",
+      "stroke_count": 1,
+      "points": [[-0.42, 0.5], [-0.34, 0.82], [0.0, 1.0], [0.34, 0.82], [0.42, 0.5], [0.34, 0.18], [0.0, 0.0], [-0.34, 0.18], [-0.42, 0.5], [0.42, 0.5]]
+    },
+    {
+      "trajectory_id": "greek_iota_v1",
+      "family": "greek",
+      "symbol": "Ι",
+      "latin_name": "iota",
+      "stroke_count": 1,
+      "points": [[0.0, 1.0], [0.0, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_kappa_v1",
+      "family": "greek",
+      "symbol": "Κ",
+      "latin_name": "kappa",
+      "stroke_count": 1,
+      "points": [[-0.35, 1.0], [-0.35, 0.0], [-0.35, 0.5], [0.38, 1.0], [-0.35, 0.5], [0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_lambda_v1",
+      "family": "greek",
+      "symbol": "Λ",
+      "latin_name": "lambda",
+      "stroke_count": 1,
+      "points": [[-0.45, 0.0], [0.0, 1.0], [0.45, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_mu_v1",
+      "family": "greek",
+      "symbol": "Μ",
+      "latin_name": "mu",
+      "stroke_count": 1,
+      "points": [[-0.42, 0.0], [-0.42, 1.0], [0.0, 0.25], [0.42, 1.0], [0.42, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_nu_v1",
+      "family": "greek",
+      "symbol": "Ν",
+      "latin_name": "nu",
+      "stroke_count": 1,
+      "points": [[-0.4, 0.0], [-0.4, 1.0], [0.4, 0.0], [0.4, 1.0]]
+    },
+    {
+      "trajectory_id": "greek_xi_v1",
+      "family": "greek",
+      "symbol": "Ξ",
+      "latin_name": "xi",
+      "stroke_count": 1,
+      "points": [[-0.42, 1.0], [0.42, 1.0], [0.42, 0.58], [-0.42, 0.58], [-0.42, 0.0], [0.42, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_omicron_v1",
+      "family": "greek",
+      "symbol": "Ο",
+      "latin_name": "omicron",
+      "stroke_count": 1,
+      "points": [[0.0, 1.0], [0.32, 0.88], [0.44, 0.5], [0.32, 0.12], [0.0, 0.0], [-0.32, 0.12], [-0.44, 0.5], [-0.32, 0.88], [0.0, 1.0]]
+    },
+    {
+      "trajectory_id": "greek_pi_v1",
+      "family": "greek",
+      "symbol": "Π",
+      "latin_name": "pi",
+      "stroke_count": 1,
+      "points": [[-0.4, 0.0], [-0.4, 1.0], [0.4, 1.0], [0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_rho_v1",
+      "family": "greek",
+      "symbol": "Ρ",
+      "latin_name": "rho",
+      "stroke_count": 1,
+      "points": [[-0.35, 0.0], [-0.35, 1.0], [0.05, 1.0], [0.38, 0.88], [0.4, 0.68], [0.18, 0.52], [-0.35, 0.52]]
+    },
+    {
+      "trajectory_id": "greek_sigma_v1",
+      "family": "greek",
+      "symbol": "Σ",
+      "latin_name": "sigma",
+      "stroke_count": 1,
+      "points": [[0.42, 1.0], [-0.4, 1.0], [0.18, 0.5], [-0.4, 0.0], [0.42, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_tau_v1",
+      "family": "greek",
+      "symbol": "Τ",
+      "latin_name": "tau",
+      "stroke_count": 1,
+      "points": [[-0.42, 1.0], [0.42, 1.0], [0.0, 1.0], [0.0, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_upsilon_v1",
+      "family": "greek",
+      "symbol": "Υ",
+      "latin_name": "upsilon",
+      "stroke_count": 1,
+      "points": [[-0.42, 1.0], [0.0, 0.52], [0.42, 1.0], [0.0, 0.52], [0.0, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_phi_v1",
+      "family": "greek",
+      "symbol": "Φ",
+      "latin_name": "phi",
+      "stroke_count": 1,
+      "points": [[0.0, 1.0], [0.0, 0.0], [0.0, 0.18], [-0.3, 0.18], [-0.42, 0.5], [-0.3, 0.82], [0.0, 0.82], [0.3, 0.82], [0.42, 0.5], [0.3, 0.18], [0.0, 0.18]]
+    },
+    {
+      "trajectory_id": "greek_chi_v1",
+      "family": "greek",
+      "symbol": "Χ",
+      "latin_name": "chi",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [0.4, 0.0], [0.0, 0.5], [0.4, 1.0], [-0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_psi_v1",
+      "family": "greek",
+      "symbol": "Ψ",
+      "latin_name": "psi",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [-0.32, 0.68], [0.0, 0.48], [0.32, 0.68], [0.4, 1.0], [0.32, 0.68], [0.0, 0.48], [0.0, 0.0]]
+    },
+    {
+      "trajectory_id": "greek_omega_v1",
+      "family": "greek",
+      "symbol": "Ω",
+      "latin_name": "omega",
+      "stroke_count": 1,
+      "points": [[-0.45, 0.0], [-0.28, 0.0], [-0.42, 0.25], [-0.4, 0.55], [-0.25, 0.85], [0.0, 1.0], [0.25, 0.85], [0.4, 0.55], [0.42, 0.25], [0.28, 0.0], [0.45, 0.0]]
     }
   ]
 }

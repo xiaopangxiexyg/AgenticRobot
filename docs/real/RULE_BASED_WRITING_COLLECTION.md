@@ -4,17 +4,14 @@ The default profile is rule-based writing; the opt-in `full-replay` profile
 records one complete source dataset Episode without interpreting its
 detail-stage annotations.
 
-This reconciliation contains the dedicated trajectory-collection application
-and browser UI, but the current launcher does **not** select them yet. The
-generic RealTeleop entrypoint/runtime that owns UI activation and Episode
-lifecycle is outside this branch's integration scope and has another active
-owner. Until that owner integrates the dedicated hooks, this launcher keeps the
-established RealTeleop UI and receives source/path/speed configuration from
-startup arguments. This partial path is retained for CLI construction,
-`--dry-run`, and offline validation only; it is **not** approved for real
-device execution. The owner integration must also select the rule command
-source before component construction, disable VIVE requirements, bind DMTAC
-backends into the Session Rig, and enable robot-state-only runtime Home.
+The launcher selects the dedicated trajectory-collection application and
+browser UI through the existing RealTeleop entrypoint. The specialized runtime
+extension is bound before device preflight, owns the exclusive rule command
+override, disables human gripper input and VIVE requirements, binds configured
+DMTAC backends into the Session Rig, and uses robot-state-only runtime Home.
+The integrated launcher has completed supervised real-device collection; every
+new deployment still requires its normal device, calibration, workspace, and
+operator preflight.
 
 The application still composes the existing authoritative robot loop, replay,
 fixed trajectory, safety chain, and formal writer. It does not introduce a
@@ -24,9 +21,8 @@ angle-trigger fallback; configured DMTAC backends remain available for
 measured state and tactile capture. The staged dedicated UI exposes only idle
 source/path/speed configuration, an ordered prevalidated queue, rule
 start/stop, pre-collection gripper reset, rule-step state, and device/safety
-messages. Those controls are not active in the current launcher. The active
-compatibility path still accepts the rule Session after robot-state Home in
-`ARMED`; it does not require a prior human-teleop command dispatch.
+messages. The active application accepts the rule Session after robot-state
+Home in `ARMED`; it does not require a prior human-teleop command dispatch.
 `FROZEN`, Hold, Init, Fix-Hold, dataset reconfiguration, and the remaining
 collection gates still reject the start.
 
@@ -72,8 +68,8 @@ Its complete plan is deliberately only:
    60 Hz reference and 120 Hz command transport.
 3. Finalize the output as one independent Episode, then return to the existing
    next-item-ready state. The staged dedicated UI can queue multiple complete
-   source Episodes, but current-launcher operation selects one startup item and
-   still requires an explicit formal Episode for every output.
+   source Episodes and still requires an explicit formal Episode for every
+   output.
 
 This profile uses the existing `ReplayTrajectoryGroup`,
 `RuleBasedInitialize`/`RuleBasedReplay`, collision/TCP envelope, Session/Rig,
@@ -98,8 +94,8 @@ bash scripts/run_rule_based_writing_collection.sh \
 With `--source-pool-manifest`, every candidate in the selected range remains
 a complete-Episode choice regardless of which writing subphases made it
 eligible for the pool. The current launcher selects deterministically from
-startup arguments; the staged dedicated UI can expose the same candidates once
-its generic-entrypoint hooks are integrated. The source pool is only an
+startup arguments and the dedicated UI exposes the same candidates. The source
+pool is only an
 immutable dataset/Episode index here; its detail annotation artifacts are not
 opened.
 
@@ -189,9 +185,8 @@ remains without Q6, a foot pedal, or a second device loop. The runtime status
 publishes the exact control topology, current phase/frame, accepted/plan sample
 count, and initialization speed multiplier.
 
-The staged dedicated UI contains “松开夹爪” and “闭紧夹爪”; the current launcher
-does not expose those rule-specific buttons. Once activated by the generic
-entrypoint owner, they are available only while the shared Session is actually
+The dedicated UI contains “松开夹爪” and “闭紧夹爪”. They are available only while
+the shared Session is actually
 `ARMED`. A click starts a feedback-gated sequence rather than one full-range
 command: every newly advanced normalized target increment is at most `0.05`
 from the latest fresh measurement. If an accepted register write produces no
@@ -281,11 +276,12 @@ subphases:
 manifest candidate list; omitting it uses the full list. For each of
 `pen_down`, `write`, and `pen_up`, the launcher selects an eligible
 candidate deterministically from the range using the manifest semantic hash
-and `--selection-seed`. The staged dedicated UI contains three independent
+and `--selection-seed`. The dedicated UI contains three independent
 selectors for every phase-eligible candidate, all nine fixed digit paths, all
-four directions, glyph height, writing speed, and an initialization-speed
-multiplier. These controls remain dormant in the current generic-entrypoint
-launcher. Its values come from validated startup arguments instead. The staged
+24 fixed one-stroke Greek paths, all four directions, glyph height, writing
+speed, and an initialization-speed multiplier. Startup arguments provide the
+initial values and the dedicated UI may rebuild them only while the runtime is
+motion-inert. The
 pre-motion form also contains the runtime-safe writer controls:
 the native tactile-bundle root and minimum-free-space reserve, tactile
 compression, writer/process/storage queue sizing, writer thread count,
@@ -293,20 +289,18 @@ collection-frequency warning threshold, and Parquet/video enablement.
 The per-camera queue admission timeout is also configurable; when a blocking
 route exceeds it, the affected recorder is quarantined instead of stalling the
 control path indefinitely.
-When the dedicated UI is activated by its owner, applying a change rebuilds
+Applying a dedicated-UI change rebuilds
 and validates the immutable plan on a background worker and keeps start
 disabled until validation succeeds. In both paths, the exact pool hash, range,
 candidate IDs, datasets, episodes, detail sets, tags, and pose contracts are
 recorded in every rule command and admitted formal sample.
 
-The staged dedicated UI can build and prevalidate an ordered batch without
-opening hardware resources. Each queue item remains one independent formal
-Episode and never starts automatically. With the current launcher, collect
-several combinations as separate validated invocations; do not treat dormant
-batch controls as an available operational interface.
+The dedicated UI can build and prevalidate an ordered batch without opening
+hardware resources. Each queue item remains one independent formal Episode and
+never starts automatically.
 
-From `/home/user/zc/AgenticRobot-deployment-20260830`, in the complete
-`dexteleop310` environment:
+From the selected AgenticRobot checkout in the complete `dexteleop310`
+environment:
 
 ```bash
 bash scripts/run_rule_based_writing_collection.sh \
@@ -384,10 +378,8 @@ If writer preparation or Episode opening fails (for example, the configured
 minimum tactile free-space reserve exceeds the mounted disk's current free
 space), rule motion stays command-inert while the camera preview,
 safety/control loop, warning messages, and stop/Hold remain available. In the
-current launcher, correct the startup configuration and restart the validated
-invocation. Dedicated in-place writer reconfiguration/retry exists only in the
-staged UI and is not an active operational control. The reserve is never
-reduced automatically.
+dedicated UI, correct and revalidate the motion-inert configuration before
+retrying. The reserve is never reduced automatically.
 
 The default fixed-path speed is derived from the right TCP average over the
 selected source `write` span. Use
@@ -401,9 +393,8 @@ at the established 60 Hz position-reference rate, with zero endpoint velocity
 and acceleration and continuous velocity/acceleration/jerk certificates.
 The configured value in `[0.05, 1.0]` scales only the certified execution duration;
 it no longer changes path geometry or creates a sparse staircase. The values
-become immutable once rule motion begins. The staged dedicated path may rebuild
-them while an armed rule is waiting in its explicit writer-blocked state; the
-current launcher requires a corrected, newly validated invocation.
+become immutable once rule motion begins. The dedicated UI may rebuild them
+while an armed rule is waiting in its explicit writer-blocked state.
 
 By default the launcher uses the right-gripper rule-writing progress and stage
 profiles. With `--with-left-gripper`, it selects
