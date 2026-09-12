@@ -9,8 +9,9 @@ imports the GraspGenX package, loads model weights, or touches devices;
 it returns a typed fail-closed receipt for diagnostics and evidence.
 
 The receipt proves environment compatibility only. It is not a model
-load, inference, camera, or real-robot acceptance, and it does not
-change the default isolated loopback service mode.
+load, inference, camera, or real-robot acceptance. The default in-process
+backend must pass this contract before it imports the upstream package or
+loads model weights.
 """
 
 from __future__ import annotations

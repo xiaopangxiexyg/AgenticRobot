@@ -164,7 +164,13 @@ def test_graspgenx_gpu_smoke_verify_only_requires_inprocess_bundle() -> None:
         is True
     )
     rejected = subprocess.run(
-        [sys.executable, str(GRASPGENX_SMOKE), "--verify-only"],
+        [
+            sys.executable,
+            str(GRASPGENX_SMOKE),
+            "--mode",
+            "service",
+            "--verify-only",
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -190,11 +196,11 @@ def test_graspgenx_gpu_smoke_verify_only_requires_inprocess_bundle() -> None:
     assert "--verify-only requires --asset-bundle" in missing_bundle.stderr
 
 
-def test_graspgenx_gpu_smoke_defaults_to_isolated_service() -> None:
-    assert smoke_graspgenx_inference._parse_args([]).mode == "service"
+def test_graspgenx_gpu_smoke_defaults_to_inprocess() -> None:
+    assert smoke_graspgenx_inference._parse_args([]).mode == "in-process"
     assert (
-        smoke_graspgenx_inference._parse_args(["--mode", "in-process"]).mode
-        == "in-process"
+        smoke_graspgenx_inference._parse_args(["--mode", "service"]).mode
+        == "service"
     )
 
 

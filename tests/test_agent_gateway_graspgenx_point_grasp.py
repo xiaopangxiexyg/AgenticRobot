@@ -119,9 +119,9 @@ class _DuckBackend:
         return self.grasps.copy(), self.scores.copy()
 
 
-def test_graspgenx_default_mode_is_isolated_service() -> None:
+def test_graspgenx_default_mode_is_inprocess() -> None:
     assert DEFAULT_POINT_GRASP_BACKEND_ID == "graspgenx"
-    assert GRASPGENX_DEFAULT_MODE == "service"
+    assert GRASPGENX_DEFAULT_MODE == "in-process"
 
 
 def _sha256(path: Path) -> str:

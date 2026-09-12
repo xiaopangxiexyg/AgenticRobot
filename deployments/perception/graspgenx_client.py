@@ -1,9 +1,9 @@
 """GraspGenX inference backends for the point-grasp planner.
 
-The loopback client keeps the GPU stack in a separate asset-contained
-environment, while the optional in-process adapter imports the official
-package lazily into a compatible Gateway environment. Neither backend owns
-robot or motion resources.
+The default in-process adapter imports the official package lazily into a
+compatible Gateway environment.  The loopback client remains an explicit
+compatibility option that keeps the GPU stack in a separate asset-contained
+environment.  Neither backend owns robot or motion resources.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from .graspgenx_runtime_contract import (
 GRASPGENX_DEFAULT_HOST = "127.0.0.1"
 GRASPGENX_DEFAULT_PORT = 5556
 GRASPGENX_DEFAULT_TIMEOUT_MS = 120_000
-GRASPGENX_DEFAULT_MODE = "service"
+GRASPGENX_DEFAULT_MODE = "in-process"
 GRASPGENX_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 GRASPGENX_INPROCESS_BACKEND_ID = "graspgenx-inprocess-v1"
 _GRASPGENX_IMPORT_LOCK = threading.RLock()
