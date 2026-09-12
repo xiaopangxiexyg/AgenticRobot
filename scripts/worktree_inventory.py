@@ -131,6 +131,7 @@ def inspect(
     repo: Path,
     *,
     branches: list[str] | None = None,
+    active_only: bool = False,
     mainlines: tuple[str, ...] = ("main", "master"),
 ) -> dict[str, Any]:
     root = Path(git(repo, "rev-parse", "--show-toplevel").stdout.strip())
@@ -139,6 +140,8 @@ def inspect(
     entries = parse_worktrees(git(root, "worktree", "list", "--porcelain").stdout)
     inspected: list[dict[str, Any]] = []
     selected = set(branches or [])
+    if selected and active_only:
+        raise ValueError("--active cannot be combined with --branch")
     present = {entry.get("branch", "").removeprefix("refs/heads/") for entry in entries}
     missing = selected - present
     if missing:
@@ -146,11 +149,64 @@ def inspect(
             "selected branches have no worktree: " + ", ".join(sorted(missing))
         )
 
+    current_branch_result = git(
+        repo,
+        "branch",
+        "--show-current",
+        check=False,
+    )
+    current_branch = current_branch_result.stdout.strip() or None
+    active_selection: set[str] = set()
+    active_candidates: list[dict[str, Any]] = []
+    unclassified_branch_worktrees = 0
+    if active_only:
+        for entry in entries:
+            raw_branch = entry.get("branch")
+            branch = raw_branch.removeprefix("refs/heads/") if raw_branch else None
+            if branch is None:
+                continue
+            if branch in mainlines or branch == current_branch:
+                active_selection.add(branch)
+                continue
+            result = git(
+                root,
+                "config",
+                "--get",
+                f"branch.{branch}.description",
+                check=False,
+            )
+            fields, errors = parse_description(result.stdout.rstrip("\n"))
+            state = fields.get("state", [None])[0]
+            if state in ACTIVE_STATES:
+                active_candidates.append(
+                    {
+                        "branch": branch,
+                        "owner": fields.get("owner", [None])[0],
+                        "state": state,
+                        "write_scope_count": len(fields.get("write-scope", [])),
+                        "semantic_scope_count": len(
+                            fields.get("semantic-scope", [])
+                        ),
+                        "details_argv": [
+                            "python",
+                            "scripts/worktree_inventory.py",
+                            str(root),
+                            "--branch",
+                            branch,
+                            "--json",
+                        ],
+                    }
+                )
+            elif errors:
+                unclassified_branch_worktrees += 1
+
     for entry in entries:
         path = Path(entry["worktree"])
         branch_ref = entry.get("branch")
         branch = branch_ref.removeprefix("refs/heads/") if branch_ref else None
         if selected and branch not in selected:
+            continue
+        if active_only and branch not in active_selection:
             continue
         warnings: list[str] = []
         status: list[str] = []
@@ -395,12 +451,50 @@ def inspect(
             snapshot_warnings.append(
                 f"integration target moved during inventory: {target_ref}"
             )
+    projected_worktrees = inspected
+    if active_only:
+        projected_worktrees = [
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"changed_paths", "out_of_scope_paths", "inputs"}
+            }
+            | {
+                "changed_path_count": len(item["changed_paths"]),
+                "out_of_scope_path_count": len(item["out_of_scope_paths"]),
+                "ordered_input_count": len(item["inputs"]),
+                "details_argv": [
+                    "python",
+                    "scripts/worktree_inventory.py",
+                    str(root),
+                    "--branch",
+                    item["branch"],
+                    "--json",
+                ],
+            }
+            for item in inspected
+        ]
     return {
         "repository": str(root),
-        "selection": sorted(selected) if selected else "all worktrees",
+        "selection": (
+            sorted(selected)
+            if selected
+            else "current and mainline branch worktrees"
+            if active_only
+            else "all worktrees"
+        ),
+        "inventory_counts": {
+            "total": len(entries),
+            "branch_attached": sum(1 for entry in entries if entry.get("branch")),
+            "detached": sum(1 for entry in entries if not entry.get("branch")),
+            "selected": len(inspected),
+            "declared_active_candidates": len(active_candidates),
+            "unclassified_branch_worktrees": unclassified_branch_worktrees,
+        },
+        "active_candidates": active_candidates,
         "main_before": current_main_sha,
         "main_after": final_main_sha,
-        "worktrees": inspected,
+        "worktrees": projected_worktrees,
         "overlaps": overlaps,
         "snapshot_warnings": snapshot_warnings,
     }
@@ -409,6 +503,22 @@ def inspect(
 def print_text(report: dict[str, Any]) -> None:
     print(f"repository: {report['repository']}")
     print(f"selection: {report['selection']}")
+    counts = report["inventory_counts"]
+    print(
+        "inventory: "
+        f"{counts['selected']} selected / {counts['total']} total "
+        f"({counts['branch_attached']} branch, {counts['detached']} detached, "
+        f"{counts['declared_active_candidates']} active candidates, "
+        f"{counts['unclassified_branch_worktrees']} unclassified branch)"
+    )
+    if report["active_candidates"]:
+        print("active candidates (metadata only; use --branch for exact inspection):")
+        for candidate in report["active_candidates"]:
+            print(
+                f"  {candidate['branch']}: "
+                f"{candidate['owner'] or '(unknown)'}/"
+                f"{candidate['state'] or '(unknown)'}"
+            )
     print("note: this is a best-effort snapshot; recheck pins before promotion or push")
     for warning in report["snapshot_warnings"]:
         print(f"warning: {warning}")
@@ -422,10 +532,13 @@ def print_text(report: dict[str, Any]) -> None:
         if item["target_ref"]:
             print(f"  integration target: {item['target_ref']}")
         print(f"  pinned tip: {item['tip'] or '(pending/unknown)'}")
-        print(f"  ordered inputs: {len(item['inputs'])}")
+        print(
+            f"  ordered inputs: {item.get('ordered_input_count', len(item.get('inputs', [])))}"
+        )
         print(f"  dirty entries: {item['dirty_entries']}")
         print(
-            f"  changed paths (base diff plus worktree): {len(item['changed_paths'])}"
+            "  changed paths (base diff plus worktree): "
+            f"{item.get('changed_path_count', len(item.get('changed_paths', [])))}"
         )
         for warning in item["warnings"]:
             print(f"  warning: {warning}")
@@ -451,6 +564,14 @@ def main() -> int:
         help="inspect a relevant branch only; repeat for peers (default: all)",
     )
     parser.add_argument(
+        "--active",
+        action="store_true",
+        help=(
+            "inspect current and mainline worktrees; summarize declared active "
+            "branches and report aggregate counts for the rest"
+        ),
+    )
+    parser.add_argument(
         "--mainline",
         action="append",
         help="shared branch with no task description; repeat (default: main, master)",
@@ -467,6 +588,7 @@ def main() -> int:
         report = inspect(
             Path(args.repository).resolve(),
             branches=args.branch,
+            active_only=args.active,
             mainlines=tuple(args.mainline or ("main", "master")),
         )
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

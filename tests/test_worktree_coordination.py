@@ -211,6 +211,112 @@ def test_unknown_selected_branch_is_an_error(repo):
 
 
 @pytest.mark.integration
+def test_active_inventory_skips_detached_and_inactive_worktree_details(
+    repo, tmp_path, coordination
+):
+    active = tmp_path / "active"
+    assert _claim(repo, active).returncode == 0
+    peer = tmp_path / "peer"
+    base = _git(repo, "rev-parse", "main")
+    _git(repo, "worktree", "add", "-b", "codex/peer", str(peer), base)
+    fields, errors = coordination.parse_description(
+        _git(repo, "config", "--get", "branch.codex/test.description")
+    )
+    assert errors == []
+    fields["owner"] = ["peer-owner"]
+    _git(
+        repo,
+        "config",
+        "branch.codex/peer.description",
+        coordination.serialize_description(fields),
+    )
+    inactive = tmp_path / "inactive"
+    _git(repo, "worktree", "add", "-b", "codex/inactive", str(inactive), base)
+    fields["owner"] = ["inactive-owner"]
+    fields["state"] = ["superseded"]
+    _git(
+        repo,
+        "config",
+        "branch.codex/inactive.description",
+        coordination.serialize_description(fields),
+    )
+    detached = tmp_path / "detached"
+    _git(repo, "worktree", "add", "--detach", str(detached), base)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "worktree_inventory.py"),
+            str(active),
+            "--active",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert report["selection"] == "current and mainline branch worktrees"
+    assert {item["branch"] for item in report["worktrees"]} == {
+        "main",
+        "codex/test",
+    }
+    assert report["inventory_counts"] == {
+        "total": 5,
+        "branch_attached": 4,
+        "detached": 1,
+        "selected": 2,
+        "declared_active_candidates": 1,
+        "unclassified_branch_worktrees": 0,
+    }
+    assert report["active_candidates"] == [
+        {
+            "branch": "codex/peer",
+            "owner": "peer-owner",
+            "state": "active",
+            "write_scope_count": 2,
+            "semantic_scope_count": 1,
+            "details_argv": [
+                "python",
+                "scripts/worktree_inventory.py",
+                str(active),
+                "--branch",
+                "codex/peer",
+                "--json",
+            ],
+        }
+    ]
+    current = next(
+        item for item in report["worktrees"] if item["branch"] == "codex/test"
+    )
+    assert "changed_paths" not in current
+    assert current["changed_path_count"] == 0
+    assert current["details_argv"][-3:] == ["--branch", "codex/test", "--json"]
+
+
+@pytest.mark.integration
+def test_active_inventory_rejects_explicit_branch_mix(repo):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "worktree_inventory.py"),
+            str(repo),
+            "--active",
+            "--branch",
+            "main",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "--active cannot be combined with --branch" in result.stderr
+
+
+@pytest.mark.integration
 def test_installed_skill_cli_delegates_to_canonical_inventory(repo):
     shim = (
         SCRIPTS.parent

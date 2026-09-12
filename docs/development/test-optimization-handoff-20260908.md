@@ -1,5 +1,9 @@
 # AgenticRobot 测试耗时压缩与安全交接文档
 
+> 历史快照：仅用于追溯 2026-09-08 的候选和测量，不是当前测试、分支、
+> worktree 或 Harness 操作入口。当前开发与测试入口见 `AGENTS.md`、
+> `docs/development/git-workflow.md` 和 `tests/README.md`。
+
 文档版本：2026-09-08
 
 本文记录本次 AgenticRobot 测试耗时优化的目标、当前候选、性能证据、开发约束、调试方式、集成门槛和回滚方式。文中带有日期、commit、工作区和 /tmp 路径的内容都是本次快照；集成或复测前必须重新盘点并重新固定 SHA，不能把旧快照当成当前事实。

@@ -54,12 +54,19 @@ boundary test when changing one; do not duplicate the full package map here.
 
 ## Development ownership
 
-Use Harness by default: its installed project guide, generated Task contract,
-scope, writer lease, and evidence records govern managed work. Do not also run
+Select the mode from local facts once. A worktree is Harness-managed only when
+its enclosing generated workspace has a readable `task.env` and Task contract
+whose Task ID and repository root match the current checkout. If those markers
+are present but missing, contradictory, or stale, stop and repair the handoff;
+do not silently fall back. With no managed markers, use standalone Git mode.
+
+In Harness mode, its installed project guide, generated Task contract, scope,
+writer lease, and evidence records govern managed work. Do not also run
 `claim_worktree.py` or maintain a second branch-description record for that Task.
-Independent local development may use the lightweight Git workflow defined in
+Standalone local development uses the lightweight Git workflow defined in
 `docs/development/git-workflow.md` and `$integrate-shared-worktrees`; explicitly
-identify this mode once. It requires no Harness installation or robot assets.
+identify the selected mode once, without repeatedly loading both workflows. It
+requires no Harness installation or robot assets.
 Coordinate with any existing owner before overlapping work, including managed
 Tasks; switching mode is a handoff, never a way around an unresolved gate.
 

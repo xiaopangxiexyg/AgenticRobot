@@ -7,12 +7,18 @@ Harness 服务、Task、lease 或机器人资产。已受 Harness 管理的工�
 
 ## 创建与所有权
 
-先确认目标仓库、开发线和已有工作：
+先确认目标仓库、开发线和当前相关工作。默认盘点只精查当前和主线；其他声明为
+active 的 branch 只显示 owner/state 和 scope 数量，同时保留全部 branch/detached 数量。
+不要把大型共享仓库的原始 worktree 清单直接放进 Agent 上下文：
 
 ```bash
-git worktree list --porcelain
 git status --short --branch
+python scripts/worktree_inventory.py . --active --mainline development
 ```
+
+如果输出存在未分类 branch worktree，或相关 owner/scope 仍不明确，再根据候选名称用重复
+`--branch` 精确扩展；只有恢复、清理或仍无法归属时才做完整盘点或读取原始
+`git worktree list --porcelain`。
 
 本项目通常以 AgenticRobot `development` 为基线；其他开发线必须来自实际任务。
 复用清楚归属的现有任务，或为独立范围建立新工作区。短路径、
@@ -73,7 +79,8 @@ python scripts/worktree_inventory.py /absolute/path/to/repository \
   --mainline development --branch codex/<task> --branch <relevant-peer>
 ```
 
-省略 `--branch` 做完整只读盘点。输出明确标明选择范围；选错不存在的分支会失败。
+`--active` 是开发开始和交接的默认入口；省略 `--branch` 与 `--active` 才做完整只读
+盘点。输出明确标明选择范围及未展开项计数；选错不存在的分支会失败。
 `--strict` 将发现的问题转成非零退出码，不能当作并行授权。只读盘点可在未解决
 冲突时运行。不要每条命令重扫历史 worktree；开始写入、交接、集成及相关状态
 变化时刷新需要的事实。未知所有者不能被推断为空闲。

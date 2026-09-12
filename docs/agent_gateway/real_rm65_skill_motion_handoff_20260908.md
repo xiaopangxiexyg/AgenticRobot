@@ -1,5 +1,9 @@
 # AgenticRobot 抓姿生成与 RM65 Skill 全链路交接
 
+> 历史快照：本文中的分支、SHA、worktree、远端状态和验收结论只用于追溯
+> 2026-09-08 的交接，不是当前 Gateway 或真机操作入口。当前入口见
+> `docs/agent_gateway/README.md` 和 `agent_gateway/README.md`。
+
 > 文档日期：2026-09-08（Asia/Shanghai）
 > 文档目的：把抓姿生成、upward TCP 筛选、MuJoCo 可视化、左右臂、真机 Gateway、运动抖动修复、trace 证据、资产和验收边界集中记录，供后续开发者和远端 `user` 接手。
 > 当前文档源自独立 Git 候选，现由正式 Harness Task 继续验证；它不代表已经合入 `development`，也不代表真机验收已完成。

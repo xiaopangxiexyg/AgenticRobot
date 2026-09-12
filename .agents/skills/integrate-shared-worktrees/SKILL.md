@@ -12,9 +12,13 @@ description: Coordinate standalone Git worktrees, ownership, handoffs, authorize
 [Git 工作流](../../../docs/development/git-workflow.md) 的相关章节。
 本流程由 AgenticRobot 维护并适用于本仓库；其他仓库使用各自的开发规则。
 
-1. 用 `git worktree list --porcelain` 发现所有者；检查相关工作区和语义范围。
-   用 `scripts/worktree_inventory.py <repo> --branch <branch>` 检查指定候选，
-   重复 `--branch` 纳入相关同伴；无法识别所有权时再做完整盘点。
+1. 先用 `scripts/worktree_inventory.py <repo> --active --mainline development`
+   精查当前和本项目主线；其他声明为
+   active 的 branch 只返回 owner/state 和 scope 数量，detached/非活动项只返回计数，不逐项
+   灌入上下文。根据元数据选出相关候选后，用 `--branch <branch>` 精确检查，重复
+   `--branch` 纳入相关同伴。
+   仅当未分类计数、所有权或语义范围仍无法判断时，才运行不带筛选的完整盘点；
+   原始 `git worktree list --porcelain` 留给恢复、清理或工具故障诊断。
 2. 独立任务通过 `scripts/claim_worktree.py` 创建隔离工作区并记录范围。
    同一任务复用归属明确的工作区；已有目录、分支、资产和其他人的修改不覆盖。
 3. 审查路径和语义重叠；盘点工具只报告事实，不能授权并行或集成。
