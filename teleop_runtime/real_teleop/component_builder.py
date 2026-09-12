@@ -225,6 +225,7 @@ from .session_recording import (
 )
 from .side_mapping import (
     build_vive_tracker_configs_for_args as _build_vive_tracker_configs_for_args,
+    resolve_active_arm_ip_by_side as _active_arm_ip_by_side,
     resolve_logical_side_assignments as _resolve_logical_side_assignments,
     tracker_name_for_source_side as _tracker_name_for_source_side,
     tracker_source_side_for_logical_side as _tracker_source_side_for_logical_side,
@@ -259,24 +260,6 @@ def _collision_debug_box_templates(
         }
     )
     return boxes
-
-
-def _active_arm_ip_by_side(
-    args: argparse.Namespace,
-    active_sides: tuple[str, ...],
-) -> dict[str, tuple[str, str]]:
-    """Return only arm-IP assignments admitted by ``active_sides``.
-
-    A shared command may contain configuration for both arms even when this
-    runtime is intentionally single-arm. Active-side selection owns
-    admission; inactive values remain inert configuration context.
-    """
-
-    return {
-        logical_side: (source_name, arm_ip)
-        for source_name, (logical_side, arm_ip) in _resolve_logical_side_assignments(args).items()
-        if logical_side in active_sides and arm_ip
-    }
 
 
 def build_real_teleop_components(
