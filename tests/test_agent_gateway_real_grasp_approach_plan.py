@@ -381,3 +381,109 @@ def test_planner_rejection_returns_evidence_without_motion_or_hold() -> None:
     )
     assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
     assert port.snapshot().dispatch_count == 0
+
+
+@pytest.fixture
+def stored_plan():
+    _, provider, store, _, request, operation = _planning_fixture(
+        planner=lambda **kwargs: _stationary_trajectory(kwargs["qpos_by_side"])
+    )
+    _, plan = provider.plan_request(request, operation)
+    assert plan is not None
+    reservation = {
+        "plan_id": plan.plan_id,
+        "plan_hash": plan.semantic_content_hash,
+        "operation_id": "motion-operation:one",
+        "runtime_session_id": plan.runtime_session_id,
+        "profile_hash": plan.profile_hash,
+        "component_id": plan.component_id,
+        "expected_station_revision": plan.source_station_revision,
+        "now": plan.created_at + 0.1,
+    }
+    return store, plan, reservation
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("plan_id", "missing-plan", "not_found"),
+        ("plan_hash", "different-hash", "hash_mismatch"),
+        ("runtime_session_id", "another-session", "session_mismatch"),
+        ("profile_hash", "another-profile", "profile_mismatch"),
+        ("component_id", "another-component", "component_mismatch"),
+        ("expected_station_revision", 8, "station_changed"),
+    ],
+)
+def test_plan_store_rejects_wrong_lineage_without_reserving(
+    stored_plan, field, value, reason
+) -> None:
+    store, plan, reservation = stored_plan
+    with pytest.raises(
+        RealGraspApproachPlanLookupError, match=f"^grasp_path_plan_{reason}$"
+    ):
+        store.reserve(**(reservation | {field: value, "operation_id": "wrong-owner"}))
+    assert store.reserve(**reservation) is plan
+
+
+@pytest.mark.parametrize("previously_reserved", [False, True])
+def test_plan_store_rejects_plan_at_expiry(stored_plan, previously_reserved) -> None:
+    store, plan, reservation = stored_plan
+    if previously_reserved:
+        store.reserve(**reservation)
+    # Unreserved expired plans are pruned; reservations retain replay evidence.
+    reason = "expired" if previously_reserved else "not_found"
+    with pytest.raises(
+        RealGraspApproachPlanLookupError, match=f"^grasp_path_plan_{reason}$"
+    ):
+        store.reserve(**(reservation | {"now": plan.expires_at}))
+
+
+def test_plan_store_preserves_reservation_under_capacity_pressure(stored_plan) -> None:
+    _, plan, reservation = stored_plan
+    store = BoundedRealGraspApproachPlanStore(max_retained_plans=1)
+    store.put(plan, now=reservation["now"])
+    assert store.reserve(**reservation) is plan
+    assert store.reserve(**reservation) is plan
+    with pytest.raises(
+        RealGraspApproachPlanLookupError, match="^grasp_path_plan_already_reserved$"
+    ):
+        store.reserve(**(reservation | {"operation_id": "motion-operation:two"}))
+    with pytest.raises(
+        RealGraspApproachPlanLookupError, match="^grasp_path_plan_reservation_mismatch$"
+    ):
+        store.consume(plan_id=plan.plan_id, operation_id="motion-operation:two")
+
+    next_plan = replace(plan, planning_operation_id="planning-operation:next")
+    with pytest.raises(
+        RuntimeError, match="All retained grasp-approach plans are reserved"
+    ):
+        store.put(next_plan, now=reservation["now"])
+    assert store.reserve(**reservation) is plan
+    store.consume(plan_id=plan.plan_id, operation_id=reservation["operation_id"])
+    store.put(next_plan, now=reservation["now"])
+    with pytest.raises(
+        RealGraspApproachPlanLookupError, match="^grasp_path_plan_not_found$"
+    ):
+        store.reserve(**reservation)
+    next_reservation = reservation | {
+        "plan_id": next_plan.plan_id,
+        "plan_hash": next_plan.semantic_content_hash,
+        "operation_id": "motion-operation:two",
+    }
+    assert store.reserve(**next_reservation) is next_plan
+
+
+def test_plan_store_close_revokes_retained_plan(stored_plan) -> None:
+    store, plan, reservation = stored_plan
+    store.reserve(**reservation)
+    store.close()
+    with pytest.raises(
+        RealGraspApproachPlanLookupError, match="^grasp_path_plan_store_closed$"
+    ):
+        store.reserve(**reservation)
+    with pytest.raises(
+        RealGraspApproachPlanLookupError, match="^grasp_path_plan_reservation_mismatch$"
+    ):
+        store.consume(plan_id=plan.plan_id, operation_id=reservation["operation_id"])
+    with pytest.raises(RuntimeError, match="Grasp-approach plan store is closed"):
+        store.put(plan, now=reservation["now"])
