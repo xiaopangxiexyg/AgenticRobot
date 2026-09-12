@@ -23,6 +23,7 @@ from hardware.rebot_b601_rs import (
     B601HardwareDependencyError,
     B601HardwareError,
     B601JointConfig,
+    B601JointState,
     B601ModeReceipt,
     B601MotionAuthorizationError,
     B601RSBackend,
@@ -942,6 +943,47 @@ def test_host_fresh_poll_rejects_malformed_observation_metadata(
     assert state.host_receive_freshness_verified is False
     assert state.joint("joint6").valid is False
     assert message in (state.fault_reason or "")
+
+
+@pytest.mark.parametrize("value", (1.0, 1.5, "1", "1.5", True, 0, -1))
+def test_joint_state_rejects_invalid_status_sequence(value: object) -> None:
+    with pytest.raises(ValueError, match="status_sequence must be a positive integer"):
+        B601JointState(
+            name="joint1",
+            motor_id=1,
+            feedback_id=0xFD,
+            arbitration_id=None,
+            status_code=0,
+            position_rad=0.0,
+            velocity_reported=0.0,
+            torque_reported_nm=0.0,
+            observed_at_sec=0.0,
+            sample_sequence=0,
+            valid=True,
+            stale=False,
+            status_sequence=value,
+        )
+
+
+def test_joint_state_preserves_positive_integer_status_sequence() -> None:
+    state = B601JointState(
+        name="joint1",
+        motor_id=1,
+        feedback_id=0xFD,
+        arbitration_id=None,
+        status_code=0,
+        position_rad=0.0,
+        velocity_reported=0.0,
+        torque_reported_nm=0.0,
+        observed_at_sec=0.0,
+        sample_sequence=0,
+        valid=True,
+        stale=False,
+        status_sequence=7,
+    )
+
+    assert state.status_sequence == 7
+    assert type(state.status_sequence) is int
 
 
 def test_host_fresh_poll_requires_advertised_motorbridge_capability() -> None:

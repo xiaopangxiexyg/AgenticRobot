@@ -528,10 +528,12 @@ class B601JointState:
             raise TypeError("valid and stale must be bools")
         object.__setattr__(self, "error", None if self.error is None else str(self.error))
         object.__setattr__(self, "position_source", str(self.position_source))
-        if self.status_sequence is not None:
-            if isinstance(self.status_sequence, bool) or int(self.status_sequence) <= 0:
-                raise ValueError("status_sequence must be a positive integer")
-            object.__setattr__(self, "status_sequence", int(self.status_sequence))
+        if self.status_sequence is not None and (
+            isinstance(self.status_sequence, bool)
+            or not isinstance(self.status_sequence, int)
+            or self.status_sequence <= 0
+        ):
+            raise ValueError("status_sequence must be a positive integer")
         if self.receive_age_sec is not None:
             age = _finite_float(self.receive_age_sec, name="receive_age_sec")
             if age < 0.0:
