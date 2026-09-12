@@ -20,4 +20,6 @@
 
 如果本机 inotify 限制太低，脚本会提示提高 `max_user_watches/max_user_instances`，否则 `lsyncd` 可能无法启动。
 
-如果 SSH 还未免密，会自动调用 `setup_ssh_passwordless.sh`。按 `Ctrl-C` 停止实时同步。
+如果 SSH 还未免密，会自动调用 `setup_ssh_passwordless.sh`。目标 host key 必须已
+经过独立核对并记录在本机 `known_hosts` 中，脚本不会自动信任首次出现的密钥。
+按 `Ctrl-C` 停止实时同步。

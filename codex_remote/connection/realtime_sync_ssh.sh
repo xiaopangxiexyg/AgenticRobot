@@ -40,6 +40,7 @@ Options:
 
 This is a one-way live mirror: local directory -> remote directory.
 If passwordless SSH is not ready, this script runs setup_ssh_passwordless.sh.
+The host key must already be verified and present in known_hosts.
 If LOCAL/.realtime_sync_ssh.exclude exists, it is loaded automatically.
 EOF
 }
@@ -150,7 +151,7 @@ build_ssh_command() {
   fi
   SSH_COMMAND+=(
     -p "$REMOTE_PORT"
-    -o StrictHostKeyChecking=accept-new
+    -o StrictHostKeyChecking=yes
     -o BatchMode=yes
     -o NumberOfPasswordPrompts=0
     "$(remote_target)"
@@ -165,7 +166,7 @@ build_rsync_rsh() {
   fi
 
   rsh+=" -p $(shell_single_quote "$REMOTE_PORT")"
-  rsh+=" -o StrictHostKeyChecking=accept-new"
+  rsh+=" -o StrictHostKeyChecking=yes"
   rsh+=" -o BatchMode=yes"
   rsh+=" -o NumberOfPasswordPrompts=0"
 

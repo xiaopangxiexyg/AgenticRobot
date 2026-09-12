@@ -24,7 +24,9 @@ Options:
   -k, --key FILE         Local SSH private key. Default: ~/.ssh/id_ed25519.
   -h, --help             Show this help.
 
-The remote password is requested silently and is not written to disk.
+The remote password is requested silently and is not written to disk. The host
+key must already be verified and present in known_hosts; this script never
+accepts a new host key.
 EOF
 }
 
@@ -111,10 +113,6 @@ set password $env(REMOTE_PASSWORD)
 unset env(REMOTE_PASSWORD)
 spawn {*}$argv
 expect {
-  -re {(?i)are you sure you want to continue connecting} {
-    send "yes\r"
-    exp_continue
-  }
   -re {(?i)(password|verification code).*:} {
     send -- "$password\r"
     exp_continue
@@ -180,10 +178,7 @@ while True:
 
     buffer = (buffer + text)[-512:]
     lower = buffer.lower()
-    if "are you sure you want to continue connecting" in lower:
-        os.write(fd, b"yes\r")
-        buffer = ""
-    elif "password:" in lower or "verification code:" in lower:
+    if "password:" in lower or "verification code:" in lower:
         os.write(fd, (password + "\r").encode())
         buffer = ""
 
@@ -209,7 +204,7 @@ install_public_key() {
     ssh
     -p "$REMOTE_PORT"
     -o ConnectTimeout=10
-    -o StrictHostKeyChecking=accept-new
+    -o StrictHostKeyChecking=yes
     -o PubkeyAuthentication=no
     -o PreferredAuthentications=password,keyboard-interactive
     -o NumberOfPasswordPrompts=1
@@ -241,7 +236,7 @@ verify_passwordless_login() {
       -p "$REMOTE_PORT" \
       -o BatchMode=yes \
       -o ConnectTimeout=10 \
-      -o StrictHostKeyChecking=accept-new \
+      -o StrictHostKeyChecking=yes \
       "$target" \
       "printf '%s\n' passwordless-ok" 2>&1
   )" && [[ "$output" == "passwordless-ok" ]]; then
