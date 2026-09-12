@@ -5,13 +5,12 @@ description: Use AgenticRobot codex_remote wrappers for remote inspection, trans
 
 # Remote Access
 
-Own only the operation that crosses the remote boundary. Local code semantics
-remain with their domain Skill; `$debug-teleop-ik-motion` owns motion-path logic,
-`$change-agent-gateway` owns Gateway contracts, and
-`$manage-project-local-resources` owns local storage and bindings.
+Own the remote operation; local semantics remain with the domain Skills named
+in the repository's `AGENTS.md`.
 
-Use the reviewed `codex_remote/` wrappers as the execution boundary. For a known
-wrapper, inspect its `--help`; read
+Use the reviewed `codex_remote/` wrappers as the execution boundary. Inspect
+`--help` when arguments are unknown, changed, or rejected; reuse already checked
+arguments for the same wrapper version. Read
 [the wrapper catalog](references/wrapper-catalog.md) when the choice or effect
 class is unclear. Before changing a wrapper, inspect that wrapper, its shared
 helper and tests, and only the relevant section of
@@ -21,7 +20,11 @@ helper and tests, and only the relevant section of
 
 1. **Fix the context.** Record the exact SSH target, repository path or runtime
    surface, intended effect, local/remote write scope, and timeout or stop
-   condition. Distinguish the SSH host from a robot/controller address.
+   condition. Distinguish the SSH host from a robot/controller address. State
+   this once for a bounded batch; subsequent commentary may refer to that target
+   and state only changed scope, process, or timeout. Re-expand when the binding
+   is unclear or changes, and in requests for device/motion authority. This is
+   prose reuse only: keep explicit command targets and wrapper audit output.
 2. **Select the narrow wrapper.** Use the known dedicated wrapper or consult the
    catalog. Separate read-only observation, result transfer, process execution,
    device-state change, and real motion.
@@ -44,6 +47,14 @@ helper and tests, and only the relevant section of
    materialization. Inspect or retrieve named results intentionally and report
    the exact target, command class, boundary reached, and remaining unverified
    state.
+
+Use focused diagnostics for the current question; do not repeat full environment
+inventories merely because another command uses SSH. Required identity, sync,
+and safety checks still apply. Bound log reads with supported `--head`, `--tail`,
+or `--max-bytes`; disclose partial evidence. Summarize results without copying
+unchanged connection metadata or full argv already shown by the tool. Keep
+errors, exit status, and unresolved facts visible; never infer success from
+omitted output. Final handoffs must identify the exact target independently.
 
 ## Guardrails
 

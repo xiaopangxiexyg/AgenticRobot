@@ -1,8 +1,9 @@
 # Remote wrapper catalog
 
 Use this reference when the dedicated wrapper or effect class is not already
-clear. Wrapper `--help` remains authoritative for current arguments; consult
-only the matching `codex_remote/README.md` section when more context is needed.
+clear. Wrapper `--help` remains authoritative for current arguments; consult it
+when needed under the entrypoint's reuse rule. Read only the matching
+`codex_remote/README.md` section when more context is needed.
 
 ## Effect classes
 
@@ -15,6 +16,8 @@ only the matching `codex_remote/README.md` section when more context is needed.
 | Real motion/system control | homing, replay, trajectory, servo, gripper, force control, reboot, shutdown, firmware or bus reset | Require the exact action explicitly; never infer permission from a broader task |
 
 Classify an unlisted or ambiguous operation as the highest plausible risk.
+Target/scope statements may reference the bounded batch defined in `SKILL.md`;
+this does not extend its authority or replace fresh checks.
 
 ## Wrapper selection
 
