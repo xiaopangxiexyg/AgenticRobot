@@ -3350,6 +3350,30 @@ def test_degraded_fault_hold_recovers_live_gravity_without_disable(
                 positions_rad=q,
                 fault_reason=None,
             ),
+            SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            ),
+            SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            ),
+            SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            ),
+            SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            ),
         ),
         cached_receipts=(_fault_hold_command_receipt(accepted=True, sequence=2),),
     )
@@ -3372,20 +3396,164 @@ def test_degraded_fault_hold_recovers_live_gravity_without_disable(
         torque_limits_nm=(1.0,) * 6,
         rate_hz=20.0,
         stop={"requested": True, "full_disable_requested": False},
-        max_iterations=3,
+        max_iterations=6,
         driver_kd_nm_s_per_rad=(1.0,) * 6,
         cached_gravity_tau_nm=gravity,
         degraded_telemetry=telemetry,
     )
 
     hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
-    assert hold_count == 3
-    assert live_dispatch_count == 2
+    assert hold_count == 6
+    assert live_dispatch_count == 5
     assert len(backend.cached_dispatches) == 1
     assert full_receipt is None
     assert errors == []
     assert telemetry["entry_count"] == 1
     assert telemetry["recovery_count"] == 1
+    assert telemetry["recovery_samples_required"] == 3
+    assert telemetry["recovery_candidate_count"] == 0
+    assert telemetry["state"] == "LIVE"
+
+
+def test_degraded_entry_uses_first_live_frame_as_baseline_without_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    telemetry: dict[str, object] = {}
+    live_dispatch_count = 0
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        nonlocal live_dispatch_count
+        live_dispatch_count += 1
+        return _fault_hold_command_receipt(
+            accepted=True,
+            sequence=live_dispatch_count,
+        ), gravity, gravity
+
+    backend = _FaultHoldBackend(
+        feedback=(
+            SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            ),
+        ),
+        cached_receipts=(_fault_hold_command_receipt(accepted=True),),
+    )
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=float("inf"),
+        fault_qpos_rad=None,
+        fault_qvel_rad_s=None,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=2,
+        driver_kd_nm_s_per_rad=(1.0,) * 6,
+        cached_qpos_rad=q,
+        cached_gravity_tau_nm=gravity,
+        degraded_entry_reason="simulated missing active feedback",
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
+    assert hold_count == 2
+    assert live_dispatch_count == 1
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["entry_count"] == 1
+    assert telemetry["recovery_count"] == 0
+    assert telemetry["recovery_candidate_count"] == 0
+    assert telemetry["state"] == "DEGRADED"
+
+
+def test_entry_dispatch_failure_uses_first_live_frame_as_recovery_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry_q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    recovered_q = (0.3, 0.9, 1.4, 0.1, -0.2, 0.3)
+    gravity = (0.0, 0.8, 0.4, 0.1, 0.0, 0.0)
+    telemetry: dict[str, object] = {}
+    live_dispatch_count = 0
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        nonlocal live_dispatch_count
+        live_dispatch_count += 1
+        if live_dispatch_count <= 2:
+            raise probe.LowGainProbeError("simulated entry dispatch failure")
+        return _fault_hold_command_receipt(
+            accepted=True,
+            sequence=live_dispatch_count,
+        ), gravity, gravity
+
+    backend = _FaultHoldBackend(
+        feedback=(
+            SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=recovered_q,
+                fault_reason=None,
+            ),
+        ),
+        cached_receipts=(_fault_hold_command_receipt(accepted=True),),
+    )
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        backend,
+        object(),
+        qpos_rad=entry_q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=None,
+        fault_qvel_rad_s=None,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=SimpleNamespace(max_torque_rate_nm_s=(10.0,) * 6),
+        gravity_scale=1.0,
+        previous_tau=gravity,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": False, "full_disable_requested": False},
+        max_iterations=2,
+        driver_kd_nm_s_per_rad=(1.0,) * 6,
+        cached_qpos_rad=entry_q,
+        cached_gravity_tau_nm=gravity,
+        degraded_telemetry=telemetry,
+    )
+
+    hold_count, _latest_tau, _first, _non_hold, full_receipt, errors = result
+    assert hold_count == 2
+    assert live_dispatch_count == 3
+    assert len(backend.cached_dispatches) == 1
+    assert full_receipt is None
+    assert errors == []
+    assert telemetry["entry_count"] == 1
+    assert telemetry["recovery_count"] == 0
+    assert telemetry["state"] == "DEGRADED"
+    assert telemetry["last_transition"] == "recovery_baseline"
 
 
 def test_fault_hold_retries_one_incomplete_all_joint_frame(
