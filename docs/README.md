@@ -17,6 +17,10 @@
 | 执行模式与模块边界 | [architecture](./architecture/README.md) | [单源直通、多源组合与运行域边界](./architecture/runtime_domain_boundaries.md)；不作为新的运行入口 |
 | 被替代命令和历史报告 | [legacy](./legacy/README.md) | 仅用于追溯和复现实验；[VIVE role diagnostics wrapper 退役报告](./legacy/reports/vive_role_diagnostics_wrapper_retirement_20260825.md) |
 
+专项交接按需查阅：[测试优化](./development/test-optimization-handoff-20260908.md)、
+[RTC 开发](./real/RTC_DEVELOPMENT_HANDOFF_20260908.md)、
+[真机 Gateway 与 RM65 运动](./agent_gateway/real_rm65_skill_motion_handoff_20260908.md)。
+
 跨模块的只读架构与 RTC 图示集中在 [architecture](./architecture/README.md)；它们不是运行入口，也不新增实施契约。
 当前 deploy、human teleop 和 replay 的默认模式各自直达既有 target owner；只有显式多源 profile 才加载
 `control_composition`。被动 trace/shadow 不改变这个分类。
