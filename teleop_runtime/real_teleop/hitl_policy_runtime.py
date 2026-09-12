@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from dataset_contracts.hitl import (
+    EXCLUSIVE_HITL_POLICY_MODES,
     ExclusiveHITLDatasetContract,
     exclusive_hitl_policy_artifact_contract_hash,
 )
@@ -31,9 +32,8 @@ from .pose_frame_runtime import resolve_runtime_pose_frame_contract
 from .single_source_composition import ExclusiveSingleSourceComposer
 
 
-HITL_POLICY_MODE_NORMAL = "normal"
-HITL_POLICY_MODE_RTC = "rtc"
-HITL_POLICY_MODES = (HITL_POLICY_MODE_NORMAL, HITL_POLICY_MODE_RTC)
+HITL_POLICY_MODES = EXCLUSIVE_HITL_POLICY_MODES
+HITL_POLICY_MODE_NORMAL, HITL_POLICY_MODE_RTC = HITL_POLICY_MODES
 
 
 def resolve_hitl_runtime_pose_frame_contract(

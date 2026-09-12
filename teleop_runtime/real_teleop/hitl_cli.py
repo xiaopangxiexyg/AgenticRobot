@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from dataset_contracts.hitl import EXCLUSIVE_HITL_POLICY_MODES
+
 from ..cli_value_parsers import _non_negative_int, _positive_float
 from .cli_value_parsers import _positive_int
 
@@ -25,8 +27,8 @@ def add_exclusive_hitl_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--hitl-policy-mode",
-        choices=("normal", "rtc"),
-        default="normal",
+        choices=EXCLUSIVE_HITL_POLICY_MODES,
+        default=EXCLUSIVE_HITL_POLICY_MODES[0],
         help=(
             "Policy producer kind for exclusive HITL. RTC accepts only committed "
             "PolicyActionEmission input and is held/no-action until the repository's "

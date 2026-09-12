@@ -64,7 +64,6 @@ from dataset_interface.gripper_force import (
 )
 from teleop_runtime.action.human_shadow_frontend import (
     RealTeleopHumanShadowProfile,
-    add_human_shadow_arguments,
     build_real_teleop_human_shadow_frontend,
     validate_human_shadow_arguments,
 )
@@ -162,7 +161,6 @@ from teleop_runtime.configs import (
     load_impedance_pose_smoothing_config,
 )
 from teleop_runtime.configs.dmtac_hardware import (
-    add_dmtac_assignment_arguments,
     dmtac_backend_configs_from_assignment,
     load_dmtac_hardware_assignment,
     manual_dmtac_backend_config_for_side,
@@ -200,7 +198,6 @@ from teleop_runtime.hand_render import (
 )
 from teleop_runtime.hand_tcp_alignment import (
     DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
-    add_vive_tracker_height_correction_args,
     tracker_hand_to_rm65_tcp_rotation,
 )
 from teleop_runtime.tracker_hand import TRACKER_OFFSET_CALIBRATION_VERSION, canonical_hand_rpy_default
@@ -413,10 +410,6 @@ from teleop_runtime.real_teleop.hand_config import (
 )
 from teleop_runtime.real_teleop.hand_cli import (
     DEFAULT_TASKS_CONFIG_PATH,
-    add_dmtac_arguments,
-    add_gripper_policy_arguments,
-    add_hand_backend_arguments,
-    add_inspire_hand_arguments,
 )
 from teleop_runtime.real_teleop.gripper_policy import (
     GRIPPER_POLICY_DEFAULTS,
@@ -632,16 +625,6 @@ def _apply_real_loop_timing_defaults(
     )
 
 
-def _source_arm_ip_fields_for_active_sides(
-    args: argparse.Namespace,
-    active_sides: tuple[str, ...],
-) -> dict[str, str]:
-    return _cli_runtime_config._source_arm_ip_fields_for_active_sides(
-        args,
-        active_sides,
-    )
-
-
 def _apply_default_arm_ips(
     args: argparse.Namespace,
     *,
@@ -716,21 +699,6 @@ def _collection_task_ui_state(args: argparse.Namespace) -> dict[str, object]:
     return real_teleop_dataset_layout.collection_task_ui_state(args, expand_path=_expand_cli_path)
 
 
-def _resolve_formal_dataset_layout(args: argparse.Namespace) -> tuple[Path, str, str, str, str, str]:
-    layout = real_teleop_dataset_layout.resolve_formal_dataset_layout(
-        args,
-        date_prefix=datetime.now().strftime("%Y-%m-%d"),
-    )
-    return (
-        layout.dataset_root,
-        layout.task_name,
-        layout.task_name_zh,
-        layout.task_id,
-        layout.task_description,
-        layout.dataset_name,
-    )
-
-
 def _apply_formal_dataset_layout(args: argparse.Namespace) -> None:
     real_teleop_dataset_layout.apply_formal_dataset_layout(
         args,
@@ -754,7 +722,6 @@ def _toggle_collection_round_trip_phase(args: argparse.Namespace) -> bool:
 
 from teleop_runtime.real_teleop.cli_resolution import (
     bind_legacy_support as _bind_cli_resolution_support,
-    parse_real_teleop_args,
     parse_real_teleop_args_with_parser,
 )
 from control_station.real_agent_primitive_runtime import (
@@ -897,41 +864,9 @@ def _apply_vive_tracker_mapping(
 # Compatibility bridge: retain legacy threshold globals through thin wrappers
 # while the extracted module owns tracker-status payload construction.
 from teleop_runtime.real_teleop.gui_tracker_status import (
-    pose_xyz_rpy_summary as _ExtractedPoseXyzRpySummary,
     publish_raw_tracker_pose_state as _extracted_publish_raw_tracker_pose_state,
     raw_tracker_pose_state_from_channels as _extracted_raw_tracker_pose_state_from_channels,
-    tracker_gui_status as _extracted_tracker_gui_status,
 )
-
-
-def _tracker_gui_status(
-    *,
-    enabled: bool,
-    valid: bool,
-    age_sec: float | None,
-) -> tuple[str, str, bool]:
-    return _extracted_tracker_gui_status(
-        enabled=enabled,
-        valid=valid,
-        age_sec=age_sec,
-        warn_age_sec=TRACKER_GUI_WARN_AGE_SEC,
-        stale_age_sec=TRACKER_GUI_STALE_AGE_SEC,
-    )
-
-
-def _pose_xyz_rpy_summary(
-    channel: object | None,
-    *,
-    now: float,
-    enabled: bool = True,
-) -> dict[str, object]:
-    return _ExtractedPoseXyzRpySummary(
-        channel,
-        now=now,
-        enabled=enabled,
-        warn_age_sec=TRACKER_GUI_WARN_AGE_SEC,
-        stale_age_sec=TRACKER_GUI_STALE_AGE_SEC,
-    )
 
 
 def _raw_tracker_pose_state_from_channels(

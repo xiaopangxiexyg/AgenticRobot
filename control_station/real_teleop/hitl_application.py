@@ -25,14 +25,14 @@ from control_station.hitl import (
     observe_exclusive_hitl_policy_reset,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.hitl import EXCLUSIVE_HITL_POLICY_MODES
 
 
 HITL_HOME_CAPTURE_HASH_DOMAIN_V1 = (
     "dexteleop.control_station.real_teleop_hitl_home_capture.v1"
 )
-HITL_POLICY_MODE_NORMAL = "normal"
-HITL_POLICY_MODE_RTC = "rtc"
-HITL_POLICY_MODES = (HITL_POLICY_MODE_NORMAL, HITL_POLICY_MODE_RTC)
+HITL_POLICY_MODES = EXCLUSIVE_HITL_POLICY_MODES
+HITL_POLICY_MODE_NORMAL, HITL_POLICY_MODE_RTC = HITL_POLICY_MODES
 
 
 class ExclusiveHITLRealTeleopExtension:

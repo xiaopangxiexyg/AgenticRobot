@@ -8,16 +8,19 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from control_station.real_teleop import hitl_application
 from control_station.real_teleop.hitl_application import (
     ExclusiveHITLRealTeleopExtension,
 )
 from control_station.real_teleop_application import (
     build_real_teleop_progress_application,
 )
+from dataset_contracts.hitl import EXCLUSIVE_HITL_POLICY_MODES
 from robot_motion.action import BIMANUAL_QPOS_V1, RobotAction
 from robot_motion.deploy import NormalizedAction, PolicyActionEmission
 from robot_motion.deploy.runtime import SourceValidationResult
 from teleop_runtime.diagnostics import TeleopRunState
+from teleop_runtime.real_teleop import hitl_policy_runtime
 from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
 from teleop_runtime.real_teleop.hitl_cli import add_exclusive_hitl_arguments
 from teleop_runtime.real_teleop.hitl_terminal import HITLTerminalClutchInput
@@ -365,3 +368,28 @@ def test_rtc_committed_emission_intervention_fails_held_without_motion() -> None
     assert "no-action" in str(extension.state.error)
     assert session.state_machine.state == TeleopRunState.DEBUG_ONLY
     assert session.arm_count == 0
+
+
+def test_hitl_policy_mode_constants_share_the_dataset_contract_source() -> None:
+    assert hitl_policy_runtime.HITL_POLICY_MODES == EXCLUSIVE_HITL_POLICY_MODES
+    assert hitl_application.HITL_POLICY_MODES == EXCLUSIVE_HITL_POLICY_MODES
+    assert (
+        hitl_policy_runtime.HITL_POLICY_MODE_NORMAL
+        == hitl_application.HITL_POLICY_MODE_NORMAL
+        == "normal"
+    )
+    assert (
+        hitl_policy_runtime.HITL_POLICY_MODE_RTC
+        == hitl_application.HITL_POLICY_MODE_RTC
+        == "rtc"
+    )
+
+
+def test_hitl_cli_policy_mode_choices_follow_the_dataset_contract() -> None:
+    parser = build_real_teleop_argument_parser()
+    add_exclusive_hitl_arguments(parser)
+    action = next(
+        action for action in parser._actions if action.dest == "hitl_policy_mode"
+    )
+    assert tuple(action.choices) == EXCLUSIVE_HITL_POLICY_MODES
+    assert action.default == EXCLUSIVE_HITL_POLICY_MODES[0]
