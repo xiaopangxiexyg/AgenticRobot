@@ -14,6 +14,216 @@ import numpy as np
 
 from robot_motion.rebot_b601_rs.mit import _six_finite, _six_non_negative
 
+_ARM_JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
+
+
+def _finite_non_negative(value: object, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a real number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return result
+
+
+def _timing_summary(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {"minimum": None, "maximum": None, "median": None, "p99": None}
+    array = np.asarray(values, dtype=float)
+    return {
+        "minimum": float(array.min()),
+        "maximum": float(array.max()),
+        "median": float(np.median(array)),
+        "p99": float(np.percentile(array, 99)),
+    }
+
+
+def _sha256_identity(value: object, *, name: str) -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"{name} must be a 64-character SHA-256 value")
+    if any(character not in "0123456789abcdefABCDEF" for character in value):
+        raise ValueError(f"{name} must be hexadecimal")
+    return value.lower()
+
+
+def audit_b601_type24_control_trace(payload: Mapping[str, object]) -> dict[str, object]:
+    """Validate host-paired Type-24 feedback and MIT dispatch timing.
+
+    Passing this audit qualifies only the recorded host observation/dispatch
+    schedule for deterministic simulation replay.  RobStride exposes no device
+    acquisition clock here, so the result cannot qualify sensor delay or plant
+    identification.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("control trace must be a mapping")
+    if payload.get("feedback_source") != "active-report":
+        raise ValueError("control trace must use active-report feedback")
+    if tuple(payload.get("active_joint_names", ())) != _ARM_JOINT_NAMES:
+        raise ValueError("control trace must explicitly order all six arm joints")
+    freshness = payload.get("feedback_freshness")
+    if not isinstance(freshness, Mapping):
+        raise TypeError("feedback_freshness must be a mapping")
+    if freshness.get("control_admitted") is not True:
+        raise ValueError("Type-24 feedback was not admitted for control")
+    if freshness.get("host_receive_sequence_and_age_verified") is not True:
+        raise ValueError("host receive sequence and age were not verified")
+    maximum_age = _finite_non_negative(
+        freshness.get("maximum_receive_age_sec"),
+        name="maximum_receive_age_sec",
+    )
+    if maximum_age == 0.0:
+        raise ValueError("maximum_receive_age_sec must be positive")
+    samples = payload.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("control trace requires a non-empty samples list")
+    identity = {
+        "config_sha256": _sha256_identity(
+            payload.get("config_sha256"), name="config_sha256"
+        ),
+        "urdf_sha256": _sha256_identity(
+            payload.get("urdf_sha256"), name="urdf_sha256"
+        ),
+    }
+
+    previous_feedback_time: float | None = None
+    previous_control_sequence: int | None = None
+    previous_dispatch_sequence: int | None = None
+    previous_status_sequences: dict[str, int] = {}
+    feedback_intervals: list[float] = []
+    receive_ages: list[float] = []
+    feedback_to_dispatch: list[float] = []
+    unobserved_status_counts = {name: 0 for name in _ARM_JOINT_NAMES}
+    for sample_index, row in enumerate(samples):
+        if not isinstance(row, Mapping):
+            raise TypeError(f"sample {sample_index} must be a mapping")
+        control_sequence = row.get("sequence")
+        if (
+            isinstance(control_sequence, bool)
+            or not isinstance(control_sequence, int)
+            or control_sequence <= 0
+        ):
+            raise ValueError(f"sample {sample_index}: invalid control sequence")
+        if (
+            previous_control_sequence is not None
+            and control_sequence <= previous_control_sequence
+        ):
+            raise ValueError(f"sample {sample_index}: control sequence did not advance")
+        previous_control_sequence = control_sequence
+        for field in ("qpos_rad", "conditioned_tau_nm", "dispatch_qref_rad"):
+            _six_finite(row.get(field, ()), name=f"sample {sample_index}.{field}")
+        feedback_time = _finite_non_negative(
+            row.get("feedback_timestamp_sec"),
+            name=f"sample {sample_index}.feedback_timestamp_sec",
+        )
+        if previous_feedback_time is not None:
+            if feedback_time <= previous_feedback_time:
+                raise ValueError(f"sample {sample_index}: feedback time did not advance")
+            feedback_intervals.append(feedback_time - previous_feedback_time)
+        previous_feedback_time = feedback_time
+
+        observation = row.get("host_observation")
+        if not isinstance(observation, Mapping):
+            raise TypeError(f"sample {sample_index}.host_observation must be a mapping")
+        if observation.get("schema") != "b601.type24-host-observation.v1":
+            raise ValueError(f"sample {sample_index}: unsupported host observation schema")
+        if observation.get("host_receive_freshness_verified") is not True:
+            raise ValueError(f"sample {sample_index}: host receive freshness is unverified")
+        if observation.get("device_source_timestamp_verified") is not False:
+            raise ValueError(f"sample {sample_index}: invalid device timestamp claim")
+        joints = observation.get("joints")
+        if not isinstance(joints, (list, tuple)) or tuple(
+            joint.get("name") if isinstance(joint, Mapping) else None
+            for joint in joints
+        ) != _ARM_JOINT_NAMES:
+            raise ValueError(f"sample {sample_index}: host observation joint order is invalid")
+        for joint in joints:
+            assert isinstance(joint, Mapping)
+            name = str(joint["name"])
+            sequence = joint.get("status_sequence")
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+                raise ValueError(f"sample {sample_index}.{name}: invalid status_sequence")
+            previous_sequence = previous_status_sequences.get(name)
+            if previous_sequence is not None:
+                if sequence <= previous_sequence:
+                    raise ValueError(
+                        f"sample {sample_index}.{name}: status_sequence did not advance"
+                    )
+                unobserved_status_counts[name] += sequence - previous_sequence - 1
+            previous_status_sequences[name] = sequence
+            age = _finite_non_negative(
+                joint.get("receive_age_sec"),
+                name=f"sample {sample_index}.{name}.receive_age_sec",
+            )
+            if age > maximum_age:
+                raise ValueError(
+                    f"sample {sample_index}.{name}: receive_age_sec exceeds admitted maximum"
+                )
+            receive_ages.append(age)
+
+        receipt = row.get("dispatch_receipt")
+        if not isinstance(receipt, Mapping):
+            raise TypeError(f"sample {sample_index}.dispatch_receipt must be a mapping")
+        if receipt.get("accepted") is not True:
+            raise ValueError(f"sample {sample_index}: dispatch was not accepted")
+        if tuple(receipt.get("requested_joint_names", ())) != _ARM_JOINT_NAMES:
+            raise ValueError(f"sample {sample_index}: dispatch request was not all-arm")
+        if tuple(receipt.get("sent_joint_names", ())) != _ARM_JOINT_NAMES:
+            raise ValueError(f"sample {sample_index}: dispatch send was not complete")
+        if receipt.get("failed_joint_names") or receipt.get("errors"):
+            raise ValueError(f"sample {sample_index}: dispatch receipt contains failures")
+        if receipt.get("source_sequence") != control_sequence:
+            raise ValueError(f"sample {sample_index}: dispatch source sequence mismatch")
+        dispatch_sequence = receipt.get("sequence")
+        if (
+            isinstance(dispatch_sequence, bool)
+            or not isinstance(dispatch_sequence, int)
+            or dispatch_sequence <= 0
+        ):
+            raise ValueError(f"sample {sample_index}: invalid dispatch sequence")
+        if (
+            previous_dispatch_sequence is not None
+            and dispatch_sequence <= previous_dispatch_sequence
+        ):
+            raise ValueError(f"sample {sample_index}: dispatch sequence did not advance")
+        previous_dispatch_sequence = dispatch_sequence
+        for field in ("mode", "frame_id"):
+            if not isinstance(receipt.get(field), str) or not receipt[field].strip():
+                raise ValueError(f"sample {sample_index}: dispatch {field} is empty")
+        requested_at = _finite_non_negative(
+            receipt.get("requested_at_sec"),
+            name=f"sample {sample_index}.dispatch.requested_at_sec",
+        )
+        completed_at = _finite_non_negative(
+            receipt.get("completed_at_sec"),
+            name=f"sample {sample_index}.dispatch.completed_at_sec",
+        )
+        if not feedback_time <= requested_at <= completed_at:
+            raise ValueError(f"sample {sample_index}: invalid feedback/dispatch time order")
+        feedback_to_dispatch.append(completed_at - feedback_time)
+
+    return {
+        "status": "HOST_TIMING_REPLAY_READY",
+        "sample_count": len(samples),
+        "joint_names": _ARM_JOINT_NAMES,
+        "declared_identity": identity,
+        "identity_verified_against_assets": False,
+        "source_termination_status": payload.get("status"),
+        "feedback_interval_sec": _timing_summary(feedback_intervals),
+        "receive_age_sec": _timing_summary(receive_ages),
+        "feedback_to_dispatch_sec": _timing_summary(feedback_to_dispatch),
+        "unobserved_status_sequence_count": unobserved_status_counts,
+        "host_timing_replay_ready": True,
+        "device_acquisition_timing_verified": False,
+        "quantitative_plant_identification_ready": False,
+        "blockers": (
+            "device_acquisition_timestamp_unavailable",
+            "load_contact_operator_input_and_temperature_are_not_qualified",
+            "fit_and_held_out_episode_split_not_established",
+        ),
+        "hardware_safety_claim": False,
+    }
+
 
 def audit_b601_probe_trace(payload: Mapping[str, object]) -> dict[str, object]:
     """Audit the existing low-gain probe JSON, without replaying or fitting it.

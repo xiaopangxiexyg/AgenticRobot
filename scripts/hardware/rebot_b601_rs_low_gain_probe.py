@@ -2808,6 +2808,33 @@ def _command_receipt_payload(
     }
 
 
+def _host_observation_payload(state: object) -> dict[str, object]:
+    """Serialize the already-admitted host observation without another read.
+
+    This records MotorBridge's per-motor Type-24 sequence and userspace receive
+    age from the exact state used by the controller.  It does not add CAN
+    traffic and must not be described as a device acquisition timestamp.
+    """
+
+    joints = tuple(getattr(state, "joints", ()))
+    return {
+        "schema": "b601.type24-host-observation.v1",
+        "host_receive_freshness_verified": bool(
+            getattr(state, "host_receive_freshness_verified", False)
+        ),
+        "device_source_timestamp_verified": False,
+        "joints": tuple(
+            {
+                "name": getattr(joint, "name", None),
+                "status_sequence": getattr(joint, "status_sequence", None),
+                "receive_age_sec": getattr(joint, "receive_age_sec", None),
+                "observed_at_sec": getattr(joint, "observed_at_sec", None),
+            }
+            for joint in joints
+        ),
+    }
+
+
 def _backend_feedback_diagnostics(state: object) -> tuple[dict[str, object], ...]:
     """Serialize the backend's per-joint admission evidence for a bad frame."""
 
@@ -8056,6 +8083,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "pose_impedance": pose_audit,
                     "freshness_verified": state.freshness_verified,
                     "freshness_semantics": state.freshness_semantics,
+                    "host_observation": (
+                        _host_observation_payload(state)
+                        if active_report_gate is not None
+                        else None
+                    ),
+                    "dispatch_receipt": _command_receipt_payload(receipt),
                     "vendor_status": vendor_status_cache_diagnostics(state),
                 }
             )
