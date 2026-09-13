@@ -4,20 +4,11 @@ These adapters terminate at an existing typed source-emission seam.  They do
 not own an Arbiter, action queue, dispatcher, device, or episode lifecycle.
 """
 
-from .synthetic_human import (
-    SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1,
-    SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1,
-    SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1,
-    SyntheticHumanPoseSource,
-    SyntheticHumanPoseSourceSpec,
-    SyntheticHumanQposSource,
-    SyntheticHumanQposSourceSpec,
-)
 from .human import (
     HUMAN_TAKEOVER_READINESS_CANDIDATE_HASH_DOMAIN_V1,
     HumanObservationCutAdmissionCore,
-    HumanProposalAdmissionCore,
     HumanPoseSourceContract,
+    HumanProposalAdmissionCore,
     HumanTakeoverReadinessCandidate,
     HumanTakeoverReadinessProvider,
     PassiveHumanCommandEmissionIngress,
@@ -32,11 +23,48 @@ from .human_component_input import (
     adapt_human_emission_to_component_action,
     adapt_human_emission_to_composition_input,
 )
+from .policy import (
+    POLICY_COMPOSITION_INPUT_BINDING_HASH_DOMAIN_V1,
+    PolicyCompositionInputAdapter,
+    PolicyCompositionInputBinding,
+    SyncPolicyEmissionBinding,
+)
+from .rebot_b601_pose import (
+    B601_READONLY_FEEDBACK_FRAME_V1,
+    B601_READONLY_POSE_ACTION_SPEC_V1,
+    B601_READONLY_POSE_CLOCK_DOMAIN_V1,
+    B601_READONLY_POSE_FRAME_CONTRACT_V1,
+    B601_READONLY_POSE_SOURCE_CONTRACT_ID_V1,
+    B601_READONLY_POSE_SOURCE_HASH_DOMAIN_V1,
+    B601_READONLY_POSE_UNITS_V1,
+    B601ReadOnlyPoseSource,
+    B601ReadOnlyPoseSourceSpec,
+    B601ReadOnlyPoseStep,
+)
+from .replay import ReplaySourceObserverBinding
+from .replay_gui import (
+    ReplayGuiStationConsumer,
+    ReplayGuiStationConsumerStatus,
+)
+from .rtc_policy import (
+    RtcPolicyEmissionBinding,
+    RtcPolicyStationConsumer,
+    RtcPolicyStationConsumerStatus,
+)
+from .synthetic_human import (
+    SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1,
+    SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1,
+    SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1,
+    SyntheticHumanPoseSource,
+    SyntheticHumanPoseSourceSpec,
+    SyntheticHumanQposSource,
+    SyntheticHumanQposSourceSpec,
+)
 from .teleop_pose import (
-    AttachablePassiveTeleopComponentSource,
     PASSIVE_TELEOP_COMPONENT_SOURCE_CONTRACT_ID_V1,
     PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1,
     PASSIVE_TELEOP_POSE_SOURCE_CONTRACT_ID_V1,
+    AttachablePassiveTeleopComponentSource,
     PassiveTeleopComponentBindingReceipt,
     PassiveTeleopComponentClockBridge,
     PassiveTeleopComponentSessionSource,
@@ -50,46 +78,37 @@ from .teleop_pose import (
     build_passive_teleop_component_session_source,
     build_passive_teleop_pose_session_source,
 )
-from .replay_gui import (
-    ReplayGuiStationConsumer,
-    ReplayGuiStationConsumerStatus,
-)
-from .replay import ReplaySourceObserverBinding
-from .policy import (
-    POLICY_COMPOSITION_INPUT_BINDING_HASH_DOMAIN_V1,
-    PolicyCompositionInputAdapter,
-    PolicyCompositionInputBinding,
-    SyncPolicyEmissionBinding,
-)
-from .rtc_policy import (
-    RtcPolicyEmissionBinding,
-    RtcPolicyStationConsumer,
-    RtcPolicyStationConsumerStatus,
-)
 
 __all__ = [
-    "SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1",
-    "SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
-    "SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1",
+    "B601_READONLY_FEEDBACK_FRAME_V1",
+    "B601_READONLY_POSE_ACTION_SPEC_V1",
+    "B601_READONLY_POSE_CLOCK_DOMAIN_V1",
+    "B601_READONLY_POSE_FRAME_CONTRACT_V1",
+    "B601_READONLY_POSE_SOURCE_CONTRACT_ID_V1",
+    "B601_READONLY_POSE_SOURCE_HASH_DOMAIN_V1",
+    "B601_READONLY_POSE_UNITS_V1",
     "HUMAN_TAKEOVER_READINESS_CANDIDATE_HASH_DOMAIN_V1",
     "PASSIVE_TELEOP_COMPONENT_SOURCE_CONTRACT_ID_V1",
     "PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
     "PASSIVE_TELEOP_POSE_SOURCE_CONTRACT_ID_V1",
-    "HumanPoseSourceContract",
+    "POLICY_COMPOSITION_INPUT_BINDING_HASH_DOMAIN_V1",
+    "SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
+    "SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1",
+    "SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1",
+    "AttachablePassiveTeleopComponentSource",
+    "B601ReadOnlyPoseSource",
+    "B601ReadOnlyPoseSourceSpec",
+    "B601ReadOnlyPoseStep",
+    "HumanComponentActionAdaptation",
+    "HumanCompositionInputAdaptation",
     "HumanObservationCutAdmissionCore",
+    "HumanPoseSourceContract",
     "HumanProposalAdmissionCore",
     "HumanTakeoverReadinessCandidate",
     "HumanTakeoverReadinessProvider",
-    "HumanComponentActionAdaptation",
-    "HumanCompositionInputAdaptation",
     "PassiveHumanCommandEmissionIngress",
     "PassiveHumanCommandEmissionIngressStatus",
     "PassiveHumanCommandObserverFanout",
-    "admit_human_command_emission",
-    "admit_human_observation_cut",
-    "adapt_human_emission_to_component_action",
-    "adapt_human_emission_to_composition_input",
-    "AttachablePassiveTeleopComponentSource",
     "PassiveTeleopComponentBindingReceipt",
     "PassiveTeleopComponentClockBridge",
     "PassiveTeleopComponentSessionSource",
@@ -100,20 +119,23 @@ __all__ = [
     "PassiveTeleopPoseSessionSource",
     "PassiveTeleopPoseSourceSpec",
     "PassiveTeleopPoseStep",
-    "build_passive_teleop_component_session_source",
-    "build_passive_teleop_pose_session_source",
+    "PolicyCompositionInputAdapter",
+    "PolicyCompositionInputBinding",
     "ReplayGuiStationConsumer",
     "ReplayGuiStationConsumerStatus",
     "ReplaySourceObserverBinding",
-    "POLICY_COMPOSITION_INPUT_BINDING_HASH_DOMAIN_V1",
-    "PolicyCompositionInputAdapter",
-    "PolicyCompositionInputBinding",
-    "SyncPolicyEmissionBinding",
+    "RtcPolicyEmissionBinding",
     "RtcPolicyStationConsumer",
     "RtcPolicyStationConsumerStatus",
-    "RtcPolicyEmissionBinding",
-    "SyntheticHumanQposSource",
-    "SyntheticHumanQposSourceSpec",
+    "SyncPolicyEmissionBinding",
     "SyntheticHumanPoseSource",
     "SyntheticHumanPoseSourceSpec",
+    "SyntheticHumanQposSource",
+    "SyntheticHumanQposSourceSpec",
+    "adapt_human_emission_to_component_action",
+    "adapt_human_emission_to_composition_input",
+    "admit_human_command_emission",
+    "admit_human_observation_cut",
+    "build_passive_teleop_component_session_source",
+    "build_passive_teleop_pose_session_source",
 ]
