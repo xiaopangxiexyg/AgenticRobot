@@ -14,6 +14,7 @@ from hardware.rebot_b601_rs import (
     evaluate_active_report_capture,
 )
 from hardware.rebot_b601_rs.active_report import (
+    B601ActiveReportControlGate,
     evaluate_decoded_active_report_observations,
 )
 from scripts.hardware import rebot_b601_rs_active_report_probe as active_probe
@@ -93,6 +94,58 @@ def _state(
         ),
         host_receive_freshness_verified=host_fresh,
     )
+
+
+def test_control_gate_requires_two_complete_advancing_type24_snapshots() -> None:
+    gate = B601ActiveReportControlGate(
+        tuple(f"joint{index}" for index in range(1, 7)),
+        maximum_receive_age_sec=0.05,
+    )
+
+    assert gate.observe(_state(10)) is False
+    assert gate.observe(_state(11)) is True
+    assert gate.last_status_sequences == {
+        f"joint{index}": 11 for index in range(1, 7)
+    }
+
+
+def test_control_gate_rejects_static_sequence_without_rebasing() -> None:
+    gate = B601ActiveReportControlGate(
+        tuple(f"joint{index}" for index in range(1, 7)),
+        maximum_receive_age_sec=0.05,
+    )
+    gate.observe(_state(10))
+
+    with pytest.raises(ValueError, match="status_sequence did not advance"):
+        gate.observe(_state(10))
+
+    assert gate.last_status_sequences["joint1"] == 10
+    assert gate.observe(_state(11)) is True
+
+
+def test_control_gate_rejects_wrong_source_and_over_age_atomically() -> None:
+    gate = B601ActiveReportControlGate(
+        tuple(f"joint{index}" for index in range(1, 7)),
+        maximum_receive_age_sec=0.05,
+    )
+    gate.observe(_state(10))
+    wrong_source = _state(11)
+    object.__setattr__(
+        wrong_source.joints[2],
+        "position_source",
+        "robstride_mech_pos_parameter_host_id",
+    )
+
+    with pytest.raises(ValueError, match="position source"):
+        gate.observe(wrong_source)
+    wrong_type = _state(11)
+    object.__setattr__(wrong_type.joints[2], "arbitration_id", 0x020003FD)
+    with pytest.raises(ValueError, match="not Type-24"):
+        gate.observe(wrong_type)
+    with pytest.raises(ValueError, match="receive_age_sec"):
+        gate.observe(_state(11, receive_age_sec=0.051))
+
+    assert gate.last_status_sequences["joint3"] == 10
 
 
 def test_active_report_acceptance_requires_every_selected_device() -> None:

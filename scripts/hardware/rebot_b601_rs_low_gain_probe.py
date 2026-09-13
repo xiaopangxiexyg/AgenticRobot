@@ -38,8 +38,12 @@ paths require verified volatile driver torque limits on all six joints.  The
 host still applies its final absolute torque and slew-rate bounds to the
 gravity and task-space wrench it owns before calling
 :meth:`B601RSBackend.send_mit`.
-Feedback uses the existing explicit ``mechPos`` request path; its source
-freshness remains unverified by MotorBridge 0.4.9 and is reported as such.
+Feedback defaults to the existing explicit ``mechPos`` request path.  The
+optional ``active-report`` source consumes MotorBridge's decoded Type-24 cache
+and admits a cycle only when all six host-receive ages are bounded and all six
+per-motor sequences advance atomically.  RobStride still provides no device
+acquisition timestamp, so this is a wired-host freshness contract rather than
+a source-clock claim.
 
 ``gravity-calibration`` hands the startup lock to a normal draggable
 gravity/damping controller.  Once ACTIVE, the operator may move joint1..joint6,
@@ -152,12 +156,14 @@ from hardware.rebot_b601_rs import (
     B601CommandReceipt,
     B601DriverTorqueLimitReceipt,
     B601HardwareError,
+    B601HardwareState,
     B601ModeReceipt,
     B601RSBackend,
     B601RSBackendConfig,
     FrequencyLedger,
     evaluate_frequency_target,
 )
+from hardware.rebot_b601_rs.active_report import B601ActiveReportControlGate
 from robot_motion.rebot_b601_rs import (
     B601MitControlProfile,
     B601MitReference,
@@ -3477,6 +3483,34 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
+    feedback_source = getattr(args, "feedback_source", "parameter")
+    if feedback_source not in ("parameter", "active-report"):
+        raise LowGainProbeError(f"unknown feedback source: {feedback_source}")
+    if feedback_source == "active-report":
+        if args.mode in (
+            "gravity-calibration-fit",
+            "feedback-stability",
+            "driver-torque-limit-roundtrip",
+        ):
+            raise LowGainProbeError(
+                f"{args.mode} does not support active-report control feedback"
+            )
+        if not getattr(args, "allow_active_report", False):
+            raise LowGainProbeError(
+                "active-report feedback requires --allow-active-report"
+            )
+        if not getattr(args, "auto_disable_active_report", False):
+            raise LowGainProbeError(
+                "active-report feedback requires --auto-disable-active-report"
+            )
+    elif getattr(args, "allow_active_report", False) or getattr(
+        args,
+        "auto_disable_active_report",
+        False,
+    ):
+        raise LowGainProbeError(
+            "active-report acknowledgements require --feedback-source active-report"
+        )
     if args.mode == "gravity-calibration-fit":
         if getattr(args, "allow_motion", False):
             raise LowGainProbeError(
@@ -5753,6 +5787,7 @@ def _run_latched_fault_hold(
     gravity_joint_bias_nm: Sequence[float] = _ZERO_SIX,
     gravity_coulomb_friction_nm: Sequence[float] = _ZERO_SIX,
     gravity_coulomb_velocity_threshold_rad_s: float = 0.0,
+    feedback_reader: Callable[[], B601HardwareState] | None = None,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -6235,7 +6270,11 @@ def _run_latched_fault_hold(
         cycle_failures: tuple[str, ...] = ()
         baseline_sample = False
         try:
-            state = backend.poll_feedback(request_feedback=True)
+            state = (
+                backend.poll_feedback(request_feedback=True)
+                if feedback_reader is None
+                else feedback_reader()
+            )
             observed_at = time.monotonic()
             if (
                 not state.valid
@@ -6431,6 +6470,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
     _validate_cli(args)
+    feedback_source = getattr(args, "feedback_source", "parameter")
     driver_kd_arg = getattr(args, "driver_kd", None)
     driver_kd_nm_s_per_rad = (
         _DEFAULT_DRIVER_KD
@@ -6535,6 +6575,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     config = B601RSBackendConfig.from_rs_yaml(
         config_path,
         allow_motion=True,
+        allow_active_reporting=(feedback_source == "active-report"),
         position_limits_rad=position_limits,
         feedback_position_limits_rad=feedback_position_limits,
     )
@@ -6611,6 +6652,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     mode_receipt: B601ModeReceipt | None = None
     enable_receipt: B601ModeReceipt | None = None
     cleanup_receipt: B601ModeReceipt | None = None
+    active_report_enable_receipt = None
+    active_report_disable_receipt = None
+    active_report_enable_attempted = False
     driver_limit_apply_receipt: B601DriverTorqueLimitReceipt | None = None
     driver_limit_restore_receipt: B601DriverTorqueLimitReceipt | None = None
     cleanup_errors: list[str] = []
@@ -6694,6 +6738,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     last_control_elapsed_sec = 0.0
     connected = False
     enabled = False
+    active_report_gate = (
+        B601ActiveReportControlGate(
+            _ALL_JOINTS,
+            maximum_receive_age_sec=config.feedback_timeout_sec,
+        )
+        if feedback_source == "active-report"
+        else None
+    )
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigusr1 = signal.getsignal(signal.SIGUSR1)
 
@@ -6702,6 +6754,43 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             return
         startup_state_history.append(state)
         _operator_notice(f"[B601] STARTUP {state}")
+
+    def poll_control_feedback() -> tuple[B601HardwareState, bool]:
+        """Read one configured feedback source and enforce its control gate."""
+
+        if active_report_gate is None:
+            return backend.poll_feedback(request_feedback=True), True
+        state = backend.poll_feedback(require_host_freshness=True)
+        try:
+            advanced = active_report_gate.observe(state)
+        except (TypeError, ValueError) as exc:
+            raise LowGainProbeError(
+                f"active-report feedback rejected: {exc}"
+            ) from exc
+        return state, advanced
+
+    def read_admitted_control_feedback() -> B601HardwareState:
+        if active_report_gate is None:
+            state, _advanced = poll_control_feedback()
+            return state
+        deadline = time.monotonic() + config.feedback_timeout_sec
+        last_error: LowGainProbeError | None = None
+        while time.monotonic() <= deadline:
+            try:
+                state, advanced = poll_control_feedback()
+            except LowGainProbeError as exc:
+                last_error = exc
+            else:
+                if advanced:
+                    return state
+                last_error = LowGainProbeError(
+                    "active-report feedback established a baseline but did not yet advance"
+                )
+            time.sleep(0.001)
+        raise LowGainProbeError(
+            "no advancing complete Type-24 snapshot arrived within "
+            f"{config.feedback_timeout_sec:.6f}s: {last_error}"
+        )
 
     signal.signal(
         signal.SIGINT,
@@ -6722,9 +6811,28 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             operator_keys = OperatorKeyReader()
         backend.connect()
         connected = True
+        if active_report_gate is not None:
+            _operator_notice(
+                "[B601] TYPE-24 ENABLE: waiting for two complete advancing "
+                "six-joint snapshots before motor enable."
+            )
+            active_report_enable_attempted = True
+            active_report_enable_receipt = backend.set_active_reporting(
+                True,
+                joint_names=_ALL_JOINTS,
+            )
+            if not active_report_enable_receipt.completed:
+                raise LowGainProbeError(
+                    "active-report enable failed: "
+                    + (
+                        "; ".join(active_report_enable_receipt.errors)
+                        or "incomplete receipt"
+                    )
+                )
         warmup_deadline = time.monotonic() + args.warmup_sec
         warmup_state = None
         warmup_observed_at_sec: float | None = None
+        warmup_feedback_advanced = False
         while time.monotonic() < warmup_deadline:
             if stop["full_disable_requested"]:
                 raise LowGainProbeError(
@@ -6732,10 +6840,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 )
             if stop["requested"]:
                 raise LowGainProbeError("operator interrupt before motor enable")
-            warmup_state = backend.poll_feedback(request_feedback=True)
+            try:
+                warmup_state, warmup_feedback_advanced = poll_control_feedback()
+            except LowGainProbeError:
+                time.sleep(0.01)
+                continue
             warmup_observed_at_sec = time.monotonic()
             if (
-                warmup_state.valid
+                warmup_feedback_advanced
+                and warmup_state.valid
                 and not getattr(warmup_state, "stale", False)
                 and warmup_state.positions_rad is not None
             ):
@@ -6743,6 +6856,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             time.sleep(0.01)
         if (
             warmup_state is None
+            or not warmup_feedback_advanced
             or not warmup_state.valid
             or getattr(warmup_state, "stale", False)
             or warmup_state.positions_rad is None
@@ -6835,7 +6949,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             raise LowGainProbeError(
                 "operator interrupt immediately after motor enable"
             )
-        arming_state = backend.poll_feedback(request_feedback=True)
+        arming_state = read_admitted_control_feedback()
         arming_observed_at_sec = time.monotonic()
         if (
             not arming_state.valid
@@ -7000,7 +7114,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             if stop["requested"]:
                 stop_reason = "operator_interrupt during arming settle"
                 break
-            settle_state = backend.poll_feedback(request_feedback=True)
+            settle_state = read_admitted_control_feedback()
             settle_observed_at_sec = time.monotonic()
             if (
                 not settle_state.valid
@@ -7199,7 +7313,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             now = time.monotonic()
             if now < next_deadline:
                 time.sleep(next_deadline - now)
-            state = backend.poll_feedback(request_feedback=True)
+            state = read_admitted_control_feedback()
             observed_at_sec = time.monotonic()
             ledger.mark("feedback", state.receive_timestamp_sec)
             if not state.valid or state.positions_rad is None:
@@ -8245,6 +8359,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             gravity_coulomb_velocity_threshold_rad_s=(
                                 gravity_coulomb_velocity_threshold_rad_s
                             ),
+                            feedback_reader=read_admitted_control_feedback,
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
@@ -8301,6 +8416,23 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             )
                 except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
                     cleanup_errors.append(f"restore driver torque limit: {exc}")
+        if connected and active_report_enable_attempted:
+            try:
+                active_report_disable_receipt = backend.set_active_reporting(
+                    False,
+                    joint_names=_ALL_JOINTS,
+                )
+                if not active_report_disable_receipt.completed:
+                    cleanup_errors.extend(
+                        f"disable active reporting: {error}"
+                        for error in active_report_disable_receipt.errors
+                    )
+                    if not active_report_disable_receipt.errors:
+                        cleanup_errors.append(
+                            "disable active reporting incomplete without vendor error"
+                        )
+            except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                cleanup_errors.append(f"disable active reporting: {exc}")
         try:
             backend.close()
         except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
@@ -8341,10 +8473,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             and driver_limit_restore_receipt.completed
         )
     )
+    active_report_cleanup_ok = (
+        active_report_gate is None
+        or (
+            active_report_disable_receipt is not None
+            and active_report_disable_receipt.completed
+        )
+    )
     cleanup_ok = (
         cleanup_receipt is not None
         and cleanup_receipt.completed
         and driver_limit_cleanup_ok
+        and active_report_cleanup_ok
         and not cleanup_errors
     )
     calibration_acceptance = evaluate_gravity_calibration_capture(
@@ -8517,6 +8657,30 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             ),
         },
         "transport": "motorbridge_wired_local",
+        "feedback_source": feedback_source,
+        "feedback_freshness": {
+            "control_admitted": active_report_gate is not None,
+            "host_receive_sequence_and_age_verified": (
+                active_report_gate is not None
+            ),
+            "device_source_timestamp_verified": False,
+            "maximum_receive_age_sec": (
+                config.feedback_timeout_sec
+                if active_report_gate is not None
+                else None
+            ),
+            "last_status_sequences": (
+                active_report_gate.last_status_sequences
+                if active_report_gate is not None
+                else {}
+            ),
+            "active_report_enable_receipt": _mode_receipt_payload(
+                active_report_enable_receipt
+            ),
+            "active_report_disable_receipt": _mode_receipt_payload(
+                active_report_disable_receipt
+            ),
+        },
         "joint_names": _ALL_JOINTS,
         "active_joint_names": active_joint_names,
         "support_joint_names": support_joint_names,
@@ -9104,6 +9268,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional per-window stability position-span criterion for fitting",
     )
     parser.add_argument("--warmup-sec", type=float, default=_DEFAULT_WARMUP_SEC)
+    parser.add_argument(
+        "--feedback-source",
+        choices=("parameter", "active-report"),
+        default="parameter",
+        help=(
+            "parameter keeps the legacy explicit mechPos reads; active-report "
+            "requires an all-six advancing host-fresh Type-24 snapshot per cycle"
+        ),
+    )
+    parser.add_argument(
+        "--allow-active-report",
+        action="store_true",
+        help="explicitly authorize the RobStride Type-24 reporting state change",
+    )
+    parser.add_argument(
+        "--auto-disable-active-report",
+        action="store_true",
+        help="require and audit Type-24 disable during final cleanup",
+    )
     parser.add_argument(
         "--freeze-sec",
         type=float,

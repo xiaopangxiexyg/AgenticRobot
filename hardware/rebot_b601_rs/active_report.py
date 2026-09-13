@@ -17,9 +17,126 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .backend import B601HardwareState, B601JointConfig
+
+
+@dataclass
+class B601ActiveReportControlGate:
+    """Admit complete, advancing Type-24 snapshots to a control loop.
+
+    MotorBridge timestamps active reports on host receipt; RobStride does not
+    provide a source acquisition timestamp in this frame.  This gate therefore
+    makes the narrower claim needed by the wired local commissioning loop: all
+    selected joints must come from the decoded operation-status cache, remain
+    within the configured host-receive age, and advance their individual
+    status sequence since the last admitted complete snapshot.
+
+    The first complete snapshot establishes a baseline and is deliberately not
+    admitted.  State is updated atomically only after every selected joint
+    passes, so a partial or wrong-source frame can never rebase one joint.
+    """
+
+    selected_joint_names: tuple[str, ...]
+    maximum_receive_age_sec: float
+    _last_status_sequences: dict[str, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        selected = tuple(str(name) for name in self.selected_joint_names)
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("selected_joint_names must be non-empty and unique")
+        object.__setattr__(self, "selected_joint_names", selected)
+        object.__setattr__(
+            self,
+            "maximum_receive_age_sec",
+            _positive(
+                self.maximum_receive_age_sec,
+                name="maximum_receive_age_sec",
+            ),
+        )
+
+    @property
+    def baseline_established(self) -> bool:
+        return bool(self._last_status_sequences)
+
+    @property
+    def last_status_sequences(self) -> Mapping[str, int]:
+        return dict(self._last_status_sequences)
+
+    def observe(self, state: B601HardwareState) -> bool:
+        """Validate ``state`` and return whether it advances a prior baseline.
+
+        ``False`` is returned only for the first valid complete observation.
+        Invalid, stale, static-sequence, mixed-source, or over-age observations
+        raise ``ValueError`` and leave the previous baseline unchanged.
+        """
+
+        if not isinstance(state, B601HardwareState):
+            raise TypeError("state must be a B601HardwareState")
+        if not state.valid or state.stale:
+            raise ValueError(
+                "active-report control snapshot is not complete and valid: "
+                f"{state.fault_reason or 'unknown fault'}"
+            )
+        if not state.host_receive_freshness_verified:
+            raise ValueError(
+                "active-report control snapshot lacks verified host receive freshness"
+            )
+        by_name = {joint.name: joint for joint in state.joints}
+        candidate: dict[str, int] = {}
+        for name in self.selected_joint_names:
+            joint = by_name.get(name)
+            if joint is None:
+                raise ValueError(f"active-report control snapshot is missing {name}")
+            if (
+                not joint.valid
+                or joint.stale
+                or not joint.host_receive_freshness_verified
+            ):
+                raise ValueError(f"{name} is not a valid host-fresh observation")
+            if joint.position_source != "robstride_operation_status_cache":
+                raise ValueError(
+                    f"{name} position source is {joint.position_source!r}, not "
+                    "the decoded operation-status cache"
+                )
+            arbitration_id = joint.arbitration_id
+            communication_type = (
+                None
+                if arbitration_id is None
+                else (int(arbitration_id) >> 24) & 0x1F
+            )
+            if communication_type != 24:
+                raise ValueError(
+                    f"{name} latest status frame is communication type "
+                    f"{communication_type!r}, not Type-24 active report"
+                )
+            sequence = joint.status_sequence
+            if sequence is None:
+                raise ValueError(f"{name} status_sequence is unavailable")
+            age = joint.receive_age_sec
+            if age is None or not math.isfinite(age) or age < 0.0:
+                raise ValueError(f"{name} receive_age_sec is unavailable or invalid")
+            if age > self.maximum_receive_age_sec:
+                raise ValueError(
+                    f"{name} receive_age_sec={age:.6f} exceeds "
+                    f"maximum={self.maximum_receive_age_sec:.6f}"
+                )
+            previous = self._last_status_sequences.get(name)
+            if previous is not None and sequence <= previous:
+                raise ValueError(
+                    f"{name} status_sequence did not advance: "
+                    f"previous={previous}, current={sequence}"
+                )
+            candidate[name] = sequence
+
+        had_baseline = self.baseline_established
+        self._last_status_sequences = candidate
+        return had_baseline
 
 
 def _positive(value: object, *, name: str) -> float:
