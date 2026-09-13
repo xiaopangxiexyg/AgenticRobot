@@ -672,6 +672,69 @@ def test_planner_bounded_centering_recovers_offset_grasp_without_changing_depth(
     planner.close()
 
 
+def test_planner_normalizes_float32_model_rotation_for_strict_frame_contract(
+    tmp_path: Path,
+) -> None:
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.0
+    mask = depth > 0.0
+    angle = np.float32(np.deg2rad(10.0))
+    cosine = np.float32(np.cos(angle))
+    sine = np.float32(np.sin(angle))
+    base_from_model_base = np.eye(4, dtype=np.float64)
+    base_from_model_base[:3, :3] = np.asarray(
+        (
+            (cosine, -sine, 0.0),
+            (sine, cosine, 0.0),
+            (0.0, 0.0, 1.0),
+        ),
+        dtype=np.float32,
+    )
+    base_from_model_base[2, 3] = 0.975
+    original_rotation = base_from_model_base[:3, :3].copy()
+    assert np.max(
+        np.abs(original_rotation.T @ original_rotation - np.eye(3))
+    ) == pytest.approx(4.555837662678641e-08)
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(mask),
+        client=_PlannerClient(
+            base_from_model_base[None], np.asarray((0.9,), dtype=np.float64)
+        ),
+    )
+    planner.start()
+
+    result = planner.plan(
+        Image.new("RGB", (20, 20)),
+        depth,
+        pixel_uv=(10, 10),
+        intrinsics={
+            "width": 20,
+            "height": 20,
+            "fx": 100.0,
+            "fy": 100.0,
+            "cx": 10.0,
+            "cy": 10.0,
+        },
+        base_from_camera=np.eye(4),
+        max_candidates=1,
+    )
+
+    candidate = result.candidates[0]
+    for values in (candidate.camera_from_tcp, candidate.base_from_tcp):
+        pose = np.asarray(values, dtype=np.float64).reshape(4, 4)
+        rotation = pose[:3, :3]
+        np.testing.assert_allclose(
+            rotation.T @ rotation,
+            np.eye(3),
+            atol=1e-9,
+            rtol=0.0,
+        )
+        assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-9)
+        np.testing.assert_allclose(rotation, original_rotation, atol=3e-8, rtol=0.0)
+    planner.close()
+
+
 def test_planner_fails_closed_when_model_pose_misses_clicked_object(
     tmp_path: Path,
 ) -> None:

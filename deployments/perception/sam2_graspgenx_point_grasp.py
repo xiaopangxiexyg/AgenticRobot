@@ -102,6 +102,43 @@ def _rigid_matrix(value: object, *, field_name: str) -> np.ndarray:
     return matrix
 
 
+def _strict_rigid_matrix(value: object, *, field_name: str) -> np.ndarray:
+    """Validate a pose against the downstream CoordinateFrameGraph contract."""
+
+    matrix = _rigid_matrix(value, field_name=field_name)
+    rotation = matrix[:3, :3]
+    if not np.allclose(
+        rotation.T @ rotation,
+        np.eye(3),
+        atol=1e-9,
+        rtol=0.0,
+    ) or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-9, rtol=0.0):
+        raise ValueError(f"{field_name} rotation must satisfy the strict frame contract.")
+    return matrix
+
+
+def _normalize_graspgenx_rigid_matrix(
+    value: object,
+    *,
+    field_name: str,
+) -> np.ndarray:
+    """Project one accepted float32 model pose to its nearest proper rotation."""
+
+    matrix = _rigid_matrix(value, field_name=field_name)
+    rotation = matrix[:3, :3]
+    try:
+        left, _singular_values, right_t = np.linalg.svd(rotation)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"{field_name} rotation could not be normalized.") from exc
+    projected = left @ right_t
+    if np.linalg.det(projected) < 0.0:
+        left[:, -1] *= -1.0
+        projected = left @ right_t
+    normalized = matrix.copy()
+    normalized[:3, :3] = projected
+    return _strict_rigid_matrix(normalized, field_name=field_name)
+
+
 @dataclass(frozen=True)
 class GraspGenXPointGraspModelSpec:
     model_profile_id: str
@@ -587,6 +624,13 @@ class Sam2GraspGenXPointGraspPlanner:
         }
         for base_from_model_base, raw_score in zip(grasps, scores, strict=True):
             counts["detected"] = int(counts["detected"]) + 1
+            try:
+                base_from_model_base = _normalize_graspgenx_rigid_matrix(
+                    base_from_model_base,
+                    field_name="GraspGenX base_from_model_base",
+                )
+            except ValueError:
+                continue
             base_from_tcp = base_from_model_base @ model_base_from_tcp
             camera_from_tcp = camera_from_base @ base_from_tcp
             camera_from_tcp, base_from_tcp = select_upward_parallel_jaw_tcp_pose(
@@ -603,6 +647,14 @@ class Sam2GraspGenXPointGraspPlanner:
                 target_points_camera,
             )
             base_from_tcp = base_from_camera @ camera_from_tcp
+            camera_from_tcp = _strict_rigid_matrix(
+                camera_from_tcp,
+                field_name="GraspGenX camera_from_tcp candidate",
+            )
+            base_from_tcp = _strict_rigid_matrix(
+                base_from_tcp,
+                field_name="GraspGenX base_from_tcp candidate",
+            )
             tcp_from_camera = np.linalg.inv(camera_from_tcp)
             local = (
                 target_points_camera @ tcp_from_camera[:3, :3].T
