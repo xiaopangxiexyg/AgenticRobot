@@ -1051,6 +1051,49 @@ class MujocoPositionExecutionRig(Rig):
                 # apply the same lifecycle event a second time next tick.
                 self._hold_reason = None
 
+    def queue_gripper_close_targets(
+        self,
+        close_by_gripper: Mapping[str, float],
+    ) -> int:
+        """Queue gripper-only targets without fabricating an arm qref.
+
+        This is the narrow lower boundary used by the atomic gripper Skill.
+        It deliberately does not call :meth:`send_commands`, whose contract is
+        one atomic reference for every active arm.
+        """
+
+        with self._lock:
+            if not self._started or self._stop_event.is_set():
+                raise RuntimeError("MuJoCo position execution is not ready.")
+            if self._last_worker_error is not None:
+                raise RuntimeError(
+                    "MuJoCo position execution is faulted: "
+                    f"{self._last_worker_error}"
+                )
+            if self._gripper_execution is None:
+                raise RuntimeError("No MuJoCo gripper executor is configured.")
+            return self._gripper_execution.queue_close_targets(close_by_gripper)
+
+    def gripper_execution_snapshot(self) -> dict[str, object]:
+        """Return the current gripper transport/servo state under the rig lock."""
+
+        with self._lock:
+            if self._gripper_execution is None:
+                raise RuntimeError("No MuJoCo gripper executor is configured.")
+            return self._gripper_execution.snapshot()
+
+    def hold_gripper_motion(self, reason: str = "manual gripper hold") -> None:
+        """Freeze only gripper targets; leave arm planners untouched."""
+
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("reason must be non-empty.")
+        with self._lock:
+            if self._gripper_execution is None:
+                raise RuntimeError("No MuJoCo gripper executor is configured.")
+            if self._started:
+                self._gripper_execution.hold_targets()
+
     def accepted_qcmd_by_side(self) -> dict[str, np.ndarray]:
         with self._lock:
             return {
