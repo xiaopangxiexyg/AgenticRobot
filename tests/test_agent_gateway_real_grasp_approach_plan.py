@@ -394,6 +394,19 @@ def test_planner_rejection_surfaces_nested_dense_path_diagnostics() -> None:
                     "modified_sides": ("right",),
                     "segment_index": 0,
                     "edge_sample_index": 0,
+                    "envelope_projection_by_side": {
+                        "right": {
+                            "translation_modified": True,
+                            "rotation_modified": False,
+                            "translation_adjustment_m": 0.12014,
+                            "rotation_adjustment_deg": 0.0,
+                            "violated_translation_constraints": ["absolute:y:max"],
+                            "active_translation_constraints": ["absolute:y:max"],
+                            "raw_target_xyz_m": [-0.3324, 0.22014, 0.2012],
+                            "effective_target_xyz_m": [-0.3324, 0.1, 0.2012],
+                        }
+                    },
+                    "envelope_ingress_rejection": "path_moved_away_from_envelope",
                 },
             },
         },
@@ -403,6 +416,19 @@ def test_planner_rejection_surfaces_nested_dense_path_diagnostics() -> None:
         "modified_sides": ["right"],
         "segment_index": 0,
         "edge_sample_index": 0,
+        "envelope_projection_by_side": {
+            "right": {
+                "translation_modified": True,
+                "rotation_modified": False,
+                "translation_adjustment_m": 0.12014,
+                "rotation_adjustment_deg": 0.0,
+                "violated_translation_constraints": ["absolute:y:max"],
+                "active_translation_constraints": ["absolute:y:max"],
+                "raw_target_xyz_m": [-0.3324, 0.22014, 0.2012],
+                "effective_target_xyz_m": [-0.3324, 0.1, 0.2012],
+            }
+        },
+        "envelope_ingress_rejection": "path_moved_away_from_envelope",
     }
 
 

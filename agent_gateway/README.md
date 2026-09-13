@@ -671,6 +671,15 @@ either `path_found` or a bounded rejection reason. This inspection Route cannot
 dispatch motion or request HOLD. A successful result contains an immutable,
 session-local plan ID/hash with a maximum 30-second lifetime.
 
+The final grasp target remains strictly inside the configured envelope. If the
+fresh measured TCP of the moving arm starts outside only an absolute translation
+bound, the planner may construct a strictly-inside ingress waypoint without
+widening that envelope. This route is accepted only when the initial violation
+belongs exclusively to the moving arm, is at most 15 cm, monotonically approaches
+the envelope, passes dense URDF/FCL collision checks, and never leaves again after
+entry. Rotation violations, an out-of-envelope held arm, or any target outside
+the envelope still fail closed.
+
 Motion remains a separate decision. `motion.execute_grasp_approach_plan@1`
 accepts only the advertised component ID and that exact plan ID/hash. It cannot
 replace the target pose or trajectory, replans nothing, rechecks freshness and

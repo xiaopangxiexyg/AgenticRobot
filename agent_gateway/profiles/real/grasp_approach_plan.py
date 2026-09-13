@@ -935,6 +935,8 @@ class RealGraspApproachPlanProvider:
             "segment_index",
             "edge_sample_index",
             "exception_type",
+            "envelope_projection_by_side",
+            "envelope_ingress_rejection",
         ):
             if field_name in details:
                 value = details[field_name]

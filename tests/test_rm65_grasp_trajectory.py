@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from dataset_contracts.pose_frames import load_pose_frame_contract
+from robot_motion.joint_limits import load_joint_velocity_limit_profiles
 from robot_motion.path_planning import (
     JointConfigurationCheck,
     JointPathPlannerConfig,
@@ -64,6 +65,9 @@ from teleop_runtime.skill_deploy.rm65_ports import RM65SkillTargetBuilder
 from teleop_runtime.skill_deploy.rm65_profile import (
     ExclusiveRM65SkillDeploymentProfile,
     resolve_exclusive_rm65_skill_deployment_profile,
+)
+from teleop_runtime.skill_deploy.rm65_target_safety import (
+    ExclusiveRM65SkillTargetSafetyRuntime,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -127,6 +131,56 @@ FIELD_TRACE_TARGET_XYZQUAT = (
     0.4891019705,
 )
 
+# Read-only state and selected candidate 3 from the 2026-09-14 real-camera
+# capture.  The right TCP starts 120.14 mm beyond the task envelope's y-max;
+# direct joint interpolation bows 11-13 mm beyond x-min even though both the
+# endpoint IK and collision path are otherwise valid.
+OFFLINE_INGRESS_QPOS = {
+    "left": np.array(
+        [
+            2.1717306372880065,
+            0.7135255042676896,
+            1.947473298743486,
+            1.8227171180045607,
+            -1.4734768305542945,
+            -0.2781182236289894,
+        ]
+    ),
+    "right": np.array(
+        [
+            -2.363420178861948,
+            0.5556779157983619,
+            1.9816119612830483,
+            -1.8960210264831552,
+            -1.4296341416347016,
+            0.46656142176839466,
+        ]
+    ),
+}
+OFFLINE_INGRESS_TARGET = np.array(
+    [
+        [
+            0.10129286688712125,
+            0.574460392170871,
+            -0.8122407358318575,
+            -0.37643595830989307,
+        ],
+        [
+            -0.14104412837227742,
+            -0.7999009731187866,
+            -0.5833223697539148,
+            0.022083489151767426,
+        ],
+        [
+            -0.9848077522894972,
+            0.17364818176562513,
+            2.5051369531056684e-09,
+            0.1397863014487406,
+        ],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+)
+
 
 def _field_trace_snapshot() -> AuthoritativeRobotStateSnapshot:
     identity = ShadowExecutionIdentity(
@@ -182,8 +236,7 @@ def _field_trace_mujoco_expectation(
             for side in ("left", "right")
         },
         joint_names_by_side={
-            side: arm_profile.joint_names_by_side[side]
-            for side in ("left", "right")
+            side: arm_profile.joint_names_by_side[side] for side in ("left", "right")
         },
         tool_profile_id_by_side={
             "left": "DMTAC_M:left",
@@ -223,7 +276,10 @@ class _ReachabilityBuilder:
         return {"left": np.eye(4), "right": self.realized_pose.copy()}
 
 
-def _real_profile():
+def _real_profile(
+    *,
+    envelope_profile_name: str = "agent_primitive_right_relative_tight_v1.json",
+):
     return resolve_exclusive_rm65_skill_deployment_profile(
         ExclusiveRM65SkillDeploymentProfile(
             arm_ip_assignment_path=(
@@ -238,7 +294,8 @@ def _real_profile():
             },
             envelope_profile_path=(
                 REPO_ROOT
-                / "teleop_runtime/configs/skill_deploy/agent_primitive_right_relative_tight_v1.json"
+                / "teleop_runtime/configs/skill_deploy"
+                / envelope_profile_name
             ),
         )
     )
@@ -356,9 +413,396 @@ def test_dense_grasp_path_cannot_bypass_tcp_safety_envelope() -> None:
         RM65GraspTrajectoryPlanningError,
         match="path_target_safety_envelope_blocked",
     ) as raised:
-        planner._revalidate((SAFE_QPOS, moved))
+        planner._revalidate((SAFE_QPOS, moved), moving_side="right")
 
     assert raised.value.reason_code == "path_target_safety_envelope_blocked"
+    assert raised.value.details["modified_sides"] == ("right",)
+    assert (
+        raised.value.details["envelope_ingress_rejection"]
+        == "projection_diagnostics_unavailable"
+    )
+
+
+class _IngressEnvelopeFilter:
+    def __init__(
+        self,
+        adjustments_m: tuple[float, ...],
+        *,
+        constraints_by_call: tuple[tuple[str, ...], ...] | None = None,
+    ) -> None:
+        self.adjustments_m = adjustments_m
+        self.constraints_by_call = constraints_by_call
+        self.calls = 0
+        self._projection = None
+
+    def __call__(self, targets):
+        adjustment = self.adjustments_m[min(self.calls, len(self.adjustments_m) - 1)]
+        constraints = (
+            ("absolute:y:max",)
+            if self.constraints_by_call is None
+            else self.constraints_by_call[
+                min(self.calls, len(self.constraints_by_call) - 1)
+            ]
+        )
+        self.calls += 1
+        projected = {side: pose.copy() for side, pose in targets.items()}
+        raw_pose = {side: np.eye(4) for side in ("left", "right")}
+        effective_pose = {side: np.eye(4) for side in ("left", "right")}
+        raw_pose["right"][1, 3] = 0.1 + adjustment
+        effective_pose["right"][1, 3] = 0.1
+        if adjustment > 0.0:
+            projected["right"][0, 3] += 0.01
+        self._projection = {
+            "raw_tcp_pose_by_side": {
+                side: pose.tolist() for side, pose in raw_pose.items()
+            },
+            "effective_tcp_pose_by_side": {
+                side: pose.tolist() for side, pose in effective_pose.items()
+            },
+            "side_projection_by_side": {
+                "left": {
+                    "modified": False,
+                    "translation_modified": False,
+                    "rotation_modified": False,
+                    "translation_adjustment_m": 0.0,
+                    "rotation_adjustment_rad": 0.0,
+                    "violated_translation_constraints": (),
+                    "active_translation_constraints": (),
+                },
+                "right": {
+                    "modified": adjustment > 0.0,
+                    "translation_modified": adjustment > 0.0,
+                    "rotation_modified": False,
+                    "translation_adjustment_m": adjustment,
+                    "rotation_adjustment_rad": 0.0,
+                    "violated_translation_constraints": (
+                        constraints if adjustment > 0.0 else ()
+                    ),
+                    "active_translation_constraints": (
+                        constraints if adjustment > 0.0 else ()
+                    ),
+                },
+            },
+        }
+        return projected
+
+    def snapshot(self):
+        return SimpleNamespace(projection=self._projection)
+
+
+def test_dense_grasp_path_accepts_bounded_monotonic_envelope_ingress() -> None:
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    envelope_filter = _IngressEnvelopeFilter((0.12, 0.0))
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=envelope_filter,
+    )
+
+    result = planner._revalidate(
+        (SAFE_QPOS, SAFE_QPOS),
+        moving_side="right",
+    )
+
+    assert result["sample_count"] == 2
+    assert result["envelope_ingress"] == {
+        "side": "right",
+        "initial_translation_adjustment_m": 0.12,
+        "violated_translation_constraints": ["absolute:y:max"],
+        "observed_translation_constraints": ["absolute:y:max"],
+        "entered_at": {"segment_index": 0, "edge_sample_index": 1},
+    }
+
+
+def test_dense_grasp_path_rejects_motion_away_from_envelope() -> None:
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    envelope_filter = _IngressEnvelopeFilter((0.12, 0.119, 0.1215))
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=envelope_filter,
+    )
+
+    with pytest.raises(
+        RM65GraspTrajectoryPlanningError,
+        match="path_target_safety_envelope_blocked",
+    ) as raised:
+        planner._revalidate(
+            (SAFE_QPOS, SAFE_QPOS, SAFE_QPOS),
+            moving_side="right",
+        )
+
+    assert (
+        raised.value.details["envelope_ingress_rejection"]
+        == "path_moved_away_from_envelope"
+    )
+
+
+def test_dense_grasp_path_allows_submillimeter_tangent_during_ingress() -> None:
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    envelope_filter = _IngressEnvelopeFilter(
+        (0.12, 0.00025, 0.0),
+        constraints_by_call=(
+            ("absolute:y:max",),
+            ("absolute:x:min", "absolute:y:max"),
+            (),
+        ),
+    )
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=envelope_filter,
+    )
+
+    result = planner._revalidate(
+        (SAFE_QPOS, SAFE_QPOS, SAFE_QPOS),
+        moving_side="right",
+    )
+
+    assert result["envelope_ingress"]["observed_translation_constraints"] == [
+        "absolute:x:min",
+        "absolute:y:max",
+    ]
+
+
+def test_dense_grasp_path_rejects_larger_new_constraint_during_ingress() -> None:
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    envelope_filter = _IngressEnvelopeFilter(
+        (0.12, 0.0008),
+        constraints_by_call=(
+            ("absolute:y:max",),
+            ("absolute:x:min", "absolute:y:max"),
+        ),
+    )
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=envelope_filter,
+    )
+
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
+        planner._revalidate(
+            (SAFE_QPOS, SAFE_QPOS),
+            moving_side="right",
+        )
+
+    assert (
+        raised.value.details["envelope_ingress_rejection"]
+        == "violation_constraint_set_expanded"
+    )
+
+
+@pytest.mark.parametrize(
+    ("details", "expected_rejection"),
+    [
+        (
+            {"modified_sides": ("left", "right")},
+            "modified_sides_are_not_the_moving_side_only",
+        ),
+        (
+            {
+                "modified_sides": ("right",),
+                "envelope_projection_by_side": {
+                    "right": {
+                        "translation_modified": True,
+                        "rotation_modified": True,
+                        "translation_adjustment_m": 0.1,
+                        "violated_translation_constraints": ["absolute:y:max"],
+                    }
+                },
+            },
+            "violation_is_not_translation_only",
+        ),
+        (
+            {
+                "modified_sides": ("right",),
+                "envelope_projection_by_side": {
+                    "right": {
+                        "translation_modified": True,
+                        "rotation_modified": False,
+                        "translation_adjustment_m": 0.151,
+                        "violated_translation_constraints": ["absolute:y:max"],
+                    }
+                },
+            },
+            "initial_distance_exceeds_limit",
+        ),
+        (
+            {
+                "modified_sides": ("right",),
+                "envelope_projection_by_side": {
+                    "right": {
+                        "translation_modified": True,
+                        "rotation_modified": False,
+                        "translation_adjustment_m": 0.1,
+                        "violated_translation_constraints": [
+                            "absolute:x:min",
+                            "absolute:y:max",
+                        ],
+                    }
+                },
+            },
+            "multiple_initial_constraints_are_not_supported",
+        ),
+    ],
+)
+def test_envelope_ingress_requires_one_bounded_moving_arm_translation_violation(
+    details: dict[str, object],
+    expected_rejection: str,
+) -> None:
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
+        planner._bounded_ingress_projection(
+            moving_side="right",
+            details=details,
+        )
+
+    assert raised.value.reason_code == "path_target_safety_envelope_blocked"
+    assert raised.value.details["envelope_ingress_rejection"] == expected_rejection
+
+
+def test_real_snapshot_plans_via_strict_envelope_ingress_waypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _real_profile(envelope_profile_name="agent_grasp_right_workspace_v1.json")
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    target_safety = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
+        target_builder=builder,
+        station_world_from_arm_base_by_side=profile.scene_world_from_arm_base_by_side,
+        station_world_frame_id=profile.station_world_frame_id,
+        envelope_profile_path=profile.envelope_profile_path,
+    )
+    envelope_filter = target_safety.envelope_filter
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=envelope_filter,
+    )
+    phases: list[str] = []
+    original_plan_path_leg = planner._plan_path_leg
+
+    def tracked_plan_path_leg(**kwargs):
+        phases.append(kwargs["planning_phase"])
+        return original_plan_path_leg(**kwargs)
+
+    monkeypatch.setattr(planner, "_plan_path_leg", tracked_plan_path_leg)
+    start_solver = builder.solver_world_targets_for_qpos_pair(
+        left_qpos=OFFLINE_INGRESS_QPOS["left"],
+        right_qpos=OFFLINE_INGRESS_QPOS["right"],
+    )
+    projected_start = envelope_filter(start_solver)
+    initial_projection = envelope_filter.snapshot().projection
+
+    assert not np.allclose(projected_start["right"], start_solver["right"])
+    assert initial_projection["side_projection_by_side"]["right"][
+        "translation_adjustment_m"
+    ] == pytest.approx(0.12014024248066646)
+    assert initial_projection["side_projection_by_side"]["right"][
+        "violated_translation_constraints"
+    ] == ("absolute:y:max",)
+
+    trajectory = planner(
+        qpos_by_side=OFFLINE_INGRESS_QPOS,
+        side="right",
+        target_tool_tcp_world=OFFLINE_INGRESS_TARGET,
+        speed_scale=0.2,
+    )
+
+    assert phases[:2] == ["envelope_ingress", "grasp_target"]
+    assert trajectory.time_from_start_sec.size > 2
+    assert np.all(np.diff(trajectory.time_from_start_sec) > 0.0)
+    np.testing.assert_allclose(
+        trajectory.qpos_by_side["left"],
+        np.broadcast_to(
+            OFFLINE_INGRESS_QPOS["left"],
+            trajectory.qpos_by_side["left"].shape,
+        ),
+    )
+    final_tcp = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=trajectory.qpos_by_side["left"][-1],
+        right_qpos=trajectory.qpos_by_side["right"][-1],
+    )["right"]
+    position_error_m, orientation_error_deg = pose_delta_metrics(
+        final_tcp,
+        OFFLINE_INGRESS_TARGET,
+    )
+    sampled_velocity = (
+        np.abs(np.diff(trajectory.qpos_by_side["right"], axis=0))
+        / np.diff(trajectory.time_from_start_sec)[:, None]
+    )
+    velocity_limit = (
+        np.deg2rad(
+            np.asarray(
+                load_joint_velocity_limit_profiles()[
+                    profile.position_profile.ik_execution.joint_velocity_limit_profile
+                ].max_velocity_deg_s,
+                dtype=float,
+            )
+        )
+        * 0.2
+    )
+
+    assert position_error_m <= planner.config.endpoint_position_tolerance_m
+    assert orientation_error_deg <= planner.config.endpoint_orientation_tolerance_deg
+    assert np.all(sampled_velocity <= velocity_limit + 1e-9)
+
+    entered = False
+    for index in range(trajectory.time_from_start_sec.size):
+        qpos = {
+            side: trajectory.qpos_by_side[side][index] for side in ("left", "right")
+        }
+        solver_targets = builder.solver_world_targets_for_qpos_pair(
+            left_qpos=qpos["left"],
+            right_qpos=qpos["right"],
+        )
+        projected = envelope_filter(solver_targets)
+        modified = not np.allclose(
+            projected["right"],
+            solver_targets["right"],
+            atol=1e-9,
+            rtol=0.0,
+        )
+        if entered:
+            assert modified is False
+        elif not modified:
+            entered = True
+    assert entered is True
+
+
+def test_real_snapshot_ingress_does_not_admit_an_outside_grasp_target() -> None:
+    profile = _real_profile(envelope_profile_name="agent_grasp_right_workspace_v1.json")
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    target_safety = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
+        target_builder=builder,
+        station_world_from_arm_base_by_side=profile.scene_world_from_arm_base_by_side,
+        station_world_frame_id=profile.station_world_frame_id,
+        envelope_profile_path=profile.envelope_profile_path,
+    )
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=target_safety.envelope_filter,
+    )
+    outside_target = OFFLINE_INGRESS_TARGET.copy()
+    outside_target[0, 3] = 0.5
+
+    with pytest.raises(
+        RM65GraspTrajectoryPlanningError,
+        match="target_safety_envelope_blocked",
+    ) as raised:
+        planner(
+            qpos_by_side=OFFLINE_INGRESS_QPOS,
+            side="right",
+            target_tool_tcp_world=outside_target,
+            speed_scale=0.2,
+        )
+
+    assert raised.value.reason_code == "target_safety_envelope_blocked"
     assert raised.value.details["modified_sides"] == ("right",)
 
 
@@ -377,7 +821,9 @@ def test_field_trace_grasp_target_is_fully_planned_before_motion(
     )["right"]
     position_error_m, orientation_error_deg = pose_delta_metrics(final_tcp, target)
     maximum_step_deg = max(
-        float(np.rad2deg(np.max(np.abs(np.diff(trajectory.qpos_by_side[side], axis=0)))))
+        float(
+            np.rad2deg(np.max(np.abs(np.diff(trajectory.qpos_by_side[side], axis=0))))
+        )
         for side in ("left", "right")
     )
 
@@ -536,9 +982,7 @@ def test_reachability_stops_on_wall_time_budget_and_returns_best_basic_solution(
 def test_reachability_multistart_respects_total_evaluation_budget(
     monkeypatch,
 ) -> None:
-    planner = _planner_without_assets(
-        config=RM65GraspTrajectoryPlanningConfig()
-    )
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
     planner.reachability_config = RM65GraspReachabilityConfig(
         time_budget_ms=1_000.0,
         max_solve_cycles=5,
@@ -578,9 +1022,7 @@ def test_reachability_multistart_respects_total_evaluation_budget(
 def test_reachability_reports_seed_budget_without_invalidating_result(
     monkeypatch,
 ) -> None:
-    planner = _planner_without_assets(
-        config=RM65GraspTrajectoryPlanningConfig()
-    )
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
     planner.reachability_config = RM65GraspReachabilityConfig(
         time_budget_ms=1_000.0,
         max_solve_cycles=10,
@@ -655,9 +1097,7 @@ def _planner_without_assets(
         station_world_frame_id="canonical_station",
         position_profile=SimpleNamespace(
             rates=SimpleNamespace(ik_hz=20.0),
-            ik_execution=SimpleNamespace(
-                joint_velocity_limit_profile="test-velocity"
-            ),
+            ik_execution=SimpleNamespace(joint_velocity_limit_profile="test-velocity"),
         ),
     )
     planner.target_envelope_filter = None
@@ -692,7 +1132,9 @@ def test_endpoint_planner_collects_distinct_exact_multistart_solutions() -> None
         np.array_equal(candidate.qpos_by_side["left"], current["left"])
         for candidate in candidates
     )
-    assert len({tuple(candidate.qpos_by_side["right"]) for candidate in candidates}) == 5
+    assert (
+        len({tuple(candidate.qpos_by_side["right"]) for candidate in candidates}) == 5
+    )
     # Endpoint optimization uses the read-only FK port and must not mutate the
     # online target builder's tracked state.
     assert builder.seed_history == []
@@ -773,7 +1215,9 @@ def test_endpoint_planner_solves_real_workspace_pose_outside_local_qp_basin() ->
         )["right"]
         position_error_m, orientation_error_deg = pose_delta_metrics(realized, target)
         assert position_error_m <= planner.config.endpoint_position_tolerance_m
-        assert orientation_error_deg <= planner.config.endpoint_orientation_tolerance_deg
+        assert (
+            orientation_error_deg <= planner.config.endpoint_orientation_tolerance_deg
+        )
         assert planner.oracle.check(candidate.qpos_by_side).safe is True
 
     reachability = planner.assess_endpoint_ik(
@@ -823,7 +1267,7 @@ def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
         ),
     )
     planner._endpoint_qpos_candidates = lambda **_kwargs: endpoints
-    planner._revalidate = lambda _waypoints: {
+    planner._revalidate = lambda _waypoints, **_kwargs: {
         "sample_count": 2,
         "minimum_distance_m": 0.03,
     }
@@ -855,9 +1299,7 @@ def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
     monkeypatch.setattr(
         grasp_trajectory_module,
         "load_joint_velocity_limit_profiles",
-        lambda: {
-            "test-velocity": SimpleNamespace(max_velocity_deg_s=(30.0,) * 6)
-        },
+        lambda: {"test-velocity": SimpleNamespace(max_velocity_deg_s=(30.0,) * 6)},
     )
 
     trajectory = planner(

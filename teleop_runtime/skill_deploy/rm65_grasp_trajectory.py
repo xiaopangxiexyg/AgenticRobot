@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from itertools import pairwise
+from typing import NoReturn
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -48,7 +49,9 @@ _STRICT_SCENE_PROFILE = "dual_arm_hand_proxy_strict"
 class RM65GraspTrajectoryPlanningError(RuntimeError):
     """Typed zero-motion failure produced before lower activation."""
 
-    def __init__(self, reason_code: str, *, details: Mapping[str, object] | None = None):
+    def __init__(
+        self, reason_code: str, *, details: Mapping[str, object] | None = None
+    ):
         self.reason_code = str(reason_code).strip()
         if not self.reason_code:
             raise ValueError("reason_code must be non-empty.")
@@ -73,6 +76,15 @@ class RM65GraspTrajectoryPlanningConfig:
     endpoint_position_tolerance_m: float = 0.003
     endpoint_orientation_tolerance_deg: float = 1.0
     final_edge_resolution_rad: float = float(np.deg2rad(0.1))
+    maximum_path_envelope_ingress_distance_m: float = 0.15
+    path_envelope_ingress_progress_tolerance_m: float = 0.002
+    path_envelope_ingress_tangent_tolerance_m: float = 0.0005
+    path_envelope_ingress_waypoint_fractions: tuple[float, ...] = (
+        0.05,
+        0.10,
+        0.20,
+        0.35,
+    )
 
     def __post_init__(self) -> None:
         for name in (
@@ -86,6 +98,9 @@ class RM65GraspTrajectoryPlanningConfig:
             "endpoint_position_residual_scale_m",
             "endpoint_orientation_residual_scale_deg",
             "final_edge_resolution_rad",
+            "maximum_path_envelope_ingress_distance_m",
+            "path_envelope_ingress_progress_tolerance_m",
+            "path_envelope_ingress_tangent_tolerance_m",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -125,6 +140,26 @@ class RM65GraspTrajectoryPlanningConfig:
             "path_search_attempts_per_endpoint",
             path_attempts,
         )
+        fractions = tuple(
+            float(value) for value in self.path_envelope_ingress_waypoint_fractions
+        )
+        if (
+            not fractions
+            or len(fractions) > 8
+            or any(
+                not math.isfinite(value) or not 0.0 < value < 1.0 for value in fractions
+            )
+            or any(current <= previous for previous, current in pairwise(fractions))
+        ):
+            raise ValueError(
+                "path_envelope_ingress_waypoint_fractions must contain 1-8 "
+                "strictly increasing finite values in (0, 1)."
+            )
+        object.__setattr__(
+            self,
+            "path_envelope_ingress_waypoint_fractions",
+            fractions,
+        )
 
 
 @dataclass(frozen=True)
@@ -162,10 +197,7 @@ class RM65GraspReachabilityConfig:
             if configured_per_seed is None
             else int(configured_per_seed)
         )
-        if (
-            isinstance(configured_per_seed, bool)
-            or not 1 <= per_seed <= cycles
-        ):
+        if isinstance(configured_per_seed, bool) or not 1 <= per_seed <= cycles:
             raise ValueError(
                 "max_solve_evaluations_per_seed must be within the total budget."
             )
@@ -222,6 +254,14 @@ class _EndpointIKCandidate:
     orientation_residual_deg: float
 
 
+@dataclass(frozen=True)
+class _PlannedPathLeg:
+    endpoint: _EndpointIKCandidate
+    path: JointPathPlanResult
+    dense_revalidation: Mapping[str, object]
+    search_attempts: tuple[Mapping[str, object], ...]
+
+
 class RM65GraspJointTrajectoryPlanner:
     """Resolve endpoint IK, plan around fixed table/poles, then time-sample qpos."""
 
@@ -230,7 +270,9 @@ class RM65GraspJointTrajectoryPlanner:
         *,
         profile: ResolvedExclusiveRM65SkillDeploymentProfile,
         planning_target_builder: object,
-        target_envelope_filter: Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray] | None]
+        target_envelope_filter: Callable[
+            [Mapping[str, np.ndarray]], Mapping[str, np.ndarray] | None
+        ]
         | None,
         config: RM65GraspTrajectoryPlanningConfig | None = None,
         planner_config: JointPathPlannerConfig | None = None,
@@ -243,6 +285,7 @@ class RM65GraspJointTrajectoryPlanner:
             "solver_world_targets_for_qpos_pair",
             "solver_world_target_from_tool_tcp_world_target",
             "tool_tcp_world_targets_for_qpos_pair",
+            "tool_tcp_world_target_from_solver_world_target",
             "solve_target_pair",
         ):
             if not callable(getattr(planning_target_builder, name, None)):
@@ -269,7 +312,9 @@ class RM65GraspJointTrajectoryPlanner:
             "fixed-scene:table",
         }
         if {item.obstacle_id for item in fixed_obstacles} != required:
-            raise ValueError("strict RM65 URDF must expose table and three camera poles.")
+            raise ValueError(
+                "strict RM65 URDF must expose table and three camera poles."
+            )
         frame_hash = canonical_content_hash(
             {
                 "deployment_profile_hash": profile.semantic_content_hash,
@@ -297,6 +342,86 @@ class RM65GraspJointTrajectoryPlanner:
             attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
         )
 
+    def _target_envelope_projection_details(
+        self,
+        modified_sides: tuple[str, ...],
+    ) -> dict[str, object]:
+        """Return compact diagnostics without weakening a fail-closed decision."""
+
+        snapshot_fn = getattr(self.target_envelope_filter, "snapshot", None)
+        if not callable(snapshot_fn):
+            return {}
+        try:
+            projection = getattr(snapshot_fn(), "projection", None)
+        except Exception:  # noqa: BLE001 - diagnostics must not mask the block.
+            return {}
+        if not isinstance(projection, Mapping):
+            return {}
+        raw_pose_by_side = projection.get("raw_tcp_pose_by_side")
+        effective_pose_by_side = projection.get("effective_tcp_pose_by_side")
+        side_projection_by_side = projection.get("side_projection_by_side")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (
+                raw_pose_by_side,
+                effective_pose_by_side,
+                side_projection_by_side,
+            )
+        ):
+            return {}
+
+        def xyz_from(mapping: Mapping[str, object], side: str) -> list[float] | None:
+            try:
+                pose = np.asarray(mapping[side], dtype=float)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+                return None
+            return [float(value) for value in pose[:3, 3]]
+
+        details_by_side: dict[str, object] = {}
+        for side in modified_sides:
+            side_projection = side_projection_by_side.get(side)
+            if not isinstance(side_projection, Mapping):
+                continue
+            details: dict[str, object] = {}
+            for field_name in ("translation_modified", "rotation_modified"):
+                value = side_projection.get(field_name)
+                if type(value) is bool:
+                    details[field_name] = value
+            for source_name, output_name, scale in (
+                ("translation_adjustment_m", "translation_adjustment_m", 1.0),
+                ("rotation_adjustment_rad", "rotation_adjustment_deg", 180.0 / math.pi),
+            ):
+                value = side_projection.get(source_name)
+                if (
+                    not isinstance(value, bool)
+                    and isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    and float(value) >= 0.0
+                ):
+                    details[output_name] = float(value) * scale
+            for field_name in (
+                "violated_translation_constraints",
+                "active_translation_constraints",
+            ):
+                value = side_projection.get(field_name)
+                if isinstance(value, (tuple, list)) and all(
+                    isinstance(item, str) and item for item in value
+                ):
+                    details[field_name] = list(value)
+            raw_xyz = xyz_from(raw_pose_by_side, side)
+            effective_xyz = xyz_from(effective_pose_by_side, side)
+            if raw_xyz is not None:
+                details["raw_target_xyz_m"] = raw_xyz
+            if effective_xyz is not None:
+                details["effective_target_xyz_m"] = effective_xyz
+            if details:
+                details_by_side[side] = details
+        return (
+            {"envelope_projection_by_side": details_by_side} if details_by_side else {}
+        )
+
     def _require_unmodified_target_envelope(
         self,
         solver_targets: Mapping[str, np.ndarray],
@@ -307,23 +432,11 @@ class RM65GraspJointTrajectoryPlanner:
     ) -> None:
         if self.target_envelope_filter is None:
             return
-        try:
-            projected = self.target_envelope_filter(
-                {name: np.asarray(value, dtype=float).copy() for name, value in solver_targets.items()}
-            )
-        except Exception as exc:
-            raise RM65GraspTrajectoryPlanningError(
-                f"{phase}_safety_envelope_unavailable",
-                details={
-                    **dict(details or {}),
-                    "exception_type": type(exc).__name__,
-                },
-            ) from exc
-        if not isinstance(projected, Mapping) or set(projected) != set(_SIDES):
-            raise RM65GraspTrajectoryPlanningError(
-                f"{phase}_safety_envelope_unavailable",
-                details=dict(details or {}),
-            )
+        projected = self._project_target_envelope(
+            solver_targets,
+            phase=phase,
+            details=details,
+        )
         modified_sides = tuple(
             side
             for side in sides
@@ -340,8 +453,224 @@ class RM65GraspJointTrajectoryPlanner:
                 details={
                     **dict(details or {}),
                     "modified_sides": modified_sides,
+                    **self._target_envelope_projection_details(modified_sides),
                 },
             )
+
+    def _project_target_envelope(
+        self,
+        solver_targets: Mapping[str, np.ndarray],
+        *,
+        phase: str,
+        details: Mapping[str, object] | None = None,
+    ) -> Mapping[str, np.ndarray]:
+        if self.target_envelope_filter is None:
+            return {
+                name: np.asarray(value, dtype=float).copy()
+                for name, value in solver_targets.items()
+            }
+        try:
+            projected = self.target_envelope_filter(
+                {
+                    name: np.asarray(value, dtype=float).copy()
+                    for name, value in solver_targets.items()
+                }
+            )
+        except Exception as exc:
+            raise RM65GraspTrajectoryPlanningError(
+                f"{phase}_safety_envelope_unavailable",
+                details={
+                    **dict(details or {}),
+                    "exception_type": type(exc).__name__,
+                },
+            ) from exc
+        if not isinstance(projected, Mapping) or set(projected) != set(_SIDES):
+            raise RM65GraspTrajectoryPlanningError(
+                f"{phase}_safety_envelope_unavailable",
+                details=dict(details or {}),
+            )
+        normalized: dict[str, np.ndarray] = {}
+        for side in _SIDES:
+            value = np.asarray(projected[side], dtype=float)
+            if value.shape != (4, 4) or not np.all(np.isfinite(value)):
+                raise RM65GraspTrajectoryPlanningError(
+                    f"{phase}_safety_envelope_unavailable",
+                    details=dict(details or {}),
+                )
+            normalized[side] = value.copy()
+        return normalized
+
+    @staticmethod
+    def _raise_ingress_rejection(
+        details: Mapping[str, object],
+        reason: str,
+    ) -> NoReturn:
+        raise RM65GraspTrajectoryPlanningError(
+            "path_target_safety_envelope_blocked",
+            details={
+                **dict(details),
+                "envelope_ingress_rejection": reason,
+            },
+        )
+
+    def _bounded_ingress_projection(
+        self,
+        *,
+        moving_side: str,
+        details: Mapping[str, object],
+    ) -> tuple[float, frozenset[str]]:
+        if tuple(details.get("modified_sides", ())) != (moving_side,):
+            self._raise_ingress_rejection(
+                details,
+                "modified_sides_are_not_the_moving_side_only",
+            )
+        projection_by_side = details.get("envelope_projection_by_side")
+        projection = (
+            projection_by_side.get(moving_side)
+            if isinstance(projection_by_side, Mapping)
+            else None
+        )
+        if not isinstance(projection, Mapping):
+            self._raise_ingress_rejection(
+                details,
+                "projection_diagnostics_unavailable",
+            )
+        if (
+            projection.get("translation_modified") is not True
+            or projection.get("rotation_modified") is not False
+        ):
+            self._raise_ingress_rejection(
+                details,
+                "violation_is_not_translation_only",
+            )
+        adjustment = projection.get("translation_adjustment_m")
+        if (
+            isinstance(adjustment, bool)
+            or not isinstance(adjustment, (int, float))
+            or not math.isfinite(float(adjustment))
+            or float(adjustment) <= 0.0
+        ):
+            self._raise_ingress_rejection(
+                details,
+                "translation_adjustment_is_invalid",
+            )
+        raw_constraints = projection.get("violated_translation_constraints")
+        if (
+            not isinstance(raw_constraints, (tuple, list))
+            or not raw_constraints
+            or any(
+                not isinstance(item, str) or not item.startswith("absolute:")
+                for item in raw_constraints
+            )
+        ):
+            self._raise_ingress_rejection(
+                details,
+                "violation_is_not_an_absolute_translation_bound",
+            )
+        if len(raw_constraints) != 1:
+            self._raise_ingress_rejection(
+                details,
+                "multiple_initial_constraints_are_not_supported",
+            )
+        if float(adjustment) > self.config.maximum_path_envelope_ingress_distance_m:
+            self._raise_ingress_rejection(
+                details,
+                "initial_distance_exceeds_limit",
+            )
+        return float(adjustment), frozenset(raw_constraints)
+
+    def _envelope_ingress_targets(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        final_tool_tcp_world: np.ndarray,
+    ) -> tuple[tuple[float, np.ndarray], ...]:
+        if self.target_envelope_filter is None:
+            return ()
+        solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
+            left_qpos=qpos_by_side["left"],
+            right_qpos=qpos_by_side["right"],
+        )
+        projected = self._project_target_envelope(
+            solver_targets,
+            phase="path_target",
+        )
+        modified_sides = tuple(
+            name
+            for name in _SIDES
+            if not np.allclose(
+                projected[name],
+                np.asarray(solver_targets[name], dtype=float),
+                atol=1e-9,
+                rtol=0.0,
+            )
+        )
+        if not modified_sides:
+            return ()
+        projection_details = {
+            "modified_sides": modified_sides,
+            **self._target_envelope_projection_details(modified_sides),
+        }
+        self._bounded_ingress_projection(
+            moving_side=side,
+            details=projection_details,
+        )
+
+        final_solver_targets = {
+            name: np.asarray(value, dtype=float).copy()
+            for name, value in solver_targets.items()
+        }
+        final_solver_targets[side] = (
+            self.target_builder.solver_world_target_from_tool_tcp_world_target(
+                side=side,
+                tool_tcp_world_target=final_tool_tcp_world,
+            )
+        )
+        self._require_unmodified_target_envelope(
+            final_solver_targets,
+            sides=(side,),
+            phase="target",
+        )
+
+        boundary = np.asarray(projected[side], dtype=float)
+        final_solver = np.asarray(final_solver_targets[side], dtype=float)
+        targets: list[tuple[float, np.ndarray]] = []
+        for fraction in self.config.path_envelope_ingress_waypoint_fractions:
+            ingress_solver = boundary.copy()
+            ingress_solver[:3, 3] += fraction * (final_solver[:3, 3] - boundary[:3, 3])
+            ingress_pair = {
+                name: np.asarray(projected[name], dtype=float).copy() for name in _SIDES
+            }
+            ingress_pair[side] = ingress_solver
+            try:
+                self._require_unmodified_target_envelope(
+                    ingress_pair,
+                    sides=_SIDES,
+                    phase="ingress_waypoint",
+                    details={"inward_fraction": fraction},
+                )
+            except RM65GraspTrajectoryPlanningError as error:
+                if error.reason_code == "ingress_waypoint_safety_envelope_blocked":
+                    continue
+                raise
+            target = self.target_builder.tool_tcp_world_target_from_solver_world_target(
+                side=side,
+                solver_world_target=ingress_solver,
+            )
+            targets.append((fraction, np.asarray(target, dtype=float).copy()))
+        if not targets:
+            raise RM65GraspTrajectoryPlanningError(
+                "path_target_safety_envelope_blocked",
+                details={
+                    **projection_details,
+                    "modified_sides": modified_sides,
+                    "envelope_ingress_rejection": (
+                        "no_strictly_inside_ingress_waypoint"
+                    ),
+                },
+            )
+        return tuple(targets)
 
     def _endpoint_qpos_candidates(
         self,
@@ -384,21 +713,17 @@ class RM65GraspJointTrajectoryPlanner:
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         baseline = {
-            name: np.asarray(qpos_by_side[name], dtype=float).copy()
-            for name in _SIDES
+            name: np.asarray(qpos_by_side[name], dtype=float).copy() for name in _SIDES
         }
         maximum = (
-            self.config.endpoint_seed_count
-            if seed_count is None
-            else int(seed_count)
+            self.config.endpoint_seed_count if seed_count is None else int(seed_count)
         )
         if not 1 <= maximum <= 64:
             raise ValueError("seed_count must be in [1, 64].")
         seeds: list[dict[str, np.ndarray]] = []
         local_values = [
             np.clip(
-                baseline[side]
-                + pattern * self.config.endpoint_seed_perturbation_rad,
+                baseline[side] + pattern * self.config.endpoint_seed_perturbation_rad,
                 lower,
                 upper,
             )
@@ -622,9 +947,7 @@ class RM65GraspJointTrajectoryPlanner:
                         side=side,
                         target_tool_tcp_world=target_tool_tcp_world,
                         seed_qpos=seed[side],
-                        maximum_evaluations=(
-                            self.config.maximum_endpoint_solve_cycles
-                        ),
+                        maximum_evaluations=(self.config.maximum_endpoint_solve_cycles),
                     )
                 )
                 candidate[inactive] = np.asarray(
@@ -729,16 +1052,12 @@ class RM65GraspJointTrajectoryPlanner:
             reason,
             details={
                 "cycles": sum(int(item["solve_cycles"]) for item in attempts),
-                "best_position_residual_m": best_attempt[
-                    "best_position_residual_m"
-                ],
+                "best_position_residual_m": best_attempt["best_position_residual_m"],
                 "best_orientation_residual_deg": best_attempt[
                     "best_orientation_residual_deg"
                 ],
                 "endpoint_seed_count": len(attempts),
-                "maximum_cycles_per_seed": (
-                    self.config.maximum_endpoint_solve_cycles
-                ),
+                "maximum_cycles_per_seed": (self.config.maximum_endpoint_solve_cycles),
                 "endpoint_solver": "scipy_least_squares_fk_multistart",
                 "solve_unit": "function_evaluations",
                 "attempts": attempts,
@@ -842,15 +1161,78 @@ class RM65GraspJointTrajectoryPlanner:
                 termination_reason=termination,
             )
 
-    def _revalidate(self, waypoints: tuple[Mapping[str, np.ndarray], ...]) -> dict[str, object]:
+    def _revalidate(
+        self,
+        waypoints: tuple[Mapping[str, np.ndarray], ...],
+        *,
+        moving_side: str,
+    ) -> dict[str, object]:
         checks = 0
         minimum_distance = math.inf
+        ingress_constraints: frozenset[str] | None = None
+        ingress_initial_adjustment_m: float | None = None
+        ingress_best_adjustment_m: float | None = None
+        ingress_observed_constraints: set[str] = set()
+        ingress_entered_at: dict[str, int] | None = None
+
+        def reject_ingress(
+            error: RM65GraspTrajectoryPlanningError,
+            reason: str,
+        ) -> None:
+            raise RM65GraspTrajectoryPlanningError(
+                error.reason_code,
+                details={
+                    **error.details,
+                    "envelope_ingress_rejection": reason,
+                },
+            ) from error
+
+        def blocked_projection(
+            error: RM65GraspTrajectoryPlanningError,
+        ) -> tuple[float, frozenset[str]]:
+            if tuple(error.details.get("modified_sides", ())) != (moving_side,):
+                reject_ingress(error, "modified_sides_are_not_the_moving_side_only")
+            projection_by_side = error.details.get("envelope_projection_by_side")
+            projection = (
+                projection_by_side.get(moving_side)
+                if isinstance(projection_by_side, Mapping)
+                else None
+            )
+            if not isinstance(projection, Mapping):
+                reject_ingress(error, "projection_diagnostics_unavailable")
+            if (
+                projection.get("translation_modified") is not True
+                or projection.get("rotation_modified") is not False
+            ):
+                reject_ingress(error, "violation_is_not_translation_only")
+            adjustment = projection.get("translation_adjustment_m")
+            if (
+                isinstance(adjustment, bool)
+                or not isinstance(adjustment, (int, float))
+                or not math.isfinite(float(adjustment))
+                or float(adjustment) <= 0.0
+            ):
+                reject_ingress(error, "translation_adjustment_is_invalid")
+            raw_constraints = projection.get("violated_translation_constraints")
+            if (
+                not isinstance(raw_constraints, (tuple, list))
+                or not raw_constraints
+                or any(
+                    not isinstance(item, str) or not item.startswith("absolute:")
+                    for item in raw_constraints
+                )
+            ):
+                reject_ingress(error, "violation_is_not_an_absolute_translation_bound")
+            return float(adjustment), frozenset(raw_constraints)
+
         for segment_index, (start, end) in enumerate(pairwise(waypoints)):
             maximum_delta = max(
                 float(np.max(np.abs(np.asarray(end[side]) - np.asarray(start[side]))))
                 for side in _SIDES
             )
-            steps = max(1, math.ceil(maximum_delta / self.config.final_edge_resolution_rad))
+            steps = max(
+                1, math.ceil(maximum_delta / self.config.final_edge_resolution_rad)
+            )
             for index in range(steps + 1):
                 alpha = float(index) / float(steps)
                 qpos = {
@@ -862,15 +1244,69 @@ class RM65GraspJointTrajectoryPlanner:
                     left_qpos=qpos["left"],
                     right_qpos=qpos["right"],
                 )
-                self._require_unmodified_target_envelope(
-                    solver_targets,
-                    sides=_SIDES,
-                    phase="path_target",
-                    details={
-                        "segment_index": segment_index,
-                        "edge_sample_index": index,
-                    },
-                )
+                try:
+                    self._require_unmodified_target_envelope(
+                        solver_targets,
+                        sides=_SIDES,
+                        phase="path_target",
+                        details={
+                            "segment_index": segment_index,
+                            "edge_sample_index": index,
+                        },
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    if error.reason_code != "path_target_safety_envelope_blocked":
+                        raise
+                    if ingress_entered_at is not None:
+                        reject_ingress(error, "path_left_envelope_after_entry")
+                    adjustment, constraints = blocked_projection(error)
+                    if ingress_constraints is None:
+                        if segment_index != 0 or index != 0:
+                            reject_ingress(error, "path_did_not_start_at_the_violation")
+                        if len(constraints) != 1:
+                            reject_ingress(
+                                error,
+                                "multiple_initial_constraints_are_not_supported",
+                            )
+                        if (
+                            adjustment
+                            > self.config.maximum_path_envelope_ingress_distance_m
+                        ):
+                            reject_ingress(error, "initial_distance_exceeds_limit")
+                        ingress_constraints = constraints
+                        ingress_observed_constraints.update(constraints)
+                        ingress_initial_adjustment_m = adjustment
+                        ingress_best_adjustment_m = adjustment
+                    else:
+                        unexpected_constraints = constraints - ingress_constraints
+                        if (
+                            unexpected_constraints
+                            and adjustment
+                            > self.config.path_envelope_ingress_tangent_tolerance_m
+                        ):
+                            reject_ingress(error, "violation_constraint_set_expanded")
+                        ingress_observed_constraints.update(constraints)
+                        assert ingress_initial_adjustment_m is not None
+                        assert ingress_best_adjustment_m is not None
+                        tolerance = (
+                            self.config.path_envelope_ingress_progress_tolerance_m
+                        )
+                        if adjustment > ingress_initial_adjustment_m + tolerance:
+                            reject_ingress(
+                                error, "path_exceeded_initial_outer_boundary"
+                            )
+                        if adjustment > ingress_best_adjustment_m + tolerance:
+                            reject_ingress(error, "path_moved_away_from_envelope")
+                        ingress_best_adjustment_m = min(
+                            ingress_best_adjustment_m,
+                            adjustment,
+                        )
+                else:
+                    if ingress_constraints is not None and ingress_entered_at is None:
+                        ingress_entered_at = {
+                            "segment_index": segment_index,
+                            "edge_sample_index": index,
+                        }
                 check = self.oracle.check(qpos)
                 checks += 1
                 if check.minimum_distance_m is not None:
@@ -886,54 +1322,57 @@ class RM65GraspJointTrajectoryPlanner:
                             "collision_check": check.to_dict(),
                         },
                     )
+        if ingress_constraints is not None and ingress_entered_at is None:
+            raise RM65GraspTrajectoryPlanningError(
+                "path_target_safety_envelope_blocked",
+                details={
+                    "envelope_ingress_rejection": "path_never_entered_envelope",
+                    "modified_sides": (moving_side,),
+                },
+            )
         return {
             "sample_count": checks,
             "minimum_distance_m": (
                 None if not math.isfinite(minimum_distance) else minimum_distance
             ),
+            "envelope_ingress": (
+                None
+                if ingress_constraints is None
+                else {
+                    "side": moving_side,
+                    "initial_translation_adjustment_m": (ingress_initial_adjustment_m),
+                    "violated_translation_constraints": sorted(ingress_constraints),
+                    "observed_translation_constraints": sorted(
+                        ingress_observed_constraints
+                    ),
+                    "entered_at": ingress_entered_at,
+                }
+            ),
         }
 
-    def __call__(
+    def _plan_path_leg(
         self,
         *,
         qpos_by_side: Mapping[str, np.ndarray],
         side: str,
         target_tool_tcp_world: np.ndarray,
-        speed_scale: float,
-    ) -> RealAgentJointTrajectory:
-        selected_side = str(side).strip().lower()
-        if selected_side not in _SIDES:
-            raise ValueError("side must be left or right.")
-        current = {
-            name: np.asarray(dict(qpos_by_side).get(name), dtype=float).reshape(6).copy()
-            for name in _SIDES
-        }
-        target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
-        scale = float(speed_scale)
-        if not 0.0 < scale <= 1.0:
-            raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
+        planning_phase: str,
+    ) -> _PlannedPathLeg:
         endpoint_candidates = self._endpoint_qpos_candidates(
-            qpos_by_side=current,
-            side=selected_side,
-            target_tool_tcp_world=target_pose,
+            qpos_by_side=qpos_by_side,
+            side=side,
+            target_tool_tcp_world=target_tool_tcp_world,
         )
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         cfg = self.planner_config
         search_attempts: list[dict[str, object]] = []
-        selected: (
-            tuple[_EndpointIKCandidate, JointPathPlanResult, dict[str, object]]
-            | None
-        ) = None
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
         for endpoint_index, endpoint in enumerate(endpoint_candidates):
             target = endpoint.qpos_by_side
-            for path_attempt in range(
-                self.config.path_search_attempts_per_endpoint
-            ):
+            for path_attempt in range(self.config.path_search_attempts_per_endpoint):
                 full_joint_range = (
-                    path_attempt
-                    == self.config.path_search_attempts_per_endpoint - 1
+                    path_attempt == self.config.path_search_attempts_per_endpoint - 1
                 )
                 padding = cfg.sample_padding_rad * float(2**path_attempt)
                 corridor_lower = (
@@ -941,8 +1380,7 @@ class RM65GraspJointTrajectoryPlanner:
                     if full_joint_range
                     else np.maximum(
                         lower,
-                        np.minimum(current[selected_side], target[selected_side])
-                        - padding,
+                        np.minimum(qpos_by_side[side], target[side]) - padding,
                     )
                 )
                 corridor_upper = (
@@ -950,30 +1388,29 @@ class RM65GraspJointTrajectoryPlanner:
                     if full_joint_range
                     else np.minimum(
                         upper,
-                        np.maximum(current[selected_side], target[selected_side])
-                        + padding,
+                        np.maximum(qpos_by_side[side], target[side]) + padding,
                     )
                 )
                 attempt_config = replace(
                     cfg,
                     seed=(
                         cfg.seed
-                        + endpoint_index
-                        * self.config.path_search_attempts_per_endpoint
+                        + endpoint_index * self.config.path_search_attempts_per_endpoint
                         + path_attempt
                     ),
                 )
                 path = plan_collision_aware_joint_path(
-                    start_qpos_by_component=current,
+                    start_qpos_by_component=qpos_by_side,
                     target_qpos_by_component=target,
-                    movable_components=(selected_side,),
+                    movable_components=(side,),
                     oracle=self.oracle,
                     config=attempt_config,
-                    joint_lower_by_component={selected_side: corridor_lower},
-                    joint_upper_by_component={selected_side: corridor_upper},
+                    joint_lower_by_component={side: corridor_lower},
+                    joint_upper_by_component={side: corridor_upper},
                     scene_hash=self.scene.semantic_content_hash,
                 )
                 attempt_record: dict[str, object] = {
+                    "planning_phase": planning_phase,
                     "endpoint_seed_index": endpoint.seed_index,
                     "path_attempt": path_attempt,
                     "search_seed": attempt_config.seed,
@@ -988,6 +1425,7 @@ class RM65GraspJointTrajectoryPlanner:
                         terminal_error = RM65GraspTrajectoryPlanningError(
                             "path_collision_check_unavailable",
                             details={
+                                "planning_phase": planning_phase,
                                 "path": path.to_dict(),
                                 "search_attempts": search_attempts,
                             },
@@ -995,73 +1433,196 @@ class RM65GraspJointTrajectoryPlanner:
                         break
                     continue
                 try:
-                    dense = self._revalidate(path.waypoints)
-                except RM65GraspTrajectoryPlanningError as exc:
-                    attempt_record["dense_revalidation_error"] = exc.reason_code
-                    terminal_error = exc
-                    if exc.reason_code == "path_collision_check_unavailable":
+                    dense = self._revalidate(
+                        path.waypoints,
+                        moving_side=side,
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    attempt_record["dense_revalidation_error"] = error.reason_code
+                    terminal_error = error
+                    if error.reason_code == "path_collision_check_unavailable":
                         break
                     continue
-                selected = (endpoint, path, dense)
-                break
-            if selected is not None or (
+                return _PlannedPathLeg(
+                    endpoint=endpoint,
+                    path=path,
+                    dense_revalidation=dense,
+                    search_attempts=tuple(search_attempts),
+                )
+            if (
                 terminal_error is not None
                 and terminal_error.reason_code == "path_collision_check_unavailable"
             ):
                 break
-        if selected is None:
-            if terminal_error is not None and terminal_error.reason_code in {
-                "path_collision_check_unavailable",
-                "path_target_safety_envelope_unavailable",
-            }:
-                reason = terminal_error.reason_code
-            elif any(
-                item["status"] == JointPathStatus.PATH_SEARCH_EXHAUSTED.value
-                for item in search_attempts
-            ):
-                reason = "path_search_exhausted"
-            elif any(
-                item["status"] == JointPathStatus.START_BLOCKED.value
-                for item in search_attempts
-            ):
-                reason = "path_start_collision_blocked"
-            elif any(
-                item["status"] == JointPathStatus.TARGET_BLOCKED.value
-                for item in search_attempts
-            ):
-                reason = "path_target_collision_blocked"
-            elif terminal_error is not None:
-                reason = terminal_error.reason_code
-            else:
-                reason = "path_planner_error"
-            raise RM65GraspTrajectoryPlanningError(
-                reason,
-                details={
-                    "endpoint_candidate_count": len(endpoint_candidates),
-                    "search_attempts": search_attempts,
-                    "last_dense_revalidation_error": (
-                        None
-                        if terminal_error is None
-                        else {
-                            "reason_code": terminal_error.reason_code,
-                            "details": terminal_error.details,
-                        }
-                    ),
-                },
+
+        if terminal_error is not None and terminal_error.reason_code in {
+            "path_collision_check_unavailable",
+            "path_target_safety_envelope_blocked",
+            "path_target_safety_envelope_unavailable",
+        }:
+            reason = terminal_error.reason_code
+        elif any(
+            item["status"] == JointPathStatus.PATH_SEARCH_EXHAUSTED.value
+            for item in search_attempts
+        ):
+            reason = "path_search_exhausted"
+        elif any(
+            item["status"] == JointPathStatus.START_BLOCKED.value
+            for item in search_attempts
+        ):
+            reason = "path_start_collision_blocked"
+        elif any(
+            item["status"] == JointPathStatus.TARGET_BLOCKED.value
+            for item in search_attempts
+        ):
+            reason = "path_target_collision_blocked"
+        elif terminal_error is not None:
+            reason = terminal_error.reason_code
+        else:
+            reason = "path_planner_error"
+        raise RM65GraspTrajectoryPlanningError(
+            reason,
+            details={
+                "planning_phase": planning_phase,
+                "endpoint_candidate_count": len(endpoint_candidates),
+                "search_attempts": search_attempts,
+                "last_dense_revalidation_error": (
+                    None
+                    if terminal_error is None
+                    else {
+                        "reason_code": terminal_error.reason_code,
+                        "details": terminal_error.details,
+                    }
+                ),
+            },
+        )
+
+    def __call__(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        target_tool_tcp_world: np.ndarray,
+        speed_scale: float,
+    ) -> RealAgentJointTrajectory:
+        selected_side = str(side).strip().lower()
+        if selected_side not in _SIDES:
+            raise ValueError("side must be left or right.")
+        current = {
+            name: np.asarray(dict(qpos_by_side).get(name), dtype=float)
+            .reshape(6)
+            .copy()
+            for name in _SIDES
+        }
+        target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        scale = float(speed_scale)
+        if not 0.0 < scale <= 1.0:
+            raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
+        ingress_targets = self._envelope_ingress_targets(
+            qpos_by_side=current,
+            side=selected_side,
+            final_tool_tcp_world=target_pose,
+        )
+        ingress_route_attempts: list[dict[str, object]] = []
+        selected_legs: tuple[_PlannedPathLeg, ...] | None = None
+        ingress_route: dict[str, object] | None = None
+        route_error: RM65GraspTrajectoryPlanningError | None = None
+        if not ingress_targets:
+            selected_legs = (
+                self._plan_path_leg(
+                    qpos_by_side=current,
+                    side=selected_side,
+                    target_tool_tcp_world=target_pose,
+                    planning_phase="grasp_target",
+                ),
             )
-        endpoint, path, dense = selected
-        target = endpoint.qpos_by_side
+        else:
+            for inward_fraction, ingress_target in ingress_targets:
+                route_attempt: dict[str, object] = {
+                    "inward_fraction": inward_fraction,
+                }
+                ingress_route_attempts.append(route_attempt)
+                try:
+                    ingress_leg = self._plan_path_leg(
+                        qpos_by_side=current,
+                        side=selected_side,
+                        target_tool_tcp_world=ingress_target,
+                        planning_phase="envelope_ingress",
+                    )
+                    ingress_qpos = ingress_leg.endpoint.qpos_by_side
+                    grasp_leg = self._plan_path_leg(
+                        qpos_by_side=ingress_qpos,
+                        side=selected_side,
+                        target_tool_tcp_world=target_pose,
+                        planning_phase="grasp_target",
+                    )
+                    combined_waypoints = (
+                        *ingress_leg.path.waypoints,
+                        *grasp_leg.path.waypoints[1:],
+                    )
+                    combined_dense = self._revalidate(
+                        combined_waypoints,
+                        moving_side=selected_side,
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    route_error = error
+                    route_attempt.update(
+                        {
+                            "status": "rejected",
+                            "reason_code": error.reason_code,
+                            "planning_phase": error.details.get("planning_phase"),
+                        }
+                    )
+                    if error.reason_code == "path_collision_check_unavailable":
+                        break
+                    continue
+                route_attempt["status"] = "path_found"
+                selected_legs = (ingress_leg, grasp_leg)
+                ingress_route = {
+                    "inward_fraction": inward_fraction,
+                    "ingress_target_tool_tcp_world": ingress_target,
+                    "ingress_endpoint_seed_index": ingress_leg.endpoint.seed_index,
+                    "ingress_path_hash": ingress_leg.path.semantic_content_hash,
+                }
+                dense = combined_dense
+                break
+            if selected_legs is None:
+                if route_error is None:
+                    route_error = RM65GraspTrajectoryPlanningError("path_planner_error")
+                raise RM65GraspTrajectoryPlanningError(
+                    route_error.reason_code,
+                    details={
+                        **route_error.details,
+                        "envelope_ingress_route_attempts": ingress_route_attempts,
+                    },
+                ) from route_error
+
+        assert selected_legs is not None
+        if ingress_route is None:
+            dense = dict(selected_legs[0].dense_revalidation)
+        endpoint = selected_legs[-1].endpoint
+        waypoints = tuple(
+            waypoint
+            for leg_index, leg in enumerate(selected_legs)
+            for waypoint in (
+                leg.path.waypoints if leg_index == 0 else leg.path.waypoints[1:]
+            )
+        )
+        search_attempts = [
+            dict(attempt) for leg in selected_legs for attempt in leg.search_attempts
+        ]
         velocity_profile = load_joint_velocity_limit_profiles()[
             self.profile.position_profile.ik_execution.joint_velocity_limit_profile
         ]
-        joint_velocity = np.deg2rad(
-            np.asarray(velocity_profile.max_velocity_deg_s, dtype=float)
-        ) * scale
+        joint_velocity = (
+            np.deg2rad(np.asarray(velocity_profile.max_velocity_deg_s, dtype=float))
+            * scale
+        )
         reference_hz = float(self.profile.position_profile.rates.ik_hz)
         times = [0.0]
         samples = {name: [current[name].copy()] for name in _SIDES}
         elapsed = 0.0
-        for start, end in pairwise(path.waypoints):
+        for start, end in pairwise(waypoints):
             start_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
                 left_qpos=start["left"], right_qpos=start["right"]
             )[selected_side]
@@ -1069,7 +1630,9 @@ class RM65GraspJointTrajectoryPlanner:
                 left_qpos=end["left"], right_qpos=end["right"]
             )[selected_side]
             translation, rotation_deg = pose_delta_metrics(start_tcp, end_tcp)
-            delta = np.abs(np.asarray(end[selected_side]) - np.asarray(start[selected_side]))
+            delta = np.abs(
+                np.asarray(end[selected_side]) - np.asarray(start[selected_side])
+            )
             duration = max(
                 self.config.minimum_segment_duration_sec,
                 1.875 * translation / (self.config.linear_speed_m_s * scale),
@@ -1095,8 +1658,13 @@ class RM65GraspJointTrajectoryPlanner:
         evidence_hash = canonical_content_hash(
             {
                 "scene_hash": self.scene.semantic_content_hash,
-                "path_hash": path.semantic_content_hash,
+                "path_hash": selected_legs[-1].path.semantic_content_hash,
+                "path_leg_hashes": [
+                    leg.path.semantic_content_hash for leg in selected_legs
+                ],
                 "dense_revalidation": dense,
+                "envelope_ingress_route": ingress_route,
+                "envelope_ingress_route_attempts": ingress_route_attempts,
                 "endpoint_seed_index": endpoint.seed_index,
                 "endpoint_solve_cycles": endpoint.solve_cycles,
                 "endpoint_position_residual_m": endpoint.position_residual_m,
