@@ -58,6 +58,7 @@ DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1: dict[str, object] = {
 DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M = 0.006
 GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M = 0.015
 GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG = 15.0
+GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG = 20.0
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -380,6 +381,13 @@ class Sam2GraspGenXPointGraspPlanner:
                     "closing_axis_symmetry_deg": (
                         GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
                     ),
+                },
+                "candidate_selection": {
+                    "policy": "score_ordered_distinct_approach_first_v1",
+                    "approach_axis_deg": (
+                        GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG
+                    ),
+                    "fallback": "score_ordered_family_variants",
                 },
                 "gripper": {
                     "profile": "DMTAC_M",
@@ -772,17 +780,34 @@ class Sam2GraspGenXPointGraspPlanner:
                 )
             )
         ranked.sort(key=lambda item: (-item[0], item[2]))
-        selected: list[tuple[float, float, float, float, np.ndarray, np.ndarray]] = []
+        deduplicated: list[
+            tuple[float, float, float, float, np.ndarray, np.ndarray]
+        ] = []
         for item in ranked:
             pose = item[4]
             if any(
                 self._same_candidate_family(pose, previous[4])
-                for previous in selected
+                for previous in deduplicated
             ):
                 continue
-            selected.append(item)
-            if len(selected) == maximum:
-                break
+            deduplicated.append(item)
+
+        # GraspMoE's OBB expert can assign its highest scores to a dense yaw
+        # sweep of one top-down pose.  Those yaws are useful alternatives, but
+        # allowing them to occupy every returned slot hides lower-scored 6-DoF
+        # diffusion poses with materially different approach directions.  Pick
+        # one representative from each approach cone first, then fill any
+        # remaining slots with the best score-ordered family variants.  The
+        # final membership remains ordered by score for the operator display.
+        representative_indices, selected_indices = (
+            self._distinct_approach_first_indices(
+                tuple(item[4] for item in deduplicated),
+                maximum=maximum,
+            )
+        )
+        selected = [deduplicated[index] for index in sorted(selected_indices)]
+        counts["candidate_family_count"] = len(deduplicated)
+        counts["distinct_approach_count"] = len(representative_indices)
         counts["selected"] = len(selected)
         if filter_summary is not None:
             filter_summary.update(counts)
@@ -828,6 +853,43 @@ class Sam2GraspGenXPointGraspPlanner:
         return closing_axis_angle < math.radians(
             GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
         )
+
+    @staticmethod
+    def _same_approach_cone(first: np.ndarray, second: np.ndarray) -> bool:
+        cosine = float(
+            np.clip(np.dot(first[:3, 2], second[:3, 2]), -1.0, 1.0)
+        )
+        return math.acos(cosine) < math.radians(
+            GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG
+        )
+
+    @classmethod
+    def _distinct_approach_first_indices(
+        cls,
+        poses: tuple[np.ndarray, ...],
+        *,
+        maximum: int,
+    ) -> tuple[list[int], list[int]]:
+        representative_indices: list[int] = []
+        for index, pose in enumerate(poses):
+            if any(
+                cls._same_approach_cone(pose, poses[previous_index])
+                for previous_index in representative_indices
+            ):
+                continue
+            representative_indices.append(index)
+
+        selected_indices = representative_indices[:maximum]
+        if len(selected_indices) < maximum:
+            selected_set = set(selected_indices)
+            for index in range(len(poses)):
+                if index in selected_set:
+                    continue
+                selected_indices.append(index)
+                selected_set.add(index)
+                if len(selected_indices) == maximum:
+                    break
+        return representative_indices, selected_indices
 
 
 __all__ = [

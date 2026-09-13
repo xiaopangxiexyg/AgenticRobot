@@ -623,6 +623,42 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
     planner.close()
 
 
+def test_candidate_selection_covers_distinct_approaches_before_yaw_variants() -> None:
+    poses = []
+    for yaw_degrees in (0.0, 30.0, 60.0, 90.0, 120.0):
+        yaw = math.radians(yaw_degrees)
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = np.asarray(
+            (
+                (math.cos(yaw), -math.sin(yaw), 0.0),
+                (math.sin(yaw), math.cos(yaw), 0.0),
+                (0.0, 0.0, 1.0),
+            )
+        )
+        poses.append(pose)
+    for tilt_degrees in (30.0, -30.0, 60.0):
+        tilt = math.radians(tilt_degrees)
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = np.asarray(
+            (
+                (math.cos(tilt), 0.0, math.sin(tilt)),
+                (0.0, 1.0, 0.0),
+                (-math.sin(tilt), 0.0, math.cos(tilt)),
+            )
+        )
+        poses.append(pose)
+
+    representatives, selected = (
+        Sam2GraspGenXPointGraspPlanner._distinct_approach_first_indices(
+            tuple(poses),
+            maximum=4,
+        )
+    )
+
+    assert representatives == [0, 5, 6, 7]
+    assert selected == [0, 5, 6, 7]
+
+
 def test_planner_bounded_centering_recovers_offset_grasp_without_changing_depth(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

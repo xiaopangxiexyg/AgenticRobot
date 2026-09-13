@@ -612,6 +612,42 @@ def test_endpoint_planner_collects_distinct_exact_multistart_solutions() -> None
     np.testing.assert_array_equal(builder.seed_history[-1]["right"], current["right"])
 
 
+def test_endpoint_planner_reports_best_multistart_residuals_on_exhaustion() -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            maximum_endpoint_solve_cycles=1,
+            endpoint_seed_count=3,
+        )
+    )
+    planner.target_builder = _MultistartBuilder()
+    planner.oracle = SimpleNamespace(
+        check=lambda _qpos: JointConfigurationCheck(safe=True)
+    )
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    target = np.eye(4, dtype=float)
+    target[0, 3] = 0.1
+
+    with pytest.raises(
+        RM65GraspTrajectoryPlanningError,
+        match="ik_search_exhausted",
+    ) as error:
+        planner._endpoint_qpos_candidates(
+            qpos_by_side=current,
+            side="right",
+            target_tool_tcp_world=target,
+        )
+
+    assert error.value.details["cycles"] == 3
+    assert error.value.details["best_position_residual_m"] == pytest.approx(0.1)
+    assert error.value.details["best_orientation_residual_deg"] == pytest.approx(0.0)
+    assert error.value.details["endpoint_seed_count"] == 3
+    assert len(error.value.details["attempts"]) == 3
+
+
+def test_endpoint_planner_uses_all_structured_seed_basins_by_default() -> None:
+    assert RM65GraspTrajectoryPlanningConfig().endpoint_seed_count == 7
+
+
 def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

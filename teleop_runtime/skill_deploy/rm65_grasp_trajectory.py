@@ -63,7 +63,7 @@ class RM65GraspTrajectoryPlanningConfig:
     angular_speed_deg_s: float = 45.0
     minimum_segment_duration_sec: float = 0.25
     maximum_endpoint_solve_cycles: int = 240
-    endpoint_seed_count: int = 5
+    endpoint_seed_count: int = 7
     endpoint_seed_perturbation_rad: float = float(np.deg2rad(25.0))
     path_search_attempts_per_endpoint: int = 4
     endpoint_position_tolerance_m: float = 0.003
@@ -503,9 +503,25 @@ class RM65GraspJointTrajectoryPlanner:
             reason = "endpoint_collision_blocked"
         else:
             reason = "ik_search_exhausted"
+        best_attempt = min(
+            attempts,
+            key=lambda item: max(
+                float(item["best_position_residual_m"])
+                / self.config.endpoint_position_tolerance_m,
+                float(item["best_orientation_residual_deg"])
+                / self.config.endpoint_orientation_tolerance_deg,
+            ),
+        )
         raise RM65GraspTrajectoryPlanningError(
             reason,
             details={
+                "cycles": sum(int(item["solve_cycles"]) for item in attempts),
+                "best_position_residual_m": best_attempt[
+                    "best_position_residual_m"
+                ],
+                "best_orientation_residual_deg": best_attempt[
+                    "best_orientation_residual_deg"
+                ],
                 "endpoint_seed_count": len(attempts),
                 "maximum_cycles_per_seed": (
                     self.config.maximum_endpoint_solve_cycles
