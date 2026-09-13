@@ -652,8 +652,6 @@ class FootPadControlModeTests(unittest.TestCase):
         control.plus_curation = None
         control._teleop_started = True
         control._two_pedal_switch_blocked_by_init = lambda: False
-        control._tracker_side_confirmation_pending = False
-        control._tracker_side_request_pending = False
         control._hold_requested = False
 
         self.assertIn(5, FOOT_PAD_TWO_PEDAL_STYLE_COUNTS)
@@ -694,8 +692,6 @@ class FootPadControlModeTests(unittest.TestCase):
         control.plus_curation = None
         control._teleop_started = True
         control._two_pedal_switch_blocked_by_init = lambda: False
-        control._tracker_side_confirmation_pending = False
-        control._tracker_side_request_pending = False
         control._hold_requested = False
 
         self.assertTrue(control._foot_pad_mode_configured())
@@ -789,8 +785,6 @@ class FootPadControlModeTests(unittest.TestCase):
         control._progress_ui_controls = ()
         control._two_pedal_mode_active = lambda: False
         control._teleop_started = True
-        control._tracker_side_confirmation_pending = False
-        control._tracker_side_request_pending = False
         control._hold_requested = True
 
         with mock.patch(
