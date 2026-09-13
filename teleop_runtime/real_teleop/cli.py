@@ -1756,8 +1756,7 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Position-mode physical joint-limit behavior. legacy preserves "
             "the stable selector; boundary_hold removes only inward motion "
-            "inside the narrow guard band; forced_escape_latched retains the "
-            "2026-08-02 outward-step experiment for offline comparison."
+            "inside the narrow guard band."
         ),
     )
     parser.add_argument(
