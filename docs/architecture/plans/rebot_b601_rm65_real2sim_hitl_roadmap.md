@@ -1,6 +1,7 @@
 # ReBot B601-RS 与 RM65 双向 Real2Sim / HITL 开发路线图
 
-> 状态：长期共享规划，2026-09-09 首版。本文记录跨阶段目标、依赖顺序、所有权和验收门禁，
+> 状态：长期共享规划，2026-09-09 首版，2026-09-13 明确 Real2Sim 力控范围。本文记录跨阶段
+> 目标、依赖顺序、所有权和验收门禁，
 > 不声明未落地功能已经完成，也不授予真机使能、运动、合并、push 或安装权限。当前代码事实
 > 以测试和对应实现为准；B601 真机候选的精确状态、参数和现场流程见
 > [`../../hardware/rebot_b601_rs_task_handoff.md`](../../hardware/rebot_b601_rs_task_handoff.md)。
@@ -29,6 +30,30 @@ policy emission + same-cut human residual
 当前规划暂以 RM65 action space 作为 policy 的规范动作空间。ReBot 到 RM65 与 RM65 到
 ReBot 是两个有各自 frame、anchor、scale、limit 和 freshness 契约的有向适配器；不得因为
 两端都是六自由度机械臂就假定两个映射互为逆变换。
+
+### 1.1 ReBot Real2Sim 力控范围
+
+ReBot Real2Sim 的必要目标是建立**控制等价、方向正确、能量受限**的仿真边界，而不是在
+缺少独立动态和力传感证据时追求高保真力觉数字孪生。当前必须复现和验证：
+
+- gravity/controller profile、driver-local damping、host ZOH 与多时钟语义；
+- qpos 与 Cartesian/SE(3) impedance、`J.T @ wrench`、最终 torque clip/slew；
+- qpos/qvel/qacc、stale/wrong-frame/dropout 和 protective-hold 故障语义；
+- 接触方向、wrench frame/origin、功率不变量及有界能量行为。
+
+以下内容只在有合格数据且影响后续验收时辨识：精确 armature、传动摩擦、柔顺性、控制带宽、
+绝对接触力和最终触感。它们不能由手感调参或多组互相补偿的系数制造，也不作为 motion-only
+M4 的前置条件。
+
+依赖边界固定为：
+
+- M4 的首个 ReBot-real -> RM65-sim 切片只依赖可信的 read-only state/FK、frame、anchor、
+  freshness 和 RM65 canonical safety/dispatch，不等待完整 M2 plant 辨识或 M3 触觉通道；
+- M5 对 ReBot sim 动态响应的定量声明需要 M1 控制器等价，以及 M2 中与该声明相关且有证据的
+  plant/transport 参数；未辨识项必须保持显式 `unmodeled`；
+- M3 是任何 haptic feedback 分支的前置门禁，但不是纯运动遥操的前置门禁；
+- M7 的真机 qpos/Cartesian impedance 与 haptic acceptance 仍需各自独立的仿真、shadow 和
+  现场验收，不能由 M4 motion PASS 推导。
 
 ## 2. 长期不变量
 
@@ -109,7 +134,7 @@ Coulomb [N.m]        = 0, 0, 0, 0, 0, 0
 - CAN 顺序发送可检测 partial receipt，但不是总线原子事务。这一剩余风险必须在真实系统验收中
   保留，不能由仿真 PASS 消除。
 
-### 3.4 当前 Real2Sim 缺口
+### 3.4 当前 Real2Sim 缺口与优先级
 
 当前 B601 MuJoCo 是理想 generalized-effort 验收模型，不是已标定数字孪生：
 
@@ -119,6 +144,10 @@ Coulomb [N.m]        = 0, 0, 0, 0, 0, 0
 - command/feedback delay、host ZOH、量化、噪声、dropout 和坏帧尚未建模；
 - B601 当前 scene 尚未形成真实接触场景，virtual wall 只是数学 fixture；
 - 尚无同一初态、同一 reference/history 下的 real/sim paired replay 和 held-out 验证。
+
+其中 controller 公式、本地阻尼位置、多时钟/ZOH、安全门禁、阻抗和接触方向/功率属于必须闭合
+的结构契约；armature、摩擦、柔顺性、带宽和绝对接触力属于证据驱动的逼真度增量。后者不因
+尚未完成而阻塞 motion-only M4，也不能在没有 held-out 改善时成为默认非零参数。
 
 ## 4. 阶段路线图
 
@@ -170,7 +199,8 @@ profile 契约。
 
 **目标**
 
-使用真机安全采集的无接触数据辨识可观察参数，并用独立 held-out 数据判断是否采用。
+使用真机安全采集的无接触数据辨识与后续稳定性或动态响应声明相关的可观察参数，并用独立
+held-out 数据判断是否采用；本阶段不以复刻全部电机、传动和接触细节为完成条件。
 
 **优先数据**
 
@@ -195,6 +225,9 @@ profile 契约。
 - 静态 drift、settling、q/qvel/qacc、torque/slew 和启动瞬态都有误差报告；
 - 无法独立辨识的项保持 `unmodeled`，不通过多组互相补偿的参数制造表面拟合。
 
+M2 全部参数辨识不是 motion-only M4 的前置门禁。M5 的 ReBot sim 定量动态声明、M7 的真机
+阻抗升级，以及任何依赖特定 plant/transport 参数的结论，只等待与该结论直接相关的 M2 子集。
+
 ### M3：B601 MuJoCo 接触和触觉通道
 
 **目标**
@@ -217,12 +250,24 @@ profile 契约。
 - 延迟/jitter/dropout sweep 下不产生未限制能量；
 - 没有独立传感器证据前，不宣称仿真接触绝对力值等于真机手感。
 
+纯运动的 M4 可以在 M3 未完成时启动；一旦启用 RM65 sim contact -> ReBot haptic feedback，
+该 profile 必须先满足本节 frame、功率和能量门禁，并独立于 motion authority 验收。
+
 ### M4：ReBot 真机遥操 RM65 Sim
 
 **目标**
 
 以 ReBot 真机状态作为 human source，先驱动 RM65 MuJoCo target，完成第一条跨 embodiment
-动作链；此阶段不需要 RM65 真机。
+动作链；此阶段不需要 RM65 真机。首个切片默认只启用 motion channel，触觉通道保持关闭并
+单独升级。
+
+**最小前置条件**
+
+- B601 model/joint order/FK 与 frame 契约已有固定身份；
+- ReBot read-only source 能发布经过 admission 的完整 J1-J6 state，并明确 host freshness 与
+  device-source freshness 的证据差异；
+- RM65 MuJoCo target 的 IK、canonical safety、dispatch 和 HOLD/stop 语义可复用；
+- 不要求先完成全部 M2 参数辨识或 M3 触觉通道。
 
 **交付物**
 
@@ -263,6 +308,7 @@ profile 契约。
 - 反向映射不改变原 policy emission；
 - ReBot sim 不可达、奇异或越界时 fail closed，而不是裁剪后伪装完全执行；
 - execution difference 可区分 policy、映射、canonical safety 和 plant dynamics 的误差；
+- ReBot sim 使用显式 controller/plant/transport profile，所有未辨识物理项保持可见；
 - shadow PASS 不授予 ReBot 真机运动权限。
 
 ### M6：Policy + 人工实时干预，先在 Sim 闭环验收
@@ -399,8 +445,29 @@ pure contract/unit tests
     -> held-out/system acceptance
 ```
 
-实现时优先选择最小完整切片。第一批应只覆盖 M0 和 M1：集中 profile、控制器等价、多时钟
-执行和回归测试；不应同时引入接触、跨机器人 mapping、policy composition 和真机入口。
+实现时优先选择最小完整切片，并区分三条有依赖但不互相无限阻塞的路径：
+
+```text
+motion-source critical path:
+M0 identity/model + read-only source admission + RM65 target contract
+    -> M4 ReBot real to RM65 sim
+    -> M6 policy and human residual in RM65 sim
+    -> M7/M8 separately authorized real targets
+
+ReBot simulated-target path:
+M1 controller equivalence
+    -> M2 evidence-backed plant/transport subsets when the claim depends on them
+    -> M5 ReBot sim dynamic acceptance
+    -> M7 ReBot real impedance acceptance
+
+haptic-feedback path:
+M1 torque/wrench bounds + M3 contact, frame and bounded-energy feedback
+    -> M7/M8 haptic acceptance
+```
+
+M4 motion-only 开发在 read-only source、FK/frame/freshness 和 RM65 target 门禁闭合后即可开始。
+它不得等待“全部物理参数已辨识”，也不得把运动遥操 PASS 扩张为力控、触觉或真机目标 PASS。
+M2/M3 可继续提供逼真度和触觉证据；只有使用相关能力的 profile 才必须等待对应门禁。
 
 每批交接至少报告：
 
@@ -412,16 +479,16 @@ pure contract/unit tests
 
 ## 8. 当前开放决策
 
-以下问题不阻塞 M0-M3 的 B601 Real2Sim，但必须在 M4 之前闭合：
+以下问题不阻塞 M0-M3；应在首次依赖它们的阶段前闭合：
 
-1. 阶段 M6-M8 中“主臂/从臂”是严格指命令 source/target，还是任务机器人与触觉设备的产品
-   角色名称；现场人工物理输入最终发生在 RealMan 还是 ReBot。
+1. M6 前明确“主臂/从臂”是严格指命令 source/target，还是任务机器人与触觉设备的产品
+   角色名称；M7/M8 前明确现场人工物理输入最终发生在 RealMan 还是 ReBot。
 2. ReBot 到 RM65 的首个规范映射采用末端 pose/twist residual 还是 joint-space residual；当前
-   建议优先 anchor-relative Cartesian pose/twist，并只在 target 侧做 RM65 IK。
-3. RM65 policy 反向传导给 ReBot 时，ReBot 是纯 shadow、物理任务执行器还是 haptic follower；
-   三者的安全、接触和数据语义不同，不能共用一个模糊 profile。
+   建议优先 anchor-relative Cartesian pose/twist，并只在 target 侧做 RM65 IK；M4 前闭合。
+3. M5 前明确 RM65 policy 反向传导给 ReBot 时，ReBot 是纯 shadow、物理任务执行器还是
+   haptic follower；三者的安全、接触和数据语义不同，不能共用一个模糊 profile。
 4. system-level stale/wrong-frame 行为应由 source admission 立即撤销资格，再由 target watchdog
-   决定 HOLD/stop；不得用“继续保持上一合法动作直到无限期 watchdog”作为隐式默认。
+   决定 HOLD/stop；不得用“继续保持上一合法动作直到无限期 watchdog”作为隐式默认；M4 前闭合。
 
 这些决定闭合后，应更新本文而不是另建一份相互冲突的临时路线图。
 
