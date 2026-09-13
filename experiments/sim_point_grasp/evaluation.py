@@ -143,12 +143,12 @@ TERMINAL_OBSERVATION_HOME_QPOS_BY_SIDE = {
         -1.2409476186373012,
     ),
     "right": (
-        -1.7691667000546045,
-        0.843065418144126,
-        0.30890265228211944,
-        -2.422013050968448,
-        -2.2319737866621563,
-        1.3934095311463468,
+        -0.8352406314227725,
+        0.5956882063622921,
+        1.0931223562678203,
+        0.09425157862353473,
+        1.4753280659947152,
+        0.36443456426279486,
     ),
 }
 
@@ -1629,6 +1629,19 @@ def _trial(
                             timing_ms[str(name)] = float(
                                 timing_ms.get(str(name), 0.0)
                             ) + float(value)
+                planner_filter_summary = getattr(
+                    provider.planner,
+                    "last_filter_summary",
+                    None,
+                )
+                if (
+                    isinstance(planner_filter_summary, Mapping)
+                    and prompt_records
+                    and prompt_records[-1]["prompt_index"] == prompt_index
+                ):
+                    prompt_records[-1]["generation_filter_summary"] = dict(
+                        planner_filter_summary
+                    )
             prompt_index += 1
         timing_ms["point_grasp_provider_total"] = (
             time.perf_counter() - provider_started

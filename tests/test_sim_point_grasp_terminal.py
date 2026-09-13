@@ -26,6 +26,8 @@ def test_terminal_defaults_to_real_like_graspgenx_wrist_cycle() -> None:
     assert args.graspgenx_mode == "service"
     assert args.max_candidates == 5
     assert args.minimum_downward_approach_cosine == 0.5
+    assert args.cube_center_x_m == -0.272
+    assert args.cube_center_y_m == 0.0
 
 
 def test_terminal_config_resolves_selected_physical_wrist(tmp_path: Path) -> None:
@@ -77,6 +79,10 @@ def test_terminal_run_builds_one_deterministic_cube_trial(
             "left",
             "--seed",
             "7",
+            "--cube-center-x-m",
+            "-0.222",
+            "--cube-center-y-m",
+            "0.05",
         ]
     )
     terminal_module.run(args)
@@ -89,6 +95,7 @@ def test_terminal_run_builds_one_deterministic_cube_trial(
     assert config.use_terminal_observation_home
     assert config.cube_spawn_xy_jitter_m == (0.0, 0.0)
     assert config.cube_spawn_yaw_jitter_rad == 0.0
+    assert config.cube_center_xy_m == (-0.222, 0.05)
     assert config.minimum_downward_approach_cosine == 0.5
 
 

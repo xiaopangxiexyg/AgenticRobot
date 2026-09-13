@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from experiments.sim_point_grasp.evaluation import (
+    EVALUATION_OBJECT_CENTER_XY_M,
     SimPointGraspEvaluationConfig,
     evaluate_sim_point_grasps,
 )
@@ -65,6 +66,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-candidates", type=int, default=5)
     parser.add_argument(
+        "--cube-center-x-m",
+        type=float,
+        default=EVALUATION_OBJECT_CENTER_XY_M[0],
+        help="Deterministic simulated cube center x coordinate in meters.",
+    )
+    parser.add_argument(
+        "--cube-center-y-m",
+        type=float,
+        default=EVALUATION_OBJECT_CENTER_XY_M[1],
+        help="Deterministic simulated cube center y coordinate in meters.",
+    )
+    parser.add_argument(
         "--minimum-downward-approach-cosine",
         type=float,
         default=0.5,
@@ -118,6 +131,7 @@ def run(args: argparse.Namespace) -> dict:
         max_candidates=args.max_candidates,
         minimum_downward_approach_cosine=args.minimum_downward_approach_cosine,
         target_point_count=1,
+        cube_center_xy_m=(args.cube_center_x_m, args.cube_center_y_m),
         cube_spawn_xy_jitter_m=(0.0, 0.0),
         cube_spawn_yaw_jitter_rad=0.0,
         candidate_selection_policy=args.candidate_selection_policy,
