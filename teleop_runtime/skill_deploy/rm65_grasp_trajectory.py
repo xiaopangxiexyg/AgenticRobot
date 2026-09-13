@@ -10,6 +10,8 @@ from dataclasses import dataclass, replace
 from itertools import pairwise
 
 import numpy as np
+from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.joint_limits import load_joint_velocity_limit_profiles
@@ -21,15 +23,13 @@ from robot_motion.path_planning import (
 )
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.rm65 import (
+    DEFAULT_LEFT_ARM_QPOS,
+    DEFAULT_RIGHT_ARM_QPOS,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
     RM65DualArmCollisionIKConfig,
     build_dual_arm_scene_profile,
     build_rm65_dual_arm_collision_ik_solver,
-)
-from robot_motion.rm65.dual_arm_target_solver import (
-    BimanualPoseTarget,
-    BimanualPoseTargetSource,
 )
 from robot_motion.rm65.obstacle_collision import (
     RM65_D405_ATTACHED_COLLISION_PROXIES,
@@ -62,9 +62,13 @@ class RM65GraspTrajectoryPlanningConfig:
     linear_speed_m_s: float = 0.12
     angular_speed_deg_s: float = 45.0
     minimum_segment_duration_sec: float = 0.25
-    maximum_endpoint_solve_cycles: int = 240
-    endpoint_seed_count: int = 7
+    maximum_endpoint_solve_cycles: int = 180
+    endpoint_seed_count: int = 24
     endpoint_seed_perturbation_rad: float = float(np.deg2rad(25.0))
+    maximum_endpoint_candidates: int = 8
+    endpoint_position_residual_scale_m: float = 0.01
+    endpoint_orientation_residual_scale_deg: float = 10.0
+    endpoint_tolerance_margin_ratio: float = 0.90
     path_search_attempts_per_endpoint: int = 4
     endpoint_position_tolerance_m: float = 0.003
     endpoint_orientation_tolerance_deg: float = 1.0
@@ -79,20 +83,37 @@ class RM65GraspTrajectoryPlanningConfig:
             "endpoint_position_tolerance_m",
             "endpoint_orientation_tolerance_deg",
             "endpoint_seed_perturbation_rad",
+            "endpoint_position_residual_scale_m",
+            "endpoint_orientation_residual_scale_deg",
             "final_edge_resolution_rad",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
             object.__setattr__(self, name, value)
+        margin = float(self.endpoint_tolerance_margin_ratio)
+        if not math.isfinite(margin) or not 0.0 < margin < 1.0:
+            raise ValueError("endpoint_tolerance_margin_ratio must be in (0, 1).")
+        object.__setattr__(self, "endpoint_tolerance_margin_ratio", margin)
         cycles = int(self.maximum_endpoint_solve_cycles)
         if isinstance(self.maximum_endpoint_solve_cycles, bool) or cycles < 1:
             raise ValueError("maximum_endpoint_solve_cycles must be positive.")
         object.__setattr__(self, "maximum_endpoint_solve_cycles", cycles)
         seed_count = int(self.endpoint_seed_count)
-        if isinstance(self.endpoint_seed_count, bool) or not 1 <= seed_count <= 7:
-            raise ValueError("endpoint_seed_count must be in [1, 7].")
+        if isinstance(self.endpoint_seed_count, bool) or not 1 <= seed_count <= 64:
+            raise ValueError("endpoint_seed_count must be in [1, 64].")
         object.__setattr__(self, "endpoint_seed_count", seed_count)
+        endpoint_candidates = int(self.maximum_endpoint_candidates)
+        if (
+            isinstance(self.maximum_endpoint_candidates, bool)
+            or not 1 <= endpoint_candidates <= 16
+        ):
+            raise ValueError("maximum_endpoint_candidates must be in [1, 16].")
+        object.__setattr__(
+            self,
+            "maximum_endpoint_candidates",
+            endpoint_candidates,
+        )
         path_attempts = int(self.path_search_attempts_per_endpoint)
         if (
             isinstance(self.path_search_attempts_per_endpoint, bool)
@@ -111,7 +132,8 @@ class RM65GraspReachabilityConfig:
     """Finite endpoint-IK budget used only for optional candidate annotation."""
 
     time_budget_ms: float = 1_000.0
-    max_solve_cycles: int = 120
+    max_solve_cycles: int = 180
+    seed_count: int = 16
     standard_position_tolerance_m: float = 0.003
     standard_orientation_tolerance_deg: float = 1.0
     basic_position_tolerance_m: float = 0.05
@@ -133,6 +155,10 @@ class RM65GraspReachabilityConfig:
         if isinstance(self.max_solve_cycles, bool) or cycles < 1:
             raise ValueError("max_solve_cycles must be positive.")
         object.__setattr__(self, "max_solve_cycles", cycles)
+        seed_count = int(self.seed_count)
+        if isinstance(self.seed_count, bool) or not 1 <= seed_count <= 64:
+            raise ValueError("seed_count must be in [1, 64].")
+        object.__setattr__(self, "seed_count", seed_count)
         if (
             self.standard_position_tolerance_m >= self.basic_position_tolerance_m
             or self.standard_orientation_tolerance_deg
@@ -321,9 +347,13 @@ class RM65GraspJointTrajectoryPlanner:
         qpos_by_side: Mapping[str, np.ndarray],
         *,
         side: str,
+        seed_count: int | None = None,
     ) -> tuple[dict[str, np.ndarray], ...]:
-        # Structured shoulder/elbow and base/wrist perturbations cover distinct
-        # RM65 IK basins while retaining the measured posture as seed zero.
+        # Retain the measured posture and nearby basins first so the shortest
+        # solution wins when it exists.  The deterministic Halton tail covers
+        # the full bounded RM65 joint domain; arbitrary grasp poses routinely
+        # have valid branches far outside a 25-degree neighborhood of the live
+        # posture.
         patterns = np.asarray(
             (
                 (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
@@ -342,22 +372,201 @@ class RM65GraspJointTrajectoryPlanner:
             name: np.asarray(qpos_by_side[name], dtype=float).copy()
             for name in _SIDES
         }
+        maximum = (
+            self.config.endpoint_seed_count
+            if seed_count is None
+            else int(seed_count)
+        )
+        if not 1 <= maximum <= 64:
+            raise ValueError("seed_count must be in [1, 64].")
         seeds: list[dict[str, np.ndarray]] = []
-        for pattern in patterns[: self.config.endpoint_seed_count]:
-            candidate = {name: value.copy() for name, value in baseline.items()}
-            candidate[side] = np.clip(
+        local_values = [
+            np.clip(
                 baseline[side]
                 + pattern * self.config.endpoint_seed_perturbation_rad,
                 lower,
                 upper,
             )
+            for pattern in patterns
+        ]
+        default_by_side = {
+            "left": np.asarray(DEFAULT_LEFT_ARM_QPOS, dtype=float),
+            "right": np.asarray(DEFAULT_RIGHT_ARM_QPOS, dtype=float),
+        }
+        local_values.insert(1, np.clip(default_by_side[side], lower, upper))
+        for values in local_values:
+            candidate = {name: value.copy() for name, value in baseline.items()}
+            candidate[side] = np.asarray(values, dtype=float).copy()
             if any(
                 np.allclose(candidate[side], existing[side], atol=1e-9, rtol=0.0)
                 for existing in seeds
             ):
                 continue
             seeds.append(candidate)
+            if len(seeds) == maximum:
+                return tuple(seeds)
+
+        for sample_index in range(1, maximum * 2 + 1):
+            unit = np.asarray(
+                [
+                    self._radical_inverse(sample_index, prime)
+                    for prime in (2, 3, 5, 7, 11, 13)
+                ],
+                dtype=float,
+            )
+            candidate = {name: value.copy() for name, value in baseline.items()}
+            candidate[side] = lower + unit * (upper - lower)
+            if any(
+                np.allclose(candidate[side], existing[side], atol=1e-9, rtol=0.0)
+                for existing in seeds
+            ):
+                continue
+            seeds.append(candidate)
+            if len(seeds) == maximum:
+                break
         return tuple(seeds)
+
+    @staticmethod
+    def _radical_inverse(index: int, base: int) -> float:
+        value = 0.0
+        denominator = 1.0
+        current = int(index)
+        while current > 0:
+            current, remainder = divmod(current, int(base))
+            denominator *= float(base)
+            value += float(remainder) / denominator
+        return value
+
+    def _least_squares_endpoint_from_seed(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        target_tool_tcp_world: np.ndarray,
+        seed_qpos: np.ndarray,
+        maximum_evaluations: int,
+    ) -> tuple[dict[str, np.ndarray], int, float, float]:
+        target_pose = np.asarray(target_tool_tcp_world, dtype=float)
+        lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
+        upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+        position_scale = self.config.endpoint_position_residual_scale_m
+        orientation_scale = math.radians(
+            self.config.endpoint_orientation_residual_scale_deg
+        )
+
+        def qpos_pair(values: np.ndarray) -> dict[str, np.ndarray]:
+            pair = {
+                name: np.asarray(qpos_by_side[name], dtype=float).copy()
+                for name in _SIDES
+            }
+            pair[side] = np.asarray(values, dtype=float).copy()
+            return pair
+
+        def residual(values: np.ndarray) -> np.ndarray:
+            pair = qpos_pair(values)
+            tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=pair["left"],
+                right_qpos=pair["right"],
+            )[side]
+            rotation_error = Rotation.from_matrix(
+                target_pose[:3, :3] @ tcp[:3, :3].T
+            ).as_rotvec()
+            return np.concatenate(
+                (
+                    (target_pose[:3, 3] - tcp[:3, 3]) / position_scale,
+                    rotation_error / orientation_scale,
+                )
+            )
+
+        solved = least_squares(
+            residual,
+            np.asarray(seed_qpos, dtype=float),
+            bounds=(lower, upper),
+            max_nfev=int(maximum_evaluations),
+            xtol=1e-9,
+            ftol=1e-9,
+            gtol=1e-9,
+        )
+        candidate = qpos_pair(np.asarray(solved.x, dtype=float))
+        tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=candidate["left"],
+            right_qpos=candidate["right"],
+        )[side]
+        position, orientation = pose_delta_metrics(tcp, target_pose)
+        if (
+            position <= self.config.endpoint_position_tolerance_m
+            and orientation <= self.config.endpoint_orientation_tolerance_deg
+        ):
+            candidate, position, orientation = self._closest_tolerance_endpoint(
+                qpos_by_side=qpos_by_side,
+                side=side,
+                target_tool_tcp_world=target_pose,
+                seed_qpos=np.asarray(seed_qpos, dtype=float),
+                solved_qpos=np.asarray(candidate[side], dtype=float),
+            )
+        return candidate, int(solved.nfev), position, orientation
+
+    def _closest_tolerance_endpoint(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        target_tool_tcp_world: np.ndarray,
+        seed_qpos: np.ndarray,
+        solved_qpos: np.ndarray,
+    ) -> tuple[dict[str, np.ndarray], float, float]:
+        """Keep the earliest seed-to-solution point inside a strict margin.
+
+        A least-squares optimum commonly drives numerical error to zero even
+        though the motion contract only requires a bounded endpoint.  Backing
+        toward the seed preserves the same IK branch and materially shortens
+        the subsequent collision-aware path without relaxing acceptance.
+        """
+
+        position_limit = (
+            self.config.endpoint_position_tolerance_m
+            * self.config.endpoint_tolerance_margin_ratio
+        )
+        orientation_limit = (
+            self.config.endpoint_orientation_tolerance_deg
+            * self.config.endpoint_tolerance_margin_ratio
+        )
+        target_pose = np.asarray(target_tool_tcp_world, dtype=float)
+        seed = np.asarray(seed_qpos, dtype=float)
+        solved = np.asarray(solved_qpos, dtype=float)
+
+        def evaluate(alpha: float) -> tuple[dict[str, np.ndarray], float, float]:
+            pair = {
+                name: np.asarray(qpos_by_side[name], dtype=float).copy()
+                for name in _SIDES
+            }
+            pair[side] = seed + float(alpha) * (solved - seed)
+            tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=pair["left"],
+                right_qpos=pair["right"],
+            )[side]
+            position, orientation = pose_delta_metrics(tcp, target_pose)
+            return pair, position, orientation
+
+        previous_alpha = 0.0
+        bracket: tuple[float, float] | None = None
+        for alpha in np.linspace(0.0, 1.0, 33)[1:]:
+            _pair, position, orientation = evaluate(float(alpha))
+            if position <= position_limit and orientation <= orientation_limit:
+                bracket = (previous_alpha, float(alpha))
+                break
+            previous_alpha = float(alpha)
+        if bracket is None:
+            return evaluate(1.0)
+        lower, upper = bracket
+        for _ in range(32):
+            midpoint = (lower + upper) * 0.5
+            _pair, position, orientation = evaluate(midpoint)
+            if position <= position_limit and orientation <= orientation_limit:
+                upper = midpoint
+            else:
+                lower = midpoint
+        return evaluate(upper)
 
     def _endpoint_qpos_candidates_locked(
         self,
@@ -382,129 +591,118 @@ class RM65GraspJointTrajectoryPlanner:
             phase="target",
         )
         inactive = "right" if side == "left" else "left"
-        source = BimanualPoseTargetSource(
-            command_type="tcp_pose",
-            value=np.asarray(target_tool_tcp_world, dtype=float),
-            frame_name=self.profile.station_world_frame_id,
-            metadata={"planner": "real_grasp_urdf_fcl"},
-        )
         attempts: list[dict[str, object]] = []
         accepted: list[_EndpointIKCandidate] = []
         collision_unavailable = False
         collision_blocked = False
-        try:
-            for seed_index, seed in enumerate(
-                self._endpoint_seed_qpos(qpos_by_side, side=side)
-            ):
-                self.target_builder.set_current_qpos_pair(
-                    left_qpos=seed["left"],
-                    right_qpos=seed["right"],
-                    reset_tracking=True,
+        for seed_index, seed in enumerate(
+            self._endpoint_seed_qpos(qpos_by_side, side=side)
+        ):
+            outcome = "ik_search_exhausted"
+            evaluations = 0
+            try:
+                candidate, evaluations, position, orientation = (
+                    self._least_squares_endpoint_from_seed(
+                        qpos_by_side=qpos_by_side,
+                        side=side,
+                        target_tool_tcp_world=target_tool_tcp_world,
+                        seed_qpos=seed[side],
+                        maximum_evaluations=(
+                            self.config.maximum_endpoint_solve_cycles
+                        ),
+                    )
                 )
-                best: tuple[float, float, float] | None = None
-                outcome = "ik_search_exhausted"
-                cycles = 0
-                for cycle in range(self.config.maximum_endpoint_solve_cycles):
-                    result = self.target_builder.solve_target_pair(
-                        BimanualPoseTarget(
-                            timestamp=(
-                                float(cycle)
-                                / self.profile.position_profile.rates.ik_hz
-                            ),
-                            target_pose_by_side=solver_targets,
-                            active_sides=(side,),
-                            hard_hold_inactive_sides=True,
-                            source_by_side={side: source, inactive: None},
-                        )
-                    )
-                    cycles = cycle + 1
-                    candidate = {
-                        name: np.asarray(
-                            result.side_results[name].qpos,
-                            dtype=float,
-                        ).copy()
-                        for name in _SIDES
+                candidate[inactive] = np.asarray(
+                    qpos_by_side[inactive], dtype=float
+                ).copy()
+            except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+                attempts.append(
+                    {
+                        "seed_index": seed_index,
+                        "solve_cycles": evaluations,
+                        "outcome": "ik_solver_error",
+                        "error_type": type(exc).__name__,
                     }
-                    candidate[inactive] = np.asarray(
-                        qpos_by_side[inactive], dtype=float
-                    ).copy()
-                    tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                        left_qpos=candidate["left"],
-                        right_qpos=candidate["right"],
-                    )[side]
-                    position, orientation = pose_delta_metrics(
-                        tcp, target_tool_tcp_world
+                )
+                continue
+            if (
+                position <= self.config.endpoint_position_tolerance_m
+                and orientation <= self.config.endpoint_orientation_tolerance_deg
+            ):
+                if any(
+                    np.allclose(
+                        candidate[side],
+                        item.qpos_by_side[side],
+                        atol=1e-5,
+                        rtol=0.0,
                     )
-                    normalized = max(
-                        position / self.config.endpoint_position_tolerance_m,
-                        orientation / self.config.endpoint_orientation_tolerance_deg,
-                    )
-                    if best is None or normalized < best[0]:
-                        best = (normalized, position, orientation)
-                    if (
-                        position > self.config.endpoint_position_tolerance_m
-                        or orientation
-                        > self.config.endpoint_orientation_tolerance_deg
-                    ):
-                        continue
-                    if any(
-                        np.allclose(
-                            candidate[side],
-                            item.qpos_by_side[side],
-                            atol=1e-5,
-                            rtol=0.0,
-                        )
-                        for item in accepted
-                    ):
-                        outcome = "duplicate_exact_solution"
-                        break
+                    for item in accepted
+                ):
+                    outcome = "duplicate_exact_solution"
+                else:
                     check = self.oracle.check(candidate)
                     if not check.collision_check_available:
                         collision_unavailable = True
                         outcome = "endpoint_collision_check_unavailable"
-                        break
-                    if not check.safe:
+                    elif not check.safe:
                         collision_blocked = True
                         outcome = "endpoint_collision_blocked"
-                        break
-                    accepted.append(
-                        _EndpointIKCandidate(
-                            qpos_by_side=candidate,
-                            seed_index=seed_index,
-                            solve_cycles=cycles,
-                            position_residual_m=position,
-                            orientation_residual_deg=orientation,
+                    else:
+                        accepted.append(
+                            _EndpointIKCandidate(
+                                qpos_by_side=candidate,
+                                seed_index=seed_index,
+                                solve_cycles=evaluations,
+                                position_residual_m=position,
+                                orientation_residual_deg=orientation,
+                            )
                         )
-                    )
-                    outcome = "accepted"
-                    break
-                if best is None:
-                    raise RuntimeError("RM65 endpoint solver produced no candidate.")
-                attempts.append(
-                    {
-                        "seed_index": seed_index,
-                        "solve_cycles": cycles,
-                        "outcome": outcome,
-                        "best_position_residual_m": best[1],
-                        "best_orientation_residual_deg": best[2],
-                    }
-                )
-        finally:
-            self.target_builder.set_current_qpos_pair(
-                left_qpos=qpos_by_side["left"],
-                right_qpos=qpos_by_side["right"],
-                reset_tracking=True,
+                        outcome = "accepted"
+            attempts.append(
+                {
+                    "seed_index": seed_index,
+                    "solve_cycles": evaluations,
+                    "outcome": outcome,
+                    "best_position_residual_m": position,
+                    "best_orientation_residual_deg": orientation,
+                }
             )
         if accepted:
-            return tuple(accepted)
+            current = np.asarray(qpos_by_side[side], dtype=float)
+            accepted.sort(
+                key=lambda item: float(
+                    np.linalg.norm(np.asarray(item.qpos_by_side[side]) - current)
+                )
+            )
+            return tuple(accepted[: self.config.maximum_endpoint_candidates])
         if collision_unavailable:
             reason = "endpoint_collision_check_unavailable"
         elif collision_blocked:
             reason = "endpoint_collision_blocked"
         else:
             reason = "ik_search_exhausted"
+        residual_attempts = [
+            item
+            for item in attempts
+            if item.get("best_position_residual_m") is not None
+            and item.get("best_orientation_residual_deg") is not None
+        ]
+        if not residual_attempts:
+            raise RM65GraspTrajectoryPlanningError(
+                "ik_solver_error",
+                details={
+                    "cycles": sum(int(item["solve_cycles"]) for item in attempts),
+                    "endpoint_seed_count": len(attempts),
+                    "maximum_cycles_per_seed": (
+                        self.config.maximum_endpoint_solve_cycles
+                    ),
+                    "endpoint_solver": "scipy_least_squares_fk_multistart",
+                    "solve_unit": "function_evaluations",
+                    "attempts": attempts,
+                },
+            )
         best_attempt = min(
-            attempts,
+            residual_attempts,
             key=lambda item: max(
                 float(item["best_position_residual_m"])
                 / self.config.endpoint_position_tolerance_m,
@@ -526,6 +724,8 @@ class RM65GraspJointTrajectoryPlanner:
                 "maximum_cycles_per_seed": (
                     self.config.maximum_endpoint_solve_cycles
                 ),
+                "endpoint_solver": "scipy_least_squares_fk_multistart",
+                "solve_unit": "function_evaluations",
                 "attempts": attempts,
             },
         )
@@ -538,7 +738,7 @@ class RM65GraspJointTrajectoryPlanner:
         target_tool_tcp_world: np.ndarray,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> RM65GraspReachabilityResult:
-        """Classify one endpoint using the lower solver, without path planning."""
+        """Classify one endpoint with bounded read-only FK IK, without a path."""
 
         if side not in _SIDES:
             raise ValueError("side must be left or right.")
@@ -547,61 +747,34 @@ class RM65GraspJointTrajectoryPlanner:
             raise ValueError("target_tool_tcp_world must be one finite 4x4 pose.")
         config = self.reachability_config
         with self._solver_lock:
-            self.target_builder.set_current_qpos_pair(
-                left_qpos=qpos_by_side["left"],
-                right_qpos=qpos_by_side["right"],
-                reset_tracking=True,
-            )
-            solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
-                left_qpos=qpos_by_side["left"],
-                right_qpos=qpos_by_side["right"],
-            )
-            solver_targets[side] = (
-                self.target_builder.solver_world_target_from_tool_tcp_world_target(
-                    side=side,
-                    tool_tcp_world_target=target_pose,
-                )
-            )
-            inactive = "right" if side == "left" else "left"
-            source = BimanualPoseTargetSource(
-                command_type="tcp_pose",
-                value=target_pose,
-                frame_name=self.profile.station_world_frame_id,
-                metadata={"planner": "real_grasp_reachability"},
-            )
             started = float(monotonic())
             deadline = started + config.time_budget_ms / 1_000.0
             best: tuple[float, float, float] | None = None
             cycles = 0
-            termination = "cycle_budget_exhausted"
-            for cycle in range(config.max_solve_cycles):
-                if cycle > 0 and float(monotonic()) >= deadline:
+            termination = "seed_budget_exhausted"
+            for seed_index, seed in enumerate(
+                self._endpoint_seed_qpos(
+                    qpos_by_side,
+                    side=side,
+                    seed_count=config.seed_count,
+                )
+            ):
+                if seed_index > 0 and float(monotonic()) >= deadline:
                     termination = "time_budget_exhausted"
                     break
-                result = self.target_builder.solve_target_pair(
-                    BimanualPoseTarget(
-                        timestamp=(
-                            float(cycle) / self.profile.position_profile.rates.ik_hz
-                        ),
-                        target_pose_by_side=solver_targets,
-                        active_sides=(side,),
-                        hard_hold_inactive_sides=True,
-                        source_by_side={side: source, inactive: None},
+                try:
+                    _candidate, evaluations, position, orientation = (
+                        self._least_squares_endpoint_from_seed(
+                            qpos_by_side=qpos_by_side,
+                            side=side,
+                            target_tool_tcp_world=target_pose,
+                            seed_qpos=seed[side],
+                            maximum_evaluations=config.max_solve_cycles,
+                        )
                     )
-                )
-                cycles = cycle + 1
-                candidate = {
-                    name: np.asarray(result.side_results[name].qpos, dtype=float).copy()
-                    for name in _SIDES
-                }
-                candidate[inactive] = np.asarray(
-                    qpos_by_side[inactive], dtype=float
-                ).copy()
-                tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                    left_qpos=candidate["left"],
-                    right_qpos=candidate["right"],
-                )[side]
-                position, orientation = pose_delta_metrics(tcp, target_pose)
+                except (RuntimeError, ValueError, np.linalg.LinAlgError):
+                    continue
+                cycles += evaluations
                 normalized_error = max(
                     position / config.basic_position_tolerance_m,
                     orientation / config.basic_orientation_tolerance_deg,

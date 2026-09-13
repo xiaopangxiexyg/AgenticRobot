@@ -703,7 +703,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                         StationPointGraspArmReachabilityProfile(
                             arm_side=side,
                             evaluator_profile_id=(
-                                "rm65.lower_endpoint_ik_reachability.v1"
+                                "rm65.global_fk_multistart_reachability.v1"
                             ),
                             evaluator_profile_hash=(
                                 reachability_config.semantic_content_hash

@@ -73,7 +73,7 @@ class StationPointGraspArmReachabilityProfile:
     solver_reference_frame_spec_hash: str
     frame_graph_hash: str
     time_budget_ms: float = 1_000.0
-    max_solve_cycles: int = 120
+    max_solve_cycles: int = 180
     max_measured_qpos_age_ms: float = 200.0
     standard_position_tolerance_m: float = 0.003
     standard_orientation_tolerance_deg: float = 1.0

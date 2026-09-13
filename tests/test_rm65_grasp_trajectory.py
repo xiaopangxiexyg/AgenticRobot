@@ -478,7 +478,10 @@ def test_reachability_classification_uses_one_solution_residual_pair(
         profile=profile,
         planning_target_builder=initial_builder,
         target_envelope_filter=None,
-        reachability_config=RM65GraspReachabilityConfig(max_solve_cycles=1),
+        reachability_config=RM65GraspReachabilityConfig(
+            max_solve_cycles=1,
+            seed_count=1,
+        ),
     )
     realized = np.eye(4)
     realized[0, 3] = translation_m
@@ -602,14 +605,17 @@ def test_endpoint_planner_collects_distinct_exact_multistart_solutions() -> None
         target_tool_tcp_world=np.eye(4),
     )
 
-    assert [candidate.seed_index for candidate in candidates] == [0, 1, 2, 3, 4]
+    assert candidates[0].seed_index == 0
+    assert {candidate.seed_index for candidate in candidates} == {0, 1, 2, 3, 4}
     assert all(candidate.solve_cycles == 1 for candidate in candidates)
     assert all(
         np.array_equal(candidate.qpos_by_side["left"], current["left"])
         for candidate in candidates
     )
     assert len({tuple(candidate.qpos_by_side["right"]) for candidate in candidates}) == 5
-    np.testing.assert_array_equal(builder.seed_history[-1]["right"], current["right"])
+    # Endpoint optimization uses the read-only FK port and must not mutate the
+    # online target builder's tracked state.
+    assert builder.seed_history == []
 
 
 def test_endpoint_planner_reports_best_multistart_residuals_on_exhaustion() -> None:
@@ -644,8 +650,58 @@ def test_endpoint_planner_reports_best_multistart_residuals_on_exhaustion() -> N
     assert len(error.value.details["attempts"]) == 3
 
 
-def test_endpoint_planner_uses_all_structured_seed_basins_by_default() -> None:
-    assert RM65GraspTrajectoryPlanningConfig().endpoint_seed_count == 7
+def test_endpoint_planner_uses_global_deterministic_seed_coverage_by_default() -> None:
+    config = RM65GraspTrajectoryPlanningConfig()
+
+    assert config.endpoint_seed_count == 24
+    assert config.maximum_endpoint_candidates == 8
+
+
+def test_endpoint_planner_solves_real_workspace_pose_outside_local_qp_basin() -> None:
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_seed_count=16,
+            maximum_endpoint_candidates=4,
+        ),
+    )
+    target = np.eye(4, dtype=float)
+    target[:3, :3] = np.asarray(
+        (
+            (-0.9396926168, 0.3420201541, 0.0),
+            (0.3420201541, 0.9396926168, 0.0),
+            (0.0, 0.0, -1.0),
+        )
+    )
+    target[:3, 3] = (-0.3287666177, 0.0735600430, 0.1556847929)
+
+    candidates = planner._endpoint_qpos_candidates(
+        qpos_by_side=SAFE_QPOS,
+        side="right",
+        target_tool_tcp_world=target,
+    )
+
+    assert candidates
+    for candidate in candidates:
+        realized = builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=candidate.qpos_by_side["left"],
+            right_qpos=candidate.qpos_by_side["right"],
+        )["right"]
+        position_error_m, orientation_error_deg = pose_delta_metrics(realized, target)
+        assert position_error_m <= planner.config.endpoint_position_tolerance_m
+        assert orientation_error_deg <= planner.config.endpoint_orientation_tolerance_deg
+        assert planner.oracle.check(candidate.qpos_by_side).safe is True
+
+    reachability = planner.assess_endpoint_ik(
+        qpos_by_side=SAFE_QPOS,
+        side="right",
+        target_tool_tcp_world=target,
+    )
+    assert reachability.classification == "standard_reachable"
 
 
 def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
