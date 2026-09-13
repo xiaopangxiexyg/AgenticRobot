@@ -332,7 +332,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 "num_grasps": self.num_grasps,
                 "server_top_k": self.server_top_k,
                 "score_threshold": self.score_threshold,
-                "inference_frame": "arm_base_z_up",
+                "inference_frame": "gravity_aligned_reference_z_up",
                 "gripper": {
                     "profile": "DMTAC_M",
                     "sweep_volume_v1": DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
@@ -468,8 +468,9 @@ class Sam2GraspGenXPointGraspPlanner:
         stage_started = time.perf_counter()
         grasps, scores = self.client.infer_object(
             # GraspMoE's OBB branch defines "top" using input-frame +Z, so
-            # inference must run in the gravity-aligned arm-base frame rather
-            # than the camera optical frame.
+            # inference must run in the gravity-aligned reference frame rather
+            # than the camera optical frame. In simulation this is the arm base;
+            # the real Station path uses its canonical z-up station frame.
             target_points_base,
             sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
             planner=self.planner,
