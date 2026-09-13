@@ -860,6 +860,46 @@ def test_fixed_writing_uses_calibrated_descent_endpoint_when_supplied() -> None:
     assert first.arm_pose_by_side["right"][2] == pytest.approx(0.301)
 
 
+@pytest.mark.parametrize(
+    ("option", "value_hint"),
+    (
+        ("--mode", "NAME"),
+        ("--source-dataset", "PATH"),
+        ("--source-episode", "N"),
+        ("--detail-annotation-dir", "PATH"),
+        ("--source-pool-manifest", "PATH"),
+        ("--source-pool-range", "START:END"),
+        ("--selection-seed", "N"),
+        ("--tactile-bundle-root", "PATH"),
+        ("--dataset-root", "PATH"),
+        ("--trajectory", "ID"),
+        ("--size-m", "M"),
+        ("--direction", "NAME"),
+        ("--speed-m-s", "MPS"),
+        ("--initial-alignment-speed-scale", "S"),
+        ("--left-gripper-port", "PATH"),
+        ("--right-gripper-port", "PATH"),
+        ("--task-name", "NAME"),
+        ("--tactile-min-free-gb", "N"),
+        ("--camera-frame-max-age-sec", "S"),
+    ),
+)
+def test_launcher_value_options_preserve_missing_value_errors(
+    option: str,
+    value_hint: str,
+) -> None:
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), option],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr == f"[RuleBased] {option} requires {value_hint}.\n"
+
+
 def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     tmp_path: Path,
 ) -> None:

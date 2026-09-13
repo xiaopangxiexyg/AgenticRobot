@@ -81,103 +81,61 @@ CAMERA_FRAME_MAX_AGE_SEC="0.25"
 WITH_LEFT_GRIPPER=0
 DRY_RUN=0
 
+# Keep this shell layer limited to site binding and profile assembly.  The
+# option-to-variable table avoids duplicating the same arity check and
+# assignment branch for every value option while preserving the CLI contract.
+declare -A VALUE_OPTION_TARGET=(
+  [--mode]=COLLECTION_MODE
+  [--source-dataset]=SOURCE_DATASET
+  [--source-episode]=SOURCE_EPISODE
+  [--detail-annotation-dir]=DETAIL_ANNOTATION_DIR
+  [--source-pool-manifest]=SOURCE_POOL_MANIFEST
+  [--source-pool-range]=SOURCE_POOL_RANGE
+  [--selection-seed]=SELECTION_SEED
+  [--tactile-bundle-root]=TACTILE_ROOT
+  [--dataset-root]=OUTPUT_DATASET_ROOT
+  [--trajectory]=TRAJECTORY
+  [--size-m]=SIZE_M
+  [--direction]=DIRECTION
+  [--speed-m-s]=SPEED_M_S
+  [--initial-alignment-speed-scale]=INITIAL_ALIGNMENT_SPEED_SCALE
+  [--left-gripper-port]=LEFT_GRIPPER_PORT
+  [--right-gripper-port]=RIGHT_GRIPPER_PORT
+  [--task-name]=TASK_NAME
+  [--tactile-min-free-gb]=TACTILE_MIN_FREE_GB
+  [--camera-frame-max-age-sec]=CAMERA_FRAME_MAX_AGE_SEC
+)
+declare -A VALUE_OPTION_HINT=(
+  [--mode]=NAME
+  [--source-dataset]=PATH
+  [--source-episode]=N
+  [--detail-annotation-dir]=PATH
+  [--source-pool-manifest]=PATH
+  [--source-pool-range]=START:END
+  [--selection-seed]=N
+  [--tactile-bundle-root]=PATH
+  [--dataset-root]=PATH
+  [--trajectory]=ID
+  [--size-m]=M
+  [--direction]=NAME
+  [--speed-m-s]=MPS
+  [--initial-alignment-speed-scale]=S
+  [--left-gripper-port]=PATH
+  [--right-gripper-port]=PATH
+  [--task-name]=NAME
+  [--tactile-min-free-gb]=N
+  [--camera-frame-max-age-sec]=S
+)
+
 while [[ $# -gt 0 ]]; do
+  option="$1"
+  if [[ -n "${VALUE_OPTION_TARGET[$option]+present}" ]]; then
+    [[ $# -ge 2 ]] || die "$option requires ${VALUE_OPTION_HINT[$option]}."
+    printf -v "${VALUE_OPTION_TARGET[$option]}" '%s' "$2"
+    shift 2
+    continue
+  fi
   case "$1" in
-    --mode)
-      [[ $# -ge 2 ]] || die "--mode requires NAME."
-      COLLECTION_MODE="$2"
-      shift 2
-      ;;
-    --source-dataset)
-      [[ $# -ge 2 ]] || die "--source-dataset requires PATH."
-      SOURCE_DATASET="$2"
-      shift 2
-      ;;
-    --source-episode)
-      [[ $# -ge 2 ]] || die "--source-episode requires N."
-      SOURCE_EPISODE="$2"
-      shift 2
-      ;;
-    --detail-annotation-dir)
-      [[ $# -ge 2 ]] || die "--detail-annotation-dir requires PATH."
-      DETAIL_ANNOTATION_DIR="$2"
-      shift 2
-      ;;
-    --source-pool-manifest)
-      [[ $# -ge 2 ]] || die "--source-pool-manifest requires PATH."
-      SOURCE_POOL_MANIFEST="$2"
-      shift 2
-      ;;
-    --source-pool-range)
-      [[ $# -ge 2 ]] || die "--source-pool-range requires START:END."
-      SOURCE_POOL_RANGE="$2"
-      shift 2
-      ;;
-    --selection-seed)
-      [[ $# -ge 2 ]] || die "--selection-seed requires N."
-      SELECTION_SEED="$2"
-      shift 2
-      ;;
-    --tactile-bundle-root)
-      [[ $# -ge 2 ]] || die "--tactile-bundle-root requires PATH."
-      TACTILE_ROOT="$2"
-      shift 2
-      ;;
-    --dataset-root)
-      [[ $# -ge 2 ]] || die "--dataset-root requires PATH."
-      OUTPUT_DATASET_ROOT="$2"
-      shift 2
-      ;;
-    --trajectory)
-      [[ $# -ge 2 ]] || die "--trajectory requires ID."
-      TRAJECTORY="$2"
-      shift 2
-      ;;
-    --size-m)
-      [[ $# -ge 2 ]] || die "--size-m requires M."
-      SIZE_M="$2"
-      shift 2
-      ;;
-    --direction)
-      [[ $# -ge 2 ]] || die "--direction requires NAME."
-      DIRECTION="$2"
-      shift 2
-      ;;
-    --speed-m-s)
-      [[ $# -ge 2 ]] || die "--speed-m-s requires MPS."
-      SPEED_M_S="$2"
-      shift 2
-      ;;
-    --initial-alignment-speed-scale)
-      [[ $# -ge 2 ]] || die "--initial-alignment-speed-scale requires S."
-      INITIAL_ALIGNMENT_SPEED_SCALE="$2"
-      shift 2
-      ;;
-    --left-gripper-port)
-      [[ $# -ge 2 ]] || die "--left-gripper-port requires PATH."
-      LEFT_GRIPPER_PORT="$2"
-      shift 2
-      ;;
-    --right-gripper-port)
-      [[ $# -ge 2 ]] || die "--right-gripper-port requires PATH."
-      RIGHT_GRIPPER_PORT="$2"
-      shift 2
-      ;;
-    --task-name)
-      [[ $# -ge 2 ]] || die "--task-name requires NAME."
-      TASK_NAME="$2"
-      shift 2
-      ;;
-    --tactile-min-free-gb)
-      [[ $# -ge 2 ]] || die "--tactile-min-free-gb requires N."
-      TACTILE_MIN_FREE_GB="$2"
-      shift 2
-      ;;
-    --camera-frame-max-age-sec)
-      [[ $# -ge 2 ]] || die "--camera-frame-max-age-sec requires S."
-      CAMERA_FRAME_MAX_AGE_SEC="$2"
-      shift 2
-      ;;
     --with-left-gripper)
       WITH_LEFT_GRIPPER=1
       shift
@@ -315,22 +273,17 @@ if [[ -n "$SPEED_M_S" && "$COLLECTION_MODE" == "rule-based-writing" ]]; then
   RULE_ARGS+=(--rule-writing-speed-m-s "$SPEED_M_S")
 fi
 
+LEFT_HAND_BACKEND=none
+if [[ "$WITH_LEFT_GRIPPER" -eq 1 ]]; then
+  LEFT_HAND_BACKEND=dmtac-gripper
+fi
 HAND_TOPOLOGY_ARGS=(
-  --left-hand-backend none
+  --left-hand-backend "$LEFT_HAND_BACKEND"
   --right-hand-backend dmtac-gripper
   --gripper-input-source none
   --no-q6-default-config
   --special-arm-control-mode manual
 )
-if [[ "$WITH_LEFT_GRIPPER" -eq 1 ]]; then
-  HAND_TOPOLOGY_ARGS=(
-    --left-hand-backend dmtac-gripper
-    --right-hand-backend dmtac-gripper
-    --gripper-input-source none
-    --no-q6-default-config
-    --special-arm-control-mode manual
-  )
-fi
 
 if [[ -n "${LEFT_GRIPPER_PORT:-}" ]]; then
   HAND_TOPOLOGY_ARGS+=(--left-gripper-port "$LEFT_GRIPPER_PORT")
