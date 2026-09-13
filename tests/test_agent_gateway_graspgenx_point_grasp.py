@@ -14,6 +14,9 @@ from agent_gateway.profiles.real.point_grasp_deployment import (
 )
 from deployments.perception.graspgenx_client import (
     GRASPGENX_DEFAULT_MODE,
+    GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+    GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
+    GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM,
     GraspGenXClient,
     GraspGenXInferenceBackend,
     GraspGenXInProcessBackend,
@@ -325,6 +328,17 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
     assert _Sampler.calls == 1
     assert len(runner_calls) == 1
     assert runner_calls[0][2]["topk_num_grasps"] == -1
+    assert (
+        runner_calls[0][2]["moe_num_yaws"]
+        == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
+    )
+    assert (
+        runner_calls[0][2]["moe_obb_density"]
+        == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
+    )
+    assert runner_calls[0][2]["moe_obb_position_spacing_cm"] == pytest.approx(
+        GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
+    )
     assert scores.tolist() == pytest.approx([0.9])
     np.testing.assert_allclose(grasps[0], second)
     backend.close()
@@ -386,6 +400,11 @@ def test_client_sends_dmtac_sweep_volume_and_sorts_top_k() -> None:
     assert socket.connected_to == "tcp://127.0.0.1:5556"
     request = unpack_graspgenx_message(socket.sent[0])
     assert request["action"] == "infer_object"
+    assert request["moe_num_yaws"] == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
+    assert request["moe_obb_density"] == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
+    assert request["moe_obb_position_spacing_cm"] == pytest.approx(
+        GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
+    )
     assert request["sweep_volume_params"]["gripper_type"] == 0
     np.testing.assert_allclose(
         request["sweep_volume_params"]["extents_open"],

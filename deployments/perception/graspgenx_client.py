@@ -34,7 +34,20 @@ GRASPGENX_DEFAULT_TIMEOUT_MS = 120_000
 GRASPGENX_DEFAULT_MODE = "in-process"
 GRASPGENX_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 GRASPGENX_INPROCESS_BACKEND_ID = "graspgenx-inprocess-v1"
+GRASPGENX_POINT_GRASP_MOE_NUM_YAWS = 18
+GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY = "dense-topandside"
+GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM = 3.0
 _GRASPGENX_IMPORT_LOCK = threading.RLock()
+
+
+def _point_grasp_moe_sampling_config() -> dict[str, object]:
+    return {
+        "num_yaws": GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+        "obb_density": GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
+        "obb_position_spacing_cm": (
+            GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
+        ),
+    }
 
 
 @runtime_checkable
@@ -195,6 +208,7 @@ class GraspGenXClient:
             "port": self.port,
             "timeout_ms": self.timeout_ms,
             "maximum_message_bytes": GRASPGENX_MAX_MESSAGE_BYTES,
+            "graspmoe_sampling": _point_grasp_moe_sampling_config(),
         }
 
     def start(self) -> None:
@@ -286,6 +300,11 @@ class GraspGenXClient:
                     "sweep_volume_params": params,
                     "planner": planner,
                     "num_grasps": int(num_grasps),
+                    "moe_num_yaws": GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+                    "moe_obb_density": GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
+                    "moe_obb_position_spacing_cm": (
+                        GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
+                    ),
                 }
             )
         grasps = _finite_rigid_matrices(response.get("grasps"))
@@ -434,6 +453,7 @@ class GraspGenXInProcessBackend:
             "tensorrt_precision": (
                 self.tensorrt_precision if self.use_tensorrt else None
             ),
+            "graspmoe_sampling": _point_grasp_moe_sampling_config(),
         }
 
     @property
@@ -647,6 +667,11 @@ class GraspGenXInProcessBackend:
                         grasp_threshold=-1.0,
                         num_grasps=int(num_grasps),
                         topk_num_grasps=backend_top_k,
+                        moe_num_yaws=GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+                        moe_obb_density=GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
+                        moe_obb_position_spacing_cm=(
+                            GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
+                        ),
                     )
                 )
         grasps = _finite_rigid_matrices(self._to_numpy(raw_grasps))
@@ -676,6 +701,9 @@ __all__ = [
     "GRASPGENX_DEFAULT_PORT",
     "GRASPGENX_DEFAULT_TIMEOUT_MS",
     "GRASPGENX_INPROCESS_BACKEND_ID",
+    "GRASPGENX_POINT_GRASP_MOE_NUM_YAWS",
+    "GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY",
+    "GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM",
     "GraspGenXClient",
     "GraspGenXInProcessBackend",
     "GraspGenXInferenceBackend",
