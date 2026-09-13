@@ -383,6 +383,29 @@ def test_planner_rejection_returns_evidence_without_motion_or_hold() -> None:
     assert port.snapshot().dispatch_count == 0
 
 
+def test_planner_rejection_surfaces_nested_dense_path_diagnostics() -> None:
+    error = RM65GraspTrajectoryPlanningError(
+        "path_target_safety_envelope_blocked",
+        details={
+            "endpoint_candidate_count": 3,
+            "last_dense_revalidation_error": {
+                "reason_code": "path_target_safety_envelope_blocked",
+                "details": {
+                    "modified_sides": ("right",),
+                    "segment_index": 0,
+                    "edge_sample_index": 0,
+                },
+            },
+        },
+    )
+
+    assert RealGraspApproachPlanProvider._diagnostics(error) == {
+        "modified_sides": ["right"],
+        "segment_index": 0,
+        "edge_sample_index": 0,
+    }
+
+
 @pytest.fixture
 def stored_plan():
     _, provider, store, _, request, operation = _planning_fixture(

@@ -921,6 +921,11 @@ class RealGraspApproachPlanProvider:
     @staticmethod
     def _diagnostics(exc: RM65GraspTrajectoryPlanningError) -> dict[str, Any]:
         details = dict(exc.details)
+        nested_failure = details.get("last_dense_revalidation_error")
+        if isinstance(nested_failure, Mapping):
+            nested_details = nested_failure.get("details")
+            if isinstance(nested_details, Mapping):
+                details.update(nested_details)
         diagnostics: dict[str, Any] = {}
         for field_name in (
             "cycles",
