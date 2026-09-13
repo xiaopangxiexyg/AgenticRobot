@@ -889,6 +889,19 @@ class PolicyDeployRuntime:
         self._next_scheduled_effective_at = None
         self.reset_arm_hold_semantics()
 
+    def reset_stream(self) -> None:
+        """Begin a fresh policy stream at an explicit lifecycle boundary.
+
+        Queue contents, chunk lineage, the prediction-rate clock and latched
+        arm-hold semantics describe one stream.  Reset them atomically so a
+        caller cannot accidentally retain one part of a retired stream.
+        Inference and chunk identity counters remain monotonic across the
+        boundary.
+        """
+
+        self.clear_action_queue()
+        self._last_prediction_at = None
+
     def action_queue_pop_count(self) -> int:
         return int(self._action_queue.popped_count)
 

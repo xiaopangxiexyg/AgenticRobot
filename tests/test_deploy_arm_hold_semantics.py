@@ -1135,21 +1135,31 @@ def test_history_sidecar_does_not_change_sync_action_or_emission_identity() -> N
     assert history_runtime.action_queue_pop_count() == 1
 
 
-def test_runtime_semantic_reset_rotates_history_epoch_and_bootstrap() -> None:
+def test_runtime_stream_reset_is_atomic_and_rotates_history_epoch() -> None:
     contract = _contract()
     binding = _history_binding(contract, epoch=8)
     observation = _observation()
     runtime = _runtime(contract, history_binding=binding)
     runtime.predict_and_queue(
-        _Policy(_policy_output(contract, ((1.0, 0.0),))),
+        _Policy(_policy_output(contract, ((1.0, 0.0), (1.0, 0.0)))),
         observation,
         now=10.0,
     )
     runtime.prepare_next_action(observation, preparer=_pipeline())
+    assert runtime.action_queue_length() == 1
+    assert runtime.should_predict(
+        now=10.1,
+        policy_interval_s=1.0,
+    ) is False
 
-    runtime.reset_arm_hold_semantics()
+    runtime.reset_stream()
     reset = runtime.arm_hold_resolved_history_snapshot()
 
+    assert runtime.action_queue_length() == 0
+    assert runtime.should_predict(
+        now=10.1,
+        policy_interval_s=1.0,
+    ) is True
     assert reset is not None
     assert reset.binding.binding_id == binding.binding_id
     assert reset.binding.epoch == 9
