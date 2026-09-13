@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -50,6 +51,7 @@ class _EdgeResult:
     safe: bool
     available: bool
     rejection: Mapping[str, Any] | None = None
+    timed_out: bool = False
 
 
 def _validated_mapping(value: Mapping[str, Any]) -> dict[str, np.ndarray]:
@@ -81,15 +83,33 @@ def plan_collision_aware_joint_path(
     joint_lower_by_component: Mapping[str, Any] | None = None,
     joint_upper_by_component: Mapping[str, Any] | None = None,
     scene_hash: str | None = None,
+    monotonic: Callable[[], float] = time.perf_counter,
 ) -> JointPathPlanResult:
     """Plan a collision-checked path without authorizing its execution.
 
     Only dimensions owned by ``movable_components`` are sampled.  Every other
     component is reconstructed from the exact start configuration before every
-    oracle call and in every returned waypoint.
+    oracle call and in every returned waypoint.  ``time_budget_sec`` is a
+    cooperative wall-time bound checked before and after collision-oracle
+    queries; it cannot preempt one oracle call already in progress.
     """
 
     cfg = config if config is not None else JointPathPlannerConfig()
+    deadline = (
+        None
+        if cfg.time_budget_sec is None
+        else float(monotonic()) + cfg.time_budget_sec
+    )
+
+    def budget_expired() -> bool:
+        return deadline is not None and float(monotonic()) >= deadline
+
+    def timeout_rejection(phase: str) -> dict[str, str]:
+        return {
+            "reason": "time_budget_exhausted",
+            "termination_phase": phase,
+        }
+
     resolved_scene_hash, scene_binding_metadata, scene_binding_error = (
         _resolve_scene_binding(oracle=oracle, requested_scene_hash=scene_hash)
     )
@@ -195,15 +215,48 @@ def plan_collision_aware_joint_path(
         "adaptive_edge_resolution_rad": cfg.adaptive_edge_resolution_rad,
         "adaptive_refinement_distance_m": cfg.adaptive_refinement_distance_m,
         "shortcut_attempts": cfg.shortcut_attempts,
+        "time_budget_sec": cfg.time_budget_sec,
         "collision_scope": "complete_configuration",
         "inactive_components_frozen": True,
         **scene_binding_metadata,
     }
+
+    def timeout_result(
+        phase: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> JointPathPlanResult:
+        return _result(
+            JointPathStatus.PATH_SEARCH_EXHAUSTED,
+            start,
+            target,
+            movable,
+            resolved_scene_hash,
+            "time_budget_exhausted",
+            {
+                **base_metadata,
+                **({} if metadata is None else metadata),
+                "search_termination": "time_budget_exhausted",
+                "termination_phase": phase,
+            },
+        )
+
+    if budget_expired():
+        return timeout_result("start_check")
     if not start_check.collision_check_available:
         return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "start_collision_check_unavailable", {**base_metadata, "start_check": start_check.to_dict()})
     if not start_check.safe:
         return _result(JointPathStatus.START_BLOCKED, start, target, movable, resolved_scene_hash, "start_configuration_blocked", {**base_metadata, "start_check": start_check.to_dict()})
+    if budget_expired():
+        return timeout_result("target_check", {"start_check": start_check.to_dict()})
     target_check = check(target_flat)
+    if budget_expired():
+        return timeout_result(
+            "target_check",
+            {
+                "start_check": start_check.to_dict(),
+                "target_check": target_check.to_dict(),
+            },
+        )
     if not target_check.collision_check_available:
         return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "target_collision_check_unavailable", {**base_metadata, "start_check": start_check.to_dict(), "target_check": target_check.to_dict()})
     if not target_check.safe:
@@ -219,9 +272,23 @@ def plan_collision_aware_joint_path(
         count = max(1, int(np.ceil(float(np.max(np.abs(delta))) / resolution_rad)))
         minimum_distance_m = math.inf
         for sample_index in range(1, count + 1):
+            if budget_expired():
+                return _EdgeResult(
+                    False,
+                    True,
+                    timeout_rejection("edge_check"),
+                    timed_out=True,
+                ), None
             alpha = float(sample_index) / float(count)
             candidate = np.asarray(a, dtype=float) + alpha * delta
             assessment = check(candidate)
+            if budget_expired():
+                return _EdgeResult(
+                    False,
+                    True,
+                    timeout_rejection("edge_check"),
+                    timed_out=True,
+                ), None
             if not assessment.collision_check_available:
                 return _EdgeResult(
                     False,
@@ -289,6 +356,11 @@ def plan_collision_aware_joint_path(
     if np.array_equal(start_flat, target_flat):
         return _result(JointPathStatus.PATH_FOUND, start, target, movable, resolved_scene_hash, "start_equals_target", {**base_metadata, "direct_path": True, "search_iterations": 0, "search_node_count": 1}, (expand(start_flat),))
     direct = edge_safe(start_flat, target_flat)
+    if direct.timed_out:
+        return timeout_result(
+            "direct_edge",
+            {"last_rejected_edge": direct.rejection},
+        )
     if not direct.available:
         return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "direct_edge_collision_check_unavailable", {**base_metadata, "last_rejected_edge": direct.rejection})
     if direct.safe:
@@ -305,6 +377,8 @@ def plan_collision_aware_joint_path(
     unavailable_rejection: Mapping[str, Any] | None = None
 
     def extend(tree: _Tree, destination: np.ndarray) -> tuple[str, int | None, Mapping[str, Any] | None, bool]:
+        if budget_expired():
+            return "timed_out", None, timeout_rejection("tree_extend"), True
         nearest_index = tree.nearest(destination)
         nearest = tree.nodes[nearest_index]
         delta = destination - nearest
@@ -314,6 +388,8 @@ def plan_collision_aware_joint_path(
         scale = min(1.0, cfg.extension_step_rad / maximum)
         candidate = nearest + scale * delta
         edge = edge_safe(nearest, candidate)
+        if edge.timed_out:
+            return "timed_out", None, edge.rejection, True
         if not edge.available:
             return "trapped", None, edge.rejection, False
         if not edge.safe:
@@ -321,19 +397,36 @@ def plan_collision_aware_joint_path(
         index = tree.add(candidate, nearest_index)
         return ("reached" if scale >= 1.0 - 1e-12 else "advanced"), index, None, True
 
-    def connect(tree: _Tree, destination: np.ndarray) -> tuple[bool, int | None, Mapping[str, Any] | None, bool]:
+    def connect(
+        tree: _Tree,
+        destination: np.ndarray,
+    ) -> tuple[bool, int | None, Mapping[str, Any] | None, bool, bool]:
         while len(start_tree.nodes) + len(target_tree.nodes) < cfg.max_nodes:
+            if budget_expired():
+                return (
+                    False,
+                    None,
+                    timeout_rejection("tree_connect"),
+                    True,
+                    True,
+                )
             status, index, rejection, available = extend(tree, destination)
+            if status == "timed_out":
+                return False, None, rejection, True, True
             if status == "trapped":
-                return False, None, rejection, available
+                return False, None, rejection, available, False
             if status == "reached":
-                return True, index, None, True
-        return False, None, None, True
+                return True, index, None, True, False
+        return False, None, None, True, False
 
     found: list[np.ndarray] | None = None
     iterations = 0
+    timeout_phase: str | None = None
     for iteration in range(1, cfg.max_iterations + 1):
         iterations = iteration
+        if budget_expired():
+            timeout_phase = "tree_search"
+            break
         if len(start_tree.nodes) + len(target_tree.nodes) >= cfg.max_nodes:
             break
         grow_start = iteration % 2 == 1
@@ -344,14 +437,27 @@ def plan_collision_aware_joint_path(
         status, active_index, rejection, available = extend(active, sample)
         if rejection is not None:
             last_rejection = rejection
+        if status == "timed_out":
+            timeout_phase = str(
+                (rejection or {}).get("termination_phase", "tree_extend")
+            )
+            break
         if not available:
             unavailable_rejection = rejection
             break
         if status == "trapped" or active_index is None:
             continue
-        connected, other_index, rejection, available = connect(other, active.nodes[active_index])
+        connected, other_index, rejection, available, timed_out = connect(
+            other,
+            active.nodes[active_index],
+        )
         if rejection is not None:
             last_rejection = rejection
+        if timed_out:
+            timeout_phase = str(
+                (rejection or {}).get("termination_phase", "tree_connect")
+            )
+            break
         if not available:
             unavailable_rejection = rejection
             break
@@ -373,17 +479,34 @@ def plan_collision_aware_joint_path(
         "search_node_count": len(start_tree.nodes) + len(target_tree.nodes),
         "last_rejected_edge": last_rejection,
     }
+    if timeout_phase is not None:
+        return timeout_result(timeout_phase, search_metadata)
     if unavailable_rejection is not None:
         return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "search_collision_check_unavailable", search_metadata)
     if found is None:
         return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable, resolved_scene_hash, "bounded_search_exhausted", search_metadata)
 
-    shortened, shortcut_unavailable = _shortcut_path(found, edge_safe, rng, cfg.shortcut_attempts)
+    shortened, shortcut_unavailable, shortcut_timed_out = _shortcut_path(
+        found,
+        edge_safe,
+        rng,
+        cfg.shortcut_attempts,
+    )
+    if shortcut_timed_out:
+        return timeout_result(
+            "shortcut",
+            {**search_metadata, "last_rejected_edge": shortcut_unavailable},
+        )
     if shortcut_unavailable is not None:
         return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "shortcut_collision_check_unavailable", {**search_metadata, "last_rejected_edge": shortcut_unavailable})
     final_rejection = None
     for left, right in zip(shortened, shortened[1:]):
         validation = edge_safe(left, right)
+        if validation.timed_out:
+            return timeout_result(
+                "final_revalidation",
+                {**search_metadata, "last_rejected_edge": validation.rejection},
+            )
         if not validation.available:
             return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "final_path_collision_check_unavailable", {**search_metadata, "last_rejected_edge": validation.rejection})
         if not validation.safe:
@@ -391,6 +514,8 @@ def plan_collision_aware_joint_path(
             break
     if final_rejection is not None:
         return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable, resolved_scene_hash, "final_path_revalidation_failed", {**search_metadata, "last_rejected_edge": final_rejection})
+    if budget_expired():
+        return timeout_result("finalize", search_metadata)
     return _result(
         JointPathStatus.PATH_FOUND,
         start,
@@ -505,7 +630,12 @@ def _search_bounds(
     return np.concatenate(lower_parts), np.concatenate(upper_parts)
 
 
-def _shortcut_path(path: list[np.ndarray], edge_safe: Any, rng: np.random.Generator, attempts: int) -> tuple[list[np.ndarray], Mapping[str, Any] | None]:
+def _shortcut_path(
+    path: list[np.ndarray],
+    edge_safe: Any,
+    rng: np.random.Generator,
+    attempts: int,
+) -> tuple[list[np.ndarray], Mapping[str, Any] | None, bool]:
     shortened = [np.asarray(item, dtype=float).copy() for item in path]
     for _ in range(attempts):
         if len(shortened) < 3:
@@ -514,11 +644,13 @@ def _shortcut_path(path: list[np.ndarray], edge_safe: Any, rng: np.random.Genera
         if right <= left + 1:
             continue
         edge = edge_safe(shortened[left], shortened[right])
+        if edge.timed_out:
+            return shortened, edge.rejection, True
         if not edge.available:
-            return shortened, edge.rejection
+            return shortened, edge.rejection, False
         if edge.safe:
             shortened = shortened[: left + 1] + shortened[right:]
-    return shortened, None
+    return shortened, None, False
 
 
 def _result(

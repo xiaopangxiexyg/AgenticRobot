@@ -247,6 +247,40 @@ def test_bounded_search_exhaustion_does_not_claim_kinematic_unreachability() -> 
     assert result.metadata["search_is_complete"] is False
 
 
+def test_wall_time_budget_returns_typed_partial_search_result() -> None:
+    now = [0.0]
+
+    class _SlowClearOracle:
+        def check(self, _qpos_by_component):
+            now[0] += 0.1
+            return JointConfigurationCheck(safe=True)
+
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [0.0]},
+        target_qpos_by_component={"left": [1.0]},
+        movable_components=("left",),
+        oracle=_SlowClearOracle(),
+        config=_planner_config(
+            edge_resolution_rad=0.01,
+            time_budget_sec=0.25,
+        ),
+        monotonic=lambda: now[0],
+    )
+
+    assert result.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+    assert result.reason == "time_budget_exhausted"
+    assert result.waypoints == ()
+    assert result.metadata["search_termination"] == "time_budget_exhausted"
+    assert result.metadata["termination_phase"] == "direct_edge"
+    assert result.metadata["time_budget_sec"] == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("value", (0.0, -1.0, float("nan"), float("inf")))
+def test_wall_time_budget_must_be_positive_and_finite(value: float) -> None:
+    with pytest.raises(ValueError, match="time_budget_sec"):
+        JointPathPlannerConfig(time_budget_sec=value)
+
+
 def test_inactive_target_change_is_an_invalid_request() -> None:
     result = plan_collision_aware_joint_path(
         start_qpos_by_component={"left": [0.0], "right": [1.0]},

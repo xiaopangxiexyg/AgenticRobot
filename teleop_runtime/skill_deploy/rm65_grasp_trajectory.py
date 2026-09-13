@@ -73,6 +73,7 @@ class RM65GraspTrajectoryPlanningConfig:
     endpoint_orientation_residual_scale_deg: float = 10.0
     endpoint_tolerance_margin_ratio: float = 0.90
     path_search_attempts_per_endpoint: int = 4
+    path_planning_time_budget_sec: float = 120.0
     endpoint_position_tolerance_m: float = 0.003
     endpoint_orientation_tolerance_deg: float = 1.0
     final_edge_resolution_rad: float = float(np.deg2rad(0.1))
@@ -97,6 +98,7 @@ class RM65GraspTrajectoryPlanningConfig:
             "endpoint_seed_perturbation_rad",
             "endpoint_position_residual_scale_m",
             "endpoint_orientation_residual_scale_deg",
+            "path_planning_time_budget_sec",
             "final_edge_resolution_rad",
             "maximum_path_envelope_ingress_distance_m",
             "path_envelope_ingress_progress_tolerance_m",
@@ -341,6 +343,26 @@ class RM65GraspJointTrajectoryPlanner:
             expected_reference_frame_spec_hash=self.scene.reference_frame_spec_hash,
             attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
         )
+
+    def _remaining_path_planning_time_sec(
+        self,
+        *,
+        deadline: float,
+        monotonic: Callable[[], float],
+        planning_phase: str,
+        details: Mapping[str, object] | None = None,
+    ) -> float:
+        remaining = float(deadline) - float(monotonic())
+        if remaining <= 0.0:
+            raise RM65GraspTrajectoryPlanningError(
+                "path_planning_time_budget_exhausted",
+                details={
+                    "planning_phase": planning_phase,
+                    "time_budget_sec": self.config.path_planning_time_budget_sec,
+                    **dict(details or {}),
+                },
+            )
+        return remaining
 
     def _target_envelope_projection_details(
         self,
@@ -678,12 +700,16 @@ class RM65GraspJointTrajectoryPlanner:
         qpos_by_side: Mapping[str, np.ndarray],
         side: str,
         target_tool_tcp_world: np.ndarray,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
         with self._solver_lock:
             return self._endpoint_qpos_candidates_locked(
                 qpos_by_side=qpos_by_side,
                 side=side,
                 target_tool_tcp_world=target_tool_tcp_world,
+                deadline=deadline,
+                monotonic=monotonic,
             )
 
     def _endpoint_seed_qpos(
@@ -914,6 +940,8 @@ class RM65GraspJointTrajectoryPlanner:
         qpos_by_side: Mapping[str, np.ndarray],
         side: str,
         target_tool_tcp_world: np.ndarray,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
         solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
             left_qpos=qpos_by_side["left"],
@@ -938,6 +966,20 @@ class RM65GraspJointTrajectoryPlanner:
         for seed_index, seed in enumerate(
             self._endpoint_seed_qpos(qpos_by_side, side=side)
         ):
+            if deadline is not None and float(monotonic()) >= deadline:
+                if accepted:
+                    break
+                raise RM65GraspTrajectoryPlanningError(
+                    "path_planning_time_budget_exhausted",
+                    details={
+                        "planning_phase": "endpoint_ik",
+                        "time_budget_sec": (
+                            self.config.path_planning_time_budget_sec
+                        ),
+                        "endpoint_seed_count_attempted": len(attempts),
+                        "attempts": attempts,
+                    },
+                )
             outcome = "ik_search_exhausted"
             evaluations = 0
             try:
@@ -1004,6 +1046,20 @@ class RM65GraspJointTrajectoryPlanner:
                     "best_position_residual_m": position,
                     "best_orientation_residual_deg": orientation,
                 }
+            )
+        if (
+            deadline is not None
+            and not accepted
+            and float(monotonic()) >= deadline
+        ):
+            raise RM65GraspTrajectoryPlanningError(
+                "path_planning_time_budget_exhausted",
+                details={
+                    "planning_phase": "endpoint_ik",
+                    "time_budget_sec": self.config.path_planning_time_budget_sec,
+                    "endpoint_seed_count_attempted": len(attempts),
+                    "attempts": attempts,
+                },
             )
         if accepted:
             current = np.asarray(qpos_by_side[side], dtype=float)
@@ -1166,6 +1222,8 @@ class RM65GraspJointTrajectoryPlanner:
         waypoints: tuple[Mapping[str, np.ndarray], ...],
         *,
         moving_side: str,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> dict[str, object]:
         checks = 0
         minimum_distance = math.inf
@@ -1234,6 +1292,16 @@ class RM65GraspJointTrajectoryPlanner:
                 1, math.ceil(maximum_delta / self.config.final_edge_resolution_rad)
             )
             for index in range(steps + 1):
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        planning_phase="dense_revalidation",
+                        details={
+                            "segment_index": segment_index,
+                            "edge_sample_index": index,
+                        },
+                    )
                 alpha = float(index) / float(steps)
                 qpos = {
                     side: np.asarray(start[side])
@@ -1309,6 +1377,16 @@ class RM65GraspJointTrajectoryPlanner:
                         }
                 check = self.oracle.check(qpos)
                 checks += 1
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        planning_phase="dense_revalidation",
+                        details={
+                            "segment_index": segment_index,
+                            "edge_sample_index": index,
+                        },
+                    )
                 if check.minimum_distance_m is not None:
                     minimum_distance = min(minimum_distance, check.minimum_distance_m)
                 if not check.collision_check_available or not check.safe:
@@ -1357,11 +1435,21 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         planning_phase: str,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> _PlannedPathLeg:
+        if deadline is not None:
+            self._remaining_path_planning_time_sec(
+                deadline=deadline,
+                monotonic=monotonic,
+                planning_phase=planning_phase,
+            )
         endpoint_candidates = self._endpoint_qpos_candidates(
             qpos_by_side=qpos_by_side,
             side=side,
             target_tool_tcp_world=target_tool_tcp_world,
+            deadline=deadline,
+            monotonic=monotonic,
         )
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
@@ -1398,6 +1486,26 @@ class RM65GraspJointTrajectoryPlanner:
                         + endpoint_index * self.config.path_search_attempts_per_endpoint
                         + path_attempt
                     ),
+                    time_budget_sec=(
+                        cfg.time_budget_sec
+                        if deadline is None
+                        else min(
+                            self._remaining_path_planning_time_sec(
+                                deadline=deadline,
+                                monotonic=monotonic,
+                                planning_phase=planning_phase,
+                                details={
+                                    "endpoint_seed_index": endpoint.seed_index,
+                                    "path_attempt": path_attempt,
+                                },
+                            ),
+                            (
+                                math.inf
+                                if cfg.time_budget_sec is None
+                                else cfg.time_budget_sec
+                            ),
+                        )
+                    ),
                 )
                 path = plan_collision_aware_joint_path(
                     start_qpos_by_component=qpos_by_side,
@@ -1408,6 +1516,7 @@ class RM65GraspJointTrajectoryPlanner:
                     joint_lower_by_component={side: corridor_lower},
                     joint_upper_by_component={side: corridor_upper},
                     scene_hash=self.scene.semantic_content_hash,
+                    monotonic=monotonic,
                 )
                 attempt_record: dict[str, object] = {
                     "planning_phase": planning_phase,
@@ -1421,6 +1530,19 @@ class RM65GraspJointTrajectoryPlanner:
                 }
                 search_attempts.append(attempt_record)
                 if path.status is not JointPathStatus.PATH_FOUND:
+                    if path.reason == "time_budget_exhausted":
+                        terminal_error = RM65GraspTrajectoryPlanningError(
+                            "path_planning_time_budget_exhausted",
+                            details={
+                                "planning_phase": planning_phase,
+                                "time_budget_sec": (
+                                    self.config.path_planning_time_budget_sec
+                                ),
+                                "path": path.to_dict(),
+                                "search_attempts": search_attempts,
+                            },
+                        )
+                        break
                     if path.status is JointPathStatus.COLLISION_CHECK_UNAVAILABLE:
                         terminal_error = RM65GraspTrajectoryPlanningError(
                             "path_collision_check_unavailable",
@@ -1436,11 +1558,16 @@ class RM65GraspJointTrajectoryPlanner:
                     dense = self._revalidate(
                         path.waypoints,
                         moving_side=side,
+                        deadline=deadline,
+                        monotonic=monotonic,
                     )
                 except RM65GraspTrajectoryPlanningError as error:
                     attempt_record["dense_revalidation_error"] = error.reason_code
                     terminal_error = error
-                    if error.reason_code == "path_collision_check_unavailable":
+                    if error.reason_code in {
+                        "path_collision_check_unavailable",
+                        "path_planning_time_budget_exhausted",
+                    }:
                         break
                     continue
                 return _PlannedPathLeg(
@@ -1451,12 +1578,17 @@ class RM65GraspJointTrajectoryPlanner:
                 )
             if (
                 terminal_error is not None
-                and terminal_error.reason_code == "path_collision_check_unavailable"
+                and terminal_error.reason_code
+                in {
+                    "path_collision_check_unavailable",
+                    "path_planning_time_budget_exhausted",
+                }
             ):
                 break
 
         if terminal_error is not None and terminal_error.reason_code in {
             "path_collision_check_unavailable",
+            "path_planning_time_budget_exhausted",
             "path_target_safety_envelope_blocked",
             "path_target_safety_envelope_unavailable",
         }:
@@ -1504,6 +1636,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         speed_scale: float,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> RealAgentJointTrajectory:
         selected_side = str(side).strip().lower()
         if selected_side not in _SIDES:
@@ -1518,6 +1651,9 @@ class RM65GraspJointTrajectoryPlanner:
         scale = float(speed_scale)
         if not 0.0 < scale <= 1.0:
             raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
+        deadline = (
+            float(monotonic()) + self.config.path_planning_time_budget_sec
+        )
         ingress_targets = self._envelope_ingress_targets(
             qpos_by_side=current,
             side=selected_side,
@@ -1534,6 +1670,8 @@ class RM65GraspJointTrajectoryPlanner:
                     side=selected_side,
                     target_tool_tcp_world=target_pose,
                     planning_phase="grasp_target",
+                    deadline=deadline,
+                    monotonic=monotonic,
                 ),
             )
         else:
@@ -1548,6 +1686,8 @@ class RM65GraspJointTrajectoryPlanner:
                         side=selected_side,
                         target_tool_tcp_world=ingress_target,
                         planning_phase="envelope_ingress",
+                        deadline=deadline,
+                        monotonic=monotonic,
                     )
                     ingress_qpos = ingress_leg.endpoint.qpos_by_side
                     grasp_leg = self._plan_path_leg(
@@ -1555,6 +1695,8 @@ class RM65GraspJointTrajectoryPlanner:
                         side=selected_side,
                         target_tool_tcp_world=target_pose,
                         planning_phase="grasp_target",
+                        deadline=deadline,
+                        monotonic=monotonic,
                     )
                     combined_waypoints = (
                         *ingress_leg.path.waypoints,
@@ -1563,6 +1705,8 @@ class RM65GraspJointTrajectoryPlanner:
                     combined_dense = self._revalidate(
                         combined_waypoints,
                         moving_side=selected_side,
+                        deadline=deadline,
+                        monotonic=monotonic,
                     )
                 except RM65GraspTrajectoryPlanningError as error:
                     route_error = error
@@ -1573,7 +1717,10 @@ class RM65GraspJointTrajectoryPlanner:
                             "planning_phase": error.details.get("planning_phase"),
                         }
                     )
-                    if error.reason_code == "path_collision_check_unavailable":
+                    if error.reason_code in {
+                        "path_collision_check_unavailable",
+                        "path_planning_time_budget_exhausted",
+                    }:
                         break
                     continue
                 route_attempt["status"] = "path_found"
@@ -1598,6 +1745,11 @@ class RM65GraspJointTrajectoryPlanner:
                 ) from route_error
 
         assert selected_legs is not None
+        self._remaining_path_planning_time_sec(
+            deadline=deadline,
+            monotonic=monotonic,
+            planning_phase="trajectory_parameterization",
+        )
         if ingress_route is None:
             dense = dict(selected_legs[0].dense_revalidation)
         endpoint = selected_legs[-1].endpoint
@@ -1623,6 +1775,11 @@ class RM65GraspJointTrajectoryPlanner:
         samples = {name: [current[name].copy()] for name in _SIDES}
         elapsed = 0.0
         for start, end in pairwise(waypoints):
+            self._remaining_path_planning_time_sec(
+                deadline=deadline,
+                monotonic=monotonic,
+                planning_phase="trajectory_parameterization",
+            )
             start_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
                 left_qpos=start["left"], right_qpos=start["right"]
             )[selected_side]

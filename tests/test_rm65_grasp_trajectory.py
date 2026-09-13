@@ -1177,6 +1177,75 @@ def test_endpoint_planner_uses_global_deterministic_seed_coverage_by_default() -
 
     assert config.endpoint_seed_count == 24
     assert config.maximum_endpoint_candidates == 8
+    assert config.path_planning_time_budget_sec == pytest.approx(120.0)
+
+
+def test_path_leg_shares_remaining_wall_time_and_stops_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_seed_count=2,
+            path_search_attempts_per_endpoint=4,
+        )
+    )
+    planner.planner_config = JointPathPlannerConfig(
+        max_iterations=1,
+        max_nodes=2,
+        shortcut_attempts=0,
+    )
+    planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
+    planner.oracle = SimpleNamespace()
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    target = {side: value.copy() for side, value in current.items()}
+    target["right"] = np.full(6, 0.1)
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=target,
+        seed_index=0,
+        solve_cycles=10,
+        position_residual_m=0.001,
+        orientation_residual_deg=0.2,
+    )
+    planner._endpoint_qpos_candidates = lambda **_kwargs: (endpoint,)
+    calls: list[dict[str, object]] = []
+
+    def fake_plan(**kwargs):
+        calls.append(kwargs)
+        return JointPathPlanResult(
+            status=JointPathStatus.PATH_SEARCH_EXHAUSTED,
+            start_qpos_by_component=kwargs["start_qpos_by_component"],
+            target_qpos_by_component=kwargs["target_qpos_by_component"],
+            movable_components=("right",),
+            scene_hash="scene:test",
+            reason="time_budget_exhausted",
+            metadata={"search_termination": "time_budget_exhausted"},
+        )
+
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "plan_collision_aware_joint_path",
+        fake_plan,
+    )
+
+    with pytest.raises(
+        RM65GraspTrajectoryPlanningError,
+        match="path_planning_time_budget_exhausted",
+    ) as error:
+        planner._plan_path_leg(
+            qpos_by_side=current,
+            side="right",
+            target_tool_tcp_world=np.eye(4),
+            planning_phase="grasp_target",
+            deadline=10.0,
+            monotonic=lambda: 2.0,
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["config"].time_budget_sec == pytest.approx(8.0)
+    assert calls[0]["monotonic"]() == pytest.approx(2.0)
+    assert error.value.details["search_attempts"][0]["reason"] == (
+        "time_budget_exhausted"
+    )
 
 
 def test_endpoint_planner_solves_real_workspace_pose_outside_local_qp_basin() -> None:
