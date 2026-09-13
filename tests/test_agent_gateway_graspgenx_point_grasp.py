@@ -474,7 +474,7 @@ def test_planner_rejects_non_finite_score_threshold(tmp_path: Path) -> None:
         )
 
 
-def test_planner_converts_gripper_base_pose_to_calibrated_dmtac_tcp(
+def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     tmp_path: Path,
 ) -> None:
     depth = np.zeros((20, 20), dtype=np.float32)
@@ -482,8 +482,14 @@ def test_planner_converts_gripper_base_pose_to_calibrated_dmtac_tcp(
     mask = depth > 0.0
     camera_from_model_base = np.eye(4, dtype=np.float64)
     camera_from_model_base[2, 3] = 0.975
+    base_from_camera = np.eye(4, dtype=np.float64)
+    base_from_camera[:3, :3] = np.asarray(
+        ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+    )
+    base_from_camera[:3, 3] = (0.20, -0.10, 0.30)
+    base_from_model_base = base_from_camera @ camera_from_model_base
     client = _PlannerClient(
-        camera_from_model_base[None], np.asarray((0.9,), dtype=np.float64)
+        base_from_model_base[None], np.asarray((0.9,), dtype=np.float64)
     )
     planner = Sam2GraspGenXPointGraspPlanner(
         model_spec=_model_spec(tmp_path),
@@ -504,14 +510,29 @@ def test_planner_converts_gripper_base_pose_to_calibrated_dmtac_tcp(
             "cx": 10.0,
             "cy": 10.0,
         },
-        base_from_camera=np.eye(4),
+        base_from_camera=base_from_camera,
         max_candidates=1,
     )
 
     assert client.started
     assert len(client.calls) == 1
     assert client.calls[0][0].shape == (25, 3)
+    expected_camera_points = np.asarray(
+        [
+            ((u - 10.0) / 100.0, (v - 10.0) / 100.0, 1.0)
+            for v in range(8, 13)
+            for u in range(8, 13)
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(
+        client.calls[0][0],
+        expected_camera_points @ base_from_camera[:3, :3].T
+        + base_from_camera[:3, 3],
+        atol=1e-6,
+    )
     assert client.calls[0][1]["planner"] == "graspmoe"
+    assert client.calls[0][1]["top_k"] == 1_000
     candidate = result.candidates[0]
     camera_from_tcp = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
     assert camera_from_tcp[2, 3] == pytest.approx(1.017999, abs=1e-6)
@@ -519,6 +540,9 @@ def test_planner_converts_gripper_base_pose_to_calibrated_dmtac_tcp(
     assert candidate.visible_collision_free is True
     assert planner.last_target_mask is not None
     assert "graspgenx_inference" in planner.last_plan_timing_ms
+    assert planner.last_filter_summary["detected"] == 1
+    assert planner.last_filter_summary["width_valid"] == 1
+    assert planner.last_filter_summary["target_capture_valid"] == 1
 
     planner.close()
     assert client.closed_for_test
@@ -539,7 +563,7 @@ def test_planner_fails_closed_when_model_pose_misses_clicked_object(
     )
     planner.start()
 
-    with pytest.raises(RuntimeError, match="No visible collision-free"):
+    with pytest.raises(RuntimeError, match='"target_capture_valid":0'):
         planner.plan(
             Image.new("RGB", (20, 20)),
             depth,

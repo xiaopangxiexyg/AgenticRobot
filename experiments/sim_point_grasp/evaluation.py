@@ -1,7 +1,7 @@
-"""RGB-D point-grasp Skill to physical MuJoCo cube-lift evaluation.
+"""RGB-D point-grasp Skills to physical MuJoCo cube-lift evaluation.
 
 This experiment composes existing owners instead of creating another motion
-runtime: the read-only Gateway provider owns SAM2 + GraspNet inference, while
+runtime: the read-only Gateway provider owns SAM2 plus the selected backend, while
 ``CubeLiftKernel`` retains IK, collision projection, actuator, contact, and
 episode-success authority.
 """
@@ -36,6 +36,14 @@ from deployments.perception.dmtac_grasp_overlay import (
     DmtacGraspOverlayCandidate,
     render_dmtac_grasp_overlays,
 )
+from deployments.perception.graspgenx_client import (
+    GraspGenXClient,
+    GraspGenXInProcessBackend,
+)
+from deployments.perception.sam2_graspgenx_point_grasp import (
+    GraspGenXPointGraspModelSpec,
+    Sam2GraspGenXPointGraspPlanner,
+)
 from deployments.perception.sam2_graspnet_point_grasp import (
     GraspNetPointGraspModelSpec,
     Sam2GraspNetPointGraspPlanner,
@@ -47,6 +55,8 @@ from deployments.perception.sam2_grounding_dino import (
 from deployments.perception.sam2_vgn_point_grasp import (
     DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
     PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
+    Sam2VgnPointGraspPlanner,
+    VgnPointGraspModelSpec,
 )
 from project_paths import resolve_path
 from robot_motion.rm65 import endpoint_to_tool_transform, load_rm65_tool_profile
@@ -73,6 +83,12 @@ EVALUATION_HEAVY_SCENE_CONTRACT = Path(
 EVALUATION_HEAVY_SCENE_CONTRACT_SHA256 = (
     "43a9c7b2590a4fd8980feb9e1162640d50504dd9ba5778cf7d87e7a700831789"
 )
+EVALUATION_CUBE_SCENE_CONTRACT = Path(
+    "experiments/sim_point_grasp/configs/rm65_bimanual_cube_v1.json"
+)
+EVALUATION_CUBE_SCENE_CONTRACT_SHA256 = (
+    "70fe5c7b9e3906633be3f673c5c49f547e40ba389c5dd89f711f73454e70dd3d"
+)
 EVALUATION_RIGHT_TOOL_PROFILE = Path(
     "experiments/sim_point_grasp/configs/rm65_right_DMTAC_M_4b2_cad_tool_tcp.json"
 )
@@ -94,6 +110,7 @@ EVALUATION_TOOL_PROFILE_SHA256_BY_SIDE = {
     "right": EVALUATION_RIGHT_TOOL_PROFILE_SHA256,
 }
 EVALUATION_OBJECT_SIZE_M = (0.04, 0.04, 0.10)
+EVALUATION_CUBE_SIZE_M = (0.04, 0.04, 0.04)
 EVALUATION_OBJECT_CENTER_XY_M = (-0.272, 0.0)
 EVALUATION_GRIPPER_PROFILE_NAME = "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
 EVALUATION_GRIPPER_PROFILE_SHA256 = (
@@ -109,6 +126,31 @@ MULTIPOINT_MAX_COMBINED_CANDIDATES = 10
 RESULT_SCHEMA_V1 = "dexteleop.experiments.sim_point_grasp_evaluation.v1"
 TRIAL_SCHEMA_V1 = "dexteleop.experiments.sim_point_grasp_trial.v1"
 CAMERA_NAME = "front"
+POINT_GRASP_BACKENDS = frozenset({"vgn", "graspnet", "graspgenx"})
+GENERATION_VIEWS = frozenset({"front", "selected_wrist"})
+OBJECT_PROFILES = frozenset({"tall_box", "cube"})
+
+# Collision-safe homes found through the same MuJoCo pose-action/IK path used
+# below.  At reset, the selected physical wrist optical axis points at the
+# 40 mm cube; these are terminal observation homes, not real-hardware homes.
+TERMINAL_OBSERVATION_HOME_QPOS_BY_SIDE = {
+    "left": (
+        1.9085502826568146,
+        0.8697800480375084,
+        0.41671629129436566,
+        2.408633918441217,
+        -2.231878777844559,
+        -1.2409476186373012,
+    ),
+    "right": (
+        -0.8352406314227725,
+        0.5956882063622921,
+        1.0931223562678203,
+        0.09425157862353473,
+        1.4753280659947152,
+        0.36443456426279486,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -117,6 +159,15 @@ class SimPointGraspEvaluationConfig:
     sam2_asset_bundle: Path
     graspnet_asset_bundle: Path
     arm_side: str = "right"
+    point_grasp_backend: str = "graspnet"
+    generation_view: str = "front"
+    object_profile: str = "tall_box"
+    use_terminal_observation_home: bool = False
+    graspgenx_mode: str = "service"
+    graspgenx_host: str = "127.0.0.1"
+    graspgenx_port: int = 5556
+    graspgenx_timeout_ms: int = 120_000
+    graspgenx_source_root: Path | None = None
     trials: int = 10
     seed_start: int = 0
     device: str = "cuda"
@@ -129,6 +180,8 @@ class SimPointGraspEvaluationConfig:
     cube_spawn_yaw_jitter_rad: float = math.pi / 4.0
     pregrasp_offset_m: float = 0.070
     adaptive_pregrasp_offsets_m: tuple[float, ...] = (0.050, 0.035)
+    pregrasp_transit_clearance_m: float = 0.080
+    minimum_downward_approach_cosine: float | None = None
     candidate_selection_policy: str = "reachability_aware"
     lift_offset_m: float = 0.100
     pose_position_tolerance_m: float = 0.008
@@ -154,6 +207,47 @@ class SimPointGraspEvaluationConfig:
         if arm_side not in EVALUATION_TOOL_PROFILE_BY_SIDE:
             raise ValueError("arm_side must be left or right.")
         object.__setattr__(self, "arm_side", arm_side)
+        backend = str(self.point_grasp_backend).strip().lower()
+        if backend not in POINT_GRASP_BACKENDS:
+            raise ValueError(
+                f"point_grasp_backend must be one of {sorted(POINT_GRASP_BACKENDS)}."
+            )
+        object.__setattr__(self, "point_grasp_backend", backend)
+        generation_view = str(self.generation_view).strip().lower()
+        if generation_view not in GENERATION_VIEWS:
+            raise ValueError(
+                f"generation_view must be one of {sorted(GENERATION_VIEWS)}."
+            )
+        object.__setattr__(self, "generation_view", generation_view)
+        object_profile = str(self.object_profile).strip().lower()
+        if object_profile not in OBJECT_PROFILES:
+            raise ValueError(
+                f"object_profile must be one of {sorted(OBJECT_PROFILES)}."
+            )
+        object.__setattr__(self, "object_profile", object_profile)
+        if not isinstance(self.use_terminal_observation_home, bool):
+            raise TypeError("use_terminal_observation_home must be a bool.")
+        mode = str(self.graspgenx_mode).strip().lower()
+        if mode not in {"service", "in-process"}:
+            raise ValueError("graspgenx_mode must be service or in-process.")
+        object.__setattr__(self, "graspgenx_mode", mode)
+        host = str(self.graspgenx_host).strip()
+        if not host:
+            raise ValueError("graspgenx_host must not be empty.")
+        object.__setattr__(self, "graspgenx_host", host)
+        if not 1 <= int(self.graspgenx_port) <= 65535:
+            raise ValueError("graspgenx_port must be in [1, 65535].")
+        object.__setattr__(self, "graspgenx_port", int(self.graspgenx_port))
+        if int(self.graspgenx_timeout_ms) <= 0:
+            raise ValueError("graspgenx_timeout_ms must be positive.")
+        object.__setattr__(self, "graspgenx_timeout_ms", int(self.graspgenx_timeout_ms))
+        if self.graspgenx_source_root is not None:
+            source_root = (
+                Path(self.graspgenx_source_root).expanduser().resolve(strict=True)
+            )
+            if not source_root.is_dir():
+                raise ValueError("graspgenx_source_root must be an existing directory.")
+            object.__setattr__(self, "graspgenx_source_root", source_root)
         if not 1 <= int(self.trials) <= 100:
             raise ValueError("trials must be in [1, 100].")
         if not 1 <= int(self.max_candidates) <= 5:
@@ -168,7 +262,7 @@ class SimPointGraspEvaluationConfig:
         if self.gripper_force_profile not in {"standard", "strong"}:
             raise ValueError("gripper_force_profile must be standard or strong.")
         if not str(self.device).startswith("cuda"):
-            raise ValueError("The reviewed GraspNet profile requires a CUDA device.")
+            raise ValueError("The reviewed point-grasp profiles require a CUDA device.")
         if len(self.cube_center_xy_m) != 2 or any(
             not math.isfinite(float(value)) for value in self.cube_center_xy_m
         ):
@@ -187,6 +281,7 @@ class SimPointGraspEvaluationConfig:
             )
         for field_name in (
             "pregrasp_offset_m",
+            "pregrasp_transit_clearance_m",
             "lift_offset_m",
             "pose_position_tolerance_m",
             "pose_orientation_tolerance_rad",
@@ -202,6 +297,13 @@ class SimPointGraspEvaluationConfig:
                 "adaptive_pregrasp_offsets_m must contain positive finite values."
             )
         object.__setattr__(self, "adaptive_pregrasp_offsets_m", adaptive_offsets)
+        if self.minimum_downward_approach_cosine is not None:
+            cosine = float(self.minimum_downward_approach_cosine)
+            if not math.isfinite(cosine) or not 0.0 <= cosine <= 1.0:
+                raise ValueError(
+                    "minimum_downward_approach_cosine must be in [0, 1] or None."
+                )
+            object.__setattr__(self, "minimum_downward_approach_cosine", cosine)
         if self.candidate_selection_policy not in {
             "provider_selected_ordinal",
             "reachability_aware",
@@ -230,6 +332,12 @@ class SimPointGraspEvaluationConfig:
             raise ValueError(
                 "lift_translation_action_scale must be finite and in (0, 1]."
             )
+
+    @property
+    def generation_camera_name(self) -> str:
+        if self.generation_view == "selected_wrist":
+            return f"{self.arm_side}_wrist"
+        return CAMERA_NAME
 
 
 @dataclass(frozen=True)
@@ -455,6 +563,8 @@ def build_sim_point_grasp_task_config(
     cube_center_xy_m: tuple[float, float] = EVALUATION_OBJECT_CENTER_XY_M,
     cube_spawn_xy_jitter_m: tuple[float, float],
     cube_spawn_yaw_jitter_rad: float,
+    object_profile: str = "tall_box",
+    controlled_home_qpos: tuple[float, ...] | None = None,
     max_episode_steps: int | None = None,
 ) -> CubeLiftTaskConfig:
     """Return one side-specific physical Cube-Lift point-grasp profile."""
@@ -464,14 +574,31 @@ def build_sim_point_grasp_task_config(
     if side not in EVALUATION_TOOL_PROFILE_BY_SIDE:
         raise ValueError("controlled_side must be left or right.")
     fixed_side = "right" if side == "left" else "left"
-    if float(object_mass_kg) == 0.08:
-        contract_relative = EVALUATION_LIGHT_SCENE_CONTRACT
-        expected_contract_sha256 = EVALUATION_LIGHT_SCENE_CONTRACT_SHA256
-    elif float(object_mass_kg) == 0.20:
-        contract_relative = EVALUATION_HEAVY_SCENE_CONTRACT
-        expected_contract_sha256 = EVALUATION_HEAVY_SCENE_CONTRACT_SHA256
-    else:
+    profile = str(object_profile).strip().lower()
+    if profile not in OBJECT_PROFILES:
+        raise ValueError(f"object_profile must be one of {sorted(OBJECT_PROFILES)}.")
+    contract_by_profile_and_mass = {
+        ("tall_box", 0.08): (
+            EVALUATION_LIGHT_SCENE_CONTRACT,
+            EVALUATION_LIGHT_SCENE_CONTRACT_SHA256,
+        ),
+        ("tall_box", 0.20): (
+            EVALUATION_HEAVY_SCENE_CONTRACT,
+            EVALUATION_HEAVY_SCENE_CONTRACT_SHA256,
+        ),
+        ("cube", 0.08): (
+            EVALUATION_CUBE_SCENE_CONTRACT,
+            EVALUATION_CUBE_SCENE_CONTRACT_SHA256,
+        ),
+    }
+    mass = float(object_mass_kg)
+    if mass not in {0.08, 0.20}:
         raise ValueError("object_mass_kg must be one of {0.08, 0.20}.")
+    if profile == "cube" and mass != 0.08:
+        raise ValueError("The terminal cube profile currently supports 0.08 kg only.")
+    contract_relative, expected_contract_sha256 = contract_by_profile_and_mass[
+        (profile, mass)
+    ]
     if gripper_force_profile == "standard":
         gripper_profile_name = EVALUATION_GRIPPER_PROFILE_NAME
         gripper_profile_sha256 = EVALUATION_GRIPPER_PROFILE_SHA256
@@ -505,6 +632,15 @@ def build_sim_point_grasp_task_config(
         "left": base.left_home_qpos,
         "right": base.right_home_qpos,
     }
+    selected_home_qpos = (
+        home_by_physical_side[side]
+        if controlled_home_qpos is None
+        else tuple(float(value) for value in controlled_home_qpos)
+    )
+    if len(selected_home_qpos) != 6 or any(
+        not math.isfinite(value) for value in selected_home_qpos
+    ):
+        raise ValueError("controlled_home_qpos must contain six finite values.")
     gripper_by_physical_side = {
         "left": "left_eg2_4b2_cad",
         "right": "right_eg2_4b2_cad",
@@ -512,7 +648,11 @@ def build_sim_point_grasp_task_config(
     grasp_prefix = f"{side}_eg2_4b2_cad"
     return replace(
         base,
-        name=f"rm65_{side}_cube_lift_sam2_graspnet_evaluation_v1",
+        name=(
+            f"rm65_{side}_cube_lift_sam2_graspnet_evaluation_v1"
+            if profile == "tall_box"
+            else f"rm65_{side}_cube_lift_point_grasp_cube_terminal_v1"
+        ),
         base_contract_path=str(contract_relative),
         base_contract_sha256=contract_sha256,
         controlled_side=side,
@@ -520,8 +660,10 @@ def build_sim_point_grasp_task_config(
         # These two legacy fields are fixed-slot and controlled-slot homes,
         # respectively. Swap their physical-side values for the left-arm task.
         left_home_qpos=home_by_physical_side[fixed_side],
-        right_home_qpos=home_by_physical_side[side],
-        object_size_m=EVALUATION_OBJECT_SIZE_M,
+        right_home_qpos=selected_home_qpos,
+        object_size_m=(
+            EVALUATION_CUBE_SIZE_M if profile == "cube" else EVALUATION_OBJECT_SIZE_M
+        ),
         wrist_rgb_camera_name=CAMERA_NAME,
         cube_center_xy_m=tuple(float(value) for value in cube_center_xy_m),
         cube_spawn_xy_jitter_m=tuple(float(value) for value in cube_spawn_xy_jitter_m),
@@ -748,6 +890,46 @@ def build_pregrasp_pose(grasp_pose: np.ndarray, offset_m: float) -> np.ndarray:
     return pose
 
 
+def build_staged_pregrasp_waypoints(
+    current_pose: np.ndarray,
+    grasp_pose: np.ndarray,
+    pregrasp_pose: np.ndarray,
+    *,
+    transit_clearance_m: float,
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Build a collision-aware pose sequence before the final approach.
+
+    Translating and rotating toward a distant grasp in one local-IK step can
+    force the RM65 into a joint-limit branch even when a safe solution exists.
+    First translate above the grasp while preserving the current wrist, then
+    orient at clearance height, and only then move to the declared pregrasp.
+    Arm-base +Z is gravity-up in the reviewed bimanual scene contract.
+    """
+
+    current = np.asarray(current_pose, dtype=float).reshape(4, 4)
+    grasp = np.asarray(grasp_pose, dtype=float).reshape(4, 4)
+    pregrasp = np.asarray(pregrasp_pose, dtype=float).reshape(4, 4)
+    clearance = float(transit_clearance_m)
+    if not all(np.all(np.isfinite(value)) for value in (current, grasp, pregrasp)):
+        raise ValueError("Staged pregrasp poses must be finite.")
+    if not math.isfinite(clearance) or clearance <= 0.0:
+        raise ValueError("transit_clearance_m must be finite and positive.")
+
+    transit_z = max(
+        float(pregrasp[2, 3]),
+        float(grasp[2, 3]) + clearance,
+    )
+    translate = current.copy()
+    translate[:3, 3] = (grasp[0, 3], grasp[1, 3], transit_z)
+    orient = translate.copy()
+    orient[:3, :3] = grasp[:3, :3]
+    return (
+        ("pregrasp transit translation", translate),
+        ("pregrasp transit orientation", orient),
+        ("pregrasp approach start", pregrasp.copy()),
+    )
+
+
 def apply_parallel_jaw_wrist_symmetry(
     grasp_pose: np.ndarray,
     wrist_symmetry_deg: int,
@@ -883,6 +1065,8 @@ def _drive_pose(
     orientation_tolerance_rad: float,
     translation_action_scale: float = 1.0,
     on_frame: Callable[[np.ndarray], None] | None = None,
+    stagnation_window_steps: int = 20,
+    stagnation_min_normalized_improvement: float = 0.05,
 ) -> tuple[bool, str]:
     kernel = env.kernel
     controller = kernel._pose_action_controller
@@ -890,7 +1074,9 @@ def _drive_pose(
         raise RuntimeError(
             "Physical Cube-Lift profile has no pose-action motion owner."
         )
-    for _ in range(maximum_steps):
+    best_normalized_error = math.inf
+    last_progress_step = 0
+    for step_index in range(maximum_steps):
         measured = _current_tool_pose_arm_base(kernel.scene, kernel.config)
         position_error, orientation_error = _pose_error(measured, desired_pose)
         if (
@@ -898,6 +1084,25 @@ def _drive_pose(
             and orientation_error <= orientation_tolerance_rad
         ):
             return True, "pose_reached"
+        normalized_error = max(
+            position_error / position_tolerance_m,
+            orientation_error / orientation_tolerance_rad,
+        )
+        if (
+            normalized_error
+            <= best_normalized_error - stagnation_min_normalized_improvement
+        ):
+            best_normalized_error = normalized_error
+            last_progress_step = step_index
+        elif step_index - last_progress_step >= stagnation_window_steps:
+            return (
+                False,
+                (
+                    "pose_stagnated:"
+                    f"position={position_error:.6f},rotation={orientation_error:.6f},"
+                    f"steps_without_progress={step_index - last_progress_step}"
+                ),
+            )
         action = bounded_pose_action(
             controller.target_pose_arm_base,
             desired_pose,
@@ -929,6 +1134,41 @@ def _drive_pose(
     )
 
 
+def _drive_staged_pregrasp(
+    *,
+    env: FastCubeLiftEnv,
+    grasp_pose: np.ndarray,
+    pregrasp_pose: np.ndarray,
+    trace: _ExecutionTrace,
+    renderer: MujocoCameraRenderer | None,
+    video: _TrialVideo | None,
+    config: SimPointGraspEvaluationConfig,
+    on_waypoint: Callable[[str, np.ndarray], None] | None = None,
+) -> tuple[bool, str]:
+    current = _current_tool_pose_arm_base(env.kernel.scene, env.kernel.config)
+    for label, waypoint in build_staged_pregrasp_waypoints(
+        current,
+        grasp_pose,
+        pregrasp_pose,
+        transit_clearance_m=config.pregrasp_transit_clearance_m,
+    ):
+        reached, reason = _drive_pose(
+            env=env,
+            desired_pose=waypoint,
+            trace=trace,
+            renderer=renderer,
+            video=video,
+            maximum_steps=config.phase_step_limit,
+            position_tolerance_m=config.pose_position_tolerance_m,
+            orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
+        )
+        if not reached:
+            return False, f"{label}:{reason}"
+        if on_waypoint is not None:
+            on_waypoint(label, waypoint)
+    return True, "pregrasp_reached"
+
+
 def _preflight_candidate(
     *,
     env: FastCubeLiftEnv,
@@ -941,23 +1181,47 @@ def _preflight_candidate(
 ) -> _CandidatePreflight:
     """Check IK and the authoritative MuJoCo path without closing or lifting."""
 
-    _observation, reset_info = env.reset(seed=seed)
-    trace = _ExecutionTrace(info=dict(reset_info))
     grasp = apply_parallel_jaw_wrist_symmetry(
         np.asarray(candidate["T_base_from_tcp"], dtype=float).reshape(4, 4),
         wrist_symmetry_deg,
     )
+    minimum_downward_cosine = getattr(config, "minimum_downward_approach_cosine", None)
+    downward_approach_cosine = -float(grasp[2, 2])
+    if (
+        minimum_downward_cosine is not None
+        and downward_approach_cosine < minimum_downward_cosine
+    ):
+        return _CandidatePreflight(
+            ordinal=int(ordinal),
+            pregrasp_offset_m=float(pregrasp_offset_m),
+            wrist_symmetry_deg=int(wrist_symmetry_deg),
+            pregrasp_reached=False,
+            grasp_reached=False,
+            reason=(
+                "approach_direction_rejected:"
+                f"downward_cosine={downward_approach_cosine:.6f},"
+                f"minimum={minimum_downward_cosine:.6f}"
+            ),
+            termination_reason=None,
+            motion_steps=0,
+            safety_intervention_steps=0,
+            ik_rejection_steps=0,
+            final_joint_margin_rad=None,
+            model_score=float(candidate["model_score"]),
+            combined_score=float(candidate["score"]),
+        )
+    _observation, reset_info = env.reset(seed=seed)
+    trace = _ExecutionTrace(info=dict(reset_info))
     pregrasp = build_pregrasp_pose(grasp, pregrasp_offset_m)
     try:
-        pregrasp_reached, reason = _drive_pose(
+        pregrasp_reached, reason = _drive_staged_pregrasp(
             env=env,
-            desired_pose=pregrasp,
+            grasp_pose=grasp,
+            pregrasp_pose=pregrasp,
             trace=trace,
             renderer=None,
             video=None,
-            maximum_steps=config.phase_step_limit,
-            position_tolerance_m=config.pose_position_tolerance_m,
-            orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
+            config=config,
         )
     except RuntimeError as exc:
         # A lower-owned hard collision rejection is one candidate's preflight
@@ -1097,23 +1361,59 @@ def _make_provider(
 ) -> tuple[Any, PointGraspProvider]:
     sam_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(config.sam2_asset_bundle)
     localizer = Sam2GroundingDinoLocalizer(model_spec=sam_spec, device=config.device)
-    grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(
-        config.graspnet_asset_bundle
-    )
-    planner = Sam2GraspNetPointGraspPlanner(
-        model_spec=grasp_spec,
-        point_segmenter=localizer,
-        device=config.device,
-    )
+    if config.point_grasp_backend == "vgn":
+        grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(
+            config.graspnet_asset_bundle
+        )
+        planner = Sam2VgnPointGraspPlanner(
+            model_spec=grasp_spec,
+            point_segmenter=localizer,
+            device=config.device,
+        )
+    elif config.point_grasp_backend == "graspnet":
+        grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(
+            config.graspnet_asset_bundle
+        )
+        planner = Sam2GraspNetPointGraspPlanner(
+            model_spec=grasp_spec,
+            point_segmenter=localizer,
+            device=config.device,
+        )
+    else:
+        grasp_spec = GraspGenXPointGraspModelSpec.from_asset_bundle(
+            config.graspnet_asset_bundle
+        )
+        graspgenx_backend = (
+            GraspGenXClient(
+                host=config.graspgenx_host,
+                port=config.graspgenx_port,
+                timeout_ms=config.graspgenx_timeout_ms,
+            )
+            if config.graspgenx_mode == "service"
+            else GraspGenXInProcessBackend(
+                model_spec=grasp_spec,
+                source_root=config.graspgenx_source_root,
+                device=config.device,
+            )
+        )
+        planner = Sam2GraspGenXPointGraspPlanner(
+            model_spec=grasp_spec,
+            point_segmenter=localizer,
+            client=graspgenx_backend,
+        )
     registration = build_real_point_grasp_registration(
         backend_id=planner.backend_id,
         model_profile_id=grasp_spec.model_profile_id,
         model_profile_hash=grasp_spec.semantic_content_hash,
         inference_implementation_hash=planner.semantic_content_hash,
         local_path_enabled=True,
-        runtime_session_id=f"sim-point-grasp-evaluation-{config.arm_side}",
+        runtime_session_id=(
+            f"sim-point-grasp-evaluation-{config.point_grasp_backend}-{config.arm_side}"
+        ),
         control_domain_id="offline-mujoco-evaluation",
-        target_binding_id=f"simulated-fixed-head-rgbd-{config.arm_side}-arm",
+        target_binding_id=(
+            f"simulated-{config.generation_camera_name}-rgbd-{config.arm_side}-arm"
+        ),
         station_manifest_hash="not-applicable-offline-simulation",
         execution_manifest_hash="sim-point-grasp-evaluation-v1",
     )
@@ -1156,6 +1456,7 @@ def _trial(
     resting_z = math.nan
     failure_stage: str | None = "setup"
     reason = "trial_not_started"
+    generation_camera_name = config.generation_camera_name
     try:
         phase_started = time.perf_counter()
         try:
@@ -1167,9 +1468,9 @@ def _trial(
         trace.max_cube_z_m = float(reset_info["cube_z_m"])
         phase_started = time.perf_counter()
         try:
-            initial_rgb = renderer.render(CAMERA_NAME)
+            initial_rgb = renderer.render(generation_camera_name)
             depth = np.ascontiguousarray(
-                renderer.render_depth(CAMERA_NAME), dtype=np.float32
+                renderer.render_depth(generation_camera_name), dtype=np.float32
             )
         finally:
             timing_ms["rgbd_render"] = (time.perf_counter() - phase_started) * 1000.0
@@ -1191,13 +1492,13 @@ def _trial(
         ) * 1000.0
 
         scene = env.kernel.scene
-        metadata = scene.camera_metadata()[CAMERA_NAME]
+        metadata = scene.camera_metadata()[generation_camera_name]
         intrinsics = render_intrinsics_from_fovy(
             width=int(metadata["width"]),
             height=int(metadata["height"]),
             fovy_deg=float(metadata["fovy_deg"]),
         )
-        world_from_camera = optical_camera_pose_world(scene)
+        world_from_camera = optical_camera_pose_world(scene, generation_camera_name)
         cube_center = scene.body_pose(env.kernel.config.object_body_name)[:3, 3]
         u, v, projected_depth = project_world_point(
             cube_center,
@@ -1227,7 +1528,7 @@ def _trial(
                 "cx": intrinsics.cx,
                 "cy": intrinsics.cy,
             },
-            "camera_frame_id": "head_camera_frame_optical",
+            "camera_frame_id": f"sim_{generation_camera_name}_optical",
             "base_frame_id": f"{env.kernel.config.controlled_side}_arm_base_link",
             "T_base_from_camera": base_from_camera.reshape(-1).tolist(),
             "max_candidates": config.max_candidates,
@@ -1328,6 +1629,19 @@ def _trial(
                             timing_ms[str(name)] = float(
                                 timing_ms.get(str(name), 0.0)
                             ) + float(value)
+                planner_filter_summary = getattr(
+                    provider.planner,
+                    "last_filter_summary",
+                    None,
+                )
+                if (
+                    isinstance(planner_filter_summary, Mapping)
+                    and prompt_records
+                    and prompt_records[-1]["prompt_index"] == prompt_index
+                ):
+                    prompt_records[-1]["generation_filter_summary"] = dict(
+                        planner_filter_summary
+                    )
             prompt_index += 1
         timing_ms["point_grasp_provider_total"] = (
             time.perf_counter() - provider_started
@@ -1365,12 +1679,6 @@ def _trial(
             timing_ms["candidate_motion_preflight"] = (
                 time.perf_counter() - phase_started
             ) * 1000.0
-        if config.candidate_selection_policy == "reachability_aware" and not any(
-            value.executable for value in preflight
-        ):
-            failure_stage = "motion_planning_preflight"
-            best = min(preflight, key=_candidate_preflight_rank)
-            raise RuntimeError(f"no_reachable_candidate:{best.reason}")
         candidate = combined_candidates[selected_ordinal]
         selected_score = float(candidate["score"])
         selected_model_score = float(candidate["model_score"])
@@ -1426,6 +1734,12 @@ def _trial(
         timing_ms["skill_validation_and_visualization"] = (
             time.perf_counter() - phase_started
         ) * 1000.0
+        if config.candidate_selection_policy == "reachability_aware" and not any(
+            value.executable for value in preflight
+        ):
+            failure_stage = "motion_planning_preflight"
+            best = min(preflight, key=_candidate_preflight_rank)
+            raise RuntimeError(f"no_reachable_candidate:{best.reason}")
 
         # Candidate preflight advances the simulator only as a read-only motion
         # feasibility check.  Recreate the deterministic initial state before
@@ -1445,16 +1759,20 @@ def _trial(
         assert selected_pregrasp_offset_m is not None
         pregrasp = build_pregrasp_pose(base_from_tcp, selected_pregrasp_offset_m)
         phase_started = time.perf_counter()
+
+        def record_pregrasp_waypoint(label: str, _pose: np.ndarray) -> None:
+            keyframes.append((label, renderer.render(CAMERA_NAME)))
+
         try:
-            reached, reason = _drive_pose(
+            reached, reason = _drive_staged_pregrasp(
                 env=env,
-                desired_pose=pregrasp,
+                grasp_pose=base_from_tcp,
+                pregrasp_pose=pregrasp,
                 trace=trace,
                 renderer=renderer,
                 video=video,
-                maximum_steps=config.phase_step_limit,
-                position_tolerance_m=config.pose_position_tolerance_m,
-                orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
+                config=config,
+                on_waypoint=record_pregrasp_waypoint,
             )
         finally:
             timing_ms["pregrasp_motion"] = (
@@ -1634,7 +1952,7 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
     # smaller than the evaluator's own legal worst-case path, causing valid
     # lift attempts to truncate before their phase limit.
     execution_step_budget = (
-        2 * int(config.phase_step_limit)
+        4 * int(config.phase_step_limit)
         + int(config.close_step_limit)
         + int(config.lift_step_limit)
         + 5
@@ -1646,6 +1964,12 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
         cube_center_xy_m=config.cube_center_xy_m,
         cube_spawn_xy_jitter_m=config.cube_spawn_xy_jitter_m,
         cube_spawn_yaw_jitter_rad=config.cube_spawn_yaw_jitter_rad,
+        object_profile=config.object_profile,
+        controlled_home_qpos=(
+            TERMINAL_OBSERVATION_HOME_QPOS_BY_SIDE[config.arm_side]
+            if config.use_terminal_observation_home
+            else None
+        ),
         max_episode_steps=execution_step_budget,
     )
     scene_contract = task_config.base_contract()
@@ -1686,10 +2010,10 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
         setup_timing_ms["sam2_startup"] = (
             time.perf_counter() - sam2_startup_started
         ) * 1000.0
-        graspnet_startup_started = time.perf_counter()
+        point_grasp_startup_started = time.perf_counter()
         provider.start()
-        setup_timing_ms["graspnet_startup"] = (
-            time.perf_counter() - graspnet_startup_started
+        setup_timing_ms["point_grasp_backend_startup"] = (
+            time.perf_counter() - point_grasp_startup_started
         ) * 1000.0
         for offset in range(config.trials):
             result = _trial(
@@ -1754,7 +2078,10 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
                     and math.isfinite(float(item.timing_ms[name]))
                 ]
             )
-            for name in ("sam2_inference", "graspnet_inference")
+            for name in (
+                "sam2_inference",
+                f"{config.point_grasp_backend}_inference",
+            )
         },
         "success_definition": {
             "termination_reason": BILATERAL_CONTACT_LIFT_SUCCESS_REASON,
@@ -1764,8 +2091,9 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
             "table_contact_forbidden_at_success": True,
         },
         "camera": {
-            "name": CAMERA_NAME,
-            "frame": "head_camera_frame optical: +x right, +y down, +z forward",
+            "name": config.generation_camera_name,
+            "view": config.generation_view,
+            "frame": "optical: +x right, +y down, +z forward",
             "rgb_depth_aligned": True,
             "depth_unit": "meter",
         },
@@ -1821,7 +2149,7 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
         },
         "skill": {
             "skill_id": "perception.plan_point_grasp.v1",
-            "backend": "graspnet",
+            "backend": config.point_grasp_backend,
             "selected_candidate_policy": config.candidate_selection_policy,
             "target_point_count": config.target_point_count,
             "target_point_sampling": (
@@ -1844,6 +2172,13 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
                 config.pregrasp_offset_m,
                 *config.adaptive_pregrasp_offsets_m,
             ],
+            "pregrasp_motion_policy": (
+                "translate_above_grasp_then_orient_then_move_to_pregrasp"
+            ),
+            "pregrasp_transit_clearance_m": config.pregrasp_transit_clearance_m,
+            "minimum_downward_approach_cosine": (
+                config.minimum_downward_approach_cosine
+            ),
             "maximum_visible_collision_points": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
             "contact_stability_policy_steps": config.contact_stability_steps,
             "close_action_scale": config.close_action_scale,
@@ -1871,6 +2206,7 @@ __all__ = [
     "bounded_pose_action",
     "build_pregrasp_pose",
     "build_sim_point_grasp_task_config",
+    "build_staged_pregrasp_waypoints",
     "draw_grasp_overlay",
     "evaluate_sim_point_grasps",
     "merge_point_prompt_candidates",

@@ -112,6 +112,29 @@ def select_upward_parallel_jaw_tcp_pose(
     return camera, reference
 
 
+def robust_target_center_in_tcp(
+    camera_from_tcp: np.ndarray,
+    target_points_camera: np.ndarray,
+) -> np.ndarray:
+    """Return the robust SAM2 target center in physical tool-TCP coordinates."""
+
+    pose = _rigid_matrix(camera_from_tcp, field_name="camera_from_tcp")
+    points = np.asarray(target_points_camera, dtype=np.float64)
+    if (
+        points.ndim != 2
+        or points.shape[1:] != (3,)
+        or len(points) < 16
+        or not np.all(np.isfinite(points))
+    ):
+        raise ValueError(
+            "target_points_camera must contain at least 16 finite XYZ points."
+        )
+    tcp_from_camera = np.linalg.inv(pose)
+    local = points @ tcp_from_camera[:3, :3].T + tcp_from_camera[:3, 3]
+    low, high = np.percentile(local, (5.0, 95.0), axis=0)
+    return (low + high) * 0.5
+
+
 def _rotation_distance_radians(first: np.ndarray, second: np.ndarray) -> float:
     relative = first.T @ second
     cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
@@ -657,20 +680,7 @@ class Sam2VgnPointGraspPlanner:
         camera_from_tcp: np.ndarray,
         target_points_camera: np.ndarray,
     ) -> np.ndarray:
-        points = np.asarray(target_points_camera, dtype=np.float64)
-        if (
-            points.ndim != 2
-            or points.shape[1:] != (3,)
-            or len(points) < 16
-            or not np.all(np.isfinite(points))
-        ):
-            raise ValueError(
-                "target_points_camera must contain at least 16 finite XYZ points."
-            )
-        tcp_from_camera = np.linalg.inv(camera_from_tcp)
-        local = points @ tcp_from_camera[:3, :3].T + tcp_from_camera[:3, 3]
-        low, high = np.percentile(local, (5.0, 95.0), axis=0)
-        return (low + high) * 0.5
+        return robust_target_center_in_tcp(camera_from_tcp, target_points_camera)
 
     def _snap_tcp_to_target_capture_region(
         self,
@@ -976,5 +986,6 @@ __all__ = [
     "PointGraspResult",
     "Sam2VgnPointGraspPlanner",
     "VgnPointGraspModelSpec",
+    "robust_target_center_in_tcp",
     "select_upward_parallel_jaw_tcp_pose",
 ]

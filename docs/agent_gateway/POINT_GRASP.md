@@ -407,8 +407,10 @@ GraspNet 的 +X
 接近、+Y 开口、+Z 高度轴则分别映射到 DMTAC `tool_tcp` 的 +Z 接近、+X 开口、+Y 高度轴。
 GraspNet 输出第 3 列的 grasp depth 不能丢弃：实现按官方 0.060 m 指长，把 model seed 沿
 `depth - 0.060` 平移到 DMTAC 掌/指边界，再继续平移到实际 `tool_tcp`；同时使用 SAM2 目标点云沿开口轴的 5%/95% 分位
-中点做最多 0.020 m 的居中校正，并沿指高轴做最多 0.030 m 的同类居中校正。三项语义均纳入
-planner semantic content hash。
+中点做最多 0.020 m 的居中校正，并沿指高轴做最多 0.030 m 的同类居中校正。居中后还必须要求
+目标点云的稳健中心同时落在候选开口宽度、DMTAC 指垫高度以及掌部到指尖的纵向区间内；GraspNet
+没有 VGN 体素量化对应的有界修正依据，因此越界候选直接 fail-closed，不把目标外抓姿送入运动预检。
+这些语义均纳入 planner semantic content hash。
 GraspGenX 与 DMTAC M 已共享 +Z 接近、+X 闭合的模型基座约定；适配器使用 open
 `(70,25.5,50) mm`、mid `(35,25.5,50) mm` 的内部 sweep-volume，二者中心均在掌/指边界前
 25 mm，并把模型基座沿 +Z 平移 42.999 mm 得到实际 `tool_tcp`。建议开口宽度由点击 mask 点云在

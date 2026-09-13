@@ -36,6 +36,7 @@ from .sam2_vgn_point_grasp import (
     PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
     PointGraspCandidate,
     PointGraspResult,
+    robust_target_center_in_tcp,
     select_upward_parallel_jaw_tcp_pose,
 )
 
@@ -395,6 +396,16 @@ class Sam2GraspNetPointGraspPlanner:
                     "maximum_shift_m": self.max_target_height_centering_shift_m,
                     "model_axis": "+z_height",
                 },
+                "target_capture": {
+                    "source": "sam2_target_points_5_95_percentile_midpoint",
+                    "opening_bound": "candidate_width",
+                    "half_pad_height_m": DMTAC_M_PAD_HEIGHT_M / 2.0,
+                    "palm_z_m": DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+                    "fingertip_z_m": (
+                        DMTAC_M_PALM_FROM_TOOL_TCP_Z_M + DMTAC_M_FINGER_LENGTH_M
+                    ),
+                    "correction": "none_fail_closed",
+                },
                 "click_distance_m": self.max_click_distance_m,
                 "gripper": {
                     "profile": "DMTAC_M",
@@ -621,6 +632,7 @@ class Sam2GraspNetPointGraspPlanner:
             timing_ms["plan_total"] = (time.perf_counter() - plan_started) * 1000.0
             self._record_plan_timing(timing_ms)
         ranking_started = time.perf_counter()
+        filter_summary: dict[str, int | float | None] = {}
         try:
             candidates = self._rank(
                 predictions,
@@ -630,6 +642,7 @@ class Sam2GraspNetPointGraspPlanner:
                 depth=depth,
                 intrinsics=values,
                 maximum=int(max_candidates),
+                filter_summary=filter_summary,
             )
         finally:
             timing_ms["candidate_ranking_and_visible_collision"] = (
@@ -639,7 +652,9 @@ class Sam2GraspNetPointGraspPlanner:
             self._record_plan_timing(timing_ms)
         if not candidates:
             raise RuntimeError(
-                "No visible collision-free DMTAC M GraspNet candidate belongs to the clicked region."
+                "No physically admissible DMTAC M GraspNet candidate belongs "
+                "to the clicked region; "
+                f"filter_summary={json.dumps(filter_summary, sort_keys=True, separators=(',', ':'))}"
             )
         mask_rows, mask_columns = np.nonzero(mask)
         return PointGraspResult(
@@ -721,6 +736,7 @@ class Sam2GraspNetPointGraspPlanner:
         depth: np.ndarray,
         intrinsics: Mapping[str, float],
         maximum: int,
+        filter_summary: dict[str, int | float | None] | None = None,
     ) -> tuple[PointGraspCandidate, ...]:
         if len(target_points) > 50_000:
             indices = np.linspace(0, len(target_points) - 1, 50_000, dtype=np.int64)
@@ -736,9 +752,27 @@ class Sam2GraspNetPointGraspPlanner:
             dtype=np.float64,
         )
         ranked: list[tuple[float, float, float, float, np.ndarray, np.ndarray]] = []
+        counts: dict[str, int | float | None] = {
+            "detected": 0,
+            "width_valid": 0,
+            "target_surface_valid": 0,
+            "target_capture_valid": 0,
+            "click_distance_valid": 0,
+            "visible_collision_valid": 0,
+            "min_target_capture_violation_m": None,
+            "closest_target_center_tcp_x_m": None,
+            "closest_target_center_tcp_y_m": None,
+            "closest_target_center_tcp_z_m": None,
+            "capture_palm_z_m": DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+            "capture_fingertip_z_m": (
+                DMTAC_M_PALM_FROM_TOOL_TCP_Z_M + DMTAC_M_FINGER_LENGTH_M
+            ),
+            "capture_half_pad_height_m": DMTAC_M_PAD_HEIGHT_M / 2.0,
+        }
         for prediction, surface_distance in zip(
             predictions, surface_distances, strict=True
         ):
+            counts["detected"] = int(counts["detected"]) + 1
             if not np.all(np.isfinite(prediction)):
                 continue
             model_score = min(1.0, max(0.0, float(prediction[0])))
@@ -746,10 +780,12 @@ class Sam2GraspNetPointGraspPlanner:
             grasp_depth = float(prediction[3])
             if not 0.005 <= width <= self.max_gripper_width_m:
                 continue
+            counts["width_valid"] = int(counts["width_valid"]) + 1
             if not 0.010 <= grasp_depth <= 0.040:
                 continue
             if float(surface_distance) > self.max_target_surface_distance_m:
                 continue
+            counts["target_surface_valid"] = int(counts["target_surface_valid"]) + 1
             camera_from_grasp = np.eye(4, dtype=np.float64)
             camera_from_grasp[:3, :3] = prediction[4:13].reshape(3, 3)
             camera_from_grasp[:3, 3] = prediction[13:16]
@@ -815,15 +851,45 @@ class Sam2GraspNetPointGraspPlanner:
                 base_from_tcp,
                 field_name="GraspNet base_from_tcp candidate",
             )
+            target_center_tcp = robust_target_center_in_tcp(
+                camera_from_tcp,
+                target_points,
+            )
+            half_opening = width / 2.0
+            half_height = DMTAC_M_PAD_HEIGHT_M / 2.0
+            palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
+            fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
+            capture_violation = max(
+                0.0,
+                abs(float(target_center_tcp[0])) - half_opening,
+                abs(float(target_center_tcp[1])) - half_height,
+                palm_z - float(target_center_tcp[2]),
+                float(target_center_tcp[2]) - fingertip_z,
+            )
+            previous_violation = counts["min_target_capture_violation_m"]
+            if previous_violation is None or capture_violation < float(
+                previous_violation
+            ):
+                counts["min_target_capture_violation_m"] = capture_violation
+                counts["closest_target_center_tcp_x_m"] = float(target_center_tcp[0])
+                counts["closest_target_center_tcp_y_m"] = float(target_center_tcp[1])
+                counts["closest_target_center_tcp_z_m"] = float(target_center_tcp[2])
+            if capture_violation > 0.0:
+                continue
+            counts["target_capture_valid"] = int(counts["target_capture_valid"]) + 1
             click_distance = float(
                 np.linalg.norm(camera_from_grasp[:3, 3] - target_camera)
             )
             if click_distance > self.max_click_distance_m:
                 continue
+            counts["click_distance_valid"] = int(counts["click_distance_valid"]) + 1
             if not self._visible_collision_free(
                 camera_from_tcp, width, depth, intrinsics
             ):
                 continue
+            counts["visible_collision_valid"] = (
+                int(counts["visible_collision_valid"]) + 1
+            )
             score = (
                 model_score
                 * math.exp(-float(surface_distance) / 0.025)
@@ -854,6 +920,8 @@ class Sam2GraspNetPointGraspPlanner:
             selected.append(item)
             if len(selected) == maximum:
                 break
+        if filter_summary is not None:
+            filter_summary.update(counts)
         return tuple(
             PointGraspCandidate(
                 score=float(score),

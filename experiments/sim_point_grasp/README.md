@@ -8,6 +8,57 @@ Both physical arm choices are available through `--arm-side left|right`.
 `base_frame_id`, tool TCP, IK target, grasp body, finger contacts, and gripper
 actuation; the other arm is held at its mirrored home pose.
 
+## Real-like one-shot terminal
+
+`run_terminal` is the smallest end-to-end operator entrypoint. It starts from
+a collision-checked, side-specific observation home whose real MuJoCo wrist
+camera points at a red 40×40×40 mm cube. It then renders aligned RGB-D from
+either the fixed head camera or that physical wrist camera, invokes the same
+point-grasp provider implementations offered by the real Gateway, saves the
+candidate annotation and selected-grasp overlay, and executes pregrasp, grasp,
+close, and lift through the existing CubeLift motion owner. It never connects
+to real cameras or robot hardware.
+
+The default matches the real backend direction: GraspGenX over a loopback
+service, using the selected wrist view. Start the reviewed service separately,
+then run:
+
+```bash
+bash scripts/run_graspgenx_server.sh \
+  --host 127.0.0.1 --port 5556
+
+MUJOCO_GL=egl python -m experiments.sim_point_grasp.commands.run_terminal
+```
+
+GraspNet and VGN are selectable without changing the terminal or motion path:
+
+```bash
+MUJOCO_GL=egl python -m experiments.sim_point_grasp.commands.run_terminal \
+  --backend graspnet --view selected_wrist --arm-side right
+
+MUJOCO_GL=egl python -m experiments.sim_point_grasp.commands.run_terminal \
+  --backend vgn --view front --arm-side left
+```
+
+Use `--graspgenx-mode in-process` only in the separately validated compatible
+GraspGenX Python environment. Every invocation owns one new output directory
+under `runtime_artifacts/runs/experiments/sim_point_grasp_terminal/` and prints
+one compact JSON outcome. The directory retains `initial_rgb.png`, aligned
+metric depth, `skill_annotated.jpg`, `grasp_pose_overlay.png`, the complete
+Skill/preflight JSON, execution montage, and optional MP4. A nonzero exit after
+candidate generation is a motion/contact/lift failure, not loss of the grasp
+rendering evidence.
+
+Before motion, the terminal requires the SAM2 target center to lie inside the
+candidate's physical DMTAC M opening, pad height, and finger-length interval.
+It also rejects tabletop candidates whose tool +Z approach has less than the
+default `0.5` downward cosine (`--minimum-downward-approach-cosine`). Accepted
+poses move through an 80 mm gravity-up transit: translate with the current
+wrist orientation, orient at clearance, then move to the declared pregrasp.
+Each waypoint stops early when normalized pose error makes no progress for 20
+steps, so an IK branch that is stuck at a limit does not consume the full phase
+budget repeatedly.
+
 ## Visualization-only three-camera flow
 
 Use the visualization command when the goal is to inspect generated poses, not
@@ -71,8 +122,10 @@ read-only `perception.plan_point_grasp.v1` provider:
    apply GraspNet's insertion depth and SAM2 target-cloud width centering, then
    preflight candidates through the same IK and full-scene collision chain;
 5. retain the generator's upward-selected parallel-jaw TCP and try 7/5/3.5 cm
-   pregrasp offsets, execute the selected side-specific CAD-aligned DMTAC M `tool_tcp` goal,
-   close the physical gripper, then lift 10 cm;
+   pregrasp offsets; move by translating above the grasp, orienting at 8 cm
+   clearance, and then entering the declared pregrasp before executing the
+   selected side-specific CAD-aligned DMTAC M `tool_tcp` goal, closing the
+   physical gripper, and lifting 10 cm;
 6. let `CubeLiftKernel` own canonical RM65 IK, collision projection, fitted
    actuators, contacts, termination, and success evaluation.
 
