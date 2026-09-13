@@ -34,7 +34,7 @@ let configurationBatch = [];
 let collectionMode = "rule_based_writing";
 
 const configurationInputs = () => [
-  "full-replay-source", "pen-down-source", "write-source", "pen-up-source", "trajectory",
+  "full-replay-source", "pre-pen-down-source", "pen-down-source", "write-source", "pen-up-source", "trajectory",
   "direction", "writing-size", "writing-speed", "alignment-speed-input",
   "tactile-bundle-root", "tactile-min-free", "tactile-compression",
   "writer-workers", "writer-queue-size", "process-queue-size",
@@ -84,6 +84,10 @@ async function loadOptions() {
     if (!(sources.pen_down || []).length || !(sources.write || []).length ||
         !(sources.pen_up || []).length || !(options.trajectory_ids || []).length ||
         !(options.directions || []).length) return;
+    addOptions(
+      document.getElementById("pre-pen-down-source"),
+      options.pre_pen_down_replay_candidates || [],
+    );
     addOptions(document.getElementById("pen-down-source"), sources.pen_down);
     addOptions(document.getElementById("write-source"), sources.write);
     addOptions(document.getElementById("pen-up-source"), sources.pen_up);
@@ -147,6 +151,7 @@ function syncConfiguration(state) {
   if (!optionsLoaded || configurationDirty || document.activeElement && configurationInputs().includes(document.activeElement)) return;
   const selected = state.rule_configuration || {};
   document.getElementById("full-replay-source").value = selected.full_replay_candidate_id || "";
+  document.getElementById("pre-pen-down-source").value = selected.pre_pen_down_replay_candidate_id || "";
   document.getElementById("pen-down-source").value = selected.pen_down_candidate_id || "";
   document.getElementById("write-source").value = selected.write_candidate_id || "";
   document.getElementById("pen-up-source").value = selected.pen_up_candidate_id || "";
@@ -198,6 +203,7 @@ function currentConfiguration() {
     };
   }
   return {
+    pre_pen_down_replay_candidate_id: document.getElementById("pre-pen-down-source").value,
     pen_down_candidate_id: document.getElementById("pen-down-source").value,
     write_candidate_id: document.getElementById("write-source").value,
     pen_up_candidate_id: document.getElementById("pen-up-source").value,
@@ -212,7 +218,7 @@ function currentConfiguration() {
 const batchLabel = (entry, index) =>
   fullReplayMode()
     ? `${index + 1}. 完整 Episode · ${entry.full_replay_candidate_id}`
-    : `${index + 1}. ${entry.trajectory_id} · ${entry.pen_down_candidate_id} / ${entry.write_candidate_id} / ${entry.pen_up_candidate_id}`;
+    : `${index + 1}. ${entry.trajectory_id} · 前置:${entry.pre_pen_down_replay_candidate_id || "关闭"} · ${entry.pen_down_candidate_id} / ${entry.write_candidate_id} / ${entry.pen_up_candidate_id}`;
 
 function renderBatch() {
   const validated = latestState && Array.isArray(latestState.rule_configuration_batch)

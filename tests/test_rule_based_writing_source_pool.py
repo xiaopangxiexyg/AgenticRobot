@@ -169,6 +169,40 @@ def test_full_replay_source_selection_uses_whole_episode_not_phase_eligibility(
     assert metadata["mode"] == "source_pool_gui_selection"
 
 
+def test_pre_pen_down_source_selection_requires_exact_in_range_pool_candidate(
+    tmp_path: Path,
+) -> None:
+    _make_dirs(tmp_path, ("a", "b"))
+    manifest = _write_manifest(
+        tmp_path,
+        [_candidate("a", "pen_down", 1), _candidate("b", "write", 2)],
+    )
+    args = argparse.Namespace(
+        rule_source_pool_manifest=str(manifest),
+        rule_source_pool_range="0:1",
+        rule_source_dataset=None,
+        rule_source_episode=None,
+        rule_detail_annotation_dir=None,
+        rule_pre_pen_down_replay_candidate_id="a",
+    )
+
+    selected = writing_plan._resolve_pre_pen_down_replay_source_spec(args)
+    assert selected is not None
+    assert selected.candidate.candidate_id == "a"
+
+    args.rule_pre_pen_down_replay_candidate_id = "b"
+    with pytest.raises(ValueError, match="outside the selected source-pool range"):
+        writing_plan._resolve_pre_pen_down_replay_source_spec(args)
+
+    args.rule_source_pool_manifest = None
+    args.rule_source_pool_range = None
+    args.rule_source_dataset = str(tmp_path / "datasets" / "a")
+    args.rule_source_episode = 1
+    args.rule_detail_annotation_dir = str(tmp_path / "details" / "a")
+    with pytest.raises(ValueError, match="requires --rule-source-pool-manifest"):
+        writing_plan._resolve_pre_pen_down_replay_source_spec(args)
+
+
 def test_hand_resampling_rejects_non_monotonic_times_before_division() -> None:
     values = np.zeros((2, 6), dtype=np.float32)
     with np.errstate(all="raise"):
@@ -197,6 +231,8 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
     assert contract is not None
     episodes: dict[Path, LoadedReplayEpisode] = {}
     actions_by_path: dict[Path, np.ndarray] = {}
+    qpos_by_path: dict[Path, dict[str, np.ndarray]] = {}
+    tcp_by_path: dict[Path, dict[str, np.ndarray]] = {}
     for index, candidate_id in enumerate(ids, start=1):
         root = (tmp_path / "datasets" / candidate_id).resolve()
         parquet = root / f"episode_{index:06d}.parquet"
@@ -223,12 +259,32 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         actions = np.zeros((6, ACTION_DIM), dtype=np.float32)
         for frame in range(6):
             actions[frame, ACTION_ARM_POSE_SLICES["left"]] = [
-                0.1, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0
+                0.1 * index + 0.001 * frame,
+                0.0,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
             ]
             actions[frame, ACTION_ARM_POSE_SLICES["right"]] = [
                 0.01 * index * frame, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0
             ]
         actions_by_path[parquet.resolve()] = actions
+        qpos_by_path[parquet.resolve()] = {
+            side: np.full((6, 6), 0.01 * index, dtype=np.float32)
+            for side in ("left", "right")
+        }
+        tcp_by_path[parquet.resolve()] = {
+            side: np.tile(
+                np.asarray(
+                    [0.01 * index, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0],
+                    dtype=np.float32,
+                ),
+                (6, 1),
+            )
+            for side in ("left", "right")
+        }
 
     class Index:
         def __init__(self, root: str | Path) -> None:
@@ -266,15 +322,10 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         "load_contract_replay_actions_from_parquet",
         lambda path, **_kwargs: (actions_by_path[Path(path).resolve()].copy(), {}, contract, True),
     )
-    qpos = {side: np.zeros((6, 6), dtype=np.float32) for side in ("left", "right")}
-    tcp = {
-        side: np.tile(np.asarray([0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0]), (6, 1))
-        for side in ("left", "right")
-    }
     monkeypatch.setattr(
         writing_plan,
         "load_replay_arm_observation_qpos_from_parquet",
-        lambda *_args, **_kwargs: qpos,
+        lambda path, **_kwargs: qpos_by_path[Path(path).resolve()],
     )
     monkeypatch.setattr(
         writing_plan,
@@ -284,7 +335,7 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
     monkeypatch.setattr(
         writing_plan,
         "load_replay_arm_actual_tcp_pose_from_parquet",
-        lambda *_args, **_kwargs: tcp,
+        lambda path, **_kwargs: tcp_by_path[Path(path).resolve()],
     )
     args = argparse.Namespace(
         rule_source_pool_manifest=str(manifest),
@@ -323,6 +374,18 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         == build.source_selection["pool_manifest_hash"]
     )
     options = build.extension._configuration_options
+    assert [step.step_id for step in build.extension.plan.steps] == [
+        "initial_alignment",
+        "right_write.pen_down",
+        "right_write.pen_down.height_descent",
+        "right_write.write",
+        "right_write.pen_up",
+    ]
+    assert "pre_pen_down" not in build.extension.trajectory_groups
+    assert options["pre_pen_down_replay_candidates"][0] == {
+        "value": "",
+        "label": "不启用（保持当前流程）",
+    }
     assert [
         item["value"]
         for item in options["source_candidates_by_phase"]["pen_down"]
@@ -353,8 +416,67 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
     assert writing_step.action_source.trajectory_id == "digit_9_v1"
     assert writing_step.action_source.direction == "left"
     assert rebuilt.config.initial_alignment_speed_scale == pytest.approx(0.4)
+    prelude_rebuilt = build.extension._configuration_rebuilder(
+        {
+            **selected_configuration,
+            "pre_pen_down_replay_candidate_id": "stroke",
+        }
+    )
+    assert [step.step_id for step in prelude_rebuilt.plan.steps] == [
+        writing_plan.PRE_PEN_DOWN_ALIGNMENT_STEP_ID,
+        writing_plan.PRE_PEN_DOWN_REPLAY_STEP_ID,
+        writing_plan.PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID,
+        "right_write.pen_down",
+        "right_write.pen_down.height_descent",
+        "right_write.write",
+        "right_write.pen_up",
+    ]
+    prelude_group = prelude_rebuilt.trajectory_groups["pre_pen_down"]
+    assert prelude_group.source_episode_index == 2
+    assert prelude_group.frame_count == 6
+    np.testing.assert_allclose(
+        prelude_group.actions[:, ACTION_ARM_POSE_SLICES["left"]],
+        np.repeat(
+            build.extension.trajectory_groups["pen_down"].actions[
+                :1, ACTION_ARM_POSE_SLICES["left"]
+            ],
+            prelude_group.frame_count,
+            axis=0,
+        ),
+    )
+    np.testing.assert_allclose(
+        prelude_group.arm_observation_actual_qpos["left"],
+        np.repeat(
+            build.extension.trajectory_groups["pen_down"]
+            .arm_observation_actual_qpos["left"][:1],
+            prelude_group.frame_count,
+            axis=0,
+        ),
+    )
+    np.testing.assert_allclose(
+        prelude_group.arm_observation_actual_tcp_pose["left"],
+        np.repeat(
+            build.extension.trajectory_groups["pen_down"]
+            .arm_observation_actual_tcp_pose["left"][:1],
+            prelude_group.frame_count,
+            axis=0,
+        ),
+    )
+    prelude_steps = prelude_rebuilt.plan.steps[:3]
+    assert prelude_steps[0].capture.enabled is False
+    assert prelude_steps[1].active_sides == ("right",)
+    assert prelude_steps[1].capture.enabled is False
+    assert prelude_steps[2].capture.enabled is False
+    assert (
+        prelude_rebuilt.source_selection["pre_pen_down_replay"]["candidate_id"]
+        == "stroke"
+    )
     rebuilt._initial_alignment_executor.shutdown(wait=False, cancel_futures=True)
     rebuilt._configuration_executor.shutdown(wait=False, cancel_futures=True)
+    prelude_rebuilt._initial_alignment_executor.shutdown(
+        wait=False, cancel_futures=True
+    )
+    prelude_rebuilt._configuration_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def test_gui_phase_candidate_overrides_cover_independent_source_combinations(

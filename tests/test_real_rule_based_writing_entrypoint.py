@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -103,6 +104,7 @@ def _build_args(tmp_path: Path) -> argparse.Namespace:
         rule_source_dataset=str(tmp_path),
         rule_source_episode=3,
         rule_detail_annotation_dir=str(tmp_path / "detail"),
+        rule_writing_trajectory_catalog=None,
         rule_writing_trajectory="digit_1_v1",
         rule_writing_size_m=0.08,
         rule_writing_direction="up",
@@ -129,6 +131,33 @@ def _build_args(tmp_path: Path) -> argparse.Namespace:
         arm_control_hz=120.0,
         write_parquet=True,
         write_video=True,
+    )
+
+
+def _write_trajectory_catalog(
+    path: Path,
+    *,
+    trajectory_id: str = "custom_zigzag_v1",
+    stroke_count: int = 1,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "agentic_robot.rule_based_fixed_trajectories.v1",
+                "path_frame": "glyph_local_xy",
+                "normalization": "bounding_height_is_one",
+                "trajectories": [
+                    {
+                        "trajectory_id": trajectory_id,
+                        "family": "custom",
+                        "symbol": "zigzag",
+                        "stroke_count": stroke_count,
+                        "points": [[0.0, 0.0], [0.3, 1.0], [0.6, 0.0], [0.9, 1.0]],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -870,9 +899,11 @@ def test_fixed_writing_uses_calibrated_descent_endpoint_when_supplied() -> None:
         ("--source-pool-manifest", "PATH"),
         ("--source-pool-range", "START:END"),
         ("--selection-seed", "N"),
+        ("--pre-pen-down-replay-candidate-id", "ID"),
         ("--tactile-bundle-root", "PATH"),
         ("--dataset-root", "PATH"),
         ("--trajectory", "ID"),
+        ("--trajectory-catalog", "PATH"),
         ("--size-m", "M"),
         ("--direction", "NAME"),
         ("--speed-m-s", "MPS"),
@@ -1006,6 +1037,101 @@ def test_launcher_accepts_greek_trajectory_catalog_id(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "--rule-writing-trajectory greek_omega_v1" in result.stdout
+
+
+def test_launcher_accepts_latin_and_additional_trajectory_catalog(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    catalog = tmp_path / "custom-trajectories.json"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+    _write_trajectory_catalog(catalog)
+    result = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--trajectory-catalog",
+            str(catalog),
+            "--trajectory",
+            "custom_zigzag_v1",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"--rule-writing-trajectory-catalog {catalog}" in result.stdout
+    assert "--rule-writing-trajectory custom_zigzag_v1" in result.stdout
+
+
+def test_build_appends_custom_catalog_and_records_provenance(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_source(monkeypatch, tmp_path)
+    catalog = tmp_path / "custom-trajectories.json"
+    _write_trajectory_catalog(catalog)
+    args = _build_args(tmp_path)
+    args.rule_writing_trajectory_catalog = str(catalog)
+    args.rule_writing_trajectory = "custom_zigzag_v1"
+    deployment = rule_based_plan.RuleBasedRealTeleopDeployment(
+        active_sides=("left", "right"),
+        collection_pose_frame_contract=_contract(),
+        tcp_pose_envelope_profile="fixture-envelope",
+    )
+
+    build = rule_based_plan.build_rule_based_writing(args, deployment=deployment)
+
+    catalog_metadata = build.source_selection["trajectory_catalog"]
+    assert catalog_metadata["mode"] == "default_plus_additional"
+    assert catalog_metadata["additional_path"] == str(catalog.resolve())
+    assert len(catalog_metadata["additional_sha256"]) == 64
+    assert len(catalog_metadata["combined_sha256"]) == 64
+    options = build.extension._configuration_options["trajectory_ids"]
+    assert options[-1] == {
+        "value": "custom_zigzag_v1",
+        "label": "zigzag · custom_zigzag_v1",
+    }
+    writing_step = next(
+        step
+        for step in build.extension.plan.steps
+        if step.step_id == "right_write.write"
+    )
+    assert writing_step.action_source.additional_catalog_path == catalog.resolve()
+    build.extension._initial_alignment_executor.shutdown(wait=False, cancel_futures=True)
+    build.extension._configuration_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_build_rejects_non_one_stroke_additional_catalog_before_source_loading(
+    tmp_path: Path,
+) -> None:
+    catalog = tmp_path / "invalid-trajectories.json"
+    _write_trajectory_catalog(catalog, stroke_count=2)
+    args = _build_args(tmp_path)
+    args.rule_writing_trajectory_catalog = str(catalog)
+    deployment = rule_based_plan.RuleBasedRealTeleopDeployment(
+        active_sides=("left", "right"),
+        collection_pose_frame_contract=_contract(),
+        tcp_pose_envelope_profile="fixture-envelope",
+    )
+
+    with pytest.raises(ValueError, match="is not a one-stroke path"):
+        rule_based_plan.build_rule_based_writing(args, deployment=deployment)
 
 
 def test_launcher_full_replay_mode_uses_complete_episode_progress_without_detail(
@@ -1189,6 +1315,8 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
             "10:30",
             "--selection-seed",
             "42",
+            "--pre-pen-down-replay-candidate-id",
+            "stroke-before-pen",
             "--tactile-bundle-root",
             str(tactile),
             "--dry-run",
@@ -1204,9 +1332,62 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
     assert f"--rule-source-pool-manifest {manifest}" in output
     assert "--rule-source-pool-range 10:30" in output
     assert "--rule-source-selection-seed 42" in output
+    assert (
+        "--rule-pre-pen-down-replay-candidate-id stroke-before-pen" in output
+    )
     assert "--rule-source-dataset" not in output
     assert "--rule-source-episode" not in output
     assert "--rule-detail-annotation-dir" not in output
+
+
+def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
+    tmp_path: Path,
+) -> None:
+    full_replay = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--mode",
+            "full-replay",
+            "--pre-pen-down-replay-candidate-id",
+            "candidate-a",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert full_replay.returncode == 2
+    assert "not valid in full-replay mode" in full_replay.stderr
+
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+    legacy = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "1",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--pre-pen-down-replay-candidate-id",
+            "candidate-a",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert legacy.returncode == 2
+    assert "requires --source-pool-manifest" in legacy.stderr
 
 
 def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
@@ -1224,12 +1405,22 @@ def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
             "0.04",
             "--rule-writing-direction",
             "down",
+            "--rule-writing-trajectory-catalog",
+            "/custom-trajectories.json",
+            "--rule-writing-trajectory",
+            "custom_spiral_v1",
         ]
     )
 
     assert args.rule_source_episode == 7
     assert args.rule_writing_size_m == pytest.approx(0.04)
     assert args.rule_writing_direction == "down"
+    assert args.rule_writing_trajectory_catalog == "/custom-trajectories.json"
+    assert args.rule_writing_trajectory == "custom_spiral_v1"
+    assert rule_based_plan._fixed_trajectory_option("latin_z_v1") == {
+        "value": "latin_z_v1",
+        "label": "英文字母 Z",
+    }
 
 
 def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:
@@ -1243,6 +1434,8 @@ def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:
             "4:19",
             "--rule-source-selection-seed",
             "8",
+            "--rule-pre-pen-down-replay-candidate-id",
+            "candidate-12",
         ]
     )
 
@@ -1250,3 +1443,4 @@ def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:
     assert args.rule_source_pool_manifest == "/pool.json"
     assert args.rule_source_pool_range == "4:19"
     assert args.rule_source_selection_seed == 8
+    assert args.rule_pre_pen_down_replay_candidate_id == "candidate-12"

@@ -201,19 +201,62 @@ def _catalog_path(path: str | Path | None) -> Path:
     return Path(path or DEFAULT_FIXED_TRAJECTORY_CATALOG_PATH).expanduser().resolve()
 
 
-def fixed_trajectory_catalog_hash(catalog_path: str | Path | None = None) -> str:
-    """Return the content hash recorded with generated targets."""
+def _composed_fixed_trajectory_specs(
+    catalog_path: str | Path | None,
+    additional_catalog_path: str | Path | None,
+) -> tuple[tuple[FixedTrajectorySpec, ...], str]:
+    specs, catalog_hash = _load_fixed_trajectory_specs(str(_catalog_path(catalog_path)))
+    if additional_catalog_path is None:
+        return specs, catalog_hash
 
-    _, catalog_hash = _load_fixed_trajectory_specs(str(_catalog_path(catalog_path)))
+    additional_specs, additional_hash = _load_fixed_trajectory_specs(
+        str(_catalog_path(additional_catalog_path))
+    )
+    existing_ids = {spec.trajectory_id for spec in specs}
+    duplicate_ids = sorted(
+        spec.trajectory_id for spec in additional_specs if spec.trajectory_id in existing_ids
+    )
+    if duplicate_ids:
+        raise ValueError(
+            "additional fixed trajectory catalog duplicates existing ids: "
+            + ", ".join(duplicate_ids)
+        )
+    combined_hash = hashlib.sha256(
+        bytes.fromhex(catalog_hash) + bytes.fromhex(additional_hash)
+    ).hexdigest()
+    return specs + additional_specs, combined_hash
+
+
+def fixed_trajectory_catalog_hash(
+    catalog_path: str | Path | None = None,
+    *,
+    additional_catalog_path: str | Path | None = None,
+) -> str:
+    """Return the content hash recorded with generated targets.
+
+    ``catalog_path`` retains its existing replacement semantics.  The optional
+    additional catalog is appended to that base without allowing id shadowing.
+    """
+
+    _, catalog_hash = _composed_fixed_trajectory_specs(
+        catalog_path,
+        additional_catalog_path,
+    )
     return catalog_hash
 
 
 def available_fixed_trajectory_ids(
-    *, family: str | None = None, catalog_path: str | Path | None = None
+    *,
+    family: str | None = None,
+    catalog_path: str | Path | None = None,
+    additional_catalog_path: str | Path | None = None,
 ) -> tuple[str, ...]:
     """List deterministic catalog ids, optionally restricted to a family."""
 
-    specs, _ = _load_fixed_trajectory_specs(str(_catalog_path(catalog_path)))
+    specs, _ = _composed_fixed_trajectory_specs(
+        catalog_path,
+        additional_catalog_path,
+    )
     normalized_family = None if family is None else _required_text(family, name="family")
     return tuple(
         spec.trajectory_id
@@ -223,12 +266,18 @@ def available_fixed_trajectory_ids(
 
 
 def get_fixed_trajectory(
-    trajectory_id: str, *, catalog_path: str | Path | None = None
+    trajectory_id: str,
+    *,
+    catalog_path: str | Path | None = None,
+    additional_catalog_path: str | Path | None = None,
 ) -> FixedTrajectorySpec:
     """Resolve one checked-in trajectory or fail closed."""
 
     normalized_id = _required_text(trajectory_id, name="trajectory_id")
-    specs, _ = _load_fixed_trajectory_specs(str(_catalog_path(catalog_path)))
+    specs, _ = _composed_fixed_trajectory_specs(
+        catalog_path,
+        additional_catalog_path,
+    )
     for spec in specs:
         if spec.trajectory_id == normalized_id:
             return spec
@@ -264,6 +313,7 @@ def build_fixed_trajectory_targets(
     direction: str = "up",
     yaw_rad: float | None = None,
     catalog_path: str | Path | None = None,
+    additional_catalog_path: str | Path | None = None,
 ) -> list[TimestampedMotionTarget]:
     """Build a one-stroke canonical-desk target sequence from an actual boundary.
 
@@ -277,7 +327,11 @@ def build_fixed_trajectory_targets(
     intentionally left to the existing position controller.
     """
 
-    spec = get_fixed_trajectory(trajectory_id, catalog_path=catalog_path)
+    spec = get_fixed_trajectory(
+        trajectory_id,
+        catalog_path=catalog_path,
+        additional_catalog_path=additional_catalog_path,
+    )
     if spec.stroke_count != 1:
         raise ValueError(f"fixed trajectory {spec.trajectory_id!r} is not a one-stroke path")
     scale = _finite_float(scale_m, name="scale_m")
@@ -304,7 +358,10 @@ def build_fixed_trajectory_targets(
     cumulative = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(local_xy, axis=0), axis=1))))
     timestamps = duration_sec * cumulative / path_length_m
     base_position = boundary[normalized_side][:3, 3].copy()
-    catalog_hash = fixed_trajectory_catalog_hash(catalog_path)
+    catalog_hash = fixed_trajectory_catalog_hash(
+        catalog_path,
+        additional_catalog_path=additional_catalog_path,
+    )
     metadata = {
         "phase": "rule_based_fixed_trajectory",
         "rule": "fixed_trajectory",
