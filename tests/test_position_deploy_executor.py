@@ -1733,7 +1733,35 @@ def test_cross_chunk_first_action_uses_one_period_boundary_transition() -> None:
             for command in commands[before_new_chunk : before_new_chunk + 3]
         ]
         assert boundary_values == sorted(boundary_values)
-        assert boundary_values[0] == pytest.approx(0.20, abs=2e-3)
+        first_boundary_command = commands[before_new_chunk]
+        first_boundary_metadata = first_boundary_command.metadata
+        source_timestamps = first_boundary_metadata[
+            "position_parent_source_timestamps_by_modality"
+        ]["pose"]
+        assert len(source_timestamps) == 2
+        left_source_timestamp, right_source_timestamp = (
+            float(source_timestamps[0]),
+            float(source_timestamps[1]),
+        )
+        assert right_source_timestamp > left_source_timestamp
+        assert right_source_timestamp - left_source_timestamp == pytest.approx(
+            executor.config.sample_period_sec
+        )
+        query_timestamp = float(
+            first_boundary_metadata["position_reference_query_monotonic_time"]
+        )
+        # A worker may emit slightly after the scheduled reference tick.  The
+        # lookahead contract is therefore interpolation at the actual causal
+        # query time, rather than a fixed wall-clock value at exactly 0.20.
+        assert left_source_timestamp <= query_timestamp <= right_source_timestamp
+        query_alpha = (query_timestamp - left_source_timestamp) / (
+            right_source_timestamp - left_source_timestamp
+        )
+        expected_boundary_value = 0.20 + (0.30 - 0.20) * query_alpha
+        assert boundary_values[0] == pytest.approx(
+            expected_boundary_value,
+            abs=2e-4,
+        )
         assert boundary_values[-1] < 0.30 - 1e-3
         _wait_until(
             lambda: any(
