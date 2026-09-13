@@ -1753,6 +1753,72 @@ def test_initial_alignment_planning_timeout_holds_and_requests_episode_reclaim(
     assert ui.failure_stop_requests == 1
 
 
+def test_consecutive_initializations_plan_from_their_own_targets() -> None:
+    first_group = _group()
+    second_qpos = np.full((2, 6), 0.08, dtype=np.float32)
+    second_group = replace(
+        _group(),
+        key="second",
+        label="second",
+        arm_joint_targets={
+            "left": second_qpos.copy(),
+            "right": second_qpos.copy(),
+        },
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedInitialize(step_id="first_init", group_key="source"),
+                RuleBasedInitialize(step_id="second_init", group_key="second"),
+            )
+        ),
+        trajectory_groups={"source": first_group, "second": second_group},
+        config=RuleBasedRealTeleopConfig(settle_consecutive_samples=1),
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    now = 6.0
+    first_plan_hash: str | None = None
+    for _ in range(500):
+        current = _wait_for_command(session, now=now)
+        metadata = current.command.metadata
+        step_id = str(metadata["rule_based_step_id"])
+        if step_id == "first_init":
+            first_plan_hash = str(metadata["rule_based_initial_alignment_plan_hash"])
+        elif step_id == "second_init":
+            assert first_plan_hash is not None
+            assert metadata["rule_based_initial_alignment_plan_hash"] != first_plan_hash
+            assert extension._initial_alignment_plan is not None
+            for side in ("left", "right"):
+                np.testing.assert_allclose(
+                    extension._initial_alignment_plan.target_qpos_by_side[side],
+                    np.full(6, 0.08),
+                )
+            break
+        else:
+            raise AssertionError(f"unexpected rule step {step_id!r}")
+        for side in ("left", "right"):
+            recorder.arm_state_poller.qpos[side] = np.asarray(
+                current.command.commands[f"{side}_arm"].value,
+                dtype=float,
+            ).copy()
+        extension.after_session_step(
+            step_result=SimpleNamespace(
+                command=current.command,
+                command_dispatched=True,
+                state=SimpleNamespace(value="RUNNING"),
+                faults=(),
+            ),
+            now=now,
+        )
+        now += 0.051
+    else:
+        raise AssertionError("second initial alignment did not start")
+
+
 def test_target_arrival_timeout_is_contained_in_hold_and_episode_reclaim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

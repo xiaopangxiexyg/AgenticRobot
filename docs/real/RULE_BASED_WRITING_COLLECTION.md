@@ -48,6 +48,25 @@ Only steps 2-4 are admitted to the formal dataset. Cameras, tactile capture,
 sample synchronization, and persistence remain atomic and are owned by the
 existing formal writer.
 
+An optional source-pool prelude can be inserted before step 1 with
+`--pre-pen-down-replay-candidate-id ID` or the dedicated UI selector. When it
+is enabled, the runtime first uses the same collision-checked qpos
+initialization to approach frame 0 of that candidate, replays the candidate's
+complete right-arm Episode, and then runs a second collision-checked
+initialization to the selected `pen_down` frame 0. The prelude and both smooth
+transitions have capture disabled, so the formal output still contains only
+the existing pen-down/write/pen-up stages. The left arm action and measured
+qpos/TCP initialization state are pinned to the selected pen-down source hold
+throughout the prelude. Enabled DMTAC channels keep using the existing causal,
+step-limited runtime path.
+
+The option is disabled by default and is intentionally available only with a
+source-pool manifest, where `ID` has one exact dataset/Episode identity inside
+the selected pool range. Legacy single-source and `full-replay` modes reject
+it instead of inferring a trajectory. Every item in a configured GUI batch
+stores its own optional prelude choice, so the sequence is rebuilt before each
+formal Episode without changing the writer or device lifecycle.
+
 ## Complete source-Episode replay mode
 
 Pass `--mode full-replay` to select the additional, startup-time-isolated

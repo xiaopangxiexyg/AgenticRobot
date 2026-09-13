@@ -899,6 +899,7 @@ def test_fixed_writing_uses_calibrated_descent_endpoint_when_supplied() -> None:
         ("--source-pool-manifest", "PATH"),
         ("--source-pool-range", "START:END"),
         ("--selection-seed", "N"),
+        ("--pre-pen-down-replay-candidate-id", "ID"),
         ("--tactile-bundle-root", "PATH"),
         ("--dataset-root", "PATH"),
         ("--trajectory", "ID"),
@@ -1314,6 +1315,8 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
             "10:30",
             "--selection-seed",
             "42",
+            "--pre-pen-down-replay-candidate-id",
+            "stroke-before-pen",
             "--tactile-bundle-root",
             str(tactile),
             "--dry-run",
@@ -1329,9 +1332,62 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
     assert f"--rule-source-pool-manifest {manifest}" in output
     assert "--rule-source-pool-range 10:30" in output
     assert "--rule-source-selection-seed 42" in output
+    assert (
+        "--rule-pre-pen-down-replay-candidate-id stroke-before-pen" in output
+    )
     assert "--rule-source-dataset" not in output
     assert "--rule-source-episode" not in output
     assert "--rule-detail-annotation-dir" not in output
+
+
+def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
+    tmp_path: Path,
+) -> None:
+    full_replay = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--mode",
+            "full-replay",
+            "--pre-pen-down-replay-candidate-id",
+            "candidate-a",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert full_replay.returncode == 2
+    assert "not valid in full-replay mode" in full_replay.stderr
+
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+    legacy = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "1",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--pre-pen-down-replay-candidate-id",
+            "candidate-a",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert legacy.returncode == 2
+    assert "requires --source-pool-manifest" in legacy.stderr
 
 
 def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
@@ -1378,6 +1434,8 @@ def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:
             "4:19",
             "--rule-source-selection-seed",
             "8",
+            "--rule-pre-pen-down-replay-candidate-id",
+            "candidate-12",
         ]
     )
 
@@ -1385,3 +1443,4 @@ def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:
     assert args.rule_source_pool_manifest == "/pool.json"
     assert args.rule_source_pool_range == "4:19"
     assert args.rule_source_selection_seed == 8
+    assert args.rule_pre_pen_down_replay_candidate_id == "candidate-12"

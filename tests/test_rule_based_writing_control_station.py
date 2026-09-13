@@ -355,6 +355,7 @@ def test_rule_ui_asset_contains_no_teleop_episode_progress_or_pedal_controls() -
     assert 'id="batch-items"' in asset
     assert 'id="collection-mode"' in asset
     assert 'id="full-replay-source"' in asset
+    assert 'id="pre-pen-down-source"' in asset
     assert 'id="pen-down-source"' in asset
     assert 'id="write-source"' in asset
     assert 'id="pen-up-source"' in asset
@@ -670,6 +671,20 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
     application.bind_rule_runtime()
     application.observe_rule_status({"rule_start_available": True})
     options = {
+        "configuration_core_fields": [
+            "pre_pen_down_replay_candidate_id",
+            "pen_down_candidate_id",
+            "write_candidate_id",
+            "pen_up_candidate_id",
+            "trajectory_id",
+            "direction",
+            "writing_size_m",
+            "initial_alignment_speed_scale",
+        ],
+        "choice_fields": {
+            "pre_pen_down_replay_candidate_id": "pre_pen_down_replay_candidates",
+        },
+        "pre_pen_down_replay_candidates": ["", "a", "b"],
         "source_candidates_by_phase": {
             phase: [
                 {"value": "a", "label": "A"},
@@ -685,6 +700,7 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
         },
     }
     selected = {
+        "pre_pen_down_replay_candidate_id": "",
         "pen_down_candidate_id": "a",
         "write_candidate_id": "a",
         "pen_up_candidate_id": "a",
@@ -696,6 +712,7 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
     application.configure_rule_options(options, selected)
     changed = {
         **selected,
+        "pre_pen_down_replay_candidate_id": "b",
         "pen_down_candidate_id": "b",
         "pen_up_candidate_id": "b",
         "trajectory_id": "digit_9_v1",

@@ -32,6 +32,9 @@ Options:
                               Initial dual-arm alignment speed multiplier in (0, 1].
   --source-pool-range A:B     Half-open candidate range (default: whole pool).
   --selection-seed N          Deterministic source selection seed (default: 0).
+  --pre-pen-down-replay-candidate-id ID
+                              Writing mode only; optional complete source Episode
+                              replayed without capture before pen-down.
   --task-name NAME            Output collection task name.
   --tactile-min-free-gb N     Required tactile free space (default: 200).
   --camera-frame-max-age-sec S
@@ -67,6 +70,7 @@ DETAIL_ANNOTATION_DIR=""
 SOURCE_POOL_MANIFEST=""
 SOURCE_POOL_RANGE=""
 SELECTION_SEED="0"
+PRE_PEN_DOWN_REPLAY_CANDIDATE_ID=""
 COLLECTION_MODE="rule-based-writing"
 TACTILE_ROOT="${TACTILE_BUNDLE_ROOT:-}"
 OUTPUT_DATASET_ROOT="${DATASET_BASE:-}"
@@ -95,6 +99,7 @@ declare -A VALUE_OPTION_TARGET=(
   [--source-pool-manifest]=SOURCE_POOL_MANIFEST
   [--source-pool-range]=SOURCE_POOL_RANGE
   [--selection-seed]=SELECTION_SEED
+  [--pre-pen-down-replay-candidate-id]=PRE_PEN_DOWN_REPLAY_CANDIDATE_ID
   [--tactile-bundle-root]=TACTILE_ROOT
   [--dataset-root]=OUTPUT_DATASET_ROOT
   [--trajectory]=TRAJECTORY
@@ -117,6 +122,7 @@ declare -A VALUE_OPTION_HINT=(
   [--source-pool-manifest]=PATH
   [--source-pool-range]=START:END
   [--selection-seed]=N
+  [--pre-pen-down-replay-candidate-id]=ID
   [--tactile-bundle-root]=PATH
   [--dataset-root]=PATH
   [--trajectory]=ID
@@ -174,6 +180,9 @@ fi
 if [[ "$COLLECTION_MODE" == "full-replay" && -n "$TRAJECTORY_CATALOG" ]]; then
   die "--trajectory-catalog is not valid in full-replay mode."
 fi
+if [[ "$COLLECTION_MODE" == "full-replay" && -n "$PRE_PEN_DOWN_REPLAY_CANDIDATE_ID" ]]; then
+  die "--pre-pen-down-replay-candidate-id is not valid in full-replay mode."
+fi
 
 [[ -n "$TACTILE_ROOT" ]] || die "--tactile-bundle-root is required."
 [[ "$TACTILE_ROOT" == /* ]] || die "tactile root must be absolute."
@@ -204,6 +213,8 @@ if [[ -n "$SOURCE_POOL_MANIFEST" ]]; then
 else
   [[ -z "$SOURCE_POOL_RANGE" ]] || die \
     "--source-pool-range requires --source-pool-manifest."
+  [[ -z "$PRE_PEN_DOWN_REPLAY_CANDIDATE_ID" ]] || die \
+    "--pre-pen-down-replay-candidate-id requires --source-pool-manifest."
   [[ -n "$SOURCE_DATASET" ]] || die \
     "provide --source-pool-manifest or --source-dataset."
   [[ -n "$SOURCE_EPISODE" ]] || die "--source-episode is required in legacy mode."
@@ -276,6 +287,12 @@ if [[ -n "$SOURCE_POOL_MANIFEST" ]]; then
   )
   if [[ -n "$SOURCE_POOL_RANGE" ]]; then
     RULE_ARGS+=(--rule-source-pool-range "$SOURCE_POOL_RANGE")
+  fi
+  if [[ -n "$PRE_PEN_DOWN_REPLAY_CANDIDATE_ID" ]]; then
+    RULE_ARGS+=(
+      --rule-pre-pen-down-replay-candidate-id
+      "$PRE_PEN_DOWN_REPLAY_CANDIDATE_ID"
+    )
   fi
 else
   RULE_ARGS+=(
@@ -392,6 +409,7 @@ printf '%s\n' \
   "[RuleBased] starting collection mode=$COLLECTION_MODE on the established real-teleop UI." \
   '[RuleBased] clear the workspace; start one formal Episode only after the existing GUI reports ready.' \
   "[RuleBased] source_pool=${SOURCE_POOL_MANIFEST:-legacy_single_source} range=${SOURCE_POOL_RANGE:-all} seed=$SELECTION_SEED" \
+  "[RuleBased] pre_pen_down_replay=${PRE_PEN_DOWN_REPLAY_CANDIDATE_ID:-disabled}" \
   "[RuleBased] source_dataset=${SOURCE_DATASET:-pool_selected} episode=${SOURCE_EPISODE:-pool_selected}" \
   "[RuleBased] detail_annotation_dir=${DETAIL_ANNOTATION_DIR:-pool_selected}" \
   "[RuleBased] trajectory=$TRAJECTORY catalog=${TRAJECTORY_CATALOG:-builtin} size_m=$SIZE_M direction=$DIRECTION speed_m_s=${SPEED_M_S:-source_average}" \

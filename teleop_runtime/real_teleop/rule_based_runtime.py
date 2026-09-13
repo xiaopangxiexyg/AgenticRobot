@@ -13,7 +13,7 @@ import time
 from bisect import bisect_right
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -3485,6 +3485,20 @@ class RuleBasedRealTeleopExtension:
             raise RuntimeError("initial-alignment planner is not attached.")
         if self._initial_alignment_future is not None:
             raise RuntimeError("initial-alignment planning is already active.")
+        if self._initial_alignment_template is not None:
+            raise RuntimeError("previous initial-alignment execution is still active.")
+        # One collection plan may contain more than one smooth transition.  A
+        # completed transition intentionally retains its plan long enough for
+        # terminal-arrival accounting, so clear that completed cache before
+        # submitting the next transition.  Otherwise the second transition
+        # could consume the first transition's waypoints.
+        self._initial_alignment_plan = None
+        self._initial_alignment_waypoint_index = 0
+        self._initial_alignment_effective_waypoint_count = 0
+        self._initial_alignment_started_at = None
+        self._initial_alignment_last_schedule_lag_sec = 0.0
+        self._initial_alignment_cumulative_schedule_shift_sec = 0.0
+        self._initial_alignment_skipped_clock_ticks = 0
         start = self._snapshot_qpos_pair(snapshots)
         target = {
             side: np.asarray(emission.directive.qpos_by_side[side], dtype=float).copy()

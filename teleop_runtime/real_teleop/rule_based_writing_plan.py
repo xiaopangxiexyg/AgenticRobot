@@ -116,6 +116,11 @@ RULE_COLLECTION_MODES = (
 )
 FULL_REPLAY_INITIALIZE_STEP_ID = "execute_task.replay_initial_alignment"
 FULL_REPLAY_STEP_ID = "execute_task.manipulate"
+PRE_PEN_DOWN_ALIGNMENT_STEP_ID = "right_write.pre_pen_down.alignment"
+PRE_PEN_DOWN_REPLAY_STEP_ID = "right_write.pre_pen_down.replay"
+PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID = (
+    "right_write.pre_pen_down.to_pen_down_alignment"
+)
 
 _RULE_GUI_SHARED_RUNTIME_CONFIGURATION_FIELDS = (
     "tactile_bundle_root",
@@ -303,6 +308,15 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Optional source-pool candidate selected for complete-Episode replay; "
             "the GUI can replace it before collection starts."
+        ),
+    )
+    group.add_argument(
+        "--rule-pre-pen-down-replay-candidate-id",
+        default=None,
+        help=(
+            "Optional source-pool candidate replayed before pen-down. The runtime "
+            "smoothly aligns to this complete Episode, replays its right-arm motion "
+            "without capture, then smoothly aligns to the ordinary pen-down start."
         ),
     )
     group.add_argument(
@@ -547,6 +561,50 @@ def _slice_group(
             for side, values in actual_tcp.items()
         },
         metadata=dict(metadata),
+    )
+
+
+def _freeze_group_arm_state(
+    group: ReplayTrajectoryGroup,
+    *,
+    side: str,
+    action_pose: np.ndarray,
+    actual_qpos: np.ndarray,
+    actual_tcp: np.ndarray,
+) -> ReplayTrajectoryGroup:
+    """Hold one arm throughout a replay group at one measured source state."""
+
+    normalized_side = str(side)
+    if normalized_side not in ACTION_ARM_POSE_SLICES:
+        raise ValueError(f"unsupported held arm side: {normalized_side!r}.")
+    pose = np.asarray(action_pose, dtype=np.float32).reshape(-1)
+    qpos = np.asarray(actual_qpos, dtype=np.float32).reshape(-1)
+    tcp = np.asarray(actual_tcp, dtype=np.float32).reshape(-1)
+    if pose.shape != (7,) or tcp.shape != (7,) or qpos.shape != (6,):
+        raise ValueError("held arm state must contain pose(7), qpos(6), and TCP(7).")
+    if not all(np.all(np.isfinite(values)) for values in (pose, qpos, tcp)):
+        raise ValueError("held arm state must be finite.")
+    actions = np.asarray(group.actions, dtype=np.float32).copy()
+    actions[:, ACTION_ARM_POSE_SLICES[normalized_side]] = pose
+    qpos_by_side = {
+        key: np.asarray(values, dtype=np.float32).copy()
+        for key, values in group.arm_observation_actual_qpos.items()
+    }
+    tcp_by_side = {
+        key: np.asarray(values, dtype=np.float32).copy()
+        for key, values in group.arm_observation_actual_tcp_pose.items()
+    }
+    qpos_by_side[normalized_side] = np.repeat(
+        qpos[None, :], int(group.frame_count), axis=0
+    )
+    tcp_by_side[normalized_side] = np.repeat(
+        tcp[None, :], int(group.frame_count), axis=0
+    )
+    return replace(
+        group,
+        actions=actions,
+        arm_observation_actual_qpos=qpos_by_side,
+        arm_observation_actual_tcp_pose=tcp_by_side,
     )
 
 
@@ -1452,6 +1510,35 @@ def _resolve_full_replay_source_spec(
     )
 
 
+def _requested_pre_pen_down_replay_candidate_id(args: argparse.Namespace) -> str:
+    requested = getattr(args, "_rule_pre_pen_down_replay_candidate_id", None)
+    if requested is None:
+        requested = getattr(args, "rule_pre_pen_down_replay_candidate_id", None)
+    return "" if requested is None else str(requested).strip()
+
+
+def _resolve_pre_pen_down_replay_source_spec(
+    args: argparse.Namespace,
+) -> ResolvedRuleBasedWritingSourceCandidate | None:
+    requested_id = _requested_pre_pen_down_replay_candidate_id(args)
+    if not requested_id:
+        return None
+    if getattr(args, "rule_source_pool_manifest", None) is None:
+        raise ValueError(
+            "pre-pen-down replay requires --rule-source-pool-manifest; legacy "
+            "single-source mode has no exact candidate identity."
+        )
+    candidates = _source_pool_candidates(args)
+    by_id = {spec.candidate.candidate_id: spec for spec in candidates}
+    try:
+        return by_id[requested_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"pre-pen-down replay candidate {requested_id!r} is outside the "
+            "selected source-pool range."
+        ) from exc
+
+
 def _configuration_option_entry(
     spec: ResolvedRuleBasedWritingSourceCandidate,
 ) -> dict[str, str]:
@@ -1609,6 +1696,27 @@ def _rule_configuration_options(
         or DEFAULT_COLLECTION_TERMINAL_EVENT_PUT_TIMEOUT_SEC
     )
     options = {
+        "configuration_core_fields": [
+            "pre_pen_down_replay_candidate_id",
+            "pen_down_candidate_id",
+            "write_candidate_id",
+            "pen_up_candidate_id",
+            "trajectory_id",
+            "direction",
+            "writing_size_m",
+            "initial_alignment_speed_scale",
+        ],
+        "choice_fields": {
+            "pre_pen_down_replay_candidate_id": "pre_pen_down_replay_candidates",
+        },
+        "pre_pen_down_replay_candidates": [
+            {"value": "", "label": "不启用（保持当前流程）"},
+            *(
+                [_configuration_option_entry(spec) for spec in candidates]
+                if manifest is not None
+                else []
+            ),
+        ],
         "source_candidates_by_phase": source_options,
         "trajectory_ids": [
             _fixed_trajectory_option(
@@ -1704,6 +1812,9 @@ def _rule_configuration_options(
     }
     selected.update(
         {
+            "pre_pen_down_replay_candidate_id": (
+                _requested_pre_pen_down_replay_candidate_id(args)
+            ),
             "trajectory_id": str(args.rule_writing_trajectory),
             "direction": str(args.rule_writing_direction),
             "writing_size_m": float(args.rule_writing_size_m),
@@ -2266,6 +2377,10 @@ def build_rule_based_writing(
             raise ValueError(
                 "rule writing trajectory catalog is not valid in full replay mode."
             )
+        if _requested_pre_pen_down_replay_candidate_id(args):
+            raise ValueError(
+                "pre-pen-down replay is not valid in full replay mode."
+            )
         return _build_full_trajectory_replay(
             args,
             deployment=deployment,
@@ -2275,6 +2390,7 @@ def build_rule_based_writing(
         raise ValueError(f"unsupported rule collection mode: {collection_mode!r}.")
     additional_catalog_path = _additional_fixed_trajectory_catalog_path(args)
     source_specs, source_selection = _resolve_source_specs(args)
+    pre_pen_down_spec = _resolve_pre_pen_down_replay_source_spec(args)
     requested_by_candidate: dict[str, list[str]] = {}
     spec_by_candidate: dict[str, ResolvedRuleBasedWritingSourceCandidate] = {}
     for phase, spec in source_specs.items():
@@ -2292,6 +2408,30 @@ def build_rule_based_writing(
         phase: loaded_by_candidate[spec.candidate.candidate_id]
         for phase, spec in source_specs.items()
     }
+    pre_pen_down_source: _LoadedWritingSource | None = None
+    if pre_pen_down_spec is not None:
+        pre_pen_down_source = loaded_by_candidate.get(
+            pre_pen_down_spec.candidate.candidate_id
+        )
+        if pre_pen_down_source is None:
+            pre_pen_down_source = _load_replay_source_episode(
+                pre_pen_down_spec,
+                deployment=deployment,
+            )
+        if pre_pen_down_source.episode.frame_count < 2:
+            raise ValueError("pre-pen-down replay requires at least two source frames.")
+        right_actions = np.asarray(
+            pre_pen_down_source.actions[:, ACTION_ARM_POSE_SLICES["right"]],
+            dtype=float,
+        )
+        if right_actions.shape != (
+            pre_pen_down_source.episode.frame_count,
+            7,
+        ) or not np.all(np.isfinite(right_actions)):
+            raise ValueError(
+                "pre-pen-down replay requires finite right-arm actions for every "
+                "source frame."
+            )
     pen_down_source = selected_sources["pen_down"]
     write_source = selected_sources["write"]
     pen_up_source = selected_sources["pen_up"]
@@ -2306,6 +2446,14 @@ def build_rule_based_writing(
     ).copy()
     if left_hold_pose.shape != (7,) or not np.all(np.isfinite(left_hold_pose)):
         raise ValueError("source pen-down left hold pose is invalid.")
+    left_hold_qpos = np.asarray(
+        pen_down_source.actual_qpos["left"][pen_down.start],
+        dtype=np.float32,
+    ).copy()
+    left_hold_tcp = np.asarray(
+        pen_down_source.actual_tcp["left"][pen_down.start],
+        dtype=np.float32,
+    ).copy()
 
     (
         configured_gripper_sides,
@@ -2332,6 +2480,20 @@ def build_rule_based_writing(
             "source_contract_hash": source.source_contract_hash,
             "tags": list(spec.candidate.tags),
         }
+    pre_pen_down_provenance: dict[str, Any] | None = None
+    if pre_pen_down_source is not None and pre_pen_down_spec is not None:
+        pre_pen_down_provenance = {
+            "candidate_id": pre_pen_down_source.candidate_id,
+            "dataset_root": str(pre_pen_down_source.dataset_root),
+            "episode_index": pre_pen_down_source.episode_index,
+            "source_contract_hash": pre_pen_down_source.source_contract_hash,
+            "source_frame_count": pre_pen_down_source.episode.frame_count,
+            "source_timing": pre_pen_down_source.episode.timing_source,
+            "tags": list(pre_pen_down_spec.candidate.tags),
+            "capture_enabled": False,
+            "active_arm_sides": ["right"],
+            "left_arm_policy": "pen_down_source_fixed_hold",
+        }
     source_selection = {
         **source_selection,
         "trajectory_catalog": {
@@ -2355,6 +2517,11 @@ def build_rule_based_writing(
             ),
         },
         "phases": phase_provenance,
+        **(
+            {"pre_pen_down_replay": pre_pen_down_provenance}
+            if pre_pen_down_provenance is not None
+            else {}
+        ),
         "gripper_sides": list(configured_gripper_sides),
         "control_topology": {
             "arms": ["left", "right"],
@@ -2422,6 +2589,32 @@ def build_rule_based_writing(
             left_hold_pose=left_hold_pose,
         ),
     }
+    pre_pen_down_group: ReplayTrajectoryGroup | None = None
+    if pre_pen_down_source is not None:
+        pre_pen_down_group = _slice_group(
+            key="pre_pen_down",
+            span=StageSpan(0, pre_pen_down_source.episode.frame_count),
+            episode_index=pre_pen_down_source.episode_index,
+            source_path=pre_pen_down_source.source_path,
+            action_hz=pre_pen_down_source.episode.nominal_hz,
+            frame_times_sec=pre_pen_down_source.episode.frame_times_sec,
+            actions=pre_pen_down_source.actions,
+            hand_joint_targets=pre_pen_down_source.hand_joint_targets,
+            actual_qpos=pre_pen_down_source.actual_qpos,
+            actual_tcp=pre_pen_down_source.actual_tcp,
+            metadata={
+                **pre_pen_down_source.metadata,
+                "rule_based_source_selection": source_selection,
+            },
+            left_hold_pose=left_hold_pose,
+        )
+        pre_pen_down_group = _freeze_group_arm_state(
+            pre_pen_down_group,
+            side="left",
+            action_pose=left_hold_pose,
+            actual_qpos=left_hold_qpos,
+            actual_tcp=left_hold_tcp,
+        )
     if configured_gripper_sides:
         phase_groups = {
             phase: _with_runtime_dmtac_contract(
@@ -2430,6 +2623,11 @@ def build_rule_based_writing(
             )
             for phase, group in phase_groups.items()
         }
+        if pre_pen_down_group is not None:
+            pre_pen_down_group = _with_runtime_dmtac_contract(
+                pre_pen_down_group,
+                sides=configured_gripper_sides,
+            )
 
     speed = (
         float(args.rule_writing_speed_m_s)
@@ -2547,6 +2745,8 @@ def build_rule_based_writing(
         "pen_down": phase_groups["pen_down"],
         "pen_up": phase_groups["pen_up"],
     }
+    if pre_pen_down_group is not None:
+        groups[pre_pen_down_group.key] = pre_pen_down_group
     writing_source = FixedWritingActionSource(
         trajectory_id=args.rule_writing_trajectory,
         scale_m=size_m,
@@ -2564,8 +2764,45 @@ def build_rule_based_writing(
         hand_action_specs_by_side=runtime_hand_specs,
     )
     capture = RuleBasedCaptureSelection(enabled=True)
-    plan = RuleBasedCollectionPlan(
-        steps=(
+    plan_steps: list[Any] = []
+    if pre_pen_down_group is not None:
+        plan_steps.extend(
+            (
+                RuleBasedInitialize(
+                    step_id=PRE_PEN_DOWN_ALIGNMENT_STEP_ID,
+                    group_key=pre_pen_down_group.key,
+                    frame_index=0,
+                    active_sides=("left", "right"),
+                    qpos_source="observation_actual_qpos",
+                    include_end_effectors=bool(configured_gripper_sides),
+                    end_effector_sides=configured_gripper_sides,
+                    capture=RuleBasedCaptureSelection(enabled=False),
+                ),
+                RuleBasedReplay(
+                    step_id=PRE_PEN_DOWN_REPLAY_STEP_ID,
+                    group_key=pre_pen_down_group.key,
+                    start_index=0,
+                    end_index=pre_pen_down_group.frame_count,
+                    active_sides=("right",),
+                    include_end_effectors=bool(configured_gripper_sides),
+                    end_effector_sides=configured_gripper_sides,
+                    wait_for_terminal_arrival=True,
+                    capture=RuleBasedCaptureSelection(enabled=False),
+                ),
+                RuleBasedInitialize(
+                    step_id=PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID,
+                    group_key="pen_down",
+                    frame_index=0,
+                    active_sides=("left", "right"),
+                    qpos_source="observation_actual_qpos",
+                    include_end_effectors=bool(configured_gripper_sides),
+                    end_effector_sides=configured_gripper_sides,
+                    capture=RuleBasedCaptureSelection(enabled=False),
+                ),
+            )
+        )
+    else:
+        plan_steps.append(
             RuleBasedInitialize(
                 step_id="initial_alignment",
                 group_key="pen_down",
@@ -2575,7 +2812,10 @@ def build_rule_based_writing(
                 include_end_effectors=bool(configured_gripper_sides),
                 end_effector_sides=configured_gripper_sides,
                 capture=RuleBasedCaptureSelection(enabled=False),
-            ),
+            )
+        )
+    plan_steps.extend(
+        (
             RuleBasedReplay(
                 step_id=DETAIL_PHASE_IDS[0],
                 group_key="pen_down",
@@ -2625,6 +2865,7 @@ def build_rule_based_writing(
             ),
         )
     )
+    plan = RuleBasedCollectionPlan(steps=tuple(plan_steps))
     extension = RuleBasedRealTeleopExtension(
         deployment=deployment,
         plan=plan,
@@ -2654,6 +2895,9 @@ def build_rule_based_writing(
                 phase: str(configuration[f"{phase}_candidate_id"])
                 for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1
             }
+            rebuilt_args._rule_pre_pen_down_replay_candidate_id = str(
+                configuration["pre_pen_down_replay_candidate_id"]
+            )
             rebuilt_args.rule_writing_trajectory = str(configuration["trajectory_id"])
             rebuilt_args.rule_writing_direction = str(configuration["direction"])
             rebuilt_args.rule_writing_size_m = float(configuration["writing_size_m"])
@@ -2729,6 +2973,12 @@ def build_rule_based_writing_extension(
             f"{phase}={selected.get(phase, {}).get('candidate_id', '?')}"
             for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1
         )
+        prelude = build.source_selection.get("pre_pen_down_replay")
+        if isinstance(prelude, Mapping):
+            selected_summary = (
+                f"pre_pen_down={prelude.get('candidate_id', '?')},"
+                f"{selected_summary}"
+            )
         speed_summary = f"{build.writing_speed_m_s:.6f}"
     print(
         "[RuleBased] prepared "
@@ -2749,6 +2999,9 @@ __all__ = [
     "DETAIL_PROGRESS_STEP_ID",
     "FULL_REPLAY_INITIALIZE_STEP_ID",
     "FULL_REPLAY_STEP_ID",
+    "PRE_PEN_DOWN_ALIGNMENT_STEP_ID",
+    "PRE_PEN_DOWN_REPLAY_STEP_ID",
+    "PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID",
     "RULE_COLLECTION_MODE_FULL_REPLAY",
     "RULE_COLLECTION_MODE_WRITING",
     "DetailWritingSelection",
