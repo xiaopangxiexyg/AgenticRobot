@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,10 @@ from deployments.openpi.client.observation_adapter import (
     resolve_prepared_prompt_selection,
 )
 from deployments.openpi.client.preflight import preflight_policy_artifact
+from deployments.openpi.client.server_artifact_bootstrap import (
+    fetch_server_policy_artifact,
+    materialize_runtime_policy_artifact,
+)
 from deployments.openpi.image_wire import (
     OPENPI_IMAGE_WIRE_JPEG_V1,
     OPENPI_IMAGE_WIRE_LEGACY_RAW_V1,
@@ -426,6 +431,21 @@ def main(argv: list[str] | None = None) -> int:
     if artifact_path is not None and not artifact_path.is_file():
         parser.error(f"policy artifact does not exist or is not a file: {artifact_path}")
     policy_artifact = None if artifact_path is None else load_policy_artifact(artifact_path)
+    artifact_from_server = False
+    if (
+        policy_artifact is None
+        and not args.contract_check_only
+        and args.rtc_profile == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+    ):
+        try:
+            policy_artifact = fetch_server_policy_artifact(
+                host=args.host,
+                port=int(args.port),
+                api_key=_optional_text(args.api_key),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            parser.error(f"could not bootstrap policy artifact from OpenPI server: {exc}")
+        artifact_from_server = True
     if policy_artifact is not None:
         validate_declared_camera_semantics(policy_artifact)
         expected_camera_binding_hash = str(
@@ -547,8 +567,6 @@ def main(argv: list[str] | None = None) -> int:
                 str(float(args.disconnected_gripper_state)),
             )
         )
-    if artifact_path is not None:
-        runtime_args.extend(("--policy-artifact-json", str(artifact_path)))
     if args.debug:
         runtime_args.append("--debug")
     if args.debug_dir is not None:
@@ -681,16 +699,26 @@ def main(argv: list[str] | None = None) -> int:
 
         rtc_model_adapter_factory = _create_openpi_rtc_adapter
 
-    delegated_args = [
-        "--policy",
-        "deployments.openpi.client.policy:create_policy",
-        "--policy-kwargs-json",
-        json.dumps(policy_kwargs, separators=(",", ":")),
-        *runtime_args,
-    ]
-    if rtc_model_adapter_factory is None:
-        return run_real_policy(delegated_args)
-    return run_real_policy(
-        delegated_args,
-        rtc_model_adapter_factory=rtc_model_adapter_factory,
+    artifact_context = (
+        materialize_runtime_policy_artifact(policy_artifact)
+        if artifact_from_server
+        else nullcontext(artifact_path)
     )
+    with artifact_context as runtime_artifact_path:
+        if runtime_artifact_path is not None:
+            runtime_args.extend(
+                ("--policy-artifact-json", str(runtime_artifact_path))
+            )
+        delegated_args = [
+            "--policy",
+            "deployments.openpi.client.policy:create_policy",
+            "--policy-kwargs-json",
+            json.dumps(policy_kwargs, separators=(",", ":")),
+            *runtime_args,
+        ]
+        if rtc_model_adapter_factory is None:
+            return run_real_policy(delegated_args)
+        return run_real_policy(
+            delegated_args,
+            rtc_model_adapter_factory=rtc_model_adapter_factory,
+        )
