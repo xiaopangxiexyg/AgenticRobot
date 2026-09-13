@@ -3,10 +3,10 @@
 本文是环境依赖、安装细节和复现约束的权威说明；可直接复制的最短安装/检查命令见
 [`docs/setup/README.md`](./docs/setup/README.md)。项目主环境统一使用 Python 3.10 conda 环境
 `dexteleop310`；SAM2、Grounding DINO、VGN、GraspNet 作为抓姿扩展安装到同一个环境。启用
-point-grasp 时真实 Gateway CLI 默认选择 GraspGenX，并通过
-`assets/perception/graspgenx-point-grasp/runtime/.venv` 内的隔离 loopback service 推理，
-不修改 `dexteleop310`。只有 Gateway 本身运行在满足官方 PyTorch 约束的独立环境中时，才应显式
-选择 in-process 模式。两种模式都不改变 Gateway Skill 或下游运动语义。
+point-grasp 时真实 Gateway CLI 默认选择 GraspGenX，并在满足官方 PyTorch 约束的独立 Gateway
+Python 环境中以 in-process 模式直接推理，无需启动模型服务。显式选择 service 模式时，才使用
+`assets/perception/graspgenx-point-grasp/runtime/.venv` 内的隔离 loopback runtime；两种模式都
+不修改 `dexteleop310`，也不改变 Gateway Skill 或下游运动语义。
 RPent
 属于独立的上层项目环境，不是本仓抓姿/仿真运行的前置条件。`core`、`test`、`dataset`、
 `annotation`、`sim`、`model`、`openpi`、
