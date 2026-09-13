@@ -255,11 +255,10 @@ def test_snapshot_restore_primes_planner_at_prior_command_phase() -> None:
         # at t=0.500 therefore has its preceding 120 Hz proposal at the
         # physics-aligned t=0.492 tick, not at t=0.499 or t=0.500.
         assert planner._last_commit_monotonic == pytest.approx(9.992)
-        assert planner._target_published_monotonic == pytest.approx(
-            9.483333333333333
-        )
+        assert planner._target_published_monotonic == pytest.approx(9.483333333333333)
     finally:
         rig.close()
+
 
 def test_direct_execution_rejects_inapplicable_causal_state() -> None:
     scene = _FakeScene()
@@ -487,6 +486,50 @@ def test_sample_aligned_held_source_bucket_does_not_advance_gripper() -> None:
     rig.close()
 
 
+def test_gripper_only_boundary_does_not_require_or_queue_arm_reference() -> None:
+    rig = MujocoPositionExecutionRig(
+        _FakeScene(),
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+    )
+    rig.start()
+
+    class _FakeGripperExecution:
+        def __init__(self) -> None:
+            self.queued = []
+            self.hold_count = 0
+
+        def queue_close_targets(self, targets):
+            self.queued.append(dict(targets))
+            return 9
+
+        def snapshot(self):
+            return {"measured_close_by_gripper": {"right_gripper": 0.25}}
+
+        def hold_targets(self):
+            self.hold_count += 1
+
+    gripper = _FakeGripperExecution()
+    rig._gripper_execution = gripper
+
+    assert rig.queue_gripper_close_targets({"right_gripper": 1.0}) == 9
+    assert rig._pending_reference is None
+    assert rig.gripper_execution_snapshot() == {
+        "measured_close_by_gripper": {"right_gripper": 0.25}
+    }
+    rig.hold_gripper_motion("atomic skill terminal hold")
+    assert gripper.queued == [{"right_gripper": 1.0}]
+    assert gripper.hold_count == 1
+
+    rig._gripper_execution = None
+    rig.close()
+
+
 def test_mujoco_position_rig_rejects_partial_bimanual_reference() -> None:
     scene = _FakeScene()
     rig = MujocoPositionExecutionRig(
@@ -624,7 +667,9 @@ def test_mujoco_position_rig_close_does_not_wait_on_live_worker_lock() -> None:
     assert rig._worker is None
 
 
-def test_mujoco_position_rig_restarts_from_measured_state_without_stale_mailbox() -> None:
+def test_mujoco_position_rig_restarts_from_measured_state_without_stale_mailbox() -> (
+    None
+):
     scene = _FakeScene()
     rig = MujocoPositionExecutionRig(
         scene,

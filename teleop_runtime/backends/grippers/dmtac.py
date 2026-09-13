@@ -2045,6 +2045,29 @@ class DMTacGripperBackend(EffectorBackend):
             preserve_existing_grip=False,
         )
 
+    def hold_gripper_motion(self, reason: str = "manual gripper hold") -> bool:
+        """Stop an active DMTAC move without closing the shared backend.
+
+        The atomic gripper Skill uses this as its cancellation and terminal
+        HOLD boundary.  It never reconnects a missing device: loss of the live
+        serial session remains a failed HOLD that callers must surface.
+        """
+
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("reason must be non-empty.")
+        if self.config.observation_only:
+            return True
+        if self.config.disconnected_state_scalar is not None:
+            return True
+        with self._lock:
+            if self.device is None or getattr(self.device, "gripper", None) is None:
+                return False
+            self.device.stop()
+            self._last_send_status = "gripper_hold"
+            self._last_send_skip_reason = normalized_reason
+            return True
+
     def set_torque(self, torque: float) -> float:
         """Set normalized gripper torque and apply it to an active device now.
 
