@@ -7,12 +7,16 @@ writer persistence, or the rule cursor.
 
 from __future__ import annotations
 
-import queue
 import math
+import queue
+import secrets
 import threading
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any
+
+from .task_chain import RuleWritingTaskChain, RuleWritingTaskChainPhase
 
 
 class RuleBasedWritingIntent(str, Enum):
@@ -91,6 +95,15 @@ class RuleBasedWritingUiState:
     height_calibration_error: str = ""
     can_capture_height: bool = False
     can_clear_height: bool = False
+    task_chain_active: bool = False
+    task_chain_phase: str = "idle"
+    task_chain_step: str = "0 / 5"
+    task_chain_title: str = "任务链未启动"
+    task_chain_detail: str = "按“继续任务链”后先松开夹爪。"
+    task_chain_can_advance: bool = False
+    task_chain_cycle_count: int = 0
+    task_chain_selected_configuration: dict[str, object] = field(default_factory=dict)
+    task_chain_selected_configuration_index: int | None = None
     held: bool = False
     completed: bool = False
     aborted: bool = False
@@ -126,13 +139,20 @@ class RuleBasedWritingApplication:
         }
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        task_chain_choice_index: Callable[[int], int] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._state = RuleBasedWritingUiState()
         self._runtime_events: queue.Queue[str] = queue.Queue()
         self._rule_intents: queue.Queue[RuleBasedWritingIntent] = queue.Queue()
         self._configuration_requests: queue.Queue[dict[str, object]] = queue.Queue()
         self._height_calibration_requests: queue.Queue[dict[str, object]] = queue.Queue()
+        self._task_chain = RuleWritingTaskChain()
+        self._task_chain_configuration_pool: list[dict[str, object]] = []
+        self._task_chain_choice_index = task_chain_choice_index or secrets.randbelow
         self._configuration_options: dict[str, object] = {}
         self._runtime_controls: frozenset[str] = frozenset()
         self._runtime_controls_seen = False
@@ -237,95 +257,107 @@ class RuleBasedWritingApplication:
         if not isinstance(intent, RuleBasedWritingIntent):
             raise TypeError("intent must be RuleBasedWritingIntent.")
         with self._lock:
-            if intent is RuleBasedWritingIntent.START:
-                if not self._state.can_start:
-                    return False
-                retry_writer_only = bool(self._state.writer_blocked)
-                if not retry_writer_only:
-                    self._completion_stop_queued = False
-                    self._rule_intents.put(intent)
-                self._runtime_events.put("episode_start")
-                self._state.phase = "armed"
-                self._state.writer_retry_pending = retry_writer_only
-                self._state.title = (
-                    "正在重试正式 Writer" if retry_writer_only else "规则采集启动中"
-                )
-                self._state.detail = (
-                    "正在按当前 GUI 配置重新准备 writer；就绪前不会输出规则运动命令。"
-                    if retry_writer_only
-                    else "正在准备 writer；就绪前不会输出规则运动命令。"
-                )
-            elif intent is RuleBasedWritingIntent.STOP:
-                if not self._state.can_stop:
-                    return False
-                self._rule_intents.put(intent)
-                self._runtime_events.put("episode_stop:rule_based_hold_cancel")
-                self._runtime_events.put("h")
-                self._state.phase = "stopping"
-                self._state.title = "规则采集停止中"
-                self._state.detail = "正在进入 Hold 并取消本轮规则采集。"
-            elif intent is RuleBasedWritingIntent.DEVICE_RETRY:
-                if not self._state.can_retry_devices:
-                    return False
-                self._state.device_retry_pending = True
-                self._state.phase = "preparing"
-                if self._device_retry_directly_admitted_locked():
-                    self._device_retry_waiting_for_hold = False
-                    self._runtime_events.put("device_retry")
-                    self._set_device_retry_running_locked()
-                else:
-                    self._device_retry_waiting_for_hold = True
-                    self._runtime_events.put("h")
-                    self._state.title = "正在安全停臂后重连"
-                    self._state.detail = (
-                        "已停止接纳规则命令；正在等待底层 Hold 与位置命令流释放回执，"
-                        "确认后将自动重连失败设备。"
-                    )
-            elif intent is RuleBasedWritingIntent.RUNTIME_HOME_RETRY:
-                if not self._state.can_runtime_home:
-                    return False
-                self._runtime_events.put("runtime_home_retry")
-                self._state.runtime_home_pending = True
-                self._state.phase = "preparing"
-                self._state.title = "正在重新确认安全初始化"
-                self._state.detail = (
-                    "请保持机械臂处于安全位置；正在重新采集 runtime Home，"
-                    "完成前不会开始规则运动。"
-                )
-            elif intent in {
+            if self._task_chain.active and intent in {
+                RuleBasedWritingIntent.START,
                 RuleBasedWritingIntent.RELEASE_GRIPPERS,
                 RuleBasedWritingIntent.CLOSE_GRIPPERS,
             }:
-                if not (
-                    self._state.can_release_grippers
-                    if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
-                    else self._state.can_close_grippers
-                ):
-                    return False
+                return False
+            return self._submit_intent_locked(intent)
+
+    def _submit_intent_locked(
+        self,
+        intent: RuleBasedWritingIntent,
+    ) -> bool:
+        available = self._base_control_availability_locked()
+        if intent is RuleBasedWritingIntent.START:
+            if not available["start"]:
+                return False
+            retry_writer_only = bool(self._state.writer_blocked)
+            if not retry_writer_only:
+                self._completion_stop_queued = False
                 self._rule_intents.put(intent)
-                self._state.gripper_action_pending = True
-                self._state.gripper_action_status = (
-                    "正在松开夹爪…"
-                    if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
-                    else "正在闭紧夹爪…"
-                )
-                self._state.detail = self._state.gripper_action_status
-            elif intent is RuleBasedWritingIntent.DEBUG_TOGGLE:
-                if not self._state.can_toggle_debug:
-                    return False
-                # Reuse the existing asynchronous real-control diagnostic
-                # recorder.  The lower runtime remains the authority that
-                # starts/stops disk I/O and publishes the resulting state.
-                self._runtime_events.put("d")
-                self._state.debug_mode_pending = True
+            self._runtime_events.put("episode_start")
+            self._state.phase = "armed"
+            self._state.writer_retry_pending = retry_writer_only
+            self._state.title = (
+                "正在重试正式 Writer" if retry_writer_only else "规则采集启动中"
+            )
+            self._state.detail = (
+                "正在按当前 GUI 配置重新准备 writer；就绪前不会输出规则运动命令。"
+                if retry_writer_only
+                else "正在准备 writer；就绪前不会输出规则运动命令。"
+            )
+        elif intent is RuleBasedWritingIntent.STOP:
+            if not available["stop"]:
+                return False
+            self._rule_intents.put(intent)
+            self._runtime_events.put("episode_stop:rule_based_hold_cancel")
+            self._runtime_events.put("h")
+            self._state.phase = "stopping"
+            self._state.title = "规则采集停止中"
+            self._state.detail = "正在进入 Hold 并取消本轮规则采集。"
+        elif intent is RuleBasedWritingIntent.DEVICE_RETRY:
+            if not available["retry_devices"]:
+                return False
+            self._state.device_retry_pending = True
+            self._state.phase = "preparing"
+            if self._device_retry_directly_admitted_locked():
+                self._device_retry_waiting_for_hold = False
+                self._runtime_events.put("device_retry")
+                self._set_device_retry_running_locked()
             else:
-                self._runtime_events.put("q")
-                self._state.phase = "stopping"
-                self._state.title = "程序退出中"
-                self._state.detail = "正在停止机械臂并关闭运行资源。"
-            self._rebuild_controls()
-            self._touch()
-            return True
+                self._device_retry_waiting_for_hold = True
+                self._runtime_events.put("h")
+                self._state.title = "正在安全停臂后重连"
+                self._state.detail = (
+                    "已停止接纳规则命令；正在等待底层 Hold 与位置命令流释放回执，"
+                    "确认后将自动重连失败设备。"
+                )
+        elif intent is RuleBasedWritingIntent.RUNTIME_HOME_RETRY:
+            if not available["runtime_home"]:
+                return False
+            self._runtime_events.put("runtime_home_retry")
+            self._state.runtime_home_pending = True
+            self._state.phase = "preparing"
+            self._state.title = "正在重新确认安全初始化"
+            self._state.detail = (
+                "请保持机械臂处于安全位置；正在重新采集 runtime Home，"
+                "完成前不会开始规则运动。"
+            )
+        elif intent in {
+            RuleBasedWritingIntent.RELEASE_GRIPPERS,
+            RuleBasedWritingIntent.CLOSE_GRIPPERS,
+        }:
+            control = (
+                "release_grippers"
+                if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
+                else "close_grippers"
+            )
+            if not available[control]:
+                return False
+            self._rule_intents.put(intent)
+            self._state.gripper_action_pending = True
+            self._state.gripper_action_status = (
+                "正在松开夹爪…"
+                if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
+                else "正在闭紧夹爪…"
+            )
+            self._state.detail = self._state.gripper_action_status
+        elif intent is RuleBasedWritingIntent.DEBUG_TOGGLE:
+            if not available["toggle_debug"]:
+                return False
+            # Reuse the existing asynchronous real-control diagnostic recorder.
+            self._runtime_events.put("d")
+            self._state.debug_mode_pending = True
+        else:
+            self._runtime_events.put("q")
+            self._state.phase = "stopping"
+            self._state.title = "程序退出中"
+            self._state.detail = "正在停止机械臂并关闭运行资源。"
+        self._rebuild_controls()
+        self._touch()
+        return True
 
     def configure_rule_options(
         self,
@@ -346,6 +378,7 @@ class RuleBasedWritingApplication:
                 or self._state.collection_mode
             )
             self._state.rule_configuration = normalized_selected
+            self._task_chain_configuration_pool = [dict(normalized_selected)]
             self._state.configuration_error = ""
             self._rebuild_controls()
             self._touch()
@@ -354,7 +387,7 @@ class RuleBasedWritingApplication:
         """Queue one validated configuration batch while collection is idle."""
 
         with self._lock:
-            if not self._state.can_configure or self._state.configuration_pending:
+            if self._task_chain.active:
                 return False
             try:
                 configuration = self._validate_configuration_request(
@@ -365,15 +398,26 @@ class RuleBasedWritingApplication:
                 self._state.configuration_error = str(exc)
                 self._touch()
                 return False
-            self._configuration_requests.put(configuration)
-            self._state.configuration_pending = True
-            self._state.configuration_error = ""
-            self._state.phase = "configuring"
-            self._state.title = "正在更新规则组合"
-            self._state.detail = "正在后台读取并验证所选来源；完成前不会输出运动命令。"
-            self._rebuild_controls()
-            self._touch()
-            return True
+            return self._submit_configuration_locked(configuration)
+
+    def _submit_configuration_locked(
+        self,
+        configuration: Mapping[str, object],
+    ) -> bool:
+        if (
+            not self._base_control_availability_locked()["configure"]
+            or self._state.configuration_pending
+        ):
+            return False
+        self._configuration_requests.put(dict(configuration))
+        self._state.configuration_pending = True
+        self._state.configuration_error = ""
+        self._state.phase = "configuring"
+        self._state.title = "正在更新规则组合"
+        self._state.detail = "正在后台读取并验证所选来源；完成前不会输出运动命令。"
+        self._rebuild_controls()
+        self._touch()
+        return True
 
     def complete_configuration(
         self,
@@ -382,6 +426,10 @@ class RuleBasedWritingApplication:
         error: str | None,
     ) -> None:
         with self._lock:
+            chain_configuration = (
+                self._task_chain.phase
+                is RuleWritingTaskChainPhase.CONFIGURATION_PENDING
+            )
             self._state.configuration_pending = False
             if error:
                 self._state.configuration_error = str(error)
@@ -397,6 +445,11 @@ class RuleBasedWritingApplication:
                     else:
                         self._state.rule_configuration_batch = [dict(selected)]
                         self._state.rule_configuration = dict(selected)
+                    if not chain_configuration:
+                        self._task_chain_configuration_pool = [
+                            dict(item)
+                            for item in self._state.rule_configuration_batch
+                        ]
                 self._state.configuration_error = ""
                 if self._state.startup_blockers:
                     self._set_readiness_blocked_locked()
@@ -417,52 +470,164 @@ class RuleBasedWritingApplication:
             }:
                 self._project_prestart_readiness_locked()
             self._rebuild_controls()
+            if chain_configuration:
+                if error:
+                    self._task_chain.fail_rule_preparation(str(error))
+                elif selected is None:
+                    self._task_chain.fail_rule_preparation(
+                        "配置接口未返回已激活的配置。"
+                    )
+                elif self._submit_intent_locked(RuleBasedWritingIntent.START):
+                    self._task_chain.begin_rule()
+                else:
+                    self._task_chain.fail_rule_preparation(
+                        "配置已验证，但现有安全门禁未允许开始规则采集。"
+                    )
+                self._rebuild_controls()
             self._touch()
 
     def submit_height_calibration(self, payload: Mapping[str, object]) -> bool:
         """Queue one command-inert right-TCP height maintenance request."""
 
         with self._lock:
-            operation = str(payload.get("operation") or "").strip().lower()
-            if operation == "capture":
-                if not self._state.can_capture_height:
-                    return False
-                try:
-                    lower_mm = float(payload.get("lower_tolerance_mm", 1.0))
-                    upper_mm = float(payload.get("upper_tolerance_mm", 1.0))
-                except (TypeError, ValueError):
-                    return False
-                if (
-                    not math.isfinite(lower_mm)
-                    or not math.isfinite(upper_mm)
-                    or not 0.1 <= lower_mm <= 20.0
-                    or not 0.1 <= upper_mm <= 20.0
-                ):
-                    return False
-                request = {
-                    "operation": "capture",
-                    "lower_tolerance_m": lower_mm / 1000.0,
-                    "upper_tolerance_m": upper_mm / 1000.0,
-                }
-            elif operation == "clear":
-                if not self._state.can_clear_height:
-                    return False
-                request = {"operation": "clear"}
-            else:
+            if self._task_chain.active:
                 return False
-            self._height_calibration_requests.put(request)
-            self._state.height_calibration_pending = True
-            self._state.height_calibration_error = ""
-            self._rebuild_controls()
-            self._touch()
-            return True
+            request = self._height_calibration_request_locked(payload)
+            if request is None:
+                return False
+            return self._submit_height_calibration_locked(request)
+
+    def _height_calibration_request_locked(
+        self,
+        payload: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        operation = str(payload.get("operation") or "").strip().lower()
+        available = self._base_control_availability_locked()
+        if operation == "capture":
+            if not available["capture_height"]:
+                return None
+            try:
+                lower_mm = float(payload.get("lower_tolerance_mm", 1.0))
+                upper_mm = float(payload.get("upper_tolerance_mm", 1.0))
+            except (TypeError, ValueError):
+                return None
+            if (
+                not math.isfinite(lower_mm)
+                or not math.isfinite(upper_mm)
+                or not 0.1 <= lower_mm <= 20.0
+                or not 0.1 <= upper_mm <= 20.0
+            ):
+                return None
+            return {
+                "operation": "capture",
+                "lower_tolerance_m": lower_mm / 1000.0,
+                "upper_tolerance_m": upper_mm / 1000.0,
+            }
+        if operation == "clear" and available["clear_height"]:
+            return {"operation": "clear"}
+        return None
+
+    def _submit_height_calibration_locked(
+        self,
+        request: Mapping[str, object],
+    ) -> bool:
+        if self._state.height_calibration_pending:
+            return False
+        self._height_calibration_requests.put(dict(request))
+        self._state.height_calibration_pending = True
+        self._state.height_calibration_error = ""
+        self._rebuild_controls()
+        self._touch()
+        return True
 
     def complete_height_calibration(self, *, error: str | None) -> None:
         with self._lock:
+            chain_height = (
+                self._task_chain.phase is RuleWritingTaskChainPhase.HEIGHT_PENDING
+            )
             self._state.height_calibration_pending = False
             self._state.height_calibration_error = str(error or "")
+            if chain_height:
+                self._task_chain.finish_height(error=error)
             self._rebuild_controls()
             self._touch()
+
+    def submit_task_chain_advance(self, payload: Mapping[str, object]) -> bool:
+        """Advance exactly one externally visible task-chain phase.
+
+        The rule Episode is the only compound phase: after this method chooses
+        and submits one prevalidated configuration, the existing asynchronous
+        configuration callback starts the existing complete rule lifecycle.
+        """
+
+        with self._lock:
+            if str(payload.get("event") or "advance") != "advance":
+                return False
+            phase = self._task_chain.phase
+            available = self._base_control_availability_locked()
+            if phase in {
+                RuleWritingTaskChainPhase.IDLE,
+                RuleWritingTaskChainPhase.COMPLETE,
+            }:
+                if not self._task_chain_initially_available_locked(available):
+                    return False
+                status_baseline = self._state.gripper_action_status
+                if not self._submit_intent_locked(
+                    RuleBasedWritingIntent.RELEASE_GRIPPERS
+                ):
+                    return False
+                self._task_chain.begin_initial_release(
+                    status_baseline=status_baseline
+                )
+            elif phase is RuleWritingTaskChainPhase.READY_CLOSE:
+                status_baseline = self._state.gripper_action_status
+                if not self._submit_intent_locked(
+                    RuleBasedWritingIntent.CLOSE_GRIPPERS
+                ):
+                    return False
+                self._task_chain.begin_close(status_baseline=status_baseline)
+            elif phase is RuleWritingTaskChainPhase.READY_HEIGHT:
+                request = self._height_calibration_request_locked(
+                    {
+                        "operation": "capture",
+                        "lower_tolerance_mm": payload.get("lower_tolerance_mm", 1.0),
+                        "upper_tolerance_mm": payload.get("upper_tolerance_mm", 1.0),
+                    }
+                )
+                if request is None or not self._submit_height_calibration_locked(request):
+                    return False
+                self._task_chain.begin_height()
+            elif phase is RuleWritingTaskChainPhase.READY_RULE:
+                if not available["configure"] or not self._task_chain_configuration_pool:
+                    return False
+                count = len(self._task_chain_configuration_pool)
+                index = int(self._task_chain_choice_index(count))
+                if not 0 <= index < count:
+                    raise ValueError("task_chain_choice_index returned an invalid index.")
+                selected = dict(self._task_chain_configuration_pool[index])
+                # Revalidate at the same trust boundary used by manual GUI
+                # configuration; the chain never promotes cached UI state.
+                selected = self._validate_configuration_request(
+                    selected,
+                    options=self._configuration_options,
+                )
+                if not self._submit_configuration_locked(selected):
+                    return False
+                self._task_chain.begin_configuration(index=index, selected=selected)
+            elif phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE:
+                status_baseline = self._state.gripper_action_status
+                if not self._submit_intent_locked(
+                    RuleBasedWritingIntent.RELEASE_GRIPPERS
+                ):
+                    return False
+                self._task_chain.begin_final_release(
+                    status_baseline=status_baseline
+                )
+            else:
+                return False
+            self._rebuild_controls()
+            self._touch()
+            return True
 
     @staticmethod
     def _option_values(options: Mapping[str, object], key: str) -> set[str]:
@@ -893,8 +1058,80 @@ class RuleBasedWritingApplication:
                     self._state.detail = self._state.configuration_error
                 elif self._state.gripper_action_status:
                     self._state.detail = self._state.gripper_action_status
+            self._observe_task_chain_status_locked(
+                begun=begun,
+                completed=completed,
+                aborted=aborted,
+                held=held,
+            )
             self._rebuild_controls()
             self._touch()
+
+    def _observe_task_chain_status_locked(
+        self,
+        *,
+        begun: bool,
+        completed: bool,
+        aborted: bool,
+        held: bool,
+    ) -> None:
+        phase = self._task_chain.phase
+        if (
+            phase
+            in {
+                RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING,
+                RuleWritingTaskChainPhase.CLOSE_PENDING,
+                RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING,
+            }
+        ):
+            if self._state.gripper_action_pending:
+                self._task_chain.observe_gripper_pending()
+                return
+            status_changed = bool(
+                self._state.gripper_action_status
+                and self._state.gripper_action_status
+                != self._task_chain.gripper_status_baseline
+                and not self._state.gripper_action_status.startswith("正在")
+            )
+            if not self._task_chain.gripper_pending_seen and not status_changed:
+                return
+            expected = (
+                "夹爪实测已闭紧"
+                if phase is RuleWritingTaskChainPhase.CLOSE_PENDING
+                else "夹爪实测已松开"
+            )
+            error = (
+                None
+                if self._state.gripper_action_status == expected
+                else self._state.gripper_action_status or "夹爪动作未返回成功回执。"
+            )
+            if phase is RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING:
+                self._task_chain.finish_initial_release(error=error)
+            elif phase is RuleWritingTaskChainPhase.CLOSE_PENDING:
+                self._task_chain.finish_close(error=error)
+            else:
+                self._task_chain.finish_final_release(error=error)
+            return
+
+        if phase is not RuleWritingTaskChainPhase.RULE_PENDING:
+            return
+        if begun:
+            self._task_chain.observe_rule_execution()
+        if aborted or held:
+            self._task_chain.fail_rule(
+                "规则 Episode 已中止或进入 Hold；完成现有恢复门禁后可重试。"
+            )
+            return
+        if (
+            self._task_chain.rule_execution_seen
+            and not begun
+            and not completed
+            and self._state.batch_completed_count >= 1
+            and not self._state.configuration_pending
+        ):
+            # The lower runtime increments this count only after the writer has
+            # fully closed the singleton chain Episode and reset to pre-start.
+            self._task_chain.finish_rule()
 
     @staticmethod
     def _waiting_detail(waiting: str) -> str:
@@ -972,8 +1209,55 @@ class RuleBasedWritingApplication:
             self._touch()
 
     def _rebuild_controls(self) -> None:
-        terminal = self._state.completed or self._state.aborted or self._state.shutdown
+        available = self._base_control_availability_locked()
+        chain = self._task_chain.presentation()
+        self._state.task_chain_active = bool(chain["active"])
+        self._state.task_chain_phase = str(chain["phase"])
+        self._state.task_chain_step = str(chain["step"])
+        self._state.task_chain_title = str(chain["title"])
+        self._state.task_chain_detail = str(chain["detail"])
+        self._state.task_chain_cycle_count = int(chain["cycle_count"])
+        selected_configuration = chain["selected_configuration"]
+        self._state.task_chain_selected_configuration = (
+            dict(selected_configuration)
+            if isinstance(selected_configuration, Mapping)
+            else {}
+        )
+        selected_index = chain["selected_configuration_index"]
+        self._state.task_chain_selected_configuration_index = (
+            None if selected_index is None else int(selected_index)
+        )
+        self._state.task_chain_can_advance = self._task_chain_can_advance_locked(
+            available
+        )
+
+        chain_owns_manual_step = self._task_chain.active
         self._state.can_configure = bool(
+            available["configure"] and not chain_owns_manual_step
+        )
+        self._state.can_start = bool(
+            available["start"] and not chain_owns_manual_step
+        )
+        self._state.can_stop = available["stop"]
+        self._state.can_retry_devices = available["retry_devices"]
+        self._state.can_runtime_home = available["runtime_home"]
+        self._state.can_release_grippers = bool(
+            available["release_grippers"] and not chain_owns_manual_step
+        )
+        self._state.can_close_grippers = bool(
+            available["close_grippers"] and not chain_owns_manual_step
+        )
+        self._state.can_toggle_debug = available["toggle_debug"]
+        self._state.can_capture_height = bool(
+            available["capture_height"] and not chain_owns_manual_step
+        )
+        self._state.can_clear_height = bool(
+            available["clear_height"] and not chain_owns_manual_step
+        )
+
+    def _base_control_availability_locked(self) -> dict[str, bool]:
+        terminal = self._state.completed or self._state.aborted or self._state.shutdown
+        configure = bool(
             self._rule_runtime_bound
             and self._state.configuration_available
             and not self._state.shutdown
@@ -983,7 +1267,7 @@ class RuleBasedWritingApplication:
             and not self._state.gripper_action_pending
             and not self._state.height_calibration_pending
         )
-        self._state.can_start = bool(
+        start = bool(
             self._rule_runtime_bound
             and (self._state.rule_start_available or self._state.writer_blocked)
             and not terminal
@@ -994,14 +1278,14 @@ class RuleBasedWritingApplication:
             and not self._state.height_calibration_pending
             and not self._state.startup_blockers
         )
-        self._state.can_stop = bool(
+        stop = bool(
             not terminal
             and (
                 self._state.phase in {"armed", "running"}
                 or (self._state.phase == "blocked" and self._state.writer_blocked)
             )
         )
-        self._state.can_retry_devices = bool(
+        retry_devices = bool(
             self._rule_runtime_bound
             and not terminal
             and self._state.phase in {"ready", "blocked", "preparing"}
@@ -1013,7 +1297,7 @@ class RuleBasedWritingApplication:
             and not self._state.gripper_action_pending
             and not self._state.height_calibration_pending
         )
-        self._state.can_runtime_home = bool(
+        runtime_home = bool(
             self._rule_runtime_bound
             and not terminal
             and not self._state.runtime_home_pending
@@ -1029,20 +1313,20 @@ class RuleBasedWritingApplication:
             and self._state.gripper_sides
             and not self._state.gripper_action_pending
         )
-        self._state.can_release_grippers = bool(
+        release_grippers = bool(
             grippers_ready and not terminal and self._state.phase == "ready"
             and not self._state.height_calibration_pending
         )
-        self._state.can_close_grippers = bool(
+        close_grippers = bool(
             grippers_ready and not terminal and self._state.phase == "ready"
             and not self._state.height_calibration_pending
         )
-        self._state.can_toggle_debug = bool(
+        toggle_debug = bool(
             self._rule_runtime_bound
             and not self._state.shutdown
             and not self._state.debug_mode_pending
         )
-        self._state.can_capture_height = bool(
+        capture_height = bool(
             self._state.collection_mode == "rule_based_writing"
             and self._state.height_calibration_available
             and not terminal
@@ -1051,7 +1335,7 @@ class RuleBasedWritingApplication:
             and not self._state.configuration_pending
             and not self._state.gripper_action_pending
         )
-        self._state.can_clear_height = bool(
+        clear_height = bool(
             self._state.collection_mode == "rule_based_writing"
             and self._state.height_calibration_clear_available
             and not terminal
@@ -1060,6 +1344,52 @@ class RuleBasedWritingApplication:
             and not self._state.configuration_pending
             and not self._state.gripper_action_pending
         )
+        return {
+            "configure": configure,
+            "start": start,
+            "stop": stop,
+            "retry_devices": retry_devices,
+            "runtime_home": runtime_home,
+            "release_grippers": release_grippers,
+            "close_grippers": close_grippers,
+            "toggle_debug": toggle_debug,
+            "capture_height": capture_height,
+            "clear_height": clear_height,
+        }
+
+    def _task_chain_initially_available_locked(
+        self,
+        available: Mapping[str, bool],
+    ) -> bool:
+        return bool(
+            self._state.collection_mode == "rule_based_writing"
+            and self._task_chain_configuration_pool
+            and available["configure"]
+            and available["start"]
+            and available["release_grippers"]
+            and available["close_grippers"]
+            and available["capture_height"]
+        )
+
+    def _task_chain_can_advance_locked(
+        self,
+        available: Mapping[str, bool],
+    ) -> bool:
+        phase = self._task_chain.phase
+        if phase in {
+            RuleWritingTaskChainPhase.IDLE,
+            RuleWritingTaskChainPhase.COMPLETE,
+        }:
+            return self._task_chain_initially_available_locked(available)
+        if phase is RuleWritingTaskChainPhase.READY_CLOSE:
+            return bool(available["close_grippers"])
+        if phase is RuleWritingTaskChainPhase.READY_HEIGHT:
+            return bool(available["capture_height"])
+        if phase is RuleWritingTaskChainPhase.READY_RULE:
+            return bool(available["configure"] and self._task_chain_configuration_pool)
+        if phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE:
+            return bool(available["release_grippers"])
+        return False
 
     def _set_ready_locked(self) -> None:
         self._state.phase = "ready"

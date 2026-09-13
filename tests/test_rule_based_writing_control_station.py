@@ -8,7 +8,60 @@ from control_station.rule_based_writing import (
     RuleBasedWritingApplication,
     RuleBasedWritingIntent,
     RuleBasedWritingWebUi,
+    RuleWritingTaskChainPhase,
 )
+
+
+def _task_chain_configuration() -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    options = {
+        "source_candidates_by_phase": {
+            phase: ["a", "b"] for phase in ("pen_down", "write", "pen_up")
+        },
+        "trajectory_ids": ["digit_1_v1", "letter_s_v1"],
+        "directions": ["up"],
+        "numeric_bounds": {
+            "writing_size_m": [0.005, 0.2],
+            "initial_alignment_speed_scale": [0.05, 1.0],
+        },
+    }
+    first = {
+        "pen_down_candidate_id": "a",
+        "write_candidate_id": "a",
+        "pen_up_candidate_id": "a",
+        "trajectory_id": "digit_1_v1",
+        "direction": "up",
+        "writing_size_m": 0.08,
+        "initial_alignment_speed_scale": 1.0,
+    }
+    second = {
+        **first,
+        "write_candidate_id": "b",
+        "trajectory_id": "letter_s_v1",
+        "initial_alignment_speed_scale": 0.5,
+    }
+    return options, first, second
+
+
+def _task_chain_ready_status(**updates: object) -> dict[str, object]:
+    return {
+        "started": True,
+        "armed": False,
+        "execution_begun": False,
+        "completed": False,
+        "aborted": False,
+        "held": False,
+        "session_state": "ARMED",
+        "rule_start_available": True,
+        "configuration_available": True,
+        "gripper_control_available": True,
+        "gripper_sides": ["right"],
+        "height_calibration_available": True,
+        **updates,
+    }
 
 
 def test_rule_application_exposes_one_start_and_translates_to_writer_intent() -> None:
@@ -337,13 +390,14 @@ def test_transient_writer_pause_keeps_running_controls_stable() -> None:
 
 
 def test_rule_ui_asset_contains_no_teleop_episode_progress_or_pedal_controls() -> None:
-    asset = (
+    package = (
         Path(__file__).resolve().parents[1]
         / "control_station"
         / "rule_based_writing"
-        / "static"
-        / "index.html"
-    ).read_text(encoding="utf-8")
+    )
+    asset = (package / "static" / "index.html").read_text(encoding="utf-8")
+    script = (package / "static" / "app.js").read_text(encoding="utf-8")
+    transport = (package / "control_ui.py").read_text(encoding="utf-8")
 
     assert "开始规则采集" in asset
     assert "停止并 Hold" in asset
@@ -374,6 +428,11 @@ def test_rule_ui_asset_contains_no_teleop_episode_progress_or_pedal_controls() -
     assert 'id="debug-mode"' in asset
     assert 'data-event="debug_toggle"' in asset
     assert 'data-event="runtime_home_retry"' in asset
+    assert 'id="task-chain-advance"' in asset
+    assert "Alt+N" in asset
+    assert 'fetch("/task-chain"' in script
+    assert "event.altKey" in script
+    assert '"/task-chain"' in transport
     for forbidden in ("开始遥操", "Episode", "长程进度", "踏板", "夹爪控制"):
         assert forbidden not in asset
 
@@ -1058,3 +1117,205 @@ def test_manual_gripper_pending_blocks_start_and_reverse_action() -> None:
     assert state["can_close_grippers"] is False
     assert application.submit_intent(RuleBasedWritingIntent.RELEASE_GRIPPERS) is False
     assert application.submit_intent(RuleBasedWritingIntent.START) is False
+
+
+def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda count: count - 1)
+    options, first, second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    batch = {"batch": [first, second]}
+    assert application.submit_configuration(batch) is True
+    assert application.consume_configuration_requests() == (batch,)
+    application.complete_configuration(selected=batch, error=None)
+    application.observe_rule_status(_task_chain_ready_status())
+    assert application.snapshot()["task_chain_can_advance"] is True
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("release_grippers",)
+    assert application.snapshot()["task_chain_phase"] == "initial_release_pending"
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=True,
+            gripper_action_status="已排队：松开夹爪",
+        )
+    )
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=False,
+            gripper_action_status="夹爪实测已松开",
+        )
+    )
+    assert application.snapshot()["task_chain_phase"] == "ready_close"
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("close_grippers",)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=False,
+            gripper_action_status="夹爪实测已松开",
+        )
+    )
+    assert application.snapshot()["task_chain_phase"] == "close_pending"
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=True,
+            gripper_action_status="已排队：闭紧夹爪",
+        )
+    )
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=False,
+            gripper_action_status="夹爪实测已闭紧",
+        )
+    )
+    assert application.snapshot()["task_chain_phase"] == "ready_height"
+
+    assert application.submit_task_chain_advance(
+        {
+            "event": "advance",
+            "lower_tolerance_mm": 1.5,
+            "upper_tolerance_mm": 2.0,
+        }
+    ) is True
+    assert application.consume_height_calibration_requests() == (
+        {
+            "operation": "capture",
+            "lower_tolerance_m": pytest.approx(0.0015),
+            "upper_tolerance_m": pytest.approx(0.002),
+        },
+    )
+    application.complete_height_calibration(error=None)
+    assert application.snapshot()["task_chain_phase"] == "ready_rule"
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_configuration_requests() == (second,)
+    assert application.snapshot()["task_chain_phase"] == "configuration_pending"
+    application.complete_configuration(selected=second, error=None)
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "rule_pending"
+    assert state["task_chain_selected_configuration"] == second
+    assert state["task_chain_selected_configuration_index"] == 1
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            armed=True,
+            execution_begun=True,
+            session_state="RUNNING",
+            rule_start_available=False,
+            configuration_available=False,
+            height_calibration_available=False,
+            batch_count=1,
+            batch_completed_count=0,
+        )
+    )
+    assert application.snapshot()["task_chain_phase"] == "rule_pending"
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            batch_count=1,
+            batch_completed_count=1,
+            batch_cycle_complete=True,
+        )
+    )
+    assert application.snapshot()["task_chain_phase"] == "ready_final_release"
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("release_grippers",)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=True,
+            gripper_action_status="已排队：松开夹爪",
+            batch_count=1,
+            batch_completed_count=1,
+            batch_cycle_complete=True,
+        )
+    )
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=False,
+            gripper_action_status="夹爪实测已松开",
+            batch_count=1,
+            batch_completed_count=1,
+            batch_cycle_complete=True,
+        )
+    )
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "complete"
+    assert state["task_chain_cycle_count"] == 1
+    assert state["task_chain_can_advance"] is True
+
+
+def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.submit_intent(RuleBasedWritingIntent.START) is False
+    assert application.submit_intent(RuleBasedWritingIntent.CLOSE_GRIPPERS) is False
+    assert application.submit_configuration(first) is False
+    assert application.submit_height_calibration({"operation": "capture"}) is False
+
+    application.consume_rule_intents()
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=False,
+            gripper_action_status="夹爪控制超时",
+        )
+    )
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "idle"
+    assert "夹爪控制超时" in state["task_chain_detail"]
+    assert state["task_chain_cycle_count"] == 0
+
+
+def test_task_chain_waits_for_writer_commit_and_stops_on_rule_hold() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    application._task_chain.phase = RuleWritingTaskChainPhase.CONFIGURATION_PENDING
+    application.complete_configuration(selected=first, error=None)
+    application.consume_rule_intents()
+    application.consume_runtime_events()
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            armed=True,
+            execution_begun=True,
+            rule_start_available=False,
+            configuration_available=False,
+            height_calibration_available=False,
+        )
+    )
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            completed=True,
+            rule_start_available=False,
+            configuration_available=False,
+            height_calibration_available=False,
+            batch_completed_count=0,
+        )
+    )
+    assert application.snapshot()["task_chain_phase"] == "rule_pending"
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            aborted=True,
+            held=True,
+            rule_start_available=False,
+            configuration_available=False,
+            height_calibration_available=False,
+        )
+    )
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "ready_rule"
+    assert state["task_chain_can_advance"] is False
+    assert "中止" in state["task_chain_detail"]

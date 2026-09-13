@@ -105,6 +105,7 @@ class RuleBasedWritingWebUi:
                     "/event",
                     "/configuration",
                     "/height-calibration",
+                    "/task-chain",
                 }:
                     self._send(404, "text/plain; charset=utf-8", b"not found")
                     return
@@ -121,13 +122,14 @@ class RuleBasedWritingWebUi:
                 except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
                     self._send(400, "text/plain; charset=utf-8", b"invalid event")
                     return
-                accepted = (
-                    ui._application.submit_intent(intent)
-                    if self.path == "/event"
-                    else ui._application.submit_configuration(payload)
-                    if self.path == "/configuration"
-                    else ui._application.submit_height_calibration(payload)
-                )
+                if self.path == "/event":
+                    accepted = ui._application.submit_intent(intent)
+                elif self.path == "/configuration":
+                    accepted = ui._application.submit_configuration(payload)
+                elif self.path == "/height-calibration":
+                    accepted = ui._application.submit_height_calibration(payload)
+                else:
+                    accepted = ui._application.submit_task_chain_advance(payload)
                 if not accepted:
                     self._send(409, "text/plain; charset=utf-8", b"inactive event")
                     return

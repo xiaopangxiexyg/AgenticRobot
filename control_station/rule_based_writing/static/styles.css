@@ -12,7 +12,7 @@ h1, h2, p { margin-top: 0; }
 h1 { font-size: clamp(2rem, 5vw, 3.5rem); margin-bottom: 0; }
 .eyebrow { color: #79d5c5; letter-spacing: .16em; font-size: .75rem; position: absolute; top: 20px; }
 .phase { margin-left: auto; padding: 7px 12px; border-radius: 999px; background: #1d3446; color: #9bded2; }
-.status-card, .configuration, .messages { background: rgba(17, 29, 40, .92); border: 1px solid #294154; border-radius: 18px; padding: 24px; box-shadow: 0 20px 50px rgba(0,0,0,.25); }
+.status-card, .configuration, .task-chain, .messages { background: rgba(17, 29, 40, .92); border: 1px solid #294154; border-radius: 18px; padding: 24px; box-shadow: 0 20px 50px rgba(0,0,0,.25); }
 .status-card > p { color: #aebfcd; }
 dl { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 24px 0 0; }
 dl div { background: #0c1822; padding: 14px; border-radius: 12px; min-width: 0; }
@@ -20,6 +20,11 @@ dt { color: #7890a3; font-size: .8rem; }
 dd { margin: 6px 0 0; overflow-wrap: anywhere; }
 .controls { display: flex; gap: 12px; margin: 18px 0; }
 .configuration { margin-top: 18px; }
+.task-chain { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 18px; border-color: #3f7169; }
+.task-chain h2 { margin-bottom: 8px; }
+.task-chain > div > p { margin-bottom: 0; color: #9fb5c4; }
+.task-chain .task-chain-step { color: #79d5c5; font-size: .8rem; font-weight: 700; letter-spacing: .08em; margin-bottom: 6px; }
+.task-chain button { min-width: 230px; }
 .section-heading, .configuration-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .section-heading span, .configuration-actions span { color: #8fa6b7; font-size: .85rem; }
 .configuration-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 16px; }
@@ -55,6 +60,8 @@ body[data-phase="aborted"] .phase, body[data-phase="stopping"] .phase { backgrou
   .configuration-grid { grid-template-columns: 1fr; }
   .configuration-grid label.wide { grid-column: span 1; }
   .controls { flex-direction: column; }
+  .task-chain { align-items: stretch; flex-direction: column; }
+  .task-chain button { min-width: 0; }
   .height-calibration-inputs { grid-template-columns: 1fr; }
   button.secondary { margin-left: 0; }
 }
