@@ -82,13 +82,13 @@ def test_stage12_profiles_keep_the_same_deployable_model_io_contract() -> None:
     assert "rtc_prefix_mask_conditioning" not in stage2_model_rtc
 
 
-def test_stage12_remote_recipe_separates_server_and_client_checkpoint_identity() -> None:
+def test_stage12_remote_recipe_keeps_checkpoint_identity_server_only() -> None:
     section = _section_23()
 
     assert "SERVER_CHECKPOINT_DIR" in section
-    assert "CLIENT_CHECKPOINT_DIR" in section
     assert "SERVER_CKPT_STEP" in section
-    assert "CLIENT_CKPT_STEP" in section
+    assert "CLIENT_CHECKPOINT_DIR" not in section
+    assert "CLIENT_CKPT_STEP" not in section
     assert "writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json" in section
     assert "writing_stage2_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json" in section
     assert "writing-stage1-all-valid-all-view-h32-absolute-model-rtc-systemic-v3" in section
@@ -139,6 +139,9 @@ def test_stage12_real_recipe_separates_no_action_and_bounded_active() -> None:
     assert "plan-only" in no_action
     assert "不会声称机械臂已经到达数据集起点" in no_action
     assert "--no-init-qpos" not in "\n".join(_bash_blocks(no_action))
+    assert "--checkpoint-dir" not in no_action
+    assert "--prepared-training-profile" not in no_action
+    assert "--model-rtc-profile" not in no_action
 
     active = _subsection(
         section,
@@ -161,6 +164,28 @@ def test_stage12_real_recipe_separates_no_action_and_bounded_active() -> None:
     assert "--min-rtc-emissions-before-exit 1" in active
     assert "--no-init-qpos" not in active_blocks
     assert "--no-wait-for-ready-confirm" not in active_blocks
+    assert "--checkpoint-dir" not in active_blocks
+    assert "--prepared-training-profile" not in active_blocks
+    assert "--model-rtc-profile" not in active_blocks
+
+
+def test_stage12_client_contract_check_bootstraps_from_running_server() -> None:
+    section = _section_23()
+    server_section = _subsection(
+        section,
+        "### 23.3 终端 A：conditioned model-RTC server",
+        "### 23.4 终端 B：100-step 真机 observation no-action shadow",
+    )
+    blocks = _bash_blocks(server_section)
+    contract_blocks = [block for block in blocks if "--contract-check-only" in block]
+
+    assert len(contract_blocks) == 1
+    contract = contract_blocks[0]
+    assert "--host \"$POLICY_SERVER_HOST\"" in contract
+    assert "--port \"$OPENPI_PORT\"" in contract
+    assert "--checkpoint-dir" not in contract
+    assert "--prepared-training-profile" not in contract
+    assert "--model-rtc-profile" not in contract
 
 
 def test_stage12_remote_bash_blocks_are_syntactically_valid() -> None:
