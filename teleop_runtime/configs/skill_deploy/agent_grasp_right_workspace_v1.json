@@ -1,0 +1,12 @@
+{
+  "schema_version": "teleop_runtime.tcp_pose_envelope.v1",
+  "profile_id": "agent-grasp-right-station-workspace-v1",
+  "sides": {
+    "right": {
+      "absolute_bounds": {
+        "min_xyz_m": [-0.39, -0.6, 0.08],
+        "max_xyz_m": [0.39, 0.1, 0.85]
+      }
+    }
+  }
+}

@@ -6,7 +6,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 
 import numpy as np
@@ -15,6 +15,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.joint_limits import load_joint_velocity_limit_profiles
 from robot_motion.path_planning import (
     JointPathPlannerConfig,
+    JointPathPlanResult,
     JointPathStatus,
     plan_collision_aware_joint_path,
 )
@@ -62,6 +63,9 @@ class RM65GraspTrajectoryPlanningConfig:
     angular_speed_deg_s: float = 45.0
     minimum_segment_duration_sec: float = 0.25
     maximum_endpoint_solve_cycles: int = 240
+    endpoint_seed_count: int = 5
+    endpoint_seed_perturbation_rad: float = float(np.deg2rad(25.0))
+    path_search_attempts_per_endpoint: int = 4
     endpoint_position_tolerance_m: float = 0.003
     endpoint_orientation_tolerance_deg: float = 1.0
     final_edge_resolution_rad: float = float(np.deg2rad(0.1))
@@ -74,6 +78,7 @@ class RM65GraspTrajectoryPlanningConfig:
             "minimum_segment_duration_sec",
             "endpoint_position_tolerance_m",
             "endpoint_orientation_tolerance_deg",
+            "endpoint_seed_perturbation_rad",
             "final_edge_resolution_rad",
         ):
             value = float(getattr(self, name))
@@ -84,6 +89,21 @@ class RM65GraspTrajectoryPlanningConfig:
         if isinstance(self.maximum_endpoint_solve_cycles, bool) or cycles < 1:
             raise ValueError("maximum_endpoint_solve_cycles must be positive.")
         object.__setattr__(self, "maximum_endpoint_solve_cycles", cycles)
+        seed_count = int(self.endpoint_seed_count)
+        if isinstance(self.endpoint_seed_count, bool) or not 1 <= seed_count <= 7:
+            raise ValueError("endpoint_seed_count must be in [1, 7].")
+        object.__setattr__(self, "endpoint_seed_count", seed_count)
+        path_attempts = int(self.path_search_attempts_per_endpoint)
+        if (
+            isinstance(self.path_search_attempts_per_endpoint, bool)
+            or not 1 <= path_attempts <= 8
+        ):
+            raise ValueError("path_search_attempts_per_endpoint must be in [1, 8].")
+        object.__setattr__(
+            self,
+            "path_search_attempts_per_endpoint",
+            path_attempts,
+        )
 
 
 @dataclass(frozen=True)
@@ -150,6 +170,15 @@ class RM65GraspReachabilityResult:
             field_name: getattr(self, field_name)
             for field_name in self.__dataclass_fields__
         }
+
+
+@dataclass(frozen=True)
+class _EndpointIKCandidate:
+    qpos_by_side: Mapping[str, np.ndarray]
+    seed_index: int
+    solve_cycles: int
+    position_residual_m: float
+    orientation_residual_deg: float
 
 
 class RM65GraspJointTrajectoryPlanner:
@@ -273,32 +302,70 @@ class RM65GraspJointTrajectoryPlanner:
                 },
             )
 
-    def _endpoint_qpos(
+    def _endpoint_qpos_candidates(
         self,
         *,
         qpos_by_side: Mapping[str, np.ndarray],
         side: str,
         target_tool_tcp_world: np.ndarray,
-    ) -> dict[str, np.ndarray]:
+    ) -> tuple[_EndpointIKCandidate, ...]:
         with self._solver_lock:
-            return self._endpoint_qpos_locked(
+            return self._endpoint_qpos_candidates_locked(
                 qpos_by_side=qpos_by_side,
                 side=side,
                 target_tool_tcp_world=target_tool_tcp_world,
             )
 
-    def _endpoint_qpos_locked(
+    def _endpoint_seed_qpos(
+        self,
+        qpos_by_side: Mapping[str, np.ndarray],
+        *,
+        side: str,
+    ) -> tuple[dict[str, np.ndarray], ...]:
+        # Structured shoulder/elbow and base/wrist perturbations cover distinct
+        # RM65 IK basins while retaining the measured posture as seed zero.
+        patterns = np.asarray(
+            (
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                (0.0, 1.0, -1.0, 0.0, 0.0, 0.0),
+                (0.0, -1.0, 1.0, 0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0, 0.0, -1.0, 0.0),
+                (-1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0, -1.0, 0.0, 1.0),
+                (0.0, 0.0, -1.0, 1.0, 0.0, -1.0),
+            ),
+            dtype=float,
+        )
+        lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
+        upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
+        baseline = {
+            name: np.asarray(qpos_by_side[name], dtype=float).copy()
+            for name in _SIDES
+        }
+        seeds: list[dict[str, np.ndarray]] = []
+        for pattern in patterns[: self.config.endpoint_seed_count]:
+            candidate = {name: value.copy() for name, value in baseline.items()}
+            candidate[side] = np.clip(
+                baseline[side]
+                + pattern * self.config.endpoint_seed_perturbation_rad,
+                lower,
+                upper,
+            )
+            if any(
+                np.allclose(candidate[side], existing[side], atol=1e-9, rtol=0.0)
+                for existing in seeds
+            ):
+                continue
+            seeds.append(candidate)
+        return tuple(seeds)
+
+    def _endpoint_qpos_candidates_locked(
         self,
         *,
         qpos_by_side: Mapping[str, np.ndarray],
         side: str,
         target_tool_tcp_world: np.ndarray,
-    ) -> dict[str, np.ndarray]:
-        self.target_builder.set_current_qpos_pair(
-            left_qpos=qpos_by_side["left"],
-            right_qpos=qpos_by_side["right"],
-            reset_tracking=True,
-        )
+    ) -> tuple[_EndpointIKCandidate, ...]:
         solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
             left_qpos=qpos_by_side["left"],
             right_qpos=qpos_by_side["right"],
@@ -321,55 +388,129 @@ class RM65GraspJointTrajectoryPlanner:
             frame_name=self.profile.station_world_frame_id,
             metadata={"planner": "real_grasp_urdf_fcl"},
         )
-        best_position = math.inf
-        best_orientation = math.inf
-        last_qpos = {name: np.asarray(value, dtype=float).copy() for name, value in qpos_by_side.items()}
-        for cycle in range(self.config.maximum_endpoint_solve_cycles):
-            result = self.target_builder.solve_target_pair(
-                BimanualPoseTarget(
-                    timestamp=float(cycle) / self.profile.position_profile.rates.ik_hz,
-                    target_pose_by_side=solver_targets,
-                    active_sides=(side,),
-                    hard_hold_inactive_sides=True,
-                    source_by_side={side: source, inactive: None},
-                )
-            )
-            candidate = {
-                name: np.asarray(result.side_results[name].qpos, dtype=float).copy()
-                for name in _SIDES
-            }
-            candidate[inactive] = np.asarray(qpos_by_side[inactive], dtype=float).copy()
-            tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                left_qpos=candidate["left"],
-                right_qpos=candidate["right"],
-            )[side]
-            position, orientation = pose_delta_metrics(tcp, target_tool_tcp_world)
-            best_position = min(best_position, position)
-            best_orientation = min(best_orientation, orientation)
-            last_qpos = candidate
-            if (
-                position <= self.config.endpoint_position_tolerance_m
-                and orientation <= self.config.endpoint_orientation_tolerance_deg
+        attempts: list[dict[str, object]] = []
+        accepted: list[_EndpointIKCandidate] = []
+        collision_unavailable = False
+        collision_blocked = False
+        try:
+            for seed_index, seed in enumerate(
+                self._endpoint_seed_qpos(qpos_by_side, side=side)
             ):
-                check = self.oracle.check(candidate)
-                if not check.collision_check_available:
-                    raise RM65GraspTrajectoryPlanningError(
-                        "endpoint_collision_check_unavailable",
-                        details={"collision_check": check.to_dict()},
+                self.target_builder.set_current_qpos_pair(
+                    left_qpos=seed["left"],
+                    right_qpos=seed["right"],
+                    reset_tracking=True,
+                )
+                best: tuple[float, float, float] | None = None
+                outcome = "ik_search_exhausted"
+                cycles = 0
+                for cycle in range(self.config.maximum_endpoint_solve_cycles):
+                    result = self.target_builder.solve_target_pair(
+                        BimanualPoseTarget(
+                            timestamp=(
+                                float(cycle)
+                                / self.profile.position_profile.rates.ik_hz
+                            ),
+                            target_pose_by_side=solver_targets,
+                            active_sides=(side,),
+                            hard_hold_inactive_sides=True,
+                            source_by_side={side: source, inactive: None},
+                        )
                     )
-                if not check.safe:
-                    raise RM65GraspTrajectoryPlanningError(
-                        "endpoint_collision_blocked",
-                        details={"collision_check": check.to_dict()},
+                    cycles = cycle + 1
+                    candidate = {
+                        name: np.asarray(
+                            result.side_results[name].qpos,
+                            dtype=float,
+                        ).copy()
+                        for name in _SIDES
+                    }
+                    candidate[inactive] = np.asarray(
+                        qpos_by_side[inactive], dtype=float
+                    ).copy()
+                    tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                        left_qpos=candidate["left"],
+                        right_qpos=candidate["right"],
+                    )[side]
+                    position, orientation = pose_delta_metrics(
+                        tcp, target_tool_tcp_world
                     )
-                return candidate
+                    normalized = max(
+                        position / self.config.endpoint_position_tolerance_m,
+                        orientation / self.config.endpoint_orientation_tolerance_deg,
+                    )
+                    if best is None or normalized < best[0]:
+                        best = (normalized, position, orientation)
+                    if (
+                        position > self.config.endpoint_position_tolerance_m
+                        or orientation
+                        > self.config.endpoint_orientation_tolerance_deg
+                    ):
+                        continue
+                    if any(
+                        np.allclose(
+                            candidate[side],
+                            item.qpos_by_side[side],
+                            atol=1e-5,
+                            rtol=0.0,
+                        )
+                        for item in accepted
+                    ):
+                        outcome = "duplicate_exact_solution"
+                        break
+                    check = self.oracle.check(candidate)
+                    if not check.collision_check_available:
+                        collision_unavailable = True
+                        outcome = "endpoint_collision_check_unavailable"
+                        break
+                    if not check.safe:
+                        collision_blocked = True
+                        outcome = "endpoint_collision_blocked"
+                        break
+                    accepted.append(
+                        _EndpointIKCandidate(
+                            qpos_by_side=candidate,
+                            seed_index=seed_index,
+                            solve_cycles=cycles,
+                            position_residual_m=position,
+                            orientation_residual_deg=orientation,
+                        )
+                    )
+                    outcome = "accepted"
+                    break
+                if best is None:
+                    raise RuntimeError("RM65 endpoint solver produced no candidate.")
+                attempts.append(
+                    {
+                        "seed_index": seed_index,
+                        "solve_cycles": cycles,
+                        "outcome": outcome,
+                        "best_position_residual_m": best[1],
+                        "best_orientation_residual_deg": best[2],
+                    }
+                )
+        finally:
+            self.target_builder.set_current_qpos_pair(
+                left_qpos=qpos_by_side["left"],
+                right_qpos=qpos_by_side["right"],
+                reset_tracking=True,
+            )
+        if accepted:
+            return tuple(accepted)
+        if collision_unavailable:
+            reason = "endpoint_collision_check_unavailable"
+        elif collision_blocked:
+            reason = "endpoint_collision_blocked"
+        else:
+            reason = "ik_search_exhausted"
         raise RM65GraspTrajectoryPlanningError(
-            "ik_search_exhausted",
+            reason,
             details={
-                "cycles": self.config.maximum_endpoint_solve_cycles,
-                "best_position_residual_m": best_position,
-                "best_orientation_residual_deg": best_orientation,
-                "last_qpos_by_side": last_qpos,
+                "endpoint_seed_count": len(attempts),
+                "maximum_cycles_per_seed": (
+                    self.config.maximum_endpoint_solve_cycles
+                ),
+                "attempts": attempts,
             },
         )
 
@@ -554,7 +695,7 @@ class RM65GraspJointTrajectoryPlanner:
         scale = float(speed_scale)
         if not 0.0 < scale <= 1.0:
             raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
-        target = self._endpoint_qpos(
+        endpoint_candidates = self._endpoint_qpos_candidates(
             qpos_by_side=current,
             side=selected_side,
             target_tool_tcp_world=target_pose,
@@ -562,38 +703,137 @@ class RM65GraspJointTrajectoryPlanner:
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         cfg = self.planner_config
-        corridor_lower = np.maximum(
-            lower,
-            np.minimum(current[selected_side], target[selected_side])
-            - cfg.sample_padding_rad,
-        )
-        corridor_upper = np.minimum(
-            upper,
-            np.maximum(current[selected_side], target[selected_side])
-            + cfg.sample_padding_rad,
-        )
-        path = plan_collision_aware_joint_path(
-            start_qpos_by_component=current,
-            target_qpos_by_component=target,
-            movable_components=(selected_side,),
-            oracle=self.oracle,
-            config=cfg,
-            joint_lower_by_component={selected_side: corridor_lower},
-            joint_upper_by_component={selected_side: corridor_upper},
-            scene_hash=self.scene.semantic_content_hash,
-        )
-        if path.status is not JointPathStatus.PATH_FOUND:
-            reason = {
-                JointPathStatus.START_BLOCKED: "path_start_collision_blocked",
-                JointPathStatus.TARGET_BLOCKED: "path_target_collision_blocked",
-                JointPathStatus.PATH_SEARCH_EXHAUSTED: "path_search_exhausted",
-                JointPathStatus.COLLISION_CHECK_UNAVAILABLE: "path_collision_check_unavailable",
-            }.get(path.status, "path_planner_error")
+        search_attempts: list[dict[str, object]] = []
+        selected: (
+            tuple[_EndpointIKCandidate, JointPathPlanResult, dict[str, object]]
+            | None
+        ) = None
+        terminal_error: RM65GraspTrajectoryPlanningError | None = None
+        for endpoint_index, endpoint in enumerate(endpoint_candidates):
+            target = endpoint.qpos_by_side
+            for path_attempt in range(
+                self.config.path_search_attempts_per_endpoint
+            ):
+                full_joint_range = (
+                    path_attempt
+                    == self.config.path_search_attempts_per_endpoint - 1
+                )
+                padding = cfg.sample_padding_rad * float(2**path_attempt)
+                corridor_lower = (
+                    lower
+                    if full_joint_range
+                    else np.maximum(
+                        lower,
+                        np.minimum(current[selected_side], target[selected_side])
+                        - padding,
+                    )
+                )
+                corridor_upper = (
+                    upper
+                    if full_joint_range
+                    else np.minimum(
+                        upper,
+                        np.maximum(current[selected_side], target[selected_side])
+                        + padding,
+                    )
+                )
+                attempt_config = replace(
+                    cfg,
+                    seed=(
+                        cfg.seed
+                        + endpoint_index
+                        * self.config.path_search_attempts_per_endpoint
+                        + path_attempt
+                    ),
+                )
+                path = plan_collision_aware_joint_path(
+                    start_qpos_by_component=current,
+                    target_qpos_by_component=target,
+                    movable_components=(selected_side,),
+                    oracle=self.oracle,
+                    config=attempt_config,
+                    joint_lower_by_component={selected_side: corridor_lower},
+                    joint_upper_by_component={selected_side: corridor_upper},
+                    scene_hash=self.scene.semantic_content_hash,
+                )
+                attempt_record: dict[str, object] = {
+                    "endpoint_seed_index": endpoint.seed_index,
+                    "path_attempt": path_attempt,
+                    "search_seed": attempt_config.seed,
+                    "full_joint_range": full_joint_range,
+                    "sample_padding_rad": None if full_joint_range else padding,
+                    "status": path.status.value,
+                    "reason": path.reason,
+                }
+                search_attempts.append(attempt_record)
+                if path.status is not JointPathStatus.PATH_FOUND:
+                    if path.status is JointPathStatus.COLLISION_CHECK_UNAVAILABLE:
+                        terminal_error = RM65GraspTrajectoryPlanningError(
+                            "path_collision_check_unavailable",
+                            details={
+                                "path": path.to_dict(),
+                                "search_attempts": search_attempts,
+                            },
+                        )
+                        break
+                    continue
+                try:
+                    dense = self._revalidate(path.waypoints)
+                except RM65GraspTrajectoryPlanningError as exc:
+                    attempt_record["dense_revalidation_error"] = exc.reason_code
+                    terminal_error = exc
+                    if exc.reason_code == "path_collision_check_unavailable":
+                        break
+                    continue
+                selected = (endpoint, path, dense)
+                break
+            if selected is not None or (
+                terminal_error is not None
+                and terminal_error.reason_code == "path_collision_check_unavailable"
+            ):
+                break
+        if selected is None:
+            if terminal_error is not None and terminal_error.reason_code in {
+                "path_collision_check_unavailable",
+                "path_target_safety_envelope_unavailable",
+            }:
+                reason = terminal_error.reason_code
+            elif any(
+                item["status"] == JointPathStatus.PATH_SEARCH_EXHAUSTED.value
+                for item in search_attempts
+            ):
+                reason = "path_search_exhausted"
+            elif any(
+                item["status"] == JointPathStatus.START_BLOCKED.value
+                for item in search_attempts
+            ):
+                reason = "path_start_collision_blocked"
+            elif any(
+                item["status"] == JointPathStatus.TARGET_BLOCKED.value
+                for item in search_attempts
+            ):
+                reason = "path_target_collision_blocked"
+            elif terminal_error is not None:
+                reason = terminal_error.reason_code
+            else:
+                reason = "path_planner_error"
             raise RM65GraspTrajectoryPlanningError(
                 reason,
-                details={"path": path.to_dict()},
+                details={
+                    "endpoint_candidate_count": len(endpoint_candidates),
+                    "search_attempts": search_attempts,
+                    "last_dense_revalidation_error": (
+                        None
+                        if terminal_error is None
+                        else {
+                            "reason_code": terminal_error.reason_code,
+                            "details": terminal_error.details,
+                        }
+                    ),
+                },
             )
-        dense = self._revalidate(path.waypoints)
+        endpoint, path, dense = selected
+        target = endpoint.qpos_by_side
         velocity_profile = load_joint_velocity_limit_profiles()[
             self.profile.position_profile.ik_execution.joint_velocity_limit_profile
         ]
@@ -640,6 +880,13 @@ class RM65GraspJointTrajectoryPlanner:
                 "scene_hash": self.scene.semantic_content_hash,
                 "path_hash": path.semantic_content_hash,
                 "dense_revalidation": dense,
+                "endpoint_seed_index": endpoint.seed_index,
+                "endpoint_solve_cycles": endpoint.solve_cycles,
+                "endpoint_position_residual_m": endpoint.position_residual_m,
+                "endpoint_orientation_residual_deg": (
+                    endpoint.orientation_residual_deg
+                ),
+                "path_search_attempts": search_attempts,
                 "target_tool_tcp_world": target_pose,
                 "speed_scale": scale,
                 "reference_hz": reference_hz,

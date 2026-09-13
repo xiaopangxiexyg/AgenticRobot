@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,8 +15,8 @@ from robot_motion.target_safety.tcp_pose_envelope import (
 from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     TCP_POSE_ENVELOPE_FILE_SCHEMA_V1,
     TCPPoseEnvelopeRuntimeError,
-    TCPPoseEnvelopeTargetFrameBinding,
     TCPPoseEnvelopeTargetFilter,
+    TCPPoseEnvelopeTargetFrameBinding,
     capture_tcp_pose_envelope_anchor,
     install_tcp_pose_envelope_filter,
     load_tcp_pose_envelope_profile,
@@ -588,3 +588,27 @@ def test_real_agent_primitive_relative_tight_profiles_are_strict_runtime_specs(
     assert config.relative_max_xyz_m == pytest.approx((0.1, 0.1, 0.1))
     assert config.relative_axes == "canonical_axes"
     assert config.max_rotation_rad == pytest.approx(np.deg2rad(45.0))
+
+
+def test_real_agent_grasp_profile_uses_station_absolute_workspace_without_anchor(
+) -> None:
+    calibration, retargeter, _ = _fixture()
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "teleop_runtime/configs/skill_deploy/agent_grasp_right_workspace_v1.json"
+    )
+
+    profile = load_tcp_pose_envelope_profile(
+        path,
+        calibration=calibration,
+        retargeter=retargeter,
+        active_sides=("right",),
+    )
+
+    assert profile.enabled_sides == ("right",)
+    assert profile.anchor_required_sides == ()
+    config = profile.side_config_by_side["right"]
+    assert config.absolute_min_xyz_m == pytest.approx((-0.39, -0.6, 0.08))
+    assert config.absolute_max_xyz_m == pytest.approx((0.39, 0.1, 0.85))
+    assert config.relative_min_xyz_m is None
+    assert config.max_rotation_rad is None

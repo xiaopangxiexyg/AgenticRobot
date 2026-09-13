@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import msgpack
@@ -32,6 +33,7 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
     GraspGenXPointGraspModelSpec,
     Sam2GraspGenXPointGraspPlanner,
 )
+from deployments.perception.sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner
 
 
 class _FakeSocket:
@@ -546,6 +548,128 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
 
     planner.close()
     assert client.closed_for_test
+
+
+def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.0
+    mask = depth > 0.0
+    grasps = []
+    for degrees in (0.0, 30.0, 60.0, 180.0):
+        radians = math.radians(degrees)
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = np.asarray(
+            (
+                (math.cos(radians), -math.sin(radians), 0.0),
+                (math.sin(radians), math.cos(radians), 0.0),
+                (0.0, 0.0, 1.0),
+            )
+        )
+        pose[2, 3] = 0.975
+        grasps.append(pose)
+    tilted = np.eye(4, dtype=np.float64)
+    tilted_angle = math.radians(30.0)
+    tilted[:3, :3] = np.asarray(
+        (
+            (math.cos(tilted_angle), 0.0, math.sin(tilted_angle)),
+            (0.0, 1.0, 0.0),
+            (-math.sin(tilted_angle), 0.0, math.cos(tilted_angle)),
+        )
+    )
+    tilted[2, 3] = 0.975
+    grasps.append(tilted)
+    client = _PlannerClient(
+        np.stack(grasps), np.asarray((0.9, 0.8, 0.7, 0.65, 0.6), dtype=np.float64)
+    )
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(mask),
+        client=client,
+    )
+    monkeypatch.setattr(
+        Sam2VgnPointGraspPlanner,
+        "_visible_collision_free",
+        staticmethod(lambda *_args, **_kwargs: True),
+    )
+    planner.start()
+
+    result = planner.plan(
+        Image.new("RGB", (20, 20)),
+        depth,
+        pixel_uv=(10, 10),
+        intrinsics={
+            "width": 20,
+            "height": 20,
+            "fx": 100.0,
+            "fy": 100.0,
+            "cx": 10.0,
+            "cy": 10.0,
+        },
+        base_from_camera=np.eye(4),
+        max_candidates=5,
+    )
+
+    assert [candidate.model_score for candidate in result.candidates] == pytest.approx(
+        [0.9, 0.8, 0.7, 0.6]
+    )
+    first = np.asarray(result.candidates[0].camera_from_tcp).reshape(4, 4)
+    tilted_result = np.asarray(result.candidates[-1].camera_from_tcp).reshape(4, 4)
+    assert np.dot(first[:3, 2], tilted_result[:3, 2]) == pytest.approx(
+        math.cos(tilted_angle)
+    )
+    planner.close()
+
+
+def test_planner_bounded_centering_recovers_offset_grasp_without_changing_depth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.0
+    mask = depth > 0.0
+    grasp = np.eye(4, dtype=np.float64)
+    grasp[0, 3] = -0.020
+    grasp[1, 3] = -0.012
+    grasp[2, 3] = 0.975
+    client = _PlannerClient(grasp[None], np.asarray((0.9,), dtype=np.float64))
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(mask),
+        client=client,
+    )
+    monkeypatch.setattr(
+        Sam2VgnPointGraspPlanner,
+        "_visible_collision_free",
+        staticmethod(lambda *_args, **_kwargs: True),
+    )
+    planner.start()
+
+    result = planner.plan(
+        Image.new("RGB", (20, 20)),
+        depth,
+        pixel_uv=(10, 10),
+        intrinsics={
+            "width": 20,
+            "height": 20,
+            "fx": 100.0,
+            "fy": 100.0,
+            "cx": 10.0,
+            "cy": 10.0,
+        },
+        base_from_camera=np.eye(4),
+        max_candidates=1,
+    )
+
+    candidate = np.asarray(result.candidates[0].camera_from_tcp).reshape(4, 4)
+    # The target centre is moved onto the physical closing/height centre, but
+    # the model's approach depth is not altered by this admission correction.
+    assert candidate[0, 3] == pytest.approx(0.0, abs=1e-9)
+    assert candidate[1, 3] == pytest.approx(0.0, abs=1e-9)
+    assert candidate[2, 3] == pytest.approx(1.017999, abs=1e-9)
+    planner.close()
 
 
 def test_planner_fails_closed_when_model_pose_misses_clicked_object(

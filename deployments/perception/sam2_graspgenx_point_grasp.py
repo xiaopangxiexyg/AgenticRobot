@@ -27,6 +27,8 @@ from .sam2_vgn_point_grasp import (
     DEFAULT_DMTAC_M_URDF,
     DEFAULT_DMTAC_M_URDF_SHA256,
     DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
+    DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M,
+    DMTAC_M_TARGET_OPENING_CENTER_MAX_SHIFT_M,
     PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
     PointGraspCandidate,
     PointGraspResult,
@@ -54,6 +56,8 @@ DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1: dict[str, object] = {
     "fingertip_depth": DMTAC_M_FINGER_LENGTH_M,
 }
 DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M = 0.006
+GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M = 0.015
+GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG = 15.0
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -333,6 +337,13 @@ class Sam2GraspGenXPointGraspPlanner:
                 "server_top_k": self.server_top_k,
                 "score_threshold": self.score_threshold,
                 "inference_frame": "gravity_aligned_reference_z_up",
+                "candidate_family_nms": {
+                    "translation_m": GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M,
+                    "approach_axis_deg": GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG,
+                    "closing_axis_symmetry_deg": (
+                        GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
+                    ),
+                },
                 "gripper": {
                     "profile": "DMTAC_M",
                     "sweep_volume_v1": DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
@@ -340,6 +351,12 @@ class Sam2GraspGenXPointGraspPlanner:
                     "maximum_opening_m": self.max_gripper_width_m,
                     "width_clearance_m": DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
                     "maximum_visible_collision_points": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
+                    "target_opening_center_max_shift_m": (
+                        DMTAC_M_TARGET_OPENING_CENTER_MAX_SHIFT_M
+                    ),
+                    "target_height_center_max_shift_m": (
+                        DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M
+                    ),
                     "tool_tcp_from_flange_m": [
                         0.0,
                         0.0,
@@ -575,6 +592,17 @@ class Sam2GraspGenXPointGraspPlanner:
             camera_from_tcp, base_from_tcp = select_upward_parallel_jaw_tcp_pose(
                 camera_from_tcp, base_from_tcp
             )
+            # GraspGenX predicts the gripper pose against a sampled object
+            # cloud, so a useful orientation may still miss the physical pad
+            # centre by a few millimetres.  Reuse the embodiment-owned bounded
+            # X/Y correction used by VGN.  This changes neither approach depth
+            # nor orientation and remains subject to the full capture-volume
+            # and visible-collision checks below.
+            camera_from_tcp = Sam2VgnPointGraspPlanner._center_tcp_on_target(
+                camera_from_tcp,
+                target_points_camera,
+            )
+            base_from_tcp = base_from_camera @ camera_from_tcp
             tcp_from_camera = np.linalg.inv(camera_from_tcp)
             local = (
                 target_points_camera @ tcp_from_camera[:3, :3].T
@@ -647,10 +675,12 @@ class Sam2GraspGenXPointGraspPlanner:
                 counts["target_capture_downward_approach_count"] = int(
                     counts["target_capture_downward_approach_count"]
                 ) + 1
+            centered_camera_from_model_base = camera_from_tcp @ np.linalg.inv(
+                model_base_from_tcp
+            )
             click_distance = float(
                 np.linalg.norm(
-                    (camera_from_base @ base_from_model_base)[:3, 3]
-                    - target_camera
+                    centered_camera_from_model_base[:3, 3] - target_camera
                 )
             )
             if click_distance > self.max_click_distance_m:
@@ -694,9 +724,7 @@ class Sam2GraspGenXPointGraspPlanner:
         for item in ranked:
             pose = item[4]
             if any(
-                np.linalg.norm(pose[:3, 3] - previous[4][:3, 3]) < 0.015
-                and self._rotation_distance_radians(pose[:3, :3], previous[4][:3, :3])
-                < math.radians(15.0)
+                self._same_candidate_family(pose, previous[4])
                 for previous in selected
             ):
                 continue
@@ -724,10 +752,30 @@ class Sam2GraspGenXPointGraspPlanner:
         )
 
     @staticmethod
-    def _rotation_distance_radians(first: np.ndarray, second: np.ndarray) -> float:
-        relative = first.T @ second
-        cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
-        return math.acos(cosine)
+    def _same_candidate_family(first: np.ndarray, second: np.ndarray) -> bool:
+        if (
+            np.linalg.norm(first[:3, 3] - second[:3, 3])
+            >= GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M
+        ):
+            return False
+        cosine = float(
+            np.clip(np.dot(first[:3, 2], second[:3, 2]), -1.0, 1.0)
+        )
+        approach_angle = math.acos(cosine)
+        if approach_angle >= math.radians(
+            GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
+        ):
+            return False
+        # Rotating a parallel-jaw grasp around its approach axis changes the
+        # closing direction and must remain selectable.  Only identify closing
+        # axes up to sign because exchanging the two fingers is equivalent.
+        closing_cosine = float(
+            np.clip(abs(np.dot(first[:3, 0], second[:3, 0])), 0.0, 1.0)
+        )
+        closing_axis_angle = math.acos(closing_cosine)
+        return closing_axis_angle < math.radians(
+            GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
+        )
 
 
 __all__ = [

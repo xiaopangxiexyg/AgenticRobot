@@ -1,9 +1,17 @@
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from dataset_contracts.pose_frames import load_pose_frame_contract
+from robot_motion.path_planning import (
+    JointConfigurationCheck,
+    JointPathPlannerConfig,
+    JointPathPlanResult,
+    JointPathStatus,
+)
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.rm65 import (
@@ -41,10 +49,12 @@ from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
     MujocoShadowCompatibilityExpectation,
     execute_registered_shadow_trajectory,
 )
+from teleop_runtime.skill_deploy import rm65_grasp_trajectory as grasp_trajectory_module
 from teleop_runtime.skill_deploy.motion_port import RealAgentJointTrajectory
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspJointTrajectoryPlanner,
     RM65GraspReachabilityConfig,
+    RM65GraspTrajectoryPlanningConfig,
     RM65GraspTrajectoryPlanningError,
 )
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
@@ -518,3 +528,181 @@ def test_reachability_stops_on_wall_time_budget_and_returns_best_basic_solution(
     assert result.classification == "basically_reachable"
     assert result.termination_reason == "time_budget_exhausted"
     assert result.solve_cycles == 1
+
+
+class _MultistartBuilder:
+    def __init__(self) -> None:
+        self.current = {side: np.zeros(6) for side in ("left", "right")}
+        self.seed_history: list[dict[str, np.ndarray]] = []
+
+    def set_current_qpos_pair(self, *, left_qpos, right_qpos, **_kwargs) -> None:
+        self.current = {
+            "left": np.asarray(left_qpos, dtype=float).copy(),
+            "right": np.asarray(right_qpos, dtype=float).copy(),
+        }
+        self.seed_history.append(
+            {side: value.copy() for side, value in self.current.items()}
+        )
+
+    def solver_world_targets_for_qpos_pair(self, **_kwargs):
+        return {"left": np.eye(4), "right": np.eye(4)}
+
+    def solver_world_target_from_tool_tcp_world_target(self, **kwargs):
+        return np.asarray(kwargs["tool_tcp_world_target"], dtype=float)
+
+    def solve_target_pair(self, _target):
+        side_results = {
+            side: SimpleNamespace(qpos=value.copy())
+            for side, value in self.current.items()
+        }
+        return SimpleNamespace(side_results=side_results)
+
+    def tool_tcp_world_targets_for_qpos_pair(self, **_kwargs):
+        return {"left": np.eye(4), "right": np.eye(4)}
+
+
+def _planner_without_assets(
+    *,
+    config: RM65GraspTrajectoryPlanningConfig,
+) -> RM65GraspJointTrajectoryPlanner:
+    planner = object.__new__(RM65GraspJointTrajectoryPlanner)
+    planner.config = config
+    planner.reachability_config = RM65GraspReachabilityConfig()
+    planner.profile = SimpleNamespace(
+        station_world_frame_id="canonical_station",
+        position_profile=SimpleNamespace(
+            rates=SimpleNamespace(ik_hz=20.0),
+            ik_execution=SimpleNamespace(
+                joint_velocity_limit_profile="test-velocity"
+            ),
+        ),
+    )
+    planner.target_envelope_filter = None
+    planner._solver_lock = threading.Lock()
+    return planner
+
+
+def test_endpoint_planner_collects_distinct_exact_multistart_solutions() -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            maximum_endpoint_solve_cycles=1,
+            endpoint_seed_count=5,
+        )
+    )
+    builder = _MultistartBuilder()
+    planner.target_builder = builder
+    planner.oracle = SimpleNamespace(
+        check=lambda _qpos: JointConfigurationCheck(safe=True)
+    )
+    current = {side: np.zeros(6) for side in ("left", "right")}
+
+    candidates = planner._endpoint_qpos_candidates(
+        qpos_by_side=current,
+        side="right",
+        target_tool_tcp_world=np.eye(4),
+    )
+
+    assert [candidate.seed_index for candidate in candidates] == [0, 1, 2, 3, 4]
+    assert all(candidate.solve_cycles == 1 for candidate in candidates)
+    assert all(
+        np.array_equal(candidate.qpos_by_side["left"], current["left"])
+        for candidate in candidates
+    )
+    assert len({tuple(candidate.qpos_by_side["right"]) for candidate in candidates}) == 5
+    np.testing.assert_array_equal(builder.seed_history[-1]["right"], current["right"])
+
+
+def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_seed_count=2,
+            path_search_attempts_per_endpoint=4,
+        )
+    )
+    planner.planner_config = JointPathPlannerConfig(
+        max_iterations=1,
+        max_nodes=2,
+        shortcut_attempts=0,
+    )
+    planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
+    planner.oracle = SimpleNamespace()
+    planner.target_builder = _MultistartBuilder()
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    first_target = {side: value.copy() for side, value in current.items()}
+    first_target["right"] = np.full(6, 0.1)
+    second_target = {side: value.copy() for side, value in current.items()}
+    second_target["right"] = np.full(6, 0.2)
+    endpoints = (
+        grasp_trajectory_module._EndpointIKCandidate(
+            qpos_by_side=first_target,
+            seed_index=0,
+            solve_cycles=10,
+            position_residual_m=0.001,
+            orientation_residual_deg=0.2,
+        ),
+        grasp_trajectory_module._EndpointIKCandidate(
+            qpos_by_side=second_target,
+            seed_index=1,
+            solve_cycles=12,
+            position_residual_m=0.001,
+            orientation_residual_deg=0.2,
+        ),
+    )
+    planner._endpoint_qpos_candidates = lambda **_kwargs: endpoints
+    planner._revalidate = lambda _waypoints: {
+        "sample_count": 2,
+        "minimum_distance_m": 0.03,
+    }
+    calls: list[dict[str, object]] = []
+
+    def fake_plan(**kwargs):
+        calls.append(kwargs)
+        target = kwargs["target_qpos_by_component"]
+        found = np.array_equal(target["right"], second_target["right"])
+        return JointPathPlanResult(
+            status=(
+                JointPathStatus.PATH_FOUND
+                if found
+                else JointPathStatus.PATH_SEARCH_EXHAUSTED
+            ),
+            start_qpos_by_component=kwargs["start_qpos_by_component"],
+            target_qpos_by_component=target,
+            movable_components=("right",),
+            waypoints=(kwargs["start_qpos_by_component"], target) if found else (),
+            scene_hash="scene:test",
+            reason=None if found else "bounded_search_exhausted",
+        )
+
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "plan_collision_aware_joint_path",
+        fake_plan,
+    )
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "load_joint_velocity_limit_profiles",
+        lambda: {
+            "test-velocity": SimpleNamespace(max_velocity_deg_s=(30.0,) * 6)
+        },
+    )
+
+    trajectory = planner(
+        qpos_by_side=current,
+        side="right",
+        target_tool_tcp_world=np.eye(4),
+        speed_scale=0.2,
+    )
+
+    assert len(calls) == 5
+    first_widths = [
+        np.asarray(call["joint_upper_by_component"]["right"])
+        - np.asarray(call["joint_lower_by_component"]["right"])
+        for call in calls[:4]
+    ]
+    assert np.all(first_widths[1] > first_widths[0])
+    assert np.all(first_widths[2] >= first_widths[1])
+    assert np.any(first_widths[2] > first_widths[1])
+    assert np.all(first_widths[3] >= first_widths[2])
+    np.testing.assert_allclose(trajectory.qpos_by_side["right"][-1], 0.2)
