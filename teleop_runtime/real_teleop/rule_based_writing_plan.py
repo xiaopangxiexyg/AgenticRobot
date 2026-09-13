@@ -320,6 +320,16 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     group.add_argument(
+        "--rule-pre-pen-down-replay-normal-episodes",
+        type=int,
+        default=0,
+        help=(
+            "Number of successful normal Episodes between pre-pen-down replays. "
+            "Zero preserves the existing behavior and runs the configured replay "
+            "before every Episode."
+        ),
+    )
+    group.add_argument(
         "--rule-writing-trajectory-catalog",
         default=None,
         help=(
@@ -1517,6 +1527,25 @@ def _requested_pre_pen_down_replay_candidate_id(args: argparse.Namespace) -> str
     return "" if requested is None else str(requested).strip()
 
 
+def _pre_pen_down_replay_normal_episodes(args: argparse.Namespace) -> int:
+    value = getattr(args, "rule_pre_pen_down_replay_normal_episodes", 0)
+    if isinstance(value, bool):
+        raise ValueError(
+            "rule pre-pen-down replay normal Episodes must be a non-negative integer."
+        )
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "rule pre-pen-down replay normal Episodes must be a non-negative integer."
+        ) from exc
+    if normalized < 0 or normalized != value:
+        raise ValueError(
+            "rule pre-pen-down replay normal Episodes must be a non-negative integer."
+        )
+    return normalized
+
+
 def _resolve_pre_pen_down_replay_source_spec(
     args: argparse.Namespace,
 ) -> ResolvedRuleBasedWritingSourceCandidate | None:
@@ -1698,6 +1727,7 @@ def _rule_configuration_options(
     options = {
         "configuration_core_fields": [
             "pre_pen_down_replay_candidate_id",
+            "pre_pen_down_replay_normal_episodes",
             "pen_down_candidate_id",
             "write_candidate_id",
             "pen_up_candidate_id",
@@ -1735,6 +1765,7 @@ def _rule_configuration_options(
             _RULE_GUI_RUNTIME_CONFIGURATION_FIELDS
         ),
         "integer_fields": [
+            "pre_pen_down_replay_normal_episodes",
             "writer_workers",
             "writer_queue_size",
             "collection_process_queue_size",
@@ -1757,6 +1788,7 @@ def _rule_configuration_options(
                 ),
                 1.0,
             ],
+            "pre_pen_down_replay_normal_episodes": [0, 10000],
             "writing_speed_m_s": [
                 min(0.001, float(resolved_writing_speed_m_s)),
                 max(0.2, float(resolved_writing_speed_m_s)),
@@ -1814,6 +1846,9 @@ def _rule_configuration_options(
         {
             "pre_pen_down_replay_candidate_id": (
                 _requested_pre_pen_down_replay_candidate_id(args)
+            ),
+            "pre_pen_down_replay_normal_episodes": (
+                _pre_pen_down_replay_normal_episodes(args)
             ),
             "trajectory_id": str(args.rule_writing_trajectory),
             "direction": str(args.rule_writing_direction),
@@ -2481,6 +2516,7 @@ def build_rule_based_writing(
             "tags": list(spec.candidate.tags),
         }
     pre_pen_down_provenance: dict[str, Any] | None = None
+    pre_pen_down_normal_episodes = _pre_pen_down_replay_normal_episodes(args)
     if pre_pen_down_source is not None and pre_pen_down_spec is not None:
         pre_pen_down_provenance = {
             "candidate_id": pre_pen_down_source.candidate_id,
@@ -2493,6 +2529,7 @@ def build_rule_based_writing(
             "capture_enabled": False,
             "active_arm_sides": ["right"],
             "left_arm_policy": "pen_down_source_fixed_hold",
+            "normal_episodes_between_replays": pre_pen_down_normal_episodes,
         }
     source_selection = {
         **source_selection,
@@ -2764,120 +2801,123 @@ def build_rule_based_writing(
         hand_action_specs_by_side=runtime_hand_specs,
     )
     capture = RuleBasedCaptureSelection(enabled=True)
-    plan_steps: list[Any] = []
+    normal_initialize = RuleBasedInitialize(
+        step_id="initial_alignment",
+        group_key="pen_down",
+        frame_index=0,
+        active_sides=("left", "right"),
+        qpos_source="observation_actual_qpos",
+        include_end_effectors=bool(configured_gripper_sides),
+        end_effector_sides=configured_gripper_sides,
+        capture=RuleBasedCaptureSelection(enabled=False),
+    )
+    pre_pen_down_steps: tuple[Any, ...] = ()
     if pre_pen_down_group is not None:
-        plan_steps.extend(
-            (
-                RuleBasedInitialize(
-                    step_id=PRE_PEN_DOWN_ALIGNMENT_STEP_ID,
-                    group_key=pre_pen_down_group.key,
-                    frame_index=0,
-                    active_sides=("left", "right"),
-                    qpos_source="observation_actual_qpos",
-                    include_end_effectors=bool(configured_gripper_sides),
-                    end_effector_sides=configured_gripper_sides,
-                    capture=RuleBasedCaptureSelection(enabled=False),
-                ),
-                RuleBasedReplay(
-                    step_id=PRE_PEN_DOWN_REPLAY_STEP_ID,
-                    group_key=pre_pen_down_group.key,
-                    start_index=0,
-                    end_index=pre_pen_down_group.frame_count,
-                    active_sides=("right",),
-                    include_end_effectors=bool(configured_gripper_sides),
-                    end_effector_sides=configured_gripper_sides,
-                    wait_for_terminal_arrival=True,
-                    capture=RuleBasedCaptureSelection(enabled=False),
-                ),
-                RuleBasedInitialize(
-                    step_id=PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID,
-                    group_key="pen_down",
-                    frame_index=0,
-                    active_sides=("left", "right"),
-                    qpos_source="observation_actual_qpos",
-                    include_end_effectors=bool(configured_gripper_sides),
-                    end_effector_sides=configured_gripper_sides,
-                    capture=RuleBasedCaptureSelection(enabled=False),
-                ),
-            )
-        )
-    else:
-        plan_steps.append(
+        pre_pen_down_steps = (
             RuleBasedInitialize(
-                step_id="initial_alignment",
-                group_key="pen_down",
+                step_id=PRE_PEN_DOWN_ALIGNMENT_STEP_ID,
+                group_key=pre_pen_down_group.key,
                 frame_index=0,
                 active_sides=("left", "right"),
                 qpos_source="observation_actual_qpos",
                 include_end_effectors=bool(configured_gripper_sides),
                 end_effector_sides=configured_gripper_sides,
                 capture=RuleBasedCaptureSelection(enabled=False),
-            )
-        )
-    plan_steps.extend(
-        (
-            RuleBasedReplay(
-                step_id=DETAIL_PHASE_IDS[0],
-                group_key="pen_down",
-                start_index=0,
-                end_index=groups["pen_down"].frame_count,
-                active_sides=("left", "right"),
-                include_end_effectors=bool(configured_gripper_sides),
-                end_effector_sides=configured_gripper_sides,
-                wait_for_terminal_arrival=True,
-                capture=capture,
-            ),
-            RuleBasedActionSegment(
-                step_id=HEIGHT_DESCENT_STEP_ID,
-                action_source=height_descent_source,
-                stop_condition=RuleBasedSegmentStopCondition(
-                    max_steps=height_descent_source.max_steps,
-                    min_steps=1,
-                    stop_when=_height_descent_complete,
-                    name="calibrated_height_descent_complete",
-                ),
-                capture=capture,
-                allow_empty=True,
-                planned_steps_hint=0,
-            ),
-            RuleBasedActionSegment(
-                step_id=DETAIL_PHASE_IDS[1],
-                action_source=writing_source,
-                stop_condition=RuleBasedSegmentStopCondition(
-                    max_steps=len(preview_targets),
-                    min_steps=len(preview_targets),
-                    name="fixed_writing_path_complete",
-                ),
-                capture=capture,
             ),
             RuleBasedReplay(
-                step_id=DETAIL_PHASE_IDS[2],
-                group_key="pen_up",
+                step_id=PRE_PEN_DOWN_REPLAY_STEP_ID,
+                group_key=pre_pen_down_group.key,
                 start_index=0,
-                end_index=groups["pen_up"].frame_count,
+                end_index=pre_pen_down_group.frame_count,
                 active_sides=("right",),
-                relative_to=DETAIL_PHASE_IDS[1],
-                source_start_index=0,
                 include_end_effectors=bool(configured_gripper_sides),
                 end_effector_sides=configured_gripper_sides,
                 wait_for_terminal_arrival=True,
-                capture=capture,
+                capture=RuleBasedCaptureSelection(enabled=False),
+            ),
+            RuleBasedInitialize(
+                step_id=PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID,
+                group_key="pen_down",
+                frame_index=0,
+                # The first alignment already moved the left arm to this
+                # Episode's pen-down source state and the runtime FixArm now
+                # owns that hold. Only the right arm may move again.
+                active_sides=("right",),
+                qpos_source="observation_actual_qpos",
+                include_end_effectors=bool(configured_gripper_sides),
+                end_effector_sides=configured_gripper_sides,
+                capture=RuleBasedCaptureSelection(enabled=False),
             ),
         )
+    collection_steps: tuple[Any, ...] = (
+        RuleBasedReplay(
+            step_id=DETAIL_PHASE_IDS[0],
+            group_key="pen_down",
+            start_index=0,
+            end_index=groups["pen_down"].frame_count,
+            active_sides=("left", "right"),
+            include_end_effectors=bool(configured_gripper_sides),
+            end_effector_sides=configured_gripper_sides,
+            wait_for_terminal_arrival=True,
+            capture=capture,
+        ),
+        RuleBasedActionSegment(
+            step_id=HEIGHT_DESCENT_STEP_ID,
+            action_source=height_descent_source,
+            stop_condition=RuleBasedSegmentStopCondition(
+                max_steps=height_descent_source.max_steps,
+                min_steps=1,
+                stop_when=_height_descent_complete,
+                name="calibrated_height_descent_complete",
+            ),
+            capture=capture,
+            allow_empty=True,
+            planned_steps_hint=0,
+        ),
+        RuleBasedActionSegment(
+            step_id=DETAIL_PHASE_IDS[1],
+            action_source=writing_source,
+            stop_condition=RuleBasedSegmentStopCondition(
+                max_steps=len(preview_targets),
+                min_steps=len(preview_targets),
+                name="fixed_writing_path_complete",
+            ),
+            capture=capture,
+        ),
+        RuleBasedReplay(
+            step_id=DETAIL_PHASE_IDS[2],
+            group_key="pen_up",
+            start_index=0,
+            end_index=groups["pen_up"].frame_count,
+            active_sides=("right",),
+            relative_to=DETAIL_PHASE_IDS[1],
+            source_start_index=0,
+            include_end_effectors=bool(configured_gripper_sides),
+            end_effector_sides=configured_gripper_sides,
+            wait_for_terminal_arrival=True,
+            capture=capture,
+        ),
     )
-    plan = RuleBasedCollectionPlan(steps=tuple(plan_steps))
+    normal_plan = RuleBasedCollectionPlan(steps=(normal_initialize, *collection_steps))
+    pre_pen_down_plan = (
+        RuleBasedCollectionPlan(steps=(*pre_pen_down_steps, *collection_steps))
+        if pre_pen_down_steps
+        else None
+    )
     extension = RuleBasedRealTeleopExtension(
         deployment=deployment,
-        plan=plan,
+        plan=normal_plan,
         trajectory_groups=groups,
         config=RuleBasedRealTeleopConfig(
             action_hz=writing_action_hz,
             position_reference_hz=effective_position_reference_hz(args),
             initial_alignment_speed_scale=alignment_speed_scale,
+            pre_pen_down_replay_normal_episodes=pre_pen_down_normal_episodes,
             gripper_sides=configured_gripper_sides,
             gripper_max_step=gripper_max_step,
         ),
         source_selection=source_selection,
+        pre_pen_down_replay_plan=pre_pen_down_plan,
     )
     if enable_prestart_configuration:
         options, selected_configuration = _rule_configuration_options(
@@ -2897,6 +2937,9 @@ def build_rule_based_writing(
             }
             rebuilt_args._rule_pre_pen_down_replay_candidate_id = str(
                 configuration["pre_pen_down_replay_candidate_id"]
+            )
+            rebuilt_args.rule_pre_pen_down_replay_normal_episodes = int(
+                configuration["pre_pen_down_replay_normal_episodes"]
             )
             rebuilt_args.rule_writing_trajectory = str(configuration["trajectory_id"])
             rebuilt_args.rule_writing_direction = str(configuration["direction"])

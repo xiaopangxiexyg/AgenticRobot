@@ -27,6 +27,7 @@ from robot_motion.replay import (
     ReplayTrajectoryGroup,
     RuleBasedActionSegment,
     RuleBasedCaptureSelection,
+    RuleBasedCollectionCursor,
     RuleBasedCollectionPlan,
     RuleBasedCustomAction,
     RuleBasedInitialize,
@@ -1488,6 +1489,79 @@ def test_filtered_initialization_rewrite_fails_closed_before_dispatch() -> None:
     assert extension.status().aborted is True
     assert extension.status().held is True
     assert clutch.reasons == ["rule_based_runtime_hold"]
+
+
+def test_right_only_second_alignment_preserves_established_left_fix() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedInitialize(
+                    step_id="prelude_alignment",
+                    group_key="source",
+                    active_sides=("left", "right"),
+                ),
+                RuleBasedInitialize(
+                    step_id="pen_down_alignment",
+                    group_key="source",
+                    frame_index=1,
+                    active_sides=("right",),
+                ),
+            )
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(settle_consecutive_samples=1),
+    )
+    poller = _Poller()
+    poller.qpos = {
+        "left": np.full(6, -0.02),
+        "right": np.full(6, -0.02),
+    }
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, ui = _bind(extension, recorder, arm=False)
+    controller = _install_arm_only_fix_controller(extension)
+    assert extension.defers_progress_entry_arm_control(
+        target_progress_step_id="right_write",
+        current_fixed_sides=(),
+        target_fixed_sides=("left",),
+        fixed_scope="arm_only",
+    )
+    ui.request_start()
+    extension.after_control_input_poll(now=30.0)
+
+    now = 30.1
+    current = _wait_for_command(session, now=now)
+    while current.command.metadata["rule_based_step_id"] == "prelude_alignment":
+        filtered = controller.filter_command(current.command, SimpleNamespace(), now)
+        assert session.command_guard(filtered, SimpleNamespace(), now) is None
+        for side in ("left", "right"):
+            poller.qpos[side] = np.asarray(
+                filtered.commands[f"{side}_arm"].value,
+                dtype=float,
+            ).copy()
+        extension.after_session_step(
+            step_result=SimpleNamespace(
+                command=filtered,
+                command_dispatched=True,
+            ),
+            now=now,
+        )
+        now += 0.051
+        current = _wait_for_command(session, now=now)
+
+    assert current.command.metadata["rule_based_step_id"] == "pen_down_alignment"
+    assert controller.fixed_sides == ("left",)
+    filtered = controller.filter_command(current.command, SimpleNamespace(), now)
+    assert filtered.commands["left_arm"].metadata["fix_arm_active"] is True
+    np.testing.assert_allclose(
+        filtered.commands["left_arm"].value,
+        current.command.commands["left_arm"].value,
+        atol=1e-10,
+        rtol=0.0,
+    )
+    assert session.command_guard(filtered, SimpleNamespace(), now) is None
+    assert extension.status().aborted is False
 
 
 def test_deferred_fix_establishment_failure_holds_and_reclaims_episode() -> None:
@@ -2993,6 +3067,201 @@ def test_prevalidated_batch_advances_only_after_successful_writer_close() -> Non
     assert status.batch_cycle_complete is True
     assert status.rule_configuration == {"speed": 0.5}
     assert session.external_commands == []
+
+
+def test_pre_pen_down_replay_cadence_counts_only_committed_normal_episodes() -> None:
+    normal_plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="normal",
+                action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+            ),
+        )
+    )
+    prelude_plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="with_prelude",
+                action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=normal_plan,
+        pre_pen_down_replay_plan=prelude_plan,
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            pre_pen_down_replay_normal_episodes=2,
+        ),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, _ui = _bind(extension, recorder, arm=False)
+    session.state_machine.state = SimpleNamespace(value="RUNNING")
+
+    assert extension.plan is normal_plan
+    assert extension.status().pre_pen_down_replay_active is False
+
+    # An aborted or held attempt never reaches the successful writer-close
+    # transition and therefore cannot consume the cadence.
+    extension._aborted = True
+    extension._held = True
+    extension._execution_begun = True
+    extension.after_control_input_poll(now=1.0)
+    assert extension.status().pre_pen_down_normal_completed_count == 0
+    extension._aborted = False
+    extension._held = False
+    extension._execution_begun = False
+
+    for expected_count, now in ((1, 2.0), (2, 3.0)):
+        extension._completed = True
+        extension._execution_begun = True
+        extension.after_control_input_poll(now=now)
+        status = extension.status()
+        assert status.pre_pen_down_normal_completed_count == expected_count
+
+    assert extension.plan is prelude_plan
+    assert extension.status().pre_pen_down_replay_active is True
+    assert extension._pre_pen_down_replay_schedule_metadata() == {
+        "configured": True,
+        "active_for_episode": True,
+        "normal_episodes_between_replays": 2,
+        "normal_successful_episodes_since_replay": 2,
+    }
+
+    extension._completed = True
+    extension._execution_begun = True
+    extension.after_control_input_poll(now=4.0)
+    status = extension.status()
+    assert status.pre_pen_down_normal_completed_count == 0
+    assert status.pre_pen_down_replay_active is False
+    assert extension.plan is normal_plan
+
+
+def test_batch_adoption_changes_left_source_target_and_preserves_cadence() -> None:
+    def rebuilt(request):
+        left_qpos = float(request["left_qpos"])
+        group = replace(
+            _group(),
+            arm_observation_actual_qpos={
+                "left": np.full((2, 6), left_qpos, dtype=np.float32),
+                "right": np.zeros((2, 6), dtype=np.float32),
+            },
+        )
+        normal_plan = RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedInitialize(
+                    step_id=f"normal_{request['name']}",
+                    group_key="source",
+                    qpos_source="observation_actual_qpos",
+                ),
+            )
+        )
+        prelude_plan = RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedInitialize(
+                    step_id=f"prelude_{request['name']}",
+                    group_key="source",
+                    qpos_source="observation_actual_qpos",
+                ),
+            )
+        )
+        return RuleBasedRealTeleopExtension(
+            deployment=_deployment(),
+            plan=normal_plan,
+            pre_pen_down_replay_plan=prelude_plan,
+            trajectory_groups={"source": group},
+            config=RuleBasedRealTeleopConfig(
+                pre_pen_down_replay_normal_episodes=2,
+            ),
+        )
+
+    first = {"name": "first", "left_qpos": 0.1}
+    second = {"name": "second", "left_qpos": 0.2}
+    extension = rebuilt(first)
+    extension.configure_prestart_rebuild(
+        options={"fixture": True},
+        selected=first,
+        rebuilder=rebuilt,
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(extension, recorder, arm=False)
+    session.state_machine.state = SimpleNamespace(value="RUNNING")
+    ui.configuration_requests.append({"batch": [first, second]})
+    extension.after_control_input_poll(now=1.0)
+    for index in range(200):
+        extension.after_control_input_poll(now=1.0 + index * 0.001)
+        if not extension.status().configuration_pending:
+            break
+        time.sleep(0.001)
+
+    first_directive = next(
+        RuleBasedCollectionCursor(
+            extension.plan,
+            extension.trajectory_groups,
+        )
+    )
+    np.testing.assert_allclose(first_directive.qpos_by_side["left"], 0.1)
+    assert extension.status().pre_pen_down_replay_active is False
+
+    extension._completed = True
+    extension._execution_begun = True
+    extension.after_control_input_poll(now=2.0)
+    second_directive = next(
+        RuleBasedCollectionCursor(
+            extension.plan,
+            extension.trajectory_groups,
+        )
+    )
+    np.testing.assert_allclose(second_directive.qpos_by_side["left"], 0.2)
+    assert extension.status().pre_pen_down_normal_completed_count == 1
+    assert extension.status().pre_pen_down_replay_active is False
+
+    extension._completed = True
+    extension._execution_begun = True
+    extension.after_control_input_poll(now=3.0)
+    wrapped_directive = next(
+        RuleBasedCollectionCursor(
+            extension.plan,
+            extension.trajectory_groups,
+        )
+    )
+    np.testing.assert_allclose(wrapped_directive.qpos_by_side["left"], 0.1)
+    assert wrapped_directive.step_id == "prelude_first"
+    assert extension.status().pre_pen_down_normal_completed_count == 2
+    assert extension.status().pre_pen_down_replay_active is True
+
+
+def test_zero_pre_pen_down_interval_preserves_replay_every_episode() -> None:
+    normal_plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="normal",
+                action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+            ),
+        )
+    )
+    prelude_plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="with_prelude",
+                action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=normal_plan,
+        pre_pen_down_replay_plan=prelude_plan,
+        trajectory_groups={},
+    )
+    assert extension.plan is prelude_plan
+    assert extension.status().pre_pen_down_replay_active is True
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        RuleBasedRealTeleopConfig(pre_pen_down_replay_normal_episodes=-1)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        RuleBasedRealTeleopConfig(pre_pen_down_replay_normal_episodes=True)
 
 
 def test_successful_attempt_waits_for_finalize_then_releases_rule_fix_without_hold() -> None:

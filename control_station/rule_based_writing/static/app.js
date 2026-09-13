@@ -34,7 +34,7 @@ let configurationBatch = [];
 let collectionMode = "rule_based_writing";
 
 const configurationInputs = () => [
-  "full-replay-source", "pre-pen-down-source", "pen-down-source", "write-source", "pen-up-source", "trajectory",
+  "full-replay-source", "pre-pen-down-source", "pre-pen-down-normal-episodes", "pen-down-source", "write-source", "pen-up-source", "trajectory",
   "direction", "writing-size", "writing-speed", "alignment-speed-input",
   "tactile-bundle-root", "tactile-min-free", "tactile-compression",
   "writer-workers", "writer-queue-size", "process-queue-size",
@@ -101,11 +101,15 @@ async function loadOptions() {
   );
   const bounds = options.numeric_bounds || {};
   const sizeBounds = bounds.writing_size_m || [0.005, 0.2];
+  const preludeIntervalBounds = bounds.pre_pen_down_replay_normal_episodes || [0, 10000];
   const speedBounds = bounds.initial_alignment_speed_scale || [0.05, 1.0];
   const writingSpeedBounds = bounds.writing_speed_m_s || [0.001, 0.2];
   const size = document.getElementById("writing-size");
   size.min = sizeBounds[0];
   size.max = sizeBounds[1];
+  const preludeInterval = document.getElementById("pre-pen-down-normal-episodes");
+  preludeInterval.min = preludeIntervalBounds[0];
+  preludeInterval.max = preludeIntervalBounds[1];
   const speed = document.getElementById("alignment-speed-input");
   speed.min = speedBounds[0];
   speed.max = speedBounds[1];
@@ -152,6 +156,7 @@ function syncConfiguration(state) {
   const selected = state.rule_configuration || {};
   document.getElementById("full-replay-source").value = selected.full_replay_candidate_id || "";
   document.getElementById("pre-pen-down-source").value = selected.pre_pen_down_replay_candidate_id || "";
+  if (selected.pre_pen_down_replay_normal_episodes != null) document.getElementById("pre-pen-down-normal-episodes").value = selected.pre_pen_down_replay_normal_episodes;
   document.getElementById("pen-down-source").value = selected.pen_down_candidate_id || "";
   document.getElementById("write-source").value = selected.write_candidate_id || "";
   document.getElementById("pen-up-source").value = selected.pen_up_candidate_id || "";
@@ -204,6 +209,7 @@ function currentConfiguration() {
   }
   return {
     pre_pen_down_replay_candidate_id: document.getElementById("pre-pen-down-source").value,
+    pre_pen_down_replay_normal_episodes: Number(document.getElementById("pre-pen-down-normal-episodes").value),
     pen_down_candidate_id: document.getElementById("pen-down-source").value,
     write_candidate_id: document.getElementById("write-source").value,
     pen_up_candidate_id: document.getElementById("pen-up-source").value,
@@ -218,7 +224,7 @@ function currentConfiguration() {
 const batchLabel = (entry, index) =>
   fullReplayMode()
     ? `${index + 1}. 完整 Episode · ${entry.full_replay_candidate_id}`
-    : `${index + 1}. ${entry.trajectory_id} · 前置:${entry.pre_pen_down_replay_candidate_id || "关闭"} · ${entry.pen_down_candidate_id} / ${entry.write_candidate_id} / ${entry.pen_up_candidate_id}`;
+    : `${index + 1}. ${entry.trajectory_id} · 前置:${entry.pre_pen_down_replay_candidate_id || "关闭"} · 间隔:${entry.pre_pen_down_replay_normal_episodes || 0} · ${entry.pen_down_candidate_id} / ${entry.write_candidate_id} / ${entry.pen_up_candidate_id}`;
 
 function renderBatch() {
   const validated = latestState && Array.isArray(latestState.rule_configuration_batch)
