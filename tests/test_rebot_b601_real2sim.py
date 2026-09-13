@@ -744,6 +744,144 @@ def test_probe_trace_rejects_corrupt_or_ambiguous_rows(probe_trace, corruption):
         audit_b601_probe_trace(probe_trace)
 
 
+@pytest.fixture
+def type24_control_trace():
+    joints = [f"joint{i}" for i in range(1, 7)]
+    samples = []
+    for index in range(3):
+        sequence = 40 + index
+        feedback_time = 100.0 + 0.025 * index
+        samples.append(
+            {
+                "sequence": sequence,
+                "feedback_timestamp_sec": feedback_time,
+                "qpos_rad": [0.01 * joint for joint in range(6)],
+                "conditioned_tau_nm": [0.1 * joint for joint in range(6)],
+                "dispatch_qref_rad": [0.01 * joint for joint in range(6)],
+                "host_observation": {
+                    "schema": "b601.type24-host-observation.v1",
+                    "host_receive_freshness_verified": True,
+                    "device_source_timestamp_verified": False,
+                    "joints": [
+                        {
+                            "name": name,
+                            "status_sequence": 100 + index * 2 + joint_index,
+                            "receive_age_sec": 0.001 * joint_index,
+                            "observed_at_sec": feedback_time - 0.001 * joint_index,
+                        }
+                        for joint_index, name in enumerate(joints, start=1)
+                    ],
+                },
+                "dispatch_receipt": {
+                    "sequence": sequence,
+                    "mode": "mit",
+                    "frame_id": "rebot_b601_rs/base_link",
+                    "requested_at_sec": feedback_time + 0.002,
+                    "completed_at_sec": feedback_time + 0.004,
+                    "requested_joint_names": joints,
+                    "sent_joint_names": joints,
+                    "failed_joint_names": [],
+                    "errors": [],
+                    "accepted": True,
+                    "source_sequence": sequence,
+                },
+            }
+        )
+    return {
+        "status": "FAIL",
+        "feedback_source": "active-report",
+        "active_joint_names": joints,
+        "config_sha256": "a" * 64,
+        "urdf_sha256": "b" * 64,
+        "feedback_freshness": {
+            "control_admitted": True,
+            "host_receive_sequence_and_age_verified": True,
+            "device_source_timestamp_verified": False,
+            "maximum_receive_age_sec": 0.05,
+        },
+        "samples": samples,
+    }
+
+
+def test_type24_control_trace_qualifies_only_host_timing(type24_control_trace):
+    from sim.mujoco.rebot_b601_rs.real2sim import audit_b601_type24_control_trace
+
+    result = audit_b601_type24_control_trace(type24_control_trace)
+
+    assert result["status"] == "HOST_TIMING_REPLAY_READY"
+    assert result["sample_count"] == 3
+    assert result["declared_identity"] == {
+        "config_sha256": "a" * 64,
+        "urdf_sha256": "b" * 64,
+    }
+    assert result["identity_verified_against_assets"] is False
+    assert result["source_termination_status"] == "FAIL"
+    assert result["feedback_interval_sec"]["median"] == pytest.approx(0.025)
+    assert result["receive_age_sec"]["maximum"] == pytest.approx(0.006)
+    assert result["feedback_to_dispatch_sec"]["median"] == pytest.approx(0.004)
+    assert set(result["unobserved_status_sequence_count"].values()) == {2}
+    assert result["host_timing_replay_ready"] is True
+    assert result["device_acquisition_timing_verified"] is False
+    assert result["quantitative_plant_identification_ready"] is False
+    assert result["hardware_safety_claim"] is False
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "legacy",
+        "wrong_source",
+        "stale",
+        "joint_order",
+        "duplicate_sequence",
+        "receive_age",
+        "partial_dispatch",
+        "source_sequence",
+        "time_order",
+        "identity",
+        "control_sequence",
+        "dispatch_sequence",
+        "command_vector",
+    ],
+)
+def test_type24_control_trace_rejects_unpaired_or_ambiguous_rows(
+    type24_control_trace,
+    corruption,
+):
+    from sim.mujoco.rebot_b601_rs.real2sim import audit_b601_type24_control_trace
+
+    row = type24_control_trace["samples"][1]
+    if corruption == "legacy":
+        row.pop("host_observation")
+    elif corruption == "wrong_source":
+        type24_control_trace["feedback_source"] = "mechpos-request"
+    elif corruption == "stale":
+        row["host_observation"]["host_receive_freshness_verified"] = False
+    elif corruption == "joint_order":
+        row["host_observation"]["joints"].reverse()
+    elif corruption == "duplicate_sequence":
+        row["host_observation"]["joints"][0]["status_sequence"] -= 2
+    elif corruption == "receive_age":
+        row["host_observation"]["joints"][0]["receive_age_sec"] = 0.051
+    elif corruption == "partial_dispatch":
+        row["dispatch_receipt"]["sent_joint_names"].pop()
+    elif corruption == "source_sequence":
+        row["dispatch_receipt"]["source_sequence"] -= 1
+    elif corruption == "time_order":
+        row["dispatch_receipt"]["requested_at_sec"] -= 1.0
+    elif corruption == "identity":
+        type24_control_trace["config_sha256"] = "not-a-hash"
+    elif corruption == "control_sequence":
+        row["sequence"] -= 1
+    elif corruption == "dispatch_sequence":
+        row["dispatch_receipt"]["sequence"] -= 1
+    else:
+        row["conditioned_tau_nm"].pop()
+
+    with pytest.raises((TypeError, ValueError)):
+        audit_b601_type24_control_trace(type24_control_trace)
+
+
 @pytest.mark.parametrize("failure", ["invalid", "wrong_frame", "dropout", "duplicate"])
 def test_active_reference_failure_never_rearms_or_refreshes_watchdog(startup_driver, failure):
     driver = startup_driver

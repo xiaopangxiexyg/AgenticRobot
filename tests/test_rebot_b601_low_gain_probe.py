@@ -816,6 +816,54 @@ def test_active_report_warmup_requires_advancing_type24_and_disables_stream(
     assert events[-3:] == ["limits_off", "report_off", "close"]
 
 
+def test_host_observation_payload_preserves_exact_type24_metadata() -> None:
+    joints = tuple(
+        B601JointState(
+            name=f"joint{index}",
+            motor_id=index,
+            feedback_id=0xFD,
+            arbitration_id=0x180000FD | (index << 8),
+            status_code=0,
+            position_rad=0.01 * index,
+            velocity_reported=0.0,
+            torque_reported_nm=0.0,
+            observed_at_sec=10.0 + index * 0.001,
+            sample_sequence=20,
+            valid=True,
+            stale=False,
+            status_sequence=100 + index,
+            receive_age_sec=index * 0.001,
+            host_receive_freshness_verified=True,
+        )
+        for index in range(1, 7)
+    )
+    state = B601HardwareState(
+        sequence=20,
+        receive_timestamp_sec=10.01,
+        joints=joints,
+        valid=True,
+        stale=False,
+        freshness_semantics=(
+            "host_receive_sequence_and_age_verified; "
+            "device_source_timestamp_unavailable"
+        ),
+        host_receive_freshness_verified=True,
+    )
+
+    result = probe._host_observation_payload(state)
+
+    assert result["schema"] == "b601.type24-host-observation.v1"
+    assert result["host_receive_freshness_verified"] is True
+    assert result["device_source_timestamp_verified"] is False
+    assert tuple(row["name"] for row in result["joints"]) == probe._ALL_JOINTS
+    assert tuple(row["status_sequence"] for row in result["joints"]) == tuple(
+        range(101, 107)
+    )
+    assert tuple(row["receive_age_sec"] for row in result["joints"]) == pytest.approx(
+        tuple(index * 0.001 for index in range(1, 7))
+    )
+
+
 def test_protective_hold_notice_is_high_visibility_and_log_safe() -> None:
     notice = probe._protective_hold_notice(
         "protective hold degraded",

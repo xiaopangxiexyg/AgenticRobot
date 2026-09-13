@@ -706,3 +706,33 @@ delay/jitter/dropout 写入 Real2Sim observation/transport profile。armature、
 高频位置、重力/阻抗或 haptic 闭环可用。下一步仍需在 MotorBridge 暴露实际 firmware 的
 decoded sequence/receive-age 后，做 P2 decoded-observation 验收，再将实测 delay/jitter/dropout
 写入 Real2Sim transport profile。
+
+## P2.2 Type-24 控制帧配对记录与主机时序审计（2026-09-13）
+
+MotorBridge Type-24 解码、失能 TX/RX、使能保持和 40 Hz 保持已分阶段完成现场验收；控制入口
+现在以六轴递增 `status_sequence` 和受限 `receive_age_sec` 作为 active-report admission。一次
+使用新默认人工拖动 envelope 的 40 Hz 运行由操作者在约 40.13 s 主动结束，现场确认无异常；
+1604 个 compute/feedback/TX 样本均约 39.94 Hz、无 deadline miss，motion guard 没有隔离或
+确认中止。因为未运行满 90 s，其自动 acceptance 为 FAIL，证据只能标记为“现场行为通过、
+自动时长未完成”，不要求为本软件增量重复运动。
+
+该运行也暴露了证据格式缺口：在线控制虽消费 Type-24 metadata，但旧 `samples[]` 未保存
+逐关节 sequence/receive-age，也没有逐样本 MIT dispatch receipt，不能直接用于 transport
+回放。本批保持控制路径不变，只从已经用于当前控制 tick 的 `B601HardwareState` 序列化
+`b601.type24-host-observation.v1`，并把现有 `B601CommandReceipt` 附在同一样本；不增加 CAN
+读取、不重复 MotorBridge 解码，也不改变 torque、gravity、driver Kd、guard 或 protective hold。
+
+新增纯函数 `audit_b601_type24_control_trace(payload)` 严格要求：
+
+- exact J1--J6 顺序、active-report 控制 admission 和配置内 receive-age 上限；
+- 各关节正整数且逐样本严格递增的 Type-24 sequence；
+- 单调反馈/control/dispatch sequence 和 `feedback <= requested <= completed`；
+- 完整六轴有限 q、conditioned torque、dispatch qref，以及 accepted all-arm dispatch receipt；
+- 64 位十六进制 config/URDF SHA-256 身份。
+
+PASS 只产生 `HOST_TIMING_REPLAY_READY`：报告反馈间隔、receive age、feedback-to-dispatch 延迟，
+并把 sequence 跳号记为 `unobserved_status_sequence_count`，不能把跳号直接解释成总线 packet
+drop。设备没有 acquisition timestamp，所以 `device_acquisition_timing_verified=false`；负载、
+接触、温度和 fit/held-out 也尚未合格，因此
+`quantitative_plant_identification_ready=false`。后续 exact candidate 合并后再采集一次完整前台
+Type-24 控制记录即可运行该审计；本批本身不需要、也不授权任何真机动作。
