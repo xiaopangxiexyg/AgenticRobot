@@ -2022,49 +2022,15 @@ def test_dual_arm_candidate_layer_generates_joint_limit_escape_for_left_arm() ->
     assert metadata["selected_source"] == "joint_limit_escape"
 
 
-def test_limit_escape_latch_uses_candidate_joint_margin_when_another_joint_is_closer() -> None:
-    lower = np.full(12, -1.0, dtype=float)
-    upper = np.full(12, 1.0, dtype=float)
-    solver = _FakeDualArmSolver(lower=lower, upper=upper)
-    retargeter = _retargeter(
-        solver,
-        joint_limit_guard_mode="forced_escape_latched",
+def test_forced_escape_latched_joint_limit_guard_mode_is_retired() -> None:
+    assert (
+        target_solver_module.JOINT_LIMIT_GUARD_FORCED_ESCAPE_LATCHED
+        not in target_solver_module.JOINT_LIMIT_GUARD_MODE_CHOICES
     )
-    retargeter.set_execution_dt_sec(1.0 / 60.0)
-    reference = np.zeros(12, dtype=float)
-    reference[2] = upper[2] - np.deg2rad(0.50)
-    reference[8] = upper[8] - np.deg2rad(1.00)
-    targets = retargeter.current_world_targets()
-
-    candidates, _metadata = retargeter._dual_arm_limit_escape_candidates(
-        reference_full_q=reference,
-        current_targets=targets,
-    )
-    right_candidate = next(
-        candidate
-        for candidate in candidates
-        if candidate.metadata["local_step_limit_escape_side"] == "right"
-    )
-    candidate_metadata = right_candidate.metadata
-
-    # The left J3 remains the global minimum, so the old global metric is zero
-    # even though the selected right J3 candidate has moved outward.
-    assert candidate_metadata["local_step_limit_escape_margin_progress_deg"] == pytest.approx(0.0)
-    assert candidate_metadata["local_step_limit_escape_joint_margin_progress_deg"] > 0.0
-
-    receipt = retargeter._update_joint_limit_escape_direction_latch(
-        reference_full_q=reference,
-        admitted_full_q=right_candidate.qpos,
-        raw_full_q=reference,
-        status="tracking",
-        selection_metadata={
-            "selected_source": "joint_limit_escape",
-            "selected_metadata": {
-                "candidate_metadata": candidate_metadata,
-            },
-        },
-    )
-    assert receipt["active"] == {"right:j3": -1}
+    with pytest.raises(ValueError, match="joint_limit_guard_mode must be one of"):
+        DualArmCollisionAwareRetargeterConfig(
+            joint_limit_guard_mode="forced_escape_latched"
+        )
 
 
 def test_limit_escape_excludes_only_authority_fixed_side() -> None:
@@ -5054,150 +5020,8 @@ def test_admitted_qref_fk_is_read_only_and_uses_both_final_arm_vectors() -> None
     np.testing.assert_allclose(solver.current_q, initial_q)
 
 
-def test_active_limit_band_blocks_inward_candidate_before_latch_arms(
-    monkeypatch,
-) -> None:
-    lower = np.full(12, -1.0, dtype=float)
-    upper = np.full(12, 1.0, dtype=float)
-    solver = _FakeDualArmSolver(lower=lower, upper=upper)
-    retargeter = _retargeter(
-        solver,
-        joint_limit_guard_mode="forced_escape_latched",
-    )
-    reference = np.zeros(12, dtype=float)
-    reference[8] = 1.0 - np.deg2rad(1.0)
-    ordinary = reference.copy()
-    ordinary[8] += 0.005
-    escape = reference.copy()
-    escape[8] -= 0.005
-
-    ordinary_candidate = target_solver_module._DualArmCandidate(
-        name="ordinary_inward",
-        qpos=ordinary,
-        source="multitask",
-        method="ordinary_inward",
-    )
-    escape_metadata = {
-        "local_step_limit_escape_candidate": True,
-        "local_step_limit_escape_side": "right",
-        "local_step_limit_escape_joint_index": 2,
-        "local_step_limit_escape_full_joint_index": 8,
-        "local_step_limit_escape_direction": -1,
-        "local_step_limit_escape_margin_progress_deg": 1.0,
-    }
-    escape_candidate = target_solver_module._DualArmCandidate(
-        name="joint_limit_escape_right_j3_neg",
-        qpos=escape,
-        source="joint_limit_escape",
-        method="joint_limit_escape_right_j3_neg",
-        metadata=escape_metadata,
-    )
-    calls = []
-
-    def fake_candidates(**kwargs):
-        calls.append(dict(kwargs))
-        if bool(kwargs.get("include_base", True)):
-            return [ordinary_candidate], {"enabled": True, "status": "active"}
-        return [escape_candidate], {"enabled": True, "status": "active"}
-
-    def fake_evaluate(*, candidate, step_scale, **_kwargs):
-        return True, candidate.qpos.copy(), {
-            "candidate_metadata": dict(candidate.metadata),
-            "score": 0.0,
-            "step_scale": float(step_scale),
-        }
-
-    monkeypatch.setattr(retargeter, "_dual_arm_tracking_candidates", fake_candidates)
-    monkeypatch.setattr(retargeter, "_evaluate_dual_arm_step_candidate", fake_evaluate)
-
-    assert retargeter._joint_limit_escape_direction_latch == {}
-    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
-        # Keep the raw result neutral so this test exercises the second,
-        # canonical-branch trigger after the ordinary candidate is evaluated.
-        raw_full_q=reference,
-        reference_full_q=reference,
-        current_targets=retargeter.current_world_targets(),
-        profile=None,
-    )
-
-    assert name == "joint_limit_escape_right_j3_neg"
-    assert metadata["selected_source"] == "joint_limit_escape"
-    assert metadata["joint_limit_escape_hysteresis"]["status"] == (
-        "pending_single_escape"
-    )
-    assert qpos[8] < reference[8]
-    assert len(calls) == 2
-    assert calls[1]["include_base"] is False
-    assert calls[1]["include_posture_escape"] is False
-    assert calls[1]["include_wrist_unload"] is False
-    assert calls[1]["include_singularity_escape"] is False
-    assert calls[1]["limit_escape_max_candidates"] == 1
 
 
-def test_near_limit_outward_tracking_does_not_launch_escape_search(monkeypatch) -> None:
-    lower = np.full(12, -1.0, dtype=float)
-    upper = np.full(12, 1.0, dtype=float)
-    solver = _FakeDualArmSolver(lower=lower, upper=upper)
-    retargeter = _retargeter(
-        solver,
-        joint_limit_guard_mode="forced_escape_latched",
-    )
-    reference = np.zeros(12, dtype=float)
-    reference[8] = 1.0 - np.deg2rad(1.0)
-    ordinary = reference.copy()
-    ordinary[8] -= 0.005
-    escape = reference.copy()
-    escape[8] -= 0.01
-
-    ordinary_candidate = target_solver_module._DualArmCandidate(
-        name="ordinary_outward",
-        qpos=ordinary,
-        source="multitask",
-        method="ordinary_outward",
-    )
-    escape_candidate = target_solver_module._DualArmCandidate(
-        name="joint_limit_escape_right_j3_neg",
-        qpos=escape,
-        source="joint_limit_escape",
-        method="joint_limit_escape_right_j3_neg",
-        metadata={
-            "local_step_limit_escape_candidate": True,
-            "local_step_limit_escape_side": "right",
-            "local_step_limit_escape_joint_index": 2,
-            "local_step_limit_escape_full_joint_index": 8,
-            "local_step_limit_escape_direction": -1,
-            "local_step_limit_escape_margin_progress_deg": 1.0,
-        },
-    )
-    calls = []
-
-    def fake_candidates(**kwargs):
-        calls.append(dict(kwargs))
-        if bool(kwargs.get("include_base", True)):
-            return [ordinary_candidate], {"enabled": True, "status": "active"}
-        return [escape_candidate], {"enabled": True, "status": "active"}
-
-    def fake_evaluate(*, candidate, step_scale, **_kwargs):
-        return True, candidate.qpos.copy(), {
-            "candidate_metadata": dict(candidate.metadata),
-            "score": 0.0,
-            "step_scale": float(step_scale),
-        }
-
-    monkeypatch.setattr(retargeter, "_dual_arm_tracking_candidates", fake_candidates)
-    monkeypatch.setattr(retargeter, "_evaluate_dual_arm_step_candidate", fake_evaluate)
-
-    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
-        raw_full_q=ordinary,
-        reference_full_q=reference,
-        current_targets=retargeter.current_world_targets(),
-        profile=None,
-    )
-
-    assert name == "ordinary_outward"
-    np.testing.assert_allclose(qpos, ordinary)
-    assert metadata["joint_limit_escape_hysteresis"]["status"] == "normal_tracking"
-    assert len(calls) == 1
 
 
 def test_default_limit_guard_preserves_stable_legacy_candidate_path(
@@ -5312,7 +5136,6 @@ def test_boundary_hold_projects_only_inward_near_limit_joint(
     )
     assert repeated_name == "joint_limit_boundary_hold"
     np.testing.assert_allclose(repeated_qpos, qpos)
-    assert retargeter._joint_limit_escape_direction_latch == {}
 
 
 def test_boundary_hold_releases_immediately_for_outward_candidate(
@@ -5433,141 +5256,3 @@ def test_boundary_hold_removes_legacy_escape_from_auxiliary_candidate_pool(
     assert len(calls) == 2
     assert calls[0]["include_limit_escape"] is False
     assert calls[1]["include_limit_escape"] is False
-
-
-def test_limit_escape_direction_latch_blocks_immediate_inward_ik_reselection(
-    monkeypatch,
-) -> None:
-    lower = np.full(12, -1.0, dtype=float)
-    upper = np.full(12, 1.0, dtype=float)
-    solver = _FakeDualArmSolver(lower=lower, upper=upper)
-    retargeter = _retargeter(
-        solver,
-        joint_limit_guard_mode="forced_escape_latched",
-    )
-    reference = np.zeros(12, dtype=float)
-    reference[8] = 1.0 - np.deg2rad(3.0)
-    ordinary = reference.copy()
-    ordinary[8] += 0.01
-    escape = reference.copy()
-    escape[8] -= 0.01
-    retargeter._joint_limit_escape_direction_latch[("right", 2)] = -1
-
-    ordinary_candidate = target_solver_module._DualArmCandidate(
-        name="ordinary_inward",
-        qpos=ordinary,
-        source="multitask",
-        method="ordinary_inward",
-    )
-    escape_metadata = {
-        "local_step_limit_escape_candidate": True,
-        "local_step_limit_escape_side": "right",
-        "local_step_limit_escape_joint_index": 2,
-        "local_step_limit_escape_full_joint_index": 8,
-        "local_step_limit_escape_direction": -1,
-        "local_step_limit_escape_margin_progress_deg": 1.0,
-    }
-    escape_candidate = target_solver_module._DualArmCandidate(
-        name="joint_limit_escape_right_j3_neg",
-        qpos=escape,
-        source="joint_limit_escape",
-        method="joint_limit_escape_right_j3_neg",
-        metadata=escape_metadata,
-    )
-    calls = []
-
-    def fake_candidates(**kwargs):
-        calls.append(dict(kwargs))
-        if bool(kwargs.get("include_base", True)):
-            return [ordinary_candidate], {"enabled": True, "status": "active"}
-        return [escape_candidate], {"enabled": True, "status": "active"}
-
-    def fake_evaluate(*, candidate, step_scale, **_kwargs):
-        return True, candidate.qpos.copy(), {
-            "candidate_metadata": dict(candidate.metadata),
-            "score": 0.0,
-            "step_scale": float(step_scale),
-        }
-
-    monkeypatch.setattr(retargeter, "_dual_arm_tracking_candidates", fake_candidates)
-    monkeypatch.setattr(retargeter, "_evaluate_dual_arm_step_candidate", fake_evaluate)
-
-    qpos, name, _score, _distance, metadata = retargeter._select_safe_tracking_candidate(
-        raw_full_q=ordinary,
-        reference_full_q=reference,
-        current_targets=retargeter.current_world_targets(),
-        profile=None,
-    )
-
-    assert name == "joint_limit_escape_right_j3_neg"
-    assert metadata["selected_source"] == "joint_limit_escape"
-    assert metadata["joint_limit_escape_hysteresis"]["status"] == "latched_escape_only"
-    assert qpos[8] < reference[8]
-    assert len(calls) == 1
-    assert calls[0]["include_base"] is False
-    assert calls[0]["include_posture_escape"] is False
-    assert calls[0]["include_wrist_unload"] is False
-    assert calls[0]["include_singularity_escape"] is False
-    assert calls[0]["limit_escape_max_candidates"] == 1
-
-
-def test_limit_escape_direction_latch_releases_after_extra_margin() -> None:
-    lower = np.full(12, -1.0, dtype=float)
-    upper = np.full(12, 1.0, dtype=float)
-    solver = _FakeDualArmSolver(lower=lower, upper=upper)
-    retargeter = _retargeter(
-        solver,
-        joint_limit_guard_mode="forced_escape_latched",
-    )
-    reference = np.zeros(12, dtype=float)
-    reference[8] = 1.0 - np.deg2rad(3.0)
-    admitted = reference.copy()
-    admitted[8] -= 0.01
-    selection_metadata = {
-        "selected_source": "joint_limit_escape",
-        "selected_metadata": {
-            "candidate_metadata": {
-                "local_step_limit_escape_side": "right",
-                "local_step_limit_escape_joint_index": 2,
-                "local_step_limit_escape_full_joint_index": 8,
-                "local_step_limit_escape_direction": -1,
-                "local_step_limit_escape_margin_progress_deg": 1.0,
-            }
-        },
-    }
-
-    armed = retargeter._update_joint_limit_escape_direction_latch(
-        reference_full_q=reference,
-        admitted_full_q=admitted,
-        status="tracking",
-        selection_metadata=selection_metadata,
-    )
-    assert armed["armed"]["joint"] == "right:j3"
-    assert armed["active"] == {"right:j3": -1}
-
-    released_q = admitted.copy()
-    released_q[8] = 1.0 - np.deg2rad(5.0)
-    raw_inward = admitted.copy()
-    raw_inward[8] += 0.02
-    guarded = retargeter._update_joint_limit_escape_direction_latch(
-        reference_full_q=admitted,
-        admitted_full_q=released_q,
-        raw_full_q=raw_inward,
-        status="tracking",
-        selection_metadata=selection_metadata,
-    )
-    assert guarded["released"] == []
-    assert guarded["active"] == {"right:j3": -1}
-    assert retargeter._joint_limit_escape_release_guard == {("right", 2): -1}
-
-    raw_outward = released_q.copy()
-    raw_outward[8] -= 0.02
-    released = retargeter._update_joint_limit_escape_direction_latch(
-        reference_full_q=released_q,
-        admitted_full_q=released_q,
-        raw_full_q=raw_outward,
-        status="tracking",
-        selection_metadata=None,
-    )
-    assert released["released"] == ["right:j3"]
-    assert released["active"] == {}
