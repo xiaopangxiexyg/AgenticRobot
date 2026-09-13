@@ -8,6 +8,47 @@ Both physical arm choices are available through `--arm-side left|right`.
 `base_frame_id`, tool TCP, IK target, grasp body, finger contacts, and gripper
 actuation; the other arm is held at its mirrored home pose.
 
+## Real-like one-shot terminal
+
+`run_terminal` is the smallest end-to-end operator entrypoint. It starts from
+a collision-checked, side-specific observation home whose real MuJoCo wrist
+camera points at a red 40×40×40 mm cube. It then renders aligned RGB-D from
+either the fixed head camera or that physical wrist camera, invokes the same
+point-grasp provider implementations offered by the real Gateway, saves the
+candidate annotation and selected-grasp overlay, and executes pregrasp, grasp,
+close, and lift through the existing CubeLift motion owner. It never connects
+to real cameras or robot hardware.
+
+The default matches the real backend direction: GraspGenX over a loopback
+service, using the selected wrist view. Start the reviewed service separately,
+then run:
+
+```bash
+bash scripts/run_graspgenx_server.sh \
+  --host 127.0.0.1 --port 5556
+
+MUJOCO_GL=egl python -m experiments.sim_point_grasp.commands.run_terminal
+```
+
+GraspNet and VGN are selectable without changing the terminal or motion path:
+
+```bash
+MUJOCO_GL=egl python -m experiments.sim_point_grasp.commands.run_terminal \
+  --backend graspnet --view selected_wrist --arm-side right
+
+MUJOCO_GL=egl python -m experiments.sim_point_grasp.commands.run_terminal \
+  --backend vgn --view front --arm-side left
+```
+
+Use `--graspgenx-mode in-process` only in the separately validated compatible
+GraspGenX Python environment. Every invocation owns one new output directory
+under `runtime_artifacts/runs/experiments/sim_point_grasp_terminal/` and prints
+one compact JSON outcome. The directory retains `initial_rgb.png`, aligned
+metric depth, `skill_annotated.jpg`, `grasp_pose_overlay.png`, the complete
+Skill/preflight JSON, execution montage, and optional MP4. A nonzero exit after
+candidate generation is a motion/contact/lift failure, not loss of the grasp
+rendering evidence.
+
 ## Visualization-only three-camera flow
 
 Use the visualization command when the goal is to inspect generated poses, not
