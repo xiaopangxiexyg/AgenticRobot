@@ -396,14 +396,37 @@ extras 是生成锁文件和安装完整依赖时使用的依赖分组，不要�
 
 ### B601-RS/reBotArm 有线 CAN 依赖
 
-`reBotArm_control_py` 是独立的 reBotArm 源码/gitlink。它的 RS 配置使用 Python 3.10 和
-`motorbridge`；该依赖属于真机硬件附加项，不应让没有 reBotArm gitlink 的基础环境隐式初始化
-设备。当前按上游 `pyproject.toml` 的 `motorbridge>=0.4.9` 要求，在 `dexteleop310` 中验证的
-兼容版本为 `0.4.9`。上游已提交的 `uv.lock` 仍记录旧的 `0.4.6`，不能把该旧锁定值当作当前
-RS 依赖依据。
+`reBotArm_control_py` 和 `MotorBridge` 是两个独立源码/gitlink：前者提供 B601-RS 厂商配置、
+模型和参考实现，后者提供有线 CAN 传输、RobStride 协议和 Python/C ABI。它们属于真机硬件
+附加项；基础环境不得仅因导入 AgenticRobot 就初始化 submodule、打开 CAN 或创建设备实例。
 
-当目标 worktree 已包含经审查的 `hardware/reBotArm_control_py` 提交，并且确实需要 RS 真机
-backend 时，在同一个主环境中执行：
+父仓将 `hardware/MotorBridge` 固定在提交
+`93a6b4c21f3f4252e935dfbd5f0d42dd06e06424`。该提交包含 B601 当前使用的 RobStride
+type-24 状态解码；父仓不跟随 MotorBridge 浮动分支。更新父仓后先物化两个精确 gitlink：
+
+```bash
+git submodule update --init -- \
+  hardware/reBotArm_control_py \
+  hardware/MotorBridge
+```
+
+`reBotArm_control_py` 上游 `pyproject.toml` 仍声明 `motorbridge>=0.4.9`，但不能用其旧
+`uv.lock` 中的 `0.4.6` 或 PyPI wheel 替代父仓固定的 MotorBridge 源码来证明 type-24
+能力。开发和验收时应从该 submodule 构建 ABI，并显式绑定源码与动态库：
+
+```bash
+cd hardware/MotorBridge
+cargo build -p motor_abi --release
+
+export PYTHONPATH="$PWD/bindings/python/src${PYTHONPATH:+:$PYTHONPATH}"
+export MOTORBRIDGE_LIB="$PWD/target/release/libmotor_abi.so"
+python -c 'from motorbridge import abi_capabilities, abi_version; print(abi_version(), abi_capabilities())'
+```
+
+上述命令只构建和读取 ABI 元数据，不打开 CAN。构建产物保留在 submodule 的 ignored
+`target/` 中，不提交到父仓；`dexteleop310` 继续视为只读环境，不用本地 wheel 覆盖安装。
+
+只有在需要复现尚未迁移到父仓固定源码的旧流程时，才使用已发布的兼容 wheel：
 
 ```bash
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
@@ -413,7 +436,7 @@ python -m pip install --no-deps motorbridge==0.4.9
 `--no-deps` 是为了复用本环境已有的 Python/NumPy/Pinocchio 基础层，避免 pip 改写项目锁定的
 数值栈；若以后把 reBotArm RS 依赖正式纳入 DexTeleop 主安装流程，应同时更新主项目
 `pyproject.toml`、重新生成 `uv.lock` 并由独立 Harness Task 验证，不能手工编辑锁文件。
-安装后的无动作 API 检查：
+该旧流程安装后的无动作 API 检查：
 
 ```bash
 PYTHONNOUSERSITE=1 python -c \

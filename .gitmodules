@@ -4,6 +4,9 @@
 [submodule "hardware/reBotArm_control_py"]
 	path = hardware/reBotArm_control_py
 	url = https://github.com/Seeed-Projects/reBotArm_control_py.git
+[submodule "hardware/MotorBridge"]
+	path = hardware/MotorBridge
+	url = git@github.com:CYBER-QAQ/motorbridge.git
 [submodule "model/perception/sam2"]
 	path = model/perception/sam2
 	url = https://github.com/facebookresearch/sam2.git
