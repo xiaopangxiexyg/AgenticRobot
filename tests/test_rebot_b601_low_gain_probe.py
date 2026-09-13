@@ -4263,6 +4263,8 @@ def test_parser_help_is_read_only() -> None:
     assert args.feedback_source == "parameter"
     assert args.allow_active_report is False
     assert args.auto_disable_active_report is False
+    assert args.velocity_abort_rad_s == pytest.approx(2.5)
+    assert args.acceleration_abort_rad_s2 == pytest.approx(80.0)
     assert args.gravity_scale == pytest.approx(1.0)
     assert args.gravity_joint_scales == pytest.approx(
         (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
