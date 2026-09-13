@@ -318,7 +318,7 @@ def build_prepared_openpi_config(
                 front_occlusion_schedule=((0.0, 1.0),),
                 explicit_mask_keys=explicit_mask_keys,
                 front_force_black=False,
-                episode_manifest=str(source["episode_manifest"]),
+                episode_manifest=source.get("episode_manifest"),
             )
             for source in resolution.prepared_source_manifests
         )
@@ -472,7 +472,11 @@ def prepared_config_summary(
                 "name": str(source.name),
                 "dataset_root": str(source.dataset_root),
                 "sample_weight": int(source.sample_weight),
-                "episode_manifest": str(source.episode_manifest),
+                "episode_manifest": (
+                    None
+                    if source.episode_manifest is None
+                    else str(source.episode_manifest)
+                ),
             }
             for source in config.data.dataset_sources
         ],

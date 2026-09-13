@@ -1018,7 +1018,7 @@ class _SourceConfig:
     front_occlusion_schedule: tuple[tuple[float, float], ...]
     explicit_mask_keys: tuple[str, ...]
     front_force_black: bool
-    episode_manifest: str
+    episode_manifest: str | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1271,11 +1271,42 @@ def test_rebuilt_model_rtc_config_uses_output_identity_and_bound_artifact(
     checkpoint, profile_path, model_profile_path, _openpi_root, _profile = (
         _model_rtc_fixture(tmp_path)
     )
+    source_root = Path(str(_profile["sources"][0]["dataset_root"]))
+    (source_root / "meta" / "info.json").unlink()
+    (source_root / "meta").rmdir()
+    source_root.rmdir()
+    bindings_root = (
+        Path(str(_profile["organized_dataset_root"]))
+        / "derived"
+        / "openpi_prepared_skill_bindings"
+    )
+    binding_roots = tuple(bindings_root.iterdir())
+    assert len(binding_roots) == 1
+    binding_root = binding_roots[0]
+    binding_manifest = json.loads(
+        (binding_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    for record in binding_manifest["source_manifests"]:
+        (binding_root / record["episode_manifest"]).unlink()
+    (binding_root / "manifest.json").unlink()
+    binding_root.rmdir()
     resolution = prepared_deployment.prepare_checkpoint_deployment_artifact(
         checkpoint,
         profile_path,
         model_rtc_profile_path=model_profile_path,
         output_dir=tmp_path / "runtime",
+    )
+    training_run = json.loads(
+        (checkpoint / "model_continuation_training_run.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    source_binding = training_run["source_bindings"][0]
+    assert resolution.binding["prepared_skill_binding_hash"] == str(
+        source_binding["dataset_identity_hash"]
+    ).removeprefix("sha256:")
+    assert resolution.binding["prepared_skill_manifest_hash"] == (
+        source_binding["episode_manifest_hash"]
     )
     augmentation = _StateAugmentation(
         state_input_mode=resolution.deployment_artifact.state_input_mode,
@@ -1327,6 +1358,7 @@ def test_rebuilt_model_rtc_config_uses_output_identity_and_bound_artifact(
     )
     assert bound == resolution.deployment_artifact
     assert bound.model_continuation is not None
+    assert config.data.dataset_sources[0].episode_manifest is None
 
 
 def test_prepared_client_contract_check_uses_the_same_bound_artifact(
