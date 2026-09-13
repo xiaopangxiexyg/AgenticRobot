@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from hardware.rebot_b601_rs import B601HardwareState, B601JointState
 from robot_motion.rebot_b601_rs import B601_RS_ARM_JOINT_NAMES
 from scripts.hardware import rebot_b601_rs_low_gain_probe as probe
 
@@ -685,6 +686,134 @@ def test_enabled_startup_exit_attempts_recovery_before_stop(monkeypatch, tmp_pat
         assert after_enable.index("hold") < after_enable.index("disable")
         assert after_enable.count("read") >= 2
     assert after_enable[-2:] == ["restore", "close"]
+
+
+def test_active_report_warmup_requires_advancing_type24_and_disables_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("test fixture\n", encoding="utf-8")
+    config = SimpleNamespace(
+        channel="fake-no-hardware",
+        joints=[SimpleNamespace(mit_kp=1.0, mit_kd=0.1) for _ in range(6)],
+        feedback_timeout_sec=0.05,
+    )
+
+    def state(sequence: int) -> B601HardwareState:
+        joints = tuple(
+            B601JointState(
+                name=f"joint{index}",
+                motor_id=index,
+                feedback_id=0xFD,
+                arbitration_id=0x180000FD | (index << 8),
+                status_code=0,
+                position_rad=q[index - 1],
+                velocity_reported=0.0,
+                torque_reported_nm=0.0,
+                observed_at_sec=float(sequence),
+                sample_sequence=sequence,
+                valid=True,
+                stale=False,
+                position_source="robstride_operation_status_cache",
+                status_sequence=sequence,
+                receive_age_sec=0.001,
+                host_receive_freshness_verified=True,
+            )
+            for index in range(1, 7)
+        )
+        return B601HardwareState(
+            sequence=sequence,
+            receive_timestamp_sec=float(sequence),
+            joints=joints,
+            valid=True,
+            stale=False,
+            host_receive_freshness_verified=True,
+        )
+
+    class Backend:
+        sequence = 0
+
+        def connect(self) -> None:
+            events.append("connect")
+
+        def set_active_reporting(self, enabled: bool, **_kwargs: object) -> object:
+            events.append("report_on" if enabled else "report_off")
+            return SimpleNamespace(
+                completed=True,
+                errors=(),
+                operation="active_report",
+                requested_joint_names=probe._ALL_JOINTS,
+                completed_joint_names=probe._ALL_JOINTS,
+                failed_joint_names=(),
+            )
+
+        def poll_feedback(self, **kwargs: object) -> B601HardwareState:
+            assert kwargs == {"require_host_freshness": True}
+            self.sequence += 1
+            events.append(f"type24_{self.sequence}")
+            return state(self.sequence)
+
+        def safe_stop(self, **_kwargs: object) -> object:
+            events.append("safe_stop")
+            return SimpleNamespace(completed=True, errors=())
+
+        def apply_temporary_driver_torque_limits(self, *_args: object, **_kwargs: object) -> object:
+            events.append("limits_on")
+            return SimpleNamespace(completed=True, errors=())
+
+        def restore_driver_torque_limits(self) -> object:
+            events.append("limits_off")
+            return SimpleNamespace(completed=True, errors=())
+
+        def prepare_mit_mode(self, **_kwargs: object) -> object:
+            events.append("mit_mode")
+            return SimpleNamespace(completed=True, errors=())
+
+        def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(probe, "B601RSBackend", lambda _config: Backend())
+    monkeypatch.setattr(
+        probe.B601RSBackendConfig,
+        "from_rs_yaml",
+        lambda *_args, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        probe,
+        "_resolve_model_and_limits",
+        lambda _root: (SimpleNamespace(urdf_path=config_path), _fault_hold_limits()),
+    )
+    monkeypatch.setattr(probe, "_resolve_effort_limits", lambda *_args, **_kwargs: (1.0,) * 6)
+    monkeypatch.setattr(probe, "_drive_enable_countdown", lambda _stop: False)
+    monkeypatch.setattr(probe, "_operator_notice", lambda _message: None)
+    args = probe.build_parser().parse_args(
+        [
+            "--mode",
+            "hold",
+            "--config",
+            str(config_path),
+            "--rebot-source-root",
+            str(tmp_path),
+            "--feedback-source",
+            "active-report",
+            "--allow-active-report",
+            "--auto-disable-active-report",
+            "--allow-motion",
+            "--auto-disable",
+            "--apply-driver-torque-limits",
+            "--confirmation",
+            probe.CONFIRMATION,
+        ]
+    )
+
+    with pytest.raises(probe.LowGainProbeError, match="drive countdown"):
+        probe.run_probe(args)
+
+    assert events[:4] == ["connect", "report_on", "type24_1", "type24_2"]
+    assert events[-3:] == ["limits_off", "report_off", "close"]
 
 
 def test_protective_hold_notice_is_high_visibility_and_log_safe() -> None:
@@ -2971,6 +3100,65 @@ def test_latched_protective_hold_references_current_pose_after_manual_drag(
     assert errors == []
 
 
+def test_latched_protective_hold_uses_injected_control_feedback_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    reader_calls = 0
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        return _fault_hold_command_receipt(accepted=True), (0.0,) * 6, (0.0,) * 6
+
+    def feedback_reader() -> object:
+        nonlocal reader_calls
+        reader_calls += 1
+        return SimpleNamespace(
+            valid=True,
+            stale=False,
+            positions_rad=q,
+            fault_reason=None,
+        )
+
+    class FakeBackend:
+        def poll_feedback(self, **_kwargs: object) -> object:
+            raise AssertionError("legacy parameter feedback path must not be used")
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            raise AssertionError(f"unexpected safe_stop for {joint_names}")
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=object(),
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=2,
+        operator_interrupt=True,
+        feedback_reader=feedback_reader,
+    )
+
+    assert result[0] == 2
+    assert result[-1] == []
+    assert reader_calls == 1
+
+
 def test_operator_interrupt_ignores_transient_fault_velocity_for_first_hold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4072,6 +4260,9 @@ def test_parser_help_is_read_only() -> None:
     assert args.kp == pytest.approx(0.0)
     assert args.kd == pytest.approx(0.0)
     assert args.driver_kd is None
+    assert args.feedback_source == "parameter"
+    assert args.allow_active_report is False
+    assert args.auto_disable_active_report is False
     assert args.gravity_scale == pytest.approx(1.0)
     assert args.gravity_joint_scales == pytest.approx(
         (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
@@ -4167,12 +4358,46 @@ def test_parser_help_is_read_only() -> None:
     calibrated_args.gravity_joint_scales[1] = -0.1
     with pytest.raises(ValueError, match="six non-negative"):
         probe._validate_cli(calibrated_args)
-
     calibrated_args.gravity_joint_scales[1] = 0.95
     calibrated_args.gravity_coulomb_friction_nm[1] = -0.1
     with pytest.raises(ValueError, match="six non-negative"):
         probe._validate_cli(calibrated_args)
 
+
+def test_active_report_control_feedback_requires_both_state_acknowledgements() -> None:
+    parser = probe.build_parser()
+    base = [
+        "--mode",
+        "hold",
+        "--config",
+        "config.yaml",
+        "--rebot-source-root",
+        "source",
+        "--feedback-source",
+        "active-report",
+        "--allow-motion",
+        "--auto-disable",
+        "--apply-driver-torque-limits",
+        "--confirmation",
+        probe.CONFIRMATION,
+    ]
+
+    with pytest.raises(probe.LowGainProbeError, match="--allow-active-report"):
+        probe._validate_cli(parser.parse_args(base))
+    with pytest.raises(
+        probe.LowGainProbeError,
+        match="--auto-disable-active-report",
+    ):
+        probe._validate_cli(parser.parse_args([*base, "--allow-active-report"]))
+
+    args = parser.parse_args(
+        [
+            *base,
+            "--allow-active-report",
+            "--auto-disable-active-report",
+        ]
+    )
+    probe._validate_cli(args)
 
 def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
     parser = probe.build_parser()
