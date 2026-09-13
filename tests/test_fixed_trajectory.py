@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -7,6 +10,7 @@ from robot_motion.replay import (
     FIXED_TRAJECTORY_DIRECTIONS,
     available_fixed_trajectory_ids,
     build_fixed_trajectory_targets,
+    fixed_trajectory_catalog_hash,
     fixed_trajectory_direction_yaw_rad,
     get_fixed_trajectory,
 )
@@ -71,6 +75,19 @@ def test_greek_catalog_contains_complete_verified_one_stroke_alphabet() -> None:
         assert spec.bounding_height == pytest.approx(1.0)
 
 
+def test_latin_catalog_contains_complete_verified_one_stroke_alphabet() -> None:
+    letters = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    ids = available_fixed_trajectory_ids(family="latin")
+
+    assert ids == tuple(f"latin_{letter.lower()}_v1" for letter in letters)
+    for trajectory_id, letter in zip(ids, letters, strict=True):
+        spec = get_fixed_trajectory(trajectory_id)
+        assert spec.symbol == letter
+        assert spec.stroke_count == 1
+        assert len(spec.points) >= 2
+        assert spec.bounding_height == pytest.approx(1.0)
+
+
 def test_every_greek_trajectory_reuses_size_direction_and_boundary_contract() -> None:
     boundary = {"right": _pose(0.2, -0.1, 0.4)}
 
@@ -94,6 +111,94 @@ def test_every_greek_trajectory_reuses_size_direction_and_boundary_contract() ->
         assert targets[0].metadata["size_m"] == pytest.approx(0.06)
         assert targets[0].metadata["direction"] == "right"
         assert targets[-1].timestamp > targets[0].timestamp
+
+
+def test_every_latin_trajectory_reuses_size_direction_and_boundary_contract() -> None:
+    boundary = {"right": _pose(0.2, -0.1, 0.4)}
+
+    for trajectory_id in available_fixed_trajectory_ids(family="latin"):
+        targets = build_fixed_trajectory_targets(
+            boundary,
+            trajectory_id,
+            scale_m=0.06,
+            linear_speed_m_s=0.03,
+            direction="left",
+        )
+        positions = np.stack(
+            [
+                np.asarray(target.pose_by_side["right"], dtype=float)[:3, 3]
+                for target in targets
+            ]
+        )
+        np.testing.assert_allclose(targets[0].pose_by_side["right"], boundary["right"])
+        np.testing.assert_allclose(positions[:, 2], 0.4)
+        assert targets[0].metadata["family"] == "latin"
+        assert targets[0].metadata["size_m"] == pytest.approx(0.06)
+        assert targets[0].metadata["direction"] == "left"
+        assert targets[-1].timestamp > targets[0].timestamp
+
+
+def _write_additional_catalog(
+    path: Path,
+    *,
+    trajectory_id: str = "custom_triangle_v1",
+    stroke_count: int = 1,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "agentic_robot.rule_based_fixed_trajectories.v1",
+                "path_frame": "glyph_local_xy",
+                "normalization": "bounding_height_is_one",
+                "trajectories": [
+                    {
+                        "trajectory_id": trajectory_id,
+                        "family": "custom",
+                        "symbol": "triangle",
+                        "stroke_count": stroke_count,
+                        "points": [[0.0, 0.0], [0.5, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_additional_catalog_appends_without_replacing_builtins(tmp_path: Path) -> None:
+    catalog = tmp_path / "custom-trajectories.json"
+    _write_additional_catalog(catalog)
+
+    assert available_fixed_trajectory_ids(catalog_path=catalog) == (
+        "custom_triangle_v1",
+    )
+    ids = available_fixed_trajectory_ids(additional_catalog_path=catalog)
+    assert ids[:9] == tuple(f"digit_{index}_v1" for index in range(1, 10))
+    assert ids[-1] == "custom_triangle_v1"
+    assert get_fixed_trajectory(
+        "custom_triangle_v1",
+        additional_catalog_path=catalog,
+    ).family == "custom"
+
+    targets = build_fixed_trajectory_targets(
+        {"right": _pose(0.0, 0.0, 0.4)},
+        "custom_triangle_v1",
+        scale_m=0.08,
+        linear_speed_m_s=0.04,
+        additional_catalog_path=catalog,
+    )
+    assert targets[0].metadata["catalog_hash"] == fixed_trajectory_catalog_hash(
+        additional_catalog_path=catalog
+    )
+    assert targets[0].metadata["catalog_hash"] != fixed_trajectory_catalog_hash()
+
+
+def test_additional_catalog_cannot_shadow_builtin_id(tmp_path: Path) -> None:
+    catalog = tmp_path / "duplicate.json"
+    _write_additional_catalog(catalog, trajectory_id="digit_1_v1")
+
+    with pytest.raises(ValueError, match="duplicates existing ids: digit_1_v1"):
+        available_fixed_trajectory_ids(additional_catalog_path=catalog)
 
 
 def test_fixed_trajectory_anchors_first_point_and_holds_other_side() -> None:

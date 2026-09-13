@@ -257,6 +257,188 @@
       "latin_name": "omega",
       "stroke_count": 1,
       "points": [[-0.45, 0.0], [-0.28, 0.0], [-0.42, 0.25], [-0.4, 0.55], [-0.25, 0.85], [0.0, 1.0], [0.25, 0.85], [0.4, 0.55], [0.42, 0.25], [0.28, 0.0], [0.45, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_a_v1",
+      "family": "latin",
+      "symbol": "A",
+      "stroke_count": 1,
+      "points": [[-0.45, 0.0], [0.0, 1.0], [0.45, 0.0], [0.22, 0.48], [-0.22, 0.48]]
+    },
+    {
+      "trajectory_id": "latin_b_v1",
+      "family": "latin",
+      "symbol": "B",
+      "stroke_count": 1,
+      "points": [[-0.4, 0.0], [-0.4, 1.0], [0.02, 1.0], [0.34, 0.9], [0.4, 0.74], [0.32, 0.58], [-0.4, 0.52], [0.05, 0.52], [0.36, 0.42], [0.4, 0.22], [0.28, 0.06], [-0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_c_v1",
+      "family": "latin",
+      "symbol": "C",
+      "stroke_count": 1,
+      "points": [[0.4, 0.88], [0.18, 1.0], [-0.15, 0.96], [-0.4, 0.72], [-0.45, 0.45], [-0.36, 0.16], [-0.1, 0.0], [0.2, 0.03], [0.42, 0.18]]
+    },
+    {
+      "trajectory_id": "latin_d_v1",
+      "family": "latin",
+      "symbol": "D",
+      "stroke_count": 1,
+      "points": [[-0.4, 0.0], [-0.4, 1.0], [0.0, 1.0], [0.32, 0.85], [0.43, 0.5], [0.32, 0.15], [0.0, 0.0], [-0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_e_v1",
+      "family": "latin",
+      "symbol": "E",
+      "stroke_count": 1,
+      "points": [[0.4, 1.0], [-0.4, 1.0], [-0.4, 0.5], [0.25, 0.5], [-0.4, 0.5], [-0.4, 0.0], [0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_f_v1",
+      "family": "latin",
+      "symbol": "F",
+      "stroke_count": 1,
+      "points": [[0.4, 1.0], [-0.4, 1.0], [-0.4, 0.5], [0.25, 0.5], [-0.4, 0.5], [-0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_g_v1",
+      "family": "latin",
+      "symbol": "G",
+      "stroke_count": 1,
+      "points": [[0.4, 0.85], [0.2, 1.0], [-0.15, 0.98], [-0.42, 0.72], [-0.45, 0.4], [-0.32, 0.12], [-0.05, 0.0], [0.28, 0.08], [0.42, 0.3], [0.42, 0.48], [0.08, 0.48]]
+    },
+    {
+      "trajectory_id": "latin_h_v1",
+      "family": "latin",
+      "symbol": "H",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [-0.4, 0.0], [-0.4, 0.5], [0.4, 0.5], [0.4, 1.0], [0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_i_v1",
+      "family": "latin",
+      "symbol": "I",
+      "stroke_count": 1,
+      "points": [[-0.32, 1.0], [0.32, 1.0], [0.0, 1.0], [0.0, 0.0], [-0.32, 0.0], [0.32, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_j_v1",
+      "family": "latin",
+      "symbol": "J",
+      "stroke_count": 1,
+      "points": [[-0.35, 1.0], [0.35, 1.0], [0.25, 1.0], [0.25, 0.22], [0.12, 0.03], [-0.12, 0.0], [-0.32, 0.18]]
+    },
+    {
+      "trajectory_id": "latin_k_v1",
+      "family": "latin",
+      "symbol": "K",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [-0.4, 0.0], [-0.4, 0.5], [0.4, 1.0], [-0.4, 0.5], [0.42, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_l_v1",
+      "family": "latin",
+      "symbol": "L",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [-0.4, 0.0], [0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_m_v1",
+      "family": "latin",
+      "symbol": "M",
+      "stroke_count": 1,
+      "points": [[-0.45, 0.0], [-0.45, 1.0], [0.0, 0.45], [0.45, 1.0], [0.45, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_n_v1",
+      "family": "latin",
+      "symbol": "N",
+      "stroke_count": 1,
+      "points": [[-0.4, 0.0], [-0.4, 1.0], [0.4, 0.0], [0.4, 1.0]]
+    },
+    {
+      "trajectory_id": "latin_o_v1",
+      "family": "latin",
+      "symbol": "O",
+      "stroke_count": 1,
+      "points": [[0.0, 1.0], [0.32, 0.88], [0.44, 0.5], [0.32, 0.12], [0.0, 0.0], [-0.32, 0.12], [-0.44, 0.5], [-0.32, 0.88], [0.0, 1.0]]
+    },
+    {
+      "trajectory_id": "latin_p_v1",
+      "family": "latin",
+      "symbol": "P",
+      "stroke_count": 1,
+      "points": [[-0.4, 0.0], [-0.4, 1.0], [0.02, 1.0], [0.35, 0.88], [0.4, 0.68], [0.25, 0.52], [-0.4, 0.52]]
+    },
+    {
+      "trajectory_id": "latin_q_v1",
+      "family": "latin",
+      "symbol": "Q",
+      "stroke_count": 1,
+      "points": [[0.3, 0.15], [0.0, 0.0], [-0.32, 0.12], [-0.44, 0.5], [-0.32, 0.88], [0.0, 1.0], [0.32, 0.88], [0.44, 0.5], [0.3, 0.15], [0.45, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_r_v1",
+      "family": "latin",
+      "symbol": "R",
+      "stroke_count": 1,
+      "points": [[-0.4, 0.0], [-0.4, 1.0], [0.02, 1.0], [0.35, 0.88], [0.4, 0.68], [0.25, 0.52], [-0.4, 0.52], [0.42, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_s_v1",
+      "family": "latin",
+      "symbol": "S",
+      "stroke_count": 1,
+      "points": [[0.38, 0.86], [0.2, 1.0], [-0.12, 0.98], [-0.36, 0.8], [-0.28, 0.62], [0.12, 0.52], [0.36, 0.36], [0.32, 0.14], [0.08, 0.0], [-0.22, 0.03], [-0.4, 0.18]]
+    },
+    {
+      "trajectory_id": "latin_t_v1",
+      "family": "latin",
+      "symbol": "T",
+      "stroke_count": 1,
+      "points": [[-0.42, 1.0], [0.42, 1.0], [0.0, 1.0], [0.0, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_u_v1",
+      "family": "latin",
+      "symbol": "U",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [-0.4, 0.25], [-0.25, 0.04], [0.0, 0.0], [0.25, 0.04], [0.4, 0.25], [0.4, 1.0]]
+    },
+    {
+      "trajectory_id": "latin_v_v1",
+      "family": "latin",
+      "symbol": "V",
+      "stroke_count": 1,
+      "points": [[-0.45, 1.0], [0.0, 0.0], [0.45, 1.0]]
+    },
+    {
+      "trajectory_id": "latin_w_v1",
+      "family": "latin",
+      "symbol": "W",
+      "stroke_count": 1,
+      "points": [[-0.48, 1.0], [-0.25, 0.0], [0.0, 0.55], [0.25, 0.0], [0.48, 1.0]]
+    },
+    {
+      "trajectory_id": "latin_x_v1",
+      "family": "latin",
+      "symbol": "X",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [0.4, 0.0], [0.0, 0.5], [0.4, 1.0], [-0.4, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_y_v1",
+      "family": "latin",
+      "symbol": "Y",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [0.0, 0.5], [0.4, 1.0], [0.0, 0.5], [0.0, 0.0]]
+    },
+    {
+      "trajectory_id": "latin_z_v1",
+      "family": "latin",
+      "symbol": "Z",
+      "stroke_count": 1,
+      "points": [[-0.4, 1.0], [0.4, 1.0], [-0.4, 0.0], [0.4, 0.0]]
     }
   ]
 }

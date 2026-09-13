@@ -59,6 +59,7 @@ from robot_motion.replay import (
     RuleBasedSegmentStopCondition,
     available_fixed_trajectory_ids,
     build_fixed_trajectory_targets,
+    fixed_trajectory_catalog_hash,
     get_fixed_trajectory,
     replay_action_metadata,
     replay_end_effector_targets_at_index,
@@ -305,10 +306,20 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     group.add_argument(
+        "--rule-writing-trajectory-catalog",
+        default=None,
+        help=(
+            "Optional absolute JSON catalog appended to the built-in trajectories. "
+            "Ids must be unique and every trajectory must be one stroke."
+        ),
+    )
+    group.add_argument(
         "--rule-writing-trajectory",
         default="digit_1_v1",
-        choices=available_fixed_trajectory_ids(),
-        help="One-stroke fixed trajectory inserted in place of the source write stage.",
+        help=(
+            "One-stroke fixed trajectory inserted in place of the source write stage; "
+            "validated against the composed catalog before device preflight."
+        ),
     )
     group.add_argument(
         "--rule-writing-size-m",
@@ -789,6 +800,7 @@ class FixedWritingActionSource:
         direction: str,
         left_hold_pose: np.ndarray,
         reference_hz: float,
+        additional_catalog_path: Path | None = None,
         hand_trajectory_by_side: Mapping[str, np.ndarray] | None = None,
         hand_action_specs_by_side: Mapping[str, HandActionSpec] | None = None,
     ) -> None:
@@ -796,6 +808,7 @@ class FixedWritingActionSource:
         self.scale_m = float(scale_m)
         self.speed_m_s = float(speed_m_s)
         self.direction = str(direction)
+        self.additional_catalog_path = additional_catalog_path
         self.left_hold_pose = np.asarray(left_hold_pose, dtype=float).reshape(7).copy()
         self.hand_trajectory_by_side = {
             str(side): np.asarray(values, dtype=np.float32).copy()
@@ -885,6 +898,7 @@ class FixedWritingActionSource:
                 linear_speed_m_s=self.speed_m_s,
                 side="right",
                 direction=self.direction,
+                additional_catalog_path=self.additional_catalog_path,
             )
             self._targets = resample_motion_targets(
                 keyframes,
@@ -1453,10 +1467,48 @@ def _configuration_option_entry(
     }
 
 
-def _fixed_trajectory_option(trajectory_id: str) -> dict[str, str]:
-    spec = get_fixed_trajectory(trajectory_id)
+def _additional_fixed_trajectory_catalog_path(
+    args: argparse.Namespace,
+) -> Path | None:
+    value = getattr(args, "rule_writing_trajectory_catalog", None)
+    if value is None or not str(value).strip():
+        return None
+    candidate = Path(os.path.expandvars(str(value))).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("rule writing trajectory catalog path must be absolute.")
+    if candidate.is_symlink():
+        raise ValueError("rule writing trajectory catalog must not be a symlink.")
+    if not candidate.is_file():
+        raise ValueError(
+            f"rule writing trajectory catalog does not exist: {candidate}"
+        )
+    resolved = candidate.resolve(strict=True)
+
+    # Validate the complete overlay, including conflicts with the checked-in
+    # catalog, before any option is exposed to the real collection UI.
+    available_fixed_trajectory_ids(additional_catalog_path=resolved)
+    for trajectory_id in available_fixed_trajectory_ids(catalog_path=resolved):
+        spec = get_fixed_trajectory(trajectory_id, catalog_path=resolved)
+        if spec.stroke_count != 1:
+            raise ValueError(
+                f"additional fixed trajectory {trajectory_id!r} is not a one-stroke path"
+            )
+    return resolved
+
+
+def _fixed_trajectory_option(
+    trajectory_id: str,
+    *,
+    additional_catalog_path: Path | None = None,
+) -> dict[str, str]:
+    spec = get_fixed_trajectory(
+        trajectory_id,
+        additional_catalog_path=additional_catalog_path,
+    )
     if spec.family == "digit":
         label = f"数字 {spec.symbol}"
+    elif spec.family == "latin":
+        label = f"英文字母 {spec.symbol}"
     elif spec.family == "greek":
         latin_name = str(spec.metadata.get("latin_name", "")).strip()
         suffix = f" · {latin_name}" if latin_name else ""
@@ -1472,6 +1524,7 @@ def _rule_configuration_options(
     source_specs: Mapping[str, ResolvedRuleBasedWritingSourceCandidate],
     resolved_writing_speed_m_s: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    additional_catalog_path = _additional_fixed_trajectory_catalog_path(args)
     manifest = getattr(args, "rule_source_pool_manifest", None)
     if manifest is None:
         candidates = tuple({spec.candidate.candidate_id: spec for spec in source_specs.values()}.values())
@@ -1558,8 +1611,13 @@ def _rule_configuration_options(
     options = {
         "source_candidates_by_phase": source_options,
         "trajectory_ids": [
-            _fixed_trajectory_option(value)
-            for value in available_fixed_trajectory_ids()
+            _fixed_trajectory_option(
+                value,
+                additional_catalog_path=additional_catalog_path,
+            )
+            for value in available_fixed_trajectory_ids(
+                additional_catalog_path=additional_catalog_path,
+            )
         ],
         "directions": [
             {"value": value, "label": {"up": "向上", "right": "向右", "down": "向下", "left": "向左"}[value]}
@@ -2204,6 +2262,10 @@ def build_rule_based_writing(
         or RULE_COLLECTION_MODE_WRITING
     )
     if collection_mode == RULE_COLLECTION_MODE_FULL_REPLAY:
+        if getattr(args, "rule_writing_trajectory_catalog", None):
+            raise ValueError(
+                "rule writing trajectory catalog is not valid in full replay mode."
+            )
         return _build_full_trajectory_replay(
             args,
             deployment=deployment,
@@ -2211,6 +2273,7 @@ def build_rule_based_writing(
         )
     if collection_mode != RULE_COLLECTION_MODE_WRITING:
         raise ValueError(f"unsupported rule collection mode: {collection_mode!r}.")
+    additional_catalog_path = _additional_fixed_trajectory_catalog_path(args)
     source_specs, source_selection = _resolve_source_specs(args)
     requested_by_candidate: dict[str, list[str]] = {}
     spec_by_candidate: dict[str, ResolvedRuleBasedWritingSourceCandidate] = {}
@@ -2271,6 +2334,26 @@ def build_rule_based_writing(
         }
     source_selection = {
         **source_selection,
+        "trajectory_catalog": {
+            "mode": (
+                "default_plus_additional"
+                if additional_catalog_path is not None
+                else "default"
+            ),
+            "combined_sha256": fixed_trajectory_catalog_hash(
+                additional_catalog_path=additional_catalog_path,
+            ),
+            "additional_path": (
+                str(additional_catalog_path)
+                if additional_catalog_path is not None
+                else None
+            ),
+            "additional_sha256": (
+                fixed_trajectory_catalog_hash(additional_catalog_path)
+                if additional_catalog_path is not None
+                else None
+            ),
+        },
         "phases": phase_provenance,
         "gripper_sides": list(configured_gripper_sides),
         "control_topology": {
@@ -2376,6 +2459,7 @@ def build_rule_based_writing(
         linear_speed_m_s=speed,
         side="right",
         direction=args.rule_writing_direction,
+        additional_catalog_path=additional_catalog_path,
     )
     preview_targets = resample_motion_targets(
         preview_keyframes,
@@ -2469,6 +2553,7 @@ def build_rule_based_writing(
         speed_m_s=speed,
         direction=args.rule_writing_direction,
         left_hold_pose=left_hold_pose,
+        additional_catalog_path=additional_catalog_path,
         hand_trajectory_by_side=writing_hand_trajectory,
         hand_action_specs_by_side=runtime_hand_specs,
         reference_hz=float(write_source.episode.nominal_hz),

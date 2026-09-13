@@ -247,6 +247,56 @@ The fixed path is authored in glyph-local XY and rotated only within
 through the current runtime contract. The existing RealTeleop resolver then
 performs the canonical-desk to per-arm hardware-frame conversion.
 
+## Built-in and operator-authored trajectories
+
+The versioned built-in catalog contains nine digits, 24 Greek letters, and all
+26 uppercase English letters. English identifiers are `latin_a_v1` through
+`latin_z_v1`. They use the same one-stroke, size, four-direction, speed, desk
+frame, causal anchoring, left-arm hold, and dataset-capture contracts as the
+existing digits and Greek letters.
+
+An operator can append trajectories without changing Python or the production
+launcher. Put one or more paths in a separate JSON file with the same catalog
+schema, then pass both the catalog and selected trajectory id:
+
+```json
+{
+  "schema": "agentic_robot.rule_based_fixed_trajectories.v1",
+  "path_frame": "glyph_local_xy",
+  "normalization": "bounding_height_is_one",
+  "trajectories": [
+    {
+      "trajectory_id": "custom_triangle_v1",
+      "family": "custom",
+      "symbol": "triangle",
+      "stroke_count": 1,
+      "points": [[0.0, 0.0], [0.5, 1.0], [1.0, 0.0], [0.0, 0.0]]
+    }
+  ]
+}
+```
+
+```bash
+bash scripts/run_rule_based_writing_collection.sh \
+  ... \
+  --trajectory-catalog /absolute/path/to/operator-trajectories.json \
+  --trajectory custom_triangle_v1
+```
+
+The external file is an overlay, not a replacement: all built-in identifiers
+remain selectable. The launcher requires an existing absolute, non-symlink
+file. Before device preflight, the plan validates its schema, finite points,
+positive path height, nonzero consecutive segments, one-stroke declaration,
+and uniqueness against both the external file and built-ins. A custom id cannot
+shadow a built-in id. The catalog path, its SHA-256, and the combined built-in
+plus external hash are retained in collection provenance.
+
+Catalogs are immutable for one launcher process. To add or revise a trajectory,
+stop while motion-inert, edit the external file, inspect with `--dry-run`, and
+start a new process. Never replace the file while an Episode is running. This
+keeps the generated path fixed for the complete collection attempt while making
+future additions data-only changes.
+
 ## Offline command inspection
 
 ### Cross-dataset source pool
@@ -278,8 +328,9 @@ manifest candidate list; omitting it uses the full list. For each of
 candidate deterministically from the range using the manifest semantic hash
 and `--selection-seed`. The dedicated UI contains three independent
 selectors for every phase-eligible candidate, all nine fixed digit paths, all
-24 fixed one-stroke Greek paths, all four directions, glyph height, writing
-speed, and an initialization-speed multiplier. Startup arguments provide the
+24 fixed one-stroke Greek paths, all 26 uppercase English paths, every admitted
+external path, all four directions, glyph height, writing speed, and an
+initialization-speed multiplier. Startup arguments provide the
 initial values and the dedicated UI may rebuild them only while the runtime is
 motion-inert. The
 pre-motion form also contains the runtime-safe writer controls:
