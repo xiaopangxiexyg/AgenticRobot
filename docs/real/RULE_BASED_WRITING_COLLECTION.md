@@ -48,6 +48,17 @@ Only steps 2-4 are admitted to the formal dataset. Cameras, tactile capture,
 sample synchronization, and persistence remain atomic and are owned by the
 existing formal writer.
 
+The left-arm target is selected per formal Episode, not once per launcher.
+For a normal Episode, the first certified initialization moves the left arm to
+frame 0 of that Episode's selected `pen_down` source while it moves the right
+arm to the matching start. FixArm captures the left qpos only after measured
+arrival, and the left arm then remains stationary through pen-down, generated
+writing, and relative pen-up. After a successful writer close, the runtime
+releases only that deferred FixArm authority and activates the next validated
+batch item. The next operator Start therefore performs a new bimanual
+initialization to that item's own source state. No inter-Episode motion starts
+automatically, and failed or aborted attempts do not advance the batch.
+
 An optional source-pool prelude can be inserted before step 1 with
 `--pre-pen-down-replay-candidate-id ID` or the dedicated UI selector. When it
 is enabled, the runtime first uses the same collision-checked qpos
@@ -59,6 +70,16 @@ the existing pen-down/write/pen-up stages. The left arm action and measured
 qpos/TCP initialization state are pinned to the selected pen-down source hold
 throughout the prelude. Enabled DMTAC channels keep using the existing causal,
 step-limited runtime path.
+
+`--pre-pen-down-replay-normal-episodes N` controls how often the configured
+prelude is used. For `N > 0`, the runtime commits `N` ordinary successful
+Episodes, then uses the prelude for one Episode, resets the counter, and
+repeats. An Episode counts only after the formal writer has closed
+successfully; Hold, abort, failed startup, and discarded attempts do not
+consume the interval. `N=0` preserves the previous behavior and uses the
+configured prelude before every Episode. If no prelude candidate is selected,
+the interval has no motion effect. The selected interval and the current
+schedule state are written into rule-based sample provenance.
 
 The option is disabled by default and is intentionally available only with a
 source-pool manifest, where `ID` has one exact dataset/Episode identity inside
@@ -349,7 +370,9 @@ and `--selection-seed`. The dedicated UI contains three independent
 selectors for every phase-eligible candidate, all nine fixed digit paths, all
 24 fixed one-stroke Greek paths, all 26 uppercase English paths, every admitted
 external path, all four directions, glyph height, writing speed, and an
-initialization-speed multiplier. Startup arguments provide the
+initialization-speed multiplier. The optional prelude selector is accompanied
+by an integer field for the number of ordinary successful Episodes between
+prelude runs. Startup arguments provide the
 initial values and the dedicated UI may rebuild them only while the runtime is
 motion-inert. The
 pre-motion form also contains the runtime-safe writer controls:
@@ -377,6 +400,8 @@ bash scripts/run_rule_based_writing_collection.sh \
   --source-pool-manifest /absolute/path/to/writing_source_pool.json \
   --source-pool-range 0:200 \
   --selection-seed 42 \
+  --pre-pen-down-replay-candidate-id day07-episode101 \
+  --pre-pen-down-replay-normal-episodes 5 \
   --dataset-root /home/user/zc/datasets/RealmanDMTAC/FormalCollection \
   --tactile-bundle-root /absolute/path/to/existing/tactile_root \
   --trajectory digit_1_v1 \

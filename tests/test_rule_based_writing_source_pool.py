@@ -18,6 +18,7 @@ from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM
 from robot_motion.pose_frame_profiles import (
     default_rm65_workspace_near_boundary_collection_pose_frame_contract,
 )
+from robot_motion.replay import RuleBasedCollectionCursor
 from teleop_runtime.real_teleop import rule_based_writing_plan as writing_plan
 from teleop_runtime.replay.dataset import EpisodeSummary, LoadedReplayEpisode
 
@@ -349,6 +350,7 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         rule_writing_direction="up",
         rule_writing_speed_m_s=None,
         rule_initial_alignment_speed_scale=1.0,
+        rule_pre_pen_down_replay_normal_episodes=0,
         left_hand_backend="none",
         right_hand_backend="none",
     )
@@ -374,6 +376,17 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         == build.source_selection["pool_manifest_hash"]
     )
     options = build.extension._configuration_options
+    assert options["integer_fields"][0] == "pre_pen_down_replay_normal_episodes"
+    assert options["numeric_bounds"]["pre_pen_down_replay_normal_episodes"] == [
+        0,
+        10000,
+    ]
+    assert (
+        build.extension._selected_configuration[
+            "pre_pen_down_replay_normal_episodes"
+        ]
+        == 0
+    )
     assert [step.step_id for step in build.extension.plan.steps] == [
         "initial_alignment",
         "right_write.pen_down",
@@ -381,6 +394,18 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         "right_write.write",
         "right_write.pen_up",
     ]
+    normal_initialize = next(
+        RuleBasedCollectionCursor(
+            build.extension._normal_plan,
+            build.extension.trajectory_groups,
+        )
+    )
+    assert set(normal_initialize.qpos_by_side) == {"left", "right"}
+    np.testing.assert_allclose(
+        normal_initialize.qpos_by_side["left"],
+        build.extension.trajectory_groups["pen_down"]
+        .arm_observation_actual_qpos["left"][0],
+    )
     assert "pre_pen_down" not in build.extension.trajectory_groups
     assert options["pre_pen_down_replay_candidates"][0] == {
         "value": "",
@@ -464,19 +489,51 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
     )
     prelude_steps = prelude_rebuilt.plan.steps[:3]
     assert prelude_steps[0].capture.enabled is False
+    assert prelude_steps[0].active_sides == ("left", "right")
     assert prelude_steps[1].active_sides == ("right",)
     assert prelude_steps[1].capture.enabled is False
+    assert prelude_steps[2].active_sides == ("right",)
     assert prelude_steps[2].capture.enabled is False
     assert (
         prelude_rebuilt.source_selection["pre_pen_down_replay"]["candidate_id"]
         == "stroke"
     )
+    cadenced_rebuilt = build.extension._configuration_rebuilder(
+        {
+            **selected_configuration,
+            "pre_pen_down_replay_candidate_id": "stroke",
+            "pre_pen_down_replay_normal_episodes": 2,
+        }
+    )
+    assert [step.step_id for step in cadenced_rebuilt.plan.steps] == [
+        "initial_alignment",
+        "right_write.pen_down",
+        "right_write.pen_down.height_descent",
+        "right_write.write",
+        "right_write.pen_up",
+    ]
+    assert cadenced_rebuilt._pre_pen_down_replay_plan is not None
+    assert [
+        step.step_id for step in cadenced_rebuilt._pre_pen_down_replay_plan.steps[:3]
+    ] == [
+        writing_plan.PRE_PEN_DOWN_ALIGNMENT_STEP_ID,
+        writing_plan.PRE_PEN_DOWN_REPLAY_STEP_ID,
+        writing_plan.PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID,
+    ]
+    assert cadenced_rebuilt.status().pre_pen_down_replay_active is False
+    assert cadenced_rebuilt.status().pre_pen_down_replay_normal_episodes == 2
     rebuilt._initial_alignment_executor.shutdown(wait=False, cancel_futures=True)
     rebuilt._configuration_executor.shutdown(wait=False, cancel_futures=True)
     prelude_rebuilt._initial_alignment_executor.shutdown(
         wait=False, cancel_futures=True
     )
     prelude_rebuilt._configuration_executor.shutdown(wait=False, cancel_futures=True)
+    cadenced_rebuilt._initial_alignment_executor.shutdown(
+        wait=False, cancel_futures=True
+    )
+    cadenced_rebuilt._configuration_executor.shutdown(
+        wait=False, cancel_futures=True
+    )
 
 
 def test_gui_phase_candidate_overrides_cover_independent_source_combinations(

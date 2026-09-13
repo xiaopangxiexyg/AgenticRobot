@@ -35,6 +35,9 @@ Options:
   --pre-pen-down-replay-candidate-id ID
                               Writing mode only; optional complete source Episode
                               replayed without capture before pen-down.
+  --pre-pen-down-replay-normal-episodes N
+                              Successful normal Episodes before one configured
+                              pre-pen-down replay (default: 0, replay every Episode).
   --task-name NAME            Output collection task name.
   --tactile-min-free-gb N     Required tactile free space (default: 200).
   --camera-frame-max-age-sec S
@@ -71,6 +74,7 @@ SOURCE_POOL_MANIFEST=""
 SOURCE_POOL_RANGE=""
 SELECTION_SEED="0"
 PRE_PEN_DOWN_REPLAY_CANDIDATE_ID=""
+PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES="0"
 COLLECTION_MODE="rule-based-writing"
 TACTILE_ROOT="${TACTILE_BUNDLE_ROOT:-}"
 OUTPUT_DATASET_ROOT="${DATASET_BASE:-}"
@@ -100,6 +104,7 @@ declare -A VALUE_OPTION_TARGET=(
   [--source-pool-range]=SOURCE_POOL_RANGE
   [--selection-seed]=SELECTION_SEED
   [--pre-pen-down-replay-candidate-id]=PRE_PEN_DOWN_REPLAY_CANDIDATE_ID
+  [--pre-pen-down-replay-normal-episodes]=PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES
   [--tactile-bundle-root]=TACTILE_ROOT
   [--dataset-root]=OUTPUT_DATASET_ROOT
   [--trajectory]=TRAJECTORY
@@ -123,6 +128,7 @@ declare -A VALUE_OPTION_HINT=(
   [--source-pool-range]=START:END
   [--selection-seed]=N
   [--pre-pen-down-replay-candidate-id]=ID
+  [--pre-pen-down-replay-normal-episodes]=N
   [--tactile-bundle-root]=PATH
   [--dataset-root]=PATH
   [--trajectory]=ID
@@ -183,12 +189,17 @@ fi
 if [[ "$COLLECTION_MODE" == "full-replay" && -n "$PRE_PEN_DOWN_REPLAY_CANDIDATE_ID" ]]; then
   die "--pre-pen-down-replay-candidate-id is not valid in full-replay mode."
 fi
+if [[ "$COLLECTION_MODE" == "full-replay" && "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" != "0" ]]; then
+  die "--pre-pen-down-replay-normal-episodes is not valid in full-replay mode."
+fi
 
 [[ -n "$TACTILE_ROOT" ]] || die "--tactile-bundle-root is required."
 [[ "$TACTILE_ROOT" == /* ]] || die "tactile root must be absolute."
 [[ -d "$TACTILE_ROOT" ]] || die "tactile root does not exist: $TACTILE_ROOT"
 [[ ! -L "$TACTILE_ROOT" ]] || die "tactile root must not be a symlink."
 [[ "$SELECTION_SEED" =~ ^-?[0-9]+$ ]] || die "selection seed must be an integer."
+[[ "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" =~ ^[0-9]+$ ]] || \
+  die "pre-pen-down replay normal Episodes must be a non-negative integer."
 if ! [[ "$INITIAL_ALIGNMENT_SPEED_SCALE" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
   die "initial alignment speed scale must be a positive decimal in (0, 1]."
 fi
@@ -275,6 +286,8 @@ if [[ "$COLLECTION_MODE" == "rule-based-writing" ]]; then
     --rule-writing-trajectory "$TRAJECTORY"
     --rule-writing-size-m "$SIZE_M"
     --rule-writing-direction "$DIRECTION"
+    --rule-pre-pen-down-replay-normal-episodes
+    "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES"
   )
   if [[ -n "$TRAJECTORY_CATALOG" ]]; then
     RULE_ARGS+=(--rule-writing-trajectory-catalog "$TRAJECTORY_CATALOG")
@@ -409,7 +422,7 @@ printf '%s\n' \
   "[RuleBased] starting collection mode=$COLLECTION_MODE on the established real-teleop UI." \
   '[RuleBased] clear the workspace; start one formal Episode only after the existing GUI reports ready.' \
   "[RuleBased] source_pool=${SOURCE_POOL_MANIFEST:-legacy_single_source} range=${SOURCE_POOL_RANGE:-all} seed=$SELECTION_SEED" \
-  "[RuleBased] pre_pen_down_replay=${PRE_PEN_DOWN_REPLAY_CANDIDATE_ID:-disabled}" \
+  "[RuleBased] pre_pen_down_replay=${PRE_PEN_DOWN_REPLAY_CANDIDATE_ID:-disabled} normal_episodes_between_replays=$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" \
   "[RuleBased] source_dataset=${SOURCE_DATASET:-pool_selected} episode=${SOURCE_EPISODE:-pool_selected}" \
   "[RuleBased] detail_annotation_dir=${DETAIL_ANNOTATION_DIR:-pool_selected}" \
   "[RuleBased] trajectory=$TRAJECTORY catalog=${TRAJECTORY_CATALOG:-builtin} size_m=$SIZE_M direction=$DIRECTION speed_m_s=${SPEED_M_S:-source_average}" \

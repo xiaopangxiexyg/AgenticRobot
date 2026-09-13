@@ -182,6 +182,7 @@ class RuleBasedRealTeleopConfig:
     settle_consecutive_samples: int = 3
     target_timeout_sec: float = 30.0
     initial_alignment_speed_scale: float = 1.0
+    pre_pen_down_replay_normal_episodes: int = 0
     gripper_sides: tuple[str, ...] = ()
     gripper_max_step: float = 0.05
     gripper_qpos_tolerance: float = 0.05
@@ -218,6 +219,20 @@ class RuleBasedRealTeleopConfig:
                 raise ValueError(f"{name} must be finite and positive.")
         if float(self.initial_alignment_speed_scale) > 1.0:
             raise ValueError("initial_alignment_speed_scale must be in (0, 1].")
+        normal_episodes = self.pre_pen_down_replay_normal_episodes
+        if (
+            isinstance(normal_episodes, bool)
+            or not isinstance(normal_episodes, (int, np.integer))
+            or int(normal_episodes) < 0
+        ):
+            raise ValueError(
+                "pre_pen_down_replay_normal_episodes must be a non-negative integer."
+            )
+        object.__setattr__(
+            self,
+            "pre_pen_down_replay_normal_episodes",
+            int(normal_episodes),
+        )
         if float(self.gripper_max_step) > 1.0:
             raise ValueError("gripper_max_step must be in (0, 1].")
         if float(self.manual_gripper_tolerance) > float(self.gripper_max_step):
@@ -333,6 +348,9 @@ class RuleBasedRealTeleopStatus:
     planned_sample_count: int = 0
     collection_position: str | None = None
     initial_alignment_speed_scale: float = 1.0
+    pre_pen_down_replay_active: bool = False
+    pre_pen_down_replay_normal_episodes: int = 0
+    pre_pen_down_normal_completed_count: int = 0
     gripper_sides: tuple[str, ...] = field(default_factory=tuple)
     control_topology: str = "双臂（无夹爪）"
     gripper_control_available: bool = False
@@ -409,17 +427,31 @@ class RuleBasedRealTeleopExtension:
         trajectory_groups: Mapping[str, ReplayTrajectoryGroup],
         config: RuleBasedRealTeleopConfig | None = None,
         source_selection: Mapping[str, Any] | None = None,
+        pre_pen_down_replay_plan: RuleBasedCollectionPlan | None = None,
     ) -> None:
         if not isinstance(deployment, RuleBasedRealTeleopDeployment):
             raise TypeError("deployment must be RuleBasedRealTeleopDeployment.")
         if not isinstance(plan, RuleBasedCollectionPlan):
             raise TypeError("plan must be RuleBasedCollectionPlan.")
+        if pre_pen_down_replay_plan is not None and not isinstance(
+            pre_pen_down_replay_plan,
+            RuleBasedCollectionPlan,
+        ):
+            raise TypeError(
+                "pre_pen_down_replay_plan must be RuleBasedCollectionPlan when provided."
+            )
         self.deployment = deployment
-        self.plan = plan
         self.trajectory_groups = dict(trajectory_groups)
         self.config = config or RuleBasedRealTeleopConfig()
         self.source_selection = copy.deepcopy(dict(source_selection or {}))
-        self._validate_plan()
+        self._normal_plan = plan
+        self._pre_pen_down_replay_plan = pre_pen_down_replay_plan
+        self._pre_pen_down_normal_completed_count = 0
+        self._pre_pen_down_replay_active = False
+        self.plan = self._plan_for_next_attempt()
+        self._validate_plan(self._normal_plan)
+        if self._pre_pen_down_replay_plan is not None:
+            self._validate_plan(self._pre_pen_down_replay_plan)
         self._planned_sample_count = self._count_planned_samples()
         self._stage_total_by_step = self._stage_totals_by_step()
         self.runtime_pose_frame_contract = resolve_runtime_pose_frame_contract(
@@ -660,8 +692,8 @@ class RuleBasedRealTeleopExtension:
                 totals[step.step_id] = int(getattr(step, "repeats", 1))
         return totals
 
-    def _validate_plan(self) -> None:
-        steps = tuple(self.plan.steps)
+    def _validate_plan(self, plan: RuleBasedCollectionPlan | None = None) -> None:
+        steps = tuple((self.plan if plan is None else plan).steps)
         for index, step in enumerate(steps):
             if step.capture.stream_ids:
                 raise ValueError(
@@ -693,6 +725,45 @@ class RuleBasedRealTeleopExtension:
                 )
             result[step.relative_to] = frame
         return result
+
+    def _plan_for_next_attempt(self) -> RuleBasedCollectionPlan:
+        interval = int(self.config.pre_pen_down_replay_normal_episodes)
+        use_prelude = bool(
+            self._pre_pen_down_replay_plan is not None
+            and (
+                interval == 0
+                or self._pre_pen_down_normal_completed_count >= interval
+            )
+        )
+        self._pre_pen_down_replay_active = use_prelude
+        return (
+            self._pre_pen_down_replay_plan
+            if use_prelude and self._pre_pen_down_replay_plan is not None
+            else self._normal_plan
+        )
+
+    def _advance_pre_pen_down_replay_cadence(self) -> None:
+        """Count only a fully committed successful Episode."""
+
+        if self._pre_pen_down_replay_plan is None:
+            self._pre_pen_down_normal_completed_count = 0
+            return
+        if self._pre_pen_down_replay_active:
+            self._pre_pen_down_normal_completed_count = 0
+        else:
+            self._pre_pen_down_normal_completed_count += 1
+
+    def _pre_pen_down_replay_schedule_metadata(self) -> dict[str, Any]:
+        return {
+            "configured": self._pre_pen_down_replay_plan is not None,
+            "active_for_episode": bool(self._pre_pen_down_replay_active),
+            "normal_episodes_between_replays": int(
+                self.config.pre_pen_down_replay_normal_episodes
+            ),
+            "normal_successful_episodes_since_replay": int(
+                self._pre_pen_down_normal_completed_count
+            ),
+        }
 
     def attach_components(self, components: object) -> object:
         if set(getattr(components, "active_sides", ())) != {"left", "right"}:
@@ -764,6 +835,7 @@ class RuleBasedRealTeleopExtension:
                         f"Session Rig already owns a different backend for "
                         f"{effector_name}"
                     )
+
         if session.command_override_provider is not None:
             raise RuntimeError("RealTeleop already has a command override provider.")
         if session.human_command_selection_provider is not None:
@@ -901,6 +973,12 @@ class RuleBasedRealTeleopExtension:
                 "expected": list(expected_identity),
                 "actual": list(actual_identity),
             }
+        template = self._initial_alignment_template
+        actively_aligned_sides = set(
+            ()
+            if template is None
+            else template.directive.qpos_by_side
+        )
         verified: dict[str, EffectorCommand] = {}
         for side in ("left", "right"):
             name = f"{side}_arm"
@@ -942,7 +1020,10 @@ class RuleBasedRealTeleopExtension:
                     "max_error_rad": max_error,
                 }
                 continue
-            if bool(getattr(actual, "metadata", {}).get("fix_arm_active", False)):
+            fix_arm_active = bool(
+                getattr(actual, "metadata", {}).get("fix_arm_active", False)
+            )
+            if fix_arm_active and side in actively_aligned_sides:
                 mismatch[name] = "fix_arm_rewrote_initialization_command"
                 continue
             verified[side] = actual.copy()
@@ -1714,11 +1795,27 @@ class RuleBasedRealTeleopExtension:
             wait=False,
             cancel_futures=True,
         )
-        self.plan = replacement.plan
+        prior_interval = int(self.config.pre_pen_down_replay_normal_episodes)
+        prior_has_prelude = self._pre_pen_down_replay_plan is not None
+        prior_normal_completed = self._pre_pen_down_normal_completed_count
+        self._normal_plan = replacement._normal_plan
+        self._pre_pen_down_replay_plan = replacement._pre_pen_down_replay_plan
         self.trajectory_groups = dict(replacement.trajectory_groups)
         self.config = replacement.config
         self.source_selection = copy.deepcopy(replacement.source_selection)
-        self._validate_plan()
+        preserve_cadence = bool(
+            prior_has_prelude
+            and self._pre_pen_down_replay_plan is not None
+            and prior_interval
+            == int(self.config.pre_pen_down_replay_normal_episodes)
+        )
+        self._pre_pen_down_normal_completed_count = (
+            prior_normal_completed if preserve_cadence else 0
+        )
+        self.plan = self._plan_for_next_attempt()
+        self._validate_plan(self._normal_plan)
+        if self._pre_pen_down_replay_plan is not None:
+            self._validate_plan(self._pre_pen_down_replay_plan)
         self._planned_sample_count = self._count_planned_samples()
         self._stage_total_by_step = self._stage_totals_by_step()
         self._boundaries.clear()
@@ -3501,7 +3598,10 @@ class RuleBasedRealTeleopExtension:
         self._initial_alignment_skipped_clock_ticks = 0
         start = self._snapshot_qpos_pair(snapshots)
         target = {
-            side: np.asarray(emission.directive.qpos_by_side[side], dtype=float).copy()
+            side: np.asarray(
+                emission.directive.qpos_by_side.get(side, start[side]),
+                dtype=float,
+            ).copy()
             for side in ("left", "right")
         }
         hand_target = {
@@ -5156,6 +5256,7 @@ class RuleBasedRealTeleopExtension:
                     + str(getattr(transition, "message", "unknown failure"))
                 )
                 return
+        self._advance_pre_pen_down_replay_cadence()
         try:
             if self._configuration_batch:
                 count = len(self._configuration_batch)
@@ -5179,6 +5280,7 @@ class RuleBasedRealTeleopExtension:
             else:
                 self._configuration_batch_completed_count = 1
                 self._configuration_batch_cycle_complete = True
+                self.plan = self._plan_for_next_attempt()
         except Exception as exc:  # noqa: BLE001 - batch activation fails closed.
             self._completed = False
             self._aborted = True
@@ -5318,6 +5420,9 @@ class RuleBasedRealTeleopExtension:
                     self._deferred_progress_arm_fix_established
                 ),
                 "rule_based_source_selection": copy.deepcopy(self.source_selection),
+                "rule_based_pre_pen_down_replay_schedule": (
+                    self._pre_pen_down_replay_schedule_metadata()
+                ),
                 "rule_based_height_calibration": self._height_calibration_metadata(),
                 **{
                     str(key): _mutable_metadata_copy(value)
@@ -5762,6 +5867,13 @@ class RuleBasedRealTeleopExtension:
             collection_position=self._collection_position,
             initial_alignment_speed_scale=float(
                 self.config.initial_alignment_speed_scale
+            ),
+            pre_pen_down_replay_active=bool(self._pre_pen_down_replay_active),
+            pre_pen_down_replay_normal_episodes=int(
+                self.config.pre_pen_down_replay_normal_episodes
+            ),
+            pre_pen_down_normal_completed_count=int(
+                self._pre_pen_down_normal_completed_count
             ),
             gripper_sides=tuple(self.config.gripper_sides),
             control_topology=topology,

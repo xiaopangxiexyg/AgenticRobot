@@ -356,6 +356,7 @@ def test_rule_ui_asset_contains_no_teleop_episode_progress_or_pedal_controls() -
     assert 'id="collection-mode"' in asset
     assert 'id="full-replay-source"' in asset
     assert 'id="pre-pen-down-source"' in asset
+    assert 'id="pre-pen-down-normal-episodes"' in asset
     assert 'id="pen-down-source"' in asset
     assert 'id="write-source"' in asset
     assert 'id="pen-up-source"' in asset
@@ -673,6 +674,7 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
     options = {
         "configuration_core_fields": [
             "pre_pen_down_replay_candidate_id",
+            "pre_pen_down_replay_normal_episodes",
             "pen_down_candidate_id",
             "write_candidate_id",
             "pen_up_candidate_id",
@@ -695,12 +697,15 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
         "trajectory_ids": ["digit_1_v1", "digit_9_v1"],
         "directions": ["up", "left"],
         "numeric_bounds": {
+            "pre_pen_down_replay_normal_episodes": [0, 10000],
             "writing_size_m": [0.005, 0.2],
             "initial_alignment_speed_scale": [0.05, 1.0],
         },
+        "integer_fields": ["pre_pen_down_replay_normal_episodes"],
     }
     selected = {
         "pre_pen_down_replay_candidate_id": "",
+        "pre_pen_down_replay_normal_episodes": 0,
         "pen_down_candidate_id": "a",
         "write_candidate_id": "a",
         "pen_up_candidate_id": "a",
@@ -713,6 +718,7 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
     changed = {
         **selected,
         "pre_pen_down_replay_candidate_id": "b",
+        "pre_pen_down_replay_normal_episodes": 3,
         "pen_down_candidate_id": "b",
         "pen_up_candidate_id": "b",
         "trajectory_id": "digit_9_v1",
@@ -728,6 +734,11 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
     state = application.snapshot()
     assert state["rule_configuration"] == changed
     assert state["can_start"] is True
+
+    assert application.submit_configuration(
+        {**changed, "pre_pen_down_replay_normal_episodes": 1.5}
+    ) is False
+    assert "必须是整数" in application.snapshot()["configuration_error"]
 
 
 def test_rule_configuration_rejects_out_of_range_speed_without_queueing() -> None:

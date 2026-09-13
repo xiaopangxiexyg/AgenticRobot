@@ -900,6 +900,7 @@ def test_fixed_writing_uses_calibrated_descent_endpoint_when_supplied() -> None:
         ("--source-pool-range", "START:END"),
         ("--selection-seed", "N"),
         ("--pre-pen-down-replay-candidate-id", "ID"),
+        ("--pre-pen-down-replay-normal-episodes", "N"),
         ("--tactile-bundle-root", "PATH"),
         ("--dataset-root", "PATH"),
         ("--trajectory", "ID"),
@@ -1317,6 +1318,8 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
             "42",
             "--pre-pen-down-replay-candidate-id",
             "stroke-before-pen",
+            "--pre-pen-down-replay-normal-episodes",
+            "3",
             "--tactile-bundle-root",
             str(tactile),
             "--dry-run",
@@ -1335,6 +1338,7 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
     assert (
         "--rule-pre-pen-down-replay-candidate-id stroke-before-pen" in output
     )
+    assert "--rule-pre-pen-down-replay-normal-episodes 3" in output
     assert "--rule-source-dataset" not in output
     assert "--rule-source-episode" not in output
     assert "--rule-detail-annotation-dir" not in output
@@ -1359,6 +1363,23 @@ def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
     )
     assert full_replay.returncode == 2
     assert "not valid in full-replay mode" in full_replay.stderr
+
+    full_replay_interval = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--mode",
+            "full-replay",
+            "--pre-pen-down-replay-normal-episodes",
+            "2",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert full_replay_interval.returncode == 2
+    assert "not valid in full-replay mode" in full_replay_interval.stderr
 
     source = tmp_path / "source"
     detail = tmp_path / "detail"
@@ -1436,6 +1457,8 @@ def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:
             "8",
             "--rule-pre-pen-down-replay-candidate-id",
             "candidate-12",
+            "--rule-pre-pen-down-replay-normal-episodes",
+            "4",
         ]
     )
 
@@ -1444,3 +1467,4 @@ def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:
     assert args.rule_source_pool_range == "4:19"
     assert args.rule_source_selection_seed == 8
     assert args.rule_pre_pen_down_replay_candidate_id == "candidate-12"
+    assert args.rule_pre_pen_down_replay_normal_episodes == 4
