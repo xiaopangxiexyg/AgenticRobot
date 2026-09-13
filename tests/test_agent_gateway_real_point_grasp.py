@@ -535,9 +535,12 @@ def test_graspnet_rank_publishes_strict_rigid_candidate_from_float32_rotation(
 
     candidates = planner._rank(
         prediction,
-        target_points=np.asarray(
-            [[0.0, -0.01, 0.49], [0.0, 0.01, 0.51]],
-            dtype=np.float32,
+        target_points=np.tile(
+            np.asarray(
+                [[0.0, -0.01, 0.49], [0.0, 0.01, 0.51]],
+                dtype=np.float32,
+            ),
+            (8, 1),
         ),
         target_camera=np.asarray([0.0, 0.0, 0.5]),
         base_from_camera=np.eye(4),
@@ -615,9 +618,12 @@ def test_graspnet_candidate_axes_are_mapped_to_dmtac_tool_tcp(tmp_path: Path) ->
     ).reshape(-1)
     candidates = planner._rank(
         prediction,
-        target_points=np.asarray(
-            [[0.0, -0.01, 0.51], [0.0, 0.02, 0.53]],
-            dtype=np.float32,
+        target_points=np.tile(
+            np.asarray(
+                [[0.0, -0.01, 0.51], [0.0, 0.02, 0.53]],
+                dtype=np.float32,
+            ),
+            (8, 1),
         ),
         target_camera=np.asarray([0.0, 0.005, 0.5]),
         base_from_camera=np.asarray(
@@ -641,6 +647,55 @@ def test_graspnet_candidate_axes_are_mapped_to_dmtac_tool_tcp(tmp_path: Path) ->
     # perpendicular to approach (opening y and finger-height z).
     np.testing.assert_allclose(camera[:3, 3], [0.012999, 0.005, 0.52])
     np.testing.assert_allclose(base[:3, 3], [0.112999, 0.205, 0.82])
+
+
+def test_graspnet_rank_rejects_target_center_outside_dmtac_capture_region(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint-rs.tar"
+    checkpoint.write_bytes(b"graspnet")
+    planner = Sam2GraspNetPointGraspPlanner(
+        model_spec=GraspNetPointGraspModelSpec(
+            model_profile_id="graspnet:test",
+            checkpoint_path=checkpoint,
+            checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            source_revision=GRASPNET_REVIEWED_REVISION,
+            model_type="realsense",
+            license_acknowledgement=(GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2),
+        ),
+        point_segmenter=SimpleNamespace(
+            segment_point=lambda *_args, **_kwargs: None,
+            semantic_content_hash="sam:test",
+        ),
+        device="cuda",
+    )
+    prediction = np.zeros((1, 17), dtype=np.float64)
+    prediction[0, 0] = 0.9
+    prediction[0, 1] = 0.05
+    prediction[0, 3] = 0.03
+    prediction[0, 4:13] = np.eye(3).reshape(-1)
+    prediction[0, 13:16] = [0.0, 0.0, 0.5]
+    target_points = np.tile(np.asarray((0.030, 0.0, 0.5)), (16, 1))
+    filter_summary: dict[str, int | float | None] = {}
+
+    candidates = planner._rank(
+        prediction,
+        target_points=target_points,
+        target_camera=np.asarray((0.0, 0.0, 0.5)),
+        base_from_camera=np.eye(4),
+        depth=np.zeros((10, 12), dtype=np.float32),
+        intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
+        maximum=1,
+        filter_summary=filter_summary,
+    )
+
+    assert candidates == ()
+    assert filter_summary["target_surface_valid"] == 1
+    assert filter_summary["target_capture_valid"] == 0
+    assert filter_summary["min_target_capture_violation_m"] == pytest.approx(
+        0.010000,
+        abs=1e-6,
+    )
 
 
 def test_parallel_jaw_tcp_symmetry_selects_reference_up_and_preserves_frames() -> None:
@@ -708,9 +763,12 @@ def test_graspnet_parallel_jaw_symmetry_pair_collapses_to_upward_tcp(
 
     candidates = planner._rank(
         prediction,
-        target_points=np.asarray(
-            [[0.0, -0.01, 0.49], [0.0, 0.01, 0.51]],
-            dtype=np.float32,
+        target_points=np.tile(
+            np.asarray(
+                [[0.0, -0.01, 0.49], [0.0, 0.01, 0.51]],
+                dtype=np.float32,
+            ),
+            (8, 1),
         ),
         target_camera=np.asarray([0.0, 0.0, 0.5]),
         base_from_camera=np.eye(4),

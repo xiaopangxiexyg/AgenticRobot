@@ -49,6 +49,16 @@ Skill/preflight JSON, execution montage, and optional MP4. A nonzero exit after
 candidate generation is a motion/contact/lift failure, not loss of the grasp
 rendering evidence.
 
+Before motion, the terminal requires the SAM2 target center to lie inside the
+candidate's physical DMTAC M opening, pad height, and finger-length interval.
+It also rejects tabletop candidates whose tool +Z approach has less than the
+default `0.5` downward cosine (`--minimum-downward-approach-cosine`). Accepted
+poses move through an 80 mm gravity-up transit: translate with the current
+wrist orientation, orient at clearance, then move to the declared pregrasp.
+Each waypoint stops early when normalized pose error makes no progress for 20
+steps, so an IK branch that is stuck at a limit does not consume the full phase
+budget repeatedly.
+
 ## Visualization-only three-camera flow
 
 Use the visualization command when the goal is to inspect generated poses, not
@@ -112,8 +122,10 @@ read-only `perception.plan_point_grasp.v1` provider:
    apply GraspNet's insertion depth and SAM2 target-cloud width centering, then
    preflight candidates through the same IK and full-scene collision chain;
 5. retain the generator's upward-selected parallel-jaw TCP and try 7/5/3.5 cm
-   pregrasp offsets, execute the selected side-specific CAD-aligned DMTAC M `tool_tcp` goal,
-   close the physical gripper, then lift 10 cm;
+   pregrasp offsets; move by translating above the grasp, orienting at 8 cm
+   clearance, and then entering the declared pregrasp before executing the
+   selected side-specific CAD-aligned DMTAC M `tool_tcp` goal, closing the
+   physical gripper, and lifting 10 cm;
 6. let `CubeLiftKernel` own canonical RM65 IK, collision projection, fitted
    actuators, contacts, termination, and success evaluation.
 

@@ -18,6 +18,7 @@ from experiments.sim_point_grasp.evaluation import (
     bounded_pose_action,
     build_pregrasp_pose,
     build_sim_point_grasp_task_config,
+    build_staged_pregrasp_waypoints,
     draw_grasp_overlay,
     merge_point_prompt_candidates,
     optical_camera_pose_world,
@@ -125,6 +126,84 @@ def test_pregrasp_backs_away_on_candidate_approach_axis() -> None:
     np.testing.assert_allclose(pregrasp[:3, 3], grasp[:3, 3] - grasp[:3, 2] * 0.07)
 
 
+def test_staged_pregrasp_translates_then_orients_before_approach() -> None:
+    current = np.eye(4)
+    current[:3, 3] = [0.0, 0.0, 0.25]
+    grasp = np.eye(4)
+    grasp[:3, :3] = Rotation.from_euler(
+        "xyz", [25.0, -40.0, 10.0], degrees=True
+    ).as_matrix()
+    grasp[:3, 3] = [-0.25, 0.27, 0.03]
+    pregrasp = build_pregrasp_pose(grasp, 0.07)
+
+    waypoints = build_staged_pregrasp_waypoints(
+        current,
+        grasp,
+        pregrasp,
+        transit_clearance_m=0.08,
+    )
+
+    assert [label for label, _pose in waypoints] == [
+        "pregrasp transit translation",
+        "pregrasp transit orientation",
+        "pregrasp approach start",
+    ]
+    translate = waypoints[0][1]
+    orient = waypoints[1][1]
+    np.testing.assert_allclose(translate[:3, :3], current[:3, :3])
+    np.testing.assert_allclose(translate[:2, 3], grasp[:2, 3])
+    assert translate[2, 3] == pytest.approx(max(pregrasp[2, 3], 0.11))
+    np.testing.assert_allclose(orient[:3, :3], grasp[:3, :3])
+    np.testing.assert_allclose(orient[:3, 3], translate[:3, 3])
+    np.testing.assert_allclose(waypoints[2][1], pregrasp)
+
+
+def test_drive_pose_stops_when_normalized_error_stagnates(monkeypatch) -> None:
+    scene = SimpleNamespace(body_pose=lambda _name: np.eye(4))
+    controller = SimpleNamespace(target_pose_arm_base=np.eye(4), last_step=None)
+    kernel = SimpleNamespace(
+        scene=scene,
+        config=SimpleNamespace(
+            object_body_name="cube",
+            right_tcp_delta_m=(0.02, 0.02, 0.02),
+            right_tcp_rotation_delta_rad=(0.15, 0.15, 0.15),
+        ),
+        _pose_action_controller=controller,
+    )
+    calls = 0
+
+    class _Env:
+        def __init__(self) -> None:
+            self.kernel = kernel
+
+        def step(self, _action):
+            nonlocal calls
+            calls += 1
+            return None, 0.0, False, False, {}
+
+    monkeypatch.setattr(
+        evaluation_module,
+        "_current_tool_pose_arm_base",
+        lambda _scene, _config: np.eye(4),
+    )
+    desired = np.eye(4)
+    desired[0, 3] = 0.10
+    reached, reason = evaluation_module._drive_pose(
+        env=_Env(),
+        desired_pose=desired,
+        trace=evaluation_module._ExecutionTrace(info={}),
+        renderer=None,
+        video=None,
+        maximum_steps=90,
+        position_tolerance_m=0.008,
+        orientation_tolerance_rad=math.radians(6.0),
+    )
+
+    assert not reached
+    assert reason.startswith("pose_stagnated:position=0.100000")
+    assert calls == 20
+
+
 def test_candidate_preflight_records_lower_runtime_rejection(monkeypatch) -> None:
     env = SimpleNamespace(
         reset=lambda *, seed: (None, {"seed": seed}),
@@ -136,7 +215,7 @@ def test_candidate_preflight_records_lower_runtime_rejection(monkeypatch) -> Non
     )
     monkeypatch.setattr(
         evaluation_module,
-        "_drive_pose",
+        "_drive_staged_pregrasp",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("hard collision")),
     )
     monkeypatch.setattr(
@@ -161,6 +240,32 @@ def test_candidate_preflight_records_lower_runtime_rejection(monkeypatch) -> Non
 
     assert not result.executable
     assert result.reason == "pregrasp_runtime_rejection:hard collision"
+
+
+def test_candidate_preflight_rejects_non_downward_approach_before_motion() -> None:
+    class _Env:
+        def reset(self, *, seed):
+            raise AssertionError(f"rejected candidate must not reset env: seed={seed}")
+
+    grasp = np.eye(4)
+    grasp[:3, :3] = Rotation.from_euler("y", 90.0, degrees=True).as_matrix()
+    result = evaluation_module._preflight_candidate(
+        env=_Env(),
+        candidate={
+            "T_base_from_tcp": grasp.reshape(-1).tolist(),
+            "model_score": 0.8,
+            "score": 0.7,
+        },
+        ordinal=1,
+        pregrasp_offset_m=0.05,
+        wrist_symmetry_deg=0,
+        seed=4,
+        config=SimpleNamespace(minimum_downward_approach_cosine=0.5),
+    )
+
+    assert not result.executable
+    assert result.motion_steps == 0
+    assert result.reason.startswith("approach_direction_rejected:downward_cosine=")
 
 
 def test_parallel_jaw_wrist_symmetry_swaps_fingers_but_preserves_approach() -> None:

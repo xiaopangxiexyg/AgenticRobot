@@ -65,6 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-candidates", type=int, default=5)
     parser.add_argument(
+        "--minimum-downward-approach-cosine",
+        type=float,
+        default=0.5,
+        help=(
+            "Tabletop admission: require tool +Z approach to point downward "
+            "by at least this cosine; 0 allows horizontal approaches."
+        ),
+    )
+    parser.add_argument(
         "--candidate-selection-policy",
         choices=("reachability_aware", "provider_selected_ordinal"),
         default="reachability_aware",
@@ -107,6 +116,7 @@ def run(args: argparse.Namespace) -> dict:
         trials=1,
         seed_start=args.seed,
         max_candidates=args.max_candidates,
+        minimum_downward_approach_cosine=args.minimum_downward_approach_cosine,
         target_point_count=1,
         cube_spawn_xy_jitter_m=(0.0, 0.0),
         cube_spawn_yaw_jitter_rad=0.0,

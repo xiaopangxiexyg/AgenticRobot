@@ -180,6 +180,8 @@ class SimPointGraspEvaluationConfig:
     cube_spawn_yaw_jitter_rad: float = math.pi / 4.0
     pregrasp_offset_m: float = 0.070
     adaptive_pregrasp_offsets_m: tuple[float, ...] = (0.050, 0.035)
+    pregrasp_transit_clearance_m: float = 0.080
+    minimum_downward_approach_cosine: float | None = None
     candidate_selection_policy: str = "reachability_aware"
     lift_offset_m: float = 0.100
     pose_position_tolerance_m: float = 0.008
@@ -279,6 +281,7 @@ class SimPointGraspEvaluationConfig:
             )
         for field_name in (
             "pregrasp_offset_m",
+            "pregrasp_transit_clearance_m",
             "lift_offset_m",
             "pose_position_tolerance_m",
             "pose_orientation_tolerance_rad",
@@ -294,6 +297,13 @@ class SimPointGraspEvaluationConfig:
                 "adaptive_pregrasp_offsets_m must contain positive finite values."
             )
         object.__setattr__(self, "adaptive_pregrasp_offsets_m", adaptive_offsets)
+        if self.minimum_downward_approach_cosine is not None:
+            cosine = float(self.minimum_downward_approach_cosine)
+            if not math.isfinite(cosine) or not 0.0 <= cosine <= 1.0:
+                raise ValueError(
+                    "minimum_downward_approach_cosine must be in [0, 1] or None."
+                )
+            object.__setattr__(self, "minimum_downward_approach_cosine", cosine)
         if self.candidate_selection_policy not in {
             "provider_selected_ordinal",
             "reachability_aware",
@@ -880,6 +890,46 @@ def build_pregrasp_pose(grasp_pose: np.ndarray, offset_m: float) -> np.ndarray:
     return pose
 
 
+def build_staged_pregrasp_waypoints(
+    current_pose: np.ndarray,
+    grasp_pose: np.ndarray,
+    pregrasp_pose: np.ndarray,
+    *,
+    transit_clearance_m: float,
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Build a collision-aware pose sequence before the final approach.
+
+    Translating and rotating toward a distant grasp in one local-IK step can
+    force the RM65 into a joint-limit branch even when a safe solution exists.
+    First translate above the grasp while preserving the current wrist, then
+    orient at clearance height, and only then move to the declared pregrasp.
+    Arm-base +Z is gravity-up in the reviewed bimanual scene contract.
+    """
+
+    current = np.asarray(current_pose, dtype=float).reshape(4, 4)
+    grasp = np.asarray(grasp_pose, dtype=float).reshape(4, 4)
+    pregrasp = np.asarray(pregrasp_pose, dtype=float).reshape(4, 4)
+    clearance = float(transit_clearance_m)
+    if not all(np.all(np.isfinite(value)) for value in (current, grasp, pregrasp)):
+        raise ValueError("Staged pregrasp poses must be finite.")
+    if not math.isfinite(clearance) or clearance <= 0.0:
+        raise ValueError("transit_clearance_m must be finite and positive.")
+
+    transit_z = max(
+        float(pregrasp[2, 3]),
+        float(grasp[2, 3]) + clearance,
+    )
+    translate = current.copy()
+    translate[:3, 3] = (grasp[0, 3], grasp[1, 3], transit_z)
+    orient = translate.copy()
+    orient[:3, :3] = grasp[:3, :3]
+    return (
+        ("pregrasp transit translation", translate),
+        ("pregrasp transit orientation", orient),
+        ("pregrasp approach start", pregrasp.copy()),
+    )
+
+
 def apply_parallel_jaw_wrist_symmetry(
     grasp_pose: np.ndarray,
     wrist_symmetry_deg: int,
@@ -1015,6 +1065,8 @@ def _drive_pose(
     orientation_tolerance_rad: float,
     translation_action_scale: float = 1.0,
     on_frame: Callable[[np.ndarray], None] | None = None,
+    stagnation_window_steps: int = 20,
+    stagnation_min_normalized_improvement: float = 0.05,
 ) -> tuple[bool, str]:
     kernel = env.kernel
     controller = kernel._pose_action_controller
@@ -1022,7 +1074,9 @@ def _drive_pose(
         raise RuntimeError(
             "Physical Cube-Lift profile has no pose-action motion owner."
         )
-    for _ in range(maximum_steps):
+    best_normalized_error = math.inf
+    last_progress_step = 0
+    for step_index in range(maximum_steps):
         measured = _current_tool_pose_arm_base(kernel.scene, kernel.config)
         position_error, orientation_error = _pose_error(measured, desired_pose)
         if (
@@ -1030,6 +1084,25 @@ def _drive_pose(
             and orientation_error <= orientation_tolerance_rad
         ):
             return True, "pose_reached"
+        normalized_error = max(
+            position_error / position_tolerance_m,
+            orientation_error / orientation_tolerance_rad,
+        )
+        if (
+            normalized_error
+            <= best_normalized_error - stagnation_min_normalized_improvement
+        ):
+            best_normalized_error = normalized_error
+            last_progress_step = step_index
+        elif step_index - last_progress_step >= stagnation_window_steps:
+            return (
+                False,
+                (
+                    "pose_stagnated:"
+                    f"position={position_error:.6f},rotation={orientation_error:.6f},"
+                    f"steps_without_progress={step_index - last_progress_step}"
+                ),
+            )
         action = bounded_pose_action(
             controller.target_pose_arm_base,
             desired_pose,
@@ -1061,6 +1134,41 @@ def _drive_pose(
     )
 
 
+def _drive_staged_pregrasp(
+    *,
+    env: FastCubeLiftEnv,
+    grasp_pose: np.ndarray,
+    pregrasp_pose: np.ndarray,
+    trace: _ExecutionTrace,
+    renderer: MujocoCameraRenderer | None,
+    video: _TrialVideo | None,
+    config: SimPointGraspEvaluationConfig,
+    on_waypoint: Callable[[str, np.ndarray], None] | None = None,
+) -> tuple[bool, str]:
+    current = _current_tool_pose_arm_base(env.kernel.scene, env.kernel.config)
+    for label, waypoint in build_staged_pregrasp_waypoints(
+        current,
+        grasp_pose,
+        pregrasp_pose,
+        transit_clearance_m=config.pregrasp_transit_clearance_m,
+    ):
+        reached, reason = _drive_pose(
+            env=env,
+            desired_pose=waypoint,
+            trace=trace,
+            renderer=renderer,
+            video=video,
+            maximum_steps=config.phase_step_limit,
+            position_tolerance_m=config.pose_position_tolerance_m,
+            orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
+        )
+        if not reached:
+            return False, f"{label}:{reason}"
+        if on_waypoint is not None:
+            on_waypoint(label, waypoint)
+    return True, "pregrasp_reached"
+
+
 def _preflight_candidate(
     *,
     env: FastCubeLiftEnv,
@@ -1073,23 +1181,47 @@ def _preflight_candidate(
 ) -> _CandidatePreflight:
     """Check IK and the authoritative MuJoCo path without closing or lifting."""
 
-    _observation, reset_info = env.reset(seed=seed)
-    trace = _ExecutionTrace(info=dict(reset_info))
     grasp = apply_parallel_jaw_wrist_symmetry(
         np.asarray(candidate["T_base_from_tcp"], dtype=float).reshape(4, 4),
         wrist_symmetry_deg,
     )
+    minimum_downward_cosine = getattr(config, "minimum_downward_approach_cosine", None)
+    downward_approach_cosine = -float(grasp[2, 2])
+    if (
+        minimum_downward_cosine is not None
+        and downward_approach_cosine < minimum_downward_cosine
+    ):
+        return _CandidatePreflight(
+            ordinal=int(ordinal),
+            pregrasp_offset_m=float(pregrasp_offset_m),
+            wrist_symmetry_deg=int(wrist_symmetry_deg),
+            pregrasp_reached=False,
+            grasp_reached=False,
+            reason=(
+                "approach_direction_rejected:"
+                f"downward_cosine={downward_approach_cosine:.6f},"
+                f"minimum={minimum_downward_cosine:.6f}"
+            ),
+            termination_reason=None,
+            motion_steps=0,
+            safety_intervention_steps=0,
+            ik_rejection_steps=0,
+            final_joint_margin_rad=None,
+            model_score=float(candidate["model_score"]),
+            combined_score=float(candidate["score"]),
+        )
+    _observation, reset_info = env.reset(seed=seed)
+    trace = _ExecutionTrace(info=dict(reset_info))
     pregrasp = build_pregrasp_pose(grasp, pregrasp_offset_m)
     try:
-        pregrasp_reached, reason = _drive_pose(
+        pregrasp_reached, reason = _drive_staged_pregrasp(
             env=env,
-            desired_pose=pregrasp,
+            grasp_pose=grasp,
+            pregrasp_pose=pregrasp,
             trace=trace,
             renderer=None,
             video=None,
-            maximum_steps=config.phase_step_limit,
-            position_tolerance_m=config.pose_position_tolerance_m,
-            orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
+            config=config,
         )
     except RuntimeError as exc:
         # A lower-owned hard collision rejection is one candidate's preflight
@@ -1614,16 +1746,20 @@ def _trial(
         assert selected_pregrasp_offset_m is not None
         pregrasp = build_pregrasp_pose(base_from_tcp, selected_pregrasp_offset_m)
         phase_started = time.perf_counter()
+
+        def record_pregrasp_waypoint(label: str, _pose: np.ndarray) -> None:
+            keyframes.append((label, renderer.render(CAMERA_NAME)))
+
         try:
-            reached, reason = _drive_pose(
+            reached, reason = _drive_staged_pregrasp(
                 env=env,
-                desired_pose=pregrasp,
+                grasp_pose=base_from_tcp,
+                pregrasp_pose=pregrasp,
                 trace=trace,
                 renderer=renderer,
                 video=video,
-                maximum_steps=config.phase_step_limit,
-                position_tolerance_m=config.pose_position_tolerance_m,
-                orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
+                config=config,
+                on_waypoint=record_pregrasp_waypoint,
             )
         finally:
             timing_ms["pregrasp_motion"] = (
@@ -1803,7 +1939,7 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
     # smaller than the evaluator's own legal worst-case path, causing valid
     # lift attempts to truncate before their phase limit.
     execution_step_budget = (
-        2 * int(config.phase_step_limit)
+        4 * int(config.phase_step_limit)
         + int(config.close_step_limit)
         + int(config.lift_step_limit)
         + 5
@@ -2023,6 +2159,13 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
                 config.pregrasp_offset_m,
                 *config.adaptive_pregrasp_offsets_m,
             ],
+            "pregrasp_motion_policy": (
+                "translate_above_grasp_then_orient_then_move_to_pregrasp"
+            ),
+            "pregrasp_transit_clearance_m": config.pregrasp_transit_clearance_m,
+            "minimum_downward_approach_cosine": (
+                config.minimum_downward_approach_cosine
+            ),
             "maximum_visible_collision_points": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
             "contact_stability_policy_steps": config.contact_stability_steps,
             "close_action_scale": config.close_action_scale,
@@ -2050,6 +2193,7 @@ __all__ = [
     "bounded_pose_action",
     "build_pregrasp_pose",
     "build_sim_point_grasp_task_config",
+    "build_staged_pregrasp_waypoints",
     "draw_grasp_overlay",
     "evaluate_sim_point_grasps",
     "merge_point_prompt_candidates",
