@@ -486,6 +486,28 @@ class PassiveReadSkillExecutor:
                 "output_artifact_bindings_rejected",
             }
             if not bool(getattr(outcome, "accepted", False)) and rejected_result:
+                rejection_diagnostic = getattr(outcome, "failure_diagnostic", None)
+                if not isinstance(rejection_diagnostic, Mapping):
+                    rejection_diagnostic = {
+                        "exception_type": "ResultValidationError",
+                        "message": str(rejection_reason),
+                    }
+                diagnostic = {
+                    "executor_id": self.executor_id,
+                    "operation_id": running.operation_id,
+                    "exception_type": str(
+                        rejection_diagnostic.get(
+                            "exception_type", "ResultValidationError"
+                        )
+                    )[:128],
+                    "message": str(
+                        rejection_diagnostic.get("message", rejection_reason)
+                    )[:512],
+                    "failed_at": self._time(),
+                }
+                with self._lock:
+                    self._failure_diagnostics[running.operation_id] = diagnostic
+                    self._trim_records_locked()
                 outcome = service.complete_operation(
                     operation_id=running.operation_id,
                     expected_operation_hash=running.semantic_content_hash,
@@ -497,6 +519,13 @@ class PassiveReadSkillExecutor:
                     ),
                     current_station_revision=self._revision(),
                     execution_receipt_refs=(execution_receipt.receipt_id,),
+                    progress_summary={
+                        "phase": "failed",
+                        "failure_diagnostic": {
+                            "exception_type": diagnostic["exception_type"],
+                            "message": diagnostic["message"],
+                        },
+                    },
                 )
             with self._lock:
                 self._execution_receipts[running.operation_id] = execution_receipt

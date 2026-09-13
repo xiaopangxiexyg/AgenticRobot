@@ -132,7 +132,8 @@ class RM65GraspReachabilityConfig:
     """Finite endpoint-IK budget used only for optional candidate annotation."""
 
     time_budget_ms: float = 1_000.0
-    max_solve_cycles: int = 180
+    max_solve_cycles: int = 2_880
+    max_solve_evaluations_per_seed: int | None = None
     seed_count: int = 16
     standard_position_tolerance_m: float = 0.003
     standard_orientation_tolerance_deg: float = 1.0
@@ -155,6 +156,20 @@ class RM65GraspReachabilityConfig:
         if isinstance(self.max_solve_cycles, bool) or cycles < 1:
             raise ValueError("max_solve_cycles must be positive.")
         object.__setattr__(self, "max_solve_cycles", cycles)
+        configured_per_seed = self.max_solve_evaluations_per_seed
+        per_seed = (
+            min(180, cycles)
+            if configured_per_seed is None
+            else int(configured_per_seed)
+        )
+        if (
+            isinstance(configured_per_seed, bool)
+            or not 1 <= per_seed <= cycles
+        ):
+            raise ValueError(
+                "max_solve_evaluations_per_seed must be within the total budget."
+            )
+        object.__setattr__(self, "max_solve_evaluations_per_seed", per_seed)
         seed_count = int(self.seed_count)
         if isinstance(self.seed_count, bool) or not 1 <= seed_count <= 64:
             raise ValueError("seed_count must be in [1, 64].")
@@ -762,6 +777,10 @@ class RM65GraspJointTrajectoryPlanner:
                 if seed_index > 0 and float(monotonic()) >= deadline:
                     termination = "time_budget_exhausted"
                     break
+                remaining_evaluations = config.max_solve_cycles - cycles
+                if remaining_evaluations <= 0:
+                    termination = "cycle_budget_exhausted"
+                    break
                 try:
                     _candidate, evaluations, position, orientation = (
                         self._least_squares_endpoint_from_seed(
@@ -769,12 +788,19 @@ class RM65GraspJointTrajectoryPlanner:
                             side=side,
                             target_tool_tcp_world=target_pose,
                             seed_qpos=seed[side],
-                            maximum_evaluations=config.max_solve_cycles,
+                            maximum_evaluations=min(
+                                config.max_solve_evaluations_per_seed,
+                                remaining_evaluations,
+                            ),
                         )
                     )
                 except (RuntimeError, ValueError, np.linalg.LinAlgError):
                     continue
                 cycles += evaluations
+                if cycles > config.max_solve_cycles:
+                    raise RuntimeError(
+                        "RM65 reachability solver exceeded its total evaluation budget."
+                    )
                 normalized_error = max(
                     position / config.basic_position_tolerance_m,
                     orientation / config.basic_orientation_tolerance_deg,
@@ -798,6 +824,8 @@ class RM65GraspJointTrajectoryPlanner:
                 raise RuntimeError("RM65 reachability solver produced no candidate.")
             if float(monotonic()) >= deadline:
                 termination = "time_budget_exhausted"
+            elif cycles >= config.max_solve_cycles:
+                termination = "cycle_budget_exhausted"
             _normalized, position, orientation = best
             classification = (
                 "basically_reachable"

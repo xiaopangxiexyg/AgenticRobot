@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -430,6 +431,23 @@ def test_station_point_grasp_v3_reachability_is_request_gated_and_annotation_onl
     registration.payload_validator.validate_execution_result_for_parameters(
         enabled_request.parameters, enabled
     )
+
+    seed_exhausted = copy.deepcopy(enabled)
+    seed_exhausted_annotation = seed_exhausted["candidates"][0][
+        "arm_reachability"
+    ]
+    seed_exhausted_annotation.update(
+        {
+            "classification": "difficult_to_reach",
+            "position_residual_m": 0.06,
+            "orientation_residual_deg": 25.0,
+            "solve_cycles": (
+                registration.profile.arm_reachability_profile.max_solve_cycles
+            ),
+            "termination_reason": "seed_budget_exhausted",
+        }
+    )
+    registration.payload_validator.validate_execution_result(seed_exhausted)
 
     with pytest.raises(ValueError, match="does not match the request"):
         registration.payload_validator.validate_execution_result_for_parameters(

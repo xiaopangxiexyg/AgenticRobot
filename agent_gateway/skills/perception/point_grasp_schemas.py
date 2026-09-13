@@ -506,6 +506,7 @@ def point_grasp_schema_entry_v3(
                     "standard_tolerance_met",
                     "time_budget_exhausted",
                     "cycle_budget_exhausted",
+                    "seed_budget_exhausted",
                 ],
             },
         },
@@ -1501,7 +1502,11 @@ def validate_point_grasp_result_v3(
         if classification == "standard_reachable":
             if reason != "standard_tolerance_met":
                 raise ValueError("Standard reachability has the wrong termination.")
-        elif reason not in {"time_budget_exhausted", "cycle_budget_exhausted"}:
+        elif reason not in {
+            "time_budget_exhausted",
+            "cycle_budget_exhausted",
+            "seed_budget_exhausted",
+        }:
             raise ValueError("Non-standard reachability has the wrong termination.")
 
 

@@ -9,6 +9,7 @@ fake/null-only compatibility surface.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -55,6 +56,8 @@ from .operation_store import (
 from .payload_validation import AgentSkillPayloadValidatorRegistry
 from .protocol_runtime import AgentGatewayProtocolRuntime
 
+_LOGGER = logging.getLogger(__name__)
+
 
 def _required_text(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -96,6 +99,7 @@ class AgentGatewayOperationOutcome:
     reason_code: str
     operation: AgentSkillOperation | None = None
     port_receipt: AgentSkillOperationPortReceipt | None = None
+    failure_diagnostic: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1189,11 +1193,23 @@ class AgentGatewayService:
                     payload=execution_result,
                     request_parameters=request.parameters,
                 )
-            except (TypeError, ValueError, KeyError):
+            except (TypeError, ValueError, KeyError) as error:
+                message = " ".join(str(error).split()) or "no detail"
+                diagnostic = {
+                    "exception_type": type(error).__name__,
+                    "message": message[:512],
+                }
+                _LOGGER.exception(
+                    "Execution result payload rejected for route %s operation %s: %s",
+                    route.route_id,
+                    normalized_id,
+                    message,
+                )
                 return AgentGatewayOperationOutcome(
                     False,
                     "execution_result_payload_rejected",
                     self.operation_store.get(normalized_id),
+                    failure_diagnostic=diagnostic,
                 )
         next_status = (
             "awaiting_evaluation"

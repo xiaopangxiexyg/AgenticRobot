@@ -1083,6 +1083,10 @@ def test_result_validator_receives_original_immutable_request_parameters() -> No
     assert not rejected.accepted
     assert rejected.reason_code == "execution_result_payload_rejected"
     assert rejected.operation.status == "running"
+    assert rejected.failure_diagnostic == {
+        "exception_type": "ValueError",
+        "message": "result exceeds request freshness bound",
+    }
     assert seen_parameters == [{"max_age_ms": 25}]
 
     completed = service.complete_operation(
@@ -2145,6 +2149,97 @@ def test_passive_read_executor_fails_closed_when_output_artifact_is_rejected() -
     assert failed is not None and failed.status == "failed"
     assert failed.reason_code == "passive_read_output_artifacts_rejected"
     assert failed.output_artifact_bindings == ()
+    assert domain_port.calls == []
+
+
+def test_passive_read_result_rejection_retains_validator_diagnostic() -> None:
+    clock = _ManualClock()
+    capability = _capability()
+    manifest = _manifest(capability)
+
+    def reject_result(_payload) -> None:
+        raise ValueError("solve_cycles is outside the profile bound.")
+
+    validators = AgentSkillPayloadValidatorRegistry(
+        registry_id="payload-validators:rejection-diagnostic",
+        validators=(
+            AgentSkillPayloadValidatorSet(
+                validator_id="payload-validator:rejection-diagnostic:v1",
+                skill_id=capability.skill_id,
+                skill_version=capability.skill_version,
+                route_id=capability.route_id,
+                route_version=capability.route_version,
+                parameter_schema_hash=capability.parameter_schema_hash,
+                execution_result_schema_hash=capability.execution_result_schema_hash,
+                task_evaluation_schema_hash=capability.task_evaluation_schema_hash,
+                validate_parameters=lambda _payload: None,
+                validate_execution_result=reject_result,
+                validate_task_evaluation=lambda _payload: None,
+            ),
+        ),
+    )
+
+    def read(_request, operation) -> PassiveReadResult:
+        return PassiveReadResult(
+            execution_result={"operation_id": operation.operation_id},
+            evidence_refs=(f"passive-cut:{operation.operation_id}",),
+        )
+
+    executor = PassiveReadSkillExecutor(
+        port_id="passive-reader:rejection-diagnostic",
+        executor_id="passive-reader-executor:rejection-diagnostic",
+        read=read,
+        current_station_revision=lambda: 4,
+        clock=clock,
+    )
+    domain_port = _AuthoritativeStationPort(clock)
+    service = AgentGatewayService(
+        manifest=manifest,
+        access_policy=_policy(),
+        executor_registry=SkillExecutorRegistry.bind_all_routes_to_port(
+            manifest=manifest,
+            execution_port=executor,
+        ),
+        domain_control_port=domain_port,
+        payload_validators=validators,
+        operation_store=BoundedInMemoryAgentSkillOperationStore(
+            max_retained_operations=4
+        ),
+        clock=clock,
+    )
+    assert service.publish_observation(
+        snapshot=_snapshot(manifest),
+        now=10.0,
+    ).accepted
+    admitted = service.submit_request(
+        request=_request(manifest, capability),
+        current_station_revision=4,
+        now=10.0,
+    )
+    assert admitted.accepted and admitted.operation is not None
+    operation_id = admitted.operation.operation_id
+    assert service.launch_operation(operation_id).accepted
+    assert executor.wait(operation_id, timeout_sec=1.0)
+
+    failed = service.operation_store.get(operation_id)
+    assert failed is not None and failed.status == "failed"
+    assert failed.reason_code == "passive_read_result_rejected"
+    assert failed.progress_summary == {
+        "phase": "failed",
+        "failure_diagnostic": {
+            "exception_type": "ValueError",
+            "message": "solve_cycles is outside the profile bound.",
+        },
+    }
+    assert executor.failure_diagnostics == (
+        {
+            "executor_id": "passive-reader-executor:rejection-diagnostic",
+            "operation_id": operation_id,
+            "exception_type": "ValueError",
+            "message": "solve_cycles is outside the profile bound.",
+            "failed_at": 10.0,
+        },
+    )
     assert domain_port.calls == []
 
 

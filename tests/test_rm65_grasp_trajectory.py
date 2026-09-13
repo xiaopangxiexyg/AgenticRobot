@@ -533,6 +533,86 @@ def test_reachability_stops_on_wall_time_budget_and_returns_best_basic_solution(
     assert result.solve_cycles == 1
 
 
+def test_reachability_multistart_respects_total_evaluation_budget(
+    monkeypatch,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig()
+    )
+    planner.reachability_config = RM65GraspReachabilityConfig(
+        time_budget_ms=1_000.0,
+        max_solve_cycles=5,
+        max_solve_evaluations_per_seed=3,
+        seed_count=3,
+    )
+    requested_budgets = []
+    seeds = tuple(
+        {side: np.full(6, index, dtype=float) for side in ("left", "right")}
+        for index in range(3)
+    )
+    monkeypatch.setattr(
+        planner,
+        "_endpoint_seed_qpos",
+        lambda *_args, **_kwargs: seeds,
+    )
+
+    def solve(**kwargs):
+        budget = kwargs["maximum_evaluations"]
+        requested_budgets.append(budget)
+        return ({}, budget, 0.06, 25.0)
+
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+
+    result = planner.assess_endpoint_ik(
+        qpos_by_side={side: np.zeros(6) for side in ("left", "right")},
+        side="right",
+        target_tool_tcp_world=np.eye(4),
+        monotonic=lambda: 0.0,
+    )
+
+    assert requested_budgets == [3, 2]
+    assert result.solve_cycles == 5
+    assert result.termination_reason == "cycle_budget_exhausted"
+
+
+def test_reachability_reports_seed_budget_without_invalidating_result(
+    monkeypatch,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig()
+    )
+    planner.reachability_config = RM65GraspReachabilityConfig(
+        time_budget_ms=1_000.0,
+        max_solve_cycles=10,
+        max_solve_evaluations_per_seed=3,
+        seed_count=2,
+    )
+    seeds = tuple(
+        {side: np.full(6, index, dtype=float) for side in ("left", "right")}
+        for index in range(2)
+    )
+    monkeypatch.setattr(
+        planner,
+        "_endpoint_seed_qpos",
+        lambda *_args, **_kwargs: seeds,
+    )
+    monkeypatch.setattr(
+        planner,
+        "_least_squares_endpoint_from_seed",
+        lambda **_kwargs: ({}, 1, 0.06, 25.0),
+    )
+
+    result = planner.assess_endpoint_ik(
+        qpos_by_side={side: np.zeros(6) for side in ("left", "right")},
+        side="right",
+        target_tool_tcp_world=np.eye(4),
+        monotonic=lambda: 0.0,
+    )
+
+    assert result.solve_cycles == 2
+    assert result.termination_reason == "seed_budget_exhausted"
+
+
 class _MultistartBuilder:
     def __init__(self) -> None:
         self.current = {side: np.zeros(6) for side in ("left", "right")}
