@@ -3403,9 +3403,12 @@ def main(
         submit_legacy_owner_state=submit_legacy_owner_state,
     )
 
-    def reset_policy_for_activation() -> None:
+    def reset_policy_stream_for_activation() -> None:
+        """Reset every policy-owned part of an activation stream once."""
+
         nonlocal rtc_active_latency_gate_passed
         policy.reset()
+        policy_deploy_runtime.reset_stream()
         rtc_active_latency_samples.clear()
         rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
 
@@ -3945,13 +3948,11 @@ def main(
                     ):
                         policy_active = False
                         continue
-                    reset_policy_for_activation()
-                    policy_deploy_runtime.clear_action_queue()
+                    reset_policy_stream_for_activation()
                     _reset_startup_initializer(
                         startup_initializer,
                         current_pose_start_allowed=current_pose_start_override,
                     )
-                    policy_deploy_runtime.reset_prediction_schedule()
                     ready_confirmed = not wait_for_ready_confirm
                     if (
                         fixed_init_controller is not None
@@ -4037,8 +4038,7 @@ def main(
                             )
                         else:
                             ready_confirmed = True
-                            policy_deploy_runtime.clear_action_queue()
-                            policy_deploy_runtime.reset_prediction_schedule()
+                            policy_deploy_runtime.reset_stream()
                             console_log_event(
                                 "Policy",
                                 "READY: policy inference/execution may start.",
@@ -4370,13 +4370,11 @@ def main(
                                     ),
                                 )
                             )
-                            reset_policy_for_activation()
+                            reset_policy_stream_for_activation()
                             _reset_startup_initializer(
                                 startup_initializer,
                                 current_pose_start_allowed=current_pose_start_override,
                             )
-                            policy_deploy_runtime.clear_action_queue()
-                            policy_deploy_runtime.reset_prediction_schedule()
                             ready_confirmed = not wait_for_ready_confirm
                             faults.append(
                                 "impedance_force_guard_rearmed_press_g_to_resume"
@@ -4433,12 +4431,11 @@ def main(
                                 )
                             )
                             last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
-                            reset_policy_for_activation()
+                            reset_policy_stream_for_activation()
                             _reset_startup_initializer(
                                 startup_initializer,
                                 current_pose_start_allowed=current_pose_start_override,
                             )
-                            policy_deploy_runtime.reset_prediction_schedule()
                             ready_confirmed = not wait_for_ready_confirm
                             faults.append("position_safety_rearmed_press_g_to_resume")
                             print(
@@ -4487,13 +4484,11 @@ def main(
                     if fixed_result.message:
                         print(fixed_result.message)
                     if fixed_result.completed:
-                        reset_policy_for_activation()
-                        policy_deploy_runtime.clear_action_queue()
+                        reset_policy_stream_for_activation()
                         _reset_startup_initializer(
                             startup_initializer,
                             current_pose_start_allowed=current_pose_start_override,
                         )
-                        policy_deploy_runtime.reset_prediction_schedule()
                         ready_confirmed = not wait_for_ready_confirm
                         if bool(args.auto_start):
                             policy_active = True
@@ -4528,8 +4523,7 @@ def main(
                     if policy_qpos_result.message and not policy_qpos_result.completed:
                         print(policy_qpos_result.message)
                     if policy_qpos_result.completed:
-                        reset_policy_for_activation()
-                        policy_deploy_runtime.clear_action_queue()
+                        reset_policy_stream_for_activation()
                         if not policy_qpos_result.requires_fresh_observation:
                             raise RuntimeError(
                                 "policy qpos init completion is missing its "
@@ -4539,7 +4533,6 @@ def main(
                             last_action,
                             current_startup_satisfied,
                         ) = _finish_policy_qpos_init_reference_cut(startup_initializer)
-                        policy_deploy_runtime.reset_prediction_schedule()
                         ready_confirmed = not wait_for_ready_confirm
                         policy_active = True
                         if deploy_tcp_pose_envelope_projector is not None:
@@ -4676,8 +4669,7 @@ def main(
                                                 "[StartupInit] replay startup target consumed; "
                                                 f"skipped {skipped} replay frame(s)."
                                             )
-                                    policy_deploy_runtime.clear_action_queue()
-                                    policy_deploy_runtime.reset_prediction_schedule()
+                                    policy_deploy_runtime.reset_stream()
                                     if wait_for_ready_confirm and not ready_confirmed:
                                         print(
                                             "[StartupInit] ready; press A to start policy inference/execution."
@@ -5453,6 +5445,7 @@ def main(
                         execution: _PreparedActionExecution | None = None
                         plan_cut_proposal = None
                         post_arm_states: dict[str, dict[str, Any]] | None = None
+                        record_dispatch_outcome = False
                         if position_deploy_executor is None:
                             annotate_deploy_arm_command_limits(
                                 canonical_action.command,
@@ -5557,106 +5550,81 @@ def main(
                                         observation,
                                         deploy_layout=deploy_layout,
                                     )
-                            if debug_logger.enabled:
-                                post_state_started = time.monotonic()
-                                post_arm_states = _debug_backend_arm_states(
-                                    arm_backends
-                                )
-                                action_phase_timing["post_arm_state_snapshot_ms"] = max(
-                                    0.0,
-                                    time.monotonic() - post_state_started,
-                                ) * 1000.0
+                            record_dispatch_outcome = True
                         except Exception as exc:
                             if plan_cut_proposal is not None:
                                 position_plan_cut_detector.reject(plan_cut_proposal)
                                 plan_cut_proposal = None
                             dispatch_error = exc
-                            if (
-                                policy_arbiter_shadow is not None
-                                and action_step.emission is not None
-                            ):
-                                legacy_shadow_event = (
-                                    policy_arbiter_shadow.observe_legacy_execution(
-                                        emission=action_step.emission,
-                                        shadow_step=arbiter_shadow_step,
-                                        canonical_action=canonical_action,
-                                        execution=execution,
-                                        dispatch_error=dispatch_error,
-                                    )
-                                )
-                                debug_logger.log_event(
-                                    "legacy_execution_observation",
-                                    legacy_shadow_event.to_debug_payload(),
-                                )
-                            if debug_logger.enabled:
-                                post_state_started = time.monotonic()
-                                post_arm_states = _debug_backend_arm_states(
-                                    arm_backends
-                                )
-                                action_phase_timing["post_arm_state_snapshot_ms"] = max(
-                                    0.0,
-                                    time.monotonic() - post_state_started,
-                                ) * 1000.0
-                                action_phase_timing["loop_before_debug_ms"] = max(
-                                    0.0,
-                                    time.monotonic() - control_loop_started_at,
-                                ) * 1000.0
-                                debug_logger.log_action_step(
-                                    timestamp=loop_started_at,
-                                    step_index=step_index,
-                                    policy_name=policy.name,
-                                    raw_action=raw_action,
-                                    canonical_action=canonical_action,
-                                    pre_arm_states=arm_states,
-                                    post_arm_states=post_arm_states,
-                                    arm_backends=arm_backends,
-                                    send_actions=send_actions,
-                                    queue_len_before_pop=queue_len_before_pop,
-                                    queue_len_after_pop=queue_len_after_pop,
-                                    faults=faults,
-                                    dispatch_error=dispatch_error,
-                                    execution=execution,
-                                    phase_timing=action_phase_timing,
-                                )
+                            record_dispatch_outcome = True
                             raise
-                        if (
-                            policy_arbiter_shadow is not None
-                            and action_step.emission is not None
-                        ):
-                            legacy_shadow_event = (
-                                policy_arbiter_shadow.observe_legacy_execution(
-                                    emission=action_step.emission,
-                                    shadow_step=arbiter_shadow_step,
-                                    canonical_action=canonical_action,
-                                    execution=execution,
-                                    dispatch_error=dispatch_error,
-                                )
-                            )
-                            debug_logger.log_event(
-                                "legacy_execution_observation",
-                                legacy_shadow_event.to_debug_payload(),
-                            )
-                        action_phase_timing["loop_before_debug_ms"] = max(
-                            0.0,
-                            time.monotonic() - control_loop_started_at,
-                        ) * 1000.0
-                        debug_logger.log_action_step(
-                            timestamp=loop_started_at,
-                            step_index=step_index,
-                            policy_name=policy.name,
-                            raw_action=raw_action,
-                            canonical_action=canonical_action,
-                            pre_arm_states=arm_states,
-                            post_arm_states=post_arm_states,
-                            arm_backends=arm_backends,
-                            send_actions=send_actions,
-                            queue_len_before_pop=queue_len_before_pop,
-                            queue_len_after_pop=queue_len_after_pop,
-                            faults=faults,
-                            dispatch_error=dispatch_error,
-                            execution=execution,
-                            phase_timing=action_phase_timing,
-                        )
+                        finally:
+                            if record_dispatch_outcome:
+                                # Preserve the historical observation order:
+                                # successful dispatch snapshots precede the
+                                # passive observer; failed dispatch snapshots
+                                # follow it.
+                                if debug_logger.enabled and dispatch_error is None:
+                                    post_state_started = time.monotonic()
+                                    post_arm_states = _debug_backend_arm_states(
+                                        arm_backends
+                                    )
+                                    action_phase_timing[
+                                        "post_arm_state_snapshot_ms"
+                                    ] = max(
+                                        0.0,
+                                        time.monotonic() - post_state_started,
+                                    ) * 1000.0
+                                if (
+                                    policy_arbiter_shadow is not None
+                                    and action_step.emission is not None
+                                ):
+                                    legacy_shadow_event = (
+                                        policy_arbiter_shadow.observe_legacy_execution(
+                                            emission=action_step.emission,
+                                            shadow_step=arbiter_shadow_step,
+                                            canonical_action=canonical_action,
+                                            execution=execution,
+                                            dispatch_error=dispatch_error,
+                                        )
+                                    )
+                                    debug_logger.log_event(
+                                        "legacy_execution_observation",
+                                        legacy_shadow_event.to_debug_payload(),
+                                    )
+                                if debug_logger.enabled and dispatch_error is not None:
+                                    post_state_started = time.monotonic()
+                                    post_arm_states = _debug_backend_arm_states(
+                                        arm_backends
+                                    )
+                                    action_phase_timing[
+                                        "post_arm_state_snapshot_ms"
+                                    ] = max(
+                                        0.0,
+                                        time.monotonic() - post_state_started,
+                                    ) * 1000.0
+                                if dispatch_error is None or debug_logger.enabled:
+                                    action_phase_timing["loop_before_debug_ms"] = max(
+                                        0.0,
+                                        time.monotonic() - control_loop_started_at,
+                                    ) * 1000.0
+                                    debug_logger.log_action_step(
+                                        timestamp=loop_started_at,
+                                        step_index=step_index,
+                                        policy_name=policy.name,
+                                        raw_action=raw_action,
+                                        canonical_action=canonical_action,
+                                        pre_arm_states=arm_states,
+                                        post_arm_states=post_arm_states,
+                                        arm_backends=arm_backends,
+                                        send_actions=send_actions,
+                                        queue_len_before_pop=queue_len_before_pop,
+                                        queue_len_after_pop=queue_len_after_pop,
+                                        faults=faults,
+                                        dispatch_error=dispatch_error,
+                                        execution=execution,
+                                        phase_timing=action_phase_timing,
+                                    )
 
                     if (
                         position_deploy_executor is not None
