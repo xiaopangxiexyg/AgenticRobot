@@ -2027,255 +2027,164 @@ python -u -m deployments.openpi.client.real \
 硬件授权后，才可以在同一条命令末尾显式加入 `--send-actions`。本节不授权真实运动，也不
 允许用 `--no-init-qpos`、`--disable-camera-semantic-resolution` 或 raw mask 作为故障绕过。
 
-## 23. 当前 corrected Stage1 v2 / historical Stage2 v1 all-view h32 trained model-RTC 部署测试
+## 23. 当前 Stage1–4 all-view h32 trained model-RTC 部署
 
-本节对应 `front + left_wrist + right_wrist`、h32、absolute 的两个独立 trained model-RTC。
-必须先完成真实 observation/transport 的 conditioned no-action shadow：它会连接三路
-RealSense、双臂状态和 DMTAC 状态，也会请求 GPU server 推理，但因为没有
-`--send-actions` 而不会派发 policy action。`--rtc-real-shadow` 本身只选择实时 RTC 路径；
-在完成全部安全门后显式加入 `--send-actions` 才进入 Active，且不会移除 qpos-init。
+本节对应四个独立的 `front + left_wrist + right_wrist`、h32、absolute trained
+model-RTC checkpoint。2026-09-14 的固定核验结果为：Stage1、Stage2、Stage3、Stage4 均有
+Orbax committed 的 `25000/50000/75000/100000` checkpoint；下面默认使用 `100000`，不会
+自动选择 smoke、信号收尾产生的非标准 step 或旧 historical Stage2 v1。
 
-2026-09-07 的固定盘点结果是：系统性修正后的 Stage1 v2 在用户要求的 25k 停止点保存了
-完整 `25000` checkpoint，并在信号收尾时又完整提交了最新 `25006`；下面 Stage1 默认选择
-`25006`。Stage2 `100000` 也已完整，但它是系统性修正前的 historical v1，只用于兼容性对照，
-不能声称为 corrected Stage2 重训结果。两者都不得自动回退到 smoke 或较早 step；若研究中间
-step，必须显式设置 `SERVER_CKPT_STEP` 并记录 server 实际身份。
+checkpoint、Stage、prepared profile、model-RTC profile 与 OpenPI source 只由 server 选择。
+client 从 server metadata 获取 checkpoint 发布的 policy artifact，只验证实际线协议需要的
+layout、三路相机、absolute action、normalization、prompt 与 RTC capability；client 命令不携带
+Stage、step、checkpoint 或 training/model-RTC profile。切换 Stage/step 时正常停止旧 client 和
+server，确认端口与 GPU 释放，启动新 server 后再运行同一条 client 命令；不要复用旧连接的
+queue 或 RTC history。
 
-checkpoint、Stage、prepared profile 与 model-RTC profile 都只由 server 选择。client 从
-server metadata 获取 checkpoint 已发布的 policy artifact，只校验实际线协议需要的 layout、
-三路相机、absolute action、normalization、prompt 与 RTC capability；client 命令不再重复
-model id、checkpoint step 或训练数据路径。切换 Stage/step 时只重启 server，随后为新的
-server metadata 新启一个 client，不能复用旧连接的 queue 或 RTC history。
+### 23.1 终端 A：可切换 Stage/step 的完整 server 命令
 
-### 23.1 共同变量与完整性门
-
-在两个终端分别复制同一段。`DEPLOY_ROOT` 是本 Task 同步后的隔离只读代码目录，不使用远端
-脏 `AgenticRobot`/`DexTeleop` checkout：
+这是一条直接的 Python 命令。只修改末尾两个参数：第一个是 `1/2/3/4`，第二个是
+`25000/50000/75000/100000`。命令先验证四类必要路径，再 exec 正式 server；没有 shell heredoc
+或嵌套 f-string。
 
 ```bash
-set -euo pipefail
+/home/user/zc/openpi/.venv/bin/python -u -c '
+import os
+import sys
+from pathlib import Path
 
-: "${DEPLOY_ROOT:?set DEPLOY_ROOT to one immutable AgenticRobot deployment snapshot}"
-: "${EXPECTED_DEPLOY_COMMIT:?set EXPECTED_DEPLOY_COMMIT to its full commit SHA}"
-export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
-export POLICY_SERVER_HOST=127.0.0.1
-export OPENPI_PORT=8078
-export STAGE="${STAGE:-1}"
-export RTC_RUNTIME_OPENPI_ROOT="$DEPLOY_ROOT/model/openpi"
-export QPOS_INIT_DATASET=/home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success
-export LEFT_GRIPPER_PORT=/dev/ttyUSB1
-export RIGHT_GRIPPER_PORT=/dev/ttyUSB3
-
-case "$STAGE" in
-  1)
-    export PREPARED_PROFILE=/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/profiles/writing_stage1_all_valid_all_view_h32_absolute_non_rtc_100k_systemic_v3.json
-    export MODEL_RTC_PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/model_rtc/writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json"
-    export OPENPI_ROOT=/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/openpi
-    export TRAINING_OPENPI_COMMIT=359f1ced5c68faeba3167a859a42153d36ab1fd2
-    export CHECKPOINT_ROOT=/home/user/zc/checkpoints/openpi/writing-stage1-all-valid-all-view-h32-absolute-prepared-model-rtc-v2/writing-stage1-all-valid-all-view-h32-absolute-model-rtc-systemic-v3-359f1ced-r1-20260906
-    export DEFAULT_CKPT_STEP=25006
-    ;;
-  2)
-    export PREPARED_PROFILE=/home/user/zc/openpi_stage2_model_rtc_runs/20260904_snapshot_v5/profiles/writing_stage2_all_valid_all_view_h32_absolute_non_rtc_100k_lowmem_semanticbounds_v5.json
-    export MODEL_RTC_PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/model_rtc/writing_stage2_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json"
-    export OPENPI_ROOT=/home/user/zc/openpi_stage2_model_rtc_runs/20260904_snapshot_v1/code/openpi-e21cb961
-    export TRAINING_OPENPI_COMMIT=e21cb9612de936fcf13c7757b27df1c086c6c59e
-    export CHECKPOINT_ROOT=/home/user/zc/checkpoints/openpi/writing-stage2-all-valid-all-view-h32-absolute-prepared-model-rtc-v1/writing-stage2-all-valid-all-view-h32-absolute-model-rtc-b1-nw0-lowmem-semanticbounds-v5-20260904
-    export DEFAULT_CKPT_STEP=100000
-    ;;
-  *)
-    printf 'STAGE must be 1 or 2, got %s\n' "$STAGE" >&2
-    exit 2
-    ;;
-esac
-
-export SERVER_CKPT_STEP="${SERVER_CKPT_STEP:-$DEFAULT_CKPT_STEP}"
-export SERVER_CHECKPOINT_DIR="${SERVER_CHECKPOINT_DIR:-$CHECKPOINT_ROOT/$SERVER_CKPT_STEP}"
-
-test -d "$SERVER_CHECKPOINT_DIR/params"
-test -d "$SERVER_CHECKPOINT_DIR/training_step"
-test -f "$SERVER_CHECKPOINT_DIR/_CHECKPOINT_METADATA"
-test -f "$SERVER_CHECKPOINT_DIR/policy_artifact.json"
-test -f "$SERVER_CHECKPOINT_DIR/model_continuation_training_run.json"
-test -f "$SERVER_CHECKPOINT_DIR/model_continuation_checkpoint_receipt.json"
-test -f "$PREPARED_PROFILE"
-test -f "$MODEL_RTC_PROFILE"
-test -d "$OPENPI_ROOT/.git" -o -f "$OPENPI_ROOT/.git"
-test "$(git -C "$DEPLOY_ROOT" rev-parse HEAD)" = "$EXPECTED_DEPLOY_COMMIT"
-test "$(git -C "$OPENPI_ROOT" rev-parse HEAD)" = "$TRAINING_OPENPI_COMMIT"
-test -f "$RTC_RUNTIME_OPENPI_ROOT/scripts/serve_dexteleop_policy.py"
-test "$(git -C "$DEPLOY_ROOT" rev-parse HEAD:model/openpi)" = \
-  "$(git -C "$RTC_RUNTIME_OPENPI_ROOT" rev-parse HEAD)"
+deploy_root = Path("/home/user/zc/AgenticRobot-deployment-20260914-66227390-rtc-self-contained")
+stage = sys.argv[1]
+step = sys.argv[2]
+allowed_steps = {"25000", "50000", "75000", "100000"}
+profiles = {
+    "1": {
+        "checkpoint_root": "/home/user/zc/checkpoints/openpi/writing-stage1-all-valid-all-view-h32-absolute-prepared-model-rtc-v2/writing-stage1-all-valid-all-view-h32-absolute-model-rtc-systemic-v3-359f1ced-r1-20260906",
+        "prepared": "/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/profiles/writing_stage1_all_valid_all_view_h32_absolute_non_rtc_100k_systemic_v3.json",
+        "model_rtc": "/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/AgenticRobot/deployments/openpi/configs/model_rtc/writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json",
+        "openpi": "/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/openpi",
+    },
+    "2": {
+        "checkpoint_root": "/home/user/zc/checkpoints/openpi/writing-stage2-all-valid-all-view-h32-absolute-prepared-model-rtc-v2/writing-stage2-all-valid-all-view-h32-absolute-model-rtc-systemic-v2-b1-nw2-359f1ced-20260909",
+        "prepared": "/home/user/zc/openpi_stage2_model_rtc_runs/20260909_systemic_v2/profiles/writing_stage2_model_rtc_systemic_v2_b1_nw2.json",
+        "model_rtc": "/home/user/zc/openpi_stage2_model_rtc_runs/20260909_systemic_v2/profiles/writing_stage2_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json",
+        "openpi": "/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/openpi",
+    },
+    "3": {
+        "checkpoint_root": "/home/user/zc/checkpoints/openpi/writing-stage3-all-valid-all-view-h32-absolute-prepared-model-rtc-by-date-v1/writing-stage3-all-valid-all-view-h32-absolute-model-rtc-by-date-semantic-bounds-v2-b1-nw2-359f1ced-20260910",
+        "prepared": "/home/user/zc/openpi_stage3_model_rtc_runs/20260910_by_date_v2_semantic_bounds/profiles/writing_stage3_all_valid_all_view_h32_absolute_non_rtc_100k_by_date_v1.json",
+        "model_rtc": "/home/user/zc/openpi_stage3_model_rtc_runs/20260910_by_date_v2_semantic_bounds/profiles/writing-stage3-model-rtc-by-date-v1.json",
+        "openpi": "/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/openpi",
+    },
+    "4": {
+        "checkpoint_root": "/home/user/zc/checkpoints/openpi/writing-stage4-all-valid-all-view-h32-absolute-prepared-model-rtc-by-date-v1/writing-stage4-all-valid-all-view-h32-absolute-model-rtc-by-date-semantic-bounds-v2-b1-nw2-20260913",
+        "prepared": "/home/user/zc/openpi_stage4_model_rtc_runs/20260913_by_date_v2/profiles/writing_stage4_all_valid_all_view_h32_absolute_non_rtc_100k_by_date_v1.json",
+        "model_rtc": "/home/user/zc/openpi_stage4_model_rtc_runs/20260913_by_date_v2/profiles/writing_stage4_all_valid_all_view_h32_absolute_prepared_model_rtc_by_date_v1.json",
+        "openpi": "/home/user/zc/openpi_stage4_model_rtc_runs/20260913_by_date_v1/code/openpi-359f1ced",
+    },
+}
+if stage not in profiles:
+    raise SystemExit("stage must be 1, 2, 3, or 4")
+if step not in allowed_steps:
+    raise SystemExit("checkpoint step must be 25000, 50000, 75000, or 100000")
+p = profiles[stage]
+checkpoint_dir = Path(p["checkpoint_root"]) / step
+required = (
+    deploy_root / "deployments/openpi/server.py",
+    checkpoint_dir / "params",
+    checkpoint_dir / "training_step",
+    checkpoint_dir / "_CHECKPOINT_METADATA",
+    checkpoint_dir / "policy_artifact.json",
+    checkpoint_dir / "model_continuation_training_run.json",
+    checkpoint_dir / "model_continuation_checkpoint_receipt.json",
+    Path(p["prepared"]),
+    Path(p["model_rtc"]),
+    Path(p["openpi"]) / "scripts/serve_dexteleop_policy.py",
+)
+missing = [str(path) for path in required if not path.exists()]
+if missing:
+    raise SystemExit("missing deployment inputs:\n" + "\n".join(missing))
+env = os.environ.copy()
+env["PYTHONPATH"] = str(deploy_root) + os.pathsep + env.get("PYTHONPATH", "")
+env["JAX_PLATFORMS"] = "cuda"
+env["CUDA_VISIBLE_DEVICES"] = "0"
+env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.70"
+args = [
+    sys.executable,
+    "-u",
+    "-m",
+    "deployments.openpi.server",
+    "--checkpoint-dir",
+    str(checkpoint_dir),
+    "--prepared-training-profile",
+    p["prepared"],
+    "--model-rtc-profile",
+    p["model_rtc"],
+    "--openpi-root",
+    p["openpi"],
+    "--enable-rtc-continuation",
+    "--rtc-inference-steps",
+    "10",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8078",
+]
+print("[openpi-server] stage=" + stage + " step=" + step + " checkpoint=" + str(checkpoint_dir), flush=True)
+os.chdir(deploy_root)
+os.execvpe(sys.executable, args, env)
+' 1 100000
 ```
 
-该门只检查必要文件与冻结 OpenPI source identity；随后仍必须执行两端各自的语义检查。
+`10` 是这四个 trained model-RTC checkpoint 的原始 sampler contract；本节不使用需要额外
+deployment-only OpenPI source binding 的 8-step 派生路径。server 与 client 在同一远端主机上，
+因此只监听 `127.0.0.1`；不要为本机部署无故扩大到 `0.0.0.0`。
 
-### 23.2 完全无硬件的 server prepared-config 检查
+### 23.2 终端 B：无硬件 contract-check
 
-该段不启动 server、不连接相机、夹爪或机械臂，也不加载 GPU 权重：
+server 出现 `server listening on 127.0.0.1:8078` 后运行。该命令只连接 metadata、验证 server
+发布的 policy artifact 后退出，不构造相机、夹爪或机械臂；四个 Stage 使用完全相同的命令。
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 "$OPENPI_PYTHON" -u -m deployments.openpi.server \
-  --checkpoint-dir "$SERVER_CHECKPOINT_DIR" \
-  --prepared-training-profile "$PREPARED_PROFILE" \
-  --model-rtc-profile "$MODEL_RTC_PROFILE" \
-  --openpi-root "$OPENPI_ROOT" \
-  --enable-rtc-continuation \
-  --rtc-inference-steps 8 \
-  --rtc-runtime-openpi-root "$RTC_RUNTIME_OPENPI_ROOT" \
-  --prepared-config-check-only
+PYTHONPATH=/home/user/zc/AgenticRobot-deployment-20260914-66227390-rtc-self-contained /home/user/miniconda3/envs/dexteleop310-harness/bin/python -u -m deployments.openpi.client.real --host 127.0.0.1 --port 8078 --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 --rtc-inference-steps 10 --contract-check-only
 ```
 
-通过后，确认没有别人的 OpenPI 训练/server 使用 GPU，确认 `8078` 未监听；不要为了部署
-测试停止不属于自己的训练。
+成功输出必须包含三路 camera slots、`action_horizon=32`、`action_pose_mode=absolute`、对应 server
+实际加载的 model id/step，以及 `hardware_output=false`。client 不要求 model id/step 与前一次连接
+相同，但其它 tensor、camera、normalization、prompt、pose-frame 与 continuation capability 必须
+兼容。
 
-### 23.3 终端 A：conditioned model-RTC server
+### 23.3 终端 B：真机 observation no-action shadow
+
+该命令会打开真实 observation 资源，因此运行前仍需现场确认两台机械臂安全静止、急停可用、
+三路 RealSense 与 DMTAC 端口归属正确。它不含 `--send-actions`，不会派发 policy action。
+dataset-frame qpos-init 并未被移除：它会读取、规划并做碰撞检查，但在 no-action 路径明确以
+`plan-only` reference cut 结束，不会伪造“已到达”收据。这里使用 by-date full-task Episode 127
+frame 0，替代与 writing 无关的 cube 默认数据。
 
 ```bash
-cd "$DEPLOY_ROOT"
-export JAX_PLATFORMS=cuda
-export CUDA_VISIBLE_DEVICES=0
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
-
-"$OPENPI_PYTHON" -u -m deployments.openpi.server \
-  --checkpoint-dir "$SERVER_CHECKPOINT_DIR" \
-  --prepared-training-profile "$PREPARED_PROFILE" \
-  --model-rtc-profile "$MODEL_RTC_PROFILE" \
-  --openpi-root "$OPENPI_ROOT" \
-  --enable-rtc-continuation \
-  --rtc-inference-steps 8 \
-  --rtc-runtime-openpi-root "$RTC_RUNTIME_OPENPI_ROOT" \
-  --host 0.0.0.0 \
-  --port "$OPENPI_PORT"
+PYTHONPATH=/home/user/zc/AgenticRobot-deployment-20260914-66227390-rtc-self-contained /home/user/miniconda3/envs/dexteleop310-harness/bin/python -u -m deployments.openpi.client.real --host 127.0.0.1 --port 8078 --deployment-profile rm65_bimanual_dmtac --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 --rtc-inference-steps 10 --rtc-real-shadow --policy-action-pose-mode absolute --policy-qpos-init-dataset /home/user/zc/datasets/RealmanDMTAC/by-date/2026-08-03__writing-full4 --policy-qpos-init-episode 127 --policy-qpos-init-frame 0 --policy-qpos-init-source auto --policy-qpos-init-collision-check --dmtac-no-validate-current-usb --left-gripper-port /dev/ttyUSB1 --right-gripper-port /dev/ttyUSB3 --max-steps 100 --min-rtc-emissions-before-exit 1 --debug --rtc-debug-level summary --debug-dir /home/user/zc/logs/openpi_model_rtc_shadow
 ```
 
-另开只读终端执行：
+Episode 127 是完整成功、无 force collision、414 帧且 coarse progress facts 闭合的候选；其
+Stage1/2/3/4 第一个不早于 progress transition 的 parquet frame 分别为 `0/109/187/309`。
+这些只是数据证据，不等于 Stage2–4 的现场 Active 起点验收：阶段中间姿态同时依赖毛笔、笔盖、
+双夹爪和工作区的真实当前状态。
+
+### 23.4 终端 B：Stage1 限步 Active（需要单独的现场运动授权）
+
+当前只交付 Stage1 的受限 Active 命令。它会真实平滑移动到 Episode 127/frame 0 的双臂和末端
+目标，保留 branch search、插值、碰撞检查与手动 ready；完成 qpos-init 后还必须由现场操作者
+人工按 `A` 才放行 policy。首次仅运行 10 个 control step，并要求冷启动丢弃、warm completion
+和严格 `<0.4 s` 推理延迟门。命令存在并不构成本次会话的运动授权。
 
 ```bash
-curl --fail --silent "http://127.0.0.1:$OPENPI_PORT/healthz"
-curl --fail --silent "http://127.0.0.1:$OPENPI_PORT/metadata" | python -m json.tool
+PYTHONPATH=/home/user/zc/AgenticRobot-deployment-20260914-66227390-rtc-self-contained /home/user/miniconda3/envs/dexteleop310-harness/bin/python -u -m deployments.openpi.client.real --host 127.0.0.1 --port 8078 --deployment-profile rm65_bimanual_dmtac --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 --rtc-inference-steps 10 --rtc-real-shadow --rtc-active-warmup-discard-completions 1 --rtc-active-warmup-completions 3 --rtc-active-max-inference-latency-sec 0.4 --policy-action-pose-mode absolute --policy-qpos-init-dataset /home/user/zc/datasets/RealmanDMTAC/by-date/2026-08-03__writing-full4 --policy-qpos-init-episode 127 --policy-qpos-init-frame 0 --policy-qpos-init-source auto --policy-qpos-init-collision-check --dmtac-no-validate-current-usb --left-gripper-port /dev/ttyUSB1 --right-gripper-port /dev/ttyUSB3 --send-actions --wait-for-ready-confirm --max-steps 10 --min-rtc-emissions-before-exit 1 --debug --rtc-debug-level summary --debug-dir /home/user/zc/logs/openpi_model_rtc_stage1_active
 ```
 
-metadata 必须表明三路 camera slots、h32、absolute、匹配的 layout/normalization，以及已加载
-RTC continuation capability。model id/step 可以与 client artifact 不同，但不能以此忽略其它
-契约差异。
-
-server 健康后，在终端 B 先执行这个无硬件 client 契约检查。它只建立 metadata WebSocket、
-验证 server 发布的 policy artifact 后关闭连接；不会加载本地 checkpoint，也不会构造相机、
-夹爪或机械臂：
-
-```bash
-cd "$DEPLOY_ROOT"
-conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
-export DEXTELEOP_PYTHON="$(command -v python)"
-
-PYTHONDONTWRITEBYTECODE=1 "$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
-  --host "$POLICY_SERVER_HOST" \
-  --port "$OPENPI_PORT" \
-  --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
-  --rtc-inference-steps 8 \
-  --contract-check-only
-```
-
-### 23.4 终端 B：100-step 真机 observation no-action shadow
-
-该命令会打开真实 observation 资源，因此运行前仍需现场确认两台 RM65 处于安全静止状态、
-急停可用、三路 RealSense 与 DMTAC 端口归属正确。它没有动作下发权限。启动时仍会完整读取
-Episode 0/frame 0、根据当前关节状态完成 branch search、插值与碰撞检查，但随后明确走
-`plan-only` reference cut：不会虚拟等待整条 qpos 轨迹，也不会声称机械臂已经到达数据集起点，
-而是从下一份新鲜的当前观测开始 conditioned RTC 推理：
-
-```bash
-cd "$DEPLOY_ROOT"
-conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
-export DEXTELEOP_PYTHON="$(command -v python)"
-export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage${STAGE}_shadow_$(date +%Y%m%dT%H%M%S)"
-
-"$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
-  --host "$POLICY_SERVER_HOST" \
-  --port "$OPENPI_PORT" \
-  --deployment-profile rm65_bimanual_dmtac \
-  --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
-  --rtc-inference-steps 8 \
-  --rtc-real-shadow \
-  --policy-action-pose-mode absolute \
-  --policy-qpos-init-dataset "$QPOS_INIT_DATASET" \
-  --policy-qpos-init-episode 0 \
-  --policy-qpos-init-frame 0 \
-  --policy-qpos-init-source auto \
-  --policy-qpos-init-collision-check \
-  --dmtac-no-validate-current-usb \
-  --left-gripper-port "$LEFT_GRIPPER_PORT" \
-  --right-gripper-port "$RIGHT_GRIPPER_PORT" \
-  --max-steps 100 \
-  --min-rtc-emissions-before-exit 1 \
-  --debug \
-  --rtc-debug-level summary \
-  --debug-dir "$RTC_DEBUG_DIR"
-```
-
-Stage1 与 Stage2 分别启动新 client；切换前先 `Ctrl+C` 正常停止 client/server，确认资源和
-`8078` 已释放，再设置 `STAGE=2` 重跑 23.1～23.4。不要复用前一进程的 queue、RTC history
-或 camera backend。本节的验收边界止于真实 observation + conditioned inference + no-action
-drain；qpos-init 的来源、目标、branch search、插值和碰撞门均被保留并校验，但计划只在
-observation-only 模式标记为 `plan-only`，不会发送轨迹或伪造“已到达”收据，也不授权 RTC
-Active、伺服或任何机械臂/夹爪运动。Active 会重新生成并真实执行同一类 qpos-init 计划，
-不能继承这次 plan-only reference cut。
-
-### 23.5 终端 B：Stage1 小步数 Active（必须另行获得现场运动授权）
-
-当前只给出 Stage1 的受限 Active 命令。Stage2 尚未建立经过审查的物理衔接姿态和 qpos-init
-目标，因此本段对 `STAGE=2` fail closed；不得把 Stage1 起点或 `--no-init-qpos` 静默套用到
-Stage2。运行前必须重新确认：两臂和笔/夹爪当前状态允许移动到指定 Episode 0/frame 0，工作区
-无人且无障碍，急停在手，DMTAC/RealSense 归属正确，server metadata 与 23.4 no-action 均通过。
-
-下面命令会真实发动作。它显式保留 dataset-frame qpos-init 和碰撞检查，并把
-`--wait-for-ready-confirm` 放在 profile 参数之后，以覆盖 RTC real-shadow profile 的自动启动
-默认值；初始化轨迹完成并出现 ready 提示后，仍须由现场操作者人工按 `A` 放行 policy。首次只
-运行 10 个 control step，并显式固定 1 次冷启动丢弃、3 次 warm completion 与严格
-`<0.4 s` 延迟门；不得自动注入按键：
-
-```bash
-set -euo pipefail
-
-if [ "$STAGE" != 1 ]; then
-  printf 'Stage2 Active is not reviewed; STAGE must be 1, got %s\n' "$STAGE" >&2
-  exit 2
-fi
-
-cd "$DEPLOY_ROOT"
-conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
-export DEXTELEOP_PYTHON="$(command -v python)"
-export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage1_active_$(date +%Y%m%dT%H%M%S)"
-
-"$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
-  --host "$POLICY_SERVER_HOST" \
-  --port "$OPENPI_PORT" \
-  --deployment-profile rm65_bimanual_dmtac \
-  --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
-  --rtc-inference-steps 8 \
-  --rtc-real-shadow \
-  --rtc-active-warmup-discard-completions 1 \
-  --rtc-active-warmup-completions 3 \
-  --rtc-active-max-inference-latency-sec 0.4 \
-  --policy-action-pose-mode absolute \
-  --policy-qpos-init-dataset "$QPOS_INIT_DATASET" \
-  --policy-qpos-init-episode 0 \
-  --policy-qpos-init-frame 0 \
-  --policy-qpos-init-source auto \
-  --policy-qpos-init-collision-check \
-  --dmtac-no-validate-current-usb \
-  --left-gripper-port "$LEFT_GRIPPER_PORT" \
-  --right-gripper-port "$RIGHT_GRIPPER_PORT" \
-  --send-actions \
-  --wait-for-ready-confirm \
-  --max-steps 10 \
-  --min-rtc-emissions-before-exit 1 \
-  --debug \
-  --rtc-debug-level summary \
-  --debug-dir "$RTC_DEBUG_DIR"
-```
-
-此命令只是受限首次 Active 入口，不是运动授权本身。不得追加 `--no-init-qpos`、
-`--no-wait-for-ready-confirm`、`--no-position-collision-check` 或任何自动 ready/按键脚本；若
-qpos-init、观测新鲜度、力/碰撞、RTC drain 或 operator ready 任一门失败，立即停止并保留日志。
+Stage2–4 若作为连续任务接管，必须从上一阶段真实完成后的物体和机器人状态进入；若独立启动，
+则必须分别现场审查 Episode 127 的 frame `109/187/309`，不能把 Stage1 frame 0 或
+`--no-init-qpos` 静默套用。当前 server metadata 不发布物体状态或 stage-specific qpos-init authority，
+所以在补齐该契约之前，client 虽然无需知道 Stage/step，也不能安全地自动选择 Stage2–4 的 Active
+初始化姿态。任一 qpos-init、观测新鲜度、力/碰撞、RTC drain、推理延迟或 operator ready 门失败，
+立即停止并保留日志。
