@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -104,6 +105,54 @@ def _validated_by_date_entry_sidecar(
         raise CameraSemanticPreparedViewContractError(
             "Prepared-view by-date entry contains tactile-specific metadata."
         )
+    return path
+
+
+def _validated_stage_annotation_writer_lock_sidecar(root: Path) -> Path | None:
+    """Accept only an idle, payload-free annotation compatibility lock.
+
+    The annotation store intentionally leaves this zero-byte flock inode in
+    place after an editor exits.  It is runtime coordination state, not camera
+    payload, so it cannot be part of the immutable prepared-view inventory.
+    Episode-scoped lock directories and a legacy exclusive flock still mean
+    that an annotation writer may be active and remain fail-closed.
+    """
+
+    path = root / "meta/progress/stage_annotations/.writer.lock"
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise CameraSemanticPreparedViewContractError(
+            f"Prepared-view annotation writer lock must be a regular file: {path}"
+        )
+    if path.stat().st_size != 0:
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view annotation writer lock must remain payload-free."
+        )
+
+    episode_lock_root = root / "meta/progress/stage_annotation_locks"
+    if episode_lock_root.exists() or episode_lock_root.is_symlink():
+        if episode_lock_root.is_symlink() or not episode_lock_root.is_dir():
+            raise CameraSemanticPreparedViewContractError(
+                "Prepared-view annotation episode lock root is invalid."
+            )
+        if any(episode_lock_root.iterdir()):
+            raise CameraSemanticPreparedViewContractError(
+                "Prepared-view annotations have active or unreconciled episode locks."
+            )
+
+    try:
+        with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except BlockingIOError as exc:
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view annotations are held by a legacy exclusive writer."
+        ) from exc
+    except OSError as exc:
+        raise CameraSemanticPreparedViewContractError(
+            f"Cannot validate prepared-view annotation writer lock: {exc}"
+        ) from exc
     return path
 
 
@@ -230,6 +279,9 @@ def load_camera_semantic_prepared_view(
         root,
         manifest.manifest_hash,
     )
+    annotation_writer_lock_path = (
+        _validated_stage_annotation_writer_lock_sidecar(root)
+    )
 
     actual_files: set[str] = set()
     for path in sorted(root.rglob("*")):
@@ -237,7 +289,11 @@ def load_camera_semantic_prepared_view(
             raise CameraSemanticPreparedViewContractError(
                 f"Prepared view refuses symlinks: {path}"
             )
-        if path.is_file() and path not in {manifest_path, by_date_entry_path}:
+        if path.is_file() and path not in {
+            manifest_path,
+            by_date_entry_path,
+            annotation_writer_lock_path,
+        }:
             relative = path.relative_to(root)
             if any(part.endswith(".lock") for part in relative.parts):
                 raise CameraSemanticPreparedViewContractError(

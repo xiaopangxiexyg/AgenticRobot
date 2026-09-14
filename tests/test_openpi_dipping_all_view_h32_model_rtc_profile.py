@@ -208,6 +208,56 @@ def test_camera_prepared_view_accepts_hash_bound_by_date_entry(tmp_path: Path) -
         load_camera_semantic_prepared_view(root, verify_payload_hashes=True)
 
 
+def test_camera_prepared_view_accepts_idle_annotation_writer_lock(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "2026-09-11__writing-detail-s3"
+    _write_minimal_camera_prepared_view(root)
+    writer_lock = root / "meta/progress/stage_annotations/.writer.lock"
+    writer_lock.parent.mkdir(parents=True)
+    writer_lock.touch()
+    (root / "meta/progress/stage_annotation_locks").mkdir(parents=True)
+
+    loaded = load_camera_semantic_prepared_view(root, verify_payload_hashes=True)
+
+    assert loaded.episode_indices == (0,)
+
+
+def test_camera_prepared_view_rejects_nonempty_annotation_writer_lock(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "2026-09-11__writing-detail-s3"
+    _write_minimal_camera_prepared_view(root)
+    writer_lock = root / "meta/progress/stage_annotations/.writer.lock"
+    writer_lock.parent.mkdir(parents=True)
+    writer_lock.write_text("unexpected payload", encoding="utf-8")
+
+    with pytest.raises(
+        CameraSemanticPreparedViewContractError,
+        match="payload-free",
+    ):
+        load_camera_semantic_prepared_view(root, verify_payload_hashes=True)
+
+
+def test_camera_prepared_view_rejects_annotation_episode_lock(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "2026-09-11__writing-detail-s3"
+    _write_minimal_camera_prepared_view(root)
+    writer_lock = root / "meta/progress/stage_annotations/.writer.lock"
+    writer_lock.parent.mkdir(parents=True)
+    writer_lock.touch()
+    episode_lock = root / "meta/progress/stage_annotation_locks/episode-0"
+    episode_lock.mkdir(parents=True)
+    (episode_lock / "owner.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(
+        CameraSemanticPreparedViewContractError,
+        match="active or unreconciled episode locks",
+    ):
+        load_camera_semantic_prepared_view(root, verify_payload_hashes=True)
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     (
