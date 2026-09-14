@@ -185,6 +185,17 @@ def load_builtin_writing_four_stage_subtasks_skill_projection_catalog() -> (
     )
 
 
+def load_builtin_writing_five_stage_dipping_skill_projection_catalog() -> (
+    SkillProjectionCatalog
+):
+    """Load the detailed five-stage writing dipping Skill mapping."""
+
+    return load_skill_projection_catalog(
+        Path(__file__).with_name("skill_projection_assets")
+        / "writing_five_stage_dipping_v1.json"
+    )
+
+
 def validate_progress_skill_projection(
     *,
     progress_profile: TaskProgressProfileV1,
@@ -535,6 +546,7 @@ __all__ = [
     "ProjectedEpisodeSkillView",
     "SkillProjectionCatalog",
     "load_builtin_writing_four_stage_subtasks_skill_projection_catalog",
+    "load_builtin_writing_five_stage_dipping_skill_projection_catalog",
     "load_builtin_writing_stage1_skill_projection_catalog",
     "load_builtin_writing_skill_projection_catalog",
     "load_skill_projection_catalog",

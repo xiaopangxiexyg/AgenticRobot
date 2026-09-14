@@ -29,6 +29,7 @@ from dataset_interface.prepared_training import (
 from dataset_interface.progress_annotation_jobs import list_progress_annotation_work_items
 from dataset_interface.progress_skill_projection import (
     SkillProjectionCatalog,
+    load_builtin_writing_five_stage_dipping_skill_projection_catalog,
     load_builtin_writing_four_stage_subtasks_skill_projection_catalog,
     load_builtin_writing_stage1_skill_projection_catalog,
 )
@@ -95,6 +96,9 @@ DEFAULT_PROFILE = (
 SKILL_PROJECTION_CATALOG_WRITING_STAGE1_V2 = "writing_stage1_v2"
 SKILL_PROJECTION_CATALOG_WRITING_FOUR_STAGE_SUBTASKS_V2 = (
     "writing_four_stage_subtasks_v2"
+)
+SKILL_PROJECTION_CATALOG_WRITING_FIVE_STAGE_DIPPING_V1 = (
+    "writing_five_stage_dipping_v1"
 )
 _EMPTY_CHECKPOINT_ROOT_ENTRIES = frozenset({"wandb", "wandb_id.txt"})
 OPENPI_SOURCE_IDENTITY_FILENAME = "OPENPI_SOURCE_IDENTITY.json"
@@ -982,6 +986,8 @@ def _skill_projection_catalog(
         return load_builtin_writing_stage1_skill_projection_catalog()
     if catalog_id == SKILL_PROJECTION_CATALOG_WRITING_FOUR_STAGE_SUBTASKS_V2:
         return load_builtin_writing_four_stage_subtasks_skill_projection_catalog()
+    if catalog_id == SKILL_PROJECTION_CATALOG_WRITING_FIVE_STAGE_DIPPING_V1:
+        return load_builtin_writing_five_stage_dipping_skill_projection_catalog()
     raise ValueError(
         f"Unsupported Skill projection catalog id: {catalog_id!r}."
     )
