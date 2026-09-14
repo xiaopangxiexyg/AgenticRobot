@@ -55,10 +55,13 @@ from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPort,
 )
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC,
     RM65GraspTrajectoryPlanningError,
 )
 
 from .station_point_grasp_deployment import StationBoundPointGraspRegistration
+
+_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = 15.0
 
 REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1 = "real.rm65.perception.plan_grasp_approach"
 REAL_AGENT_GRASP_APPROACH_PLAN_EXECUTOR_ID_V1 = (
@@ -376,7 +379,17 @@ def build_real_grasp_approach_plan_registration(
         may_open_publication=False,
         requires_operator_confirmation=False,
         requires_deadman=False,
-        max_operation_duration_ms=60_000,
+        # The route deadline must outlive the planner's own bounded search so a
+        # budget exhaustion is returned as a read-only candidate rejection.
+        max_operation_duration_ms=int(
+            math.ceil(
+                (
+                    RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC
+                    + _GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC
+                )
+                * 1000.0
+            )
+        ),
         cancellation_policy="cancel_only",
         requires_task_evaluation=False,
         skill_io_contract_hash=io_contract.semantic_content_hash,

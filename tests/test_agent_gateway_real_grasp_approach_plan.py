@@ -35,6 +35,7 @@ from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPortConfig,
 )
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC,
     RM65GraspTrajectoryPlanningError,
 )
 
@@ -285,6 +286,19 @@ def _stationary_trajectory(qpos_by_side) -> RealAgentJointTrajectory:
         },
         planner_evidence_refs=("rm65-production-urdf-fcl-path:test",),
     )
+
+
+def test_planning_route_deadline_outlives_internal_planner_budget() -> None:
+    registration, *_ = _planning_fixture(planner=lambda **_kwargs: None)
+
+    route = registration.skill.routes[0]
+
+    assert route.max_operation_duration_ms == 135_000
+    assert route.max_operation_duration_ms > int(
+        RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC * 1000.0
+    )
+    assert route.control_effect_class == "read_only"
+    assert route.may_move_robot is False
 
 
 def test_path_found_is_read_only_and_produces_one_use_immutable_plan() -> None:

@@ -44,6 +44,7 @@ from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
 
 _SIDES = ("left", "right")
 _STRICT_SCENE_PROFILE = "dual_arm_hand_proxy_strict"
+RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
 
 
 class RM65GraspTrajectoryPlanningError(RuntimeError):
@@ -73,11 +74,11 @@ class RM65GraspTrajectoryPlanningConfig:
     endpoint_orientation_residual_scale_deg: float = 10.0
     endpoint_tolerance_margin_ratio: float = 0.90
     path_search_attempts_per_endpoint: int = 4
-    path_planning_time_budget_sec: float = 120.0
+    path_planning_time_budget_sec: float = RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC
     endpoint_position_tolerance_m: float = 0.003
     endpoint_orientation_tolerance_deg: float = 1.0
     final_edge_resolution_rad: float = float(np.deg2rad(0.1))
-    maximum_path_envelope_ingress_distance_m: float = 0.15
+    maximum_path_envelope_ingress_distance_m: float = 0.16
     path_envelope_ingress_progress_tolerance_m: float = 0.002
     path_envelope_ingress_tangent_tolerance_m: float = 0.0005
     path_envelope_ingress_waypoint_fractions: tuple[float, ...] = (
@@ -272,10 +273,9 @@ class RM65GraspJointTrajectoryPlanner:
         *,
         profile: ResolvedExclusiveRM65SkillDeploymentProfile,
         planning_target_builder: object,
-        target_envelope_filter: Callable[
-            [Mapping[str, np.ndarray]], Mapping[str, np.ndarray] | None
-        ]
-        | None,
+        target_envelope_filter: (
+            Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray] | None] | None
+        ),
         config: RM65GraspTrajectoryPlanningConfig | None = None,
         planner_config: JointPathPlannerConfig | None = None,
         reachability_config: RM65GraspReachabilityConfig | None = None,
@@ -596,7 +596,16 @@ class RM65GraspJointTrajectoryPlanner:
             )
         if float(adjustment) > self.config.maximum_path_envelope_ingress_distance_m:
             self._raise_ingress_rejection(
-                details,
+                {
+                    **dict(details),
+                    "maximum_path_envelope_ingress_distance_m": (
+                        self.config.maximum_path_envelope_ingress_distance_m
+                    ),
+                    "path_envelope_ingress_distance_excess_m": (
+                        float(adjustment)
+                        - self.config.maximum_path_envelope_ingress_distance_m
+                    ),
+                },
                 "initial_distance_exceeds_limit",
             )
         return float(adjustment), frozenset(raw_constraints)
@@ -632,6 +641,7 @@ class RM65GraspJointTrajectoryPlanner:
             return ()
         projection_details = {
             "modified_sides": modified_sides,
+            "envelope_projection_subject": "current_measured_solver_tcp",
             **self._target_envelope_projection_details(modified_sides),
         }
         self._bounded_ingress_projection(
@@ -973,9 +983,7 @@ class RM65GraspJointTrajectoryPlanner:
                     "path_planning_time_budget_exhausted",
                     details={
                         "planning_phase": "endpoint_ik",
-                        "time_budget_sec": (
-                            self.config.path_planning_time_budget_sec
-                        ),
+                        "time_budget_sec": (self.config.path_planning_time_budget_sec),
                         "endpoint_seed_count_attempted": len(attempts),
                         "attempts": attempts,
                     },
@@ -1047,11 +1055,7 @@ class RM65GraspJointTrajectoryPlanner:
                     "best_orientation_residual_deg": orientation,
                 }
             )
-        if (
-            deadline is not None
-            and not accepted
-            and float(monotonic()) >= deadline
-        ):
+        if deadline is not None and not accepted and float(monotonic()) >= deadline:
             raise RM65GraspTrajectoryPlanningError(
                 "path_planning_time_budget_exhausted",
                 details={
@@ -1391,9 +1395,11 @@ class RM65GraspJointTrajectoryPlanner:
                     minimum_distance = min(minimum_distance, check.minimum_distance_m)
                 if not check.collision_check_available or not check.safe:
                     raise RM65GraspTrajectoryPlanningError(
-                        "path_collision_check_unavailable"
-                        if not check.collision_check_available
-                        else "path_collision_blocked",
+                        (
+                            "path_collision_check_unavailable"
+                            if not check.collision_check_available
+                            else "path_collision_blocked"
+                        ),
                         details={
                             "segment_index": segment_index,
                             "edge_sample_index": index,
@@ -1576,14 +1582,10 @@ class RM65GraspJointTrajectoryPlanner:
                     dense_revalidation=dense,
                     search_attempts=tuple(search_attempts),
                 )
-            if (
-                terminal_error is not None
-                and terminal_error.reason_code
-                in {
-                    "path_collision_check_unavailable",
-                    "path_planning_time_budget_exhausted",
-                }
-            ):
+            if terminal_error is not None and terminal_error.reason_code in {
+                "path_collision_check_unavailable",
+                "path_planning_time_budget_exhausted",
+            }:
                 break
 
         if terminal_error is not None and terminal_error.reason_code in {
@@ -1651,9 +1653,7 @@ class RM65GraspJointTrajectoryPlanner:
         scale = float(speed_scale)
         if not 0.0 < scale <= 1.0:
             raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
-        deadline = (
-            float(monotonic()) + self.config.path_planning_time_budget_sec
-        )
+        deadline = float(monotonic()) + self.config.path_planning_time_budget_sec
         ingress_targets = self._envelope_ingress_targets(
             qpos_by_side=current,
             side=selected_side,
@@ -1846,6 +1846,7 @@ __all__ = [
     "RM65GraspJointTrajectoryPlanner",
     "RM65GraspReachabilityConfig",
     "RM65GraspReachabilityResult",
+    "RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC",
     "RM65GraspTrajectoryPlanningConfig",
     "RM65GraspTrajectoryPlanningError",
 ]

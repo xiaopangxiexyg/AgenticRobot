@@ -131,51 +131,51 @@ FIELD_TRACE_TARGET_XYZQUAT = (
     0.4891019705,
 )
 
-# Read-only state and selected candidate 3 from the 2026-09-14 real-camera
-# capture.  The right TCP starts 120.14 mm beyond the task envelope's y-max;
-# direct joint interpolation bows 11-13 mm beyond x-min even though both the
-# endpoint IK and collision path are otherwise valid.
+# Read-only state and selected candidate 3 from the 2026-09-14 10:56
+# real-camera capture.  The right TCP starts 154.16 mm beyond the task
+# envelope's y-max; the 160 mm ingress cap admits this measured staging pose
+# while preserving monotonic envelope entry and dense collision revalidation.
 OFFLINE_INGRESS_QPOS = {
     "left": np.array(
         [
-            2.1717306372880065,
-            0.7135255042676896,
-            1.947473298743486,
-            1.8227171180045607,
-            -1.4734768305542945,
-            -0.2781182236289894,
+            2.2549480297663664,
+            0.4383219939384942,
+            2.2667114786173554,
+            1.8238690683340744,
+            -1.3990559923145207,
+            -0.41160100069361605,
         ]
     ),
     "right": np.array(
         [
-            -2.363420178861948,
-            0.5556779157983619,
-            1.9816119612830483,
-            -1.8960210264831552,
-            -1.4296341416347016,
-            0.46656142176839466,
+            -2.441157052133034,
+            0.5387831547380355,
+            1.8238167372186542,
+            -2.1215349775880297,
+            -1.4772815556456362,
+            0.6232221724979286,
         ]
     ),
 }
 OFFLINE_INGRESS_TARGET = np.array(
     [
         [
-            0.10129286688712125,
-            0.574460392170871,
-            -0.8122407358318575,
-            -0.37643595830989307,
+            0.7536026758524672,
+            -0.6323477267158206,
+            0.17949751938490785,
+            -0.1292053338337324,
         ],
         [
-            -0.14104412837227742,
-            -0.7999009731187866,
-            -0.5833223697539148,
-            0.022083489151767426,
+            0.13750307481077162,
+            -0.11537878437095266,
+            -0.9837584259027543,
+            -0.07293043669658317,
         ],
         [
-            -0.9848077522894972,
-            0.17364818176562513,
-            2.5051369531056684e-09,
-            0.1397863014487406,
+            0.6427876098413727,
+            0.7660444429890577,
+            -3.865527780625074e-09,
+            0.14860936225424548,
         ],
         [0.0, 0.0, 0.0, 1.0],
     ]
@@ -624,7 +624,7 @@ def test_dense_grasp_path_rejects_larger_new_constraint_during_ingress() -> None
                     "right": {
                         "translation_modified": True,
                         "rotation_modified": False,
-                        "translation_adjustment_m": 0.151,
+                        "translation_adjustment_m": 0.161,
                         "violated_translation_constraints": ["absolute:y:max"],
                     }
                 },
@@ -701,7 +701,7 @@ def test_real_snapshot_plans_via_strict_envelope_ingress_waypoint(
     assert not np.allclose(projected_start["right"], start_solver["right"])
     assert initial_projection["side_projection_by_side"]["right"][
         "translation_adjustment_m"
-    ] == pytest.approx(0.12014024248066646)
+    ] == pytest.approx(0.15415882876337186)
     assert initial_projection["side_projection_by_side"]["right"][
         "violated_translation_constraints"
     ] == ("absolute:y:max",)
@@ -1178,6 +1178,7 @@ def test_endpoint_planner_uses_global_deterministic_seed_coverage_by_default() -
     assert config.endpoint_seed_count == 24
     assert config.maximum_endpoint_candidates == 8
     assert config.path_planning_time_budget_sec == pytest.approx(120.0)
+    assert config.maximum_path_envelope_ingress_distance_m == pytest.approx(0.16)
 
 
 def test_path_leg_shares_remaining_wall_time_and_stops_after_timeout(
