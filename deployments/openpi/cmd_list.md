@@ -2039,14 +2039,13 @@ RealSense、双臂状态和 DMTAC 状态，也会请求 GPU server 推理，但�
 完整 `25000` checkpoint，并在信号收尾时又完整提交了最新 `25006`；下面 Stage1 默认选择
 `25006`。Stage2 `100000` 也已完整，但它是系统性修正前的 historical v1，只用于兼容性对照，
 不能声称为 corrected Stage2 重训结果。两者都不得自动回退到 smoke 或较早 step；若研究中间
-step，必须显式设置 `SERVER_CKPT_STEP` 和 `CLIENT_CKPT_STEP` 并记录实际身份。
+step，必须显式设置 `SERVER_CKPT_STEP` 并记录 server 实际身份。
 
-client 与 server 的 checkpoint 变量刻意分开。默认二者选择同一步以减少现场变量，但协议不
-强制 model id/checkpoint step 相同；可以把 client 保持在一个已验证 artifact 上，切换到另一个
-兼容 server step/model。两端仍分别校验自己的 prepared/model-RTC profile 和 checkpoint
-receipt，连接时仍严格校验 layout、三路相机、absolute action、normalization、prompt 与 RTC
-capability。model/step 只记录在两端 provenance 中；不要以覆盖 hash 的方式绕过真正的
-协议不兼容。
+checkpoint、Stage、prepared profile 与 model-RTC profile 都只由 server 选择。client 从
+server metadata 获取 checkpoint 已发布的 policy artifact，只校验实际线协议需要的 layout、
+三路相机、absolute action、normalization、prompt 与 RTC capability；client 命令不再重复
+model id、checkpoint step 或训练数据路径。切换 Stage/step 时只重启 server，随后为新的
+server metadata 新启一个 client，不能复用旧连接的 queue 或 RTC history。
 
 ### 23.1 共同变量与完整性门
 
@@ -2091,18 +2090,14 @@ case "$STAGE" in
 esac
 
 export SERVER_CKPT_STEP="${SERVER_CKPT_STEP:-$DEFAULT_CKPT_STEP}"
-export CLIENT_CKPT_STEP="${CLIENT_CKPT_STEP:-$SERVER_CKPT_STEP}"
 export SERVER_CHECKPOINT_DIR="${SERVER_CHECKPOINT_DIR:-$CHECKPOINT_ROOT/$SERVER_CKPT_STEP}"
-export CLIENT_CHECKPOINT_DIR="${CLIENT_CHECKPOINT_DIR:-$CHECKPOINT_ROOT/$CLIENT_CKPT_STEP}"
 
-for checkpoint in "$SERVER_CHECKPOINT_DIR" "$CLIENT_CHECKPOINT_DIR"; do
-  test -d "$checkpoint/params"
-  test -d "$checkpoint/training_step"
-  test -f "$checkpoint/_CHECKPOINT_METADATA"
-  test -f "$checkpoint/policy_artifact.json"
-  test -f "$checkpoint/model_continuation_training_run.json"
-  test -f "$checkpoint/model_continuation_checkpoint_receipt.json"
-done
+test -d "$SERVER_CHECKPOINT_DIR/params"
+test -d "$SERVER_CHECKPOINT_DIR/training_step"
+test -f "$SERVER_CHECKPOINT_DIR/_CHECKPOINT_METADATA"
+test -f "$SERVER_CHECKPOINT_DIR/policy_artifact.json"
+test -f "$SERVER_CHECKPOINT_DIR/model_continuation_training_run.json"
+test -f "$SERVER_CHECKPOINT_DIR/model_continuation_checkpoint_receipt.json"
 test -f "$PREPARED_PROFILE"
 test -f "$MODEL_RTC_PROFILE"
 test -d "$OPENPI_ROOT/.git" -o -f "$OPENPI_ROOT/.git"
@@ -2115,23 +2110,11 @@ test "$(git -C "$DEPLOY_ROOT" rev-parse HEAD:model/openpi)" = \
 
 该门只检查必要文件与冻结 OpenPI source identity；随后仍必须执行两端各自的语义检查。
 
-### 23.2 完全无硬件的 client/server 契约检查
+### 23.2 完全无硬件的 server prepared-config 检查
 
-该段不连接 server、相机、夹爪或机械臂，也不加载 GPU 权重：
+该段不启动 server、不连接相机、夹爪或机械臂，也不加载 GPU 权重：
 
 ```bash
-cd "$DEPLOY_ROOT"
-conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
-export DEXTELEOP_PYTHON="$(command -v python)"
-
-PYTHONDONTWRITEBYTECODE=1 "$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
-  --checkpoint-dir "$CLIENT_CHECKPOINT_DIR" \
-  --prepared-training-profile "$PREPARED_PROFILE" \
-  --model-rtc-profile "$MODEL_RTC_PROFILE" \
-  --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
-  --rtc-inference-steps 8 \
-  --contract-check-only
-
 PYTHONDONTWRITEBYTECODE=1 "$OPENPI_PYTHON" -u -m deployments.openpi.server \
   --checkpoint-dir "$SERVER_CHECKPOINT_DIR" \
   --prepared-training-profile "$PREPARED_PROFILE" \
@@ -2143,8 +2126,8 @@ PYTHONDONTWRITEBYTECODE=1 "$OPENPI_PYTHON" -u -m deployments.openpi.server \
   --prepared-config-check-only
 ```
 
-两项都通过后，确认没有别人的 OpenPI 训练/server 使用 GPU，确认 `8078` 未监听；不要为了
-部署测试停止不属于自己的训练。
+通过后，确认没有别人的 OpenPI 训练/server 使用 GPU，确认 `8078` 未监听；不要为了部署
+测试停止不属于自己的训练。
 
 ### 23.3 终端 A：conditioned model-RTC server
 
@@ -2177,6 +2160,23 @@ metadata 必须表明三路 camera slots、h32、absolute、匹配的 layout/nor
 RTC continuation capability。model id/step 可以与 client artifact 不同，但不能以此忽略其它
 契约差异。
 
+server 健康后，在终端 B 先执行这个无硬件 client 契约检查。它只建立 metadata WebSocket、
+验证 server 发布的 policy artifact 后关闭连接；不会加载本地 checkpoint，也不会构造相机、
+夹爪或机械臂：
+
+```bash
+cd "$DEPLOY_ROOT"
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
+
+PYTHONDONTWRITEBYTECODE=1 "$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
+  --host "$POLICY_SERVER_HOST" \
+  --port "$OPENPI_PORT" \
+  --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
+  --rtc-inference-steps 8 \
+  --contract-check-only
+```
+
 ### 23.4 终端 B：100-step 真机 observation no-action shadow
 
 该命令会打开真实 observation 资源，因此运行前仍需现场确认两台 RM65 处于安全静止状态、
@@ -2194,9 +2194,6 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage${STAGE}_shadow_$
 "$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
   --host "$POLICY_SERVER_HOST" \
   --port "$OPENPI_PORT" \
-  --checkpoint-dir "$CLIENT_CHECKPOINT_DIR" \
-  --prepared-training-profile "$PREPARED_PROFILE" \
-  --model-rtc-profile "$MODEL_RTC_PROFILE" \
   --deployment-profile rm65_bimanual_dmtac \
   --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
   --rtc-inference-steps 8 \
@@ -2254,9 +2251,6 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage1_active_$(date +
 "$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
   --host "$POLICY_SERVER_HOST" \
   --port "$OPENPI_PORT" \
-  --checkpoint-dir "$CLIENT_CHECKPOINT_DIR" \
-  --prepared-training-profile "$PREPARED_PROFILE" \
-  --model-rtc-profile "$MODEL_RTC_PROFILE" \
   --deployment-profile rm65_bimanual_dmtac \
   --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
   --rtc-inference-steps 8 \

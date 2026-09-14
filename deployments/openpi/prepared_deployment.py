@@ -458,17 +458,21 @@ def _validate_model_rtc_profile_binding(
     return evidence
 
 
-def _sha256_file_bytes(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _prepared_model_rtc_binding_inventory(
     *,
     checkpoint_artifact: PolicyArtifactContract,
     prepared_profile: Mapping[str, Any],
     model_rtc_profile: Mapping[str, Any],
     evidence: OpenPIModelRtcCheckpointEvidence,
-) -> tuple[Path, Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
+) -> tuple[Path | None, Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
+    """Validate checkpoint/profile source identity without reopening training data.
+
+    The model-RTC training receipt already binds the prepared manifest bytes and
+    dataset identity.  Deployment keeps those immutable identities as
+    provenance, but source datasets and the organized training workspace are
+    not inference inputs and may no longer exist on the serving host.
+    """
+
     source_bindings = evidence.training_run.source_bindings
     if len(source_bindings) != 1:
         raise ValueError(
@@ -494,152 +498,16 @@ def _prepared_model_rtc_binding_inventory(
         character not in "0123456789abcdef" for character in binding_hash.lower()
     ):
         raise ValueError("Prepared model-RTC binding identity is not a SHA-256 hash.")
-    workspace = Path(
-        str(prepared_profile["organized_dataset_root"])
-    ).expanduser().resolve()
-    binding_root = (
-        workspace
-        / "derived"
-        / "openpi_prepared_skill_bindings"
-        / binding_hash
-    )
-    manifest_path = binding_root / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(
-            f"Prepared model-RTC binding manifest is missing: {manifest_path}"
-        )
-    if _sha256_file_bytes(manifest_path) != source_binding.episode_manifest_hash:
-        raise ValueError(
-            "Prepared binding manifest bytes differ from the training run."
-        )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, Mapping):
-        raise ValueError("Prepared binding manifest must contain an object.")
-    binding = manifest.get("binding")
-    records = manifest.get("source_manifests")
-    if not isinstance(binding, Mapping) or not isinstance(records, Sequence):
-        raise ValueError("Prepared binding manifest structure is invalid.")
-    if any(not isinstance(record, Mapping) for record in records):
-        raise ValueError("Prepared source manifest inventory is invalid.")
-    expected_camera_mapping = [
-        {"model_slot": str(slot), "dataset_camera_key": str(key)}
-        for slot, key in prepared_profile["camera_slot_to_dataset_key"].items()
-    ]
-    expected_binding = {
-        "binding_hash": binding_hash,
-        "skill_id": str(prepared_profile["target_skill_id"]),
-        "camera_slot_to_dataset_key": expected_camera_mapping,
-        "action_horizon": int(prepared_profile["action_horizon"]),
-        "action_pose_mode": str(prepared_profile["action_pose_mode"]),
-        "source_mixing_policy": str(
-            prepared_profile.get("source_mixing_policy") or ""
-        ),
-    }
-    actual_binding = {
-        key: binding.get(key) for key in expected_binding
-    }
-    if actual_binding != expected_binding:
-        raise ValueError(
-            "Prepared binding manifest differs from the prepared profile."
-        )
-    expected_episode_count = prepared_profile.get(
-        "expected_total_eligible_episode_count"
-    )
-    if (
-        expected_episode_count is not None
-        and int(binding.get("episode_count", -1)) != int(expected_episode_count)
-    ):
-        raise ValueError(
-            "Prepared binding episode count differs from the prepared profile."
-        )
     profile_sources = tuple(prepared_profile["sources"])
-    records_by_id = {
-        str(record.get("source_dataset_id") or ""): record
-        for record in records
-    }
-    expected_source_ids = {
-        str(source["source_dataset_id"]) for source in profile_sources
-    }
-    if set(records_by_id) != expected_source_ids:
-        raise ValueError(
-            "Prepared source manifest inventory differs from the prepared profile."
-        )
-    binding_episodes = binding.get("episodes")
-    if not isinstance(binding_episodes, Sequence) or any(
-        not isinstance(episode, Mapping) for episode in binding_episodes
-    ):
-        raise ValueError("Prepared binding episode inventory is invalid.")
-    episodes_by_source: dict[str, list[Mapping[str, Any]]] = {}
-    for episode in binding_episodes:
-        episodes_by_source.setdefault(
-            str(episode.get("source_dataset_id") or ""),
-            [],
-        ).append(episode)
-    camera_slots = [
-        str(value)
-        for value in prepared_profile["camera_slot_to_dataset_key"].keys()
-    ]
-    training_view_hash = str(binding.get("training_view_hash") or "")
     normalized_records: list[Mapping[str, Any]] = []
     for source in profile_sources:
         source_id = str(source["source_dataset_id"])
         source_root = Path(str(source["dataset_root"])).expanduser().resolve()
-        record = records_by_id[source_id]
-        record_root = Path(
-            str(record.get("source_dataset_root") or "")
-        ).expanduser().resolve()
-        if record_root != source_root:
-            raise ValueError(
-                "Prepared source root differs from the prepared profile."
-            )
-        episode_manifest = (
-            binding_root / str(record.get("episode_manifest") or "")
-        ).resolve()
-        if not episode_manifest.is_relative_to(binding_root) or not episode_manifest.is_file():
-            raise ValueError("Prepared source episode manifest path is invalid.")
-        expected_episodes = sorted(
-            episodes_by_source.get(source_id, ()),
-            key=lambda value: int(value["source_episode_index"]),
-        )
-        actual_lines = [
-            json.loads(line)
-            for line in episode_manifest.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        if len(actual_lines) != len(expected_episodes):
-            raise ValueError(
-                "Prepared source episode manifest count differs from its binding."
-            )
-        for actual, expected in zip(actual_lines, expected_episodes, strict=True):
-            expected_fields = {
-                "source_episode_index": int(expected["source_episode_index"]),
-                "episode_identity": str(
-                    expected["episode_capture_identity_hash"]
-                ),
-                "camera_slots": camera_slots,
-                "view_profile": "prepared_skill",
-                "quality_class": "strict_success_non_abnormal",
-                "prepared_training_view_hash": training_view_hash,
-                "openpi_prepared_skill_binding_hash": binding_hash,
-            }
-            if not isinstance(actual, Mapping) or any(
-                actual.get(key) != value for key, value in expected_fields.items()
-            ):
-                raise ValueError(
-                    "Prepared source episode manifest differs from its binding."
-                )
-            actual_root = Path(
-                str(actual.get("source_dataset_root") or "")
-            ).expanduser().resolve()
-            if actual_root != source_root:
-                raise ValueError(
-                    "Prepared source episode root differs from its binding."
-                )
         normalized_records.append(
             {
                 "source_dataset_id": source_id,
                 "source_dataset_root": str(source_root),
-                "episode_manifest": str(episode_manifest),
+                "episode_manifest": None,
             }
         )
     artifact_sources = _canonical_source_roots(checkpoint_artifact.source_datasets)
@@ -650,7 +518,7 @@ def _prepared_model_rtc_binding_inventory(
         raise ValueError(
             "Prepared model-RTC artifact sources differ from the prepared profile."
         )
-    return binding_root, binding, tuple(normalized_records)
+    return None, {"binding_hash": binding_hash}, tuple(normalized_records)
 
 
 def checkpoint_artifact_payload_hash(payload: Mapping[str, Any]) -> str:
@@ -1357,8 +1225,8 @@ def _expected_deployment(
         )
     if model_rtc_profile is not None:
         assert model_rtc_evidence is not None
-        assert prepared_binding_root is not None
         assert prepared_binding_payload is not None
+        source_binding = model_rtc_evidence.training_run.source_bindings[0]
         continuation_data = checkpoint_artifact.model_continuation
         if not isinstance(continuation_data, ModelContinuationDataContractV2):
             raise ValueError(
@@ -1386,8 +1254,8 @@ def _expected_deployment(
                 "prepared_skill_binding_hash": str(
                     prepared_binding_payload["binding_hash"]
                 ),
-                "prepared_skill_manifest_hash": _sha256_file_bytes(
-                    prepared_binding_root / "manifest.json"
+                "prepared_skill_manifest_hash": str(
+                    source_binding.episode_manifest_hash
                 ),
             }
         )

@@ -1018,7 +1018,7 @@ class _SourceConfig:
     front_occlusion_schedule: tuple[tuple[float, float], ...]
     explicit_mask_keys: tuple[str, ...]
     front_force_black: bool
-    episode_manifest: str
+    episode_manifest: str | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1157,7 +1157,9 @@ def test_prepared_weight_loader_requires_replaceable_loader(
         )
 
 
-def test_rebuilt_config_rejects_layout_metadata_drift(tmp_path: Path) -> None:
+def test_rebuilt_config_uses_checkpoint_layout_when_source_is_unavailable(
+    tmp_path: Path,
+) -> None:
     checkpoint, profile_path, _openpi_root, _profile = _fixture(tmp_path)
     resolution = prepared_deployment.prepare_checkpoint_deployment_artifact(
         checkpoint,
@@ -1172,10 +1174,9 @@ def test_rebuilt_config_rejects_layout_metadata_drift(tmp_path: Path) -> None:
     source_root = Path(
         str(resolution.profile["sources"][0]["dataset_root"])
     )
-    (source_root / "meta" / "info.json").write_text(
-        '{"policy_io_layout_hash":"sha256:drift"}\n',
-        encoding="utf-8",
-    )
+    (source_root / "meta" / "info.json").unlink()
+    (source_root / "meta").rmdir()
+    source_root.rmdir()
     base = _Config(
         name="fixture-base",
         data=_Data(
@@ -1196,6 +1197,7 @@ def test_rebuilt_config_rejects_layout_metadata_drift(tmp_path: Path) -> None:
         resume=False,
         overwrite=False,
         num_workers=0,
+        weight_loader=_WeightLoader("wrong-base-params"),
     )
 
     class TrainingConfig:
@@ -1206,12 +1208,61 @@ def test_rebuilt_config_rejects_layout_metadata_drift(tmp_path: Path) -> None:
     class DatasetPolicy:
         DexTeleopV23DatasetSourceConfig = _SourceConfig
 
-    with pytest.raises(ValueError, match="policy-I/O layout differs"):
-        prepared_server_runtime.build_prepared_openpi_config(
-            resolution,
-            training_config=TrainingConfig,
-            dataset_policy=DatasetPolicy,
+    config = prepared_server_runtime.build_prepared_openpi_config(
+        resolution,
+        training_config=TrainingConfig,
+        dataset_policy=DatasetPolicy,
+    )
+
+    assert config.data.layout_path == str(
+        resolution.deployment_artifact_path.resolve()
+    )
+    assert config.data.layout_hash == resolution.deployment_artifact.layout_hash
+    assert config.policy_metadata["policy_artifact"] == (
+        resolution.deployment_artifact.to_dict()
+    )
+
+
+def test_checkpoint_policy_metadata_resolver_is_exact_and_restored(
+    tmp_path: Path,
+) -> None:
+    checkpoint, profile_path, _openpi_root, _profile = _fixture(tmp_path)
+    resolution = prepared_deployment.prepare_checkpoint_deployment_artifact(
+        checkpoint,
+        profile_path,
+        output_dir=tmp_path / "runtime",
+    )
+    prepared = dataclasses.make_dataclass(
+        "PreparedConfig",
+        (("policy_metadata", object),),
+        frozen=True,
+    )(
+        {
+            "policy_artifact": resolution.deployment_artifact.to_dict(),
+        }
+    )
+    other = object()
+    calls: list[object] = []
+    training_config = ModuleType("fixture_training_config")
+
+    def _original(candidate: object) -> object:
+        calls.append(candidate)
+        return ("resolved", candidate)
+
+    training_config.resolve_policy_metadata = _original
+    with prepared_server_runtime._use_checkpoint_policy_metadata(
+        training_config,
+        prepared,
+        resolution,
+    ):
+        assert training_config.resolve_policy_metadata(prepared) is prepared
+        assert training_config.resolve_policy_metadata(other) == (
+            "resolved",
+            other,
         )
+        assert calls == [other]
+
+    assert training_config.resolve_policy_metadata is _original
 
 
 def test_rebuilt_model_rtc_config_uses_output_identity_and_bound_artifact(
@@ -1220,11 +1271,42 @@ def test_rebuilt_model_rtc_config_uses_output_identity_and_bound_artifact(
     checkpoint, profile_path, model_profile_path, _openpi_root, _profile = (
         _model_rtc_fixture(tmp_path)
     )
+    source_root = Path(str(_profile["sources"][0]["dataset_root"]))
+    (source_root / "meta" / "info.json").unlink()
+    (source_root / "meta").rmdir()
+    source_root.rmdir()
+    bindings_root = (
+        Path(str(_profile["organized_dataset_root"]))
+        / "derived"
+        / "openpi_prepared_skill_bindings"
+    )
+    binding_roots = tuple(bindings_root.iterdir())
+    assert len(binding_roots) == 1
+    binding_root = binding_roots[0]
+    binding_manifest = json.loads(
+        (binding_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    for record in binding_manifest["source_manifests"]:
+        (binding_root / record["episode_manifest"]).unlink()
+    (binding_root / "manifest.json").unlink()
+    binding_root.rmdir()
     resolution = prepared_deployment.prepare_checkpoint_deployment_artifact(
         checkpoint,
         profile_path,
         model_rtc_profile_path=model_profile_path,
         output_dir=tmp_path / "runtime",
+    )
+    training_run = json.loads(
+        (checkpoint / "model_continuation_training_run.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    source_binding = training_run["source_bindings"][0]
+    assert resolution.binding["prepared_skill_binding_hash"] == str(
+        source_binding["dataset_identity_hash"]
+    ).removeprefix("sha256:")
+    assert resolution.binding["prepared_skill_manifest_hash"] == (
+        source_binding["episode_manifest_hash"]
     )
     augmentation = _StateAugmentation(
         state_input_mode=resolution.deployment_artifact.state_input_mode,
@@ -1276,6 +1358,7 @@ def test_rebuilt_model_rtc_config_uses_output_identity_and_bound_artifact(
     )
     assert bound == resolution.deployment_artifact
     assert bound.model_continuation is not None
+    assert config.data.dataset_sources[0].episode_manifest is None
 
 
 def test_prepared_client_contract_check_uses_the_same_bound_artifact(

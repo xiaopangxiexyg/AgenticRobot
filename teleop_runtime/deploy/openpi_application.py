@@ -434,7 +434,6 @@ def main(argv: list[str] | None = None) -> int:
     artifact_from_server = False
     if (
         policy_artifact is None
-        and not args.contract_check_only
         and args.rtc_profile == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
     ):
         try:
@@ -482,8 +481,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.contract_check_only:
         if policy_artifact is None:
             parser.error(
-                "--contract-check-only requires --checkpoint-dir or "
-                "--policy-artifact-json."
+                "--contract-check-only requires a local policy artifact or "
+                "a model-RTC server that publishes one."
             )
         report = preflight_policy_artifact(policy_artifact).to_dict()
         if (

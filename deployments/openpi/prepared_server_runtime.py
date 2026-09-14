@@ -9,12 +9,13 @@ only for this process, and then delegates to OpenPI's existing server script.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import dataclasses
 import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from deployments.openpi.image_wire import (
     OPENPI_IMAGE_WIRE_TRAINING_METADATA_KEY_V1,
@@ -150,6 +151,56 @@ def _prepared_weight_loader(
     return dataclasses.replace(weight_loader, params_path=str(params_path))
 
 
+@contextmanager
+def _use_checkpoint_policy_metadata(
+    training_config: Any,
+    config: Any,
+    resolution: PreparedDeploymentResolution,
+) -> Iterator[None]:
+    """Keep prepared inference on the already validated checkpoint artifact.
+
+    OpenPI normally derives policy metadata again when it creates a policy.
+    That is appropriate for training configs, but it makes inference reopen
+    every historical dataset source even though the prepared deployment
+    artifact has already been recomputed and validated against the checkpoint.
+    Intercept only the exact process-local config registered below; every other
+    config continues through OpenPI's original resolver.
+    """
+
+    expected_artifact = resolution.deployment_artifact.to_dict()
+    metadata = getattr(config, "policy_metadata", None)
+    if not isinstance(metadata, Mapping) or (
+        metadata.get("policy_artifact") != expected_artifact
+    ):
+        raise ValueError(
+            "Prepared OpenPI config lacks its validated checkpoint policy artifact."
+        )
+    original = training_config.resolve_policy_metadata
+
+    def _resolve(candidate: Any) -> Any:
+        if candidate is not config:
+            return original(candidate)
+        candidate_metadata = getattr(candidate, "policy_metadata", None)
+        if not isinstance(candidate_metadata, Mapping) or (
+            candidate_metadata.get("policy_artifact") != expected_artifact
+        ):
+            raise ValueError(
+                "Prepared OpenPI config policy artifact changed after registration."
+            )
+        return candidate
+
+    training_config.resolve_policy_metadata = _resolve
+    try:
+        yield
+    finally:
+        current = training_config.resolve_policy_metadata
+        training_config.resolve_policy_metadata = original
+        if current is not _resolve:
+            raise RuntimeError(
+                "OpenPI policy metadata resolver changed during prepared serving."
+            )
+
+
 def build_prepared_openpi_config(
     resolution: PreparedDeploymentResolution,
     *,
@@ -267,29 +318,29 @@ def build_prepared_openpi_config(
                 front_occlusion_schedule=((0.0, 1.0),),
                 explicit_mask_keys=explicit_mask_keys,
                 front_force_black=False,
-                episode_manifest=str(source["episode_manifest"]),
+                episode_manifest=source.get("episode_manifest"),
             )
             for source in resolution.prepared_source_manifests
         )
     if not source_configs:
         raise ValueError("Prepared deployment has no source configs.")
     first_root = Path(str(source_configs[0].dataset_root)).expanduser().resolve()
-    layout_path = first_root / "meta" / "info.json"
+    layout_path = resolution.deployment_artifact_path.expanduser().resolve()
     if not layout_path.is_file():
         raise FileNotFoundError(
-            f"Prepared deployment layout metadata is missing: {layout_path}"
+            f"Prepared deployment policy artifact is missing: {layout_path}"
         )
     layout_payload = json.loads(layout_path.read_text(encoding="utf-8"))
     if not isinstance(layout_payload, Mapping):
         raise ValueError(
-            f"Prepared deployment layout metadata must be an object: {layout_path}"
+            f"Prepared deployment policy artifact must be an object: {layout_path}"
         )
     actual_layout_hash = str(
         layout_payload.get("policy_io_layout_hash") or ""
     )
     if actual_layout_hash != artifact.layout_hash:
         raise ValueError(
-            "Prepared deployment source policy-I/O layout differs from the "
+            "Prepared deployment policy-I/O layout differs from the "
             "checkpoint artifact."
         )
     assets = dataclasses.replace(
@@ -329,11 +380,14 @@ def build_prepared_openpi_config(
             Path(str(profile["openpi_checkout"])).expanduser().resolve(),
         ),
     }
+    if not hasattr(base, "policy_metadata"):
+        raise ValueError(
+            "Prepared OpenPI base config has no policy_metadata field."
+        )
+    policy_metadata = dict(getattr(base, "policy_metadata", None) or {})
+    policy_metadata["policy_artifact"] = artifact.to_dict()
+    config_overrides["policy_metadata"] = policy_metadata
     if resolution.model_rtc_profile is not None:
-        if not hasattr(base, "policy_metadata"):
-            raise ValueError(
-                "Prepared model-RTC base config has no policy_metadata field."
-            )
         mask_aware = bool(
             resolution.model_rtc_profile.get(
                 "rtc_prefix_mask_conditioning",
@@ -344,9 +398,6 @@ def build_prepared_openpi_config(
             base.model,
             rtc_prefix_mask_conditioning=mask_aware,
         )
-        policy_metadata = dict(getattr(base, "policy_metadata", None) or {})
-        policy_metadata["policy_artifact"] = artifact.to_dict()
-        config_overrides["policy_metadata"] = policy_metadata
     config = dataclasses.replace(base, **config_overrides)
     if config.name != artifact.model_id:
         raise ValueError(
@@ -421,7 +472,11 @@ def prepared_config_summary(
                 "name": str(source.name),
                 "dataset_root": str(source.dataset_root),
                 "sample_weight": int(source.sample_weight),
-                "episode_manifest": str(source.episode_manifest),
+                "episode_manifest": (
+                    None
+                    if source.episode_manifest is None
+                    else str(source.episode_manifest)
+                ),
             }
             for source in config.data.dataset_sources
         ],
@@ -684,6 +739,10 @@ def main(argv: list[str] | None = None) -> int:
         ), install_openpi_state_only_server_adapter(
             server_module.websocket_policy_server,
             state_only_bridge,
+        ), _use_checkpoint_policy_metadata(
+            training_config,
+            config,
+            resolution,
         ):
             return _serve_until_stopped(server_module, server_args)
     finally:

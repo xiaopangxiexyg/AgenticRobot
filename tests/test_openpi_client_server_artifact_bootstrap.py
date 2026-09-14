@@ -172,3 +172,37 @@ def test_model_rtc_client_bootstraps_server_artifact_without_stage_or_step(
     )
     assert kwargs_payload["policy_artifact"] == artifact.to_dict()
     assert callable(observed["kwargs"]["rtc_model_adapter_factory"])
+
+
+def test_model_rtc_contract_check_bootstraps_server_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    artifact = _model_rtc_artifact()
+    bootstrap = mock.Mock(return_value=artifact)
+    monkeypatch.setattr(
+        openpi_application,
+        "fetch_server_policy_artifact",
+        bootstrap,
+    )
+
+    result = openpi_application.main(
+        [
+            "--host",
+            "model-host",
+            "--port",
+            "8078",
+            "--rtc-profile",
+            MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+            "--rtc-inference-steps",
+            "8",
+            "--contract-check-only",
+        ]
+    )
+
+    assert result == 0
+    bootstrap.assert_called_once_with(host="model-host", port=8078, api_key=None)
+    report = json.loads(capsys.readouterr().out)
+    assert report["model_id"] == artifact.model_id
+    assert report["checkpoint_step"] == artifact.checkpoint_step
+    assert report["rtc_inference_steps"] == 8
