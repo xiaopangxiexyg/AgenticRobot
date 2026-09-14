@@ -17,6 +17,7 @@ from robot_motion.rebot_b601_rs.model import (
     B601_RS_URDF_RELATIVE_PATH,
     B601ModelError,
 )
+from sim.contracts import SceneSpec
 from sim.mujoco.config import ArmSpec
 from sim.mujoco.mjcf import MJCFConversion, convert_urdf_to_mjcf_xml
 from sim.mujoco.scene import MujocoScene, SceneLoadResult
@@ -26,6 +27,7 @@ from sim.mujoco.urdf import (
     parse_urdf,
 )
 
+from .contact import add_b601_contact_wrench_sensor
 from .real2sim import B601Real2SimPlantProfile
 
 B601_RS_SIM_ARM_KEY = "b601_rs"
@@ -277,12 +279,15 @@ def _mjcf_xml_from_model(
     gravity: np.ndarray,
     actuation_mode: B601ActuationMode,
     plant_profile: B601Real2SimPlantProfile | None = None,
+    scene_spec: SceneSpec | None = None,
+    enable_contact_observation: bool = False,
 ) -> str:
     xml_text = convert_urdf_to_mjcf_xml(
         model,
         camera_mounts=(),
         timestep=timestep,
         gravity=tuple(float(value) for value in gravity),
+        scene_spec=scene_spec,
     )
     root = ET.fromstring(xml_text)
     option = root.find("option")
@@ -309,6 +314,8 @@ def _mjcf_xml_from_model(
                 ("armature", plant_profile.armature_kg_m2),
             ):
                 joint.set(attribute, repr(values[index]))
+    if enable_contact_observation:
+        add_b601_contact_wrench_sensor(root)
     ET.indent(root, space="  ")
     return ET.tostring(root, encoding="unicode")
 
@@ -320,6 +327,8 @@ def build_b601_mjcf_xml(
     gravity_mps2: Sequence[float] = (0.0, 0.0, 0.0),
     actuation_mode: B601ActuationMode = "position",
     plant_profile: B601Real2SimPlantProfile | None = None,
+    scene_spec: SceneSpec | None = None,
+    enable_contact_observation: bool = False,
 ) -> str:
     """Return in-memory MJCF without modifying or copying upstream assets."""
 
@@ -330,6 +339,11 @@ def build_b601_mjcf_xml(
     if gravity.shape != (3,) or not np.all(np.isfinite(gravity)):
         raise ValueError("gravity_mps2 must contain three finite values")
     mode = _validate_actuation_mode(actuation_mode)
+    _validate_contact_scene_contract(
+        scene_spec=scene_spec,
+        gravity=gravity,
+        enable_contact_observation=enable_contact_observation,
+    )
     _urdf_path, urdf_model = _load_normalized_urdf(source_root)
     return _mjcf_xml_from_model(
         urdf_model,
@@ -337,7 +351,34 @@ def build_b601_mjcf_xml(
         gravity=gravity,
         actuation_mode=mode,
         plant_profile=plant_profile,
+        scene_spec=scene_spec,
+        enable_contact_observation=enable_contact_observation,
     )
+
+
+def _validate_contact_scene_contract(
+    *,
+    scene_spec: SceneSpec | None,
+    gravity: np.ndarray,
+    enable_contact_observation: bool,
+) -> None:
+    if scene_spec is not None and not isinstance(scene_spec, SceneSpec):
+        raise TypeError("scene_spec must be a SceneSpec")
+    if not isinstance(enable_contact_observation, bool):
+        raise TypeError("enable_contact_observation must be a bool")
+    if scene_spec is not None and not np.allclose(
+        gravity,
+        np.asarray(scene_spec.gravity_mps2, dtype=float),
+        atol=0.0,
+        rtol=0.0,
+    ):
+        raise ValueError("gravity_mps2 must exactly match scene_spec.gravity_mps2")
+    if enable_contact_observation and (
+        scene_spec is None or not scene_spec.collision.enabled
+    ):
+        raise ValueError(
+            "enable_contact_observation requires a collision-enabled scene_spec"
+        )
 
 
 def _validate_initial_qpos(values: Sequence[float], model: URDFModel) -> np.ndarray:
@@ -359,6 +400,8 @@ def build_b601_mujoco_scene(
     initial_arm_qpos: Sequence[float] = B601_RS_DEFAULT_ARM_QPOS,
     actuation_mode: B601ActuationMode = "position",
     plant_profile: B601Real2SimPlantProfile | None = None,
+    scene_spec: SceneSpec | None = None,
+    enable_contact_observation: bool = False,
 ) -> MujocoScene:
     """Compile the B601 plant and wrap it in the generic scene facade."""
 
@@ -378,12 +421,19 @@ def build_b601_mujoco_scene(
     if gravity.shape != (3,) or not np.all(np.isfinite(gravity)):
         raise ValueError("gravity_mps2 must contain three finite values")
     mode = _validate_actuation_mode(actuation_mode)
+    _validate_contact_scene_contract(
+        scene_spec=scene_spec,
+        gravity=gravity,
+        enable_contact_observation=enable_contact_observation,
+    )
     xml_text = _mjcf_xml_from_model(
         urdf_model,
         timestep=timestep,
         gravity=gravity,
         actuation_mode=mode,
         plant_profile=plant_profile,
+        scene_spec=scene_spec,
+        enable_contact_observation=enable_contact_observation,
     )
     model = mujoco.MjModel.from_xml_string(xml_text)
     data = mujoco.MjData(model)
@@ -394,11 +444,17 @@ def build_b601_mujoco_scene(
         joint_names=tuple(
             joint.name for joint in urdf_model.joints if joint.joint_type != "fixed"
         ),
-        body_names=tuple(urdf_model.links),
+        body_names=tuple(urdf_model.links) + (
+            () if scene_spec is None else tuple(obj.name for obj in scene_spec.objects)
+        ),
         scene_profile_name=(
-            B601_RS_PROVISIONAL_PROFILE_NAME
-            if mode == "position"
-            else B601_RS_EFFORT_PROFILE_NAME
+            scene_spec.profile_name
+            if scene_spec is not None
+            else (
+                B601_RS_PROVISIONAL_PROFILE_NAME
+                if mode == "position"
+                else B601_RS_EFFORT_PROFILE_NAME
+            )
         ),
     )
     arm_spec = ArmSpec(
@@ -416,7 +472,7 @@ def build_b601_mujoco_scene(
             cameras=(),
             arms={B601_RS_SIM_ARM_KEY: arm_spec},
             grippers={},
-            scene_spec=None,
+            scene_spec=scene_spec,
         ),
     )
     scene.set_arm_qpos(B601_RS_SIM_ARM_KEY, initial)
