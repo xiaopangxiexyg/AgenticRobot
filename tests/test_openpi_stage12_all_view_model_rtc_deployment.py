@@ -181,6 +181,8 @@ def test_stage14_client_contract_check_is_server_bootstrapped() -> None:
     assert "--checkpoint-dir" not in contract
     assert "--prepared-training-profile" not in contract
     assert "--model-rtc-profile" not in contract
+    assert "不是 client 到某个 Stage、step 或 model id 的强绑定" in section
+    assert "以新连接实际发布的 metadata 重新建立契约" in section
 
 
 def test_stage14_real_recipe_separates_no_action_and_bounded_active() -> None:

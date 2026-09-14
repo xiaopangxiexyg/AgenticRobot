@@ -2041,6 +2041,11 @@ Stage、step、checkpoint 或 training/model-RTC profile。切换 Stage/step 时
 server，确认端口与 GPU 释放，启动新 server 后再运行同一条 client 命令；不要复用旧连接的
 queue 或 RTC history。
 
+server 启动前检查的 `model_continuation_training_run.json` 与
+`model_continuation_checkpoint_receipt.json` 只用于证明所选 checkpoint 内部完整且与其
+`policy_artifact.json` 一致；它们不是 client 到某个 Stage、step 或 model id 的强绑定。client
+断开后可以连接另一个兼容 server，并以新连接实际发布的 metadata 重新建立契约。
+
 ### 23.1 终端 A：可切换 Stage/step 的完整 server 命令
 
 这是一条直接的 Python 命令。只修改末尾两个参数：第一个是 `1/2/3/4`，第二个是
