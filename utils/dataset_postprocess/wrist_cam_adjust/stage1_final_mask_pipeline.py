@@ -445,6 +445,58 @@ def _selected_wrist_camera_keys(profile: Mapping[str, Any]) -> tuple[str, ...]:
     return cameras
 
 
+def _physical_provenance_source_binding(
+    *,
+    provenance: Mapping[str, Any],
+    source_root: Path,
+    output_index: int,
+) -> dict[str, Any]:
+    """Bind a build-plan source to direct or reviewed flattened provenance."""
+
+    declared_text = str(provenance.get("source_dataset_root", "")).strip()
+    if declared_text and Path(declared_text).expanduser().resolve() == source_root:
+        return {
+            "mode": "direct_source_dataset_root",
+            "source_dataset_root": declared_text,
+        }
+
+    if (
+        provenance.get("provenance_flattening")
+        != "by_date_parts_consolidated_after_verified_merge"
+        or provenance.get("source_dataset_root_kind")
+        != "stable_non_sensitive_alias"
+    ):
+        raise ValueError(
+            "physical provenance differs from the build plan for output "
+            f"episode {output_index}."
+        )
+
+    intermediate_text = str(
+        provenance.get("intermediate_source_dataset_root", "")
+    ).strip()
+    raw_text = str(provenance.get("raw_source_dataset_root", "")).strip()
+    alias_path = Path(declared_text)
+    if (
+        not intermediate_text
+        or Path(intermediate_text).expanduser().resolve() != source_root
+        or not raw_text
+        or not Path(raw_text).is_absolute()
+        or not alias_path.is_absolute()
+        or alias_path.parts[:2] != ("/", "realmandmtac-provenance")
+    ):
+        raise ValueError(
+            "flattened physical provenance is incomplete or differs from the "
+            f"build plan for output episode {output_index}."
+        )
+    return {
+        "mode": "reviewed_flattened_by_date_source",
+        "source_dataset_root": declared_text,
+        "source_dataset_root_kind": "stable_non_sensitive_alias",
+        "intermediate_source_dataset_root": intermediate_text,
+        "raw_source_dataset_root": raw_text,
+    }
+
+
 def _physical_devices_by_episode(
     dataset_root: Path,
     episode_indices: Sequence[int],
@@ -526,15 +578,18 @@ def _physical_devices_by_episode(
             )
         expected_source_episode = int(item["source_episode_index"])
         if (
-            Path(str(provenance.get("source_dataset_root", ""))).expanduser().resolve()
-            != source_root
-            or int(provenance.get("source_episode_index", -1))
+            int(provenance.get("source_episode_index", -1))
             != expected_source_episode
         ):
             raise ValueError(
                 "physical provenance differs from the build plan for output "
                 f"episode {output_index}."
             )
+        provenance_source_binding = _physical_provenance_source_binding(
+            provenance=provenance,
+            source_root=source_root,
+            output_index=output_index,
+        )
         if not devices_path.is_file() or devices_path.is_symlink():
             raise FileNotFoundError(
                 "physical source devices manifest is missing for output "
@@ -550,6 +605,7 @@ def _physical_devices_by_episode(
         contract_key = str(devices_path)
         contract = {
             "source_dataset_root": str(source_root),
+            "provenance_source_binding": provenance_source_binding,
             "copied_manifest_path": contract_key,
             "copied_manifest_sha256": copied_sha256,
             "original_manifest_path": str(original_path),
@@ -804,6 +860,32 @@ def _wrist_intrinsics_overlays_for_source(
             f"wrist_intrinsics_overrides: {source_id}"
         )
 
+    donor_roots = dict(profile_sources)
+    raw_donor_sources = profile.get("wrist_intrinsics_donor_sources", {})
+    if not isinstance(raw_donor_sources, Mapping):
+        raise TypeError("wrist_intrinsics_donor_sources must be an object")
+    external_donor_ids: set[str] = set()
+    for raw_donor_id, raw_donor in raw_donor_sources.items():
+        donor_id = str(raw_donor_id).strip()
+        if (
+            not donor_id
+            or donor_id in donor_roots
+            or donor_id in external_donor_ids
+            or not isinstance(raw_donor, Mapping)
+        ):
+            raise ValueError(
+                "wrist intrinsics donor source IDs must be non-empty, distinct "
+                "from training sources, and map to objects"
+            )
+        donor_root_text = str(raw_donor.get("dataset_root", "")).strip()
+        donor_root = Path(donor_root_text).expanduser()
+        if not donor_root.is_absolute() or not donor_root.is_dir():
+            raise FileNotFoundError(
+                f"wrist intrinsics donor dataset root is unavailable: {donor_id}"
+            )
+        donor_roots[donor_id] = donor_root.resolve()
+        external_donor_ids.add(donor_id)
+
     selected_episodes = tuple(int(value) for value in episodes)
     if devices_by_episode is None:
         default_devices = (
@@ -869,12 +951,26 @@ def _wrist_intrinsics_overlays_for_source(
             ).strip()
             donor_camera_key = str(raw_override.get("donor_camera_key", "")).strip()
             expected_serial = str(raw_override.get("expected_serial", "")).strip()
+            expected_donor_sha256 = str(
+                raw_override.get("expected_donor_devices_sha256", "")
+            ).strip()
+            external_donor = donor_source_id in external_donor_ids
             if (
                 target_camera_key != camera_key
-                or donor_source_id not in profile_sources
+                or donor_source_id not in donor_roots
                 or not donor_relative_path
                 or not donor_camera_key
                 or not expected_serial
+                or (
+                    external_donor
+                    and (
+                        len(expected_donor_sha256) != 64
+                        or any(
+                            value not in "0123456789abcdef"
+                            for value in expected_donor_sha256
+                        )
+                    )
+                )
             ):
                 raise ValueError(
                     f"invalid wrist intrinsics override: {source_id}/{camera_key}"
@@ -883,7 +979,7 @@ def _wrist_intrinsics_overlays_for_source(
             cache_key = (donor_source_id, donor_relative_path)
             donor_cached = donor_cache.get(cache_key)
             if donor_cached is None:
-                donor_root = profile_sources[donor_source_id]
+                donor_root = donor_roots[donor_source_id]
                 donor_path = _contained_regular_file(
                     donor_root,
                     donor_relative_path,
@@ -896,6 +992,14 @@ def _wrist_intrinsics_overlays_for_source(
                 )
                 donor_cache[cache_key] = donor_cached
             donor_path, donor_records, donor_contract = donor_cached
+            if (
+                expected_donor_sha256
+                and _sha256(donor_path) != expected_donor_sha256
+            ):
+                raise ValueError(
+                    "wrist intrinsics donor manifest hash differs from the "
+                    f"profile: {donor_source_id}/{donor_relative_path}"
+                )
 
             target_record = target_records.get(target_camera_key)
             donor_record = donor_records.get(donor_camera_key)
@@ -940,6 +1044,9 @@ def _wrist_intrinsics_overlays_for_source(
                     "donor_source_dataset_id": donor_source_id,
                     "donor_devices_path": str(donor_path),
                     "donor_devices_sha256": _sha256(donor_path),
+                    "expected_donor_devices_sha256": (
+                        expected_donor_sha256 or None
+                    ),
                     "donor_camera_key": donor_camera_key,
                     "donor_devices_contract": donor_contract,
                 }

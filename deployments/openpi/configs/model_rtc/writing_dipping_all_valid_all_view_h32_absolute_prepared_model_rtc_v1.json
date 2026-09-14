@@ -1,0 +1,30 @@
+{
+  "schema": "dexteleop.openpi_prepared_model_rtc_training_profile.v2",
+  "profile_id": "writing_dipping_all_valid_all_view_h32_absolute_prepared_model_rtc_v1",
+  "prepared_skill_profile_id": "writing_dipping_all_valid_all_view_h32_absolute_non_rtc_100k_by_date_v1",
+  "output_config_name": "writing-dipping-all-valid-all-view-h32-absolute-prepared-model-rtc-v1",
+  "default_exp_name": "writing-dipping-all-valid-all-view-h32-absolute-model-rtc-v1",
+  "training_implementation": "mask_aware_hard_flow_prefix_v2",
+  "rtc_prefix_mask_conditioning": true,
+  "minimum_forecast_delay_steps": 1,
+  "maximum_forecast_delay_steps": 12,
+  "minimum_prefix_steps": 0,
+  "maximum_prefix_steps": 12,
+  "sampling_spec": {
+    "schema": "dexteleop_model_continuation_training_sampling_v1",
+    "strategy": "hash_indexed_uniform_explicit_pairs_v1",
+    "selection_salt": "writing-dipping-all-valid-all-view-h32-absolute-prepared-model-rtc-v1",
+    "delay_prefix_pairs": [
+      [1, 0],
+      [1, 1],
+      [2, 1],
+      [2, 2],
+      [4, 2],
+      [4, 4],
+      [8, 4],
+      [8, 8],
+      [12, 8],
+      [12, 12]
+    ]
+  }
+}
