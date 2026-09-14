@@ -17,6 +17,7 @@ from scipy.spatial.transform import Rotation
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.joint_limits import load_joint_velocity_limit_profiles
 from robot_motion.path_planning import (
+    JointConfigurationCheck,
     JointPathPlannerConfig,
     JointPathPlanResult,
     JointPathStatus,
@@ -265,6 +266,61 @@ class _PlannedPathLeg:
     search_attempts: tuple[Mapping[str, object], ...]
 
 
+class _TargetEnvelopePathOracle:
+    """Compose collision and TCP-envelope checks for grasp path search."""
+
+    def __init__(
+        self,
+        *,
+        collision_oracle: object,
+        envelope_check: Callable[[Mapping[str, np.ndarray]], None],
+    ) -> None:
+        self._collision_oracle = collision_oracle
+        self._envelope_check = envelope_check
+        self.scene_hash = getattr(collision_oracle, "scene_hash")
+
+    def check(
+        self,
+        qpos_by_component: Mapping[str, np.ndarray],
+    ) -> JointConfigurationCheck:
+        collision_check = self._collision_oracle.check(qpos_by_component)
+        if not isinstance(collision_check, JointConfigurationCheck):
+            return JointConfigurationCheck(
+                safe=False,
+                collision_check_available=False,
+                reason="collision_oracle_returned_invalid_type",
+                metadata={"returned_type": type(collision_check).__name__},
+            )
+        if not collision_check.collision_check_available or not collision_check.safe:
+            return collision_check
+        try:
+            self._envelope_check(qpos_by_component)
+        except RM65GraspTrajectoryPlanningError as error:
+            available = error.reason_code == "path_target_safety_envelope_blocked"
+            return JointConfigurationCheck(
+                safe=False,
+                collision_check_available=available,
+                reason=error.reason_code,
+                minimum_distance_m=collision_check.minimum_distance_m,
+                metadata={
+                    "collision_check": collision_check.to_dict(),
+                    "target_envelope": error.details,
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - search must fail closed.
+            return JointConfigurationCheck(
+                safe=False,
+                collision_check_available=False,
+                reason="path_target_safety_envelope_unavailable",
+                minimum_distance_m=collision_check.minimum_distance_m,
+                metadata={
+                    "collision_check": collision_check.to_dict(),
+                    "exception_type": type(error).__name__,
+                },
+            )
+        return collision_check
+
+
 class RM65GraspJointTrajectoryPlanner:
     """Resolve endpoint IK, plan around fixed table/poles, then time-sample qpos."""
 
@@ -301,7 +357,7 @@ class RM65GraspJointTrajectoryPlanner:
         self.reachability_config = reachability_config or RM65GraspReachabilityConfig()
         self._solver_lock = threading.Lock()
         self.planner_config = planner_config or JointPathPlannerConfig(
-            shortcut_attempts=8,
+            shortcut_attempts=80,
             adaptive_edge_resolution_rad=self.config.final_edge_resolution_rad,
             adaptive_refinement_distance_m=0.03,
         )
@@ -521,6 +577,58 @@ class RM65GraspJointTrajectoryPlanner:
                 )
             normalized[side] = value.copy()
         return normalized
+
+    def _require_qpos_within_target_envelope(
+        self,
+        qpos_by_side: Mapping[str, np.ndarray],
+        *,
+        sides: tuple[str, ...],
+        phase: str,
+    ) -> None:
+        solver_targets = self.target_builder.solver_world_targets_for_qpos_pair(
+            left_qpos=qpos_by_side["left"],
+            right_qpos=qpos_by_side["right"],
+        )
+        self._require_unmodified_target_envelope(
+            solver_targets,
+            sides=sides,
+            phase=phase,
+        )
+
+    def _qpos_is_within_target_envelope(
+        self,
+        qpos_by_side: Mapping[str, np.ndarray],
+        *,
+        sides: tuple[str, ...],
+        phase: str,
+    ) -> bool:
+        try:
+            self._require_qpos_within_target_envelope(
+                qpos_by_side,
+                sides=sides,
+                phase=phase,
+            )
+        except RM65GraspTrajectoryPlanningError as error:
+            if error.reason_code == f"{phase}_safety_envelope_blocked":
+                return False
+            raise
+        return True
+
+    def _path_search_oracle(self, *, planning_phase: str) -> object:
+        # The measured staging pose may intentionally start just outside the
+        # task envelope.  Its dedicated ingress leg is bounded, monotonic, and
+        # densely revalidated.  Once inside, every grasp-search sample must
+        # satisfy both collision and TCP-envelope constraints.
+        if planning_phase != "grasp_target" or self.target_envelope_filter is None:
+            return self.oracle
+        return _TargetEnvelopePathOracle(
+            collision_oracle=self.oracle,
+            envelope_check=lambda qpos: self._require_qpos_within_target_envelope(
+                qpos,
+                sides=_SIDES,
+                phase="path_target",
+            ),
+        )
 
     @staticmethod
     def _raise_ingress_rejection(
@@ -924,11 +1032,26 @@ class RM65GraspJointTrajectoryPlanner:
             position, orientation = pose_delta_metrics(tcp, target_pose)
             return pair, position, orientation
 
+        def acceptable(
+            pair: Mapping[str, np.ndarray],
+            position: float,
+            orientation: float,
+        ) -> bool:
+            return (
+                position <= position_limit
+                and orientation <= orientation_limit
+                and self._qpos_is_within_target_envelope(
+                    pair,
+                    sides=(side,),
+                    phase="endpoint",
+                )
+            )
+
         previous_alpha = 0.0
         bracket: tuple[float, float] | None = None
         for alpha in np.linspace(0.0, 1.0, 33)[1:]:
-            _pair, position, orientation = evaluate(float(alpha))
-            if position <= position_limit and orientation <= orientation_limit:
+            pair, position, orientation = evaluate(float(alpha))
+            if acceptable(pair, position, orientation):
                 bracket = (previous_alpha, float(alpha))
                 break
             previous_alpha = float(alpha)
@@ -937,8 +1060,8 @@ class RM65GraspJointTrajectoryPlanner:
         lower, upper = bracket
         for _ in range(32):
             midpoint = (lower + upper) * 0.5
-            _pair, position, orientation = evaluate(midpoint)
-            if position <= position_limit and orientation <= orientation_limit:
+            pair, position, orientation = evaluate(midpoint)
+            if acceptable(pair, position, orientation):
                 upper = midpoint
             else:
                 lower = midpoint
@@ -973,6 +1096,7 @@ class RM65GraspJointTrajectoryPlanner:
         accepted: list[_EndpointIKCandidate] = []
         collision_unavailable = False
         collision_blocked = False
+        endpoint_envelope_blocked = False
         for seed_index, seed in enumerate(
             self._endpoint_seed_qpos(qpos_by_side, side=side)
         ):
@@ -1003,6 +1127,8 @@ class RM65GraspJointTrajectoryPlanner:
                 candidate[inactive] = np.asarray(
                     qpos_by_side[inactive], dtype=float
                 ).copy()
+            except RM65GraspTrajectoryPlanningError:
+                raise
             except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
                 attempts.append(
                     {
@@ -1017,7 +1143,14 @@ class RM65GraspJointTrajectoryPlanner:
                 position <= self.config.endpoint_position_tolerance_m
                 and orientation <= self.config.endpoint_orientation_tolerance_deg
             ):
-                if any(
+                if not self._qpos_is_within_target_envelope(
+                    candidate,
+                    sides=(side,),
+                    phase="endpoint",
+                ):
+                    endpoint_envelope_blocked = True
+                    outcome = "endpoint_safety_envelope_blocked"
+                elif any(
                     np.allclose(
                         candidate[side],
                         item.qpos_by_side[side],
@@ -1075,6 +1208,8 @@ class RM65GraspJointTrajectoryPlanner:
             return tuple(accepted[: self.config.maximum_endpoint_candidates])
         if collision_unavailable:
             reason = "endpoint_collision_check_unavailable"
+        elif endpoint_envelope_blocked:
+            reason = "endpoint_safety_envelope_blocked"
         elif collision_blocked:
             reason = "endpoint_collision_blocked"
         else:
@@ -1329,10 +1464,10 @@ class RM65GraspJointTrajectoryPlanner:
                 except RM65GraspTrajectoryPlanningError as error:
                     if error.reason_code != "path_target_safety_envelope_blocked":
                         raise
+                    adjustment, constraints = blocked_projection(error)
                     if ingress_entered_at is not None:
                         reject_ingress(error, "path_left_envelope_after_entry")
-                    adjustment, constraints = blocked_projection(error)
-                    if ingress_constraints is None:
+                    elif ingress_constraints is None:
                         if segment_index != 0 or index != 0:
                             reject_ingress(error, "path_did_not_start_at_the_violation")
                         if len(constraints) != 1:
@@ -1460,6 +1595,7 @@ class RM65GraspJointTrajectoryPlanner:
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         cfg = self.planner_config
+        search_oracle = self._path_search_oracle(planning_phase=planning_phase)
         search_attempts: list[dict[str, object]] = []
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
         for endpoint_index, endpoint in enumerate(endpoint_candidates):
@@ -1517,7 +1653,7 @@ class RM65GraspJointTrajectoryPlanner:
                     start_qpos_by_component=qpos_by_side,
                     target_qpos_by_component=target,
                     movable_components=(side,),
-                    oracle=self.oracle,
+                    oracle=search_oracle,
                     config=attempt_config,
                     joint_lower_by_component={side: corridor_lower},
                     joint_upper_by_component={side: corridor_upper},

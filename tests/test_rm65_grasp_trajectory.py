@@ -181,6 +181,56 @@ OFFLINE_INGRESS_TARGET = np.array(
     ]
 )
 
+# Exact read-only qpos and candidate 3 from the 2026-09-14 13:49 blue-cube
+# capture.  Candidate 0 exposed a large TCP-envelope excursion along a
+# collision-clear joint interpolation; candidate 3 provides a short strict
+# route from the same measured HOLD posture.
+LATEST_BLUE_CUBE_QPOS = {
+    "left": np.array(
+        [
+            2.254965340313452,
+            0.4383045502333542,
+            2.2665719289762354,
+            1.8238690683340744,
+            -1.398881422105066,
+            -0.41174061691376346,
+        ]
+    ),
+    "right": np.array(
+        [
+            -2.441104854175668,
+            0.5387307903331019,
+            1.8238516246289345,
+            -2.1214477590623293,
+            -1.4772641119404961,
+            0.6231174436880611,
+        ]
+    ),
+}
+LATEST_BLUE_CUBE_CANDIDATE_3 = np.array(
+    [
+        [
+            0.7702649959168447,
+            0.2803535459146707,
+            -0.5727946624736426,
+            -0.33077911609627286,
+        ],
+        [
+            -0.5382509172192118,
+            -0.19590731346984203,
+            -0.819698892668342,
+            0.05540680494080945,
+        ],
+        [
+            -0.34202015463697494,
+            0.9396926166689296,
+            7.224301935798734e-09,
+            0.1543208538538673,
+        ],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+)
+
 
 def _field_trace_snapshot() -> AuthoritativeRobotStateSnapshot:
     identity = ShadowExecutionIdentity(
@@ -568,6 +618,30 @@ def test_dense_grasp_path_allows_submillimeter_tangent_during_ingress() -> None:
     ]
 
 
+def test_dense_grasp_path_rejects_submillimeter_excursion_after_starting_inside() -> (
+    None
+):
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    envelope_filter = _IngressEnvelopeFilter(
+        (0.0, 0.000335),
+        constraints_by_call=((), ("absolute:x:min",)),
+    )
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=envelope_filter,
+    )
+
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
+        planner._revalidate((SAFE_QPOS, SAFE_QPOS), moving_side="right")
+
+    assert (
+        raised.value.details["envelope_ingress_rejection"]
+        == "path_did_not_start_at_the_violation"
+    )
+
+
 def test_dense_grasp_path_rejects_larger_new_constraint_during_ingress() -> None:
     profile = _real_profile()
     builder = build_exclusive_rm65_skill_target_builder(profile)
@@ -759,6 +833,62 @@ def test_real_snapshot_plans_via_strict_envelope_ingress_waypoint(
         solver_targets = builder.solver_world_targets_for_qpos_pair(
             left_qpos=qpos["left"],
             right_qpos=qpos["right"],
+        )
+        projected = envelope_filter(solver_targets)
+        modified = not np.allclose(
+            projected["right"],
+            solver_targets["right"],
+            atol=1e-9,
+            rtol=0.0,
+        )
+        if entered:
+            assert modified is False
+        elif not modified:
+            entered = True
+    assert entered is True
+
+
+def test_latest_blue_cube_candidate_has_short_strict_read_only_path() -> None:
+    profile = _real_profile(envelope_profile_name="agent_grasp_right_workspace_v1.json")
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    target_safety = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
+        target_builder=builder,
+        station_world_from_arm_base_by_side=profile.scene_world_from_arm_base_by_side,
+        station_world_frame_id=profile.station_world_frame_id,
+        envelope_profile_path=profile.envelope_profile_path,
+    )
+    envelope_filter = target_safety.envelope_filter
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=envelope_filter,
+    )
+
+    trajectory = planner(
+        qpos_by_side=LATEST_BLUE_CUBE_QPOS,
+        side="right",
+        target_tool_tcp_world=LATEST_BLUE_CUBE_CANDIDATE_3,
+        speed_scale=0.2,
+    )
+
+    assert trajectory.time_from_start_sec.size > 2
+    assert float(trajectory.time_from_start_sec[-1]) < 35.0
+    final_tcp = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=trajectory.qpos_by_side["left"][-1],
+        right_qpos=trajectory.qpos_by_side["right"][-1],
+    )["right"]
+    position_error_m, orientation_error_deg = pose_delta_metrics(
+        final_tcp,
+        LATEST_BLUE_CUBE_CANDIDATE_3,
+    )
+    assert position_error_m <= planner.config.endpoint_position_tolerance_m
+    assert orientation_error_deg <= planner.config.endpoint_orientation_tolerance_deg
+
+    entered = False
+    for index in range(trajectory.time_from_start_sec.size):
+        solver_targets = builder.solver_world_targets_for_qpos_pair(
+            left_qpos=trajectory.qpos_by_side["left"][index],
+            right_qpos=trajectory.qpos_by_side["right"][index],
         )
         projected = envelope_filter(solver_targets)
         modified = not np.allclose(
@@ -1086,6 +1216,36 @@ class _MultistartBuilder:
         return {"left": np.eye(4), "right": np.eye(4)}
 
 
+class _LinearQposBuilder(_MultistartBuilder):
+    @staticmethod
+    def _poses(*, left_qpos, right_qpos):
+        poses = {"left": np.eye(4), "right": np.eye(4)}
+        poses["left"][0, 3] = float(np.asarray(left_qpos)[0])
+        poses["right"][0, 3] = float(np.asarray(right_qpos)[0])
+        return poses
+
+    def solver_world_targets_for_qpos_pair(self, **kwargs):
+        return self._poses(**kwargs)
+
+    def tool_tcp_world_targets_for_qpos_pair(self, **kwargs):
+        return self._poses(**kwargs)
+
+
+class _MinimumRightXEnvelopeFilter:
+    def __init__(self, minimum_x: float) -> None:
+        self.minimum_x = float(minimum_x)
+
+    def __call__(self, targets):
+        projected = {
+            side: np.asarray(pose, dtype=float).copy() for side, pose in targets.items()
+        }
+        projected["right"][0, 3] = max(
+            self.minimum_x,
+            float(projected["right"][0, 3]),
+        )
+        return projected
+
+
 def _planner_without_assets(
     *,
     config: RM65GraspTrajectoryPlanningConfig,
@@ -1103,6 +1263,131 @@ def _planner_without_assets(
     planner.target_envelope_filter = None
     planner._solver_lock = threading.Lock()
     return planner
+
+
+def test_grasp_search_oracle_composes_collision_and_target_envelope() -> None:
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _LinearQposBuilder()
+    collision_oracle = SimpleNamespace(
+        scene_hash="scene:test",
+        check=lambda _qpos: JointConfigurationCheck(
+            safe=True,
+            minimum_distance_m=0.03,
+        ),
+    )
+    planner.oracle = collision_oracle
+    planner.target_envelope_filter = _MinimumRightXEnvelopeFilter(0.8)
+    outside = {side: np.zeros(6) for side in ("left", "right")}
+    outside["right"][0] = 0.5
+    inside = {side: value.copy() for side, value in outside.items()}
+    inside["right"][0] = 0.9
+
+    search_oracle = planner._path_search_oracle(planning_phase="grasp_target")
+
+    assert search_oracle is not collision_oracle
+    assert search_oracle.scene_hash == "scene:test"
+    outside_check = search_oracle.check(outside)
+    assert outside_check.safe is False
+    assert outside_check.collision_check_available is True
+    assert outside_check.reason == "path_target_safety_envelope_blocked"
+    assert search_oracle.check(inside).safe is True
+    assert (
+        planner._path_search_oracle(planning_phase="envelope_ingress")
+        is collision_oracle
+    )
+
+
+def test_grasp_search_oracle_fails_closed_when_envelope_is_unavailable() -> None:
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _LinearQposBuilder()
+    planner.oracle = SimpleNamespace(
+        scene_hash="scene:test",
+        check=lambda _qpos: JointConfigurationCheck(safe=True),
+    )
+
+    def unavailable(_targets):
+        raise RuntimeError("test envelope failure")
+
+    planner.target_envelope_filter = unavailable
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+
+    check = planner._path_search_oracle(planning_phase="grasp_target").check(qpos)
+
+    assert check.safe is False
+    assert check.collision_check_available is False
+    assert check.reason == "path_target_safety_envelope_unavailable"
+
+
+def test_closest_tolerance_endpoint_must_also_be_inside_envelope() -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_position_tolerance_m=0.3,
+        )
+    )
+    planner.target_builder = _LinearQposBuilder()
+    planner.target_envelope_filter = _MinimumRightXEnvelopeFilter(0.8)
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    target = np.eye(4)
+    target[0, 3] = 1.0
+    solved = np.zeros(6)
+    solved[0] = 1.0
+
+    candidate, position, orientation = planner._closest_tolerance_endpoint(
+        qpos_by_side=current,
+        side="right",
+        target_tool_tcp_world=target,
+        seed_qpos=np.zeros(6),
+        solved_qpos=solved,
+    )
+
+    assert candidate["right"][0] == pytest.approx(0.8, abs=1e-8)
+    assert position == pytest.approx(0.2, abs=1e-8)
+    assert orientation == pytest.approx(0.0)
+
+
+def test_endpoint_candidate_rejects_realized_pose_outside_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            maximum_endpoint_solve_cycles=1,
+            endpoint_seed_count=1,
+        )
+    )
+    planner.target_builder = _LinearQposBuilder()
+    planner.target_envelope_filter = _MinimumRightXEnvelopeFilter(0.8)
+    planner.oracle = SimpleNamespace(
+        check=lambda _qpos: JointConfigurationCheck(safe=True)
+    )
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    unsafe_candidate = {side: value.copy() for side, value in current.items()}
+    unsafe_candidate["right"][0] = 0.5
+    monkeypatch.setattr(
+        planner,
+        "_endpoint_seed_qpos",
+        lambda *_args, **_kwargs: (current,),
+    )
+    monkeypatch.setattr(
+        planner,
+        "_least_squares_endpoint_from_seed",
+        lambda **_kwargs: (unsafe_candidate, 1, 0.001, 0.0),
+    )
+    target = np.eye(4)
+    target[0, 3] = 1.0
+
+    with pytest.raises(
+        RM65GraspTrajectoryPlanningError,
+        match="endpoint_safety_envelope_blocked",
+    ) as raised:
+        planner._endpoint_qpos_candidates(
+            qpos_by_side=current,
+            side="right",
+            target_tool_tcp_world=target,
+        )
+
+    assert raised.value.details["attempts"][0]["outcome"] == (
+        "endpoint_safety_envelope_blocked"
+    )
 
 
 def test_endpoint_planner_collects_distinct_exact_multistart_solutions() -> None:
