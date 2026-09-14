@@ -7,6 +7,15 @@ from pathlib import Path
 import pytest
 
 from collection_runtime.progress.profiles import load_managed_task_profile
+from dataset_contracts.camera_semantic_prepared_view import (
+    CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH,
+    CameraSemanticPreparedViewContractError,
+    CameraSemanticPreparedViewFileV1,
+    CameraSemanticPreparedViewManifestV1,
+)
+from dataset_interface.camera_semantic_prepared_view import (
+    load_camera_semantic_prepared_view,
+)
 from dataset_interface.progress_skill_projection import (
     load_builtin_writing_five_stage_dipping_skill_projection_catalog,
     validate_progress_skill_projection,
@@ -37,6 +46,58 @@ _MODEL_RTC_PROFILE = (
 _CALIBRATION_DEVICES_SHA256 = (
     "aa2f2e1d78314e8c93bcff7dad92b7dbf97cfa69e170c67f6b6f5d90eca5f023"
 )
+
+
+def _write_minimal_camera_prepared_view(root: Path) -> Path:
+    episodes_path = root / "meta/episodes.jsonl"
+    episodes_path.parent.mkdir(parents=True)
+    episodes_path.write_text('{"episode_index": 0}\n', encoding="utf-8")
+    file_record = CameraSemanticPreparedViewFileV1(
+        relative_path="meta/episodes.jsonl",
+        size_bytes=episodes_path.stat().st_size,
+        sha256=hashlib.sha256(episodes_path.read_bytes()).hexdigest(),
+    )
+    manifest = CameraSemanticPreparedViewManifestV1(
+        source_dataset_name="dipping-source",
+        source_dataset_identity_hash="1" * 64,
+        selected_source_inventory_hash="2" * 64,
+        camera_binding_hash="3" * 64,
+        camera_materialization_receipt_hash="4" * 64,
+        plan_hash="5" * 64,
+        episode_indices=(0,),
+        files=(file_record,),
+    )
+    manifest_path = root / CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _write_by_date_entry(root: Path, manifest_path: Path, **updates: object) -> None:
+    payload: dict[str, object] = {
+        "dataset_relative_path": root.name,
+        "destination_relative_path": root.name,
+        "direct_dataset_root": True,
+        "prepared_view_manifest_sha256": hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest(),
+    }
+    payload.update(updates)
+    payload["entry_semantic_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    (root / "ENTRY.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def test_dipping_skill_projection_matches_managed_five_stage_contract() -> None:
@@ -129,6 +190,62 @@ def test_dipping_model_rtc_profile_is_data_bound_but_checkpoint_independent() ->
         "prepared_final_mask_inventory_receipt_sha256",
     }
     assert forbidden.isdisjoint(model_rtc)
+
+
+def test_camera_prepared_view_accepts_hash_bound_by_date_entry(tmp_path: Path) -> None:
+    root = tmp_path / "2026-09-14__writing-detail-s3"
+    manifest_path = _write_minimal_camera_prepared_view(root)
+    _write_by_date_entry(root, manifest_path)
+
+    loaded = load_camera_semantic_prepared_view(root, verify_payload_hashes=True)
+
+    assert loaded.episode_indices == (0,)
+    (root / "unexpected.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(
+        CameraSemanticPreparedViewContractError,
+        match="file inventory differs",
+    ):
+        load_camera_semantic_prepared_view(root, verify_payload_hashes=True)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        ({"direct_dataset_root": False}, "direct dataset root"),
+        ({"dataset_relative_path": "wrong-root"}, "dataset_relative_path"),
+        ({"prepared_view_manifest_sha256": "0" * 64}, "different manifest"),
+        ({"tactile_receipt": "not-allowed"}, "tactile-specific metadata"),
+    ),
+)
+def test_camera_prepared_view_rejects_invalid_by_date_entry(
+    tmp_path: Path,
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    root = tmp_path / "2026-09-14__writing-detail-s3"
+    manifest_path = _write_minimal_camera_prepared_view(root)
+    _write_by_date_entry(root, manifest_path, **updates)
+
+    with pytest.raises(CameraSemanticPreparedViewContractError, match=message):
+        load_camera_semantic_prepared_view(root, verify_payload_hashes=True)
+
+
+def test_camera_prepared_view_rejects_by_date_entry_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "2026-09-14__writing-detail-s3"
+    manifest_path = _write_minimal_camera_prepared_view(root)
+    _write_by_date_entry(root, manifest_path)
+    entry_path = root / "ENTRY.json"
+    payload = json.loads(entry_path.read_text(encoding="utf-8"))
+    payload["destination_relative_path"] = "tampered"
+    entry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        CameraSemanticPreparedViewContractError,
+        match="semantic hash mismatch",
+    ):
+        load_camera_semantic_prepared_view(root, verify_payload_hashes=True)
 
 
 def _write_flattened_physical_binding(

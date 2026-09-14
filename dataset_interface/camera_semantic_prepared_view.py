@@ -24,6 +24,16 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _contains_tactile_key(value: Any) -> bool:
     if isinstance(value, dict):
         return any(
@@ -34,6 +44,66 @@ def _contains_tactile_key(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_tactile_key(item) for item in value)
     return False
+
+
+def _validated_by_date_entry_sidecar(
+    root: Path,
+    manifest_path: Path,
+) -> Path | None:
+    """Validate the reserved by-date catalog sidecar outside payload inventory.
+
+    ``ENTRY.json`` is written after a camera-only prepared view is sealed.  It
+    binds the prepared-view manifest hash and includes its own semantic hash,
+    so including it in the prepared-view manifest would create a circular
+    identity.  Accept only the exact, self-consistent control-plane sidecar;
+    every other undeclared file remains an inventory error.
+    """
+
+    path = root / "ENTRY.json"
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise CameraSemanticPreparedViewContractError(
+            f"Prepared-view by-date entry must be a regular file: {path}"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CameraSemanticPreparedViewContractError(
+            f"Cannot read prepared-view by-date entry: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry must be an object."
+        )
+    semantic_payload = dict(payload)
+    supplied_hash = str(
+        semantic_payload.pop("entry_semantic_sha256", "")
+    ).strip().lower()
+    if supplied_hash != _canonical_json_sha256(semantic_payload):
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry semantic hash mismatch."
+        )
+    if payload.get("direct_dataset_root") is not True:
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry must identify a direct dataset root."
+        )
+    for field in ("dataset_relative_path", "destination_relative_path"):
+        if str(payload.get(field) or "") != root.name:
+            raise CameraSemanticPreparedViewContractError(
+                f"Prepared-view by-date entry {field} differs from its root."
+            )
+    if str(payload.get("prepared_view_manifest_sha256") or "").strip().lower() != (
+        _sha256_file(manifest_path)
+    ):
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry binds a different manifest."
+        )
+    if _contains_tactile_key(payload):
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry contains tactile-specific metadata."
+        )
+    return path
 
 
 def camera_semantic_prepared_view_manifest_path(
@@ -155,13 +225,15 @@ def load_camera_semantic_prepared_view(
             "Prepared view contains an undeclared video-integrity exclusions receipt."
         )
 
+    by_date_entry_path = _validated_by_date_entry_sidecar(root, manifest_path)
+
     actual_files: set[str] = set()
     for path in sorted(root.rglob("*")):
         if path.is_symlink():
             raise CameraSemanticPreparedViewContractError(
                 f"Prepared view refuses symlinks: {path}"
             )
-        if path.is_file() and path != manifest_path:
+        if path.is_file() and path not in {manifest_path, by_date_entry_path}:
             relative = path.relative_to(root)
             if any(part.endswith(".lock") for part in relative.parts):
                 raise CameraSemanticPreparedViewContractError(
