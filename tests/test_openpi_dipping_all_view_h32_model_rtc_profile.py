@@ -81,9 +81,9 @@ def _write_by_date_entry(root: Path, manifest_path: Path, **updates: object) -> 
         "dataset_relative_path": root.name,
         "destination_relative_path": root.name,
         "direct_dataset_root": True,
-        "prepared_view_manifest_sha256": hashlib.sha256(
-            manifest_path.read_bytes()
-        ).hexdigest(),
+        "prepared_view_manifest_sha256": json.loads(
+            manifest_path.read_text(encoding="utf-8")
+        )["manifest_hash"],
     }
     payload.update(updates)
     payload["entry_semantic_sha256"] = hashlib.sha256(

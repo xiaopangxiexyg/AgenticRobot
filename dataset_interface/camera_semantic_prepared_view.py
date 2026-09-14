@@ -48,7 +48,7 @@ def _contains_tactile_key(value: Any) -> bool:
 
 def _validated_by_date_entry_sidecar(
     root: Path,
-    manifest_path: Path,
+    manifest_hash: str,
 ) -> Path | None:
     """Validate the reserved by-date catalog sidecar outside payload inventory.
 
@@ -93,8 +93,9 @@ def _validated_by_date_entry_sidecar(
             raise CameraSemanticPreparedViewContractError(
                 f"Prepared-view by-date entry {field} differs from its root."
             )
-    if str(payload.get("prepared_view_manifest_sha256") or "").strip().lower() != (
-        _sha256_file(manifest_path)
+    if (
+        str(payload.get("prepared_view_manifest_sha256") or "").strip().lower()
+        != manifest_hash
     ):
         raise CameraSemanticPreparedViewContractError(
             "Prepared-view by-date entry binds a different manifest."
@@ -225,7 +226,10 @@ def load_camera_semantic_prepared_view(
             "Prepared view contains an undeclared video-integrity exclusions receipt."
         )
 
-    by_date_entry_path = _validated_by_date_entry_sidecar(root, manifest_path)
+    by_date_entry_path = _validated_by_date_entry_sidecar(
+        root,
+        manifest.manifest_hash,
+    )
 
     actual_files: set[str] = set()
     for path in sorted(root.rglob("*")):
