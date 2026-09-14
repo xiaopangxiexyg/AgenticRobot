@@ -445,6 +445,43 @@ def test_inflight_sdk_completion_activates_latest_target_without_velocity_reset(
         backend.close()
 
 
+def test_deferred_target_published_after_sdk_completion_uses_publication_as_activation_cut() -> None:
+    backend, _arm = _backend(
+        target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    )
+    first_receipt = backend.send_command(_command(0.04))
+    with backend._state_lock:
+        backend._stream_sdk_inflight_target_sequence = first_receipt.metadata[
+            "transport_target_sequence"
+        ]
+
+    deferred_receipt = backend.send_command(_command(0.08))
+    assert deferred_receipt.metadata["target_admission_timing"][
+        "target_activation_deferred"
+    ] is True
+    with backend._state_lock:
+        assert backend._stream_deferred_target is not None
+        published = backend._stream_deferred_target.timestamp_monotonic
+        activated = backend._activate_deferred_acceleration_target_locked(
+            accepted_qpos=np.zeros(6),
+            activated_monotonic_time=published - 0.001,
+            completed_target_sequence=first_receipt.metadata[
+                "transport_target_sequence"
+            ],
+        )
+
+    assert activated is True
+    stream = backend.get_state()["background_streaming"]
+    activation = stream["last_deferred_target_activation"]
+    assert activation["published_monotonic_time"] == pytest.approx(published)
+    assert activation["activated_monotonic_time"] == pytest.approx(published)
+    assert activation["publication_after_sdk_completion_sec"] == pytest.approx(
+        0.001
+    )
+    assert activation["planner_velocity_preserved"] is True
+    assert stream["fault"] is None
+
+
 def test_inflight_quick_stop_discards_deferred_tracking_target() -> None:
     backend, _arm = _backend(
         target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
