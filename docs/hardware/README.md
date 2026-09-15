@@ -104,6 +104,9 @@ bash scripts/run_pytest.sh -q hardware/quest_dev/tests
 
 ## 7. B601-RS 力觉离线验收与真机验收计划
 
+[ReBot → RM65 MuJoCo 执行接入进度](../architecture/reports/rebot_b601_rm65_motion_execution_progress.md)
+记录单源 human proposal、目标端 IK/dispatch 的离线验证与尚待装配的真机遥操边界。
+
 本轮有线后端预检、反馈/计算/发送/力觉独立频率记录，以及真机分阶段操作边界见
 [`B601-RS hardware commissioning`](./rebot_b601_rs_hardware_commissioning.md)。该文档中的
 position probe 仍属于 M 级操作，只能由现场操作者在完成安全检查后显式运行。
