@@ -27,6 +27,19 @@ async function sendHeightCalibration(operation) {
   if (!response.ok) await refresh();
 }
 
+async function advanceTaskChain() {
+  const response = await fetch("/task-chain", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      event: "advance",
+      lower_tolerance_mm: Number(document.getElementById("height-lower-tolerance").value),
+      upper_tolerance_mm: Number(document.getElementById("height-upper-tolerance").value),
+    }),
+  });
+  if (!response.ok) await refresh();
+}
+
 let optionsLoaded = false;
 let latestState = null;
 let configurationDirty = false;
@@ -332,6 +345,29 @@ async function refresh() {
       : "夹爪独立控制：当前拓扑未启用。"
   );
   text("gripper-status", gripperStatus);
+  text("task-chain-step", state.task_chain_step);
+  text("task-chain-title", state.task_chain_title);
+  text("task-chain-detail", state.task_chain_detail);
+  const chainSelection = state.task_chain_selected_configuration || {};
+  const chainIndex = state.task_chain_selected_configuration_index;
+  text(
+    "task-chain-selection",
+    Object.keys(chainSelection).length
+      ? `本轮随机选择：池中第 ${Number(chainIndex) + 1} 条 · ${chainSelection.trajectory_id || chainSelection.full_replay_candidate_id || "已验证组合"}`
+      : "尚未选择本轮轨迹。",
+  );
+  const chainButton = document.getElementById("task-chain-advance");
+  chainButton.disabled = !state.task_chain_can_advance || configurationDirty;
+  const chainButtonLabels = {
+    idle: "开始任务链（Alt+N）",
+    ready_close: "下一步：闭紧夹爪（Alt+N）",
+    ready_height: "下一步：标定高度（Alt+N）",
+    ready_rule: "下一步：随机执行规则采集（Alt+N）",
+    ready_final_release: "下一步：松开夹爪完成（Alt+N）",
+    complete: "开始下一轮（Alt+N）",
+  };
+  chainButton.textContent = chainButtonLabels[state.task_chain_phase]
+    || "当前步骤执行中…";
   document.body.dataset.phase = state.phase;
   document.getElementById("start").disabled = !state.can_start || configurationDirty;
   document.getElementById("start").textContent = state.writer_blocked
@@ -399,6 +435,20 @@ document.getElementById("add-to-batch").addEventListener("click", addCurrentToBa
 document.getElementById("clear-batch").addEventListener("click", clearBatch);
 document.getElementById("capture-height").addEventListener("click", () => sendHeightCalibration("capture"));
 document.getElementById("clear-height").addEventListener("click", () => sendHeightCalibration("clear"));
+document.getElementById("task-chain-advance").addEventListener("click", advanceTaskChain);
+document.addEventListener("keydown", (event) => {
+  const target = event.target;
+  const editing = target instanceof HTMLElement
+    && ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName);
+  if (event.altKey && !event.ctrlKey && !event.metaKey
+      && event.key.toLowerCase() === "n" && !editing) {
+    const button = document.getElementById("task-chain-advance");
+    if (!button.disabled) {
+      event.preventDefault();
+      advanceTaskChain();
+    }
+  }
+});
 configurationInputs().forEach((input) => {
   input.addEventListener("input", () => { configurationDirty = true; });
   input.addEventListener("change", () => { configurationDirty = true; });

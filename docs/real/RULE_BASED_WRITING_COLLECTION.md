@@ -392,6 +392,35 @@ The dedicated UI can build and prevalidate an ordered batch without opening
 hardware resources. Each queue item remains one independent formal Episode and
 never starts automatically.
 
+### Optional step-gated task chain
+
+Rule-writing mode exposes an additional lightweight task chain in the same UI:
+
+1. release the enabled gripper and wait for measured-success feedback;
+2. close it and wait for measured-success feedback;
+3. capture the current right-TCP `canonical_desk` writing height;
+4. randomly choose one entry from the operator-prevalidated configuration
+   batch, activate it through the existing configuration validator, then run
+   its existing pen-down replay, generated writing, and relative pen-up replay
+   as one automatic formal collection;
+5. only after the existing writer has fully committed and closed that formal
+   Episode, release the gripper and wait for measured-success feedback.
+
+The operator advances one externally visible step with the chain button or
+`Alt+N`. A pending gripper action, height capture, configuration validation, or
+formal collection cannot be advanced a second time. The three motion parts in
+step 4 remain automatic because they are one existing rule plan; the chain
+does not add a replay cursor, motion loop, writer, or safety authority.
+
+Random selection changes only which already validated batch item is activated.
+It never adds a random TCP, joint, frame, or height offset. While a chain is
+active, its manual start/gripper/configuration/height controls are locked to
+prevent replacement races; Stop/Hold, device recovery, runtime Home, debug,
+and quit remain on their existing paths. Any missing success receipt, Hold,
+abort, validation error, or writer failure stops at the current gate and never
+skips forward. After the fifth measured-success receipt, the chain reports one
+completed cycle; the next press starts another cycle.
+
 From the selected AgenticRobot checkout in the complete `dexteleop310`
 environment:
 
