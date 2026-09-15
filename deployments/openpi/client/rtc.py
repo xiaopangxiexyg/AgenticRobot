@@ -845,12 +845,20 @@ class OpenPIFinalChunkRtcBackend:
             observe_bundle=observe_bundle,
         )
 
-    def begin_worker_session(self) -> bool:
+    @property
+    def worker_session_aware(self) -> bool:
+        return callable(getattr(self._transport, "begin_session", None))
+
+    def begin_worker_session(self, *, wait_timeout_sec: float = 0.0) -> bool:
         """Re-arm an optional session-aware transport for a new worker."""
 
         hook = getattr(self._transport, "begin_session", None)
         if not callable(hook):
             return False
+        wait = getattr(self._transport, "wait_for_close", None)
+        if wait_timeout_sec > 0.0 and callable(wait):
+            if not wait(timeout_sec=wait_timeout_sec):
+                return False
         accepted = hook()
         if not isinstance(accepted, bool):
             raise TypeError("OpenPI transport begin_session() must return bool.")

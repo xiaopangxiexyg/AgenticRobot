@@ -241,6 +241,23 @@ def test_transport_close_failure_latches_and_blocks_rearm() -> None:
     blocked = transport.begin_session_with_receipt()
     assert not blocked.accepted
     assert blocked.status == "close_failed"
+    assert not transport.wait_for_close(timeout_sec=0.01)
+
+
+def test_transport_wait_for_close_is_bounded_and_wakes_when_close_finishes():
+    connection = _BlockingCloseConnection()
+    transport = OpenPIWebsocketTransport()
+    transport._ws = connection
+    transport.request_cancel()
+    assert connection.closed.wait(timeout=1.0)
+    started = time.monotonic()
+    assert not transport.wait_for_close(timeout_sec=0.01)
+    assert time.monotonic() - started < 0.2
+    assert transport.session_cancel_requested
+    connection.close_release.set()
+    assert transport.wait_for_close(timeout_sec=1.0)
+    assert transport.session_cancel_requested
+    assert transport.begin_session()
 
 
 def test_explicit_close_deadline_becomes_phase_and_lifecycle_failure() -> None:

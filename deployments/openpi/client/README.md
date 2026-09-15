@@ -299,6 +299,18 @@ step，这些由 Server 选择。使用完整的 `--send-actions` 拼写，并�
 无效目标与反馈、部分失败和 worker 清理。该证据不代表真实 CANFD 频率、模型推理
 延迟或真机运动验收；日志中的低频警告需在真机测试中继续观察。
 
+Conditioned model-RTC 的 Active 预热不会接纳或合并动作：按 A 后保持当前
+安全 Hold，在同一个 worker/transport 会话内执行预热 RPC。首个编译样本默认
+丢弃，随后 3 个 warm 样本的端到端 worker 延迟（含输入准备、RPC 和解码）必须
+各自严格小于 0.4 s，才释放正式推理。预热 RPC
+单独受 `--rtc-active-preflight-timeout-sec`（默认 60 s）限制；超时或 provider
+异常停止预热，不算通过。这个期限不改变 `--rtc-request-validity-steps` 或正式
+动作过期检查。首个丢弃样本也不进入正式延迟估计，正式请求重新取最新观测。
+预热采样之间不关闭连接、不切换 producer epoch；需要恢复被取消的会话时，
+socket close 的有界等待只在模型 worker 内发生。`summary` JSONL 包含已有的
+`completion_fault_code` / `completion_fault_detail`（最多 512 字符），便于区分
+超时、连接未恢复和 Server 异常，不需要开启大体量 trace。
+
 For a real observation/transport probe, add both the raw profile and the
 explicit read-only guard:
 

@@ -4986,17 +4986,24 @@ def main(
                                 allow_policy_output
                                 or rtc_active_latency_warmup
                             ),
+                            preflight_timeout_sec=(
+                                float(args.rtc_active_preflight_timeout_sec)
+                                if rtc_active_latency_warmup else None
+                            ),
+                            preflight_record_latency=(
+                                len(rtc_active_latency_samples)
+                                >= int(args.rtc_active_warmup_discard_completions)
+                            ),
                         )
                         if (
                             rtc_active_latency_warmup
                             and rtc_step.completion is not None
-                            and rtc_step.result_transition is not None
-                            and rtc_step.result_transition.receipt.accepted
+                            and rtc_step.preflight_completion
                         ):
                             try:
                                 latency_sec = _rtc_active_completion_latency_sec(
                                     inference_started_at=(
-                                        rtc_step.completion.result.inference_started_at
+                                        rtc_step.completion.worker_started_at
                                     ),
                                     released_at=rtc_step.completion.released_at,
                                 )
@@ -5037,10 +5044,6 @@ def main(
                                     ),
                                 )
                             )
-                            hold_rtc_if_eligible(
-                                now=control_loop_started_at,
-                                reason="rtc_active_latency_warmup_sample",
-                            )
                             if gate_complete:
                                 assert observed_max is not None
                                 if not gate_accepted:
@@ -5066,14 +5069,9 @@ def main(
                                     f"{int(args.rtc_active_warmup_completions)}.",
                                     now=loop_started_at,
                                 )
-                            if not rearm_rtc_if_needed(
-                                now=control_loop_started_at,
-                                reason="rtc_active_latency_warmup_next_sample",
-                            ):
-                                raise RuntimeError(
-                                    "RTC Active latency warmup could not rearm "
-                                    "a fresh producer epoch."
-                                )
+                            # Reuse the drained RPC exchange between samples.
+                            # No preflight result entered the executable plan;
+                            # the next formal request uses a fresh observation.
                         rtc_gap_reason = (
                             "rtc_active_latency_warmup"
                             if rtc_active_latency_warmup
@@ -5182,6 +5180,7 @@ def main(
                                 or rtc_step.result_transition is not None
                                 or rtc_step.emission_result.emission is not None
                                 or rtc_step.request_transition is not None
+                                or rtc_step.worker_submission is not None
                                 or rtc_step.lifecycle_transition is not None
                                 or rtc_step.budget_exceeded
                             )

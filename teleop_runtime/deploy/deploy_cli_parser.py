@@ -230,6 +230,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--rtc-active-preflight-timeout-sec",
+        type=_positive_float,
+        default=60.0,
+        help=(
+            "Bounded non-executable model warmup RPC deadline (default: 60 s). "
+            "Does not extend executable RTC request/action validity."
+        ),
+    )
+    parser.add_argument(
         "--rtc-active-warmup-discard-completions",
         type=_non_negative_int,
         default=1,

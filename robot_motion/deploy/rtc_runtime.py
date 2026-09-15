@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import numpy as np
@@ -620,6 +620,7 @@ class RtcFrontendStep:
     forecast_delay_steps: int | None = None
     request_validity_steps: int | None = None
     timing_contract_hash: str = ""
+    preflight_completion: bool = False
 
     @property
     def budget_exceeded(self) -> bool:
@@ -687,6 +688,13 @@ class RtcFrontendStep:
             "completion_status": (
                 None if self.completion is None else self.completion.status
             ),
+            "completion_fault_code": (
+                None if self.completion is None else self.completion.result.fault_code
+            ),
+            "completion_fault_detail": (
+                None if self.completion is None else self.completion.result.fault_detail
+            ),
+            "preflight_completion": self.preflight_completion,
             "completion_worker_started_at": (
                 None
                 if self.completion is None
@@ -1199,6 +1207,8 @@ class RtcPolicyShadowFrontend:
         self._late_completion_rejection_count = 0
         self._last_forecast_delay_steps: int | None = None
         self._last_request_validity_steps: int | None = None
+        self._preflight_request: PolicyInferenceRequest | None = None
+        self._preflight_record_latency = False
         self._emitted_keyframe_ids: set[tuple[str, int, int]] = set()
         self._started = False
         self._closed = False
@@ -1562,6 +1572,7 @@ class RtcPolicyShadowFrontend:
             ),
         )
         self._state = transition.state
+        self._preflight_request = None
         self.deploy_runtime.reset_arm_hold_semantics()
         stop = self._worker.stop(
             timeout_sec=self.config.effective_worker_stop_timeout_sec
@@ -1664,10 +1675,21 @@ class RtcPolicyShadowFrontend:
         now: float,
         allow_output: bool = True,
         allow_request: bool | None = None,
+        preflight_timeout_sec: float | None = None,
+        preflight_record_latency: bool = True,
     ) -> RtcFrontendStep:
         self._require_running()
         tick_started = time.perf_counter()
         decision_at = _finite(now, field_name="now")
+        preflight = preflight_timeout_sec is not None
+        if preflight:
+            timeout = _finite(preflight_timeout_sec, field_name="preflight_timeout_sec")
+            if timeout <= 0.0:
+                raise ValueError("preflight_timeout_sec must be positive.")
+            if allow_output or self._state.active_request is not None or self._state.plan.keyframes:
+                raise ValueError("RTC preflight cannot share an executable request or plan.")
+        elif allow_output and self._preflight_request is not None:
+            raise ValueError("RTC preflight must finish before executable output is enabled.")
         request_allowed = (
             bool(allow_output)
             if allow_request is None
@@ -1676,7 +1698,36 @@ class RtcPolicyShadowFrontend:
         completion = self._worker.poll_completion()
         result_transition = None
         lifecycle_transition = None
-        if completion is not None:
+        preflight_completion = False
+        pending_preflight = self._preflight_request
+        if pending_preflight is not None and completion is not None:
+            # Preflight uses the model protocol, never producer admission/merge.
+            # Its longer RPC deadline cannot extend any executable action TTL.
+            self._preflight_request = None
+            result = completion.result
+            if (
+                completion.worker_session_id != self._state.worker_session_id
+                or result.request_hash != pending_preflight.semantic_content_hash
+                or result.request_id != pending_preflight.request_id
+                or result.inference_id != pending_preflight.inference_id
+                or result.status == "fault"
+                or decision_at >= pending_preflight.valid_until
+                or completion.released_at >= pending_preflight.valid_until
+            ):
+                lifecycle_transition = self.fault(
+                    now=decision_at,
+                    reason=result.fault_code or "rtc_preflight_result_invalid_or_expired",
+                )
+            else:
+                preflight_completion = True
+                if self._preflight_record_latency:
+                    self._delay_state = self._delay_state.record(
+                        self.config.delay_estimator_spec,
+                        max(0.0, completion.released_at - completion.worker_started_at),
+                    )
+        elif pending_preflight is not None and decision_at >= pending_preflight.valid_until:
+            lifecycle_transition = self.fault(now=decision_at, reason="rtc_preflight_timeout")
+        elif completion is not None:
             lifecycle_before_result = self._state.lifecycle_state
             result_transition = admit_policy_chunk_result(
                 self._state,
@@ -1693,7 +1744,7 @@ class RtcPolicyShadowFrontend:
                 self._late_completion_rejection_count += 1
             latency = max(
                 0.0,
-                completion.released_at - completion.result.inference_started_at,
+                completion.released_at - completion.worker_started_at,
             )
             self._delay_state = self._delay_state.record(
                 self.config.delay_estimator_spec,
@@ -1839,7 +1890,12 @@ class RtcPolicyShadowFrontend:
 
         request_transition = None
         worker_submission = None
-        if request_allowed and self._should_request(decision_at):
+        if (
+            request_allowed
+            and self._preflight_request is None
+            and not (preflight and completion is not None)
+            and self._should_request(decision_at)
+        ):
             policy_observation = self.deploy_runtime.prepare_policy_observation(
                 observation
             )
@@ -1862,12 +1918,14 @@ class RtcPolicyShadowFrontend:
                     ),
                 )
             else:
-                request_transition = admit_policy_inference_request(
-                    self._state,
-                    request,
-                )
-                self._state = request_transition.state
-                if request_transition.receipt.accepted:
+                if preflight:
+                    request = replace(request, valid_until=decision_at + timeout)
+                    self._preflight_request = request
+                    self._preflight_record_latency = bool(preflight_record_latency)
+                else:
+                    request_transition = admit_policy_inference_request(self._state, request)
+                    self._state = request_transition.state
+                if preflight or request_transition.receipt.accepted:
                     self._last_request_triggered_at = decision_at
                     work_item = PolicyInferenceWorkItem(
                         worker_id=self._worker.worker_id,
@@ -1907,6 +1965,7 @@ class RtcPolicyShadowFrontend:
             forecast_delay_steps=self._last_forecast_delay_steps,
             request_validity_steps=self._last_request_validity_steps,
             timing_contract_hash=self.config.timing_contract_hash,
+            preflight_completion=preflight_completion,
         )
 
     def close(self, *, now: float | None = None) -> PolicyWorkerStopReceipt:
