@@ -80,11 +80,12 @@ def request_policy_inference_soft_hold(
     *,
     reason: str,
 ) -> dict[str, dict[str, object]]:
-    """Freeze measured arm state while synchronous policy inference is pending.
+    """Request backend-owned holding while policy inference is pending.
 
     The hook is optional so position-only and non-RM65 backends retain their
-    existing semantics.  An implemented backend must fail closed when it
-    cannot produce a valid measured snapshot.
+    existing semantics.  Impedance freezes measured qpos; position decelerates
+    and holds through its command planner.  Both require valid measured
+    feedback and fail closed if they cannot establish their Hold.
     """
 
     receipts: dict[str, dict[str, object]] = {}

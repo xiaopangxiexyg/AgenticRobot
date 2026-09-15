@@ -279,6 +279,25 @@ overridden by the RTC adapter.
 
 ## Explicit live observation shadow
 
+### RTC Active 与 RM65 位控
+
+RM65 位控 RTC 等待窗口复用 backend 的 acceleration/jerk-limited quick-stop：
+先清除 executor 中剩余的旧计划，再按已提交 qcmd 的动态状态减速并持续保持。
+实测 qpos 必须新鲜、有限且无设备故障，但不会用滞后反馈直接重置正在运动的
+qcmd。重复空计划 tick 不重复 clear 或重启减速；只有通过既有安全检查并激活的
+新目标才恢复输出。反馈失败、worker 故障、急停或未建立 Hold 仍停止该部署路径。
+
+位控部署使用 `--arm-execution-profile position_15_60_120hz`：reference/IK 为
+60 Hz，CANFD sender 为 120 Hz；模型 action/policy 时间基保持训练时的 30 Hz，
+不能把 action-hz 改成 60 来代替位控设置。Client 无需知道 Stage 或 checkpoint
+step，这些由 Server 选择。使用完整的 `--send-actions` 拼写，并保留
+`--wait-for-ready-confirm`；数据集起点初始化完成后按 A 才允许策略执行。
+
+闭环离线回归使用真实 PositionDeployExecutor、RM65 位控 backend 和注入的假 SDK，
+覆盖双臂运动中等待、延迟反馈、减速/单步/速度/加速度约束、重复保持、新目标恢复、
+无效目标与反馈、部分失败和 worker 清理。该证据不代表真实 CANFD 频率、模型推理
+延迟或真机运动验收；日志中的低频警告需在真机测试中继续观察。
+
 For a real observation/transport probe, add both the raw profile and the
 explicit read-only guard:
 

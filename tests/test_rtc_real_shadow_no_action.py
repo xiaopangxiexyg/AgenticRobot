@@ -143,6 +143,9 @@ def test_active_rtc_gap_uses_measured_qpos_hold_and_clears_position_plan() -> No
         def __init__(self) -> None:
             self.clear_count = 0
 
+        def snapshot(self):
+            return {"active": True}
+
         def clear(self) -> None:
             self.clear_count += 1
 
@@ -182,6 +185,60 @@ def test_active_rtc_gap_rejects_backend_without_measured_qpos_hold() -> None:
     assert backend.hold_reasons == [
         "rtc_producer_not_eligible:measured_qpos_hold_failed"
     ]
+
+
+@pytest.mark.parametrize("receipt", ({}, {"active": False, "status": "skipped"}, {"active": True, "status": "unknown"}))
+def test_active_rtc_gap_rejects_inactive_or_malformed_hold_receipt(receipt) -> None:
+    class _Arm:
+        def __init__(self):
+            self.holds = []
+
+        def request_policy_inference_soft_hold(self, reason):
+            return receipt
+
+        def hold_motion(self, reason):
+            self.holds.append(reason)
+
+    arm = _Arm()
+    with pytest.raises(RuntimeError, match="Hold was not established"):
+        run_policy._hold_active_rtc_gap(
+            reason="rtc_plan_underrun", send_actions=True,
+            arm_backends={"left": arm}, position_deploy_executor=None,
+        )
+    assert arm.holds == ["rtc_plan_underrun:measured_qpos_hold_failed"]
+
+
+def test_active_rtc_gap_clear_failure_still_holds_both_arms() -> None:
+    class _Executor:
+        def snapshot(self):
+            return {"active": True}
+
+        def clear(self):
+            raise RuntimeError("clear failed")
+
+    class _Arm:
+        def __init__(self):
+            self.holds = []
+
+        def hold_motion(self, reason):
+            self.holds.append(reason)
+
+    left, right = _Arm(), _Arm()
+    with pytest.raises(RuntimeError, match="clear failed"):
+        run_policy._hold_active_rtc_gap(
+            reason="rtc_plan_underrun", send_actions=True,
+            arm_backends={"left": left, "right": right},
+            position_deploy_executor=_Executor(),
+        )
+    assert left.holds == right.holds == ["rtc_plan_underrun:measured_qpos_hold_failed"]
+
+
+@pytest.mark.parametrize("reason,send_actions", ((None, True), ("rtc_plan_underrun", False)))
+def test_active_rtc_gap_normal_ticks_and_dry_run_do_not_touch_backends(reason, send_actions):
+    assert run_policy._hold_active_rtc_gap(
+        reason=reason, send_actions=send_actions,
+        arm_backends={"left": object()}, position_deploy_executor=object(),
+    ) == {}
 
 
 def test_active_rtc_latency_gate_discards_cold_sample_and_bounds_warm_max() -> None:
