@@ -125,25 +125,35 @@ class VisibleGraspScene:
         return cls(points=xyz, target_mask=mask[rows, columns], geometry=geometry,
                    capture_qpos_by_side=capture_qpos_by_side)
 
-    def without_captured_palm_observations(
+    def _solid_mask(self, local: np.ndarray, *, opening_m: float,
+                    distance_m: float = 0) -> np.ndarray:
+        """Use the same separate palm/finger solids for filtering and checks."""
+        g = self.geometry
+        x, y, z = local.T
+        fingers = ((z > g.palm_z_m-distance_m) & (z < g.palm_z_m+g.finger_length_m)
+                   & (np.abs(x) > opening_m/2)
+                   & (np.abs(x) < opening_m/2+g.finger_thickness_m))
+        palm = ((z > g.palm_z_m-g.finger_thickness_m-distance_m)
+                & (z <= g.palm_z_m) & (np.abs(x) < opening_m/2+g.finger_thickness_m))
+        return (np.abs(y) < g.pad_height_m/2) & (fingers | palm)
+
+    def without_captured_gripper_observations(
         self, tool_tcp_poses: Mapping[str, np.ndarray],
     ) -> tuple[VisibleGraspScene, int]:
-        """Remove only background observed inside fixed palms at capture time.
+        """Remove background inside nominal open gripper solids at capture time.
 
         This is robot self-observation filtering, not collision-pair permission.
-        No padding, approach volume, target points, or moving fingers are removed.
-        Finger self-filtering needs measured opening, which this snapshot lacks.
+        Capture opening is approximated by maximum_opening_m, as in the path
+        checks. No padding, finger gap, approach sweep, or target is removed.
+        The resulting scene stays fixed while the robot moves in the planner.
         """
         occupied = np.zeros(len(self.points), dtype=bool)
         g = self.geometry
         for pose in tool_tcp_poses.values():
             self.collision_counts(pose, opening_m=g.maximum_opening_m)
             pose = g.solid_pose(np.asarray(pose, dtype=float))
-            x, y, z = ((self.points-pose[:3, 3]) @ pose[:3, :3]).T
-            occupied |= ((np.abs(y) < g.pad_height_m/2)
-                         & (z > g.palm_z_m-g.finger_thickness_m)
-                         & (z <= g.palm_z_m)
-                         & (np.abs(x) < g.maximum_opening_m/2+g.finger_thickness_m))
+            local = (self.points-pose[:3, 3]) @ pose[:3, :3]
+            occupied |= self._solid_mask(local, opening_m=g.maximum_opening_m)
         remove = occupied & ~self.target_mask
         return (VisibleGraspScene(points=self.points[~remove],
                                   target_mask=self.target_mask[~remove],
@@ -164,14 +174,7 @@ class VisibleGraspScene:
             raise ValueError("grasp pose must be rigid")
         pose = g.solid_pose(pose)
         local, labels = self._local_points(pose, opening_m=opening_m)
-        x, y, z = local.T
-        in_height = np.abs(y) < g.pad_height_m/2
-        fingers = ((z > g.palm_z_m) & (z < g.palm_z_m+g.finger_length_m)
-                   & (np.abs(x) > opening_m/2)
-                   & (np.abs(x) < opening_m/2+g.finger_thickness_m))
-        palm = ((z > g.palm_z_m-g.finger_thickness_m) & (z <= g.palm_z_m)
-                & (np.abs(x) < opening_m/2+g.finger_thickness_m))
-        occupied = in_height & (fingers | palm)
+        occupied = self._solid_mask(local, opening_m=opening_m)
         return (int(np.count_nonzero(occupied & labels)),
                 int(np.count_nonzero(occupied & ~labels)))
 
@@ -189,13 +192,6 @@ class VisibleGraspScene:
         self.collision_counts(grasp_pose, opening_m=opening_m)
         pose = self.geometry.solid_pose(np.asarray(grasp_pose))
         local, labels = self._local_points(pose, opening_m=opening_m, distance_m=distance_m)
-        x, y, z = local.T
-        g = self.geometry
-        fingers = ((z > g.palm_z_m-distance_m) & (z < g.palm_z_m+g.finger_length_m)
-                   & (np.abs(x) > opening_m/2)
-                   & (np.abs(x) < opening_m/2+g.finger_thickness_m))
-        palm = ((z > g.palm_z_m-g.finger_thickness_m-distance_m)
-                & (z <= g.palm_z_m) & (np.abs(x) < opening_m/2+g.finger_thickness_m))
-        occupied = (np.abs(y) < g.pad_height_m/2) & (fingers | palm)
+        occupied = self._solid_mask(local, opening_m=opening_m, distance_m=distance_m)
         return (int(np.count_nonzero(occupied & labels)),
                 int(np.count_nonzero(occupied & ~labels)))

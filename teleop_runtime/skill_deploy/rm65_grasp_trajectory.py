@@ -2600,15 +2600,15 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
-        excluded_palm_observation_count = 0
+        excluded_gripper_observation_count = 0
         if visible_scene is not None and visible_scene.capture_qpos_by_side is not None:
             capture_qpos = visible_scene.capture_qpos_by_side
             with self._solver_lock:
                 capture_poses = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
                     left_qpos=capture_qpos["left"], right_qpos=capture_qpos["right"],
                 )
-            visible_scene, excluded_palm_observation_count = (
-                visible_scene.without_captured_palm_observations(capture_poses)
+            visible_scene, excluded_gripper_observation_count = (
+                visible_scene.without_captured_gripper_observations(capture_poses)
             )
         pregrasp_pose = self._pregrasp_target_pose(target_pose)
         final_solver_targets = (
@@ -2845,7 +2845,8 @@ class RM65GraspJointTrajectoryPlanner:
                     )
             dense["visible_scene_final_trajectory"] = {
                 "scene_hash": visible_scene.semantic_content_hash,
-                "excluded_captured_palm_background_points": excluded_palm_observation_count,
+                "excluded_captured_gripper_background_points": excluded_gripper_observation_count,
+                "self_filter_opening_basis": "nominal_maximum_opening",
                 "sample_count": len(times),
                 "opening_m": visible_scene.geometry.maximum_opening_m,
                 "scope": "observed_points_nominal_parallel_jaw_solids_only",

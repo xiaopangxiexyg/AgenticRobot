@@ -1410,6 +1410,49 @@ def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_bin
     assert checked
 
 
+@pytest.mark.parametrize("has_capture_qpos", [False, True])
+def test_grasp_planner_filters_once_at_capture_pose_before_path_search(has_capture_qpos):
+    from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry, VisibleGraspScene
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner._solver_lock = threading.Lock()
+    class Builder:
+        def tool_tcp_world_targets_for_qpos_pair(self, *, left_qpos, right_qpos):
+            poses = {side: np.eye(4) for side in ("left", "right")}
+            poses["right"][0, 3] = right_qpos[0]
+            poses["left"][0, 3] = .5 + left_qpos[0]
+            return poses
+        def solver_world_targets_for_qpos_pair(self, **qpos):
+            return self.tool_tcp_world_targets_for_qpos_pair(**qpos)
+        def solver_world_target_from_tool_tcp_world_target(self, *, side, tool_tcp_world_target):
+            return tool_tcp_world_target
+    planner.target_builder = Builder()
+    planner._require_unmodified_target_envelope = lambda *_args, **_kwargs: None
+    planner._preflight_start_envelope = lambda **_kwargs: None
+    capture = {side: np.zeros(6) for side in ("left", "right")}
+    current = {side: q.copy() for side, q in capture.items()}
+    current["right"][0] = .2
+    view = VisibleGraspScene(points=np.array([[.04, 0, -.02], [.54, 0, -.02], [.44, 0, -.02]]),
+                             target_mask=np.zeros(3, dtype=bool),
+                             geometry=ParallelJawSolidGeometry(-.043, .05, .01, .0255, .07),
+                             capture_qpos_by_side=capture if has_capture_qpos else None)
+    checked = []
+    def inspect_chain(**arguments):
+        filtered = arguments["visible_scene"]
+        np.testing.assert_array_equal(filtered.points, view.points[[2]] if has_capture_qpos else view.points)
+        np.testing.assert_array_equal(arguments["qpos_by_side"]["right"], current["right"])
+        checked.append(filtered)
+        raise RM65GraspTrajectoryPlanningError("path_collision_check_unavailable")
+    planner._plan_chain_for_pregrasp = inspect_chain
+    target = np.eye(4)
+    target[0, 3] = .8
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_collision_check_unavailable"):
+        planner(qpos_by_side=current, side="right", target_tool_tcp_world=target,
+                speed_scale=.2, visible_scene=view, monotonic=lambda: 0)
+    assert len(checked) == 1
+    assert len(view.points) == 3
+
+
 def test_pregrasp_branch_selection_validates_local_stage_before_exact_global_connection():
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
     current = {side: np.zeros(6) for side in ("left", "right")}

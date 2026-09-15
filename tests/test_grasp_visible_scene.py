@@ -30,7 +30,7 @@ def test_offset_solid_frame_is_used_by_endpoint_sweep_and_capture_filter():
                              target_mask=np.array([False, True, False]), geometry=geometry)
     assert view.collision_counts(np.eye(4), opening_m=.07) == (1, 1)
     assert view.approach_collision_counts(np.eye(4), opening_m=.07, distance_m=.06) == (1, 2)
-    filtered, removed = view.without_captured_palm_observations({"right": np.eye(4)})
+    filtered, removed = view.without_captured_gripper_observations({"right": np.eye(4)})
     assert removed == 1
     assert filtered.collision_counts(np.eye(4), opening_m=.07) == (1, 0)
     assert filtered.approach_collision_counts(np.eye(4), opening_m=.07, distance_m=.06) == (1, 1)
@@ -58,24 +58,46 @@ def test_target_is_not_deleted_from_noncontact_approach():
     assert view.approach_collision_counts(np.eye(4), opening_m=0.07, distance_m=0.06) == (1, 0)
 
 
-def test_captured_palm_filter_preserves_target_fingers_and_nearby_background():
+def test_captured_gripper_filter_preserves_targets_gap_sweep_and_nearby_background():
     view = scene([[0, 0, -.05], [0, 0, -.05], [.04, 0, -.02],
-                  [0, 0, -.054], [0, .013, -.05]], [False, True, False, False, False])
-    filtered, removed = view.without_captured_palm_observations({"right": np.eye(4)})
-    assert removed == 1
-    np.testing.assert_array_equal(filtered.points, view.points[1:])
-    assert filtered.collision_counts(np.eye(4), opening_m=.07) == (1, 1)
-    assert len(view.points) == 5
+                  [0, 0, -.054], [0, .013, -.05], [0, 0, -.02],
+                  [-.04, 0, -.02], [.04, 0, -.02], [.04, 0, -.08]],
+                 [False, True, False, False, False, False, False, True, False])
+    filtered, removed = view.without_captured_gripper_observations({"right": np.eye(4)})
+    assert removed == 3
+    np.testing.assert_array_equal(filtered.points, view.points[[1, 3, 4, 5, 7, 8]])
+    assert filtered.collision_counts(np.eye(4), opening_m=.07) == (2, 0)
+    assert filtered.approach_collision_counts(np.eye(4), opening_m=.07, distance_m=.06) == (2, 2)
+    assert len(view.points) == 9
 
 
-def test_palm_filter_uses_capture_pose_not_a_later_robot_pose():
+@pytest.mark.parametrize("local_point", [[0, 0, -.05], [.04, 0, -.02], [-.04, 0, -.02]])
+def test_gripper_filter_uses_capture_pose_not_a_later_robot_pose(local_point):
     capture = np.eye(4)
     later = np.eye(4)
     later[0, 3] = .2
-    view = scene([[0, 0, -.05], [.2, 0, -.05]], [False, False])
-    filtered, removed = view.without_captured_palm_observations({"right": capture})
+    point = np.array(local_point)
+    view = scene([point, point + later[:3, 3]], [False, False])
+    filtered, removed = view.without_captured_gripper_observations({"right": capture})
     assert removed == 1
     assert filtered.collision_counts(later, opening_m=.07) == (0, 1)
+
+
+def test_gripper_filter_uses_both_capture_poses_and_preserves_finger_gaps():
+    poses = {"right": np.eye(4), "left": np.eye(4)}
+    poses["left"][:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
+    poses["left"][:3, 3] = [.2, .3, .1]
+    local = np.array([[0, 0, -.05], [.04, 0, -.02], [-.04, 0, -.02],
+                      [0, 0, -.02], [.04, 0, -.08]])
+    points = np.concatenate([local @ pose[:3, :3].T + pose[:3, 3]
+                             for pose in poses.values()])
+    view = scene(points, np.zeros(len(points), dtype=bool))
+    filtered, removed = view.without_captured_gripper_observations(poses)
+    assert removed == 6
+    np.testing.assert_array_equal(filtered.points, points[[3, 4, 8, 9]])
+    for pose in poses.values():
+        assert filtered.collision_counts(pose, opening_m=.07) == (0, 0)
+        assert filtered.approach_collision_counts(pose, opening_m=.07, distance_m=.06) == (0, 1)
 
 
 def test_capture_qpos_are_copied_immutable_and_retained_after_filter():
@@ -86,7 +108,7 @@ def test_capture_qpos_are_copied_immutable_and_retained_after_filter():
     assert view.capture_qpos_by_side["right"][0] == 0
     with pytest.raises(ValueError):
         view.capture_qpos_by_side["right"][0] = 2
-    filtered, _ = view.without_captured_palm_observations({"right": np.eye(4)})
+    filtered, _ = view.without_captured_gripper_observations({"right": np.eye(4)})
     np.testing.assert_array_equal(filtered.capture_qpos_by_side["right"], np.zeros(6))
 
 
