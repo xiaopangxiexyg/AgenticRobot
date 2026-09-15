@@ -207,6 +207,215 @@ _PROGRESS_FAILURE_PROMOTABLE_HOLD_REASONS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class _HoldReasonPresentation:
+    """Canonical hardware and confirmed-UI projection for one Hold reason."""
+
+    hardware_reason: str
+    confirmed_ui_message: str
+    requires_session_home_recalibration: bool = False
+
+
+_HOLD_REASON_PRESENTATIONS: Mapping[str, _HoldReasonPresentation] = {
+    "q6_gesture": _HoldReasonPresentation(
+        hardware_reason="q6 gesture hold requested",
+        confirmed_ui_message=(
+            "机械臂已进入保持状态；松开双手后三维到释放区间 1 秒，再次握紧 1 秒后会重新采集 runtime home。"
+        ),
+    ),
+    "tracker_loss_timeout": _HoldReasonPresentation(
+        hardware_reason=(
+            "tracker target loss requires runtime home recalibration"
+        ),
+        confirmed_ui_message=(
+            "Tracker 目标持续丢失已进入手动 Hold；必须点击“开始遥操”重新采集 runtime home 后才能恢复。"
+        ),
+    ),
+    "position_force_guard_collision": _HoldReasonPresentation(
+        hardware_reason=(
+            "position force guard collision emergency stop; "
+            "runtime home recalibration required"
+        ),
+        confirmed_ui_message=(
+            "受力碰撞已急停双臂并结束当前数采；GUI 与设备连接保持。"
+            "请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。"
+        ),
+        requires_session_home_recalibration=True,
+    ),
+    "position_force_guard_fault": _HoldReasonPresentation(
+        hardware_reason=(
+            "position force guard safety fault; "
+            "runtime home recalibration required"
+        ),
+        confirmed_ui_message=(
+            "位控受力安全监控已急停双臂并结束当前数采；"
+            "请检查设备后点击“开始遥操”重新采集 runtime Home。"
+        ),
+        requires_session_home_recalibration=True,
+    ),
+    "impedance_force_collision": _HoldReasonPresentation(
+        hardware_reason=(
+            "impedance force collision emergency stop; "
+            "runtime home recalibration required"
+        ),
+        confirmed_ui_message=(
+            "力控碰撞已急停双臂并结束当前数采；GUI 与设备连接保持。"
+            "请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。"
+        ),
+        requires_session_home_recalibration=True,
+    ),
+    "emergency_stop_latched": _HoldReasonPresentation(
+        hardware_reason=(
+            "emergency stop latch observed during command dispatch; "
+            "runtime home recalibration required"
+        ),
+        confirmed_ui_message=(
+            "检测到急停与控制帧竞态，当前数采已结束并进入 Hold；"
+            "请检查机械臂后重新采集 runtime Home。"
+        ),
+        requires_session_home_recalibration=True,
+    ),
+    "joint_horizon_certification": _HoldReasonPresentation(
+        hardware_reason=(
+            "joint horizon candidate could not be certified; "
+            "runtime home recalibration required"
+        ),
+        confirmed_ui_message=(
+            "关节前视候选未通过认证，当前数采已停止并进入 Hold；"
+            "请检查机械臂后重新采集 runtime Home。"
+        ),
+        requires_session_home_recalibration=True,
+    ),
+    "joint_hard_limit": _HoldReasonPresentation(
+        hardware_reason=(
+            "RM65 joint hard limit rejected the command; "
+            "runtime home recalibration required"
+        ),
+        confirmed_ui_message=(
+            "机械臂关节硬限位门禁已拒绝命令并急停双臂；当前数采已停止。"
+            "请人工检查并调整机械臂后重新采集 runtime Home。"
+        ),
+        requires_session_home_recalibration=True,
+    ),
+    "position_admittance_endpoint_limit": _HoldReasonPresentation(
+        hardware_reason=(
+            "position admittance endpoint envelope reached; "
+            "holding the last safe qpos until runtime home recalibration"
+        ),
+        confirmed_ui_message=(
+            "力控末端已到达位移或旋转包络，已保持最后安全位置；"
+            "进程与设备连接保持。确认姿态后点击“开始遥操”重新采集 runtime Home。"
+        ),
+        requires_session_home_recalibration=True,
+    ),
+    "progress_failure": _HoldReasonPresentation(
+        hardware_reason=(
+            "collection progress failure reported; "
+            "waiting for operator adjustment and runtime home recalibration"
+        ),
+        confirmed_ui_message=(
+            "当前阶段失败已记录，正式数采已暂停且机械臂进入 Hold。"
+            "人工调整后点击“开始遥操”重新采集 runtime Home；"
+            "writer 接纳恢复后的首帧时会创建同阶段 Retry Attempt。"
+        ),
+    ),
+    "progress_arm_profile_transition": _HoldReasonPresentation(
+        hardware_reason=(
+            "collection progress arm profile requires a newly active arm; "
+            "waiting for target-side runtime home calibration"
+        ),
+        confirmed_ui_message=(
+            "当前子任务的正式数采边界已暂停，目标子任务尚未提交。"
+            "请摆好目标活动臂 VIVE 后点击“开始遥操”；Home 与目标 Fix "
+            "状态建立成功后才会切换子任务并继续写入。"
+        ),
+    ),
+    "": _HoldReasonPresentation(
+        hardware_reason="gui hold requested",
+        confirmed_ui_message=(
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 "
+            "runtime home。原因：manual。"
+        ),
+    ),
+    "manual": _HoldReasonPresentation(
+        hardware_reason="gui hold requested",
+        confirmed_ui_message=(
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 "
+            "runtime home。原因：manual。"
+        ),
+    ),
+    "two_pedal_b": _HoldReasonPresentation(
+        hardware_reason="gui hold requested",
+        confirmed_ui_message=(
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 "
+            "runtime home。原因：two_pedal_b。"
+        ),
+    ),
+    "two_pedal_c": _HoldReasonPresentation(
+        hardware_reason="gui hold requested",
+        confirmed_ui_message=(
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 "
+            "runtime home。原因：two_pedal_c。"
+        ),
+    ),
+}
+
+
+def _generic_hold_reason_ui_message(normalized_reason: str) -> str:
+    """Build the existing fallback UI prompt for an arbitrary Hold reason."""
+
+    return (
+        "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 "
+        f"runtime home。原因：{normalized_reason or 'manual'}。"
+    )
+
+
+def _hold_reason_presentation(hold_reason: object) -> _HoldReasonPresentation:
+    """Resolve one Hold reason without duplicating hardware/UI conditionals."""
+
+    normalized_reason = str(hold_reason or "")
+    if normalized_reason.startswith("init_qpos_"):
+        completed = normalized_reason in {
+            "init_qpos_completed",
+            "init_qpos_sequence_completed",
+        }
+        return _HoldReasonPresentation(
+            hardware_reason=(
+                "Init qpos operation completed; runtime home recalibration required"
+                if completed
+                else "Init qpos operation failed; safe Hold and runtime home recalibration required"
+            ),
+            confirmed_ui_message=(
+                "Init qpos 已完成并进入 Hold；请摆好 VIVE/Q6 后点击“开始遥操”重新采集 runtime Home。"
+                if completed
+                else "Init qpos 未安全完成，已进入 Hold；请检查提示和机械臂状态，确认后重新采集 runtime Home。"
+            ),
+        )
+    if normalized_reason == "joint_horizon_certification":
+        # The established UI contract uses the generic Hold prompt for this
+        # safety reason; only its hardware projection has a dedicated message.
+        return _HoldReasonPresentation(
+            hardware_reason=(
+                "joint horizon candidate could not be certified; "
+                "runtime home recalibration required"
+            ),
+            confirmed_ui_message=_generic_hold_reason_ui_message(
+                normalized_reason
+            ),
+            requires_session_home_recalibration=True,
+        )
+    presentation = _HOLD_REASON_PRESENTATIONS.get(normalized_reason)
+    if presentation is not None:
+        return presentation
+    return _HoldReasonPresentation(
+        hardware_reason=(
+            f"runtime Hold requested ({normalized_reason}); "
+            "runtime home recalibration required"
+        ),
+        confirmed_ui_message=_generic_hold_reason_ui_message(normalized_reason),
+    )
+
+
 @dataclass
 class _ProgressWorkflowErrorLatch:
     """Suppress repeated Hold/UI effects for one unchanged workflow error."""
@@ -3066,71 +3275,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                             f"{type(exc).__name__}: {exc}",
                             now=loop_start,
                         )
-            if hold_reason == "q6_gesture":
-                hold_hardware_reason = "q6 gesture hold requested"
-            elif hold_reason == "tracker_loss_timeout":
-                hold_hardware_reason = "tracker target loss requires runtime home recalibration"
-            elif hold_reason == "position_force_guard_collision":
-                hold_hardware_reason = (
-                    "position force guard collision emergency stop; "
-                    "runtime home recalibration required"
-                )
-            elif hold_reason == "position_force_guard_fault":
-                hold_hardware_reason = (
-                    "position force guard safety fault; "
-                    "runtime home recalibration required"
-                )
-            elif hold_reason == "impedance_force_collision":
-                hold_hardware_reason = (
-                    "impedance force collision emergency stop; "
-                    "runtime home recalibration required"
-                )
-            elif hold_reason == "emergency_stop_latched":
-                hold_hardware_reason = (
-                    "emergency stop latch observed during command dispatch; "
-                    "runtime home recalibration required"
-                )
-            elif hold_reason == "joint_horizon_certification":
-                hold_hardware_reason = (
-                    "joint horizon candidate could not be certified; "
-                    "runtime home recalibration required"
-                )
-            elif hold_reason == "joint_hard_limit":
-                hold_hardware_reason = (
-                    "RM65 joint hard limit rejected the command; "
-                    "runtime home recalibration required"
-                )
-            elif hold_reason == "position_admittance_endpoint_limit":
-                hold_hardware_reason = (
-                    "position admittance endpoint envelope reached; "
-                    "holding the last safe qpos until runtime home recalibration"
-                )
-            elif hold_reason == "progress_failure":
-                hold_hardware_reason = (
-                    "collection progress failure reported; "
-                    "waiting for operator adjustment and runtime home recalibration"
-                )
-            elif hold_reason == "progress_arm_profile_transition":
-                hold_hardware_reason = (
-                    "collection progress arm profile requires a newly active arm; "
-                    "waiting for target-side runtime home calibration"
-                )
-            elif hold_reason.startswith("init_qpos_"):
-                hold_hardware_reason = (
-                    "Init qpos operation completed; runtime home recalibration required"
-                    if hold_reason in {
-                        "init_qpos_completed",
-                        "init_qpos_sequence_completed",
-                    }
-                    else "Init qpos operation failed; safe Hold and runtime home recalibration required"
-                )
-            elif hold_reason in {"", "manual", "two_pedal_b", "two_pedal_c"}:
-                hold_hardware_reason = "gui hold requested"
-            else:
-                hold_hardware_reason = (
-                    f"runtime Hold requested ({hold_reason}); "
-                    "runtime home recalibration required"
-                )
+            hold_reason_presentation = _hold_reason_presentation(hold_reason)
+            hold_hardware_reason = hold_reason_presentation.hardware_reason
             if recording_active():
                 try:
                     if restart_extension_after_hold:
@@ -3363,66 +3509,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         "应用 Hold 已生效，但机械臂停机回执不完整；"
                         "不要执行 Home、设备重连或维护运动，请检查设备并重启。"
                     )
-                elif hold_reason == "q6_gesture":
-                    message = "机械臂已进入保持状态；松开双手后三维到释放区间 1 秒，再次握紧 1 秒后会重新采集 runtime home。"
-                elif hold_reason == "tracker_loss_timeout":
-                    message = "Tracker 目标持续丢失已进入手动 Hold；必须点击“开始遥操”重新采集 runtime home 后才能恢复。"
-                elif hold_reason == "position_force_guard_collision":
-                    message = (
-                        "受力碰撞已急停双臂并结束当前数采；GUI 与设备连接保持。"
-                        "请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。"
-                    )
-                elif hold_reason == "position_force_guard_fault":
-                    message = (
-                        "位控受力安全监控已急停双臂并结束当前数采；"
-                        "请检查设备后点击“开始遥操”重新采集 runtime Home。"
-                    )
-                elif hold_reason == "impedance_force_collision":
-                    message = (
-                        "力控碰撞已急停双臂并结束当前数采；GUI 与设备连接保持。"
-                        "请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。"
-                    )
-                elif hold_reason == "emergency_stop_latched":
-                    message = (
-                        "检测到急停与控制帧竞态，当前数采已结束并进入 Hold；"
-                        "请检查机械臂后重新采集 runtime Home。"
-                    )
-                elif hold_reason == "joint_hard_limit":
-                    message = (
-                        "机械臂关节硬限位门禁已拒绝命令并急停双臂；当前数采已停止。"
-                        "请人工检查并调整机械臂后重新采集 runtime Home。"
-                    )
-                elif hold_reason == "position_admittance_endpoint_limit":
-                    message = (
-                        "力控末端已到达位移或旋转包络，已保持最后安全位置；"
-                        "进程与设备连接保持。确认姿态后点击“开始遥操”重新采集 runtime Home。"
-                    )
-                elif hold_reason == "progress_failure":
-                    message = (
-                        "当前阶段失败已记录，正式数采已暂停且机械臂进入 Hold。"
-                        "人工调整后点击“开始遥操”重新采集 runtime Home；"
-                        "writer 接纳恢复后的首帧时会创建同阶段 Retry Attempt。"
-                    )
-                elif hold_reason == "progress_arm_profile_transition":
-                    message = (
-                        "当前子任务的正式数采边界已暂停，目标子任务尚未提交。"
-                        "请摆好目标活动臂 VIVE 后点击“开始遥操”；Home 与目标 Fix "
-                        "状态建立成功后才会切换子任务并继续写入。"
-                    )
-                elif hold_reason.startswith("init_qpos_"):
-                    message = (
-                        "Init qpos 已完成并进入 Hold；请摆好 VIVE/Q6 后点击“开始遥操”重新采集 runtime Home。"
-                        if hold_reason in {
-                            "init_qpos_completed",
-                            "init_qpos_sequence_completed",
-                        }
-                        else "Init qpos 未安全完成，已进入 Hold；请检查提示和机械臂状态，确认后重新采集 runtime Home。"
-                    )
                 else:
-                    message = (
-                        "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 "
-                        f"runtime home。原因：{hold_reason or 'manual'}。"
-                    )
+                    message = hold_reason_presentation.confirmed_ui_message
                 try:
                     control_ui.append_message("Hold", message)
                     if special_cancel_messages:
@@ -4443,6 +4531,62 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 return True
             return False
 
+        def dispatch_recovery_command(
+            command: Any,
+            *,
+            hand_command: Any,
+            observation: Any,
+            phase: str,
+        ) -> tuple[Any, bool, bool]:
+            """Apply the shared recovery filter/guard/dispatch sequence.
+
+            The tuple is ``(command, dispatched, skip_frame)``.  A skipped
+            frame preserves the existing fail-closed ``continue`` behavior for
+            a consumed collision or classified safety dispatch race.
+            """
+
+            command = _merge_runtime_hand_command(command, hand_command)
+            command = _filter_manual_real_command(
+                components,
+                command,
+                observation,
+                loop_start,
+            )
+            if command is None:
+                return None, False, False
+            command_guard_fault = components.session.evaluate_command_guard(
+                command,
+                observation,
+                loop_start,
+            )
+            if command_guard_fault is not None:
+                components.session.reject_command_for_guard_fault(command_guard_fault)
+                _log(
+                    "Safety",
+                    f"{phase} command rejected by pre-dispatch guard: "
+                    f"{command_guard_fault.code}",
+                    now=loop_start,
+                )
+                return None, False, False
+            if not _guard_impedance_force_control(
+                args,
+                components,
+                context=phase,
+                now=loop_start,
+                collision_handler=handle_impedance_force_collision,
+            ):
+                return None, False, bool(impedance_collision_consumed["value"])
+            assert components.session.rig is not None
+            try:
+                components.session.dispatch_command(command)
+            except Exception as exc:  # noqa: BLE001 - consume stop races only.
+                if handle_safety_dispatch_exception(exc):
+                    return None, False, True
+                raise
+            if components.temporary_safety_limiter is not None:
+                components.temporary_safety_limiter.sync_from_command(command)
+            return command, True, False
+
         phase_recorder = loop_phase_timer.record if loop_phase_timer is not None else None
         if agent_motion_port is not None:
             agent_motion_snapshot = agent_motion_port.apply_owner_requests(
@@ -5047,49 +5191,18 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                             f"start mode={recovery_plan.mode} duration={recovery_plan.duration_sec:.2f}s",
                             now=loop_start,
                         )
-                active_command = _merge_runtime_hand_command(active_command, hand_command)
-                active_command = _filter_manual_real_command(
-                    components,
+                (
                     active_command,
-                    step_result.observation,
-                    loop_start,
+                    manual_recovery_command_dispatched,
+                    skip_recovery_frame,
+                ) = dispatch_recovery_command(
+                    active_command,
+                    hand_command=hand_command,
+                    observation=step_result.observation,
+                    phase="recovery_start",
                 )
-                if active_command is not None:
-                    command_guard_fault = components.session.evaluate_command_guard(
-                        active_command,
-                        step_result.observation,
-                        loop_start,
-                    )
-                    if command_guard_fault is not None:
-                        components.session.reject_command_for_guard_fault(command_guard_fault)
-                        _log(
-                            "Safety",
-                            "recovery_start command rejected by pre-dispatch guard: "
-                            f"{command_guard_fault.code}",
-                            now=loop_start,
-                        )
-                        active_command = None
-                    elif _guard_impedance_force_control(
-                        args,
-                        components,
-                        context="recovery_start",
-                        now=loop_start,
-                        collision_handler=handle_impedance_force_collision,
-                    ):
-                        assert components.session.rig is not None
-                        try:
-                            components.session.dispatch_command(active_command)
-                        except Exception as exc:  # noqa: BLE001 - consume stop races only.
-                            if handle_safety_dispatch_exception(exc):
-                                continue
-                            raise
-                        manual_recovery_command_dispatched = True
-                        if components.temporary_safety_limiter is not None:
-                            components.temporary_safety_limiter.sync_from_command(active_command)
-                    elif impedance_collision_consumed["value"]:
-                        continue
-                    else:
-                        active_command = None
+                if skip_recovery_frame:
+                    continue
                 if recovery_done:
                     components.session.finish_recovery("recovery completed")
                     recovery_plan = None
@@ -5100,49 +5213,18 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     recovery_plan,
                     now=loop_start,
                 )
-                active_command = _merge_runtime_hand_command(active_command, hand_command)
-                active_command = _filter_manual_real_command(
-                    components,
+                (
                     active_command,
-                    step_result.observation,
-                    loop_start,
+                    manual_recovery_command_dispatched,
+                    skip_recovery_frame,
+                ) = dispatch_recovery_command(
+                    active_command,
+                    hand_command=hand_command,
+                    observation=step_result.observation,
+                    phase="recovery_advance",
                 )
-                if active_command is not None:
-                    command_guard_fault = components.session.evaluate_command_guard(
-                        active_command,
-                        step_result.observation,
-                        loop_start,
-                    )
-                    if command_guard_fault is not None:
-                        components.session.reject_command_for_guard_fault(command_guard_fault)
-                        _log(
-                            "Safety",
-                            "recovery_advance command rejected by pre-dispatch guard: "
-                            f"{command_guard_fault.code}",
-                            now=loop_start,
-                        )
-                        active_command = None
-                    elif _guard_impedance_force_control(
-                        args,
-                        components,
-                        context="recovery_advance",
-                        now=loop_start,
-                        collision_handler=handle_impedance_force_collision,
-                    ):
-                        assert components.session.rig is not None
-                        try:
-                            components.session.dispatch_command(active_command)
-                        except Exception as exc:  # noqa: BLE001 - consume stop races only.
-                            if handle_safety_dispatch_exception(exc):
-                                continue
-                            raise
-                        manual_recovery_command_dispatched = True
-                        if components.temporary_safety_limiter is not None:
-                            components.temporary_safety_limiter.sync_from_command(active_command)
-                    elif impedance_collision_consumed["value"]:
-                        continue
-                    else:
-                        active_command = None
+                if skip_recovery_frame:
+                    continue
                 if recovery_done:
                     components.session.finish_recovery("recovery completed")
                     if not recording_active():
