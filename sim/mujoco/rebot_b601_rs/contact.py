@@ -114,7 +114,10 @@ def read_b601_contact_observation(
     MuJoCo's ``netforce`` contact result is world-oriented and expressed about
     its reported application point.  The returned moment is therefore shifted
     with ``r x f`` to the current ``gripper_end`` origin.  No scaling or
-    filtering is applied here.
+    filtering is applied here.  ``mj_step`` leaves derived fields at the
+    pre-integration state, so forward dynamics is evaluated on an independent
+    data copy before reading the sensor and pose.  The live scene is unchanged.
+    Call from the scene-owner thread, not concurrently with a physics step.
     """
 
     if not isinstance(scene, MujocoScene):
@@ -135,27 +138,42 @@ def read_b601_contact_observation(
             f"expected {B601_RS_CONTACT_SENSOR_DIM}, got {sensor_dim}"
         )
     sensor_address = int(scene.model.sensor_adr[sensor_id])
-    values = np.asarray(
-        scene.data.sensordata[
-            sensor_address : sensor_address + B601_RS_CONTACT_SENSOR_DIM
-        ],
-        dtype=float,
-    ).copy()
-    if values.shape != (B601_RS_CONTACT_SENSOR_DIM,) or not np.all(
-        np.isfinite(values)
-    ):
-        raise ValueError("B601 contact wrench sensor returned non-finite data")
-    physics_time_sec = float(scene.data.time)
+
+    def sensor_values(sensordata: np.ndarray) -> np.ndarray:
+        values = np.asarray(
+            sensordata[
+                sensor_address : sensor_address + B601_RS_CONTACT_SENSOR_DIM
+            ],
+            dtype=float,
+        ).copy()
+        if values.shape != (B601_RS_CONTACT_SENSOR_DIM,) or not np.all(
+            np.isfinite(values)
+        ):
+            raise ValueError("B601 contact wrench sensor returned non-finite data")
+        found = float(values[0])
+        if found < 0.0 or not math.isclose(found, round(found), abs_tol=1e-9):
+            raise ValueError("B601 contact wrench sensor returned an invalid count")
+        return values
+
+    # Do not conceal a corrupt cached result by recomputing it.
+    sensor_values(scene.data.sensordata)
+    if scene.mujoco.get_mjcb_control() is not None:
+        raise ValueError("B601 contact observation requires no control callback")
+    data = scene.mujoco.MjData(scene.model)
+    scene.mujoco.mj_copyData(data, scene.model, scene.data)
+    physics_time_sec = float(data.time)
     if not math.isfinite(physics_time_sec) or physics_time_sec < 0.0:
         raise ValueError("B601 MuJoCo physics time must be finite and non-negative")
+    state_spec = scene.mujoco.mjtState.mjSTATE_INTEGRATION
+    state = np.empty(scene.mujoco.mj_stateSize(scene.model, state_spec))
+    scene.mujoco.mj_getState(scene.model, data, state, state_spec)
+    if not np.all(np.isfinite(state)):
+        raise ValueError("B601 contact observation requires finite integration state")
+    # Never run the control callback or advance the live solver/integrator.
+    scene.mujoco.mj_forward(scene.model, data)
+    values = sensor_values(data.sensordata)
 
-    found = float(values[0])
-    matched_contact_count = round(found)
-    if (
-        found < 0.0
-        or not math.isclose(found, matched_contact_count, abs_tol=1e-9)
-    ):
-        raise ValueError("B601 contact wrench sensor returned an invalid count")
+    matched_contact_count = round(float(values[0]))
     if matched_contact_count == 0:
         return B601MujocoContactObservation(
             wrench=B601SpatialWrench(
@@ -171,7 +189,9 @@ def read_b601_contact_observation(
     force_world = values[1:4]
     torque_at_contact_world = values[4:7]
     application_point_world = values[7:10]
-    end_effector_position_world = scene.body_pose(B601_RS_END_EFFECTOR_FRAME)[:3, 3]
+    end_effector_position_world = np.asarray(
+        data.xpos[scene.body_id(B601_RS_END_EFFECTOR_FRAME)], dtype=float
+    )
     torque_at_end_effector_world = torque_at_contact_world + np.cross(
         application_point_world - end_effector_position_world,
         force_world,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -203,6 +204,49 @@ def test_contact_force_acts_on_subtree2_and_moment_is_shifted_to_ee_origin() -> 
     np.testing.assert_allclose(observation.application_point_world_m, raw[7:10])
 
 
+@pytest.mark.parametrize("initial_contact", [False, True])
+def test_post_step_observation_uses_current_state_without_mutating_scene(
+    initial_contact: bool,
+) -> None:
+    scene = _synthetic_contact_scene(contact=initial_contact)
+    scene.data.qvel[0] = -40.0 if initial_contact else 40.0
+    scene.mujoco.mj_forward(scene.model, scene.data)
+    scene.mujoco.mj_step(scene.model, scene.data)
+    # mj_step integrates qpos/time after evaluating sensors and Cartesian poses.
+    assert bool(scene.data.sensordata[0]) is initial_contact
+    assert scene.data.xpos[1, 0] != scene.data.qpos[0]
+    source = copy.copy(scene.data)
+    expected = copy.copy(source)
+    scene.mujoco.mj_forward(scene.model, expected)
+    assert bool(expected.sensordata[0]) is not initial_contact
+
+    observation = read_b601_contact_observation(scene)
+
+    assert observation.physics_time_sec == expected.time
+    assert observation.in_contact is not initial_contact
+    np.testing.assert_allclose(observation.wrench.force_n, expected.sensordata[1:4])
+    ee_id = scene.body_id(B601_RS_END_EFFECTOR_FRAME)
+    expected_torque = expected.sensordata[4:7] + np.cross(
+        expected.sensordata[7:10] - expected.xpos[ee_id],
+        expected.sensordata[1:4],
+    )
+    np.testing.assert_allclose(observation.wrench.torque_nm, expected_torque)
+    if observation.in_contact:
+        np.testing.assert_allclose(
+            observation.application_point_world_m, expected.sensordata[7:10]
+        )
+    else:
+        assert observation.application_point_world_m is None
+    assert scene.data.time == source.time
+    for field in (
+        "qpos", "qvel", "act", "ctrl", "qfrc_applied", "xfrc_applied",
+        "qacc_warmstart", "qacc", "sensordata", "xpos", "xmat",
+    ):
+        np.testing.assert_array_equal(
+            getattr(scene.data, field), getattr(source, field), err_msg=field
+        )
+
+
 def test_contact_observer_fails_closed_on_missing_or_nonfinite_sensor_data() -> None:
     with pytest.raises(ValueError, match="has no contact wrench sensor"):
         read_b601_contact_observation(
@@ -224,3 +268,54 @@ def test_contact_observer_fails_closed_on_missing_or_nonfinite_sensor_data() -> 
     scene_without_sensor.model.sensor_dim[0] = 9
     with pytest.raises(ValueError, match="dimension mismatch"):
         read_b601_contact_observation(scene_without_sensor)
+
+
+@pytest.mark.parametrize("field", ["qpos", "qvel", "qfrc_applied", "qacc_warmstart"])
+def test_contact_observer_rejects_nonfinite_integration_inputs(field: str) -> None:
+    scene = _synthetic_contact_scene(contact=False)
+    getattr(scene.data, field)[0] = np.nan
+    with pytest.raises(ValueError, match="finite integration state"):
+        read_b601_contact_observation(scene)
+    assert np.isnan(getattr(scene.data, field)[0])
+
+
+@pytest.mark.parametrize("count", [-1.0, 0.5])
+def test_contact_observer_does_not_repair_an_invalid_cached_count(count: float) -> None:
+    scene = _synthetic_contact_scene(contact=False)
+    scene.data.sensordata[0] = count
+    with pytest.raises(ValueError, match="invalid count"):
+        read_b601_contact_observation(scene)
+    assert scene.data.sensordata[0] == count
+
+
+def test_contact_observer_rejects_control_callback_without_calling_it() -> None:
+    scene = _synthetic_contact_scene(contact=False)
+    previous_callback = scene.mujoco.get_mjcb_control()
+    calls = []
+
+    def control(model: object, data: object) -> None:
+        calls.append((model, data))
+
+    scene.mujoco.set_mjcb_control(control)
+    try:
+        with pytest.raises(ValueError, match="no control callback"):
+            read_b601_contact_observation(scene)
+        assert not calls
+    finally:
+        scene.mujoco.set_mjcb_control(previous_callback)
+
+
+def test_contact_observer_rejects_nonfinite_recomputed_sensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scene = _synthetic_contact_scene(contact=False)
+    forward = scene.mujoco.mj_forward
+
+    def corrupt_sensor(model: object, data: object) -> None:
+        forward(model, data)
+        data.sensordata[1] = np.nan
+
+    monkeypatch.setattr(scene.mujoco, "mj_forward", corrupt_sensor)
+    with pytest.raises(ValueError, match="non-finite"):
+        read_b601_contact_observation(scene)
+    assert np.all(np.isfinite(scene.data.sensordata))
