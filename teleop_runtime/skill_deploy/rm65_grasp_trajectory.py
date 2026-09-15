@@ -293,6 +293,20 @@ class _PreparedGraspApproaches:
     validation_attempts: tuple[Mapping[str, object], ...]
 
 
+class _CollisionSearchOracle:
+    """Use clearance guards only in search, not endpoint or final validation."""
+
+    def __init__(self, oracle: RM65ObstacleCollisionOracle, refinement_distance_m: float) -> None:
+        self.oracle = oracle
+        self.refinement_distance_m = refinement_distance_m
+        self.scene_hash = oracle.scene_hash
+
+    def check(self, qpos_by_component: Mapping[str, np.ndarray]) -> JointConfigurationCheck:
+        return self.oracle.check_for_search(
+            qpos_by_component, refinement_distance_m=self.refinement_distance_m,
+        )
+
+
 class _TargetEnvelopePathOracle:
     """Compose collision and TCP-envelope checks for grasp path search."""
 
@@ -727,6 +741,14 @@ class RM65GraspJointTrajectoryPlanner:
                             visible_scene: VisibleGraspScene | None = None,
                             side: str | None = None,
                             start_qpos_by_side: Mapping[str, np.ndarray] | None = None) -> object:
+        collision_oracle = self.oracle
+        if isinstance(collision_oracle, RM65ObstacleCollisionOracle):
+            refinement = (
+                self.planner_config.adaptive_refinement_distance_m
+                if self.planner_config.adaptive_edge_resolution_rad is not None
+                else self.scene.minimum_clearance_m
+            )
+            collision_oracle = _CollisionSearchOracle(collision_oracle, refinement)
         # The measured staging pose may intentionally start just outside the
         # task envelope.  Its dedicated ingress leg is bounded, monotonic, and
         # densely revalidated.  Once inside, every grasp-search sample must
@@ -735,7 +757,7 @@ class RM65GraspJointTrajectoryPlanner:
             if side not in _SIDES or start_qpos_by_side is None:
                 raise ValueError("envelope ingress search requires its moving side and start qpos")
             oracle = _TargetEnvelopePathOracle(
-                collision_oracle=self.oracle,
+                collision_oracle=collision_oracle,
                 envelope_check=self._ingress_search_envelope_check(
                     qpos_by_side=start_qpos_by_side, side=side,
                 ),
@@ -744,10 +766,10 @@ class RM65GraspJointTrajectoryPlanner:
             planning_phase not in {"pregrasp_target", "grasp_target"}
             or self.target_envelope_filter is None
         ):
-            oracle = self.oracle
+            oracle = collision_oracle
         else:
             oracle = _TargetEnvelopePathOracle(
-                collision_oracle=self.oracle,
+                collision_oracle=collision_oracle,
                 envelope_check=lambda qpos: self._require_qpos_within_target_envelope(
                     qpos, sides=_SIDES, phase="path_target",
                 ),

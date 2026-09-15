@@ -1688,6 +1688,46 @@ def test_constrained_approach_rejects_lateral_tcp_bow() -> None:
     assert error.value.details["lateral_error_m"] > 0.002
 
 
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_clearance_guard_is_confined_to_search_and_uses_actual_refinement_boundary(adaptive) -> None:
+    from robot_motion.rm65.obstacle_collision import RM65ObstacleCollisionOracle
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig(
+        adaptive_edge_resolution_rad=0.001 if adaptive else None,
+        adaptive_refinement_distance_m=0.03 if adaptive else None,
+    )
+    planner.scene = SimpleNamespace(minimum_clearance_m=0.02)
+    class RecordingOracle(RM65ObstacleCollisionOracle):
+        def __init__(self):
+            self.calls = []
+        @property
+        def scene_hash(self):
+            return "scene:test"
+        def check_for_search(self, qpos, *, refinement_distance_m):
+            self.calls.append(("search", refinement_distance_m))
+            return JointConfigurationCheck(safe=True, minimum_distance_m=0.04)
+        def check(self, qpos):
+            self.calls.append(("exact", None))
+            return JointConfigurationCheck(safe=True, minimum_distance_m=0.05)
+    planner.oracle = RecordingOracle()
+    planner.target_envelope_filter = None
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    search = planner._path_search_oracle(planning_phase="pregrasp_target")
+    assert search.scene_hash == planner.oracle.scene_hash
+    assert search.check(qpos).safe
+    assert planner.oracle.calls == [("search", 0.03 if adaptive else 0.02)]
+    assert planner.oracle.check(qpos).minimum_distance_m == 0.05
+    assert planner.oracle.calls[-1] == ("exact", None)
+    planner.target_builder = _CartesianQposBuilder()
+    planner.oracle.calls.clear()
+    end = {side: values.copy() for side, values in qpos.items()}
+    end["right"][0] = 0.002
+    dense = planner._revalidate((qpos, end), moving_side="right")
+    assert dense["minimum_distance_m"] == 0.05
+    assert dense["sample_count"] >= 2
+    assert all(mode == "exact" for mode, _ in planner.oracle.calls)
+
+
 def test_grasp_search_oracle_composes_collision_and_target_envelope() -> None:
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
     planner.target_builder = _LinearQposBuilder()
