@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,10 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from control_station.composition.rebot_b601_rm65_residual import B601RM65ResidualSource
+from control_station.sim_hil_profile.rebot_b601_rm65_foreground import (
+    B601RM65TerminalCommands,
+    run_b601_rm65_foreground,
+)
 from control_station.sources.rebot_b601_pose import (
     B601ReadOnlyPoseSource,
     B601ReadOnlyPoseSourceSpec,
@@ -424,6 +429,173 @@ def _session_step(session, clock):
     return session.step(
         target_effective_at=clock() + 0.01, effective_until=clock() + 0.1
     )
+
+
+def test_terminal_input_drains_pasted_commands_without_blocking():
+    reader_fd, writer_fd = os.pipe()
+    try:
+        terminal = B601RM65TerminalCommands(file_descriptor=reader_fd)
+        os.write(writer_fd, b"a")
+        assert terminal(0) is None
+        os.write(writer_fd, b"\nq\n")
+        assert terminal(0) == "a"
+        # The writer is still open: buffered q must not wait for kernel input.
+        assert terminal(0) == "q"
+        assert terminal(0) is None
+    finally:
+        os.close(reader_fd)
+        os.close(writer_fd)
+
+
+def test_terminal_eof_requests_stop():
+    reader_fd, writer_fd = os.pipe()
+    os.close(writer_fd)
+    try:
+        assert B601RM65TerminalCommands(file_descriptor=reader_fd)(0) == "q"
+    finally:
+        os.close(reader_fd)
+
+
+@pytest.mark.parametrize("delayed_sample", [False, True])
+def test_session_current_tick_is_timestamped_after_slow_poll(
+    setup_motion, monkeypatch, delayed_sample
+):
+    clock, _, _, source, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.activate()
+    poll = source.poll_pose
+
+    def slow_poll():
+        clock.value += 0.01
+        if delayed_sample:
+            projection = poll()
+            clock.value += 0.08
+            return projection
+        clock.value += 0.08
+        return poll()
+
+    monkeypatch.setattr(source, "poll_pose", slow_poll)
+    receipt = session.step()
+    assert receipt.accepted, receipt.message
+    assert receipt.proposal.target_effective_at == clock()
+    assert receipt.proposal.effective_until == (
+        clock() - (0.08 if delayed_sample else 0) + session.binding.limits[0]
+    )
+
+
+def test_session_half_absolute_window_is_rejected_and_held(setup_motion):
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.activate()
+    clock.value += 0.05
+    with pytest.raises(ValueError, match="both absolute"):
+        session.step(target_effective_at=clock())
+    assert session.state == "held" and session.anchor is None
+    assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+
+
+def test_foreground_commands_clutch_and_quit_use_the_existing_owner(setup_motion):
+    clock, scene, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    commands = iter(["a", None, "c", None, "r", None, "s", "q"])
+    statuses, events, sequences = [], [], []
+
+    def poll(timeout):
+        command = next(commands)
+        clock.value += timeout if command is None else 0.001
+        if command is None:
+            if session.state == "active":
+                backend.q[0] += 0.01
+            else:
+                backend.q[0] = 0.5
+        sequences.append((session.state, backend.sequence))
+        return command
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=statuses.append,
+        record=events.append,
+    )
+    assert session.state == "inactive" and session.anchor is None
+    admissions = [event for event in events if event["event"] == "proposal_admission"]
+    assert len(admissions) == 2 and all(event["accepted"] for event in admissions)
+    assert scene.writes
+    assert sequences[3][1] == sequences[2][1]
+    assert "master state unchanged" in statuses[-1]
+    assert any("reposition/settle" in status for status in statuses)
+    assert events[-1]["event"] == "foreground_stopped"
+    assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt(), OSError("target failed")])
+def test_foreground_failure_cancels_target_without_swallowing(setup_motion, failure):
+    clock, scene, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    commands = iter(["a", None])
+
+    def poll(timeout):
+        command = next(commands)
+        clock.value += timeout if command is None else 0.001
+        backend.q[0] = 0.01
+        return command
+
+    def failed_target():
+        raise failure
+
+    with pytest.raises(type(failure)):
+        run_b601_rm65_foreground(
+            session, rate_hz=20, advance_target=failed_target,
+            poll_command=poll, emit=lambda _message: None,
+        )
+    assert session.state == "inactive" and session.anchor is None
+    assert not scene.writes
+    assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+
+
+def test_foreground_wrong_operator_command_never_activates(setup_motion):
+    _, _, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    commands = iter(["r", "bad", "?", "q"])
+    initial_sequence = backend.sequence
+    statuses = []
+    run_b601_rm65_foreground(
+        session, rate_hz=20, advance_target=lambda: pytest.fail("No tick elapsed"),
+        poll_command=lambda _timeout: next(commands), emit=statuses.append,
+    )
+    assert backend.sequence == initial_sequence
+    assert any("r rejected" in status for status in statuses)
+    assert any("unknown command" in status for status in statuses)
+    assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+
+
+@pytest.mark.parametrize("target_cost_sec", [0.01, 0.08])
+def test_foreground_timing_does_not_add_compute_time_or_burst(
+    setup_motion, target_cost_sec
+):
+    clock, _, _, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    commands = iter([None, None, "q"])
+    waits = []
+
+    def poll(timeout):
+        command = next(commands)
+        waits.append(timeout)
+        if command is None:
+            clock.value += timeout
+        return command
+
+    def target():
+        clock.value += target_cost_sec
+
+    run_b601_rm65_foreground(
+        session, rate_hz=20, advance_target=target,
+        poll_command=poll, emit=lambda _message: None,
+    )
+    assert waits[0] == pytest.approx(0.05)
+    assert waits[1] == pytest.approx(0.04 if target_cost_sec < 0.05 else 0.05)
 
 
 def test_session_clutch_cancels_pending_and_recenter_has_zero_delta(setup_motion):

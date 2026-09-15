@@ -537,7 +537,10 @@ class B601RM65MotionSession:
             self._hold("operator_deactivated", state="inactive")
 
     def step(
-        self, *, target_effective_at: float, effective_until: float
+        self,
+        *,
+        target_effective_at: float | None = None,
+        effective_until: float | None = None,
     ) -> ProposalAdmissionReceipt:
         """Publish once; the caller still owns control timing and dispatch."""
         if self._state != "active":
@@ -555,6 +558,17 @@ class B601RM65MotionSession:
                 adapted_at=now,
                 adapted_clock_domain_id=self.binding.runtime.config.clock_domain_id,
             )
+            if (target_effective_at is None) != (effective_until is None):
+                raise ValueError("Supply both absolute proposal times or neither.")
+            if target_effective_at is None:
+                # Foreground callers cannot timestamp after an in-flight poll.
+                # Keep expiry tied to the original sample, not its adaptation.
+                target_effective_at = now
+                sample = projection.pose_sample
+                effective_until = (
+                    sample.measured_at if sample is not None else now
+                ) + self.binding.limits[0]
+            assert effective_until is not None
             receipt = self.binding.submit(
                 step,
                 self._anchor,

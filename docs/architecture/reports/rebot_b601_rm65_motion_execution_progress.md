@@ -117,3 +117,32 @@ fault/transitioning 不降级。首轮合成 fixture 因同一时间重复采样
 下一步在既有应用 leaf 内绑定真实只读 source、明确 frame/TCP profile、target measurement 与
 前台按键/日志。master 重力补偿保持独立、已验收的 owner，不通过普通 `finally` 自动失能。
 真机命令必须在该装配及失败清理验证完成后另行提供；本轮专项结果不是真机遥操 PASS。
+
+## 6. 前台交互驱动与采样时序
+
+2026-09-16：按操作者授权再次受控恢复同一 Task，以现有 `28f5af3c` 会话检查点继续。
+新增一个应用 leaf `control_station/sim_hil_profile/rebot_b601_rm65_foreground.py`，
+继续复用现有 source/binding/session、测试模块和本文，不新增生产 CLI、设备 factory 或环境依赖。
+
+- 前台显示简短操作说明：先摆到合理位置并静止；Enter 提交 `a` 激活、`c` 离合、
+  `r` 双侧重居中、`s` 停跟随、`q` 退出、`?` 查看说明。启动时撤销旧跟随参考。
+- 输入为每会话独立的非阻塞行缓冲，粘贴多条命令可逐条排出，EOF 请求停跟随；
+  不启动后台输入线程、servo worker 或不可及时中断的阻塞 prompt。
+- 激活、离合、拒绝和停止都提供终端状态；admission 事件提供原生 receipt 的 accepted/
+  rejection_code，由调用方的既有 JSON/log sink 记录。admission 不冒充实际跟随测量。
+- 前台只推进注入的 target owner；正常计算时间计入原有 tick，不额外叠加一个完整周期。
+  超时跳过补发，避免连续发送过期 catch-up proposal。
+- `session.step()` 可使用采样完成后的当前生效时间；expiry 仍等于原始样本时间加
+  已配置最大 source age，不能因慢 poll/adapt 重盖时间而延期。既有成对绝对时间调用保留。
+- operator 无效状态命令不激活；source/target/log/终端异常和 Ctrl-C 都在退出前撤销 RM65
+  跟随，异常继续向调用方传播。退出不调用 ReBot disable，也不终止其独立 gravity/damping owner。
+
+检查：最新无外部模型专项为 38 passed、1 明确的资产缺失 skip。最终模型与关联边界检查
+115 passed（含粘贴行缓冲、EOF 和慢采样时序）；Ruff、py_compile、文档导航、资源审计及
+`git diff --check` 通过。正式 Profiles 与最终候选身份以 native exact-source Run 为准，
+不复用旧提交证据。没有修改 URDF、硬件安全阈值或重力 profile。
+
+这仍是已装配会话的前台 driver，不是完整真实 CAN → RM65 GUI factory。下一步应在既有
+应用入口选择显式 frame/TCP profile、绑定只读硬件与 target measurement、连接 command/output
+日志并给现场操作者 exact-source 启动命令；不得将本文的 pytest 命令当成真机验收命令。
+真实设备前仍需确认 source profile 与实际工具/坐标绑定，并保留原 gravity/protective-hold 回退。
