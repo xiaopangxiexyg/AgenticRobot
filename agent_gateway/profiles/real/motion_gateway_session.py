@@ -1315,6 +1315,7 @@ def assemble_real_agent_primitive_gateway_session(
                 point_grasp_executor=station_point_grasp_executor,
                 perception_provider=perception_provider,
                 frame_binding=frame_binding,
+                solid_geometry=getattr(station_point_grasp_planner, "solid_geometry", None),
                 runtime_session_id=contract_bundle.attachment.runtime_session_id,
                 current_station_revision=lambda: producer.current_station_revision,
             )

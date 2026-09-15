@@ -365,13 +365,17 @@ def test_station_point_grasp_profile_accepts_graspgenx_backend() -> None:
     "T_reference_from_camera", "depth_content_hash", "candidate_score",
     "snapshot_bytes", "snapshot_length", "missing_snapshot",
 ])
-def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tmp_path, monkeypatch, mutation) -> None:
+@pytest.mark.parametrize("cad_bound", [False, True])
+def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tmp_path, monkeypatch, mutation, cad_bound) -> None:
     from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
     from agent_gateway.profiles.real.point_grasp_gateway import build_station_bound_point_grasp_executor
     from agent_gateway.profiles.real.grasp_approach_plan import build_grasp_visible_scene_reader
     from agent_gateway.profiles.real.station_point_grasp_deployment import REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID
     from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
-    source, _, _, registration, provider = _provider_stack(backend_id="graspgenx")
+    source, _, planner, registration, provider = _provider_stack(backend_id="graspgenx")
+    if cad_bound:
+        from deployments.perception.dmtac_grasp_overlay import reviewed_4b2_cad_solid_geometry
+        planner.solid_geometry = reviewed_4b2_cad_solid_geometry()
     store = RecoverableAgentArtifactStore(root=tmp_path/"artifacts", quota_bytes=32*1024*1024,
                                          max_artifact_bytes=16*1024*1024, max_chunk_bytes=1024*1024)
     executor = build_station_bound_point_grasp_executor(
@@ -408,6 +412,7 @@ def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tm
     assert isinstance(retained.execution_result["target_pixel_uv"], tuple)
     scene = reader(retained, retained.execution_result)
     assert len(scene.points) == 12
+    assert scene.geometry == planner.solid_geometry
     assert scene.capture_qpos_by_side is None
     with pytest.raises(ValueError, match="capture differ"):
         reader(SimpleNamespace(output_artifact_bindings=bindings), {**result.execution_result, "station_revision": 8})

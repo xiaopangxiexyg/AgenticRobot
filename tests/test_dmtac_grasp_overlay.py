@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from deployments.perception.dmtac_grasp_overlay import (
     DMTAC_M_FINGER_LENGTH_M,
@@ -10,6 +11,7 @@ from deployments.perception.dmtac_grasp_overlay import (
     camera_from_reference_poses,
     project_dmtac_grasp,
     render_dmtac_grasp_overlays,
+    reviewed_4b2_cad_solid_geometry,
 )
 
 INTRINSICS = {
@@ -65,6 +67,23 @@ def test_wireframe_is_expressed_about_actual_tool_tcp() -> None:
     assert z_values.min() == DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
     assert z_values.max() == (DMTAC_M_PALM_FROM_TOOL_TCP_Z_M + DMTAC_M_FINGER_LENGTH_M)
     assert z_values.min() < 0.0 < z_values.max()
+
+
+def test_cad_geometry_moves_body_not_controlled_tcp_axes() -> None:
+    candidate = _candidate()
+    geometry = reviewed_4b2_cad_solid_geometry()
+    rendered = project_dmtac_grasp(candidate, reference_from_camera=np.eye(4),
+                                  intrinsics=INTRINSICS, solid_geometry=geometry)
+    legacy = project_dmtac_grasp(candidate, reference_from_camera=np.eye(4),
+                                intrinsics=INTRINSICS)
+    assert rendered.tcp_pixel_uv == legacy.tcp_pixel_uv == (50, 40)
+    assert [s for s in rendered.segments if s.kind.startswith("axis_")] == [
+        s for s in legacy.segments if s.kind.startswith("axis_")]
+    assert [s for s in rendered.segments if not s.kind.startswith("axis_")] != [
+        s for s in legacy.segments if not s.kind.startswith("axis_")]
+    # The flange mating offset lifts the 97.001 mm internal marker to
+    # 105.201 mm; the real controller still controls its calibrated 140 mm TCP.
+    assert geometry.solid_pose(np.eye(4))[2, 3] + geometry.palm_z_m == pytest.approx(-.034799)
 
 
 def test_projection_classifies_full_partial_outside_and_behind() -> None:

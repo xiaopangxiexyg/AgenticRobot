@@ -9,7 +9,7 @@ import math
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -323,6 +323,7 @@ class Sam2GraspGenXPointGraspPlanner:
         score_threshold: float = -1.0,
         max_gripper_width_m: float = 0.070,
         max_click_distance_m: float = 0.100,
+        solid_geometry: ParallelJawSolidGeometry | None = None,
     ) -> None:
         if not isinstance(model_spec, GraspGenXPointGraspModelSpec):
             raise TypeError("model_spec must be typed.")
@@ -354,12 +355,23 @@ class Sam2GraspGenXPointGraspPlanner:
         self.score_threshold = threshold
         self.max_gripper_width_m = float(max_gripper_width_m)
         self.max_click_distance_m = float(max_click_distance_m)
+        nominal_geometry = ParallelJawSolidGeometry(
+            DMTAC_M_PALM_FROM_TOOL_TCP_Z_M, DMTAC_M_FINGER_LENGTH_M,
+            DMTAC_M_FINGER_THICKNESS_M, DMTAC_M_PAD_HEIGHT_M,
+            self.max_gripper_width_m,
+        )
+        self._solid_geometry = solid_geometry if solid_geometry is not None else nominal_geometry
+        if not isinstance(self._solid_geometry, ParallelJawSolidGeometry):
+            raise TypeError("solid_geometry must be typed")
+        if replace(self._solid_geometry, tool_from_solid_xyz_m=(0, 0, 0),
+                   solid_yaw_rad=0) != nominal_geometry:
+            raise ValueError("GraspGenX adapter requires the reviewed nominal DMTAC M dimensions")
         self._lock = threading.RLock()
         self._started = False
         self._closed = False
         self._last_target_mask: np.ndarray | None = None
         self._last_plan_timing_ms: dict[str, float] = {}
-        self._last_filter_summary: dict[str, int | float | None] = {}
+        self._last_filter_summary: dict[str, int | float | str | None] = {}
 
     @property
     def semantic_content_hash(self) -> str:
@@ -392,8 +404,9 @@ class Sam2GraspGenXPointGraspPlanner:
                 },
                 "gripper": {
                     "profile": "DMTAC_M",
+                    "solid_geometry": asdict(self.solid_geometry),
                     "sweep_volume_v1": DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
-                    "model_base_from_tool_tcp_z_m": -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+                    "model_base_from_geometry_z_m": -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
                     "maximum_opening_m": self.max_gripper_width_m,
                     "width_clearance_m": DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
                     "maximum_visible_collision_points": 0,
@@ -430,7 +443,7 @@ class Sam2GraspGenXPointGraspPlanner:
             return dict(self._last_plan_timing_ms)
 
     @property
-    def last_filter_summary(self) -> dict[str, int | float | None]:
+    def last_filter_summary(self) -> dict[str, int | float | str | None]:
         with self._lock:
             return dict(self._last_filter_summary)
 
@@ -543,7 +556,7 @@ class Sam2GraspGenXPointGraspPlanner:
         )
         timing["graspgenx_inference"] = (time.perf_counter() - stage_started) * 1000.0
         stage_started = time.perf_counter()
-        filter_summary: dict[str, int | float | None] = {}
+        filter_summary: dict[str, int | float | str | None] = {}
         candidates = self._rank(
             grasps,
             scores,
@@ -597,7 +610,7 @@ class Sam2GraspGenXPointGraspPlanner:
         depth: np.ndarray,
         intrinsics: Mapping[str, float],
         maximum: int,
-        filter_summary: dict[str, int | float | None] | None = None,
+        filter_summary: dict[str, int | float | str | None] | None = None,
     ) -> tuple[PointGraspCandidate, ...]:
         model_base_from_tcp = np.eye(4, dtype=np.float64)
         model_base_from_tcp[2, 3] = -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
@@ -607,10 +620,13 @@ class Sam2GraspGenXPointGraspPlanner:
             target_mask=self.last_target_mask,
             intrinsics=intrinsics,
             reference_from_camera=np.eye(4),
-            geometry=self.solid_geometry,
+            # Inference and capture checks use the +X-closing model geometry
+            # frame. Convert to the real controller TCP only at the output.
+            geometry=replace(self.solid_geometry, tool_from_solid_xyz_m=(0, 0, 0),
+                             solid_yaw_rad=0),
         )
         ranked: list[tuple[float, float, float, float, np.ndarray, np.ndarray]] = []
-        counts: dict[str, int | float | None] = {
+        counts: dict[str, int | float | str | None] = {
             "detected": 0,
             "width_valid": 0,
             "target_capture_valid": 0,
@@ -639,6 +655,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 DMTAC_M_PALM_FROM_TOOL_TCP_Z_M + DMTAC_M_FINGER_LENGTH_M
             ),
             "capture_half_pad_height_m": DMTAC_M_PAD_HEIGHT_M / 2.0,
+            "capture_coordinate_frame": "grasp_geometry",
         }
         for base_from_model_base, raw_score in zip(grasps, scores, strict=True):
             counts["detected"] = int(counts["detected"]) + 1
@@ -831,6 +848,7 @@ class Sam2GraspGenXPointGraspPlanner:
         counts["selected"] = len(selected)
         if filter_summary is not None:
             filter_summary.update(counts)
+        geometry_from_tool = np.linalg.inv(self.solid_geometry.solid_pose(np.eye(4)))
         return tuple(
             PointGraspCandidate(
                 score=float(score),
@@ -838,10 +856,14 @@ class Sam2GraspGenXPointGraspPlanner:
                 click_distance_m=float(click_distance),
                 gripper_width_m=float(width),
                 camera_from_tcp=tuple(
-                    float(value) for value in camera_from_tcp.reshape(-1)
+                    float(value) for value in (
+                        camera_from_tcp @ geometry_from_tool
+                    ).reshape(-1)
                 ),
                 base_from_tcp=tuple(
-                    float(value) for value in base_from_tcp.reshape(-1)
+                    float(value) for value in (
+                        base_from_tcp @ geometry_from_tool
+                    ).reshape(-1)
                 ),
                 visible_collision_free=True,
             )
@@ -926,13 +948,7 @@ class Sam2GraspGenXPointGraspPlanner:
 
     @property
     def solid_geometry(self) -> ParallelJawSolidGeometry:
-        return ParallelJawSolidGeometry(
-            palm_z_m=DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
-            finger_length_m=DMTAC_M_FINGER_LENGTH_M,
-            finger_thickness_m=DMTAC_M_FINGER_THICKNESS_M,
-            pad_height_m=DMTAC_M_PAD_HEIGHT_M,
-            maximum_opening_m=self.max_gripper_width_m,
-        )
+        return self._solid_geometry
 
 
 __all__ = [

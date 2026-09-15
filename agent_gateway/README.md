@@ -523,12 +523,19 @@ scene/robot/path safety proof. The caller-calibrated v1 Route remains available
 only to the separate offline tooling.
 
 The DMTAC M adapter distinguishes each model's grasp frame from
-the calibrated actual `tool_tcp`. The current zero-translation 4B2 proxy
-attachment has a 97.001 mm internal boundary marker, while the selected DMTAC
-M TCP is 140 mm from the flange; the adapter explicitly locks the resulting
-42.999 mm local approach-axis mapping. That proxy marker is not a separate
-physical mating-plane measurement. Candidate output, visible collision
-geometry, and overlays all apply the same mapping. The combined RM65 profile
+the calibrated actual `tool_tcp`. 对完整 4B2 CAD 装配，独立 real-rm65 入口的
+GraspGenX 显式绑定模型几何框架：相对真实控制 TCP 横向偏移 24.5 mm、轴向
+偏移 8.2 mm，绕 +Z 旋转 90°，使几何 +X 对应实际夹爪开合方向；真实 TCP
+标定仍为 flange `[0, 0, 0.140, 0, 0, 0]`。97.001 mm 内部 marker 在完整
+装配中的 flange 深度是 105.201 mm，不能把零平移 proxy marker 直接当作
+完整安装后的 TCP 几何。模型评分、目标覆盖及多样性检查保持在模型几何
+框架内；候选输出明确转换为控制 TCP，渲染、捕获时掌部自身点云过滤和
+可见接近/路径检查使用同一份 `solid_geometry` 转换。快照保留该转换；旧
+快照未声明转换时仍按原定义解码，不会静默重解释旧候选。独立离线工具
+与其他 backend 的既有默认框架不变。
+这是名义双指代理的坐标修正，不代表完整 CAD 手指碰撞、实际开度、闭合
+接触或携物退出已通过验证；没有开度测量时不删除手指区域的背景点。
+The combined RM65 profile
 rejects point-grasp startup when the selected arm tool profile does not match
 that reviewed TCP; RPent never supplies or repairs this tool geometry.
 

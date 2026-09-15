@@ -25,6 +25,8 @@ class ParallelJawSolidGeometry:
     finger_thickness_m: float
     pad_height_m: float
     maximum_opening_m: float
+    tool_from_solid_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    solid_yaw_rad: float = 0.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.palm_z_m):
@@ -33,6 +35,24 @@ class ParallelJawSolidGeometry:
                       self.pad_height_m, self.maximum_opening_m):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("gripper dimensions must be finite and positive")
+        offset = np.asarray(self.tool_from_solid_xyz_m, dtype=float)
+        if offset.shape != (3,) or not np.all(np.isfinite(offset)):
+            raise ValueError("solid frame offset must contain three finite meters")
+        if not math.isfinite(self.solid_yaw_rad):
+            raise ValueError("solid frame yaw must be finite")
+        object.__setattr__(self, "tool_from_solid_xyz_m", tuple(float(x) for x in offset))
+
+    def solid_pose(self, tool_pose: np.ndarray) -> np.ndarray:
+        """Locate +X-closing solids without changing the controller TCP.
+
+        Only local yaw/translation are supported: +Z remains the approach axis,
+        so the analytic approach sweep uses the same direction in both frames.
+        """
+        transform = np.eye(4)
+        c, s = math.cos(self.solid_yaw_rad), math.sin(self.solid_yaw_rad)
+        transform[:3, :3] = ((c, -s, 0), (s, c, 0), (0, 0, 1))
+        transform[:3, 3] = self.tool_from_solid_xyz_m
+        return np.asarray(tool_pose) @ transform
 
 
 class VisibleGraspScene:
@@ -118,7 +138,7 @@ class VisibleGraspScene:
         g = self.geometry
         for pose in tool_tcp_poses.values():
             self.collision_counts(pose, opening_m=g.maximum_opening_m)
-            pose = np.asarray(pose, dtype=float)
+            pose = g.solid_pose(np.asarray(pose, dtype=float))
             x, y, z = ((self.points-pose[:3, 3]) @ pose[:3, :3]).T
             occupied |= ((np.abs(y) < g.pad_height_m/2)
                          & (z > g.palm_z_m-g.finger_thickness_m)
@@ -142,6 +162,7 @@ class VisibleGraspScene:
                 or not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-7)
                 or not np.isclose(np.linalg.det(pose[:3, :3]), 1)):
             raise ValueError("grasp pose must be rigid")
+        pose = g.solid_pose(pose)
         local, labels = self._local_points(pose, opening_m=opening_m)
         x, y, z = local.T
         in_height = np.abs(y) < g.pad_height_m/2
@@ -166,7 +187,7 @@ class VisibleGraspScene:
             raise ValueError("approach distance must be finite and nonnegative")
         # Validate opening and transform using the independently callable check.
         self.collision_counts(grasp_pose, opening_m=opening_m)
-        pose = np.asarray(grasp_pose)
+        pose = self.geometry.solid_pose(np.asarray(grasp_pose))
         local, labels = self._local_points(pose, opening_m=opening_m, distance_m=distance_m)
         x, y, z = local.T
         g = self.geometry

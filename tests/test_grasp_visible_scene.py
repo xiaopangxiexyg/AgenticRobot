@@ -20,6 +20,32 @@ def test_opening_is_free_but_fingers_and_palm_are_solid():
     assert view.collision_counts(np.eye(4), opening_m=0.07) == (1, 1)
 
 
+def test_offset_solid_frame_is_used_by_endpoint_sweep_and_capture_filter():
+    from dataclasses import replace
+    geometry = replace(GEOMETRY, tool_from_solid_xyz_m=(.0245, 0, .0082),
+                       solid_yaw_rad=np.pi/2)
+    solid_points = np.array([[0, 0, -.05], [.04, 0, -.02], [.04, 0, -.08]])
+    pose = geometry.solid_pose(np.eye(4))
+    view = VisibleGraspScene(points=solid_points @ pose[:3, :3].T + pose[:3, 3],
+                             target_mask=np.array([False, True, False]), geometry=geometry)
+    assert view.collision_counts(np.eye(4), opening_m=.07) == (1, 1)
+    assert view.approach_collision_counts(np.eye(4), opening_m=.07, distance_m=.06) == (1, 2)
+    filtered, removed = view.without_captured_palm_observations({"right": np.eye(4)})
+    assert removed == 1
+    assert filtered.collision_counts(np.eye(4), opening_m=.07) == (1, 0)
+    assert filtered.approach_collision_counts(np.eye(4), opening_m=.07, distance_m=.06) == (1, 1)
+    assert geometry.solid_pose(np.eye(4))[:3, 2].tolist() == [0, 0, 1]
+
+
+@pytest.mark.parametrize("fields", [{"tool_from_solid_xyz_m": (0, 0)},
+                                    {"tool_from_solid_xyz_m": (0, np.nan, 0)},
+                                    {"solid_yaw_rad": np.inf}])
+def test_invalid_solid_frame_fails_at_geometry_boundary(fields):
+    from dataclasses import replace
+    with pytest.raises(ValueError):
+        replace(GEOMETRY, **fields)
+
+
 def test_endpoint_clear_does_not_hide_thin_obstacle_in_approach_sweep():
     view = scene([[0.04, 0, -0.08]], [False])
     assert view.collision_counts(np.eye(4), opening_m=0.07) == (0, 0)

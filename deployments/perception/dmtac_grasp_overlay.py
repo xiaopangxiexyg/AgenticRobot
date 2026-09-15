@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw
+from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry
 
 GRASP_VISIBILITY_STATES = frozenset(
     {"visible", "partially_visible", "behind_camera", "out_of_frame"}
@@ -43,6 +44,26 @@ DMTAC_M_PALM_FROM_TOOL_TCP_Z_M = (
 DMTAC_M_FINGER_LENGTH_M = 0.050
 DMTAC_M_FINGER_THICKNESS_M = 0.010
 DMTAC_M_PAD_HEIGHT_M = 0.0255
+
+
+def reviewed_4b2_cad_solid_geometry(*, maximum_opening_m: float = 0.070) -> ParallelJawSolidGeometry:
+    """Bind the reviewed full 4B2 assembly to the unchanged 140 mm real TCP.
+
+    The URDF arm_link6 -> CAD base chain translates 24.5 mm laterally and
+    8.2 mm axially. CAD jaws close along flange Y, not controller TCP X.
+    Keep the model's +X-closing geometry frame distinct from controller TCP;
+    this is a nominal solid adapter, not a new hardware calibration.
+    Source: rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf.
+    """
+    return ParallelJawSolidGeometry(
+        palm_z_m=DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+        finger_length_m=DMTAC_M_FINGER_LENGTH_M,
+        finger_thickness_m=DMTAC_M_FINGER_THICKNESS_M,
+        pad_height_m=DMTAC_M_PAD_HEIGHT_M,
+        maximum_opening_m=maximum_opening_m,
+        tool_from_solid_xyz_m=(0.0245, -8.9993525e-8, 0.0082),
+        solid_yaw_rad=math.pi / 2,
+    )
 
 
 def _rigid_transform(value: Any, *, field_name: str) -> np.ndarray:
@@ -324,6 +345,7 @@ def project_dmtac_grasp(
     reference_from_camera: Any,
     intrinsics: Mapping[str, Any],
     near_clip_m: float = 0.005,
+    solid_geometry: ParallelJawSolidGeometry | None = None,
 ) -> DmtacGraspProjection:
     """Project one DMTAC M wireframe and classify its image visibility."""
 
@@ -341,8 +363,12 @@ def project_dmtac_grasp(
     clipped_count = 0
 
     for kind, first_local, second_local in local_segments:
-        first_camera = camera_from_tcp[:3, :3] @ first_local + camera_from_tcp[:3, 3]
-        second_camera = camera_from_tcp[:3, :3] @ second_local + camera_from_tcp[:3, 3]
+        # TCP axes retain the actual controlled frame. Only physical solids
+        # receive the deployment-bound geometry-frame transform.
+        body_pose = (camera_from_tcp if solid_geometry is None or kind.startswith("axis_")
+                     else solid_geometry.solid_pose(camera_from_tcp))
+        first_camera = body_pose[:3, :3] @ first_local + body_pose[:3, 3]
+        second_camera = body_pose[:3, :3] @ second_local + body_pose[:3, 3]
         near_segment = _clip_near_plane(first_camera, second_camera, near_clip_m=near)
         if near_segment is None:
             continue
@@ -422,6 +448,7 @@ def render_dmtac_grasp_overlays(
     intrinsics: Mapping[str, Any],
     target_pixel_uv: tuple[int, int] | None = None,
     target_bbox_xyxy: tuple[int, int, int, int] | None = None,
+    solid_geometry: ParallelJawSolidGeometry | None = None,
 ) -> tuple[Image.Image, tuple[DmtacGraspProjection, ...]]:
     """Overlay ranked candidates and return machine-readable projection records."""
 
@@ -443,6 +470,7 @@ def render_dmtac_grasp_overlays(
             candidate,
             reference_from_camera=camera_pose,
             intrinsics=intrinsics,
+            solid_geometry=solid_geometry,
         )
         for candidate in candidates
     )

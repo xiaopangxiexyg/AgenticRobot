@@ -103,6 +103,8 @@ def _annotate(
     pixel_uv: tuple[int, int],
     prepared: Any,
     intrinsics: dict[str, Any],
+    *,
+    solid_geometry: Any = None,
 ) -> bytes:
     # The result carries every ranked proposal; the preview stays legible by
     # rendering only selected ordinal 0.
@@ -123,6 +125,7 @@ def _annotate(
         intrinsics=intrinsics,
         target_pixel_uv=pixel_uv,
         target_bbox_xyxy=tuple(prepared.target_mask_bbox_xyxy),
+        solid_geometry=solid_geometry,
     )
     stream = io.BytesIO()
     output.save(stream, format="JPEG", quality=90, optimize=True)
@@ -488,6 +491,7 @@ class StationBoundPointGraspProvider:
                 pixel_uv,
                 planned,
                 dict(capture.intrinsics),
+                solid_geometry=getattr(self.planner, "solid_geometry", None),
             )
             if len(annotated) > self.registration.profile.max_annotated_bytes:
                 raise RuntimeError(

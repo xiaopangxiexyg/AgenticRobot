@@ -38,6 +38,7 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
     Sam2GraspGenXPointGraspPlanner,
 )
 from deployments.perception.sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner
+from deployments.perception.dmtac_grasp_overlay import reviewed_4b2_cad_solid_geometry
 
 
 class _FakeSocket:
@@ -501,8 +502,10 @@ def test_planner_rejects_non_finite_score_threshold(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("cad_bound", [False, True])
 def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     tmp_path: Path,
+    cad_bound: bool,
 ) -> None:
     depth = np.zeros((20, 20), dtype=np.float32)
     depth[8:13, 8:13] = 1.0
@@ -522,6 +525,7 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
         model_spec=_model_spec(tmp_path),
         point_segmenter=_Segmenter(mask),
         client=client,
+        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
     )
     planner.start()
 
@@ -562,7 +566,14 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     assert client.calls[0][1]["top_k"] == 1_000
     candidate = result.candidates[0]
     camera_from_tcp = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
-    assert camera_from_tcp[2, 3] == pytest.approx(1.017999, abs=1e-6)
+    camera_from_geometry = planner.solid_geometry.solid_pose(camera_from_tcp)
+    expected_geometry = camera_from_model_base.copy()
+    expected_geometry[2, 3] += .042999
+    np.testing.assert_allclose(camera_from_geometry, expected_geometry, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(candidate.base_from_tcp).reshape(4, 4),
+                               base_from_camera @ camera_from_tcp, atol=1e-9)
+    assert camera_from_tcp[2, 3] == pytest.approx(1.017999 - (.0082 if cad_bound else 0), abs=1e-6)
+    assert candidate.model_score == pytest.approx(.9)
     assert 0.005 <= candidate.gripper_width_m <= 0.070
     assert candidate.visible_collision_free is True
     assert planner.last_target_mask is not None
