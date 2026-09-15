@@ -109,10 +109,63 @@ Cartesian cache 均不被改写；不通过从时间戳减去固定 `dt` 猜测�
 以上证据只证明 simulator contact observation 的结构、方向和 frame/origin 契约，不证明真实
 接触力精度、触觉稳定性、passivity 或真机安全。
 
-## 5. 后续切片
+## 5. 物理接触闭环与同状态 trace（2026-09-15）
 
-1. 在固定 B601 初态加入可复现的 virtual wall/box 接触场景，并记录接触、wrench、q/dq 与
-   physics timestamp 的同一 tick trace。
+已有 `sim.mujoco.rebot_b601_rs.haptic_demo` 新增 opt-in `contact-box`，复用唯一的
+`B601MujocoEffortDriver` 和原有 spring、gravity、damping、限幅/限速及状态门禁，不新增控制器或
+生产入口。启动前将 2 cm、50 g 的自由 box 放到固定 B601 `gripper_end` 碰撞 mesh 的世界系最高
+顶点上，初始几何重叠为 0.5 mm；这是可重复的仿真验收输入，不是真机 payload 或摩擦标定。
+spring anchor 使用仿真初态的当前 FK，不另外规划一段机械臂运动。默认无碰撞数学 fixture 保持不变。
+
+MuJoCo 约束求解器已经把接触反力施加到 plant。本切片**不将测得的 `J.T @ contact_wrench` 再加回
+同一机械臂**，否则会重复施力。该投影只用于方向和 `F.T @ V == tau.T @ dq` 的诊断，真正送入
+driver 的 overlay 仍然只有已有 spring。下游 master/follower force reflection 尚未实现。
+
+`--trace-jsonl PATH` 创建新的 JSONL（已有文件拒绝覆盖），按参考 tick 流式记录：
+
+- 当前积分状态的 native physics time、driver tick time、q/dq、末端 FK pose、contact count；
+- frame/origin 明确的物理 wrench、作用点及只读 `J.T @ wrench` 投影和两种 power；
+- 求解该观察时尚未更新的 actuator ctrl、下一参考的 spring overlay、发送 admission 和实际
+  actuator torque、该物理步的 interval end time。
+
+采样阶段明确为 `current_state_before_reference_admission`：wrench 对应当前 q/dq 及上一安装的
+ctrl，不冒充新参考执行后的接触力；新参考和后续物理步单独记录。native time 累加 dt，driver
+time 来自整数 tick，比较只允许浮点 roundoff。主 JSON 只保留首尾 sample 和有界大小的统计，不把
+完整 trace 装进内存。功率恒等式只验证投影数学，不宣称 passivity、实测功率分解或触觉稳定性。
+
+从交接候选的 AgenticRobot worktree 根目录运行（纯仿真，不访问 CAN；不添加 `&`）：
+
+```bash
+(
+  RUN_DIR="$(mktemp -d /tmp/b601-contact-box-XXXXXX)" || exit 1
+  /home/zc/anaconda3/envs/dexteleop310/bin/python3.10 \
+    -m sim.mujoco.rebot_b601_rs.haptic_demo \
+    --rebot-source-root hardware/reBotArm_control_py \
+    --fixture contact-box --duration-sec 1.5 \
+    --trace-jsonl "$RUN_DIR/contact.jsonl" > "$RUN_DIR/result.json"
+  printf 'sim exit=%s; results=%s\n' "$?" "$RUN_DIR"
+)
+```
+
+需 GUI 时在同一入口追加 `--viewer`。预期看到机械臂保持在预置仿真姿态附近、轻载 box 与真实
+collision mesh 接触并自由运动；未人工验证 GUI。关闭 viewer 或 Ctrl-C 只影响仿真进程，不改变
+任何真机状态。要求无 fault、无 torque/overlay 限幅、至少出现非零物理接触 wrench、projection
+power error < `1e-9 W`；同状态 trace 不应跳帧或混用步前/步后 q。
+
+最小 1.5 s 实验：1500 physics ticks、750 reference ticks，接触力峰值约 `0.74 N`，
+速度峰值约 `0.047 rad/s`，加速度峰值约 `10.35 rad/s^2`，无 driver fault 或 torque/overlay
+限幅。这只是当前 seed 的观测结果，不是新的安全默认限制。新增 trace/单 torque-owner 测试、
+无接触负对照、确定性重放与旧证据保护；新旧 contact/haptic 两文件聚焦验证为 `34 passed`。
+七文件 B601 MuJoCo/MIT/Real2Sim/haptics/composition 回归为 `202 passed`（仅已有 `hppfcl`
+deprecation warning），现有 CLI `--help`、Ruff 与 diff check 通过。正式候选状态和 Run ID 由
+本次最终 Harness 交接给出，不能沿用前一候选的 Profile；排除 optional 的 fast/motion/sim-feedback
+Profile 不单独证明新增 physical-contact 测试，以上聚焦结果与固定 gitlink 的实际模型仿真证据需要
+独立保留。
+
+## 6. 后续切片
+
+1. 当前 box 接触 trace 已完成；后续扩展更明确的接触方向/工作空间对照及固定障碍物场景时，
+   继续复用通用 scene compiler，不能为了测试重复施加 native 接触反力。
 2. 复用现有 haptics limit/filter 与 frame transform，将原始 contact wrench 变成独立的
    `HapticWrenchSample`；保持 motion channel 与 haptic channel 分离。
 3. 建立 `F_slave -> F_master -> J_master.T @ F_master` 的纯仿真链，验证方向、功率不变量、

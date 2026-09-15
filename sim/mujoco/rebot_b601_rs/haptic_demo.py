@@ -1,4 +1,4 @@
-"""Headless-first B601 virtual-spring and virtual-wall acceptance demo."""
+"""Headless-first B601 virtual-fixture and physical-contact acceptance demo."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import math
 import time
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 
@@ -23,9 +24,10 @@ from robot_motion.rebot_b601_rs import (
     B601VirtualWall,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
-from sim.contracts import TimingSpec
+from sim.contracts import FreeBodyObjectSpec, TimingSpec
 from sim.mujoco.viewer import MujocoPassiveViewerSession
 
+from .contact import b601_contact_scene_spec, read_b601_contact_observation
 from .mit_driver import B601MujocoEffortDriver, default_b601_mit_profile
 from .real2sim import B601Real2SimControllerProfile, B601SimStartupProfile
 from .scene import B601_RS_PHYSICS_HZ, build_b601_mujoco_scene
@@ -38,6 +40,7 @@ DEFAULT_SPRING_DAMPING_N_S_PER_M = (8.0, 8.0, 8.0)
 DEFAULT_MAX_FORCE_N = 8.0
 DEFAULT_MAX_OVERLAY_TORQUE_NM = 6.0
 DEFAULT_WALL_PENETRATION_M = 0.025
+CONTACT_FIXTURE = "contact-box"
 POSE_FIXTURES = (
     "pose-tx",
     "pose-ty",
@@ -52,7 +55,7 @@ POSE_FIXTURES = (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run a deterministic B601 virtual spring or wall through the "
+            "Run a deterministic B601 virtual fixture or physical contact box through the "
             "ideal-effort MuJoCo backend. Headless is the default."
         )
     )
@@ -64,8 +67,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fixture",
-        choices=("spring", "wall", *POSE_FIXTURES),
+        choices=("spring", "wall", CONTACT_FIXTURE, *POSE_FIXTURES),
         default="spring",
+    )
+    parser.add_argument(
+        "--trace-jsonl", type=Path,
+        help="Contact-box only: create an exclusive same-state command-tick trace file.",
     )
     parser.add_argument(
         "--duration-sec",
@@ -152,7 +159,7 @@ def _fixture_metrics(
         result = fixture.evaluate(pose[:3, 3], spatial_velocity[:3])
         translation_metric = (
             float(np.linalg.norm(result.displacement_m))
-            if fixture_name == "spring"
+            if fixture_name in {"spring", CONTACT_FIXTURE}
             else float(result.penetration_m)
         )
         rotation_metric = 0.0
@@ -199,15 +206,18 @@ def run_haptic_fixture_demo(
     fixture_damping_scale: float = 1.0,
     torque_rise_time_sec: float | None = None,
     controller_profile: B601Real2SimControllerProfile | None = None,
+    trace_jsonl: str | Path | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
-    if fixture_name not in {"spring", "wall", *POSE_FIXTURES}:
+    if fixture_name not in {"spring", "wall", CONTACT_FIXTURE, *POSE_FIXTURES}:
         raise ValueError(
             "fixture_name must name a supported spring, wall, or pose fixture"
         )
     if not isinstance(viewer, bool):
         raise TypeError("viewer must be a bool")
+    if trace_jsonl is not None and fixture_name != CONTACT_FIXTURE:
+        raise ValueError("trace_jsonl requires contact-box")
     if startup_profile is not None and not real2sim_controller:
         raise ValueError("startup_profile requires real2sim_controller")
     if controller_profile is not None:
@@ -273,7 +283,9 @@ def run_haptic_fixture_demo(
             "ik_orientation_error_rad": ik_result.orientation_error_rad,
         }
     initial_position = model.forward_kinematics(initial_qpos)[:3, 3]
-    if fixture_name == "spring":
+    if fixture_name in {"spring", CONTACT_FIXTURE}:
+        if fixture_name == CONTACT_FIXTURE:
+            anchor_position = initial_position.copy()
         fixture = B601TranslationalVirtualSpring(
             anchor_position_m=tuple(float(value) for value in anchor_position),
             stiffness_n_per_m=stiffness,
@@ -339,7 +351,43 @@ def run_haptic_fixture_demo(
         initial_arm_qpos=initial_qpos,
         gravity_mps2=(0.0, 0.0, -9.81),
         actuation_mode="effort",
+        scene_spec=b601_contact_scene_spec() if fixture_name == CONTACT_FIXTURE else None,
+        enable_contact_observation=fixture_name == CONTACT_FIXTURE,
     )
+    if fixture_name == CONTACT_FIXTURE:
+        # Place a small free box on the actual pinned collision mesh, not on a
+        # replacement probe.  This kinematic placement happens before control.
+        geom_id = scene.mujoco.mj_name2id(
+            scene.model, scene.mujoco.mjtObj.mjOBJ_GEOM, "gripper_end_collision_0"
+        )
+        if geom_id < 0:
+            raise ValueError("contact-box requires the pinned gripper collision mesh")
+        mesh_id = int(scene.model.geom_dataid[geom_id])
+        if mesh_id < 0:
+            raise ValueError("contact-box requires a mesh collision geometry")
+        address = int(scene.model.mesh_vertadr[mesh_id])
+        count = int(scene.model.mesh_vertnum[mesh_id])
+        vertices = (
+            scene.model.mesh_vert[address : address + count]
+            @ scene.data.geom_xmat[geom_id].reshape(3, 3).T
+            + scene.data.geom_xpos[geom_id]
+        )
+        top = vertices[np.argmax(vertices[:, 2])]
+        box = FreeBodyObjectSpec(
+            name="b601_contact_box", size_m=(0.02,) * 3, mass_kg=0.05,
+            initial_position_m=tuple(float(v) for v in top + (0.0, 0.0, 0.0095)),
+        )
+        scene = build_b601_mujoco_scene(
+            source_root, initial_arm_qpos=initial_qpos,
+            gravity_mps2=(0.0, 0.0, -9.81), actuation_mode="effort",
+            scene_spec=b601_contact_scene_spec(objects=(box,)),
+            enable_contact_observation=True,
+        )
+        fixture_contract.update(
+            physical_object=box.to_dict(),
+            placement="mesh_highest_world_vertex_plus_half_box_height_minus_0.0005m",
+            contact_feedback_control="native_constraint_only_not_added_to_overlay",
+        )
     base_profile = (
         default_b601_mit_profile(scene)
         if torque_rise_time_sec is None
@@ -389,8 +437,6 @@ def run_haptic_fixture_demo(
     )
     requested_steps = math.ceil(duration * B601_RS_PHYSICS_HZ)
     viewer_session = MujocoPassiveViewerSession(scene) if viewer else None
-    if viewer_session is not None:
-        viewer_session.start()
 
     next_sequence = 0
     command_count = 0
@@ -414,6 +460,15 @@ def run_haptic_fixture_demo(
     minimum_rotation_metric = initial_rotation_metric
     final_tick = None
     viewer_closed_early = False
+    contact_diagnostics = {
+        "sample_count": 0, "nonzero_wrench_samples": 0,
+        "peak_force_norm_n": 0.0, "max_power_identity_error_w": 0.0,
+        "first_sample": None, "last_sample": None,
+        "sampling_phase": "current_state_before_reference_admission",
+        "projection_role": "diagnostic_only_never_dispatched",
+        "trace_jsonl": None if trace_jsonl is None else str(trace_jsonl),
+        "force_calibrated": False, "passivity_claim": False,
+    }
     phase_transitions = [
         {
             "phase": driver.execution_metadata["sim_control_phase"],
@@ -421,9 +476,16 @@ def run_haptic_fixture_demo(
             "reason": None,
         }
     ]
-    try:
+    with ExitStack() as cleanup:
+        if viewer_session is not None:
+            cleanup.callback(viewer_session.close)
+            viewer_session.start()
+        trace_stream = (
+            None if trace_jsonl is None else cleanup.enter_context(Path(trace_jsonl).open("x"))
+        )
         for step in range(requested_steps):
             reference = None
+            contact_record = None
             if driver.command_due:
                 qpos = scene.get_arm_qpos("b601_rs")
                 qvel = _arm_qvel(scene)
@@ -441,6 +503,44 @@ def run_haptic_fixture_demo(
                     qvel_rad_s=qvel,
                 )
                 timestamp = driver.physics_time_sec
+                if fixture_name == CONTACT_FIXTURE:
+                    observation = read_b601_contact_observation(scene)
+                    # Native time accumulates dt; the driver clock multiplies
+                    # an integer tick.  Allow only floating-point roundoff.
+                    if not math.isclose(
+                        observation.physics_time_sec, timestamp, rel_tol=0.0, abs_tol=1e-12,
+                    ):
+                        raise RuntimeError("contact observation and driver time differ")
+                    projection = map_world_aligned_ee_wrench_to_joint_torque(
+                        model, qpos, observation.wrench, qvel_rad_s=qvel,
+                    )
+                    force_norm = float(np.linalg.norm(observation.wrench.force_n))
+                    contact_diagnostics["sample_count"] += 1
+                    contact_diagnostics["nonzero_wrench_samples"] += int(force_norm > 1e-6)
+                    contact_diagnostics["peak_force_norm_n"] = max(
+                        contact_diagnostics["peak_force_norm_n"], force_norm,
+                    )
+                    contact_diagnostics["max_power_identity_error_w"] = max(
+                        contact_diagnostics["max_power_identity_error_w"],
+                        abs(projection.cartesian_power_w - projection.joint_power_w),
+                    )
+                    contact_record = {
+                        "sequence": next_sequence,
+                        "physics_time_sec": observation.physics_time_sec,
+                        "driver_time_sec": timestamp,
+                        "qpos_rad": qpos.tolist(), "qvel_rad_s": qvel.tolist(),
+                        "end_effector_pose_world": model.forward_kinematics(qpos).tolist(),
+                        "matched_contact_count": observation.matched_contact_count,
+                        "wrench_frame": observation.wrench.frame_id,
+                        "force_n": list(observation.wrench.force_n),
+                        "torque_nm": list(observation.wrench.torque_nm),
+                        "application_point_world_m": observation.application_point_world_m,
+                        "projected_contact_torque_diagnostic_nm": projection.joint_torque_nm,
+                        "contact_cartesian_power_w": projection.cartesian_power_w,
+                        "contact_joint_power_w": projection.joint_power_w,
+                        "spring_overlay_requested_nm": mapping.joint_torque_nm,
+                        "contact_solver_ctrl": scene.data.ctrl.copy().tolist(),
+                    }
                 if fixture_name in POSE_FIXTURES:
                     # Diagnostic only: unclipped -J.T D J dq, sampled and held
                     # at the host rate. It is not a decomposition of the final
@@ -496,6 +596,18 @@ def run_haptic_fixture_demo(
                     fixture_limited_ticks += 1
 
             final_tick = driver.step_physics(reference)
+            if contact_record is not None:
+                contact_record.update(
+                    command_applied=final_tick.command_applied,
+                    plant_advanced=final_tick.plant_advanced,
+                    applied_actuator_torque_nm=final_tick.applied_torque_nm,
+                    interval_end_time_sec=driver.physics_time_sec,
+                )
+                if contact_diagnostics["first_sample"] is None:
+                    contact_diagnostics["first_sample"] = contact_record
+                contact_diagnostics["last_sample"] = contact_record
+                if trace_stream is not None:
+                    trace_stream.write(json.dumps(contact_record, allow_nan=False) + "\n")
             if (
                 not phase_transitions
                 or phase_transitions[-1]["phase"] != final_tick.control_phase
@@ -551,10 +663,6 @@ def run_haptic_fixture_demo(
                     viewer_closed_early = True
                     break
                 time.sleep(1.0 / B601_RS_PHYSICS_HZ)
-    finally:
-        if viewer_session is not None:
-            viewer_session.close()
-
     if final_tick is None:
         raise RuntimeError("haptic fixture demo did not execute a physics tick")
     final_qpos = np.asarray(final_tick.measured_qpos, dtype=float)
@@ -580,7 +688,18 @@ def run_haptic_fixture_demo(
         and torque_limited_ticks == 0
         and peak_applied_torque_nm <= max(profile.max_abs_torque_nm) + 1e-12
     )
-    if fixture_name == "spring":
+    if fixture_name == CONTACT_FIXTURE:
+        effect_pass = bool(
+            contact_diagnostics["nonzero_wrench_samples"] > 0
+            and contact_diagnostics["max_power_identity_error_w"] < 1e-9
+            and contact_diagnostics["sample_count"] == command_count
+        )
+        effect_contract = {
+            "metric": "physical_contact_wrench_and_diagnostic_power_identity",
+            "power_identity_tolerance_w": 1e-9,
+            "contact_force_reapplied": False,
+        }
+    elif fixture_name == "spring":
         effect_pass = bool(
             initial_metric > 0.02
             and final_metric <= 0.45 * initial_metric
@@ -715,6 +834,14 @@ def run_haptic_fixture_demo(
             "physical safety"
         ),
     }
+    if fixture_name == CONTACT_FIXTURE:
+        payload["contact_diagnostics"] = contact_diagnostics
+        payload["fidelity"] = (
+            "Offline native mesh/box contact on an unidentified ideal-effort plant; "
+            "contact reaction is applied only by MuJoCo, its J-transpose projection "
+            "is diagnostic and never dispatched. Does not validate a motor, CAN, "
+            "absolute force, haptic feel, passivity or physical safety."
+        )
     return (0 if accepted else 3), payload
 
 
@@ -767,6 +894,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fixture_damping_scale=args.fixture_damping_scale,
         torque_rise_time_sec=args.torque_rise_time_sec,
         controller_profile=controller,
+        trace_jsonl=args.trace_jsonl,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return code
