@@ -1,4 +1,4 @@
-"""Pure construction of relative-delta component action schemas.
+"""Pure relative-delta component schemas and stateless pose application.
 
 The helper is source- and baseline-neutral.  It derives a pose/joint-position
 delta layout from an exact absolute target schema while preserving topology,
@@ -8,11 +8,14 @@ dependencies for the selected components.
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+
+import numpy as np
+from scipy.spatial.transform import Rotation
 
 from dataset_contracts.action_schema import ActionPayloadSchema
 
-from .component_action import ComponentActionSchema
+from .component_action import ComponentAction, ComponentActionSchema
 from .components import ActionComponentCatalogV2, ControlComponentSpecV2
 
 
@@ -36,9 +39,7 @@ def build_relative_delta_action_schema(
     """Derive a relative pose/qpos schema from selected absolute components."""
 
     if not isinstance(absolute_action_schema, ComponentActionSchema):
-        raise TypeError(
-            "absolute_action_schema must be ComponentActionSchema."
-        )
+        raise TypeError("absolute_action_schema must be ComponentActionSchema.")
     selected = (
         tuple(absolute_action_schema.component_ids)
         if component_ids is None
@@ -58,9 +59,7 @@ def build_relative_delta_action_schema(
         )
     payloads: dict[str, ActionPayloadSchema] = {}
     for component_id in selected:
-        absolute = absolute_action_schema.payload_schema_by_component[
-            component_id
-        ]
+        absolute = absolute_action_schema.payload_schema_by_component[component_id]
         if (
             absolute.value_semantics != "absolute_target"
             or absolute.representation_family
@@ -102,9 +101,7 @@ def build_relative_delta_action_schema(
     for component_id in selected:
         source = source_catalog.component_by_id[component_id]
         dependencies = tuple(
-            dependency
-            for dependency in source.dependencies
-            if dependency in selected
+            dependency for dependency in source.dependencies if dependency in selected
         )
         if len(dependencies) != len(source.dependencies):
             missing = sorted(set(source.dependencies) - set(selected))
@@ -152,4 +149,40 @@ def build_relative_delta_action_schema(
     )
 
 
-__all__ = ["build_relative_delta_action_schema"]
+def apply_relative_pose_component_value(
+    baseline: ComponentAction,
+    delta: ComponentAction,
+    *,
+    component_id: str,
+) -> np.ndarray:
+    """Apply reference-additive translation and baseline-local rotation once.
+
+    Pure numerical semantics only: no source admission, authority or dispatch.
+    Both single-source teleoperation and explicit composition use this path.
+    """
+    baseline_schema = baseline.action_schema.payload_schema_by_component[component_id]
+    delta_schema = delta.action_schema.payload_schema_by_component[component_id]
+    if (
+        baseline_schema.representation_family != "cartesian_pose"
+        or delta_schema.representation_family != "cartesian_pose"
+        or baseline_schema.value_semantics != "absolute_target"
+        or delta_schema.value_semantics != "relative_delta"
+    ):
+        raise ValueError("relative_pose_semantics_mismatch")
+    if (
+        baseline_schema.reference_frame != delta_schema.reference_frame
+        or baseline_schema.controlled_frame != delta_schema.controlled_frame
+    ):
+        raise ValueError("relative_pose_frame_mismatch")
+    baseline_value = np.asarray(baseline.value(component_id).values, dtype=np.float64)
+    delta_value = np.asarray(delta.value(component_id).values, dtype=np.float64)
+    translation = baseline_value[:3] + delta_value[:3]
+    quaternion = (
+        Rotation.from_quat(baseline_value[3:7]) * Rotation.from_quat(delta_value[3:7])
+    ).as_quat()
+    if float(np.dot(quaternion, baseline_value[3:7])) < 0.0:
+        quaternion = -quaternion
+    return np.concatenate((translation, quaternion)).astype(baseline_schema.dtype)
+
+
+__all__ = ["apply_relative_pose_component_value", "build_relative_delta_action_schema"]

@@ -13,7 +13,7 @@ from control_station.sources.rebot_b601_pose import (
     B601ReadOnlyPoseSource,
     B601ReadOnlyPoseSourceSpec,
 )
-from control_station.sources.rebot_b601_rm65_motion import B601RM65MujocoMotionBinding
+from control_station.sources.rebot_b601_rm65_motion import B601RM65MotionBinding
 from hardware.rebot_b601_rs import (
     B601_RS_FEEDBACK_FRAME,
     B601HardwareState,
@@ -260,7 +260,7 @@ def setup_motion():
     clock, scene = _Clock(), _Scene()
     runtime = _build_runtime(scene, clock, RM65CanonicalIK(scene, _Planner()))
     source, backend = _source(runtime, clock)
-    binding = B601RM65MujocoMotionBinding(
+    binding = B601RM65MotionBinding(
         runtime,
         source,
         maximum_source_age_sec=0.15,
@@ -331,6 +331,7 @@ def test_admits_human_not_policy_and_only_target_dispatches(setup_motion):
         "expiry",
         "wrong_anchor",
         "wrong_schema",
+        "wrong_emission",
     ],
 )
 def test_rejection_cancels_old_reference_and_cannot_auto_resume(setup_motion, failure):
@@ -357,6 +358,13 @@ def test_rejection_cancels_old_reference_and_cannot_auto_resume(setup_motion, fa
     if failure == "wrong_anchor":
         replacement = replace(anchor.master_anchor, anchor_generation=1)
         setup_motion = (*setup_motion[:6], replace(anchor, master_anchor=replacement))
+    if failure == "wrong_emission":
+        rejected = replace(
+            rejected,
+            projection=replace(
+                rejected.projection, source_emission_hash="unbound-emission"
+            ),
+        )
     if failure == "wrong_schema":
         rejected = replace(
             rejected,
@@ -399,7 +407,7 @@ def test_stationary_source_has_zero_delta_without_accumulation(setup_motion):
 
 def test_disabled_binding_does_not_change_execution_gate(setup_motion):
     _, _, runtime, source, _, _, anchor = setup_motion
-    binding = B601RM65MujocoMotionBinding(
+    binding = B601RM65MotionBinding(
         runtime,
         source,
         maximum_source_age_sec=0.15,
@@ -531,7 +539,7 @@ def test_actual_mujoco_rm65_canonical_ik_and_measured_motion():
     clock = _Clock()
     runtime = _build_runtime(scene, clock, ik)
     source, backend = _source(runtime, clock)
-    binding = B601RM65MujocoMotionBinding(
+    binding = B601RM65MotionBinding(
         runtime,
         source,
         maximum_source_age_sec=0.15,

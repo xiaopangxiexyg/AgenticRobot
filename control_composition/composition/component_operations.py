@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.spatial.transform import Rotation
+
+from robot_motion.action.relative import apply_relative_pose_component_value
 
 from .core import CompositionInputRecord
 from .formal_strategy import FormalCompositionStrategyInput
@@ -43,37 +44,9 @@ def relative_pose_component_value(
     *,
     component_id: str,
 ) -> np.ndarray:
-    baseline_schema = baseline.action.action_schema.payload_schema_by_component[
-        component_id
-    ]
-    delta_schema = delta.action.action_schema.payload_schema_by_component[component_id]
-    if (
-        baseline_schema.representation_family != "cartesian_pose"
-        or delta_schema.representation_family != "cartesian_pose"
-        or baseline_schema.value_semantics != "absolute_target"
-        or delta_schema.value_semantics != "relative_delta"
-    ):
-        raise ValueError("relative_pose_semantics_mismatch")
-    if (
-        baseline_schema.reference_frame != delta_schema.reference_frame
-        or baseline_schema.controlled_frame != delta_schema.controlled_frame
-    ):
-        raise ValueError("relative_pose_frame_mismatch")
-    baseline_value = np.asarray(
-        baseline.action.value(component_id).values,
-        dtype=np.float64,
+    return apply_relative_pose_component_value(
+        baseline.action, delta.action, component_id=component_id
     )
-    delta_value = np.asarray(
-        delta.action.value(component_id).values,
-        dtype=np.float64,
-    )
-    translation = baseline_value[:3] + delta_value[:3]
-    quaternion = (
-        Rotation.from_quat(baseline_value[3:7]) * Rotation.from_quat(delta_value[3:7])
-    ).as_quat()
-    if float(np.dot(quaternion, baseline_value[3:7])) < 0.0:
-        quaternion = -quaternion
-    return np.concatenate((translation, quaternion)).astype(baseline_schema.dtype)
 
 
 def relative_qpos_component_value(

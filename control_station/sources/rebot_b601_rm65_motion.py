@@ -8,10 +8,9 @@ shadow evaluation is promoted, and no hardware command is issued here.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-
-import numpy as np
-from scipy.spatial.transform import Rotation
+from typing import Any, Protocol, runtime_checkable
 
 from control_station.composition.rebot_b601_rm65_residual import (
     B601RM65ResidualSource,
@@ -21,12 +20,20 @@ from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
     ArmActionSpec,
     ComponentAction,
+    ComponentActionSchema,
     ExecutionMeasurementObservation,
 )
-from robot_motion.action.proposal import ProposalAdmissionReceipt
+from robot_motion.action.components import ActionComponentCatalog
+from robot_motion.action.proposal import ActionProposalDraft, ProposalAdmissionReceipt
+from robot_motion.action.relative import apply_relative_pose_component_value
+from robot_motion.pose import pose_delta_metrics
 from robot_motion.runtime import EffectorCommand, TeleopCommand
-from robot_motion.transforms import parse_pose_matrix, validate_pose_matrix
-from sim.mujoco.deploy import MujocoDeployRuntime
+from robot_motion.runtime.execution_gate import ExecutionGateSnapshot
+from robot_motion.transforms import (
+    identity_pose,
+    parse_pose_matrix,
+    validate_pose_matrix,
+)
 from teleop_runtime.action.adapters import TeleopCommandActionAdapterConfig
 from teleop_runtime.action.human_proposal import (
     HumanCommandEmission,
@@ -34,6 +41,45 @@ from teleop_runtime.action.human_proposal import (
     HumanProposalAdapterConfig,
 )
 from teleop_runtime.action.human_residual import HumanResidualPoseAnchor
+
+
+class _MotionTargetConfig(Protocol):
+    runtime_session_id: str
+    control_domain_id: str
+    embodiment_instance_id: str
+    producer_id: str
+    producer_epoch: int
+    clock_domain_id: str
+    initial_control_mode: str
+    enable_replay_authority: bool
+    enable_composer_authority: bool
+    enable_primary_policy_authority: bool
+    enable_component_execution_handoff: bool
+    direct_component_proposal_source: object | None
+
+
+class _MotionTargetPort(Protocol):
+    def capture_execution_gate_snapshot(
+        self, *, now: float | None = None
+    ) -> ExecutionGateSnapshot: ...
+
+    def admit_proposal(
+        self, proposal: ActionProposalDraft, *, source_event_id: str
+    ) -> ProposalAdmissionReceipt: ...
+
+
+@runtime_checkable
+class B601RM65MotionTarget(Protocol):
+    """Existing target authority surface; no concrete backend construction."""
+
+    config: _MotionTargetConfig
+    authoritative_port: _MotionTargetPort
+    catalog: ActionComponentCatalog
+    action_schema: ComponentActionSchema
+    composition_port: object | None
+    clock: Callable[[], float]
+
+    def transition_execution_gate(self, status: str, *, reason: str) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -64,11 +110,11 @@ class B601RM65MotionAnchor:
                 != value.payload_schema.semantic_content_hash
                 or self.target_measurement.representation_by_component.get(component_id)
                 != "cartesian_pose"
-                or not np.array_equal(
-                    value.values,
+                or value.values.tolist()
+                != (
                     value.payload_schema.validate_values(
                         self.target_measurement.value_by_component[component_id]
-                    ),
+                    ).tolist()
                 )
             ):
                 raise ValueError(
@@ -76,12 +122,12 @@ class B601RM65MotionAnchor:
                 )
 
 
-class B601RM65MujocoMotionBinding:
+class B601RM65MotionBinding:
     """Default-off, bounded publication to a configured single-human target."""
 
     def __init__(
         self,
-        runtime: MujocoDeployRuntime,
+        runtime: B601RM65MotionTarget,
         source: B601RM65ResidualSource,
         *,
         maximum_source_age_sec: float,
@@ -90,8 +136,10 @@ class B601RM65MujocoMotionBinding:
         maximum_rotation_rad: float,
         enabled: bool = False,
     ) -> None:
-        if not isinstance(runtime, MujocoDeployRuntime):
-            raise TypeError("runtime must be a MujocoDeployRuntime.")
+        if not isinstance(runtime, B601RM65MotionTarget):
+            raise TypeError(
+                "runtime must provide the typed B601 RM65 motion target port."
+            )
         if not isinstance(source, B601RM65ResidualSource):
             raise TypeError("source must be a B601RM65ResidualSource.")
         if not isinstance(enabled, bool):
@@ -269,8 +317,12 @@ class B601RM65MujocoMotionBinding:
             assert step.projection.pose_sample is not None
             sample = step.projection.pose_sample
             receipt = step.adaptation.receipt
+            source_emission = step.projection.source_step.emission
             if (
-                receipt.anchor_hash != anchor.master_anchor.semantic_content_hash
+                source_emission is None
+                or source_emission.semantic_content_hash
+                != step.projection.source_emission_hash
+                or receipt.anchor_hash != anchor.master_anchor.semantic_content_hash
                 or receipt.adapter_contract_hash
                 != self.source.residual_adapter.contract_hash
                 or receipt.adapted_clock_domain_id
@@ -315,12 +367,10 @@ class B601RM65MujocoMotionBinding:
             delta = self._pose(
                 step.relative_action.values_by_component[self.component_id].values
             )
+            translation_m, rotation_deg = pose_delta_metrics(identity_pose(), delta)
             if (
-                np.linalg.norm(delta[:3, 3]) > self.limits[2]
-                or np.linalg.norm(
-                    Rotation.from_matrix(delta[:3, :3].copy()).as_rotvec()
-                )
-                > self.limits[3]
+                translation_m > self.limits[2]
+                or math.radians(rotation_deg) > self.limits[3]
             ):
                 raise ValueError(
                     "Residual exceeds the configured translation/rotation range."
@@ -329,8 +379,13 @@ class B601RM65MujocoMotionBinding:
             for component_id, value in anchor.target_action.values_by_component.items():
                 pose = self._pose(value.values)
                 if component_id == self.component_id:
-                    pose[:3, 3] += delta[:3, 3]
-                    pose[:3, :3] = pose[:3, :3] @ delta[:3, :3]
+                    pose = self._pose(
+                        apply_relative_pose_component_value(
+                            anchor.target_action,
+                            step.relative_action,
+                            component_id=component_id,
+                        )
+                    )
                 command.add_command(
                     EffectorCommand(
                         effector_name=component_id,
@@ -347,7 +402,7 @@ class B601RM65MujocoMotionBinding:
                 emitted_at=now,
                 contributions=(("b601_anchor_relative_motion", command),),
                 merged_command=command,
-                observation_sample_refs=step.projection.source_step.emission.observation_sample_refs,
+                observation_sample_refs=source_emission.observation_sample_refs,
             )
             adapted = self._adapter.adapt(
                 emission,
@@ -407,7 +462,7 @@ class B601RM65MujocoMotionBinding:
             )
 
     @staticmethod
-    def _pose(value: object) -> np.ndarray:
+    def _pose(value: object) -> Any:
         pose = parse_pose_matrix(value)
         valid, reason = validate_pose_matrix(pose, atol=1e-7)
         if not valid:

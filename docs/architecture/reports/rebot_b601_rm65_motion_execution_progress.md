@@ -17,6 +17,7 @@ MuJoCo 只做合理的大致表达，不以精细辨识拖延真机主线。
 
 本批新增 `control_station/sources/rebot_b601_rm65_motion.py` 和对应测试；未改变既有
 硬件后端、URDF、重力 profile、启动状态机、protective hold、shadow 或 policy 逻辑。
+既有 composition 的相对 pose 函数只改为复用同一 `robot_motion` 下层运算，数学行为不变。
 
 ## 2. 已实现的单源执行接缝
 
@@ -26,13 +27,14 @@ B601ReadOnlyPoseSource → B601RM65ResidualSource → bounded human pose proposa
 → canonical coupled IK/collision safety → qref/qcmd planner → dispatch → measurement
 ```
 
-- `B601RM65MujocoMotionBinding` 默认关闭，只接入显式 single-human target。
+- `B601RM65MotionBinding` 默认关闭，通过 backend-neutral typed target port 接入显式 single-human target。
 - 反馈、FK、frame mapping、anchor-relative residual 与 proposal 均复用现有实现。
 - 显式要求既有 component execution handoff；不借用 policy/agent-skill producer 身份。
 - binding 不启动设备，不拥有 runtime lifecycle，不跑独立 IK、插值、仿真或 dispatch。
 - 调用方拥有采样、activation/clutch/recenter；目标 runtime 是唯一 execution owner。
 - RM65 两臂 coupled schema 使用完整测量 anchor，非目标臂保持其测量参考。
-- 平移在 reference frame 中相加；旋转在 baseline-local 中右乘。
+- 平移在 reference frame 中相加；旋转在 baseline-local 中右乘。运算由 `robot_motion.action.relative`
+  唯一实现，既有 composition 只作转发，单源入口不为此加载 composition runtime。
 - anchor 绑定 gate epoch；目标 baseline 必须与测量值经原生 schema dtype 转换后精确一致。
 - 校验源时间、receive freshness、序号、source binding、schema、anchor lineage、范围和 TTL。
 - 错误输入使 RM65 sim 进入 hold 并撤销旧 proposal/segment；后续合法样本不能自动恢复。
@@ -43,8 +45,11 @@ B601ReadOnlyPoseSource → B601RM65ResidualSource → bounded human pose proposa
 
 ## 3. 已观察的离线证据
 
-- 新文件 focused：17 passed，包含错误参考拒绝、recenter、非交换旋转与测量更新。
+- 新文件 focused：18 passed，包含错误参考/emission 拒绝、recenter、非交换旋转与测量更新。
 - 源/residual/shadow/session/边界相关回归：73 passed。
+- 架构修复后，新执行接缝、source/target contracts、station/composition/runtime 边界：108 passed。
+  首轮正式 sim/station 曾因 source 直接导入 sim 与数值库而失败；已修复代码，未放宽边界断言。
+- 下层 relative action、既有 formal/component composition 与新接缝回归：93 passed。
 - Ruff check 与 `git diff --check` 通过。
 - local-resource audit 通过。标准 pytest wrapper 临时绑定 reviewed RM65 assets，退出后清理链接；
   没有复制、修改共享资产或添加依赖。
