@@ -66,7 +66,9 @@ def test_model_rtc_profile_keeps_qpos_init_and_requires_explicit_dispatch() -> N
     assert args.send_actions is True
     assert args.policy_qpos_init_dataset.name == "bimanual-cube-new-success"
     assert args.policy_qpos_init_collision_check is True
-    assert args.arm_control_mode == "impedance"
+    assert args.arm_control_mode == "position"
+    assert args.position_reference_hz == 60.0
+    assert args.arm_control_hz == 120.0
 
 
 def test_active_model_rtc_qpos_init_sends_bounded_smooth_steps_then_releases() -> None:
