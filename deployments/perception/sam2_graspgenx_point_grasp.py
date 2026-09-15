@@ -317,7 +317,7 @@ class Sam2GraspGenXPointGraspPlanner:
         client: GraspGenXInferenceBackend,
         planner: str = "graspmoe",
         num_grasps: int = 200,
-        server_top_k: int = 1_000,
+        server_top_k: int = -1,
         score_threshold: float = -1.0,
         max_gripper_width_m: float = 0.070,
         max_click_distance_m: float = 0.100,
@@ -335,8 +335,10 @@ class Sam2GraspGenXPointGraspPlanner:
             raise ValueError("planner must be 'graspmoe' or 'diffusion'.")
         if isinstance(num_grasps, bool) or not 1 <= int(num_grasps) <= 1_000:
             raise ValueError("num_grasps must be in [1, 1000].")
-        if isinstance(server_top_k, bool) or not 1 <= int(server_top_k) <= 1_000:
-            raise ValueError("server_top_k must be in [1, 1000].")
+        if isinstance(server_top_k, bool) or not (
+            int(server_top_k) == -1 or 1 <= int(server_top_k) <= 1_000
+        ):
+            raise ValueError("server_top_k must be -1 or in [1, 1000].")
         if not 0.0 < float(max_gripper_width_m) <= 0.070:
             raise ValueError("DMTAC M gripper width must be in (0, 0.070].")
         if not 0.0 < float(max_click_distance_m) <= 0.200:
@@ -394,11 +396,12 @@ class Sam2GraspGenXPointGraspPlanner:
                     ),
                 },
                 "candidate_selection": {
-                    "policy": "balanced_approach_and_family_variants_v2",
+                    "policy": "balanced_approach_family_and_scored_variants_v3",
                     "approach_axis_deg": (
                         GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG
                     ),
-                    "fallback": "score_ordered_family_variants",
+                    "fallback": "score_ordered_scored_pose_variants",
+                    "duplicate_pose_atol": 1e-6,
                 },
                 "gripper": {
                     "profile": "DMTAC_M",
@@ -823,23 +826,35 @@ class Sam2GraspGenXPointGraspPlanner:
         ] = []
         for item in ranked:
             pose = item[4]
-            if any(
-                self._same_candidate_family(pose, previous[4])
-                for previous in deduplicated
-            ):
+            if any(np.allclose(pose, previous[4], rtol=0, atol=1e-6)
+                   for previous in deduplicated):
                 continue
             deduplicated.append(item)
 
-        # Share the bounded display budget between approach directions and
-        # closing-axis/position alternatives. Endpoint IK remains annotation only.
+        # A family is a display-priority group, not an IK-equivalence class.
+        # Nearby scored depths can differ in support clearance and arm feasibility.
+        family_indices: list[int] = []
+        for index, item in enumerate(deduplicated):
+            if not any(self._same_candidate_family(item[4], deduplicated[previous][4])
+                       for previous in family_indices):
+                family_indices.append(index)
         representative_indices, selected_indices = (
             self._distinct_approach_first_indices(
-                tuple(item[4] for item in deduplicated),
+                tuple(deduplicated[index][4] for index in family_indices),
                 maximum=maximum,
             )
         )
+        selected_indices = [family_indices[index] for index in selected_indices]
+        selected_set = set(selected_indices)
+        for index in range(len(deduplicated)):
+            if len(selected_indices) == maximum:
+                break
+            if index not in selected_set:
+                selected_indices.append(index)
+                selected_set.add(index)
         selected = [deduplicated[index] for index in sorted(selected_indices)]
-        counts["candidate_family_count"] = len(deduplicated)
+        counts["candidate_family_count"] = len(family_indices)
+        counts["candidate_variant_count"] = len(deduplicated)
         counts["distinct_approach_count"] = len(representative_indices)
         counts["selected"] = len(selected)
         if filter_summary is not None:

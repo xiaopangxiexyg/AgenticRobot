@@ -296,7 +296,10 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
 
     def _runner(points, sampler, **kwargs):
         runner_calls.append((points.copy(), sampler, kwargs))
-        return np.stack((first, second)), np.asarray((0.2, 0.9)), [], None
+        return (
+            np.concatenate((np.repeat(first[None], 1001, axis=0), second[None])),
+            np.asarray([0.2] * 1001 + [0.9]), [], None,
+        )
 
     backend = GraspGenXInProcessBackend(model_spec=_model_spec(tmp_path))
     monkeypatch.setattr(
@@ -347,6 +350,16 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
     )
     assert scores.tolist() == pytest.approx([0.9])
     np.testing.assert_allclose(grasps[0], second)
+    all_grasps, all_scores = backend.infer_object(
+        points, sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+        top_k=-1,
+    )
+    assert _Sampler.calls == 1
+    assert len(runner_calls) == 2
+    assert len(all_grasps) == len(all_scores) == 1002
+    np.testing.assert_allclose(all_grasps[0], second)
+    assert all_scores[0] == pytest.approx(.9)
+    assert all_scores[-1] == pytest.approx(.2)
     backend.close()
 
 
@@ -438,6 +451,49 @@ def test_client_start_requires_health_and_infer_object_metadata() -> None:
         "health",
         "metadata",
     ]
+
+
+def test_client_can_retain_scored_union_larger_than_1000() -> None:
+    grasps = np.repeat(np.eye(4)[None], 1002, axis=0)
+    grasps[:, 0, 3] = np.arange(1002) * .001
+    scores = np.linspace(.3, .9, 1002)
+    socket = _FakeSocket([pack_graspgenx_message(
+        {"grasps": grasps, "confidences": scores},
+    )])
+    client = GraspGenXClient(context=_FakeContext(socket))
+
+    actual, confidence = client.infer_object(
+        np.zeros((16, 3), dtype=np.float32),
+        sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+        top_k=-1,
+    )
+
+    assert len(actual) == len(confidence) == 1002
+    np.testing.assert_allclose(actual, grasps[::-1])
+    np.testing.assert_allclose(confidence, scores[::-1])
+    # The reviewed service returns all candidates and rejects a wire top-k.
+    assert "topk_num_grasps" not in unpack_graspgenx_message(socket.sent[0])
+
+
+@pytest.mark.parametrize("top_k", [-2, 0, True, 1001])
+@pytest.mark.parametrize("inprocess", [False, True])
+def test_inference_rejects_invalid_top_k_before_model_or_transport(
+    tmp_path: Path, top_k, inprocess: bool,
+) -> None:
+    backend = (GraspGenXInProcessBackend(model_spec=_model_spec(tmp_path))
+               if inprocess else GraspGenXClient(context=_FakeContext(_FakeSocket([]))))
+    with pytest.raises(ValueError, match="top_k"):
+        backend.infer_object(
+            np.zeros((16, 3), dtype=np.float32),
+            sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+            top_k=top_k,
+        )
+
+
+def test_moe_samples_five_mm_insertion_intervals_before_scoring() -> None:
+    offsets = np.asarray(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
+    assert set((-8., -6., -4., -2., -1., 0.)) <= set(offsets)
+    np.testing.assert_allclose(np.diff(offsets[offsets >= -4.]), .5)
 
 
 def test_client_rejects_score_threshold_outside_confidence_range() -> None:
@@ -570,7 +626,7 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
         atol=1e-6,
     )
     assert client.calls[0][1]["planner"] == "graspmoe"
-    assert client.calls[0][1]["top_k"] == 1_000
+    assert client.calls[0][1]["top_k"] == -1
     candidate = result.candidates[0]
     camera_from_tcp = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
     camera_from_geometry = planner.solid_geometry.solid_pose(camera_from_tcp)
@@ -714,6 +770,48 @@ def test_candidate_selection_balances_approaches_and_closing_axis_variants() -> 
 
     assert representatives == [0, 5, 6, 7]
     assert selected == [0, 5, 1, 2]
+
+
+@pytest.mark.parametrize("maximum", [2, 4, 5])
+@pytest.mark.parametrize("cad_bound", [False, True])
+def test_planner_retains_scored_depth_variants_after_family_priority(
+    tmp_path: Path, maximum: int, cad_bound: bool,
+) -> None:
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.
+    poses = []
+    for yaw, z in ((0, .975), (0, .975), (0, .980),
+                   (math.pi, .975), (math.pi, .980)):
+        pose = np.eye(4)
+        pose[:3, :3] = ((math.cos(yaw), -math.sin(yaw), 0),
+                       (math.sin(yaw), math.cos(yaw), 0), (0, 0, 1))
+        pose[2, 3] = z
+        poses.append(pose)
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(depth > 0),
+        client=_PlannerClient(np.stack(poses), np.asarray((.9, .89, .8, .7, .6))),
+        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
+    )
+    planner.start()
+    result = planner.plan(
+        Image.new("RGB", (20, 20)), depth, pixel_uv=(10, 10),
+        intrinsics=dict(width=20, height=20, fx=200., fy=200., cx=10., cy=10.),
+        base_from_camera=np.eye(4), max_candidates=maximum,
+    )
+    expected_indices = [0, 3] if maximum == 2 else [0, 2, 3, 4]
+    assert len(result.candidates) == len(expected_indices)
+    for candidate, index in zip(result.candidates, expected_indices, strict=True):
+        expected = poses[index].copy()
+        expected[:3, 3] += .042999 * expected[:3, 2]
+        actual = planner.solid_geometry.solid_pose(
+            np.asarray(candidate.camera_from_tcp).reshape(4, 4),
+        )
+        np.testing.assert_allclose(actual, expected, atol=1e-9)
+        assert candidate.model_score == pytest.approx((.9, .89, .8, .7, .6)[index])
+        assert candidate.visible_collision_free
+    assert planner.last_filter_summary["candidate_family_count"] == 2
+    assert planner.last_filter_summary["candidate_variant_count"] == 4
+    planner.close()
 
 
 @pytest.mark.parametrize("yaw_degrees,same_family", [(0, True), (10, True), (30, False), (180, False)])
