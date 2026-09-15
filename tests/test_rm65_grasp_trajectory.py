@@ -1412,7 +1412,12 @@ def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_bin
 
 
 @pytest.mark.parametrize("has_capture_qpos", [False, True])
-def test_grasp_planner_filters_once_at_capture_pose_before_path_search(has_capture_qpos):
+@pytest.mark.parametrize("failure_reason", [
+    "path_collision_check_unavailable",
+    "endpoint_collision_check_unavailable",
+    "approach_endpoint_safety_envelope_unavailable",
+])
+def test_grasp_planner_filters_once_at_capture_pose_before_path_search(has_capture_qpos, failure_reason):
     from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry, VisibleGraspScene
 
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
@@ -1443,11 +1448,11 @@ def test_grasp_planner_filters_once_at_capture_pose_before_path_search(has_captu
         np.testing.assert_array_equal(filtered.points, view.points[[2]] if has_capture_qpos else view.points)
         np.testing.assert_array_equal(arguments["qpos_by_side"]["right"], current["right"])
         checked.append(filtered)
-        raise RM65GraspTrajectoryPlanningError("path_collision_check_unavailable")
+        raise RM65GraspTrajectoryPlanningError(failure_reason)
     planner._plan_chain_for_pregrasp = inspect_chain
     target = np.eye(4)
     target[0, 3] = .8
-    with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_collision_check_unavailable"):
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match=failure_reason):
         planner(qpos_by_side=current, side="right", target_tool_tcp_world=target,
                 speed_scale=.2, visible_scene=view, monotonic=lambda: 0)
     assert len(checked) == 1
@@ -1591,6 +1596,165 @@ def test_local_chain_is_prevalidated_and_reused_after_envelope_ingress():
     assert legs[1].endpoint is pre
     assert legs[2] is local
     assert route["ingress_path_hash"] == "ingress:test"
+
+
+@pytest.mark.parametrize("failure_stage", [
+    "ingress", "connection", "revalidation", "unavailable", "endpoint_unavailable",
+    "envelope_unavailable", "target_envelope_unavailable", "global", "global_boundary",
+])
+def test_ingress_route_slice_preserves_other_entries_exact_branch_and_global_deadline(failure_stage):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=current, seed_index=0, solve_cycles=1,
+        position_residual_m=0, orientation_residual_deg=0,
+    )
+    leg = grasp_trajectory_module._PlannedPathLeg(
+        endpoint=endpoint, path=SimpleNamespace(waypoints=(current, current), semantic_content_hash="path:test"),
+        dense_revalidation={}, search_attempts=(),
+    )
+    prepared = grasp_trajectory_module._PreparedGraspApproaches(((endpoint, leg),), ())
+    clock = [0.0]
+    prepare_calls = []
+    def prepare(**arguments):
+        prepare_calls.append(arguments["deadline"])
+        return prepared
+    planner._prepare_grasp_approaches = prepare
+    planner._envelope_ingress_targets = lambda **_: ((.05, np.eye(4)), (.1, np.eye(4)))
+    route_calls = []
+    unavailable_reasons = {
+        "unavailable": "path_collision_check_unavailable",
+        "endpoint_unavailable": "endpoint_collision_check_unavailable",
+        "envelope_unavailable": "path_target_safety_envelope_unavailable",
+        "target_envelope_unavailable": "target_safety_envelope_unavailable",
+    }
+    def fail_first(stage, arguments):
+        if len(route_calls) != 1:
+            return
+        selected = (
+            "ingress" if failure_stage in unavailable_reasons
+            or failure_stage in {"global", "global_boundary"} else failure_stage
+        )
+        if stage != selected:
+            return
+        clock[0] = 10.0 if failure_stage in {"global", "global_boundary"} else arguments["deadline"]
+        if failure_stage in unavailable_reasons:
+            clock[0] = 1.0
+        raise RM65GraspTrajectoryPlanningError(
+            unavailable_reasons.get(
+                failure_stage,
+                "path_search_exhausted" if failure_stage == "global_boundary"
+                else "path_planning_time_budget_exhausted",
+            ),
+            details={"planning_phase": stage, "first_failure_retained": True},
+        )
+    def ingress(**arguments):
+        route_calls.append(arguments["deadline"])
+        fail_first("ingress", arguments)
+        return leg
+    def connect(**arguments):
+        assert arguments["deadline"] == route_calls[-1]
+        assert arguments["prepared_approaches"] is prepared
+        fail_first("connection", arguments)
+        return leg, leg
+    def dense(*_, **arguments):
+        assert arguments["deadline"] == route_calls[-1]
+        fail_first("revalidation", arguments)
+        return {"minimum_distance_m": .05}
+    planner._plan_path_leg = ingress
+    planner._plan_pregrasp_and_approach = connect
+    planner._revalidate = dense
+    arguments = dict(qpos_by_side=current, side="right", pregrasp_tool_tcp_world=np.eye(4),
+                     grasp_tool_tcp_world=np.eye(4), deadline=10.0, monotonic=lambda: clock[0])
+    if failure_stage in unavailable_reasons or failure_stage in {"global", "global_boundary"}:
+        with pytest.raises(RM65GraspTrajectoryPlanningError) as error:
+            planner._plan_chain_for_pregrasp(**arguments)
+        assert route_calls == [5.0]
+        attempts = error.value.details["envelope_ingress_route_attempts"]
+        assert attempts[0]["details"]["first_failure_retained"]
+        if failure_stage == "global":
+            assert attempts[0]["budget_scope"] == "global"
+        if failure_stage == "global_boundary":
+            assert error.value.reason_code == "path_planning_time_budget_exhausted"
+            assert len(attempts) == 1
+            assert attempts[0]["reason_code"] == "path_search_exhausted"
+    else:
+        legs, route, attempts = planner._plan_chain_for_pregrasp(**arguments)
+        assert route_calls == [5.0, 10.0]
+        assert route["inward_fraction"] == .1
+        assert legs == (leg, leg, leg)
+        assert attempts[0]["budget_scope"] == "ingress_route"
+        assert attempts[0]["details"]["first_failure_retained"]
+        assert attempts[1]["status"] == "path_found"
+    assert prepare_calls == [10.0]
+
+
+def test_path_leg_visits_other_ik_branch_before_expanding_a_failed_branch(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(path_search_attempts_per_endpoint=2))
+    planner.planner_config = JointPathPlannerConfig()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test")
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    endpoints = tuple(grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side={"left": current["left"], "right": np.full(6, value)},
+        seed_index=index, solve_cycles=1, position_residual_m=0, orientation_residual_deg=0,
+    ) for index, value in enumerate((.1, .2)))
+    clock = [0.0]
+    calls = []
+    def plan(**arguments):
+        value = float(arguments["target_qpos_by_component"]["right"][0])
+        calls.append((value, arguments["config"].seed, arguments["config"].time_budget_sec))
+        found = value == .2
+        clock[0] += 1.0 if found else 8.0
+        return JointPathPlanResult(
+            status=JointPathStatus.PATH_FOUND if found else JointPathStatus.PATH_SEARCH_EXHAUSTED,
+            start_qpos_by_component=current, target_qpos_by_component=arguments["target_qpos_by_component"],
+            movable_components=("right",), scene_hash="scene:test",
+            reason="direct_path_clear" if found else "bounded_search_exhausted",
+            waypoints=(current, arguments["target_qpos_by_component"]) if found else (),
+        )
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", plan)
+    planner._revalidate = lambda *_args, **_kwargs: {"minimum_distance_m": .05}
+    leg = planner._plan_path_leg(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+        planning_phase="grasp_target", endpoint_candidates=endpoints, deadline=10.0, monotonic=lambda: clock[0])
+    assert calls == [(.1, 0, 10.0), (.2, 2, 2.0)]
+    assert leg.endpoint is endpoints[1]
+    assert [a["endpoint_seed_index"] for a in leg.search_attempts] == [0, 1]
+    assert all(a["path_attempt"] == 0 for a in leg.search_attempts)
+    assert leg.dense_revalidation["minimum_distance_m"] == .05
+
+
+@pytest.mark.parametrize("failure_reason", [
+    "path_collision_check_unavailable", "path_target_safety_envelope_unavailable",
+])
+def test_path_leg_dense_query_fault_stops_before_other_branch(monkeypatch, failure_reason):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test")
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    endpoints = tuple(grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side={"left": current["left"], "right": np.full(6, value)},
+        seed_index=index, solve_cycles=1, position_residual_m=0, orientation_residual_deg=0,
+    ) for index, value in enumerate((.1, .2)))
+    calls = []
+    def plan(**arguments):
+        calls.append(arguments["target_qpos_by_component"])
+        return JointPathPlanResult(
+            status=JointPathStatus.PATH_FOUND, start_qpos_by_component=current,
+            target_qpos_by_component=arguments["target_qpos_by_component"],
+            movable_components=("right",), scene_hash="scene:test", reason="direct_path_clear",
+            waypoints=(current, arguments["target_qpos_by_component"]),
+        )
+    def dense(*_args, **_kwargs):
+        raise RM65GraspTrajectoryPlanningError(failure_reason, details={"query_fault": True})
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", plan)
+    planner._revalidate = dense
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match=failure_reason) as error:
+        planner._plan_path_leg(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+            planning_phase="grasp_target", endpoint_candidates=endpoints,
+            deadline=10.0, monotonic=lambda: 0.0)
+    assert len(calls) == 1
+    assert calls[0] is endpoints[0].qpos_by_side
+    assert error.value.details["last_dense_revalidation_error"]["details"]["query_fault"]
 
 
 def test_pregrasp_backs_away_along_tool_approach_axis() -> None:
@@ -2113,7 +2277,7 @@ def test_endpoint_planner_solves_real_workspace_pose_outside_local_qp_basin() ->
     assert reachability.classification == "standard_reachable"
 
 
-def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
+def test_path_planner_visits_all_endpoints_each_round_before_widening_corridor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     planner = _planner_without_assets(
@@ -2126,6 +2290,8 @@ def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
         max_iterations=1,
         max_nodes=2,
         shortcut_attempts=0,
+        # Keep intermediate mock corridors distinct from the final full range.
+        sample_padding_rad=0.1,
     )
     planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
     planner.oracle = SimpleNamespace()
@@ -2161,7 +2327,17 @@ def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
     def fake_plan(**kwargs):
         calls.append(kwargs)
         target = kwargs["target_qpos_by_component"]
-        found = np.array_equal(target["right"], second_target["right"])
+        found = (
+            np.array_equal(target["right"], second_target["right"])
+            and np.array_equal(
+                kwargs["joint_lower_by_component"]["right"],
+                grasp_trajectory_module.RM65_ABSOLUTE_Q_MIN_RAD,
+            )
+            and np.array_equal(
+                kwargs["joint_upper_by_component"]["right"],
+                grasp_trajectory_module.RM65_ABSOLUTE_Q_MAX_RAD,
+            )
+        )
         return JointPathPlanResult(
             status=(
                 JointPathStatus.PATH_FOUND
@@ -2194,11 +2370,17 @@ def test_path_planner_widens_corridor_then_uses_alternate_endpoint(
         speed_scale=0.2,
     )
 
-    assert len(calls) == 5
+    assert len(calls) == 8
+    assert [call["config"].seed for call in calls] == [0, 4, 1, 5, 2, 6, 3, 7]
+    for index, call in enumerate(calls):
+        np.testing.assert_array_equal(
+            call["target_qpos_by_component"]["right"],
+            (first_target if index % 2 == 0 else second_target)["right"],
+        )
     first_widths = [
         np.asarray(call["joint_upper_by_component"]["right"])
         - np.asarray(call["joint_lower_by_component"]["right"])
-        for call in calls[:4]
+        for call in calls[::2]
     ]
     assert np.all(first_widths[1] > first_widths[0])
     assert np.all(first_widths[2] >= first_widths[1])

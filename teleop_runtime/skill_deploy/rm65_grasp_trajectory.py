@@ -2060,9 +2060,10 @@ class RM65GraspJointTrajectoryPlanner:
         )
         search_attempts: list[dict[str, object]] = []
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
-        for endpoint_index, endpoint in enumerate(endpoint_candidates):
-            target = endpoint.qpos_by_side
-            for path_attempt in range(self.config.path_search_attempts_per_endpoint):
+        # Visit every IK branch before widening one branch's search corridor.
+        for path_attempt in range(self.config.path_search_attempts_per_endpoint):
+            for endpoint_index, endpoint in enumerate(endpoint_candidates):
+                target = endpoint.qpos_by_side
                 full_joint_range = (
                     path_attempt == self.config.path_search_attempts_per_endpoint - 1
                 )
@@ -2178,6 +2179,7 @@ class RM65GraspJointTrajectoryPlanner:
                     if error.reason_code in {
                         "path_collision_check_unavailable",
                         "path_planning_time_budget_exhausted",
+                        "path_target_safety_envelope_unavailable",
                     }:
                         break
                     continue
@@ -2190,6 +2192,7 @@ class RM65GraspJointTrajectoryPlanner:
             if terminal_error is not None and terminal_error.reason_code in {
                 "path_collision_check_unavailable",
                 "path_planning_time_budget_exhausted",
+                "path_target_safety_envelope_unavailable",
             }:
                 break
 
@@ -2629,8 +2632,19 @@ class RM65GraspJointTrajectoryPlanner:
 
         ingress_route_attempts: list[dict[str, object]] = []
         route_error: RM65GraspTrajectoryPlanningError | None = None
-        for inward_fraction, ingress_target in ingress_targets:
-            route_attempt: dict[str, object] = {"inward_fraction": inward_fraction}
+        for route_index, (inward_fraction, ingress_target) in enumerate(ingress_targets):
+            remaining = self._remaining_path_planning_time_sec(
+                deadline=deadline, monotonic=monotonic, planning_phase="envelope_ingress",
+                details={"envelope_ingress_route_attempts": ingress_route_attempts},
+            )
+            # An unsuccessful entry must not consume every other route's time.
+            # The same slice includes connection and exact combined revalidation.
+            route_budget = remaining / (len(ingress_targets) - route_index)
+            route_deadline = min(deadline, float(monotonic()) + route_budget)
+            route_attempt: dict[str, object] = {
+                "inward_fraction": inward_fraction,
+                "route_time_budget_sec": route_budget,
+            }
             ingress_route_attempts.append(route_attempt)
             try:
                 ingress_leg = self._plan_path_leg(
@@ -2639,7 +2653,7 @@ class RM65GraspJointTrajectoryPlanner:
                     target_tool_tcp_world=ingress_target,
                     planning_phase="envelope_ingress",
                     visible_scene=visible_scene,
-                    deadline=deadline,
+                    deadline=route_deadline,
                     monotonic=monotonic,
                 )
                 pregrasp_leg, approach_leg = self._plan_pregrasp_and_approach(
@@ -2647,7 +2661,7 @@ class RM65GraspJointTrajectoryPlanner:
                     side=side,
                     pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
                     grasp_tool_tcp_world=grasp_tool_tcp_world,
-                    deadline=deadline,
+                    deadline=route_deadline,
                     monotonic=monotonic,
                     visible_scene=visible_scene,
                     prepared_approaches=prepared,
@@ -2660,7 +2674,7 @@ class RM65GraspJointTrajectoryPlanner:
                 self._revalidate(
                     combined_waypoints,
                     moving_side=side,
-                    deadline=deadline,
+                    deadline=route_deadline,
                     monotonic=monotonic,
                 )
             except RM65GraspTrajectoryPlanningError as error:
@@ -2670,14 +2684,22 @@ class RM65GraspJointTrajectoryPlanner:
                         "status": "rejected",
                         "reason_code": error.reason_code,
                         "planning_phase": error.details.get("planning_phase"),
+                        "details": dict(error.details),
                     }
                 )
                 if error.reason_code in {
                     "path_collision_check_unavailable",
-                    "path_planning_time_budget_exhausted",
+                    "endpoint_collision_check_unavailable",
                     "approach_endpoint_collision_check_unavailable",
+                    "path_target_safety_envelope_unavailable",
+                    "target_safety_envelope_unavailable",
                 }:
                     break
+                if error.reason_code == "path_planning_time_budget_exhausted":
+                    global_exhausted = float(monotonic()) >= deadline
+                    route_attempt["budget_scope"] = "global" if global_exhausted else "ingress_route"
+                    if global_exhausted:
+                        break
                 continue
             route_attempt["status"] = "path_found"
             return (
@@ -2832,7 +2854,9 @@ class RM65GraspJointTrajectoryPlanner:
                     if error.reason_code in {
                         "path_collision_check_unavailable",
                         "path_planning_time_budget_exhausted",
+                        "endpoint_collision_check_unavailable",
                         "approach_endpoint_collision_check_unavailable",
+                        "approach_endpoint_safety_envelope_unavailable",
                         "path_target_safety_envelope_unavailable",
                         "target_safety_envelope_unavailable",
                     }:
