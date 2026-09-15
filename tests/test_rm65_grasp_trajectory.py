@@ -1514,7 +1514,48 @@ def test_pregrasp_branch_selection_validates_local_stage_before_exact_global_con
     assert approach.endpoint is endpoints[1]
     assert pregrasp.search_attempts[0]["reason_code"] == "approach_branch_discontinuous"
     assert pregrasp.search_attempts[1]["status"] == "local_chain_valid"
-    assert pregrasp.search_attempts[2]["status"] == "path_found"
+    assert len(pregrasp.search_attempts) == 2
+
+
+def test_pregrasp_shared_connection_reuses_exact_selected_cached_local_chain():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    endpoints = tuple(grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side={"left": current["left"], "right": np.full(6, value)},
+        seed_index=index, solve_cycles=1, position_residual_m=0, orientation_residual_deg=0,
+    ) for index, value in enumerate((.1, .2)))
+    planner._endpoint_qpos_candidates = lambda **_: endpoints
+    calls = []
+    local_legs = []
+
+    def local(**arguments):
+        index = len(local_legs)
+        calls.append(("local", index))
+        leg = grasp_trajectory_module._PlannedPathLeg(
+            endpoint=endpoints[index], path=SimpleNamespace(waypoints=(arguments["qpos_by_side"],)),
+            dense_revalidation={}, search_attempts=(),
+        )
+        local_legs.append(leg)
+        return leg
+
+    def connect(**arguments):
+        assert arguments["endpoint_candidates"] == endpoints
+        calls.append(("global", len(arguments["endpoint_candidates"])))
+        return grasp_trajectory_module._PlannedPathLeg(
+            endpoint=endpoints[1], path=SimpleNamespace(waypoints=(current, endpoints[1].qpos_by_side)),
+            dense_revalidation={}, search_attempts=({"status": "path_found"},),
+        )
+
+    planner._plan_constrained_approach_leg = local
+    planner._plan_path_leg = connect
+    pregrasp, approach = planner._plan_pregrasp_and_approach(
+        qpos_by_side=current, side="right", pregrasp_tool_tcp_world=np.eye(4),
+        grasp_tool_tcp_world=np.eye(4), deadline=10.0, monotonic=lambda: 0.0,
+    )
+    assert calls == [("local", 0), ("local", 1), ("global", 2)]
+    assert pregrasp.endpoint is endpoints[1]
+    assert approach is local_legs[1]
+    assert pregrasp.search_attempts[-1]["status"] == "path_found"
 
 
 @pytest.mark.parametrize("failure_stage", ["pregrasp_ik", "approach"])
@@ -1689,7 +1730,7 @@ def test_ingress_route_slice_preserves_other_entries_exact_branch_and_global_dea
     assert prepare_calls == [10.0]
 
 
-def test_path_leg_visits_other_ik_branch_before_expanding_a_failed_branch(monkeypatch):
+def test_path_leg_submits_all_ik_branches_to_one_budgeted_search(monkeypatch):
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(path_search_attempts_per_endpoint=2))
     planner.planner_config = JointPathPlannerConfig()
     planner.oracle = SimpleNamespace(scene_hash="scene:test")
@@ -1702,23 +1743,24 @@ def test_path_leg_visits_other_ik_branch_before_expanding_a_failed_branch(monkey
     calls = []
     def plan(**arguments):
         value = float(arguments["target_qpos_by_component"]["right"][0])
-        calls.append((value, arguments["config"].seed, arguments["config"].time_budget_sec))
-        found = value == .2
-        clock[0] += 1.0 if found else 8.0
+        alternative = arguments["alternative_target_qpos_by_component"][0]
+        calls.append((value, float(alternative["right"][0]), arguments["config"].seed, arguments["config"].time_budget_sec))
+        clock[0] += 1.0
         return JointPathPlanResult(
-            status=JointPathStatus.PATH_FOUND if found else JointPathStatus.PATH_SEARCH_EXHAUSTED,
-            start_qpos_by_component=current, target_qpos_by_component=arguments["target_qpos_by_component"],
+            status=JointPathStatus.PATH_FOUND,
+            start_qpos_by_component=current, target_qpos_by_component=alternative,
             movable_components=("right",), scene_hash="scene:test",
-            reason="direct_path_clear" if found else "bounded_search_exhausted",
-            waypoints=(current, arguments["target_qpos_by_component"]) if found else (),
+            reason="bounded_search_found_path", metadata={"selected_target_index": 1},
+            waypoints=(current, alternative),
         )
     monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", plan)
     planner._revalidate = lambda *_args, **_kwargs: {"minimum_distance_m": .05}
     leg = planner._plan_path_leg(qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
         planning_phase="grasp_target", endpoint_candidates=endpoints, deadline=10.0, monotonic=lambda: clock[0])
-    assert calls == [(.1, 0, 10.0), (.2, 2, 2.0)]
+    assert calls == [(.1, .2, 0, 10.0)]
     assert leg.endpoint is endpoints[1]
-    assert [a["endpoint_seed_index"] for a in leg.search_attempts] == [0, 1]
+    assert [a["endpoint_seed_index"] for a in leg.search_attempts] == [1]
+    assert leg.search_attempts[0]["endpoint_seed_indices"] == (0, 1)
     assert all(a["path_attempt"] == 0 for a in leg.search_attempts)
     assert leg.dense_revalidation["minimum_distance_m"] == .05
 
@@ -1755,6 +1797,72 @@ def test_path_leg_dense_query_fault_stops_before_other_branch(monkeypatch, failu
     assert len(calls) == 1
     assert calls[0] is endpoints[0].qpos_by_side
     assert error.value.details["last_dense_revalidation_error"]["details"]["query_fault"]
+
+
+def test_shared_goal_dense_rejection_prioritizes_other_branch_without_dropping_goals(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(path_search_attempts_per_endpoint=2))
+    planner.planner_config = JointPathPlannerConfig()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test")
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    endpoints = tuple(grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side={"left": current["left"], "right": np.full(6, value)},
+        seed_index=index, solve_cycles=1, position_residual_m=0, orientation_residual_deg=0,
+    ) for index, value in enumerate((.1, .2)))
+    calls = []
+
+    def plan(**arguments):
+        targets = (arguments["target_qpos_by_component"],) + arguments["alternative_target_qpos_by_component"]
+        calls.append(tuple(float(target["right"][0]) for target in targets))
+        return JointPathPlanResult(
+            status=JointPathStatus.PATH_FOUND, start_qpos_by_component=current,
+            target_qpos_by_component=targets[0], movable_components=("right",),
+            waypoints=(current, targets[0]), metadata={"selected_target_index": 0},
+        )
+
+    def dense(waypoints, **_):
+        if float(waypoints[-1]["right"][0]) == .1:
+            raise RM65GraspTrajectoryPlanningError("path_target_safety_envelope_blocked")
+        return {"sample_count": 2}
+
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", plan)
+    planner._revalidate = dense
+    leg = planner._plan_path_leg(
+        qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+        planning_phase="pregrasp_target", endpoint_candidates=endpoints,
+        deadline=10.0, monotonic=lambda: 0.0,
+    )
+    assert calls == [(.1, .2), (.2, .1)]
+    assert leg.endpoint is endpoints[1]
+    assert leg.search_attempts[0]["dense_revalidation_error"] == "path_target_safety_envelope_blocked"
+    assert leg.search_attempts[1]["endpoint_seed_indices"] == (1, 0)
+
+
+@pytest.mark.parametrize("selected_index", [0, 2])
+def test_shared_goal_result_cannot_claim_a_different_endpoint(monkeypatch, selected_index):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.planner_config = JointPathPlannerConfig()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test")
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    endpoints = tuple(grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side={"left": current["left"], "right": np.full(6, value)},
+        seed_index=index, solve_cycles=1, position_residual_m=0, orientation_residual_deg=0,
+    ) for index, value in enumerate((.1, .2)))
+    def plan(**_):
+        return JointPathPlanResult(
+            status=JointPathStatus.PATH_FOUND, start_qpos_by_component=current,
+            target_qpos_by_component=endpoints[1].qpos_by_side, movable_components=("right",),
+            waypoints=(current, endpoints[1].qpos_by_side), metadata={"selected_target_index": selected_index},
+        )
+    def unexpected_dense(*_, **__):
+        pytest.fail("a mismatched goal must not reach dense validation")
+    monkeypatch.setattr(grasp_trajectory_module, "plan_collision_aware_joint_path", plan)
+    planner._revalidate = unexpected_dense
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_planner_error"):
+        planner._plan_path_leg(
+            qpos_by_side=current, side="right", target_tool_tcp_world=np.eye(4),
+            planning_phase="pregrasp_target", endpoint_candidates=endpoints,
+            deadline=10.0, monotonic=lambda: 0.0,
+        )
 
 
 def test_pregrasp_backs_away_along_tool_approach_axis() -> None:
@@ -2277,7 +2385,7 @@ def test_endpoint_planner_solves_real_workspace_pose_outside_local_qp_basin() ->
     assert reachability.classification == "standard_reachable"
 
 
-def test_path_planner_visits_all_endpoints_each_round_before_widening_corridor(
+def test_path_planner_shares_goal_set_in_every_expanding_corridor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     planner = _planner_without_assets(
@@ -2326,7 +2434,7 @@ def test_path_planner_visits_all_endpoints_each_round_before_widening_corridor(
 
     def fake_plan(**kwargs):
         calls.append(kwargs)
-        target = kwargs["target_qpos_by_component"]
+        target = kwargs["alternative_target_qpos_by_component"][0]
         found = (
             np.array_equal(target["right"], second_target["right"])
             and np.array_equal(
@@ -2350,6 +2458,7 @@ def test_path_planner_visits_all_endpoints_each_round_before_widening_corridor(
             waypoints=(kwargs["start_qpos_by_component"], target) if found else (),
             scene_hash="scene:test",
             reason=None if found else "bounded_search_exhausted",
+            metadata={"selected_target_index": 1} if found else {},
         )
 
     monkeypatch.setattr(
@@ -2370,17 +2479,21 @@ def test_path_planner_visits_all_endpoints_each_round_before_widening_corridor(
         speed_scale=0.2,
     )
 
-    assert len(calls) == 8
-    assert [call["config"].seed for call in calls] == [0, 4, 1, 5, 2, 6, 3, 7]
+    assert len(calls) == 4
+    assert [call["config"].seed for call in calls] == [0, 1, 2, 3]
     for index, call in enumerate(calls):
         np.testing.assert_array_equal(
             call["target_qpos_by_component"]["right"],
-            (first_target if index % 2 == 0 else second_target)["right"],
+            first_target["right"],
+        )
+        np.testing.assert_array_equal(
+            call["alternative_target_qpos_by_component"][0]["right"],
+            second_target["right"],
         )
     first_widths = [
         np.asarray(call["joint_upper_by_component"]["right"])
         - np.asarray(call["joint_lower_by_component"]["right"])
-        for call in calls[::2]
+        for call in calls
     ]
     assert np.all(first_widths[1] > first_widths[0])
     assert np.all(first_widths[2] >= first_widths[1])

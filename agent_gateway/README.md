@@ -682,8 +682,10 @@ dispatch motion or request HOLD. A successful result contains an immutable,
 session-local plan ID/hash with a maximum 30-second lifetime.
 
 The reach planner first validates a fixed-orientation Cartesian approach along
-tool +Z for each pregrasp IK branch, then plans globally to that exact pregrasp
-joint state. A failed branch does not discard the remaining branches. It searches
+tool +Z for each pregrasp IK branch, then connects globally to the set of exact,
+validated pregrasp joint states using a shared start tree and goal forest. The
+selected goal retains its original local approach; IK is not re-solved at the
+connection. A failed branch does not discard the remaining branches. It searches
 pregrasp distances from 60 mm down to a 20 mm minimum in 10 mm steps, preferring
 the longest fully feasible route rather than projecting a blocked pose. Local
 targets are at most 5 mm apart. Dense FK revalidation rejects lateral deviation
@@ -776,8 +778,14 @@ IK 临时生成未评分的旋转候选或沿用另一预测的分数。
 20 mm 安全余量与是否加密。查询不可用直接拒绝，不用精确查询掩盖故障。
 搜索缓存与普通精确缓存隔离，端点及最终密集轨迹复核仍使用原精确查询；不缩小
 碰撞几何、不减少碰撞对、不降低采样分辨率，也不放宽包络或 IK 容差。
-多解路径搜索逐轮访问全部 IK 终点，再扩展某个终点的搜索范围；每个终点/轮次
-仍使用原确定性种子和范围。包络入场的多个目标按剩余总预算分配路由时间片，
+同一抓姿的已验证近场 IK 分支组成全局连接目标集合；每轮共享起点树、目标森林、
+碰撞查询缓存和节点/迭代/时间预算，而不是为每个终点重新搜索。搜索范围覆盖全部
+目标后逐轮扩展，最后一轮仍为原关节硬限位；确定性种子为基础种子加轮次。返回
+准确的目标序号和关节状态，再连接该分支原先验证的接近段。目标碰撞可剔除，
+任一查询不可用或输入不合法都停止；密集轨迹复核仍保留原检查。
+某条连接被密集复核拒绝时，下轮优先尝试其他分支，但不删除该目标或扩大总预算。
+这是同一用户选定抓姿内的多 IK 目标，不会在 v1 Skill 中静默改选其他抓姿。
+包络入场的多个目标按剩余总预算分配路由时间片，
 该时间片同时覆盖入场、连接到已验证局部分支和组合路径的精确复核。一个路由
 超时且总预算尚未耗尽时可尝试下一个路由；碰撞查询不可用仍停止。诊断分别保留
 路由时间片、总预算耗尽与各路由失败详情，不把局部超时解释为物理不可达。

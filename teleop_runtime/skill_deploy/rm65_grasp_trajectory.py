@@ -2060,142 +2060,125 @@ class RM65GraspJointTrajectoryPlanner:
         )
         search_attempts: list[dict[str, object]] = []
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
-        # Visit every IK branch before widening one branch's search corridor.
+        if not endpoint_candidates:
+            raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+        target_values = np.stack([endpoint.qpos_by_side[side] for endpoint in endpoint_candidates])
+        search_candidates = endpoint_candidates
+        # All locally valid branches share one tree and query cache per corridor.
         for path_attempt in range(self.config.path_search_attempts_per_endpoint):
-            for endpoint_index, endpoint in enumerate(endpoint_candidates):
-                target = endpoint.qpos_by_side
-                full_joint_range = (
-                    path_attempt == self.config.path_search_attempts_per_endpoint - 1
-                )
-                padding = cfg.sample_padding_rad * float(2**path_attempt)
-                corridor_lower = (
-                    lower
-                    if full_joint_range
-                    else np.maximum(
-                        lower,
-                        np.minimum(qpos_by_side[side], target[side]) - padding,
+            target = search_candidates[0].qpos_by_side
+            full_joint_range = path_attempt == self.config.path_search_attempts_per_endpoint - 1
+            padding = cfg.sample_padding_rad * float(2**path_attempt)
+            corridor_lower = lower if full_joint_range else np.maximum(
+                lower, np.minimum(qpos_by_side[side], target_values.min(axis=0)) - padding,
+            )
+            corridor_upper = upper if full_joint_range else np.minimum(
+                upper, np.maximum(qpos_by_side[side], target_values.max(axis=0)) + padding,
+            )
+            attempt_config = replace(
+                cfg,
+                seed=cfg.seed + path_attempt,
+                time_budget_sec=(
+                    cfg.time_budget_sec if deadline is None else min(
+                        self._remaining_path_planning_time_sec(
+                            deadline=deadline, monotonic=monotonic,
+                            planning_phase=planning_phase,
+                            details={"path_attempt": path_attempt,
+                                     "endpoint_seed_indices": tuple(e.seed_index for e in search_candidates)},
+                        ),
+                        math.inf if cfg.time_budget_sec is None else cfg.time_budget_sec,
                     )
-                )
-                corridor_upper = (
-                    upper
-                    if full_joint_range
-                    else np.minimum(
-                        upper,
-                        np.maximum(qpos_by_side[side], target[side]) + padding,
+                ),
+            )
+            path = plan_collision_aware_joint_path(
+                start_qpos_by_component=qpos_by_side,
+                target_qpos_by_component=target,
+                alternative_target_qpos_by_component=tuple(
+                    endpoint.qpos_by_side for endpoint in search_candidates[1:]
+                ),
+                movable_components=(side,), oracle=search_oracle,
+                config=attempt_config,
+                joint_lower_by_component={side: corridor_lower},
+                joint_upper_by_component={side: corridor_upper},
+                monotonic=monotonic,
+            )
+            attempt_record: dict[str, object] = {
+                "planning_phase": planning_phase,
+                "endpoint_seed_indices": tuple(e.seed_index for e in search_candidates),
+                "path_attempt": path_attempt,
+                "search_seed": attempt_config.seed,
+                "full_joint_range": full_joint_range,
+                "sample_padding_rad": None if full_joint_range else padding,
+                "status": path.status.value,
+                "reason": path.reason,
+            }
+            search_attempts.append(attempt_record)
+            if path.status is not JointPathStatus.PATH_FOUND:
+                if path.status is JointPathStatus.START_BLOCKED:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "path_start_collision_blocked",
+                        details={"planning_phase": planning_phase,
+                                 "path": path.to_dict(), "search_attempts": search_attempts},
                     )
-                )
-                attempt_config = replace(
-                    cfg,
-                    seed=(
-                        cfg.seed
-                        + endpoint_index * self.config.path_search_attempts_per_endpoint
-                        + path_attempt
-                    ),
-                    time_budget_sec=(
-                        cfg.time_budget_sec
-                        if deadline is None
-                        else min(
-                            self._remaining_path_planning_time_sec(
-                                deadline=deadline,
-                                monotonic=monotonic,
-                                planning_phase=planning_phase,
-                                details={
-                                    "endpoint_seed_index": endpoint.seed_index,
-                                    "path_attempt": path_attempt,
-                                },
-                            ),
-                            (
-                                math.inf
-                                if cfg.time_budget_sec is None
-                                else cfg.time_budget_sec
-                            ),
-                        )
-                    ),
-                )
-                path = plan_collision_aware_joint_path(
-                    start_qpos_by_component=qpos_by_side,
-                    target_qpos_by_component=target,
-                    movable_components=(side,),
-                    oracle=search_oracle,
-                    config=attempt_config,
-                    joint_lower_by_component={side: corridor_lower},
-                    joint_upper_by_component={side: corridor_upper},
-                    monotonic=monotonic,
-                )
-                attempt_record: dict[str, object] = {
-                    "planning_phase": planning_phase,
-                    "endpoint_seed_index": endpoint.seed_index,
-                    "path_attempt": path_attempt,
-                    "search_seed": attempt_config.seed,
-                    "full_joint_range": full_joint_range,
-                    "sample_padding_rad": None if full_joint_range else padding,
-                    "status": path.status.value,
-                    "reason": path.reason,
-                }
-                search_attempts.append(attempt_record)
-                if path.status is not JointPathStatus.PATH_FOUND:
-                    if path.status is JointPathStatus.START_BLOCKED:
-                        raise RM65GraspTrajectoryPlanningError(
-                            "path_start_collision_blocked",
-                            details={"planning_phase": planning_phase,
-                                     "path": path.to_dict(),
-                                     "search_attempts": search_attempts},
-                        )
-                    if path.reason == "time_budget_exhausted":
-                        terminal_error = RM65GraspTrajectoryPlanningError(
-                            "path_planning_time_budget_exhausted",
-                            details={
-                                "planning_phase": planning_phase,
-                                "time_budget_sec": (
-                                    self.config.path_planning_time_budget_sec
-                                ),
-                                "path": path.to_dict(),
-                                "search_attempts": search_attempts,
-                            },
-                        )
-                        break
-                    if path.status is JointPathStatus.COLLISION_CHECK_UNAVAILABLE:
-                        terminal_error = RM65GraspTrajectoryPlanningError(
-                            "path_collision_check_unavailable",
-                            details={
-                                "planning_phase": planning_phase,
-                                "path": path.to_dict(),
-                                "search_attempts": search_attempts,
-                            },
-                        )
-                        break
-                    continue
-                try:
-                    dense = self._revalidate(
-                        path.waypoints,
-                        moving_side=side,
-                        deadline=deadline,
-                        monotonic=monotonic,
+                if path.status is JointPathStatus.INVALID_REQUEST:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "path_planner_error",
+                        details={"planning_phase": planning_phase,
+                                 "path": path.to_dict(), "search_attempts": search_attempts},
                     )
-                except RM65GraspTrajectoryPlanningError as error:
-                    attempt_record["dense_revalidation_error"] = error.reason_code
-                    attempt_record["dense_revalidation_details"] = dict(error.details)
-                    terminal_error = error
-                    if error.reason_code in {
-                        "path_collision_check_unavailable",
+                if path.reason == "time_budget_exhausted":
+                    terminal_error = RM65GraspTrajectoryPlanningError(
                         "path_planning_time_budget_exhausted",
-                        "path_target_safety_envelope_unavailable",
-                    }:
-                        break
-                    continue
-                return _PlannedPathLeg(
-                    endpoint=endpoint,
-                    path=path,
-                    dense_revalidation=dense,
-                    search_attempts=tuple(search_attempts),
+                        details={"planning_phase": planning_phase,
+                                 "time_budget_sec": self.config.path_planning_time_budget_sec,
+                                 "path": path.to_dict(), "search_attempts": search_attempts},
+                    )
+                    break
+                if path.status is JointPathStatus.COLLISION_CHECK_UNAVAILABLE:
+                    terminal_error = RM65GraspTrajectoryPlanningError(
+                        "path_collision_check_unavailable",
+                        details={"planning_phase": planning_phase,
+                                 "path": path.to_dict(), "search_attempts": search_attempts},
+                    )
+                    break
+                continue
+            selected_index = int(path.metadata.get("selected_target_index", 0))
+            if not 0 <= selected_index < len(endpoint_candidates):
+                raise RM65GraspTrajectoryPlanningError(
+                    "path_planner_error", details={"planning_phase": planning_phase,
+                                                   "rejection": "selected_endpoint_index_out_of_range"},
                 )
-            if terminal_error is not None and terminal_error.reason_code in {
-                "path_collision_check_unavailable",
-                "path_planning_time_budget_exhausted",
-                "path_target_safety_envelope_unavailable",
-            }:
-                break
-
+            endpoint = search_candidates[selected_index]
+            if any(
+                not np.array_equal(endpoint.qpos_by_side[name], path.target_qpos_by_component[name])
+                for name in _SIDES
+            ):
+                raise RM65GraspTrajectoryPlanningError(
+                    "path_planner_error", details={"planning_phase": planning_phase,
+                                                   "rejection": "selected_endpoint_mismatch"},
+                )
+            attempt_record["endpoint_seed_index"] = endpoint.seed_index
+            try:
+                dense = self._revalidate(
+                    path.waypoints, moving_side=side, deadline=deadline, monotonic=monotonic,
+                )
+            except RM65GraspTrajectoryPlanningError as error:
+                attempt_record["dense_revalidation_error"] = error.reason_code
+                attempt_record["dense_revalidation_details"] = dict(error.details)
+                terminal_error = error
+                if error.reason_code in {
+                    "path_collision_check_unavailable", "path_planning_time_budget_exhausted",
+                    "path_target_safety_envelope_unavailable",
+                }:
+                    break
+                # Keep this goal available, but do not let a rejected direct
+                # connection hide the other local branches in the next round.
+                search_candidates = tuple(e for e in search_candidates if e is not endpoint) + (endpoint,)
+                continue
+            return _PlannedPathLeg(
+                endpoint=endpoint, path=path, dense_revalidation=dense,
+                search_attempts=tuple(search_attempts),
+            )
         if terminal_error is not None and terminal_error.reason_code in {
             "path_collision_check_unavailable",
             "path_planning_time_budget_exhausted",
@@ -2548,46 +2531,29 @@ class RM65GraspJointTrajectoryPlanner:
             grasp_tool_tcp_world=grasp_tool_tcp_world,
             deadline=deadline, monotonic=monotonic,
         )
-        attempts: list[dict[str, object]] = []
-        last_error: RM65GraspTrajectoryPlanningError | None = None
-        for endpoint, approach in prepared.candidates:
-            attempt: dict[str, object] = {
-                "planning_phase": "pregrasp_global_connection",
-                "endpoint_seed_index": endpoint.seed_index,
-            }
-            attempts.append(attempt)
-            try:
-                pregrasp = self._plan_path_leg(
-                    qpos_by_side=qpos_by_side, side=side,
-                    target_tool_tcp_world=pregrasp_tool_tcp_world,
-                    planning_phase="pregrasp_target", visible_scene=visible_scene,
-                    prefer_closest_tolerance=False, endpoint_candidates=(endpoint,),
-                    deadline=deadline, monotonic=monotonic,
-                )
-            except RM65GraspTrajectoryPlanningError as error:
-                last_error = error
-                attempt.update(status="rejected", reason_code=error.reason_code)
-                if error.reason_code in {
-                    "path_collision_check_unavailable", "path_planning_time_budget_exhausted",
-                    "path_target_safety_envelope_unavailable",
-                }:
-                    break
-                continue
-            attempt["status"] = "path_found"
-            return (
-                replace(
-                    pregrasp,
-                    search_attempts=prepared.validation_attempts + tuple(attempts) + pregrasp.search_attempts,
-                ),
-                approach,
+        try:
+            pregrasp = self._plan_path_leg(
+                qpos_by_side=qpos_by_side, side=side,
+                target_tool_tcp_world=pregrasp_tool_tcp_world,
+                planning_phase="pregrasp_target", visible_scene=visible_scene,
+                prefer_closest_tolerance=False,
+                endpoint_candidates=tuple(endpoint for endpoint, _ in prepared.candidates),
+                deadline=deadline, monotonic=monotonic,
             )
-        assert last_error is not None
-        raise RM65GraspTrajectoryPlanningError(
-            last_error.reason_code,
-            details={**last_error.details,
-                     "local_approach_validation_attempts": prepared.validation_attempts,
-                     "pregrasp_branch_attempts": attempts},
-        ) from last_error
+        except RM65GraspTrajectoryPlanningError as error:
+            raise RM65GraspTrajectoryPlanningError(
+                error.reason_code,
+                details={**error.details,
+                         "local_approach_validation_attempts": prepared.validation_attempts},
+            ) from error
+        approach = next(
+            approach for endpoint, approach in prepared.candidates
+            if endpoint is pregrasp.endpoint
+        )
+        return (
+            replace(pregrasp, search_attempts=prepared.validation_attempts + pregrasp.search_attempts),
+            approach,
+        )
 
     def _plan_chain_for_pregrasp(
         self,
