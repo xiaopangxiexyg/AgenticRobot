@@ -2064,7 +2064,6 @@ class RM65GraspJointTrajectoryPlanner:
                     config=attempt_config,
                     joint_lower_by_component={side: corridor_lower},
                     joint_upper_by_component={side: corridor_upper},
-                    scene_hash=self.scene.semantic_content_hash,
                     monotonic=monotonic,
                 )
                 attempt_record: dict[str, object] = {

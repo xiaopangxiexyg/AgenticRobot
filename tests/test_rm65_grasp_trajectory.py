@@ -1339,6 +1339,70 @@ def _planner_without_assets(
     return planner
 
 
+@pytest.mark.parametrize("phase", ["envelope_ingress", "pregrasp_target", "grasp_target"])
+@pytest.mark.parametrize("obstruction", ["clear", "visible_target", "visible_background", "production"])
+def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_binding(phase, obstruction):
+    from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry, VisibleGraspScene
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        path_search_attempts_per_endpoint=1,
+    ))
+    planner.planner_config = JointPathPlannerConfig()
+    planner.scene = SimpleNamespace(semantic_content_hash="production:test")
+    checked = []
+
+    class ProductionOracle:
+        scene_hash = "production:test"
+
+        def check(self, qpos):
+            checked.append(qpos["right"].copy())
+            return JointConfigurationCheck(
+                safe=not (obstruction == "production" and qpos["right"][0] > .05),
+                collision_check_available=True,
+                reason="production_block" if obstruction == "production" else None,
+            )
+
+    class Builder:
+        def tool_tcp_world_targets_for_qpos_pair(self, *, left_qpos, right_qpos):
+            poses = {side: np.eye(4) for side in ("left", "right")}
+            poses["right"][0, 3] = right_qpos[0]
+            return poses
+
+    planner.oracle = ProductionOracle()
+    planner.target_builder = Builder()
+    planner.target_envelope_filter = lambda targets: targets
+    planner._require_qpos_within_target_envelope = lambda *_args, **_kwargs: None
+    planner._revalidate = lambda *_args, **_kwargs: {}
+    scene = VisibleGraspScene(
+        points=np.array([[.14, 0, -.02]]) if obstruction.startswith("visible") else np.empty((0, 3)),
+        target_mask=np.array([obstruction == "visible_target"], dtype=bool)
+        if obstruction.startswith("visible") else np.empty(0, dtype=bool),
+        geometry=ParallelJawSolidGeometry(-.043, .05, .01, .0255, .07),
+    )
+    start = {side: np.zeros(6) for side in ("left", "right")}
+    target = {side: q.copy() for side, q in start.items()}
+    target["right"][0] = .1
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=target, seed_index=0, solve_cycles=1,
+        position_residual_m=0, orientation_residual_deg=0,
+    )
+    arguments = dict(qpos_by_side=start, side="right", target_tool_tcp_world=np.eye(4),
+                     planning_phase=phase, visible_scene=scene, endpoint_candidates=(endpoint,))
+    if obstruction == "clear":
+        leg = planner._plan_path_leg(**arguments)
+        assert leg.path.status is JointPathStatus.PATH_FOUND
+        assert leg.path.scene_hash == planner._path_search_oracle(
+            planning_phase=phase, visible_scene=scene, side="right",
+        ).scene_hash
+        assert leg.path.scene_hash != planner.scene.semantic_content_hash
+        assert leg.path.metadata["requested_scene_hash"] is None
+        assert len(leg.search_attempts) == 1
+    else:
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_target_collision_blocked"):
+            planner._plan_path_leg(**arguments)
+    assert checked
+
+
 def test_pregrasp_branch_selection_validates_local_stage_before_exact_global_connection():
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
     current = {side: np.zeros(6) for side in ("left", "right")}
