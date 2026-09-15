@@ -1394,6 +1394,7 @@ def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_bin
         assert leg.path.status is JointPathStatus.PATH_FOUND
         assert leg.path.scene_hash == planner._path_search_oracle(
             planning_phase=phase, visible_scene=scene, side="right",
+            start_qpos_by_side=start,
         ).scene_hash
         assert leg.path.scene_hash != planner.scene.semantic_content_hash
         assert leg.path.metadata["requested_scene_hash"] is None
@@ -1507,7 +1508,89 @@ def test_pregrasp_branch_selection_validates_local_stage_before_exact_global_con
     assert pregrasp.endpoint is endpoints[1]
     assert approach.endpoint is endpoints[1]
     assert pregrasp.search_attempts[0]["reason_code"] == "approach_branch_discontinuous"
-    assert pregrasp.search_attempts[1]["status"] == "path_found"
+    assert pregrasp.search_attempts[1]["status"] == "local_chain_valid"
+    assert pregrasp.search_attempts[2]["status"] == "path_found"
+
+
+@pytest.mark.parametrize("failure_stage", ["pregrasp_ik", "approach"])
+def test_local_chain_failure_never_spends_envelope_ingress_search_budget(failure_stage):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=current, seed_index=0, solve_cycles=1,
+        position_residual_m=0, orientation_residual_deg=0,
+    )
+    def endpoints(**_):
+        if failure_stage == "pregrasp_ik":
+            raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+        return (endpoint,)
+    planner._endpoint_qpos_candidates = endpoints
+    def approach(**_):
+        raise RM65GraspTrajectoryPlanningError("approach_branch_discontinuous")
+    planner._plan_constrained_approach_leg = approach
+    def must_not_search(**_):
+        pytest.fail("a rejected local chain must not search global/ingress paths")
+    planner._envelope_ingress_targets = must_not_search
+    planner._plan_path_leg = must_not_search
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as error:
+        planner._plan_chain_for_pregrasp(
+            qpos_by_side=current, side="right", pregrasp_tool_tcp_world=np.eye(4),
+            grasp_tool_tcp_world=np.eye(4), deadline=10, monotonic=lambda: 0,
+        )
+    assert error.value.details["planning_phase"] == (
+        "local_pregrasp_ik" if failure_stage == "pregrasp_ik" else "local_approach_validation"
+    )
+
+
+def test_local_chain_is_prevalidated_and_reused_after_envelope_ingress():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    def qpos(value):
+        pair = {side: q.copy() for side, q in current.items()}
+        pair["right"][0] = value
+        return pair
+    def endpoint(value):
+        return grasp_trajectory_module._EndpointIKCandidate(
+            qpos_by_side=qpos(value), seed_index=0, solve_cycles=1,
+            position_residual_m=0, orientation_residual_deg=0,
+        )
+    pre, final, ingress = (endpoint(value) for value in (.1, .12, .05))
+    def leg(start, end, name):
+        return grasp_trajectory_module._PlannedPathLeg(
+            endpoint=end, path=SimpleNamespace(waypoints=(start, end.qpos_by_side), semantic_content_hash=name),
+            dense_revalidation={}, search_attempts=(),
+        )
+    calls = []
+    def endpoints(**arguments):
+        np.testing.assert_array_equal(arguments["qpos_by_side"]["right"], current["right"])
+        calls.append("local_ik")
+        return (pre,)
+    planner._endpoint_qpos_candidates = endpoints
+    local = leg(pre.qpos_by_side, final, "local:test")
+    def approach(**arguments):
+        np.testing.assert_array_equal(arguments["qpos_by_side"]["right"], pre.qpos_by_side["right"])
+        calls.append("local_approach")
+        return local
+    planner._plan_constrained_approach_leg = approach
+    planner._envelope_ingress_targets = lambda **_: ((.05, np.eye(4)),)
+    def global_path(**arguments):
+        if arguments["planning_phase"] == "envelope_ingress":
+            calls.append("ingress")
+            return leg(current, ingress, "ingress:test")
+        assert arguments["endpoint_candidates"] == (pre,)
+        np.testing.assert_array_equal(arguments["qpos_by_side"]["right"], ingress.qpos_by_side["right"])
+        calls.append("global_connection")
+        return leg(ingress.qpos_by_side, pre, "global:test")
+    planner._plan_path_leg = global_path
+    planner._revalidate = lambda *_args, **_kwargs: {}
+    legs, route, _ = planner._plan_chain_for_pregrasp(
+        qpos_by_side=current, side="right", pregrasp_tool_tcp_world=np.eye(4),
+        grasp_tool_tcp_world=np.eye(4), deadline=10, monotonic=lambda: 0,
+    )
+    assert calls == ["local_ik", "local_approach", "ingress", "global_connection"]
+    assert legs[1].endpoint is pre
+    assert legs[2] is local
+    assert route["ingress_path_hash"] == "ingress:test"
 
 
 def test_pregrasp_backs_away_along_tool_approach_axis() -> None:
@@ -1631,10 +1714,75 @@ def test_grasp_search_oracle_composes_collision_and_target_envelope() -> None:
     assert outside_check.collision_check_available is True
     assert outside_check.reason == "path_target_safety_envelope_blocked"
     assert search_oracle.check(inside).safe is True
-    assert (
-        planner._path_search_oracle(planning_phase="envelope_ingress")
-        is collision_oracle
+    ingress_oracle = planner._path_search_oracle(
+        planning_phase="envelope_ingress", side="right", start_qpos_by_side=inside,
     )
+    assert ingress_oracle is not collision_oracle
+    assert ingress_oracle.check(inside).safe
+    assert not ingress_oracle.check(outside).safe
+
+
+@pytest.mark.parametrize("initial,next_adjustment,constraints,reason", [
+    (.12, .10, ("absolute:y:max",), None),
+    (.12, .123, ("absolute:y:max",), "path_exceeded_initial_outer_boundary"),
+    (.12, .00025, ("absolute:y:max", "absolute:x:min"), None),
+    (.12, .0008, ("absolute:y:max", "absolute:x:min"), "violation_constraint_set_expanded"),
+    (.12, 0, (), None),
+    (0, .000335, ("absolute:y:max",), "path_did_not_start_at_the_violation"),
+])
+def test_ingress_search_rejects_outer_excursions_before_path_found(initial, next_adjustment, constraints, reason):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _CartesianQposBuilder()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test", check=lambda _: JointConfigurationCheck(safe=True))
+    planner.target_envelope_filter = _IngressEnvelopeFilter(
+        (initial, next_adjustment),
+        constraints_by_call=(("absolute:y:max",), constraints),
+    )
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    oracle = planner._path_search_oracle(planning_phase="envelope_ingress", side="right", start_qpos_by_side=qpos)
+    check = oracle.check(qpos)
+    assert check.collision_check_available
+    assert check.safe == (reason is None)
+    if reason is not None:
+        assert check.reason == "path_target_safety_envelope_blocked"
+        assert check.metadata["target_envelope"]["envelope_ingress_rejection"] == reason
+
+
+def test_ingress_search_queries_do_not_mutate_global_best_or_entry_state():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _CartesianQposBuilder()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test", check=lambda _: JointConfigurationCheck(safe=True))
+    planner.target_envelope_filter = _IngressEnvelopeFilter((.12, .05, 0, .11, .123))
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    oracle = planner._path_search_oracle(planning_phase="envelope_ingress", side="right", start_qpos_by_side=qpos)
+    # A random inside or near-boundary query is not committed path progress.
+    assert oracle.check(qpos).safe
+    assert oracle.check(qpos).safe
+    assert oracle.check(qpos).safe
+    assert not oracle.check(qpos).safe
+
+
+def test_ingress_search_requires_a_valid_initial_projection():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _CartesianQposBuilder()
+    planner.oracle = SimpleNamespace(scene_hash="scene:test", check=lambda _: JointConfigurationCheck(safe=True))
+    planner.target_envelope_filter = _IngressEnvelopeFilter((.17,))
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as error:
+        planner._path_search_oracle(planning_phase="envelope_ingress", side="right", start_qpos_by_side=qpos)
+    assert error.value.details["envelope_ingress_rejection"] == "initial_distance_exceeds_limit"
+
+
+def test_ingress_search_never_overrides_production_collision():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.target_builder = _CartesianQposBuilder()
+    refusal = JointConfigurationCheck(safe=False, collision_check_available=True, reason="production_collision")
+    planner.oracle = SimpleNamespace(scene_hash="scene:test", check=lambda _: refusal)
+    planner.target_envelope_filter = _IngressEnvelopeFilter((.12, .10))
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    oracle = planner._path_search_oracle(planning_phase="envelope_ingress", side="right", start_qpos_by_side=qpos)
+    assert oracle.check(qpos) is refusal
+    assert planner.target_envelope_filter.calls == 1
 
 
 def test_grasp_search_oracle_fails_closed_when_envelope_is_unavailable() -> None:

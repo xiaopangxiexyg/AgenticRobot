@@ -287,6 +287,12 @@ class _PlannedPathLeg:
     search_attempts: tuple[Mapping[str, object], ...]
 
 
+@dataclass(frozen=True)
+class _PreparedGraspApproaches:
+    candidates: tuple[tuple[_EndpointIKCandidate, _PlannedPathLeg], ...]
+    validation_attempts: tuple[Mapping[str, object], ...]
+
+
 class _TargetEnvelopePathOracle:
     """Compose collision and TCP-envelope checks for grasp path search."""
 
@@ -719,12 +725,22 @@ class RM65GraspJointTrajectoryPlanner:
 
     def _path_search_oracle(self, *, planning_phase: str,
                             visible_scene: VisibleGraspScene | None = None,
-                            side: str | None = None) -> object:
+                            side: str | None = None,
+                            start_qpos_by_side: Mapping[str, np.ndarray] | None = None) -> object:
         # The measured staging pose may intentionally start just outside the
         # task envelope.  Its dedicated ingress leg is bounded, monotonic, and
         # densely revalidated.  Once inside, every grasp-search sample must
         # satisfy both collision and TCP-envelope constraints.
-        if (
+        if planning_phase == "envelope_ingress" and self.target_envelope_filter is not None:
+            if side not in _SIDES or start_qpos_by_side is None:
+                raise ValueError("envelope ingress search requires its moving side and start qpos")
+            oracle = _TargetEnvelopePathOracle(
+                collision_oracle=self.oracle,
+                envelope_check=self._ingress_search_envelope_check(
+                    qpos_by_side=start_qpos_by_side, side=side,
+                ),
+            )
+        elif (
             planning_phase not in {"pregrasp_target", "grasp_target"}
             or self.target_envelope_filter is None
         ):
@@ -1007,7 +1023,7 @@ class RM65GraspJointTrajectoryPlanner:
             },
         )
 
-    def _bounded_ingress_projection(
+    def _ingress_projection(
         self,
         *,
         moving_side: str,
@@ -1061,7 +1077,18 @@ class RM65GraspJointTrajectoryPlanner:
                 details,
                 "violation_is_not_an_absolute_translation_bound",
             )
-        if len(raw_constraints) != 1:
+        return float(adjustment), frozenset(raw_constraints)
+
+    def _bounded_ingress_projection(
+        self,
+        *,
+        moving_side: str,
+        details: Mapping[str, object],
+    ) -> tuple[float, frozenset[str]]:
+        adjustment, constraints = self._ingress_projection(
+            moving_side=moving_side, details=details,
+        )
+        if len(constraints) != 1:
             self._raise_ingress_rejection(
                 details,
                 "multiple_initial_constraints_are_not_supported",
@@ -1080,7 +1107,62 @@ class RM65GraspJointTrajectoryPlanner:
                 },
                 "initial_distance_exceeds_limit",
             )
-        return float(adjustment), frozenset(raw_constraints)
+        return adjustment, constraints
+
+    def _require_ingress_progress(
+        self,
+        *,
+        details: Mapping[str, object],
+        adjustment_m: float,
+        constraints: frozenset[str],
+        initial_adjustment_m: float,
+        initial_constraints: frozenset[str],
+        best_adjustment_m: float,
+    ) -> float:
+        if (constraints - initial_constraints
+                and adjustment_m > self.config.path_envelope_ingress_tangent_tolerance_m):
+            self._raise_ingress_rejection(details, "violation_constraint_set_expanded")
+        tolerance = self.config.path_envelope_ingress_progress_tolerance_m
+        if adjustment_m > initial_adjustment_m + tolerance:
+            self._raise_ingress_rejection(details, "path_exceeded_initial_outer_boundary")
+        if adjustment_m > best_adjustment_m + tolerance:
+            self._raise_ingress_rejection(details, "path_moved_away_from_envelope")
+        return min(best_adjustment_m, adjustment_m)
+
+    def _ingress_search_envelope_check(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+    ) -> Callable[[Mapping[str, np.ndarray]], None]:
+        initial: tuple[float, frozenset[str]] | None = None
+        try:
+            self._require_qpos_within_target_envelope(qpos_by_side, sides=_SIDES, phase="path_target")
+        except RM65GraspTrajectoryPlanningError as error:
+            if error.reason_code != "path_target_safety_envelope_blocked":
+                raise
+            initial = self._bounded_ingress_projection(moving_side=side, details=error.details)
+
+        def check(qpos: Mapping[str, np.ndarray]) -> None:
+            try:
+                self._require_qpos_within_target_envelope(qpos, sides=_SIDES, phase="path_target")
+            except RM65GraspTrajectoryPlanningError as error:
+                if error.reason_code != "path_target_safety_envelope_blocked":
+                    raise
+                if initial is None:
+                    self._raise_ingress_rejection(error.details, "path_did_not_start_at_the_violation")
+                adjustment, constraints = self._ingress_projection(moving_side=side, details=error.details)
+                initial_adjustment, initial_constraints = initial
+                # BiRRT queries are unordered. Bound samples against the fixed
+                # start, never mutate progress on a random oracle query. Global
+                # best progress and no re-exit remain final path-order checks.
+                self._require_ingress_progress(
+                    details=error.details, adjustment_m=adjustment, constraints=constraints,
+                    initial_adjustment_m=initial_adjustment, initial_constraints=initial_constraints,
+                    best_adjustment_m=initial_adjustment,
+                )
+
+        return check
 
     def _preflight_start_envelope(
         self,
@@ -1784,44 +1866,6 @@ class RM65GraspJointTrajectoryPlanner:
                 },
             ) from error
 
-        def blocked_projection(
-            error: RM65GraspTrajectoryPlanningError,
-        ) -> tuple[float, frozenset[str]]:
-            if tuple(error.details.get("modified_sides", ())) != (moving_side,):
-                reject_ingress(error, "modified_sides_are_not_the_moving_side_only")
-            projection_by_side = error.details.get("envelope_projection_by_side")
-            projection = (
-                projection_by_side.get(moving_side)
-                if isinstance(projection_by_side, Mapping)
-                else None
-            )
-            if not isinstance(projection, Mapping):
-                reject_ingress(error, "projection_diagnostics_unavailable")
-            if (
-                projection.get("translation_modified") is not True
-                or projection.get("rotation_modified") is not False
-            ):
-                reject_ingress(error, "violation_is_not_translation_only")
-            adjustment = projection.get("translation_adjustment_m")
-            if (
-                isinstance(adjustment, bool)
-                or not isinstance(adjustment, (int, float))
-                or not math.isfinite(float(adjustment))
-                or float(adjustment) <= 0.0
-            ):
-                reject_ingress(error, "translation_adjustment_is_invalid")
-            raw_constraints = projection.get("violated_translation_constraints")
-            if (
-                not isinstance(raw_constraints, (tuple, list))
-                or not raw_constraints
-                or any(
-                    not isinstance(item, str) or not item.startswith("absolute:")
-                    for item in raw_constraints
-                )
-            ):
-                reject_ingress(error, "violation_is_not_an_absolute_translation_bound")
-            return float(adjustment), frozenset(raw_constraints)
-
         for segment_index, (start, end) in enumerate(pairwise(waypoints)):
             maximum_delta = max(
                 float(np.max(np.abs(np.asarray(end[side]) - np.asarray(start[side]))))
@@ -1864,7 +1908,9 @@ class RM65GraspJointTrajectoryPlanner:
                 except RM65GraspTrajectoryPlanningError as error:
                     if error.reason_code != "path_target_safety_envelope_blocked":
                         raise
-                    adjustment, constraints = blocked_projection(error)
+                    adjustment, constraints = self._ingress_projection(
+                        moving_side=moving_side, details=error.details,
+                    )
                     if ingress_entered_at is not None:
                         reject_ingress(error, "path_left_envelope_after_entry")
                     elif ingress_constraints is None:
@@ -1885,28 +1931,14 @@ class RM65GraspJointTrajectoryPlanner:
                         ingress_initial_adjustment_m = adjustment
                         ingress_best_adjustment_m = adjustment
                     else:
-                        unexpected_constraints = constraints - ingress_constraints
-                        if (
-                            unexpected_constraints
-                            and adjustment
-                            > self.config.path_envelope_ingress_tangent_tolerance_m
-                        ):
-                            reject_ingress(error, "violation_constraint_set_expanded")
                         ingress_observed_constraints.update(constraints)
                         assert ingress_initial_adjustment_m is not None
                         assert ingress_best_adjustment_m is not None
-                        tolerance = (
-                            self.config.path_envelope_ingress_progress_tolerance_m
-                        )
-                        if adjustment > ingress_initial_adjustment_m + tolerance:
-                            reject_ingress(
-                                error, "path_exceeded_initial_outer_boundary"
-                            )
-                        if adjustment > ingress_best_adjustment_m + tolerance:
-                            reject_ingress(error, "path_moved_away_from_envelope")
-                        ingress_best_adjustment_m = min(
-                            ingress_best_adjustment_m,
-                            adjustment,
+                        ingress_best_adjustment_m = self._require_ingress_progress(
+                            details=error.details, adjustment_m=adjustment, constraints=constraints,
+                            initial_adjustment_m=ingress_initial_adjustment_m,
+                            initial_constraints=ingress_constraints,
+                            best_adjustment_m=ingress_best_adjustment_m,
                         )
                 else:
                     if ingress_constraints is not None and ingress_entered_at is None:
@@ -2001,7 +2033,8 @@ class RM65GraspJointTrajectoryPlanner:
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         cfg = self.planner_config
         search_oracle = self._path_search_oracle(
-            planning_phase=planning_phase, visible_scene=visible_scene, side=side
+            planning_phase=planning_phase, visible_scene=visible_scene, side=side,
+            start_qpos_by_side=qpos_by_side,
         )
         search_attempts: list[dict[str, object]] = []
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
@@ -2118,6 +2151,7 @@ class RM65GraspJointTrajectoryPlanner:
                     )
                 except RM65GraspTrajectoryPlanningError as error:
                     attempt_record["dense_revalidation_error"] = error.reason_code
+                    attempt_record["dense_revalidation_details"] = dict(error.details)
                     terminal_error = error
                     if error.reason_code in {
                         "path_collision_check_unavailable",
@@ -2397,7 +2431,7 @@ class RM65GraspJointTrajectoryPlanner:
             search_attempts=tuple(attempts),
         )
 
-    def _plan_pregrasp_and_approach(
+    def _prepare_grasp_approaches(
         self,
         *,
         qpos_by_side: Mapping[str, np.ndarray],
@@ -2406,18 +2440,24 @@ class RM65GraspJointTrajectoryPlanner:
         grasp_tool_tcp_world: np.ndarray,
         deadline: float,
         monotonic: Callable[[], float],
-        visible_scene: VisibleGraspScene | None = None,
-    ) -> tuple[_PlannedPathLeg, _PlannedPathLeg]:
-        """Validate each local IK branch before its exact global connection."""
+    ) -> _PreparedGraspApproaches:
+        """Validate local branches before spending any global/ingress budget."""
 
-        endpoints = self._endpoint_qpos_candidates(
-            qpos_by_side=qpos_by_side,
-            side=side,
-            target_tool_tcp_world=pregrasp_tool_tcp_world,
-            prefer_closest_tolerance=False,
-            deadline=deadline,
-            monotonic=monotonic,
-        )
+        try:
+            endpoints = self._endpoint_qpos_candidates(
+                qpos_by_side=qpos_by_side,
+                side=side,
+                target_tool_tcp_world=pregrasp_tool_tcp_world,
+                prefer_closest_tolerance=False,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+        except RM65GraspTrajectoryPlanningError as error:
+            raise RM65GraspTrajectoryPlanningError(
+                error.reason_code,
+                details={"planning_phase": "local_pregrasp_ik", **error.details},
+            ) from error
+        candidates: list[tuple[_EndpointIKCandidate, _PlannedPathLeg]] = []
         attempts: list[dict[str, object]] = []
         last_error: RM65GraspTrajectoryPlanningError | None = None
         for endpoint in endpoints:
@@ -2435,17 +2475,6 @@ class RM65GraspJointTrajectoryPlanner:
                     deadline=deadline,
                     monotonic=monotonic,
                 )
-                pregrasp = self._plan_path_leg(
-                    qpos_by_side=qpos_by_side,
-                    side=side,
-                    target_tool_tcp_world=pregrasp_tool_tcp_world,
-                    planning_phase="pregrasp_target",
-                    visible_scene=visible_scene,
-                    prefer_closest_tolerance=False,
-                    endpoint_candidates=(endpoint,),
-                    deadline=deadline,
-                    monotonic=monotonic,
-                )
             except RM65GraspTrajectoryPlanningError as error:
                 last_error = error
                 attempt.update(
@@ -2458,20 +2487,81 @@ class RM65GraspJointTrajectoryPlanner:
                     "path_target_safety_envelope_unavailable",
                     "approach_endpoint_safety_envelope_unavailable",
                 }:
+                    raise RM65GraspTrajectoryPlanningError(
+                        error.reason_code,
+                        details={**error.details, "pregrasp_branch_attempts": attempts},
+                    ) from error
+                continue
+            attempt["status"] = "local_chain_valid"
+            candidates.append((endpoint, approach))
+        if candidates:
+            return _PreparedGraspApproaches(tuple(candidates), tuple(attempts))
+        assert last_error is not None
+        raise RM65GraspTrajectoryPlanningError(
+            last_error.reason_code,
+            details={"planning_phase": "local_approach_validation", **last_error.details,
+                     "pregrasp_branch_attempts": attempts},
+        ) from last_error
+
+    def _plan_pregrasp_and_approach(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        pregrasp_tool_tcp_world: np.ndarray,
+        grasp_tool_tcp_world: np.ndarray,
+        deadline: float,
+        monotonic: Callable[[], float],
+        visible_scene: VisibleGraspScene | None = None,
+        prepared_approaches: _PreparedGraspApproaches | None = None,
+    ) -> tuple[_PlannedPathLeg, _PlannedPathLeg]:
+        """Connect to an exact prevalidated local branch, without re-solving IK."""
+
+        prepared = prepared_approaches if prepared_approaches is not None else self._prepare_grasp_approaches(
+            qpos_by_side=qpos_by_side, side=side,
+            pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+            grasp_tool_tcp_world=grasp_tool_tcp_world,
+            deadline=deadline, monotonic=monotonic,
+        )
+        attempts: list[dict[str, object]] = []
+        last_error: RM65GraspTrajectoryPlanningError | None = None
+        for endpoint, approach in prepared.candidates:
+            attempt: dict[str, object] = {
+                "planning_phase": "pregrasp_global_connection",
+                "endpoint_seed_index": endpoint.seed_index,
+            }
+            attempts.append(attempt)
+            try:
+                pregrasp = self._plan_path_leg(
+                    qpos_by_side=qpos_by_side, side=side,
+                    target_tool_tcp_world=pregrasp_tool_tcp_world,
+                    planning_phase="pregrasp_target", visible_scene=visible_scene,
+                    prefer_closest_tolerance=False, endpoint_candidates=(endpoint,),
+                    deadline=deadline, monotonic=monotonic,
+                )
+            except RM65GraspTrajectoryPlanningError as error:
+                last_error = error
+                attempt.update(status="rejected", reason_code=error.reason_code)
+                if error.reason_code in {
+                    "path_collision_check_unavailable", "path_planning_time_budget_exhausted",
+                    "path_target_safety_envelope_unavailable",
+                }:
                     break
                 continue
             attempt["status"] = "path_found"
             return (
                 replace(
                     pregrasp,
-                    search_attempts=tuple(attempts) + pregrasp.search_attempts,
+                    search_attempts=prepared.validation_attempts + tuple(attempts) + pregrasp.search_attempts,
                 ),
                 approach,
             )
         assert last_error is not None
         raise RM65GraspTrajectoryPlanningError(
             last_error.reason_code,
-            details={**last_error.details, "pregrasp_branch_attempts": attempts},
+            details={**last_error.details,
+                     "local_approach_validation_attempts": prepared.validation_attempts,
+                     "pregrasp_branch_attempts": attempts},
         ) from last_error
 
     def _plan_chain_for_pregrasp(
@@ -2489,8 +2579,14 @@ class RM65GraspJointTrajectoryPlanner:
         dict[str, object] | None,
         list[dict[str, object]],
     ]:
-        """Plan optional envelope ingress, global pregrasp, and local approach."""
+        """Validate the local chain, then plan ingress and its exact connection."""
 
+        prepared = self._prepare_grasp_approaches(
+            qpos_by_side=qpos_by_side, side=side,
+            pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+            grasp_tool_tcp_world=grasp_tool_tcp_world,
+            deadline=deadline, monotonic=monotonic,
+        )
         ingress_targets = self._envelope_ingress_targets(
             qpos_by_side=qpos_by_side,
             side=side,
@@ -2505,6 +2601,7 @@ class RM65GraspJointTrajectoryPlanner:
                 deadline=deadline,
                 monotonic=monotonic,
                 visible_scene=visible_scene,
+                prepared_approaches=prepared,
             )
             return (pregrasp_leg, approach_leg), None, []
 
@@ -2531,6 +2628,7 @@ class RM65GraspJointTrajectoryPlanner:
                     deadline=deadline,
                     monotonic=monotonic,
                     visible_scene=visible_scene,
+                    prepared_approaches=prepared,
                 )
                 combined_waypoints = (
                     *ingress_leg.path.waypoints,
