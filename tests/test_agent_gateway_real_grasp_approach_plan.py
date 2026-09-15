@@ -321,18 +321,22 @@ def test_graspgenx_missing_snapshot_cannot_publish_an_executable_plan() -> None:
     assert plan is None and calls == []
 
 
-def test_graspgenx_snapshot_failure_is_retained_as_read_only_rejection() -> None:
+@pytest.mark.parametrize("message", ["bad frame binding", "first line\nsecond line", "x" * 900])
+def test_graspgenx_snapshot_failure_is_retained_as_read_only_rejection(caplog, message) -> None:
     calls = []
     _, provider, _, _, request, operation = _planning_fixture(
         planner=lambda **kwargs: calls.append(kwargs)
     )
     def broken_reader(*_args):
-        raise ValueError("bad frame binding")
+        raise ValueError(message)
     provider.visible_scene_reader = broken_reader
     result, plan = provider.plan_request(request, operation)
     assert result["reason_code"] == "grasp_scene_snapshot_invalid"
     assert result["diagnostics"] == {"exception_type": "ValueError"}
     assert plan is None and calls == []
+    assert repr(" ".join(message.split())[:512]) in caplog.text
+    if len(message) > 512:
+        assert message not in caplog.text
 
 
 def test_start_state_rejection_keeps_subject_and_unchanged_ingress_bound() -> None:

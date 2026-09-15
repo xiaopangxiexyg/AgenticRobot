@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import Any
 
 from agent_gateway.protocol.contracts import AgentSkillOperation
+from agent_gateway.protocol._contract_validation import thaw_json
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillDeploymentSafetyEnvelopeRef,
@@ -88,9 +89,10 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
         if not np.any(arrays["target_mask"] & (arrays["depth_m"] > 0)):
             raise ValueError("snapshot contains no observed metric target points")
         capture = metadata["capture"]
-        # Canonical encoding handles immutable retained Mapping/tuple values.
-        if canonical_content_hash(capture, domain="grasp.snapshot.capture.v1") != canonical_content_hash(
-            source, domain="grasp.snapshot.capture.v1"
+        # NPZ JSON arrays are lists; retained operations freeze them to tuples.
+        # Compare JSON semantics here without changing the typed global encoder.
+        if canonical_content_hash(thaw_json(capture), domain="grasp.snapshot.capture.v1") != canonical_content_hash(
+            thaw_json(source), domain="grasp.snapshot.capture.v1"
         ):
             raise ValueError("snapshot and retained point-grasp capture differ")
         pose, _ = frame_graph.transform_pose_matrix(
@@ -1193,7 +1195,11 @@ class RealGraspApproachPlanProvider:
                         raise TypeError("snapshot reader did not return a typed visible scene")
                 except (ValueError, TypeError, KeyError, OSError) as error:
                     raise RM65GraspTrajectoryPlanningError(
-                        "grasp_scene_snapshot_invalid", details={"exception_type": type(error).__name__}
+                        "grasp_scene_snapshot_invalid", details={
+                            "exception_type": type(error).__name__,
+                            # Retain a bounded cause in logs, not new v1 fields.
+                            "exception_message": " ".join(str(error).split())[:512],
+                        }
                     ) from error
             trajectory = self.grasp_trajectory_planner(
                 qpos_by_side=qpos_cut.qpos_by_side,

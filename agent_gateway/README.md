@@ -741,6 +741,9 @@ GraspMoE 显式保留固定版本的六个插入深度，并在 -4 / -2 cm 之�
 入口将其下载到 run-root/input/point_grasp_rgbd_snapshot.npz。
 推理之前另保留一次输入 Artifact，其路径与哈希写入 Gateway stderr，
 即使没有有效候选也能重现输入。缺少或损坏完成态快照时，不准入可执行计划。
+快照 capture 与 Gateway 冻结的保留结果先还原为相同 JSON 表示再比较哈希；
+不改变全局类型哈希规则，也不放行内容、字节长度或 SHA256 不一致。
+快照读取失败的具体类型和有界消息保留在 Gateway stderr；公开 v1 诊断字段不变。
 感知执行异常将有界类型/消息放入失败操作的 `progress_summary.failure_diagnostic`，
 RPent 在重试提示之前显示该诊断；无候选时 stderr 另保留完整筛选漏斗。
 

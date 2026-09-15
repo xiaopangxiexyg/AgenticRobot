@@ -37,7 +37,7 @@ from agent_gateway.profiles.real.station_point_grasp_render_deployment import (
     REAL_STATION_POINT_GRASP_RENDER_OUTPUT_SLOT_ID_V1,
     build_station_bound_point_grasp_render_registration,
 )
-from agent_gateway.protocol.contracts import AgentSkillRequest
+from agent_gateway.protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
 )
@@ -360,7 +360,12 @@ def test_station_point_grasp_profile_accepts_graspgenx_backend() -> None:
     assert profile.backend_id == "graspgenx"
 
 
-def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tmp_path) -> None:
+@pytest.mark.parametrize("mutation", [
+    None, "station_revision", "target_pixel_uv", "camera_intrinsics",
+    "T_reference_from_camera", "depth_content_hash", "candidate_score",
+    "snapshot_bytes", "snapshot_length", "missing_snapshot",
+])
+def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tmp_path, monkeypatch, mutation) -> None:
     from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
     from agent_gateway.profiles.real.point_grasp_gateway import build_station_bound_point_grasp_executor
     from agent_gateway.profiles.real.grasp_approach_plan import build_grasp_visible_scene_reader
@@ -389,10 +394,54 @@ def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tm
     reader = build_grasp_visible_scene_reader(artifact_store=store,
         frame_graph=provider.frame_binding.frame_graph,
         execution_frame_id=provider.frame_binding.source_frame_id)
-    scene = reader(SimpleNamespace(output_artifact_bindings=bindings), result.execution_result)
+    # Retained operations freeze JSON arrays to tuples, unlike NPZ metadata.
+    retained = AgentSkillOperation(
+        operation_id="snapshot:test", request_hash=request.semantic_content_hash,
+        runtime_session_id="station-point-grasp:test", status="completed",
+        reason_code="passive_read_completed", station_revision_at_admission=7,
+        current_station_revision=7, started_at=9.0, updated_at=10.0,
+        deadline_at=20.0, execution_outcome="completed",
+        execution_receipt_refs=("point-grasp-receipt:test",),
+        execution_result=result.execution_result, output_artifact_bindings=bindings,
+    )
+    assert isinstance(metadata["capture"]["target_pixel_uv"], list)
+    assert isinstance(retained.execution_result["target_pixel_uv"], tuple)
+    scene = reader(retained, retained.execution_result)
     assert len(scene.points) == 12
     with pytest.raises(ValueError, match="capture differ"):
         reader(SimpleNamespace(output_artifact_bindings=bindings), {**result.execution_result, "station_revision": 8})
+    if mutation is None:
+        return
+    changed = copy.deepcopy(result.execution_result)
+    expected_error = "capture differ"
+    if mutation == "station_revision":
+        changed[mutation] += 1
+    elif mutation == "target_pixel_uv":
+        changed[mutation][0] += 1
+    elif mutation == "camera_intrinsics":
+        changed[mutation]["fx"] += 1
+    elif mutation == "T_reference_from_camera":
+        changed[mutation][3] += .001
+    elif mutation == "depth_content_hash":
+        changed[mutation] = "0" * 64
+    elif mutation == "candidate_score":
+        changed["candidates"][0]["score"] += .01
+    elif mutation in {"snapshot_bytes", "snapshot_length"}:
+        path = store.managed_read_path(snapshot.artifact_id)
+        original = path.read_bytes()
+        # Simulate corrupted read bytes without modifying the immutable CAS.
+        corrupted = tmp_path / "corrupted_snapshot.npz"
+        corrupted.write_bytes(original[:-1] if mutation == "snapshot_length" else
+                              original[:-1] + bytes([original[-1] ^ 1]))
+        monkeypatch.setattr(store, "managed_read_path", lambda _artifact_id: corrupted)
+        expected_error = "Artifact identity changed"
+    else:
+        assert mutation == "missing_snapshot"
+        retained = replace(retained, output_artifact_bindings=())
+        expected_error = "no unique RGB-D snapshot"
+    retained = replace(retained, execution_result=changed)
+    with pytest.raises(ValueError, match=expected_error):
+        reader(retained, retained.execution_result)
 
 
 def test_graspgenx_inference_failure_retains_original_input_without_faking_a_mask():
