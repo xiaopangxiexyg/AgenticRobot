@@ -1340,12 +1340,12 @@ def _planner_without_assets(
 
 
 @pytest.mark.parametrize("phase", ["envelope_ingress", "pregrasp_target", "grasp_target"])
-@pytest.mark.parametrize("obstruction", ["clear", "visible_target", "visible_background", "production"])
+@pytest.mark.parametrize("obstruction", ["clear", "visible_target", "visible_background", "visible_start", "production"])
 def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_binding(phase, obstruction):
     from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry, VisibleGraspScene
 
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
-        path_search_attempts_per_endpoint=1,
+        path_search_attempts_per_endpoint=4 if obstruction == "visible_start" else 1,
     ))
     planner.planner_config = JointPathPlannerConfig()
     planner.scene = SimpleNamespace(semantic_content_hash="production:test")
@@ -1374,7 +1374,8 @@ def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_bin
     planner._require_qpos_within_target_envelope = lambda *_args, **_kwargs: None
     planner._revalidate = lambda *_args, **_kwargs: {}
     scene = VisibleGraspScene(
-        points=np.array([[.14, 0, -.02]]) if obstruction.startswith("visible") else np.empty((0, 3)),
+        points=np.array([[.04 if obstruction == "visible_start" else .14, 0, -.02]])
+        if obstruction.startswith("visible") else np.empty((0, 3)),
         target_mask=np.array([obstruction == "visible_target"], dtype=bool)
         if obstruction.startswith("visible") else np.empty(0, dtype=bool),
         geometry=ParallelJawSolidGeometry(-.043, .05, .01, .0255, .07),
@@ -1397,6 +1398,12 @@ def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_bin
         assert leg.path.scene_hash != planner.scene.semantic_content_hash
         assert leg.path.metadata["requested_scene_hash"] is None
         assert len(leg.search_attempts) == 1
+    elif obstruction == "visible_start":
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_start_collision_blocked") as error:
+            planner._plan_path_leg(**arguments)
+        assert len(error.value.details["search_attempts"]) == 1
+        assert error.value.details["path"]["status"] == JointPathStatus.START_BLOCKED.value
+        assert "visible_gripper_path_collision" in str(error.value.details["path"])
     else:
         with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_target_collision_blocked"):
             planner._plan_path_leg(**arguments)

@@ -104,6 +104,8 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
             depth_m=arrays["depth_m"], target_mask=arrays["target_mask"],
             intrinsics=capture["camera_intrinsics"], reference_from_camera=pose,
             geometry=ParallelJawSolidGeometry(**metadata["solid_geometry"]),
+            capture_qpos_by_side=(None if arrays["left_qpos"].size == 0 else
+                                  {side: arrays[side+"_qpos"] for side in ("left", "right")}),
         )
     return read
 

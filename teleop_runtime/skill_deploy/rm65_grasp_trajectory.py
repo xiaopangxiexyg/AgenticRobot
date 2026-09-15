@@ -2078,6 +2078,13 @@ class RM65GraspJointTrajectoryPlanner:
                 }
                 search_attempts.append(attempt_record)
                 if path.status is not JointPathStatus.PATH_FOUND:
+                    if path.status is JointPathStatus.START_BLOCKED:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "path_start_collision_blocked",
+                            details={"planning_phase": planning_phase,
+                                     "path": path.to_dict(),
+                                     "search_attempts": search_attempts},
+                        )
                     if path.reason == "time_budget_exhausted":
                         terminal_error = RM65GraspTrajectoryPlanningError(
                             "path_planning_time_budget_exhausted",
@@ -2593,6 +2600,16 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        excluded_palm_observation_count = 0
+        if visible_scene is not None and visible_scene.capture_qpos_by_side is not None:
+            capture_qpos = visible_scene.capture_qpos_by_side
+            with self._solver_lock:
+                capture_poses = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=capture_qpos["left"], right_qpos=capture_qpos["right"],
+                )
+            visible_scene, excluded_palm_observation_count = (
+                visible_scene.without_captured_palm_observations(capture_poses)
+            )
         pregrasp_pose = self._pregrasp_target_pose(target_pose)
         final_solver_targets = (
             self.target_builder.solver_world_targets_for_qpos_pair(
@@ -2828,6 +2845,7 @@ class RM65GraspJointTrajectoryPlanner:
                     )
             dense["visible_scene_final_trajectory"] = {
                 "scene_hash": visible_scene.semantic_content_hash,
+                "excluded_captured_palm_background_points": excluded_palm_observation_count,
                 "sample_count": len(times),
                 "opening_m": visible_scene.geometry.maximum_opening_m,
                 "scope": "observed_points_nominal_parallel_jaw_solids_only",

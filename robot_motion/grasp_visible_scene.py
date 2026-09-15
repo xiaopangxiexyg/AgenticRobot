@@ -11,6 +11,7 @@ from dataclasses import asdict
 import hashlib
 import math
 from collections.abc import Mapping
+from types import MappingProxyType
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -36,7 +37,8 @@ class ParallelJawSolidGeometry:
 
 class VisibleGraspScene:
     def __init__(self, *, points: np.ndarray, target_mask: np.ndarray,
-                 geometry: ParallelJawSolidGeometry) -> None:
+                 geometry: ParallelJawSolidGeometry,
+                 capture_qpos_by_side: Mapping[str, np.ndarray] | None = None) -> None:
         xyz = np.asarray(points, dtype=float)
         labels = np.asarray(target_mask)
         if xyz.ndim != 2 or xyz.shape[1:] != (3,) or not np.all(np.isfinite(xyz)):
@@ -46,6 +48,17 @@ class VisibleGraspScene:
         self.points = xyz.copy()
         self.target_mask = labels.copy()
         self.geometry = geometry
+        self.capture_qpos_by_side = None
+        if capture_qpos_by_side is not None:
+            if set(capture_qpos_by_side) != {"left", "right"}:
+                raise ValueError("capture qpos must retain both arms")
+            qpos = {side: np.asarray(q, dtype=float).copy()
+                    for side, q in capture_qpos_by_side.items()}
+            if any(q.shape != (6,) or not np.all(np.isfinite(q)) for q in qpos.values()):
+                raise ValueError("capture qpos must contain six finite radians per arm")
+            for q in qpos.values():
+                q.setflags(write=False)
+            self.capture_qpos_by_side = MappingProxyType(qpos)
         self.points.setflags(write=False)
         self.target_mask.setflags(write=False)
         self._tree = cKDTree(self.points)
@@ -69,7 +82,8 @@ class VisibleGraspScene:
     @classmethod
     def from_depth(cls, *, depth_m: np.ndarray, target_mask: np.ndarray,
                    intrinsics: Mapping[str, float], reference_from_camera: np.ndarray,
-                   geometry: ParallelJawSolidGeometry) -> VisibleGraspScene:
+                   geometry: ParallelJawSolidGeometry,
+                   capture_qpos_by_side: Mapping[str, np.ndarray] | None = None) -> VisibleGraspScene:
         depth = np.asarray(depth_m)
         mask = np.asarray(target_mask)
         if (depth.ndim != 2 or mask.shape != depth.shape or mask.dtype != np.bool_
@@ -88,7 +102,34 @@ class VisibleGraspScene:
         z = depth[rows, columns]
         xyz = np.column_stack(((columns-cx)*z/fx, (rows-cy)*z/fy, z))
         xyz = xyz @ transform[:3, :3].T + transform[:3, 3]
-        return cls(points=xyz, target_mask=mask[rows, columns], geometry=geometry)
+        return cls(points=xyz, target_mask=mask[rows, columns], geometry=geometry,
+                   capture_qpos_by_side=capture_qpos_by_side)
+
+    def without_captured_palm_observations(
+        self, tool_tcp_poses: Mapping[str, np.ndarray],
+    ) -> tuple[VisibleGraspScene, int]:
+        """Remove only background observed inside fixed palms at capture time.
+
+        This is robot self-observation filtering, not collision-pair permission.
+        No padding, approach volume, target points, or moving fingers are removed.
+        Finger self-filtering needs measured opening, which this snapshot lacks.
+        """
+        occupied = np.zeros(len(self.points), dtype=bool)
+        g = self.geometry
+        for pose in tool_tcp_poses.values():
+            self.collision_counts(pose, opening_m=g.maximum_opening_m)
+            pose = np.asarray(pose, dtype=float)
+            x, y, z = ((self.points-pose[:3, 3]) @ pose[:3, :3]).T
+            occupied |= ((np.abs(y) < g.pad_height_m/2)
+                         & (z > g.palm_z_m-g.finger_thickness_m)
+                         & (z <= g.palm_z_m)
+                         & (np.abs(x) < g.maximum_opening_m/2+g.finger_thickness_m))
+        remove = occupied & ~self.target_mask
+        return (VisibleGraspScene(points=self.points[~remove],
+                                  target_mask=self.target_mask[~remove],
+                                  geometry=g,
+                                  capture_qpos_by_side=self.capture_qpos_by_side),
+                int(np.count_nonzero(remove)))
 
     def collision_counts(self, pose: np.ndarray, *, opening_m: float) -> tuple[int, int]:
         """Count observed target/background points inside the nominal solids."""

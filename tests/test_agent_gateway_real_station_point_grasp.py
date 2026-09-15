@@ -408,6 +408,7 @@ def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tm
     assert isinstance(retained.execution_result["target_pixel_uv"], tuple)
     scene = reader(retained, retained.execution_result)
     assert len(scene.points) == 12
+    assert scene.capture_qpos_by_side is None
     with pytest.raises(ValueError, match="capture differ"):
         reader(SimpleNamespace(output_artifact_bindings=bindings), {**result.execution_result, "station_revision": 8})
     if mutation is None:

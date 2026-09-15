@@ -32,6 +32,47 @@ def test_target_is_not_deleted_from_noncontact_approach():
     assert view.approach_collision_counts(np.eye(4), opening_m=0.07, distance_m=0.06) == (1, 0)
 
 
+def test_captured_palm_filter_preserves_target_fingers_and_nearby_background():
+    view = scene([[0, 0, -.05], [0, 0, -.05], [.04, 0, -.02],
+                  [0, 0, -.054], [0, .013, -.05]], [False, True, False, False, False])
+    filtered, removed = view.without_captured_palm_observations({"right": np.eye(4)})
+    assert removed == 1
+    np.testing.assert_array_equal(filtered.points, view.points[1:])
+    assert filtered.collision_counts(np.eye(4), opening_m=.07) == (1, 1)
+    assert len(view.points) == 5
+
+
+def test_palm_filter_uses_capture_pose_not_a_later_robot_pose():
+    capture = np.eye(4)
+    later = np.eye(4)
+    later[0, 3] = .2
+    view = scene([[0, 0, -.05], [.2, 0, -.05]], [False, False])
+    filtered, removed = view.without_captured_palm_observations({"right": capture})
+    assert removed == 1
+    assert filtered.collision_counts(later, opening_m=.07) == (0, 1)
+
+
+def test_capture_qpos_are_copied_immutable_and_retained_after_filter():
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    view = VisibleGraspScene(points=np.empty((0, 3)), target_mask=np.empty(0, dtype=bool),
+                             geometry=GEOMETRY, capture_qpos_by_side=qpos)
+    qpos["right"][0] = 1
+    assert view.capture_qpos_by_side["right"][0] == 0
+    with pytest.raises(ValueError):
+        view.capture_qpos_by_side["right"][0] = 2
+    filtered, _ = view.without_captured_palm_observations({"right": np.eye(4)})
+    np.testing.assert_array_equal(filtered.capture_qpos_by_side["right"], np.zeros(6))
+
+
+@pytest.mark.parametrize("qpos", [{"right": np.zeros(6)},
+                                  {"right": np.zeros(6), "left": np.empty(0)},
+                                  {"right": np.zeros(6), "left": np.full(6, np.nan)}])
+def test_invalid_capture_qpos_cannot_filter_scene(qpos):
+    with pytest.raises(ValueError, match="capture qpos"):
+        VisibleGraspScene(points=np.empty((0, 3)), target_mask=np.empty(0, dtype=bool),
+                          geometry=GEOMETRY, capture_qpos_by_side=qpos)
+
+
 def test_pose_and_reference_transform_do_not_change_collision_counts():
     view = scene([[0.04, 0, -0.08]], [False])
     transform = np.eye(4)
