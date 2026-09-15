@@ -85,3 +85,35 @@ bash scripts/run_pytest.sh -p no:cacheprovider -q \
 
 现阶段没有已装配的完整真机 → sim CLI，不能把单元测试命令当成硬件验收命令。
 本批没有自行进行真机操作、GUI 观察、合并、push 或安装。
+
+## 5. 前台执行会话增量
+
+2026-09-15：操作者明确同意恢复同一 Task。原 `0aa867e4` 候选的交接资格已撤回，
+本轮最终提交、tree 和重新 handoff 状态以新的 Harness receipt 为准。不得沿用旧 Run
+冒充本轮最终 source 的证据。
+
+在同一 source 模块内补齐 `B601RM65MotionSession`，没有新增平行入口或配置文件：
+
+- 默认 inactive；`activate()` 显式重捕 master 与完整 RM65 测量 anchor。
+- 前台调用 `step()` 时只 poll 一次；adapt 时间在 poll 完成后取得，不提前盖时间戳。
+- 调用方明确提供当前执行 tick 的生效时间/期限，并继续推进已有 target runtime。
+  session 只经 binding 提交 human proposal，不执行 IK、插值或 dispatch。
+- `engage_clutch()` 将 RM65 置 hold 并清空 anchor；clutched/inactive/held 时不采样或发布。
+- `release_clutch()` 从两侧当前位置重捕。移动 master 的绝对距离不进入释放后的 residual；
+  静止释放后的第一帧 residual 为零，非目标臂仍来自完整测量参考。
+- freshness、domain/frame、schema 值与范围验证仍只有 binding 负责。全部 anchor 验证完成后，
+  仅显式 operator recenter 能把 hold 改成 ready；不能降低 lower-owner fault/transitioning。
+- 错误输入清除会话参考，合法输入不会自动恢复。采样/测量 provider 异常及 Ctrl-C 先清理
+  target，再重新抛出原错误，不吞掉故障。下层取消失败也不能伪装为 hold 成功。
+- 不创建、关闭、使能或失能 B601；RM65 hold 与独立 ReBot gravity/damping lifecycle 分离。
+  既有六轴重力 profile、启动锁、protective hold 与 J7 边界完全未改。
+
+专项检查为 28 passed，包含原真实 RM65 model/canonical IK 测量检查，以及 clutch 取消、
+双侧 recenter、拒绝后显式恢复、坏/过期测量不重开 gate、异常/Ctrl-C 清理、disabled 零副作用、
+fault/transitioning 不降级。首轮合成 fixture 因同一时间重复采样被正确拒绝，已让测试时间
+真正推进；没有降低生产端的 freshness/单调性要求。
+
+仍未装配完整真实 CAN → GUI 的前台 CLI；上述会话是其可独立离线验收的执行生命周期接缝。
+下一步在既有应用 leaf 内绑定真实只读 source、明确 frame/TCP profile、target measurement 与
+前台按键/日志。master 重力补偿保持独立、已验收的 owner，不通过普通 `finally` 自动失能。
+真机命令必须在该装配及失败清理验证完成后另行提供；本轮专项结果不是真机遥操 PASS。

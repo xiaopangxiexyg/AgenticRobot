@@ -13,7 +13,10 @@ from control_station.sources.rebot_b601_pose import (
     B601ReadOnlyPoseSource,
     B601ReadOnlyPoseSourceSpec,
 )
-from control_station.sources.rebot_b601_rm65_motion import B601RM65MotionBinding
+from control_station.sources.rebot_b601_rm65_motion import (
+    B601RM65MotionBinding,
+    B601RM65MotionSession,
+)
 from hardware.rebot_b601_rs import (
     B601_RS_FEEDBACK_FRAME,
     B601HardwareState,
@@ -403,6 +406,167 @@ def test_stationary_source_has_zero_delta_without_accumulation(setup_motion):
             (0, 0, 0, 0, 0, 0, 1),
         )
         assert receipt.proposal.produced_at == clock()
+
+
+def _session(setup_motion, measure_target=None):
+    clock, _, runtime, _, _, binding, _ = setup_motion
+    # The fixture already polled at its initial time; supply a genuinely new
+    # host sample, preserving the source's monotonicity contract.
+    clock.value += 0.01
+    return B601RM65MotionSession(
+        binding,
+        measure_target=measure_target or (lambda: _measurement(runtime, clock)),
+    )
+
+
+def _session_step(session, clock):
+    clock.value += 0.05
+    return session.step(
+        target_effective_at=clock() + 0.01, effective_until=clock() + 0.1
+    )
+
+
+def test_session_clutch_cancels_pending_and_recenter_has_zero_delta(setup_motion):
+    clock, scene, runtime, _, backend, _, _ = setup_motion
+    values = {
+        name: (0.02, 0, 0, 0, 0, 0, 1) for name in runtime.action_schema.component_ids
+    }
+    session = _session(setup_motion, lambda: _measurement(runtime, clock, values))
+    initial = session.activate()
+    backend.q[0] = 0.01
+    assert _session_step(session, clock).accepted
+    session.engage_clutch()
+    assert session.state == "clutched" and session.anchor is None
+    seq = backend.sequence
+    for _ in range(3):
+        assert not _session_step(session, clock).accepted
+        runtime.step(now=clock())
+    assert backend.sequence == seq and not scene.writes
+    # Reposition the master and independently measure the follower's current pose.
+    backend.q[0] = 0.5
+    values["right_arm"] = (0.03, 0, 0, 0, 0, 0, 1)
+    replacement = session.release_clutch()
+    assert (
+        replacement.master_anchor.anchor_generation
+        > initial.master_anchor.anchor_generation
+    )
+    assert replacement.gate_epoch != initial.gate_epoch
+    receipt = _session_step(session, clock)
+    assert receipt.accepted, receipt.message
+    for name, value in values.items():
+        np.testing.assert_allclose(
+            receipt.proposal.action.values_by_component[name].values, value
+        )
+    assert not scene.writes  # Session does not dispatch even after a valid recenter.
+
+
+@pytest.mark.parametrize("failure", ["stale", "invalid_master", "wrong_frame"])
+def test_session_failed_recenter_never_reopens_gate(setup_motion, failure, monkeypatch):
+    clock, _, runtime, _, backend, _, _ = setup_motion
+    measurement = _measurement(runtime, clock)
+    session = _session(setup_motion, lambda: measurement)
+    session.activate()
+    session.engage_clutch()
+    clock.value += 0.05
+    if failure == "stale":
+        clock.value += 0.2
+    elif failure == "invalid_master":
+        backend.valid = False
+    else:
+        measurement = replace(measurement, control_domain_id="other-target")
+    transitions = []
+    original = runtime.transition_execution_gate
+
+    def record(status, *, reason):
+        transitions.append(status)
+        return original(status, reason=reason)
+
+    monkeypatch.setattr(runtime, "transition_execution_gate", record)
+    with pytest.raises((ValueError, RuntimeError)):
+        session.release_clutch()
+    assert session.state == "clutched" and session.anchor is None
+    assert "ready" not in transitions
+    assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+
+
+def test_session_rejected_tick_requires_explicit_fresh_activation(setup_motion):
+    clock, scene, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    initial = session.activate()
+    backend.q[0] = 0.11
+    assert not _session_step(session, clock).accepted
+    assert session.state == "held" and session.anchor is None
+    backend.q[0] = 0
+    sequence = backend.sequence
+    assert not _session_step(session, clock).accepted
+    assert backend.sequence == sequence and not scene.writes
+    replacement = session.activate()
+    assert replacement.gate_epoch != initial.gate_epoch
+    assert _session_step(session, clock).accepted
+    assert not scene.writes
+    session.deactivate()
+    runtime.step(now=clock())
+    assert not scene.writes and session.state == "inactive"
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt])
+def test_session_interrupted_poll_withdraws_reference_and_reraises(
+    setup_motion, monkeypatch, error_type
+):
+    clock, scene, runtime, source, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.activate()
+    assert _session_step(session, clock).accepted
+
+    def fail():
+        raise error_type("poll interrupted")
+
+    monkeypatch.setattr(source, "poll_pose", fail)
+    with pytest.raises(error_type):
+        _session_step(session, clock)
+    assert session.state == "held" and session.anchor is None
+    runtime.step(now=clock())
+    assert not scene.writes
+
+
+def test_session_disabled_has_no_source_or_target_effect(setup_motion):
+    clock, _, runtime, source, backend, _, _ = setup_motion
+    binding = B601RM65MotionBinding(
+        runtime,
+        source,
+        maximum_source_age_sec=0.15,
+        maximum_measurement_age_sec=0.1,
+        maximum_translation_m=0.1,
+        maximum_rotation_rad=0.3,
+    )
+    session = B601RM65MotionSession(
+        binding, measure_target=lambda: pytest.fail("must not measure")
+    )
+    sequence = backend.sequence
+    session.engage_clutch()
+    session.deactivate()
+    with pytest.raises(RuntimeError):
+        session.activate()
+    assert not _session_step(session, clock).accepted
+    assert backend.sequence == sequence
+    assert (
+        runtime.authoritative_port.capture_execution_gate_snapshot().status == "ready"
+    )
+
+
+@pytest.mark.parametrize("gate_status", ["fault", "transitioning"])
+def test_session_cannot_downgrade_or_reopen_lower_gate(setup_motion, gate_status):
+    _, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    runtime.transition_execution_gate(gate_status, reason="lower_owner")
+    with pytest.raises(RuntimeError, match="not ready"):
+        session.activate()
+    session.engage_clutch()
+    assert session.anchor is None
+    assert (
+        runtime.authoritative_port.capture_execution_gate_snapshot().status
+        == gate_status
+    )
 
 
 def test_disabled_binding_does_not_change_execution_gate(setup_motion):

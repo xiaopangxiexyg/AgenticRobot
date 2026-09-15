@@ -237,10 +237,14 @@ class B601RM65MotionBinding:
         self,
         master_anchor: HumanResidualPoseAnchor,
         measurement: ExecutionMeasurementObservation,
+        *,
+        operator_recenter: bool = False,
     ) -> B601RM65MotionAnchor:
         """Capture fresh measured poses; never anchor to an unaccepted proposal."""
         if not self.enabled:
             raise RuntimeError("Motion publication is disabled.")
+        if not isinstance(operator_recenter, bool):
+            raise TypeError("operator_recenter must be bool.")
         now = float(self.runtime.clock())
         if not isinstance(master_anchor, HumanResidualPoseAnchor):
             raise TypeError("master_anchor must be a HumanResidualPoseAnchor.")
@@ -273,15 +277,23 @@ class B601RM65MotionBinding:
                 raise ValueError("Target measurement pose schema differs.")
             self._pose(measurement.value_by_component[component_id])
             values[component_id] = measurement.value_by_component[component_id]
+        target_action = ComponentAction(
+            action_schema=self.runtime.action_schema, values_by_component=values
+        )
         gate = self.runtime.authoritative_port.capture_execution_gate_snapshot(now=now)
+        if gate.status == "hold" and operator_recenter:
+            # Only an explicit operator transaction can reopen HOLD, after
+            # validating both measured anchors. No failed capture leaves READY.
+            self.runtime.transition_execution_gate("ready", reason="operator_recenter")
+            gate = self.runtime.authoritative_port.capture_execution_gate_snapshot(
+                now=now
+            )
         if gate.status != "ready":
             raise RuntimeError("Target execution gate is not ready.")
         return B601RM65MotionAnchor(
             master_anchor,
             measurement,
-            ComponentAction(
-                action_schema=self.runtime.action_schema, values_by_component=values
-            ),
+            target_action,
             gate.gate_epoch,
         )
 
@@ -468,3 +480,127 @@ class B601RM65MotionBinding:
         if not valid:
             raise ValueError(reason)
         return pose
+
+
+class B601RM65MotionSession:
+    """Foreground activation and recenter around the existing execution owner.
+
+    The application supplies measured target poses and advances the target
+    runtime. This session polls the master once per active tick and never
+    starts, stops, or commands the B601 hardware. HOLD here cancels RM65
+    execution, not the independently owned master gravity/damping lifecycle.
+    """
+
+    def __init__(
+        self,
+        binding: B601RM65MotionBinding,
+        *,
+        measure_target: Callable[[], ExecutionMeasurementObservation],
+    ) -> None:
+        if not isinstance(binding, B601RM65MotionBinding):
+            raise TypeError("binding must be B601RM65MotionBinding.")
+        if not callable(measure_target):
+            raise TypeError("measure_target must be callable.")
+        self.binding = binding
+        self.measure_target = measure_target
+        self._state = "inactive" if binding.enabled else "disabled"
+        self._anchor: B601RM65MotionAnchor | None = None
+        self._generation = 0
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def anchor(self) -> B601RM65MotionAnchor | None:
+        return self._anchor
+
+    def activate(self) -> B601RM65MotionAnchor:
+        """Explicitly engage from inactive/HOLD, always with new measured anchors."""
+        if self._state not in {"inactive", "held"}:
+            raise RuntimeError("activate() requires an inactive or held session.")
+        return self._capture(failure_state="held")
+
+    def engage_clutch(self) -> None:
+        if self._state == "disabled":
+            return
+        self._hold("operator_clutch", state="clutched")
+
+    def release_clutch(self) -> B601RM65MotionAnchor:
+        """Explicit release discards motion made while clutched on both sides."""
+        if self._state != "clutched":
+            raise RuntimeError("release_clutch() requires a clutched session.")
+        return self._capture(failure_state="clutched")
+
+    def deactivate(self) -> None:
+        if self._state != "disabled":
+            self._hold("operator_deactivated", state="inactive")
+
+    def step(
+        self, *, target_effective_at: float, effective_until: float
+    ) -> ProposalAdmissionReceipt:
+        """Publish once; the caller still owns control timing and dispatch."""
+        if self._state != "active":
+            return ProposalAdmissionReceipt(
+                accepted=False, rejection_code=f"motion_session_{self._state}"
+            )
+        assert self._anchor is not None
+        try:
+            projection = self.binding.source.poll_pose()
+            # Sample availability precedes adaptation; never stamp before polling.
+            now = float(self.binding.runtime.clock())
+            step = self.binding.source.adapt(
+                projection,
+                anchor=self._anchor.master_anchor,
+                adapted_at=now,
+                adapted_clock_domain_id=self.binding.runtime.config.clock_domain_id,
+            )
+            receipt = self.binding.submit(
+                step,
+                self._anchor,
+                target_effective_at=target_effective_at,
+                effective_until=effective_until,
+            )
+        except BaseException:
+            # Cleanup only: including Ctrl-C, every interrupted source tick
+            # withdraws the target reference before the original error escapes.
+            self._hold("b601_motion_session_input_failure", state="held")
+            raise
+        if not receipt.accepted:
+            self._hold("b601_motion_session_admission_rejected", state="held")
+        return receipt
+
+    def _capture(self, *, failure_state: str) -> B601RM65MotionAnchor:
+        runtime, source = self.binding.runtime, self.binding.source
+        try:
+            projection = source.poll_pose()
+            now = float(runtime.clock())
+            master = source.capture_anchor(
+                projection,
+                anchor_generation=self._generation,
+                captured_at=now,
+                captured_clock_domain_id=runtime.config.clock_domain_id,
+            )
+            measurement = self.measure_target()
+            anchor = self.binding.capture_anchor(
+                master, measurement, operator_recenter=True
+            )
+        except BaseException:
+            # Provider/interrupt failures are not converted to successful input.
+            self._hold("b601_motion_session_anchor_failure", state=failure_state)
+            raise
+        self._anchor = anchor
+        self._generation += 1
+        self._state = "active"
+        return anchor
+
+    def _hold(self, reason: str, *, state: str) -> None:
+        # Clear software references even when lower cancellation fails. Such a
+        # failure propagates; it must never be reported as successful HOLD.
+        self._anchor = None
+        self._state = state
+        runtime = self.binding.runtime
+        gate = runtime.authoritative_port.capture_execution_gate_snapshot()
+        # An operator session must not downgrade a lower-owner fault/transition.
+        if gate.status in {"ready", "hold"}:
+            runtime.transition_execution_gate("hold", reason=reason)
