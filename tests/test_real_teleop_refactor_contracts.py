@@ -1505,6 +1505,15 @@ def test_safety_dispatch_recovery_uses_bound_teleop_admission_state() -> None:
     )
 
 
+def test_recovery_dispatch_has_one_guarded_dispatch_path() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+
+    assert source.count("components.session.dispatch_command(command)") == 1
+    assert source.count("dispatch_recovery_command(") == 3
+    assert 'phase="recovery_start"' in source
+    assert 'phase="recovery_advance"' in source
+
+
 def test_every_hold_contains_subordinate_failures_before_motion_stays_blocked() -> None:
     source = inspect.getsource(control_loop.run_real_teleop_control_loop)
 
@@ -1516,8 +1525,159 @@ def test_every_hold_contains_subordinate_failures_before_motion_stays_blocked() 
     assert "if not safety_hold" not in source
     assert "hold_pause_error: Exception | None = None" in source
     assert 'end_reason="hold_pause_failure"' in source
-    assert '"joint_hard_limit",' in source
-    assert 'elif hold_reason == "joint_hard_limit"' in source
+    hard_limit_presentation = control_loop._hold_reason_presentation(
+        "joint_hard_limit"
+    )
+    assert "joint hard limit" in hard_limit_presentation.hardware_reason
+    assert "硬限位" in hard_limit_presentation.confirmed_ui_message
+    assert hard_limit_presentation.requires_session_home_recalibration is True
+
+
+@pytest.mark.parametrize(
+    ("reason", "hardware_reason", "ui_message", "requires_home"),
+    [
+        (
+            "q6_gesture",
+            "q6 gesture hold requested",
+            "机械臂已进入保持状态；松开双手后三维到释放区间 1 秒，再次握紧 1 秒后会重新采集 runtime home。",
+            False,
+        ),
+        (
+            "tracker_loss_timeout",
+            "tracker target loss requires runtime home recalibration",
+            "Tracker 目标持续丢失已进入手动 Hold；必须点击“开始遥操”重新采集 runtime home 后才能恢复。",
+            False,
+        ),
+        (
+            "position_force_guard_collision",
+            "position force guard collision emergency stop; runtime home recalibration required",
+            "受力碰撞已急停双臂并结束当前数采；GUI 与设备连接保持。请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。",
+            True,
+        ),
+        (
+            "position_force_guard_fault",
+            "position force guard safety fault; runtime home recalibration required",
+            "位控受力安全监控已急停双臂并结束当前数采；请检查设备后点击“开始遥操”重新采集 runtime Home。",
+            True,
+        ),
+        (
+            "impedance_force_collision",
+            "impedance force collision emergency stop; runtime home recalibration required",
+            "力控碰撞已急停双臂并结束当前数采；GUI 与设备连接保持。请人工调整机械臂位置后点击“开始遥操”重新采集 runtime Home。",
+            True,
+        ),
+        (
+            "emergency_stop_latched",
+            "emergency stop latch observed during command dispatch; runtime home recalibration required",
+            "检测到急停与控制帧竞态，当前数采已结束并进入 Hold；请检查机械臂后重新采集 runtime Home。",
+            True,
+        ),
+        (
+            "joint_horizon_certification",
+            "joint horizon candidate could not be certified; runtime home recalibration required",
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。原因：joint_horizon_certification。",
+            True,
+        ),
+        (
+            "joint_hard_limit",
+            "RM65 joint hard limit rejected the command; runtime home recalibration required",
+            "机械臂关节硬限位门禁已拒绝命令并急停双臂；当前数采已停止。请人工检查并调整机械臂后重新采集 runtime Home。",
+            True,
+        ),
+        (
+            "position_admittance_endpoint_limit",
+            "position admittance endpoint envelope reached; holding the last safe qpos until runtime home recalibration",
+            "力控末端已到达位移或旋转包络，已保持最后安全位置；进程与设备连接保持。确认姿态后点击“开始遥操”重新采集 runtime Home。",
+            True,
+        ),
+        (
+            "progress_failure",
+            "collection progress failure reported; waiting for operator adjustment and runtime home recalibration",
+            "当前阶段失败已记录，正式数采已暂停且机械臂进入 Hold。人工调整后点击“开始遥操”重新采集 runtime Home；writer 接纳恢复后的首帧时会创建同阶段 Retry Attempt。",
+            False,
+        ),
+        (
+            "progress_arm_profile_transition",
+            "collection progress arm profile requires a newly active arm; waiting for target-side runtime home calibration",
+            "当前子任务的正式数采边界已暂停，目标子任务尚未提交。请摆好目标活动臂 VIVE 后点击“开始遥操”；Home 与目标 Fix 状态建立成功后才会切换子任务并继续写入。",
+            False,
+        ),
+        (
+            "init_qpos_completed",
+            "Init qpos operation completed; runtime home recalibration required",
+            "Init qpos 已完成并进入 Hold；请摆好 VIVE/Q6 后点击“开始遥操”重新采集 runtime Home。",
+            False,
+        ),
+        (
+            "init_qpos_sequence_completed",
+            "Init qpos operation completed; runtime home recalibration required",
+            "Init qpos 已完成并进入 Hold；请摆好 VIVE/Q6 后点击“开始遥操”重新采集 runtime Home。",
+            False,
+        ),
+        (
+            "init_qpos_failed",
+            "Init qpos operation failed; safe Hold and runtime home recalibration required",
+            "Init qpos 未安全完成，已进入 Hold；请检查提示和机械臂状态，确认后重新采集 runtime Home。",
+            False,
+        ),
+        (
+            "",
+            "gui hold requested",
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。原因：manual。",
+            False,
+        ),
+        (
+            "manual",
+            "gui hold requested",
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。原因：manual。",
+            False,
+        ),
+        (
+            "two_pedal_b",
+            "gui hold requested",
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。原因：two_pedal_b。",
+            False,
+        ),
+        (
+            "two_pedal_c",
+            "gui hold requested",
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。原因：two_pedal_c。",
+            False,
+        ),
+        (
+            "unclassified_reason",
+            "runtime Hold requested (unclassified_reason); runtime home recalibration required",
+            "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。原因：unclassified_reason。",
+            False,
+        ),
+    ],
+)
+def test_hold_reason_presentation_preserves_reason_specific_contracts(
+    reason: str,
+    hardware_reason: str,
+    ui_message: str,
+    requires_home: bool,
+) -> None:
+    presentation = control_loop._hold_reason_presentation(reason)
+
+    assert presentation.hardware_reason == hardware_reason
+    assert presentation.confirmed_ui_message == ui_message
+    assert presentation.requires_session_home_recalibration is requires_home
+
+
+def test_hold_reason_presentation_normalizes_non_string_reason() -> None:
+    presentation = control_loop._hold_reason_presentation(None)
+
+    assert presentation.hardware_reason == "gui hold requested"
+    assert presentation.confirmed_ui_message.endswith("原因：manual。")
+    assert presentation.requires_session_home_recalibration is False
+
+
+def test_hold_reason_presentation_keeps_session_gate_reason_set() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+
+    assert '"joint_horizon_certification"' in source
+    assert '"joint_hard_limit"' in source
 
 
 def test_hold_countdown_cancellation_failure_is_observational() -> None:
