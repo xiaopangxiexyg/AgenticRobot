@@ -2243,8 +2243,14 @@ def test_passive_read_result_rejection_retains_validator_diagnostic() -> None:
     assert domain_port.calls == []
 
 
+@pytest.mark.parametrize("error_message", [
+    "fixture read failed before producing its Artifact",
+    "first line\nsecond line",
+    "x" * 900,
+])
 def test_required_output_passive_read_can_commit_failure_without_artifact(
     tmp_path,
+    error_message,
 ) -> None:
     clock = _ManualClock()
     base = _capability()
@@ -2323,7 +2329,7 @@ def test_required_output_passive_read_can_commit_failure_without_artifact(
     )
 
     def failed_read(_request, _operation) -> PassiveReadResult:
-        raise RuntimeError("fixture read failed before producing its Artifact")
+        raise RuntimeError(error_message)
 
     executor = PassiveReadSkillExecutor(
         port_id="passive-reader:required-output-failure",
@@ -2365,12 +2371,16 @@ def test_required_output_passive_read_can_commit_failure_without_artifact(
         failed = service.operation_store.get(operation_id)
         assert failed is not None and failed.status == "failed"
         assert failed.reason_code == "passive_read_executor_exception:RuntimeError"
+        assert failed.progress_summary["failure_diagnostic"] == {
+            "exception_type": "RuntimeError",
+            "message": " ".join(error_message.split())[:512],
+        }
         assert executor.failure_diagnostics == (
             {
                 "executor_id": "passive-reader-executor:required-output-failure",
                 "operation_id": operation_id,
                 "exception_type": "RuntimeError",
-                "message": "fixture read failed before producing its Artifact",
+                "message": " ".join(error_message.split())[:512],
                 "failed_at": 10.0,
             },
         )

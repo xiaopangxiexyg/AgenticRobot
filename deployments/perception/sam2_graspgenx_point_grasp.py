@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import threading
 import time
@@ -58,6 +59,7 @@ DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M = 0.006
 GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M = 0.015
 GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG = 15.0
 GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG = 20.0
+_LOGGER = logging.getLogger(__name__)
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -395,6 +397,7 @@ class Sam2GraspGenXPointGraspPlanner:
                     "maximum_opening_m": self.max_gripper_width_m,
                     "width_clearance_m": DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
                     "maximum_visible_collision_points": 0,
+                    "visible_endpoint_opening_m": self.max_gripper_width_m,
                     "unscored_pose_translation_allowed": False,
                     "visible_approach_sweep_distance_m": 0.060,
                     "visible_approach_opening_m": self.max_gripper_width_m,
@@ -565,6 +568,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            _LOGGER.error("No point-grasp candidate survived: filter_summary=%s", summary_json)
             raise RuntimeError(
                 "No visible collision-free DMTAC M GraspGenX candidate belongs "
                 f"to the clicked region: filter_summary={summary_json}"
@@ -744,7 +748,10 @@ class Sam2GraspGenXPointGraspPlanner:
                 continue
             counts["click_distance_valid"] = int(counts["click_distance_valid"]) + 1
             target_hits, background_hits = scene.collision_counts(
-                camera_from_tcp, opening_m=width
+                # This is the noncontact end of approach, not a closure state.
+                # The percentile-derived width remains a proposal estimate;
+                # it is not measured jaw opening or validated contact geometry.
+                camera_from_tcp, opening_m=self.max_gripper_width_m
             )
             if target_hits or background_hits:
                 counts["target_solid_collision_rejected"] = int(

@@ -15,6 +15,7 @@ from agent_gateway.profiles.real.point_grasp_deployment import (
 from deployments.perception.graspgenx_client import (
     GRASPGENX_DEFAULT_MODE,
     GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+    GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
     GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
     GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM,
     GraspGenXClient,
@@ -332,6 +333,10 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
         runner_calls[0][2]["moe_num_yaws"]
         == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
     )
+    assert runner_calls[0][2]["moe_z_offsets_cm"] == GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
+    assert -3.0 in GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
+    assert set((-8.0, -6.0, -4.0, -2.0, -1.0, 0.0)) <= set(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
+    assert backend.semantic_config["graspmoe_sampling"]["z_offsets_cm"] == GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
     assert (
         runner_calls[0][2]["moe_obb_density"]
         == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
@@ -401,6 +406,7 @@ def test_client_sends_dmtac_sweep_volume_and_sorts_top_k() -> None:
     request = unpack_graspgenx_message(socket.sent[0])
     assert request["action"] == "infer_object"
     assert request["moe_num_yaws"] == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
+    assert request["moe_z_offsets_cm"] == list(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
     assert request["moe_obb_density"] == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
     assert request["moe_obb_position_spacing_cm"] == pytest.approx(
         GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -784,6 +790,38 @@ def test_planner_normalizes_float32_model_rotation_for_strict_frame_contract(
         assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-9)
         np.testing.assert_allclose(rotation, original_rotation, atol=3e-8, rtol=0.0)
     planner.close()
+
+
+def test_noncontact_endpoint_uses_open_jaws_not_estimated_closure_width(tmp_path: Path) -> None:
+    depth = np.zeros((80, 80), dtype=np.float32)
+    mask = np.zeros(depth.shape, dtype=bool)
+    mask[38:43, 28:53] = True
+    mask[40, 62] = True
+    depth[mask] = 1.0
+    model_pose = np.eye(4)
+    model_pose[2, 3] = .975
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(mask),
+        client=_PlannerClient(model_pose[None], np.asarray([.9])),
+    )
+    planner.start()
+    try:
+        result = planner.plan(Image.new("RGB", (80, 80)), depth, pixel_uv=(40, 40),
+            intrinsics={"width": 80, "height": 80, "fx": 1000., "fy": 1000., "cx": 40., "cy": 40.},
+            base_from_camera=np.eye(4), max_candidates=1)
+        candidate = result.candidates[0]
+        pose = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
+        from robot_motion.grasp_visible_scene import VisibleGraspScene
+        scene = VisibleGraspScene.from_depth(depth_m=depth, target_mask=mask,
+            intrinsics={"fx": 1000., "fy": 1000., "cx": 40., "cy": 40.},
+            reference_from_camera=np.eye(4), geometry=planner.solid_geometry)
+        assert scene.collision_counts(pose, opening_m=candidate.gripper_width_m)[0] > 0
+        assert scene.approach_collision_counts(pose, opening_m=.07, distance_m=.06) == (0, 0)
+        assert candidate.visible_collision_free
+        assert candidate.model_score == pytest.approx(.9)
+        np.testing.assert_allclose(pose[:2, 3], model_pose[:2, 3])
+    finally:
+        planner.close()
 
 
 def test_planner_fails_closed_when_model_pose_misses_clicked_object(

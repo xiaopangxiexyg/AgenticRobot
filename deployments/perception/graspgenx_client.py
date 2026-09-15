@@ -35,6 +35,9 @@ GRASPGENX_DEFAULT_MODE = "in-process"
 GRASPGENX_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 GRASPGENX_INPROCESS_BACKEND_ID = "graspgenx-inprocess-v1"
 GRASPGENX_POINT_GRASP_MOE_NUM_YAWS = 18
+# Preserve the reviewed source's depths and add the missing 10 mm midpoint
+# between -4 and -2 cm. These poses are sampled before discriminator scoring.
+GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM = (-8.0, -6.0, -4.0, -3.0, -2.0, -1.0, 0.0)
 GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY = "dense-topandside"
 GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM = 3.0
 _GRASPGENX_IMPORT_LOCK = threading.RLock()
@@ -43,6 +46,7 @@ _GRASPGENX_IMPORT_LOCK = threading.RLock()
 def _point_grasp_moe_sampling_config() -> dict[str, object]:
     return {
         "num_yaws": GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+        "z_offsets_cm": GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
         "obb_density": GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
         "obb_position_spacing_cm": (
             GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -301,6 +305,7 @@ class GraspGenXClient:
                     "planner": planner,
                     "num_grasps": int(num_grasps),
                     "moe_num_yaws": GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+                    "moe_z_offsets_cm": GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
                     "moe_obb_density": GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
                     "moe_obb_position_spacing_cm": (
                         GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -668,6 +673,7 @@ class GraspGenXInProcessBackend:
                         num_grasps=int(num_grasps),
                         topk_num_grasps=backend_top_k,
                         moe_num_yaws=GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+                        moe_z_offsets_cm=GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
                         moe_obb_density=GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
                         moe_obb_position_spacing_cm=(
                             GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -702,6 +708,7 @@ __all__ = [
     "GRASPGENX_DEFAULT_TIMEOUT_MS",
     "GRASPGENX_INPROCESS_BACKEND_ID",
     "GRASPGENX_POINT_GRASP_MOE_NUM_YAWS",
+    "GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM",
     "GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY",
     "GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM",
     "GraspGenXClient",
