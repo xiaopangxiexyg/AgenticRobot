@@ -144,6 +144,15 @@ observation sides.  A prepared artifact with an explicit executable
 `normalization_contract` is mandatory; a raw checkpoint artifact with missing
 normalization ownership is rejected.
 
+## Server metadata compatibility
+
+普通 OpenPI 和 model-RTC client 从 server 发布的 `policy_artifact` 读取 state key、
+state input mode、连续/离散维度及实际 policy-I/O layout；server 不必在旧顶层字段重复
+发布同一信息。已显式发布的顶层字段仍优先检查，不能由 artifact 掩盖实际冲突。
+默认兼容性判断比较 layout 的执行结构，而不是 layout 名称、采集注释或哈希。
+Client contract 不自动绑定 layout hash、model id 或 checkpoint step；通用接口中显式
+请求的 hash 审计保持独立，不是普通部署的必需参数。
+
 ## RTC-4b-A raw-RTC offline adapter
 
 该 adapter 保持 OpenPI 的既有 final-chunk model/server 接口；它不消费未来动作。模型消费

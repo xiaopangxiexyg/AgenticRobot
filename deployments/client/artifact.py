@@ -59,7 +59,7 @@ def deploy_contract_from_policy_artifact(
         action_key=artifact.action_key,
         action_dim=artifact.policy_io_layout.action_dim,
         action_discrete_dim=artifact.policy_io_layout.action_discrete_dim,
-        policy_io_layout_hash=artifact.layout_hash,
+        policy_io_layout=artifact.policy_io_layout.to_dict(),
         active_sides=active_sides,
         required_camera_slots=camera_slots,
         hand_layout=None,

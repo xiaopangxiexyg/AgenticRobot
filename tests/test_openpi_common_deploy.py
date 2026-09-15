@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import tempfile
 import unittest
@@ -147,6 +148,77 @@ class _V22FakeTransport(_FakeTransport):
 
 
 class OpenPICommonDeployTest(unittest.TestCase):
+    def test_artifact_metadata_supplies_state_contract_without_duplicate_fields(self) -> None:
+        layout = PolicyIOLayout.legacy_v21_q6()
+        artifact = PolicyArtifactContract(
+            policy_io_layout=layout,
+            state_input_mode=STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+        )
+        metadata = _server_metadata()
+        metadata["deploy_schema_version"] = "dexteleop_deploy_v2"
+        metadata["policy_artifact"] = artifact.to_dict()
+        metadata["policy_artifact"].pop("policy_io_layout_hash")
+        contract = deploy_contract_from_policy_artifact(
+            artifact, protocol_version=OPENPI_LOCAL_PROTOCOL_VERSION,
+        )
+
+        self.assertIsNone(contract.policy_io_layout_hash)
+        result = validate_server_metadata(metadata, contract)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.server_summary["state_key"], "state")
+        self.assertEqual(result.server_summary["state_dim"], artifact.state_input_dim)
+        self.assertEqual(
+            result.server_summary["state_input_mode"],
+            STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+        )
+        remote = RemoteModelPolicy(
+            transport=_FakeTransport(metadata=metadata),
+            observation_adapter=lambda observation: {},
+            config=RemotePolicyConfig(action_dim=layout.action_dim),
+        )
+        OpenPIClientPolicy(
+            OpenPIClientPolicyConfig(policy_artifact=artifact), remote_policy=remote,
+        )
+
+    def test_artifact_layout_validation_checks_content_not_hash_or_labels(self) -> None:
+        artifact = PolicyArtifactContract(policy_io_layout=PolicyIOLayout.legacy_v21_q6())
+        metadata = _server_metadata()
+        metadata["deploy_schema_version"] = "dexteleop_deploy_v2"
+        metadata["policy_artifact"] = artifact.to_dict()
+        metadata["policy_io_layout_hash"] = "unrelated-provenance"
+        layout = metadata["policy_artifact"]["policy_io_layout"]
+        layout["name"] = "another-training-run"
+        layout["metadata"] = {"annotation": "not a wire contract"}
+        layout["arm"]["qpos_audit_dim"] = 99
+        for spec in layout["end_effectors"].values():
+            spec["metadata"] = {"annotation": "another collection"}
+        contract = deploy_contract_from_policy_artifact(artifact)
+        self.assertTrue(validate_server_metadata(metadata, contract).ok)
+
+        bad = copy.deepcopy(metadata)
+        bad["policy_artifact"]["policy_io_layout"]["arm"]["pose_representation"] = "xyz_euler"
+        with self.assertRaisesRegex(ServerMetadataError, "policy_io_layout_mismatch"):
+            validate_server_metadata(bad, contract)
+
+    def test_artifact_metadata_does_not_hide_explicit_wire_conflicts(self) -> None:
+        artifact = PolicyArtifactContract(
+            policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+            state_input_mode=STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+        )
+        metadata = _server_metadata()
+        metadata["deploy_schema_version"] = "dexteleop_deploy_v2"
+        metadata["policy_artifact"] = artifact.to_dict()
+        contract = deploy_contract_from_policy_artifact(artifact)
+        for key, value, error in (
+            ("input_state_key", "another_state", "input_state_key_mismatch"),
+            ("input_state_dim", 1, "input_state_dim_mismatch"),
+            ("input_state_mode", "raw_state_v1", "input_state_mode_mismatch"),
+        ):
+            bad = copy.deepcopy(metadata)
+            bad["local_robot"][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ServerMetadataError, error):
+                validate_server_metadata(bad, contract)
+
     def test_run_policy_reexports_canonical_camera_runtime(self) -> None:
         for name in (
             "DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC",

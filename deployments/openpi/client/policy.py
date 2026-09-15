@@ -318,7 +318,10 @@ class OpenPIClientPolicy:
                 if int(self.config.action_discrete_dim) > 0
                 else None
             ),
-            policy_io_layout_hash=self.config.policy_io_layout_hash,
+            policy_io_layout=(
+                None if self.config.policy_io_layout is None
+                else self.config.policy_io_layout.to_dict()
+            ),
             min_action_horizon=self.config.min_action_horizon,
             active_sides=self.config.active_sides,
             require_active_sides_match=self.config.require_active_sides_match,
