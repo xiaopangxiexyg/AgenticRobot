@@ -784,7 +784,7 @@ class RtcFrontendStep:
             "lifecycle_transition_reason": (
                 None
                 if self.lifecycle_transition is None
-                else self.lifecycle_transition.producer_transition.receipt.event
+                else self.lifecycle_transition.producer_transition.state.last_transition_reason
             ),
             "selected_target_effective_at": (
                 None if pop is None else pop.selected_target_effective_at

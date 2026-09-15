@@ -875,6 +875,7 @@ def test_openpi_relative_raw_rtc_runs_through_shared_frontend_without_dispatch()
         action_pose_mode="relative",
         frame_contract_hash=RELATIVE_FRAME_HASH,
         result_action_representation=OPENPI_RTC_RESULT_TYPED_CANONICAL_V1,
+        clock=time.monotonic,
     )
     runtime = PolicyDeployRuntime(
         PolicyDeployRuntimeConfig(
@@ -902,13 +903,15 @@ def test_openpi_relative_raw_rtc_runs_through_shared_frontend_without_dispatch()
     emitting_step = None
     try:
         for index in range(160):
-            now = base + index / 30.0
+            # Success-path timing must share the worker/model clock. Advancing
+            # 33 ms every 1 ms otherwise tests intentionally obsolete actions.
+            now = time.monotonic()
             step = frontend.step(_observation(), now=now)
             emission = step.action_preparation.emission
             if emission is not None:
                 emitting_step = step
                 break
-            time.sleep(0.001)
+            time.sleep(1.0 / 30.0)
     finally:
         frontend.close(now=base + 6.0)
 

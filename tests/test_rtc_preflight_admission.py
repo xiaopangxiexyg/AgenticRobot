@@ -103,6 +103,7 @@ def test_pending_preflight_cannot_become_executable_and_timeout_is_bounded():
             allow_output=False, allow_request=True, preflight_timeout_sec=0.5,
         )
         assert expired.state.lifecycle_state == POLICY_ASYNC_PRODUCER_FAULT
+        assert expired.to_debug_payload()["lifecycle_transition_reason"] == "rtc_preflight_timeout"
         assert not expired.preflight_completion
         assert expired.control_duration_sec < 0.1
         assert expired.emission_result.emission is None
