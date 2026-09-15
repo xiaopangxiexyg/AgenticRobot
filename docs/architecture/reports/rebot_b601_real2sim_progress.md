@@ -766,3 +766,27 @@ Profiles 前仍为开发中；
 下一批应在不增加第二条控制路径的前提下，把该 session 绑定到一个前台、可视化、只驱动 RM65
 MuJoCo 的 application runner，再以真实 B601 只读输入做现场验收。该后续现场步骤不得使能或
 控制 B601，且需单独给出预期行为、退出语义与前台日志命令。
+
+## M4 跨机械臂 frame/scale profile（2026-09-14）
+
+本批在 shadow session 候选上继续，先将真实 B601 安装到 RM65 MuJoCo 坐标系所需的
+两条刚体变换和三轴平移尺度收敛为一个可哈希 profile。它位于 Control Station 应用
+装配边界，只构造现有 `CoordinateFrameGraph` 和 `HumanResidualPoseAdapter`，不读硬件、
+不管理 clutch、不解 RM65 IK、不实现新的 safety/dispatch。
+
+契约显式固定：
+
+- B601 source pose 为 `T_base_link_gripper_end`，RM65 residual 为
+  `right_arm_base` 参考系下的 `tool_tcp` relative delta；
+- 引用变换使用 `T_target_reference_source_reference`，受控帧变换使用
+  `T_source_controlled_target_controlled`，二者均经既有刚体图约束验证；
+- 平移 gain 在 RM65 target reference frame 中按 XYZ 应用；轴方向必须由刚体旋转
+  表达，不允许用负 gain 隐式造成反射；
+- 现有 canonical adapter 只支持 1:1 旋转残差，因此非 `1.0` rotation gain 显式
+  fail closed，本批没有另外复制 SE(3) 缩放逻辑；
+- 启用时必须有 calibration source ID、64 位 SHA-256 和两个完整刚体变换。
+  默认 `off` profile 不含 identity 矩阵，无法构造可运行 adapter。
+
+这一增量仍不包含本机实际安装标定数值，也不代表 Real→Sim runner 或真机验收已完成。
+下一步是将显式 profile 加载绑定到既有 `control_station sim-hil` 生命周期，并在未提供
+有效 profile 时保持默认关闭；现场的坐标方向、尺度与 clutch 验收需在该 runner 后单独进行。
