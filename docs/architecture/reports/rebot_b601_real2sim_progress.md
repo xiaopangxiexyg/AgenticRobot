@@ -736,3 +736,33 @@ drop。设备没有 acquisition timestamp，所以 `device_acquisition_timing_ve
 接触、温度和 fit/held-out 也尚未合格，因此
 `quantitative_plant_identification_ready=false`。后续 exact candidate 合并后再采集一次完整前台
 Type-24 控制记录即可运行该审计；本批本身不需要、也不授权任何真机动作。
+
+## M4 ReBot real → RM65 sim：shadow 会话生命周期（2026-09-14）
+
+本批基于 `5a1d4b1838e811a96e547f6401a0b88777038eee`，继续复用已经合并的三层实现：
+host-fresh B601 只读 pose source、anchor-relative B601→RM65 residual adapter，以及
+RM65 MuJoCo composition shadow controller。新增 session 只负责把这些现有边界按正确顺序连接，
+不重写 FK、SE(3) 映射、RM65 measured-pose baseline、composition、IK、安全过滤或 dispatch。
+
+- profile 默认关闭且永久禁止 `send_actions`；启用时要求 session 与 MuJoCo runtime 使用同一
+  monotonic clock domain，并以可哈希 profile 固定 operation identity 和有效时域。
+- `activate()` 从同一会话时刻先取得一份当前合法 B601 pose，再捕获 RM65 当前 measured pose；
+  只有两侧都成功才进入 active。source/target 拒绝或未知、未类型化的下游结果都 fail closed。
+- clutch 立即清除本地 anchor 与 evaluation eligibility，不轮询 B601、不调用 MuJoCo composition；
+  release/recenter 必须重新取得两侧新鲜锚点。任一侧拒绝时保持 clutched，不回用旧 anchor。
+- active tick 只适配本 tick 的 B601 sample；stale/invalid source 作为本 tick withdrawal 传给既有
+  shadow controller，后者不会用缓存 residual 做 evaluation。异常会把 session 置回 inactive，
+  需要重新双侧激活；target time 要求位于当前时刻之后且严格递增。
+- session 不启动或关闭 source/runtime，不创建 execution authority，不晋升 shadow proposal，
+  不发送 sim/real command。当前产物是可审计的非执行 shadow 生命周期，尚不是操作者可运行的
+  Real→Sim application，也没有进行任何真机连接、使能或运动。
+
+本批聚焦回归覆盖默认关闭、双锚点激活、source/target 拒绝、clutch/recenter、当前样本撤销、
+异常失活、时钟域约束和无 lifecycle/dispatch 调用，相关组合/边界集合 **80 passed**。
+项目 fast feedback 的两个 unit 分片分别为 **4265 passed / 20 skipped**、
+**4418 passed / 1 skipped**，integration 为 **741 passed / 2 skipped**；Ruff、py_compile 与
+`git diff --check` 通过，临时 read-only assets 链接已由 wrapper 清除。候选完成 Harness
+Profiles 前仍为开发中；
+下一批应在不增加第二条控制路径的前提下，把该 session 绑定到一个前台、可视化、只驱动 RM65
+MuJoCo 的 application runner，再以真实 B601 只读输入做现场验收。该后续现场步骤不得使能或
+控制 B601，且需单独给出预期行为、退出语义与前台日志命令。
