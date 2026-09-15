@@ -649,7 +649,23 @@ class BoundedPolicyInferenceWorker:
     @property
     def session_state(self) -> str:
         with self._lock:
+            self._refresh_retired_session_locked()
             return self._session_state
+
+    def _refresh_retired_session_locked(self) -> None:
+        if (
+            self._stop_event.is_set()
+            and self._executing_request_id is None
+            and (self._thread is None or not self._thread.is_alive())
+        ):
+            cancel_pending = (
+                self._executor_cancel_hook_available
+                and self._executor_cancel_outcome is None
+            )
+            self._session_state = (
+                POLICY_WORKER_SESSION_RETIRED_WAITING_FOR_COMPLETION
+                if cancel_pending else POLICY_WORKER_SESSION_DRAINED
+            )
 
     @property
     def executing_request_id(self) -> str | None:
@@ -671,6 +687,7 @@ class BoundedPolicyInferenceWorker:
     def session_snapshot(self) -> PolicyWorkerSessionSnapshot:
         observed_at = self._time()
         with self._lock:
+            self._refresh_retired_session_locked()
             return PolicyWorkerSessionSnapshot(
                 worker_id=self.worker_id,
                 worker_session_id=self.worker_session_id,
@@ -814,7 +831,12 @@ class BoundedPolicyInferenceWorker:
                 if self._state != "faulted":
                     self._state = "stopped"
                 self._executing_request_id = None
-                self._session_state = POLICY_WORKER_SESSION_DRAINED
+                self._session_state = (
+                    POLICY_WORKER_SESSION_RETIRED_WAITING_FOR_COMPLETION
+                    if self._executor_cancel_hook_available
+                    and self._executor_cancel_outcome is None
+                    else POLICY_WORKER_SESSION_DRAINED
+                )
 
     def _dispatch_executor_cancel(
         self,
@@ -958,7 +980,11 @@ class BoundedPolicyInferenceWorker:
             executing_request_id = self._executing_request_id
             discarded = tuple(self._discarded_queued_request_ids)
             state = self._state
-            if thread_exited and executing_request_id is None:
+            cancel_pending = (
+                self._executor_cancel_hook_available
+                and self._executor_cancel_outcome is None
+            )
+            if thread_exited and executing_request_id is None and not cancel_pending:
                 self._session_state = POLICY_WORKER_SESSION_DRAINED
             elif executing_request_id is not None:
                 self._session_state = POLICY_WORKER_SESSION_ABANDONED_UNDRAINED
@@ -967,7 +993,9 @@ class BoundedPolicyInferenceWorker:
                     POLICY_WORKER_SESSION_RETIRED_WAITING_FOR_COMPLETION
                 )
             session_state = self._session_state
-        if thread_exited and executing_request_id is None:
+        if thread_exited and executing_request_id is None and cancel_pending:
+            status = "executor_cancel_pending"
+        elif thread_exited and executing_request_id is None:
             status = "stopped"
         elif executing_request_id is not None:
             status = "executing_call_not_drained"
