@@ -12,6 +12,7 @@ import math
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -104,6 +105,54 @@ def add_b601_contact_wrench_sensor(root: ET.Element) -> None:
             "reduce": "netforce",
         },
     )
+
+
+def build_b601_contact_box_fixture(
+    source_root: str | Path,
+    initial_arm_qpos: Sequence[float],
+) -> tuple[MujocoScene, FreeBodyObjectSpec]:
+    """Build the shared deterministic contact-test fixture, not a plant profile."""
+    # Scene compilation imports sensor assembly from this module. Keep the
+    # factory import local rather than introducing a second compiler.
+    from .scene import build_b601_mujoco_scene
+
+    def build(objects=()):
+        return build_b601_mujoco_scene(
+            source_root,
+            initial_arm_qpos=initial_arm_qpos,
+            gravity_mps2=(0.0, 0.0, -9.81),
+            actuation_mode="effort",
+            scene_spec=b601_contact_scene_spec(objects=objects),
+            enable_contact_observation=True,
+        )
+
+    scene = build()
+    geom_id = scene.mujoco.mj_name2id(
+        scene.model,
+        scene.mujoco.mjtObj.mjOBJ_GEOM,
+        "gripper_end_collision_0",
+    )
+    if (
+        geom_id < 0
+        or scene.model.geom_type[geom_id] != scene.mujoco.mjtGeom.mjGEOM_MESH
+    ):
+        raise ValueError("contact-box requires the pinned gripper collision mesh")
+    mesh_id = int(scene.model.geom_dataid[geom_id])
+    address = int(scene.model.mesh_vertadr[mesh_id])
+    count = int(scene.model.mesh_vertnum[mesh_id])
+    vertices = (
+        scene.model.mesh_vert[address : address + count]
+        @ scene.data.geom_xmat[geom_id].reshape(3, 3).T
+        + scene.data.geom_xpos[geom_id]
+    )
+    top = vertices[np.argmax(vertices[:, 2])]
+    box = FreeBodyObjectSpec(
+        name="b601_contact_box",
+        size_m=(0.02,) * 3,
+        mass_kg=0.05,
+        initial_position_m=tuple(float(v) for v in top + (0.0, 0.0, 0.0095)),
+    )
+    return build(objects=(box,)), box
 
 
 def read_b601_contact_observation(

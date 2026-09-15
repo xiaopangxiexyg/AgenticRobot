@@ -24,10 +24,10 @@ from robot_motion.rebot_b601_rs import (
     B601VirtualWall,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
-from sim.contracts import FreeBodyObjectSpec, TimingSpec
+from sim.contracts import TimingSpec
 from sim.mujoco.viewer import MujocoPassiveViewerSession
 
-from .contact import b601_contact_scene_spec, read_b601_contact_observation
+from .contact import build_b601_contact_box_fixture, read_b601_contact_observation
 from .mit_driver import B601MujocoEffortDriver, default_b601_mit_profile
 from .real2sim import B601Real2SimControllerProfile, B601SimStartupProfile
 from .scene import B601_RS_PHYSICS_HZ, build_b601_mujoco_scene
@@ -41,6 +41,7 @@ DEFAULT_MAX_FORCE_N = 8.0
 DEFAULT_MAX_OVERLAY_TORQUE_NM = 6.0
 DEFAULT_WALL_PENETRATION_M = 0.025
 CONTACT_FIXTURE = "contact-box"
+REFLECTION_FIXTURE = "force-reflection"
 POSE_FIXTURES = (
     "pose-tx",
     "pose-ty",
@@ -67,12 +68,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fixture",
-        choices=("spring", "wall", CONTACT_FIXTURE, *POSE_FIXTURES),
+        choices=("spring", "wall", CONTACT_FIXTURE, REFLECTION_FIXTURE, *POSE_FIXTURES),
         default="spring",
     )
     parser.add_argument(
-        "--trace-jsonl", type=Path,
-        help="Contact-box only: create an exclusive same-state command-tick trace file.",
+        "--trace-jsonl",
+        type=Path,
+        help="Contact-box/reflection: create an exclusive same-state command-tick trace file.",
+    )
+    parser.add_argument(
+        "--feedback-delay-sec",
+        type=float,
+        default=0.0,
+        help="Force-reflection only: deterministic local simulation delay.",
     )
     parser.add_argument(
         "--duration-sec",
@@ -346,47 +354,19 @@ def run_haptic_fixture_demo(
         stiffness_scale=fixture_stiffness_scale,
         damping_scale=fixture_damping_scale,
     )
-    scene = build_b601_mujoco_scene(
-        source_root,
-        initial_arm_qpos=initial_qpos,
-        gravity_mps2=(0.0, 0.0, -9.81),
-        actuation_mode="effort",
-        scene_spec=b601_contact_scene_spec() if fixture_name == CONTACT_FIXTURE else None,
-        enable_contact_observation=fixture_name == CONTACT_FIXTURE,
-    )
     if fixture_name == CONTACT_FIXTURE:
-        # Place a small free box on the actual pinned collision mesh, not on a
-        # replacement probe.  This kinematic placement happens before control.
-        geom_id = scene.mujoco.mj_name2id(
-            scene.model, scene.mujoco.mjtObj.mjOBJ_GEOM, "gripper_end_collision_0"
-        )
-        if geom_id < 0:
-            raise ValueError("contact-box requires the pinned gripper collision mesh")
-        mesh_id = int(scene.model.geom_dataid[geom_id])
-        if mesh_id < 0:
-            raise ValueError("contact-box requires a mesh collision geometry")
-        address = int(scene.model.mesh_vertadr[mesh_id])
-        count = int(scene.model.mesh_vertnum[mesh_id])
-        vertices = (
-            scene.model.mesh_vert[address : address + count]
-            @ scene.data.geom_xmat[geom_id].reshape(3, 3).T
-            + scene.data.geom_xpos[geom_id]
-        )
-        top = vertices[np.argmax(vertices[:, 2])]
-        box = FreeBodyObjectSpec(
-            name="b601_contact_box", size_m=(0.02,) * 3, mass_kg=0.05,
-            initial_position_m=tuple(float(v) for v in top + (0.0, 0.0, 0.0095)),
-        )
-        scene = build_b601_mujoco_scene(
-            source_root, initial_arm_qpos=initial_qpos,
-            gravity_mps2=(0.0, 0.0, -9.81), actuation_mode="effort",
-            scene_spec=b601_contact_scene_spec(objects=(box,)),
-            enable_contact_observation=True,
-        )
+        scene, box = build_b601_contact_box_fixture(source_root, initial_qpos)
         fixture_contract.update(
             physical_object=box.to_dict(),
             placement="mesh_highest_world_vertex_plus_half_box_height_minus_0.0005m",
             contact_feedback_control="native_constraint_only_not_added_to_overlay",
+        )
+    else:
+        scene = build_b601_mujoco_scene(
+            source_root,
+            initial_arm_qpos=initial_qpos,
+            gravity_mps2=(0.0, 0.0, -9.81),
+            actuation_mode="effort",
         )
     base_profile = (
         default_b601_mit_profile(scene)
@@ -864,6 +844,33 @@ def _accumulate_power(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.fixture == REFLECTION_FIXTURE:
+        if (
+            args.real2sim_controller
+            or args.gravity_control_baseline != "operator"
+            or args.startup_lock_kp is not None
+            or args.startup_lock_kd is not None
+            or args.fixture_stiffness_scale != 1.0
+            or args.fixture_damping_scale != 1.0
+            or args.torque_rise_time_sec is not None
+        ):
+            parser.error(
+                "force-reflection has a fixed offline profile; fixture/real2sim retuning is not supported"
+            )
+        from .reflection_demo import run_force_reflection_demo
+
+        code, payload = run_force_reflection_demo(
+            source_root=args.rebot_source_root,
+            duration_sec=args.duration_sec,
+            initial_qpos=DEFAULT_HAPTIC_INITIAL_QPOS,
+            viewer=bool(args.viewer),
+            trace_jsonl=args.trace_jsonl,
+            feedback_delay_sec=args.feedback_delay_sec,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return code
+    if args.feedback_delay_sec != 0.0:
+        parser.error("feedback-delay-sec requires force-reflection")
     controller = None
     if args.gravity_control_baseline == "raw-model":
         if not args.real2sim_controller:

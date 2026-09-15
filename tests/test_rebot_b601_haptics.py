@@ -8,6 +8,8 @@ import pytest
 from robot_motion.rebot_b601_rs import (
     B601_RS_URDF_RELATIVE_PATH,
     B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME,
+    B601HapticWrenchChannel,
+    B601HapticWrenchSample,
     B601PinocchioModel,
     B601PoseVirtualSpring,
     B601SpatialWrench,
@@ -22,6 +24,162 @@ from scripts.hardware import rebot_b601_rs_low_gain_probe as low_gain_probe
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REBOT_SOURCE_ROOT = REPO_ROOT / "hardware" / "reBotArm_control_py"
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def _feedback_channel(**overrides):
+    config = {
+        "source_frame_id": "follower_tip", "target_T_source": np.eye(4), "gain": 1.0,
+        "max_abs_force_n": (2.0,) * 3, "max_abs_torque_nm": (0.2,) * 3,
+        "max_force_rate_n_s": (1.0,) * 3, "max_torque_rate_nm_s": (0.1,) * 3,
+        "filter_tau_sec": 0.0, "maximum_source_age_sec": 0.1,
+    }
+    config.update(overrides)
+    return B601HapticWrenchChannel(**config)
+
+
+def _feedback_sample(sequence=0, time=0.0, **overrides):
+    fields = {
+        "sequence": sequence, "source_timestamp_sec": time, "receive_timestamp_sec": time,
+        "wrench": B601SpatialWrench((1.0, 0.0, 0.0), (0.0,) * 3, "follower_tip"),
+    }
+    fields.update(overrides)
+    return B601HapticWrenchSample(**fields)
+
+
+def test_haptic_channel_ramps_from_zero_and_expires_original_source_age() -> None:
+    channel = _feedback_channel()
+    first = channel.update(_feedback_sample(), now_sec=0.0)
+    np.testing.assert_array_equal(first.wrench.as_vector(), np.zeros(6))
+    held = channel.update(None, now_sec=0.05)
+    assert held.source_sequence == 0
+    assert held.source_age_sec == 0.05
+    assert held.source_timestamp_sec == held.receive_timestamp_sec == 0.0
+    assert held.wrench.force_n == pytest.approx((0.05, 0.0, 0.0))
+    expired = channel.update(None, now_sec=0.100001)
+    assert expired.rejection_reason == "expired_source"
+    np.testing.assert_array_equal(expired.wrench.as_vector(), np.zeros(6))
+
+
+@pytest.mark.parametrize(
+    "bad,reason",
+    [
+        (_feedback_sample(1, 0.05, valid=False), "invalid_sample"),
+        (
+            _feedback_sample(
+                1, 0.05, wrench=B601SpatialWrench((1.0,) * 3, (0.0,) * 3, "wrong")
+            ),
+            "unexpected_frame",
+        ),
+        (_feedback_sample(1, 0.2), "future_timestamp"),
+        (_feedback_sample(0, 0.05), "stale_sequence"),
+        (_feedback_sample(1, 0.0), "stale_source_timestamp"),
+    ],
+)
+def test_haptic_channel_bad_input_immediately_cancels_and_requires_new_sample(
+    bad, reason
+) -> None:
+    channel = _feedback_channel(filter_tau_sec=0.02)
+    channel.update(_feedback_sample(), now_sec=0.0)
+    assert channel.update(None, now_sec=0.04).wrench.force_n[0] > 0.0
+    rejected = channel.update(bad, now_sec=0.06)
+    assert rejected.rejection_reason == reason
+    assert rejected.source_sequence is None
+    np.testing.assert_array_equal(rejected.wrench.as_vector(), np.zeros(6))
+    np.testing.assert_array_equal(
+        channel.update(None, now_sec=0.07).wrench.as_vector(), np.zeros(6)
+    )
+    restarted = channel.update(_feedback_sample(1, 0.08), now_sec=0.08)
+    assert 0.0 < restarted.wrench.force_n[0] <= 0.01 + 1e-12
+
+
+def test_haptic_channel_delayed_sample_does_not_refresh_acquisition_time() -> None:
+    channel = _feedback_channel()
+    sample = _feedback_sample(receive_timestamp_sec=0.09)
+    output = channel.update(sample, now_sec=0.09)
+    assert output.source_age_sec == 0.09
+    assert channel.update(None, now_sec=0.11).rejection_reason == "expired_source"
+    assert (
+        _feedback_channel().update(sample, now_sec=0.11).rejection_reason
+        == "expired_source"
+    )
+
+
+def test_haptic_channel_rejects_receive_regression_and_mapped_overflow() -> None:
+    channel = _feedback_channel()
+    channel.update(_feedback_sample(receive_timestamp_sec=0.08), now_sec=0.08)
+    rejected = channel.update(_feedback_sample(1, 0.02), now_sec=0.09)
+    assert rejected.rejection_reason == "stale_receive_timestamp"
+    np.testing.assert_array_equal(rejected.wrench.as_vector(), np.zeros(6))
+    overflow = _feedback_channel(gain=1e308)
+    overflow.update(_feedback_sample(wrench=B601SpatialWrench((1e-308, 0.0, 0.0), (0.0,) * 3, "follower_tip")), now_sec=0.0)
+    assert overflow.update(None, now_sec=0.04).wrench.force_n[0] > 0.0
+    rejected = overflow.update(_feedback_sample(1, 0.05, wrench=B601SpatialWrench((2.0, 0.0, 0.0), (0.0,) * 3, "follower_tip")), now_sec=0.05)
+    assert rejected.rejection_reason == "non_finite_mapped_wrench"
+    np.testing.assert_array_equal(rejected.wrench.as_vector(), np.zeros(6))
+
+
+def test_haptic_channel_mapping_uses_rotation_and_origin_before_clipping() -> None:
+    transform = np.eye(4)
+    transform[:3, :3] = _rotation_z(np.pi / 2.0)
+    transform[:3, 3] = (1.0, 0.0, 0.0)
+    channel = _feedback_channel(
+        target_T_source=transform,
+        gain=10.0,
+        max_force_rate_n_s=(1000.0,) * 3,
+        max_torque_rate_nm_s=(1000.0,) * 3,
+    )
+    transform[:] = 0.0  # The caller cannot mutate the admitted transform.
+    channel.update(_feedback_sample(), now_sec=0.0)
+    output = channel.update(None, now_sec=0.05)
+    assert output.amplitude_limited is True
+    assert output.wrench.force_n == pytest.approx((0.0, 2.0, 0.0), abs=1e-12)
+    assert output.wrench.torque_nm == pytest.approx((0.0, 0.0, 0.2), abs=1e-12)
+    assert output.wrench.frame_id == B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME
+
+
+def test_haptic_channel_low_pass_and_slew_use_consumer_dt_not_source_interval() -> None:
+    channel = _feedback_channel(filter_tau_sec=0.02, max_force_rate_n_s=(100.0,) * 3)
+    channel.update(_feedback_sample(), now_sec=0.0)
+    assert channel.update(None, now_sec=0.01).wrench.force_n[0] == pytest.approx(
+        1.0 - np.exp(-0.5)
+    )
+    assert channel.update(None, now_sec=0.02).wrench.force_n[0] == pytest.approx(
+        1.0 - np.exp(-1.0)
+    )
+    with pytest.raises(ValueError, match="strictly advance"):
+        channel.update(None, now_sec=0.02)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"gain": -1.0},
+        {"gain": float("nan")},
+        {"filter_tau_sec": -0.1},
+        {"maximum_source_age_sec": 0.0},
+        {"max_abs_force_n": (float("inf"),) * 3},
+        {"max_force_rate_n_s": (-1.0,) * 3},
+        {"target_T_source": np.zeros((4, 4))},
+    ],
+)
+def test_haptic_channel_rejects_invalid_configuration(overrides) -> None:
+    with pytest.raises(ValueError):
+        _feedback_channel(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sequence": -1},
+        {"sequence": True},
+        {"source_timestamp_sec": float("nan")},
+        {"source_timestamp_sec": 0.2, "receive_timestamp_sec": 0.1},
+        {"valid": "true"},
+    ],
+)
+def test_haptic_sample_rejects_invalid_metadata(overrides) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        _feedback_sample(**overrides)
 
 
 @pytest.fixture(scope="module")

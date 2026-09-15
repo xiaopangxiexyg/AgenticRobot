@@ -11,7 +11,7 @@
 `simulated follower contact -> haptic feedback` 所需的原始输入契约。它不修改默认 position/
 effort 场景，不引入第二套 simulator，也不把接触力直接发送给控制器或真机。
 
-范围固定为：
+初始 contact observer 切片的范围为（后续独立反馈装配见第 6 节）：
 
 - 复用现有通用 `SceneSpec`、ground、free-body object、collision filter 和接触材质编译器；
 - 在 B601 场景中按需加入一个 MuJoCo 原生 contact sensor；
@@ -119,7 +119,8 @@ spring anchor 使用仿真初态的当前 FK，不另外规划一段机械臂运
 
 MuJoCo 约束求解器已经把接触反力施加到 plant。本切片**不将测得的 `J.T @ contact_wrench` 再加回
 同一机械臂**，否则会重复施力。该投影只用于方向和 `F.T @ V == tau.T @ dq` 的诊断，真正送入
-driver 的 overlay 仍然只有已有 spring。下游 master/follower force reflection 尚未实现。
+driver 的 overlay 仍然只有已有 spring。该单臂 fixture 不做 force reflection；独立双 plant
+装配见第 6 节。
 
 `--trace-jsonl PATH` 创建新的 JSONL（已有文件拒绝覆盖），按参考 tick 流式记录：
 
@@ -162,13 +163,88 @@ deprecation warning），现有 CLI `--help`、Ruff 与 diff check 通过。正�
 Profile 不单独证明新增 physical-contact 测试，以上聚焦结果与固定 gitlink 的实际模型仿真证据需要
 独立保留。
 
-## 6. 后续切片
+## 6. 独立 follower -> master 力反馈切片（2026-09-15）
+
+`robot_motion.rebot_b601_rs.haptics` 新增 `B601HapticWrenchSample` 和小型
+`B601HapticWrenchChannel`，复用已有 wrench 类型与 co-adjoint 变换，不依赖 MuJoCo、真机或
+teleop runtime。样本显式包含 sequence、source/receive timestamp、frame 和 valid；channel
+只拥有单条反馈的 admission/filter memory，不拥有 actuator、gravity、motion source 或 dispatch。
+
+通道顺序为：frame/sequence/time/age 验证 -> co-adjoint -> 非负 scalar gain -> 六维逐轴 clip
+-> 按 consumer dt 计算的 LPF -> slew -> 最终逐轴 bound。首个输出从零开始。
+`update(None)` 只在原始 source age 合法时保持样本，不能重写时间戳。wrong-frame、invalid、
+out-of-order、future、expired 或非有限映射立即把反馈清零并清除滤波记忆，恢复需新合法样本；
+这不改变 driver 的独立 gravity/damping/watchdog。反馈撤销不意味着 actuator 总力矩 slew 被绕过。
+
+现有 CLI 新增 `--fixture force-reflection`，内部装配位于 `reflection_demo.py`；没有第二个
+生产入口。两个独立 B601 ideal-effort plant 各复用唯一 `B601MujocoEffortDriver`：
+
+```text
+synthetic B601 follower + native mesh/box contact
+    -> immutable current-state contact wrench
+    -> optional local simulated delay
+    -> bounded wrench channel
+    -> existing master J.T mapping
+    -> master spring + feedback overlay
+    -> existing gravity/damping + final MIT clip/slew owner
+```
+
+follower 只执行自己的已有 spring，不重复施加 native contact reaction，也不受 master 位移
+影响。这里的 follower 是用于验收的 B601 合成源，不是 RM65；RM65 后续仍必须通过其已有
+canonical target 接入。当前无 teleop/policy/motion return channel，因此没有把反力导致的
+master 位移冒充 human intent，也不宣称已实现 intent observer。
+
+固定验收耦合为 tip-origin 的 `Ry(+90 deg)`、translation=0：follower 的 `-Z` 接触反力映射到
+master 的 `-X`。不是把两个 base 的位置差塞进 wrench transform 产生伪 lever-arm torque。
+通道使用每轴 force `2 N`、moment `0.2 Nm`、force slew `5 N/s`、moment slew `2 Nm/s`、
+LPF tau `0.02 s`、source age ceiling `0.1 s`；这些只是明确的离线 seed，未改任何真机默认值。
+
+trace 区分当前两端 q/dq、当前 source wrench、仍 active 的旧样本 source/receive time 和本
+tick 新到达事件，随后记录 master spring、feedback、合成 overlay 与 driver admission。
+co-adjoint power test 使用对应变换的**虚拟 source twist**；两个独立 plant 的实际速度没有被
+强制设为相等。scalar gain、clip/LPF/slew 不保持 power invariance。名义 feedback work 按
+held requested feedback torque 和步前 control qvel 累加，不能当成最终总力矩 slew 后的独立
+功率分解。有限时域 `sum(tau_overlay_limit * dq_state_limit) * elapsed` 仅为有界输出且无
+fault/clip 的本次 run 提供宽松上界，不是 passivity observer、energy tank 或长期触觉稳定性保证。
+
+纯仿真前台命令（从最终候选 worktree 根目录运行，不访问 CAN）：
+
+```bash
+(
+  RUN_DIR="$(mktemp -d /tmp/b601-force-reflection-XXXXXX)" || exit 1
+  LOG="$RUN_DIR/command_and_output.log"
+  CMD=(/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
+       -m sim.mujoco.rebot_b601_rs.haptic_demo
+       --rebot-source-root hardware/reBotArm_control_py
+       --fixture force-reflection --duration-sec 1.5 --feedback-delay-sec 0.04
+       --trace-jsonl "$RUN_DIR/feedback.jsonl")
+  { printf 'command:'; printf ' %q' "${CMD[@]}"; printf '\n'; } > "$LOG"
+  env PYTHONDONTWRITEBYTECODE=1 MUJOCO_GL=egl "${CMD[@]}" \
+    > "$RUN_DIR/result.json" 2>> "$LOG"
+  SIM_STATUS=$?
+  printf 'sim exit=%s; results=%s\n' "$SIM_STATUS" "$RUN_DIR"
+)
+```
+
+需要 GUI 时，移除 `MUJOCO_GL=egl` 并追加 `--viewer`。该 viewer **只显示 master**，不是两个
+场景拼接显示；follower 的物理接触见 result/trace 或第 5 节单臂 `contact-box --viewer`。
+固定 seed 位移很小，不能用“肉眼看起来没有动”替代 trace 验收。GUI 尚未人工验证。
+
+聚焦覆盖保留了旧 fixture 行为，并新增：源数据 freshness/sequence/frame 拒绝、即时清零与
+重启、LPF/slew、带 rotation/lever-arm 的映射后 clip、非法参数/metadata 和映射 overflow；
+两个独立 driver 的实际发送 spy、0/40 ms 延迟的完整双 plant trace、零 gain 的无反馈负对照、
+120 ms 延迟过期拒绝，以及现有 CLI 的正向/非法选项路径。七文件回归 `229 passed`，Ruff 与
+diff check 通过。40 ms seed 两端各 1500 physics ticks、750 reference ticks，无 fault 或
+torque/overlay clip；master 反馈力矩峰值约 `0.25 Nm`，名义 delivered work 约 `0.0041 J`。
+这些结果不是硬件或辨识证据；正式 Profile 必须在本次最终 commit 上重跑。
+
+## 7. 后续切片
 
 1. 当前 box 接触 trace 已完成；后续扩展更明确的接触方向/工作空间对照及固定障碍物场景时，
    继续复用通用 scene compiler，不能为了测试重复施加 native 接触反力。
-2. 复用现有 haptics limit/filter 与 frame transform，将原始 contact wrench 变成独立的
-   `HapticWrenchSample`；保持 motion channel 与 haptic channel 分离。
-3. 建立 `F_slave -> F_master -> J_master.T @ F_master` 的纯仿真链，验证方向、功率不变量、
-   saturation、slew 和 delay/jitter 下的有界能量。
+2. 原始 contact -> timestamped bounded wrench channel -> 独立 master J.T 的合成仿真链已落地。
+   后续按总路线图将 RM65 contact/source adapter 接入 canonical target，不复制 RM65 execution loop。
+3. 继续验证 jitter/dropout、更多接触方向和物理参数下的行为；需要能量稳定性声明时独立实现
+   passivity/energy-tank 门禁，不能用本次有限时域 work 上界替代。
 4. 在完成仿真与 shadow 门禁前，不把本切片接入真机 torque command；绝对 force scale、摩擦、
    payload 和触感继续等待独立真机证据。
