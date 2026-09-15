@@ -8,6 +8,10 @@ import sys
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] == "b601-rm65":
+        from .sim_hil_profile.rebot_b601_rm65_application import main as b601_rm65_main
+
+        return int(b601_rm65_main(values[1:]))
     if values and values[0] == "sim-hil":
         from .sim_hil import main as sim_hil_main
 
@@ -40,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
         "command",
         nargs="?",
         choices=(
+            "b601-rm65",
             "sim-hil",
             "vive-calibration",
             "vive-deflection",
