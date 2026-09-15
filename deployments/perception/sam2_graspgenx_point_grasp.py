@@ -29,11 +29,9 @@ from .graspgenx_client import GraspGenXInferenceBackend
 from .sam2_vgn_point_grasp import (
     DEFAULT_DMTAC_M_URDF,
     DEFAULT_DMTAC_M_URDF_SHA256,
-    PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
     PointGraspCandidate,
     PointGraspResult,
     Sam2VgnPointGraspPlanner,
-    select_upward_parallel_jaw_tcp_pose,
 )
 
 GRASPGENX_GIT_URL = "https://github.com/NVlabs/GraspGenX.git"
@@ -391,7 +389,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 "candidate_family_nms": {
                     "translation_m": GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M,
                     "approach_axis_deg": GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG,
-                    "closing_axis_symmetry_deg": (
+                    "oriented_closing_axis_deg": (
                         GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
                     ),
                 },
@@ -419,8 +417,8 @@ class Sam2GraspGenXPointGraspPlanner:
                         0.0,
                         DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
                     ],
-                    "parallel_jaw_wrist_symmetry_deg": [0, 180],
-                    "tcp_orientation_selection": PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
+                    "tcp_orientation_selection": "preserve_scored_model_orientation_v1",
+                    "finger_exchange_deduplication": False,
                 },
                 "simulation_urdf": DEFAULT_DMTAC_M_URDF,
                 "simulation_urdf_sha256": DEFAULT_DMTAC_M_URDF_SHA256,
@@ -668,11 +666,9 @@ class Sam2GraspGenXPointGraspPlanner:
                 continue
             base_from_tcp = base_from_model_base @ model_base_from_tcp
             camera_from_tcp = camera_from_base @ base_from_tcp
-            camera_from_tcp, base_from_tcp = select_upward_parallel_jaw_tcp_pose(
-                camera_from_tcp, base_from_tcp
-            )
-            # Preserve the scored model pose. Translation changes can invalidate
-            # the discriminator score and must not masquerade as its prediction.
+            # Preserve both translation and orientation of each scored pose.
+            # Finger exchange preserves the nominal jaw solids, not the whole
+            # mounted robot or its eccentric controller TCP and IK feasibility.
             camera_from_tcp = _strict_rigid_matrix(
                 camera_from_tcp,
                 field_name="GraspGenX camera_from_tcp candidate",
@@ -885,11 +881,10 @@ class Sam2GraspGenXPointGraspPlanner:
             GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
         ):
             return False
-        # Rotating a parallel-jaw grasp around its approach axis changes the
-        # closing direction and must remain selectable.  Only identify closing
-        # axes up to sign because exchanging the two fingers is equivalent.
+        # Finger exchange is not a whole-robot symmetry. Keep opposite scored
+        # closing axes for independent controller-TCP IK and path validation.
         closing_cosine = float(
-            np.clip(abs(np.dot(first[:3, 0], second[:3, 0])), 0.0, 1.0)
+            np.clip(np.dot(first[:3, 0], second[:3, 0]), -1.0, 1.0)
         )
         closing_axis_angle = math.acos(closing_cosine)
         return closing_axis_angle < math.radians(

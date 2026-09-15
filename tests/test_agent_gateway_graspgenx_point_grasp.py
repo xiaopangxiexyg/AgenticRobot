@@ -503,9 +503,11 @@ def test_planner_rejects_non_finite_score_threshold(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("cad_bound", [False, True])
+@pytest.mark.parametrize("base_tilt_degrees", [0, -30])
 def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     tmp_path: Path,
     cad_bound: bool,
+    base_tilt_degrees: float,
 ) -> None:
     depth = np.zeros((20, 20), dtype=np.float32)
     depth[8:13, 8:13] = 1.0
@@ -515,6 +517,11 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     base_from_camera = np.eye(4, dtype=np.float64)
     base_from_camera[:3, :3] = np.asarray(
         ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+    )
+    tilt = math.radians(base_tilt_degrees)
+    base_from_camera[:3, :3] = base_from_camera[:3, :3] @ np.asarray(
+        ((1, 0, 0), (0, math.cos(tilt), -math.sin(tilt)),
+         (0, math.sin(tilt), math.cos(tilt)))
     )
     base_from_camera[:3, 3] = (0.20, -0.10, 0.30)
     base_from_model_base = base_from_camera @ camera_from_model_base
@@ -586,9 +593,11 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     assert client.closed_for_test
 
 
-def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
+@pytest.mark.parametrize("cad_bound", [False, True])
+def test_planner_preserves_scored_finger_exchange_for_independent_robot_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cad_bound: bool,
 ) -> None:
     depth = np.zeros((20, 20), dtype=np.float32)
     depth[8:13, 8:13] = 1.0
@@ -627,6 +636,7 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
         model_spec=_model_spec(tmp_path),
         point_segmenter=_Segmenter(mask),
         client=client,
+        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
     )
     monkeypatch.setattr(
         Sam2VgnPointGraspPlanner,
@@ -652,9 +662,17 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
     )
 
     assert [candidate.model_score for candidate in result.candidates] == pytest.approx(
-        [0.9, 0.8, 0.7, 0.6]
+        [0.9, 0.8, 0.7, 0.65, 0.6]
     )
+    for candidate, scored_pose in zip(result.candidates, grasps, strict=True):
+        expected = scored_pose.copy()
+        expected[:3, 3] += .042999 * expected[:3, 2]
+        actual_tcp = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
+        np.testing.assert_allclose(planner.solid_geometry.solid_pose(actual_tcp), expected, atol=1e-9)
+    exchanged = np.asarray(result.candidates[3].camera_from_tcp).reshape(4, 4)
     first = np.asarray(result.candidates[0].camera_from_tcp).reshape(4, 4)
+    assert np.dot(first[:3, 0], exchanged[:3, 0]) == pytest.approx(-1)
+    assert np.linalg.norm(first[:3, 3] - exchanged[:3, 3]) == pytest.approx(.049 if cad_bound else 0, abs=1e-8)
     tilted_result = np.asarray(result.candidates[-1].camera_from_tcp).reshape(4, 4)
     assert np.dot(first[:3, 2], tilted_result[:3, 2]) == pytest.approx(
         math.cos(tilted_angle)
@@ -696,6 +714,18 @@ def test_candidate_selection_balances_approaches_and_closing_axis_variants() -> 
 
     assert representatives == [0, 5, 6, 7]
     assert selected == [0, 5, 1, 2]
+
+
+@pytest.mark.parametrize("yaw_degrees,same_family", [(0, True), (10, True), (30, False), (180, False)])
+def test_candidate_family_deduplicates_nearby_orientations_not_finger_exchange(yaw_degrees, same_family):
+    first = np.eye(4)
+    second = np.eye(4)
+    angle = math.radians(yaw_degrees)
+    second[:3, :3] = np.asarray(
+        ((math.cos(angle), -math.sin(angle), 0),
+         (math.sin(angle), math.cos(angle), 0), (0, 0, 1))
+    )
+    assert Sam2GraspGenXPointGraspPlanner._same_candidate_family(first, second) is same_family
 
 
 def test_planner_does_not_translate_scored_offset_grasp_to_hide_solid_collision(
