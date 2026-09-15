@@ -4,7 +4,7 @@
   "runtime": {
     "active_sides": "both",
     "end_effector_sides": "both",
-    "arm_execution_profile": "impedance_40hz",
+    "arm_execution_profile": "position_15_60_120hz",
     "left_arm_ip": "192.168.101.21",
     "right_arm_ip": "192.168.1.20",
     "enable_hands": true,

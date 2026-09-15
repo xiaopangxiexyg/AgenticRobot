@@ -287,7 +287,8 @@ RM65 位控 RTC 等待窗口复用 backend 的 acceleration/jerk-limited quick-s
 qcmd。重复空计划 tick 不重复 clear 或重启减速；只有通过既有安全检查并激活的
 新目标才恢复输出。反馈失败、worker 故障、急停或未建立 Hold 仍停止该部署路径。
 
-位控部署使用 `--arm-execution-profile position_15_60_120hz`：reference/IK 为
+`rm65_bimanual_dmtac` 默认使用 `position_15_60_120hz` 位控，也可显式指定
+`--arm-execution-profile position_15_60_120hz`：reference/IK 为
 60 Hz，CANFD sender 为 120 Hz；模型 action/policy 时间基保持训练时的 30 Hz，
 不能把 action-hz 改成 60 来代替位控设置。Client 无需知道 Stage 或 checkpoint
 step，这些由 Server 选择。使用完整的 `--send-actions` 拼写，并保留

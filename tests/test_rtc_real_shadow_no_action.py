@@ -325,6 +325,8 @@ def test_openpi_real_shadow_profile_preserves_qpos_init_authority() -> None:
         send_actions=True,
     )
     assert "--policy-qpos-init-dataset" in ordinary
+    position_index = ordinary.index("--arm-execution-profile")
+    assert ordinary[position_index + 1] == "position_15_60_120hz"
     assert "--policy-qpos-init-dataset" in shadow
     assert "--policy-qpos-init-collision-check" in shadow
     assert "--wait-for-ready-confirm" in ordinary
@@ -343,6 +345,29 @@ def test_openpi_real_shadow_profile_preserves_qpos_init_authority() -> None:
     run_policy.add_args(parser)
     tactile_opt_in = parser.parse_args([*ordinary, "--dmtac-with-tactile"])
     assert tactile_opt_in.dmtac_tactile is True
+
+
+def test_default_openpi_active_profile_builds_rtc_capable_60hz_position_backends() -> None:
+    args, argv = _raw_args(
+        *openpi_real._rm65_bimanual_dmtac_args(rtc_real_shadow=True, send_actions=True),
+        "--rtc-real-shadow", "--send-actions",
+        "--policy-qpos-init-dataset", "dataset",
+    )
+    run_policy.validate_args(args, raw_argv=argv)
+    assert args.arm_control_mode == "position"
+    assert args.position_reference_hz == 60.0
+    assert args.arm_control_hz == 120.0
+    backends = run_policy.build_arm_backends(
+        args, ("left", "right"), control_hz=args.arm_control_hz,
+        action_hz=args.action_hz,
+    )
+    for backend in backends.values():
+        assert isinstance(backend, RM65ArmBackend)
+        assert backend.config.background_streaming_enabled
+        assert backend.config.background_streaming_hz == 120.0
+        assert callable(backend.request_policy_inference_soft_hold)
+        assert backend.arm is None  # Constructor is not device startup.
+        backend.close()
 
 
 def test_active_real_model_rtc_rejects_no_ready_confirmation() -> None:
