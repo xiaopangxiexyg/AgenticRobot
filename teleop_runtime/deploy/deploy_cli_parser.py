@@ -9,6 +9,7 @@ wrapper around :func:`add_args`.
 from __future__ import annotations
 
 import argparse
+import math
 
 
 from pathlib import Path
@@ -167,6 +168,13 @@ from .rtc_debug import (
 DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 
 
+def _positive_finite_timeout(value: str) -> float:
+    timeout = _positive_float(value)
+    if not math.isfinite(timeout):
+        raise argparse.ArgumentTypeError("timeout must be finite")
+    return timeout
+
+
 def add_args(parser: argparse.ArgumentParser) -> None:
     policy_qpos_defaults = DeployPolicyQposInitSettings()
     parser.add_argument(
@@ -231,7 +239,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--rtc-active-preflight-timeout-sec",
-        type=_positive_float,
+        type=_positive_finite_timeout,
         default=60.0,
         help=(
             "Bounded non-executable model warmup RPC deadline (default: 60 s). "

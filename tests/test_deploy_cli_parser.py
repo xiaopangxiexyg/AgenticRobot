@@ -4,6 +4,8 @@ import argparse
 import ast
 import inspect
 
+import pytest
+
 from teleop_runtime.deploy import deploy_cli_parser, run_policy
 
 
@@ -23,7 +25,21 @@ def test_deployment_parser_preserves_compatibility_option_surface() -> None:
     compatibility = _fingerprint(run_policy.add_args)
 
     assert extracted == compatibility
-    assert extracted[0:2] == (275, 305)
+    assert extracted[0:2] == (276, 306)
+
+
+def test_rtc_preflight_deadline_is_independent_from_executable_ttl() -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    deploy_cli_parser.add_args(parser)
+    defaults = parser.parse_args([])
+    assert defaults.rtc_active_preflight_timeout_sec == 60.0
+    assert defaults.rtc_request_validity_steps == 10
+    changed = parser.parse_args(["--rtc-active-preflight-timeout-sec", "90"])
+    assert changed.rtc_active_preflight_timeout_sec == 90.0
+    assert changed.rtc_request_validity_steps == 10
+    for value in ("0", "-1", "nan", "inf"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--rtc-active-preflight-timeout-sec", value])
 
 
 def test_deployment_parser_parses_representative_typed_options() -> None:
