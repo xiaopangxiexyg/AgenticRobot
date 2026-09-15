@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,11 @@ from agent_gateway.runtime.passive_read_executor import (
     PassiveReadSkillExecutor,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.grasp_rgbd_snapshot import (
+    encode_grasp_rgbd_snapshot, GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
+    GRASP_RGBD_SNAPSHOT_MEDIA_TYPE, GRASP_RGBD_SNAPSHOT_ENCODING,
+)
+from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPort
 from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
@@ -61,6 +68,7 @@ from .point_grasp_deployment import (
 from .realsense_perception import RealSenseAgentPerceptionProvider
 from .station_point_grasp_deployment import (
     REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2,
+    REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID,
     StationBoundPointGraspRegistration,
 )
 
@@ -69,6 +77,7 @@ from .station_point_grasp_deployment import (
 class PreparedPointGrasp:
     execution_result: dict[str, Any]
     annotated_jpeg: bytes
+    rgbd_snapshot: bytes | None = None
 
 
 def _decode_depth(data: bytes, *, width: int, height: int) -> np.ndarray:
@@ -327,6 +336,7 @@ class StationBoundPointGraspProvider:
             ]
             | None
         ) = None,
+        motion_port: RealAgentMotionPort | None = None,
     ) -> None:
         if not isinstance(registration, StationBoundPointGraspRegistration):
             raise TypeError("registration must be typed.")
@@ -374,6 +384,9 @@ class StationBoundPointGraspProvider:
         self.frame_binding = frame_binding
         self._current_station_revision = current_station_revision
         self.arm_reachability_evaluator = arm_reachability_evaluator
+        if motion_port is not None and not isinstance(motion_port, RealAgentMotionPort):
+            raise TypeError("motion_port must be typed or None")
+        self.motion_port = motion_port
         self._lock = threading.Lock()
         self._started = False
 
@@ -395,7 +408,7 @@ class StationBoundPointGraspProvider:
         finally:
             self._started = False
 
-    def plan_request(self, request: Any) -> PreparedPointGrasp:
+    def plan_request(self, request: Any, *, input_snapshot_sink: Callable[[bytes], None] | None = None) -> PreparedPointGrasp:
         if request.input_artifact_bindings:
             raise ValueError("Live Station point-grasp accepts no input Artifacts.")
         expected_revision = request.expected_station_revision
@@ -404,6 +417,8 @@ class StationBoundPointGraspProvider:
                 role=str(request.parameters["role"]),
                 expected_station_revision=expected_revision,
             )
+            # Read the lower-owned mailbox; never reconstruct or advance control.
+            qpos_cut = None if self.motion_port is None else self.motion_port.latest_measured_qpos()
             source_from_camera = np.asarray(
                 capture.source_from_camera, dtype=np.float64
             ).reshape(4, 4)
@@ -423,6 +438,39 @@ class StationBoundPointGraspProvider:
                 )
             image = Image.fromarray(capture.rgb, mode="RGB")
             pixel_uv = tuple(request.parameters["target_pixel_uv"])
+            if input_snapshot_sink is not None and self.registration.profile.backend_id == "graspgenx":
+                # Persist before segmentation/inference so a failed operation is
+                # reproducible too. An unavailable mask is explicitly marked;
+                # it cannot pass the completed-capture planning binding.
+                input_data = encode_grasp_rgbd_snapshot(
+                    rgb=capture.rgb, depth_m=capture.depth_m,
+                    target_mask=np.zeros(capture.depth_m.shape, dtype=bool),
+                    qpos_by_side=None if qpos_cut is None else qpos_cut.qpos_by_side,
+                    metadata={
+                        "schema_id": GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
+                        "target_mask_available": False,
+                        "target_pixel_uv": list(pixel_uv),
+                        "camera_intrinsics": dict(capture.intrinsics),
+                        "T_reference_from_camera": reference_from_camera.tolist(),
+                        "reference_frame_id": self.frame_binding.reference_frame_id,
+                        "capture_group_id": capture.capture_group_id,
+                        "acquired_at": capture.acquired_at,
+                        "station_revision": capture.station_revision,
+                        "measured_qpos": None if qpos_cut is None else {
+                            "hash": qpos_cut.semantic_content_hash,
+                            "measured_at": qpos_cut.measured_at,
+                            "available_at": qpos_cut.available_at,
+                            "revision": qpos_cut.revision,
+                            "evidence_refs": list(qpos_cut.evidence_refs),
+                        },
+                        "scope": "pre_inference_input_not_a_validated_grasp_plan",
+                    },
+                )
+                input_snapshot_sink(input_data)
+            if self.motion_port is not None and (
+                qpos_cut is None or abs(qpos_cut.measured_at-capture.acquired_at) > 0.2
+            ):
+                raise RuntimeError("Point-grasp snapshot lacks a camera-matched measured qpos cut")
             planned = self.planner.plan(
                 image,
                 capture.depth_m,
@@ -549,7 +597,32 @@ class StationBoundPointGraspProvider:
             }
             if reachability_context is not None:
                 result["arm_reachability_context"] = reachability_context
-            return PreparedPointGrasp(result, annotated)
+            snapshot = None
+            mask = getattr(self.planner, "last_target_mask", None)
+            geometry = getattr(self.planner, "solid_geometry", None)
+            if profile.backend_id == "graspgenx":
+                if mask is None or geometry is None:
+                    raise RuntimeError("GraspGenX replay snapshot geometry or mask is unavailable")
+                metadata = {
+                    "schema_id": GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
+                    "capture": result,
+                    "solid_geometry": asdict(geometry),
+                    "measured_qpos": None if qpos_cut is None else {
+                        "hash": qpos_cut.semantic_content_hash,
+                        "revision": qpos_cut.revision,
+                        "measured_at": qpos_cut.measured_at,
+                        "available_at": qpos_cut.available_at,
+                        "evidence_refs": list(qpos_cut.evidence_refs),
+                        "camera_skew_ms": (qpos_cut.measured_at-capture.acquired_at)*1000,
+                    },
+                    "scope": "visible_nominal_open_gripper_only_no_closure_or_attached_retreat",
+                }
+                snapshot = encode_grasp_rgbd_snapshot(
+                    rgb=capture.rgb, depth_m=capture.depth_m,
+                    target_mask=np.asarray(mask), metadata=metadata,
+                    qpos_by_side=None if qpos_cut is None else qpos_cut.qpos_by_side,
+                )
+            return PreparedPointGrasp(result, annotated, snapshot)
 
 
 def build_real_point_grasp_executor(
@@ -627,7 +700,25 @@ def build_station_bound_point_grasp_executor(
     """Bind the live proposal Route without granting downstream execution."""
 
     def read(request: Any, operation: Any) -> PassiveReadResult:
-        prepared = provider.plan_request(request)
+        def retain_input(data: bytes) -> None:
+            ref = artifact_ref_for_bytes(
+                data, media_type=GRASP_RGBD_SNAPSHOT_MEDIA_TYPE,
+                schema_id=GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
+                encoding=GRASP_RGBD_SNAPSHOT_ENCODING, compression="zip",
+            )
+            committed_input = commit_artifact_bytes(
+                store=artifact_store, data=data, artifact=ref,
+                producer_id="agent_gateway.provider.station_point_grasp_input",
+                runtime_session_id=runtime_session_id,
+                idempotency_key="station-point-grasp-input:"+operation.operation_id,
+                now=float(clock()),
+            )
+            logging.getLogger(__name__).warning(
+                "Point-grasp input retained before inference: operation_id=%s sha256=%s path=%s",
+                operation.operation_id, committed_input.sha256,
+                artifact_store.managed_read_path(committed_input.artifact_id),
+            )
+        prepared = provider.plan_request(request, input_snapshot_sink=retain_input)
         expected_revision = request.expected_station_revision
         if current_station_revision() != expected_revision:
             raise RuntimeError(
@@ -663,17 +754,31 @@ def build_station_bound_point_grasp_executor(
             domain="dexteleop.agent_skill.station_point_grasp_receipt.v2",
         )
         evidence = "station-point-grasp:" + identity
+        outputs = [AgentArtifactBinding(
+            slot_id=REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2, ordinal=0,
+            artifact=committed, production_receipt_ref=evidence,
+        )]
+        if prepared.rgbd_snapshot is not None:
+            snapshot_ref = artifact_ref_for_bytes(
+                prepared.rgbd_snapshot, media_type=GRASP_RGBD_SNAPSHOT_MEDIA_TYPE,
+                schema_id=GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
+                encoding=GRASP_RGBD_SNAPSHOT_ENCODING, compression="zip",
+            )
+            snapshot_ref = commit_artifact_bytes(
+                store=artifact_store, data=prepared.rgbd_snapshot, artifact=snapshot_ref,
+                producer_id="agent_gateway.provider.station_bound_point_grasp",
+                runtime_session_id=runtime_session_id,
+                idempotency_key="station-point-grasp-snapshot:"+operation.operation_id,
+                now=float(clock()),
+            )
+            outputs.append(AgentArtifactBinding(
+                slot_id=REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID, ordinal=0,
+                artifact=snapshot_ref, production_receipt_ref=evidence,
+            ))
         return PassiveReadResult(
             execution_result=prepared.execution_result,
             evidence_refs=(evidence,),
-            output_artifact_bindings=(
-                AgentArtifactBinding(
-                    slot_id=REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2,
-                    ordinal=0,
-                    artifact=committed,
-                    production_receipt_ref=evidence,
-                ),
-            ),
+            output_artifact_bindings=tuple(outputs),
             reason_code="passive_station_point_grasp_planning_completed",
         )
 

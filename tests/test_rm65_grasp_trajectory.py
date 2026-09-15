@@ -766,6 +766,35 @@ def test_envelope_ingress_requires_one_bounded_moving_arm_translation_violation(
     assert raised.value.details["envelope_ingress_rejection"] == expected_rejection
 
 
+@pytest.mark.parametrize("adjustment", [0.159, 0.16, 0.1607339041])
+def test_start_envelope_preflight_distinguishes_current_tcp_from_grasp_target(
+    monkeypatch, adjustment,
+) -> None:
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    targets = {side: np.eye(4) for side in ("left", "right")}
+    planner.target_builder = SimpleNamespace(solver_world_targets_for_qpos_pair=lambda **_: targets)
+    planner.target_envelope_filter = object()
+    projected = {side: pose.copy() for side, pose in targets.items()}
+    projected["right"][1, 3] = -adjustment
+    monkeypatch.setattr(planner, "_project_target_envelope", lambda *_args, **_: projected)
+    monkeypatch.setattr(planner, "_target_envelope_projection_details", lambda *_: {
+        "envelope_projection_by_side": {"right": {
+            "translation_modified": True, "rotation_modified": False,
+            "translation_adjustment_m": adjustment,
+            "violated_translation_constraints": ["absolute:y:max"],
+        }}
+    })
+    qpos = {side: np.zeros(6) for side in targets}
+    if adjustment <= 0.16:
+        planner._preflight_start_envelope(qpos_by_side=qpos, side="right")
+    else:
+        with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
+            planner._preflight_start_envelope(qpos_by_side=qpos, side="right")
+        assert raised.value.reason_code == "start_state_safety_envelope_blocked"
+        assert raised.value.details["envelope_projection_subject"] == "current_measured_solver_tcp"
+        assert raised.value.details["maximum_path_envelope_ingress_distance_m"] == 0.16
+
+
 def test_real_snapshot_plans_via_strict_envelope_ingress_waypoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

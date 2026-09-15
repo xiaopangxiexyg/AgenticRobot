@@ -599,6 +599,9 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
         )
     )
     tilted[2, 3] = 0.975
+    # A scored pose must already put the object in its opening. Do not rely
+    # on production code silently translating this tilted fixture afterwards.
+    tilted[:3, 3] = np.asarray((0, 0, 1.0)) - 0.025 * tilted[:3, 2]
     grasps.append(tilted)
     client = _PlannerClient(
         np.stack(grasps), np.asarray((0.9, 0.8, 0.7, 0.65, 0.6), dtype=np.float64)
@@ -622,8 +625,8 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
         intrinsics={
             "width": 20,
             "height": 20,
-            "fx": 100.0,
-            "fy": 100.0,
+            "fx": 200.0,
+            "fy": 200.0,
             "cx": 10.0,
             "cy": 10.0,
         },
@@ -642,7 +645,7 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
     planner.close()
 
 
-def test_candidate_selection_covers_distinct_approaches_before_yaw_variants() -> None:
+def test_candidate_selection_balances_approaches_and_closing_axis_variants() -> None:
     poses = []
     for yaw_degrees in (0.0, 30.0, 60.0, 90.0, 120.0):
         yaw = math.radians(yaw_degrees)
@@ -675,10 +678,10 @@ def test_candidate_selection_covers_distinct_approaches_before_yaw_variants() ->
     )
 
     assert representatives == [0, 5, 6, 7]
-    assert selected == [0, 5, 6, 7]
+    assert selected == [0, 5, 1, 2]
 
 
-def test_planner_bounded_centering_recovers_offset_grasp_without_changing_depth(
+def test_planner_does_not_translate_scored_offset_grasp_to_hide_solid_collision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -702,28 +705,21 @@ def test_planner_bounded_centering_recovers_offset_grasp_without_changing_depth(
     )
     planner.start()
 
-    result = planner.plan(
-        Image.new("RGB", (20, 20)),
-        depth,
-        pixel_uv=(10, 10),
-        intrinsics={
-            "width": 20,
-            "height": 20,
-            "fx": 100.0,
-            "fy": 100.0,
-            "cx": 10.0,
-            "cy": 10.0,
-        },
-        base_from_camera=np.eye(4),
-        max_candidates=1,
-    )
+    with pytest.raises(RuntimeError, match="No visible collision-free"):
+        planner.plan(
+            Image.new("RGB", (20, 20)),
+            depth,
+            pixel_uv=(10, 10),
+            intrinsics={
+                "width": 20, "height": 20,
+                "fx": 100.0, "fy": 100.0, "cx": 10.0, "cy": 10.0,
+            },
+            base_from_camera=np.eye(4),
+            max_candidates=1,
+        )
 
-    candidate = np.asarray(result.candidates[0].camera_from_tcp).reshape(4, 4)
-    # The target centre is moved onto the physical closing/height centre, but
-    # the model's approach depth is not altered by this admission correction.
-    assert candidate[0, 3] == pytest.approx(0.0, abs=1e-9)
-    assert candidate[1, 3] == pytest.approx(0.0, abs=1e-9)
-    assert candidate[2, 3] == pytest.approx(1.017999, abs=1e-9)
+    assert planner.last_filter_summary["target_solid_collision_rejected"] == 1
+    assert grasp[:3, 3] == pytest.approx((-0.020, -0.012, 0.975))
     planner.close()
 
 

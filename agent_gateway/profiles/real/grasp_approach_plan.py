@@ -8,7 +8,10 @@ the resulting fresh, session-local immutable plan exactly once.
 
 from __future__ import annotations
 
+import numpy as np
+
 import logging
+import hashlib
 import math
 import threading
 import time
@@ -31,6 +34,7 @@ from agent_gateway.runtime.passive_read_executor import (
     PassiveReadSkillExecutor,
 )
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.runtime.service import AgentGatewayOperationOutcome
 from agent_gateway.skills.motion.definition import (
     execute_grasp_approach_plan_skill_definition_v1,
@@ -48,6 +52,8 @@ from agent_gateway.skills.perception.grasp_approach_plan_schemas import (
 )
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
+from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
 from robot_motion.coordinate_frames import CoordinateFrameGraph
 from teleop_runtime.skill_deploy.motion_port import (
     REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD,
@@ -60,7 +66,44 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspTrajectoryPlanningError,
 )
 
-from .station_point_grasp_deployment import StationBoundPointGraspRegistration
+from .station_point_grasp_deployment import (
+    StationBoundPointGraspRegistration, REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID,
+)
+
+
+def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifactStore,
+                                    frame_graph: CoordinateFrameGraph,
+                                    execution_frame_id: str) -> Callable:
+    """Resolve only the retained producer's hash-bound replay Artifact."""
+    def read(operation: AgentSkillOperation, source: Mapping[str, Any]) -> VisibleGraspScene:
+        bindings = [binding for binding in operation.output_artifact_bindings
+                    if binding.slot_id == REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID]
+        if len(bindings) != 1:
+            raise ValueError("point-grasp has no unique RGB-D snapshot Artifact")
+        artifact = bindings[0].artifact
+        data = artifact_store.managed_read_path(artifact.artifact_id).read_bytes()
+        if len(data) != artifact.byte_length or hashlib.sha256(data).hexdigest() != artifact.sha256:
+            raise ValueError("point-grasp snapshot Artifact identity changed")
+        arrays, metadata = decode_grasp_rgbd_snapshot(data)
+        if not np.any(arrays["target_mask"] & (arrays["depth_m"] > 0)):
+            raise ValueError("snapshot contains no observed metric target points")
+        capture = metadata["capture"]
+        # Canonical encoding handles immutable retained Mapping/tuple values.
+        if canonical_content_hash(capture, domain="grasp.snapshot.capture.v1") != canonical_content_hash(
+            source, domain="grasp.snapshot.capture.v1"
+        ):
+            raise ValueError("snapshot and retained point-grasp capture differ")
+        pose, _ = frame_graph.transform_pose_matrix(
+            np.asarray(capture["T_reference_from_camera"]).reshape(4, 4),
+            source_reference_frame_id=capture["reference_frame_id"],
+            target_reference_frame_id=execution_frame_id,
+        )
+        return VisibleGraspScene.from_depth(
+            depth_m=arrays["depth_m"], target_mask=arrays["target_mask"],
+            intrinsics=capture["camera_intrinsics"], reference_from_camera=pose,
+            geometry=ParallelJawSolidGeometry(**metadata["solid_geometry"]),
+        )
+    return read
 
 _GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = 15.0
 _LOGGER = logging.getLogger(__name__)
@@ -831,6 +874,7 @@ class RealGraspApproachPlanProvider:
         runtime_session_id: str,
         current_station_revision: Callable[[], int],
         clock: Callable[[], float] = time.time,
+        visible_scene_reader: Callable | None = None,
     ) -> None:
         if not isinstance(registration, RealGraspApproachPlanRegistration):
             raise TypeError("registration must be typed.")
@@ -871,6 +915,9 @@ class RealGraspApproachPlanProvider:
         self.registration = registration
         self.point_grasp_registration = point_grasp_registration
         self.point_grasp_executor = point_grasp_executor
+        if visible_scene_reader is not None and not callable(visible_scene_reader):
+            raise TypeError("visible_scene_reader must be callable or None")
+        self.visible_scene_reader = visible_scene_reader
         self.motion_port = motion_port
         self.frame_graph = frame_graph
         self.grasp_trajectory_planner = grasp_trajectory_planner
@@ -959,6 +1006,9 @@ class RealGraspApproachPlanProvider:
             "exception_type",
             "envelope_projection_by_side",
             "envelope_ingress_rejection",
+            "envelope_projection_subject",
+            "maximum_path_envelope_ingress_distance_m",
+            "path_envelope_ingress_distance_excess_m",
         ):
             if field_name in details:
                 value = details[field_name]
@@ -1133,11 +1183,24 @@ class RealGraspApproachPlanProvider:
                 None,
             )
         try:
+            visible_scene = None
+            if source_result["backend_id"] == "graspgenx":
+                if self.visible_scene_reader is None:
+                    raise RM65GraspTrajectoryPlanningError("grasp_scene_snapshot_unavailable")
+                try:
+                    visible_scene = self.visible_scene_reader(source_operation, source_result)
+                    if not isinstance(visible_scene, VisibleGraspScene):
+                        raise TypeError("snapshot reader did not return a typed visible scene")
+                except (ValueError, TypeError, KeyError, OSError) as error:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "grasp_scene_snapshot_invalid", details={"exception_type": type(error).__name__}
+                    ) from error
             trajectory = self.grasp_trajectory_planner(
                 qpos_by_side=qpos_cut.qpos_by_side,
                 side=profile.side,
                 target_tool_tcp_world=target_execution,
                 speed_scale=speed_scale,
+                **({"visible_scene": visible_scene} if visible_scene is not None else {}),
             )
         except RM65GraspTrajectoryPlanningError as exc:
             # The published v1 diagnostics object is intentionally bounded.

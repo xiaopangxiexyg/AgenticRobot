@@ -35,6 +35,10 @@ from agent_gateway.skills.perception.point_grasp_schemas import (
 )
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.grasp_rgbd_snapshot import (
+    GRASP_RGBD_SNAPSHOT_MEDIA_TYPE, GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
+    GRASP_RGBD_SNAPSHOT_ENCODING, GRASP_RGBD_SNAPSHOT_MAX_BYTES,
+)
 from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
@@ -43,6 +47,8 @@ from dataset_contracts.perception_artifacts import (
 )
 
 from .point_grasp_deployment import SUPPORTED_POINT_GRASP_BACKEND_IDS
+
+REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID = "point_grasp_rgbd_snapshot"
 
 REAL_STATION_POINT_GRASP_ROUTE_ID_V2 = (
     "real.realsense.local_model.perception.plan_point_grasp"
@@ -452,6 +458,16 @@ def build_station_bound_point_grasp_registration(
                 allowed_compressions=(LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,),
                 max_artifact_bytes=profile.max_annotated_bytes,
                 max_total_bytes=profile.max_annotated_bytes,
+            ),
+            SkillArtifactSlotSpec(
+                slot_id=REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID,
+                direction="output", min_count=1 if profile.backend_id == "graspgenx" else 0, max_count=1,
+                allowed_media_types=(GRASP_RGBD_SNAPSHOT_MEDIA_TYPE,),
+                allowed_schema_ids=(GRASP_RGBD_SNAPSHOT_SCHEMA_ID,),
+                allowed_encodings=(GRASP_RGBD_SNAPSHOT_ENCODING,),
+                allowed_compressions=("zip",),
+                max_artifact_bytes=GRASP_RGBD_SNAPSHOT_MAX_BYTES,
+                max_total_bytes=GRASP_RGBD_SNAPSHOT_MAX_BYTES,
             ),
         ),
     )

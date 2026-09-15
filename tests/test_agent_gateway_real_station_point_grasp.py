@@ -223,7 +223,7 @@ def _frame_binding():
     )
 
 
-def _provider_stack(*, revision=None, arm_reachability_evaluator=None):
+def _provider_stack(*, revision=None, arm_reachability_evaluator=None, backend_id="vgn"):
     source = _Source()
     binding = RealPerceptionSourceBinding(
         camera_sources={"front": source},
@@ -246,6 +246,11 @@ def _provider_stack(*, revision=None, arm_reachability_evaluator=None):
     frame_binding = _frame_binding()
     localizer = _Localizer()
     planner = _Planner(localizer, revision=revision if revision.get("mutate") else None)
+    planner.backend_id = backend_id
+    if backend_id == "graspgenx":
+        from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry
+        planner.last_target_mask = np.ones((3, 4), dtype=bool)
+        planner.solid_geometry = ParallelJawSolidGeometry(-0.043, 0.05, 0.01, 0.0255, 0.07)
     reachability_profile = (
         None
         if arm_reachability_evaluator is None
@@ -353,6 +358,69 @@ def test_station_point_grasp_profile_accepts_graspgenx_backend() -> None:
     profile = replace(registration.profile, backend_id="graspgenx")
 
     assert profile.backend_id == "graspgenx"
+
+
+def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tmp_path) -> None:
+    from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+    from agent_gateway.profiles.real.point_grasp_gateway import build_station_bound_point_grasp_executor
+    from agent_gateway.profiles.real.grasp_approach_plan import build_grasp_visible_scene_reader
+    from agent_gateway.profiles.real.station_point_grasp_deployment import REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID
+    from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
+    source, _, _, registration, provider = _provider_stack(backend_id="graspgenx")
+    store = RecoverableAgentArtifactStore(root=tmp_path/"artifacts", quota_bytes=32*1024*1024,
+                                         max_artifact_bytes=16*1024*1024, max_chunk_bytes=1024*1024)
+    executor = build_station_bound_point_grasp_executor(
+        registration=registration, provider=provider, artifact_store=store,
+        runtime_session_id="station-point-grasp:test", current_station_revision=lambda: 7,
+        max_retained_operations=4, clock=lambda: 10.0,
+    )
+    # Exercise the real adapter and Artifact store without opening any device.
+    request = _request()
+    request.semantic_content_hash = "a"*64
+    result = executor._read(request, SimpleNamespace(operation_id="snapshot:test"))
+    bindings = result.output_artifact_bindings
+    snapshot = next(x.artifact for x in bindings if x.slot_id == REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID)
+    arrays, metadata = decode_grasp_rgbd_snapshot(store.managed_read_path(snapshot.artifact_id).read_bytes())
+    assert source.read_count == 1
+    assert arrays["depth_m"].shape == (3, 4)
+    assert metadata["capture"] == result.execution_result
+    assert metadata["measured_qpos"] is None
+    assert arrays["left_qpos"].size == arrays["right_qpos"].size == 0
+    reader = build_grasp_visible_scene_reader(artifact_store=store,
+        frame_graph=provider.frame_binding.frame_graph,
+        execution_frame_id=provider.frame_binding.source_frame_id)
+    scene = reader(SimpleNamespace(output_artifact_bindings=bindings), result.execution_result)
+    assert len(scene.points) == 12
+    with pytest.raises(ValueError, match="capture differ"):
+        reader(SimpleNamespace(output_artifact_bindings=bindings), {**result.execution_result, "station_revision": 8})
+
+
+def test_graspgenx_inference_failure_retains_original_input_without_faking_a_mask():
+    from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
+    source, _, planner, _, provider = _provider_stack(backend_id="graspgenx")
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("no candidate found")
+    planner.plan = fail
+    retained = []
+    with pytest.raises(RuntimeError, match="no candidate found"):
+        provider.plan_request(_request(), input_snapshot_sink=retained.append)
+    assert source.read_count == 1 and len(retained) == 1
+    arrays, metadata = decode_grasp_rgbd_snapshot(retained[0])
+    assert arrays["depth_m"].shape == (3, 4)
+    assert metadata["target_mask_available"] is False
+    assert metadata["scope"] == "pre_inference_input_not_a_validated_grasp_plan"
+
+
+def test_missing_measured_qpos_stops_inference_but_keeps_camera_input():
+    source, _, planner, _, provider = _provider_stack(backend_id="graspgenx")
+    provider.motion_port = SimpleNamespace(latest_measured_qpos=lambda: None)
+    def must_not_infer(*_args, **_kwargs):
+        pytest.fail("missing qpos must stop this path")
+    planner.plan = must_not_infer
+    retained = []
+    with pytest.raises(RuntimeError, match="camera-matched measured qpos"):
+        provider.plan_request(_request(), input_snapshot_sink=retained.append)
+    assert source.read_count == 1 and len(retained) == 1
 
 
 def test_station_point_grasp_v3_reachability_is_request_gated_and_annotation_only() -> (

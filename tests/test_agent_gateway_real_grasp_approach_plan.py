@@ -110,6 +110,13 @@ def _no_op_point_grasp_validator(
 
 
 def _planning_fixture(*, planner):
+    from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
+    # Explicit geometry fixture: route tests exercise control/plan lifecycles,
+    # not physical grasp success. The real profile reads hash-bound Artifacts.
+    scene = VisibleGraspScene(
+        points=np.empty((0, 3)), target_mask=np.empty(0, dtype=bool),
+        geometry=ParallelJawSolidGeometry(-0.043, 0.05, 0.01, 0.0255, 0.07),
+    )
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
         frame_id="canonical_station",
@@ -247,6 +254,7 @@ def _planning_fixture(*, planner):
         motion_port=port,
         frame_graph=graph,
         grasp_trajectory_planner=planner,
+        visible_scene_reader=lambda _operation, _source: scene,
         plan_store=store,
         runtime_session_id=registration.binding.runtime_session_id,
         current_station_revision=lambda: 7,
@@ -299,6 +307,49 @@ def test_planning_route_deadline_outlives_internal_planner_budget() -> None:
     )
     assert route.control_effect_class == "read_only"
     assert route.may_move_robot is False
+
+
+def test_graspgenx_missing_snapshot_cannot_publish_an_executable_plan() -> None:
+    calls = []
+    _, provider, _, _, request, operation = _planning_fixture(
+        planner=lambda **kwargs: calls.append(kwargs)
+    )
+    provider.visible_scene_reader = None
+    result, plan = provider.plan_request(request, operation)
+    assert result["reason_code"] == "grasp_scene_snapshot_unavailable"
+    assert result["planning_status"] == "rejected"
+    assert plan is None and calls == []
+
+
+def test_graspgenx_snapshot_failure_is_retained_as_read_only_rejection() -> None:
+    calls = []
+    _, provider, _, _, request, operation = _planning_fixture(
+        planner=lambda **kwargs: calls.append(kwargs)
+    )
+    def broken_reader(*_args):
+        raise ValueError("bad frame binding")
+    provider.visible_scene_reader = broken_reader
+    result, plan = provider.plan_request(request, operation)
+    assert result["reason_code"] == "grasp_scene_snapshot_invalid"
+    assert result["diagnostics"] == {"exception_type": "ValueError"}
+    assert plan is None and calls == []
+
+
+def test_start_state_rejection_keeps_subject_and_unchanged_ingress_bound() -> None:
+    def planner(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError("start_state_safety_envelope_blocked", details={
+            "envelope_projection_subject": "current_measured_solver_tcp",
+            "maximum_path_envelope_ingress_distance_m": 0.16,
+            "path_envelope_ingress_distance_excess_m": 0.0007339041,
+            "envelope_ingress_rejection": "initial_distance_exceeds_limit",
+        })
+    registration, provider, _, _, request, operation = _planning_fixture(planner=planner)
+    result, plan = provider.plan_request(request, operation)
+    registration.payload_validator.validate_execution_result(result)
+    assert result["reason_code"] == "start_state_safety_envelope_blocked"
+    assert result["diagnostics"]["maximum_path_envelope_ingress_distance_m"] == 0.16
+    assert result["diagnostics"]["envelope_projection_subject"] == "current_measured_solver_tcp"
+    assert plan is None
 
 
 def test_path_found_is_read_only_and_produces_one_use_immutable_plan() -> None:

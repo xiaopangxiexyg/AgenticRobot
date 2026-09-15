@@ -718,6 +718,30 @@ the envelope, passes dense URDF/FCL collision checks, and never leaves again aft
 entry. Rotation violations, an out-of-envelope held arm, or any target outside
 the envelope still fail closed.
 
+起始测量 TCP 的包络准入检查现在先于多距离/多 IK 搜索进行。
+`start_state_safety_envelope_blocked` 表示起始状态问题，不是候选目标被拒绝；
+公开 diagnostics 保留投影对象、160 mm 上限及超出量。该修复不会扩大包络。
+
+GraspGenX 保留原模型位置，不再对预测进行未经重新评分的 X/Y 居中修正。
+候选预算在接近方向和同方向的闭合轴/位置变体之间分配；端点 IK 仍只标注，
+不改变候选顺序。可见碰撞预筛使用分离的掌部/两指实体，指间空间不填充；
+要求零可见点侵入，并检查最大张开代理沿 +Z 接近 60 mm 的解析扫掠体，
+目标点与背景点分别记录且均不默认放行。成对的保留候选规划还在路径搜索
+和最终下发关节样本中检查夹爪代理，原有整臂 FCL、包络、时效和单次票据
+保护不变。旧的绝对抓姿入口没有保留候选的 RGB-D 快照绑定，不提供这项
+观测夹爪检查；本轮验证建议使用成对的只读规划入口。
+
+实时 GraspGenX Route 增加可发现的 `point_grasp_rgbd_snapshot` 输出 Artifact，
+保存该次原始 RGB、float32 米制深度、SAM2 掩码、内参/外参和相机附近
+200 ms 内的双臂测量 qpos（相机独立模式显式记录无 qpos）。RPent 手动
+入口将其下载到 run-root/input/point_grasp_rgbd_snapshot.npz。
+推理之前另保留一次输入 Artifact，其路径与哈希写入 Gateway stderr，
+即使没有有效候选也能重现输入。缺少或损坏完成态快照时，不准入可执行计划。
+
+这些检查的范围仍是可见点云与名义平行夹爪代理，不是未知空间自由证明，
+也没有验证实际夹爪开度、完整闭合运动、携物退出或真实抓取成功。
+`path_found` 不能当作端到端真机抓取验收；抓取/移动仍需独立 Skill 和后续验证。
+
 Motion remains a separate decision. `motion.execute_grasp_approach_plan@1`
 accepts only the advertised component ID and that exact plan ID/hash. It cannot
 replace the target pose or trajectory, replans nothing, rechecks freshness and
@@ -747,8 +771,9 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 | 空手移动 | `motion.move_tcp_to_pose@1` | 不能作为携物碰撞验证的替代品 |
 
 当前 reach 准入验证真实机械臂连杆网格与部署的代理几何、固定桌面/相机杆和 TCP
-包络。它尚未验证目标物体的非接触接近、随开度变化的真实夹爪实体、闭合
-过程、带物退出、放置或物理夹持成功。因此 `path_found` 的含义是“reach
+包络。成对规划另验证可见目标/背景与名义张开夹爪的非接触接近，但没有将
+观测障碍纳入整臂检查，也尚未验证随开度变化的真实夹爪实体、闭合过程、
+带物退出、放置或物理夹持成功。因此 `path_found` 的含义是“reach
 阶段在当前模型下通过”，不是“完整抓取链通过”；不能据此自动闭合、试抬
 或搬运。后续这些阶段必须有独立的场景/夹爪状态和接触规则证据后才可开放。
 

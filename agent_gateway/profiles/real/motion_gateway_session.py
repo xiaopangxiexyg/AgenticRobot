@@ -75,6 +75,7 @@ from .grasp_approach_plan import (
     BoundedRealGraspApproachPlanStore,
     RealGraspApproachPlanProvider,
     build_real_grasp_approach_plan_executor,
+    build_grasp_visible_scene_reader,
 )
 from .localization_gateway import (
     ObjectLocalizationProvider,
@@ -1297,6 +1298,7 @@ def assemble_real_agent_primitive_gateway_session(
                 frame_binding=frame_binding,
                 current_station_revision=lambda: producer.current_station_revision,
                 arm_reachability_evaluator=(station_point_grasp_reachability_evaluator),
+                motion_port=port,
             )
             station_point_grasp_executor = build_station_bound_point_grasp_executor(
                 registration=point_grasp_registration,
@@ -1338,6 +1340,11 @@ def assemble_real_agent_primitive_gateway_session(
                     motion_port=port,
                     frame_graph=contract_bundle.frame_graph,
                     grasp_trajectory_planner=grasp_trajectory_planner,
+                    visible_scene_reader=build_grasp_visible_scene_reader(
+                        artifact_store=artifact_store,
+                        frame_graph=contract_bundle.frame_graph,
+                        execution_frame_id=plan_registration.profile.execution_reference_frame_id,
+                    ),
                     plan_store=grasp_approach_plan_store,
                     runtime_session_id=(contract_bundle.attachment.runtime_session_id),
                     current_station_revision=(

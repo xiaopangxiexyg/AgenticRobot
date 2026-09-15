@@ -1,10 +1,11 @@
-"""URDF/FCL-only planning for one real RM65 grasp-approach Skill."""
+"""URDF/FCL and optional observed-gripper planning for one RM65 approach Skill."""
 
 from __future__ import annotations
 
 import math
 import threading
 import time
+from robot_motion.grasp_visible_scene import VisibleGraspScene
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from itertools import pairwise
@@ -339,6 +340,41 @@ class _TargetEnvelopePathOracle:
                 },
             )
         return collision_check
+
+
+class _VisibleGripperPathOracle:
+    """Compose observed gripper solids with, never replace, canonical safety."""
+    def __init__(self, *, oracle: object, visible_scene: VisibleGraspScene,
+                 target_builder: RM65SkillTargetBuilder, side: str) -> None:
+        self.oracle = oracle
+        self.visible_scene = visible_scene
+        self.target_builder = target_builder
+        self.side = side
+        self.scene_hash = canonical_content_hash({
+            "production_scene_hash": oracle.scene_hash,
+            "visible_scene_hash": visible_scene.semantic_content_hash,
+        }, domain="dexteleop.motion.composed_grasp_scene.v1")
+
+    def check(self, qpos_by_component: Mapping[str, np.ndarray]) -> JointConfigurationCheck:
+        check = self.oracle.check(qpos_by_component)
+        if (not isinstance(check, JointConfigurationCheck) or not check.safe
+                or not check.collision_check_available):
+            return check
+        pose = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=qpos_by_component["left"], right_qpos=qpos_by_component["right"]
+        )[self.side]
+        target_hits, background_hits = self.visible_scene.collision_counts(
+            pose, opening_m=self.visible_scene.geometry.maximum_opening_m
+        )
+        if not target_hits and not background_hits:
+            return check
+        return JointConfigurationCheck(
+            safe=False, collision_check_available=True,
+            reason="visible_gripper_path_collision",
+            metadata={"production_collision_check": check.to_dict(),
+                      "target_collision_points": target_hits,
+                      "background_collision_points": background_hits},
+        )
 
 
 class RM65GraspJointTrajectoryPlanner:
@@ -681,7 +717,9 @@ class RM65GraspJointTrajectoryPlanner:
             raise
         return True
 
-    def _path_search_oracle(self, *, planning_phase: str) -> object:
+    def _path_search_oracle(self, *, planning_phase: str,
+                            visible_scene: VisibleGraspScene | None = None,
+                            side: str | None = None) -> object:
         # The measured staging pose may intentionally start just outside the
         # task envelope.  Its dedicated ingress leg is bounded, monotonic, and
         # densely revalidated.  Once inside, every grasp-search sample must
@@ -690,15 +728,22 @@ class RM65GraspJointTrajectoryPlanner:
             planning_phase not in {"pregrasp_target", "grasp_target"}
             or self.target_envelope_filter is None
         ):
-            return self.oracle
-        return _TargetEnvelopePathOracle(
-            collision_oracle=self.oracle,
-            envelope_check=lambda qpos: self._require_qpos_within_target_envelope(
-                qpos,
-                sides=_SIDES,
-                phase="path_target",
-            ),
-        )
+            oracle = self.oracle
+        else:
+            oracle = _TargetEnvelopePathOracle(
+                collision_oracle=self.oracle,
+                envelope_check=lambda qpos: self._require_qpos_within_target_envelope(
+                    qpos, sides=_SIDES, phase="path_target",
+                ),
+            )
+        if visible_scene is not None:
+            if side not in _SIDES:
+                raise ValueError("visible scene path search requires a moving side")
+            return _VisibleGripperPathOracle(
+                oracle=oracle, visible_scene=visible_scene,
+                target_builder=self.target_builder, side=side,
+            )
+        return oracle
 
     def _pregrasp_target_pose(
         self,
@@ -1036,6 +1081,37 @@ class RM65GraspJointTrajectoryPlanner:
                 "initial_distance_exceeds_limit",
             )
         return float(adjustment), frozenset(raw_constraints)
+
+    def _preflight_start_envelope(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+    ) -> None:
+        """Reject a candidate-independent start violation before searching IK."""
+        if self.target_envelope_filter is None:
+            return
+        targets = self.target_builder.solver_world_targets_for_qpos_pair(
+            left_qpos=qpos_by_side["left"], right_qpos=qpos_by_side["right"]
+        )
+        projected = self._project_target_envelope(targets, phase="path_target")
+        modified = tuple(
+            name for name in _SIDES
+            if not np.allclose(projected[name], targets[name], atol=1e-9, rtol=0.0)
+        )
+        if not modified:
+            return
+        details = {
+            "modified_sides": modified,
+            "envelope_projection_subject": "current_measured_solver_tcp",
+            **self._target_envelope_projection_details(modified),
+        }
+        try:
+            self._bounded_ingress_projection(moving_side=side, details=details)
+        except RM65GraspTrajectoryPlanningError as error:
+            raise RM65GraspTrajectoryPlanningError(
+                "start_state_safety_envelope_blocked", details=error.details
+            ) from error
 
     def _envelope_ingress_targets(
         self,
@@ -1900,6 +1976,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         planning_phase: str,
+        visible_scene: VisibleGraspScene | None = None,
         prefer_closest_tolerance: bool = True,
         endpoint_candidates: tuple[_EndpointIKCandidate, ...] | None = None,
         deadline: float | None = None,
@@ -1923,7 +2000,9 @@ class RM65GraspJointTrajectoryPlanner:
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         cfg = self.planner_config
-        search_oracle = self._path_search_oracle(planning_phase=planning_phase)
+        search_oracle = self._path_search_oracle(
+            planning_phase=planning_phase, visible_scene=visible_scene, side=side
+        )
         search_attempts: list[dict[str, object]] = []
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
         for endpoint_index, endpoint in enumerate(endpoint_candidates):
@@ -2321,6 +2400,7 @@ class RM65GraspJointTrajectoryPlanner:
         grasp_tool_tcp_world: np.ndarray,
         deadline: float,
         monotonic: Callable[[], float],
+        visible_scene: VisibleGraspScene | None = None,
     ) -> tuple[_PlannedPathLeg, _PlannedPathLeg]:
         """Validate each local IK branch before its exact global connection."""
 
@@ -2354,6 +2434,7 @@ class RM65GraspJointTrajectoryPlanner:
                     side=side,
                     target_tool_tcp_world=pregrasp_tool_tcp_world,
                     planning_phase="pregrasp_target",
+                    visible_scene=visible_scene,
                     prefer_closest_tolerance=False,
                     endpoint_candidates=(endpoint,),
                     deadline=deadline,
@@ -2396,6 +2477,7 @@ class RM65GraspJointTrajectoryPlanner:
         grasp_tool_tcp_world: np.ndarray,
         deadline: float,
         monotonic: Callable[[], float],
+        visible_scene: VisibleGraspScene | None = None,
     ) -> tuple[
         tuple[_PlannedPathLeg, ...],
         dict[str, object] | None,
@@ -2416,6 +2498,7 @@ class RM65GraspJointTrajectoryPlanner:
                 grasp_tool_tcp_world=grasp_tool_tcp_world,
                 deadline=deadline,
                 monotonic=monotonic,
+                visible_scene=visible_scene,
             )
             return (pregrasp_leg, approach_leg), None, []
 
@@ -2430,6 +2513,7 @@ class RM65GraspJointTrajectoryPlanner:
                     side=side,
                     target_tool_tcp_world=ingress_target,
                     planning_phase="envelope_ingress",
+                    visible_scene=visible_scene,
                     deadline=deadline,
                     monotonic=monotonic,
                 )
@@ -2440,6 +2524,7 @@ class RM65GraspJointTrajectoryPlanner:
                     grasp_tool_tcp_world=grasp_tool_tcp_world,
                     deadline=deadline,
                     monotonic=monotonic,
+                    visible_scene=visible_scene,
                 )
                 combined_waypoints = (
                     *ingress_leg.path.waypoints,
@@ -2496,6 +2581,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         speed_scale: float,
+        visible_scene: VisibleGraspScene | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> RealAgentJointTrajectory:
         selected_side = str(side).strip().lower()
@@ -2541,6 +2627,7 @@ class RM65GraspJointTrajectoryPlanner:
         scale = float(speed_scale)
         if not 0.0 < scale <= 1.0:
             raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
+        self._preflight_start_envelope(qpos_by_side=current, side=selected_side)
         deadline = float(monotonic()) + self.config.path_planning_time_budget_sec
         ingress_route_attempts: list[dict[str, object]] = []
         pregrasp_route_attempts: list[dict[str, object]] = []
@@ -2554,6 +2641,7 @@ class RM65GraspJointTrajectoryPlanner:
                     side=selected_side,
                     target_tool_tcp_world=target_pose,
                     planning_phase="grasp_target",
+                    visible_scene=visible_scene,
                     deadline=deadline,
                     monotonic=monotonic,
                 ),
@@ -2567,6 +2655,19 @@ class RM65GraspJointTrajectoryPlanner:
                 route_attempt: dict[str, object] = {"distance_m": distance_m}
                 pregrasp_route_attempts.append(route_attempt)
                 try:
+                    if visible_scene is not None:
+                        target_hits, background_hits = visible_scene.approach_collision_counts(
+                            target_pose,
+                            opening_m=visible_scene.geometry.maximum_opening_m,
+                            distance_m=distance_m,
+                        )
+                        if target_hits or background_hits:
+                            raise RM65GraspTrajectoryPlanningError(
+                                "visible_gripper_approach_collision",
+                                details={"planning_phase": "local_approach",
+                                         "target_collision_points": target_hits,
+                                         "background_collision_points": background_hits},
+                            )
                     (
                         candidate_legs,
                         candidate_ingress_route,
@@ -2578,6 +2679,7 @@ class RM65GraspJointTrajectoryPlanner:
                         grasp_tool_tcp_world=target_pose,
                         deadline=deadline,
                         monotonic=monotonic,
+                        visible_scene=visible_scene,
                     )
                 except RM65GraspTrajectoryPlanningError as error:
                     route_error = error
@@ -2706,6 +2808,31 @@ class RM65GraspJointTrajectoryPlanner:
             times.append(elapsed)
             for name in _SIDES:
                 samples[name].append(current[name].copy())
+        if visible_scene is not None:
+            for index in range(len(times)):
+                self._remaining_path_planning_time_sec(
+                    deadline=deadline, monotonic=monotonic,
+                    planning_phase="visible_scene_final_trajectory_revalidation",
+                )
+                pose = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=samples["left"][index], right_qpos=samples["right"][index]
+                )[selected_side]
+                target_hits, background_hits = visible_scene.collision_counts(
+                    pose, opening_m=visible_scene.geometry.maximum_opening_m
+                )
+                if target_hits or background_hits:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "visible_gripper_path_collision",
+                        details={"edge_sample_index": index,
+                                 "target_collision_points": target_hits,
+                                 "background_collision_points": background_hits},
+                    )
+            dense["visible_scene_final_trajectory"] = {
+                "scene_hash": visible_scene.semantic_content_hash,
+                "sample_count": len(times),
+                "opening_m": visible_scene.geometry.maximum_opening_m,
+                "scope": "observed_points_nominal_parallel_jaw_solids_only",
+            }
         evidence_hash = canonical_content_hash(
             {
                 "scene_hash": self.scene.semantic_content_hash,
