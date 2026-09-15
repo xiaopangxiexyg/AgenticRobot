@@ -494,8 +494,9 @@ or connect a robot backend.
 `--enable-object-localization` adds the supplied-image localization Route after
 loading its reviewed model bundle. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp
-bundle. GraspGenX through its isolated loopback service is the default; VGN and
-GraspNet are explicit compatibility choices:
+bundle. GraspGenX in-process inference is the default and does not require a
+loopback service; VGN, GraspNet, and service-mode GraspGenX are explicit
+compatibility choices:
 
 ```bash
 python -m agent_gateway real-perception \
@@ -507,8 +508,8 @@ python -m agent_gateway real-perception \
   --object-localization-asset-bundle /absolute/assets/perception/sam2_grounding_dino \
   --enable-point-grasp \
   --point-grasp-asset-bundle /absolute/assets/perception/graspgenx-point-grasp \
-  --graspgenx-host 127.0.0.1 \
-  --graspgenx-port 5556
+  --graspgenx-mode in-process \
+  --graspgenx-source-root /absolute/AgenticRobot/model/perception/graspgenx
 ```
 
 The live `perception.plan_point_grasp@2` request contains only a registered
@@ -655,9 +656,10 @@ Adding `--enable-point-grasp-arm-reachability` upgrades only this combined
 profile to `perception.plan_point_grasp@3`. Its request-gated annotation runs
 the existing lower RM65 endpoint IK from one fresh measured-qpos snapshot and
 classifies each unchanged candidate as standard (3 mm/1 degree), basic
-(5 cm/20 degrees), or difficult within a 1 second/120-cycle per-candidate
-search budget. No new cycle starts after the wall-clock deadline is observed;
-one in-flight lower solve is not preempted and its full duration is reported.
+(5 cm/20 degrees), or difficult within a 1-second/2,880-function-evaluation
+per-candidate budget (16 seeds, at most 180 evaluations per seed). No new seed
+starts after the wall-clock deadline is observed; one in-flight lower solve is
+not preempted and its full duration is reported.
 Omitting the flag preserves the exact v2 contracts and hashes; setting
 `include_arm_reachability=false` on v3 performs no IK. The annotation is not
 path planning, collision clearance, motion admission, or grasp-success proof.
@@ -666,16 +668,52 @@ The combined point-grasp profile also publishes a paired contract for the
 preferred downstream flow. `perception.plan_grasp_approach@1` accepts only a
 retained point-grasp operation ID, candidate ordinal, and speed scale. It binds
 the candidate to a fresh measured-qpos cut, applies the deployed TCP envelope,
-endpoint IK, production URDF/FCL scene, and full joint-path planner, then returns
+endpoint IK, production URDF/FCL scene, and staged reach planner, then returns
 either `path_found` or a bounded rejection reason. This inspection Route cannot
 dispatch motion or request HOLD. A successful result contains an immutable,
 session-local plan ID/hash with a maximum 30-second lifetime.
+
+The reach planner first validates a fixed-orientation Cartesian approach along
+tool +Z for each pregrasp IK branch, then plans globally to that exact pregrasp
+joint state. A failed branch does not discard the remaining branches. It searches
+pregrasp distances from 60 mm down to a 20 mm minimum in 10 mm steps, preferring
+the longest fully feasible route rather than projecting a blocked pose. Local
+targets are at most 5 mm apart. Dense FK revalidation rejects lateral deviation
+above 2 mm, orientation deviation above 1 degree, reversed progress, or a joint
+branch step above 12 degrees. The final quintic samples also obey the 0.1-degree
+geometric resolution used by the collision/envelope checks. An already-reached
+exact target remains a HOLD trajectory; it does not back away and approach again.
+These values belong to `RM65GraspTrajectoryPlanningConfig`, not caller-controlled
+motion permits. Rejected near-field stages return typed reasons and preserve
+the complete lower diagnostics in the Gateway log; the published v1 result
+schema remains unchanged.
+
+Grasp planning uses `dual_arm_hand_proxy_grasp_full`: the existing strict URDF
+with non-adjacent real-arm mesh self-collision pairs, complete cross-arm pairs,
+and all moving links checked against the fixed table and camera poles. Existing
+proxy pairs remain enabled. Coarse link3/hand boxes are not reused for own-arm
+self-collision because they intentionally overlap normal arm structure; real
+arm meshes cover that check. The live teleop profile and its pair exclusions
+remain unchanged. The planner derives conservative convex hulls from the same
+CAD arm meshes, matching MuJoCo's mesh collision representation without changing
+the URDF, assets, or minimum-clearance requirement. This avoids comparing
+triangle-soup and convex-body geometry in replay.
+This strengthens arm coverage but does not supply a real,
+opening-dependent finger model or target-object contact validation.
+
+MuJoCo admission queries are clipped at the required preventive clearance,
+not a broad 50 mm diagnostic radius. On the installed 3.10 runtime, wide
+`mj_geomDistance` queries can incorrectly report a negative distance between
+separated convex meshes. Threshold-clipped queries preserve the same forbidden
+pairs and clearance requirement, including hard-penetration recovery checks.
+Reported far-away clearance is consequently a clipped lower bound, not an exact
+physical-distance measurement; actual-contact checks remain unchanged.
 
 The final grasp target remains strictly inside the configured envelope. If the
 fresh measured TCP of the moving arm starts outside only an absolute translation
 bound, the planner may construct a strictly-inside ingress waypoint without
 widening that envelope. This route is accepted only when the initial violation
-belongs exclusively to the moving arm, is at most 15 cm, monotonically approaches
+belongs exclusively to the moving arm, is at most 16 cm, monotonically approaches
 the envelope, passes dense URDF/FCL collision checks, and never leaves again after
 entry. Rotation violations, an out-of-envelope held arm, or any target outside
 the envelope still fail closed.
@@ -690,6 +728,29 @@ move the arm. A target outside the configured envelope remains a rejected path
 assessment and is not a reason to widen the envelope automatically. Its operator
 action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 `approach_grasp_pose` action does not authorize this Route, and vice versa.
+
+### 分阶段 Skill 边界
+
+显式路径规划对调用者是可选的，但安全准入不是可选的：调用者可以先使用
+`perception.plan_grasp_approach@1` 检查并选择计划，再调用
+`motion.execute_grasp_approach_plan@1`；已有、经过审阅的绝对抓姿也可以交给
+`motion.approach_grasp_pose@1`，由同一个下层规划器内部生成并验证 reach 轨迹。
+两条执行路径均只到达抓姿，不闭合夹爪。
+
+| 阶段 | 当前公开 Skill | 边界 |
+| --- | --- | --- |
+| 获取候选 | `perception.plan_point_grasp` | 仅感知提案；端点 IK 标注不是路径或抓取成功证据 |
+| 渲染候选 | `perception.render_point_grasp_candidate` | 只读；不改变候选、姿态或运动状态 |
+| 可选的显式 reach 规划 | `perception.plan_grasp_approach@1` | 只读；计划绑定会话、场景版本、起始 qpos 和时效 |
+| 到达抓姿 | `motion.execute_grasp_approach_plan@1` / `motion.approach_grasp_pose@1` | 独立运动授权；不自动闭合夹爪 |
+| 夹爪闭合 / 松开 | 尚未在此 worktree 公开 | 必须是独立执行 Skill，不能悄悄并入 reach |
+| 空手移动 | `motion.move_tcp_to_pose@1` | 不能作为携物碰撞验证的替代品 |
+
+当前 reach 准入验证真实机械臂连杆网格与部署的代理几何、固定桌面/相机杆和 TCP
+包络。它尚未验证目标物体的非接触接近、随开度变化的真实夹爪实体、闭合
+过程、带物退出、放置或物理夹持成功。因此 `path_found` 的含义是“reach
+阶段在当前模型下通过”，不是“完整抓取链通过”；不能据此自动闭合、试抬
+或搬运。后续这些阶段必须有独立的场景/夹爪状态和接触规则证据后才可开放。
 
 The CLI is a concrete lower deployment leaf, not an Agent API. All files and
 the selected side/action are trusted operator inputs. The process exposes no
@@ -767,8 +828,9 @@ python -m agent_gateway.profiles.real.one_shot_client \
 ```
 
 `motion.approach_grasp_pose@1` resolves endpoint IK from the latest measured
-dual-arm qpos, keeps the inactive arm fixed, tries the direct joint path first,
-and invokes the bounded collision-aware planner only when needed. Every path is
+dual-arm qpos, keeps the inactive arm fixed, plans a collision-aware global path
+to pregrasp, and appends the same constrained Cartesian approach used by the
+paired read-only planner. Every path is
 densely rechecked with the production URDF/FCL collision model and the bound TCP
 workspace envelope before the existing lower owner can dispatch it. The lower
 owner atomically rechecks the trajectory start and inactive-arm hold at the

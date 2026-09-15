@@ -8,6 +8,7 @@ the resulting fresh, session-local immutable plan exactly once.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -62,6 +63,7 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
 from .station_point_grasp_deployment import StationBoundPointGraspRegistration
 
 _GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = 15.0
+_LOGGER = logging.getLogger(__name__)
 
 REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1 = "real.rm65.perception.plan_grasp_approach"
 REAL_AGENT_GRASP_APPROACH_PLAN_EXECUTOR_ID_V1 = (
@@ -939,6 +941,13 @@ class RealGraspApproachPlanProvider:
             nested_details = nested_failure.get("details")
             if isinstance(nested_details, Mapping):
                 details.update(nested_details)
+        for source_field, public_field in (
+            ("solve_cycles", "cycles"),
+            ("position_residual_m", "best_position_residual_m"),
+            ("orientation_residual_deg", "best_orientation_residual_deg"),
+        ):
+            if public_field not in details and source_field in details:
+                details[public_field] = details[source_field]
         diagnostics: dict[str, Any] = {}
         for field_name in (
             "cycles",
@@ -1131,6 +1140,14 @@ class RealGraspApproachPlanProvider:
                 speed_scale=speed_scale,
             )
         except RM65GraspTrajectoryPlanningError as exc:
+            # The published v1 diagnostics object is intentionally bounded.
+            # Preserve every new lower-stage rejection detail in the retained
+            # Gateway log without silently changing that public schema.
+            _LOGGER.error(
+                "Read-only grasp planning rejected: reason_code=%s details=%r",
+                exc.reason_code,
+                exc.details,
+            )
             failed_base = {
                 **base,
                 "planner_evidence_refs": sorted({*source_evidence, rejection_ref}),

@@ -371,6 +371,32 @@ def field_trace_plan() -> tuple[RealAgentJointTrajectory, RM65SkillTargetBuilder
     return trajectory, builder
 
 
+def test_grasp_oracle_preserves_true_link3_link5_clearance_without_loading_mujoco():
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+    )
+    separated = {
+        "left": FIELD_TRACE_QPOS["left"],
+        "right": np.array(
+            [-1.108825151892748, 1.1104379258198354, 0.6615366517214982,
+             -2.3780365243341404, -2.1097418182164964, 1.253756239109993]
+        ),
+    }
+
+    assert planner.oracle.check(FIELD_TRACE_QPOS).safe
+    check = planner.oracle.check(separated)
+    assert check.collision_check_available
+    assert check.safe
+    assert check.minimum_distance_m == pytest.approx(0.026565366, abs=1e-6)
+    assert set(check.metadata["closest_geometry_names"]) == {
+        "right_arm_link3_0", "right_arm_link5_0"
+    }
+
+
 def test_urdf_grasp_planner_handles_hold_and_moving_paths_without_mujoco() -> None:
     profile = _real_profile()
     builder = build_exclusive_rm65_skill_target_builder(profile)
@@ -787,7 +813,7 @@ def test_real_snapshot_plans_via_strict_envelope_ingress_waypoint(
         speed_scale=0.2,
     )
 
-    assert phases[:2] == ["envelope_ingress", "grasp_target"]
+    assert phases[:2] == ["envelope_ingress", "pregrasp_target"]
     assert trajectory.time_from_start_sec.size > 2
     assert np.all(np.diff(trajectory.time_from_start_sec) > 0.0)
     np.testing.assert_allclose(
@@ -1231,6 +1257,25 @@ class _LinearQposBuilder(_MultistartBuilder):
         return self._poses(**kwargs)
 
 
+class _CartesianQposBuilder(_MultistartBuilder):
+    @staticmethod
+    def _poses(*, left_qpos, right_qpos):
+        poses = {"left": np.eye(4), "right": np.eye(4)}
+        for side, qpos in (("left", left_qpos), ("right", right_qpos)):
+            values = np.asarray(qpos, dtype=float)
+            poses[side][:3, :3] = grasp_trajectory_module.Rotation.from_rotvec(
+                values[3:]
+            ).as_matrix()
+            poses[side][:3, 3] = values[:3]
+        return poses
+
+    def solver_world_targets_for_qpos_pair(self, **kwargs):
+        return self._poses(**kwargs)
+
+    def tool_tcp_world_targets_for_qpos_pair(self, **kwargs):
+        return self._poses(**kwargs)
+
+
 class _MinimumRightXEnvelopeFilter:
     def __init__(self, minimum_x: float) -> None:
         self.minimum_x = float(minimum_x)
@@ -1263,6 +1308,158 @@ def _planner_without_assets(
     planner.target_envelope_filter = None
     planner._solver_lock = threading.Lock()
     return planner
+
+
+def test_pregrasp_branch_selection_validates_local_stage_before_exact_global_connection():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    endpoints = tuple(
+        grasp_trajectory_module._EndpointIKCandidate(
+            qpos_by_side={"left": current["left"], "right": np.full(6, value)},
+            seed_index=index,
+            solve_cycles=10,
+            position_residual_m=0.0,
+            orientation_residual_deg=0.0,
+        )
+        for index, value in enumerate((0.1, 0.2))
+    )
+    planner._endpoint_qpos_candidates = lambda **_kwargs: endpoints
+    calls = []
+
+    def leg(endpoint):
+        return grasp_trajectory_module._PlannedPathLeg(
+            endpoint=endpoint,
+            path=SimpleNamespace(waypoints=(endpoint.qpos_by_side,)),
+            dense_revalidation={},
+            search_attempts=(),
+        )
+
+    def local(**kwargs):
+        qpos = kwargs["qpos_by_side"]
+        calls.append(("local", float(qpos["right"][0])))
+        if float(qpos["right"][0]) == pytest.approx(0.1):
+            raise RM65GraspTrajectoryPlanningError("approach_branch_discontinuous")
+        return leg(endpoints[1])
+
+    def global_connection(**kwargs):
+        selected = kwargs["endpoint_candidates"]
+        assert len(selected) == 1
+        assert selected[0] is endpoints[1]
+        np.testing.assert_array_equal(kwargs["qpos_by_side"]["right"], current["right"])
+        calls.append(("global", float(selected[0].qpos_by_side["right"][0])))
+        return leg(selected[0])
+
+    planner._plan_constrained_approach_leg = local
+    planner._plan_path_leg = global_connection
+    pregrasp, approach = planner._plan_pregrasp_and_approach(
+        qpos_by_side=current,
+        side="right",
+        pregrasp_tool_tcp_world=np.eye(4),
+        grasp_tool_tcp_world=np.eye(4),
+        deadline=10.0,
+        monotonic=lambda: 0.0,
+    )
+
+    assert calls == [("local", 0.1), ("local", 0.2), ("global", 0.2)]
+    assert pregrasp.endpoint is endpoints[1]
+    assert approach.endpoint is endpoints[1]
+    assert pregrasp.search_attempts[0]["reason_code"] == "approach_branch_discontinuous"
+    assert pregrasp.search_attempts[1]["status"] == "path_found"
+
+
+def test_pregrasp_backs_away_along_tool_approach_axis() -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(pregrasp_distance_m=0.06)
+    )
+    target = np.eye(4)
+    target[:3, :3] = grasp_trajectory_module.Rotation.from_euler(
+        "y", 90.0, degrees=True
+    ).as_matrix()
+    target[:3, 3] = (0.2, -0.1, 0.3)
+
+    pregrasp = planner._pregrasp_target_pose(target)
+
+    np.testing.assert_allclose(pregrasp[:3, :3], target[:3, :3], atol=1e-12)
+    np.testing.assert_allclose(
+        target[:3, 3] - pregrasp[:3, 3],
+        0.06 * target[:3, 2],
+        atol=1e-12,
+    )
+    assert planner._pregrasp_distance_candidates() == pytest.approx(
+        (0.06, 0.05, 0.04, 0.03, 0.02)
+    )
+
+
+def test_constrained_approach_plans_fixed_orientation_monotonic_tcp_path() -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            pregrasp_distance_m=0.03,
+            approach_waypoint_spacing_m=0.01,
+        )
+    )
+    planner.target_builder = _CartesianQposBuilder()
+    planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
+    planner.oracle = SimpleNamespace(
+        check=lambda _qpos: JointConfigurationCheck(
+            safe=True,
+            minimum_distance_m=0.04,
+        )
+    )
+    pregrasp = np.eye(4)
+    grasp = np.eye(4)
+    grasp[2, 3] = 0.03
+    current = {side: np.zeros(6) for side in ("left", "right")}
+
+    leg = planner._plan_constrained_approach_leg(
+        qpos_by_side=current,
+        side="right",
+        pregrasp_tool_tcp_world=pregrasp,
+        grasp_tool_tcp_world=grasp,
+    )
+
+    assert leg.path.status is JointPathStatus.PATH_FOUND
+    assert len(leg.path.waypoints) == 4
+    assert leg.path.metadata["planning_phase"] == "constrained_approach"
+    geometry = leg.dense_revalidation["approach_geometry"]
+    assert geometry["approach_distance_m"] == pytest.approx(0.03)
+    assert geometry["maximum_lateral_error_m"] < 1e-7
+    assert geometry["maximum_orientation_error_deg"] < 1e-7
+    assert geometry["maximum_reverse_progress_m"] <= 1e-12
+    np.testing.assert_allclose(
+        leg.endpoint.qpos_by_side["right"][:3],
+        (0, 0, 0.03),
+    )
+    np.testing.assert_allclose(leg.endpoint.qpos_by_side["left"], np.zeros(6))
+
+
+def test_constrained_approach_rejects_lateral_tcp_bow() -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            maximum_approach_lateral_error_m=0.002,
+        )
+    )
+    planner.target_builder = _CartesianQposBuilder()
+    pregrasp = np.eye(4)
+    grasp = np.eye(4)
+    grasp[2, 3] = 0.06
+    start = {side: np.zeros(6) for side in ("left", "right")}
+    bowed = {side: values.copy() for side, values in start.items()}
+    bowed["right"][:3] = (0.003, 0.0, 0.03)
+    end = {side: values.copy() for side, values in start.items()}
+    end["right"][2] = 0.06
+
+    with pytest.raises(
+        RM65GraspTrajectoryPlanningError,
+        match="approach_lateral_deviation",
+    ) as error:
+        planner._validate_constrained_approach_geometry(
+            (start, bowed, end),
+            moving_side="right",
+            pregrasp_tool_tcp_world=pregrasp,
+            grasp_tool_tcp_world=grasp,
+        )
+
+    assert error.value.details["lateral_error_m"] > 0.002
 
 
 def test_grasp_search_oracle_composes_collision_and_target_envelope() -> None:
@@ -1463,6 +1660,8 @@ def test_endpoint_planner_uses_global_deterministic_seed_coverage_by_default() -
     assert config.endpoint_seed_count == 24
     assert config.maximum_endpoint_candidates == 8
     assert config.path_planning_time_budget_sec == pytest.approx(120.0)
+    assert config.pregrasp_distance_m == pytest.approx(0.06)
+    assert config.minimum_pregrasp_distance_m == pytest.approx(0.02)
     assert config.maximum_path_envelope_ingress_distance_m == pytest.approx(0.16)
 
 

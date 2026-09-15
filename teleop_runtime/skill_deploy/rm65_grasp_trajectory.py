@@ -44,7 +44,7 @@ from .motion_port import RealAgentJointTrajectory
 from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
 
 _SIDES = ("left", "right")
-_STRICT_SCENE_PROFILE = "dual_arm_hand_proxy_strict"
+_STRICT_SCENE_PROFILE = "dual_arm_hand_proxy_grasp_full"
 RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
 
 
@@ -67,6 +67,14 @@ class RM65GraspTrajectoryPlanningConfig:
     linear_speed_m_s: float = 0.12
     angular_speed_deg_s: float = 45.0
     minimum_segment_duration_sec: float = 0.25
+    pregrasp_distance_m: float = 0.06
+    minimum_pregrasp_distance_m: float = 0.02
+    pregrasp_distance_step_m: float = 0.01
+    approach_waypoint_spacing_m: float = 0.005
+    maximum_approach_joint_step_rad: float = float(np.deg2rad(12.0))
+    maximum_approach_lateral_error_m: float = 0.002
+    maximum_approach_orientation_error_deg: float = 1.0
+    approach_progress_tolerance_m: float = 0.0005
     maximum_endpoint_solve_cycles: int = 180
     endpoint_seed_count: int = 24
     endpoint_seed_perturbation_rad: float = float(np.deg2rad(25.0))
@@ -95,6 +103,14 @@ class RM65GraspTrajectoryPlanningConfig:
             "linear_speed_m_s",
             "angular_speed_deg_s",
             "minimum_segment_duration_sec",
+            "pregrasp_distance_m",
+            "minimum_pregrasp_distance_m",
+            "pregrasp_distance_step_m",
+            "approach_waypoint_spacing_m",
+            "maximum_approach_joint_step_rad",
+            "maximum_approach_lateral_error_m",
+            "maximum_approach_orientation_error_deg",
+            "approach_progress_tolerance_m",
             "endpoint_position_tolerance_m",
             "endpoint_orientation_tolerance_deg",
             "endpoint_seed_perturbation_rad",
@@ -110,6 +126,10 @@ class RM65GraspTrajectoryPlanningConfig:
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
             object.__setattr__(self, name, value)
+        if self.minimum_pregrasp_distance_m > self.pregrasp_distance_m:
+            raise ValueError(
+                "minimum_pregrasp_distance_m must not exceed pregrasp_distance_m."
+            )
         margin = float(self.endpoint_tolerance_margin_ratio)
         if not math.isfinite(margin) or not 0.0 < margin < 1.0:
             raise ValueError("endpoint_tolerance_margin_ratio must be in (0, 1).")
@@ -377,6 +397,7 @@ class RM65GraspJointTrajectoryPlanner:
             {
                 "deployment_profile_hash": profile.semantic_content_hash,
                 "collision_scene_profile": _STRICT_SCENE_PROFILE,
+                "arm_collision_representation": "cad_convex_hulls_v1",
                 "fixed_obstacles": [item.to_dict() for item in fixed_obstacles],
             },
             domain="dexteleop.real_skill.rm65_fixed_obstacle_frame.v1",
@@ -391,6 +412,7 @@ class RM65GraspJointTrajectoryPlanner:
         collision_bundle = build_rm65_dual_arm_collision_ik_solver(
             RM65DualArmCollisionIKConfig(scene_profile=_STRICT_SCENE_PROFILE)
         )
+        self._use_convex_arm_meshes(collision_bundle.solver.robot.collision_model)
         self.oracle = RM65ObstacleCollisionOracle.from_solver(
             collision_bundle.solver,
             scene=self.scene,
@@ -399,6 +421,51 @@ class RM65GraspJointTrajectoryPlanner:
             expected_reference_frame_spec_hash=self.scene.reference_frame_spec_hash,
             attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
         )
+
+    @staticmethod
+    def _use_convex_arm_meshes(collision_model: object) -> None:
+        """Match MuJoCo's conservative CAD collision representation, not triangles.
+
+        The collision bundle is private to this planner.  The oracle clones it
+        afterward; the live IK solver and on-disk meshes are not modified.
+        """
+
+        expected = {
+            f"{prefix}arm_link{index}_0"
+            for prefix in ("", "right_")
+            for index in range(1, 7)
+        }
+        geometries = {
+            str(geometry.name): geometry
+            for geometry in collision_model.geometryObjects
+            if str(geometry.name) in expected
+        }
+        if set(geometries) != expected:
+            raise RM65GraspTrajectoryPlanningError(
+                "arm_collision_model_unavailable",
+                details={"missing_geometries": sorted(expected - set(geometries))},
+            )
+        for name, geometry in geometries.items():
+            mesh = geometry.geometry
+            try:
+                # A false return can mean the hull was already cached.  The
+                # actual postcondition is a retained, non-null convex shape.
+                mesh.buildConvexHull(True, "Qt")
+                hull = mesh.convex
+            except (AttributeError, RuntimeError, ValueError) as error:
+                raise RM65GraspTrajectoryPlanningError(
+                    "arm_collision_model_unavailable",
+                    details={
+                        "geometry_name": name,
+                        "exception_type": type(error).__name__,
+                    },
+                ) from error
+            if hull is None:
+                raise RM65GraspTrajectoryPlanningError(
+                    "arm_collision_model_unavailable",
+                    details={"geometry_name": name, "reason": "convex_hull_missing"},
+                )
+            geometry.geometry = hull
 
     def _remaining_path_planning_time_sec(
         self,
@@ -619,7 +686,10 @@ class RM65GraspJointTrajectoryPlanner:
         # task envelope.  Its dedicated ingress leg is bounded, monotonic, and
         # densely revalidated.  Once inside, every grasp-search sample must
         # satisfy both collision and TCP-envelope constraints.
-        if planning_phase != "grasp_target" or self.target_envelope_filter is None:
+        if (
+            planning_phase not in {"pregrasp_target", "grasp_target"}
+            or self.target_envelope_filter is None
+        ):
             return self.oracle
         return _TargetEnvelopePathOracle(
             collision_oracle=self.oracle,
@@ -629,6 +699,255 @@ class RM65GraspJointTrajectoryPlanner:
                 phase="path_target",
             ),
         )
+
+    def _pregrasp_target_pose(
+        self,
+        target_tool_tcp_world: np.ndarray,
+        *,
+        distance_m: float | None = None,
+    ) -> np.ndarray:
+        """Back away from the grasp along the tool's configured +Z approach axis."""
+
+        target = np.asarray(target_tool_tcp_world, dtype=float)
+        if target.shape != (4, 4) or not np.all(np.isfinite(target)):
+            raise ValueError("target_tool_tcp_world must be one finite 4x4 pose.")
+        rotation = target[:3, :3]
+        if not np.allclose(
+            rotation.T @ rotation,
+            np.eye(3),
+            atol=1e-5,
+            rtol=0.0,
+        ) or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5, rtol=0.0):
+            raise ValueError(
+                "target_tool_tcp_world rotation must be right-handed and orthonormal."
+            )
+        if not np.allclose(
+            target[3],
+            np.asarray((0.0, 0.0, 0.0, 1.0)),
+            atol=1e-9,
+            rtol=0.0,
+        ):
+            raise ValueError("target_tool_tcp_world must be a rigid transform.")
+        distance = (
+            self.config.pregrasp_distance_m
+            if distance_m is None
+            else float(distance_m)
+        )
+        if not math.isfinite(distance) or distance <= 0.0:
+            raise ValueError("distance_m must be finite and positive.")
+        pregrasp = target.copy()
+        pregrasp[:3, 3] -= distance * rotation[:, 2]
+        return pregrasp
+
+    def _pregrasp_distance_candidates(self) -> tuple[float, ...]:
+        """Prefer the longest local approach that remains fully feasible."""
+
+        maximum = self.config.pregrasp_distance_m
+        minimum = self.config.minimum_pregrasp_distance_m
+        step = self.config.pregrasp_distance_step_m
+        values: list[float] = []
+        current = maximum
+        while current >= minimum - 1e-12:
+            values.append(max(minimum, current))
+            current -= step
+        if values[-1] > minimum + 1e-12:
+            values.append(minimum)
+        return tuple(values)
+
+    def _constrained_approach_targets(
+        self,
+        *,
+        pregrasp_tool_tcp_world: np.ndarray,
+        grasp_tool_tcp_world: np.ndarray,
+    ) -> tuple[np.ndarray, ...]:
+        """Return fixed-orientation Cartesian targets after the pregrasp pose."""
+
+        pregrasp = np.asarray(pregrasp_tool_tcp_world, dtype=float)
+        grasp = np.asarray(grasp_tool_tcp_world, dtype=float)
+        distance = float(np.linalg.norm(grasp[:3, 3] - pregrasp[:3, 3]))
+        if not math.isfinite(distance) or distance <= 0.0:
+            raise ValueError("pregrasp and grasp positions must be distinct and finite.")
+        steps = max(
+            1,
+            math.ceil(distance / self.config.approach_waypoint_spacing_m),
+        )
+        targets: list[np.ndarray] = []
+        for index in range(1, steps + 1):
+            fraction = float(index) / float(steps)
+            waypoint = grasp.copy()
+            waypoint[:3, 3] = (
+                pregrasp[:3, 3]
+                + fraction * (grasp[:3, 3] - pregrasp[:3, 3])
+            )
+            targets.append(waypoint)
+        return tuple(targets)
+
+    def _validate_constrained_approach_geometry(
+        self,
+        waypoints: tuple[Mapping[str, np.ndarray], ...],
+        *,
+        moving_side: str,
+        pregrasp_tool_tcp_world: np.ndarray,
+        grasp_tool_tcp_world: np.ndarray,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> dict[str, object]:
+        """Fail closed unless the realized TCP stays on the intended approach ray."""
+
+        pregrasp = np.asarray(pregrasp_tool_tcp_world, dtype=float)
+        grasp = np.asarray(grasp_tool_tcp_world, dtype=float)
+        delta = grasp[:3, 3] - pregrasp[:3, 3]
+        distance = float(np.linalg.norm(delta))
+        if not math.isfinite(distance) or distance <= 0.0:
+            raise ValueError("pregrasp and grasp positions must be distinct and finite.")
+        approach_axis = delta / distance
+        sample_count = 0
+        maximum_lateral_error_m = 0.0
+        maximum_orientation_error_deg = 0.0
+        maximum_reverse_progress_m = 0.0
+        previous_progress_m: float | None = None
+
+        for segment_index, (start, end) in enumerate(pairwise(waypoints)):
+            maximum_delta = max(
+                float(
+                    np.max(
+                        np.abs(
+                            np.asarray(end[side], dtype=float)
+                            - np.asarray(start[side], dtype=float)
+                        )
+                    )
+                )
+                for side in _SIDES
+            )
+            steps = max(
+                1,
+                math.ceil(maximum_delta / self.config.final_edge_resolution_rad),
+            )
+            for edge_sample_index in range(steps + 1):
+                if segment_index > 0 and edge_sample_index == 0:
+                    continue
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        planning_phase="approach_geometry_revalidation",
+                        details={
+                            "segment_index": segment_index,
+                            "edge_sample_index": edge_sample_index,
+                        },
+                    )
+                alpha = float(edge_sample_index) / float(steps)
+                qpos = {
+                    side: np.asarray(start[side], dtype=float)
+                    + alpha
+                    * (
+                        np.asarray(end[side], dtype=float)
+                        - np.asarray(start[side], dtype=float)
+                    )
+                    for side in _SIDES
+                }
+                tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=qpos["left"],
+                    right_qpos=qpos["right"],
+                )[moving_side]
+                relative = np.asarray(tcp[:3, 3], dtype=float) - pregrasp[:3, 3]
+                progress_m = float(np.dot(relative, approach_axis))
+                lateral_error_m = float(
+                    np.linalg.norm(relative - progress_m * approach_axis)
+                )
+                orientation_error_deg = math.degrees(
+                    float(
+                        Rotation.from_matrix(
+                            grasp[:3, :3]
+                            @ np.asarray(tcp[:3, :3], dtype=float).T
+                        ).magnitude()
+                    )
+                )
+                sample_count += 1
+                maximum_lateral_error_m = max(
+                    maximum_lateral_error_m,
+                    lateral_error_m,
+                )
+                maximum_orientation_error_deg = max(
+                    maximum_orientation_error_deg,
+                    orientation_error_deg,
+                )
+                if (
+                    progress_m < -self.config.approach_progress_tolerance_m
+                    or progress_m
+                    > distance + self.config.approach_progress_tolerance_m
+                ):
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_progress_out_of_bounds",
+                        details={
+                            "segment_index": segment_index,
+                            "edge_sample_index": edge_sample_index,
+                            "progress_m": progress_m,
+                            "approach_distance_m": distance,
+                            "tolerance_m": (
+                                self.config.approach_progress_tolerance_m
+                            ),
+                        },
+                    )
+                if previous_progress_m is not None:
+                    reverse_progress_m = previous_progress_m - progress_m
+                    maximum_reverse_progress_m = max(
+                        maximum_reverse_progress_m,
+                        reverse_progress_m,
+                    )
+                    if reverse_progress_m > self.config.approach_progress_tolerance_m:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "approach_progress_reversed",
+                            details={
+                                "segment_index": segment_index,
+                                "edge_sample_index": edge_sample_index,
+                                "previous_progress_m": previous_progress_m,
+                                "progress_m": progress_m,
+                                "reverse_progress_m": reverse_progress_m,
+                                "tolerance_m": (
+                                    self.config.approach_progress_tolerance_m
+                                ),
+                            },
+                        )
+                previous_progress_m = progress_m
+                if (
+                    lateral_error_m
+                    > self.config.maximum_approach_lateral_error_m
+                ):
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_lateral_deviation",
+                        details={
+                            "segment_index": segment_index,
+                            "edge_sample_index": edge_sample_index,
+                            "lateral_error_m": lateral_error_m,
+                            "maximum_lateral_error_m": (
+                                self.config.maximum_approach_lateral_error_m
+                            ),
+                        },
+                    )
+                if (
+                    orientation_error_deg
+                    > self.config.maximum_approach_orientation_error_deg
+                ):
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_orientation_deviation",
+                        details={
+                            "segment_index": segment_index,
+                            "edge_sample_index": edge_sample_index,
+                            "orientation_error_deg": orientation_error_deg,
+                            "maximum_orientation_error_deg": (
+                                self.config.maximum_approach_orientation_error_deg
+                            ),
+                        },
+                    )
+        return {
+            "sample_count": sample_count,
+            "approach_distance_m": distance,
+            "approach_axis_world": [float(value) for value in approach_axis],
+            "maximum_lateral_error_m": maximum_lateral_error_m,
+            "maximum_orientation_error_deg": maximum_orientation_error_deg,
+            "maximum_reverse_progress_m": maximum_reverse_progress_m,
+        }
 
     @staticmethod
     def _raise_ingress_rejection(
@@ -818,6 +1137,7 @@ class RM65GraspJointTrajectoryPlanner:
         qpos_by_side: Mapping[str, np.ndarray],
         side: str,
         target_tool_tcp_world: np.ndarray,
+        prefer_closest_tolerance: bool = True,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
@@ -826,6 +1146,7 @@ class RM65GraspJointTrajectoryPlanner:
                 qpos_by_side=qpos_by_side,
                 side=side,
                 target_tool_tcp_world=target_tool_tcp_world,
+                prefer_closest_tolerance=prefer_closest_tolerance,
                 deadline=deadline,
                 monotonic=monotonic,
             )
@@ -929,6 +1250,7 @@ class RM65GraspJointTrajectoryPlanner:
         target_tool_tcp_world: np.ndarray,
         seed_qpos: np.ndarray,
         maximum_evaluations: int,
+        prefer_closest_tolerance: bool = True,
     ) -> tuple[dict[str, np.ndarray], int, float, float]:
         target_pose = np.asarray(target_tool_tcp_world, dtype=float)
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
@@ -977,7 +1299,7 @@ class RM65GraspJointTrajectoryPlanner:
             right_qpos=candidate["right"],
         )[side]
         position, orientation = pose_delta_metrics(tcp, target_pose)
-        if (
+        if prefer_closest_tolerance and (
             position <= self.config.endpoint_position_tolerance_m
             and orientation <= self.config.endpoint_orientation_tolerance_deg
         ):
@@ -1073,6 +1395,7 @@ class RM65GraspJointTrajectoryPlanner:
         qpos_by_side: Mapping[str, np.ndarray],
         side: str,
         target_tool_tcp_world: np.ndarray,
+        prefer_closest_tolerance: bool = True,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
@@ -1122,6 +1445,7 @@ class RM65GraspJointTrajectoryPlanner:
                         target_tool_tcp_world=target_tool_tcp_world,
                         seed_qpos=seed[side],
                         maximum_evaluations=(self.config.maximum_endpoint_solve_cycles),
+                        prefer_closest_tolerance=prefer_closest_tolerance,
                     )
                 )
                 candidate[inactive] = np.asarray(
@@ -1576,6 +1900,8 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         planning_phase: str,
+        prefer_closest_tolerance: bool = True,
+        endpoint_candidates: tuple[_EndpointIKCandidate, ...] | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> _PlannedPathLeg:
@@ -1585,13 +1911,15 @@ class RM65GraspJointTrajectoryPlanner:
                 monotonic=monotonic,
                 planning_phase=planning_phase,
             )
-        endpoint_candidates = self._endpoint_qpos_candidates(
-            qpos_by_side=qpos_by_side,
-            side=side,
-            target_tool_tcp_world=target_tool_tcp_world,
-            deadline=deadline,
-            monotonic=monotonic,
-        )
+        if endpoint_candidates is None:
+            endpoint_candidates = self._endpoint_qpos_candidates(
+                qpos_by_side=qpos_by_side,
+                side=side,
+                target_tool_tcp_world=target_tool_tcp_world,
+                prefer_closest_tolerance=prefer_closest_tolerance,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         cfg = self.planner_config
@@ -1767,6 +2095,400 @@ class RM65GraspJointTrajectoryPlanner:
             },
         )
 
+    def _plan_constrained_approach_leg(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        pregrasp_tool_tcp_world: np.ndarray,
+        grasp_tool_tcp_world: np.ndarray,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> _PlannedPathLeg:
+        """Resolve a fixed-orientation, same-branch Cartesian grasp approach."""
+
+        targets = self._constrained_approach_targets(
+            pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+            grasp_tool_tcp_world=grasp_tool_tcp_world,
+        )
+        inactive = "right" if side == "left" else "left"
+        current = {
+            name: np.asarray(qpos_by_side[name], dtype=float).copy()
+            for name in _SIDES
+        }
+        start = {name: value.copy() for name, value in current.items()}
+        waypoints: list[Mapping[str, np.ndarray]] = [start]
+        attempts: list[dict[str, object]] = []
+        total_cycles = 0
+        final_position_residual_m = math.inf
+        final_orientation_residual_deg = math.inf
+
+        with self._solver_lock:
+            for waypoint_index, target in enumerate(targets, start=1):
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        planning_phase="constrained_approach_ik",
+                        details={
+                            "approach_waypoint_index": waypoint_index,
+                            "approach_waypoint_count": len(targets),
+                        },
+                    )
+                try:
+                    candidate, cycles, position, orientation = (
+                        self._least_squares_endpoint_from_seed(
+                            qpos_by_side=current,
+                            side=side,
+                            target_tool_tcp_world=target,
+                            seed_qpos=current[side],
+                            maximum_evaluations=(
+                                self.config.maximum_endpoint_solve_cycles
+                            ),
+                            prefer_closest_tolerance=False,
+                        )
+                    )
+                except RM65GraspTrajectoryPlanningError:
+                    raise
+                except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_ik_solver_error",
+                        details={
+                            "approach_waypoint_index": waypoint_index,
+                            "approach_waypoint_count": len(targets),
+                            "exception_type": type(exc).__name__,
+                            "attempts": attempts,
+                        },
+                    ) from exc
+                total_cycles += cycles
+                candidate[inactive] = start[inactive].copy()
+                attempt = {
+                    "planning_phase": "constrained_approach",
+                    "approach_waypoint_index": waypoint_index,
+                    "approach_waypoint_count": len(targets),
+                    "solve_cycles": cycles,
+                    "position_residual_m": position,
+                    "orientation_residual_deg": orientation,
+                }
+                attempts.append(attempt)
+                if (
+                    position > self.config.endpoint_position_tolerance_m
+                    or orientation > self.config.endpoint_orientation_tolerance_deg
+                ):
+                    attempt["outcome"] = "ik_search_exhausted"
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_ik_search_exhausted",
+                        details={
+                            **attempt,
+                            "endpoint_position_tolerance_m": (
+                                self.config.endpoint_position_tolerance_m
+                            ),
+                            "endpoint_orientation_tolerance_deg": (
+                                self.config.endpoint_orientation_tolerance_deg
+                            ),
+                            "attempts": attempts,
+                        },
+                    )
+                try:
+                    self._require_qpos_within_target_envelope(
+                        candidate,
+                        sides=(side,),
+                        phase="approach_endpoint",
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    attempt["outcome"] = error.reason_code
+                    raise RM65GraspTrajectoryPlanningError(
+                        error.reason_code,
+                        details={
+                            **error.details,
+                            **attempt,
+                            "attempts": attempts,
+                        },
+                    ) from error
+                check = self.oracle.check(candidate)
+                if not isinstance(check, JointConfigurationCheck):
+                    attempt["outcome"] = "collision_oracle_returned_invalid_type"
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_endpoint_collision_check_unavailable",
+                        details={
+                            **attempt,
+                            "returned_type": type(check).__name__,
+                            "attempts": attempts,
+                        },
+                    )
+                if not check.collision_check_available:
+                    attempt["outcome"] = "collision_check_unavailable"
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_endpoint_collision_check_unavailable",
+                        details={
+                            **attempt,
+                            "collision_check": check.to_dict(),
+                            "attempts": attempts,
+                        },
+                    )
+                if not check.safe:
+                    attempt["outcome"] = "collision_blocked"
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_endpoint_collision_blocked",
+                        details={
+                            **attempt,
+                            "collision_check": check.to_dict(),
+                            "attempts": attempts,
+                        },
+                    )
+                maximum_joint_step_rad = float(
+                    np.max(
+                        np.abs(
+                            np.asarray(candidate[side], dtype=float)
+                            - np.asarray(current[side], dtype=float)
+                        )
+                    )
+                )
+                attempt["maximum_joint_step_rad"] = maximum_joint_step_rad
+                if (
+                    maximum_joint_step_rad
+                    > self.config.maximum_approach_joint_step_rad
+                ):
+                    attempt["outcome"] = "branch_discontinuous"
+                    raise RM65GraspTrajectoryPlanningError(
+                        "approach_branch_discontinuous",
+                        details={
+                            **attempt,
+                            "maximum_allowed_joint_step_rad": (
+                                self.config.maximum_approach_joint_step_rad
+                            ),
+                            "attempts": attempts,
+                        },
+                    )
+                attempt["outcome"] = "accepted"
+                current = {
+                    name: np.asarray(candidate[name], dtype=float).copy()
+                    for name in _SIDES
+                }
+                waypoints.append(current)
+                final_position_residual_m = position
+                final_orientation_residual_deg = orientation
+
+        waypoint_tuple = tuple(waypoints)
+        dense = self._revalidate(
+            waypoint_tuple,
+            moving_side=side,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        approach_geometry = self._validate_constrained_approach_geometry(
+            waypoint_tuple,
+            moving_side=side,
+            pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+            grasp_tool_tcp_world=grasp_tool_tcp_world,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        dense = {**dense, "approach_geometry": approach_geometry}
+        path = JointPathPlanResult(
+            status=JointPathStatus.PATH_FOUND,
+            start_qpos_by_component=start,
+            target_qpos_by_component=current,
+            movable_components=(side,),
+            waypoints=waypoint_tuple,
+            scene_hash=self.scene.semantic_content_hash,
+            metadata={
+                "planning_phase": "constrained_approach",
+                "approach_waypoint_count": len(targets),
+                "approach_geometry": approach_geometry,
+            },
+        )
+        endpoint = _EndpointIKCandidate(
+            qpos_by_side=current,
+            seed_index=-1,
+            solve_cycles=total_cycles,
+            position_residual_m=final_position_residual_m,
+            orientation_residual_deg=final_orientation_residual_deg,
+        )
+        return _PlannedPathLeg(
+            endpoint=endpoint,
+            path=path,
+            dense_revalidation=dense,
+            search_attempts=tuple(attempts),
+        )
+
+    def _plan_pregrasp_and_approach(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        pregrasp_tool_tcp_world: np.ndarray,
+        grasp_tool_tcp_world: np.ndarray,
+        deadline: float,
+        monotonic: Callable[[], float],
+    ) -> tuple[_PlannedPathLeg, _PlannedPathLeg]:
+        """Validate each local IK branch before its exact global connection."""
+
+        endpoints = self._endpoint_qpos_candidates(
+            qpos_by_side=qpos_by_side,
+            side=side,
+            target_tool_tcp_world=pregrasp_tool_tcp_world,
+            prefer_closest_tolerance=False,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        attempts: list[dict[str, object]] = []
+        last_error: RM65GraspTrajectoryPlanningError | None = None
+        for endpoint in endpoints:
+            attempt: dict[str, object] = {
+                "planning_phase": "pregrasp_branch_selection",
+                "endpoint_seed_index": endpoint.seed_index,
+            }
+            attempts.append(attempt)
+            try:
+                approach = self._plan_constrained_approach_leg(
+                    qpos_by_side=endpoint.qpos_by_side,
+                    side=side,
+                    pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+                    grasp_tool_tcp_world=grasp_tool_tcp_world,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+                pregrasp = self._plan_path_leg(
+                    qpos_by_side=qpos_by_side,
+                    side=side,
+                    target_tool_tcp_world=pregrasp_tool_tcp_world,
+                    planning_phase="pregrasp_target",
+                    prefer_closest_tolerance=False,
+                    endpoint_candidates=(endpoint,),
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+            except RM65GraspTrajectoryPlanningError as error:
+                last_error = error
+                attempt.update(
+                    {"status": "rejected", "reason_code": error.reason_code}
+                )
+                if error.reason_code in {
+                    "path_collision_check_unavailable",
+                    "path_planning_time_budget_exhausted",
+                    "approach_endpoint_collision_check_unavailable",
+                    "path_target_safety_envelope_unavailable",
+                    "approach_endpoint_safety_envelope_unavailable",
+                }:
+                    break
+                continue
+            attempt["status"] = "path_found"
+            return (
+                replace(
+                    pregrasp,
+                    search_attempts=tuple(attempts) + pregrasp.search_attempts,
+                ),
+                approach,
+            )
+        assert last_error is not None
+        raise RM65GraspTrajectoryPlanningError(
+            last_error.reason_code,
+            details={**last_error.details, "pregrasp_branch_attempts": attempts},
+        ) from last_error
+
+    def _plan_chain_for_pregrasp(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        pregrasp_tool_tcp_world: np.ndarray,
+        grasp_tool_tcp_world: np.ndarray,
+        deadline: float,
+        monotonic: Callable[[], float],
+    ) -> tuple[
+        tuple[_PlannedPathLeg, ...],
+        dict[str, object] | None,
+        list[dict[str, object]],
+    ]:
+        """Plan optional envelope ingress, global pregrasp, and local approach."""
+
+        ingress_targets = self._envelope_ingress_targets(
+            qpos_by_side=qpos_by_side,
+            side=side,
+            final_tool_tcp_world=pregrasp_tool_tcp_world,
+        )
+        if not ingress_targets:
+            pregrasp_leg, approach_leg = self._plan_pregrasp_and_approach(
+                qpos_by_side=qpos_by_side,
+                side=side,
+                pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+                grasp_tool_tcp_world=grasp_tool_tcp_world,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            return (pregrasp_leg, approach_leg), None, []
+
+        ingress_route_attempts: list[dict[str, object]] = []
+        route_error: RM65GraspTrajectoryPlanningError | None = None
+        for inward_fraction, ingress_target in ingress_targets:
+            route_attempt: dict[str, object] = {"inward_fraction": inward_fraction}
+            ingress_route_attempts.append(route_attempt)
+            try:
+                ingress_leg = self._plan_path_leg(
+                    qpos_by_side=qpos_by_side,
+                    side=side,
+                    target_tool_tcp_world=ingress_target,
+                    planning_phase="envelope_ingress",
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+                pregrasp_leg, approach_leg = self._plan_pregrasp_and_approach(
+                    qpos_by_side=ingress_leg.endpoint.qpos_by_side,
+                    side=side,
+                    pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+                    grasp_tool_tcp_world=grasp_tool_tcp_world,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+                combined_waypoints = (
+                    *ingress_leg.path.waypoints,
+                    *pregrasp_leg.path.waypoints[1:],
+                    *approach_leg.path.waypoints[1:],
+                )
+                self._revalidate(
+                    combined_waypoints,
+                    moving_side=side,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+            except RM65GraspTrajectoryPlanningError as error:
+                route_error = error
+                route_attempt.update(
+                    {
+                        "status": "rejected",
+                        "reason_code": error.reason_code,
+                        "planning_phase": error.details.get("planning_phase"),
+                    }
+                )
+                if error.reason_code in {
+                    "path_collision_check_unavailable",
+                    "path_planning_time_budget_exhausted",
+                    "approach_endpoint_collision_check_unavailable",
+                }:
+                    break
+                continue
+            route_attempt["status"] = "path_found"
+            return (
+                (ingress_leg, pregrasp_leg, approach_leg),
+                {
+                    "inward_fraction": inward_fraction,
+                    "ingress_target_tool_tcp_world": ingress_target,
+                    "ingress_endpoint_seed_index": ingress_leg.endpoint.seed_index,
+                    "ingress_path_hash": ingress_leg.path.semantic_content_hash,
+                },
+                ingress_route_attempts,
+            )
+        if route_error is None:
+            route_error = RM65GraspTrajectoryPlanningError("path_planner_error")
+        raise RM65GraspTrajectoryPlanningError(
+            route_error.reason_code,
+            details={
+                **route_error.details,
+                "envelope_ingress_route_attempts": ingress_route_attempts,
+            },
+        ) from route_error
+
     def __call__(
         self,
         *,
@@ -1786,20 +2508,46 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        pregrasp_pose = self._pregrasp_target_pose(target_pose)
+        final_solver_targets = (
+            self.target_builder.solver_world_targets_for_qpos_pair(
+                left_qpos=current["left"],
+                right_qpos=current["right"],
+            )
+        )
+        final_solver_targets[selected_side] = (
+            self.target_builder.solver_world_target_from_tool_tcp_world_target(
+                side=selected_side,
+                tool_tcp_world_target=target_pose,
+            )
+        )
+        self._require_unmodified_target_envelope(
+            final_solver_targets,
+            sides=(selected_side,),
+            phase="target",
+        )
+        current_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=current["left"],
+            right_qpos=current["right"],
+        )[selected_side]
+        (
+            current_position_error_m,
+            current_orientation_error_deg,
+        ) = pose_delta_metrics(current_tcp, target_pose)
+        already_at_grasp = (
+            current_position_error_m <= 1e-9
+            and current_orientation_error_deg <= 1e-7
+        )
         scale = float(speed_scale)
         if not 0.0 < scale <= 1.0:
             raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
         deadline = float(monotonic()) + self.config.path_planning_time_budget_sec
-        ingress_targets = self._envelope_ingress_targets(
-            qpos_by_side=current,
-            side=selected_side,
-            final_tool_tcp_world=target_pose,
-        )
         ingress_route_attempts: list[dict[str, object]] = []
+        pregrasp_route_attempts: list[dict[str, object]] = []
         selected_legs: tuple[_PlannedPathLeg, ...] | None = None
         ingress_route: dict[str, object] | None = None
         route_error: RM65GraspTrajectoryPlanningError | None = None
-        if not ingress_targets:
+        if already_at_grasp:
             selected_legs = (
                 self._plan_path_leg(
                     qpos_by_side=current,
@@ -1811,36 +2559,23 @@ class RM65GraspJointTrajectoryPlanner:
                 ),
             )
         else:
-            for inward_fraction, ingress_target in ingress_targets:
-                route_attempt: dict[str, object] = {
-                    "inward_fraction": inward_fraction,
-                }
-                ingress_route_attempts.append(route_attempt)
+            for distance_m in self._pregrasp_distance_candidates():
+                candidate_pregrasp = self._pregrasp_target_pose(
+                    target_pose,
+                    distance_m=distance_m,
+                )
+                route_attempt: dict[str, object] = {"distance_m": distance_m}
+                pregrasp_route_attempts.append(route_attempt)
                 try:
-                    ingress_leg = self._plan_path_leg(
+                    (
+                        candidate_legs,
+                        candidate_ingress_route,
+                        candidate_ingress_attempts,
+                    ) = self._plan_chain_for_pregrasp(
                         qpos_by_side=current,
                         side=selected_side,
-                        target_tool_tcp_world=ingress_target,
-                        planning_phase="envelope_ingress",
-                        deadline=deadline,
-                        monotonic=monotonic,
-                    )
-                    ingress_qpos = ingress_leg.endpoint.qpos_by_side
-                    grasp_leg = self._plan_path_leg(
-                        qpos_by_side=ingress_qpos,
-                        side=selected_side,
-                        target_tool_tcp_world=target_pose,
-                        planning_phase="grasp_target",
-                        deadline=deadline,
-                        monotonic=monotonic,
-                    )
-                    combined_waypoints = (
-                        *ingress_leg.path.waypoints,
-                        *grasp_leg.path.waypoints[1:],
-                    )
-                    combined_dense = self._revalidate(
-                        combined_waypoints,
-                        moving_side=selected_side,
+                        pregrasp_tool_tcp_world=candidate_pregrasp,
+                        grasp_tool_tcp_world=target_pose,
                         deadline=deadline,
                         monotonic=monotonic,
                     )
@@ -1851,23 +2586,25 @@ class RM65GraspJointTrajectoryPlanner:
                             "status": "rejected",
                             "reason_code": error.reason_code,
                             "planning_phase": error.details.get("planning_phase"),
+                            "approach_waypoint_index": error.details.get(
+                                "approach_waypoint_index"
+                            ),
                         }
                     )
                     if error.reason_code in {
                         "path_collision_check_unavailable",
                         "path_planning_time_budget_exhausted",
+                        "approach_endpoint_collision_check_unavailable",
+                        "path_target_safety_envelope_unavailable",
+                        "target_safety_envelope_unavailable",
                     }:
                         break
                     continue
                 route_attempt["status"] = "path_found"
-                selected_legs = (ingress_leg, grasp_leg)
-                ingress_route = {
-                    "inward_fraction": inward_fraction,
-                    "ingress_target_tool_tcp_world": ingress_target,
-                    "ingress_endpoint_seed_index": ingress_leg.endpoint.seed_index,
-                    "ingress_path_hash": ingress_leg.path.semantic_content_hash,
-                }
-                dense = combined_dense
+                selected_legs = candidate_legs
+                ingress_route = candidate_ingress_route
+                ingress_route_attempts = candidate_ingress_attempts
+                pregrasp_pose = candidate_pregrasp
                 break
             if selected_legs is None:
                 if route_error is None:
@@ -1876,7 +2613,7 @@ class RM65GraspJointTrajectoryPlanner:
                     route_error.reason_code,
                     details={
                         **route_error.details,
-                        "envelope_ingress_route_attempts": ingress_route_attempts,
+                        "pregrasp_route_attempts": pregrasp_route_attempts,
                     },
                 ) from route_error
 
@@ -1886,8 +2623,6 @@ class RM65GraspJointTrajectoryPlanner:
             monotonic=monotonic,
             planning_phase="trajectory_parameterization",
         )
-        if ingress_route is None:
-            dense = dict(selected_legs[0].dense_revalidation)
         endpoint = selected_legs[-1].endpoint
         waypoints = tuple(
             waypoint
@@ -1896,6 +2631,20 @@ class RM65GraspJointTrajectoryPlanner:
                 leg.path.waypoints if leg_index == 0 else leg.path.waypoints[1:]
             )
         )
+        dense = self._revalidate(
+            waypoints,
+            moving_side=selected_side,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        dense["stage_revalidation"] = [
+            {
+                "planning_phase": leg.path.metadata.get("planning_phase"),
+                "path_hash": leg.path.semantic_content_hash,
+                "dense_revalidation": dict(leg.dense_revalidation),
+            }
+            for leg in selected_legs
+        ]
         search_attempts = [
             dict(attempt) for leg in selected_legs for attempt in leg.search_attempts
         ]
@@ -1932,7 +2681,16 @@ class RM65GraspJointTrajectoryPlanner:
                 1.875 * rotation_deg / (self.config.angular_speed_deg_s * scale),
                 1.875 * float(np.max(delta / joint_velocity)),
             )
-            frame_count = max(2, math.ceil(duration * reference_hz) + 1)
+            frame_count = max(
+                2,
+                math.ceil(duration * reference_hz) + 1,
+                math.ceil(
+                    1.875
+                    * float(np.max(delta))
+                    / self.config.final_edge_resolution_rad
+                )
+                + 1,
+            )
             for frame_index in range(1, frame_count):
                 unit = float(frame_index) / float(frame_count - 1)
                 progress = unit**3 * (10.0 - 15.0 * unit + 6.0 * unit**2)
@@ -1958,6 +2716,7 @@ class RM65GraspJointTrajectoryPlanner:
                 "dense_revalidation": dense,
                 "envelope_ingress_route": ingress_route,
                 "envelope_ingress_route_attempts": ingress_route_attempts,
+                "pregrasp_route_attempts": pregrasp_route_attempts,
                 "endpoint_seed_index": endpoint.seed_index,
                 "endpoint_solve_cycles": endpoint.solve_cycles,
                 "endpoint_position_residual_m": endpoint.position_residual_m,
@@ -1965,6 +2724,24 @@ class RM65GraspJointTrajectoryPlanner:
                     endpoint.orientation_residual_deg
                 ),
                 "path_search_attempts": search_attempts,
+                "pregrasp_tool_tcp_world": pregrasp_pose,
+                "pregrasp_applied": not already_at_grasp,
+                "selected_pregrasp_distance_m": (
+                    0.0
+                    if already_at_grasp
+                    else float(
+                        np.linalg.norm(
+                            target_pose[:3, 3] - pregrasp_pose[:3, 3]
+                        )
+                    )
+                ),
+                "maximum_pregrasp_distance_m": self.config.pregrasp_distance_m,
+                "minimum_pregrasp_distance_m": (
+                    self.config.minimum_pregrasp_distance_m
+                ),
+                "approach_waypoint_spacing_m": (
+                    self.config.approach_waypoint_spacing_m
+                ),
                 "target_tool_tcp_world": target_pose,
                 "speed_scale": scale,
                 "reference_hz": reference_hz,

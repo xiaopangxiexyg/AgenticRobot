@@ -397,6 +397,54 @@ def test_planner_rejection_returns_evidence_without_motion_or_hold() -> None:
     assert port.snapshot().dispatch_count == 0
 
 
+def test_approach_rejection_retains_full_details_without_changing_v1_schema(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def planner(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError(
+            "approach_lateral_deviation",
+            details={
+                "segment_index": 2,
+                "edge_sample_index": 4,
+                "lateral_error_m": 0.0034,
+                "maximum_lateral_error_m": 0.002,
+            },
+        )
+
+    registration, provider, _store, port, request, operation = _planning_fixture(
+        planner=planner
+    )
+
+    result, plan = provider.plan_request(request, operation)
+
+    assert plan is None
+    assert result["reason_code"] == "approach_lateral_deviation"
+    assert result["diagnostics"] == {"segment_index": 2, "edge_sample_index": 4}
+    assert "lateral_error_m" in caplog.text
+    assert "0.0034" in caplog.text
+    registration.payload_validator.validate_execution_result(result)
+    assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
+    assert port.snapshot().dispatch_count == 0
+
+
+def test_approach_ik_rejection_uses_existing_residual_diagnostic_fields() -> None:
+    error = RM65GraspTrajectoryPlanningError(
+        "approach_ik_search_exhausted",
+        details={
+            "solve_cycles": 180,
+            "position_residual_m": 0.004,
+            "orientation_residual_deg": 1.2,
+            "approach_waypoint_index": 3,
+        },
+    )
+
+    assert RealGraspApproachPlanProvider._diagnostics(error) == {
+        "cycles": 180,
+        "best_position_residual_m": 0.004,
+        "best_orientation_residual_deg": 1.2,
+    }
+
+
 def test_planner_rejection_surfaces_nested_dense_path_diagnostics() -> None:
     error = RM65GraspTrajectoryPlanningError(
         "path_target_safety_envelope_blocked",
