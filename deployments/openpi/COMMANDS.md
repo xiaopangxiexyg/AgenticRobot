@@ -65,13 +65,18 @@ export PYTHONPATH="$DEXTELEOP_ROOT:$OPENPI_ROOT/src"
 | 统计 | `norm-stats`、`compute_norm_stats.py` | 读取数据并写 normalization assets | 不训练模型 |
 | 训练 | `train`、sequence launcher | 占用 GPU，写 checkpoint、日志、W&B 状态 | 不证明 checkpoint 可真机部署 |
 | server 预检 | `server --dry-run`、`--prepared-config-check-only` | 解析绑定并生成临时配置/命令 | 不加载权重，不监听端口 |
-| artifact 检查 | `client.real --contract-check-only` | 校验 artifact/profile/layout | 不连接 server、相机、夹爪或机械臂 |
+| artifact 检查 | `client.real --contract-check-only` | 校验 artifact/profile/layout；未指定本地 artifact 的 model-RTC client 会先连接 server 读取元数据并立即关闭 | 不发送推理请求，不连接相机、夹爪或机械臂 |
 | server | `deployments.openpi.server` | 加载模型，占用 GPU 并监听端口 | 不连接机器人 |
 | no-action client | `client.real`，不含 `--send-actions` | 可能连接 server、相机和真实 observation/backend | 只保证不下发 policy action；不是无硬件 |
 | 真实执行 | client 显式含 `--send-actions` | 进入真实动作链，仍受初始化和人工 ready gate 控制 | 不因命令能启动就获得安全授权 |
 
 这里的“训练”本身不会控制机器人；`--no-motion` 不是训练正确性的替代检查。
 任何真实 client 命令都应按现场硬件流程单独审计。
+
+普通 OpenPI 推理响应不要求逐动作块附带 `policy_io_layout_hash`：当响应没有该字段时，
+v2.2 动作适配器核对同一连接发布的 policy artifact 内的布局内容。缺少布局证据、
+布局内容不同或响应显式声明了错误哈希，仍会在安全/派发前拒绝；动作维度、离散
+token 和有限数值检查不因此放宽。
 
 ## 4. 训练路线选择
 

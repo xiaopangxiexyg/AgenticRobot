@@ -210,6 +210,64 @@ def test_v22_dual_continuous_dmtac_bridge_selects_end_effector_components() -> N
     )
 
 
+def test_v22_remote_action_accepts_matching_server_artifact_without_chunk_hash() -> None:
+    layout = _dual_dmtac_continuous_layout()
+    action = np.concatenate((_pose(-0.1), _pose(0.1), [0.2, 0.8])).astype(np.float32)
+    chunk = UnifiedActionChunk(
+        actions=action,
+        metadata={
+            "remote_policy": {
+                "server": {
+                    "policy_artifact": {"policy_io_layout": layout.to_dict()},
+                },
+            },
+        },
+    )
+
+    actions = V22DeploymentAdapter(layout).to_legacy_normalized_actions(chunk)
+
+    assert len(actions) == 1
+    np.testing.assert_allclose(actions[0].vector[ACTION_HAND_SLICES["left"]][0], 0.2)
+    np.testing.assert_allclose(actions[0].vector[ACTION_HAND_SLICES["right"]][0], 0.8)
+
+
+def test_v22_remote_action_rejects_missing_or_different_layout_evidence() -> None:
+    layout = _dual_dmtac_continuous_layout()
+    action = np.concatenate((_pose(-0.1), _pose(0.1), [0.2, 0.8])).astype(np.float32)
+    adapter = V22DeploymentAdapter(layout)
+    different_layout = layout.to_dict()
+    different_layout["end_effectors"]["right"]["target"]["legacy_q6_slot_indices"] = [1]
+    for metadata in (
+        {},
+        {"remote_policy": {"server": {"policy_artifact": {"policy_io_layout": different_layout}}}},
+    ):
+        with pytest.raises(DatasetLayoutBindingError, match="layout mismatch"):
+            adapter.to_legacy_normalized_actions(
+                UnifiedActionChunk(actions=action, metadata=metadata)
+            )
+
+    with pytest.raises(DatasetLayoutBindingError, match="layout mismatch"):
+        adapter.to_legacy_normalized_actions(
+            UnifiedActionChunk(
+                actions=action,
+                metadata={
+                    "policy_io_layout_hash": "sha256:wrong",
+                    "remote_policy": {"server": {"policy_artifact": {"policy_io_layout": layout.to_dict()}}},
+                },
+            )
+        )
+
+    with pytest.raises(V22DeploymentError, match="action float dim mismatch"):
+        adapter.to_legacy_normalized_actions(
+            UnifiedActionChunk(
+                actions=action[:-1],
+                metadata={
+                    "remote_policy": {"server": {"policy_artifact": {"policy_io_layout": layout.to_dict()}}},
+                },
+            )
+        )
+
+
 def test_v22_dual_continuous_dmtac_native_selects_end_effector_components() -> None:
     layout = _dual_dmtac_continuous_layout()
     float_action = np.concatenate((_pose(-0.1), _pose(0.1), [0.2, 0.8])).astype(np.float32)
