@@ -16,12 +16,21 @@ from deployments.openpi.client.rtc import (
     OpenPIFinalChunkRtcBackend,
     openpi_rtc_artifact_hash,
 )
+from robot_motion.deploy import RtcPolicyEmissionSourceBinding
 from robot_motion.deploy.rtc_protocol import negotiate_rtc_capability
 from teleop_runtime.deploy.rtc_step_fanout import RtcFrontendStepSourceBinding
 
-from ..contracts import ControlStationRunManifest, SourceSlotSpec
-from ..composition.rtc_policy_shadow import (
-    build_cs3_rtc_policy_passive_shadow_manifest,
+from ..contracts import (
+    ControlStationRunManifest,
+    ExecutionDomainBinding,
+    SourceSlotSpec,
+)
+
+CS3_RTC_POLICY_PASSIVE_SHADOW_MANIFEST_ID_V1 = (
+    "control_station_cs3_rtc_policy_passive_shadow_v1"
+)
+_CS3_RTC_POLICY_PRODUCER_EPOCH_HASH_DOMAIN_V1 = (
+    "dexteleop.control_station.cs3_rtc_policy_producer_epoch.v1"
 )
 
 
@@ -42,6 +51,113 @@ RTC_SOURCE_STATUS_DENIED = "denied"
 RTC_SERVER_METADATA_STATUS_VALIDATED_AT_BACKEND_CONSTRUCTION = (
     "validated_at_backend_construction"
 )
+
+
+def build_cs3_rtc_policy_passive_shadow_manifest(
+    binding: RtcPolicyEmissionSourceBinding,
+) -> ControlStationRunManifest:
+    """Freeze a target-neutral, shadow-only Station run.
+
+    The manifest projection is kept with source preflight because it only
+    records an already-constructed RTC binding.  It never owns a producer,
+    transport, target, or Station lifecycle.
+    """
+
+    if not isinstance(binding, RtcPolicyEmissionSourceBinding):
+        raise TypeError("binding must be an RtcPolicyEmissionSourceBinding.")
+    producer_epoch_policy_hash = canonical_content_hash(
+        {
+            "producer_id": binding.producer_id,
+            "producer_epoch": binding.producer_epoch,
+            "activation": "owned_by_existing_rtc_frontend",
+        },
+        domain=_CS3_RTC_POLICY_PRODUCER_EPOCH_HASH_DOMAIN_V1,
+    )
+    target = ExecutionDomainBinding(
+        binding_id=f"null-target:rtc-shadow:{binding.control_domain_id}",
+        target_kind="null",
+        control_domain_id=binding.control_domain_id,
+        embodiment_instance_id="not-applicable:passive-rtc-observer",
+        target_runtime_action_contract_hash=(
+            "not-applicable:cs3-passive-rtc-shadow-no-target-v1"
+        ),
+        execution_capability_profile_hash=(
+            "no-execution-capability:cs3-passive-rtc-shadow-v1"
+        ),
+        component_catalog_hash="not-applicable:cs3-passive-source-only-v1",
+        selection_group_ids=("not_applicable_passive_shadow",),
+        owner_registry_id="no-owner-registry:cs3-passive-rtc-shadow-v1",
+        authority_epoch_source_id="no-authority-epoch:cs3-passive-rtc-shadow-v1",
+        execution_epoch_source_id="no-execution-epoch:cs3-passive-rtc-shadow-v1",
+        trace_requirement_profile_id="control_station_passive_rtc_shadow_v1",
+        explicit_exclusions=(
+            "backend_dispatch",
+            "execution_target",
+            "motion_authority",
+            "real_backend",
+            "sim_backend",
+        ),
+    )
+    return ControlStationRunManifest(
+        manifest_id=CS3_RTC_POLICY_PASSIVE_SHADOW_MANIFEST_ID_V1,
+        manifest_version="1",
+        execution_binding=target,
+        source_slots=(
+            SourceSlotSpec(
+                source_slot_id=binding.source_slot_id,
+                source_kind="policy",
+                producer_id=binding.producer_id,
+                source_action_contract_hash=binding.action_adapter_contract_hash,
+                producer_epoch_policy_hash=producer_epoch_policy_hash,
+                supported_uses=("shadow",),
+                expected_emission_seam=(
+                    "robot_motion.deploy.runtime.PolicyActionEmission"
+                ),
+                required_binding_refs=(
+                    binding.semantic_content_hash,
+                    binding.policy_runtime_config_hash,
+                    binding.rtc_frontend_config_hash,
+                    binding.rtc_profile_hash,
+                ),
+                explicit_exclusions=(
+                    "action_candidate",
+                    "control_station_policy_merge",
+                    "control_station_policy_pop",
+                    "control_station_policy_predict",
+                    "control_station_rtc_producer_lifecycle",
+                    "motion_authority",
+                ),
+            ),
+        ),
+        authority_policy_hash="no-motion-authority:cs3-passive-rtc-shadow-v1",
+        decision_schedule_hash="not-applicable:no-station-decision-loop-v1",
+        trace_requirement_profile_id="control_station_passive_rtc_shadow_v1",
+        capture_policy_id="capture-not-owned:cs3-passive-rtc-shadow-v1",
+        allowed_intent_kinds=(
+            "acquire_control_lease",
+            "release_control_lease",
+            "connect_source",
+            "disconnect_source",
+            "connect_target",
+            "disconnect_target",
+            "run_preflight",
+            "start_shadow",
+            "stop_shadow",
+            "stop_runtime",
+        ),
+        explicit_exclusions=(
+            "action_candidate",
+            "backend_dispatch",
+            "capture_episode_lifecycle",
+            "control_station_rtc_producer_lifecycle",
+            "motion",
+            "motion_authority",
+            "policy_artifact_loading",
+            "production_entrypoint",
+            "real_motion",
+            "sim_authority",
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -334,7 +450,9 @@ def build_cs3b_openpi_rtc_source_preflight_manifest(
 
 __all__ = [
     "CS3B_OPENPI_RTC_SOURCE_PREFLIGHT_MANIFEST_ID_V1",
+    "CS3_RTC_POLICY_PASSIVE_SHADOW_MANIFEST_ID_V1",
     "OpenPIRtcSourcePreflightAssessment",
     "assess_openpi_rtc_passive_source",
+    "build_cs3_rtc_policy_passive_shadow_manifest",
     "build_cs3b_openpi_rtc_source_preflight_manifest",
 ]

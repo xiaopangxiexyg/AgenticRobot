@@ -2,13 +2,13 @@
 
 > 文档类型：当前详细操作指南。HIL 文档入口、安全范围、profile 速览和 owner 导航见
 > [`docs/HIL/README.md`](../README.md)。本文保留完整的 GUI、设备输入、capture、频率、
-> 坐标、临时 PPO、OpenPI source 和历史 CS-6b1f 说明；标为历史的段落不能当作当前
-> profile 启动契约。
+> 坐标、临时 PPO、OpenPI source 和退役 profile 审计说明；标为历史的段落不能当作
+> 当前 profile 启动契约。
 
 本文档主线对应当前 default-off 的单右臂 Sim-HIL 应用：临时 PPO 与真实或虚拟
 VIVE + Q6/angle-trigger 输入经过 component-keyed composition 后，只驱动 MuJoCo。
 它不会构造真实 RM65 backend，也不会改变既有 teleop、replay、deploy 或 RTC 路径。
-后文仍保留历史 `CS-6b1f` replay→human takeover 说明，并明确标为历史 profile。
+后文仅保留退役 CS-2/CS-3/CS-6 fixture 的边界说明，不提供其启动命令。
 当前 ownership、四类公开 Sim-HIL profile 与未完成 trajectory/real gate 见
 [HITL 当前边界](../../architecture/plans/hitl_chunk_relative_migration_plan.md)；原 R0-R4、
 R3.1a-c 的完整设计与实施记录见
@@ -265,70 +265,38 @@ trace sink 故障和重复目标拒绝做本地无设备验证；尚未连接真
 执行链。Active 接入仍需单独拆分“emit → composition/proposal/authority → canonical
 prepare”的所有权边界并保留现有 arm-hold/lookahead 语义。
 
-### 1.2 历史 CS-6b1f：pose takeover seam 与本体切换
+### 1.2 退役的 CS-2/CS-3/CS-6 fixtures
 
-本节只记录早期 replay→human pose-takeover profile，不是当前单右臂 PPO +
-VIVE/gripper 应用的启动契约。
+早期 replay→human takeover、pose-composer、MuJoCo replay/policy/RTC 和被动
+RTC Station fixtures 已从版本化源码树退役。它们没有当前生产调用者，也不是
+当前单右臂 PPO + VIVE/gripper 应用的启动契约；本指南不再提供这些 profile 的
+builder 或测试命令。退役范围、调用者审计、替代 owner 和可恢复本地备份见
+[`docs/legacy/control_station_profile_retirement_20260906.md`](../../legacy/control_station_profile_retirement_20260906.md)。
 
-HIL 的 takeover、HOLD/cancel、readiness、emission promotion、publication barrier
-和外部 recorder 都不携带“双臂”假设。`PassiveTeleopPoseSourceSpec` 现在按声明的
-`reference_frame_by_effector` 与 `action_spec_hash_by_effector` 决定 pose effector
-集合；默认值仍保留历史双臂 contract/hash，单臂只需建立一个新的数据化 source
-contract，例如：
+当前 HIL 仍使用 `PassiveTeleopPoseSourceSpec` 或
+`PassiveTeleopComponentSessionSource` 的声明式 source contract，并通过
+`control_station sim-hil` 的现行 component profile 接入已有
+`PolicyActionEmission`、`HumanCommandEmission`、safety、IK、reference、dispatch
+和 ControlTrace seam。单臂或新本体必须先提供匹配的 target catalog、frame/IK 与
+capability evidence；不得恢复一套按设备或 arm cardinality 命名的 handoff/replay/record
+实现。
 
-```python
-from control_station.sources import PassiveTeleopPoseSourceSpec
+## 2. 当前 Sim-HIL 最小验证（R1，无真实设备）
 
-human_spec = PassiveTeleopPoseSourceSpec.for_arm(
-    "right_arm",
-    reference_frame="right_arm_base",
-    action_spec_hash="rm65-tool-tcp-pose-v1",
-    source_id="human-single-arm",
-    source_profile_id="single-arm-tracker-v1",
-)
-```
-
-多个非双臂 effectors 也可通过 `for_effectors(...)` 显式声明。其余步骤仍复用同一
-`TeleopSession(rig=None, recorder=None)`、`HumanTakeoverOperationSpec`、readiness
-provider、promotion 和 recorder seam；不会为单臂新增 queue、authority、epoch 或
-episode owner。spec 的 effector/frame/action-spec 集合进入 semantic hash，少一侧、
-多一侧或错配都会在 source/target binding 阶段 fail closed。
-
-当前 `CS-6b1f` MuJoCo target 是一个明确的 **RM65 coupled-bimanual capability
-profile**，其 action catalog、pose→coupled-IK resolver 和 execution manifest 仍要求
-`left_arm + right_arm`。因此把上面的单臂 spec 直接塞进该 profile 会被拒绝，这是
-能力不兼容而不是 HIL seam 不通用。接入真正单臂本体时只需提供该本体自己的 target
-catalog、pose/frame/IK（或其它 execution）adapter 与 capability/manifest evidence，
-再复用同一 Station/HIL transaction；不得复制一套按单臂命名的 handoff/replay/record
-实现。夹爪、6DOF/16DOF 灵巧手仍属于独立的 qpos/native component gate，不因 arm
-cardinality 改成 pose。
-
-## 2. 历史 CS-6b1f 最小验证（R1，无真实设备）
-
-从仓库根目录、激活 `dexteleop310` 环境执行：
+从仓库根目录、激活项目规定的 `dexteleop310` 环境执行。以下只覆盖当前
+default-off、passive viewer 和 resource-free allocation contract，不启动真实设备、
+相机、VIVE、RM65、仿真 viewer 或运动链路：
 
 ```bash
-PYTHONPATH=. python -m pytest -q \
-  tests/test_control_station_mujoco_pose_human_replay.py::test_cs6b1f_sim_hil_promotes_passive_pose_and_keeps_publish_seam_unique
+bash scripts/run_pytest.sh -q \
+  tests/test_control_station_mujoco_sim_hil.py::test_sim_hil_profile_is_default_off \
+  tests/test_control_station_mujoco_sim_hil.py::test_application_viewer_preview_starts_only_passive_visualization \
+  tests/test_control_station_sim_hil_allocation_profile.py::test_scheme_a_preparation_is_resource_free_and_component_keyed
 ```
 
-该测试验证：
-
-1. replay 可以先成为唯一 authority；passive human poll 不产生 human proposal；
-2. takeover worker 在 HOLD 下等待 takeover boundary 之后的 immutable emission；
-3. virtual readiness 完成后，原 emission identity/content/timing 只 promotion/admit 一次；
-4. human pose 经现有 safety、scheduled pose→qpos target 和 MuJoCo planner 执行；
-5. 后续 passive emission 仍只通过已有 human publication seam 提交。
-
-正式 capture/WAL/committed-reader 验证：
-
-```bash
-PYTHONPATH=. python -m pytest -q \
-  tests/test_control_station_mujoco_pose_human_replay.py::test_cs6b1f_formal_hil_capture_seals_and_rebuilds_pose_lineage
-```
-
-该测试会在 pytest 临时目录中创建 trace WAL、seal、commit 和 ActualDecisionView，
-不会写入真实数据集，也不会连接设备。
+这些测试只证明当前 profile 选择、被动预览和 allocation contract 的离线行为；不
+证明真实设备、实时性能、物理安全、模型质量或 deployment readiness。更广泛的
+Control Station 与 Harness Profiles 仍须通过各自受认证的 runner 执行。
 
 ## 3. 应用侧组装顺序
 
@@ -850,9 +818,9 @@ PYTHONPATH=. python -m sim.mujoco_temp_pipeline.evaluate \
 `privileged_expert` checkpoint 只能作为 simulator/debug teacher，不能进入真实或通用
 policy source。
 
-### 4.3 当前动作契约与 CS-6b1f 的不兼容点
+### 4.3 当前动作契约与 component Sim-HIL 的边界
 
-| temp pipeline 输出 | CS-6b1f 要求 |
+| temp pipeline 输出 | 当前 component Sim-HIL 要求 |
 |---|---|
 | 7-D：右 TCP xyz/rotvec delta + 右夹爪 close delta | 双臂 `bimanual_ee_pose_v1` arm action |
 | 右臂控制，左臂固定 home | 左右 arm 同一 coupled selection group |
@@ -860,16 +828,16 @@ policy source。
 | `CubeLiftEnv` 自己的 observation/safety/task loop | 已启动的 authoritative MuJoCo runtime + immutable emission |
 | normal 15-D observation；privileged 31-D observation | 目标 runtime 的已声明 observation contract |
 
-因此 checkpoint 仍不能直接传给历史
-`build_scoped_cs6b1f_mujoco_pose_human_replay_station()`。当前单右臂应用使用
+因此 checkpoint 不能直接传给已退役的 replay/pose-takeover fixture。当前单右臂应用使用
 `TempPPOHILPolicySource`：它验证 checkpoint/task/normalizer，读取当前 MuJoCo TCP
 作为初始 anchor，把 7-D policy delta 解码为持续维护的绝对右臂 tool pose 与绝对
 gripper qpos，再形成正式 `PolicyActionEmission`。它不实现第二套 IK、安全、authority
 或 dispatch；这些仍由下游 MuJoCo target/runtime 所有。
 
 当前 `control_station sim-hil` profile 是独立、default-off 的
-`right_arm: cartesian_pose + right_gripper: physical_joint_qpos` component path，
-不会改变历史 CS-6b1f replay/human 路径。HOLD 后仍需显式 re-arm，不能自动清门。
+`right_arm: cartesian_pose + right_gripper: physical_joint_qpos` component path；
+它不恢复或旁路已退役的 replay/human Station 路径。HOLD 后仍需显式 re-arm，不能
+自动清门。
 
 这条路径仍然复用 `PolicyActionEmission` / `PolicyDeployRuntime` 的 lower-owned
 emission seam；模型侧不需要为 RTC 或 Station 增加专用 adapter。需要的只是应用侧

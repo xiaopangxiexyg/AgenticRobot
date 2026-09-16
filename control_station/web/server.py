@@ -607,88 +607,6 @@ def build_coordinated_control_station_server(
     return server
 
 
-def build_scoped_passive_shadow_control_station_server(
-    runtime: ControlStationRuntime,
-    *,
-    access_policy: LocalIntentAccessPolicy,
-    event_log: BoundedStationEventLog,
-    operation_coordinator: SideEffectStationOperationCoordinator,
-    passive_status_provider: Callable[[], dict[str, object]],
-    host: str = "127.0.0.1",
-    port: int = 0,
-) -> ThreadingHTTPServer:
-    """Build but do not start the null-target CS-3a passive-shadow API."""
-
-    if not isinstance(runtime, ControlStationRuntime):
-        raise TypeError("runtime must be a ControlStationRuntime.")
-    if type(access_policy) is not LocalIntentAccessPolicy:
-        raise TypeError("access_policy must be a LocalIntentAccessPolicy.")
-    if not isinstance(event_log, BoundedStationEventLog):
-        raise TypeError("event_log must be a BoundedStationEventLog.")
-    if type(operation_coordinator) is not SideEffectStationOperationCoordinator:
-        raise TypeError(
-            "operation_coordinator must be a SideEffectStationOperationCoordinator."
-        )
-    if operation_coordinator.runtime is not runtime:
-        raise ValueError("Coordinator and web server must share one runtime.")
-    if operation_coordinator.event_log is not event_log:
-        raise ValueError("Coordinator and web server must share one event log.")
-    if runtime.manifest.execution_binding.target_kind != "null":
-        raise ValueError("Scoped passive Web API requires an exact null target.")
-    required_exclusions = {
-        "backend_dispatch",
-        "control_station_rtc_producer_lifecycle",
-        "motion",
-        "motion_authority",
-        "production_entrypoint",
-    }
-    missing = sorted(required_exclusions - set(runtime.manifest.explicit_exclusions))
-    if missing:
-        raise ValueError(
-            f"Scoped passive manifest lacks required exclusions: {missing}."
-        )
-    if any(
-        use in {"candidate", "authority"}
-        for slot in runtime.manifest.source_slots
-        for use in slot.supported_uses
-    ):
-        raise ValueError("Scoped passive source cannot support candidate/authority.")
-    forbidden_intents = {
-        "request_candidate",
-        "release_candidate",
-        "request_motion_authority",
-        "release_motion_authority",
-    }
-    if forbidden_intents & set(runtime.manifest.allowed_intent_kinds):
-        raise ValueError("Scoped passive manifest exposes a control-authority intent.")
-    unsupported = sorted(
-        set(access_policy.allowed_intent_kinds)
-        - set(runtime.manifest.allowed_intent_kinds)
-    )
-    if unsupported:
-        raise ValueError(
-            f"Access policy enables intents absent from the manifest: {unsupported}."
-        )
-    if not callable(passive_status_provider):
-        raise TypeError("passive_status_provider must be callable.")
-    normalized_host = str(host).strip()
-    if normalized_host not in _LOCAL_BIND_HOSTS:
-        raise ValueError("Scoped passive Web API only permits a loopback bind.")
-    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
-        raise ValueError("port must be an integer in [0, 65535].")
-    return _ControlStationHttpServer(
-        (normalized_host, port),
-        _ReadOnlyControlStationHandler,
-        runtime=runtime,
-        access_policy=access_policy,
-        event_log=event_log,
-        operation_coordinator=operation_coordinator,
-        coordinator_kind="side_effect",
-        maturity="cs3a_rtc_policy_passive_shadow_api",
-        authority_status_provider=passive_status_provider,
-    )
-
-
 def build_scoped_sim_authority_control_station_server(
     runtime: ControlStationRuntime,
     *,
@@ -768,7 +686,6 @@ def build_scoped_sim_authority_control_station_server(
 __all__ = [
     "build_coordinated_control_station_server",
     "build_read_only_control_station_server",
-    "build_scoped_passive_shadow_control_station_server",
     "build_scoped_sim_authority_control_station_server",
     "build_typed_intent_control_station_server",
 ]
