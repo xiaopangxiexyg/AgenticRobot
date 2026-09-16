@@ -76,6 +76,10 @@ from .observation_adapter import (
     prepared_allowed_prompts,
 )
 from .policy import OPENPI_LOCAL_PROTOCOL_VERSION
+from .state_history import (
+    OpenPIStateHistoryRecorder,
+    history_binding_from_artifact_metadata,
+)
 
 
 OPENPI_FINAL_CHUNK_RTC_ADAPTER_V1 = "openpi_final_chunk_rtc_adapter_v1"
@@ -668,6 +672,19 @@ class OpenPIFinalChunkRtcBackend:
             artifact.policy_io_layout,
             state_input_mode=artifact.state_input_mode,
         )
+        history_binding = history_binding_from_artifact_metadata(artifact.metadata)
+        self._history_recorder = (
+            None
+            if history_binding is None
+            else OpenPIStateHistoryRecorder(
+                binding=history_binding,
+                adapter=self._v22_adapter,
+            )
+        )
+
+    @property
+    def observation_history_enabled(self) -> bool:
+        return self._history_recorder is not None
 
     @property
     def rtc_capability(self) -> RtcModelCapability:
@@ -881,7 +898,20 @@ class OpenPIFinalChunkRtcBackend:
             typed,
             self._observation_config,
         )
+        if self._history_recorder is not None:
+            payload.update(self._history_recorder.request_payload(observation))
         return OpenPIRtcPreparedInput(payload=payload)
+
+    def observe_deployment_observation(self, observation: Any) -> None:
+        """Capture one control tick only when the artifact enables history."""
+
+        if self._history_recorder is not None:
+            self._history_recorder.observe(observation)
+
+    def request_observation_ready(self, observation: Any) -> bool:
+        """Delay only history-enabled inference until exact offsets exist."""
+
+        return self._history_recorder is None or self._history_recorder.is_ready(observation)
 
     def infer_rtc(
         self,

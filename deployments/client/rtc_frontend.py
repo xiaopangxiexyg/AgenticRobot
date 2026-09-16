@@ -535,6 +535,21 @@ def build_rtc_conditioned_model_shadow_frontend_v3(
             "builder."
         )
     capability = adapter.rtc_continuation_capability
+    history_enabled = bool(getattr(adapter, "observation_history_enabled", False))
+    observation_observer = (
+        getattr(adapter, "observe_deployment_observation", None)
+        if history_enabled
+        else None
+    )
+    request_observation_ready = (
+        getattr(adapter, "request_observation_ready", None)
+        if history_enabled
+        else None
+    )
+    if observation_observer is not None and not callable(observation_observer):
+        raise TypeError("history-enabled adapter observer must be callable.")
+    if request_observation_ready is not None and not callable(request_observation_ready):
+        raise TypeError("history-enabled adapter readiness hook must be callable.")
     identity = RtcModelPolicyIdentity(
         name=(
             capability.continuation_implementation_id
@@ -566,6 +581,8 @@ def build_rtc_conditioned_model_shadow_frontend_v3(
         emission_adapter=getattr(preparer, "action_adapter", None),
         clock=clock,
         executor_factory=executor_factory,
+        observation_observer=observation_observer,
+        request_observation_ready=request_observation_ready,
         representation_context_builder=context_builder,
     )
 

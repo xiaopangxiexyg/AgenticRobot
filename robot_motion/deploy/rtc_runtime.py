@@ -1120,6 +1120,8 @@ class RtcPolicyShadowFrontend:
         emission_adapter: DeployRobotActionAdapter | None = None,
         clock: Callable[[], float] = time.monotonic,
         executor_factory: Callable[[str], PolicyInferenceExecutor] | None = None,
+        observation_observer: Callable[[DeploymentObservation], None] | None = None,
+        request_observation_ready: Callable[[DeploymentObservation], bool] | None = None,
         representation_context_builder: Callable[
             [PolicyObservationView, str], PolicyActionRepresentationContext
         ]
@@ -1155,6 +1157,12 @@ class RtcPolicyShadowFrontend:
         self.emission_adapter = emission_adapter
         self.clock = clock
         self._executor_factory = executor_factory
+        if observation_observer is not None and not callable(observation_observer):
+            raise TypeError("observation_observer must be callable or None.")
+        if request_observation_ready is not None and not callable(request_observation_ready):
+            raise TypeError("request_observation_ready must be callable or None.")
+        self._observation_observer = observation_observer
+        self._request_observation_ready = request_observation_ready
         if representation_context_builder is not None and not callable(
             representation_context_builder
         ):
@@ -1679,6 +1687,17 @@ class RtcPolicyShadowFrontend:
         preflight_record_latency: bool = True,
     ) -> RtcFrontendStep:
         self._require_running()
+        if not isinstance(observation, DeploymentObservation):
+            raise TypeError("observation must be DeploymentObservation.")
+        if self._observation_observer is not None:
+            self._observation_observer(observation)
+        observation_ready = (
+            True
+            if self._request_observation_ready is None
+            else self._request_observation_ready(observation)
+        )
+        if not isinstance(observation_ready, bool):
+            raise TypeError("request_observation_ready must return bool.")
         tick_started = time.perf_counter()
         decision_at = _finite(now, field_name="now")
         preflight = preflight_timeout_sec is not None
@@ -1892,6 +1911,7 @@ class RtcPolicyShadowFrontend:
         worker_submission = None
         if (
             request_allowed
+            and observation_ready
             and self._preflight_request is None
             and not (preflight and completion is not None)
             and self._should_request(decision_at)

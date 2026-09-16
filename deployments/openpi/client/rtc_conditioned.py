@@ -565,6 +565,10 @@ class OpenPIConditionedRtcBackendV3:
     def representation_context_builder(self):
         return self._base_backend.representation_context_builder
 
+    @property
+    def observation_history_enabled(self) -> bool:
+        return self._base_backend.observation_history_enabled
+
     def request_cancel(self) -> bool:
         return self._base_backend.request_cancel()
 
@@ -584,6 +588,12 @@ class OpenPIConditionedRtcBackendV3:
         observation: Any,
     ) -> RtcPreparedModelInput:
         return self._base_backend.prepare_worker_input(request, observation)
+
+    def observe_deployment_observation(self, observation: Any) -> None:
+        self._base_backend.observe_deployment_observation(observation)
+
+    def request_observation_ready(self, observation: Any) -> bool:
+        return self._base_backend.request_observation_ready(observation)
 
     def create_worker_executor(
         self,
