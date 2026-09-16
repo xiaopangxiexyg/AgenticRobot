@@ -43,12 +43,6 @@ from dataset_interface.composition_control_trace import (
 from control_station.targets.authoritative import (
     authoritative_authority_epoch_source_id,
 )
-from tests.support.repository_imports import (
-    absolute_import_roots as _absolute_import_roots,
-)
-from tests.support.repository_imports import (
-    python_files as _python_files,
-)
 
 
 def _source_slot(
@@ -1296,32 +1290,6 @@ def test_control_station_core_modules_do_not_import_backend_or_sim_packages() ->
     assert "from sim" not in source
     assert "import sim" not in source
     assert "teleop_runtime.deploy.run_policy" not in source
-
-
-def test_lower_level_packages_do_not_reverse_depend_on_control_station() -> None:
-    repository_root = Path(__file__).parents[1]
-    lower_package_roots = (
-        "robot_motion",
-        "teleop_runtime",
-        "deployments",
-        "dataset_contracts",
-        "dataset_interface",
-        "sim",
-        "hardware",
-    )
-    violations = {
-        path.relative_to(repository_root).as_posix()
-        for package_name in lower_package_roots
-        for path in _python_files(repository_root / package_name)
-        if "control_station" in _absolute_import_roots(path)
-    }
-    # Historic command shims only. Browser state and pure input policy already
-    # live in Control Station; no lower API facade may be added to this list.
-    assert sorted(violations) == [
-        "teleop_runtime/collection/umi/app.py",
-        "teleop_runtime/debug/run_vive_rm65_calibration_debug.py",
-        "teleop_runtime/debug/run_vive_rm65_real_teleop.py",
-    ]
 
 
 def test_reusable_source_and_target_contracts_do_not_bind_a_concrete_backend() -> None:

@@ -88,6 +88,20 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### 分类逻辑与架构检查的覆盖归属
+
+`test_rm65_grasp_trajectory.py` 的三种可达性分类和 wall-time budget 用例
+原本就使用固定 FK 残差的 `_ReachabilityBuilder`，现在直接复用本文件的
+无资产 planner helper，不再构建随后被替换的真实 builder 和未使用的碰撞模型。
+分类、残差、求解次数和超时断言不变；真实构造、IK、碰撞规划和 MuJoCo 执行
+仍由原有集成用例覆盖，不能把这些分类用例当作真实模型证据。
+
+禁止下层反向依赖 `control_station` 的检查统一由
+`test_control_station_boundaries.py::test_lower_packages_do_not_reverse_depend_on_control_station`
+负责。它使用相同 import 扫描器和三个历史 shim 白名单，覆盖原 contracts 检查的
+全部七个包，并额外覆盖 `collection_runtime`、`control_composition`；删除 contracts
+中较窄的重复用例，不改变 canonical 检查、白名单或验收 selector。
+
 ### 同输入仿真与模型构建去重
 
 `test_mujoco_fast_runtime.py` 的 direct / arm-only / fully-actuated 缓存隔离

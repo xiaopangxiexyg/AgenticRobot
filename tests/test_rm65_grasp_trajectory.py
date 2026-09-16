@@ -1103,16 +1103,11 @@ def test_reachability_classification_uses_one_solution_residual_pair(
     rotation_deg: float,
     expected: str,
 ) -> None:
-    profile = _real_profile()
-    initial_builder = build_exclusive_rm65_skill_target_builder(profile)
-    planner = RM65GraspJointTrajectoryPlanner(
-        profile=profile,
-        planning_target_builder=initial_builder,
-        target_envelope_filter=None,
-        reachability_config=RM65GraspReachabilityConfig(
-            max_solve_cycles=1,
-            seed_count=1,
-        ),
+    # These residuals come from the controlled builder below, not a real model.
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.reachability_config = RM65GraspReachabilityConfig(
+        max_solve_cycles=1,
+        seed_count=1,
     )
     realized = np.eye(4)
     realized[0, 3] = translation_m
@@ -1136,16 +1131,10 @@ def test_reachability_classification_uses_one_solution_residual_pair(
 def test_reachability_stops_on_wall_time_budget_and_returns_best_basic_solution() -> (
     None
 ):
-    profile = _real_profile()
-    initial_builder = build_exclusive_rm65_skill_target_builder(profile)
-    planner = RM65GraspJointTrajectoryPlanner(
-        profile=profile,
-        planning_target_builder=initial_builder,
-        target_envelope_filter=None,
-        reachability_config=RM65GraspReachabilityConfig(
-            time_budget_ms=1_000.0,
-            max_solve_cycles=120,
-        ),
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.reachability_config = RM65GraspReachabilityConfig(
+        time_budget_ms=1_000.0,
+        max_solve_cycles=120,
     )
     realized = np.eye(4)
     realized[0, 3] = 0.03
