@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import utils.dataset_postprocess.workspace_near_boundary as workspace_near_boundary_module
 from dataset_contracts.pose_frames import PoseFrameContract, PoseSourceProfile
 from utils.dataset_postprocess.workspace_near_boundary import (
     MIGRATION_ID,
@@ -81,7 +82,15 @@ def _dataset(root: Path) -> tuple[PoseFrameContract, dict[str, object]]:
     return contract, row
 
 
-def test_workspace_shift_is_dry_run_until_migration_specific_gate(tmp_path: Path) -> None:
+def test_workspace_shift_is_dry_run_until_migration_specific_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        workspace_near_boundary_module,
+        "_active_collection_processes",
+        lambda: [],
+    )
     root = tmp_path / "umi"
     original_contract, original_row = _dataset(root)
     info_before = (root / "meta/info.json").read_bytes()
