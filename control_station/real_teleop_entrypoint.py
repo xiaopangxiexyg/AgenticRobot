@@ -1310,6 +1310,7 @@ from teleop_runtime.real_teleop.debug_recorders import (
     ActionDebugLogRecorder as _ExtractedActionDebugLogRecorder,
     DebugTimingLogRecorder as _ExtractedDebugTimingLogRecorder,
     IkDebugLogRecorder as _ExtractedIkDebugLogRecorder,
+    _handle_ik_debug_log_toggle_request,
     json_safe as _json_safe,
     state_value as _state_value,
     stop_debug_writer_thread as _stop_debug_writer_thread,
@@ -1550,81 +1551,6 @@ RealTeleopControlInput.__module__ = (
 
 
 
-def _handle_ik_debug_log_toggle_request(
-    *,
-    args: argparse.Namespace,
-    components: RealTeleopComponents,
-    clutch_input: RealTeleopControlInput,
-    ik_debug_log_recorder: IkDebugLogRecorder,
-    control_ui: CalibrationWebUi | None,
-    ik_debug_profile_base_enabled: bool,
-    now: float,
-) -> None:
-    if not clutch_input.consume_ik_debug_log_toggle_request():
-        return
-    if bool(getattr(args, "no_debug_disk_write", False)):
-        clutch_input.set_ik_debug_logging_state(active=False, path="")
-        message = "本次运行已通过 --no-debug-disk-write 禁止 debug 写盘。"
-        _log("IKDebugLog", message, now=now)
-        if control_ui is not None:
-            control_ui.append_message("IKDebugLog", message)
-        return
-    if ik_debug_log_recorder.active:
-        stopped_path = ik_debug_log_recorder.stop(reason="gui_toggle_stop", now=now)
-        if components.dual_arm_retargeter is not None and len(components.active_sides) > 1:
-            components.dual_arm_retargeter.config.debug_profile = ik_debug_profile_base_enabled
-            components.dual_arm_retargeter.ik_solver.debug_profile = ik_debug_profile_base_enabled
-        clutch_input.set_ik_debug_logging_state(
-            active=False,
-            path="" if stopped_path is None else str(stopped_path),
-        )
-        _log(
-            "IKDebugLog",
-            (
-                f"stopped path={stopped_path} frames={ik_debug_log_recorder.frame_count} "
-                f"dropped={ik_debug_log_recorder.dropped_frame_count}"
-            ),
-            now=now,
-        )
-        if control_ui is not None:
-            control_ui.append_message(
-                "IKDebugLog",
-                f"已停止 IK 记录：{stopped_path}",
-            )
-        return
-
-    try:
-        started_path = ik_debug_log_recorder.start(now=now)
-    except Exception as exc:  # noqa: BLE001 - debug logging must not break teleop.
-        clutch_input.set_ik_debug_logging_state(active=False, path="")
-        message = f"IK 记录启动失败：{type(exc).__name__}: {exc}"
-        _log("IKDebugLog", message, now=now)
-        if control_ui is not None:
-            control_ui.append_message("IKDebugLog", message)
-        return
-    ik_debug_log_mode = (
-        "full" if bool(getattr(args, "ik_debug_log_full", False)) else "compact"
-    )
-    ik_debug_log_recorder.write_event(
-        "mode",
-        {"mode": ik_debug_log_mode},
-        now=now,
-    )
-    if components.dual_arm_retargeter is not None and len(components.active_sides) > 1:
-        components.dual_arm_retargeter.config.debug_profile = True
-        components.dual_arm_retargeter.ik_solver.debug_profile = True
-    clutch_input.set_ik_debug_logging_state(active=True, path=str(started_path))
-    _log(
-        "IKDebugLog",
-        f"started path={started_path} mode={ik_debug_log_mode}",
-        now=now,
-    )
-    if control_ui is not None:
-        control_ui.append_message(
-            "IKDebugLog",
-            f"已开始 IK 记录：{started_path} mode={ik_debug_log_mode}",
-        )
-
 
 
 
@@ -1656,11 +1582,8 @@ from teleop_runtime.real_teleop.startup_runtime import (
     _startup_gui_qpos_seed_command,
     _update_init_arm_arrival_from_hardware,
     _wait_for_real_teleop_start_request,
-    bind_legacy_support as _bind_startup_runtime_support,
     cleanup_active_startup,
 )
-
-_bind_startup_runtime_support(globals())
 
 from teleop_runtime.real_teleop.runtime import (
     bind_legacy_support as _bind_real_teleop_runtime_support,

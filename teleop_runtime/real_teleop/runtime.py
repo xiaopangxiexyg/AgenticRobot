@@ -104,7 +104,10 @@ from .control_profile import (
     effective_position_post_ik_qpos_smoothing_alpha as _effective_position_post_ik_qpos_smoothing_alpha,
 )
 from .dataset_recorder import RealTeleopDatasetRecorder
-from .debug_recorders import DEFAULT_ACTION_DEBUG_LOG_ROOT
+from .debug_recorders import (
+    DEFAULT_ACTION_DEBUG_LOG_ROOT,
+    _handle_ik_debug_log_toggle_request,
+)
 from .debug_timing import (
     AsyncDebugTimingConsole,
     RealDebugTimingState,
@@ -248,7 +251,6 @@ _REQUIRED_SUPPORT_NAMES = (
     "_build_components",
     "_expand_cli_path",
     "_guard_impedance_force_control",
-    "_handle_ik_debug_log_toggle_request",
     "_promote_angle_trigger_gripper_input_to_q6",
     "_real_hand_render_qpos",
     "_vive_pose_source_from_components",

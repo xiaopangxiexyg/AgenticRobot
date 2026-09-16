@@ -16,7 +16,7 @@ import numpy as np
 
 from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
-from teleop_runtime.real_teleop import cli_resolution
+from teleop_runtime.real_teleop import cli_resolution, startup_runtime
 from control_station.web import calibration_web_ui
 from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from teleop_runtime.sources.pose import VivePoseSource
@@ -1224,10 +1224,10 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             right_preview_backend=SimpleNamespace(),
             session=SimpleNamespace(poll_sources=lambda now: ({}, [])),
         )
-        with patch.object(real_teleop, "_handle_ik_debug_log_toggle_request"), patch.object(
-            real_teleop,
+        with patch.object(startup_runtime, "_handle_ik_debug_log_toggle_request"), patch.object(
+            startup_runtime,
             "_advance_startup_gui_qpos_maintenance",
-        ), patch.object(real_teleop.time, "sleep"):
+        ), patch.object(startup_runtime.time, "sleep"):
             result = real_teleop._wait_for_real_teleop_start_request(
                 components,
                 clutch,
