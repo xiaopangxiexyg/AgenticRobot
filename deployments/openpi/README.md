@@ -287,6 +287,34 @@ deployment会在连接server/设备前验证三者。部署仅开放显式
 `--rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1`的`send_actions=false`conditioned shadow；target、
 safety和dispatch仍由既有部署链路拥有，RTC adapter不接管。
 
+#### 纯模型 RTC 延迟 A/B 探针
+
+`scripts/probes/probe_openpi_rtc_latency.py` 只连接一个由操作者另行启动的
+OpenPI server，并重复发送同一份 conditioned-RTC msgpack 请求。它不会加载
+checkpoint、启动 server、打开相机、连接设备或发送动作。探针校验 server 确实消费了
+相同的 prefix indices，并检查返回 chunk 中被选择的 prefix rows 与请求完全一致；
+`400 ms` 只作为统计报告中的观察预算，不会成为新的部署准入门禁。
+
+先将一次已准备好的 conditioned-RTC wire request 原样保存为 msgpack（使用
+`deployments.openpi.client.transport.packb`）；不要用随机或全零观测替代真实请求来做
+结论性比较。然后分别启动 8-step 和 10-step server，对同一请求文件执行：
+
+```bash
+python scripts/probes/probe_openpi_rtc_latency.py \
+  --host 127.0.0.1 --port 8078 \
+  --request /absolute/path/to/the-same-conditioned-request.msgpack \
+  --label rtc-8-step \
+  --warmup-requests 2 --measured-requests 20 \
+  --latency-budget-ms 400 \
+  --output /absolute/path/to/rtc-8-step-latency.json
+```
+
+切换 server 的 inference steps 后，仅修改 `--label` 和 `--output`，请求文件必须保持
+同一个。报告分开给出端到端 wall、transport exchange、server 提供的
+`policy_timing.infer_ms`，以及 `wall - policy`；最后一项包含序列化、传输、排队和
+server transform，不能误称为纯网络耗时。`label` 是操作者注释而不是 model/step
+绑定，client 仍可在不同 checkpoint 或 server 实例之间切换。
+
 trained checkpoint使用既有base config恢复模型；conditioned wire也必须显式启用：
 
 ```bash
