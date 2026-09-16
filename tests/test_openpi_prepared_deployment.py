@@ -881,6 +881,111 @@ class Args:
     assert module.Args().port == 8078
 
 
+def _write_runtime_package(root: Path, package_name: str, marker: str) -> Path:
+    package_root = root / package_name
+    package_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text(
+        f"SOURCE_MARKER = {marker!r}\n",
+        encoding="utf-8",
+    )
+    return package_root
+
+
+def test_prepared_runtime_imports_selected_openpi_sources_before_ambient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime-openpi"
+    runtime_openpi_source = runtime_root / "src"
+    runtime_client_source = runtime_root / "packages" / "openpi-client" / "src"
+    _write_runtime_package(runtime_openpi_source, "openpi", "selected-openpi")
+    _write_runtime_package(
+        runtime_client_source,
+        "openpi_client",
+        "selected-client",
+    )
+    ambient_source = tmp_path / "ambient"
+    _write_runtime_package(ambient_source, "openpi", "ambient-openpi")
+    _write_runtime_package(ambient_source, "openpi_client", "ambient-client")
+    monkeypatch.syspath_prepend(str(ambient_source))
+    monkeypatch.delitem(sys.modules, "openpi", raising=False)
+    monkeypatch.delitem(sys.modules, "openpi_client", raising=False)
+
+    origins = prepared_server_runtime._activate_runtime_openpi_sources(runtime_root)
+
+    assert sys.modules["openpi"].SOURCE_MARKER == "selected-openpi"
+    assert sys.modules["openpi_client"].SOURCE_MARKER == "selected-client"
+    assert Path(origins["openpi"]).is_relative_to(runtime_openpi_source)
+    assert Path(origins["openpi_client"]).is_relative_to(runtime_client_source)
+    assert sys.path[:2] == [
+        str(runtime_openpi_source.resolve()),
+        str(runtime_client_source.resolve()),
+    ]
+
+
+def test_prepared_runtime_rejects_preloaded_openpi_from_another_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime-openpi"
+    _write_runtime_package(runtime_root / "src", "openpi", "selected-openpi")
+    _write_runtime_package(
+        runtime_root / "packages" / "openpi-client" / "src",
+        "openpi_client",
+        "selected-client",
+    )
+    ambient_module = ModuleType("openpi")
+    ambient_module.__file__ = str(tmp_path / "ambient" / "openpi" / "__init__.py")
+    monkeypatch.setitem(sys.modules, "openpi", ambient_module)
+    monkeypatch.delitem(sys.modules, "openpi_client", raising=False)
+
+    with pytest.raises(ImportError, match="wrong checkout"):
+        prepared_server_runtime._activate_runtime_openpi_sources(runtime_root)
+
+
+def test_prepared_runtime_imports_training_and_policy_modules_from_selected_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime-openpi"
+    openpi_source = runtime_root / "src"
+    openpi_package = _write_runtime_package(
+        openpi_source,
+        "openpi",
+        "selected-openpi",
+    )
+    _write_runtime_package(openpi_package, "training", "selected-training")
+    (openpi_package / "training" / "config.py").write_text(
+        "SOURCE_MARKER = 'selected-config'\n",
+        encoding="utf-8",
+    )
+    _write_runtime_package(openpi_package, "policies", "selected-policies")
+    (openpi_package / "policies" / "dexteleop_v23_policy.py").write_text(
+        "SOURCE_MARKER = 'selected-policy'\n",
+        encoding="utf-8",
+    )
+    client_source = runtime_root / "packages" / "openpi-client" / "src"
+    _write_runtime_package(client_source, "openpi_client", "selected-client")
+    for module_name in tuple(sys.modules):
+        if module_name == "openpi" or module_name.startswith("openpi."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+        if module_name == "openpi_client" or module_name.startswith(
+            "openpi_client."
+        ):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    training_config, dataset_policy, origins = (
+        prepared_server_runtime._import_runtime_openpi_modules(runtime_root)
+    )
+
+    assert training_config.SOURCE_MARKER == "selected-config"
+    assert dataset_policy.SOURCE_MARKER == "selected-policy"
+    assert Path(origins["openpi.training.config"]).is_relative_to(openpi_source)
+    assert Path(origins["openpi.policies.dexteleop_v23_policy"]).is_relative_to(
+        openpi_source
+    )
+
+
 def test_prepared_runtime_source_separation_is_only_for_pinned_eight_step_rtc(
     tmp_path: Path,
 ) -> None:

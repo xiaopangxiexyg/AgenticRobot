@@ -27,6 +27,12 @@ submodule；当前 DexTeleop server/client 路径不依赖这两个示例仓库�
 checkout 时才使用固定 submodule。prepared training profile 仍严格绑定其中记录的
 `openpi_checkout`，不会被 submodule fallback 静默替换。
 
+prepared server 子进程会在第一次导入 OpenPI 前，将实际选择的 checkout 中
+`src` 与 `packages/openpi-client/src` 放到解释器搜索路径最前，并核验
+`openpi`、`openpi_client` 及训练配置模块的真实 `__file__` 都位于该 checkout。
+如果虚拟环境中的 editable install 已提前载入另一份源码，进程会在模型加载前停止并报告
+实际来源；不会卸载半初始化模块后继续，也不会因此增加 checkpoint、模型或 client 的强绑定。
+
 当前经过闭环 server/client 握手验证的模型是：
 
 | 项目 | 值 |

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import dataclasses
+import importlib
 import importlib.util
 import json
 import sys
@@ -50,6 +51,115 @@ def _load_module(path: Path, name: str) -> Any:
             sys.modules.pop(name, None)
         raise
     return module
+
+
+def _module_origin(module: Any, module_name: str) -> Path:
+    raw_origin = getattr(module, "__file__", None)
+    if not raw_origin:
+        raise ImportError(
+            f"Prepared OpenPI runtime cannot verify {module_name!r}: "
+            "the imported module has no filesystem origin."
+        )
+    return Path(str(raw_origin)).expanduser().resolve()
+
+
+def _require_module_under(
+    module: Any,
+    *,
+    module_name: str,
+    source_root: Path,
+) -> Path:
+    origin = _module_origin(module, module_name)
+    if not origin.is_relative_to(source_root):
+        raise ImportError(
+            "Prepared OpenPI runtime imported a module from the wrong "
+            f"checkout: module={module_name!r} origin={origin} "
+            f"expected_source_root={source_root}."
+        )
+    return origin
+
+
+def _activate_runtime_openpi_sources(runtime_root: Path) -> dict[str, str]:
+    """Bind OpenPI imports to ``runtime_root`` before importing its packages.
+
+    ``PYTHONPATH`` is still set by the parent launcher, but an editable install
+    may also install an import hook in the selected Python environment.  Make
+    the intended source roots authoritative in this process and verify the
+    modules that Python actually selected.  A mismatched package that was
+    imported before this boundary is unsafe to unload piecemeal, so fail
+    clearly instead of attempting a silent module replacement.
+    """
+
+    resolved_root = runtime_root.expanduser().resolve()
+    source_roots = {
+        "openpi": (resolved_root / "src").resolve(),
+        "openpi_client": (
+            resolved_root / "packages" / "openpi-client" / "src"
+        ).resolve(),
+    }
+    missing = [
+        str(source_root / package_name)
+        for package_name, source_root in source_roots.items()
+        if not (source_root / package_name).is_dir()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Prepared OpenPI runtime source packages are missing: "
+            + ", ".join(missing)
+        )
+
+    for package_name, source_root in source_roots.items():
+        loaded = tuple(
+            (name, module)
+            for name, module in sys.modules.items()
+            if module is not None
+            and (name == package_name or name.startswith(package_name + "."))
+        )
+        for name, module in loaded:
+            _require_module_under(
+                module,
+                module_name=name,
+                source_root=source_root,
+            )
+
+    selected_roots = [str(source_root) for source_root in source_roots.values()]
+    sys.path[:] = selected_roots + [
+        entry for entry in sys.path if entry not in selected_roots
+    ]
+    importlib.invalidate_caches()
+
+    origins: dict[str, str] = {}
+    for package_name, source_root in source_roots.items():
+        module = importlib.import_module(package_name)
+        origins[package_name] = str(
+            _require_module_under(
+                module,
+                module_name=package_name,
+                source_root=source_root,
+            )
+        )
+    return origins
+
+
+def _import_runtime_openpi_modules(
+    runtime_root: Path,
+) -> tuple[Any, Any, dict[str, str]]:
+    origins = _activate_runtime_openpi_sources(runtime_root)
+    training_config = importlib.import_module("openpi.training.config")
+    dataset_policy = importlib.import_module("openpi.policies.dexteleop_v23_policy")
+    openpi_source_root = (runtime_root.expanduser().resolve() / "src").resolve()
+    for module_name, module in (
+        ("openpi.training.config", training_config),
+        ("openpi.policies.dexteleop_v23_policy", dataset_policy),
+    ):
+        origins[module_name] = str(
+            _require_module_under(
+                module,
+                module_name=module_name,
+                source_root=openpi_source_root,
+            )
+        )
+    return training_config, dataset_policy, origins
 
 
 def _validate_runtime_openpi_binding(
@@ -448,6 +558,7 @@ def prepared_config_summary(
     config: Any,
     *,
     image_wire_config: OpenPIImageWireServerConfig | None = None,
+    runtime_module_origins: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return an auditable, JSON-safe summary of the restored config."""
 
@@ -511,6 +622,8 @@ def prepared_config_summary(
             image_wire_config,
             image_keys=_prepared_request_image_keys(resolution, config),
         )
+    if runtime_module_origins is not None:
+        summary["runtime_module_origins"] = dict(runtime_module_origins)
     return summary
 
 
@@ -641,8 +754,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    import openpi.training.config as training_config
-    from openpi.policies import dexteleop_v23_policy
+    training_config, dexteleop_v23_policy, runtime_module_origins = (
+        _import_runtime_openpi_modules(openpi_root)
+    )
 
     config = build_prepared_openpi_config(
         resolution,
@@ -705,12 +819,21 @@ def main(argv: list[str] | None = None) -> int:
                         resolution,
                         config,
                         image_wire_config=image_wire_config,
+                        runtime_module_origins=runtime_module_origins,
                     ),
                     indent=2,
                     sort_keys=True,
                 )
             )
             return 0
+        print(
+            "[OpenPIRuntime] READY: selected module origins "
+            + " ".join(
+                f"{name}={origin}"
+                for name, origin in sorted(runtime_module_origins.items())
+            ),
+            flush=True,
+        )
         server_module = _load_module(
             openpi_root / "scripts" / "serve_dexteleop_policy.py",
             "_dexteleop_prepared_openpi_server",
