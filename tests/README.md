@@ -210,12 +210,20 @@ planner parses the source without importing it, assigns every statically
 discovered top-level `test_*` function exactly once, and fails closed on test
 classes or dynamic collection hooks. Parameterized functions remain a single
 target, so their complete case matrix stays together. The manifest records both
-source modules and exact pytest targets; this allows the current temp pipeline
-to share six-shard capacity without reducing test coverage or physics work.
+source modules and exact pytest targets. The temp pipeline and replay active
+pipeline use this exception to share shard capacity without reducing test
+coverage or physics work. Replay tests create their own temporary logs and
+fresh runtimes; the four-rollout combined-control test and each parameterized
+envelope matrix remain indivisible. Grasp trajectory stays module-local to
+preserve its shared planning fixture instead of repeating that expensive plan.
 The sparse full-suite weights come from testcase durations in a complete,
 socket-capable green Run and cover only modules that contributed at least five
 seconds there. Refresh them only from another exact green full-suite artifact;
 failed, capability-limited, or focused runs are not representative inputs.
+Current full-profile module/function weights use the green full run at
+`65ccd90b`, including the reduced publication and dual-write costs. They are
+scheduling estimates, not timeouts or acceptance thresholds; changes must be
+validated against complete testcase and skip identities as well as wall time.
 The default remains four shards. Each shard has separate pytest, Python, XDG,
 Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
 Run share only its content-addressed MuJoCo model cache; that cache uses process
