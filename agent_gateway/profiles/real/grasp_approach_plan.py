@@ -56,6 +56,9 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
 from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
 from robot_motion.coordinate_frames import CoordinateFrameGraph
+from robot_motion.rm65.captured_robot_observations import (
+    RM65CapturedRobotObservationFilterResult,
+)
 from teleop_runtime.skill_deploy.motion_port import (
     REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD,
     RealAgentJointTrajectory,
@@ -74,8 +77,17 @@ from .station_point_grasp_deployment import (
 
 def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifactStore,
                                     frame_graph: CoordinateFrameGraph,
-                                    execution_frame_id: str) -> Callable:
+                                    execution_frame_id: str,
+                                    captured_robot_observation_filter: (
+                                        Callable[..., object] | None
+                                    ) = None) -> Callable:
     """Resolve only the retained producer's hash-bound replay Artifact."""
+    if (
+        captured_robot_observation_filter is not None
+        and not callable(captured_robot_observation_filter)
+    ):
+        raise TypeError("captured_robot_observation_filter must be callable or None")
+
     def read(operation: AgentSkillOperation, source: Mapping[str, Any]) -> VisibleGraspScene:
         bindings = [binding for binding in operation.output_artifact_bindings
                     if binding.slot_id == REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID]
@@ -100,12 +112,37 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
             source_reference_frame_id=capture["reference_frame_id"],
             target_reference_frame_id=execution_frame_id,
         )
+        capture_qpos = (
+            None
+            if arrays["left_qpos"].size == 0
+            else {side: arrays[side + "_qpos"] for side in ("left", "right")}
+        )
+        depth_m = arrays["depth_m"]
+        capture_self_observation_evidence = None
+        if captured_robot_observation_filter is not None and capture_qpos is not None:
+            filtered = captured_robot_observation_filter(
+                depth_m=depth_m,
+                target_mask=arrays["target_mask"],
+                intrinsics=capture["camera_intrinsics"],
+                source_from_camera=np.asarray(
+                    capture["T_source_from_camera"], dtype=float
+                ).reshape(4, 4),
+                capture_qpos_by_side=capture_qpos,
+            )
+            if not isinstance(filtered, RM65CapturedRobotObservationFilterResult):
+                raise TypeError(
+                    "captured_robot_observation_filter returned the wrong type"
+                )
+            depth_m = filtered.depth_m
+            capture_self_observation_evidence = filtered.evidence
         return VisibleGraspScene.from_depth(
-            depth_m=arrays["depth_m"], target_mask=arrays["target_mask"],
+            depth_m=depth_m, target_mask=arrays["target_mask"],
             intrinsics=capture["camera_intrinsics"], reference_from_camera=pose,
             geometry=ParallelJawSolidGeometry(**metadata["solid_geometry"]),
-            capture_qpos_by_side=(None if arrays["left_qpos"].size == 0 else
-                                  {side: arrays[side+"_qpos"] for side in ("left", "right")}),
+            capture_qpos_by_side=capture_qpos,
+            capture_self_observation_evidence=(
+                capture_self_observation_evidence
+            ),
         )
     return read
 

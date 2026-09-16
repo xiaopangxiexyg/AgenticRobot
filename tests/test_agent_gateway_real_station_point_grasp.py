@@ -450,6 +450,119 @@ def test_graspgenx_capture_snapshot_artifact_is_replayed_through_real_profile(tm
         reader(retained, retained.execution_result)
 
 
+def test_grasp_scene_reader_filters_robot_observations_from_measured_qpos_snapshot(
+    tmp_path,
+) -> None:
+    from agent_gateway.profiles.real.grasp_approach_plan import (
+        build_grasp_visible_scene_reader,
+    )
+    from agent_gateway.profiles.real.point_grasp_gateway import (
+        build_station_bound_point_grasp_executor,
+    )
+    from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+    from robot_motion.rm65.captured_robot_observations import (
+        RM65CapturedRobotObservationFilterResult,
+    )
+
+    source, _, planner, registration, provider = _provider_stack(
+        backend_id="graspgenx"
+    )
+    target_mask = np.zeros((3, 4), dtype=bool)
+    target_mask[1, 1] = True
+    planner.last_target_mask = target_mask
+    capture_qpos = {
+        "left": np.linspace(0.0, 0.5, 6),
+        "right": np.linspace(0.1, 0.6, 6),
+    }
+    provider.motion_port = SimpleNamespace(
+        latest_measured_qpos=lambda: SimpleNamespace(
+            qpos_by_side=capture_qpos,
+            semantic_content_hash="measured-qpos:test",
+            revision=4,
+            measured_at=9.95,
+            available_at=9.952,
+            evidence_refs=("measured-qpos-receipt:test",),
+        )
+    )
+    store = RecoverableAgentArtifactStore(
+        root=tmp_path / "artifacts",
+        quota_bytes=32 * 1024 * 1024,
+        max_artifact_bytes=16 * 1024 * 1024,
+        max_chunk_bytes=1024 * 1024,
+    )
+    executor = build_station_bound_point_grasp_executor(
+        registration=registration,
+        provider=provider,
+        artifact_store=store,
+        runtime_session_id="station-point-grasp:test",
+        current_station_revision=lambda: 7,
+        max_retained_operations=4,
+        clock=lambda: 10.0,
+    )
+    request = _request()
+    request.semantic_content_hash = "b" * 64
+    result = executor._read(
+        request,
+        SimpleNamespace(operation_id="snapshot:with-qpos"),
+    )
+    retained = AgentSkillOperation(
+        operation_id="snapshot:with-qpos",
+        request_hash=request.semantic_content_hash,
+        runtime_session_id="station-point-grasp:test",
+        status="completed",
+        reason_code="passive_read_completed",
+        station_revision_at_admission=7,
+        current_station_revision=7,
+        started_at=9.0,
+        updated_at=10.0,
+        deadline_at=20.0,
+        execution_outcome="completed",
+        execution_receipt_refs=("point-grasp-receipt:test",),
+        execution_result=result.execution_result,
+        output_artifact_bindings=result.output_artifact_bindings,
+    )
+    calls = []
+
+    def filter_capture(**kwargs):
+        calls.append(kwargs)
+        np.testing.assert_array_equal(kwargs["target_mask"], target_mask)
+        for side in ("left", "right"):
+            np.testing.assert_array_equal(
+                kwargs["capture_qpos_by_side"][side], capture_qpos[side]
+            )
+        filtered_depth = np.asarray(kwargs["depth_m"], dtype=float).copy()
+        filtered_depth[0, 0] = 0.0
+        removed = np.zeros(filtered_depth.shape, dtype=bool)
+        removed[0, 0] = True
+        return RM65CapturedRobotObservationFilterResult(
+            depth_m=filtered_depth,
+            removed_mask=removed,
+            evidence={
+                "schema": "dexteleop.rm65.captured_robot_observation_filter.v1",
+                "removed_background_points": 1,
+                "removed_target_points": 0,
+            },
+        )
+
+    reader = build_grasp_visible_scene_reader(
+        artifact_store=store,
+        frame_graph=provider.frame_binding.frame_graph,
+        execution_frame_id=provider.frame_binding.source_frame_id,
+        captured_robot_observation_filter=filter_capture,
+    )
+    scene = reader(retained, retained.execution_result)
+
+    assert source.read_count == 1
+    assert len(calls) == 1
+    assert len(scene.points) == 11
+    assert scene.target_mask.sum() == 1
+    assert scene.capture_self_observation_evidence["removed_background_points"] == 1
+    for side in ("left", "right"):
+        np.testing.assert_array_equal(
+            scene.capture_qpos_by_side[side], capture_qpos[side]
+        )
+
+
 def test_graspgenx_inference_failure_retains_original_input_without_faking_a_mask():
     from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
     source, _, planner, _, provider = _provider_stack(backend_id="graspgenx")

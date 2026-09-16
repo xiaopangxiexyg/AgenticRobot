@@ -1016,6 +1016,7 @@ def assemble_real_agent_primitive_gateway_session(
     station_point_grasp_planner: object | None = None,
     station_point_grasp_reachability_evaluator: Callable[..., object] | None = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
+    captured_robot_observation_filter: Callable[..., object] | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     revision_tracker: AgentStationRevisionTracker | None = None,
@@ -1093,6 +1094,11 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError(
             "Grasp-approach planning requires the exact URDF/FCL trajectory planner."
         )
+    if (
+        captured_robot_observation_filter is not None
+        and not callable(captured_robot_observation_filter)
+    ):
+        raise TypeError("captured_robot_observation_filter must be callable or None")
     if max_session_admissions_per_route is not None and (
         isinstance(max_session_admissions_per_route, bool)
         or not isinstance(max_session_admissions_per_route, int)
@@ -1345,6 +1351,9 @@ def assemble_real_agent_primitive_gateway_session(
                         artifact_store=artifact_store,
                         frame_graph=contract_bundle.frame_graph,
                         execution_frame_id=plan_registration.profile.execution_reference_frame_id,
+                        captured_robot_observation_filter=(
+                            captured_robot_observation_filter
+                        ),
                     ),
                     plan_store=grasp_approach_plan_store,
                     runtime_session_id=(contract_bundle.attachment.runtime_session_id),

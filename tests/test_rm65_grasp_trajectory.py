@@ -1459,6 +1459,13 @@ def test_grasp_planner_filters_once_at_capture_pose_before_path_search(has_captu
     assert len(view.points) == 3
 
 
+def test_real_grasp_capture_self_filter_margin_is_bounded_to_half_a_centimeter():
+    assert (
+        grasp_trajectory_module.RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M
+        == pytest.approx(.005)
+    )
+
+
 def test_pregrasp_branch_selection_validates_local_stage_before_exact_global_connection():
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
     current = {side: np.zeros(6) for side in ("left", "right")}

@@ -71,6 +71,40 @@ def test_captured_gripper_filter_preserves_targets_gap_sweep_and_nearby_backgrou
     assert len(view.points) == 9
 
 
+def test_capture_surface_margin_removes_only_near_solid_background_and_targets_stay():
+    points = np.asarray([
+        [.049, 0, -.02],     # within the 5 mm finger surface band
+        [.049, 0, -.02],     # target at the same location must stay
+        [.0501, 0, -.02],    # just beyond the reviewed surface band
+        [0, 0, -.02],        # open finger gap
+        [.04, .0178, -.02],  # beyond the padded finger height
+        [.04, 0, -.054],     # within the padded palm surface band
+    ])
+    view = scene(points, [False, True, False, False, False, False])
+
+    exact, exact_removed = view.without_captured_gripper_observations(
+        {"right": np.eye(4)}
+    )
+    filtered, removed = view.without_captured_gripper_observations(
+        {"right": np.eye(4)}, surface_margin_m=.005
+    )
+
+    assert exact_removed == 0
+    np.testing.assert_array_equal(exact.points, points)
+    assert removed == 2
+    np.testing.assert_array_equal(filtered.points, points[[1, 2, 3, 4]])
+    assert filtered.target_mask.sum() == 1
+    assert filtered.collision_counts(np.eye(4), opening_m=.07) == (0, 0)
+
+
+@pytest.mark.parametrize("margin", [-.001, .0101, np.inf, True])
+def test_capture_surface_margin_is_bounded(margin):
+    with pytest.raises(ValueError, match="surface_margin_m"):
+        scene([], []).without_captured_gripper_observations(
+            {"right": np.eye(4)}, surface_margin_m=margin
+        )
+
+
 @pytest.mark.parametrize("local_point", [[0, 0, -.05], [.04, 0, -.02], [-.04, 0, -.02]])
 def test_gripper_filter_uses_capture_pose_not_a_later_robot_pose(local_point):
     capture = np.eye(4)
@@ -110,6 +144,48 @@ def test_capture_qpos_are_copied_immutable_and_retained_after_filter():
         view.capture_qpos_by_side["right"][0] = 2
     filtered, _ = view.without_captured_gripper_observations({"right": np.eye(4)})
     np.testing.assert_array_equal(filtered.capture_qpos_by_side["right"], np.zeros(6))
+
+
+def test_capture_robot_filter_evidence_is_hashed_and_retained_after_analytic_filter():
+    evidence = {
+        "schema": "dexteleop.rm65.captured_robot_observation_filter.v1",
+        "removed_background_points": 9,
+        "removed_target_points": 0,
+    }
+    view = VisibleGraspScene(
+        points=np.empty((0, 3)),
+        target_mask=np.empty(0, dtype=bool),
+        geometry=GEOMETRY,
+        capture_self_observation_evidence=evidence,
+    )
+    evidence["removed_background_points"] = 10
+
+    assert view.capture_self_observation_evidence["removed_background_points"] == 9
+    filtered, _ = view.without_captured_gripper_observations(
+        {"right": np.eye(4)}
+    )
+    assert filtered.capture_self_observation_evidence == (
+        view.capture_self_observation_evidence
+    )
+    assert filtered.semantic_content_hash == view.semantic_content_hash
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        {"removed_background_points": -1, "removed_target_points": 0},
+        {"removed_background_points": 1, "removed_target_points": 1},
+        {"removed_target_points": 0},
+    ),
+)
+def test_invalid_capture_robot_filter_evidence_fails_closed(evidence):
+    with pytest.raises(ValueError, match="capture self-observation evidence"):
+        VisibleGraspScene(
+            points=np.empty((0, 3)),
+            target_mask=np.empty(0, dtype=bool),
+            geometry=GEOMETRY,
+            capture_self_observation_evidence=evidence,
+        )
 
 
 @pytest.mark.parametrize("qpos", [{"right": np.zeros(6)},

@@ -47,6 +47,7 @@ from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
 _SIDES = ("left", "right")
 _STRICT_SCENE_PROFILE = "dual_arm_hand_proxy_grasp_full"
 RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
+RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M = 0.005
 
 
 class RM65GraspTrajectoryPlanningError(RuntimeError):
@@ -2708,6 +2709,12 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        capture_self_observation_evidence = (
+            None
+            if visible_scene is None
+            or visible_scene.capture_self_observation_evidence is None
+            else dict(visible_scene.capture_self_observation_evidence)
+        )
         excluded_gripper_observation_count = 0
         if visible_scene is not None and visible_scene.capture_qpos_by_side is not None:
             capture_qpos = visible_scene.capture_qpos_by_side
@@ -2716,7 +2723,12 @@ class RM65GraspJointTrajectoryPlanner:
                     left_qpos=capture_qpos["left"], right_qpos=capture_qpos["right"],
                 )
             visible_scene, excluded_gripper_observation_count = (
-                visible_scene.without_captured_gripper_observations(capture_poses)
+                visible_scene.without_captured_gripper_observations(
+                    capture_poses,
+                    surface_margin_m=(
+                        RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M
+                    ),
+                )
             )
         pregrasp_pose = self._pregrasp_target_pose(target_pose)
         final_solver_targets = (
@@ -2956,7 +2968,23 @@ class RM65GraspJointTrajectoryPlanner:
             dense["visible_scene_final_trajectory"] = {
                 "scene_hash": visible_scene.semantic_content_hash,
                 "excluded_captured_gripper_background_points": excluded_gripper_observation_count,
+                "excluded_captured_robot_background_points": (
+                    excluded_gripper_observation_count
+                    + int(
+                        0
+                        if capture_self_observation_evidence is None
+                        else capture_self_observation_evidence[
+                            "removed_background_points"
+                        ]
+                    )
+                ),
+                "captured_robot_observation_filter": (
+                    capture_self_observation_evidence
+                ),
                 "self_filter_opening_basis": "nominal_maximum_opening",
+                "self_filter_surface_margin_m": (
+                    RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M
+                ),
                 "sample_count": len(times),
                 "opening_m": visible_scene.geometry.maximum_opening_m,
                 "scope": "observed_points_nominal_parallel_jaw_solids_only",
