@@ -376,7 +376,7 @@ def test_native_bundle_resolution_is_bound_to_core_dataset_uuid() -> None:
             core,
             storage,
         )
-        assert resolved == storage / "datasets" / str(DATASET_UUID)
+        assert resolved == (storage / "datasets" / str(DATASET_UUID)).resolve()
 
 
 def test_legacy_idle_worker_entry_point_dispatches_native_bundle() -> None:
