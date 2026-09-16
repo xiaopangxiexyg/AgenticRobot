@@ -29,7 +29,7 @@ def _common_expected_args() -> list[str]:
         "--end-effector-sides",
         "both",
         "--arm-execution-profile",
-        "impedance_40hz",
+        "position_15_60_120hz",
         "--left-arm-ip",
         "192.168.101.21",
         "--right-arm-ip",
@@ -109,7 +109,7 @@ def test_profile_identity_is_workspace_independent_and_pinned() -> None:
     assert profile.profile_id == RM65_BIMANUAL_DMTAC_OPENPI_PROFILE_ID
     assert profile.source_path == PROFILE_PATH
     assert profile.semantic_content_hash == (
-        "41d159c525a2d7d0eac7f100e5ff6f20d9592bc00c6463bdfb89971b87b55084"
+        "c5ecdec944908e9df01f78853070a60481c7a810d36598b3256d6028e841598a"
     )
     assert profile.runtime_args(project_root=Path("/tmp/other-checkout"))[11] == (
         "/tmp/other-checkout/hardware/rm65/utils/configs/calibrations/"

@@ -1844,21 +1844,34 @@ def _hold_active_rtc_gap(
     arm_backends: Mapping[str, EffectorBackend],
     position_deploy_executor: Any | None,
 ) -> dict[str, dict[str, object]]:
-    """Hold measured qpos when an Active RTC producer has no safe plan.
+    """Establish backend-owned Hold when an Active RTC producer has no safe plan.
 
     Normal between-keyframe ticks pass ``reason=None`` and remain untouched.
     A real empty-plan underrun or non-eligible producer first clears any
-    position plan, then leases the latest measured qpos in each impedance
-    backend.  A backend without that seam is not silently admitted: all arms
-    are asked to enter their stronger Hold before the error escapes.
+    position plan, then requests a measured-feedback-validated Hold: impedance
+    freezes measured qpos, while position uses its bounded quick-stop planner.
+    An unsupported/inactive Hold is not silently admitted: all arms are asked
+    to enter their stronger Hold before the error escapes.
     """
 
     normalized_reason = None if reason is None else str(reason).strip()
     if not send_actions or not normalized_reason:
         return {}
-    if position_deploy_executor is not None:
-        position_deploy_executor.clear()
     try:
+        if position_deploy_executor is not None:
+            position_state = position_deploy_executor.snapshot()
+            # clear() also invokes the backend Hold callback.  Repeating it
+            # every empty-plan tick would restart deceleration and invalidate
+            # the command sequence at the policy cadence.  The executor owns
+            # whether any queued/in-flight source work still needs clearing.
+            if (
+                position_state.get("active")
+                or position_state.get("queue_depth")
+                or position_state.get("discrete_queue_depth")
+                or position_state.get("last_submitted_timestamp") is not None
+                or position_state.get("hold_retry_required")
+            ):
+                position_deploy_executor.clear()
         receipts = request_policy_inference_soft_hold(
             arm_backends,
             reason=normalized_reason,
@@ -1874,6 +1887,18 @@ def _hold_active_rtc_gap(
             raise RuntimeError(
                 "Active RTC measured-qpos Hold is unsupported for sides: "
                 + ", ".join(unsupported)
+            )
+        inactive = tuple(
+            sorted(
+                side
+                for side, receipt in receipts.items()
+                if receipt.get("active") is not True
+                or receipt.get("status") not in {"activated", "already_active"}
+            )
+        )
+        if inactive:
+            raise RuntimeError(
+                "Active RTC Hold was not established for sides: " + ", ".join(inactive)
             )
     except Exception:
         hold_deploy_arm_backends(
@@ -4961,17 +4986,24 @@ def main(
                                 allow_policy_output
                                 or rtc_active_latency_warmup
                             ),
+                            preflight_timeout_sec=(
+                                float(args.rtc_active_preflight_timeout_sec)
+                                if rtc_active_latency_warmup else None
+                            ),
+                            preflight_record_latency=(
+                                len(rtc_active_latency_samples)
+                                >= int(args.rtc_active_warmup_discard_completions)
+                            ),
                         )
                         if (
                             rtc_active_latency_warmup
                             and rtc_step.completion is not None
-                            and rtc_step.result_transition is not None
-                            and rtc_step.result_transition.receipt.accepted
+                            and rtc_step.preflight_completion
                         ):
                             try:
                                 latency_sec = _rtc_active_completion_latency_sec(
                                     inference_started_at=(
-                                        rtc_step.completion.result.inference_started_at
+                                        rtc_step.completion.worker_started_at
                                     ),
                                     released_at=rtc_step.completion.released_at,
                                 )
@@ -5012,10 +5044,6 @@ def main(
                                     ),
                                 )
                             )
-                            hold_rtc_if_eligible(
-                                now=control_loop_started_at,
-                                reason="rtc_active_latency_warmup_sample",
-                            )
                             if gate_complete:
                                 assert observed_max is not None
                                 if not gate_accepted:
@@ -5041,14 +5069,9 @@ def main(
                                     f"{int(args.rtc_active_warmup_completions)}.",
                                     now=loop_started_at,
                                 )
-                            if not rearm_rtc_if_needed(
-                                now=control_loop_started_at,
-                                reason="rtc_active_latency_warmup_next_sample",
-                            ):
-                                raise RuntimeError(
-                                    "RTC Active latency warmup could not rearm "
-                                    "a fresh producer epoch."
-                                )
+                            # Reuse the drained RPC exchange between samples.
+                            # No preflight result entered the executable plan;
+                            # the next formal request uses a fresh observation.
                         rtc_gap_reason = (
                             "rtc_active_latency_warmup"
                             if rtc_active_latency_warmup
@@ -5157,6 +5180,7 @@ def main(
                                 or rtc_step.result_transition is not None
                                 or rtc_step.emission_result.emission is not None
                                 or rtc_step.request_transition is not None
+                                or rtc_step.worker_submission is not None
                                 or rtc_step.lifecycle_transition is not None
                                 or rtc_step.budget_exceeded
                             )

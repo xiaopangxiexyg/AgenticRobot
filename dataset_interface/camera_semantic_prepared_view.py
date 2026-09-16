@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -24,6 +25,16 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _contains_tactile_key(value: Any) -> bool:
     if isinstance(value, dict):
         return any(
@@ -34,6 +45,115 @@ def _contains_tactile_key(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_tactile_key(item) for item in value)
     return False
+
+
+def _validated_by_date_entry_sidecar(
+    root: Path,
+    manifest_hash: str,
+) -> Path | None:
+    """Validate the reserved by-date catalog sidecar outside payload inventory.
+
+    ``ENTRY.json`` is written after a camera-only prepared view is sealed.  It
+    binds the prepared-view manifest hash and includes its own semantic hash,
+    so including it in the prepared-view manifest would create a circular
+    identity.  Accept only the exact, self-consistent control-plane sidecar;
+    every other undeclared file remains an inventory error.
+    """
+
+    path = root / "ENTRY.json"
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise CameraSemanticPreparedViewContractError(
+            f"Prepared-view by-date entry must be a regular file: {path}"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CameraSemanticPreparedViewContractError(
+            f"Cannot read prepared-view by-date entry: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry must be an object."
+        )
+    semantic_payload = dict(payload)
+    supplied_hash = str(
+        semantic_payload.pop("entry_semantic_sha256", "")
+    ).strip().lower()
+    if supplied_hash != _canonical_json_sha256(semantic_payload):
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry semantic hash mismatch."
+        )
+    if payload.get("direct_dataset_root") is not True:
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry must identify a direct dataset root."
+        )
+    for field in ("dataset_relative_path", "destination_relative_path"):
+        if str(payload.get(field) or "") != root.name:
+            raise CameraSemanticPreparedViewContractError(
+                f"Prepared-view by-date entry {field} differs from its root."
+            )
+    if (
+        str(payload.get("prepared_view_manifest_sha256") or "").strip().lower()
+        != manifest_hash
+    ):
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry binds a different manifest."
+        )
+    if _contains_tactile_key(payload):
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view by-date entry contains tactile-specific metadata."
+        )
+    return path
+
+
+def _validated_stage_annotation_writer_lock_sidecar(root: Path) -> Path | None:
+    """Accept only an idle, payload-free annotation compatibility lock.
+
+    The annotation store intentionally leaves this zero-byte flock inode in
+    place after an editor exits.  It is runtime coordination state, not camera
+    payload, so it cannot be part of the immutable prepared-view inventory.
+    Episode-scoped lock directories and a legacy exclusive flock still mean
+    that an annotation writer may be active and remain fail-closed.
+    """
+
+    path = root / "meta/progress/stage_annotations/.writer.lock"
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise CameraSemanticPreparedViewContractError(
+            f"Prepared-view annotation writer lock must be a regular file: {path}"
+        )
+    if path.stat().st_size != 0:
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view annotation writer lock must remain payload-free."
+        )
+
+    episode_lock_root = root / "meta/progress/stage_annotation_locks"
+    if episode_lock_root.exists() or episode_lock_root.is_symlink():
+        if episode_lock_root.is_symlink() or not episode_lock_root.is_dir():
+            raise CameraSemanticPreparedViewContractError(
+                "Prepared-view annotation episode lock root is invalid."
+            )
+        if any(episode_lock_root.iterdir()):
+            raise CameraSemanticPreparedViewContractError(
+                "Prepared-view annotations have active or unreconciled episode locks."
+            )
+
+    try:
+        with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except BlockingIOError as exc:
+        raise CameraSemanticPreparedViewContractError(
+            "Prepared-view annotations are held by a legacy exclusive writer."
+        ) from exc
+    except OSError as exc:
+        raise CameraSemanticPreparedViewContractError(
+            f"Cannot validate prepared-view annotation writer lock: {exc}"
+        ) from exc
+    return path
 
 
 def camera_semantic_prepared_view_manifest_path(
@@ -155,13 +275,25 @@ def load_camera_semantic_prepared_view(
             "Prepared view contains an undeclared video-integrity exclusions receipt."
         )
 
+    by_date_entry_path = _validated_by_date_entry_sidecar(
+        root,
+        manifest.manifest_hash,
+    )
+    annotation_writer_lock_path = (
+        _validated_stage_annotation_writer_lock_sidecar(root)
+    )
+
     actual_files: set[str] = set()
     for path in sorted(root.rglob("*")):
         if path.is_symlink():
             raise CameraSemanticPreparedViewContractError(
                 f"Prepared view refuses symlinks: {path}"
             )
-        if path.is_file() and path != manifest_path:
+        if path.is_file() and path not in {
+            manifest_path,
+            by_date_entry_path,
+            annotation_writer_lock_path,
+        }:
             relative = path.relative_to(root)
             if any(part.endswith(".lock") for part in relative.parts):
                 raise CameraSemanticPreparedViewContractError(

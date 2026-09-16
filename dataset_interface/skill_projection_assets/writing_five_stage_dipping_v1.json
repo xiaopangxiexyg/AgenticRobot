@@ -1,0 +1,40 @@
+{
+  "schema": "dexteleop.skill_projection_catalog.authoring.v1",
+  "skills": [
+    {
+      "skill_id": "writing.dip_brush_in_ink",
+      "skill_version": "1",
+      "semantic_type": "DIP_INK",
+      "controlled_component_ids": ["right_arm", "right_hand"],
+      "entry_predicate_ids": [
+        "brush.held_by_right_hand",
+        "brush.uncapped"
+      ],
+      "success_predicate_ids": ["brush.tip_dipped_in_ink"],
+      "conditionable_context_ids": ["left_arm.fixed_hold"]
+    }
+  ],
+  "projections": [
+    {
+      "projection_id": "writing5.dip_ink",
+      "projection_version": "1",
+      "skill_id": "writing.dip_brush_in_ink",
+      "source_progress_profile_hash": "3222716daa948a0939ba735b4d2d1d3ef2946ef6fe0837dedf90c00c438c5da9",
+      "source_stage_profile_hash": "0a28d6845dc07eee9cb6454a90b483d55d7bc3bcf0562bcf19e4b48b28ec9c36",
+      "source_progress_step_id": "right_dip_ink",
+      "source_stage_ids": [
+        "right_dip_ink.approach",
+        "right_dip_ink.dip",
+        "right_dip_ink.depart"
+      ],
+      "projection_kind": "CONDITIONED_STEP",
+      "projected_component_ids": ["right_arm", "right_hand"],
+      "asserted_entry_predicate_ids": [
+        "brush.held_by_right_hand",
+        "brush.uncapped"
+      ],
+      "asserted_success_predicate_ids": ["brush.tip_dipped_in_ink"],
+      "conditioned_context_ids": ["left_arm.fixed_hold"]
+    }
+  ]
+}

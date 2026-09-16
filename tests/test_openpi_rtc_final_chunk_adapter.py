@@ -875,6 +875,7 @@ def test_openpi_relative_raw_rtc_runs_through_shared_frontend_without_dispatch()
         action_pose_mode="relative",
         frame_contract_hash=RELATIVE_FRAME_HASH,
         result_action_representation=OPENPI_RTC_RESULT_TYPED_CANONICAL_V1,
+        clock=time.monotonic,
     )
     runtime = PolicyDeployRuntime(
         PolicyDeployRuntimeConfig(
@@ -902,13 +903,15 @@ def test_openpi_relative_raw_rtc_runs_through_shared_frontend_without_dispatch()
     emitting_step = None
     try:
         for index in range(160):
-            now = base + index / 30.0
+            # Success-path timing must share the worker/model clock. Advancing
+            # 33 ms every 1 ms otherwise tests intentionally obsolete actions.
+            now = time.monotonic()
             step = frontend.step(_observation(), now=now)
             emission = step.action_preparation.emission
             if emission is not None:
                 emitting_step = step
                 break
-            time.sleep(0.001)
+            time.sleep(1.0 / 30.0)
     finally:
         frontend.close(now=base + 6.0)
 
@@ -2033,7 +2036,7 @@ def test_relative_artifact_and_server_horizon_must_match() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
-        ("layout", "policy_io_layout_hash_mismatch"),
+        ("layout", "policy_io_layout_mismatch"),
         ("float_dim", "output_action_dim_mismatch"),
         ("token_dim", "output_action_discrete_dim_mismatch"),
     ),
@@ -2044,16 +2047,23 @@ def test_server_metadata_drift_fails_before_inference(
 ) -> None:
     artifact = _continuous_artifact()
     metadata = _server_metadata(artifact)
-    if mutation == "model":
-        metadata["model_id"] = "wrong"
-    elif mutation == "layout":
-        metadata["dataset_adapter"]["policy_io_layout_hash"] = "wrong"
+    if mutation == "layout":
+        metadata["policy_io_layout"] = artifact.policy_io_layout.to_dict()
+        metadata["policy_io_layout"]["arm"]["pose_representation"] = "incompatible"
     elif mutation == "float_dim":
         metadata["local_robot"]["output_action_dim"] += 1
     else:
         metadata["local_robot"]["output_action_discrete_dim"] += 1
     with pytest.raises(ValueError, match=message):
         _backend(artifact, metadata=metadata)
+
+
+def test_server_layout_hash_difference_does_not_bind_rtc_backend() -> None:
+    artifact = _continuous_artifact()
+    metadata = _server_metadata(artifact)
+    metadata["model"]["policy_io_layout_hash"] = "different-model-hash"
+    metadata["dataset_adapter"]["policy_io_layout_hash"] = "different-adapter-hash"
+    _backend(artifact, metadata=metadata)
 
 
 def test_artifact_rtc_contract_never_binds_server_model_identity() -> None:

@@ -144,6 +144,15 @@ observation sides.  A prepared artifact with an explicit executable
 `normalization_contract` is mandatory; a raw checkpoint artifact with missing
 normalization ownership is rejected.
 
+## Server metadata compatibility
+
+普通 OpenPI 和 model-RTC client 从 server 发布的 `policy_artifact` 读取 state key、
+state input mode、连续/离散维度及实际 policy-I/O layout；server 不必在旧顶层字段重复
+发布同一信息。已显式发布的顶层字段仍优先检查，不能由 artifact 掩盖实际冲突。
+默认兼容性判断比较 layout 的执行结构，而不是 layout 名称、采集注释或哈希。
+Client contract 不自动绑定 layout hash、model id 或 checkpoint step；通用接口中显式
+请求的 hash 审计保持独立，不是普通部署的必需参数。
+
 ## RTC-4b-A raw-RTC offline adapter
 
 该 adapter 保持 OpenPI 的既有 final-chunk model/server 接口；它不消费未来动作。模型消费
@@ -269,6 +278,38 @@ selected direct OpenPI host; production proxy behavior is not silently
 overridden by the RTC adapter.
 
 ## Explicit live observation shadow
+
+### RTC Active 与 RM65 位控
+
+RM65 位控 RTC 等待窗口复用 backend 的 acceleration/jerk-limited quick-stop：
+先清除 executor 中剩余的旧计划，再按已提交 qcmd 的动态状态减速并持续保持。
+实测 qpos 必须新鲜、有限且无设备故障，但不会用滞后反馈直接重置正在运动的
+qcmd。重复空计划 tick 不重复 clear 或重启减速；只有通过既有安全检查并激活的
+新目标才恢复输出。反馈失败、worker 故障、急停或未建立 Hold 仍停止该部署路径。
+
+`rm65_bimanual_dmtac` 默认使用 `position_15_60_120hz` 位控，也可显式指定
+`--arm-execution-profile position_15_60_120hz`：reference/IK 为
+60 Hz，CANFD sender 为 120 Hz；模型 action/policy 时间基保持训练时的 30 Hz，
+不能把 action-hz 改成 60 来代替位控设置。Client 无需知道 Stage 或 checkpoint
+step，这些由 Server 选择。使用完整的 `--send-actions` 拼写，并保留
+`--wait-for-ready-confirm`；数据集起点初始化完成后按 A 才允许策略执行。
+
+闭环离线回归使用真实 PositionDeployExecutor、RM65 位控 backend 和注入的假 SDK，
+覆盖双臂运动中等待、延迟反馈、减速/单步/速度/加速度约束、重复保持、新目标恢复、
+无效目标与反馈、部分失败和 worker 清理。该证据不代表真实 CANFD 频率、模型推理
+延迟或真机运动验收；日志中的低频警告需在真机测试中继续观察。
+
+Conditioned model-RTC 的 Active 预热不会接纳或合并动作：按 A 后保持当前
+安全 Hold，在同一个 worker/transport 会话内执行预热 RPC。首个编译样本默认
+丢弃，随后 3 个 warm 样本的端到端 worker 延迟（含输入准备、RPC 和解码）必须
+各自严格小于 0.4 s，才释放正式推理。预热 RPC
+单独受 `--rtc-active-preflight-timeout-sec`（默认 60 s）限制；超时或 provider
+异常停止预热，不算通过。这个期限不改变 `--rtc-request-validity-steps` 或正式
+动作过期检查。首个丢弃样本也不进入正式延迟估计，正式请求重新取最新观测。
+预热采样之间不关闭连接、不切换 producer epoch；需要恢复被取消的会话时，
+socket close 的有界等待只在模型 worker 内发生。`summary` JSONL 包含已有的
+`completion_fault_code` / `completion_fault_detail`（最多 512 字符），便于区分
+超时、连接未恢复和 Server 异常，不需要开启大体量 trace。
 
 For a real observation/transport probe, add both the raw profile and the
 explicit read-only guard:

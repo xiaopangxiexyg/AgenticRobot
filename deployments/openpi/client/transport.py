@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import math
 import threading
 import time
 from collections import deque
@@ -231,6 +232,7 @@ class OpenPIWebsocketTransport:
         )
         self._clock = clock
         self._lock = threading.RLock()
+        self._close_finished = threading.Condition(self._lock)
         self._cancel_requested = threading.Event()
         self._ws: Any = None
         self._metadata: dict[str, Any] | None = None
@@ -306,6 +308,17 @@ class OpenPIWebsocketTransport:
         """
 
         return self.begin_session_with_receipt().accepted
+
+    def wait_for_close(self, *, timeout_sec: float) -> bool:
+        """Bounded worker-thread wait; never clear cancellation or close faults."""
+        timeout = float(timeout_sec)
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError("timeout_sec must be finite and non-negative.")
+        with self._close_finished:
+            finished = self._close_finished.wait_for(
+                lambda: self._close_pending_count == 0, timeout=timeout
+            )
+            return bool(finished and self._close_failure_latched is None)
 
     def begin_session_with_receipt(self) -> OpenPITransportLifecycleReceipt:
         with self._lock:
@@ -770,6 +783,7 @@ class OpenPIWebsocketTransport:
             self._last_close_receipt = receipt
             if not receipt.completed:
                 self._close_failure_latched = receipt
+            self._close_finished.notify_all()
 
 
 __all__ = [

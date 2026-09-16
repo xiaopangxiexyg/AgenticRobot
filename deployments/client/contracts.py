@@ -40,6 +40,7 @@ class DeployPolicyContract:
     action_dim: int = 26
     action_discrete_dim: int | None = None
     policy_io_layout_hash: str | None = None
+    policy_io_layout: Mapping[str, Any] | None = None
     min_action_horizon: int = 1
     active_sides: tuple[str, ...] = ("left", "right")
     require_active_sides_match: bool = True
@@ -183,7 +184,11 @@ def validate_server_metadata(
                 f"expected={contract.state_discrete_dim}, actual={state_discrete_dim}"
             )
     state_key = _optional_str(
-        _first_present(payload, ("local_robot.input_state_key", "model.state_key", "state_key"))
+        _first_present(
+            payload,
+            ("local_robot.input_state_key", "model.state_key", "state_key",
+             "policy_artifact.inputs.state.key"),
+        )
     )
     if contract.state_key is not None and state_key != contract.state_key:
         errors.append(
@@ -197,6 +202,7 @@ def validate_server_metadata(
                 "dataset_adapter.state_input_mode",
                 "model.state_input_mode",
                 "state_input_mode",
+                "policy_artifact.state_input_mode",
             ),
         )
     )
@@ -237,11 +243,13 @@ def validate_server_metadata(
                 "local_robot.input_state_discrete_key",
                 "model.state_discrete_key",
                 "state_discrete_key",
+                "policy_artifact.inputs.state_discrete.key",
             ),
         )
     )
     if (
         contract.state_discrete_key is not None
+        and contract.state_discrete_dim != 0
         and state_discrete_key != contract.state_discrete_key
     ):
         errors.append(
@@ -266,6 +274,19 @@ def validate_server_metadata(
             )
     else:
         server_discrete_dim = _server_action_discrete_dim(payload)
+
+    if contract.policy_io_layout is not None:
+        server_layout = _first_present(
+            payload,
+            ("policy_artifact.policy_io_layout", "policy_io_layout", "dataset_adapter.policy_io_layout"),
+        )
+        if server_layout is None:
+            warnings.append("policy_io_layout_not_declared")
+        elif not isinstance(server_layout, Mapping) or (
+            _policy_io_semantics(server_layout)
+            != _policy_io_semantics(contract.policy_io_layout)
+        ):
+            errors.append("policy_io_layout_mismatch")
 
     if contract.policy_io_layout_hash is not None:
         server_layout_hash = _optional_str(
@@ -393,6 +414,26 @@ def _optional_str(value: Any) -> str | None:
     return text or None
 
 
+def _policy_io_semantics(layout: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare executable layout content, not names or collection annotations."""
+    arm = layout.get("arm")
+    if isinstance(arm, Mapping):
+        arm = {key: value for key, value in arm.items() if key != "qpos_audit_dim"}
+    end_effectors = layout.get("end_effectors")
+    if isinstance(end_effectors, Mapping):
+        end_effectors = {
+            side: {key: value for key, value in spec.items() if key != "metadata"}
+            if isinstance(spec, Mapping) else spec
+            for side, spec in end_effectors.items()
+        }
+    return {
+        "schema": layout.get("schema"),
+        "arm": arm,
+        "end_effectors": end_effectors,
+        "model": layout.get("model"),
+    }
+
+
 def _normalize_sides(values: Any) -> tuple[str, ...]:
     if values is None:
         return ()
@@ -447,6 +488,7 @@ def _server_action_dim(metadata: Mapping[str, Any]) -> int | None:
                 "dataset_adapter.deployment_action_dim",
                 "output_action_dim",
                 "action_dim",
+                "policy_artifact.outputs.actions.dim",
             ),
         )
     )
@@ -463,6 +505,7 @@ def _server_state_dim(metadata: Mapping[str, Any]) -> int | None:
                 "model.state_dim",
                 "input_state_dim",
                 "state_dim",
+                "policy_artifact.inputs.state.dim",
             ),
         )
     )
@@ -479,6 +522,7 @@ def _server_state_discrete_dim(metadata: Mapping[str, Any]) -> int | None:
                 "model.state_discrete_dim",
                 "input_state_discrete_dim",
                 "state_discrete_dim",
+                "policy_artifact.inputs.state_discrete.dim",
             ),
         )
     )
@@ -494,6 +538,7 @@ def _server_action_discrete_dim(metadata: Mapping[str, Any]) -> int | None:
                 "dataset_adapter.deployment_action_discrete_dim",
                 "model.action_discrete_dim",
                 "action_discrete_dim",
+                "policy_artifact.outputs.actions_discrete.dim",
             ),
         )
     )

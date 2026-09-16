@@ -590,10 +590,26 @@ class OpenPIConditionedRtcBackendV3:
         *,
         observe_bundle: Callable[[Any], None] | None = None,
     ) -> RtcConditionedModelClientInferenceExecutorV3:
-        self.begin_worker_session()
+        session_started = False
+
+        def prepare_input(request, observation):
+            nonlocal session_started
+            if not session_started:
+                # Session recovery may wait for socket close only on the model
+                # worker, never in factory construction/control-loop rearm.
+                if self._base_backend.worker_session_aware and not (
+                    self._base_backend.begin_worker_session(wait_timeout_sec=1.0)
+                ):
+                    raise RuntimeError(
+                        "OpenPI transport declined a new worker session: "
+                        "prior close pending or failed after bounded wait."
+                    )
+                session_started = True
+            return self.prepare_worker_input(request, observation)
+
         return RtcConditionedModelClientInferenceExecutorV3(
             client=self.create_client(),
-            prepare_input=self.prepare_worker_input,
+            prepare_input=prepare_input,
             observe_bundle=observe_bundle,
         )
 

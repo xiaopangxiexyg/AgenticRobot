@@ -82,7 +82,7 @@ def test_client_checkpoint_dir_resolves_artifact_and_profile(tmp_path: Path) -> 
     kwargs = json.loads(launched[launched.index("--policy-kwargs-json") + 1])
     assert kwargs["policy_artifact"]["model_id"] == artifact.model_id
     assert "--arm-execution-profile" in launched
-    assert launched[launched.index("--arm-execution-profile") + 1] == "impedance_40hz"
+    assert launched[launched.index("--arm-execution-profile") + 1] == "position_15_60_120hz"
     assert "--policy-prediction-mode" not in launched
     assert "--policy-prediction-prefetch-queue-threshold" not in launched
     assert "--send-actions" not in launched

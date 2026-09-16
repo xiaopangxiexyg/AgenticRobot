@@ -428,6 +428,54 @@ def test_blocking_cancel_hook_cannot_block_zero_timeout_stop() -> None:
         worker.stop(timeout_sec=1.0)
 
 
+def test_inference_exit_does_not_prove_drain_while_old_cancel_can_affect_rearm():
+    work_item, _plan, policy, record, _left, _right = _virtual_work_item()
+
+    class LateCancelExecutor(BlockingVirtualPolicyExecutor):
+        def __init__(self):
+            super().__init__(policy, record)
+            self.cancel_started = threading.Event()
+            self.cancel_release = threading.Event()
+            self.cancel_count = 0
+
+        def request_cancel(self):
+            self.cancel_count += 1
+            self.cancel_started.set()
+            self.cancel_release.wait(timeout=2.0)
+            return True
+
+    executor = LateCancelExecutor()
+    worker = BoundedPolicyInferenceWorker(
+        worker_id=work_item.worker_id, worker_session_id=work_item.worker_session_id,
+        executor=executor,
+    )
+    worker.start()
+    try:
+        assert worker.submit(work_item).accepted
+        executor.release.set()
+        _poll_completion(worker)
+        stop = worker.stop(timeout_sec=0.0)
+        assert executor.cancel_started.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while not stop.thread_exited and time.monotonic() < deadline:
+            time.sleep(0.001)
+            stop = worker.stop(timeout_sec=0.0)
+        assert stop.thread_exited
+        assert stop.status == "executor_cancel_pending"
+        assert stop.session_state != POLICY_WORKER_SESSION_DRAINED
+        assert worker.session_state != POLICY_WORKER_SESSION_DRAINED
+        assert worker.session_snapshot().session_state != POLICY_WORKER_SESSION_DRAINED
+        assert executor.cancel_count == 1
+        executor.cancel_release.set()
+        while worker.session_state != POLICY_WORKER_SESSION_DRAINED and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert worker.session_snapshot().session_state == POLICY_WORKER_SESSION_DRAINED
+    finally:
+        executor.cancel_release.set()
+        executor.release.set()
+        worker.stop(timeout_sec=1.0)
+
+
 def test_stop_timeout_never_claims_drain_and_late_result_fails_new_epoch_plan() -> None:
     work_item, plan, policy, record, _left, _right = _virtual_work_item()
     executor = BlockingVirtualPolicyExecutor(policy, record)

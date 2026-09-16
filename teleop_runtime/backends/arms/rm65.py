@@ -2866,6 +2866,99 @@ class RM65ArmBackend(EffectorBackend):
                     f"{self.name} {stop_label} failed with return code {stop_text}"
                 )
 
+    def request_policy_inference_soft_hold(
+        self,
+        reason: str = "policy_inference_wait",
+    ) -> dict[str, object]:
+        """Decelerate and hold through the existing position command planner.
+
+        Measured feedback is a validity prerequisite, not a replacement for
+        the committed command anchor: rebasing a moving arm to delayed feedback
+        would bypass the planner's dynamics bounds.  No second lease/controller
+        is created.  Repeated gaps preserve the active quick-stop sequence, and
+        normal target admission releases it only when a fresh target activates.
+        """
+
+        if self.config.observation_only or not self.config.connect_hardware:
+            return {
+                "active": False,
+                "status": "skipped",
+                "reason": "observation_only_or_dry_run",
+            }
+        normalized_reason = str(reason).strip() or "policy_inference_wait"
+        with self._send_lock:
+            with self._state_lock:
+                if self._closed or self._emergency_stopped or self._stream_fault:
+                    raise RuntimeError(
+                        f"{self.name} cannot enter inference hold while closed, "
+                        "emergency-stop latched, or stream faulted."
+                    )
+                if not (
+                    self.arm is not None
+                    and self._hardware_ready
+                    and self.config.background_streaming_enabled
+                    and self._stream_thread is not None
+                    and self._stream_thread.is_alive()
+                    and not self._stream_stop_event.is_set()
+                ):
+                    raise RuntimeError(
+                        f"{self.name} inference hold requires a ready position worker."
+                    )
+                if not isinstance(
+                    self._stream_planner,
+                    (
+                        AccelerationLimitedJointTrajectoryPlanner,
+                        SampleAlignedJerkLimitedJointTrajectoryPlanner,
+                    ),
+                ):
+                    raise RuntimeError(
+                        f"{self.name} inference hold requires a dynamics-limited planner."
+                    )
+                now = time.monotonic()
+                measured = self._measured_qpos
+                measured_at = self._measured_monotonic
+                age = None if measured_at is None else now - float(measured_at)
+                if not (
+                    self._last_hardware_read_success
+                    and self._last_hardware_arm_err == 0
+                    and self._last_hardware_sys_err == 0
+                    and measured is not None
+                    and measured.shape == (6,)
+                    and np.all(np.isfinite(measured))
+                    and age is not None
+                    and math.isfinite(age)
+                    and 0.0 <= age <= self.config.background_streaming_target_max_age_sec
+                ):
+                    raise RuntimeError(
+                        f"{self.name} inference hold requires fresh, finite, "
+                        "fault-free measured qpos."
+                    )
+                anchor = self._command_anchor_qpos_locked()
+                if anchor is None or not np.all(np.isfinite(anchor)):
+                    raise RuntimeError(f"{self.name} inference hold has no valid command anchor.")
+                already_active = bool(self._stream_quick_stop_active)
+                if not already_active:
+                    self._activate_stream_quick_stop_locked(
+                        reason=normalized_reason,
+                        monotonic_time=now,
+                        source="policy_inference_hold",
+                    )
+                    self._last_target_qpos = anchor.copy()
+                    self._last_target_pose = None
+                    self._last_send_result_code = 0
+                    self._last_send_result_text = "policy_inference_position_hold"
+                return {
+                    "active": True,
+                    "status": "already_active" if already_active else "activated",
+                    "mode": "position_planner_quick_stop",
+                    "reason": self._stream_quick_stop_reason,
+                    "target_sequence": int(self._stream_target_sequence),
+                    "measured_qpos": measured.tolist(),
+                    "measurement_timestamp": self._measured_timestamp,
+                    "measurement_age_sec": age,
+                    "command_anchor_qpos": anchor.tolist(),
+                }
+
     def disengage_position_command_stream(
         self,
         reason: str = "manual interaction",

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import utils.dataset_postprocess.v22_to_v23_desk as v22_to_v23_desk_module
 from dataset_contracts.pose_training import PoseTrainingDataContract
 from dataset_contracts.policy_artifact import PolicyArtifactContract
 from dataset_contracts.pose_chunk import PoseActionChunkContract
@@ -163,7 +164,15 @@ def _write_dataset(root: Path) -> tuple[dict[str, object], list[dict[str, object
 
 
 @pytest.mark.optional
-def test_v22_desk_conversion_is_dry_run_then_copy_on_write(tmp_path: Path) -> None:
+def test_v22_desk_conversion_is_dry_run_then_copy_on_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        v22_to_v23_desk_module,
+        "_active_collection_processes",
+        lambda: [],
+    )
     _pa, pq = _require_pyarrow()
     source = tmp_path / "source"
     output = tmp_path / "output"
