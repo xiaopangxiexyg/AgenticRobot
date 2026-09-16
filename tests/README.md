@@ -101,6 +101,23 @@ Parquet 的 256 样本、4 个 chunk 长测保留，并检查逐帧读回投影�
 不能替代无 PyArrow 环境下的 CJSON 覆盖。native-store 的两种格式精确对照、延迟
 封存及真实 producer 多帧验证仍独立保留。这里不改变生产存储、同步策略或验收 selector。
 
+### Sim-HIL 重复建场压缩
+
+`test_control_station_mujoco_sim_hil.py` 将两组使用相同任务配置的检查合并，
+每组只执行一次真实建场和 scripted reset，不共享跨用例的可变 runtime：
+
+- `test_sim_hil_default_target_rates_and_measured_reset_session_home` 保留原默认频率、
+  planner、安全间距、执行端口与 measured-reset TCP/session-anchor 的全部断言；
+  原两个用例只在无行为意义的 composer ID 标签上不同，检查都不启动 runtime。
+- `test_sim_hil_residual_schema_wiring_and_relative_human_submission` 在原人类输入
+  变换场景启动前检查全部角色 schema，然后验证 identity anchor、去重和相对输入。
+  原独立 schema 场景仅使用不同的 graph ID 标签，不提供额外状态转换覆盖。
+
+自定义 compose rate、非 off observation plan 的实际 start/step、V5 专属复位、
+hold/rearm 和所有失败路径仍独立保留。这里减少两个重复建场用例，不截短保留场景的
+physics tick 或复位动作，不减少断言或验收 selector；合并用例的前置断言失败时，
+后续断言不会执行。
+
 ## Cost gates in parallel worktrees
 
 Use the fast unit and integration selectors plus the exact tests for the owner

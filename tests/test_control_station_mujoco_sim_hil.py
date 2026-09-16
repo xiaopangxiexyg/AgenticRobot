@@ -1768,7 +1768,7 @@ def test_default_vive_coordinate_profile_is_exact_and_right_compatible() -> None
 
 
 @pytest.mark.optional
-def test_sim_hil_target_separates_policy_source_and_compose_controller_rates() -> None:
+def test_sim_hil_default_target_rates_and_measured_reset_session_home() -> None:
     _require_mujoco_runtime()
 
     hands = _hand_specs()
@@ -1828,42 +1828,8 @@ def test_sim_hil_target_separates_policy_source_and_compose_controller_rates() -
             == target.runtime.target_runtime_action_contract.semantic_content_hash
             for route in target.runtime.component_target_capability.component_routes
         )
-    finally:
-        target.runtime.close()
-
-
-@pytest.mark.optional
-def test_sim_hil_session_home_uses_measured_reset_tcp_not_real_robot_home() -> None:
-    _require_mujoco_runtime()
-
-    hands = _hand_specs()
-    schema = build_mujoco_pose_action_schema(hands)
-    composer_id = "control-station-sim-hil-coordinate-fixture"
-    contracts = build_default_mujoco_sim_hil_contracts(
-        hands,
-        composer_producer_id=composer_id,
-        proposal_ttl_sec=0.1,
-        action_schema_hash=schema.semantic_content_hash,
-    )
-    target = build_mujoco_sim_hil_target(
-        config=MujocoSimHILTargetConfig(
-            task_config_path=Path(
-                "sim/configs/tasks/"
-                "rm65_right_cube_lift_rl_normal_contact_curriculum_v3.json"
-            ),
-            realtime_worker=False,
-            composer_producer_id=composer_id,
-        ),
-        contracts=contracts,
-        composition_runtime_config=(
-            build_mujoco_sim_hil_composition_runtime_config(contracts)
-        ),
-        composition_strategy_control_factory=(
-            build_mujoco_sim_hil_strategy_control_factory(contracts)
-        ),
-        hand_specs_by_side=hands,
-    )
-    try:
+        # Both checks observe the same unstarted, physically reset target.
+        # Do not repeat its scripted reset just to read the session anchors.
         source = TeleopCalibration.load_json(DEFAULT_CALIBRATION_PROFILE)
         old_robot_home = {
             side: np.asarray(
@@ -2005,78 +1971,7 @@ def test_sim_hil_target_accepts_a_profile_selected_compose_rate() -> None:
 
 
 @pytest.mark.optional
-def test_sim_hil_target_installs_profile_role_specific_input_schemas() -> None:
-    _require_mujoco_runtime()
-
-    hands = _hand_specs()
-    schema = build_mujoco_pose_action_schema(hands)
-    profile = build_mujoco_policy_human_residual_profile(
-        absolute_action_schema=schema,
-        frame_graph=CoordinateFrameGraph(
-            graph_id="mujoco-profile-role-schema-fixture",
-            frames=tuple(
-                CoordinateFrameSpec(frame_id)
-                for frame_id in (
-                    "left_arm_base",
-                    "left_arm/tool_tcp",
-                    "right_arm_base",
-                    "right_arm/tool_tcp",
-                )
-            ),
-            transforms=(),
-        ),
-        concrete_reference_frame_by_component={
-            f"{side}_arm": f"{side}_arm_base" for side in ("left", "right")
-        },
-        concrete_controlled_frame_by_component={
-            f"{side}_arm": f"{side}_arm/tool_tcp" for side in ("left", "right")
-        },
-        source_binding_id="virtual-human-source",
-        source_binding_hash="virtual-human-source-hash",
-        composer_producer_id="control-station-sim-hil-composer",
-        proposal_ttl_sec=0.1,
-        config=MujocoPolicyHumanResidualProfileConfig(enabled=True),
-    )
-    target = build_mujoco_sim_hil_target(
-        config=MujocoSimHILTargetConfig(
-            task_config_path=Path(
-                "sim/configs/tasks/"
-                "rm65_right_cube_lift_rl_normal_contact_curriculum_v3.json"
-            ),
-            realtime_worker=False,
-        ),
-        contracts=profile.sim_hil_contracts,
-        composition_runtime_config=(
-            build_mujoco_sim_hil_composition_runtime_config(
-                profile.sim_hil_contracts
-            )
-        ),
-        composition_strategy_control_factory=(
-            build_mujoco_sim_hil_strategy_control_factory(
-                profile.sim_hil_contracts
-            )
-        ),
-        hand_specs_by_side=hands,
-        composition_input_action_schema_by_role=(profile.input_action_schema_by_role),
-    )
-    try:
-        installed = {
-            role: role_schema.semantic_content_hash
-            for role, role_schema in (
-                target.runtime.policy_topology.input_action_schema_by_role.items()
-            )
-        }
-        assert installed == dict(
-            profile.sim_hil_contracts.composition_spec.input_action_schema_hash_by_role
-        )
-        assert installed["policy"] == schema.semantic_content_hash
-        assert installed["human_residual"] != schema.semantic_content_hash
-    finally:
-        target.runtime.close()
-
-
-@pytest.mark.optional
-def test_sim_hil_human_transform_anchors_with_identity_then_submits_relative() -> None:
+def test_sim_hil_residual_schema_wiring_and_relative_human_submission() -> None:
     _require_mujoco_runtime()
 
     class PassiveSource:
@@ -2171,6 +2066,18 @@ def test_sim_hil_human_transform_anchors_with_identity_then_submits_relative() -
         ),
     )
     try:
+        # Verify installation before exercising the same target's input path.
+        installed = {
+            role: role_schema.semantic_content_hash
+            for role, role_schema in (
+                target.runtime.policy_topology.input_action_schema_by_role.items()
+            )
+        }
+        assert installed == dict(
+            profile.sim_hil_contracts.composition_spec.input_action_schema_hash_by_role
+        )
+        assert installed["policy"] == schema.semantic_content_hash
+        assert installed["human_residual"] != schema.semantic_content_hash
         composition.start()
         first_at = float(target.runtime.clock()) + 0.001
         first = _human_emission(
