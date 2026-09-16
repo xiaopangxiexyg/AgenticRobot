@@ -143,6 +143,219 @@ class B601WrenchJointTorque:
 
 
 @dataclass(frozen=True)
+class B601HapticWrenchSample:
+    """One immutable feedback observation in a shared local clock.
+
+    Simulation uses physics time, not a fabricated device acquisition clock.
+    The producer owns sequence advancement; a consumer must not re-stamp a
+    held sample to make it fresh.
+    """
+
+    sequence: int
+    source_timestamp_sec: float
+    receive_timestamp_sec: float
+    wrench: B601SpatialWrench
+    valid: bool = True
+
+    def __post_init__(self) -> None:
+        if isinstance(self.sequence, bool) or not isinstance(self.sequence, int):
+            raise TypeError("sequence must be a non-negative integer")
+        if self.sequence < 0:
+            raise ValueError("sequence must be a non-negative integer")
+        if not isinstance(self.wrench, B601SpatialWrench):
+            raise TypeError("wrench must be a B601SpatialWrench")
+        if not isinstance(self.valid, bool):
+            raise TypeError("valid must be a bool")
+        for name in ("source_timestamp_sec", "receive_timestamp_sec"):
+            object.__setattr__(
+                self, name, _non_negative_scalar(getattr(self, name), name=name)
+            )
+        if self.receive_timestamp_sec < self.source_timestamp_sec:
+            raise ValueError("receive time must not precede source time")
+
+
+@dataclass(frozen=True)
+class B601HapticWrenchOutput:
+    """Conditioned feedback only; gravity and actuator dispatch stay elsewhere."""
+
+    wrench: B601SpatialWrench
+    source_sequence: int | None
+    source_timestamp_sec: float | None
+    receive_timestamp_sec: float | None
+    source_age_sec: float | None
+    rejection_reason: str | None
+    amplitude_limited: bool
+    slew_limited: bool
+
+
+class B601HapticWrenchChannel:
+    """Co-adjoint mapping, scalar gain, clip, LPF and slew for one feedback stream.
+
+    ``target_T_source`` relates the named wrench origins, not robot bases. In
+    a tip-to-tip virtual coupling its translation is zero unless an explicit
+    lever arm is intended. Gain/clipping/filtering are not power-preserving.
+    Only the unconditioned co-adjoint transform has that invariant.
+
+    Rejected or expired input cancels feedback immediately and clears filter
+    memory; it does not keep an old force until an actuator watchdog. The
+    actuator owner independently retains gravity/damping. This is a bounded
+    conditioning channel, not a passivity controller or an intent observer.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_frame_id: str,
+        target_T_source: Sequence[Sequence[float]] | np.ndarray,
+        gain: float,
+        max_abs_force_n: Sequence[float],
+        max_abs_torque_nm: Sequence[float],
+        max_force_rate_n_s: Sequence[float],
+        max_torque_rate_nm_s: Sequence[float],
+        filter_tau_sec: float,
+        maximum_source_age_sec: float,
+    ) -> None:
+        self.source_frame_id = _frame_id(source_frame_id, name="source_frame_id")
+        self._transform = _proper_transform(target_T_source)
+        self.gain = _non_negative_scalar(gain, name="gain")
+        self._limit = np.asarray(
+            (
+                *_non_negative_vector(max_abs_force_n, size=3, name="max_abs_force_n"),
+                *_non_negative_vector(
+                    max_abs_torque_nm, size=3, name="max_abs_torque_nm"
+                ),
+            )
+        )
+        self._rate = np.asarray(
+            (
+                *_non_negative_vector(
+                    max_force_rate_n_s, size=3, name="max_force_rate_n_s"
+                ),
+                *_non_negative_vector(
+                    max_torque_rate_nm_s, size=3, name="max_torque_rate_nm_s"
+                ),
+            )
+        )
+        self.filter_tau_sec = _non_negative_scalar(
+            filter_tau_sec, name="filter_tau_sec"
+        )
+        self.maximum_source_age_sec = _non_negative_scalar(
+            maximum_source_age_sec,
+            name="maximum_source_age_sec",
+            strictly_positive=True,
+        )
+        self._last_tick: float | None = None
+        self._last_sequence: int | None = None
+        self._last_source_time: float | None = None
+        self._last_receive_time: float | None = None
+        self._sample: B601HapticWrenchSample | None = None
+        self._target = np.zeros(6)
+        self._filtered = np.zeros(6)
+        self._output = np.zeros(6)
+        self._amplitude_limited = False
+
+    def update(
+        self,
+        sample: B601HapticWrenchSample | None,
+        *,
+        now_sec: float,
+    ) -> B601HapticWrenchOutput:
+        """Advance output conditioning once; None holds only a still-fresh sample."""
+        now = _non_negative_scalar(now_sec, name="now_sec")
+        if self._last_tick is not None and now <= self._last_tick:
+            raise ValueError("consumer time must strictly advance")
+        dt = 0.0 if self._last_tick is None else now - self._last_tick
+        if sample is not None and not isinstance(sample, B601HapticWrenchSample):
+            raise TypeError("sample must be a B601HapticWrenchSample or None")
+        self._last_tick = now
+        reason = None
+        if sample is not None:
+            if not sample.valid:
+                reason = "invalid_sample"
+            elif sample.wrench.frame_id != self.source_frame_id:
+                reason = "unexpected_frame"
+            elif sample.receive_timestamp_sec > now:
+                reason = "future_timestamp"
+            elif now - sample.source_timestamp_sec > self.maximum_source_age_sec:
+                reason = "expired_source"
+            elif (
+                self._last_sequence is not None
+                and sample.sequence <= self._last_sequence
+            ):
+                reason = "stale_sequence"
+            elif (
+                self._last_source_time is not None
+                and sample.source_timestamp_sec <= self._last_source_time
+            ):
+                reason = "stale_source_timestamp"
+            elif (
+                self._last_receive_time is not None
+                and sample.receive_timestamp_sec < self._last_receive_time
+            ):
+                reason = "stale_receive_timestamp"
+            if reason is None:
+                mapped = transform_spatial_wrench(
+                    sample.wrench,
+                    target_frame_id=B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME,
+                    target_T_source=self._transform,
+                ).as_vector()
+                with np.errstate(over="ignore", invalid="ignore"):
+                    raw = self.gain * mapped
+                if not np.all(np.isfinite(raw)):
+                    reason = "non_finite_mapped_wrench"
+                else:
+                    self._sample = sample
+                    self._last_sequence = sample.sequence
+                    self._last_source_time = sample.source_timestamp_sec
+                    self._last_receive_time = sample.receive_timestamp_sec
+                    self._target = np.clip(raw, -self._limit, self._limit)
+                    self._amplitude_limited = not np.array_equal(raw, self._target)
+        if (
+            reason is None and self._sample is not None
+            and now - self._sample.source_timestamp_sec > self.maximum_source_age_sec
+        ):
+            reason = "expired_source"
+        if reason is not None or self._sample is None:
+            self._sample = None
+            self._target.fill(0.0)
+            self._filtered.fill(0.0)
+            self._output.fill(0.0)
+            self._amplitude_limited = False
+            slew_limited = False
+        else:
+            alpha = (
+                1.0
+                if self.filter_tau_sec == 0.0
+                else -math.expm1(-dt / self.filter_tau_sec)
+            )
+            self._filtered += alpha * (self._target - self._filtered)
+            limited = np.clip(
+                self._filtered,
+                self._output - self._rate * dt,
+                self._output + self._rate * dt,
+            )
+            slew_limited = not np.array_equal(limited, self._filtered)
+            # Final bound also covers floating-point drift in interpolation.
+            self._output = np.clip(limited, -self._limit, self._limit)
+        return B601HapticWrenchOutput(
+            wrench=B601SpatialWrench(
+                force_n=tuple(self._output[:3]),
+                torque_nm=tuple(self._output[3:]),
+                frame_id=B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME,
+            ),
+            source_sequence=None if self._sample is None else self._sample.sequence,
+            source_timestamp_sec=None if self._sample is None else self._sample.source_timestamp_sec,
+            receive_timestamp_sec=None if self._sample is None else self._sample.receive_timestamp_sec,
+            source_age_sec=None
+            if self._sample is None
+            else now - self._sample.source_timestamp_sec,
+            rejection_reason=reason,
+            amplitude_limited=self._amplitude_limited,
+            slew_limited=slew_limited,
+        )
+
+
+@dataclass(frozen=True)
 class B601VirtualSpringResult:
     wrench: B601SpatialWrench
     displacement_m: tuple[float, ...]
@@ -567,6 +780,9 @@ class B601VirtualWall:
 __all__ = [
     "B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME",
     "B601_RS_WRENCH_ORDER",
+    "B601HapticWrenchChannel",
+    "B601HapticWrenchOutput",
+    "B601HapticWrenchSample",
     "B601PoseVirtualSpring",
     "B601PoseVirtualSpringResult",
     "B601SpatialWrench",
