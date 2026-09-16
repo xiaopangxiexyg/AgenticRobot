@@ -7,7 +7,8 @@ or execution semantics.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from robot_motion.deploy import PolicyActionEmission
 from teleop_runtime.action.human_proposal import HumanCommandEmission
@@ -15,7 +16,6 @@ from teleop_runtime.action.human_proposal import HumanCommandEmission
 from .mujoco_allocation_control_cycle import (
     MujocoAllocationSourcePublication,
 )
-
 
 MujocoPolicyAllocationInputPublisher = Callable[
     [PolicyActionEmission, float],
@@ -41,6 +41,16 @@ def _rejection_detail(submission: Any) -> str:
     status = str(getattr(submission, "status", "") or "").strip()
     input_cycle = getattr(submission, "input_cycle", None)
     cycle_status = str(getattr(input_cycle, "status", "") or "").strip()
+    if cycle_status == "batch_rejected":
+        publication = getattr(input_cycle, "publication", None)
+        receipt = getattr(publication, "receipt", None)
+        rejection_code = str(getattr(receipt, "rejection_code", "") or "").strip()
+        rejection_message = str(getattr(receipt, "message", "") or "").strip()
+        if rejection_code:
+            details = ":".join(
+                part for part in (rejection_code, rejection_message) if part
+            )
+            return f"{error or cycle_status}:{details}"
     return error or cycle_status or status or type(submission).__name__
 
 
