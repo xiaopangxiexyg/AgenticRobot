@@ -15,6 +15,7 @@ from agent_gateway.profiles.real.point_grasp_deployment import (
 from deployments.perception.graspgenx_client import (
     GRASPGENX_DEFAULT_MODE,
     GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+    GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
     GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
     GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM,
     GraspGenXClient,
@@ -37,6 +38,7 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
     Sam2GraspGenXPointGraspPlanner,
 )
 from deployments.perception.sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner
+from deployments.perception.dmtac_grasp_overlay import reviewed_4b2_cad_solid_geometry
 
 
 class _FakeSocket:
@@ -294,7 +296,10 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
 
     def _runner(points, sampler, **kwargs):
         runner_calls.append((points.copy(), sampler, kwargs))
-        return np.stack((first, second)), np.asarray((0.2, 0.9)), [], None
+        return (
+            np.concatenate((np.repeat(first[None], 1001, axis=0), second[None])),
+            np.asarray([0.2] * 1001 + [0.9]), [], None,
+        )
 
     backend = GraspGenXInProcessBackend(model_spec=_model_spec(tmp_path))
     monkeypatch.setattr(
@@ -332,6 +337,10 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
         runner_calls[0][2]["moe_num_yaws"]
         == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
     )
+    assert runner_calls[0][2]["moe_z_offsets_cm"] == GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
+    assert -3.0 in GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
+    assert set((-8.0, -6.0, -4.0, -2.0, -1.0, 0.0)) <= set(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
+    assert backend.semantic_config["graspmoe_sampling"]["z_offsets_cm"] == GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
     assert (
         runner_calls[0][2]["moe_obb_density"]
         == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
@@ -341,6 +350,16 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
     )
     assert scores.tolist() == pytest.approx([0.9])
     np.testing.assert_allclose(grasps[0], second)
+    all_grasps, all_scores = backend.infer_object(
+        points, sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+        top_k=-1,
+    )
+    assert _Sampler.calls == 1
+    assert len(runner_calls) == 2
+    assert len(all_grasps) == len(all_scores) == 1002
+    np.testing.assert_allclose(all_grasps[0], second)
+    assert all_scores[0] == pytest.approx(.9)
+    assert all_scores[-1] == pytest.approx(.2)
     backend.close()
 
 
@@ -401,6 +420,7 @@ def test_client_sends_dmtac_sweep_volume_and_sorts_top_k() -> None:
     request = unpack_graspgenx_message(socket.sent[0])
     assert request["action"] == "infer_object"
     assert request["moe_num_yaws"] == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
+    assert request["moe_z_offsets_cm"] == list(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
     assert request["moe_obb_density"] == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
     assert request["moe_obb_position_spacing_cm"] == pytest.approx(
         GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -431,6 +451,49 @@ def test_client_start_requires_health_and_infer_object_metadata() -> None:
         "health",
         "metadata",
     ]
+
+
+def test_client_can_retain_scored_union_larger_than_1000() -> None:
+    grasps = np.repeat(np.eye(4)[None], 1002, axis=0)
+    grasps[:, 0, 3] = np.arange(1002) * .001
+    scores = np.linspace(.3, .9, 1002)
+    socket = _FakeSocket([pack_graspgenx_message(
+        {"grasps": grasps, "confidences": scores},
+    )])
+    client = GraspGenXClient(context=_FakeContext(socket))
+
+    actual, confidence = client.infer_object(
+        np.zeros((16, 3), dtype=np.float32),
+        sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+        top_k=-1,
+    )
+
+    assert len(actual) == len(confidence) == 1002
+    np.testing.assert_allclose(actual, grasps[::-1])
+    np.testing.assert_allclose(confidence, scores[::-1])
+    # The reviewed service returns all candidates and rejects a wire top-k.
+    assert "topk_num_grasps" not in unpack_graspgenx_message(socket.sent[0])
+
+
+@pytest.mark.parametrize("top_k", [-2, 0, True, 1001])
+@pytest.mark.parametrize("inprocess", [False, True])
+def test_inference_rejects_invalid_top_k_before_model_or_transport(
+    tmp_path: Path, top_k, inprocess: bool,
+) -> None:
+    backend = (GraspGenXInProcessBackend(model_spec=_model_spec(tmp_path))
+               if inprocess else GraspGenXClient(context=_FakeContext(_FakeSocket([]))))
+    with pytest.raises(ValueError, match="top_k"):
+        backend.infer_object(
+            np.zeros((16, 3), dtype=np.float32),
+            sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+            top_k=top_k,
+        )
+
+
+def test_moe_samples_five_mm_insertion_intervals_before_scoring() -> None:
+    offsets = np.asarray(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
+    assert set((-8., -6., -4., -2., -1., 0.)) <= set(offsets)
+    np.testing.assert_allclose(np.diff(offsets[offsets >= -4.]), .5)
 
 
 def test_client_rejects_score_threshold_outside_confidence_range() -> None:
@@ -495,8 +558,12 @@ def test_planner_rejects_non_finite_score_threshold(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("cad_bound", [False, True])
+@pytest.mark.parametrize("base_tilt_degrees", [0, -30])
 def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     tmp_path: Path,
+    cad_bound: bool,
+    base_tilt_degrees: float,
 ) -> None:
     depth = np.zeros((20, 20), dtype=np.float32)
     depth[8:13, 8:13] = 1.0
@@ -507,6 +574,11 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     base_from_camera[:3, :3] = np.asarray(
         ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
     )
+    tilt = math.radians(base_tilt_degrees)
+    base_from_camera[:3, :3] = base_from_camera[:3, :3] @ np.asarray(
+        ((1, 0, 0), (0, math.cos(tilt), -math.sin(tilt)),
+         (0, math.sin(tilt), math.cos(tilt)))
+    )
     base_from_camera[:3, 3] = (0.20, -0.10, 0.30)
     base_from_model_base = base_from_camera @ camera_from_model_base
     client = _PlannerClient(
@@ -516,6 +588,7 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
         model_spec=_model_spec(tmp_path),
         point_segmenter=_Segmenter(mask),
         client=client,
+        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
     )
     planner.start()
 
@@ -553,10 +626,17 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
         atol=1e-6,
     )
     assert client.calls[0][1]["planner"] == "graspmoe"
-    assert client.calls[0][1]["top_k"] == 1_000
+    assert client.calls[0][1]["top_k"] == -1
     candidate = result.candidates[0]
     camera_from_tcp = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
-    assert camera_from_tcp[2, 3] == pytest.approx(1.017999, abs=1e-6)
+    camera_from_geometry = planner.solid_geometry.solid_pose(camera_from_tcp)
+    expected_geometry = camera_from_model_base.copy()
+    expected_geometry[2, 3] += .042999
+    np.testing.assert_allclose(camera_from_geometry, expected_geometry, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(candidate.base_from_tcp).reshape(4, 4),
+                               base_from_camera @ camera_from_tcp, atol=1e-9)
+    assert camera_from_tcp[2, 3] == pytest.approx(1.017999 - (.0082 if cad_bound else 0), abs=1e-6)
+    assert candidate.model_score == pytest.approx(.9)
     assert 0.005 <= candidate.gripper_width_m <= 0.070
     assert candidate.visible_collision_free is True
     assert planner.last_target_mask is not None
@@ -569,9 +649,11 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     assert client.closed_for_test
 
 
-def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
+@pytest.mark.parametrize("cad_bound", [False, True])
+def test_planner_preserves_scored_finger_exchange_for_independent_robot_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cad_bound: bool,
 ) -> None:
     depth = np.zeros((20, 20), dtype=np.float32)
     depth[8:13, 8:13] = 1.0
@@ -599,6 +681,9 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
         )
     )
     tilted[2, 3] = 0.975
+    # A scored pose must already put the object in its opening. Do not rely
+    # on production code silently translating this tilted fixture afterwards.
+    tilted[:3, 3] = np.asarray((0, 0, 1.0)) - 0.025 * tilted[:3, 2]
     grasps.append(tilted)
     client = _PlannerClient(
         np.stack(grasps), np.asarray((0.9, 0.8, 0.7, 0.65, 0.6), dtype=np.float64)
@@ -607,6 +692,7 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
         model_spec=_model_spec(tmp_path),
         point_segmenter=_Segmenter(mask),
         client=client,
+        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
     )
     monkeypatch.setattr(
         Sam2VgnPointGraspPlanner,
@@ -622,8 +708,8 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
         intrinsics={
             "width": 20,
             "height": 20,
-            "fx": 100.0,
-            "fy": 100.0,
+            "fx": 200.0,
+            "fy": 200.0,
             "cx": 10.0,
             "cy": 10.0,
         },
@@ -632,9 +718,17 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
     )
 
     assert [candidate.model_score for candidate in result.candidates] == pytest.approx(
-        [0.9, 0.8, 0.7, 0.6]
+        [0.9, 0.8, 0.7, 0.65, 0.6]
     )
+    for candidate, scored_pose in zip(result.candidates, grasps, strict=True):
+        expected = scored_pose.copy()
+        expected[:3, 3] += .042999 * expected[:3, 2]
+        actual_tcp = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
+        np.testing.assert_allclose(planner.solid_geometry.solid_pose(actual_tcp), expected, atol=1e-9)
+    exchanged = np.asarray(result.candidates[3].camera_from_tcp).reshape(4, 4)
     first = np.asarray(result.candidates[0].camera_from_tcp).reshape(4, 4)
+    assert np.dot(first[:3, 0], exchanged[:3, 0]) == pytest.approx(-1)
+    assert np.linalg.norm(first[:3, 3] - exchanged[:3, 3]) == pytest.approx(.049 if cad_bound else 0, abs=1e-8)
     tilted_result = np.asarray(result.candidates[-1].camera_from_tcp).reshape(4, 4)
     assert np.dot(first[:3, 2], tilted_result[:3, 2]) == pytest.approx(
         math.cos(tilted_angle)
@@ -642,7 +736,7 @@ def test_planner_preserves_closing_axis_variants_and_groups_finger_exchange(
     planner.close()
 
 
-def test_candidate_selection_covers_distinct_approaches_before_yaw_variants() -> None:
+def test_candidate_selection_balances_approaches_and_closing_axis_variants() -> None:
     poses = []
     for yaw_degrees in (0.0, 30.0, 60.0, 90.0, 120.0):
         yaw = math.radians(yaw_degrees)
@@ -675,10 +769,64 @@ def test_candidate_selection_covers_distinct_approaches_before_yaw_variants() ->
     )
 
     assert representatives == [0, 5, 6, 7]
-    assert selected == [0, 5, 6, 7]
+    assert selected == [0, 5, 1, 2]
 
 
-def test_planner_bounded_centering_recovers_offset_grasp_without_changing_depth(
+@pytest.mark.parametrize("maximum", [2, 4, 5])
+@pytest.mark.parametrize("cad_bound", [False, True])
+def test_planner_retains_scored_depth_variants_after_family_priority(
+    tmp_path: Path, maximum: int, cad_bound: bool,
+) -> None:
+    depth = np.zeros((20, 20), dtype=np.float32)
+    depth[8:13, 8:13] = 1.
+    poses = []
+    for yaw, z in ((0, .975), (0, .975), (0, .980),
+                   (math.pi, .975), (math.pi, .980)):
+        pose = np.eye(4)
+        pose[:3, :3] = ((math.cos(yaw), -math.sin(yaw), 0),
+                       (math.sin(yaw), math.cos(yaw), 0), (0, 0, 1))
+        pose[2, 3] = z
+        poses.append(pose)
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(depth > 0),
+        client=_PlannerClient(np.stack(poses), np.asarray((.9, .89, .8, .7, .6))),
+        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
+    )
+    planner.start()
+    result = planner.plan(
+        Image.new("RGB", (20, 20)), depth, pixel_uv=(10, 10),
+        intrinsics=dict(width=20, height=20, fx=200., fy=200., cx=10., cy=10.),
+        base_from_camera=np.eye(4), max_candidates=maximum,
+    )
+    expected_indices = [0, 3] if maximum == 2 else [0, 2, 3, 4]
+    assert len(result.candidates) == len(expected_indices)
+    for candidate, index in zip(result.candidates, expected_indices, strict=True):
+        expected = poses[index].copy()
+        expected[:3, 3] += .042999 * expected[:3, 2]
+        actual = planner.solid_geometry.solid_pose(
+            np.asarray(candidate.camera_from_tcp).reshape(4, 4),
+        )
+        np.testing.assert_allclose(actual, expected, atol=1e-9)
+        assert candidate.model_score == pytest.approx((.9, .89, .8, .7, .6)[index])
+        assert candidate.visible_collision_free
+    assert planner.last_filter_summary["candidate_family_count"] == 2
+    assert planner.last_filter_summary["candidate_variant_count"] == 4
+    planner.close()
+
+
+@pytest.mark.parametrize("yaw_degrees,same_family", [(0, True), (10, True), (30, False), (180, False)])
+def test_candidate_family_deduplicates_nearby_orientations_not_finger_exchange(yaw_degrees, same_family):
+    first = np.eye(4)
+    second = np.eye(4)
+    angle = math.radians(yaw_degrees)
+    second[:3, :3] = np.asarray(
+        ((math.cos(angle), -math.sin(angle), 0),
+         (math.sin(angle), math.cos(angle), 0), (0, 0, 1))
+    )
+    assert Sam2GraspGenXPointGraspPlanner._same_candidate_family(first, second) is same_family
+
+
+def test_planner_does_not_translate_scored_offset_grasp_to_hide_solid_collision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -702,28 +850,21 @@ def test_planner_bounded_centering_recovers_offset_grasp_without_changing_depth(
     )
     planner.start()
 
-    result = planner.plan(
-        Image.new("RGB", (20, 20)),
-        depth,
-        pixel_uv=(10, 10),
-        intrinsics={
-            "width": 20,
-            "height": 20,
-            "fx": 100.0,
-            "fy": 100.0,
-            "cx": 10.0,
-            "cy": 10.0,
-        },
-        base_from_camera=np.eye(4),
-        max_candidates=1,
-    )
+    with pytest.raises(RuntimeError, match="No visible collision-free"):
+        planner.plan(
+            Image.new("RGB", (20, 20)),
+            depth,
+            pixel_uv=(10, 10),
+            intrinsics={
+                "width": 20, "height": 20,
+                "fx": 100.0, "fy": 100.0, "cx": 10.0, "cy": 10.0,
+            },
+            base_from_camera=np.eye(4),
+            max_candidates=1,
+        )
 
-    candidate = np.asarray(result.candidates[0].camera_from_tcp).reshape(4, 4)
-    # The target centre is moved onto the physical closing/height centre, but
-    # the model's approach depth is not altered by this admission correction.
-    assert candidate[0, 3] == pytest.approx(0.0, abs=1e-9)
-    assert candidate[1, 3] == pytest.approx(0.0, abs=1e-9)
-    assert candidate[2, 3] == pytest.approx(1.017999, abs=1e-9)
+    assert planner.last_filter_summary["target_solid_collision_rejected"] == 1
+    assert grasp[:3, 3] == pytest.approx((-0.020, -0.012, 0.975))
     planner.close()
 
 
@@ -788,6 +929,38 @@ def test_planner_normalizes_float32_model_rotation_for_strict_frame_contract(
         assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-9)
         np.testing.assert_allclose(rotation, original_rotation, atol=3e-8, rtol=0.0)
     planner.close()
+
+
+def test_noncontact_endpoint_uses_open_jaws_not_estimated_closure_width(tmp_path: Path) -> None:
+    depth = np.zeros((80, 80), dtype=np.float32)
+    mask = np.zeros(depth.shape, dtype=bool)
+    mask[38:43, 28:53] = True
+    mask[40, 62] = True
+    depth[mask] = 1.0
+    model_pose = np.eye(4)
+    model_pose[2, 3] = .975
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(mask),
+        client=_PlannerClient(model_pose[None], np.asarray([.9])),
+    )
+    planner.start()
+    try:
+        result = planner.plan(Image.new("RGB", (80, 80)), depth, pixel_uv=(40, 40),
+            intrinsics={"width": 80, "height": 80, "fx": 1000., "fy": 1000., "cx": 40., "cy": 40.},
+            base_from_camera=np.eye(4), max_candidates=1)
+        candidate = result.candidates[0]
+        pose = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
+        from robot_motion.grasp_visible_scene import VisibleGraspScene
+        scene = VisibleGraspScene.from_depth(depth_m=depth, target_mask=mask,
+            intrinsics={"fx": 1000., "fy": 1000., "cx": 40., "cy": 40.},
+            reference_from_camera=np.eye(4), geometry=planner.solid_geometry)
+        assert scene.collision_counts(pose, opening_m=candidate.gripper_width_m)[0] > 0
+        assert scene.approach_collision_counts(pose, opening_m=.07, distance_m=.06) == (0, 0)
+        assert candidate.visible_collision_free
+        assert candidate.model_score == pytest.approx(.9)
+        np.testing.assert_allclose(pose[:2, 3], model_pose[:2, 3])
+    finally:
+        planner.close()
 
 
 def test_planner_fails_closed_when_model_pose_misses_clicked_object(

@@ -123,7 +123,14 @@ class CollisionSafetyOracle:
             raise ValueError("minimum_clearance_m must be finite.")
         minimum = float("inf")
         closest: _ForbiddenGeomPair | None = None
-        limit = self.policy.distance_query_limit_m
+        # Admission only needs a distance clipped at its required clearance.
+        # A broad positive distmax can yield a false negative distance for
+        # separated convex meshes (including native CCD in MuJoCo 3.10).
+        # Querying exactly the decision threshold keeps every forbidden pair
+        # and margin active; far-away distances are lower bounds, not exact
+        # clearance measurements. Recovery thresholds can be negative, but
+        # the query radius must still include all actual penetration.
+        limit = max(0.0, clearance)
         if not self._pairs:
             return CollisionCheckResult(safe=True, minimum_distance_m=float("inf"))
         rotation = np.asarray(data.geom_xmat).reshape((-1, 3, 3))

@@ -26,6 +26,9 @@ from agent_gateway.transport.unix_transport import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.coordinate_frames import CoordinateFrameGraph
+from robot_motion.rm65.captured_robot_observations import (
+    RM65CapturedRobotObservationFilter,
+)
 from teleop_runtime.skill_deploy import (
     RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
     ExclusiveRM65SkillLowerAssembly,
@@ -787,6 +790,14 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             evidence_refs=cut.evidence_refs,
         )
 
+    captured_robot_observation_filter = (
+        None
+        if camera_mount_urdf_path is None
+        else RM65CapturedRobotObservationFilter(
+            urdf_path=camera_mount_urdf_path
+        )
+    )
+
     try:
         grasp_trajectory_planner = RM65GraspJointTrajectoryPlanner(
             profile=lower.profile,
@@ -832,6 +843,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 else None
             ),
             grasp_trajectory_planner=grasp_trajectory_planner,
+            captured_robot_observation_filter=(
+                captured_robot_observation_filter
+            ),
             perception_provider_factory=provider_factory,
             measured_qpos_observer=(
                 measured_qpos_observer if rgb_camera_geometry is not None else None

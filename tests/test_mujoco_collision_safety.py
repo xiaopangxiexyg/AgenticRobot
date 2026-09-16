@@ -10,6 +10,44 @@ TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
 
 
 @pytest.mark.parametrize(
+    ("separation_m", "clearance_m", "expected_safe"),
+    (
+        (0.026565366, 0.002, True),
+        (0.0015, 0.002, False),
+        (0.003, 0.002, True),
+        (0.003, 0.005, False),
+        (-0.005, 0.002, False),
+        (-0.005, -0.001, False),
+        (-0.0005, -0.001, True),
+    ),
+)
+def test_distance_admission_uses_required_margin_and_retains_real_penetration(
+    separation_m, clearance_m, expected_safe
+):
+    mujoco = pytest.importorskip("mujoco")
+    from sim.mujoco.collision_safety import CollisionSafetyOracle
+
+    model = mujoco.MjModel.from_xml_string(
+        '<mujoco><worldbody>'
+        '<body name="first"><geom type="box" size=".02 .02 .02" contype="2" conaffinity="2"/></body>'
+        f'<body name="second" pos="{.04 + separation_m} 0 0">'
+        '<joint type="slide" axis="1 0 0"/>'
+        '<geom type="box" size=".02 .02 .02" contype="2" conaffinity="2"/>'
+        '</body></worldbody></mujoco>'
+    )
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    oracle = CollisionSafetyOracle(mujoco, model)
+    check = oracle.check(data, minimum_clearance_m=clearance_m)
+
+    assert oracle.forbidden_pair_count == 1
+    assert check.safe is expected_safe
+    assert check.minimum_distance_m == pytest.approx(
+        min(separation_m, max(0.0, clearance_m)), abs=1e-8
+    )
+
+
+@pytest.mark.parametrize(
     ("pair_class", "expected"),
     (
         ("1:2", "robot_environment"),

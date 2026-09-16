@@ -35,6 +35,12 @@ GRASPGENX_DEFAULT_MODE = "in-process"
 GRASPGENX_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 GRASPGENX_INPROCESS_BACKEND_ID = "graspgenx-inprocess-v1"
 GRASPGENX_POINT_GRASP_MOE_NUM_YAWS = 18
+# Preserve reviewed depths, with 5 mm resolution through the final 4 cm.
+# Support surfaces can leave a valid insertion interval narrower than 10 mm.
+# Every added pose is sampled before discriminator scoring.
+GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM = (
+    -8.0, -6.0, -4.0, -3.5, -3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.0,
+)
 GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY = "dense-topandside"
 GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM = 3.0
 _GRASPGENX_IMPORT_LOCK = threading.RLock()
@@ -43,6 +49,7 @@ _GRASPGENX_IMPORT_LOCK = threading.RLock()
 def _point_grasp_moe_sampling_config() -> dict[str, object]:
     return {
         "num_yaws": GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+        "z_offsets_cm": GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
         "obb_density": GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
         "obb_position_spacing_cm": (
             GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -57,7 +64,8 @@ class GraspGenXInferenceBackend(Protocol):
     The point-grasp planner owns frame conversion and candidate admission. A
     backend only owns model execution and returns poses in the input point
     cloud frame. Both the loopback client and the direct in-process adapter
-    implement this contract.
+    implement this contract. ``top_k=-1`` retains the scored union so callers
+    can apply geometry checks before spending their final selection budget.
     """
 
     backend_id: str
@@ -286,8 +294,8 @@ class GraspGenXClient:
             raise ValueError("planner must be 'graspmoe' or 'diffusion'.")
         if isinstance(num_grasps, bool) or not 1 <= int(num_grasps) <= 1_000:
             raise ValueError("num_grasps must be in [1, 1000].")
-        if isinstance(top_k, bool) or not 1 <= int(top_k) <= 1_000:
-            raise ValueError("top_k must be in [1, 1000].")
+        if isinstance(top_k, bool) or not (int(top_k) == -1 or 1 <= int(top_k) <= 1_000):
+            raise ValueError("top_k must be -1 or in [1, 1000].")
         threshold = float(score_threshold)
         if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
             raise ValueError("score_threshold must be finite and in [-1, 1].")
@@ -301,6 +309,7 @@ class GraspGenXClient:
                     "planner": planner,
                     "num_grasps": int(num_grasps),
                     "moe_num_yaws": GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+                    "moe_z_offsets_cm": GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
                     "moe_obb_density": GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
                     "moe_obb_position_spacing_cm": (
                         GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -323,7 +332,9 @@ class GraspGenXClient:
             keep &= scores >= threshold
         grasps = grasps[keep]
         scores = scores[keep]
-        order = np.argsort(-scores, kind="stable")[: int(top_k)]
+        order = np.argsort(-scores, kind="stable")
+        if int(top_k) != -1:
+            order = order[: int(top_k)]
         return (
             np.ascontiguousarray(grasps[order], dtype=np.float64),
             np.ascontiguousarray(scores[order], dtype=np.float64),
@@ -646,8 +657,8 @@ class GraspGenXInProcessBackend:
             raise ValueError("planner must be 'graspmoe' or 'diffusion'.")
         if isinstance(num_grasps, bool) or not 1 <= int(num_grasps) <= 1_000:
             raise ValueError("num_grasps must be in [1, 1000].")
-        if isinstance(top_k, bool) or not 1 <= int(top_k) <= 1_000:
-            raise ValueError("top_k must be in [1, 1000].")
+        if isinstance(top_k, bool) or not (int(top_k) == -1 or 1 <= int(top_k) <= 1_000):
+            raise ValueError("top_k must be -1 or in [1, 1000].")
         threshold = float(score_threshold)
         if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
             raise ValueError("score_threshold must be finite and in [-1, 1].")
@@ -668,6 +679,7 @@ class GraspGenXInProcessBackend:
                         num_grasps=int(num_grasps),
                         topk_num_grasps=backend_top_k,
                         moe_num_yaws=GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+                        moe_z_offsets_cm=GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
                         moe_obb_density=GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
                         moe_obb_position_spacing_cm=(
                             GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -688,7 +700,9 @@ class GraspGenXInProcessBackend:
             keep &= scores >= threshold
         grasps = grasps[keep]
         scores = scores[keep]
-        order = np.argsort(-scores, kind="stable")[: int(top_k)]
+        order = np.argsort(-scores, kind="stable")
+        if int(top_k) != -1:
+            order = order[: int(top_k)]
         return (
             np.ascontiguousarray(grasps[order], dtype=np.float64),
             np.ascontiguousarray(scores[order], dtype=np.float64),
@@ -702,6 +716,7 @@ __all__ = [
     "GRASPGENX_DEFAULT_TIMEOUT_MS",
     "GRASPGENX_INPROCESS_BACKEND_ID",
     "GRASPGENX_POINT_GRASP_MOE_NUM_YAWS",
+    "GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM",
     "GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY",
     "GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM",
     "GraspGenXClient",

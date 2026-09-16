@@ -113,6 +113,7 @@ class JointPathPlannerConfig:
     shortcut_attempts: int = 80
     adaptive_edge_resolution_rad: float | None = None
     adaptive_refinement_distance_m: float | None = None
+    time_budget_sec: float | None = None
 
     def __post_init__(self) -> None:
         seed = int(self.seed)
@@ -153,6 +154,12 @@ class JointPathPlannerConfig:
                 )
             object.__setattr__(self, "adaptive_edge_resolution_rad", adaptive_resolution)
             object.__setattr__(self, "adaptive_refinement_distance_m", adaptive_distance)
+        time_budget = self.time_budget_sec
+        if time_budget is not None:
+            time_budget = float(time_budget)
+            if not np.isfinite(time_budget) or time_budget <= 0.0:
+                raise ValueError("time_budget_sec must be positive and finite when provided.")
+            object.__setattr__(self, "time_budget_sec", time_budget)
         bias = float(self.goal_bias)
         if not np.isfinite(bias) or not 0.0 <= bias <= 1.0:
             raise ValueError("goal_bias must be within [0, 1].")

@@ -116,6 +116,29 @@ def test_dual_arm_hand_proxy_strict_uses_strict_urdf_with_same_profile_rules():
     assert strict_table.world_to_box_pose_matrix()[2, 3] == pytest.approx(0.005)
 
 
+def test_grasp_full_profile_adds_arm_self_cross_and_fixed_pairs_without_teleop_drift():
+    strict = build_dual_arm_scene_profile("dual_arm_hand_proxy_strict")
+    full = build_dual_arm_scene_profile("dual_arm_hand_proxy_grasp_full")
+    pairs = {frozenset(pair) for pair in full.collision_pairs}
+
+    assert strict.collision_pairs == _EXPECTED_COLLISION_PAIRS
+    assert full.urdf_path == strict.urdf_path
+    assert {frozenset(pair) for pair in strict.collision_pairs} <= pairs
+    assert len(pairs) == len(full.collision_pairs)
+    for prefix in ("", "right_"):
+        assert frozenset((f"{prefix}arm_link3_0", f"{prefix}arm_link5_0")) in pairs
+        assert frozenset((f"{prefix}arm_link3_0", f"{prefix}arm_link4_0")) not in pairs
+        assert frozenset((f"{prefix}arm_link3_0", f"{prefix}arm_link3_proxy_0")) not in pairs
+        for index in range(1, 7):
+            for fixed in DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES:
+                assert frozenset((f"{prefix}arm_link{index}_0", fixed)) in pairs
+    for left_index in range(1, 7):
+        for right_index in range(1, 7):
+            assert frozenset(
+                (f"arm_link{left_index}_0", f"right_arm_link{right_index}_0")
+            ) in pairs
+
+
 def test_fixed_scene_boxes_are_exposed_as_planner_obstacles():
     obstacles = fixed_scene_aabb_obstacles(
         build_dual_arm_scene_profile("dual_arm_hand_proxy_open")

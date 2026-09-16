@@ -8,6 +8,7 @@ this module.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import Literal
 from xml.etree import ElementTree as ET
@@ -41,6 +42,54 @@ DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES = (
     "right_camera_pole_0",
     "table_0",
 )
+
+
+def _grasp_full_collision_pairs() -> tuple[tuple[str, str], ...]:
+    """Cover the complete arms without changing the live teleop proxy contract.
+
+    Adjacent arm meshes are structural contacts, not free-space self-collision
+    pairs.  Coarse link3/hand proxy boxes may overlap their own arm by design,
+    so self-collision uses the actual arm meshes, not those envelopes.  Proxy
+    checks against the other arm and fixed environment remain active.
+    """
+
+    arms = {
+        "left": tuple((f"arm_link{index}_0", index) for index in range(1, 7))
+        + (("arm_link3_proxy_0", 3), ("left_hand_proxy_0", 6)),
+        "right": tuple((f"right_arm_link{index}_0", index) for index in range(1, 7))
+        + (("right_arm_link3_proxy_0", 3), ("right_hand_proxy_0", 6)),
+    }
+    pairs = list(DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS)
+    for side, geometries in arms.items():
+        pairs.extend(
+            (first, second)
+            for (first, first_joint), (second, second_joint) in combinations(
+                geometries[:6], 2
+            )
+            if abs(first_joint - second_joint) > 1
+        )
+        pairs.extend(
+            (moving, fixed)
+            for moving, _joint in geometries
+            for fixed in DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES
+        )
+        own_base, other_base = (
+            ("base_link_0", "right_base_link_0")
+            if side == "left"
+            else ("right_base_link_0", "base_link_0")
+        )
+        pairs.extend((moving, own_base) for moving, joint in geometries if joint > 1)
+        pairs.extend((moving, other_base) for moving, _joint in geometries)
+    pairs.extend(
+        (left, right)
+        for left, _left_joint in arms["left"]
+        for right, _right_joint in arms["right"]
+    )
+    unique: dict[frozenset[str], tuple[str, str]] = {}
+    for pair in pairs:
+        unique.setdefault(frozenset(pair), pair)
+    return tuple(unique.values())
+
 
 _POSE_TRANSFORM_LEFT = np.array(
     [
@@ -334,10 +383,14 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
             solution_layout="auto",
         )
 
-    if name in {"dual_arm_hand_proxy_open", "dual_arm_hand_proxy_strict"}:
+    if name in {
+        "dual_arm_hand_proxy_open",
+        "dual_arm_hand_proxy_strict",
+        "dual_arm_hand_proxy_grasp_full",
+    }:
         urdf_name = (
             "rm65_dual_arm_hand_proxy_strict.urdf"
-            if name == "dual_arm_hand_proxy_strict"
+            if name != "dual_arm_hand_proxy_open"
             else "rm65_dual_arm_hand_proxy_open.urdf"
         )
         urdf_path = asset_dir / urdf_name
@@ -362,7 +415,11 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
             package_dirs=(asset_dir,),
             left_frame_name="arm_link6",
             right_frame_name="right_arm_link6",
-            collision_pairs=DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS,
+            collision_pairs=(
+                _grasp_full_collision_pairs()
+                if name == "dual_arm_hand_proxy_grasp_full"
+                else DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS
+            ),
             hand_proxy_boxes=(*hand_proxy_boxes, *link3_proxy_boxes),
             fixed_scene_boxes=fixed_scene_boxes,
             left_pose_transform=_POSE_TRANSFORM_LEFT.copy(),

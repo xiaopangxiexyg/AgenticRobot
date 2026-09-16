@@ -227,6 +227,35 @@ def test_point_grasp_image_cli_is_offline_and_has_no_gateway_dependency() -> Non
     )
     assert "--calibration-json" in completed.stdout
     assert "--output-image" in completed.stdout
+    assert "--graspgenx-source-root" in completed.stdout
+
+
+def test_point_grasp_image_cli_defaults_to_inprocess_graspgenx() -> None:
+    parsed = point_grasp_image_cli.build_parser().parse_args(
+        [
+            "--sam2-asset-bundle",
+            "/tmp/sam2",
+            "--point-grasp-asset-bundle",
+            "/tmp/graspgenx",
+            "--input-rgb",
+            "/tmp/rgb.png",
+            "--input-depth",
+            "/tmp/depth.npy",
+            "--calibration-json",
+            "/tmp/calibration.json",
+            "--target-u",
+            "8",
+            "--target-v",
+            "6",
+            "--output-json",
+            "/tmp/result.json",
+            "--output-image",
+            "/tmp/result.jpg",
+        ]
+    )
+
+    assert parsed.point_grasp_backend == "graspgenx"
+    assert parsed.graspgenx_source_root is None
 
 
 def _point_grasp_cli_arguments(tmp_path: Path) -> SimpleNamespace:
@@ -268,6 +297,7 @@ def _point_grasp_cli_arguments(tmp_path: Path) -> SimpleNamespace:
         output_json=tmp_path / "result.json",
         output_image=tmp_path / "annotated.jpg",
         device="cpu",
+        graspgenx_source_root=None,
         overwrite=True,
     )
 
@@ -306,6 +336,80 @@ def test_point_grasp_image_cli_bounds_depth_before_loading(
 
     with pytest.raises(ValueError, match="at most 64 MiB"):
         point_grasp_image_cli.run(args)
+
+
+def test_point_grasp_image_cli_builds_graspgenx_inprocess_backend(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    args = _point_grasp_cli_arguments(tmp_path)
+    source_root = tmp_path / "graspgenx-source"
+    source_root.mkdir()
+    args.point_grasp_backend = "graspgenx"
+    args.graspgenx_source_root = source_root
+    localizer = object()
+    calls: dict[str, object] = {}
+
+    class _GraspGenXSpec(_FakeSpec):
+        model_profile_id = "graspgenx:test"
+        semantic_content_hash = "graspgenx-model:test"
+
+    class _Backend:
+        def __init__(self, **kwargs) -> None:
+            calls["backend"] = kwargs
+
+    class _Planner:
+        def __init__(self, **kwargs) -> None:
+            calls["planner"] = kwargs
+
+    monkeypatch.setattr(
+        point_grasp_image_cli,
+        "GraspGenXPointGraspModelSpec",
+        _GraspGenXSpec,
+    )
+    monkeypatch.setattr(
+        point_grasp_image_cli,
+        "GraspGenXInProcessBackend",
+        _Backend,
+    )
+    monkeypatch.setattr(
+        point_grasp_image_cli,
+        "Sam2GraspGenXPointGraspPlanner",
+        _Planner,
+    )
+
+    spec, planner = point_grasp_image_cli._build_point_grasp_planner(
+        args=args,
+        grasp_bundle=args.point_grasp_asset_bundle,
+        localizer=localizer,
+    )
+
+    assert isinstance(spec, _GraspGenXSpec)
+    assert isinstance(planner, _Planner)
+    assert calls["backend"] == {
+        "model_spec": spec,
+        "source_root": source_root.resolve(),
+        "device": "cpu",
+    }
+    assert calls["planner"]["model_spec"] is spec
+    assert calls["planner"]["point_segmenter"] is localizer
+    assert calls["planner"]["client"].__class__ is _Backend
+
+
+def test_point_grasp_image_cli_rejects_graspgenx_source_for_other_backend(
+    tmp_path: Path,
+) -> None:
+    args = _point_grasp_cli_arguments(tmp_path)
+    source_root = tmp_path / "graspgenx-source"
+    source_root.mkdir()
+    args.graspgenx_source_root = source_root
+
+    with pytest.raises(ValueError, match="requires --point-grasp-backend graspgenx"):
+        point_grasp_image_cli._build_point_grasp_planner(
+            args=args,
+            grasp_bundle=args.point_grasp_asset_bundle,
+            localizer=object(),
+        )
 
 
 def test_point_grasp_cli_annotation_renders_only_selected_candidate(

@@ -16,7 +16,12 @@ from deployments.perception.dmtac_grasp_overlay import (
     render_dmtac_grasp_overlays,
 )
 
+from .graspgenx_client import GraspGenXInProcessBackend
 from .localize_image_cli import MAX_INPUT_PIXELS, _atomic_write, _load_image
+from .sam2_graspgenx_point_grasp import (
+    GraspGenXPointGraspModelSpec,
+    Sam2GraspGenXPointGraspPlanner,
+)
 from .sam2_graspnet_point_grasp import (
     GraspNetPointGraspModelSpec,
     Sam2GraspNetPointGraspPlanner,
@@ -38,9 +43,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--point-grasp-asset-bundle", type=Path, required=True)
     parser.add_argument(
         "--point-grasp-backend",
-        choices=("vgn", "graspnet"),
-        default="vgn",
-        help="grasp generator backend; GraspNet uses the authorized project asset bundle",
+        choices=("graspgenx", "vgn", "graspnet"),
+        default="graspgenx",
+        help=(
+            "grasp generator backend; GraspGenX runs in-process and is the "
+            "default"
+        ),
+    )
+    parser.add_argument(
+        "--graspgenx-source-root",
+        type=Path,
+        default=None,
+        help=(
+            "optional reviewed GraspGenX source checkout for the in-process "
+            "backend; defaults to model/perception/graspgenx"
+        ),
     )
     parser.add_argument("--input-rgb", type=Path, required=True)
     parser.add_argument(
@@ -162,6 +179,49 @@ def _annotated_jpeg(
     return stream.getvalue()
 
 
+def _build_point_grasp_planner(
+    *,
+    args: argparse.Namespace,
+    grasp_bundle: Path,
+    localizer: Sam2GroundingDinoLocalizer,
+) -> tuple[object, object]:
+    source_root_arg = getattr(args, "graspgenx_source_root", None)
+    if args.point_grasp_backend != "graspgenx" and source_root_arg is not None:
+        raise ValueError(
+            "--graspgenx-source-root requires --point-grasp-backend graspgenx"
+        )
+    if args.point_grasp_backend == "graspgenx":
+        source_root = (
+            None
+            if source_root_arg is None
+            else _existing(source_root_arg, directory=True)
+        )
+        grasp_spec = GraspGenXPointGraspModelSpec.from_asset_bundle(grasp_bundle)
+        backend = GraspGenXInProcessBackend(
+            model_spec=grasp_spec,
+            source_root=source_root,
+            device=args.device,
+        )
+        return grasp_spec, Sam2GraspGenXPointGraspPlanner(
+            model_spec=grasp_spec,
+            point_segmenter=localizer,
+            client=backend,
+        )
+    if args.point_grasp_backend == "graspnet":
+        grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(grasp_bundle)
+        return grasp_spec, Sam2GraspNetPointGraspPlanner(
+            model_spec=grasp_spec,
+            point_segmenter=localizer,
+            device=args.device,
+        )
+    grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(grasp_bundle)
+    return grasp_spec, Sam2VgnPointGraspPlanner(
+        model_spec=grasp_spec,
+        point_segmenter=localizer,
+        device=args.device,
+    )
+
+
 def run(args: argparse.Namespace) -> dict:
     sam_bundle = _existing(args.sam2_asset_bundle, directory=True)
     grasp_bundle = _existing(args.point_grasp_asset_bundle, directory=True)
@@ -207,16 +267,11 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("Depth must be finite C-order float32 HxW aligned meters.")
     sam_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(sam_bundle)
     localizer = Sam2GroundingDinoLocalizer(model_spec=sam_spec, device=args.device)
-    if args.point_grasp_backend == "graspnet":
-        grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(grasp_bundle)
-        planner = Sam2GraspNetPointGraspPlanner(
-            model_spec=grasp_spec, point_segmenter=localizer, device=args.device
-        )
-    else:
-        grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(grasp_bundle)
-        planner = Sam2VgnPointGraspPlanner(
-            model_spec=grasp_spec, point_segmenter=localizer, device=args.device
-        )
+    grasp_spec, planner = _build_point_grasp_planner(
+        args=args,
+        grasp_bundle=grasp_bundle,
+        localizer=localizer,
+    )
     localizer.start()
     try:
         planner.start()

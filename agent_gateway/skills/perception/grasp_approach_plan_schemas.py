@@ -100,6 +100,42 @@ def grasp_approach_plan_schema_entry_v1(
         "maxItems": 16,
         "items": {"type": "number"},
     }
+    envelope_projection = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "translation_modified": {"type": "boolean"},
+            "rotation_modified": {"type": "boolean"},
+            "translation_adjustment_m": {"type": "number", "minimum": 0},
+            "rotation_adjustment_deg": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 180.000001,
+            },
+            "violated_translation_constraints": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "active_translation_constraints": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "raw_target_xyz_m": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "number"},
+            },
+            "effective_target_xyz_m": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "number"},
+            },
+        },
+    }
     diagnostics = {
         "type": "object",
         "additionalProperties": False,
@@ -116,6 +152,26 @@ def grasp_approach_plan_schema_entry_v1(
             "segment_index": {"type": "integer", "minimum": 0},
             "edge_sample_index": {"type": "integer", "minimum": 0},
             "exception_type": {"type": "string", "minLength": 1},
+            "envelope_projection_by_side": {
+                "type": "object",
+                "minProperties": 1,
+                "additionalProperties": False,
+                "properties": {
+                    "left": envelope_projection,
+                    "right": envelope_projection,
+                },
+            },
+            "envelope_ingress_rejection": {
+                "type": "string",
+                "minLength": 1,
+            },
+            "envelope_projection_subject": {"type": "string", "minLength": 1},
+            "maximum_path_envelope_ingress_distance_m": {
+                "type": "number", "minimum": 0,
+            },
+            "path_envelope_ingress_distance_excess_m": {
+                "type": "number", "minimum": 0,
+            },
         },
     }
     result_schema = {
@@ -471,9 +527,22 @@ def validate_grasp_approach_plan_result_v1(
         "segment_index",
         "edge_sample_index",
         "exception_type",
+        "envelope_projection_by_side",
+        "envelope_ingress_rejection",
+        "envelope_projection_subject",
+        "maximum_path_envelope_ingress_distance_m",
+        "path_envelope_ingress_distance_excess_m",
     }
     if not isinstance(diagnostics, Mapping) or set(diagnostics) - allowed_diagnostics:
         raise ValueError("diagnostics contains unsupported fields.")
+    for field in ("maximum_path_envelope_ingress_distance_m", "path_envelope_ingress_distance_excess_m"):
+        if field in diagnostics and _finite(diagnostics[field], field=field) < 0:
+            raise ValueError(f"diagnostics.{field} must be nonnegative")
+    if "envelope_projection_subject" in diagnostics and (
+        not isinstance(diagnostics["envelope_projection_subject"], str)
+        or not diagnostics["envelope_projection_subject"]
+    ):
+        raise ValueError("envelope_projection_subject must be a nonempty string")
     status = payload["planning_status"]
     plan_fields = (
         "grasp_approach_plan_id",

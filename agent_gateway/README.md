@@ -494,8 +494,9 @@ or connect a robot backend.
 `--enable-object-localization` adds the supplied-image localization Route after
 loading its reviewed model bundle. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp
-bundle. GraspGenX through its isolated loopback service is the default; VGN and
-GraspNet are explicit compatibility choices:
+bundle. GraspGenX in-process inference is the default and does not require a
+loopback service; VGN, GraspNet, and service-mode GraspGenX are explicit
+compatibility choices:
 
 ```bash
 python -m agent_gateway real-perception \
@@ -507,8 +508,8 @@ python -m agent_gateway real-perception \
   --object-localization-asset-bundle /absolute/assets/perception/sam2_grounding_dino \
   --enable-point-grasp \
   --point-grasp-asset-bundle /absolute/assets/perception/graspgenx-point-grasp \
-  --graspgenx-host 127.0.0.1 \
-  --graspgenx-port 5556
+  --graspgenx-mode in-process \
+  --graspgenx-source-root /absolute/AgenticRobot/model/perception/graspgenx
 ```
 
 The live `perception.plan_point_grasp@2` request contains only a registered
@@ -522,12 +523,20 @@ scene/robot/path safety proof. The caller-calibrated v1 Route remains available
 only to the separate offline tooling.
 
 The DMTAC M adapter distinguishes each model's grasp frame from
-the calibrated actual `tool_tcp`. The current zero-translation 4B2 proxy
-attachment has a 97.001 mm internal boundary marker, while the selected DMTAC
-M TCP is 140 mm from the flange; the adapter explicitly locks the resulting
-42.999 mm local approach-axis mapping. That proxy marker is not a separate
-physical mating-plane measurement. Candidate output, visible collision
-geometry, and overlays all apply the same mapping. The combined RM65 profile
+the calibrated actual `tool_tcp`. 对完整 4B2 CAD 装配，独立 real-rm65 入口的
+GraspGenX 显式绑定模型几何框架：相对真实控制 TCP 横向偏移 24.5 mm、轴向
+偏移 8.2 mm，绕 +Z 旋转 90°，使几何 +X 对应实际夹爪开合方向；真实 TCP
+标定仍为 flange `[0, 0, 0.140, 0, 0, 0]`。97.001 mm 内部 marker 在完整
+装配中的 flange 深度是 105.201 mm，不能把零平移 proxy marker 直接当作
+完整安装后的 TCP 几何。模型评分、目标覆盖及多样性检查保持在模型几何
+框架内；候选输出明确转换为控制 TCP，渲染、捕获时夹爪自身点云过滤和
+可见接近/路径检查使用同一份 `solid_geometry` 转换。快照保留该转换；旧
+快照未声明转换时仍按原定义解码，不会静默重解释旧候选。独立离线工具
+与其他 backend 的既有默认框架不变。
+这是名义双指代理的坐标修正，不代表完整 CAD 手指碰撞、实际开度、闭合
+接触或携物退出已通过验证；当前自身过滤与路径检查都近似采用名义最大张开状态，
+不代表已测量实际开度。
+The combined RM65 profile
 rejects point-grasp startup when the selected arm tool profile does not match
 that reviewed TCP; RPent never supplies or repairs this tool geometry.
 
@@ -655,9 +664,10 @@ Adding `--enable-point-grasp-arm-reachability` upgrades only this combined
 profile to `perception.plan_point_grasp@3`. Its request-gated annotation runs
 the existing lower RM65 endpoint IK from one fresh measured-qpos snapshot and
 classifies each unchanged candidate as standard (3 mm/1 degree), basic
-(5 cm/20 degrees), or difficult within a 1 second/120-cycle per-candidate
-search budget. No new cycle starts after the wall-clock deadline is observed;
-one in-flight lower solve is not preempted and its full duration is reported.
+(5 cm/20 degrees), or difficult within a 1-second/2,880-function-evaluation
+per-candidate budget (16 seeds, at most 180 evaluations per seed). No new seed
+starts after the wall-clock deadline is observed; one in-flight lower solve is
+not preempted and its full duration is reported.
 Omitting the flag preserves the exact v2 contracts and hashes; setting
 `include_arm_reachability=false` on v3 performs no IK. The annotation is not
 path planning, collision clearance, motion admission, or grasp-success proof.
@@ -666,10 +676,139 @@ The combined point-grasp profile also publishes a paired contract for the
 preferred downstream flow. `perception.plan_grasp_approach@1` accepts only a
 retained point-grasp operation ID, candidate ordinal, and speed scale. It binds
 the candidate to a fresh measured-qpos cut, applies the deployed TCP envelope,
-endpoint IK, production URDF/FCL scene, and full joint-path planner, then returns
+endpoint IK, production URDF/FCL scene, and staged reach planner, then returns
 either `path_found` or a bounded rejection reason. This inspection Route cannot
 dispatch motion or request HOLD. A successful result contains an immutable,
 session-local plan ID/hash with a maximum 30-second lifetime.
+
+The reach planner first validates a fixed-orientation Cartesian approach along
+tool +Z for each pregrasp IK branch, then connects globally to the set of exact,
+validated pregrasp joint states using a shared start tree and goal forest. The
+selected goal retains its original local approach; IK is not re-solved at the
+connection. A failed branch does not discard the remaining branches. It searches
+pregrasp distances from 60 mm down to a 20 mm minimum in 10 mm steps, preferring
+the longest fully feasible route rather than projecting a blocked pose. Local
+targets are at most 5 mm apart. Dense FK revalidation rejects lateral deviation
+above 2 mm, orientation deviation above 1 degree, reversed progress, or a joint
+branch step above 12 degrees. The final quintic samples also obey the 0.1-degree
+geometric resolution used by the collision/envelope checks. An already-reached
+exact target remains a HOLD trajectory; it does not back away and approach again.
+These values belong to `RM65GraspTrajectoryPlanningConfig`, not caller-controlled
+motion permits. Rejected near-field stages return typed reasons and preserve
+the complete lower diagnostics in the Gateway log; the published v1 result
+schema remains unchanged.
+
+Grasp planning uses `dual_arm_hand_proxy_grasp_full`: the existing strict URDF
+with non-adjacent real-arm mesh self-collision pairs, complete cross-arm pairs,
+and all moving links checked against the fixed table and camera poles. Existing
+proxy pairs remain enabled. Coarse link3/hand boxes are not reused for own-arm
+self-collision because they intentionally overlap normal arm structure; real
+arm meshes cover that check. The live teleop profile and its pair exclusions
+remain unchanged. The planner derives conservative convex hulls from the same
+CAD arm meshes, matching MuJoCo's mesh collision representation without changing
+the URDF, assets, or minimum-clearance requirement. This avoids comparing
+triangle-soup and convex-body geometry in replay.
+This strengthens arm coverage but does not supply a real,
+opening-dependent finger model or target-object contact validation.
+
+MuJoCo admission queries are clipped at the required preventive clearance,
+not a broad 50 mm diagnostic radius. On the installed 3.10 runtime, wide
+`mj_geomDistance` queries can incorrectly report a negative distance between
+separated convex meshes. Threshold-clipped queries preserve the same forbidden
+pairs and clearance requirement, including hard-penetration recovery checks.
+Reported far-away clearance is consequently a clipped lower bound, not an exact
+physical-distance measurement; actual-contact checks remain unchanged.
+
+The final grasp target remains strictly inside the configured envelope. If the
+fresh measured TCP of the moving arm starts outside only an absolute translation
+bound, the planner may construct a strictly-inside ingress waypoint without
+widening that envelope. This route is accepted only when the initial violation
+belongs exclusively to the moving arm, is at most 16 cm, monotonically approaches
+the envelope, passes dense URDF/FCL collision checks, and never leaves again after
+entry. Rotation violations, an out-of-envelope held arm, or any target outside
+the envelope still fail closed.
+
+起始测量 TCP 的包络准入检查现在先于多距离/多 IK 搜索进行。
+`start_state_safety_envelope_blocked` 表示起始状态问题，不是候选目标被拒绝；
+公开 diagnostics 保留投影对象、160 mm 上限及超出量。该修复不会扩大包络。
+
+GraspGenX 保留原模型位置，不再对预测进行未经重新评分的 X/Y 居中修正。
+GraspMoE 保留固定版本的插入深度，在 -4～0 cm 区间使用 5 mm 间隔，避免
+跳过支撑面附近较窄的合法插入区间；新增候选由 discriminator 重新评分，
+不复制旧分数。默认 `server_top_k=-1` 将完整已评分候选交给几何预筛，
+不先按模型高分截取 1000 个；最终展示预算仍为最多 5 个。显式正数上限
+仍可用于有意限制原始候选的调用，但可能丢失低分的合法方案。
+候选预算先分配给接近方向和闭合轴/位置家族，余量保留同家族的已评分
+深度/姿态变体；15 mm 家族聚类不再等同于删除，只去掉数值重复的姿态。
+`candidate_family_count` 与 `candidate_variant_count` 分别记录家族及独立变体数。
+端点 IK 仍只标注，
+不改变候选顺序。可见碰撞预筛使用分离的掌部/两指实体，指间空间不填充；
+要求零可见点侵入，并检查最大张开代理沿 +Z 接近 60 mm 的解析扫掠体，
+终点也使用同一名义张开状态；候选的百分位宽度只是夹持宽度估计，不能拿它
+作为非接触接近时的已测开度，也没有因此开放闭合动作。
+目标点与背景点分别记录且均不默认放行。成对的保留候选规划还在路径搜索
+和最终下发关节样本中检查夹爪代理，原有整臂 FCL、包络、时效和单次票据
+保护不变。捕获时自体过滤先以同一 4B2 CAD URDF、双臂测量 qpos 和主相机
+外参渲染机器人深度；因快照暂不包含手指关节状态，过滤器只在 URDF 合法范围
+内取五个有界手指状态。背景像素必须同时满足距渲染轮廓不超过 12 px、深度差
+不超过 15 mm 才归因于机器人，目标标签始终保留。随后仍以名义张开夹爪的
+5 mm 解析表面带做第二层补充。两层过滤都只作用于捕获时点云，不会随规划位姿
+动态删除点，不填充指间空间，也不删除接近扫掠区域。它们不用于路径碰撞查询，
+不改变 FCL 几何或 20 mm 最小间距，并分别记录 URDF、容差、删除计数和语义哈希。
+旧的绝对抓姿入口没有保留候选的 RGB-D 快照绑定，不提供这项
+观测夹爪检查；本轮验证建议使用成对的只读规划入口。
+
+实时 GraspGenX Route 增加可发现的 `point_grasp_rgbd_snapshot` 输出 Artifact，
+保存该次原始 RGB、float32 米制深度、SAM2 掩码、内参/外参和相机附近
+200 ms 内的双臂测量 qpos（相机独立模式显式记录无 qpos）。RPent 手动
+入口将其下载到 run-root/input/point_grasp_rgbd_snapshot.npz。
+推理之前另保留一次输入 Artifact，其路径与哈希写入 Gateway stderr，
+即使没有有效候选也能重现输入。缺少或损坏完成态快照时，不准入可执行计划。
+快照 capture 与 Gateway 冻结的保留结果先还原为相同 JSON 表示再比较哈希；
+不改变全局类型哈希规则，也不放行内容、字节长度或 SHA256 不一致。
+快照读取失败的具体类型和有界消息保留在 Gateway stderr；公开 v1 诊断字段不变。
+路径规划使用快照同次采集的双臂 qpos；CAD 深度过滤在保留原始目标掩码后构造
+固定可见场景，解析夹爪表面带再经下层 FK 补充过滤。最终轨迹诊断分别记录
+`captured_robot_observation_filter`、
+`excluded_captured_robot_background_points`、
+`excluded_captured_gripper_background_points` 和名义开度依据。原有整臂、桌面/相机杆、可见夹爪碰撞
+和最终下发轨迹检查保持开启。起点阻挡直接保留具体碰撞证据，不重复换随机种子。
+仅相机快照不补造 qpos，不做机器人自身过滤。
+GraspGenX 保留模型实际评分的抓姿朝向，不再以“腕部向上”旋转预测，也不将
+交换两指的 180° 朝向去重。平行夹爪的局部实体对称不代表完整机器人对称；
+真实 TCP 的偏心安装、手腕附件与 IK 分支可能使两种朝向的可行性不同。
+相近位置、接近轴和有向闭合轴的重复候选仍去重，输出仍按原评分和有限显示预算
+选择；每个保留朝向都须独立通过严格 IK、整臂碰撞与完整路径验证。不会为了
+IK 临时生成未评分的旋转候选或沿用另一预测的分数。
+抓取链先验证严格预抓取 IK 和连续分支接近段，再搜索包络入场和远场连接；连接
+复用已验证局部方案的准确关节分支，不在入场后重新求另一套局部 IK。局部无解时
+报告 `local_pregrasp_ik` 或 `local_approach_validation`，不先耗尽远场搜索预算。
+包络入场搜索以该次实际起点固定外边界，提前排除超出初始越界距离与已有进度容差、
+或扩大越界约束的样本；与密集复核复用投影及边界判定。BiRRT 查询没有路径顺序，
+不以随机查询更新“已入场”或最佳进度；完整路径仍须通过单调入场与入场后不再越界
+的原有密集复核。搜索到路径但复核拒绝时，日志保留具体复核详情，不只保留原因码。
+整臂碰撞搜索先以自适应加密边界（当前 30 mm）查询保守距离下界，远离边界时
+不逐对计算精确最小距离；边界附近仍计算所有碰撞对的精确距离，按原规则判定
+20 mm 安全余量与是否加密。查询不可用直接拒绝，不用精确查询掩盖故障。
+搜索缓存与普通精确缓存隔离，端点及最终密集轨迹复核仍使用原精确查询；不缩小
+碰撞几何、不减少碰撞对、不降低采样分辨率，也不放宽包络或 IK 容差。
+同一抓姿的已验证近场 IK 分支组成全局连接目标集合；每轮共享起点树、目标森林、
+碰撞查询缓存和节点/迭代/时间预算，而不是为每个终点重新搜索。搜索范围覆盖全部
+目标后逐轮扩展，最后一轮仍为原关节硬限位；确定性种子为基础种子加轮次。返回
+准确的目标序号和关节状态，再连接该分支原先验证的接近段。目标碰撞可剔除，
+任一查询不可用或输入不合法都停止；密集轨迹复核仍保留原检查。
+某条连接被密集复核拒绝时，下轮优先尝试其他分支，但不删除该目标或扩大总预算。
+这是同一用户选定抓姿内的多 IK 目标，不会在 v1 Skill 中静默改选其他抓姿。
+包络入场的多个目标按剩余总预算分配路由时间片，
+该时间片同时覆盖入场、连接到已验证局部分支和组合路径的精确复核。一个路由
+超时且总预算尚未耗尽时可尝试下一个路由；碰撞查询不可用仍停止。诊断分别保留
+路由时间片、总预算耗尽与各路由失败详情，不把局部超时解释为物理不可达。
+感知执行异常将有界类型/消息放入失败操作的 `progress_summary.failure_diagnostic`，
+RPent 在重试提示之前显示该诊断；无候选时 stderr 另保留完整筛选漏斗。
+
+这些检查的范围仍是可见点云与名义平行夹爪代理，不是未知空间自由证明，
+也没有验证实际夹爪开度、完整闭合运动、携物退出或真实抓取成功。
+`path_found` 不能当作端到端真机抓取验收；抓取/移动仍需独立 Skill 和后续验证。
 
 Motion remains a separate decision. `motion.execute_grasp_approach_plan@1`
 accepts only the advertised component ID and that exact plan ID/hash. It cannot
@@ -681,6 +820,30 @@ move the arm. A target outside the configured envelope remains a rejected path
 assessment and is not a reason to widen the envelope automatically. Its operator
 action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 `approach_grasp_pose` action does not authorize this Route, and vice versa.
+
+### 分阶段 Skill 边界
+
+显式路径规划对调用者是可选的，但安全准入不是可选的：调用者可以先使用
+`perception.plan_grasp_approach@1` 检查并选择计划，再调用
+`motion.execute_grasp_approach_plan@1`；已有、经过审阅的绝对抓姿也可以交给
+`motion.approach_grasp_pose@1`，由同一个下层规划器内部生成并验证 reach 轨迹。
+两条执行路径均只到达抓姿，不闭合夹爪。
+
+| 阶段 | 当前公开 Skill | 边界 |
+| --- | --- | --- |
+| 获取候选 | `perception.plan_point_grasp` | 仅感知提案；端点 IK 标注不是路径或抓取成功证据 |
+| 渲染候选 | `perception.render_point_grasp_candidate` | 只读；不改变候选、姿态或运动状态 |
+| 可选的显式 reach 规划 | `perception.plan_grasp_approach@1` | 只读；计划绑定会话、场景版本、起始 qpos 和时效 |
+| 到达抓姿 | `motion.execute_grasp_approach_plan@1` / `motion.approach_grasp_pose@1` | 独立运动授权；不自动闭合夹爪 |
+| 夹爪闭合 / 松开 | 尚未在此 worktree 公开 | 必须是独立执行 Skill，不能悄悄并入 reach |
+| 空手移动 | `motion.move_tcp_to_pose@1` | 不能作为携物碰撞验证的替代品 |
+
+当前 reach 准入验证真实机械臂连杆网格与部署的代理几何、固定桌面/相机杆和 TCP
+包络。成对规划另验证可见目标/背景与名义张开夹爪的非接触接近，但没有将
+观测障碍纳入整臂检查，也尚未验证随开度变化的真实夹爪实体、闭合过程、
+带物退出、放置或物理夹持成功。因此 `path_found` 的含义是“reach
+阶段在当前模型下通过”，不是“完整抓取链通过”；不能据此自动闭合、试抬
+或搬运。后续这些阶段必须有独立的场景/夹爪状态和接触规则证据后才可开放。
 
 The CLI is a concrete lower deployment leaf, not an Agent API. All files and
 the selected side/action are trusted operator inputs. The process exposes no
@@ -758,8 +921,9 @@ python -m agent_gateway.profiles.real.one_shot_client \
 ```
 
 `motion.approach_grasp_pose@1` resolves endpoint IK from the latest measured
-dual-arm qpos, keeps the inactive arm fixed, tries the direct joint path first,
-and invokes the bounded collision-aware planner only when needed. Every path is
+dual-arm qpos, keeps the inactive arm fixed, plans a collision-aware global path
+to pregrasp, and appends the same constrained Cartesian approach used by the
+paired read-only planner. Every path is
 densely rechecked with the production URDF/FCL collision model and the bound TCP
 workspace envelope before the existing lower owner can dispatch it. The lower
 owner atomically rechecks the trajectory start and inactive-arm hold at the

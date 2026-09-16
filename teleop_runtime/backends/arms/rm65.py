@@ -1931,7 +1931,15 @@ class RM65ArmBackend(EffectorBackend):
                 "deferred target activation requires the acceleration-limited planner"
             )
         anchor = np.asarray(accepted_qpos, dtype=float).reshape(6).copy()
-        activated = float(activated_monotonic_time)
+        sdk_completion_monotonic = float(activated_monotonic_time)
+        published_monotonic = float(deferred.timestamp_monotonic)
+        # A latest-nonblocking publisher may acquire ``_state_lock`` after the
+        # SDK call returned but before the worker records that completion.  In
+        # that ordering the deferred target is legitimately published a few
+        # microseconds after ``call_finished``.  Activation cannot precede
+        # publication, so advance the activation cut instead of presenting the
+        # newer target to the planner with an artificial future timestamp.
+        activated = max(sdk_completion_monotonic, published_monotonic)
         planner_before = self._stream_planner.snapshot()
         qd_before = np.asarray(
             planner_before["qd_command_rad_s"],
@@ -1940,7 +1948,7 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_planner.accept_target(
             deferred.qpos,
             sequence=int(deferred.sequence),
-            published_monotonic_time=float(deferred.timestamp_monotonic),
+            published_monotonic_time=published_monotonic,
             monotonic_time=activated,
             speed_scale=float(deferred.policy_speed_scale),
             mode=str(deferred.policy_mode),
@@ -1980,7 +1988,13 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_last_deferred_target_activation = {
             "completed_target_sequence": int(completed_target_sequence),
             "activated_target_sequence": int(deferred.sequence),
+            "sdk_completion_monotonic_time": sdk_completion_monotonic,
+            "published_monotonic_time": published_monotonic,
             "activated_monotonic_time": activated,
+            "publication_after_sdk_completion_sec": max(
+                0.0,
+                published_monotonic - sdk_completion_monotonic,
+            ),
             "planner_velocity_preserved": velocity_preserved,
             "planner_rebased_from_zero_velocity": False,
         }

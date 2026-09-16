@@ -4,20 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry, VisibleGraspScene
 
 from .dmtac_grasp_overlay import (
     DMTAC_M_FINGER_LENGTH_M,
+    DMTAC_M_FINGER_THICKNESS_M,
     DMTAC_M_PAD_HEIGHT_M,
     DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
     DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
@@ -26,14 +29,9 @@ from .graspgenx_client import GraspGenXInferenceBackend
 from .sam2_vgn_point_grasp import (
     DEFAULT_DMTAC_M_URDF,
     DEFAULT_DMTAC_M_URDF_SHA256,
-    DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
-    DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M,
-    DMTAC_M_TARGET_OPENING_CENTER_MAX_SHIFT_M,
-    PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
     PointGraspCandidate,
     PointGraspResult,
     Sam2VgnPointGraspPlanner,
-    select_upward_parallel_jaw_tcp_pose,
 )
 
 GRASPGENX_GIT_URL = "https://github.com/NVlabs/GraspGenX.git"
@@ -59,6 +57,7 @@ DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M = 0.006
 GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M = 0.015
 GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG = 15.0
 GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG = 20.0
+_LOGGER = logging.getLogger(__name__)
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -318,10 +317,11 @@ class Sam2GraspGenXPointGraspPlanner:
         client: GraspGenXInferenceBackend,
         planner: str = "graspmoe",
         num_grasps: int = 200,
-        server_top_k: int = 1_000,
+        server_top_k: int = -1,
         score_threshold: float = -1.0,
         max_gripper_width_m: float = 0.070,
         max_click_distance_m: float = 0.100,
+        solid_geometry: ParallelJawSolidGeometry | None = None,
     ) -> None:
         if not isinstance(model_spec, GraspGenXPointGraspModelSpec):
             raise TypeError("model_spec must be typed.")
@@ -335,8 +335,10 @@ class Sam2GraspGenXPointGraspPlanner:
             raise ValueError("planner must be 'graspmoe' or 'diffusion'.")
         if isinstance(num_grasps, bool) or not 1 <= int(num_grasps) <= 1_000:
             raise ValueError("num_grasps must be in [1, 1000].")
-        if isinstance(server_top_k, bool) or not 1 <= int(server_top_k) <= 1_000:
-            raise ValueError("server_top_k must be in [1, 1000].")
+        if isinstance(server_top_k, bool) or not (
+            int(server_top_k) == -1 or 1 <= int(server_top_k) <= 1_000
+        ):
+            raise ValueError("server_top_k must be -1 or in [1, 1000].")
         if not 0.0 < float(max_gripper_width_m) <= 0.070:
             raise ValueError("DMTAC M gripper width must be in (0, 0.070].")
         if not 0.0 < float(max_click_distance_m) <= 0.200:
@@ -353,12 +355,23 @@ class Sam2GraspGenXPointGraspPlanner:
         self.score_threshold = threshold
         self.max_gripper_width_m = float(max_gripper_width_m)
         self.max_click_distance_m = float(max_click_distance_m)
+        nominal_geometry = ParallelJawSolidGeometry(
+            DMTAC_M_PALM_FROM_TOOL_TCP_Z_M, DMTAC_M_FINGER_LENGTH_M,
+            DMTAC_M_FINGER_THICKNESS_M, DMTAC_M_PAD_HEIGHT_M,
+            self.max_gripper_width_m,
+        )
+        self._solid_geometry = solid_geometry if solid_geometry is not None else nominal_geometry
+        if not isinstance(self._solid_geometry, ParallelJawSolidGeometry):
+            raise TypeError("solid_geometry must be typed")
+        if replace(self._solid_geometry, tool_from_solid_xyz_m=(0, 0, 0),
+                   solid_yaw_rad=0) != nominal_geometry:
+            raise ValueError("GraspGenX adapter requires the reviewed nominal DMTAC M dimensions")
         self._lock = threading.RLock()
         self._started = False
         self._closed = False
         self._last_target_mask: np.ndarray | None = None
         self._last_plan_timing_ms: dict[str, float] = {}
-        self._last_filter_summary: dict[str, int | float | None] = {}
+        self._last_filter_summary: dict[str, int | float | str | None] = {}
 
     @property
     def semantic_content_hash(self) -> str:
@@ -378,37 +391,37 @@ class Sam2GraspGenXPointGraspPlanner:
                 "candidate_family_nms": {
                     "translation_m": GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M,
                     "approach_axis_deg": GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG,
-                    "closing_axis_symmetry_deg": (
+                    "oriented_closing_axis_deg": (
                         GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
                     ),
                 },
                 "candidate_selection": {
-                    "policy": "score_ordered_distinct_approach_first_v1",
+                    "policy": "balanced_approach_family_and_scored_variants_v3",
                     "approach_axis_deg": (
                         GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG
                     ),
-                    "fallback": "score_ordered_family_variants",
+                    "fallback": "score_ordered_scored_pose_variants",
+                    "duplicate_pose_atol": 1e-6,
                 },
                 "gripper": {
                     "profile": "DMTAC_M",
+                    "solid_geometry": asdict(self.solid_geometry),
                     "sweep_volume_v1": DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
-                    "model_base_from_tool_tcp_z_m": -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+                    "model_base_from_geometry_z_m": -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
                     "maximum_opening_m": self.max_gripper_width_m,
                     "width_clearance_m": DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
-                    "maximum_visible_collision_points": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
-                    "target_opening_center_max_shift_m": (
-                        DMTAC_M_TARGET_OPENING_CENTER_MAX_SHIFT_M
-                    ),
-                    "target_height_center_max_shift_m": (
-                        DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M
-                    ),
+                    "maximum_visible_collision_points": 0,
+                    "visible_endpoint_opening_m": self.max_gripper_width_m,
+                    "unscored_pose_translation_allowed": False,
+                    "visible_approach_sweep_distance_m": 0.060,
+                    "visible_approach_opening_m": self.max_gripper_width_m,
                     "tool_tcp_from_flange_m": [
                         0.0,
                         0.0,
                         DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
                     ],
-                    "parallel_jaw_wrist_symmetry_deg": [0, 180],
-                    "tcp_orientation_selection": PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
+                    "tcp_orientation_selection": "preserve_scored_model_orientation_v1",
+                    "finger_exchange_deduplication": False,
                 },
                 "simulation_urdf": DEFAULT_DMTAC_M_URDF,
                 "simulation_urdf_sha256": DEFAULT_DMTAC_M_URDF_SHA256,
@@ -431,7 +444,7 @@ class Sam2GraspGenXPointGraspPlanner:
             return dict(self._last_plan_timing_ms)
 
     @property
-    def last_filter_summary(self) -> dict[str, int | float | None]:
+    def last_filter_summary(self) -> dict[str, int | float | str | None]:
         with self._lock:
             return dict(self._last_filter_summary)
 
@@ -544,7 +557,7 @@ class Sam2GraspGenXPointGraspPlanner:
         )
         timing["graspgenx_inference"] = (time.perf_counter() - stage_started) * 1000.0
         stage_started = time.perf_counter()
-        filter_summary: dict[str, int | float | None] = {}
+        filter_summary: dict[str, int | float | str | None] = {}
         candidates = self._rank(
             grasps,
             scores,
@@ -569,6 +582,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            _LOGGER.error("No point-grasp candidate survived: filter_summary=%s", summary_json)
             raise RuntimeError(
                 "No visible collision-free DMTAC M GraspGenX candidate belongs "
                 f"to the clicked region: filter_summary={summary_json}"
@@ -597,18 +611,31 @@ class Sam2GraspGenXPointGraspPlanner:
         depth: np.ndarray,
         intrinsics: Mapping[str, float],
         maximum: int,
-        filter_summary: dict[str, int | float | None] | None = None,
+        filter_summary: dict[str, int | float | str | None] | None = None,
     ) -> tuple[PointGraspCandidate, ...]:
         model_base_from_tcp = np.eye(4, dtype=np.float64)
         model_base_from_tcp[2, 3] = -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
         camera_from_base = np.linalg.inv(base_from_camera)
+        scene = VisibleGraspScene.from_depth(
+            depth_m=depth,
+            target_mask=self.last_target_mask,
+            intrinsics=intrinsics,
+            reference_from_camera=np.eye(4),
+            # Inference and capture checks use the +X-closing model geometry
+            # frame. Convert to the real controller TCP only at the output.
+            geometry=replace(self.solid_geometry, tool_from_solid_xyz_m=(0, 0, 0),
+                             solid_yaw_rad=0),
+        )
         ranked: list[tuple[float, float, float, float, np.ndarray, np.ndarray]] = []
-        counts: dict[str, int | float | None] = {
+        counts: dict[str, int | float | str | None] = {
             "detected": 0,
             "width_valid": 0,
             "target_capture_valid": 0,
             "click_distance_valid": 0,
             "visible_collision_valid": 0,
+            "visible_approach_valid": 0,
+            "target_solid_collision_rejected": 0,
+            "background_solid_collision_rejected": 0,
             "width_valid_downward_approach_count": 0,
             "target_capture_downward_approach_count": 0,
             "downward_approach_count": 0,
@@ -629,6 +656,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 DMTAC_M_PALM_FROM_TOOL_TCP_Z_M + DMTAC_M_FINGER_LENGTH_M
             ),
             "capture_half_pad_height_m": DMTAC_M_PAD_HEIGHT_M / 2.0,
+            "capture_coordinate_frame": "grasp_geometry",
         }
         for base_from_model_base, raw_score in zip(grasps, scores, strict=True):
             counts["detected"] = int(counts["detected"]) + 1
@@ -641,20 +669,9 @@ class Sam2GraspGenXPointGraspPlanner:
                 continue
             base_from_tcp = base_from_model_base @ model_base_from_tcp
             camera_from_tcp = camera_from_base @ base_from_tcp
-            camera_from_tcp, base_from_tcp = select_upward_parallel_jaw_tcp_pose(
-                camera_from_tcp, base_from_tcp
-            )
-            # GraspGenX predicts the gripper pose against a sampled object
-            # cloud, so a useful orientation may still miss the physical pad
-            # centre by a few millimetres.  Reuse the embodiment-owned bounded
-            # X/Y correction used by VGN.  This changes neither approach depth
-            # nor orientation and remains subject to the full capture-volume
-            # and visible-collision checks below.
-            camera_from_tcp = Sam2VgnPointGraspPlanner._center_tcp_on_target(
-                camera_from_tcp,
-                target_points_camera,
-            )
-            base_from_tcp = base_from_camera @ camera_from_tcp
+            # Preserve both translation and orientation of each scored pose.
+            # Finger exchange preserves the nominal jaw solids, not the whole
+            # mounted robot or its eccentric controller TCP and IK feasibility.
             camera_from_tcp = _strict_rigid_matrix(
                 camera_from_tcp,
                 field_name="GraspGenX camera_from_tcp candidate",
@@ -746,13 +763,37 @@ class Sam2GraspGenXPointGraspPlanner:
             if click_distance > self.max_click_distance_m:
                 continue
             counts["click_distance_valid"] = int(counts["click_distance_valid"]) + 1
-            if not Sam2VgnPointGraspPlanner._visible_collision_free(
-                camera_from_tcp, width, depth, intrinsics
-            ):
+            target_hits, background_hits = scene.collision_counts(
+                # This is the noncontact end of approach, not a closure state.
+                # The percentile-derived width remains a proposal estimate;
+                # it is not measured jaw opening or validated contact geometry.
+                camera_from_tcp, opening_m=self.max_gripper_width_m
+            )
+            if target_hits or background_hits:
+                counts["target_solid_collision_rejected"] = int(
+                    counts["target_solid_collision_rejected"]
+                ) + int(bool(target_hits))
+                counts["background_solid_collision_rejected"] = int(
+                    counts["background_solid_collision_rejected"]
+                ) + int(bool(background_hits))
                 continue
             counts["visible_collision_valid"] = int(
                 counts["visible_collision_valid"]
             ) + 1
+            target_hits, background_hits = scene.approach_collision_counts(
+                camera_from_tcp,
+                opening_m=self.max_gripper_width_m,
+                distance_m=0.060,
+            )
+            if target_hits or background_hits:
+                counts["target_solid_collision_rejected"] = int(
+                    counts["target_solid_collision_rejected"]
+                ) + int(bool(target_hits))
+                counts["background_solid_collision_rejected"] = int(
+                    counts["background_solid_collision_rejected"]
+                ) + int(bool(background_hits))
+                continue
+            counts["visible_approach_valid"] = int(counts["visible_approach_valid"]) + 1
             for name, combine in (
                 ("min_downward_approach_cosine", min),
                 ("max_downward_approach_cosine", max),
@@ -785,32 +826,40 @@ class Sam2GraspGenXPointGraspPlanner:
         ] = []
         for item in ranked:
             pose = item[4]
-            if any(
-                self._same_candidate_family(pose, previous[4])
-                for previous in deduplicated
-            ):
+            if any(np.allclose(pose, previous[4], rtol=0, atol=1e-6)
+                   for previous in deduplicated):
                 continue
             deduplicated.append(item)
 
-        # GraspMoE's OBB expert can assign its highest scores to a dense yaw
-        # sweep of one top-down pose.  Those yaws are useful alternatives, but
-        # allowing them to occupy every returned slot hides lower-scored 6-DoF
-        # diffusion poses with materially different approach directions.  Pick
-        # one representative from each approach cone first, then fill any
-        # remaining slots with the best score-ordered family variants.  The
-        # final membership remains ordered by score for the operator display.
+        # A family is a display-priority group, not an IK-equivalence class.
+        # Nearby scored depths can differ in support clearance and arm feasibility.
+        family_indices: list[int] = []
+        for index, item in enumerate(deduplicated):
+            if not any(self._same_candidate_family(item[4], deduplicated[previous][4])
+                       for previous in family_indices):
+                family_indices.append(index)
         representative_indices, selected_indices = (
             self._distinct_approach_first_indices(
-                tuple(item[4] for item in deduplicated),
+                tuple(deduplicated[index][4] for index in family_indices),
                 maximum=maximum,
             )
         )
+        selected_indices = [family_indices[index] for index in selected_indices]
+        selected_set = set(selected_indices)
+        for index in range(len(deduplicated)):
+            if len(selected_indices) == maximum:
+                break
+            if index not in selected_set:
+                selected_indices.append(index)
+                selected_set.add(index)
         selected = [deduplicated[index] for index in sorted(selected_indices)]
-        counts["candidate_family_count"] = len(deduplicated)
+        counts["candidate_family_count"] = len(family_indices)
+        counts["candidate_variant_count"] = len(deduplicated)
         counts["distinct_approach_count"] = len(representative_indices)
         counts["selected"] = len(selected)
         if filter_summary is not None:
             filter_summary.update(counts)
+        geometry_from_tool = np.linalg.inv(self.solid_geometry.solid_pose(np.eye(4)))
         return tuple(
             PointGraspCandidate(
                 score=float(score),
@@ -818,10 +867,14 @@ class Sam2GraspGenXPointGraspPlanner:
                 click_distance_m=float(click_distance),
                 gripper_width_m=float(width),
                 camera_from_tcp=tuple(
-                    float(value) for value in camera_from_tcp.reshape(-1)
+                    float(value) for value in (
+                        camera_from_tcp @ geometry_from_tool
+                    ).reshape(-1)
                 ),
                 base_from_tcp=tuple(
-                    float(value) for value in base_from_tcp.reshape(-1)
+                    float(value) for value in (
+                        base_from_tcp @ geometry_from_tool
+                    ).reshape(-1)
                 ),
                 visible_collision_free=True,
             )
@@ -843,11 +896,10 @@ class Sam2GraspGenXPointGraspPlanner:
             GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG
         ):
             return False
-        # Rotating a parallel-jaw grasp around its approach axis changes the
-        # closing direction and must remain selectable.  Only identify closing
-        # axes up to sign because exchanging the two fingers is equivalent.
+        # Finger exchange is not a whole-robot symmetry. Keep opposite scored
+        # closing axes for independent controller-TCP IK and path validation.
         closing_cosine = float(
-            np.clip(abs(np.dot(first[:3, 0], second[:3, 0])), 0.0, 1.0)
+            np.clip(np.dot(first[:3, 0], second[:3, 0]), -1.0, 1.0)
         )
         closing_axis_angle = math.acos(closing_cosine)
         return closing_axis_angle < math.radians(
@@ -879,10 +931,23 @@ class Sam2GraspGenXPointGraspPlanner:
                 continue
             representative_indices.append(index)
 
-        selected_indices = representative_indices[:maximum]
+        direction_budget = maximum if maximum <= 2 else math.ceil(maximum / 2)
+        selected_indices = representative_indices[:direction_budget]
         if len(selected_indices) < maximum:
             selected_set = set(selected_indices)
+            represented = tuple(poses[index] for index in selected_indices)
+            for index, pose in enumerate(poses):
+                if index in selected_set or not any(
+                    cls._same_approach_cone(pose, previous) for previous in represented
+                ):
+                    continue
+                selected_indices.append(index)
+                selected_set.add(index)
+                if len(selected_indices) == maximum:
+                    break
             for index in range(len(poses)):
+                if len(selected_indices) == maximum:
+                    break
                 if index in selected_set:
                     continue
                 selected_indices.append(index)
@@ -890,6 +955,10 @@ class Sam2GraspGenXPointGraspPlanner:
                 if len(selected_indices) == maximum:
                     break
         return representative_indices, selected_indices
+
+    @property
+    def solid_geometry(self) -> ParallelJawSolidGeometry:
+        return self._solid_geometry
 
 
 __all__ = [

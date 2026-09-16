@@ -35,6 +35,7 @@ from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPortConfig,
 )
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC,
     RM65GraspTrajectoryPlanningError,
 )
 
@@ -109,6 +110,13 @@ def _no_op_point_grasp_validator(
 
 
 def _planning_fixture(*, planner):
+    from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
+    # Explicit geometry fixture: route tests exercise control/plan lifecycles,
+    # not physical grasp success. The real profile reads hash-bound Artifacts.
+    scene = VisibleGraspScene(
+        points=np.empty((0, 3)), target_mask=np.empty(0, dtype=bool),
+        geometry=ParallelJawSolidGeometry(-0.043, 0.05, 0.01, 0.0255, 0.07),
+    )
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
         frame_id="canonical_station",
@@ -246,6 +254,7 @@ def _planning_fixture(*, planner):
         motion_port=port,
         frame_graph=graph,
         grasp_trajectory_planner=planner,
+        visible_scene_reader=lambda _operation, _source: scene,
         plan_store=store,
         runtime_session_id=registration.binding.runtime_session_id,
         current_station_revision=lambda: 7,
@@ -285,6 +294,66 @@ def _stationary_trajectory(qpos_by_side) -> RealAgentJointTrajectory:
         },
         planner_evidence_refs=("rm65-production-urdf-fcl-path:test",),
     )
+
+
+def test_planning_route_deadline_outlives_internal_planner_budget() -> None:
+    registration, *_ = _planning_fixture(planner=lambda **_kwargs: None)
+
+    route = registration.skill.routes[0]
+
+    assert route.max_operation_duration_ms == 135_000
+    assert route.max_operation_duration_ms > int(
+        RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC * 1000.0
+    )
+    assert route.control_effect_class == "read_only"
+    assert route.may_move_robot is False
+
+
+def test_graspgenx_missing_snapshot_cannot_publish_an_executable_plan() -> None:
+    calls = []
+    _, provider, _, _, request, operation = _planning_fixture(
+        planner=lambda **kwargs: calls.append(kwargs)
+    )
+    provider.visible_scene_reader = None
+    result, plan = provider.plan_request(request, operation)
+    assert result["reason_code"] == "grasp_scene_snapshot_unavailable"
+    assert result["planning_status"] == "rejected"
+    assert plan is None and calls == []
+
+
+@pytest.mark.parametrize("message", ["bad frame binding", "first line\nsecond line", "x" * 900])
+def test_graspgenx_snapshot_failure_is_retained_as_read_only_rejection(caplog, message) -> None:
+    calls = []
+    _, provider, _, _, request, operation = _planning_fixture(
+        planner=lambda **kwargs: calls.append(kwargs)
+    )
+    def broken_reader(*_args):
+        raise ValueError(message)
+    provider.visible_scene_reader = broken_reader
+    result, plan = provider.plan_request(request, operation)
+    assert result["reason_code"] == "grasp_scene_snapshot_invalid"
+    assert result["diagnostics"] == {"exception_type": "ValueError"}
+    assert plan is None and calls == []
+    assert repr(" ".join(message.split())[:512]) in caplog.text
+    if len(message) > 512:
+        assert message not in caplog.text
+
+
+def test_start_state_rejection_keeps_subject_and_unchanged_ingress_bound() -> None:
+    def planner(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError("start_state_safety_envelope_blocked", details={
+            "envelope_projection_subject": "current_measured_solver_tcp",
+            "maximum_path_envelope_ingress_distance_m": 0.16,
+            "path_envelope_ingress_distance_excess_m": 0.0007339041,
+            "envelope_ingress_rejection": "initial_distance_exceeds_limit",
+        })
+    registration, provider, _, _, request, operation = _planning_fixture(planner=planner)
+    result, plan = provider.plan_request(request, operation)
+    registration.payload_validator.validate_execution_result(result)
+    assert result["reason_code"] == "start_state_safety_envelope_blocked"
+    assert result["diagnostics"]["maximum_path_envelope_ingress_distance_m"] == 0.16
+    assert result["diagnostics"]["envelope_projection_subject"] == "current_measured_solver_tcp"
+    assert plan is None
 
 
 def test_path_found_is_read_only_and_produces_one_use_immutable_plan() -> None:
@@ -381,6 +450,103 @@ def test_planner_rejection_returns_evidence_without_motion_or_hold() -> None:
     )
     assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
     assert port.snapshot().dispatch_count == 0
+
+
+def test_approach_rejection_retains_full_details_without_changing_v1_schema(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def planner(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError(
+            "approach_lateral_deviation",
+            details={
+                "segment_index": 2,
+                "edge_sample_index": 4,
+                "lateral_error_m": 0.0034,
+                "maximum_lateral_error_m": 0.002,
+            },
+        )
+
+    registration, provider, _store, port, request, operation = _planning_fixture(
+        planner=planner
+    )
+
+    result, plan = provider.plan_request(request, operation)
+
+    assert plan is None
+    assert result["reason_code"] == "approach_lateral_deviation"
+    assert result["diagnostics"] == {"segment_index": 2, "edge_sample_index": 4}
+    assert "lateral_error_m" in caplog.text
+    assert "0.0034" in caplog.text
+    registration.payload_validator.validate_execution_result(result)
+    assert port.snapshot().phase == RealAgentMotionPhase.INACTIVE
+    assert port.snapshot().dispatch_count == 0
+
+
+def test_approach_ik_rejection_uses_existing_residual_diagnostic_fields() -> None:
+    error = RM65GraspTrajectoryPlanningError(
+        "approach_ik_search_exhausted",
+        details={
+            "solve_cycles": 180,
+            "position_residual_m": 0.004,
+            "orientation_residual_deg": 1.2,
+            "approach_waypoint_index": 3,
+        },
+    )
+
+    assert RealGraspApproachPlanProvider._diagnostics(error) == {
+        "cycles": 180,
+        "best_position_residual_m": 0.004,
+        "best_orientation_residual_deg": 1.2,
+    }
+
+
+def test_planner_rejection_surfaces_nested_dense_path_diagnostics() -> None:
+    error = RM65GraspTrajectoryPlanningError(
+        "path_target_safety_envelope_blocked",
+        details={
+            "endpoint_candidate_count": 3,
+            "last_dense_revalidation_error": {
+                "reason_code": "path_target_safety_envelope_blocked",
+                "details": {
+                    "modified_sides": ("right",),
+                    "segment_index": 0,
+                    "edge_sample_index": 0,
+                    "envelope_projection_by_side": {
+                        "right": {
+                            "translation_modified": True,
+                            "rotation_modified": False,
+                            "translation_adjustment_m": 0.12014,
+                            "rotation_adjustment_deg": 0.0,
+                            "violated_translation_constraints": ["absolute:y:max"],
+                            "active_translation_constraints": ["absolute:y:max"],
+                            "raw_target_xyz_m": [-0.3324, 0.22014, 0.2012],
+                            "effective_target_xyz_m": [-0.3324, 0.1, 0.2012],
+                        }
+                    },
+                    "envelope_ingress_rejection": "path_moved_away_from_envelope",
+                },
+            },
+        },
+    )
+
+    assert RealGraspApproachPlanProvider._diagnostics(error) == {
+        "modified_sides": ["right"],
+        "segment_index": 0,
+        "edge_sample_index": 0,
+        "envelope_projection_by_side": {
+            "right": {
+                "translation_modified": True,
+                "rotation_modified": False,
+                "translation_adjustment_m": 0.12014,
+                "rotation_adjustment_deg": 0.0,
+                "violated_translation_constraints": ["absolute:y:max"],
+                "active_translation_constraints": ["absolute:y:max"],
+                "raw_target_xyz_m": [-0.3324, 0.22014, 0.2012],
+                "effective_target_xyz_m": [-0.3324, 0.1, 0.2012],
+            }
+        },
+        "envelope_ingress_rejection": "path_moved_away_from_envelope",
+    }
 
 
 @pytest.fixture

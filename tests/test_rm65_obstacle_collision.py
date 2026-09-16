@@ -160,6 +160,62 @@ def test_attached_box_proxy_tracks_parent_frame_without_mutating_live_model() ->
     assert len(collision_model.geometryObjects) == initial_geometry_count
 
 
+@pytest.mark.parametrize("early_exit", [False, True])
+def test_search_guard_preserves_safety_and_refinement_band_without_poisoning_cache(early_exit) -> None:
+    model, collision_model = _simple_prismatic_collision_model()
+    kwargs = dict(model=model, base_collision_model=collision_model,
+                  reference_full_q=np.zeros(model.nq), qpos_indices_by_component={"arm": (0,)},
+                  scene=_scene(center_x=0.5, clearance=0.02))
+    oracle = RM65ObstacleCollisionOracle(**kwargs, stop_at_first_clearance_violation=early_exit)
+    exact = RM65ObstacleCollisionOracle(**kwargs)
+    for x in (0.0, 0.31, 0.32, 0.325, 0.33, 0.34, 0.5):
+        qpos = {"arm": np.array([x])}
+        expected = exact.check(qpos)
+        search = oracle.check_for_search(qpos, refinement_distance_m=0.03)
+        assert search.collision_check_available == expected.collision_check_available
+        assert search.safe == expected.safe
+        assert (search.minimum_distance_m <= 0.03) == (expected.minimum_distance_m <= 0.03)
+        assert search.metadata["minimum_clearance_m"] == 0.02
+        assert search.metadata["search_guard_clearance_m"] == 0.03
+        assert search.metadata["collision_pair_count"] == expected.metadata["collision_pair_count"]
+        if expected.minimum_distance_m <= 0.03:
+            assert search.minimum_distance_m == pytest.approx(expected.minimum_distance_m, abs=1e-9)
+            assert search.metadata["query_mode"] == "all_pair_minimum_distance"
+        assert oracle.check_for_search(qpos, refinement_distance_m=0.03) is search
+        ordinary = oracle.check(qpos)
+        assert ordinary.minimum_distance_m == pytest.approx(expected.minimum_distance_m, abs=1e-9)
+        assert ordinary is not search
+    assert oracle.scene_hash == exact.scene_hash
+
+
+@pytest.mark.parametrize("margin", [-0.01, float("nan"), float("inf")])
+def test_search_guard_rejects_invalid_refinement_distance(margin) -> None:
+    model, collision_model = _simple_prismatic_collision_model()
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision_model,
+        reference_full_q=np.zeros(model.nq), qpos_indices_by_component={"arm": (0,)}, scene=_scene())
+    with pytest.raises(ValueError, match="refinement_distance_m"):
+        oracle.check_for_search({"arm": np.zeros(1)}, refinement_distance_m=margin)
+
+
+def test_search_guard_failure_is_not_hidden_by_exact_retry(monkeypatch) -> None:
+    from types import SimpleNamespace
+    model, collision_model = _simple_prismatic_collision_model()
+    oracle = RM65ObstacleCollisionOracle(model=model, base_collision_model=collision_model,
+        reference_full_q=np.zeros(model.nq), qpos_indices_by_component={"arm": (0,)}, scene=_scene())
+    qpos = {"arm": np.zeros(1)}
+    assert oracle.check(qpos).safe
+    def fail(*_):
+        raise RuntimeError("guard query failed")
+    monkeypatch.setattr(oracle, "_pin", SimpleNamespace(computeCollisions=fail))
+    unavailable = oracle.check_for_search(qpos, refinement_distance_m=0.03)
+    assert not unavailable.safe
+    assert not unavailable.collision_check_available
+    assert unavailable.reason == "pinocchio_fcl_collision_query_failed"
+    invalid = oracle.check_for_search({"wrong": np.zeros(1)}, refinement_distance_m=0.03)
+    assert not invalid.collision_check_available
+    assert invalid.reason == "invalid_collision_query"
+
+
 def test_frame_contract_mismatch_is_rejected_before_geometry_construction() -> None:
     model, collision_model = _simple_prismatic_collision_model()
     with pytest.raises(ValueError, match="reference_frame_id"):

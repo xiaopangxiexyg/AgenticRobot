@@ -38,6 +38,7 @@ from deployments.perception import (
 )
 from deployments.perception.dmtac_grasp_overlay import (
     DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
+    reviewed_4b2_cad_solid_geometry,
 )
 from robot_motion.rm65 import RM65_BIMANUAL_POSITION_V1_NAME
 from teleop_runtime.skill_deploy import (
@@ -857,6 +858,7 @@ def main(argv: list[str] | None = None) -> int:
                     model_spec=point_grasp_spec,
                     point_segmenter=object_localizer,
                     client=graspgenx_backend,
+                    solid_geometry=reviewed_4b2_cad_solid_geometry(),
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid point-grasp model bundle: {error}")

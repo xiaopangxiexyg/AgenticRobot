@@ -247,6 +247,40 @@ def test_bounded_search_exhaustion_does_not_claim_kinematic_unreachability() -> 
     assert result.metadata["search_is_complete"] is False
 
 
+def test_wall_time_budget_returns_typed_partial_search_result() -> None:
+    now = [0.0]
+
+    class _SlowClearOracle:
+        def check(self, _qpos_by_component):
+            now[0] += 0.1
+            return JointConfigurationCheck(safe=True)
+
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [0.0]},
+        target_qpos_by_component={"left": [1.0]},
+        movable_components=("left",),
+        oracle=_SlowClearOracle(),
+        config=_planner_config(
+            edge_resolution_rad=0.01,
+            time_budget_sec=0.25,
+        ),
+        monotonic=lambda: now[0],
+    )
+
+    assert result.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+    assert result.reason == "time_budget_exhausted"
+    assert result.waypoints == ()
+    assert result.metadata["search_termination"] == "time_budget_exhausted"
+    assert result.metadata["termination_phase"] == "direct_edge"
+    assert result.metadata["time_budget_sec"] == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("value", (0.0, -1.0, float("nan"), float("inf")))
+def test_wall_time_budget_must_be_positive_and_finite(value: float) -> None:
+    with pytest.raises(ValueError, match="time_budget_sec"):
+        JointPathPlannerConfig(time_budget_sec=value)
+
+
 def test_inactive_target_change_is_an_invalid_request() -> None:
     result = plan_collision_aware_joint_path(
         start_qpos_by_component={"left": [0.0], "right": [1.0]},
@@ -327,3 +361,165 @@ def test_unbound_oracle_cannot_be_labeled_with_an_unverified_scene_hash() -> Non
     assert accepted.status is JointPathStatus.PATH_FOUND
     assert accepted.scene_hash is None
     assert accepted.metadata["scene_binding"] == "unbound_oracle"
+
+
+def test_shared_goal_forest_finds_other_branch_when_primary_is_disconnected() -> None:
+    class _BoxAndWall(_PlanarBoxOracle):
+        def check(self, qpos_by_component):
+            assessment = super().check(qpos_by_component)
+            x = float(qpos_by_component["left"][0])
+            return JointConfigurationCheck(safe=assessment.safe and not 0.8 <= x <= 0.9)
+
+    oracle = _BoxAndWall()
+    arguments = dict(
+        start_qpos_by_component={"left": [-1.0, 0.0], "right": [4.0, 5.0]},
+        target_qpos_by_component={"left": [1.2, 0.0], "right": [4.0, 5.0]},
+        alternative_target_qpos_by_component=({"left": [0.6, 0.0], "right": [4.0, 5.0]},),
+        movable_components=("left",), oracle=oracle, config=_planner_config(),
+        joint_lower_by_component={"left": [-1.5, -1.0]},
+        joint_upper_by_component={"left": [1.5, 1.0]},
+    )
+    result = plan_collision_aware_joint_path(**arguments)
+    assert result.status is JointPathStatus.PATH_FOUND
+    assert result.metadata["direct_path"] is False
+    assert result.metadata["shared_goal_search"] is True
+    assert result.metadata["selected_target_index"] == 1
+    assert result.metadata["target_count"] == 2
+    assert result.metadata["shortcut_revalidated"] is True
+    np.testing.assert_array_equal(result.target_qpos_by_component["left"], [0.6, 0.0])
+    np.testing.assert_array_equal(result.waypoints[-1]["left"], [0.6, 0.0])
+    assert all(np.array_equal(query["right"], [4.0, 5.0]) for query in oracle.queries)
+    query_keys = [query["left"].tobytes() for query in oracle.queries]
+    assert len(query_keys) == len(set(query_keys))
+    for left, right in zip(result.waypoints, result.waypoints[1:]):
+        count = max(1, int(np.ceil(np.max(np.abs(right["left"] - left["left"])) / 0.025)))
+        for alpha in np.linspace(0.0, 1.0, count + 1):
+            x, y = left["left"] + alpha * (right["left"] - left["left"])
+            assert not (abs(x) <= 0.25 and abs(y) <= 0.30)
+            assert not 0.8 <= x <= 0.9
+    repeated = plan_collision_aware_joint_path(**{**arguments, "oracle": _BoxAndWall()})
+    assert [q["left"].tolist() for q in repeated.waypoints] == [q["left"].tolist() for q in result.waypoints]
+    primary_only = plan_collision_aware_joint_path(**{
+        **arguments, "oracle": _BoxAndWall(), "alternative_target_qpos_by_component": (),
+    })
+    assert primary_only.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+
+
+@pytest.mark.parametrize("alternative, expected", [
+    ([1.0, 0.7], JointPathStatus.PATH_FOUND),
+    ([0.1, 0.1], JointPathStatus.TARGET_BLOCKED),
+])
+def test_goal_set_skips_blocked_endpoint_but_reports_all_blocked(alternative, expected) -> None:
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-1.0, 0.7]},
+        target_qpos_by_component={"left": [0.0, 0.0]},
+        alternative_target_qpos_by_component=({"left": alternative},),
+        movable_components=("left",), oracle=_PlanarBoxOracle(), config=_planner_config(),
+    )
+    assert result.status is expected
+    assert len(result.metadata["target_checks"]) == 2
+    if expected is JointPathStatus.PATH_FOUND:
+        assert result.metadata["selected_target_index"] == 1
+        np.testing.assert_array_equal(result.target_qpos_by_component["left"], alternative)
+    else:
+        assert result.waypoints == ()
+
+
+@pytest.mark.parametrize("alternative", [
+    "not-a-qpos-mapping",
+    {"left": [1.0], "right": [4.1, 5.0]},
+    {"left": [1.0, 0.7], "right": [4.1, 5.0]},
+    {"left": [1.0, 0.7]},
+    {"left": [float("nan"), 0.7], "right": [4.0, 5.0]},
+    {"left": [1.6, 0.7], "right": [4.0, 5.0]},
+])
+def test_invalid_goal_set_is_rejected_before_any_collision_query(alternative) -> None:
+    oracle = _PlanarBoxOracle()
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-1.0, 0.7], "right": [4.0, 5.0]},
+        target_qpos_by_component={"left": [1.0, 0.7], "right": [4.0, 5.0]},
+        alternative_target_qpos_by_component=(alternative,),
+        movable_components=("left",), oracle=oracle,
+        joint_lower_by_component={"left": [-1.5, -1.0]},
+        joint_upper_by_component={"left": [1.5, 1.0]},
+    )
+    assert result.status is JointPathStatus.INVALID_REQUEST
+    assert result.waypoints == ()
+    assert oracle.queries == []
+
+
+def test_goal_set_backend_failure_cannot_be_hidden_by_an_already_reachable_goal() -> None:
+    class _FailingSecondGoal:
+        def check(self, qpos_by_component):
+            failed = float(qpos_by_component["left"][0]) == 2.0
+            return JointConfigurationCheck(safe=not failed, collision_check_available=not failed)
+
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [0.0]},
+        target_qpos_by_component={"left": [0.0]},
+        alternative_target_qpos_by_component=({"left": [2.0]},),
+        movable_components=("left",), oracle=_FailingSecondGoal(),
+    )
+    assert result.status is JointPathStatus.COLLISION_CHECK_UNAVAILABLE
+    assert result.waypoints == ()
+
+
+def test_goal_set_uses_one_wall_time_budget_including_endpoint_checks() -> None:
+    now = [0.0]
+    calls = [0]
+
+    class _SlowOracle:
+        def check(self, _qpos_by_component):
+            calls[0] += 1
+            now[0] += 0.1
+            return JointConfigurationCheck(safe=True)
+
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [0.0]},
+        target_qpos_by_component={"left": [1.0]},
+        alternative_target_qpos_by_component=tuple({"left": [float(i)]} for i in range(2, 10)),
+        movable_components=("left",), oracle=_SlowOracle(),
+        config=_planner_config(time_budget_sec=0.25), monotonic=lambda: now[0],
+    )
+    assert result.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+    assert result.reason == "time_budget_exhausted"
+    assert result.metadata["termination_phase"] == "target_check"
+    assert result.waypoints == ()
+    assert calls[0] == 3
+
+
+def test_goal_roots_count_against_shared_node_budget() -> None:
+    oracle = _PlanarBoxOracle()
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-1.0, 0.0]},
+        target_qpos_by_component={"left": [1.0, 0.0]},
+        alternative_target_qpos_by_component=({"left": [1.1, 0.0]},),
+        movable_components=("left",), oracle=oracle, config=_planner_config(max_nodes=3),
+    )
+    assert result.status is JointPathStatus.PATH_SEARCH_EXHAUSTED
+    assert result.metadata["search_node_count"] == 3
+    assert result.waypoints == ()
+    oracle = _PlanarBoxOracle()
+    invalid = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-1.0, 0.0]},
+        target_qpos_by_component={"left": [1.0, 0.0]},
+        alternative_target_qpos_by_component=({"left": [1.1, 0.0]},),
+        movable_components=("left",), oracle=oracle, config=_planner_config(max_nodes=2),
+    )
+    assert invalid.status is JointPathStatus.INVALID_REQUEST
+    assert oracle.queries == []
+
+
+def test_expired_budget_never_starts_a_collision_query() -> None:
+    clock = iter((0.0, 1.0))
+    oracle = _PlanarBoxOracle()
+    result = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-1.0, 0.7]},
+        target_qpos_by_component={"left": [1.0, 0.7]},
+        movable_components=("left",), oracle=oracle,
+        config=_planner_config(time_budget_sec=0.1), monotonic=lambda: next(clock),
+    )
+    assert result.reason == "time_budget_exhausted"
+    assert result.metadata["termination_phase"] == "start_check"
+    assert result.waypoints == ()
+    assert oracle.queries == []

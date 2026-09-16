@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from types import MappingProxyType
 from typing import Any
@@ -250,9 +250,11 @@ class RM65ObstacleCollisionOracle:
         self._stop_at_first_clearance_violation = (
             stop_at_first_clearance_violation
         )
+        self._collision_query_margin_m: float | None = None
         if self._stop_at_first_clearance_violation:
             for request in self._collision_data.collisionRequests:
                 request.security_margin = float(scene.minimum_clearance_m)
+            self._collision_query_margin_m = float(scene.minimum_clearance_m)
         self._reference_full_q = reference.copy()
         self._indices = MappingProxyType(index_map)
         self._scene = scene
@@ -262,6 +264,7 @@ class RM65ObstacleCollisionOracle:
         self._moving_geometry_ids = moving_geometry_ids
         self._obstacle_pair_geometry_ids = obstacle_pair_geometry_ids
         self._check_cache: dict[bytes, JointConfigurationCheck] = {}
+        self._search_check_cache: dict[tuple[float, bytes], JointConfigurationCheck] = {}
 
     @classmethod
     def from_solver(
@@ -360,7 +363,55 @@ class RM65ObstacleCollisionOracle:
                 metadata=self._base_metadata(pair_count),
             )
         if self._stop_at_first_clearance_violation:
-            return self._check_embedded_early_exit(full_q, pair_count=pair_count)
+            return self._check_embedded_early_exit(
+                full_q, pair_count=pair_count, clearance_m=self._scene.minimum_clearance_m,
+            )
+        return self._check_embedded_distances(full_q, pair_count=pair_count)
+
+    def check_for_search(
+        self, qpos_by_component: Mapping[str, np.ndarray], *, refinement_distance_m: float,
+    ) -> JointConfigurationCheck:
+        """Prove clearance beyond refinement, computing exact distances near it.
+
+        A broad-phase lower bound at the safety margin alone can needlessly
+        trigger fine edge sampling. Query at the refinement boundary instead;
+        a failed guard is not a rejection until the exact safety query runs.
+        Search lower bounds never enter the ordinary check cache.
+        """
+        refinement = float(refinement_distance_m)
+        if not np.isfinite(refinement) or refinement < 0.0:
+            raise ValueError("refinement_distance_m must be finite and nonnegative.")
+        try:
+            full_q = self._embed(qpos_by_component)
+        except (TypeError, ValueError):
+            return self.check(qpos_by_component)
+        margin = max(float(self._scene.minimum_clearance_m), refinement)
+        key = (margin, full_q.tobytes())
+        if key not in self._search_check_cache:
+            pair_count = len(self._collision_model.collisionPairs)
+            if not self._moving_geometry_ids or pair_count == 0:
+                return self._check_embedded(full_q)
+            guard = self._check_embedded_early_exit(
+                full_q, pair_count=pair_count, clearance_m=margin,
+            )
+            if guard.collision_check_available and (
+                not guard.safe or guard.minimum_distance_m <= margin
+            ):
+                # The 20--30 mm band remains safe but must refine normally.
+                guard = (
+                    self._check_embedded_distances(full_q, pair_count=pair_count)
+                    if self._stop_at_first_clearance_violation
+                    else self.check(qpos_by_component)
+                )
+            self._search_check_cache[key] = replace(
+                guard, metadata={**guard.metadata, "search_guard_clearance_m": margin},
+            )
+        return self._search_check_cache[key]
+
+    def _check_embedded_distances(
+        self, full_q: np.ndarray, *, pair_count: int,
+    ) -> JointConfigurationCheck:
+        metadata = {**self._base_metadata(pair_count), "query_mode": "all_pair_minimum_distance"}
         try:
             self._pin.computeDistances(
                 self._model,
@@ -376,7 +427,7 @@ class RM65ObstacleCollisionOracle:
                 collision_check_available=False,
                 reason="pinocchio_fcl_distance_query_failed",
                 metadata={
-                    **self._base_metadata(pair_count),
+                    **metadata,
                     "exception_type": type(exc).__name__,
                     "exception": str(exc),
                 },
@@ -387,7 +438,7 @@ class RM65ObstacleCollisionOracle:
                 collision_check_available=False,
                 reason="collision_distance_result_count_mismatch",
                 metadata={
-                    **self._base_metadata(pair_count),
+                    **metadata,
                     "distance_result_count": len(distance_results),
                 },
             )
@@ -399,7 +450,7 @@ class RM65ObstacleCollisionOracle:
                 safe=False,
                 collision_check_available=False,
                 reason="collision_distance_invalid",
-                metadata=self._base_metadata(pair_count),
+                metadata=metadata,
             )
         closest_index = int(np.argmin(distances))
         closest_pair = self._collision_model.collisionPairs[closest_index]
@@ -418,7 +469,7 @@ class RM65ObstacleCollisionOracle:
             reason="collision_clearance_satisfied" if safe else "collision_clearance_violated",
             minimum_distance_m=minimum_distance,
             metadata={
-                **self._base_metadata(pair_count),
+                **metadata,
                 "closest_geometry_names": (first_name, second_name),
                 "closest_obstacle_id": obstacle_id,
             },
@@ -429,8 +480,19 @@ class RM65ObstacleCollisionOracle:
         full_q: np.ndarray,
         *,
         pair_count: int,
+        clearance_m: float,
     ) -> JointConfigurationCheck:
+        metadata = {
+            **self._base_metadata(pair_count),
+            "query_mode": "first_clearance_violation",
+            "distance_is_lower_bound": True,
+            "query_clearance_m": clearance_m,
+        }
         try:
+            if self._collision_query_margin_m != clearance_m:
+                for request in self._collision_data.collisionRequests:
+                    request.security_margin = float(clearance_m)
+                self._collision_query_margin_m = float(clearance_m)
             blocked = bool(
                 self._pin.computeCollisions(
                     self._model,
@@ -448,7 +510,7 @@ class RM65ObstacleCollisionOracle:
                 collision_check_available=False,
                 reason="pinocchio_fcl_collision_query_failed",
                 metadata={
-                    **self._base_metadata(pair_count),
+                    **metadata,
                     "exception_type": type(exc).__name__,
                     "exception": str(exc),
                 },
@@ -459,7 +521,7 @@ class RM65ObstacleCollisionOracle:
                 collision_check_available=False,
                 reason="collision_result_count_mismatch",
                 metadata={
-                    **self._base_metadata(pair_count),
+                    **metadata,
                     "collision_result_count": len(collision_results),
                 },
             )
@@ -477,7 +539,7 @@ class RM65ObstacleCollisionOracle:
                     safe=False,
                     collision_check_available=False,
                     reason="collision_result_missing_blocking_pair",
-                    metadata=self._base_metadata(pair_count),
+                    metadata=metadata,
                 )
         else:
             lower_bounds = np.asarray(
@@ -489,16 +551,14 @@ class RM65ObstacleCollisionOracle:
                     safe=False,
                     collision_check_available=False,
                     reason="collision_distance_lower_bound_invalid",
-                    metadata=self._base_metadata(pair_count),
+                    metadata=metadata,
                 )
             result_index = int(np.argmin(lower_bounds))
         pair = self._collision_model.collisionPairs[result_index]
         first_id = int(pair.first)
         second_id = int(pair.second)
         result = collision_results[result_index]
-        minimum_distance = float(result.distance_lower_bound) + float(
-            self._scene.minimum_clearance_m
-        )
+        minimum_distance = float(result.distance_lower_bound) + float(clearance_m)
         return JointConfigurationCheck(
             safe=not blocked,
             collision_check_available=True,
@@ -511,7 +571,7 @@ class RM65ObstacleCollisionOracle:
                 minimum_distance if np.isfinite(minimum_distance) else None
             ),
             metadata={
-                **self._base_metadata(pair_count),
+                **metadata,
                 "closest_geometry_names": (
                     str(self._collision_model.geometryObjects[first_id].name),
                     str(self._collision_model.geometryObjects[second_id].name),

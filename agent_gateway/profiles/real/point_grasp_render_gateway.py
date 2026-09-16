@@ -184,6 +184,7 @@ class StationBoundPointGraspRenderProvider:
         frame_binding: RealPerceptionFrameBinding,
         runtime_session_id: str,
         current_station_revision: Callable[[], int],
+        solid_geometry: Any = None,
     ) -> None:
         if not isinstance(registration, StationBoundPointGraspRenderRegistration):
             raise TypeError("registration must be typed.")
@@ -235,6 +236,7 @@ class StationBoundPointGraspRenderProvider:
         self.frame_binding = frame_binding
         self.runtime_session_id = session_id
         self._current_station_revision = current_station_revision
+        self.solid_geometry = solid_geometry
 
     def _retained_candidate(
         self,
@@ -321,6 +323,7 @@ class StationBoundPointGraspRenderProvider:
             candidates=(overlay_candidate,),
             reference_from_camera=reference_from_camera,
             intrinsics=capture.intrinsics,
+            solid_geometry=self.solid_geometry,
         )
         if self.registration.profile.debug_target_coordinate_overlay:
             image = _render_target_coordinate_debug_overlay(

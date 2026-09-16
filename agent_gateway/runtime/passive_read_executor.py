@@ -554,6 +554,13 @@ class PassiveReadSkillExecutor:
                         + type(error).__name__
                     ),
                     current_station_revision=self._revision(),
+                    progress_summary={
+                        "phase": "failed",
+                        "failure_diagnostic": {
+                            "exception_type": diagnostic["exception_type"],
+                            "message": diagnostic["message"],
+                        },
+                    },
                 )
                 with self._lock:
                     self._completion_by_operation[current.operation_id] = outcome

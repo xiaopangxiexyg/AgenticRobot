@@ -236,9 +236,11 @@ PYTHONPATH="${PWD}/model/perception/graspgenx:${PYTHONPATH:-}" \
 --graspgenx-timeout-ms 120000
 ```
 
-GraspGenX 不进入当前 in-process 离线图片 CLI；这是有意的环境隔离。真实 RGB-D 仍由同一个
-Gateway provider 在一次 retained frame 读取中送入 SAM2 和 GraspGenX，不改变现有同帧深度、
-Station frame 或 Artifact lineage 语义。
+离线图片 CLI 现在与 Gateway 一样默认使用 GraspGenX in-process backend；它只读取显式 RGB-D、
+点击点和标定文件，不提供 service 模式，也不会启动相机或连接机械臂。CLI 必须运行在通过上述
+in-process runtime contract 的兼容 Python 环境中，并可用 `--graspgenx-source-root` 指向受审源码
+checkout。真实在线路径仍由同一个 Gateway provider 在一次 retained frame 读取中送入 SAM2 和
+GraspGenX，不改变现有同帧深度、Station frame 或 Artifact lineage 语义。
 
 ## 本地 RGB-D 端到端推理
 
@@ -253,12 +255,16 @@ RGB 必须是 JPEG/PNG。深度必须是与 RGB 同宽高、C-order、`float32` 
 cp docs/agent_gateway/examples/point_grasp_fixed_camera_calibration.example.json \
   /tmp/fixed_camera_calibration.json
 mkdir -p /tmp/dexteleop-point-grasp-output
+export GRASPGENX_PYTHON=/absolute/path/to/graspgenx-compatible/python
+export GRASPGENX_SOURCE_ROOT=/absolute/path/to/model/perception/graspgenx
 
-python -m deployments.perception.point_grasp_image_cli \
+PYTHONPATH="${GRASPGENX_SOURCE_ROOT}:${PYTHONPATH:-}" \
+"${GRASPGENX_PYTHON}" -m deployments.perception.point_grasp_image_cli \
   --sam2-asset-bundle \
     "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
   --point-grasp-asset-bundle \
-    "${DEXTELEOP_ASSET_ROOT}/perception/sam2_vgn_point_grasp" \
+    "${DEXTELEOP_ASSET_ROOT}/perception/graspgenx-point-grasp" \
+  --graspgenx-source-root "${GRASPGENX_SOURCE_ROOT}" \
   --input-rgb /absolute/path/to/frame.png \
   --input-depth /absolute/path/to/aligned_depth_m_float32.npy \
   --calibration-json /tmp/fixed_camera_calibration.json \
@@ -268,8 +274,10 @@ python -m deployments.perception.point_grasp_image_cli \
   --output-image /tmp/dexteleop-point-grasp-output/annotated.jpg
 ```
 
-该命令加载真实 SAM2/VGN 并使用 GPU，但不启动 RealSense、不连接机械臂。输出存在时默认拒绝覆盖；
-确认需要替换时加 `--overwrite`。
+该命令加载真实 SAM2/GraspGenX 并使用 GPU，但不启动 RealSense、不连接机械臂。输出存在时默认拒绝
+覆盖；确认需要替换时加 `--overwrite`。选择 VGN 时显式传入
+`--point-grasp-backend vgn`，并将 `--point-grasp-asset-bundle` 改为 VGN bundle；VGN 不接受
+`--graspgenx-source-root`。
 
 选择 GraspNet 时只替换 backend 和 bundle 参数，其余 RGB-D、点击点与标定输入完全相同：
 
