@@ -191,7 +191,9 @@ def test_model_artifact_cache_publishes_one_valid_artifact_across_processes(
     assert (int(scene.model.nq), int(scene.model.nv)) == results[0][3:]
 
 
-def test_model_artifact_cache_separates_actuated_profile(tmp_path: Path) -> None:
+def test_model_artifact_cache_separates_direct_arm_and_gripper_profiles(
+    tmp_path: Path,
+) -> None:
     mujoco = pytest.importorskip("mujoco")
     from sim.mujoco.artifacts import ModelArtifactCache
     from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
@@ -205,6 +207,8 @@ def test_model_artifact_cache_separates_actuated_profile(tmp_path: Path) -> None
         position_actuation_profile=actuated.position_actuation_profile(),
     )
 
+    assert not direct_artifact.cache_hit
+    assert not actuated_artifact.cache_hit
     assert direct_artifact.key != actuated_artifact.key
     assert direct_scene.model.nu == 0
     assert actuated_scene.model.nu == 12
@@ -214,30 +218,18 @@ def test_model_artifact_cache_separates_actuated_profile(tmp_path: Path) -> None
         manifest["fingerprint"]["position_actuation_profile"]["name"]
         == actuated.position_actuation_profile_name
     )
-
-
-def test_model_artifact_cache_separates_fully_actuated_gripper_profile(
-    tmp_path: Path,
-) -> None:
-    pytest.importorskip("mujoco")
-    from sim.mujoco.artifacts import ModelArtifactCache
-    from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
-
-    arm_only = CubeLiftTaskConfig.load(ACTUATED_TASK_CONFIG)
+    # The same arm-only artifact is the boundary for both comparisons.
+    # Keep all three first loads cold, without compiling arm-only twice.
     fully_actuated = CubeLiftTaskConfig.load(FULLY_ACTUATED_TASK_CONFIG)
-    cache = ModelArtifactCache(tmp_path / "cache")
-    arm_scene, arm_artifact = cache.load_scene(
-        arm_only.base_contract(),
-        position_actuation_profile=arm_only.position_actuation_profile(),
-    )
     full_scene, full_artifact = cache.load_scene(
         fully_actuated.base_contract(),
         position_actuation_profile=fully_actuated.position_actuation_profile(),
         gripper_actuation_profile=fully_actuated.gripper_actuation_profile(),
     )
 
-    assert arm_artifact.key != full_artifact.key
-    assert arm_scene.model.nu == 12
+    assert not full_artifact.cache_hit
+    assert actuated_artifact.key != full_artifact.key
+    assert direct_artifact.key != full_artifact.key
     assert full_scene.model.nu == 16
     manifest = json.loads(full_artifact.manifest_path.read_text(encoding="utf-8"))
     assert (
@@ -325,7 +317,7 @@ def test_pose_planner_recovers_only_small_mujoco_joint_limit_residual() -> None:
         env.close()
 
 
-def test_pose_planner_hard_limit_violation_terminates_only_current_episode(
+def test_pose_planner_uses_sim_clearance_and_terminates_hard_limit_episode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("mujoco")
@@ -341,6 +333,16 @@ def test_pose_planner_hard_limit_violation_terminates_only_current_episode(
         env.reset(seed=12)
         controller = env.kernel._pose_action_controller
         assert controller is not None
+        # Read configuration before injecting the episode fault. This fixed
+        # scene does not need another seeded reset just to inspect clearance.
+        assert not env.config.randomizes_cube_spawn
+        expected = env.kernel.scene.scene_spec.collision.safety_minimum_clearance_m
+        assert expected == pytest.approx(0.002)
+        assert controller.planner_collision_min_distance_m == pytest.approx(expected)
+        if controller._ik is not None:
+            assert controller._ik.planner.config.collision_min_distance_m == pytest.approx(
+                expected
+            )
         hard_status = CubeLiftPosePlannerSyncStatus(
             safe=False,
             recovered=False,
@@ -363,32 +365,6 @@ def test_pose_planner_hard_limit_violation_terminates_only_current_episode(
         assert truncated is False
         assert info["termination_reason"] == "sim_joint_position_limit_violation"
         assert info["pose_ik_limit_violation_rad"] == pytest.approx(2e-3)
-    finally:
-        env.close()
-
-
-def test_pose_planner_uses_mujoco_collision_clearance() -> None:
-    """The sim IK anchor must use the sim policy's clearance, not real defaults."""
-
-    pytest.importorskip("mujoco")
-    pytest.importorskip("gymnasium")
-    from sim.mujoco.tasks.cube_lift import FastCubeLiftEnv
-
-    env = FastCubeLiftEnv(
-        "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json",
-        use_settled_snapshot=False,
-    )
-    try:
-        env.reset(seed=13)
-        controller = env.kernel._pose_action_controller
-        assert controller is not None
-        expected = env.kernel.scene.scene_spec.collision.safety_minimum_clearance_m
-        assert expected == pytest.approx(0.002)
-        assert controller.planner_collision_min_distance_m == pytest.approx(expected)
-        if controller._ik is not None:
-            assert controller._ik.planner.config.collision_min_distance_m == pytest.approx(
-                expected
-            )
     finally:
         env.close()
 
