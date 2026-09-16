@@ -9,6 +9,18 @@ import pytest
 TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_debug_v0.json")
 
 
+def _cached_reference_env():
+    from sim.mujoco.artifacts import ModelArtifactCache
+    from sim.mujoco.tasks.cube_lift import CubeLiftEnv, CubeLiftTaskConfig
+
+    # Reuse only compiled files. Each call loads a fresh model/data and creates
+    # new controller/projector state; reset and physics work remain unchanged.
+    # The fast/reference parity test below keeps its independent cold reference.
+    config = CubeLiftTaskConfig.load(TASK_CONFIG)
+    scene, _artifact = ModelArtifactCache().load_scene(config.base_contract())
+    return CubeLiftEnv(config, scene=scene)
+
+
 @pytest.mark.parametrize(
     ("separation_m", "clearance_m", "expected_safe"),
     (
@@ -174,9 +186,8 @@ def test_soft_penetration_projection_can_use_hard_bound_for_recovery(
 def test_collision_safety_oracle_keeps_active_data_immutable() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
-    from sim.mujoco.tasks.cube_lift import CubeLiftEnv
 
-    env = CubeLiftEnv(TASK_CONFIG)
+    env = _cached_reference_env()
     try:
         env.reset(seed=1)
         projector = env.scene.collision_projector()
@@ -208,9 +219,8 @@ def test_collision_safety_oracle_keeps_active_data_immutable() -> None:
 def test_scripted_downward_motion_is_projected_before_table_penetration() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
-    from sim.mujoco.tasks.cube_lift import CubeLiftEnv
 
-    env = CubeLiftEnv(TASK_CONFIG)
+    env = _cached_reference_env()
     action = np.asarray((0.45, 0.99, -0.99, -0.99, 1.0, -0.99, -0.99), dtype=np.float32)
     modified = False
     minimum_contact_distance = float("inf")
@@ -272,9 +282,8 @@ def test_general_qpos_controller_holds_last_state_for_unsafe_target() -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
     from sim.mujoco.controllers import QposController
-    from sim.mujoco.tasks.cube_lift import CubeLiftEnv
 
-    env = CubeLiftEnv(TASK_CONFIG)
+    env = _cached_reference_env()
     try:
         env.reset(seed=4)
         before = env.scene.get_arm_qpos("right")
