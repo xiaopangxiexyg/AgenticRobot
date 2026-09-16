@@ -305,6 +305,20 @@ def _chunk_layout_hash(metadata: Mapping[str, Any]) -> str | None:
     return None if value is None else str(value).strip() or None
 
 
+def _server_artifact_declares_layout(metadata: Mapping[str, Any], layout: PolicyIOLayout) -> bool:
+    """Accept an unhashed remote action only with the server's actual layout.
+
+    The OpenPI response carries no per-action layout hash. Its transport adds
+    the negotiated server artifact to action metadata, so compare that layout
+    directly instead of requiring a redundant hash on every response.
+    """
+
+    advertised = _mapping_value(
+        metadata, "remote_policy.server.policy_artifact.policy_io_layout"
+    )
+    return isinstance(advertised, Mapping) and dict(advertised) == layout.to_dict()
+
+
 def _action_end_effector_component(
     layout: PolicyIOLayout,
     *,
@@ -451,7 +465,13 @@ class V22DeploymentAdapter:
                 "v2.2 action token dim mismatch: expected "
                 f"{self.layout.action_discrete_dim}, got {chunk.discrete_actions.shape[1]}."
             )
-        if self.require_action_layout_hash and chunk.layout_hash != self.layout.layout_hash:
+        if self.require_action_layout_hash and (
+            (chunk.layout_hash is not None and chunk.layout_hash != self.layout.layout_hash)
+            or (
+                chunk.layout_hash is None
+                and not _server_artifact_declares_layout(chunk.metadata, self.layout)
+            )
+        ):
             raise DatasetLayoutBindingError(
                 "v2.2 policy action layout mismatch: "
                 f"expected={self.layout.layout_hash!r}, actual={chunk.layout_hash!r}."
