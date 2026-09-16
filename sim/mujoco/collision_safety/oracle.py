@@ -102,6 +102,7 @@ class CollisionSafetyOracle:
         data,
         *,
         minimum_clearance_m: float | None = None,
+        distance_query_limit_m: float | None = None,
     ) -> CollisionCheckResult:
         """Check preventive clearance, optionally with a recovery threshold.
 
@@ -112,6 +113,10 @@ class CollisionSafetyOracle:
         temporary, explicit threshold for that recovery projection; active
         contact checks remain governed by the configured ``hard_penetration_m``
         bound.
+
+        The default query reports a lower bound clipped at the admission
+        threshold. A diagnostic caller may explicitly request a larger query
+        radius to measure clearance; this never changes the safety threshold.
         """
 
         clearance = (
@@ -131,6 +136,13 @@ class CollisionSafetyOracle:
         # clearance measurements. Recovery thresholds can be negative, but
         # the query radius must still include all actual penetration.
         limit = max(0.0, clearance)
+        if distance_query_limit_m is not None:
+            requested_limit = float(distance_query_limit_m)
+            if not np.isfinite(requested_limit) or requested_limit < limit:
+                raise ValueError(
+                    "distance_query_limit_m must be finite and cover the clearance threshold."
+                )
+            limit = requested_limit
         if not self._pairs:
             return CollisionCheckResult(safe=True, minimum_distance_m=float("inf"))
         rotation = np.asarray(data.geom_xmat).reshape((-1, 3, 3))

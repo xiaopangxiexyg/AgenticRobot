@@ -45,6 +45,13 @@ def test_distance_admission_uses_required_margin_and_retains_real_penetration(
     assert check.minimum_distance_m == pytest.approx(
         min(separation_m, max(0.0, clearance_m)), abs=1e-8
     )
+    measured = oracle.check(
+        data, minimum_clearance_m=clearance_m, distance_query_limit_m=0.05
+    )
+    assert measured.safe is expected_safe
+    assert measured.minimum_distance_m == pytest.approx(separation_m, abs=1e-8)
+    with pytest.raises(ValueError, match="distance_query_limit_m"):
+        oracle.check(data, minimum_clearance_m=0.002, distance_query_limit_m=0.001)
 
 
 @pytest.mark.parametrize(
