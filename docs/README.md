@@ -19,7 +19,6 @@
 
 专项交接按需查阅：[测试优化](./development/test-optimization-handoff-20260908.md)、
 [RTC 开发](./real/RTC_DEVELOPMENT_HANDOFF_20260908.md)、
-[OpenPI RTC 状态历史](./real/OPENPI_RTC_STATE_HISTORY.md)、
 [真机 Gateway 与 RM65 运动](./agent_gateway/real_rm65_skill_motion_handoff_20260908.md)。
 
 跨模块的只读架构与 RTC 图示集中在 [architecture](./architecture/README.md)；它们不是运行入口，也不新增实施契约。
