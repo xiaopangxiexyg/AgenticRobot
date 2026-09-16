@@ -13,6 +13,7 @@
 | [REPLAY](./REPLAY.md) | 离线/真机 replay 参数和安全门 |
 | [DEPLOY](./DEPLOY.md) | 通用 deploy 合约和验收 |
 | [OPENPI](./OPENPI.md) | OpenPI 两进程部署 |
+| [OpenPI RTC 状态历史](./OPENPI_RTC_STATE_HISTORY.md) | Stage3 关节、TCP 与夹爪历史输入的训练/部署合同和兼容边界 |
 | [UMI](./UMI.md) | UMI 配置、标定和数采 |
 | [离线评估报告](./reports/README.md) | 带日期、数据来源、验证边界和回退结论的历史结果 |
 | [Tracker-Hand 旧 RPY 判定退役记录](../legacy/reports/tracker_hand_legacy_predicate_retirement_20260825.md) | 全仓无调用的旧 canonical RPY 判定移除、保留的校准接口和验证边界 |
