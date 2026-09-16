@@ -1,7 +1,7 @@
 # ReBot CAN → RM65 MuJoCo GUI 装配进度
 
-本页记录应用接入进度，不修改总路线图。当前是 **离线验证通过、不可真机验收、未 handoff**。
-它不是新的重力补偿程序，也不证明硬件遥操已经可用。
+本页记录应用接入的源码阶段证据，不修改总路线图。离线验证不等于完成隔离集成或真机验收；
+当前 handoff 状态以 Harness Task receipt 为准。它不是新的重力补偿程序，也不证明硬件遥操已经可用。
 
 ## 实现与所有权
 
@@ -82,4 +82,5 @@ bash scripts/run_pytest.sh -q \
 6. stale/坏帧/越界/GUI fault 撤销仿真跟随并要求重新预检；`s`、`q`、Ctrl-C 不得影响 master 的重力补偿。
 7. master 的首次 Ctrl-C protective hold 和再次 Ctrl-C/SIGUSR1 全臂掉能仍只由其原硬件控制 owner 处理。
 
-真机和 GUI 观察均为 **NOT_RUN**。组合依赖和 Profiles 完成前不提供或执行 live CAN 验收命令；不合并、不 push、不安装。
+真机和 GUI 观察均为 **NOT_RUN**。隔离集成的完整组合门禁通过后，才提供包含现场安全预检的
+live CAN 验收命令；实际执行仍由现场操作者负责。本 Task worker 不合并、不 push、不安装。
