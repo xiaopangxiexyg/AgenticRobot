@@ -191,7 +191,9 @@ def test_model_artifact_cache_publishes_one_valid_artifact_across_processes(
     assert (int(scene.model.nq), int(scene.model.nv)) == results[0][3:]
 
 
-def test_model_artifact_cache_separates_actuated_profile(tmp_path: Path) -> None:
+def test_model_artifact_cache_separates_direct_arm_and_gripper_profiles(
+    tmp_path: Path,
+) -> None:
     mujoco = pytest.importorskip("mujoco")
     from sim.mujoco.artifacts import ModelArtifactCache
     from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
@@ -205,6 +207,8 @@ def test_model_artifact_cache_separates_actuated_profile(tmp_path: Path) -> None
         position_actuation_profile=actuated.position_actuation_profile(),
     )
 
+    assert not direct_artifact.cache_hit
+    assert not actuated_artifact.cache_hit
     assert direct_artifact.key != actuated_artifact.key
     assert direct_scene.model.nu == 0
     assert actuated_scene.model.nu == 12
@@ -214,30 +218,18 @@ def test_model_artifact_cache_separates_actuated_profile(tmp_path: Path) -> None
         manifest["fingerprint"]["position_actuation_profile"]["name"]
         == actuated.position_actuation_profile_name
     )
-
-
-def test_model_artifact_cache_separates_fully_actuated_gripper_profile(
-    tmp_path: Path,
-) -> None:
-    pytest.importorskip("mujoco")
-    from sim.mujoco.artifacts import ModelArtifactCache
-    from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
-
-    arm_only = CubeLiftTaskConfig.load(ACTUATED_TASK_CONFIG)
+    # The same arm-only artifact is the boundary for both comparisons.
+    # Keep all three first loads cold, without compiling arm-only twice.
     fully_actuated = CubeLiftTaskConfig.load(FULLY_ACTUATED_TASK_CONFIG)
-    cache = ModelArtifactCache(tmp_path / "cache")
-    arm_scene, arm_artifact = cache.load_scene(
-        arm_only.base_contract(),
-        position_actuation_profile=arm_only.position_actuation_profile(),
-    )
     full_scene, full_artifact = cache.load_scene(
         fully_actuated.base_contract(),
         position_actuation_profile=fully_actuated.position_actuation_profile(),
         gripper_actuation_profile=fully_actuated.gripper_actuation_profile(),
     )
 
-    assert arm_artifact.key != full_artifact.key
-    assert arm_scene.model.nu == 12
+    assert not full_artifact.cache_hit
+    assert actuated_artifact.key != full_artifact.key
+    assert direct_artifact.key != full_artifact.key
     assert full_scene.model.nu == 16
     manifest = json.loads(full_artifact.manifest_path.read_text(encoding="utf-8"))
     assert (

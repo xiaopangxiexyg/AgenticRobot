@@ -88,6 +88,19 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### 同输入仿真与模型构建去重
+
+`test_mujoco_fast_runtime.py` 的 direct / arm-only / fully-actuated 缓存隔离
+使用同一空缓存中的三个真实首次构建，复用中间的 arm-only 结果做两组比较，
+不再另起空缓存重复编译 arm-only。三种配置均断言 cache miss，保留 actuator 数量、
+integrator 和 manifest fingerprint 检查，并检查三种 key 两两不同。
+损坏恢复、跨进程发布和运行时行为测试仍使用各自原有的隔离方式。
+
+`test_rebot_b601_mujoco_haptics.py` 的 `pose-6d` 平移与旋转指标断言并入已有的
+七种 pose 参数化矩阵；矩阵中的七种场景仍真实运行 1.5 秒，不再为相同输入单独重跑一次。
+接触、反射、确定性双回放及安全负例不变。这两处各减少一个独立测试结果；
+合并场景的前置断言失败时，后续断言不会执行，不代表新的性能基准或硬件证据。
+
 ### v2.5-p shadow 的规模与持久化覆盖
 
 `test_v25p_dual_write_shadow.py` 的 CJSON 多帧成功用例使用 12 个不同数值的样本，

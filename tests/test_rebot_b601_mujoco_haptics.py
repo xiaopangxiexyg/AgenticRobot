@@ -88,21 +88,12 @@ def test_pose_fixture_restores_bounded_axis_or_6d_disturbance(
     assert fixture["anchor_source"] == "current_fk_before_disturbance"
     assert fixture["disturbance"]["rotation_tool_local_rad"] is not None
 
-
-def test_pose_6d_acceptance_reports_translation_and_rotation_separately() -> None:
-    code, payload = run_haptic_fixture_demo(
-        source_root=REBOT_SOURCE_ROOT,
-        fixture_name="pose-6d",
-        duration_sec=1.5,
-        viewer=False,
-    )
-
-    effect = payload["effect_acceptance"]
-    assert code == 0
-    assert effect["translation_required"] is True
-    assert effect["rotation_required"] is True
-    assert effect["initial_metric"] > effect["final_metric"]
-    assert effect["initial_rotation_metric"] > effect["final_rotation_metric"]
+    if fixture_name == "pose-6d":
+        # Inspect the existing full rollout, not a second identical one.
+        assert effect["translation_required"] is True
+        assert effect["rotation_required"] is True
+        assert effect["initial_metric"] > effect["final_metric"]
+        assert effect["initial_rotation_metric"] > effect["final_rotation_metric"]
 
 
 @pytest.mark.parametrize("fixture_name", ["spring", "wall"])
