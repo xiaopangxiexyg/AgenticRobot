@@ -16,6 +16,7 @@ from teleop_runtime.sources.hand import AngleTriggerSource
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
 from teleop_runtime.real_teleop import hand_cli
 from teleop_runtime.real_teleop import cli_runtime_config
+from teleop_runtime.real_teleop import gripper_recovery
 from teleop_runtime.real_teleop.device_retry_runtime import (
     build_device_retry_runtime,
 )
@@ -611,17 +612,17 @@ def test_runtime_reconnect_promotes_angle_trigger_to_q6_atomically() -> None:
 
     with (
         patch.object(
-            real_teleop,
+            gripper_recovery,
             "_discover_runtime_q6_ports",
             return_value={"left": "/dev/q6-left", "right": "/dev/q6-right"},
         ),
         patch.object(
-            real_teleop.HandQ6Source,
+            gripper_recovery.HandQ6Source,
             "from_bimanual",
             return_value=q6_source,
         ),
         patch.object(
-            real_teleop,
+            gripper_recovery,
             "_q6_gripper_retargeter_for_side",
             side_effect=lambda _args, side: _gripper_retargeter(side, q6=True),
         ),
@@ -679,12 +680,12 @@ def test_runtime_q6_promotion_failure_keeps_angle_trigger_fallback() -> None:
 
     with (
         patch.object(
-            real_teleop,
+            gripper_recovery,
             "_discover_runtime_q6_ports",
             return_value={"left": "/dev/q6-left", "right": "/dev/q6-right"},
         ),
         patch.object(
-            real_teleop.HandQ6Source,
+            gripper_recovery.HandQ6Source,
             "from_bimanual",
             return_value=q6_source,
         ),
@@ -731,17 +732,17 @@ def test_runtime_q6_promotion_recovers_when_angle_trigger_source_was_missing() -
 
     with (
         patch.object(
-            real_teleop,
+            gripper_recovery,
             "_discover_runtime_q6_ports",
             return_value={"left": "/dev/q6-left", "right": "/dev/q6-right"},
         ),
         patch.object(
-            real_teleop.HandQ6Source,
+            gripper_recovery.HandQ6Source,
             "from_bimanual",
             return_value=q6_source,
         ),
         patch.object(
-            real_teleop,
+            gripper_recovery,
             "_q6_gripper_retargeter_for_side",
             side_effect=lambda _args, side: _gripper_retargeter(side, q6=True),
         ),
@@ -792,17 +793,17 @@ def test_runtime_q6_promotion_keeps_dmtac_retargeters_out_of_session() -> None:
 
     with (
         patch.object(
-            real_teleop,
+            gripper_recovery,
             "_discover_runtime_q6_ports",
             return_value={"left": "/dev/q6-left", "right": "/dev/q6-right"},
         ),
         patch.object(
-            real_teleop.HandQ6Source,
+            gripper_recovery.HandQ6Source,
             "from_bimanual",
             return_value=q6_source,
         ),
         patch.object(
-            real_teleop,
+            gripper_recovery,
             "_q6_gripper_retargeter_for_side",
             side_effect=lambda _args, side: _gripper_retargeter(side, q6=True),
         ),

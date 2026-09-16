@@ -1322,46 +1322,19 @@ def test_episode_recording_shutdown_commits_force_guard_reason_before_resources(
     ]
 
 
-def test_real_component_builder_preserves_legacy_wrapper_and_import_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sentinel_args = SimpleNamespace()
-    sentinel_components = object()
-    sentinel_dmtac_resolver = object()
-    captured: dict[str, object] = {}
-
-    def fake_builder(
-        args: argparse.Namespace,
-        *,
-        dmtac_backend_configs,
-    ):
-        captured["args"] = args
-        captured["dmtac_backend_configs"] = dmtac_backend_configs
-        return sentinel_components
-
-    monkeypatch.setattr(
-        legacy_entrypoint,
-        "_dmtac_backend_configs",
-        sentinel_dmtac_resolver,
+def test_real_component_builder_uses_canonical_config_owner_and_import_boundary() -> None:
+    assert (
+        legacy_entrypoint._build_components
+        is component_builder.build_real_teleop_components
     )
-    monkeypatch.setattr(
-        legacy_entrypoint,
-        "build_real_teleop_components",
-        fake_builder,
-    )
-
-    assert legacy_entrypoint._build_components(sentinel_args) is sentinel_components
-    assert captured == {
-        "args": sentinel_args,
-        "dmtac_backend_configs": sentinel_dmtac_resolver,
-    }
     assert list(
         inspect.signature(component_builder.build_real_teleop_components).parameters
-    ) == ["args", "dmtac_backend_configs"]
+    ) == ["args"]
 
     source = (
         ROOT / "teleop_runtime/real_teleop/component_builder.py"
     ).read_text(encoding="utf-8")
+    assert "from .cli_runtime_config import _dmtac_backend_configs" in source
     assert "run_vive_rm65_real_teleop" in source
     assert "from teleop_runtime.debug" not in source
     assert "from ..debug" not in source
@@ -1380,11 +1353,12 @@ def test_component_builder_uses_active_sides_for_arm_ip_admission() -> None:
 
 
 def test_extracted_application_runtime_preserves_entrypoint_support_contract() -> None:
-    runtime.bind_legacy_support(vars(legacy_entrypoint))
     assert list(inspect.signature(runtime.run_real_teleop).parameters) == [
         "args",
         "progress_application",
         "input_batch_prioritizer",
+        "control_ui_type",
+        "startup_progress_type",
     ]
     assert list(inspect.signature(legacy_entrypoint.main).parameters) == []
 
@@ -1395,13 +1369,71 @@ def test_extracted_application_runtime_preserves_entrypoint_support_contract() -
     assert "input_batch_prioritizer: RealTeleopInputBatchPrioritizer | None" in source
     assert "from teleop_runtime.debug" not in source
     assert "from ..debug" not in source
-    assert set(runtime._REQUIRED_SUPPORT_NAMES).issubset(vars(legacy_entrypoint))
+    assert not hasattr(runtime, "bind_legacy_support")
+    assert not hasattr(runtime, "_REQUIRED_SUPPORT_NAMES")
+    assert runtime._build_components is component_builder.build_real_teleop_components
+    assert (
+        runtime._promote_angle_trigger_gripper_input_to_q6
+        is gripper_recovery.promote_angle_trigger_gripper_input_to_q6
+    )
+    assert (
+        runtime._guard_impedance_force_control
+        is impedance_force_runtime._guard_impedance_force_control
+    )
+    assert runtime._real_hand_render_qpos is runtime_home._real_hand_render_qpos
+    assert (
+        runtime._vive_pose_source_from_components
+        is vive_calibration_runtime._vive_pose_source_from_components
+    )
+
+
+def test_control_station_passes_explicit_runtime_ui_factories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = SimpleNamespace()
+    captured: dict[str, object] = {}
+
+    class CustomUi:
+        pass
+
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_parse_args_with_configuration",
+        lambda **_kwargs: args,
+    )
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "_bind_real_teleop_runtime_support",
+        lambda _namespace: (_ for _ in ()).throw(
+            AssertionError("runtime support binder must not be called")
+        ),
+    )
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "build_real_teleop_progress_application",
+        lambda _args: "progress",
+    )
+    monkeypatch.setattr(
+        legacy_entrypoint,
+        "run_real_teleop",
+        lambda parsed, **kwargs: captured.update(args=parsed, **kwargs),
+    )
+    monkeypatch.setattr(legacy_entrypoint, "cleanup_active_startup", lambda: None)
+
+    legacy_entrypoint.run_real_teleop_entrypoint(
+        runtime_extension_factory=lambda _args: None,
+        control_ui_type=CustomUi,
+    )
+
+    assert captured["args"] is args
+    assert captured["control_ui_type"] is CustomUi
+    assert captured["startup_progress_type"] is legacy_entrypoint.GuiStartupProgress
+    assert not hasattr(args, "_real_teleop_control_ui_type")
 
 
 def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime.bind_legacy_support(vars(legacy_entrypoint))
     events: list[str] = []
 
     class FakeWatchdog:

@@ -495,11 +495,12 @@ def hold_motion_after_impedance_guard_issue(
     *,
     reason: str,
     now: float,
-    log: Callable[..., None],
+    log: Callable[..., None] | None = None,
 ) -> None:
+    emit_log = _log if log is None else log
     rig = components.session.rig
     if rig is None:
-        log(
+        emit_log(
             "ForceControl",
             f"control fault hold_motion skipped because session has no rig: {_short_status_text(reason)}",
             now=now,
@@ -508,14 +509,14 @@ def hold_motion_after_impedance_guard_issue(
     try:
         rig.hold_motion(f"control fault: {reason}")
     except Exception as exc:  # noqa: BLE001
-        log(
+        emit_log(
             "ForceControl",
             "control fault hold_motion failed: "
             f"{type(exc).__name__}: {exc}; reason={_short_status_text(reason)}",
             now=now,
         )
     else:
-        log(
+        emit_log(
             "ForceControl",
             f"control fault hold_motion requested for all rig backends: {_short_status_text(reason)}",
             now=now,
@@ -528,9 +529,9 @@ def guard_impedance_force_control(
     *,
     context: str,
     now: float,
-    issue_provider: Callable[..., str | None],
-    hold_handler: Callable[..., None],
-    log: Callable[..., None],
+    issue_provider: Callable[..., str | None] | None = None,
+    hold_handler: Callable[..., None] | None = None,
+    log: Callable[..., None] | None = None,
     collision_handler: Callable[[str], None] | None = None,
 ) -> bool:
     if context == "main_loop" and components.session.state_machine.state not in {
@@ -539,8 +540,19 @@ def guard_impedance_force_control(
         TeleopRunState.RECOVERING,
     }:
         return True
+    resolve_issue = (
+        _impedance_force_control_issue
+        if issue_provider is None
+        else issue_provider
+    )
+    hold_on_issue = (
+        hold_motion_after_impedance_guard_issue
+        if hold_handler is None
+        else hold_handler
+    )
+    emit_log = _log if log is None else log
     try:
-        issue = issue_provider(args, components)
+        issue = resolve_issue(args, components)
     except Exception as exc:  # noqa: BLE001 - classify raced controller stops below.
         issue_text = f"{context}: {type(exc).__name__}: {exc}"
         lowered = issue_text.lower()
@@ -575,10 +587,13 @@ def guard_impedance_force_control(
         collision_handler(reason)
         return False
     if components.session.state_machine.state != TeleopRunState.FAULT:
-        log("ForceControl", reason, now=now)
-        hold_handler(components, reason=reason, now=now)
+        emit_log("ForceControl", reason, now=now)
+        hold_on_issue(components, reason=reason, now=now)
         components.session.fault(reason)
     return False
+
+
+_guard_impedance_force_control = guard_impedance_force_control
 
 __all__ = [
     "_emergency_stop_real_arms",
@@ -586,6 +601,7 @@ __all__ = [
     "_exception_chain_messages",
     "_force_collision_recording_summary",
     "_force_guard_recording_stop_context",
+    "_guard_impedance_force_control",
     "_handle_init_qpos_emergency_stop",
     "_impedance_force_control_issue",
     "_position_force_guard_collision_summary",
