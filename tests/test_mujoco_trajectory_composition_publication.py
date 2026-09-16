@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -623,6 +624,22 @@ def test_locked_chunk_residual_enters_existing_mujoco_chain_once() -> None:
             ),
         )
 
+        # Expiry is rejected before input admission: sequence zero must remain
+        # usable by the valid request below in the same real MuJoCo session.
+        expired_request = replace(request, residual_effective_until=due_target)
+        proposal_count = len(target.runtime.core.proposals)
+        trace_count = len(target.runtime.trace_facts)
+
+        expired = controller.publish_exact_target(lambda: expired_request)
+
+        assert expired.status == "no_action"
+        assert expired.input_preparation.reason == "residual_support_expired"
+        assert controller.state.semantic_content_hash == state.semantic_content_hash
+        assert len(target.runtime.core.proposals) == proposal_count
+        assert expired.input_preparation.nominal_input_admission is None
+        assert expired.input_preparation.residual_input_admission is None
+        assert len(target.runtime.trace_facts) == trace_count
+
         cycle = controller.publish_exact_target(lambda: request)
 
         assert cycle.status == "proposal_admitted"
@@ -825,134 +842,6 @@ def test_locked_chunk_residual_enters_existing_mujoco_chain_once() -> None:
 
         with pytest.raises(RuntimeError, match="another Station.*activation"):
             controller.publish_exact_target(must_not_fetch_for_next_activation)
-    finally:
-        if session_controller is not None:
-            session_controller.close()
-        composition.close()
-
-
-@pytest.mark.slow_sim
-def test_expired_residual_returns_no_action_without_new_proposal() -> None:
-    target, composition, residual_profile, schema, _observation_sink = (
-        _build_running_fixture()
-    )
-    session_controller = None
-    try:
-        now = float(target.runtime.clock())
-        pose = capture_mujoco_sim_hil_tool_tcp_pose_by_side(
-            target.scene,
-            target.task_config,
-        )["right"]
-        nominal_action = _action(schema, pose=pose)
-        residual_action = _action(
-            residual_profile.relative_contracts.residual_action_schema,
-            pose=pose,
-            residual_x=0.004,
-        )
-        residual_profile.input_adapter.process_absolute_action(
-            nominal_action,
-            source_action_id="virtual-anchor-expiry",
-            source_action_hash=nominal_action.semantic_content_hash,
-            source_available_at=now,
-            measured_at=now,
-            measured_clock_domain_id=target.runtime.config.clock_domain_id,
-            observed_at=now,
-            observed_clock_domain_id=target.runtime.config.clock_domain_id,
-        )
-        anchor = residual_profile.input_adapter.anchor
-        activation_cut = target.runtime.capture_control_cut(
-            cutoff_at=float(target.runtime.clock())
-        )
-        policy_producer = composition.policy_input_adapter.binding.producer_id
-        activation = next(
-            record
-            for record in reversed(
-                target.runtime.core.producer_epochs.records_at_or_before(
-                    activation_cut
-                )
-            )
-            if record.producer_id == policy_producer
-        )
-        created_at = float(target.runtime.clock())
-        first_target = created_at + 0.020
-        due_target = created_at + 0.050
-        trajectory = _trajectory(
-            schema,
-            action=nominal_action,
-            created_at=created_at,
-            first_target=first_target,
-            second_target=due_target,
-            activation_id=activation.activation_id,
-            activation_hash=activation.semantic_content_hash,
-            producer_id=policy_producer,
-        )
-        cut = target.runtime.capture_control_cut(
-            cutoff_at=float(target.runtime.clock())
-        )
-        state = activate_residual_session(
-            offer_nominal_trajectory(
-                empty_trajectory_editing_state(reducer_id="expiry-editor"),
-                trajectory,
-                offer_sequence=0,
-            ),
-            residual_session_id="expiry-session",
-            activation_scope=composition.activation_scope,
-            control_cut=cut,
-            residual_anchor_receipt=anchor.receipt,
-            first_editable_target_at=first_target,
-        )
-        session_controller = _active_session_controller(composition)
-        controller = MujocoTrajectoryPublicationController(
-            profile=MujocoTrajectoryPublicationProfile(
-                profile_id="mujoco-locked-chunk-expiry",
-                enabled=True,
-                send_actions=True,
-            ),
-            composition=composition,
-            initial_state=state,
-            composition_spec=residual_profile.sim_hil_contracts.composition_spec,
-            publication_barrier=session_controller.publication_barrier,
-            nominal_role=residual_profile.config.baseline_role,
-            residual_role=residual_profile.config.residual_role,
-        )
-        produced_at = float(target.runtime.clock())
-        request = MujocoTrajectoryPublicationRequest(
-            target_effective_at=due_target,
-            nominal_stamp=TrajectoryCompositionContributorStamp(
-                producer_id=policy_producer,
-                producer_epoch=composition.policy_input_adapter.binding.producer_epoch,
-                sequence=0,
-                produced_at=produced_at,
-                produced_clock_domain_id=target.runtime.config.clock_domain_id,
-            ),
-            residual_stamp=TrajectoryCompositionContributorStamp(
-                producer_id=composition.config.human_producer_id,
-                producer_epoch=composition.config.human_producer_epoch,
-                sequence=0,
-                produced_at=produced_at,
-                produced_clock_domain_id=target.runtime.config.clock_domain_id,
-            ),
-            residual_action=residual_action,
-            residual_fact_id="expired-residual",
-            residual_fact_hash=residual_action.semantic_content_hash,
-            residual_anchor_receipt_id=anchor.receipt.receipt_id,
-            residual_anchor_receipt_hash=(
-                anchor.receipt.semantic_content_hash
-            ),
-            residual_effective_until=due_target,
-            residual_warp_spec=ResidualTemporalWarpSpec(
-                spec_id="expired-residual-ramp",
-                ramp_duration_sec=0.02,
-            ),
-        )
-        proposal_count = len(target.runtime.core.proposals)
-
-        cycle = controller.publish_exact_target(lambda: request)
-
-        assert cycle.status == "no_action"
-        assert cycle.input_preparation.reason == "residual_support_expired"
-        assert controller.state.semantic_content_hash == state.semantic_content_hash
-        assert len(target.runtime.core.proposals) == proposal_count
     finally:
         if session_controller is not None:
             session_controller.close()

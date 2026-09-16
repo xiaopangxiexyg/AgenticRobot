@@ -104,6 +104,14 @@ neither net line reductions nor test-count quotas are acceptance criteria.
 
 ### 同输入仿真与模型构建去重
 
+`test_mujoco_trajectory_composition_publication.py` 在同一真实 MuJoCo session 中
+先验证 `residual_effective_until == target_effective_at` 的到期拒绝，再以相同
+producer sequence 0 验证有效发布。拒绝发生在输入登记前；显式检查 editor hash、
+proposal 数量与 trace 数量不变，且两路 input admission 均为空。随后保留原有真实
+dispatch、FK 观测、因果链、重复发布、Hold 和旧 activation 拒绝检查，不再为
+无副作用的到期负例单独建场/reset。底层纯逻辑到期用例仍独立保留；这里减少一个
+独立测试结果，前置负例失败时后续闭环断言不会执行。physics tick、TTL 和安全条件不变。
+
 `test_mujoco_fast_runtime.py` 的 direct / arm-only / fully-actuated 缓存隔离
 使用同一空缓存中的三个真实首次构建，复用中间的 arm-only 结果做两组比较，
 不再另起空缓存重复编译 arm-only。三种配置均断言 cache miss，保留 actuator 数量、
