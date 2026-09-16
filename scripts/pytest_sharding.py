@@ -24,7 +24,9 @@ FULL_WEIGHTS = {
     "tests/test_replay_position_admittance_active_pipeline.py": 106.650,
     "tests/test_mujoco_fast_runtime.py": 58.974,
     "tests/test_control_station_mujoco_sim_hil.py": 49.169,
-    "tests/test_rm65_grasp_trajectory.py": 31.391,
+    # Refreshed from green six-shard acceptance at 95b954db after new grasp
+    # safety cases; the previous 31.391s estimate predates that coverage.
+    "tests/test_rm65_grasp_trajectory.py": 92.781,
     "tests/test_rebot_b601_real2sim.py": 21.898,
     "tests/test_control_station_sim_hil_allocation_profile.py": 21.484,
     "tests/test_v25p_dual_write_shadow.py": 20.941,
@@ -65,8 +67,8 @@ FULL_WEIGHTS = {
 # A test module normally remains the isolation unit.  This one is an explicit
 # exception because its 121 independent top-level tests account for roughly
 # two thirds of the six-shard critical path.  The sparse function weights come
-# from the same complete green Run as FULL_WEIGHTS; unlisted functions share
-# the small measured residual so newly added tests remain covered automatically.
+# from the original complete green Run that seeded FULL_WEIGHTS. Unlisted
+# functions share the small measured residual so new tests remain covered.
 FULL_SPLIT_NODE_WEIGHTS = {
     "tests/test_mujoco_temp_pipeline.py": {
         "test_contact_curriculum_reset_retries_recoverable_failure": 3.289,
