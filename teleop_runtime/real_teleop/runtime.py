@@ -1,12 +1,12 @@
 """Canonical real-teleop application lifecycle.
 
-The debug entrypoint parses arguments, refreshes this module's remaining
-lifecycle compatibility bindings, and delegates here.  The control loop uses
-its canonical lower-owned dependencies directly; only the three behaviors
-composed by the entrypoint are passed through its explicit context.  Device
-startup and control-loop ordering remain under :func:`run_real_teleop`;
-ordered best-effort release is delegated to the shutdown runtime without
-transferring device or control authority.
+The Control Station entrypoint parses arguments and delegates here with its
+explicit UI factories and application ports.  All reusable runtime support is
+imported from its canonical lower-owned module; the lifecycle no longer
+refreshes module globals from an application namespace.  Device startup and
+control-loop ordering remain under :func:`run_real_teleop`; ordered
+best-effort release is delegated to the shutdown runtime without transferring
+device or control authority.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from typing import Any
 
 import numpy as np
 
+from collection_runtime.dataset_layout import expand_cli_path as _expand_cli_path
 from dataset_contracts.capture_modalities import CaptureModalityContract
 from robot_motion.position_control import (
     DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
@@ -74,6 +75,7 @@ from .camera_runtime import (
     _start_camera_sources,
     _start_camera_sources_best_effort,
 )
+from .component_builder import build_real_teleop_components as _build_components
 from .components import RealTeleopComponents
 from .control_loop import (
     RealTeleopControlLoopContext,
@@ -105,7 +107,10 @@ from .control_profile import (
 )
 from .dataset_recorder import RealTeleopDatasetRecorder
 from .debug_recorders import (
+    ActionDebugLogRecorder,
     DEFAULT_ACTION_DEBUG_LOG_ROOT,
+    DebugTimingLogRecorder,
+    IkDebugLogRecorder,
     _handle_ik_debug_log_toggle_request,
 )
 from .debug_timing import (
@@ -149,6 +154,9 @@ from .foot_pad_controls import (
     initialize_startup_foot_pad_input,
 )
 from .gripper_control import _run_gripper_warmup_probe_for_side
+from .gripper_recovery import (
+    promote_angle_trigger_gripper_input_to_q6 as _promote_angle_trigger_gripper_input_to_q6,
+)
 from .gripper_warmup_runtime import build_gripper_warmup_probe_runtime
 from .hand_runtime import (
     _enable_gui_tactile_solving,
@@ -161,7 +169,10 @@ from .hand_runtime import (
     _tactile_solving_available,
     _tactile_visualization_available,
 )
-from .impedance_force_runtime import _emergency_stop_real_arms
+from .impedance_force_runtime import (
+    _emergency_stop_real_arms,
+    _guard_impedance_force_control,
+)
 from .main_loop_watchdog import MainLoopStallWatchdog
 from .operator_control_runtime import RealTeleopControlInput
 from .position_admittance_shadow import (
@@ -192,6 +203,7 @@ from .runtime_home import (
     _emit_home_alignment_logs,
     _emit_tracker_axis_mapping_logs,
     _manual_calibration_confirmation_required,
+    _real_hand_render_qpos,
     _runtime_home_calibration,
 )
 from .runtime_metadata import (
@@ -240,38 +252,8 @@ from .status_payloads import _camera_status_blocking_message, _safe_float_value
 from .tactile_idle_compression import RealTeleopIdleTactileCompression
 from .tactile_visualization import _build_tactile_visualizer
 from .terminal_input import TerminalClutchInput
+from .vive_calibration_runtime import _vive_pose_source_from_components
 from .visualization_runtime import build_visualization_runtime
-
-_REQUIRED_SUPPORT_NAMES = (
-    "ActionDebugLogRecorder",
-    "CalibrationWebUi",
-    "DebugTimingLogRecorder",
-    "GuiStartupProgress",
-    "IkDebugLogRecorder",
-    "_build_components",
-    "_expand_cli_path",
-    "_guard_impedance_force_control",
-    "_promote_angle_trigger_gripper_input_to_q6",
-    "_real_hand_render_qpos",
-    "_vive_pose_source_from_components",
-)
-
-
-def bind_legacy_support(namespace: Mapping[str, Any]) -> None:
-    """Refresh entrypoint-owned compatibility symbols before one runtime run."""
-
-    missing = [
-        name
-        for name in _REQUIRED_SUPPORT_NAMES
-        if name not in namespace
-    ]
-    if missing:
-        raise RuntimeError(
-            "real-teleop runtime support is incomplete: " + ", ".join(missing)
-        )
-    module_globals = globals()
-    for name in _REQUIRED_SUPPORT_NAMES:
-        module_globals[name] = namespace[name]
 
 
 def _position_admittance_runtime_event_payload(
@@ -449,6 +431,8 @@ def run_real_teleop(
     *,
     progress_application: ProgressApplicationPort | None = None,
     input_batch_prioritizer: RealTeleopInputBatchPrioritizer | None = None,
+    control_ui_type: type | None = None,
+    startup_progress_type: type | None = None,
 ) -> None:
     runtime_extension: RealTeleopRuntimeExtension | None = getattr(
         args,
@@ -465,11 +449,19 @@ def run_real_teleop(
         ) from exc
     if hasattr(args, "_resolved_position_admittance_profile"):
         delattr(args, "_resolved_position_admittance_profile")
-    control_ui_type = getattr(args, "_real_teleop_control_ui_type", CalibrationWebUi)
-    if hasattr(args, "_real_teleop_control_ui_type"):
-        delattr(args, "_real_teleop_control_ui_type")
-    if not isinstance(control_ui_type, type):
-        raise TypeError("_real_teleop_control_ui_type must be a UI class.")
+    gui_requested = bool(getattr(args, "gui_requested", False))
+    if control_ui_type is not None and not isinstance(control_ui_type, type):
+        raise TypeError("control_ui_type must be a UI class or None.")
+    if startup_progress_type is not None and not isinstance(startup_progress_type, type):
+        raise TypeError("startup_progress_type must be a progress class or None.")
+    if gui_requested and control_ui_type is None:
+        raise RuntimeError(
+            "GUI startup requires an explicit control_ui_type from the application."
+        )
+    if gui_requested and startup_progress_type is None:
+        raise RuntimeError(
+            "GUI startup requires an explicit startup_progress_type from the application."
+        )
     materialize_real_teleop_artifact_context(args)
     startup_cleanup = _activate_startup_cleanup(logger=_log)
     capability_admission = (
@@ -478,8 +470,10 @@ def run_real_teleop(
     startup_ui = initialize_startup_ui(
         args,
         startup_cleanup=startup_cleanup,
-        ui_type=control_ui_type,
-        progress_type=GuiStartupProgress,
+        # Headless startup returns before constructing either placeholder.
+        # GUI startup was admitted above and therefore receives real types.
+        ui_type=control_ui_type or type,
+        progress_type=startup_progress_type or type,
     )
     control_ui = startup_ui.control_ui
     startup_progress = startup_ui.progress
@@ -1806,12 +1800,9 @@ def run_real_teleop(
                 )
             else:
                 try:
-                    # The canonical runtime still receives the historical
-                    # control_station compatibility wrapper, whose
-                    # constructor intentionally has the old public signature.
-                    # Set this optional recorder-only prefix after construction
-                    # so that wrapper and legacy callers remain source-
-                    # compatible while the opt-in file is clearly identified.
+                    # Keep the optional recorder-only prefix out of the public
+                    # constructor so legacy direct callers remain compatible
+                    # while the opt-in file is clearly identified.
                     ik_debug_log_recorder.filename_prefix = "ik_debug_0827"
                     ik_debug_0827_path = ik_debug_log_recorder.start(now=time.time())
                     if (
@@ -2722,7 +2713,6 @@ def run_real_teleop(
                 raise episode_shutdown_error
 
 __all__ = [
-    "bind_legacy_support",
     "cleanup_active_startup",
     "run_real_teleop",
 ]

@@ -333,6 +333,7 @@ from teleop_runtime.real_teleop.runtime_home import (
     _hand_render_qpos,
     _manual_calibration_confirmation_required,
     _mean_pose,
+    _real_hand_render_qpos,
     _resolve_robot_home_for_side,
     _runtime_home_calibration,
     _vive_tracker_local_translation_offset,
@@ -764,13 +765,9 @@ from teleop_runtime.real_teleop.side_mapping import (
     tracker_role_for_source_side as _tracker_role_for_source_side,
     tracker_source_side_for_logical_side as _tracker_source_side_for_logical_side,
 )
-
-
-def _vive_pose_source_from_components(components: RealTeleopComponents) -> VivePoseSource | None:
-    for source in components.session.sources:
-        if isinstance(source, VivePoseSource):
-            return source
-    return None
+from teleop_runtime.real_teleop.vive_calibration_runtime import (
+    _vive_pose_source_from_components,
+)
 
 
 from teleop_runtime.real_teleop.hand_runtime import (
@@ -799,52 +796,15 @@ from teleop_runtime.real_teleop.hand_runtime import (
     _tactile_solving_available,
     _tactile_visualization_available,
 )
-def _discover_runtime_q6_ports(
-    args: argparse.Namespace,
-    active_sides: Sequence[str],
-) -> dict[str, str]:
-    return _cli_runtime_config._discover_runtime_q6_ports(args, active_sides)
-
-
-def _q6_gripper_retargeter_for_side(
-    args: argparse.Namespace,
-    side: str,
-) -> ScalarToGripperRetargeter:
-    policy = _resolved_gripper_policy_for_side(args, side)
-    return ScalarToGripperRetargeter(
-        ScalarToGripperRetargeterConfig(
-            side=side,
-            input_channel_name=f"{side}_hand_q6",
-            effector_name=f"{side}_hand",
-            source_dim=int(policy["source_dim"]),
-            output_dim=int(policy["output_dim"]),
-            invert=bool(policy["invert"]),
-            alpha=float(policy["alpha"]),
-            input_min=float(policy["input_min"]),
-            input_max=float(policy["input_max"]),
-            output_max=float(policy["max_action"]),
-        )
-    )
-
-
 from teleop_runtime.real_teleop.gripper_recovery import (
+    _q6_gripper_retargeter_for_side,
     promote_angle_trigger_gripper_input_to_q6,
 )
 
-
-def _promote_angle_trigger_gripper_input_to_q6(
-    args: argparse.Namespace,
-    components: RealTeleopComponents,
-    *,
-    ready_timeout_sec: float = 2.0,
-) -> tuple[bool, str]:
-    return promote_angle_trigger_gripper_input_to_q6(
-        args,
-        components,
-        ready_timeout_sec=ready_timeout_sec,
-        discover_runtime_q6_ports=_discover_runtime_q6_ports,
-        q6_gripper_retargeter_for_side=_q6_gripper_retargeter_for_side,
-    )
+_discover_runtime_q6_ports = _cli_runtime_config._discover_runtime_q6_ports
+_promote_angle_trigger_gripper_input_to_q6 = (
+    promote_angle_trigger_gripper_input_to_q6
+)
 
 
 def _apply_vive_tracker_mapping(
@@ -1115,12 +1075,7 @@ from teleop_runtime.real_teleop.position_tuning import (
 
 from teleop_runtime.real_teleop.component_builder import build_real_teleop_components
 
-
-def _build_components(args: argparse.Namespace) -> RealTeleopComponents:
-    return build_real_teleop_components(
-        args,
-        dmtac_backend_configs=_dmtac_backend_configs,
-    )
+_build_components = build_real_teleop_components
 
 
 from teleop_runtime.real_teleop.arm_state_sync import (
@@ -1219,15 +1174,6 @@ from teleop_runtime.real_teleop.gripper_control import (
     _probe_gripper_backend_motion,
     _run_gripper_warmup_probe_for_side,
 )
-
-
-def _real_hand_render_qpos(
-    backend: InspireTacHandBackend | DMTacGripperBackend | None,
-    side: str,
-) -> np.ndarray:
-    if isinstance(backend, DMTacGripperBackend):
-        return _hand_render_qpos(None, side)
-    return _hand_render_qpos(backend, side)
 
 
 from teleop_runtime.real_teleop.gripper_status import (
@@ -1585,10 +1531,13 @@ from teleop_runtime.real_teleop.startup_runtime import (
     cleanup_active_startup,
 )
 
-from teleop_runtime.real_teleop.runtime import (
-    bind_legacy_support as _bind_real_teleop_runtime_support,
-    run_real_teleop,
-)
+from teleop_runtime.real_teleop.runtime import run_real_teleop
+
+
+def _bind_real_teleop_runtime_support(_namespace: Mapping[str, Any]) -> None:
+    """Retain the old patch point without mutating canonical runtime globals."""
+
+    return None
 
 
 def run_real_teleop_entrypoint(
@@ -1623,16 +1572,15 @@ def run_real_teleop_entrypoint(
             )
         else:
             args = _parse_args_with_configuration(configure_parser=configure_parser)
-        _bind_real_teleop_runtime_support(globals())
         if not build_runtime_extension_before_device_preflight:
             runtime_extension = runtime_extension_factory(args)
         args._real_teleop_runtime_extension = runtime_extension
-        if control_ui_type is not None:
-            args._real_teleop_control_ui_type = control_ui_type
         run_real_teleop(
             args,
             progress_application=build_real_teleop_progress_application(args),
             input_batch_prioritizer=prioritize_input_batch,
+            control_ui_type=control_ui_type or CalibrationWebUi,
+            startup_progress_type=GuiStartupProgress,
         )
     except KeyboardInterrupt:
         # Keep Ctrl+C a normal operator action.  The runtime's regular

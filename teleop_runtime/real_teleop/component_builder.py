@@ -126,6 +126,7 @@ from .command_filters import (
     _compose_real_fault_filter,
     _fix_arm_required_effectors_by_side,
 )
+from .cli_runtime_config import _dmtac_backend_configs
 from .components import RealTeleopComponents
 
 
@@ -264,10 +265,7 @@ def _collision_debug_box_templates(
 
 def build_real_teleop_components(
     args: argparse.Namespace,
-    *,
-    dmtac_backend_configs: Callable[..., dict[str, object]],
 ) -> RealTeleopComponents:
-    _dmtac_backend_configs = dmtac_backend_configs
     position_admittance_profile = resolve_position_admittance_profile(args)
     _resolve_movement_multiple_args(args)
     debug_timing_modules = _debug_timing_modules(args)

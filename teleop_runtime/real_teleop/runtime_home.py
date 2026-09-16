@@ -28,6 +28,7 @@ from sim.rm65.sapien_renderer import (
 )
 
 from ..backends.arms import RM65ArmBackend
+from ..backends.grippers import DMTacGripperBackend
 from ..backends.hands import InspireTacHandBackend
 from ..calibration import TeleopCalibration
 from ..cli_value_parsers import _normalize_active_sides
@@ -1422,6 +1423,21 @@ def _hand_render_qpos(backend: InspireTacHandBackend | None, side: str) -> np.nd
     return inspire_q6_to_render_qpos(q6)
 
 
+def _real_hand_render_qpos(
+    backend: InspireTacHandBackend | DMTacGripperBackend | None,
+    side: str,
+) -> np.ndarray:
+    """Project only Inspire state into the hand renderer.
+
+    DMTAC is a scalar gripper and has no compatible six-joint hand state, so
+    its preview intentionally remains the canonical open-hand pose.
+    """
+
+    if isinstance(backend, DMTacGripperBackend):
+        return _hand_render_qpos(None, side)
+    return _hand_render_qpos(backend, side)
+
+
 def _hand_observation_for_step(
     components: RealTeleopComponents,
     step_result: object,
@@ -1455,6 +1471,7 @@ __all__ = [
     "_emit_runtime_orientation_logs",
     "_emit_tracker_axis_mapping_logs",
     "_hand_render_qpos",
+    "_real_hand_render_qpos",
     "_manual_calibration_confirmation_required",
     "_mean_pose",
     "_resolve_robot_home_for_side",

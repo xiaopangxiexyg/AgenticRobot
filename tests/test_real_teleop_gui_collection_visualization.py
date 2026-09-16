@@ -16,7 +16,11 @@ import numpy as np
 
 from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
-from teleop_runtime.real_teleop import cli_resolution, startup_runtime
+from teleop_runtime.real_teleop import (
+    cli_resolution,
+    impedance_force_runtime,
+    startup_runtime,
+)
 from control_station.web import calibration_web_ui
 from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from teleop_runtime.sources.pose import VivePoseSource
@@ -6635,11 +6639,11 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         issue = "right_arm pose impedance loop stopped before command dispatch"
         expected_reason = f"main_loop: {issue}"
 
-        with patch.object(real_teleop, "_impedance_force_control_issue", return_value=issue), patch.object(
-            real_teleop,
+        with patch.object(impedance_force_runtime, "_impedance_force_control_issue", return_value=issue), patch.object(
+            impedance_force_runtime,
             "_log",
         ):
-            ok = real_teleop._guard_impedance_force_control(
+            ok = impedance_force_runtime._guard_impedance_force_control(
                 SimpleNamespace(),
                 components,
                 context="main_loop",
@@ -6676,11 +6680,11 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         issue = "left_arm pose impedance is disabled before command dispatch"
         expected_reason = f"main_loop: {issue}"
 
-        with patch.object(real_teleop, "_impedance_force_control_issue", return_value=issue), patch.object(
-            real_teleop,
+        with patch.object(impedance_force_runtime, "_impedance_force_control_issue", return_value=issue), patch.object(
+            impedance_force_runtime,
             "_log",
         ) as log:
-            ok = real_teleop._guard_impedance_force_control(
+            ok = impedance_force_runtime._guard_impedance_force_control(
                 SimpleNamespace(),
                 components,
                 context="main_loop",
@@ -6708,11 +6712,11 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         issue = "left_arm pose impedance fault before command dispatch: RuntimeError: left: force 55.0000N > hard_stop_force_n"
         collisions: list[str] = []
 
-        with patch.object(real_teleop, "_impedance_force_control_issue", return_value=issue), patch.object(
-            real_teleop,
+        with patch.object(impedance_force_runtime, "_impedance_force_control_issue", return_value=issue), patch.object(
+            impedance_force_runtime,
             "_log",
-        ) as log, patch.object(real_teleop, "_hold_motion_after_impedance_guard_issue") as hold:
-            ok = real_teleop._guard_impedance_force_control(
+        ) as log, patch.object(impedance_force_runtime, "hold_motion_after_impedance_guard_issue") as hold:
+            ok = impedance_force_runtime._guard_impedance_force_control(
                 SimpleNamespace(),
                 components,
                 context="main_loop",

@@ -4,14 +4,43 @@ from __future__ import annotations
 
 import argparse
 import time
-from collections.abc import Callable
 
 import numpy as np
 
-from ..retargeters import ScalarToGripperRetargeter
+from ..retargeters import (
+    ScalarToGripperRetargeter,
+    ScalarToGripperRetargeterConfig,
+)
 from ..sources.hand import AngleTriggerSource, HandQ6Source
+from .cli_runtime_config import _discover_runtime_q6_ports
 from .components import RealTeleopComponents
+from .gripper_policy import (
+    resolved_gripper_policy_for_side as _resolved_gripper_policy_for_side,
+)
 from .hand_runtime import _gripper_retargeter_for_side
+
+
+def _q6_gripper_retargeter_for_side(
+    args: argparse.Namespace,
+    side: str,
+) -> ScalarToGripperRetargeter:
+    """Build the canonical Q6-to-gripper mapping for one logical side."""
+
+    policy = _resolved_gripper_policy_for_side(args, side)
+    return ScalarToGripperRetargeter(
+        ScalarToGripperRetargeterConfig(
+            side=side,
+            input_channel_name=f"{side}_hand_q6",
+            effector_name=f"{side}_hand",
+            source_dim=int(policy["source_dim"]),
+            output_dim=int(policy["output_dim"]),
+            invert=bool(policy["invert"]),
+            alpha=float(policy["alpha"]),
+            input_min=float(policy["input_min"]),
+            input_max=float(policy["input_max"]),
+            output_max=float(policy["max_action"]),
+        )
+    )
 
 
 def promote_angle_trigger_gripper_input_to_q6(
@@ -19,8 +48,6 @@ def promote_angle_trigger_gripper_input_to_q6(
     components: RealTeleopComponents,
     *,
     ready_timeout_sec: float = 2.0,
-    discover_runtime_q6_ports: Callable[..., dict[str, str]],
-    q6_gripper_retargeter_for_side: Callable[..., ScalarToGripperRetargeter],
 ) -> tuple[bool, str]:
     """Hot-switch a healthy angle-trigger fallback to newly connected Q6 input."""
 
@@ -38,7 +65,7 @@ def promote_angle_trigger_gripper_input_to_q6(
     # the session, but a later Q6 reconnect is still a valid recovery path.
     # The replacement assembly below inserts Q6 when no old source exists.
 
-    ports = discover_runtime_q6_ports(args, components.active_sides)
+    ports = _discover_runtime_q6_ports(args, components.active_sides)
     q6_source = HandQ6Source.from_bimanual(
         left_port=ports.get("left"),
         right_port=ports.get("right"),
@@ -96,7 +123,7 @@ def promote_angle_trigger_gripper_input_to_q6(
             old_retargeter = _gripper_retargeter_for_side(components, side)
             if old_retargeter is None:
                 continue
-            replacement = q6_gripper_retargeter_for_side(args, side)
+            replacement = _q6_gripper_retargeter_for_side(args, side)
             replacements[id(old_retargeter)] = replacement
             new_by_side[side] = replacement
         if not new_by_side:
@@ -200,4 +227,7 @@ def promote_angle_trigger_gripper_input_to_q6(
     return True, message
 
 
-__all__ = ["promote_angle_trigger_gripper_input_to_q6"]
+__all__ = [
+    "_q6_gripper_retargeter_for_side",
+    "promote_angle_trigger_gripper_input_to_q6",
+]
