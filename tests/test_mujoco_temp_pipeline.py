@@ -161,8 +161,13 @@ def _require_mujoco_runtime() -> None:
 
 @pytest.mark.optional
 def test_temp_training_defaults_to_fully_actuated_task() -> None:
-    pytest.importorskip("torch")
+    # Import the package before PyTorch, matching the production module entry
+    # point and its environment-local C++ runtime preload contract.  Loading
+    # PyTorch first can pin an incompatible system runtime and make later
+    # Pinocchio-backed pose planning take a different trajectory.
     from sim.mujoco_temp_pipeline.config import PPOConfig
+
+    pytest.importorskip("torch")
     from sim.mujoco_temp_pipeline.train import build_arg_parser
 
     args = build_arg_parser().parse_args([])
