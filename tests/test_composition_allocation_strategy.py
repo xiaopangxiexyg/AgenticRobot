@@ -1036,6 +1036,90 @@ def test_formal_composer_consumes_base_relative_and_absolute_modes() -> None:
     )
 
 
+def test_absolute_owner_does_not_require_a_policy_baseline() -> None:
+    output_schema, delta_schema = _schemas()
+    allocation_spec = _allocation_spec()
+    contracts = build_allocated_composition_contracts(
+        contract_id="exclusive-allocated-arm-hand",
+        output_action_schema=output_schema,
+        relative_action_schema=delta_schema,
+        allocation_spec=allocation_spec,
+        allocation_context_channel="source_allocation",
+        required_roles=(),
+    )
+    runtime, clock, activation, anchor_receipt = _runtime(
+        output_schema, delta_schema, contracts.strategy
+    )
+    absolute = ComponentAction(
+        action_schema=output_schema,
+        values_by_component={
+            "arm": (9.0, 8.0, 7.0, 0.0, 0.0, 0.0, 1.0),
+            "hand": (0.9, 0.8),
+        },
+    )
+    assert runtime.admit_composition_input(
+        _input_draft("operator_absolute", absolute, anchor_receipt, activation),
+        activation_scope=activation,
+    ).accepted
+
+    allocation_state = empty_composition_allocation_state(
+        "allocation-reducer", spec=allocation_spec
+    )
+    allocation_state = _admit_allocation_context(
+        runtime,
+        clock,
+        allocation_state,
+        allocation_spec,
+        activation,
+        anchor_receipt,
+        level=0.0,
+        at=10.0,
+        sequence=0,
+    )
+    base_only = runtime.evaluate_composition(
+        spec=contracts.composition_spec,
+        target_effective_at=10.05,
+        required_context_channels=("source_allocation",),
+        activation_scope=activation,
+        residual_anchor_lifecycle_scope_id="human-allocation",
+    ).composition_evaluation
+    assert base_only.output_status == "no_action"
+    assert base_only.reason == "allocated_component:arm:allocation_baseline_unavailable"
+
+    _admit_allocation_context(
+        runtime,
+        clock,
+        allocation_state,
+        allocation_spec,
+        activation,
+        anchor_receipt,
+        level=4.0,
+        at=10.10,
+        sequence=1,
+    )
+    human_only = runtime.evaluate_composition(
+        spec=contracts.composition_spec,
+        target_effective_at=10.15,
+        required_context_channels=("source_allocation",),
+        activation_scope=activation,
+        residual_anchor_lifecycle_scope_id="human-allocation",
+    ).composition_evaluation
+    assert human_only.output_status == "ready", human_only.reason
+    assert human_only.composed_candidate is not None
+    assert (
+        human_only.composed_candidate.action_schema.semantic_content_hash
+        == output_schema.semantic_content_hash
+    )
+    np.testing.assert_allclose(
+        human_only.composed_candidate.value("arm").values,
+        absolute.value("arm").values,
+    )
+    np.testing.assert_allclose(
+        human_only.composed_candidate.value("hand").values,
+        absolute.value("hand").values,
+    )
+
+
 def test_continuity_enabled_strategy_aligns_absolute_entry_and_records_receipt() -> None:
     output_schema, delta_schema, allocation_spec, contracts = (
         _continuity_contract()

@@ -245,6 +245,68 @@ def evaluate_allocated_component_rule(
                 reason=f"allocation_selected_input_anchor_mismatch:{role}",
                 context_id=context.context_id,
             )
+    mode = modes[rule.component_id]
+    if mode == COMPOSITION_ALLOCATION_MODE_ABSOLUTE_OVERLAY_OWNER:
+        # Absolute ownership is a complete source. Policy may be intentionally
+        # suspended, so do not require its short-lived baseline in this mode.
+        absolute = selected_inputs.get(rule.absolute_overlay_role)
+        if absolute is None or not component_record_available(
+            absolute,
+            component_id=rule.component_id,
+            representation=rule.representation,
+        ):
+            return _blocked(
+                rule,
+                reason="allocation_absolute_overlay_unavailable",
+                context_id=context.context_id,
+            )
+        if (
+            absolute.semantic_binding_id_by_kind.get(
+                RESIDUAL_ANCHOR_SEMANTIC_BINDING_KIND
+            )
+            != anchor_binding.receipt_id
+            or absolute.semantic_binding_hash_by_kind.get(
+                RESIDUAL_ANCHOR_SEMANTIC_BINDING_KIND
+            )
+            != anchor_binding.receipt_hash
+        ):
+            return _blocked(
+                rule,
+                reason="allocation_absolute_anchor_binding_mismatch",
+                context_id=context.context_id,
+            )
+        if not record_matches_declared_schema(strategy_input, absolute):
+            return AllocatedComponentRuleEvaluation(
+                output_status="invalid",
+                reason="allocation_absolute_overlay_schema_mismatch",
+                component_id=rule.component_id,
+                value=None,
+                output_action_schema=None,
+                used_context_id=context.context_id,
+            )
+        output_schema = absolute.action.action_schema
+        if (
+            output_schema.semantic_content_hash
+            != strategy_input.input_snapshot.action_schema_hash
+        ):
+            return AllocatedComponentRuleEvaluation(
+                output_status="invalid",
+                reason="allocation_absolute_output_schema_mismatch",
+                component_id=rule.component_id,
+                value=None,
+                output_action_schema=None,
+                used_context_id=context.context_id,
+            )
+        return AllocatedComponentRuleEvaluation(
+            output_status="ready",
+            reason=f"allocation_mode:{mode}",
+            component_id=rule.component_id,
+            value=np.array(absolute.action.value(rule.component_id).values, copy=True),
+            output_action_schema=output_schema,
+            used_context_id=context.context_id,
+            selected_mode=mode,
+        )
+
     baseline_evaluation = _baseline_only(
         strategy_input,
         rule=rule,
@@ -257,7 +319,6 @@ def evaluate_allocated_component_rule(
     assert baseline_evaluation.output_action_schema is not None
     output_schema = baseline_evaluation.output_action_schema
 
-    mode = modes[rule.component_id]
     if mode == COMPOSITION_ALLOCATION_MODE_BASE_ONLY:
         value = np.array(
             baseline.action.value(rule.component_id).values,
@@ -323,64 +384,6 @@ def evaluate_allocated_component_rule(
                 output_action_schema=None,
                 used_context_id=context.context_id,
             )
-    elif mode == COMPOSITION_ALLOCATION_MODE_ABSOLUTE_OVERLAY_OWNER:
-        absolute = selected_inputs.get(rule.absolute_overlay_role)
-        if absolute is None or not component_record_available(
-            absolute,
-            component_id=rule.component_id,
-            representation=rule.representation,
-        ):
-            return _blocked(
-                rule,
-                reason="allocation_absolute_overlay_unavailable",
-                context_id=context.context_id,
-            )
-        if (
-            absolute.semantic_binding_id_by_kind.get(
-                RESIDUAL_ANCHOR_SEMANTIC_BINDING_KIND
-            )
-            != anchor_binding.receipt_id
-            or absolute.semantic_binding_hash_by_kind.get(
-                RESIDUAL_ANCHOR_SEMANTIC_BINDING_KIND
-            )
-            != anchor_binding.receipt_hash
-        ):
-            return _blocked(
-                rule,
-                reason="allocation_absolute_anchor_binding_mismatch",
-                context_id=context.context_id,
-            )
-        if not record_matches_declared_schema(strategy_input, absolute):
-            return AllocatedComponentRuleEvaluation(
-                output_status="invalid",
-                reason="allocation_absolute_overlay_schema_mismatch",
-                component_id=rule.component_id,
-                value=None,
-                output_action_schema=None,
-                used_context_id=context.context_id,
-            )
-        baseline_payload_schema = output_schema.payload_schema_by_component[
-            rule.component_id
-        ]
-        absolute_payload_schema = (
-            absolute.action.action_schema.payload_schema_by_component[rule.component_id]
-        )
-        if (
-            absolute_payload_schema.semantic_content_hash
-            != baseline_payload_schema.semantic_content_hash
-        ):
-            return AllocatedComponentRuleEvaluation(
-                output_status="invalid",
-                reason="allocation_absolute_payload_schema_mismatch",
-                component_id=rule.component_id,
-                value=None,
-                output_action_schema=None,
-                used_context_id=context.context_id,
-            )
-        value = np.array(
-            absolute.action.value(rule.component_id).values,
-            copy=True,
-        )
     else:  # pragma: no cover - context parser rejects this first.
         raise AssertionError(f"Unhandled allocation mode {mode!r}.")
 
