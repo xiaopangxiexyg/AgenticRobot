@@ -317,7 +317,7 @@ def test_pose_planner_recovers_only_small_mujoco_joint_limit_residual() -> None:
         env.close()
 
 
-def test_pose_planner_hard_limit_violation_terminates_only_current_episode(
+def test_pose_planner_uses_sim_clearance_and_terminates_hard_limit_episode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("mujoco")
@@ -333,6 +333,16 @@ def test_pose_planner_hard_limit_violation_terminates_only_current_episode(
         env.reset(seed=12)
         controller = env.kernel._pose_action_controller
         assert controller is not None
+        # Read configuration before injecting the episode fault. This fixed
+        # scene does not need another seeded reset just to inspect clearance.
+        assert not env.config.randomizes_cube_spawn
+        expected = env.kernel.scene.scene_spec.collision.safety_minimum_clearance_m
+        assert expected == pytest.approx(0.002)
+        assert controller.planner_collision_min_distance_m == pytest.approx(expected)
+        if controller._ik is not None:
+            assert controller._ik.planner.config.collision_min_distance_m == pytest.approx(
+                expected
+            )
         hard_status = CubeLiftPosePlannerSyncStatus(
             safe=False,
             recovered=False,
@@ -355,32 +365,6 @@ def test_pose_planner_hard_limit_violation_terminates_only_current_episode(
         assert truncated is False
         assert info["termination_reason"] == "sim_joint_position_limit_violation"
         assert info["pose_ik_limit_violation_rad"] == pytest.approx(2e-3)
-    finally:
-        env.close()
-
-
-def test_pose_planner_uses_mujoco_collision_clearance() -> None:
-    """The sim IK anchor must use the sim policy's clearance, not real defaults."""
-
-    pytest.importorskip("mujoco")
-    pytest.importorskip("gymnasium")
-    from sim.mujoco.tasks.cube_lift import FastCubeLiftEnv
-
-    env = FastCubeLiftEnv(
-        "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json",
-        use_settled_snapshot=False,
-    )
-    try:
-        env.reset(seed=13)
-        controller = env.kernel._pose_action_controller
-        assert controller is not None
-        expected = env.kernel.scene.scene_spec.collision.safety_minimum_clearance_m
-        assert expected == pytest.approx(0.002)
-        assert controller.planner_collision_min_distance_m == pytest.approx(expected)
-        if controller._ik is not None:
-            assert controller._ik.planner.config.collision_min_distance_m == pytest.approx(
-                expected
-            )
     finally:
         env.close()
 

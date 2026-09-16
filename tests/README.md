@@ -101,6 +101,12 @@ integrator 和 manifest fingerprint 检查，并检查三种 key 两两不同。
 接触、反射、确定性双回放及安全负例不变。这两处各减少一个独立测试结果；
 合并场景的前置断言失败时，后续断言不会执行，不代表新的性能基准或硬件证据。
 
+`test_mujoco_fast_runtime.py` 的 clearance 配置检查并入硬超限 episode 测试，先检查真实初始化的
+scene/controller/planner 安全间距，再注入原有的 hard-limit 状态。该配置不随机化
+spawn，原 seed 12/13 不构成不同场景；合并用例显式检查这一前提。它不因缺少
+canonical planner 而跳过，保留原来的条件式 planner 断言以及 fallback 下的
+controller 检查。小超限恢复用例仍独立保留，不能将其可选依赖 skip 扩大到配置检查。
+
 ### v2.5-p shadow 的规模与持久化覆盖
 
 `test_v25p_dual_write_shadow.py` 的 CJSON 多帧成功用例使用 12 个不同数值的样本，
