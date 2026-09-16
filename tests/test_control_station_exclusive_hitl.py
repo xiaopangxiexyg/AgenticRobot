@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -222,7 +223,11 @@ def test_exclusive_hitl_virtual_policy_and_devices_switch_through_mujoco(
                 kind="request_human_takeover",
             ),
         )
-        assert takeover["status"] == "switch_ready", takeover
+        assert takeover["status"] == "switch_ready", json.dumps(
+            {"takeover": takeover, "application": app.status()},
+            indent=2,
+            default=str,
+        )
         assert takeover["exclusive_hitl_switch"]["target_source"] == "human"
         assert takeover["exclusive_hitl_switch"]["home_capture"] is not None
         human_evidence_refs = set(
