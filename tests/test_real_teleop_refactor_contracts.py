@@ -564,6 +564,8 @@ def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
 def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
     assert list(inspect.signature(legacy_entrypoint.parse_args).parameters) == []
     assert list(inspect.signature(cli_resolution.parse_real_teleop_args).parameters) == []
+    assert not hasattr(cli_resolution, "bind_legacy_support")
+    assert not hasattr(cli_resolution, "_LegacyFunctionProxy")
     assert list(inspect.signature(legacy_entrypoint.main).parameters) == []
     assert list(inspect.signature(legacy_entrypoint._build_components).parameters) == ["args"]
     control_parameters = list(

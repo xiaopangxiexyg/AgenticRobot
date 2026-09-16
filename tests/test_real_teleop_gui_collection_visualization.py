@@ -16,6 +16,7 @@ import numpy as np
 
 from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime.real_teleop import cli_resolution
 from control_station.web import calibration_web_ui
 from teleop_runtime.schemas import EffectorCommand, ObservationChannel, TeleopCommand
 from teleop_runtime.sources.pose import VivePoseSource
@@ -1298,7 +1299,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             newer = profile_dir / "20260702_090000_vive_rm65_real_teleop.json"
             older.write_text("{}", encoding="utf-8")
             newer.write_text("{}", encoding="utf-8")
-            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
+            with patch.object(cli_resolution, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
                 sys,
                 "argv",
                 [
@@ -1320,7 +1321,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_parse_args_errors_when_default_load_profile_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", Path(tmp_dir)), patch.object(
+            with patch.object(cli_resolution, "DEFAULT_CALIBRATION_PROFILE_DIR", Path(tmp_dir)), patch.object(
                 sys,
                 "argv",
                 [
@@ -1347,7 +1348,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             init_profile = profile_dir / "init_arm.json"
             calibration_profile.write_text("{}", encoding="utf-8")
             init_profile.write_text("{}", encoding="utf-8")
-            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
+            with patch.object(cli_resolution, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
                 sys,
                 "argv",
                 [
@@ -1381,8 +1382,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             calibration_profile = profile_dir / "20260702_090000_vive_rm65_real_teleop.json"
             calibration_profile.write_text("{}", encoding="utf-8")
             missing_init_profile = profile_dir / "missing-init-qpos.json"
-            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
-                real_teleop, "configured_foot_pad_count", return_value=2
+            with patch.object(cli_resolution, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
+                cli_resolution, "configured_foot_pad_count", return_value=2
             ), patch.object(
                 sys,
                 "argv",
@@ -1506,7 +1507,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
             calibration_profile.write_text("{}", encoding="utf-8")
             with patch.object(
-                real_teleop,
+                cli_resolution,
                 "DEFAULT_CALIBRATION_PROFILE_DIR",
                 profile_dir,
             ), patch.object(
@@ -1542,7 +1543,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             profile_dir = Path(tmp_dir)
             profile = profile_dir / "20260702_090000_vive_rm65_real_teleop.json"
             profile.write_text("{}", encoding="utf-8")
-            with patch.object(real_teleop, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
+            with patch.object(cli_resolution, "DEFAULT_CALIBRATION_PROFILE_DIR", profile_dir), patch.object(
                 sys,
                 "argv",
                 [

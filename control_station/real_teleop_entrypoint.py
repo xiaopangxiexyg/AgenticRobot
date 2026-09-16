@@ -721,7 +721,6 @@ def _toggle_collection_round_trip_phase(args: argparse.Namespace) -> bool:
 
 
 from teleop_runtime.real_teleop.cli_resolution import (
-    bind_legacy_support as _bind_cli_resolution_support,
     parse_real_teleop_args_with_parser,
 )
 from control_station.real_agent_primitive_runtime import (
@@ -736,7 +735,6 @@ def _parse_args_with_configuration(
     configure_parser: Callable[[argparse.ArgumentParser], None] | None = None,
     before_device_preflight: Callable[[argparse.Namespace], None] | None = None,
 ) -> argparse.Namespace:
-    _bind_cli_resolution_support(globals())
     parser = build_real_teleop_argument_parser()
     add_real_agent_primitive_arguments(parser)
     if configure_parser is not None:
