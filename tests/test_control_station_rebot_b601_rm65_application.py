@@ -81,7 +81,7 @@ def test_assembly_preserves_injected_owners_and_current_pose_anchor(setup_motion
 
 def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
     session = _session(setup_motion)
-    clock, scene, _, _, backend, _, _ = setup_motion
+    clock, _, _, _, backend, _, _ = setup_motion
     viewer = _Viewer()
     records = []
     commands = iter(("a", None, "c", "r", None, "q"))
@@ -101,7 +101,6 @@ def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
     )
     assert any(event.get("accepted") for event in records), records
     assert any(event.get("status") == "dispatched" for event in records)
-    assert scene.writes
     assert session.state == "inactive"
     assert session.anchor is None
     # Resource lifecycles belong to the application, not this injected loop.

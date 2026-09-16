@@ -302,7 +302,7 @@ class B601RM65MotionBinding:
         step: B601RM65ResidualStep,
         anchor: B601RM65MotionAnchor,
         *,
-        target_effective_at: float,
+        target_effective_at: float | None,
         effective_until: float,
     ) -> ProposalAdmissionReceipt:
         """Admit one current source proposal; receipt is not a dispatch receipt."""
@@ -366,7 +366,15 @@ class B601RM65MotionBinding:
             self._age(now, receipt.adapted_at, self.limits[0])
             if sample.measured_at < anchor.master_anchor.captured_at:
                 raise ValueError("Source predates the activation barrier.")
-            target_time, expires = float(target_effective_at), float(effective_until)
+            # The binding owns its final admission timestamp. A foreground
+            # caller cannot safely pre-stamp an immediate target before source
+            # adaptation, because real monotonic time advances during that
+            # work. Explicit scheduled times remain subject to the same strict
+            # future/TTL validation below.
+            target_time = (
+                now if target_effective_at is None else float(target_effective_at)
+            )
+            expires = float(effective_until)
             if (
                 not math.isfinite(target_time)
                 or not math.isfinite(expires)
@@ -562,8 +570,8 @@ class B601RM65MotionSession:
                 raise ValueError("Supply both absolute proposal times or neither.")
             if target_effective_at is None:
                 # Foreground callers cannot timestamp after an in-flight poll.
-                # Keep expiry tied to the original sample, not its adaptation.
-                target_effective_at = now
+                # Keep expiry tied to the original sample, not its adaptation;
+                # the final admission owner selects the immediate target time.
                 sample = projection.pose_sample
                 effective_until = (
                     sample.measured_at if sample is not None else now

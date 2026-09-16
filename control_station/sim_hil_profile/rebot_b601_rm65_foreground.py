@@ -125,6 +125,11 @@ def run_b601_rm65_foreground(
                             "r": session.release_clutch,
                             "s": session.deactivate,
                         }[command]()
+                        if command in {"a", "r"}:
+                            # Activation/recenter consumes one complete master
+                            # snapshot as the anchor. Do not immediately poll
+                            # the same vendor cache frame again in this tick.
+                            next_tick = float(clock()) + period
                         emit(f"[B601→RM65] {session.state}")
                         event("operator_command", command=command)
                 else:

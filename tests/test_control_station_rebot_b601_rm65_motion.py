@@ -483,6 +483,27 @@ def test_session_current_tick_is_timestamped_after_slow_poll(
     )
 
 
+def test_session_default_target_time_is_selected_by_final_admission_owner(
+    setup_motion, monkeypatch
+):
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.activate()
+    clock.value += 0.05
+
+    def advancing_runtime_clock():
+        clock.value += 0.001
+        return clock()
+
+    monkeypatch.setattr(runtime, "clock", advancing_runtime_clock)
+    receipt = session.step()
+    assert receipt.accepted, receipt.message
+    assert receipt.proposal.target_effective_at >= receipt.proposal.effective_from
+    assert receipt.proposal.effective_until <= (
+        receipt.proposal.target_effective_at + session.binding.limits[0]
+    )
+
+
 def test_session_half_absolute_window_is_rejected_and_held(setup_motion):
     clock, _, runtime, _, _, _, _ = setup_motion
     session = _session(setup_motion)
@@ -528,6 +549,39 @@ def test_foreground_commands_clutch_and_quit_use_the_existing_owner(setup_motion
     assert any("reposition/settle" in status for status in statuses)
     assert events[-1]["event"] == "foreground_stopped"
     assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+
+
+def test_foreground_activation_waits_for_next_feedback_period(setup_motion):
+    clock, _, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    commands = iter(("a", None, "q"))
+    events = []
+    anchor_sequence = None
+
+    def poll(timeout):
+        nonlocal anchor_sequence
+        command = next(commands)
+        if command == "a":
+            clock.value += 0.001
+        elif command is None:
+            anchor_sequence = backend.sequence
+            clock.value += timeout
+        return command
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=lambda _message: None,
+        record=events.append,
+    )
+    admission = next(
+        event for event in events if event["event"] == "proposal_admission"
+    )
+    assert admission["accepted"]
+    assert anchor_sequence is not None
+    assert backend.sequence == anchor_sequence + 1
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt(), OSError("target failed")])
