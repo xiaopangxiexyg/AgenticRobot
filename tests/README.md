@@ -88,6 +88,19 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### v2.5-p shadow 的规模与持久化覆盖
+
+`test_v25p_dual_write_shadow.py` 的 CJSON 多帧成功用例使用 12 个不同数值的样本，
+覆盖首帧、零/一起始索引和 9/10 文件序号转换，并逐帧检查真实落盘后的投影。
+这是对原 256 个近似重复样本的规模压缩，不再声称覆盖 256 样本的 CJSON 长 episode。
+中途/末尾 mismatch 用例还验证失败 receipt、native 数据保留和下一 episode 状态清理。
+文件/目录同步故障用例只在指定失败点注入异常，其他同步调用仍执行真实 `fsync`；
+它们检查未完成 capture 不会发布完成 manifest，不代表真实掉电恢复验证。
+
+Parquet 的 256 样本、4 个 chunk 长测保留，并检查逐帧读回投影；该 optional 用例
+不能替代无 PyArrow 环境下的 CJSON 覆盖。native-store 的两种格式精确对照、延迟
+封存及真实 producer 多帧验证仍独立保留。这里不改变生产存储、同步策略或验收 selector。
+
 ## Cost gates in parallel worktrees
 
 Use the fast unit and integration selectors plus the exact tests for the owner

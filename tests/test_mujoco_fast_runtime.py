@@ -18,6 +18,13 @@ FULLY_ACTUATED_TASK_CONFIG = Path(
 )
 
 
+@pytest.fixture(scope="module")
+def runtime_model_cache(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    # Share compiled artifacts, never environments, MjModel/MjData or snapshots.
+    # Cache-contract tests below deliberately keep their own cold tmp_path roots.
+    return tmp_path_factory.mktemp("fast-runtime-model-cache")
+
+
 def _load_shared_model_artifact(
     cache_root: str,
     start_at: float,
@@ -71,7 +78,7 @@ def test_worker_runtime_library_path_restores_parent_environment(
         assert os.environ["LD_LIBRARY_PATH"] == parent_value
 
 
-def test_fast_kernel_matches_reference_action_trace(tmp_path: Path) -> None:
+def test_fast_kernel_matches_reference_action_trace(runtime_model_cache: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
     from sim.mujoco.tasks.cube_lift import CubeLiftEnv, FastCubeLiftEnv
@@ -80,7 +87,7 @@ def test_fast_kernel_matches_reference_action_trace(tmp_path: Path) -> None:
     fast = FastCubeLiftEnv(
         TASK_CONFIG,
         use_settled_snapshot=False,
-        model_cache_dir=tmp_path / "cache",
+        model_cache_dir=runtime_model_cache,
     )
     rng = np.random.default_rng(20260715)
     try:
@@ -102,12 +109,12 @@ def test_fast_kernel_matches_reference_action_trace(tmp_path: Path) -> None:
         reference.close()
 
 
-def test_fast_kernel_settled_snapshot_avoids_repeated_settle(tmp_path: Path) -> None:
+def test_fast_kernel_settled_snapshot_avoids_repeated_settle(runtime_model_cache: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
     from sim.mujoco.tasks.cube_lift import FastCubeLiftEnv
 
-    env = FastCubeLiftEnv(TASK_CONFIG, model_cache_dir=tmp_path / "cache")
+    env = FastCubeLiftEnv(TASK_CONFIG, model_cache_dir=runtime_model_cache)
     try:
         first, first_info = env.reset(seed=1)
         second, second_info = env.reset(seed=2)
@@ -432,7 +439,7 @@ def test_default_cube_lift_uses_measured_identified_gripper_state() -> None:
 
 @pytest.mark.slow_sim
 def test_vector_executor_is_deterministic_and_preserves_terminal_observation(
-    tmp_path: Path,
+    runtime_model_cache: Path,
 ) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
@@ -441,7 +448,7 @@ def test_vector_executor_is_deterministic_and_preserves_terminal_observation(
     kwargs = {
         "num_envs": 2,
         "config_path": TASK_CONFIG,
-        "model_cache_dir": tmp_path / "cache",
+        "model_cache_dir": runtime_model_cache,
         "master_seed": 31,
         "start_method": "spawn",
     }
@@ -471,21 +478,21 @@ def test_vector_executor_is_deterministic_and_preserves_terminal_observation(
         assert all(info["final_observation"].shape == (31,) for info in infos)
 
 
-def test_fast_env_passes_gymnasium_checker(tmp_path: Path) -> None:
+def test_fast_env_passes_gymnasium_checker(runtime_model_cache: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
     from gymnasium.utils.env_checker import check_env
 
     from sim.mujoco.tasks.cube_lift import FastCubeLiftEnv
 
-    env = FastCubeLiftEnv(TASK_CONFIG, model_cache_dir=tmp_path / "cache")
+    env = FastCubeLiftEnv(TASK_CONFIG, model_cache_dir=runtime_model_cache)
     try:
         check_env(env, skip_render_check=True)
     finally:
         env.close()
 
 
-def test_vector_env_exposes_batched_gymnasium_spaces(tmp_path: Path) -> None:
+def test_vector_env_exposes_batched_gymnasium_spaces(runtime_model_cache: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")
     from gymnasium.vector import VectorEnv
@@ -495,7 +502,7 @@ def test_vector_env_exposes_batched_gymnasium_spaces(tmp_path: Path) -> None:
     env = CubeLiftVectorEnv(
         2,
         config_path=TASK_CONFIG,
-        model_cache_dir=tmp_path / "cache",
+        model_cache_dir=runtime_model_cache,
         start_method="spawn",
     )
     try:

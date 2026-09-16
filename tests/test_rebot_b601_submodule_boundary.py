@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import ast
 from configparser import ConfigParser
 from pathlib import Path
 import subprocess
 
 import pytest
 from setuptools import find_packages
+
+from tests.support.repository_imports import absolute_import_modules
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -87,13 +88,7 @@ def test_m0_adds_no_parent_runtime_import_of_rebot_vendor_code() -> None:
     violations: dict[str, list[str]] = {}
 
     for path in _parent_python_files():
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        imports: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imports.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                imports.add(node.module)
+        imports = absolute_import_modules(path)
         matched = sorted(
             module
             for module in imports
