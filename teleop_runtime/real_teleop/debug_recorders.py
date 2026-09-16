@@ -8,20 +8,27 @@ specific filenames, schemas, and bounded best-effort writer behavior.
 
 from __future__ import annotations
 
+import argparse
 import json
 import queue
 import threading
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from robot_motion.runtime import run_best_effort_cleanup
 
 from ..collection.diagnostics import should_report_debug_frozen
+from ..log_utils import log_event as _log
 from project_paths import teleop_records_root
+
+if TYPE_CHECKING:
+    from ..operator_ui_ports import OperatorUiPort
+    from .components import RealTeleopComponents
+    from .operator_control_runtime import RealTeleopControlInput
 
 
 DEFAULT_IK_DEBUG_LOG_ROOT = teleop_records_root() / "ik_debug"
@@ -666,6 +673,84 @@ class IkDebugLogRecorder:
         self.stop(reason="close")
 
 
+def _handle_ik_debug_log_toggle_request(
+    *,
+    args: argparse.Namespace,
+    components: RealTeleopComponents,
+    clutch_input: RealTeleopControlInput,
+    ik_debug_log_recorder: IkDebugLogRecorder,
+    control_ui: OperatorUiPort | None,
+    ik_debug_profile_base_enabled: bool,
+    now: float,
+) -> None:
+    """Apply one operator request to the IK recorder and debug-profile state."""
+
+    if not clutch_input.consume_ik_debug_log_toggle_request():
+        return
+    if bool(getattr(args, "no_debug_disk_write", False)):
+        clutch_input.set_ik_debug_logging_state(active=False, path="")
+        message = "本次运行已通过 --no-debug-disk-write 禁止 debug 写盘。"
+        _log("IKDebugLog", message, now=now)
+        if control_ui is not None:
+            control_ui.append_message("IKDebugLog", message)
+        return
+    if ik_debug_log_recorder.active:
+        stopped_path = ik_debug_log_recorder.stop(reason="gui_toggle_stop", now=now)
+        if components.dual_arm_retargeter is not None and len(components.active_sides) > 1:
+            components.dual_arm_retargeter.config.debug_profile = ik_debug_profile_base_enabled
+            components.dual_arm_retargeter.ik_solver.debug_profile = ik_debug_profile_base_enabled
+        clutch_input.set_ik_debug_logging_state(
+            active=False,
+            path="" if stopped_path is None else str(stopped_path),
+        )
+        _log(
+            "IKDebugLog",
+            (
+                f"stopped path={stopped_path} frames={ik_debug_log_recorder.frame_count} "
+                f"dropped={ik_debug_log_recorder.dropped_frame_count}"
+            ),
+            now=now,
+        )
+        if control_ui is not None:
+            control_ui.append_message(
+                "IKDebugLog",
+                f"已停止 IK 记录：{stopped_path}",
+            )
+        return
+
+    try:
+        started_path = ik_debug_log_recorder.start(now=now)
+    except Exception as exc:  # noqa: BLE001 - debug logging must not break teleop.
+        clutch_input.set_ik_debug_logging_state(active=False, path="")
+        message = f"IK 记录启动失败：{type(exc).__name__}: {exc}"
+        _log("IKDebugLog", message, now=now)
+        if control_ui is not None:
+            control_ui.append_message("IKDebugLog", message)
+        return
+    ik_debug_log_mode = (
+        "full" if bool(getattr(args, "ik_debug_log_full", False)) else "compact"
+    )
+    ik_debug_log_recorder.write_event(
+        "mode",
+        {"mode": ik_debug_log_mode},
+        now=now,
+    )
+    if components.dual_arm_retargeter is not None and len(components.active_sides) > 1:
+        components.dual_arm_retargeter.config.debug_profile = True
+        components.dual_arm_retargeter.ik_solver.debug_profile = True
+    clutch_input.set_ik_debug_logging_state(active=True, path=str(started_path))
+    _log(
+        "IKDebugLog",
+        f"started path={started_path} mode={ik_debug_log_mode}",
+        now=now,
+    )
+    if control_ui is not None:
+        control_ui.append_message(
+            "IKDebugLog",
+            f"已开始 IK 记录：{started_path} mode={ik_debug_log_mode}",
+        )
+
+
 __all__ = [
     "ActionDebugLogRecorder",
     "DebugTimingLogRecorder",
@@ -673,6 +758,7 @@ __all__ = [
     "DEFAULT_DEBUG_TIMING_LOG_ROOT",
     "DEFAULT_IK_DEBUG_LOG_ROOT",
     "IkDebugLogRecorder",
+    "_handle_ik_debug_log_toggle_request",
     "json_safe",
     "state_value",
     "stop_debug_writer_thread",

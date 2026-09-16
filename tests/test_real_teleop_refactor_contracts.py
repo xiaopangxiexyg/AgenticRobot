@@ -39,6 +39,7 @@ from teleop_runtime.real_teleop import (
     debug_payload_primitives,
     debug_ik_payload,
     debug_log_frames,
+    debug_recorders,
     debug_timing_payload,
     defaults,
     diagnostic_setup,
@@ -564,6 +565,8 @@ def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
 def test_legacy_runtime_entrypoint_signatures_are_frozen() -> None:
     assert list(inspect.signature(legacy_entrypoint.parse_args).parameters) == []
     assert list(inspect.signature(cli_resolution.parse_real_teleop_args).parameters) == []
+    assert not hasattr(cli_resolution, "bind_legacy_support")
+    assert not hasattr(cli_resolution, "_LegacyFunctionProxy")
     assert list(inspect.signature(legacy_entrypoint.main).parameters) == []
     assert list(inspect.signature(legacy_entrypoint._build_components).parameters) == ["args"]
     control_parameters = list(
@@ -2186,24 +2189,33 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
         "_arm_after_start_calibration",
     ):
         assert getattr(legacy_entrypoint, name).__module__ == startup_runtime.__name__
+    assert not hasattr(startup_runtime, "bind_legacy_support")
+    assert not hasattr(startup_runtime, "_LegacyFunctionProxy")
+    assert (
+        legacy_entrypoint._handle_ik_debug_log_toggle_request
+        is debug_recorders._handle_ik_debug_log_toggle_request
+    )
+    assert (
+        runtime._handle_ik_debug_log_toggle_request
+        is debug_recorders._handle_ik_debug_log_toggle_request
+    )
 
     calls: list[str] = []
     monkeypatch.setattr(
-        legacy_entrypoint,
+        startup_runtime,
         "_advance_startup_gui_qpos_maintenance",
         lambda **kwargs: calls.append("advance") or False,
     )
     monkeypatch.setattr(
-        legacy_entrypoint,
+        startup_runtime,
         "_handle_ik_debug_log_toggle_request",
         lambda **kwargs: calls.append("debug"),
     )
     monkeypatch.setattr(
-        legacy_entrypoint,
+        startup_runtime,
         "_impedance_force_control_not_ready_sides",
         lambda args, components: [],
     )
-    startup_runtime.bind_legacy_support(vars(legacy_entrypoint))
     clutch = SimpleNamespace(
         enabled=True,
         args=SimpleNamespace(),
@@ -2872,21 +2884,20 @@ def test_startup_home_wait_quiesces_idle_maintenance_during_delay(
 ) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
-        legacy_entrypoint,
+        startup_runtime,
         "_advance_startup_gui_qpos_maintenance",
         lambda **kwargs: False,
     )
     monkeypatch.setattr(
-        legacy_entrypoint,
+        startup_runtime,
         "_handle_ik_debug_log_toggle_request",
         lambda **kwargs: None,
     )
     monkeypatch.setattr(
-        legacy_entrypoint,
+        startup_runtime,
         "_impedance_force_control_not_ready_sides",
         lambda args, components: [],
     )
-    startup_runtime.bind_legacy_support(vars(legacy_entrypoint))
     clutch = SimpleNamespace(
         enabled=True,
         poll=lambda: None,

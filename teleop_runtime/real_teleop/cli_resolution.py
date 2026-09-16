@@ -8,21 +8,68 @@ the canonical debug entrypoint.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping
-import inspect
+from collections.abc import Callable
 import os
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 
+from collection_runtime import dataset_layout as real_teleop_dataset_layout
 from collection_runtime.progress.profiles import (
     inspect_dataset_progress_profile,
     inspect_dataset_task_stage_profile,
 )
+from robot_motion.pose_frame_profiles import (
+    default_rm65_workspace_near_boundary_collection_pose_frame_contract,
+)
+from robot_motion.position_control.trajectory import (
+    POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+    POSITION_COMMAND_PLANNER_LINEAR,
+    POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+    normalize_position_command_planner,
+)
+from robot_motion.rm65.position_profile import LEGACY_POSITION_CONTROL_PROFILE_NAME
+
+from ..action.human_shadow_frontend import validate_human_shadow_arguments
+from ..arm_frames import TOOL_TCP_FRAME
+from ..backends.grippers import normalize_dmtac_tactile_fields
+from ..cli_value_parsers import _active_sides_from_args
+from ..configs.presets import ANNOTATED_DUAL_RM65_BASE_DISTANCE_M
+from ..defaults import DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ
+from ..position_control.config import (
+    POSITION_15_60_120HZ_PROFILE_NAME,
+    resolve_control_debug_config,
+    resolve_real_arm_execution_config,
+)
+from ..position_control.formal_profile import apply_rm65_position_profile_defaults
 
 from .artifact_context import configure_real_teleop_artifact_paths
+from .cli import build_real_teleop_argument_parser
+from .cli_runtime_config import (
+    _apply_default_arm_ips,
+    _apply_default_q6_ports,
+    _apply_real_loop_timing_defaults,
+    _argv_has_option,
+    _resolve_gripper_input_source,
+    _run_gui_device_preflight,
+    _save_explicit_arm_ips_latest,
+    _validate_required_arm_ips,
+)
+from .foot_pad_controls import (
+    configured_foot_pad_count,
+    resolve_special_arm_control_mode,
+)
+from .gripper_policy import resolved_gripper_policy as _resolved_gripper_policy
+from .hand_config import (
+    HAND_BACKEND_INSPIRE,
+    dmtac_sides as _dmtac_sides,
+    hand_backend_mode_for_side as _hand_backend_mode_for_side,
+)
+from .hand_runtime import _parse_hand_tactile_regions
 from .hitl_cli import add_exclusive_hitl_arguments
+from .movement import resolve_movement_multiple_args as _resolve_movement_multiple_args
 from .position_admittance_shadow import (
     resolve_position_admittance_profile,
 )
@@ -32,84 +79,12 @@ from .progress_adapter import (
     resolve_real_teleop_stage_profile_for_admission,
     validate_real_teleop_initial_progress_profile,
 )
-
-
-_SUPPORT_NAMES = (
-    "ANNOTATED_DUAL_RM65_BASE_DISTANCE_M",
-    "DEFAULT_CALIBRATION_PROFILE_DIR",
-    "DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ",
-    "HAND_BACKEND_INSPIRE",
-    "LEGACY_POSITION_CONTROL_PROFILE_NAME",
-    "POSITION_15_60_120HZ_PROFILE_NAME",
-    "POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED",
-    "POSITION_COMMAND_PLANNER_LINEAR",
-    "POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED",
-    "TOOL_TCP_FRAME",
-    "_active_sides_from_args",
-    "_apply_default_arm_ips",
-    "_apply_default_q6_ports",
-    "_apply_formal_dataset_layout",
-    "_apply_real_loop_timing_defaults",
-    "_argv_has_option",
-    "_dmtac_sides",
-    "_hand_backend_mode_for_side",
-    "_init_arm_qpos_speed_scale_for_side",
-    "_latest_vive_calibration_profile_path",
-    "_parse_hand_tactile_regions",
-    "_resolve_gripper_input_source",
-    "_resolve_movement_multiple_args",
-    "_resolve_workspace_override_args",
-    "_resolved_gripper_policy",
-    "_run_gui_device_preflight",
-    "_save_explicit_arm_ips_latest",
-    "_validate_required_arm_ips",
-    "apply_rm65_position_profile_defaults",
-    "build_real_teleop_argument_parser",
-    "configured_foot_pad_count",
-    "default_rm65_workspace_near_boundary_collection_pose_frame_contract",
-    "normalize_dmtac_tactile_fields",
-    "normalize_position_command_planner",
-    "resolve_control_debug_config",
-    "resolve_real_arm_execution_config",
-    "resolve_special_arm_control_mode",
-    "validate_human_shadow_arguments",
+from .special_arm_runtime import _init_arm_qpos_speed_scale_for_side
+from .vive_calibration_profiles import (
+    DEFAULT_CALIBRATION_PROFILE_DIR,
+    _latest_vive_calibration_profile_path,
 )
-
-
-class _LegacyFunctionProxy:
-    __slots__ = ("_namespace", "_name")
-
-    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
-        self._namespace = namespace
-        self._name = str(name)
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        target = self._namespace[self._name]
-        if target is self:
-            raise RuntimeError(f"recursive CLI-resolution support proxy: {self._name}")
-        return target(*args, **kwargs)  # type: ignore[operator]
-
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._namespace[self._name], attribute)
-
-
-def bind_legacy_support(namespace: Mapping[str, object]) -> None:
-    missing = [name for name in _SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "real-teleop CLI resolution support is incomplete: "
-            + ", ".join(sorted(missing))
-        )
-    globals().update(
-        {
-            name: (
-                _LegacyFunctionProxy(namespace, name)
-                if inspect.isroutine(namespace[name])
-                else namespace[name]
-            )
-            for name in _SUPPORT_NAMES
-        }
-    )
+from .workspace import resolve_workspace_override_args as _resolve_workspace_override_args
 
 
 def _validate_tactile_bundle_root(
@@ -585,7 +560,10 @@ def _parse_real_teleop_args(
         _resolve_workspace_override_args(args)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
-    _apply_formal_dataset_layout(args)
+    real_teleop_dataset_layout.apply_formal_dataset_layout(
+        args,
+        date_prefix=time.strftime("%Y-%m-%d"),
+    )
     _validate_tactile_bundle_root(args, parser)
     progress_profile = getattr(args, "collection_progress_profile", None)
     if bool(getattr(args, "collection_progress_gui", False)) and bool(
@@ -813,7 +791,9 @@ def _parse_real_teleop_args(
             f"{', '.join(sorted(special_arm_modes))} requires --active-sides both."
         )
     if not str(getattr(args, "load_profile", "") or "").strip():
-        latest_profile = _latest_vive_calibration_profile_path()
+        latest_profile = _latest_vive_calibration_profile_path(
+            profile_dir=DEFAULT_CALIBRATION_PROFILE_DIR,
+        )
         if latest_profile is None:
             parser.error(
                 "--load-profile was not provided and no calibration profile JSON was found in "
@@ -919,7 +899,6 @@ def parse_real_teleop_args_with_parser(
 
 
 __all__ = [
-    "bind_legacy_support",
     "parse_real_teleop_args",
     "parse_real_teleop_args_with_parser",
 ]

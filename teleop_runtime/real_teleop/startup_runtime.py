@@ -1,20 +1,20 @@
 """Startup hold, exact-qpos maintenance, and runtime-home orchestration.
 
 This module owns only the startup-stage ordering that used to live at the end
-of the canonical real-teleop entrypoint.  Its compatibility binding keeps
-historical entrypoint monkeypatch points live without importing debug modules.
+of the canonical real-teleop entrypoint.  Startup dependencies come directly
+from their implementation owners rather than an entrypoint-populated namespace.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping
-import inspect
 import time
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from collection_runtime.dataset_layout import expand_cli_path as _expand_cli_path
 from robot_motion.runtime import (
     EffectorCommand,
     TeleopCommand,
@@ -23,8 +23,13 @@ from robot_motion.runtime import (
 )
 
 from ..collection.camera_preview import CameraPreviewer
-from ..log_utils import ChangeGate
+from ..log_utils import ChangeGate, log_event as _log
 from ..sources.camera import RealSenseRGBSource
+from .arm_runtime import (
+    _impedance_force_control_not_ready_sides,
+    _impedance_force_control_warmup_backends,
+)
+from .arm_state_sync import _reset_runtime_motion_state_from_real_qpos
 from .camera_runtime import (
     CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES,
     CAMERA_STARTUP_SELF_CHECK_DURATION_SEC,
@@ -32,36 +37,28 @@ from .camera_runtime import (
     CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC,
     CameraStartupFreshnessGate,
 )
+from .debug_recorders import _handle_ik_debug_log_toggle_request
+from .impedance_force_runtime import (
+    _enable_impedance_force_control_after_runtime_home,
+    _handle_init_qpos_emergency_stop,
+    _warm_start_impedance_force_control_before_home,
+)
+from .runtime_home import DEFAULT_RUNTIME_HOME_START_DELAY_SEC
 from .runtime_extension import runtime_extension_refresh_status
+from .special_arm_runtime import (
+    _cancel_special_arm_modes_for_hold,
+    _release_gui_qpos_init_transit,
+)
+from .status_payloads import (
+    _camera_self_check_payload,
+    _with_expected_wrist_depth_camera_statuses,
+)
 
 if TYPE_CHECKING:
     from ..operator_ui_ports import OperatorUiPort
     from .operator_control_runtime import RealTeleopControlInput
     from ..special_tasks.init_arm import InitArmCommandController
     from .components import RealTeleopComponents
-
-
-_SUPPORT_NAMES = (
-    "DEFAULT_RUNTIME_HOME_START_DELAY_SEC",
-    "_advance_startup_gui_qpos_maintenance",
-    "_camera_self_check_payload",
-    "_cancel_special_arm_modes_for_hold",
-    "_enable_impedance_force_control_after_runtime_home",
-    "_expand_cli_path",
-    "_finish_startup_gui_qpos_terminal",
-    "_handle_ik_debug_log_toggle_request",
-    "_handle_init_qpos_emergency_stop",
-    "_impedance_force_control_not_ready_sides",
-    "_impedance_force_control_warmup_backends",
-    "_log",
-    "_release_gui_qpos_init_transit",
-    "_reset_runtime_motion_state_from_real_qpos",
-    "_safe_float_value",
-    "_safe_int_value",
-    "_startup_gui_qpos_seed_command",
-    "_warm_start_impedance_force_control_before_home",
-    "_with_expected_wrist_depth_camera_statuses",
-)
 
 
 _ACTIVE_STARTUP_CLEANUP: "StartupCleanupRegistry | None" = None
@@ -166,42 +163,6 @@ def register_component_startup_cleanup(
     session = getattr(components, "session", None)
     if session is not None:
         registry.add("teleop_session", session.close)
-
-
-class _LegacyFunctionProxy:
-    __slots__ = ("_namespace", "_name")
-
-    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
-        self._namespace = namespace
-        self._name = str(name)
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        target = self._namespace[self._name]
-        if target is self:
-            raise RuntimeError(f"recursive startup support proxy: {self._name}")
-        return target(*args, **kwargs)  # type: ignore[operator]
-
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._namespace[self._name], attribute)
-
-
-def bind_legacy_support(namespace: Mapping[str, object]) -> None:
-    missing = [name for name in _SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "real-teleop startup support is incomplete: "
-            + ", ".join(sorted(missing))
-        )
-    globals().update(
-        {
-            name: (
-                _LegacyFunctionProxy(namespace, name)
-                if inspect.isroutine(namespace[name])
-                else namespace[name]
-            )
-            for name in _SUPPORT_NAMES
-        }
-    )
 
 
 def _run_camera_startup_self_check(
@@ -1332,7 +1293,6 @@ __all__ = [
     "CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC",
     "StartupCleanupRegistry",
     "activate_startup_cleanup",
-    "bind_legacy_support",
     "cleanup_active_startup",
     "deactivate_startup_cleanup",
     "register_component_startup_cleanup",
