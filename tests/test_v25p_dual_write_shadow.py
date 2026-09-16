@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +13,8 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.v22 import PolicyIOLayout
 from dataset_contracts.v25p_native_storage import V25P_PARQUET_CHUNK_LAYOUT_V1
-from dataset_interface.v25p_native import load_v25p_native_episode
+from dataset_interface.v25p_native import V25pNativeReadError, load_v25p_native_episode
+from dataset_interface.v25p_v23_adapter import project_native_episode_to_v23_rows
 from teleop_runtime.collection.v25p_capture_profiles import (
     V25P_REAL_TELEOP_SOURCE,
     build_policy_io_v25p_capture_profiles,
@@ -35,16 +39,17 @@ class _Producer:
 
     def produce(self, sample: dict[str, object]) -> V25pProducedSample:
         timestamp = float(sample["timestamp"])
+        offset = int(sample["frame_index"]) / 16.0
         inputs = {}
         for stream in self.bundle.streams.streams:
             if stream.representation_family in {"xyz_quat_xyzw", "cartesian_pose"}:
                 side_offset = 0.0 if stream.stream_id.endswith(".left") else 1.0
                 values = np.asarray(
-                    [side_offset, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                    [side_offset + offset, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
                     dtype=np.float32,
                 )
             elif stream.representation_family == "joint_position":
-                values = np.arange(6, dtype=np.float32)
+                values = np.arange(6, dtype=np.float32) + offset
             else:  # pragma: no cover - the no-hand test layout has no other streams
                 raise AssertionError(stream.stream_id)
             inputs[stream.stream_id] = V25pComponentInput(
@@ -104,15 +109,16 @@ def _legacy_row(
     timestamp: float = 3.0,
     drift: bool = False,
 ) -> dict[str, object]:
-    left_x = 0.25 if drift else 0.0
+    offset = frame_index / 16.0
+    left_x = offset + (0.25 if drift else 0.0)
     return {
         "episode_index": 0,
         "frame_index": int(frame_index),
         "timestamp": float(timestamp),
         "action.left_arm.pose": [left_x, 0, 0, 0, 0, 0, 1],
-        "observation.left_arm.pose": [0, 0, 0, 0, 0, 0, 1],
-        "action.right_arm.pose": [1, 0, 0, 0, 0, 0, 1],
-        "observation.right_arm.pose": [1, 0, 0, 0, 0, 0, 1],
+        "observation.left_arm.pose": [offset, 0, 0, 0, 0, 0, 1],
+        "action.right_arm.pose": [1 + offset, 0, 0, 0, 0, 0, 1],
+        "observation.right_arm.pose": [1 + offset, 0, 0, 0, 0, 0, 1],
     }
 
 
@@ -120,6 +126,27 @@ def _publish_legacy_episode_record(root: Path, row: dict[str, object]) -> None:
     path = root / "meta" / "episodes.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _assert_persisted_projection(loaded, bundle, *, sample_count: int) -> None:
+    projected = project_native_episode_to_v23_rows(loaded, bundle.v23_projection)
+    assert len(projected.rows) == sample_count
+    for frame_index, row in enumerate(projected.rows):
+        expected = _legacy_row(
+            frame_index=frame_index, timestamp=3.0 + frame_index / 15.0
+        )
+        assert row.sample_index == frame_index
+        assert row.cut_at == expected["timestamp"]
+        assert row.cut_clock_domain_id == "test_clock"
+        assert dict(row.fields) == {
+            field: tuple(expected[field])
+            for field in (
+                "action.left_arm.pose",
+                "observation.left_arm.pose",
+                "action.right_arm.pose",
+                "observation.right_arm.pose",
+            )
+        }
 
 
 def test_shadow_uses_owner_identity_and_commits_complete_receipt(tmp_path: Path) -> None:
@@ -189,17 +216,19 @@ def test_shadow_mismatch_keeps_native_capture_and_publishes_failed_receipt(
 
 
 @pytest.mark.slow_sim
-def test_shadow_long_episode_preserves_exact_projection_for_every_sample(
+def test_shadow_multiframe_episode_preserves_persisted_projection_for_every_sample(
     tmp_path: Path,
 ) -> None:
-    _bundle, shadow, identity = _setup(tmp_path)
+    bundle, shadow, identity = _setup(tmp_path)
     shadow.prepare_episode(identity)
     shadow.bind_prepared_episode(
         identity,
         bound_at=2.0,
         bound_clock_domain_id="test_clock",
     )
-    sample_count = 256
+    # Exercise zero/one-based records and the 9/10 filename transition with
+    # distinct payloads. Large-volume chunk coverage remains in the Parquet test.
+    sample_count = 12
     for frame_index in range(sample_count):
         timestamp = 3.0 + frame_index / 15.0
         append = shadow.append(
@@ -232,6 +261,135 @@ def test_shadow_long_episode_preserves_exact_projection_for_every_sample(
     loaded = load_v25p_native_episode(tmp_path, identity.episode_uuid)
     assert loaded.native_capture_manifest.sample_count == sample_count
     assert len(loaded.samples) == sample_count
+    _assert_persisted_projection(loaded, bundle, sample_count=sample_count)
+
+
+@pytest.mark.parametrize("mismatch_index", (5, 11), ids=("middle", "last"))
+def test_shadow_late_mismatch_preserves_capture_and_resets_next_episode(
+    tmp_path: Path,
+    mismatch_index: int,
+) -> None:
+    bundle, shadow, identity = _setup(tmp_path)
+    shadow.prepare_episode(identity)
+    shadow.bind_prepared_episode(
+        identity, bound_at=2.0, bound_clock_domain_id="test_clock"
+    )
+    for frame_index in range(12):
+        timestamp = 3.0 + frame_index / 15.0
+        report = shadow.append(
+            identity,
+            source_sample={"frame_index": frame_index, "timestamp": timestamp},
+            legacy_row=_legacy_row(
+                frame_index=frame_index,
+                timestamp=timestamp,
+                drift=frame_index == mismatch_index,
+            ),
+        )
+        assert report.sample_index == frame_index
+        assert report.equivalent is (frame_index != mismatch_index)
+        assert report.mismatch_fields == (
+            ("action.left_arm.pose",) if frame_index == mismatch_index else ()
+        )
+    legacy_record = {"episode_index": 0, "length": 12}
+    _publish_legacy_episode_record(tmp_path, legacy_record)
+    finalized = shadow.finalize_after_legacy(
+        identity,
+        legacy_episode_record=legacy_record,
+        completed_at=5.0,
+        completed_clock_domain_id="test_clock",
+    )
+    assert finalized.receipt.status == "failed"
+    assert finalized.receipt.target_episode_locator is None
+    assert finalized.equivalent_sample_count == 11
+    assert finalized.mismatched_sample_count == 1
+    loaded = load_v25p_native_episode(tmp_path, identity.episode_uuid)
+    assert loaded.native_capture_manifest.sample_count == 12
+    _assert_persisted_projection(loaded, bundle, sample_count=12)
+    assert shadow.active_identity is None
+    assert shadow.store.active_identity is None
+
+    # Reuse the actual wrapper/store: a failed parity report must not leak into
+    # the next episode, and its sample index must restart from zero.
+    second = replace(
+        identity, episode_uuid="shadow-next", legacy_episode_index=1, prepared_at=6.0
+    )
+    shadow.prepare_episode(second)
+    shadow.bind_prepared_episode(
+        second, bound_at=7.0, bound_clock_domain_id="test_clock"
+    )
+    row = _legacy_row(timestamp=8.0)
+    row["episode_index"] = 1
+    report = shadow.append(
+        second,
+        source_sample={"frame_index": 0, "timestamp": 8.0},
+        legacy_row=row,
+    )
+    assert report.equivalent
+    _publish_legacy_episode_record(tmp_path, row)
+    next_result = shadow.finalize_after_legacy(
+        second,
+        legacy_episode_record=row,
+        completed_at=9.0,
+        completed_clock_domain_id="test_clock",
+    )
+    assert next_result.receipt.status == "complete"
+    assert next_result.equivalent_sample_count == 1
+    assert next_result.mismatched_sample_count == 0
+    next_loaded = load_v25p_native_episode(tmp_path, second.episode_uuid)
+    assert next_loaded.identity == second
+    assert len(next_loaded.samples) == 1
+    assert next_loaded.samples[0].sample_index == 0
+
+
+@pytest.mark.parametrize("fail_directory", (False, True), ids=("file", "directory"))
+def test_shadow_seal_sync_failure_never_publishes_complete_episode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_directory: bool,
+) -> None:
+    _bundle, shadow, identity = _setup(tmp_path)
+    shadow.prepare_episode(identity)
+    shadow.bind_prepared_episode(
+        identity, bound_at=2.0, bound_clock_domain_id="test_clock"
+    )
+    row = _legacy_row()
+    assert shadow.append(
+        identity,
+        source_sample={"frame_index": 0, "timestamp": 3.0},
+        legacy_row=row,
+    ).equivalent
+    _publish_legacy_episode_record(tmp_path, row)
+    real_fsync = os.fsync
+    sync_count = 0
+
+    def fail_second_sync(fd: int) -> None:
+        nonlocal sync_count
+        if stat.S_ISDIR(os.fstat(fd).st_mode) == fail_directory:
+            sync_count += 1
+            if sync_count == 2:
+                raise OSError("injected native seal sync failure")
+        real_fsync(fd)
+
+    # Leave earlier writes real; fail after a durable prefix has been published.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", fail_second_sync)
+        with pytest.raises(OSError, match="injected native seal sync failure"):
+            shadow.finalize_after_legacy(
+                identity,
+                legacy_episode_record=row,
+                completed_at=4.0,
+                completed_clock_domain_id="test_clock",
+            )
+    assert sync_count == 2
+    episode_dir = tmp_path / "meta/v25p/native/episodes" / identity.episode_uuid
+    assert tuple((episode_dir / "streams").glob("*/*.cjson"))
+    assert not (episode_dir / "native_capture_manifest.cjson").exists()
+    assert not (episode_dir / "episode_manifest.cjson").exists()
+    assert not (episode_dir / "compatibility_projections").exists()
+    assert shadow.active_identity == identity
+    assert shadow.store.active_identity == identity
+    with pytest.raises(V25pNativeReadError, match="missing"):
+        load_v25p_native_episode(tmp_path, identity.episode_uuid)
 
 
 @pytest.mark.optional
@@ -239,7 +397,7 @@ def test_parquet_shadow_long_episode_preserves_v23_projection_and_chunks(
     tmp_path: Path,
 ) -> None:
     pytest.importorskip("pyarrow")
-    _bundle, shadow, identity = _setup(
+    bundle, shadow, identity = _setup(
         tmp_path,
         physical_storage_layout=V25P_PARQUET_CHUNK_LAYOUT_V1,
         parquet_chunk_rows=64,
@@ -282,6 +440,7 @@ def test_parquet_shadow_long_episode_preserves_v23_projection_and_chunks(
     assert len(loaded.samples) == sample_count
     episode_dir = tmp_path / "meta/v25p/native/episodes" / identity.episode_uuid
     assert len(tuple((episode_dir / "chunks").glob("*.cjson"))) == 4
+    _assert_persisted_projection(loaded, bundle, sample_count=sample_count)
 
 
 def test_shadow_discard_is_subordinate_and_close_unsealed_preserves_audit(
