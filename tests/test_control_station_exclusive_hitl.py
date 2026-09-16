@@ -133,7 +133,11 @@ def test_exclusive_hitl_virtual_policy_and_devices_switch_through_mujoco(
                 device="cpu",
                 realtime_worker=False,
                 mujoco_viewer_enabled=False,
-                warmup_timeout_sec=1.0,
+                # Keep activation execution on the production-default budget.
+                # A cold isolated Profile can exceed one second while still
+                # producing the same admitted target; human emission remains
+                # independently fail-closed by the one-second timeout below.
+                warmup_timeout_sec=5.0,
                 human_emission_timeout_sec=1.0,
                 compose_target_hz=15.0,
             ),
