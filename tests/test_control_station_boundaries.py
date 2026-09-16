@@ -295,6 +295,9 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # The concrete real-RM65 CLI validates reviewed camera/tool geometry
         # while assembling its profile; Gateway core remains numerical-neutral.
         "agent_gateway/profiles/real/gateway_cli.py": ["numpy"],
+        # The concrete RM65 approach profile decodes RGBD and binds its
+        # retained visible scene; numerical work stays outside Gateway core.
+        "agent_gateway/profiles/real/grasp_approach_plan.py": ["numpy"],
         "agent_gateway/profiles/real/perception_probe.py": ["numpy"],
         # Offline v1 and deployment-bound live v2 point-grasp stay in one
         # concrete profile leaf: NumPy decodes/projects only at this boundary.

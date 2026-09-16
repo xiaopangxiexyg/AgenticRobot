@@ -114,9 +114,10 @@ class CollisionSafetyOracle:
         contact checks remain governed by the configured ``hard_penetration_m``
         bound.
 
-        The default query reports a lower bound clipped at the admission
-        threshold. A diagnostic caller may explicitly request a larger query
-        radius to measure clearance; this never changes the safety threshold.
+        Preserve the policy's reporting radius for general simulation. A
+        caller may explicitly use the admission threshold as the query radius
+        to avoid broad-query mesh artifacts; that result is a clipped lower
+        bound, not measured clearance. Neither mode changes the safety margin.
         """
 
         clearance = (
@@ -128,17 +129,11 @@ class CollisionSafetyOracle:
             raise ValueError("minimum_clearance_m must be finite.")
         minimum = float("inf")
         closest: _ForbiddenGeomPair | None = None
-        # Admission only needs a distance clipped at its required clearance.
-        # A broad positive distmax can yield a false negative distance for
-        # separated convex meshes (including native CCD in MuJoCo 3.10).
-        # Querying exactly the decision threshold keeps every forbidden pair
-        # and margin active; far-away distances are lower bounds, not exact
-        # clearance measurements. Recovery thresholds can be negative, but
-        # the query radius must still include all actual penetration.
-        limit = max(0.0, clearance)
+        required_limit = max(0.0, clearance)
+        limit = max(self.policy.distance_query_limit_m, required_limit)
         if distance_query_limit_m is not None:
             requested_limit = float(distance_query_limit_m)
-            if not np.isfinite(requested_limit) or requested_limit < limit:
+            if not np.isfinite(requested_limit) or requested_limit < required_limit:
                 raise ValueError(
                     "distance_query_limit_m must be finite and cover the clearance threshold."
                 )

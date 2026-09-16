@@ -38,16 +38,17 @@ def test_distance_admission_uses_required_margin_and_retains_real_penetration(
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     oracle = CollisionSafetyOracle(mujoco, model)
-    check = oracle.check(data, minimum_clearance_m=clearance_m)
+    check = oracle.check(
+        data, minimum_clearance_m=clearance_m,
+        distance_query_limit_m=max(0.0, clearance_m),
+    )
 
     assert oracle.forbidden_pair_count == 1
     assert check.safe is expected_safe
     assert check.minimum_distance_m == pytest.approx(
         min(separation_m, max(0.0, clearance_m)), abs=1e-8
     )
-    measured = oracle.check(
-        data, minimum_clearance_m=clearance_m, distance_query_limit_m=0.05
-    )
+    measured = oracle.check(data, minimum_clearance_m=clearance_m)
     assert measured.safe is expected_safe
     assert measured.minimum_distance_m == pytest.approx(separation_m, abs=1e-8)
     with pytest.raises(ValueError, match="distance_query_limit_m"):

@@ -70,6 +70,7 @@ class KinematicCollisionProjector:
         controlled_qpos: np.ndarray,
         *,
         minimum_clearance_m: float | None = None,
+        distance_query_limit_m: float | None = None,
     ) -> CollisionCheckResult:
         self.scratch.qpos[:] = source_data.qpos
         self.scratch.qpos[self.controlled_qpos_indices] = controlled_qpos
@@ -79,6 +80,7 @@ class KinematicCollisionProjector:
         return self.oracle.check(
             self.scratch,
             minimum_clearance_m=minimum_clearance_m,
+            distance_query_limit_m=distance_query_limit_m,
         )
 
     def check_current(self, data) -> CollisionCheckResult:

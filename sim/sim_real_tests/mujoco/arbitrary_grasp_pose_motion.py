@@ -260,11 +260,16 @@ class _ArtifactAwareKinematicCollisionProjector(KinematicCollisionProjector):
             source_data,
             controlled_qpos,
             minimum_clearance_m=minimum_clearance_m,
+            distance_query_limit_m=max(
+                0.0,
+                self.policy.minimum_clearance_m
+                if minimum_clearance_m is None else minimum_clearance_m,
+            ),
         )
-        if collision.safe:
-            # Exact-shadow receipts report measured clearance, not the
-            # admission query's clipped lower bound. This profile already
-            # owns the full-forward witness recovery for broad-query zeros.
+        admission = collision
+        if admission.safe:
+            # Prefer measured clearance when the broader diagnostic agrees
+            # with admission. This profile owns full-forward zero recovery.
             collision = self.oracle.check(
                 self.scratch,
                 minimum_clearance_m=minimum_clearance_m,
@@ -273,13 +278,20 @@ class _ArtifactAwareKinematicCollisionProjector(KinematicCollisionProjector):
                     float(minimum_clearance_m or 0.0),
                 ),
             )
-        return _recover_projector_zero_distance_result(
+        measured = _recover_projector_zero_distance_result(
             self,
             source_data,
             controlled_qpos,
             collision,
             minimum_clearance_m=minimum_clearance_m,
         )
+        # Admission remains the threshold query, not the optional broad
+        # measurement: separated convex meshes can report negative distances
+        # only at the larger radius. If that measurement is inconsistent,
+        # retain the conservative admitted lower bound, never its invalid
+        # distance. An unsafe admission still follows the existing narrow
+        # full-forward zero-witness recovery and is never broadly overridden.
+        return admission if admission.safe and not measured.safe else measured
 
 
 def _install_artifact_aware_collision_projector(
