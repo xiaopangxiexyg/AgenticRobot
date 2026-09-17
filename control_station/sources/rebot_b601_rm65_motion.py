@@ -82,6 +82,25 @@ class B601RM65MotionTarget(Protocol):
     def transition_execution_gate(self, status: str, *, reason: str) -> object: ...
 
 
+class B601RM65TargetExecutionGateError(RuntimeError):
+    """A lower target gate is not ready for a new RM65 anchor.
+
+    The snapshot is retained for the foreground operator loop so a lower-owner
+    fault/transition can be reported and retried without converting it into a
+    generic process failure.  No target proposal is admitted from this error.
+    """
+
+    def __init__(self, snapshot: ExecutionGateSnapshot) -> None:
+        if not isinstance(snapshot, ExecutionGateSnapshot):
+            raise TypeError("snapshot must be an ExecutionGateSnapshot.")
+        self.snapshot = snapshot
+        super().__init__(
+            "Target execution gate is not ready: "
+            f"status={snapshot.status} reason={snapshot.reason!r} "
+            f"gate_epoch={snapshot.gate_epoch}."
+        )
+
+
 @dataclass(frozen=True)
 class B601RM65MotionAnchor:
     """Measured target baseline bound to one master anchor and gate epoch."""
@@ -267,10 +286,7 @@ class B601RM65MotionBinding:
             or set(master_anchor.entry_by_component) != {self.component_id}
         ):
             raise ValueError("Anchor domain/component binding differs.")
-        self._age(now, measurement.available_at, self.limits[1])
-        self._age(now, measurement.measured_at, self.limits[1])
-        self._age(now, master_anchor.captured_at, self.limits[0])
-        self._age(now, master_anchor.entries[0].source_measured_at, self.limits[0])
+        self._validate_anchor_freshness(now, master_anchor, measurement)
         values = {}
         for (
             component_id,
@@ -294,11 +310,31 @@ class B601RM65MotionBinding:
             # Only an explicit operator transaction can reopen HOLD, after
             # validating both measured anchors. No failed capture leaves READY.
             self.runtime.transition_execution_gate("ready", reason="operator_recenter")
+            # The transition is admitted at a new causal cut.  Reusing the
+            # pre-transition ``now`` would exclude that just-admitted READY
+            # event on a real monotonic clock and spuriously reject ``a``.
+            now = float(self.runtime.clock())
+            try:
+                self._validate_anchor_freshness(now, master_anchor, measurement)
+            except BaseException:
+                # A failed post-transition freshness check must not leave a
+                # READY gate behind. Preserve the original failure unless
+                # re-establishing HOLD itself fails, in which case surface the
+                # cleanup failure as the actionable safety condition.
+                try:
+                    self.runtime.transition_execution_gate(
+                        "hold", reason="operator_recenter_anchor_stale"
+                    )
+                except BaseException as hold_error:
+                    raise RuntimeError(
+                        "Recenter freshness failed and target gate could not be returned to HOLD."
+                    ) from hold_error
+                raise
             gate = self.runtime.authoritative_port.capture_execution_gate_snapshot(
                 now=now
             )
         if gate.status != "ready":
-            raise RuntimeError("Target execution gate is not ready.")
+            raise B601RM65TargetExecutionGateError(gate)
         return B601RM65MotionAnchor(
             master_anchor,
             measurement,
@@ -482,6 +518,19 @@ class B601RM65MotionBinding:
                 rejection_code="b601_motion_rejected",
                 message=str(error),
             )
+
+    def _validate_anchor_freshness(
+        self,
+        now: float,
+        master_anchor: HumanResidualPoseAnchor,
+        measurement: ExecutionMeasurementObservation,
+    ) -> None:
+        """Validate all anchor timestamps against one causal clock cut."""
+
+        self._age(now, measurement.available_at, self.limits[1])
+        self._age(now, measurement.measured_at, self.limits[1])
+        self._age(now, master_anchor.captured_at, self.limits[0])
+        self._age(now, master_anchor.entries[0].source_measured_at, self.limits[0])
 
     @staticmethod
     def _age(now: float, timestamp: float, maximum: float) -> None:

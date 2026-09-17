@@ -607,6 +607,88 @@ def test_foreground_activation_waits_for_next_feedback_period(setup_motion):
     assert backend.sequence == anchor_sequence + 1
 
 
+def test_recenter_uses_a_fresh_gate_cut_after_ready_transition(setup_motion, monkeypatch):
+    """A real-clock READY event must be visible to the same activation."""
+
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.deactivate()
+    original_transition = runtime.transition_execution_gate
+
+    def transition(status, *, reason):
+        # Simulate the monotonic clock advancing between the pre-transition
+        # snapshot and the lower-owner admission.  The old implementation then
+        # queried the gate at a cut that excluded the newly admitted READY event.
+        if status == "ready":
+            clock.value += 0.001
+        return original_transition(status, reason=reason)
+
+    monkeypatch.setattr(runtime, "transition_execution_gate", transition)
+    anchor = session.activate()
+
+    assert session.state == "active"
+    assert anchor.gate_epoch > 0
+    assert (
+        runtime.authoritative_port.capture_execution_gate_snapshot().status == "ready"
+    )
+
+
+def test_recenter_stale_after_ready_transition_returns_to_hold(setup_motion, monkeypatch):
+    """A transition cannot leave READY when the new cut fails freshness."""
+
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.deactivate()
+    original_transition = runtime.transition_execution_gate
+
+    def transition(status, *, reason):
+        if status == "ready":
+            clock.value += 0.2
+        return original_transition(status, reason=reason)
+
+    monkeypatch.setattr(runtime, "transition_execution_gate", transition)
+    with pytest.raises(ValueError, match="stale"):
+        session.activate()
+
+    assert session.state == "held" and session.anchor is None
+    assert (
+        runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+    )
+
+
+def test_foreground_keeps_ui_open_for_target_gate_retry(setup_motion):
+    """A lower target fault/transition is held and retryable, not a GUI crash."""
+
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    runtime.transition_execution_gate("transitioning", reason="lower_owner_rearm")
+    commands = iter(("a", "q"))
+    statuses, events = [], []
+
+    def poll(_timeout):
+        clock.value += 0.001
+        return next(commands)
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=statuses.append,
+        record=events.append,
+    )
+
+    assert session.state == "inactive" and session.anchor is None
+    assert any("target gate held" in status for status in statuses)
+    assert any("press a to retry" in status for status in statuses)
+    assert any(
+        event["event"] == "target_execution_gate_unavailable"
+        and event["gate_status"] == "transitioning"
+        and event["retryable"] is True
+        for event in events
+    )
+
+
 def test_foreground_keeps_receive_only_ui_open_for_retryable_feedback_dependency(
     setup_motion, monkeypatch
 ):

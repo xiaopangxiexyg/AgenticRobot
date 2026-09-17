@@ -27,6 +27,13 @@
 session/foreground 状态机，不由 shell 历史命令或后台重启承担。恢复仍需操作者显式按 `a`，
 不会在 stale/坏帧后自动恢复跟随，避免数据流刚恢复时未经确认突然产生目标运动。
 
+目标执行 gate 也遵循同一条重试边界。启动 GUI 会先把 RM65 跟随置于 `hold`；操作者按 `a`
+时，session 先采集双方当前新鲜姿态，再由 lower target owner 显式执行 `hold → ready`。
+切换后必须重新取得 monotonic clock cut，才能看见刚刚准入的 `READY` 事件；不能复用切换前
+的旧 cut。若 lower owner 处于 `fault`/`transitioning` 或切换后新鲜度复核失败，目标保持
+held、不会提交旧 anchor，前台会记录 gate status/reason 并继续等待操作者修复后重试。该
+路径也不触碰独立的 B601 重力补偿/阻尼 owner。
+
 CAN backend 以默认 `allow_motion=False`、`allow_active_reporting=False` 创建，只接收**独立 owner 已开启**的
 完整新鲜六轴反馈。它不使能、不切模式、不配置 report、不发送 MIT/position/torque、不操作 J7。
 现有 master 重力补偿/阻尼 owner 必须独立运行；应用退出仅撤销仿真跟随并关闭自己的只读连接。

@@ -16,7 +16,10 @@ import termios
 import tty
 from collections.abc import Callable, Mapping
 
-from control_station.sources.rebot_b601_rm65_motion import B601RM65MotionSession
+from control_station.sources.rebot_b601_rm65_motion import (
+    B601RM65MotionSession,
+    B601RM65TargetExecutionGateError,
+)
 from hardware.rebot_b601_rs import B601HardwareDependencyError
 
 
@@ -168,7 +171,7 @@ def run_b601_rm65_foreground(
         )
         emit("[B601→RM65] Start inactive; reposition/settle first, then a. c before recentering.")
         emit(
-            "[B601→RM65] A feedback-capability error stays held; repair the source and press a again."
+            "[B601→RM65] Feedback-capability or target-gate errors stay held; repair/rearm the source and press a again."
         )
         emit("[B601→RM65] Ctrl-C/EOF: stop RM65 following; master gravity/damping is unchanged.")
 
@@ -191,6 +194,36 @@ def run_b601_rm65_foreground(
             command=command,
             error_type=type(error).__name__,
             error=message,
+            retryable=True,
+        )
+
+    def recoverable_target_gate_error(
+        command: str, error: B601RM65TargetExecutionGateError
+    ) -> None:
+        """Keep the receive-only UI open for a lower-owner gate transition.
+
+        A target fault/transition is not permission to publish an old anchor.
+        The snapshot is reported verbatim and the operator must repair or
+        re-arm the lower owner before retrying ``a``/``r``.
+        """
+
+        snapshot = error.snapshot
+        emit(
+            "[B601→RM65] target gate held: "
+            f"status={snapshot.status} reason={snapshot.reason!r} "
+            f"gate_epoch={snapshot.gate_epoch}; no RM65 following."
+        )
+        emit(
+            "[B601→RM65] repair/re-arm the target gate, then press a to retry; "
+            "no stale anchor is reused."
+        )
+        event(
+            "target_execution_gate_unavailable",
+            command=command,
+            gate_status=snapshot.status,
+            gate_reason=snapshot.reason,
+            gate_epoch=snapshot.gate_epoch,
+            error=str(error),
             retryable=True,
         )
 
@@ -238,6 +271,13 @@ def run_b601_rm65_foreground(
                             # The session has already withdrawn its target
                             # anchor before re-raising the backend error.
                             recoverable_feedback_error(command, error)
+                            next_tick = float(clock()) + period
+                            continue
+                        except B601RM65TargetExecutionGateError as error:
+                            # A lower-owner fault/transition is retryable, but
+                            # never an implicit re-arm or permission to reuse a
+                            # previous target anchor.
+                            recoverable_target_gate_error(command, error)
                             next_tick = float(clock()) + period
                             continue
                         if command in {"a", "r"}:
