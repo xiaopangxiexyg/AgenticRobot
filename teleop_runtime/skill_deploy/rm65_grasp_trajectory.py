@@ -33,9 +33,7 @@ from robot_motion.rm65 import (
     DEFAULT_RIGHT_ARM_QPOS,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
-    RM65DualArmCollisionIKConfig,
     build_dual_arm_scene_profile,
-    build_rm65_dual_arm_collision_ik_solver,
 )
 from robot_motion.rm65.obstacle_collision import (
     RM65_D405_ATTACHED_COLLISION_PROXIES,
@@ -50,7 +48,7 @@ from .grasp_trajectory_record import write_grasp_trajectory_record
 from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
 
 _SIDES = ("left", "right")
-_STRICT_SCENE_PROFILE = "dual_arm_hand_proxy_grasp_full"
+_PATH_COLLISION_SCENE_PROFILE = DEFAULT_GRASP_PATH_COLLISION_SCENE
 RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
 RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M = 0.005
 
@@ -451,8 +449,8 @@ class RM65GraspJointTrajectoryPlanner:
             adaptive_edge_resolution_rad=self.config.final_edge_resolution_rad,
             adaptive_refinement_distance_m=0.03,
         )
-        strict_profile = build_dual_arm_scene_profile(_STRICT_SCENE_PROFILE)
-        fixed_obstacles = fixed_scene_aabb_obstacles(strict_profile)
+        path_profile = build_dual_arm_scene_profile(_PATH_COLLISION_SCENE_PROFILE)
+        fixed_obstacles = fixed_scene_aabb_obstacles(path_profile)
         required = {
             "fixed-scene:camera_pole",
             "fixed-scene:left_camera_pole",
@@ -466,8 +464,8 @@ class RM65GraspJointTrajectoryPlanner:
         frame_hash = canonical_content_hash(
             {
                 "deployment_profile_hash": profile.semantic_content_hash,
-                "collision_scene_profile": _STRICT_SCENE_PROFILE,
-                "arm_collision_representation": "cad_convex_hulls_v1",
+                "collision_scene_profile": _PATH_COLLISION_SCENE_PROFILE,
+                "arm_collision_representation": "ik_sparse_proxy_pairs_v1",
                 "fixed_obstacles": [item.to_dict() for item in fixed_obstacles],
             },
             domain="dexteleop.real_skill.rm65_fixed_obstacle_frame.v1",
@@ -479,74 +477,17 @@ class RM65GraspJointTrajectoryPlanner:
             obstacles=fixed_obstacles,
             minimum_clearance_m=self.config.minimum_clearance_m,
         )
-        collision_bundle = build_rm65_dual_arm_collision_ik_solver(
-            RM65DualArmCollisionIKConfig(scene_profile=_STRICT_SCENE_PROFILE)
-        )
-        self._use_convex_arm_meshes(collision_bundle.solver.robot.collision_model)
-        self.oracle = RM65ObstacleCollisionOracle.from_solver(
-            collision_bundle.solver,
-            scene=self.scene,
-            solution_layout=collision_bundle.scene_profile.solution_layout,
-            expected_reference_frame_id=self.scene.reference_frame_id,
-            expected_reference_frame_spec_hash=self.scene.reference_frame_spec_hash,
-            attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
-        )
-        # Reuse the established IK proxy-pair model for a cheap first search.
-        # The full model above remains the authority for endpoint and dense
-        # trajectory validation before any plan can be returned.
-        self.sparse_search_oracle = build_rm65_profile_obstacle_collision_oracle(
-            scene_profile=DEFAULT_GRASP_PATH_COLLISION_SCENE,
+        # The reviewed IK profile's sparse pairs are authoritative for both
+        # search and final path admission. This deliberately does not certify
+        # full arm-mesh or finger-mesh clearance.
+        self.oracle = build_rm65_profile_obstacle_collision_oracle(
+            scene_profile=_PATH_COLLISION_SCENE_PROFILE,
             scene=self.scene,
             expected_reference_frame_id=self.scene.reference_frame_id,
             expected_reference_frame_spec_hash=self.scene.reference_frame_spec_hash,
             attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
             use_profile_proxy_geometry=True,
         )
-
-    @staticmethod
-    def _use_convex_arm_meshes(collision_model: object) -> None:
-        """Match MuJoCo's conservative CAD collision representation, not triangles.
-
-        The collision bundle is private to this planner.  The oracle clones it
-        afterward; the live IK solver and on-disk meshes are not modified.
-        """
-
-        expected = {
-            f"{prefix}arm_link{index}_0"
-            for prefix in ("", "right_")
-            for index in range(1, 7)
-        }
-        geometries = {
-            str(geometry.name): geometry
-            for geometry in collision_model.geometryObjects
-            if str(geometry.name) in expected
-        }
-        if set(geometries) != expected:
-            raise RM65GraspTrajectoryPlanningError(
-                "arm_collision_model_unavailable",
-                details={"missing_geometries": sorted(expected - set(geometries))},
-            )
-        for name, geometry in geometries.items():
-            mesh = geometry.geometry
-            try:
-                # A false return can mean the hull was already cached.  The
-                # actual postcondition is a retained, non-null convex shape.
-                mesh.buildConvexHull(True, "Qt")
-                hull = mesh.convex
-            except (AttributeError, RuntimeError, ValueError) as error:
-                raise RM65GraspTrajectoryPlanningError(
-                    "arm_collision_model_unavailable",
-                    details={
-                        "geometry_name": name,
-                        "exception_type": type(error).__name__,
-                    },
-                ) from error
-            if hull is None:
-                raise RM65GraspTrajectoryPlanningError(
-                    "arm_collision_model_unavailable",
-                    details={"geometry_name": name, "reason": "convex_hull_missing"},
-                )
-            geometry.geometry = hull
 
     def _remaining_path_planning_time_sec(
         self,
@@ -765,11 +706,8 @@ class RM65GraspJointTrajectoryPlanner:
     def _path_search_oracle(self, *, planning_phase: str,
                             visible_scene: VisibleGraspScene | None = None,
                             side: str | None = None,
-                            start_qpos_by_side: Mapping[str, np.ndarray] | None = None,
-                            sparse_proxy: bool = False) -> object:
-        collision_oracle = (
-            self.sparse_search_oracle if sparse_proxy else self.oracle
-        )
+                            start_qpos_by_side: Mapping[str, np.ndarray] | None = None) -> object:
+        collision_oracle = self.oracle
         if isinstance(collision_oracle, RM65ObstacleCollisionOracle):
             refinement = (
                 self.planner_config.adaptive_refinement_distance_m
@@ -1998,9 +1936,9 @@ class RM65GraspJointTrajectoryPlanner:
                             "segment_index": segment_index,
                             "edge_sample_index": index,
                         }
-                # Validate every sample with the full CAD collision model at
-                # the same clearance threshold. Exact all-pair distances are
-                # unnecessary for this Boolean safety decision.
+                # Validate every sample against the selected sparse proxy
+                # pairs at the same clearance threshold. Exact distances are
+                # unnecessary for this Boolean proxy-clearance decision.
                 check = (
                     self.oracle.check_clearance_only(qpos)
                     if clearance_only else self.oracle.check(qpos)
@@ -2088,6 +2026,7 @@ class RM65GraspJointTrajectoryPlanner:
                 "clearance_guard_with_exact_waypoints"
                 if clearance_only else "all_pair_minimum_distance"
             ),
+            "collision_scene_profile": _PATH_COLLISION_SCENE_PROFILE,
             "envelope_ingress": (
                 None
                 if ingress_constraints is None
@@ -2134,16 +2073,9 @@ class RM65GraspJointTrajectoryPlanner:
         lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
         upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
         cfg = self.planner_config
-        full_search_oracle = self._path_search_oracle(
+        search_oracle = self._path_search_oracle(
             planning_phase=planning_phase, visible_scene=visible_scene, side=side,
             start_qpos_by_side=qpos_by_side,
-        )
-        sparse_search_oracle = (
-            self._path_search_oracle(
-                planning_phase=planning_phase, visible_scene=visible_scene, side=side,
-                start_qpos_by_side=qpos_by_side, sparse_proxy=True,
-            )
-            if hasattr(self, "sparse_search_oracle") else None
         )
         search_attempts: list[dict[str, object]] = []
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
@@ -2152,15 +2084,7 @@ class RM65GraspJointTrajectoryPlanner:
         target_values = np.stack([endpoint.qpos_by_side[side] for endpoint in endpoint_candidates])
         search_candidates = endpoint_candidates
         # All locally valid branches share one tree and query cache per corridor.
-        for attempt_number in range(
-            -1 if sparse_search_oracle is not None else 0,
-            self.config.path_search_attempts_per_endpoint,
-        ):
-            sparse_proxy = attempt_number == -1
-            path_attempt = max(0, attempt_number)
-            search_oracle = (
-                sparse_search_oracle if sparse_proxy else full_search_oracle
-            )
+        for path_attempt in range(self.config.path_search_attempts_per_endpoint):
             target = search_candidates[0].qpos_by_side
             full_joint_range = path_attempt == self.config.path_search_attempts_per_endpoint - 1
             padding = cfg.sample_padding_rad * float(2**path_attempt)
@@ -2199,9 +2123,7 @@ class RM65GraspJointTrajectoryPlanner:
             )
             attempt_record: dict[str, object] = {
                 "planning_phase": planning_phase,
-                "search_collision_model": (
-                    "ik_sparse_proxy_pairs" if sparse_proxy else "full_cad"
-                ),
+                "search_collision_model": "ik_sparse_proxy_pairs",
                 "endpoint_seed_indices": tuple(e.seed_index for e in search_candidates),
                 "path_attempt": path_attempt,
                 "search_seed": attempt_config.seed,
@@ -2212,15 +2134,6 @@ class RM65GraspJointTrajectoryPlanner:
             }
             search_attempts.append(attempt_record)
             if path.status is not JointPathStatus.PATH_FOUND:
-                if sparse_proxy and path.status in {
-                    JointPathStatus.START_BLOCKED,
-                    JointPathStatus.TARGET_BLOCKED,
-                    JointPathStatus.PATH_SEARCH_EXHAUSTED,
-                    JointPathStatus.COLLISION_CHECK_UNAVAILABLE,
-                }:
-                    # A proxy is a search hint, not the final safety model.
-                    # Conservative proxy rejections must not hide a full-model path.
-                    continue
                 if path.status is JointPathStatus.START_BLOCKED:
                     raise RM65GraspTrajectoryPlanningError(
                         "path_start_collision_blocked",
@@ -3170,6 +3083,8 @@ class RM65GraspJointTrajectoryPlanner:
                     trajectory,
                     moving_side=selected_side,
                     scene_hash=self.scene.semantic_content_hash,
+                    collision_scope="profile_sparse_proxy_pairs",
+                    collision_scene_profile=_PATH_COLLISION_SCENE_PROFILE,
                     target_tool_tcp_world=target_pose,
                     speed_scale=scale,
                     stage_boundaries=tuple(stage_boundaries),

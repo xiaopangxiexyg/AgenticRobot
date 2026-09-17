@@ -29,6 +29,8 @@ def _write(directory, trajectory):
         trajectory,
         moving_side="right",
         scene_hash="scene:test",
+        collision_scope="profile_sparse_proxy_pairs",
+        collision_scene_profile="dual_arm_hand_proxy_strict",
         target_tool_tcp_world=np.eye(4),
         speed_scale=0.2,
         stage_boundaries=(
@@ -49,6 +51,8 @@ def test_exact_grasp_plan_samples_survive_restart_and_are_immutable(tmp_path):
     for side in ("left", "right"):
         np.testing.assert_array_equal(restored.qpos_by_side[side], original.qpos_by_side[side])
     assert metadata["stage_boundaries"][-1]["end_sample_index"] == 2
+    assert metadata["collision_scope"] == "profile_sparse_proxy_pairs"
+    assert metadata["collision_scene_profile"] == "dual_arm_hand_proxy_strict"
     assert _write(tmp_path, original) == path
     assert path.stat().st_ino == stat_before.st_ino
 

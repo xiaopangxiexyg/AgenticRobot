@@ -104,6 +104,7 @@ class RM65ObstacleCollisionOracle:
         attached_box_proxies: Sequence[AttachedBoxCollisionProxy] = (),
         obstacle_moving_geometry_names: Sequence[str] | None = None,
         stop_at_first_clearance_violation: bool = False,
+        collision_scope: str = "full_pinocchio_collision_model",
         pin_module: Any | None = None,
         hppfcl_module: Any | None = None,
     ) -> None:
@@ -250,6 +251,7 @@ class RM65ObstacleCollisionOracle:
         self._stop_at_first_clearance_violation = (
             stop_at_first_clearance_violation
         )
+        self._collision_scope = str(collision_scope)
         self._collision_query_margin_m: float | None = None
         if self._stop_at_first_clearance_violation:
             for request in self._collision_data.collisionRequests:
@@ -280,6 +282,7 @@ class RM65ObstacleCollisionOracle:
         attached_box_proxies: Sequence[AttachedBoxCollisionProxy] = (),
         obstacle_moving_geometry_names: Sequence[str] | None = None,
         stop_at_first_clearance_violation: bool = False,
+        collision_scope: str = "full_pinocchio_collision_model",
     ) -> RM65ObstacleCollisionOracle:
         if (
             expected_reference_frame_id is None
@@ -322,6 +325,7 @@ class RM65ObstacleCollisionOracle:
             stop_at_first_clearance_violation=(
                 stop_at_first_clearance_violation
             ),
+            collision_scope=collision_scope,
         )
 
     @property
@@ -635,7 +639,7 @@ class RM65ObstacleCollisionOracle:
             "scene_hash": self._scene.semantic_content_hash,
             "scene_revision": self._scene.revision,
             "collision_model_is_independent": True,
-            "collision_scope": "full_pinocchio_collision_model",
+            "collision_scope": self._collision_scope,
             "query_mode": (
                 "first_clearance_violation"
                 if self._stop_at_first_clearance_violation
@@ -696,6 +700,10 @@ def build_rm65_profile_obstacle_collision_oracle(
             else None
         ),
         stop_at_first_clearance_violation=stop_at_first_clearance_violation,
+        collision_scope=(
+            "profile_sparse_proxy_pairs"
+            if use_profile_proxy_geometry else "profile_collision_pairs"
+        ),
     )
 
 
