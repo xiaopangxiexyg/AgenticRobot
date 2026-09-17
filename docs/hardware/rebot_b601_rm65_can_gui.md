@@ -17,12 +17,15 @@
   保留原测量时间及来源 hash；不是从旧目标或 GUI 缓存反推当前姿态。
 - GUI 复用 `MujocoPassiveViewerSession`，由唯一 rig 的 `sync_viewer()` 同步；GUI 不推进物理或重建 IK。
 - 前台交互复用已有 terminal loop：`a` 激活或重试、`c` clutch、`r` 重新锚定、`s` 撤销跟随、`q`/EOF 退出。
-  初始 inactive，操作者先把 master 放到合适位置、静置，再激活；当前没有反向 haptic channel 或 policy overlay。
+  在真实控制终端中使用 cbreak 单键输入，按键立即生效，不需要 Enter，也不需要用 shell
+  历史重新执行长命令；管道/测试文件描述符仍保留按行协议。初始 inactive，操作者先把
+  master 放到合适位置、静置，再显式按 `a` 激活；当前没有反向 haptic channel 或 policy overlay。
 
 反馈能力缺失不会再让这个接收型 GUI 进程退出。已知的
 `B601HardwareDependencyError` 会撤销当前 RM65 proposal、保持 session 为 `held`，并在前台提示
 修复反馈源后再次按 `a`；旧快照不会被重用，其他异常仍按原边界退出。恢复逻辑属于 Python
-session/foreground 状态机，不由 shell 历史命令或后台重启承担。
+session/foreground 状态机，不由 shell 历史命令或后台重启承担。恢复仍需操作者显式按 `a`，
+不会在 stale/坏帧后自动恢复跟随，避免数据流刚恢复时未经确认突然产生目标运动。
 
 CAN backend 以默认 `allow_motion=False`、`allow_active_reporting=False` 创建，只接收**独立 owner 已开启**的
 完整新鲜六轴反馈。它不使能、不切模式、不配置 report、不发送 MIT/position/torque、不操作 J7。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pty
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -459,6 +460,23 @@ def test_terminal_eof_requests_stop():
         assert B601RM65TerminalCommands(file_descriptor=reader_fd)(0) == "q"
     finally:
         os.close(reader_fd)
+
+
+def test_terminal_tty_commands_are_immediate_without_enter():
+    master_fd, reader_fd = pty.openpty()
+    terminal = B601RM65TerminalCommands(
+        file_descriptor=reader_fd,
+        immediate=True,
+    )
+    try:
+        os.write(master_fd, b"a")
+        assert terminal(0) == "a"
+        os.write(master_fd, b"q")
+        assert terminal(0) == "q"
+    finally:
+        terminal.close()
+        os.close(reader_fd)
+        os.close(master_fd)
 
 
 @pytest.mark.parametrize("delayed_sample", [False, True])
