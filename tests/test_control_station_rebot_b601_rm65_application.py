@@ -112,6 +112,12 @@ def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
         if event.get("feedback_snapshot") is not None
     ]
     assert diagnostics
+    target_steps = [
+        event for event in records if event.get("event") == "target_step"
+    ]
+    assert target_steps and all(
+        "status" in event and "source_reused" in event for event in target_steps
+    )
     assert diagnostics[0]["max_receive_age_sec"] == 0.0
     assert diagnostics[0]["joint_receive_age_sec"]["joint1"] == 0.0
     assert diagnostics[0]["feedback_timeout_sec"] == 0.1

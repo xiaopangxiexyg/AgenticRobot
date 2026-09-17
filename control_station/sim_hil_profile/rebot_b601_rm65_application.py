@@ -276,12 +276,10 @@ def run_b601_rm65_gui(
 
     def advance() -> None:
         result = session.binding.runtime.step()
+        target_details = _target_step_details(result)
+        target_details["source_reused"] = session.last_source_reused
         record_with_feedback(
-            {
-                "event": "target_step",
-                "status": result.status,
-                "source_reused": session.last_source_reused,
-            }
+            {"event": "target_step", **target_details}
         )
 
     run_b601_rm65_foreground(
@@ -510,6 +508,45 @@ def _feedback_snapshot_details(session: B601RM65MotionSession) -> dict[str, obje
     }
     if maximum_age is not None and backend_timeout is not None:
         details["freshness_margin_sec"] = backend_timeout - maximum_age
+    return details
+
+
+def _target_step_details(step: object) -> dict[str, object]:
+    """Project bounded target-owner diagnostics into the application log.
+
+    The target remains authoritative for IK, collision, and lifecycle policy;
+    this helper only makes an existing typed result inspectable when a long
+    foreground run stops changing qpos.  It deliberately copies scalar
+    resolution/cancellation fields instead of serializing private planner
+    state or changing the runtime decision.
+    """
+
+    details: dict[str, object] = {
+        "status": str(getattr(step, "status", "unknown")),
+    }
+    failure = getattr(step, "resolution_failure", None)
+    if failure is not None:
+        diagnostics = getattr(failure, "diagnostics", {})
+        details["resolution_failure"] = {
+            "reason_code": str(getattr(failure, "reason_code", "")),
+            "resolver_status": str(getattr(failure, "resolver_status", "")),
+            "message": str(getattr(failure, "message", "")),
+            "diagnostics": (
+                dict(diagnostics) if isinstance(diagnostics, Mapping) else {}
+            ),
+        }
+    cancellation = getattr(step, "cancellation_receipt", None)
+    if cancellation is not None:
+        details["cancellation"] = {
+            "complete": bool(getattr(cancellation, "complete", False)),
+            "status": str(getattr(cancellation, "status", "")),
+        }
+    completion = getattr(step, "target_completion_receipt", None)
+    if completion is not None:
+        details["target_completion"] = {
+            "status": str(getattr(completion, "status", "")),
+            "outcome_code": str(getattr(completion, "outcome_code", "")),
+        }
     return details
 
 

@@ -139,6 +139,39 @@ tests/test_control_station_rebot_b601_rm65_motion.py
 最终组合需包含 predecessor 和 profile 两项，不能从其他 worktree 的绝对路径动态导入 tracked 源码。
 predecessor 未集成只阻塞最终 integration，不影响当前 scope 内开发。
 
+## 仿真跟随性能与长时运行修复（2026-09-17）
+
+现场日志暴露了两个相互独立的问题：旧候选仍以 15 Hz 运行，且 canonical
+arbitration 每个 tick 都会对不断增长的 proposal snapshot 做哈希；后者在长时运行中
+把单次 target step 的计算拖慢，最终表现为“移动一段时间后不再跟随”。同一日志中的
+feedback age 仍在约 0.01--0.05 s，说明该次停止首先不是 CAN stale，而是运行时保留与
+调度路径的问题。
+
+当前候选作了以下收敛，均保持既有安全边界：
+
+- B601→RM65 仿真目标显式使用已验证的 `POSITION_60_120_PROFILE_NAME`，目标/IK 时钟为
+  60 Hz，底层 qref/qcmd 仍由已有 60→120 Hz MuJoCo position rig 负责；B601 约 20 Hz
+  的重复缓存帧只在 observation sample、时间、姿态、host freshness 和 source-age 均满足
+  条件时做有界 zero-order hold，绝不把过期帧当作新样本。
+- coupled RM65 planner 复用 `robot_motion.rm65` 中已有的
+  `RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S` 和 acceleration profile，避免继承
+  面向真实侧的 `0.35--0.50 rad/s` 保守默认值；这只消除仿真侧的额外限速，不改变真实
+  B601 owner 的控制参数。
+- planner 的 collision minimum distance 从任务 scene contract 读取（当前任务为约
+  `2 mm`），碰撞约束仍开启；不再把真实侧的 `30 mm` 余量误用于 MuJoCo，从而减少无碰撞
+  位置被提前 hold 的情况。
+- B601 目标 runtime 对已过期 proposal 做 owner-side 有界清理，保留 producer sequence
+  high-water mark 和不可变快照语义；通用 MuJoCo runtime 默认仍保持原 append-only 行为。
+- `target_step` 记录是否复用了 source frame；终端输出管道关闭时，JSON/log 仍会完整落盘，
+  避免用空结果文件掩盖真正的运行时故障。
+
+本轮 focused/相关回归为 **153 passed、2 skipped**（未绑定 reviewed RM65 assets 时的
+明确可选 skip），并通过 `py_compile`、Ruff（变更的 B601 app/source/test 文件）及
+`git diff --check`。尚未运行真实 CAN 或 GUI 人工验收；candidate 仍需在完整组合 checkout
+中重新执行 integration Profiles。运行时日志中的 `source_reused`、`target_step.status`、
+`feedback_snapshot.max_receive_age_sec` 和 `resolution_failure`（若有）应一并用于下轮判断
+是输入时序、IK/碰撞门控还是 viewer/worker 问题。
+
 ## 当前离线复核命令
 
 在当前 Task 源码根，使用标准项目 Python 和 approved asset binding：
@@ -149,7 +182,7 @@ bash scripts/run_pytest.sh -q \
   tests/test_control_station_rebot_b601_rm65_motion.py
 ```
 
-当前预期为 **56 passed、2 skipped**（环境没有 reviewed RM65 assets 时保留可选跳过）。
+当前预期为 **153 passed、2 skipped**（环境没有 reviewed RM65 assets 时保留可选跳过）。
 测试覆盖 injected owner 生命周期、完整当前姿态锚点、GUI close/fault、lazy CLI help、
 参数/confirmation 拒绝、离线模式不连接 CAN、日志 argv、Ctrl-C、target cleanup，以及真实模型 actuated rig 的 atomic FK measurement。
 外部构造在生命周期测试中 mock；坐标 profile 用 synthetic port，不代表真实安装姿态标定。
