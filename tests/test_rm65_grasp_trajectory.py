@@ -379,6 +379,20 @@ def test_grasp_oracle_preserves_true_link3_link5_clearance_without_loading_mujoc
         planning_target_builder=builder,
         target_envelope_filter=builder.pre_ik_target_safety_filter,
     )
+    from robot_motion.rm65.scene_profiles import DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS
+
+    sparse_model = planner.sparse_search_oracle._collision_model
+    sparse_names = {
+        frozenset((
+            sparse_model.geometryObjects[int(pair.first)].name,
+            sparse_model.geometryObjects[int(pair.second)].name,
+        ))
+        for pair in sparse_model.collisionPairs
+    }
+    assert {
+        frozenset(pair) for pair in DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS
+    } <= sparse_names
+    assert len(sparse_model.collisionPairs) < len(planner.oracle._collision_model.collisionPairs)
     separated = {
         "left": FIELD_TRACE_QPOS["left"],
         "right": np.array(
@@ -1410,6 +1424,59 @@ def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_bin
         with pytest.raises(RM65GraspTrajectoryPlanningError, match="path_target_collision_blocked"):
             planner._plan_path_leg(**arguments)
     assert checked
+
+
+@pytest.mark.parametrize("reject_sparse_path", [False, True])
+def test_sparse_proxy_search_requires_full_revalidation_and_falls_back(reject_sparse_path):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        path_search_attempts_per_endpoint=1,
+    ))
+    planner.planner_config = JointPathPlannerConfig(shortcut_attempts=0)
+    planner.scene = SimpleNamespace(minimum_clearance_m=0.01)
+    checked = []
+
+    class ProbeOracle:
+        scene_hash = "same-obstacle-scene"
+
+        def __init__(self, name):
+            self.name = name
+
+        def check(self, qpos):
+            checked.append(self.name)
+            return JointConfigurationCheck(safe=True, collision_check_available=True)
+
+    planner.oracle = ProbeOracle("full")
+    planner.sparse_search_oracle = ProbeOracle("sparse")
+    validations = []
+
+    def revalidate(*_args, **_kwargs):
+        validations.append(True)
+        if reject_sparse_path and len(validations) == 1:
+            raise RM65GraspTrajectoryPlanningError("path_collision_blocked")
+        return {"sample_count": 1}
+
+    planner._revalidate = revalidate
+    start = {side: np.zeros(6) for side in ("left", "right")}
+    target = {side: q.copy() for side, q in start.items()}
+    target["right"][0] = 0.1
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=target, seed_index=0, solve_cycles=1,
+        position_residual_m=0.0, orientation_residual_deg=0.0,
+    )
+    leg = planner._plan_path_leg(
+        qpos_by_side=start, side="right", target_tool_tcp_world=np.eye(4),
+        planning_phase="pregrasp_target", endpoint_candidates=(endpoint,),
+    )
+    assert leg.path.status is JointPathStatus.PATH_FOUND
+    assert leg.search_attempts[0]["search_collision_model"] == "ik_sparse_proxy_pairs"
+    if reject_sparse_path:
+        assert [item["search_collision_model"] for item in leg.search_attempts] == [
+            "ik_sparse_proxy_pairs", "full_cad",
+        ]
+        assert "full" in checked
+        assert len(validations) == 2
+    else:
+        assert len(leg.search_attempts) == len(validations) == 1
 
 
 @pytest.mark.parametrize("has_capture_qpos", [False, True])

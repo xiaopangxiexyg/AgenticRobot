@@ -264,6 +264,7 @@ class RM65ObstacleCollisionOracle:
         self._moving_geometry_ids = moving_geometry_ids
         self._obstacle_pair_geometry_ids = obstacle_pair_geometry_ids
         self._check_cache: dict[bytes, JointConfigurationCheck] = {}
+        self._clearance_check_cache: dict[bytes, JointConfigurationCheck] = {}
         self._search_check_cache: dict[tuple[float, bytes], JointConfigurationCheck] = {}
 
     @classmethod
@@ -345,6 +346,36 @@ class RM65ObstacleCollisionOracle:
         if key not in self._check_cache:
             self._check_cache[key] = self._check_embedded(full_q)
         return self._check_cache[key]
+
+    def check_clearance_only(
+        self, qpos_by_component: Mapping[str, np.ndarray]
+    ) -> JointConfigurationCheck:
+        """Check the full collision model at the scene's clearance threshold.
+
+        A safe fast result proves the requested clearance but reports only a
+        lower distance bound. Borderline or blocked guard results are resolved
+        with an exact query so a conservative guard cannot reject a safe path.
+        """
+
+        try:
+            full_q = self._embed(qpos_by_component)
+        except (TypeError, ValueError):
+            return self.check(qpos_by_component)
+        key = full_q.tobytes()
+        if key not in self._clearance_check_cache:
+            pair_count = len(self._collision_model.collisionPairs)
+            if not self._moving_geometry_ids or pair_count == 0:
+                result = self._check_embedded(full_q)
+            else:
+                result = self._check_embedded_early_exit(
+                    full_q,
+                    pair_count=pair_count,
+                    clearance_m=self._scene.minimum_clearance_m,
+                )
+                if result.collision_check_available and not result.safe:
+                    result = self.check(qpos_by_component)
+            self._clearance_check_cache[key] = result
+        return self._clearance_check_cache[key]
 
     def _check_embedded(self, full_q: np.ndarray) -> JointConfigurationCheck:
         pair_count = len(self._collision_model.collisionPairs)

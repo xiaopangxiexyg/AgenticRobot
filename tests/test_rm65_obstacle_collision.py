@@ -122,6 +122,34 @@ def test_early_exit_query_preserves_clearance_decision_and_distance() -> None:
         )
 
 
+def test_clearance_only_revalidation_uses_same_pairs_and_threshold() -> None:
+    model, collision_model = _simple_prismatic_collision_model()
+    oracle = RM65ObstacleCollisionOracle(
+        model=model,
+        base_collision_model=collision_model,
+        reference_full_q=np.zeros(model.nq),
+        qpos_indices_by_component={"arm": (0,)},
+        scene=_scene(center_x=0.5, clearance=0.02),
+    )
+
+    modes = set()
+    for x in np.linspace(0.0, 0.8, 81):
+        qpos = {"arm": np.array([x])}
+        guard = oracle.check_clearance_only(qpos)
+        exact = oracle.check(qpos)
+        assert guard.safe is exact.safe
+        assert guard.collision_check_available is exact.collision_check_available
+        assert guard.metadata["collision_pair_count"] == exact.metadata["collision_pair_count"]
+        modes.add(guard.metadata["query_mode"])
+        if guard.metadata.get("distance_is_lower_bound"):
+            assert guard.metadata["query_clearance_m"] == 0.02
+            assert guard.minimum_distance_m <= exact.minimum_distance_m + 1e-9
+        else:
+            assert guard.minimum_distance_m == pytest.approx(exact.minimum_distance_m)
+        assert oracle.check_clearance_only(qpos) is guard
+    assert modes == {"first_clearance_violation", "all_pair_minimum_distance"}
+
+
 def test_attached_box_proxy_tracks_parent_frame_without_mutating_live_model() -> None:
     model, collision_model = _simple_prismatic_collision_model()
     joint_id = model.getJointId("moving_x")
