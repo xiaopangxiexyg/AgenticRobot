@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import traceback
+from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
@@ -247,6 +249,109 @@ def run_b601_rm65_gui(
     )
 
 
+_B601_RS_STATE_OBSERVATION_CAPABILITY = "state_observation_metadata_v1"
+
+
+def _prepare_bundled_motorbridge_runtime() -> dict[str, object]:
+    """Prefer the checked-out MotorBridge binding before opening CAN.
+
+    The AgenticRobot repository pins the MotorBridge submodule, but Python's
+    import resolver otherwise silently selects an older site-package.  That
+    older package can expose the legacy cache while lacking the host receive
+    metadata required by :class:`B601ReadOnlyPoseSource`.  Select a complete
+    checked-out binding/library pair when available; an explicit
+    ``MOTORBRIDGE_LIB`` remains an operator override and is reported as such.
+    This helper performs no device I/O.
+    """
+
+    loaded = sys.modules.get("motorbridge")
+    if loaded is not None:
+        loaded_source = getattr(loaded, "__file__", None)
+        return {
+            "selection": "already_imported",
+            "python_source": (
+                None if loaded_source is None else str(loaded_source)
+            ),
+            "abi_path": os.environ.get("MOTORBRIDGE_LIB"),
+            "reason": "motorbridge was imported before B601 application setup",
+        }
+
+    explicit_library = os.environ.get("MOTORBRIDGE_LIB")
+    if explicit_library:
+        return {
+            "selection": "explicit_environment",
+            "python_source": None,
+            "abi_path": str(Path(explicit_library).expanduser()),
+            "reason": "MOTORBRIDGE_LIB is an explicit operator override",
+        }
+
+    project_root = Path(__file__).resolve().parents[2]
+    binding_root = project_root / "hardware" / "MotorBridge" / "bindings" / "python" / "src"
+    package_init = binding_root / "motorbridge" / "__init__.py"
+    abi_path = project_root / "hardware" / "MotorBridge" / "target" / "release" / "libmotor_abi.so"
+    if package_init.is_file() and abi_path.is_file():
+        binding_root_text = str(binding_root)
+        if binding_root_text not in sys.path:
+            sys.path.insert(0, binding_root_text)
+        return {
+            "selection": "project_pinned_binding",
+            "python_source": str(package_init),
+            "abi_path": str(abi_path),
+            "reason": "complete checked-out MotorBridge binding and ABI found",
+        }
+
+    return {
+        "selection": "installed_environment",
+        "python_source": None,
+        "abi_path": None,
+        "reason": "checked-out MotorBridge binding/ABI is unavailable",
+        "expected_binding_root": str(binding_root),
+        "expected_abi_path": str(abi_path),
+    }
+
+
+def _record_motorbridge_capability(
+    result: dict[str, object],
+    backend: object,
+    *,
+    emit: Callable[[str], None],
+) -> None:
+    """Record capability admission and keep missing metadata retryable.
+
+    Read-only RM65 following can stay open while the operator repairs the
+    MotorBridge runtime or telemetry stream.  The source still refuses every
+    observation until host receive metadata is advertised; this function only
+    makes that state explicit and actionable.
+    """
+
+    evidence = getattr(backend, "motorbridge_runtime_evidence", None)
+    if not isinstance(evidence, Mapping):
+        return
+    evidence_dict = dict(evidence)
+    contract = result["teleop_contract"]
+    assert isinstance(contract, dict)
+    contract["motorbridge_runtime_evidence"] = evidence_dict
+    contract["required_feedback_capability"] = _B601_RS_STATE_OBSERVATION_CAPABILITY
+    features = evidence_dict.get("robstride_features", ())
+    available = isinstance(features, (tuple, list, set, frozenset)) and (
+        _B601_RS_STATE_OBSERVATION_CAPABILITY in features
+    )
+    contract["state_observation_metadata_available"] = available
+    contract["control_admission"] = (
+        "eligible_pending_activation" if available else "blocked_missing_feedback_capability"
+    )
+    if not available:
+        detail = evidence_dict.get("error") or "capability was not advertised"
+        emit(
+            "[B601→RM65] waiting: host feedback capability "
+            f"{_B601_RS_STATE_OBSERVATION_CAPABILITY!r} is unavailable ({detail})."
+        )
+        emit(
+            "[B601→RM65] receive-only GUI remains open; repair the pinned "
+            "MotorBridge runtime/stream, then press a to retry."
+        )
+
+
 def _load_mapping(path: Path):
     try:
         from control_station.composition.rebot_b601_rm65_profile import (
@@ -475,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
                     if args.simulation_feedback_timeout_sec is None
                     else float(args.simulation_feedback_timeout_sec)
                 ),
+                "control_admission": "not_checked",
             },
         }
         status = 1
@@ -485,6 +591,10 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         try:
+            if args.connect_read_only:
+                result["teleop_contract"]["motorbridge_runtime_selection"] = (
+                    _prepare_bundled_motorbridge_runtime()
+                )
             from hardware.rebot_b601_rs import B601RSBackend, B601RSBackendConfig
             from robot_motion.rebot_b601_rs import B601PinocchioModel
             from sim.mujoco.viewer import MujocoPassiveViewerSession
@@ -546,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     resources.callback(backend.close)
                     backend.connect()
+                    _record_motorbridge_capability(result, backend, emit=emit)
                     viewer = MujocoPassiveViewerSession(
                         runtime.rig.scene, sync_callback=runtime.rig.sync_viewer
                     )

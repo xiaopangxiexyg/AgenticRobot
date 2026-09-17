@@ -24,6 +24,7 @@ from control_station.sources.rebot_b601_rm65_motion import (
 )
 from hardware.rebot_b601_rs import (
     B601_RS_FEEDBACK_FRAME,
+    B601HardwareDependencyError,
     B601HardwareState,
     B601JointState,
 )
@@ -586,6 +587,103 @@ def test_foreground_activation_waits_for_next_feedback_period(setup_motion):
     assert admission["accepted"]
     assert anchor_sequence is not None
     assert backend.sequence == anchor_sequence + 1
+
+
+def test_foreground_keeps_receive_only_ui_open_for_retryable_feedback_dependency(
+    setup_motion, monkeypatch
+):
+    """A missing host metadata capability is held, then retryable with ``a``."""
+
+    clock, _, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    original_poll = backend.poll_feedback
+    failures_remaining = 1
+
+    def poll_feedback(*, request_feedback, require_host_freshness):
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise B601HardwareDependencyError(
+                "host-fresh B601 feedback requires state_observation_metadata_v1"
+            )
+        return original_poll(
+            request_feedback=request_feedback,
+            require_host_freshness=require_host_freshness,
+        )
+
+    monkeypatch.setattr(backend, "poll_feedback", poll_feedback)
+    commands = iter(("a", "a", "q"))
+    statuses, events = [], []
+
+    def poll(_timeout):
+        clock.value += 0.001
+        return next(commands)
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=statuses.append,
+        record=events.append,
+    )
+
+    assert failures_remaining == 0
+    assert session.state == "inactive" and session.anchor is None
+    assert any("waiting" in message for message in statuses)
+    assert any("press a to retry" in message for message in statuses)
+    assert any(
+        event["event"] == "feedback_capability_unavailable"
+        and event["retryable"] is True
+        for event in events
+    )
+
+
+def test_foreground_retries_after_feedback_dependency_during_active_tick(
+    setup_motion, monkeypatch
+):
+    clock, _, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    original_poll = backend.poll_feedback
+    poll_count = 0
+
+    def poll_feedback(*, request_feedback, require_host_freshness):
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 2:
+            raise B601HardwareDependencyError(
+                "host-fresh B601 feedback requires state_observation_metadata_v1"
+            )
+        return original_poll(
+            request_feedback=request_feedback,
+            require_host_freshness=require_host_freshness,
+        )
+
+    monkeypatch.setattr(backend, "poll_feedback", poll_feedback)
+    commands = iter(("a", None, "a", "q"))
+    events = []
+
+    def poll(timeout):
+        command = next(commands)
+        clock.value += max(timeout, 0.001)
+        return command
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=lambda _message: None,
+        record=events.append,
+    )
+
+    assert poll_count == 3
+    assert session.state == "inactive" and session.anchor is None
+    assert any(
+        event["event"] == "feedback_capability_unavailable"
+        and event["command"] == "step"
+        for event in events
+    )
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt(), OSError("target failed")])

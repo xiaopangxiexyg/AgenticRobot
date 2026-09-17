@@ -14,6 +14,7 @@ import sys
 from collections.abc import Callable, Mapping
 
 from control_station.sources.rebot_b601_rm65_motion import B601RM65MotionSession
+from hardware.rebot_b601_rs import B601HardwareDependencyError
 
 
 class B601RM65TerminalCommands:
@@ -85,9 +86,36 @@ def run_b601_rm65_foreground(
             record({"event": name, "at": clock(), "state": session.state, **details})
 
     def instructions() -> None:
-        emit("[B601→RM65] Enter: a=activate c=clutch r=recenter s=stop q=quit ?=help")
+        emit(
+            "[B601→RM65] Enter: a=activate/retry c=clutch r=recenter s=stop q=quit ?=help"
+        )
         emit("[B601→RM65] Start inactive; reposition/settle first, then a. c before recentering.")
+        emit(
+            "[B601→RM65] A feedback-capability error stays held; repair the source and press a again."
+        )
         emit("[B601→RM65] Ctrl-C/EOF: stop RM65 following; master gravity/damping is unchanged.")
+
+    def recoverable_feedback_error(command: str, error: B601HardwareDependencyError) -> None:
+        """Keep the receive-only UI alive while the host feedback port recovers.
+
+        The backend remains fail-closed: no old observation is reused and no
+        target proposal is admitted.  This handler only converts a known
+        dependency/feedback-capability failure into an operator-visible retry
+        state.  Other exceptions still propagate to the application boundary.
+        """
+
+        message = str(error)
+        emit(f"[B601→RM65] waiting: {type(error).__name__}: {message}")
+        emit(
+            "[B601→RM65] no RM65 following; fix the feedback runtime/stream, then press a to retry."
+        )
+        event(
+            "feedback_capability_unavailable",
+            command=command,
+            error_type=type(error).__name__,
+            error=message,
+            retryable=True,
+        )
 
     try:
         if poll_command is None:
@@ -119,12 +147,21 @@ def run_b601_rm65_foreground(
                         emit(f"[B601→RM65] {command} rejected in {session.state}")
                         event("operator_command_rejected", command=command)
                     else:
-                        {
-                            "a": session.activate,
-                            "c": session.engage_clutch,
-                            "r": session.release_clutch,
-                            "s": session.deactivate,
-                        }[command]()
+                        try:
+                            {
+                                "a": session.activate,
+                                "c": session.engage_clutch,
+                                "r": session.release_clutch,
+                                "s": session.deactivate,
+                            }[command]()
+                        except B601HardwareDependencyError as error:
+                            # A missing host observation capability is
+                            # recoverable for this receive-only application.
+                            # The session has already withdrawn its target
+                            # anchor before re-raising the backend error.
+                            recoverable_feedback_error(command, error)
+                            next_tick = float(clock()) + period
+                            continue
                         if command in {"a", "r"}:
                             # Activation/recenter consumes one complete master
                             # snapshot as the anchor. Do not immediately poll
@@ -139,15 +176,23 @@ def run_b601_rm65_foreground(
             if now < next_tick:
                 continue
             if session.state == "active":
-                receipt = session.step()
-                event(
-                    "proposal_admission",
-                    accepted=receipt.accepted,
-                    rejection_code=receipt.rejection_code,
-                    rejection_message=receipt.message,
-                )
-                if not receipt.accepted:
-                    emit(f"[B601→RM65] held: {receipt.rejection_code}; inspect before a")
+                try:
+                    receipt = session.step()
+                except B601HardwareDependencyError as error:
+                    # ``step`` has moved the session to held and cleared its
+                    # anchor.  Keep advancing the lower target once below so
+                    # the cancellation is observed without retaining a stale
+                    # RM65 proposal.
+                    recoverable_feedback_error("step", error)
+                else:
+                    event(
+                        "proposal_admission",
+                        accepted=receipt.accepted,
+                        rejection_code=receipt.rejection_code,
+                        rejection_message=receipt.message,
+                    )
+                    if not receipt.accepted:
+                        emit(f"[B601→RM65] held: {receipt.rejection_code}; inspect before a")
             advance_target()
             # Do not burst stale catch-up proposals after slow polling/IK.
             next_tick += period

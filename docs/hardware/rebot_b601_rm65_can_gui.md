@@ -16,13 +16,30 @@
 - 两臂测量使用 rig 的一次 lock-consistent execution cut 和 private-MjData FK projector。
   保留原测量时间及来源 hash；不是从旧目标或 GUI 缓存反推当前姿态。
 - GUI 复用 `MujocoPassiveViewerSession`，由唯一 rig 的 `sync_viewer()` 同步；GUI 不推进物理或重建 IK。
-- 前台交互复用已有 terminal loop：`a` 激活、`c` clutch、`r` 重新锚定、`s` 撤销跟随、`q`/EOF 退出。
+- 前台交互复用已有 terminal loop：`a` 激活或重试、`c` clutch、`r` 重新锚定、`s` 撤销跟随、`q`/EOF 退出。
   初始 inactive，操作者先把 master 放到合适位置、静置，再激活；当前没有反向 haptic channel 或 policy overlay。
+
+反馈能力缺失不会再让这个接收型 GUI 进程退出。已知的
+`B601HardwareDependencyError` 会撤销当前 RM65 proposal、保持 session 为 `held`，并在前台提示
+修复反馈源后再次按 `a`；旧快照不会被重用，其他异常仍按原边界退出。恢复逻辑属于 Python
+session/foreground 状态机，不由 shell 历史命令或后台重启承担。
 
 CAN backend 以默认 `allow_motion=False`、`allow_active_reporting=False` 创建，只接收**独立 owner 已开启**的
 完整新鲜六轴反馈。它不使能、不切模式、不配置 report、不发送 MIT/position/torque、不操作 J7。
 现有 master 重力补偿/阻尼 owner 必须独立运行；应用退出仅撤销仿真跟随并关闭自己的只读连接。
 绝不能把 master `safe_stop()` 加入应用的普通 `finally`。
+
+## MotorBridge 运行时能力选择
+
+连接型入口在打开 CAN 前会记录 MotorBridge 运行时来源。若当前 checkout 中同时存在锁定的
+`hardware/MotorBridge/bindings/python/src` 和已构建的 `target/release/libmotor_abi.so`，应用会把该
+绑定放到 import 路径首位；显式 `MOTORBRIDGE_LIB` 仍是操作者指定的 override。结果 JSON 的
+`teleop_contract.motorbridge_runtime_selection` 和 `motorbridge_runtime_evidence` 用于审计实际加载的
+来源与 ABI 能力，应用不会把系统 site-package 静默宣称为仓库版本。
+
+`state_observation_metadata_v1` 是 host-fresh B601 反馈的硬门禁。若能力未宣告，GUI 仍可保持
+receive-only/held 并允许 `a` 重试，但不会降低 `feedback_timeout_sec`、转用旧 cache 或提交 RM65
+目标；应修复/重启到包含该能力的 MotorBridge 绑定后再重试。
 
 ## 遥操幅度与 RL 边界
 

@@ -118,6 +118,28 @@ def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
     assert diagnostics[0]["freshness_margin_sec"] == 0.1
 
 
+def test_missing_feedback_capability_is_recorded_as_retryable_admission_block():
+    result = {"teleop_contract": {"control_admission": "not_checked"}}
+    backend = SimpleNamespace(
+        motorbridge_runtime_evidence={
+            "verified": True,
+            "abi_version": "0.5.5",
+            "robstride_features": ("parameter_reply_correlation_v1",),
+            "error": None,
+        }
+    )
+    messages = []
+
+    app._record_motorbridge_capability(result, backend, emit=messages.append)
+
+    contract = result["teleop_contract"]
+    assert contract["required_feedback_capability"] == "state_observation_metadata_v1"
+    assert contract["state_observation_metadata_available"] is False
+    assert contract["control_admission"] == "blocked_missing_feedback_capability"
+    assert any("receive-only GUI remains open" in message for message in messages)
+    assert any("press a to retry" in message for message in messages)
+
+
 @pytest.mark.parametrize("fault", (False, True))
 def test_gui_close_or_fault_cancels_without_polling_or_master_cleanup(
     setup_motion, fault
