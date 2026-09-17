@@ -293,7 +293,12 @@ def run_b601_rm65_gui(
 
 
 _B601_RS_STATE_OBSERVATION_CAPABILITY = "state_observation_metadata_v1"
-_B601_RM65_SIMULATION_FEEDBACK_TIMEOUT_SEC = 0.15
+# A 20 Hz active-report stream has a nominal 50 ms period.  The receive-only
+# simulation tolerates one missed report plus bounded scheduling/USB jitter,
+# while ``maximum_source_age_sec`` remains the outer source TTL.  This is
+# deliberately local to the simulation process; the hardware owner's YAML
+# timeout remains unchanged.
+_B601_RM65_SIMULATION_FEEDBACK_TIMEOUT_SEC = 0.20
 
 
 def _prepare_bundled_motorbridge_runtime() -> dict[str, object]:

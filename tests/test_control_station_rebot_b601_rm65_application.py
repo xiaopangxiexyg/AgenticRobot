@@ -347,6 +347,76 @@ def test_read_only_simulation_overrides_feedback_timeout_locally(
     assert captured["connected"] and captured["closed"]
 
 
+def test_read_only_simulation_uses_bounded_default_feedback_timeout(
+    setup_motion, tmp_path, monkeypatch
+):
+    """The documented 0.20 s sim default is local and capped by source TTL."""
+
+    import hardware.rebot_b601_rs as hardware
+    from robot_motion.rebot_b601_rs import B601PinocchioModel
+    from sim.mujoco.viewer import MujocoPassiveViewerSession
+
+    @dataclass(frozen=True)
+    class _Config:
+        feedback_timeout_sec: float = 0.1
+
+        @classmethod
+        def from_rs_yaml(cls, path):
+            return cls()
+
+    clock, _, runtime, source, backend, _, _ = setup_motion
+    captured = {}
+    monkeypatch.setattr(
+        backend, "connect", lambda: captured.setdefault("connected", True), raising=False
+    )
+    monkeypatch.setattr(
+        backend, "close", lambda: captured.setdefault("closed", True), raising=False
+    )
+    def make_backend(config):
+        captured["config"] = config
+        return backend
+
+    monkeypatch.setattr(hardware, "B601RSBackend", make_backend)
+    monkeypatch.setattr(hardware, "B601RSBackendConfig", _Config)
+    monkeypatch.setattr(
+        B601PinocchioModel, "from_rebot_source_root", lambda path: _Model()
+    )
+    monkeypatch.setattr(app, "_load_mapping", lambda path: _mapping(source))
+    monkeypatch.setattr(
+        app,
+        "build_b601_rm65_sim_target",
+        lambda path: (runtime, lambda: _measurement(runtime, clock), 60),
+    )
+    viewer = _Viewer()
+    monkeypatch.setattr(
+        sys.modules[MujocoPassiveViewerSession.__module__],
+        "MujocoPassiveViewerSession",
+        lambda *args, **kwargs: viewer,
+    )
+    monkeypatch.setattr(
+        app,
+        "run_b601_rm65_gui",
+        lambda session, **kwargs: session.deactivate(),
+    )
+
+    args = [
+        *_args(tmp_path, "--connect-read-only"),
+        "--confirmation",
+        "B601_RM65_READ_ONLY_CAN_SIM_TARGET",
+        "--maximum-source-age-sec",
+        "0.25",
+    ]
+    assert dispatcher.main(["b601-rm65", *args]) == 0
+    result = json.loads((tmp_path / "result.json").read_text())
+    contract = result["teleop_contract"]
+    assert captured["config"].feedback_timeout_sec == 0.2
+    assert contract["backend_feedback_timeout_sec"] == 0.2
+    assert contract["backend_feedback_timeout_source"] == "simulation_default"
+    assert contract["simulation_feedback_timeout_source"] == "simulation_default"
+    assert contract["simulation_feedback_timeout_override_sec"] is None
+    assert captured["connected"] and captured["closed"]
+
+
 @pytest.mark.parametrize(
     "mode,interrupt",
     (
