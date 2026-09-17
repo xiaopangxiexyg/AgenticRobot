@@ -165,7 +165,7 @@ feedback age 仍在约 0.01--0.05 s，说明该次停止首先不是 CAN stale�
 - `target_step` 记录是否复用了 source frame；终端输出管道关闭时，JSON/log 仍会完整落盘，
   避免用空结果文件掩盖真正的运行时故障。
 
-本轮 focused/相关回归为 **153 passed、2 skipped**（未绑定 reviewed RM65 assets 时的
+本轮 focused/相关回归为 **154 passed、2 skipped**（未绑定 reviewed RM65 assets 时的
 明确可选 skip），并通过 `py_compile`、Ruff（变更的 B601 app/source/test 文件）及
 `git diff --check`。尚未运行真实 CAN 或 GUI 人工验收；candidate 仍需在完整组合 checkout
 中重新执行 integration Profiles。运行时日志中的 `source_reused`、`target_step.status`、
