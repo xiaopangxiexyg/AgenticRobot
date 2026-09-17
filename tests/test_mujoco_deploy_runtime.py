@@ -182,6 +182,7 @@ def build_runtime(
     clock: ManualClock | None = None,
     domain: str = "mujoco-env-0",
     composition_enabled: bool = False,
+    prune_expired_proposals: bool = False,
 ) -> tuple[MujocoDeployRuntime, FakeScene, ManualClock]:
     actual_clock = clock or ManualClock()
     scene = FakeScene()
@@ -202,6 +203,7 @@ def build_runtime(
             runtime_session_id=f"session-{domain}",
             control_domain_id=domain,
             embodiment_instance_id=f"embodiment-{domain}",
+            prune_expired_proposals=prune_expired_proposals,
         ),
         composition_runtime_config=(
             MujocoCompositionRuntimeConfig()
@@ -211,6 +213,37 @@ def build_runtime(
         clock=actual_clock,
     )
     return runtime, scene, actual_clock
+
+
+def test_opt_in_prunes_expired_proposals_before_long_snapshot_hashing() -> None:
+    runtime, _scene, clock = build_runtime(prune_expired_proposals=True)
+    runtime.start()
+    try:
+        first = runtime.submit_policy_action(
+            action(),
+            policy_output_id="old",
+            produced_at=clock(),
+            target_effective_at=clock(),
+        )
+        assert first.accepted, first.message
+
+        clock.value = 10.2
+        second = runtime.submit_policy_action(
+            action(0.3, -0.3),
+            policy_output_id="new",
+            produced_at=clock(),
+            target_effective_at=clock(),
+        )
+        assert second.accepted, second.message
+        assert len(runtime.core.proposals) == 2
+
+        result = runtime.step(now=clock())
+        assert result.status == "dispatched"
+        assert len(runtime.core.proposals) == 1
+        assert runtime.core.proposals.get(first.proposal.proposal_id) is None
+        assert runtime.core.proposals.get(second.proposal.proposal_id) is not None
+    finally:
+        runtime.close()
 
 
 def test_runtime_start_failure_does_not_leave_a_live_execution_rig(

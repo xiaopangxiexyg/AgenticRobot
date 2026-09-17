@@ -12,7 +12,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
 
+import numpy as np
+
 from control_station.composition.rebot_b601_rm65_residual import (
+    B601RM65PoseProjection,
     B601RM65ResidualSource,
     B601RM65ResidualStep,
 )
@@ -230,6 +233,7 @@ class B601RM65MotionBinding:
             raise ValueError("Residual and target pose/frame conventions differ.")
         self._last_source_sequence = -1
         self._last_source_measured_at = -math.inf
+        self._last_source_observation_sample_id: str | None = None
         self._next_proposal_sequence = 0
         self._adapter = HumanProposalAdapter(
             HumanProposalAdapterConfig(
@@ -349,12 +353,15 @@ class B601RM65MotionBinding:
         *,
         target_effective_at: float | None,
         effective_until: float,
+        allow_repeated_source: bool = False,
     ) -> ProposalAdmissionReceipt:
         """Admit one current source proposal; receipt is not a dispatch receipt."""
         if not self.enabled:
             return ProposalAdmissionReceipt(
                 accepted=False, rejection_code="motion_profile_disabled"
             )
+        if not isinstance(allow_repeated_source, bool):
+            raise TypeError("allow_repeated_source must be bool.")
         now = float(self.runtime.clock())
         gate = self.runtime.authoritative_port.capture_execution_gate_snapshot(now=now)
         if gate.status != "ready":
@@ -401,10 +408,15 @@ class B601RM65MotionBinding:
             ):
                 raise ValueError("Source/anchor/schema lineage differs.")
             state = step.projection.source_step.state
+            repeated_source = (
+                sample.measured_at == self._last_source_measured_at
+                and step.projection.source_observation_sample_id
+                == self._last_source_observation_sample_id
+            )
             if (
                 state.sequence <= self._last_source_sequence
                 or sample.measured_at <= self._last_source_measured_at
-            ):
+            ) and not (allow_repeated_source and repeated_source):
                 raise ValueError("Source sequence/time did not advance.")
             self._age(now, sample.measured_at, self.limits[0])
             self._age(now, state.receive_timestamp_sec, self.limits[0])
@@ -500,6 +512,9 @@ class B601RM65MotionBinding:
                 state.sequence,
                 sample.measured_at,
             )
+            self._last_source_observation_sample_id = (
+                step.projection.source_observation_sample_id
+            )
             self._next_proposal_sequence += 1
             admitted = self.runtime.authoritative_port.admit_proposal(
                 proposal,
@@ -592,6 +607,8 @@ class B601RM65MotionSession:
         self._state = "inactive" if binding.enabled else "disabled"
         self._anchor: B601RM65MotionAnchor | None = None
         self._generation = 0
+        self._last_residual_step: B601RM65ResidualStep | None = None
+        self._last_source_reused = False
 
     @property
     def state(self) -> str:
@@ -600,6 +617,12 @@ class B601RM65MotionSession:
     @property
     def anchor(self) -> B601RM65MotionAnchor | None:
         return self._anchor
+
+    @property
+    def last_source_reused(self) -> bool:
+        """Whether the latest step held one still-fresh source sample."""
+
+        return self._last_source_reused
 
     def activate(self) -> B601RM65MotionAnchor:
         """Explicitly engage from inactive/HOLD, always with new measured anchors."""
@@ -634,23 +657,36 @@ class B601RM65MotionSession:
                 accepted=False, rejection_code=f"motion_session_{self._state}"
             )
         assert self._anchor is not None
+        self._last_source_reused = False
         try:
             projection = self.binding.source.poll_pose()
             # Sample availability precedes adaptation; never stamp before polling.
             now = float(self.binding.runtime.clock())
-            step = self.binding.source.adapt(
-                projection,
-                anchor=self._anchor.master_anchor,
-                adapted_at=now,
-                adapted_clock_domain_id=self.binding.runtime.config.clock_domain_id,
-            )
+            if self._can_reuse_latest_source(projection, now=now):
+                # A 60 Hz target may poll the B601 cache several times between
+                # its ~20 Hz complete snapshots.  Reusing the last accepted
+                # residual is a bounded zero-order hold, not a stale fallback:
+                # both the current cache and the cached sample must remain
+                # valid and inside the source-age window below.
+                assert self._last_residual_step is not None
+                step = self._last_residual_step
+                self._last_source_reused = True
+            else:
+                step = self.binding.source.adapt(
+                    projection,
+                    anchor=self._anchor.master_anchor,
+                    adapted_at=now,
+                    adapted_clock_domain_id=self.binding.runtime.config.clock_domain_id,
+                )
+                if step.residual_available:
+                    self._last_residual_step = step
             if (target_effective_at is None) != (effective_until is None):
                 raise ValueError("Supply both absolute proposal times or neither.")
             if target_effective_at is None:
                 # Foreground callers cannot timestamp after an in-flight poll.
                 # Keep expiry tied to the original sample, not its adaptation;
                 # the final admission owner selects the immediate target time.
-                sample = projection.pose_sample
+                sample = step.projection.pose_sample
                 effective_until = (
                     sample.measured_at if sample is not None else now
                 ) + self.binding.limits[0]
@@ -660,6 +696,7 @@ class B601RM65MotionSession:
                 self._anchor,
                 target_effective_at=target_effective_at,
                 effective_until=effective_until,
+                allow_repeated_source=self._last_source_reused,
             )
         except BaseException:
             # Cleanup only: including Ctrl-C, every interrupted source tick
@@ -669,6 +706,58 @@ class B601RM65MotionSession:
         if not receipt.accepted:
             self._hold("b601_motion_session_admission_rejected", state="held")
         return receipt
+
+    def _can_reuse_latest_source(
+        self,
+        projection: B601RM65PoseProjection,
+        *,
+        now: float,
+    ) -> bool:
+        """Check whether a duplicate cache frame can be held for one tick."""
+
+        cached = self._last_residual_step
+        if cached is None or not cached.residual_available:
+            return False
+        sample = projection.pose_sample
+        cached_sample = cached.projection.pose_sample
+        if sample is None or cached_sample is None:
+            return False
+        if (
+            projection.source_observation_sample_id
+            != cached.projection.source_observation_sample_id
+            or sample.measured_at != cached_sample.measured_at
+            or sample.pose_source_reference_source_controlled.shape
+            != cached_sample.pose_source_reference_source_controlled.shape
+            or not np.array_equal(
+                sample.pose_source_reference_source_controlled,
+                cached_sample.pose_source_reference_source_controlled,
+            )
+        ):
+            return False
+        state = projection.source_step.state
+        cached_state = cached.projection.source_step.state
+        if (
+            not state.valid
+            or state.stale
+            or not state.host_receive_freshness_verified
+            or state.fault_reason is not None
+            or state.receive_timestamp_sec < cached_state.receive_timestamp_sec
+        ):
+            return False
+        try:
+            B601RM65MotionBinding._age(
+                now,
+                state.receive_timestamp_sec,
+                self.binding.limits[0],
+            )
+            B601RM65MotionBinding._age(
+                now,
+                cached_sample.measured_at,
+                self.binding.limits[0],
+            )
+        except (AssertionError, TypeError, ValueError):
+            return False
+        return True
 
     def _capture(self, *, failure_state: str) -> B601RM65MotionAnchor:
         runtime, source = self.binding.runtime, self.binding.source
@@ -685,12 +774,25 @@ class B601RM65MotionSession:
             anchor = self.binding.capture_anchor(
                 master, measurement, operator_recenter=True
             )
+            seed_step = source.adapt(
+                projection,
+                anchor=master,
+                adapted_at=float(runtime.clock()),
+                adapted_clock_domain_id=runtime.config.clock_domain_id,
+            )
+            if not seed_step.residual_available:
+                raise ValueError(
+                    "B601 source anchor adaptation failed during activation: "
+                    f"{seed_step.rejection_reason}"
+                )
         except BaseException:
             # Provider/interrupt failures are not converted to successful input.
             self._hold("b601_motion_session_anchor_failure", state=failure_state)
             raise
         self._anchor = anchor
         self._generation += 1
+        self._last_residual_step = seed_step
+        self._last_source_reused = False
         self._state = "active"
         return anchor
 
@@ -698,6 +800,8 @@ class B601RM65MotionSession:
         # Clear software references even when lower cancellation fails. Such a
         # failure propagates; it must never be reported as successful HOLD.
         self._anchor = None
+        self._last_residual_step = None
+        self._last_source_reused = False
         self._state = state
         runtime = self.binding.runtime
         gate = runtime.authoritative_port.capture_execution_gate_snapshot()

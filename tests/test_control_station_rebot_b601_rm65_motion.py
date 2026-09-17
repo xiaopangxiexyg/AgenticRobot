@@ -957,6 +957,61 @@ def test_session_interrupted_poll_withdraws_reference_and_reraises(
     assert not scene.writes
 
 
+def test_session_holds_one_fresh_duplicate_cache_sample_but_rejects_stale(
+    setup_motion, monkeypatch
+):
+    """A faster sim loop may hold a fresh hardware frame, never an old one."""
+
+    clock, _scene, _runtime, _source, backend, _binding, _anchor = setup_motion
+    session = _session(setup_motion)
+    session.activate()
+    original_poll = backend.poll_feedback
+    calls = 0
+    first_step_state = None
+
+    def poll_feedback(*, request_feedback, require_host_freshness):
+        nonlocal calls, first_step_state
+        current = original_poll(
+            request_feedback=request_feedback,
+            require_host_freshness=require_host_freshness,
+        )
+        if calls == 0:
+            first_step_state = current
+        elif first_step_state is not None:
+            # Mimic the real host cache: the receiver poll advances its local
+            # sequence/time, while the device observation timestamp and
+            # per-frame status sequence remain unchanged.
+            joints = tuple(
+                replace(
+                    previous,
+                    sample_sequence=current.sequence,
+                    observed_at_sec=first.observed_at_sec,
+                    status_sequence=first.status_sequence,
+                )
+                for previous, first in zip(
+                    current.joints, first_step_state.joints
+                )
+            )
+            current = replace(current, joints=joints)
+        calls += 1
+        return current
+
+    monkeypatch.setattr(backend, "poll_feedback", poll_feedback)
+    first = _session_step(session, clock)
+    assert first.accepted, first.message
+    repeated = _session_step(session, clock)
+    assert repeated.accepted, repeated.message
+    assert session.last_source_reused is True
+    assert session.state == "active"
+
+    # Once the same device sample exceeds the source-age contract, the
+    # session must enter HOLD instead of extending it through another repeat.
+    clock.value += 0.2
+    stale = _session_step(session, clock)
+    assert not stale.accepted
+    assert session.state == "held"
+
+
 def test_session_disabled_has_no_source_or_target_effect(setup_motion):
     clock, _, runtime, source, backend, _, _ = setup_motion
     binding = B601RM65MotionBinding(

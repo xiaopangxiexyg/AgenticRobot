@@ -427,6 +427,10 @@ class MujocoDeployConfig:
     direct_component_proposal_source: (
         MujocoDirectComponentProposalSource | None
     ) = None
+    # The B601/RM65 foreground profile opts in to owner-side retention
+    # maintenance.  Generic runtimes keep the historical append-only buffer
+    # semantics unless they explicitly request this safe cleanup.
+    prune_expired_proposals: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -464,6 +468,7 @@ class MujocoDeployConfig:
             "enable_composer_authority",
             "enable_replay_authority",
             "enable_component_execution_handoff",
+            "prune_expired_proposals",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool.")
@@ -3529,6 +3534,17 @@ class MujocoDeployRuntime:
             physics_ticks_after_dispatch,
             name="physics_ticks_after_dispatch",
         )
+        # Expired proposals cannot be eligible at this decision cut or any
+        # later cut.  Prune them at the target owner, immediately before the
+        # authoritative snapshot is built, so canonical hashing remains
+        # bounded during long-running foreground sessions.  This is opt-in:
+        # historical generic runtimes retain their append-only semantics.
+        if self.config.prune_expired_proposals:
+            decision_now = float(self.clock() if now is None else now)
+            cutoff_at = decision_now - float(
+                self.core.scheduler.spec.cutoff_lag_sec
+            )
+            self.core.proposals.prune_expired(at_or_before=cutoff_at)
         result = self.core.run_decision(now=now)
         if result.target_execution_request is not None:
             self._latest_target_execution_step = result

@@ -81,7 +81,11 @@ def build_b601_rm65_sim_target(task_config_path: Path):
     The returned runtime is not started; its caller owns start/close.
     """
     from robot_motion.action import ExecutionMeasurementObservation
+    from robot_motion.position_control import POSITION_60_120_PROFILE_NAME
     from robot_motion.rm65 import (
+        DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+        RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
+        RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
         RM65PositionCollisionPlannerConfig,
         endpoint_to_tool_transform,
         load_rm65_tool_profile,
@@ -109,9 +113,23 @@ def build_b601_rm65_sim_target(task_config_path: Path):
         MujocoSimHILTargetConfig(
             task_config_path=task_config_path,
             allow_scripted_task_reset=False,
+            # B601 feedback arrives at roughly 20 Hz, while the RM65 target
+            # has a validated 60 Hz IK/reference clock.  The motion session
+            # explicitly reuses one still-fresh source sample between
+            # hardware frames; selecting the 60 Hz profile avoids adding a
+            # second 15 Hz bottleneck in the simulation loop.
+            position_control_profile_name=POSITION_60_120_PROFILE_NAME,
+            compose_target_hz=60.0,
         )
     )
     scene = prepared.scene
+    sim_collision_clearance_m = float(
+        scene.scene_spec.collision.safety_minimum_clearance_m
+    )
+    if not math.isfinite(sim_collision_clearance_m) or sim_collision_clearance_m < 0.0:
+        raise ValueError(
+            "RM65 simulation collision clearance must be finite and non-negative."
+        )
     tool_paths = {
         "left": prepared.task_config.left_tool_profile_path,
         "right": prepared.task_config.right_tool_profile_path,
@@ -120,7 +138,27 @@ def build_b601_rm65_sim_target(task_config_path: Path):
         scene,
         tool_paths,
         planner_config=RM65PositionCollisionPlannerConfig(
-            reference_hz=prepared.position_profile.rates.ik_hz,
+            # This resolver is called by the 60 Hz composed target.  Reuse the
+            # validated RM65 position envelope instead of the planner's
+            # conservative 0.35--0.50 rad/s real-side defaults; otherwise a
+            # 1:1 B601 residual appears artificially slow in simulation.
+            reference_hz=prepared.compose_target_hz,
+            max_joint_velocity_rad_s=RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
+            max_joint_acceleration_rad_s2=(
+                RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2
+            ),
+            solve_time_budget_ms=(
+                1000.0 / float(prepared.position_profile.rates.ik_hz)
+            ),
+            # Use the task's MuJoCo collision contract (currently 2 mm), not
+            # the 30 mm real-side planner default.  Collision stopping stays
+            # enabled; only the scene-specific clearance is aligned.
+            collision_min_distance_m=sim_collision_clearance_m,
+            collision_distance_epsilon_m=min(
+                DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+                sim_collision_clearance_m,
+            ),
+            collision_constraints_enabled=prepared.config.collision_stop_enabled,
         ),
     )
     rig = MujocoPositionExecutionRig(
@@ -140,6 +178,7 @@ def build_b601_rm65_sim_target(task_config_path: Path):
             decision_hz=prepared.compose_target_hz,
             pose_frame_contract_hash=prepared.tool_frame_profile.semantic_content_hash,
             enable_component_execution_handoff=True,
+            prune_expired_proposals=True,
         ),
         pose_resolver=MujocoCoupledPoseToQposResolver(ik),
     )
@@ -237,7 +276,13 @@ def run_b601_rm65_gui(
 
     def advance() -> None:
         result = session.binding.runtime.step()
-        record_with_feedback({"event": "target_step", "status": result.status})
+        record_with_feedback(
+            {
+                "event": "target_step",
+                "status": result.status,
+                "source_reused": session.last_source_reused,
+            }
+        )
 
     run_b601_rm65_foreground(
         session,
@@ -250,6 +295,7 @@ def run_b601_rm65_gui(
 
 
 _B601_RS_STATE_OBSERVATION_CAPABILITY = "state_observation_metadata_v1"
+_B601_RM65_SIMULATION_FEEDBACK_TIMEOUT_SEC = 0.15
 
 
 def _prepare_bundled_motorbridge_runtime() -> dict[str, object]:
@@ -544,8 +590,30 @@ def main(argv: list[str] | None = None) -> int:
             log.write(json.dumps(event, ensure_ascii=False) + "\n")
             log.flush()
 
+        stdout_broken = False
+
         def emit(message: str) -> None:
-            print(message, flush=True)
+            nonlocal stdout_broken
+            if not stdout_broken:
+                try:
+                    print(message, flush=True)
+                except BrokenPipeError:
+                    # A caller may intentionally pipe the concise terminal
+                    # stream through ``head``/``sed``.  The detailed JSON/log
+                    # evidence remains authoritative and must still be closed
+                    # and written after that presentation pipe disappears.
+                    stdout_broken = True
+                    try:
+                        null_fd = os.open(os.devnull, os.O_WRONLY)
+                    except OSError:
+                        pass
+                    else:
+                        try:
+                            os.dup2(null_fd, sys.stdout.fileno())
+                        except (OSError, ValueError):
+                            pass
+                        finally:
+                            os.close(null_fd)
             record({"event": "terminal", "message": message})
 
         result = {
@@ -605,10 +673,31 @@ def main(argv: list[str] | None = None) -> int:
             )
             model = B601PinocchioModel.from_rebot_source_root(args.rebot_source_root)
             config = B601RSBackendConfig.from_rs_yaml(args.config)
-            if args.simulation_feedback_timeout_sec is not None:
+            simulation_feedback_timeout = args.simulation_feedback_timeout_sec
+            if (
+                args.connect_read_only
+                and simulation_feedback_timeout is None
+                and isinstance(config, B601RSBackendConfig)
+            ):
+                # The wired owner has a 100 ms default, but the receive-only
+                # simulation polls a roughly 20 Hz stream at 60 Hz.  Give the
+                # host cache one bounded extra frame of tolerance while still
+                # staying inside the application source-age contract.  This
+                # replacement is local to the simulation process and never
+                # mutates the operator's YAML or the B601 owner.
+                simulation_feedback_timeout = min(
+                    _B601_RM65_SIMULATION_FEEDBACK_TIMEOUT_SEC,
+                    float(args.maximum_source_age_sec),
+                )
+            if simulation_feedback_timeout is not None:
                 config = replace(
                     config,
-                    feedback_timeout_sec=args.simulation_feedback_timeout_sec,
+                    feedback_timeout_sec=simulation_feedback_timeout,
+                )
+                result["teleop_contract"]["simulation_feedback_timeout_source"] = (
+                    "simulation_cli_override"
+                    if args.simulation_feedback_timeout_sec is not None
+                    else "simulation_default"
                 )
             result["teleop_contract"].update(
                 {
@@ -618,6 +707,8 @@ def main(argv: list[str] | None = None) -> int:
                     "backend_feedback_timeout_source": (
                         "simulation_cli_override"
                         if args.simulation_feedback_timeout_sec is not None
+                        else "simulation_default"
+                        if simulation_feedback_timeout is not None
                         else "backend_config"
                     ),
                 }
@@ -625,6 +716,7 @@ def main(argv: list[str] | None = None) -> int:
             backend = B601RSBackend(config)
             with ExitStack() as resources:
                 runtime, measure, rate = build_b601_rm65_sim_target(args.task_config)
+                result["teleop_contract"]["target_control_hz"] = float(rate)
 
                 def close_target() -> None:
                     runtime.close()

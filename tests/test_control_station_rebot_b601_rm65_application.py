@@ -449,7 +449,7 @@ def test_actual_actuated_target_atomic_pose_measurement():
     runtime.start()
     try:
         observation = measure()
-        assert rate == 15
+        assert rate == 60
         assert set(observation.value_by_component) == {"left_arm", "right_arm"}
         assert observation.measured_at <= observation.available_at
         assert all(
@@ -457,6 +457,16 @@ def test_actual_actuated_target_atomic_pose_measurement():
             for value in observation.representation_by_component.values()
         )
         assert runtime.rig.config.actuation_profile is not None
+        assert runtime.config.decision_hz == 60
+        assert runtime.config.prune_expired_proposals is True
+        planner = runtime.pose_resolver.ik.planner
+        assert planner.config.reference_hz == pytest.approx(60.0)
+        assert planner.config.max_joint_velocity_rad_s == pytest.approx(
+            (5.6, 5.6, 7.2, 12.0, 12.0, 16.0)
+        )
+        assert planner.config.collision_min_distance_m == pytest.approx(
+            runtime.pose_resolver.ik.scene.scene_spec.collision.safety_minimum_clearance_m
+        )
         source, backend = _source(runtime, runtime.clock)
         session = app.assemble_b601_rm65_session(
             runtime,
