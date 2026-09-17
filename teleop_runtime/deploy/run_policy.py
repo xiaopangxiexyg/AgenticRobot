@@ -2877,6 +2877,8 @@ def main(
         }
     )
     rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
+    rtc_active_latency_gate_rejected = False
+    rtc_active_latency_gate_failure_reason: str | None = None
     rtc_active_latency_samples: list[float] = []
     accepted_rtc_dispatch_steps = 0
     step_index = 0
@@ -3473,10 +3475,95 @@ def main(
         """Reset every policy-owned part of an activation stream once."""
 
         nonlocal rtc_active_latency_gate_passed
+        nonlocal rtc_active_latency_gate_rejected
+        nonlocal rtc_active_latency_gate_failure_reason
         policy.reset()
         policy_deploy_runtime.reset_stream()
         rtc_active_latency_samples.clear()
         rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
+        rtc_active_latency_gate_rejected = False
+        rtc_active_latency_gate_failure_reason = None
+
+    def pause_after_rtc_active_latency_gate_failure(
+        *,
+        reason: str,
+        message: str,
+        observation: DeploymentObservation,
+    ) -> None:
+        """Latch a recoverable Active-RTC latency failure without dispatching.
+
+        A warmup rejection is a deployment admission failure, not a process
+        failure.  Keep the runtime alive in a visible paused/hold state so the
+        operator can inspect the cause and use ``g`` to request a fresh stream.
+        If the backend-specific measured-qpos hold cannot be established, the
+        stronger bimanual emergency stop is attempted before the paused state
+        is retained; an unacknowledged emergency stop remains a hard error.
+        """
+
+        nonlocal policy_active, ready_confirmed, last_action
+        nonlocal rtc_active_latency_gate_passed
+        nonlocal rtc_active_latency_gate_rejected
+        nonlocal rtc_active_latency_gate_failure_reason
+        normalized_reason = str(reason).strip() or "rtc_active_latency_gate_rejected"
+        rtc_active_latency_gate_passed = False
+        rtc_active_latency_gate_rejected = True
+        rtc_active_latency_gate_failure_reason = normalized_reason
+        policy_active = False
+        ready_confirmed = False
+        policy_deploy_runtime.clear_action_queue()
+        last_action = observation.hold_action()
+
+        hold_error: str | None = None
+        try:
+            hold_rtc_if_eligible(
+                now=control_loop_started_at,
+                reason=normalized_reason,
+            )
+            _hold_active_rtc_gap(
+                reason=normalized_reason,
+                send_actions=send_actions,
+                arm_backends=arm_backends,
+                position_deploy_executor=position_deploy_executor,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve fail-closed behavior.
+            hold_error = f"{type(exc).__name__}: {exc}"
+            try:
+                emergency_stop_deploy_arm_backends(
+                    arm_backends,
+                    reason=f"{normalized_reason}:hold_fallback",
+                )
+            except Exception as stop_exc:  # noqa: BLE001 - hard safety failure.
+                raise RuntimeError(
+                    "RTC Active latency gate failure could not establish Hold and "
+                    "the fallback bimanual emergency stop was not acknowledged: "
+                    f"hold={hold_error}; stop={type(stop_exc).__name__}: {stop_exc}"
+                ) from exc
+            print(
+                "[RTC] measured-qpos Hold unavailable; fallback bimanual "
+                "emergency stop acknowledged; policy remains paused: "
+                f"{hold_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        event_payload = {
+            "schema": "dexteleop_rtc_active_latency_gate_v2",
+            "status": "blocked",
+            "reason": normalized_reason,
+            "message": str(message),
+            "configured_max_latency_sec": float(
+                args.rtc_active_max_inference_latency_sec
+            ),
+            "hold_error": hold_error,
+            "recovery": "press_g_for_fresh_latency_warmup",
+        }
+        debug_logger.log_event("rtc_active_latency_gate", event_payload)
+        console_log_event(
+            "RTC",
+            "ERROR: Active latency gate blocked policy; no action dispatched; "
+            f"{message} Press g to retry a fresh warmup.",
+            now=control_loop_started_at,
+        )
 
     def record_policy_prediction_result(
         prediction: PolicyChunkPredictionResult,
@@ -4068,6 +4155,12 @@ def main(
                         print(
                             "[Deploy] ready confirm ignored: impedance force guard is "
                             "latched; complete manual re-arm with r."
+                        )
+                    elif rtc_active_latency_gate_rejected:
+                        policy_active = False
+                        print(
+                            "[Deploy] ready confirm ignored: RTC Active latency "
+                            "gate is blocked; press g to retry a fresh warmup."
                         )
                     elif (
                         fixed_init_controller is not None
@@ -4900,6 +4993,7 @@ def main(
                     rtc_active_latency_warmup = bool(
                         rtc_active_latency_gate_required
                         and not rtc_active_latency_gate_passed
+                        and not rtc_active_latency_gate_rejected
                         and can_run_policy
                         and not ik_action_gate.blocks_action_output
                         and not defer_position_action_until_fresh_cut
@@ -5036,11 +5130,13 @@ def main(
                                 >= int(args.rtc_active_warmup_discard_completions)
                             ),
                         )
+                        rtc_active_latency_gate_failed_this_step = False
                         if (
                             rtc_active_latency_warmup
                             and rtc_step.completion is not None
                             and rtc_step.preflight_completion
                         ):
+                            timing_failure = False
                             try:
                                 latency_sec = _rtc_active_completion_latency_sec(
                                     inference_started_at=(
@@ -5052,81 +5148,73 @@ def main(
                                 invalid_timing_reason = (
                                     "rtc_active_completion_timestamp_invalid"
                                 )
-                                try:
-                                    hold_rtc_if_eligible(
-                                        now=control_loop_started_at,
-                                        reason=invalid_timing_reason,
-                                    )
-                                finally:
-                                    _hold_active_rtc_gap(
-                                        reason=invalid_timing_reason,
-                                        send_actions=send_actions,
-                                        arm_backends=arm_backends,
-                                        position_deploy_executor=(
-                                            position_deploy_executor
+                                timing_failure = True
+                                pause_after_rtc_active_latency_gate_failure(
+                                    reason=invalid_timing_reason,
+                                    message=(
+                                        "completion timestamps were invalid "
+                                        f"({type(exc).__name__}: {exc})"
+                                    ),
+                                    observation=observation,
+                                )
+                                rtc_active_latency_gate_failed_this_step = True
+                                rtc_active_latency_warmup = False
+                            if not timing_failure:
+                                rtc_active_latency_samples.append(latency_sec)
+                                gate_complete, gate_accepted, observed_max = (
+                                    _rtc_active_latency_gate_result(
+                                        rtc_active_latency_samples,
+                                        discard_completions=int(
+                                            args.rtc_active_warmup_discard_completions
+                                        ),
+                                        required_completions=int(
+                                            args.rtc_active_warmup_completions
+                                        ),
+                                        maximum_latency_sec=float(
+                                            args.rtc_active_max_inference_latency_sec
                                         ),
                                     )
-                                raise RuntimeError(
-                                    "RTC Active latency gate rejected invalid "
-                                    "completion timestamps."
-                                ) from exc
-                            rtc_active_latency_samples.append(latency_sec)
-                            gate_complete, gate_accepted, observed_max = (
-                                _rtc_active_latency_gate_result(
-                                    rtc_active_latency_samples,
-                                    discard_completions=int(
-                                        args.rtc_active_warmup_discard_completions
-                                    ),
-                                    required_completions=int(
-                                        args.rtc_active_warmup_completions
-                                    ),
-                                    maximum_latency_sec=float(
-                                        args.rtc_active_max_inference_latency_sec
-                                    ),
                                 )
-                            )
-                            if gate_complete:
-                                assert observed_max is not None
-                                if not gate_accepted:
-                                    _hold_active_rtc_gap(
-                                        reason="rtc_active_latency_gate_rejected",
-                                        send_actions=send_actions,
-                                        arm_backends=arm_backends,
-                                        position_deploy_executor=(
-                                            position_deploy_executor
-                                        ),
-                                    )
-                                    raise RuntimeError(
-                                        "RTC Active latency gate rejected dispatch: "
-                                        f"warm maximum {observed_max:.6f}s is not below "
-                                        "the exclusive configured bound "
-                                        f"{float(args.rtc_active_max_inference_latency_sec):.6f}s."
-                                    )
-                                rtc_active_latency_gate_passed = True
-                                console_log_event(
-                                    "RTC",
-                                    "READY: Active inference latency gate passed; "
-                                    f"warm_max={observed_max:.6f}s samples="
-                                    f"{int(args.rtc_active_warmup_completions)}.",
-                                    now=loop_started_at,
-                                )
+                                if gate_complete:
+                                    assert observed_max is not None
+                                    if not gate_accepted:
+                                        pause_after_rtc_active_latency_gate_failure(
+                                            reason="rtc_active_latency_gate_rejected",
+                                            message=(
+                                                "warm maximum "
+                                                f"{observed_max:.6f}s is not below "
+                                                "the exclusive configured bound "
+                                                f"{float(args.rtc_active_max_inference_latency_sec):.6f}s"
+                                            ),
+                                            observation=observation,
+                                        )
+                                        rtc_active_latency_gate_failed_this_step = True
+                                        rtc_active_latency_warmup = False
+                                    else:
+                                        rtc_active_latency_gate_passed = True
+                                        console_log_event(
+                                            "RTC",
+                                            "READY: Active inference latency gate passed; "
+                                            f"warm_max={observed_max:.6f}s samples="
+                                            f"{int(args.rtc_active_warmup_completions)}.",
+                                            now=loop_started_at,
+                                        )
                             # Reuse the drained RPC exchange between samples.
                             # No preflight result entered the executable plan;
                             # the next formal request uses a fresh observation.
-                        rtc_gap_reason = (
-                            "rtc_active_latency_warmup"
-                            if rtc_active_latency_warmup
-                            else (
-                                "rtc_producer_not_eligible"
-                            if rtc_step.state.lifecycle_state
+                        if rtc_active_latency_gate_failed_this_step:
+                            rtc_gap_reason = None
+                        elif rtc_active_latency_warmup:
+                            rtc_gap_reason = "rtc_active_latency_warmup"
+                        elif (
+                            rtc_step.state.lifecycle_state
                             != POLICY_ASYNC_PRODUCER_ELIGIBLE
-                            else (
-                                "rtc_plan_underrun"
-                                if rtc_step.underrun
-                                else None
-                            )
-                            )
-                        )
+                        ):
+                            rtc_gap_reason = "rtc_producer_not_eligible"
+                        elif rtc_step.underrun:
+                            rtc_gap_reason = "rtc_plan_underrun"
+                        else:
+                            rtc_gap_reason = None
                         rtc_hold_receipts = _hold_active_rtc_gap(
                             reason=rtc_gap_reason,
                             send_actions=send_actions,
@@ -5148,7 +5236,11 @@ def main(
                         if rtc_step_fanout is not None:
                             rtc_step_fanout.put_nowait(rtc_step)
                         emission = rtc_step.emission_result.emission
-                        if rtc_emission_publisher is not None and emission is not None:
+                        if (
+                            not rtc_active_latency_gate_failed_this_step
+                            and rtc_emission_publisher is not None
+                            and emission is not None
+                        ):
                             publication_receipt = (
                                 rtc_emission_publisher.publish_committed_emission(
                                     emission,
@@ -5178,7 +5270,11 @@ def main(
                                     "rejected: "
                                     f"{publication_receipt.reasons}"
                                 )
-                        if rtc_emission_fanout is not None and emission is not None:
+                        if (
+                            not rtc_active_latency_gate_failed_this_step
+                            and rtc_emission_fanout is not None
+                            and emission is not None
+                        ):
                             commit = rtc_step.emission_commit_transition
                             if (
                                 commit is None
@@ -5521,7 +5617,8 @@ def main(
                             )
                         try:
                             if (
-                                canonical_action.command is not None
+                                not rtc_active_latency_gate_failed_this_step
+                                and canonical_action.command is not None
                                 and canonical_action.command.commands
                             ):
                                 if (
@@ -5911,6 +6008,15 @@ def main(
                                 )
                             ),
                             position_executor_status,
+                            (
+                                "rtc_active_latency=blocked:"
+                                + str(
+                                    rtc_active_latency_gate_failure_reason
+                                    or "unknown"
+                                )
+                                if rtc_active_latency_gate_rejected
+                                else ""
+                            ),
                             (
                                 "rtc="
                                 f"{rtc_frontend.state.lifecycle_state.lower()} "
