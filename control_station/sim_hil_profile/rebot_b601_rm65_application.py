@@ -8,8 +8,9 @@ import math
 import sys
 import traceback
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,8 +27,8 @@ def assemble_b601_rm65_session(
     measure_target,
     maximum_source_age_sec: float = 0.15,
     maximum_measurement_age_sec: float = 0.1,
-    maximum_translation_m: float = 0.1,
-    maximum_rotation_rad: float = 0.3,
+    maximum_translation_m: float | None = 0.1,
+    maximum_rotation_rad: float | None = 0.3,
 ) -> B601RM65MotionSession:
     """Bind existing owners; do not start or close any injected resource."""
     from control_station.composition.rebot_b601_rm65_residual import (
@@ -211,6 +212,19 @@ def run_b601_rm65_gui(
 
     commands = B601RM65TerminalCommands() if poll_command is None else poll_command
 
+    if record is not None and not callable(record):
+        raise TypeError("record must be callable or None.")
+
+    def record_with_feedback(event: dict[str, Any]) -> None:
+        if record is None:
+            return
+        enriched = dict(event)
+        if event.get("event") in {"proposal_admission", "target_step"}:
+            snapshot = _feedback_snapshot_details(session)
+            if snapshot is not None:
+                enriched["feedback_snapshot"] = snapshot
+        record(enriched)
+
     def command(timeout: float) -> str | None:
         if not viewer.sync():
             status = viewer.status()
@@ -221,8 +235,7 @@ def run_b601_rm65_gui(
 
     def advance() -> None:
         result = session.binding.runtime.step()
-        if record is not None:
-            record({"event": "target_step", "status": result.status})
+        record_with_feedback({"event": "target_step", "status": result.status})
 
     run_b601_rm65_foreground(
         session,
@@ -230,7 +243,7 @@ def run_b601_rm65_gui(
         rate_hz=rate_hz,
         poll_command=command,
         emit=emit,
-        record=record,
+        record=record_with_feedback,
     )
 
 
@@ -254,6 +267,99 @@ def _positive(value: str) -> float:
     if not math.isfinite(result) or result <= 0:
         raise argparse.ArgumentTypeError("value must be finite and positive")
     return result
+
+
+def _finite_float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _mapping_contract_metadata(mapping: object, path: Path) -> dict[str, object]:
+    """Expose the loaded mapping identity and gains in the run receipt."""
+
+    metadata: dict[str, object] = {"mapping_profile": str(path)}
+    profile_hash = getattr(mapping, "semantic_content_hash", None)
+    if profile_hash is not None:
+        metadata["mapping_profile_semantic_content_hash"] = str(profile_hash)
+    gains = getattr(mapping, "translation_gain_target_reference_xyz", None)
+    if gains is not None:
+        try:
+            normalized_gains = [float(value) for value in gains]
+        except (TypeError, ValueError, OverflowError):
+            normalized_gains = []
+        if len(normalized_gains) == 3 and all(
+            math.isfinite(value) for value in normalized_gains
+        ):
+            metadata["translation_gain_target_reference_xyz"] = normalized_gains
+    rotation_gain = _finite_float_or_none(getattr(mapping, "rotation_gain", None))
+    if rotation_gain is not None:
+        metadata["rotation_gain"] = rotation_gain
+    return metadata
+
+
+def _feedback_snapshot_details(session: B601RM65MotionSession) -> dict[str, object] | None:
+    """Return host-cache timing facts without creating a second observation path."""
+
+    binding = getattr(session, "binding", None)
+    source = getattr(binding, "source", None)
+    pose_source = getattr(source, "pose_source", None)
+    backend = getattr(pose_source, "backend", None)
+    state = getattr(backend, "last_state", None)
+    if state is None:
+        return None
+
+    ages: dict[str, float] = {}
+    status_sequences: dict[str, int] = {}
+    try:
+        joints = tuple(getattr(state, "joints", ()) or ())
+    except TypeError:
+        joints = ()
+    for joint in joints:
+        name = str(getattr(joint, "name", "unknown"))
+        age = _finite_float_or_none(getattr(joint, "receive_age_sec", None))
+        if age is not None:
+            ages[name] = age
+        sequence = getattr(joint, "status_sequence", None)
+        if isinstance(sequence, int) and not isinstance(sequence, bool):
+            status_sequences[name] = sequence
+
+    maximum_age = max(ages.values()) if ages else None
+    backend_timeout = _finite_float_or_none(
+        getattr(getattr(backend, "config", None), "feedback_timeout_sec", None)
+    )
+    source_limit = None
+    try:
+        source_limit = _finite_float_or_none(binding.limits[0])
+    except (AttributeError, IndexError, TypeError):
+        pass
+    details: dict[str, object] = {
+        "sequence": getattr(state, "sequence", None),
+        "receive_timestamp_sec": _finite_float_or_none(
+            getattr(state, "receive_timestamp_sec", None)
+        ),
+        "valid": bool(getattr(state, "valid", False)),
+        "stale": bool(getattr(state, "stale", False)),
+        "host_receive_freshness_verified": bool(
+            getattr(state, "host_receive_freshness_verified", False)
+        ),
+        "freshness_semantics": str(
+            getattr(state, "freshness_semantics", "unknown")
+        ),
+        "fault_reason": getattr(state, "fault_reason", None),
+        "joint_receive_age_sec": ages,
+        "joint_status_sequence": status_sequences,
+        "max_receive_age_sec": maximum_age,
+        "feedback_timeout_sec": backend_timeout,
+        "source_age_limit_sec": source_limit,
+    }
+    if maximum_age is not None and backend_timeout is not None:
+        details["freshness_margin_sec"] = backend_timeout - maximum_age
+    return details
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -283,6 +389,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--maximum-measurement-age-sec", type=_positive, default=0.1)
     parser.add_argument("--maximum-translation-m", type=_positive, default=0.1)
     parser.add_argument("--maximum-rotation-rad", type=_positive, default=0.3)
+    parser.add_argument(
+        "--disable-teleop-residual-envelope",
+        action="store_true",
+        help=(
+            "read-only simulation only: disable the application residual "
+            "translation/rotation gate; canonical target safety remains active"
+        ),
+    )
+    parser.add_argument(
+        "--simulation-feedback-timeout-sec",
+        type=_positive,
+        default=None,
+        help=(
+            "read-only simulation only: override this process' host-cache "
+            "freshness timeout; does not change the B601 owner"
+        ),
+    )
     args = parser.parse_args(argv)
     if (
         args.connect_read_only
@@ -291,6 +414,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "read-only CAN connection requires --confirmation B601_RM65_READ_ONLY_CAN_SIM_TARGET"
         )
+    if args.disable_teleop_residual_envelope and not args.connect_read_only:
+        parser.error(
+            "--disable-teleop-residual-envelope is only valid with --connect-read-only"
+        )
+    if args.simulation_feedback_timeout_sec is not None:
+        if not args.connect_read_only:
+            parser.error(
+                "--simulation-feedback-timeout-sec is only valid with --connect-read-only"
+            )
+        if args.simulation_feedback_timeout_sec > args.maximum_source_age_sec:
+            parser.error(
+                "--simulation-feedback-timeout-sec must be no greater than "
+                "--maximum-source-age-sec"
+            )
     values = list(sys.argv[1:] if argv is None else argv)
     # Reserve a new result before any device call; logs may append across runs.
     with (
@@ -310,6 +447,35 @@ def main(argv: list[str] | None = None) -> int:
             "status": "ERROR",
             "real_motor_commands_sent": False,
             "target_cleanup_completed": False,
+            "teleop_contract": {
+                "input_mode": "b601_read_only_to_rm65_mujoco",
+                "rl_action_delta_scaling": "not_applied",
+                "canonical_target_safety": "retained",
+                "application_residual_envelope": (
+                    "disabled_for_read_only_simulation"
+                    if args.disable_teleop_residual_envelope
+                    else "bounded"
+                ),
+                "residual_translation_limit_m": (
+                    None
+                    if args.disable_teleop_residual_envelope
+                    else float(args.maximum_translation_m)
+                ),
+                "residual_rotation_limit_rad": (
+                    None
+                    if args.disable_teleop_residual_envelope
+                    else float(args.maximum_rotation_rad)
+                ),
+                "source_age_limit_sec": float(args.maximum_source_age_sec),
+                "measurement_age_limit_sec": float(
+                    args.maximum_measurement_age_sec
+                ),
+                "simulation_feedback_timeout_override_sec": (
+                    None
+                    if args.simulation_feedback_timeout_sec is None
+                    else float(args.simulation_feedback_timeout_sec)
+                ),
+            },
         }
         status = 1
         record(
@@ -324,8 +490,28 @@ def main(argv: list[str] | None = None) -> int:
             from sim.mujoco.viewer import MujocoPassiveViewerSession
 
             mapping = _load_mapping(args.mapping_profile)
+            result["teleop_contract"].update(
+                _mapping_contract_metadata(mapping, args.mapping_profile)
+            )
             model = B601PinocchioModel.from_rebot_source_root(args.rebot_source_root)
             config = B601RSBackendConfig.from_rs_yaml(args.config)
+            if args.simulation_feedback_timeout_sec is not None:
+                config = replace(
+                    config,
+                    feedback_timeout_sec=args.simulation_feedback_timeout_sec,
+                )
+            result["teleop_contract"].update(
+                {
+                    "backend_feedback_timeout_sec": _finite_float_or_none(
+                        getattr(config, "feedback_timeout_sec", None)
+                    ),
+                    "backend_feedback_timeout_source": (
+                        "simulation_cli_override"
+                        if args.simulation_feedback_timeout_sec is not None
+                        else "backend_config"
+                    ),
+                }
+            )
             backend = B601RSBackend(config)
             with ExitStack() as resources:
                 runtime, measure, rate = build_b601_rm65_sim_target(args.task_config)
@@ -343,8 +529,16 @@ def main(argv: list[str] | None = None) -> int:
                     measure_target=measure,
                     maximum_source_age_sec=args.maximum_source_age_sec,
                     maximum_measurement_age_sec=args.maximum_measurement_age_sec,
-                    maximum_translation_m=args.maximum_translation_m,
-                    maximum_rotation_rad=args.maximum_rotation_rad,
+                    maximum_translation_m=(
+                        None
+                        if args.disable_teleop_residual_envelope
+                        else args.maximum_translation_m
+                    ),
+                    maximum_rotation_rad=(
+                        None
+                        if args.disable_teleop_residual_envelope
+                        else args.maximum_rotation_rad
+                    ),
                 )
                 if not args.validate_only:
                     emit(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -105,6 +106,16 @@ def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
     assert session.anchor is None
     # Resource lifecycles belong to the application, not this injected loop.
     assert "close" not in viewer.calls
+    diagnostics = [
+        event.get("feedback_snapshot")
+        for event in records
+        if event.get("feedback_snapshot") is not None
+    ]
+    assert diagnostics
+    assert diagnostics[0]["max_receive_age_sec"] == 0.0
+    assert diagnostics[0]["joint_receive_age_sec"]["joint1"] == 0.0
+    assert diagnostics[0]["feedback_timeout_sec"] == 0.1
+    assert diagnostics[0]["freshness_margin_sec"] == 0.1
 
 
 @pytest.mark.parametrize("fault", (False, True))
@@ -153,6 +164,8 @@ assert 'mujoco' not in sys.modules
     )
     assert result.returncode == 0, result.stderr
     assert "--connect-read-only" in result.stdout
+    assert "--simulation-feedback-timeout-sec" in result.stdout
+    assert "--disable-teleop-residual-envelope" in result.stdout
 
 
 def _args(tmp_path, mode):
@@ -195,6 +208,115 @@ def test_cli_can_requires_exact_read_only_confirmation(tmp_path):
     with pytest.raises(SystemExit) as error:
         app.main(_args(tmp_path, "--connect-read-only"))
     assert error.value.code == 2
+
+
+def test_simulation_feedback_override_requires_read_only_and_source_margin(tmp_path):
+    with pytest.raises(SystemExit) as error:
+        app.main(
+            [
+                *_args(tmp_path, "--validate-only"),
+                "--simulation-feedback-timeout-sec",
+                "0.2",
+            ]
+        )
+    assert error.value.code == 2
+    with pytest.raises(SystemExit) as error:
+        app.main(
+            [
+                *_args(tmp_path, "--connect-read-only"),
+                "--confirmation",
+                "B601_RM65_READ_ONLY_CAN_SIM_TARGET",
+                "--simulation-feedback-timeout-sec",
+                "0.2",
+                "--maximum-source-age-sec",
+                "0.15",
+            ]
+        )
+    assert error.value.code == 2
+
+
+def test_unbounded_residual_envelope_requires_read_only(tmp_path):
+    with pytest.raises(SystemExit) as error:
+        app.main(
+            [*_args(tmp_path, "--validate-only"), "--disable-teleop-residual-envelope"]
+        )
+    assert error.value.code == 2
+
+
+def test_read_only_simulation_overrides_feedback_timeout_locally(
+    setup_motion, tmp_path, monkeypatch
+):
+    """The wider sim tolerance never mutates the hardware-owner YAML config."""
+
+    import hardware.rebot_b601_rs as hardware
+    from robot_motion.rebot_b601_rs import B601PinocchioModel
+    from sim.mujoco.viewer import MujocoPassiveViewerSession
+
+    @dataclass(frozen=True)
+    class _Config:
+        feedback_timeout_sec: float = 0.1
+
+    clock, _, runtime, source, backend, _, _ = setup_motion
+    captured = {}
+    monkeypatch.setattr(
+        backend, "connect", lambda: captured.setdefault("connected", True), raising=False
+    )
+    monkeypatch.setattr(
+        backend, "close", lambda: captured.setdefault("closed", True), raising=False
+    )
+
+    def make_backend(config):
+        captured["config"] = config
+        return backend
+
+    monkeypatch.setattr(hardware, "B601RSBackend", make_backend)
+    monkeypatch.setattr(
+        hardware.B601RSBackendConfig, "from_rs_yaml", lambda path: _Config()
+    )
+    monkeypatch.setattr(
+        B601PinocchioModel, "from_rebot_source_root", lambda path: _Model()
+    )
+    monkeypatch.setattr(app, "_load_mapping", lambda path: _mapping(source))
+    monkeypatch.setattr(
+        app,
+        "build_b601_rm65_sim_target",
+        lambda path: (runtime, lambda: _measurement(runtime, clock), 20),
+    )
+    viewer = _Viewer()
+    monkeypatch.setattr(
+        sys.modules[MujocoPassiveViewerSession.__module__],
+        "MujocoPassiveViewerSession",
+        lambda *args, **kwargs: viewer,
+    )
+
+    monkeypatch.setattr(
+        app,
+        "run_b601_rm65_gui",
+        lambda session, **kwargs: session.deactivate(),
+    )
+    args = [
+        *_args(tmp_path, "--connect-read-only"),
+        "--confirmation",
+        "B601_RM65_READ_ONLY_CAN_SIM_TARGET",
+        "--maximum-source-age-sec",
+        "0.25",
+        "--simulation-feedback-timeout-sec",
+        "0.20",
+        "--disable-teleop-residual-envelope",
+    ]
+    assert dispatcher.main(["b601-rm65", *args]) == 0
+    result = json.loads((tmp_path / "result.json").read_text())
+    contract = result["teleop_contract"]
+    assert captured["config"].feedback_timeout_sec == 0.2
+    assert contract["backend_feedback_timeout_sec"] == 0.2
+    assert contract["backend_feedback_timeout_source"] == "simulation_cli_override"
+    assert contract["simulation_feedback_timeout_override_sec"] == 0.2
+    assert contract["application_residual_envelope"] == (
+        "disabled_for_read_only_simulation"
+    )
+    assert contract["residual_translation_limit_m"] is None
+    assert contract["canonical_target_safety"] == "retained"
+    assert captured["connected"] and captured["closed"]
 
 
 @pytest.mark.parametrize(

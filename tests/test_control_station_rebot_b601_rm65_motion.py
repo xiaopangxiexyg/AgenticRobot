@@ -107,6 +107,8 @@ class _Backend:
         self.clock, self.sequence = clock, 0
         self.q = np.zeros(6)
         self.valid = True
+        self.last_state = None
+        self.config = SimpleNamespace(feedback_timeout_sec=0.1)
 
     def poll_feedback(self, *, request_feedback, require_host_freshness):
         assert not request_feedback and require_host_freshness
@@ -134,7 +136,7 @@ class _Backend:
             )
             for i in range(6)
         )
-        return B601HardwareState(
+        state = B601HardwareState(
             sequence=self.sequence,
             receive_timestamp_sec=now,
             joints=joints,
@@ -145,6 +147,8 @@ class _Backend:
             fault_reason=None,
             host_receive_freshness_verified=True,
         )
+        self.last_state = state
+        return state
 
 
 class _Model:
@@ -811,6 +815,26 @@ def test_disabled_binding_does_not_change_execution_gate(setup_motion):
     assert (
         runtime.authoritative_port.capture_execution_gate_snapshot().status == "ready"
     )
+
+
+def test_none_residual_envelope_keeps_canonical_target_safety(setup_motion):
+    """Read-only teleop may skip its envelope without bypassing target admission."""
+
+    clock, scene, runtime, source, _, _bounded, anchor = setup_motion
+    binding = B601RM65MotionBinding(
+        runtime,
+        source,
+        maximum_source_age_sec=0.15,
+        maximum_measurement_age_sec=0.1,
+        maximum_translation_m=None,
+        maximum_rotation_rad=None,
+        enabled=True,
+    )
+    setup = (clock, scene, runtime, source, setup_motion[4], binding, anchor)
+    receipt = _submit(setup, _step(setup, q=(0.2, 0, 0, 0, 0, 0)))
+    assert receipt.accepted, receipt.message
+    assert binding.limits[2:] == (None, None)
+    assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "ready"
 
 
 def test_stale_target_or_master_cannot_establish_anchor(setup_motion):

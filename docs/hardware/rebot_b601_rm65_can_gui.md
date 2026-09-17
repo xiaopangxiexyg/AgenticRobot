@@ -24,6 +24,61 @@ CAN backend 以默认 `allow_motion=False`、`allow_active_reporting=False` 创�
 现有 master 重力补偿/阻尼 owner 必须独立运行；应用退出仅撤销仿真跟随并关闭自己的只读连接。
 绝不能把 master `safe_stop()` 加入应用的普通 `finally`。
 
+## 遥操幅度与 RL 边界
+
+这条入口是 B601 只读位姿到 RM65 MuJoCo 的直接遥操，不是 RL action 执行器。它提交的是
+anchor-relative 的 `cartesian_pose`，经已有 coupled IK、关节范围、碰撞、速度、加速度和目标
+生命周期门控；`right_tcp_delta_m`、`right_tcp_rotation_delta_rad`、`right_joint_delta_rad`
+等 RL 归一化动作尺度不会参与这条路径，也不应修改 RL task JSON 来放大遥操幅度。
+
+位移倍率由外部 canonical frame-mapping profile 的
+`translation_gain_target_reference_xyz` 负责。当前 B601 工作空间小于 RM65，现场遥操 profile
+应显式使用 `[1.5, 1.5, 1.5]`（旋转倍率仍为 `1.0`），并在结果 JSON 中核对
+`translation_gain_target_reference_xyz` 和 profile hash。旧的 `[0.25, 0.25, 0.25]` profile
+会缩小运动，只能作为历史对照，不能用于本轮幅度验收。
+
+可在不改动原始标定文件的情况下生成 150% 版本（省略旧 hash，让 canonical loader 重新计算）：
+
+```bash
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
+PROFILE_IN=/tmp/b601-rs-commissioning/provisional_b601_rm65_mapping_v0.json
+PROFILE_150=/tmp/b601-rs-commissioning/b601_rm65_mapping_150_v1.json
+"$PY" - "$PROFILE_IN" "$PROFILE_150" <<'PY'
+import json
+import sys
+
+source, target = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    payload = json.load(handle)
+payload["profile_id"] = "b601-rm65-provisional-lab-150-v1"
+payload["translation_gain_target_reference_xyz"] = [1.5, 1.5, 1.5]
+payload.pop("semantic_content_hash", None)
+with open(target, "x", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+print(target)
+PY
+```
+
+仿真只读连接可显式传 `--disable-teleop-residual-envelope`。它仅关闭 B601 binding 的
+“单 tick residual 平移/旋转幅度”预检，不关闭 RM65 的 canonical IK、关节、碰撞、速度、加速度、
+执行时域或 viewer fault 保护；该选项被限制为 `--connect-read-only`，不得用于真机运动 owner。
+
+## 反馈过期诊断
+
+默认 `feedback_timeout_sec=0.10` 仍属于 B601 backend/真机 owner 的安全契约。20 Hz 报告周期约
+50 ms，若一次 report 调度或 USB/CAN 接收间隔丢失，再叠加几毫秒调度抖动，host cache age 就会
+从约 50 ms 跳到 100 ms 以上；六个关节同时超时通常是整条 operation-status stream 的间隙，
+不是六个电机同时故障。`feedback-stability` 的 p50/p95 通过也不排除单 tick 的最大 age 超时。
+
+为 RM65 仿真跟随，应用提供仅作用于本进程的
+`--simulation-feedback-timeout-sec` 覆盖；推荐 `0.20`，同时将
+`--maximum-source-age-sec` 设为 `0.25`，保留约 50 ms 的 source TTL 余量。该覆盖通过
+`dataclasses.replace` 只修改 GUI 进程内的 backend config，不改 YAML、真机 owner、active
+report 或 watchdog。每个 `proposal_admission`/`target_step` 日志事件会带
+`feedback_snapshot`，包括每关节 receive age、最大 age、timeout、余量、sequence 和
+`fault_reason`，用于区分偶发报告间隙与持续 stale。
+
 `--validate-only` 不打开 CAN/GUI，不启动 worker，只构造、校验契约和模型；
 `--connect-read-only` 必须提供 `--confirmation B601_RM65_READ_ONLY_CAN_SIM_TARGET`。
 这只是连接确认，不是 motor/report/motion 授权。
@@ -67,7 +122,7 @@ bash scripts/run_pytest.sh -q \
   tests/test_control_station_rebot_b601_rm65_motion.py
 ```
 
-当前预期为 **54 passed**。
+当前预期为 **56 passed、2 skipped**（环境没有 reviewed RM65 assets 时保留可选跳过）。
 测试覆盖 injected owner 生命周期、完整当前姿态锚点、GUI close/fault、lazy CLI help、
 参数/confirmation 拒绝、离线模式不连接 CAN、日志 argv、Ctrl-C、target cleanup，以及真实模型 actuated rig 的 atomic FK measurement。
 外部构造在生命周期测试中 mock；坐标 profile 用 synthetic port，不代表真实安装姿态标定。

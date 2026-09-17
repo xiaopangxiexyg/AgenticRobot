@@ -144,6 +144,7 @@ def run_b601_rm65_foreground(
                     "proposal_admission",
                     accepted=receipt.accepted,
                     rejection_code=receipt.rejection_code,
+                    rejection_message=receipt.message,
                 )
                 if not receipt.accepted:
                     emit(f"[B601→RM65] held: {receipt.rejection_code}; inspect before a")

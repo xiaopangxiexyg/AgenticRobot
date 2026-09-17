@@ -123,7 +123,11 @@ class B601RM65MotionAnchor:
 
 
 class B601RM65MotionBinding:
-    """Default-off, bounded publication to a configured single-human target."""
+    """Default-off publication to a configured single-human target.
+
+    The optional translation/rotation envelope belongs to this application
+    ingress only; the target's canonical motion safety remains authoritative.
+    """
 
     def __init__(
         self,
@@ -132,8 +136,8 @@ class B601RM65MotionBinding:
         *,
         maximum_source_age_sec: float,
         maximum_measurement_age_sec: float,
-        maximum_translation_m: float,
-        maximum_rotation_rad: float,
+        maximum_translation_m: float | None,
+        maximum_rotation_rad: float | None,
         enabled: bool = False,
     ) -> None:
         if not isinstance(runtime, B601RM65MotionTarget):
@@ -147,17 +151,22 @@ class B601RM65MotionBinding:
         self.runtime = runtime
         self.source = source
         self.enabled = enabled
-        self.limits = tuple(
-            float(value)
-            for value in (
-                maximum_source_age_sec,
-                maximum_measurement_age_sec,
-                maximum_translation_m,
-                maximum_rotation_rad,
-            )
+        source_age = float(maximum_source_age_sec)
+        measurement_age = float(maximum_measurement_age_sec)
+        translation_limit = self._optional_positive(
+            maximum_translation_m,
+            name="maximum_translation_m",
         )
-        if any(not math.isfinite(value) or value <= 0 for value in self.limits):
-            raise ValueError("Motion age and range limits must be finite and positive.")
+        rotation_limit = self._optional_positive(
+            maximum_rotation_rad,
+            name="maximum_rotation_rad",
+        )
+        self.limits = (source_age, measurement_age, translation_limit, rotation_limit)
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in self.limits[:2]
+        ):
+            raise ValueError("Motion age limits must be finite and positive.")
         config = runtime.config
         if (
             config.initial_control_mode != "human"
@@ -388,9 +397,13 @@ class B601RM65MotionBinding:
                 step.relative_action.values_by_component[self.component_id].values
             )
             translation_m, rotation_deg = pose_delta_metrics(identity_pose(), delta)
+            maximum_translation_m, maximum_rotation_rad = self.limits[2:]
             if (
-                translation_m > self.limits[2]
-                or math.radians(rotation_deg) > self.limits[3]
+                maximum_translation_m is not None
+                and translation_m > maximum_translation_m
+            ) or (
+                maximum_rotation_rad is not None
+                and math.radians(rotation_deg) > maximum_rotation_rad
             ):
                 raise ValueError(
                     "Residual exceeds the configured translation/rotation range."
@@ -488,6 +501,22 @@ class B601RM65MotionBinding:
         if not valid:
             raise ValueError(reason)
         return pose
+
+    @staticmethod
+    def _optional_positive(value: float | None, *, name: str) -> float | None:
+        """Validate an optional application envelope value.
+
+        ``None`` deliberately disables only the pre-admission residual magnitude
+        check.  The target's canonical IK, joint, collision, velocity and
+        acceleration guards remain authoritative.
+        """
+
+        if value is None:
+            return None
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized <= 0:
+            raise ValueError(f"{name} must be finite and positive or None.")
+        return normalized
 
 
 class B601RM65MotionSession:
