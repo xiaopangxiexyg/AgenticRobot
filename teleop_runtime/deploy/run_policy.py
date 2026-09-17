@@ -407,6 +407,7 @@ from .policy_binding import (
 )
 from .position_plan_cut import (
     DeploymentPositionPlanCutDetector,
+    DeploymentPositionPlanCutProposal,
     prepare_position_plan_cut_for_action_step as _prepare_position_plan_cut_for_action_step,
 )
 from .position_stream_handoff import (
@@ -2059,6 +2060,58 @@ def _prepare_position_lookahead_chain(
     return tuple(prepared)
 
 
+def _prepare_startup_position_plan_cut(
+    detector: DeploymentPositionPlanCutDetector,
+    position_deploy_executor: PositionDeployExecutor,
+    action: NormalizedAction,
+    *,
+    step_index: int,
+    detected_at: float,
+) -> DeploymentPositionPlanCutProposal:
+    """Attach typed source lineage to a startup position action.
+
+    Startup initialization is a deployment-owned position source, not a policy
+    chunk and therefore has no ``PolicyActionEmission``.  The position
+    executor still requires the same explicit reset/Hold cut as every other
+    source when stream-start acquisition is enabled.  Give startup its own
+    stable source plan and use the control-loop step as its local keyframe
+    index; the detector then preserves the normal clear/Hold acknowledgement
+    semantics without inventing model lineage.
+    """
+
+    if not isinstance(detector, DeploymentPositionPlanCutDetector):
+        raise TypeError("detector must be a DeploymentPositionPlanCutDetector.")
+    if not isinstance(position_deploy_executor, PositionDeployExecutor):
+        raise TypeError("position_deploy_executor must be a PositionDeployExecutor.")
+    if not isinstance(action, NormalizedAction):
+        raise TypeError("action must be a NormalizedAction.")
+    if (
+        isinstance(step_index, bool)
+        or int(step_index) != step_index
+        or int(step_index) < 0
+    ):
+        raise ValueError("step_index must be a non-negative integer.")
+    index = int(step_index)
+    metadata = dict(action.metadata)
+    metadata.update(
+        {
+            "deploy_action_chunk_id": 0,
+            "deploy_action_chunk_index": index,
+            "deploy_action_chunk_size": max(1, index + 1),
+            "deploy_action_chunk_source": "startup_init",
+        }
+    )
+    lineage_action = replace(action, metadata=metadata)
+    detector.observe_hold_generation(
+        int(position_deploy_executor.snapshot().get("clear_count", 0))
+    )
+    return detector.prepare_synchronous_action(
+        lineage_action,
+        policy_node_id="startup_init",
+        detected_at=float(detected_at),
+    )
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -2794,6 +2847,29 @@ def main(
             f"[StartupInit] source=current already satisfied by {current_pose_override_name}; "
             "press A to confirm ready and start policy execution."
         )
+
+    def reset_startup_initializer_for_activation(
+        *,
+        current_pose_start_allowed: bool,
+        preserve_completed: bool = True,
+    ) -> bool:
+        """Reset startup state without replaying an already completed init.
+
+        Activation recovery follows an acknowledged Hold and clears the
+        position stream.  Re-running a completed startup target in that
+        window would create an unnecessary second stream (and, for
+        ``source=current``, a no-op motion command).  Keep the completion
+        receipt intact; an incomplete initializer still gets the normal
+        explicit reset behavior.
+        """
+
+        if preserve_completed and startup_initializer.completed:
+            return False
+        return _reset_startup_initializer(
+            startup_initializer,
+            current_pose_start_allowed=current_pose_start_allowed,
+        )
+
     fixed_init_controller = (
         None
         if fixed_init_plan is None
@@ -4102,8 +4178,7 @@ def main(
                         policy_active = False
                         continue
                     reset_policy_stream_for_activation()
-                    _reset_startup_initializer(
-                        startup_initializer,
+                    reset_startup_initializer_for_activation(
                         current_pose_start_allowed=current_pose_start_override,
                     )
                     ready_confirmed = not wait_for_ready_confirm
@@ -4530,8 +4605,7 @@ def main(
                                 )
                             )
                             reset_policy_stream_for_activation()
-                            _reset_startup_initializer(
-                                startup_initializer,
+                            reset_startup_initializer_for_activation(
                                 current_pose_start_allowed=current_pose_start_override,
                             )
                             ready_confirmed = not wait_for_ready_confirm
@@ -4591,8 +4665,7 @@ def main(
                             )
                             last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
                             reset_policy_stream_for_activation()
-                            _reset_startup_initializer(
-                                startup_initializer,
+                            reset_startup_initializer_for_activation(
                                 current_pose_start_allowed=current_pose_start_override,
                             )
                             ready_confirmed = not wait_for_ready_confirm
@@ -4644,8 +4717,7 @@ def main(
                         print(fixed_result.message)
                     if fixed_result.completed:
                         reset_policy_stream_for_activation()
-                        _reset_startup_initializer(
-                            startup_initializer,
+                        reset_startup_initializer_for_activation(
                             current_pose_start_allowed=current_pose_start_override,
                         )
                         ready_confirmed = not wait_for_ready_confirm
@@ -4758,10 +4830,15 @@ def main(
                         and policy_qpos_init_controller.blocks_policy
                     ):
                         can_run_policy = False
-                    if (
-                        startup_initializer.enabled
-                        and not startup_initializer.completed
-                    ):
+                    startup_init_pending = bool(
+                        startup_initializer.enabled and not startup_initializer.completed
+                    )
+                    rtc_active_latency_warmup_pending = bool(
+                        rtc_active_latency_gate_required
+                        and not rtc_active_latency_gate_passed
+                        and not rtc_active_latency_gate_rejected
+                    )
+                    if startup_init_pending and not rtc_active_latency_warmup_pending:
                         if can_run_policy:
                             init_action, init_faults, init_ready = (
                                 startup_initializer.next_action(
@@ -4793,17 +4870,57 @@ def main(
                                     canonical_action.command is not None
                                     and canonical_action.command.commands
                                 ):
-                                    execution = prepared_action_executor.execute(
-                                        canonical_action,
-                                        observation,
-                                        policy_name="startup_init",
-                                        source_decision_id=(
-                                            f"startup-init-decision:{step_index}"
-                                        ),
-                                        source_reference_segment_id=(
-                                            f"startup-init-reference:{step_index}"
-                                        ),
-                                    )
+                                    startup_plan_cut_proposal = None
+                                    if (
+                                        position_plan_cut_detector is not None
+                                        and prepared_action_position_executor is not None
+                                        and command_effector_kind_subset(
+                                            canonical_action.command,
+                                            kind="arm",
+                                        )
+                                        is not None
+                                    ):
+                                        startup_plan_cut_proposal = (
+                                            _prepare_startup_position_plan_cut(
+                                                position_plan_cut_detector,
+                                                prepared_action_position_executor,
+                                                canonical_action.action,
+                                                step_index=step_index,
+                                                detected_at=loop_started_at,
+                                            )
+                                        )
+                                    try:
+                                        execution = prepared_action_executor.execute(
+                                            canonical_action,
+                                            observation,
+                                            policy_name="startup_init",
+                                            source_decision_id=(
+                                                f"startup-init-decision:{step_index}"
+                                            ),
+                                            source_reference_segment_id=(
+                                                f"startup-init-reference:{step_index}"
+                                            ),
+                                            source_plan_cut=(
+                                                None
+                                                if startup_plan_cut_proposal is None
+                                                else startup_plan_cut_proposal.cut
+                                            ),
+                                        )
+                                    except Exception:
+                                        if startup_plan_cut_proposal is not None:
+                                            position_plan_cut_detector.reject(
+                                                startup_plan_cut_proposal
+                                            )
+                                        raise
+                                    if startup_plan_cut_proposal is not None:
+                                        if execution.accepted:
+                                            position_plan_cut_detector.commit(
+                                                startup_plan_cut_proposal
+                                            )
+                                        else:
+                                            position_plan_cut_detector.reject(
+                                                startup_plan_cut_proposal
+                                            )
                                     if execution.accepted:
                                         position_action_submitted_this_loop = (
                                             prepared_action_position_executor
