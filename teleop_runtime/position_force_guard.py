@@ -1,10 +1,13 @@
 """Latched force-limit guard shared by real RM65 control frontends.
 
 The guard is intentionally independent of the position command clock.  Force
-samples come from the per-arm observation connections, while a trip invokes a
-single bimanual emergency-stop callback.  A trip remains latched until an
-operator completes a fresh runtime-home calibration and explicitly re-arms
-the monitor; no automatic recovery is permitted.
+samples are polled at a bounded low rate and a trip invokes a single bimanual
+emergency-stop callback.  RM65 deployments may share the vendor SDK handle
+between force, state, and command calls; therefore the live 60 Hz reference /
+120 Hz command profile leaves this monitor disabled by default and only uses
+it for explicit diagnostics or non-following paths.  A trip remains latched
+until an operator completes a fresh runtime-home calibration and explicitly
+re-arms the monitor; no automatic recovery is permitted.
 """
 
 from __future__ import annotations
