@@ -5075,6 +5075,11 @@ def main(
                         )
                         * 1000.0,
                     }
+                    # The execution guard is consulted by both the ordinary
+                    # synchronous path and the RTC path below.  Initialize it
+                    # before branching so a non-RTC deployment can never
+                    # observe an unbound per-step gate flag.
+                    rtc_active_latency_gate_failed_this_step = False
                     if rtc_frontend is None:
                         primary_prepare_started = time.monotonic()
                         primary_prepare_cpu_started = time.thread_time()
@@ -5130,7 +5135,6 @@ def main(
                                 >= int(args.rtc_active_warmup_discard_completions)
                             ),
                         )
-                        rtc_active_latency_gate_failed_this_step = False
                         if (
                             rtc_active_latency_warmup
                             and rtc_step.completion is not None
