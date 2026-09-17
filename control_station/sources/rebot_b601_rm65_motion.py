@@ -12,8 +12,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
 
-import numpy as np
-
 from control_station.composition.rebot_b601_rm65_residual import (
     B601RM65PoseProjection,
     B601RM65ResidualSource,
@@ -728,10 +726,8 @@ class B601RM65MotionSession:
             or sample.measured_at != cached_sample.measured_at
             or sample.pose_source_reference_source_controlled.shape
             != cached_sample.pose_source_reference_source_controlled.shape
-            or not np.array_equal(
-                sample.pose_source_reference_source_controlled,
-                cached_sample.pose_source_reference_source_controlled,
-            )
+            or sample.pose_source_reference_source_controlled.tolist()
+            != cached_sample.pose_source_reference_source_controlled.tolist()
         ):
             return False
         state = projection.source_step.state
