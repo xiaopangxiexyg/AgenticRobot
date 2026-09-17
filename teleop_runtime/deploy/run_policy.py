@@ -625,6 +625,45 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     _register_deployment_cli_args(parser)
 
 
+def _validate_position_force_guard_transport(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> None:
+    """Reject a blocking force reader on a live RM65 position command lane.
+
+    ``RM65ArmBackend`` has one vendor SDK handle per arm.  ``Get_Force_Data``
+    is a synchronous request which may occupy that handle for about 50 ms;
+    merely lowering its polling rate does not make concurrent 120 Hz command
+    calls safe.  The deployment default is therefore off, and an explicit
+    opt-in is limited to dry-run/no-hardware paths.  This check runs before
+    backend construction so a bad combination cannot open a device and then
+    discover the timing conflict after startup.
+    """
+
+    if not (
+        bool(getattr(args, "position_force_guard", False))
+        and bool(getattr(args, "send_actions", False))
+        and bool(getattr(args, "arms_enabled", False))
+        and str(getattr(args, "arm_control_mode", "")).strip().lower()
+        == RM65_ARM_CONTROL_MODE_POSITION
+    ):
+        return
+    connected_sides = tuple(
+        side
+        for side in active_sides
+        if str(getattr(args, f"{side}_arm_ip", "") or "").strip()
+    )
+    if not connected_sides:
+        return
+    raise ValueError(
+        "--position-force-guard is not supported with live RM65 position "
+        "dispatch because Get_Force_Data shares the SDK handle with command "
+        "calls and can block the 60 Hz reference / 120 Hz command lane. "
+        "Omit --position-force-guard for live position deployment; the "
+        "10 Hz monitor remains available for dry-run or no-hardware diagnostics."
+    )
+
+
 def validate_args(
     args: argparse.Namespace,
     *,
@@ -656,11 +695,12 @@ def validate_args(
         args.policy_qpos_init_parquet = None
     else:
         args.policy_qpos_init_suppressed = False
-    if bool(getattr(args, "position_force_guard", False)):
-        # Resolve the complete config before any backend or device is created.
-        # In particular, RM65 force polling above 20 Hz must fail at CLI
-        # validation rather than after a real-arm connection is opened.
-        position_force_guard_config(args)
+    # Resolve the complete config before any backend or device is created.
+    # In particular, an explicitly supplied RM65 force polling rate above
+    # 20 Hz must fail at CLI validation even when the monitor itself is off;
+    # this prevents a later profile/flag change from carrying an unsafe rate
+    # into a live process.
+    position_force_guard_config(args)
     rtc_profile_id = str(getattr(args, "rtc_profile", "off")).strip()
     rtc_profile_enabled = rtc_profile_id != "off"
     minimum_rtc_emissions = int(
@@ -1039,6 +1079,7 @@ def validate_args(
     args.arm_control_hz = execution_config.arm_control_hz
     args.position_reference_hz = execution_config.position_reference_hz
     args.arm_follow_qpos_alpha = execution_config.arm_follow_qpos_alpha
+    _validate_position_force_guard_transport(args, active_sides)
     if bool(args.rm65_pose_observation):
         if not bool(args.arms_enabled):
             raise ValueError("--rm65-pose-observation requires enabled arms.")

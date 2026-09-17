@@ -63,6 +63,7 @@ from teleop_runtime.deploy.dispatch import (
     POSITION_REFERENCE_DISPATCH_AUDIT_POST,
     dispatch_position_reference_command,
     dispatch_teleop_command,
+    inspect_arm_backends_for_position_dispatch,
     require_arm_backends_ready_for_position_dispatch,
 )
 from teleop_runtime.position_control.deploy_executor import (
@@ -1919,7 +1920,7 @@ def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
     assert planner.prepare_staged_source_horizon_calls == 2
 
 
-def test_collision_dispatch_allows_transient_low_send_rate_receipt() -> None:
+def test_collision_dispatch_blocks_low_send_rate_receipt() -> None:
     planner = _FakePositionCollisionPlanner()
     commands: list[TeleopCommand] = []
 
@@ -1991,24 +1992,14 @@ def test_collision_dispatch_allows_transient_low_send_rate_receipt() -> None:
             _observation(sides=("left", "right")),
             "collision_policy_timing_degraded",
         )
-        _wait_until(lambda: executor.snapshot()["reference_count"] >= 1)
+        _wait_until(lambda: executor.snapshot()["fault_latched"] is True)
         snapshot = executor.snapshot()
-        assert snapshot["fault_latched"] is False
+        with pytest.raises(PositionDeployExecutorFault, match="became unhealthy"):
+            executor.raise_if_fault()
         assert commands
-        assert snapshot["last_reference"][
-            "position_arm_backend_dispatch_verified"
-        ] is True
-        assert snapshot["last_reference"][
-            "position_arm_dispatch_callback_ms"
-        ] >= 0.0
-        assert snapshot["last_reference"][
-            "position_arm_backend_dispatch_timing"
-        ]["backend_dispatch_ms"] == pytest.approx(6.25)
-        left_summary = snapshot["last_reference"][
-            "position_arm_backend_dispatch_by_effector"
-        ]["left_arm"]
-        assert left_summary["dispatch_timing"]["send_command_ms"] == pytest.approx(2.5)
-        assert left_summary["target_admission_timing"]["mode"] == "latest_nonblocking"
+        assert snapshot["last_reference"].get(
+            "position_arm_backend_dispatch_verified", False
+        ) is False
     finally:
         executor.close()
 
@@ -3267,7 +3258,7 @@ def test_pre_hand_arm_health_gate_preserves_background_stream_fault() -> None:
         )
 
 
-def test_position_dispatch_allows_transient_low_send_rate_warning() -> None:
+def test_position_dispatch_blocks_low_send_rate_warning() -> None:
     class TimingDegradedArmBackend:
         def is_ready(self) -> bool:
             return True
@@ -3288,18 +3279,24 @@ def test_position_dispatch_allows_transient_low_send_rate_warning() -> None:
                 },
             }
 
-    health = require_arm_backends_ready_for_position_dispatch(
-        {
-            "left": TimingDegradedArmBackend(),
-            "right": TimingDegradedArmBackend(),
-        },
+    backends = {
+        "left": TimingDegradedArmBackend(),
+        "right": TimingDegradedArmBackend(),
+    }
+    health = inspect_arm_backends_for_position_dispatch(
+        backends,
         require_background_target=True,
-        stage="pre_arm_reference_queue",
     )
-
-    assert health["ready"] is True
-    assert health["sides"]["left"]["reasons"] == []
+    assert health["ready"] is False
+    assert health["sides"]["left"]["reasons"] == ["background_unhealthy"]
     assert health["sides"]["left"]["warnings"] == ["low_send_rate"]
+
+    with pytest.raises(RuntimeError, match="left=background_unhealthy"):
+        require_arm_backends_ready_for_position_dispatch(
+            backends,
+            require_background_target=True,
+            stage="pre_arm_reference_queue",
+        )
 
 
 def test_position_dispatch_rejects_unknown_background_unhealthy_state() -> None:

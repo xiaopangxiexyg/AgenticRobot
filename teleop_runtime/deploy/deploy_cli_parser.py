@@ -800,8 +800,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         dest="position_force_guard",
         action="store_true",
         help=(
-            "Require the latched RM65 force/torque emergency-stop monitor for "
-            "real position deployment. Enabled by default."
+            "Opt in to the latched RM65 force/torque emergency-stop monitor. "
+            "Deployment uses one RM65 SDK handle for force and command calls; "
+            "do not use this with live 60 Hz reference / 120 Hz command output."
         ),
     )
     parser.add_argument(
@@ -809,11 +810,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         dest="position_force_guard",
         action="store_false",
         help=(
-            "Disable the real-position RM65 force emergency-stop monitor. "
-            "Unsafe; intended only for explicit diagnostics."
+            "Keep the deployment force monitor disabled (the default) so "
+            "Get_Force_Data cannot block the 120 Hz command lane."
         ),
     )
-    parser.set_defaults(position_force_guard=True)
+    # The RM65 vendor call is synchronous and can take roughly 50 ms.  Since
+    # force/state/command requests share one SDK handle, a live high-rate
+    # deployment must leave this low-priority diagnostic monitor off unless a
+    # non-following, lower-rate mode is deliberately selected.
+    parser.set_defaults(position_force_guard=False)
     parser.add_argument(
         "--position-force-guard-source",
         choices=POSITION_FORCE_SOURCES,
@@ -835,10 +840,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--position-force-guard-hz",
         type=_positive_float,
-        default=20.0,
+        default=10.0,
         help=(
-            "Per-arm RM65 force polling rate. Must be <=20 Hz because the SDK "
-            "requires at least 50 ms between repeated force queries."
+            "Optional per-arm RM65 force polling rate (default: 10 Hz). Must "
+            "be <=20 Hz because the SDK requires at least 50 ms between "
+            "repeated force queries; force polling is disabled by default in "
+            "live high-rate position deployment."
         ),
     )
     parser.add_argument(
