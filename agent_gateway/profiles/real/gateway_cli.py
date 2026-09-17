@@ -114,6 +114,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="absolute existing non-world-writable directory for the v2 Artifact CAS",
     )
     parser.add_argument(
+        "--planned-trajectory-dir",
+        type=Path,
+        help=(
+            "existing private directory for exact sampled grasp plans; a failed "
+            "record prevents plan admission"
+        ),
+    )
+    parser.add_argument(
         "--enable-point-grasp",
         action="store_true",
         help="enable main-view proposal generation and three-view candidate rendering",
@@ -762,6 +770,15 @@ def main(argv: list[str] | None = None) -> int:
             flag="--artifact-root",
         )
     )
+    planned_trajectory_dir = (
+        None
+        if args.planned_trajectory_dir is None
+        else _absolute_managed_directory(
+            parser,
+            args.planned_trajectory_dir,
+            flag="--planned-trajectory-dir",
+        )
+    )
     motion_trace_root = (
         None
         if args.motion_trace_root is None
@@ -893,6 +910,7 @@ def main(argv: list[str] | None = None) -> int:
         camera_config_path=camera_config,
         camera_registry_path=camera_registry,
         artifact_root=artifact_root,
+        planned_trajectory_dir=planned_trajectory_dir,
         camera_mount_urdf_path=camera_mount_urdf,
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,

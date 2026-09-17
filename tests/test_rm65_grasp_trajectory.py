@@ -1335,6 +1335,7 @@ def _planner_without_assets(
         ),
     )
     planner.target_envelope_filter = None
+    planner.trajectory_record_dir = None
     planner._solver_lock = threading.Lock()
     return planner
 

@@ -9,7 +9,9 @@ from robot_motion.grasp_visible_scene import VisibleGraspScene
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from itertools import pairwise
+from pathlib import Path
 from typing import NoReturn
+from zipfile import BadZipFile
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -42,6 +44,7 @@ from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 
 from .motion_port import RealAgentJointTrajectory
+from .grasp_trajectory_record import write_grasp_trajectory_record
 from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
 
 _SIDES = ("left", "right")
@@ -412,6 +415,7 @@ class RM65GraspJointTrajectoryPlanner:
         config: RM65GraspTrajectoryPlanningConfig | None = None,
         planner_config: JointPathPlannerConfig | None = None,
         reachability_config: RM65GraspReachabilityConfig | None = None,
+        trajectory_record_dir: str | Path | None = None,
     ) -> None:
         if not isinstance(profile, ResolvedExclusiveRM65SkillDeploymentProfile):
             raise TypeError("profile must be resolved and typed.")
@@ -432,6 +436,13 @@ class RM65GraspJointTrajectoryPlanner:
         self.target_envelope_filter = target_envelope_filter
         self.config = config or RM65GraspTrajectoryPlanningConfig()
         self.reachability_config = reachability_config or RM65GraspReachabilityConfig()
+        if trajectory_record_dir is None:
+            self.trajectory_record_dir = None
+        else:
+            record_dir = Path(trajectory_record_dir)
+            if not record_dir.is_dir() or record_dir.is_symlink():
+                raise ValueError("trajectory_record_dir must be an existing real directory.")
+            self.trajectory_record_dir = record_dir
         self._solver_lock = threading.Lock()
         self.planner_config = planner_config or JointPathPlannerConfig(
             shortcut_attempts=80,
@@ -2871,6 +2882,18 @@ class RM65GraspJointTrajectoryPlanner:
                 leg.path.waypoints if leg_index == 0 else leg.path.waypoints[1:]
             )
         )
+        leg_end_waypoint_indices: dict[int, str] = {}
+        leg_phases = {
+            1: ("grasp_target",),
+            2: ("pregrasp_target", "constrained_approach"),
+            3: ("envelope_ingress", "pregrasp_target", "constrained_approach"),
+        }[len(selected_legs)]
+        waypoint_count = 0
+        for leg_index, leg in enumerate(selected_legs):
+            waypoint_count += len(leg.path.waypoints) - (1 if leg_index else 0)
+            leg_end_waypoint_indices[waypoint_count - 1] = str(
+                leg.path.metadata.get("planning_phase", leg_phases[leg_index])
+            )
         dense = self._revalidate(
             waypoints,
             moving_side=selected_side,
@@ -2898,8 +2921,9 @@ class RM65GraspJointTrajectoryPlanner:
         reference_hz = float(self.profile.position_profile.rates.ik_hz)
         times = [0.0]
         samples = {name: [current[name].copy()] for name in _SIDES}
+        stage_boundaries: list[dict[str, object]] = []
         elapsed = 0.0
-        for start, end in pairwise(waypoints):
+        for end_waypoint_index, (start, end) in enumerate(pairwise(waypoints), start=1):
             self._remaining_path_planning_time_sec(
                 deadline=deadline,
                 monotonic=monotonic,
@@ -2941,6 +2965,14 @@ class RM65GraspJointTrajectoryPlanner:
                         np.asarray(start[name])
                         + progress * (np.asarray(end[name]) - np.asarray(start[name]))
                     )
+            if end_waypoint_index in leg_end_waypoint_indices:
+                stage_boundaries.append(
+                    {
+                        "planning_phase": leg_end_waypoint_indices[end_waypoint_index],
+                        "end_sample_index": len(times) - 1,
+                        "end_time_sec": float(times[-1]),
+                    }
+                )
         if len(times) == 1:
             elapsed = self.config.minimum_segment_duration_sec
             times.append(elapsed)
@@ -3031,11 +3063,28 @@ class RM65GraspJointTrajectoryPlanner:
             },
             domain="dexteleop.real_agent_motion.rm65_grasp_path.v1",
         )
-        return RealAgentJointTrajectory(
+        trajectory = RealAgentJointTrajectory(
             time_from_start_sec=np.asarray(times, dtype=float),
             qpos_by_side={name: np.stack(samples[name], axis=0) for name in _SIDES},
             planner_evidence_refs=("rm65-grasp-path:" + evidence_hash,),
         )
+        if self.trajectory_record_dir is not None:
+            try:
+                write_grasp_trajectory_record(
+                    self.trajectory_record_dir,
+                    trajectory,
+                    moving_side=selected_side,
+                    scene_hash=self.scene.semantic_content_hash,
+                    target_tool_tcp_world=target_pose,
+                    speed_scale=scale,
+                    stage_boundaries=tuple(stage_boundaries),
+                )
+            except (OSError, ValueError, BadZipFile) as error:
+                raise RM65GraspTrajectoryPlanningError(
+                    "trajectory_record_failed",
+                    details={"exception_type": type(error).__name__},
+                ) from error
+        return trajectory
 
 
 __all__ = [

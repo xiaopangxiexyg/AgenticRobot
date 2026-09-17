@@ -242,6 +242,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     camera_config_path: str | Path | None = None,
     camera_registry_path: str | Path | None = None,
     artifact_root: str | Path | None = None,
+    planned_trajectory_dir: str | Path | None = None,
     camera_mount_urdf_path: str | Path | None = None,
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
@@ -806,6 +807,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             ),
             target_envelope_filter=(lower.target_builder.pre_ik_target_safety_filter),
             reachability_config=reachability_config,
+            trajectory_record_dir=planned_trajectory_dir,
         )
 
         def reachability_evaluator_factory(port):
