@@ -47,6 +47,7 @@ from teleop_runtime.deploy.run_policy import (
     _defer_position_action_after_synchronous_prediction,
     _dispatch_position_discrete_command_checked,
     _hold_active_position_stream_for_synchronous_chunk_gap,
+    _prepare_startup_position_plan_cut,
     _prepare_position_plan_cut_for_action_step,
     _position_source_tail_pending_before_synchronous_chunk_gap,
 )
@@ -1379,6 +1380,59 @@ def test_synchronous_first_chunk_cut_reaches_stream_start_acquisition() -> None:
         executor._drain_submissions()
 
         assert source_index == 9
+        snapshot = executor.snapshot()
+        assert snapshot["stream_start_acquisition_count"] == 1
+        assert snapshot["last_stream_start_acquisition"]["active"] is True
+    finally:
+        executor.close()
+
+
+def test_startup_init_cut_reaches_stream_start_acquisition_after_clear() -> None:
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=1.0,
+            plan_splice_governor_enabled=True,
+            stream_start_acquisition=PositionStreamStartAcquisitionConfig(
+                enabled=True,
+                max_translation_step_m=0.005,
+                max_rotation_step_rad=np.deg2rad(0.5),
+                max_source_intervals=16,
+            ),
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    detector = DeploymentPositionPlanCutDetector()
+    startup_action = NormalizedAction(
+        vector=np.full(ACTION_DIM, np.nan, dtype=np.float32),
+        metadata={"source": "startup_init"},
+    )
+    try:
+        # This is the exact boundary reached after RTC latency rejection or
+        # operator recovery: the executor is held and its stream is empty.
+        executor.clear()
+        proposal = _prepare_startup_position_plan_cut(
+            detector,
+            executor,
+            startup_action,
+            step_index=0,
+            detected_at=10.0,
+        )
+        assert proposal.cut.evidence["lineage_source"] == (
+            "normalized_action_chunk_metadata"
+        )
+        executor.submit(
+            _filtered_pose("left", _pose(0.143)),
+            _observation(left_pose=_pose(0.1)),
+            "startup_init",
+            timestamp_monotonic=10.0,
+            source_plan_cut=proposal.cut,
+        )
+        detector.commit(proposal)
+        executor._drain_submissions()
+
         snapshot = executor.snapshot()
         assert snapshot["stream_start_acquisition_count"] == 1
         assert snapshot["last_stream_start_acquisition"]["active"] is True
