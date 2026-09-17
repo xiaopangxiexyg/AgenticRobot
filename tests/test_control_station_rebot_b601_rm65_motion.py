@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pty
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from control_station.sources.rebot_b601_rm65_motion import (
 )
 from hardware.rebot_b601_rs import (
     B601_RS_FEEDBACK_FRAME,
+    B601HardwareDependencyError,
     B601HardwareState,
     B601JointState,
 )
@@ -107,6 +109,8 @@ class _Backend:
         self.clock, self.sequence = clock, 0
         self.q = np.zeros(6)
         self.valid = True
+        self.last_state = None
+        self.config = SimpleNamespace(feedback_timeout_sec=0.1)
 
     def poll_feedback(self, *, request_feedback, require_host_freshness):
         assert not request_feedback and require_host_freshness
@@ -134,7 +138,7 @@ class _Backend:
             )
             for i in range(6)
         )
-        return B601HardwareState(
+        state = B601HardwareState(
             sequence=self.sequence,
             receive_timestamp_sec=now,
             joints=joints,
@@ -145,6 +149,8 @@ class _Backend:
             fault_reason=None,
             host_receive_freshness_verified=True,
         )
+        self.last_state = state
+        return state
 
 
 class _Model:
@@ -456,6 +462,23 @@ def test_terminal_eof_requests_stop():
         os.close(reader_fd)
 
 
+def test_terminal_tty_commands_are_immediate_without_enter():
+    master_fd, reader_fd = pty.openpty()
+    terminal = B601RM65TerminalCommands(
+        file_descriptor=reader_fd,
+        immediate=True,
+    )
+    try:
+        os.write(master_fd, b"a")
+        assert terminal(0) == "a"
+        os.write(master_fd, b"q")
+        assert terminal(0) == "q"
+    finally:
+        terminal.close()
+        os.close(reader_fd)
+        os.close(master_fd)
+
+
 @pytest.mark.parametrize("delayed_sample", [False, True])
 def test_session_current_tick_is_timestamped_after_slow_poll(
     setup_motion, monkeypatch, delayed_sample
@@ -480,6 +503,27 @@ def test_session_current_tick_is_timestamped_after_slow_poll(
     assert receipt.proposal.target_effective_at == clock()
     assert receipt.proposal.effective_until == (
         clock() - (0.08 if delayed_sample else 0) + session.binding.limits[0]
+    )
+
+
+def test_session_default_target_time_is_selected_by_final_admission_owner(
+    setup_motion, monkeypatch
+):
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.activate()
+    clock.value += 0.05
+
+    def advancing_runtime_clock():
+        clock.value += 0.001
+        return clock()
+
+    monkeypatch.setattr(runtime, "clock", advancing_runtime_clock)
+    receipt = session.step()
+    assert receipt.accepted, receipt.message
+    assert receipt.proposal.target_effective_at >= receipt.proposal.effective_from
+    assert receipt.proposal.effective_until <= (
+        receipt.proposal.target_effective_at + session.binding.limits[0]
     )
 
 
@@ -528,6 +572,218 @@ def test_foreground_commands_clutch_and_quit_use_the_existing_owner(setup_motion
     assert any("reposition/settle" in status for status in statuses)
     assert events[-1]["event"] == "foreground_stopped"
     assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+
+
+def test_foreground_activation_waits_for_next_feedback_period(setup_motion):
+    clock, _, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    commands = iter(("a", None, "q"))
+    events = []
+    anchor_sequence = None
+
+    def poll(timeout):
+        nonlocal anchor_sequence
+        command = next(commands)
+        if command == "a":
+            clock.value += 0.001
+        elif command is None:
+            anchor_sequence = backend.sequence
+            clock.value += timeout
+        return command
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=lambda _message: None,
+        record=events.append,
+    )
+    admission = next(
+        event for event in events if event["event"] == "proposal_admission"
+    )
+    assert admission["accepted"]
+    assert anchor_sequence is not None
+    assert backend.sequence == anchor_sequence + 1
+
+
+def test_recenter_uses_a_fresh_gate_cut_after_ready_transition(setup_motion, monkeypatch):
+    """A real-clock READY event must be visible to the same activation."""
+
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.deactivate()
+    original_transition = runtime.transition_execution_gate
+
+    def transition(status, *, reason):
+        # Simulate the monotonic clock advancing between the pre-transition
+        # snapshot and the lower-owner admission.  The old implementation then
+        # queried the gate at a cut that excluded the newly admitted READY event.
+        if status == "ready":
+            clock.value += 0.001
+        return original_transition(status, reason=reason)
+
+    monkeypatch.setattr(runtime, "transition_execution_gate", transition)
+    anchor = session.activate()
+
+    assert session.state == "active"
+    assert anchor.gate_epoch > 0
+    assert (
+        runtime.authoritative_port.capture_execution_gate_snapshot().status == "ready"
+    )
+
+
+def test_recenter_stale_after_ready_transition_returns_to_hold(setup_motion, monkeypatch):
+    """A transition cannot leave READY when the new cut fails freshness."""
+
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    session.deactivate()
+    original_transition = runtime.transition_execution_gate
+
+    def transition(status, *, reason):
+        if status == "ready":
+            clock.value += 0.2
+        return original_transition(status, reason=reason)
+
+    monkeypatch.setattr(runtime, "transition_execution_gate", transition)
+    with pytest.raises(ValueError, match="stale"):
+        session.activate()
+
+    assert session.state == "held" and session.anchor is None
+    assert (
+        runtime.authoritative_port.capture_execution_gate_snapshot().status == "hold"
+    )
+
+
+def test_foreground_keeps_ui_open_for_target_gate_retry(setup_motion):
+    """A lower target fault/transition is held and retryable, not a GUI crash."""
+
+    clock, _, runtime, _, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    runtime.transition_execution_gate("transitioning", reason="lower_owner_rearm")
+    commands = iter(("a", "q"))
+    statuses, events = [], []
+
+    def poll(_timeout):
+        clock.value += 0.001
+        return next(commands)
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=statuses.append,
+        record=events.append,
+    )
+
+    assert session.state == "inactive" and session.anchor is None
+    assert any("target gate held" in status for status in statuses)
+    assert any("press a to retry" in status for status in statuses)
+    assert any(
+        event["event"] == "target_execution_gate_unavailable"
+        and event["gate_status"] == "transitioning"
+        and event["retryable"] is True
+        for event in events
+    )
+
+
+def test_foreground_keeps_receive_only_ui_open_for_retryable_feedback_dependency(
+    setup_motion, monkeypatch
+):
+    """A missing host metadata capability is held, then retryable with ``a``."""
+
+    clock, _, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    original_poll = backend.poll_feedback
+    failures_remaining = 1
+
+    def poll_feedback(*, request_feedback, require_host_freshness):
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise B601HardwareDependencyError(
+                "host-fresh B601 feedback requires state_observation_metadata_v1"
+            )
+        return original_poll(
+            request_feedback=request_feedback,
+            require_host_freshness=require_host_freshness,
+        )
+
+    monkeypatch.setattr(backend, "poll_feedback", poll_feedback)
+    commands = iter(("a", "a", "q"))
+    statuses, events = [], []
+
+    def poll(_timeout):
+        clock.value += 0.001
+        return next(commands)
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=statuses.append,
+        record=events.append,
+    )
+
+    assert failures_remaining == 0
+    assert session.state == "inactive" and session.anchor is None
+    assert any("waiting" in message for message in statuses)
+    assert any("press a to retry" in message for message in statuses)
+    assert any(
+        event["event"] == "feedback_capability_unavailable"
+        and event["retryable"] is True
+        for event in events
+    )
+
+
+def test_foreground_retries_after_feedback_dependency_during_active_tick(
+    setup_motion, monkeypatch
+):
+    clock, _, runtime, _, backend, _, _ = setup_motion
+    session = _session(setup_motion)
+    original_poll = backend.poll_feedback
+    poll_count = 0
+
+    def poll_feedback(*, request_feedback, require_host_freshness):
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 2:
+            raise B601HardwareDependencyError(
+                "host-fresh B601 feedback requires state_observation_metadata_v1"
+            )
+        return original_poll(
+            request_feedback=request_feedback,
+            require_host_freshness=require_host_freshness,
+        )
+
+    monkeypatch.setattr(backend, "poll_feedback", poll_feedback)
+    commands = iter(("a", None, "a", "q"))
+    events = []
+
+    def poll(timeout):
+        command = next(commands)
+        clock.value += max(timeout, 0.001)
+        return command
+
+    run_b601_rm65_foreground(
+        session,
+        rate_hz=20,
+        advance_target=lambda: runtime.step(now=clock(), physics_ticks_after_dispatch=12),
+        poll_command=poll,
+        emit=lambda _message: None,
+        record=events.append,
+    )
+
+    assert poll_count == 3
+    assert session.state == "inactive" and session.anchor is None
+    assert any(
+        event["event"] == "feedback_capability_unavailable"
+        and event["command"] == "step"
+        for event in events
+    )
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt(), OSError("target failed")])
@@ -701,6 +957,61 @@ def test_session_interrupted_poll_withdraws_reference_and_reraises(
     assert not scene.writes
 
 
+def test_session_holds_one_fresh_duplicate_cache_sample_but_rejects_stale(
+    setup_motion, monkeypatch
+):
+    """A faster sim loop may hold a fresh hardware frame, never an old one."""
+
+    clock, _scene, _runtime, _source, backend, _binding, _anchor = setup_motion
+    session = _session(setup_motion)
+    session.activate()
+    original_poll = backend.poll_feedback
+    calls = 0
+    first_step_state = None
+
+    def poll_feedback(*, request_feedback, require_host_freshness):
+        nonlocal calls, first_step_state
+        current = original_poll(
+            request_feedback=request_feedback,
+            require_host_freshness=require_host_freshness,
+        )
+        if calls == 0:
+            first_step_state = current
+        elif first_step_state is not None:
+            # Mimic the real host cache: the receiver poll advances its local
+            # sequence/time, while the device observation timestamp and
+            # per-frame status sequence remain unchanged.
+            joints = tuple(
+                replace(
+                    previous,
+                    sample_sequence=current.sequence,
+                    observed_at_sec=first.observed_at_sec,
+                    status_sequence=first.status_sequence,
+                )
+                for previous, first in zip(
+                    current.joints, first_step_state.joints
+                )
+            )
+            current = replace(current, joints=joints)
+        calls += 1
+        return current
+
+    monkeypatch.setattr(backend, "poll_feedback", poll_feedback)
+    first = _session_step(session, clock)
+    assert first.accepted, first.message
+    repeated = _session_step(session, clock)
+    assert repeated.accepted, repeated.message
+    assert session.last_source_reused is True
+    assert session.state == "active"
+
+    # Once the same device sample exceeds the source-age contract, the
+    # session must enter HOLD instead of extending it through another repeat.
+    clock.value += 0.2
+    stale = _session_step(session, clock)
+    assert not stale.accepted
+    assert session.state == "held"
+
+
 def test_session_disabled_has_no_source_or_target_effect(setup_motion):
     clock, _, runtime, source, backend, _, _ = setup_motion
     binding = B601RM65MotionBinding(
@@ -757,6 +1068,26 @@ def test_disabled_binding_does_not_change_execution_gate(setup_motion):
     assert (
         runtime.authoritative_port.capture_execution_gate_snapshot().status == "ready"
     )
+
+
+def test_none_residual_envelope_keeps_canonical_target_safety(setup_motion):
+    """Read-only teleop may skip its envelope without bypassing target admission."""
+
+    clock, scene, runtime, source, _, _bounded, anchor = setup_motion
+    binding = B601RM65MotionBinding(
+        runtime,
+        source,
+        maximum_source_age_sec=0.15,
+        maximum_measurement_age_sec=0.1,
+        maximum_translation_m=None,
+        maximum_rotation_rad=None,
+        enabled=True,
+    )
+    setup = (clock, scene, runtime, source, setup_motion[4], binding, anchor)
+    receipt = _submit(setup, _step(setup, q=(0.2, 0, 0, 0, 0, 0)))
+    assert receipt.accepted, receipt.message
+    assert binding.limits[2:] == (None, None)
+    assert runtime.authoritative_port.capture_execution_gate_snapshot().status == "ready"
 
 
 def test_stale_target_or_master_cannot_establish_anchor(setup_motion):

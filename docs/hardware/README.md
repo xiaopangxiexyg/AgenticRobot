@@ -104,6 +104,9 @@ bash scripts/run_pytest.sh -q hardware/quest_dev/tests
 
 ## 7. B601-RS 力觉离线验收与真机验收计划
 
+[ReBot CAN → RM65 GUI 装配进度](./rebot_b601_rm65_can_gui.md) 记录只读输入、
+单源仿真执行的应用边界、已复现 timing 缺陷与修复门禁；当前仍在开发中，不可真机验收。
+
 [ReBot → RM65 MuJoCo 执行接入进度](../architecture/reports/rebot_b601_rm65_motion_execution_progress.md)
 记录单源 human proposal、目标端 IK/dispatch 的离线验证与尚待装配的真机遥操边界。
 

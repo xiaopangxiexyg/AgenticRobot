@@ -7,35 +7,85 @@ this loop. No module import or operator command enables/disables real motors.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import select
 import sys
+import termios
+import tty
 from collections.abc import Callable, Mapping
 
-from control_station.sources.rebot_b601_rm65_motion import B601RM65MotionSession
+from control_station.sources.rebot_b601_rm65_motion import (
+    B601RM65MotionSession,
+    B601RM65TargetExecutionGateError,
+)
+from hardware.rebot_b601_rs import B601HardwareDependencyError
 
 
 class B601RM65TerminalCommands:
-    """Per-session nonblocking line input, including pasted commands and EOF."""
+    """Per-session nonblocking operator input.
 
-    def __init__(self, *, file_descriptor: int | None = None) -> None:
+    A real controlling terminal uses cbreak mode, so ``a``/``c``/``r``/``s``
+    and ``q`` take effect immediately without requiring Enter or a shell
+    command re-run.  A pipe or injected file descriptor retains the line
+    protocol used by tests and by scripted diagnostics.  The reader owns the
+    terminal mode only when it enabled cbreak mode itself.
+    """
+
+    def __init__(
+        self,
+        *,
+        file_descriptor: int | None = None,
+        immediate: bool | None = None,
+    ) -> None:
         self.file_descriptor = (
             sys.stdin.fileno() if file_descriptor is None else file_descriptor
         )
         self._pending = b""
         self._eof = False
+        self._immediate = False
+        self._saved_attributes: list[object] | None = None
+        if immediate is not None and not isinstance(immediate, bool):
+            raise TypeError("immediate must be bool or None")
+        try:
+            is_tty = os.isatty(self.file_descriptor)
+        except OSError:
+            is_tty = False
+        use_immediate = is_tty if immediate is None else bool(immediate)
+        if use_immediate:
+            try:
+                self._saved_attributes = termios.tcgetattr(self.file_descriptor)
+                tty.setcbreak(self.file_descriptor)
+                termios.tcflush(self.file_descriptor, termios.TCIFLUSH)
+                self._immediate = True
+            except (OSError, termios.error):
+                self._saved_attributes = None
+                self._immediate = False
 
     def __call__(self, timeout_sec: float) -> str | None:
-        if b"\n" not in self._pending and not self._eof:
+        if self._immediate:
+            return self._poll_immediate(timeout_sec)
+        return self._poll_line(timeout_sec)
+
+    def _read(self, timeout_sec: float) -> bool:
+        """Read one non-blocking batch, returning whether bytes were added."""
+
+        if not self._eof:
             readable, _, _ = select.select(
                 [self.file_descriptor], [], [], timeout_sec
             )
             if not readable:
-                return None
+                return False
             chunk = os.read(self.file_descriptor, 4096)
             self._pending += chunk
             self._eof = not chunk
+            return bool(chunk)
+        return False
+
+    def _poll_line(self, timeout_sec: float) -> str | None:
+        if b"\n" not in self._pending and not self._eof:
+            self._read(timeout_sec)
         if b"\n" in self._pending:
             line, self._pending = self._pending.split(b"\n", 1)
             return line.decode("utf-8", errors="replace").strip().lower()
@@ -43,6 +93,35 @@ class B601RM65TerminalCommands:
             self._pending = b""
             return "q"
         return None
+
+    def _poll_immediate(self, timeout_sec: float) -> str | None:
+        if not self._pending and not self._eof:
+            self._read(timeout_sec)
+        while self._pending:
+            value, self._pending = self._pending[:1], self._pending[1:]
+            character = value.decode("ascii", errors="ignore").lower()
+            if character in {"a", "c", "r", "s", "q", "?"}:
+                return character
+            # Enter is deliberately ignored in cbreak mode.  It is not the
+            # activation/recovery protocol and should never create a second
+            # state transition after an immediate key was consumed.
+        if self._eof:
+            self._pending = b""
+            return "q"
+        return None
+
+    def close(self) -> None:
+        """Restore the operator terminal after a foreground run."""
+
+        if self._saved_attributes is not None:
+            with contextlib.suppress(OSError, termios.error):
+                termios.tcsetattr(
+                    self.file_descriptor,
+                    termios.TCSADRAIN,
+                    self._saved_attributes,
+                )
+        self._saved_attributes = None
+        self._immediate = False
 
 
 def _print_status(message: str) -> None:
@@ -61,9 +140,11 @@ def run_b601_rm65_foreground(
     """Run in the calling foreground process until q/EOF/exception/Ctrl-C.
 
     a activates at the two measured current poses, c clutches, r releases and
-    recenters, s deactivates, and q exits. The target's existing runtime step
-    belongs in advance_target. poll_command waits at most its supplied timeout;
-    it must not run a blocking prompt or launch a background input thread.
+    recenters, s deactivates, and q exits. On a real terminal these are
+    immediate single-key transitions; no Enter or shell history re-run is
+    needed. The target's existing runtime step belongs in advance_target.
+    poll_command waits at most its supplied timeout; it must not run a blocking
+    prompt or launch a background input thread.
     record receives events for an application-owned JSON/log sink. It must not
     issue commands. Failures propagate after withdrawing target following.
     """
@@ -85,10 +166,68 @@ def run_b601_rm65_foreground(
             record({"event": name, "at": clock(), "state": session.state, **details})
 
     def instructions() -> None:
-        emit("[B601→RM65] Enter: a=activate c=clutch r=recenter s=stop q=quit ?=help")
+        emit(
+            "[B601→RM65] Keys (no Enter): a=activate/retry c=clutch r=recenter s=stop q=quit ?=help"
+        )
         emit("[B601→RM65] Start inactive; reposition/settle first, then a. c before recentering.")
+        emit(
+            "[B601→RM65] Feedback-capability or target-gate errors stay held; repair/rearm the source and press a again."
+        )
         emit("[B601→RM65] Ctrl-C/EOF: stop RM65 following; master gravity/damping is unchanged.")
 
+    def recoverable_feedback_error(command: str, error: B601HardwareDependencyError) -> None:
+        """Keep the receive-only UI alive while the host feedback port recovers.
+
+        The backend remains fail-closed: no old observation is reused and no
+        target proposal is admitted.  This handler only converts a known
+        dependency/feedback-capability failure into an operator-visible retry
+        state.  Other exceptions still propagate to the application boundary.
+        """
+
+        message = str(error)
+        emit(f"[B601→RM65] waiting: {type(error).__name__}: {message}")
+        emit(
+            "[B601→RM65] no RM65 following; fix the feedback runtime/stream, then press a to retry."
+        )
+        event(
+            "feedback_capability_unavailable",
+            command=command,
+            error_type=type(error).__name__,
+            error=message,
+            retryable=True,
+        )
+
+    def recoverable_target_gate_error(
+        command: str, error: B601RM65TargetExecutionGateError
+    ) -> None:
+        """Keep the receive-only UI open for a lower-owner gate transition.
+
+        A target fault/transition is not permission to publish an old anchor.
+        The snapshot is reported verbatim and the operator must repair or
+        re-arm the lower owner before retrying ``a``/``r``.
+        """
+
+        snapshot = error.snapshot
+        emit(
+            "[B601→RM65] target gate held: "
+            f"status={snapshot.status} reason={snapshot.reason!r} "
+            f"gate_epoch={snapshot.gate_epoch}; no RM65 following."
+        )
+        emit(
+            "[B601→RM65] repair/re-arm the target gate, then press a to retry; "
+            "no stale anchor is reused."
+        )
+        event(
+            "target_execution_gate_unavailable",
+            command=command,
+            gate_status=snapshot.status,
+            gate_reason=snapshot.reason,
+            gate_epoch=snapshot.gate_epoch,
+            error=str(error),
+            retryable=True,
+        )
+
+    owns_terminal_reader = poll_command is None
     try:
         if poll_command is None:
             poll_command = B601RM65TerminalCommands()
@@ -119,12 +258,33 @@ def run_b601_rm65_foreground(
                         emit(f"[B601→RM65] {command} rejected in {session.state}")
                         event("operator_command_rejected", command=command)
                     else:
-                        {
-                            "a": session.activate,
-                            "c": session.engage_clutch,
-                            "r": session.release_clutch,
-                            "s": session.deactivate,
-                        }[command]()
+                        try:
+                            {
+                                "a": session.activate,
+                                "c": session.engage_clutch,
+                                "r": session.release_clutch,
+                                "s": session.deactivate,
+                            }[command]()
+                        except B601HardwareDependencyError as error:
+                            # A missing host observation capability is
+                            # recoverable for this receive-only application.
+                            # The session has already withdrawn its target
+                            # anchor before re-raising the backend error.
+                            recoverable_feedback_error(command, error)
+                            next_tick = float(clock()) + period
+                            continue
+                        except B601RM65TargetExecutionGateError as error:
+                            # A lower-owner fault/transition is retryable, but
+                            # never an implicit re-arm or permission to reuse a
+                            # previous target anchor.
+                            recoverable_target_gate_error(command, error)
+                            next_tick = float(clock()) + period
+                            continue
+                        if command in {"a", "r"}:
+                            # Activation/recenter consumes one complete master
+                            # snapshot as the anchor. Do not immediately poll
+                            # the same vendor cache frame again in this tick.
+                            next_tick = float(clock()) + period
                         emit(f"[B601→RM65] {session.state}")
                         event("operator_command", command=command)
                 else:
@@ -134,14 +294,23 @@ def run_b601_rm65_foreground(
             if now < next_tick:
                 continue
             if session.state == "active":
-                receipt = session.step()
-                event(
-                    "proposal_admission",
-                    accepted=receipt.accepted,
-                    rejection_code=receipt.rejection_code,
-                )
-                if not receipt.accepted:
-                    emit(f"[B601→RM65] held: {receipt.rejection_code}; inspect before a")
+                try:
+                    receipt = session.step()
+                except B601HardwareDependencyError as error:
+                    # ``step`` has moved the session to held and cleared its
+                    # anchor.  Keep advancing the lower target once below so
+                    # the cancellation is observed without retaining a stale
+                    # RM65 proposal.
+                    recoverable_feedback_error("step", error)
+                else:
+                    event(
+                        "proposal_admission",
+                        accepted=receipt.accepted,
+                        rejection_code=receipt.rejection_code,
+                        rejection_message=receipt.message,
+                    )
+                    if not receipt.accepted:
+                        emit(f"[B601→RM65] held: {receipt.rejection_code}; inspect before a")
             advance_target()
             # Do not burst stale catch-up proposals after slow polling/IK.
             next_tick += period
@@ -149,6 +318,10 @@ def run_b601_rm65_foreground(
             if next_tick <= completed_at:
                 next_tick = completed_at + period
     finally:
+        if owns_terminal_reader and isinstance(
+            poll_command, B601RM65TerminalCommands
+        ):
+            poll_command.close()
         # This cleanup never touches the independently owned master backend.
         # Lower cancellation errors must escape, not masquerade as success.
         session.deactivate()

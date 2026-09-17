@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
 
 from control_station.composition.rebot_b601_rm65_residual import (
+    B601RM65PoseProjection,
     B601RM65ResidualSource,
     B601RM65ResidualStep,
 )
@@ -82,6 +83,25 @@ class B601RM65MotionTarget(Protocol):
     def transition_execution_gate(self, status: str, *, reason: str) -> object: ...
 
 
+class B601RM65TargetExecutionGateError(RuntimeError):
+    """A lower target gate is not ready for a new RM65 anchor.
+
+    The snapshot is retained for the foreground operator loop so a lower-owner
+    fault/transition can be reported and retried without converting it into a
+    generic process failure.  No target proposal is admitted from this error.
+    """
+
+    def __init__(self, snapshot: ExecutionGateSnapshot) -> None:
+        if not isinstance(snapshot, ExecutionGateSnapshot):
+            raise TypeError("snapshot must be an ExecutionGateSnapshot.")
+        self.snapshot = snapshot
+        super().__init__(
+            "Target execution gate is not ready: "
+            f"status={snapshot.status} reason={snapshot.reason!r} "
+            f"gate_epoch={snapshot.gate_epoch}."
+        )
+
+
 @dataclass(frozen=True)
 class B601RM65MotionAnchor:
     """Measured target baseline bound to one master anchor and gate epoch."""
@@ -123,7 +143,11 @@ class B601RM65MotionAnchor:
 
 
 class B601RM65MotionBinding:
-    """Default-off, bounded publication to a configured single-human target."""
+    """Default-off publication to a configured single-human target.
+
+    The optional translation/rotation envelope belongs to this application
+    ingress only; the target's canonical motion safety remains authoritative.
+    """
 
     def __init__(
         self,
@@ -132,8 +156,8 @@ class B601RM65MotionBinding:
         *,
         maximum_source_age_sec: float,
         maximum_measurement_age_sec: float,
-        maximum_translation_m: float,
-        maximum_rotation_rad: float,
+        maximum_translation_m: float | None,
+        maximum_rotation_rad: float | None,
         enabled: bool = False,
     ) -> None:
         if not isinstance(runtime, B601RM65MotionTarget):
@@ -147,17 +171,22 @@ class B601RM65MotionBinding:
         self.runtime = runtime
         self.source = source
         self.enabled = enabled
-        self.limits = tuple(
-            float(value)
-            for value in (
-                maximum_source_age_sec,
-                maximum_measurement_age_sec,
-                maximum_translation_m,
-                maximum_rotation_rad,
-            )
+        source_age = float(maximum_source_age_sec)
+        measurement_age = float(maximum_measurement_age_sec)
+        translation_limit = self._optional_positive(
+            maximum_translation_m,
+            name="maximum_translation_m",
         )
-        if any(not math.isfinite(value) or value <= 0 for value in self.limits):
-            raise ValueError("Motion age and range limits must be finite and positive.")
+        rotation_limit = self._optional_positive(
+            maximum_rotation_rad,
+            name="maximum_rotation_rad",
+        )
+        self.limits = (source_age, measurement_age, translation_limit, rotation_limit)
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in self.limits[:2]
+        ):
+            raise ValueError("Motion age limits must be finite and positive.")
         config = runtime.config
         if (
             config.initial_control_mode != "human"
@@ -202,6 +231,7 @@ class B601RM65MotionBinding:
             raise ValueError("Residual and target pose/frame conventions differ.")
         self._last_source_sequence = -1
         self._last_source_measured_at = -math.inf
+        self._last_source_observation_sample_id: str | None = None
         self._next_proposal_sequence = 0
         self._adapter = HumanProposalAdapter(
             HumanProposalAdapterConfig(
@@ -258,10 +288,7 @@ class B601RM65MotionBinding:
             or set(master_anchor.entry_by_component) != {self.component_id}
         ):
             raise ValueError("Anchor domain/component binding differs.")
-        self._age(now, measurement.available_at, self.limits[1])
-        self._age(now, measurement.measured_at, self.limits[1])
-        self._age(now, master_anchor.captured_at, self.limits[0])
-        self._age(now, master_anchor.entries[0].source_measured_at, self.limits[0])
+        self._validate_anchor_freshness(now, master_anchor, measurement)
         values = {}
         for (
             component_id,
@@ -285,11 +312,31 @@ class B601RM65MotionBinding:
             # Only an explicit operator transaction can reopen HOLD, after
             # validating both measured anchors. No failed capture leaves READY.
             self.runtime.transition_execution_gate("ready", reason="operator_recenter")
+            # The transition is admitted at a new causal cut.  Reusing the
+            # pre-transition ``now`` would exclude that just-admitted READY
+            # event on a real monotonic clock and spuriously reject ``a``.
+            now = float(self.runtime.clock())
+            try:
+                self._validate_anchor_freshness(now, master_anchor, measurement)
+            except BaseException:
+                # A failed post-transition freshness check must not leave a
+                # READY gate behind. Preserve the original failure unless
+                # re-establishing HOLD itself fails, in which case surface the
+                # cleanup failure as the actionable safety condition.
+                try:
+                    self.runtime.transition_execution_gate(
+                        "hold", reason="operator_recenter_anchor_stale"
+                    )
+                except BaseException as hold_error:
+                    raise RuntimeError(
+                        "Recenter freshness failed and target gate could not be returned to HOLD."
+                    ) from hold_error
+                raise
             gate = self.runtime.authoritative_port.capture_execution_gate_snapshot(
                 now=now
             )
         if gate.status != "ready":
-            raise RuntimeError("Target execution gate is not ready.")
+            raise B601RM65TargetExecutionGateError(gate)
         return B601RM65MotionAnchor(
             master_anchor,
             measurement,
@@ -302,14 +349,17 @@ class B601RM65MotionBinding:
         step: B601RM65ResidualStep,
         anchor: B601RM65MotionAnchor,
         *,
-        target_effective_at: float,
+        target_effective_at: float | None,
         effective_until: float,
+        allow_repeated_source: bool = False,
     ) -> ProposalAdmissionReceipt:
         """Admit one current source proposal; receipt is not a dispatch receipt."""
         if not self.enabled:
             return ProposalAdmissionReceipt(
                 accepted=False, rejection_code="motion_profile_disabled"
             )
+        if not isinstance(allow_repeated_source, bool):
+            raise TypeError("allow_repeated_source must be bool.")
         now = float(self.runtime.clock())
         gate = self.runtime.authoritative_port.capture_execution_gate_snapshot(now=now)
         if gate.status != "ready":
@@ -356,17 +406,30 @@ class B601RM65MotionBinding:
             ):
                 raise ValueError("Source/anchor/schema lineage differs.")
             state = step.projection.source_step.state
+            repeated_source = (
+                sample.measured_at == self._last_source_measured_at
+                and step.projection.source_observation_sample_id
+                == self._last_source_observation_sample_id
+            )
             if (
                 state.sequence <= self._last_source_sequence
                 or sample.measured_at <= self._last_source_measured_at
-            ):
+            ) and not (allow_repeated_source and repeated_source):
                 raise ValueError("Source sequence/time did not advance.")
             self._age(now, sample.measured_at, self.limits[0])
             self._age(now, state.receive_timestamp_sec, self.limits[0])
             self._age(now, receipt.adapted_at, self.limits[0])
             if sample.measured_at < anchor.master_anchor.captured_at:
                 raise ValueError("Source predates the activation barrier.")
-            target_time, expires = float(target_effective_at), float(effective_until)
+            # The binding owns its final admission timestamp. A foreground
+            # caller cannot safely pre-stamp an immediate target before source
+            # adaptation, because real monotonic time advances during that
+            # work. Explicit scheduled times remain subject to the same strict
+            # future/TTL validation below.
+            target_time = (
+                now if target_effective_at is None else float(target_effective_at)
+            )
+            expires = float(effective_until)
             if (
                 not math.isfinite(target_time)
                 or not math.isfinite(expires)
@@ -380,9 +443,13 @@ class B601RM65MotionBinding:
                 step.relative_action.values_by_component[self.component_id].values
             )
             translation_m, rotation_deg = pose_delta_metrics(identity_pose(), delta)
+            maximum_translation_m, maximum_rotation_rad = self.limits[2:]
             if (
-                translation_m > self.limits[2]
-                or math.radians(rotation_deg) > self.limits[3]
+                maximum_translation_m is not None
+                and translation_m > maximum_translation_m
+            ) or (
+                maximum_rotation_rad is not None
+                and math.radians(rotation_deg) > maximum_rotation_rad
             ):
                 raise ValueError(
                     "Residual exceeds the configured translation/rotation range."
@@ -443,6 +510,9 @@ class B601RM65MotionBinding:
                 state.sequence,
                 sample.measured_at,
             )
+            self._last_source_observation_sample_id = (
+                step.projection.source_observation_sample_id
+            )
             self._next_proposal_sequence += 1
             admitted = self.runtime.authoritative_port.admit_proposal(
                 proposal,
@@ -462,6 +532,19 @@ class B601RM65MotionBinding:
                 message=str(error),
             )
 
+    def _validate_anchor_freshness(
+        self,
+        now: float,
+        master_anchor: HumanResidualPoseAnchor,
+        measurement: ExecutionMeasurementObservation,
+    ) -> None:
+        """Validate all anchor timestamps against one causal clock cut."""
+
+        self._age(now, measurement.available_at, self.limits[1])
+        self._age(now, measurement.measured_at, self.limits[1])
+        self._age(now, master_anchor.captured_at, self.limits[0])
+        self._age(now, master_anchor.entries[0].source_measured_at, self.limits[0])
+
     @staticmethod
     def _age(now: float, timestamp: float, maximum: float) -> None:
         if (
@@ -480,6 +563,22 @@ class B601RM65MotionBinding:
         if not valid:
             raise ValueError(reason)
         return pose
+
+    @staticmethod
+    def _optional_positive(value: float | None, *, name: str) -> float | None:
+        """Validate an optional application envelope value.
+
+        ``None`` deliberately disables only the pre-admission residual magnitude
+        check.  The target's canonical IK, joint, collision, velocity and
+        acceleration guards remain authoritative.
+        """
+
+        if value is None:
+            return None
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized <= 0:
+            raise ValueError(f"{name} must be finite and positive or None.")
+        return normalized
 
 
 class B601RM65MotionSession:
@@ -506,6 +605,8 @@ class B601RM65MotionSession:
         self._state = "inactive" if binding.enabled else "disabled"
         self._anchor: B601RM65MotionAnchor | None = None
         self._generation = 0
+        self._last_residual_step: B601RM65ResidualStep | None = None
+        self._last_source_reused = False
 
     @property
     def state(self) -> str:
@@ -514,6 +615,12 @@ class B601RM65MotionSession:
     @property
     def anchor(self) -> B601RM65MotionAnchor | None:
         return self._anchor
+
+    @property
+    def last_source_reused(self) -> bool:
+        """Whether the latest step held one still-fresh source sample."""
+
+        return self._last_source_reused
 
     def activate(self) -> B601RM65MotionAnchor:
         """Explicitly engage from inactive/HOLD, always with new measured anchors."""
@@ -548,23 +655,36 @@ class B601RM65MotionSession:
                 accepted=False, rejection_code=f"motion_session_{self._state}"
             )
         assert self._anchor is not None
+        self._last_source_reused = False
         try:
             projection = self.binding.source.poll_pose()
             # Sample availability precedes adaptation; never stamp before polling.
             now = float(self.binding.runtime.clock())
-            step = self.binding.source.adapt(
-                projection,
-                anchor=self._anchor.master_anchor,
-                adapted_at=now,
-                adapted_clock_domain_id=self.binding.runtime.config.clock_domain_id,
-            )
+            if self._can_reuse_latest_source(projection, now=now):
+                # A 60 Hz target may poll the B601 cache several times between
+                # its ~20 Hz complete snapshots.  Reusing the last accepted
+                # residual is a bounded zero-order hold, not a stale fallback:
+                # both the current cache and the cached sample must remain
+                # valid and inside the source-age window below.
+                assert self._last_residual_step is not None
+                step = self._last_residual_step
+                self._last_source_reused = True
+            else:
+                step = self.binding.source.adapt(
+                    projection,
+                    anchor=self._anchor.master_anchor,
+                    adapted_at=now,
+                    adapted_clock_domain_id=self.binding.runtime.config.clock_domain_id,
+                )
+                if step.residual_available:
+                    self._last_residual_step = step
             if (target_effective_at is None) != (effective_until is None):
                 raise ValueError("Supply both absolute proposal times or neither.")
             if target_effective_at is None:
                 # Foreground callers cannot timestamp after an in-flight poll.
-                # Keep expiry tied to the original sample, not its adaptation.
-                target_effective_at = now
-                sample = projection.pose_sample
+                # Keep expiry tied to the original sample, not its adaptation;
+                # the final admission owner selects the immediate target time.
+                sample = step.projection.pose_sample
                 effective_until = (
                     sample.measured_at if sample is not None else now
                 ) + self.binding.limits[0]
@@ -574,6 +694,7 @@ class B601RM65MotionSession:
                 self._anchor,
                 target_effective_at=target_effective_at,
                 effective_until=effective_until,
+                allow_repeated_source=self._last_source_reused,
             )
         except BaseException:
             # Cleanup only: including Ctrl-C, every interrupted source tick
@@ -583,6 +704,56 @@ class B601RM65MotionSession:
         if not receipt.accepted:
             self._hold("b601_motion_session_admission_rejected", state="held")
         return receipt
+
+    def _can_reuse_latest_source(
+        self,
+        projection: B601RM65PoseProjection,
+        *,
+        now: float,
+    ) -> bool:
+        """Check whether a duplicate cache frame can be held for one tick."""
+
+        cached = self._last_residual_step
+        if cached is None or not cached.residual_available:
+            return False
+        sample = projection.pose_sample
+        cached_sample = cached.projection.pose_sample
+        if sample is None or cached_sample is None:
+            return False
+        if (
+            projection.source_observation_sample_id
+            != cached.projection.source_observation_sample_id
+            or sample.measured_at != cached_sample.measured_at
+            or sample.pose_source_reference_source_controlled.shape
+            != cached_sample.pose_source_reference_source_controlled.shape
+            or sample.pose_source_reference_source_controlled.tolist()
+            != cached_sample.pose_source_reference_source_controlled.tolist()
+        ):
+            return False
+        state = projection.source_step.state
+        cached_state = cached.projection.source_step.state
+        if (
+            not state.valid
+            or state.stale
+            or not state.host_receive_freshness_verified
+            or state.fault_reason is not None
+            or state.receive_timestamp_sec < cached_state.receive_timestamp_sec
+        ):
+            return False
+        try:
+            B601RM65MotionBinding._age(
+                now,
+                state.receive_timestamp_sec,
+                self.binding.limits[0],
+            )
+            B601RM65MotionBinding._age(
+                now,
+                cached_sample.measured_at,
+                self.binding.limits[0],
+            )
+        except (AssertionError, TypeError, ValueError):
+            return False
+        return True
 
     def _capture(self, *, failure_state: str) -> B601RM65MotionAnchor:
         runtime, source = self.binding.runtime, self.binding.source
@@ -599,12 +770,25 @@ class B601RM65MotionSession:
             anchor = self.binding.capture_anchor(
                 master, measurement, operator_recenter=True
             )
+            seed_step = source.adapt(
+                projection,
+                anchor=master,
+                adapted_at=float(runtime.clock()),
+                adapted_clock_domain_id=runtime.config.clock_domain_id,
+            )
+            if not seed_step.residual_available:
+                raise ValueError(
+                    "B601 source anchor adaptation failed during activation: "
+                    f"{seed_step.rejection_reason}"
+                )
         except BaseException:
             # Provider/interrupt failures are not converted to successful input.
             self._hold("b601_motion_session_anchor_failure", state=failure_state)
             raise
         self._anchor = anchor
         self._generation += 1
+        self._last_residual_step = seed_step
+        self._last_source_reused = False
         self._state = "active"
         return anchor
 
@@ -612,6 +796,8 @@ class B601RM65MotionSession:
         # Clear software references even when lower cancellation fails. Such a
         # failure propagates; it must never be reported as successful HOLD.
         self._anchor = None
+        self._last_residual_step = None
+        self._last_source_reused = False
         self._state = state
         runtime = self.binding.runtime
         gate = runtime.authoritative_port.capture_execution_gate_snapshot()
