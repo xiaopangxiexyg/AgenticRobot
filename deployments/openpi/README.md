@@ -299,10 +299,19 @@ checkpoint、启动 server、打开相机、连接设备或发送动作。探针
 `deployments.openpi.client.transport.packb`）；不要用随机或全零观测替代真实请求来做
 结论性比较。然后分别启动 8-step 和 10-step server，对同一请求文件执行：
 
+对于当前 Stage1 的 `masked_normalized_concat_v1` artifact，部署状态必须是
+`[16 维状态, 16 维全 1 availability mask]`；训练时的 dropout mask 不能直接作为部署
+请求。需要一个仅用于传输/延迟检查的形状正确 fixture 时，可运行
+`PYTHONPATH=. python scripts/probes/create_openpi_rtc_latency_request.py --output
+/absolute/path/to/rtc-stage1-masked.msgpack`，然后用探针的
+`--state-dim 16 --state-input-mode masked_normalized_concat_v1` 在到达 server 前校验它。
+
 ```bash
 python scripts/probes/probe_openpi_rtc_latency.py \
   --host 127.0.0.1 --port 8078 \
   --request /absolute/path/to/the-same-conditioned-request.msgpack \
+  --state-dim 16 \
+  --state-input-mode masked_normalized_concat_v1 \
   --label rtc-8-step \
   --warmup-requests 2 --measured-requests 20 \
   --latency-budget-ms 400 \

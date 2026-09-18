@@ -46,6 +46,8 @@ _REQUEST_FIELDS = frozenset(
 )
 _CONDITIONED_PREFIX_MODE = "conditioned_prefix_v1"
 _UNCONDITIONED_BOOTSTRAP_MODE = "unconditioned_bootstrap_v1"
+_RAW_STATE_MODE = "raw_state_v1"
+_MASKED_STATE_MODE = "masked_normalized_concat_v1"
 
 
 class _ProbeTransport(Protocol):
@@ -140,6 +142,49 @@ def load_conditioned_request(path: Path) -> dict[str, Any]:
     request["observation"] = dict(request["observation"])
     request["receipt_context"] = dict(request["receipt_context"])
     return request
+
+
+def validate_deployment_state_contract(
+    request: Mapping[str, Any],
+    *,
+    state_dim: int,
+    state_input_mode: str,
+) -> None:
+    """Validate the state shape required by a concrete deployment artifact.
+
+    The latency probe remains model-agnostic by default. When the operator
+    supplies the loaded artifact's state contract, this check catches a
+    malformed synthetic request before it reaches the server. In particular,
+    masked deployment state is ``[state, all_available_mask]``; training-time
+    dropout masks must never be reused for deployment.
+    """
+
+    if state_dim <= 0:
+        raise ValueError("state_dim must be positive.")
+    if state_input_mode not in {_RAW_STATE_MODE, _MASKED_STATE_MODE}:
+        raise ValueError(
+            "state_input_mode must be 'raw_state_v1' or "
+            "'masked_normalized_concat_v1'."
+        )
+    observation = request.get("observation")
+    if not isinstance(observation, Mapping):
+        raise ValueError("RTC request observation must be a mapping.")
+    state = np.asarray(observation.get("state"), dtype=np.float32)
+    if state.ndim != 1 or not np.all(np.isfinite(state)):
+        raise ValueError("RTC deployment state must be a finite rank-1 array.")
+    expected_dim = state_dim * (2 if state_input_mode == _MASKED_STATE_MODE else 1)
+    if state.shape != (expected_dim,):
+        raise ValueError(
+            "RTC deployment state shape disagrees with the supplied artifact "
+            f"contract: expected {(expected_dim,)}, got {state.shape}."
+        )
+    if state_input_mode == _MASKED_STATE_MODE:
+        availability = state[state_dim:]
+        if not np.all(availability == 1.0):
+            raise ValueError(
+                "RTC deployment state availability mask must be all ones; "
+                "training/dropout masks cannot be used for deployment."
+            )
 
 
 def _provider_summary(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -394,6 +439,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--inference-timeout-sec", type=_positive_float, default=30.0)
     parser.add_argument("--close-timeout-sec", type=_positive_float, default=2.0)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--state-dim",
+        type=_positive_int,
+        default=None,
+        help="Base deployment state dimension for optional artifact-contract validation.",
+    )
+    parser.add_argument(
+        "--state-input-mode",
+        choices=(_RAW_STATE_MODE, _MASKED_STATE_MODE),
+        default=None,
+        help="State input mode for optional artifact-contract validation.",
+    )
     return parser
 
 
@@ -401,6 +458,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     request_path = args.request.expanduser().resolve()
     request = load_conditioned_request(request_path)
+    if (args.state_dim is None) != (args.state_input_mode is None):
+        raise ValueError("--state-dim and --state-input-mode must be provided together.")
+    if args.state_dim is not None and args.state_input_mode is not None:
+        validate_deployment_state_contract(
+            request,
+            state_dim=args.state_dim,
+            state_input_mode=args.state_input_mode,
+        )
     transport = OpenPIWebsocketTransport(
         host=args.host,
         port=args.port,
