@@ -179,17 +179,18 @@ def test_controlled_frame_transform_maps_source_rotation_axis() -> None:
     )
 
 
-def test_tracked_v2_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
+def test_tracked_v3_tool_tcp_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
     profile_path = (
         Path(__file__).resolve().parents[1]
         / "docs/hardware/profiles/b601_rm65_mapping_150_v2.json"
     )
     profile = load_b601_rm65_frame_mapping_profile(profile_path)
+    assert profile.profile_id == "b601-rm65-provisional-lab-150-v3-tool-tcp"
     expected_controlled = np.array(
         (
-            (0.0, 0.0, 1.0, 0.0),
             (0.0, -1.0, 0.0, 0.0),
             (1.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.0),
             (0.0, 0.0, 0.0, 1.0),
         ),
         dtype=np.float64,
@@ -200,21 +201,21 @@ def test_tracked_v2_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
     )
     assert (
         profile.semantic_content_hash
-        == "6d19eb1e0df109b050ca824d7031721994f54021491304db9e49712185a0365e"
+        == "f602cf4f7fa3b4a3ff3f46f85dec5592ae6e95fef98c4c2f810f88120b56dc4a"
     )
     assert profile.translation_gain_target_reference_xyz == (1.5, 1.5, 1.5)
 
     adapter = profile.build_residual_adapter(_schema())
     anchor = adapter.capture_anchor(
-        (_sample("anchor-v2", 1.0, 0.0),),
+        (_sample("anchor-v3", 1.0, 0.0),),
         anchor_generation=1,
         captured_at=1.0,
         captured_clock_domain_id="test.monotonic",
     )
     expected_target_rotvec_by_source_axis = {
-        (0.1, 0.0, 0.0): (0.0, 0.0, 0.1),
-        (0.0, 0.1, 0.0): (0.0, -0.1, 0.0),
-        (0.0, 0.0, 0.1): (0.1, 0.0, 0.0),
+        (0.1, 0.0, 0.0): (0.0, -0.1, 0.0),
+        (0.0, 0.1, 0.0): (0.1, 0.0, 0.0),
+        (0.0, 0.0, 0.1): (0.0, 0.0, 0.1),
     }
 
     for index, (source_rotvec, expected_target_rotvec) in enumerate(
@@ -224,7 +225,7 @@ def test_tracked_v2_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
         result = adapter.adapt(
             (
                 _sample(
-                    f"current-v2-{index}",
+                    f"current-v3-{index}",
                     1.0 + index / 10.0,
                     0.0,
                     rotation=Rotation.from_rotvec(source_rotvec).as_matrix(),
@@ -240,6 +241,65 @@ def test_tracked_v2_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
             expected_target_rotvec,
             atol=1e-12,
         )
+
+
+def test_v3_profile_matches_rm65_mujoco_tool_tcp_zero_pose() -> None:
+    """Derive the canonical tool_tcp mapping from the checked-in MuJoCo model.
+
+    The visible ``right_realman`` assembly is intentionally not used as the
+    controlled frame. This regression keeps the profile tied to the same
+    ``right_arm_link6``/``tool_tcp`` body that the target projector and IK
+    runtime measure.
+    """
+    pytest.importorskip("mujoco")
+    urdf_path = (
+        Path(__file__).resolve().parents[1]
+        / "assets/rm65_inspire_gripper_v3"
+        / "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+    )
+    if not urdf_path.is_file():
+        pytest.skip("RM65 MuJoCo URDF is not available in this checkout")
+
+    from sim.mujoco.scene import MujocoScene
+
+    scene = MujocoScene.from_urdf(
+        urdf_path,
+        camera_names=(),
+        timestep=1.0 / 120.0,
+        gravity=(0.0, 0.0, 0.0),
+    )
+    profile = load_b601_rm65_frame_mapping_profile(
+        Path(__file__).resolve().parents[1]
+        / "docs/hardware/profiles/b601_rm65_mapping_150_v2.json"
+    )
+
+    target_base = scene.body_pose("right_arm_base_link")
+    tool_pose = np.linalg.inv(target_base) @ scene.body_pose("right_arm_link6")
+    visible_pose = np.linalg.inv(target_base) @ scene.body_pose("right_realman")
+    reference_rotation = np.asarray(
+        profile.matrix_target_reference_source_reference,
+        dtype=np.float64,
+    )[:3, :3]
+    controlled_rotation = np.asarray(
+        profile.matrix_source_controlled_target_controlled,
+        dtype=np.float64,
+    )[:3, :3]
+
+    # B601 gripper_end is identity at q=0. Therefore the controlled mapping
+    # must turn the source identity into the RM65 tool_tcp zero orientation.
+    np.testing.assert_allclose(
+        reference_rotation @ controlled_rotation,
+        tool_pose[:3, :3],
+        atol=1e-5,
+    )
+    # The visible flange is a separate Rz(-90 deg) assembly frame; it must not
+    # silently replace the canonical tool_tcp/link6 orientation.
+    assert not np.allclose(visible_pose[:3, :3], tool_pose[:3, :3], atol=1e-5)
+    np.testing.assert_allclose(
+        visible_pose[:3, :3],
+        Rotation.from_euler("z", 90.0, degrees=True).as_matrix(),
+        atol=1e-5,
+    )
 
 
 def test_payload_roundtrip_and_file_loader_verify_semantic_hash(tmp_path) -> None:

@@ -87,33 +87,36 @@ print(target)
 PY
 ```
 
-### B601 末端工具坐标校正（150% v2）
+### B601 末端工具坐标校正（150% canonical tool_tcp v3）
 
 上面的 `v1` 只解决位移倍率，且把 `gripper_end` 与 `tool_tcp` 的受控坐标系暂时当作
-同向（controlled matrix 为 identity）。这会让两个旋转轴在 RM65 上互换。B601 URDF 的
-`j_gripper_end` 固定关节相对 `link6` 使用 `rpy="3.1416 -1.5708 0"`，因此当前受控帧
-合同必须显式包含：
+同向（controlled matrix 为 identity）。此前的 v2 又误用了 B601 自身
+`link6 → gripper_end` 的固定姿态，导致三个旋转轴发生循环置换。离线加载 RM65
+MuJoCo URDF 后，当前运行时的 canonical controlled frame 确认是
+`right_arm_link6/right_hand_base/tool_tcp`，不是可见的 `right_realman` 夹爪装配 frame。
+因此 v3 合同必须显式包含：
 
 ```text
 T_source_controlled_target_controlled =
-[[ 0,  0,  1, 0],
- [ 0, -1,  0, 0],
+[[ 0, -1,  0, 0],
  [ 1,  0,  0, 0],
+ [ 0,  0,  1, 0],
  [ 0,  0,  0, 1]]
 ```
 
 该矩阵只作用于 `gripper_end → tool_tcp` 的受控旋转，不改变基座参考矩阵或位移倍率。
-因此源端小旋转的离线预期是：`+X → +Z`、`+Y → -Y`、`+Z → +X`；位移仍按
-`[1.5, 1.5, 1.5]` 解释。可复用的版本化 profile 位于
+因此源端小旋转的离线预期是：`+X → -Y`、`+Y → +X`、`+Z → +Z`；位移仍按
+`[1.5, 1.5, 1.5]` 解释。为避免已有现场命令误加载旧语义，文件路径暂保持稳定，
+但 profile id 已升级为 `b601-rm65-provisional-lab-150-v3-tool-tcp`。可复用的 profile 位于
 [b601_rm65_mapping_150_v2.json](./profiles/b601_rm65_mapping_150_v2.json)：
 
 ```text
 docs/hardware/profiles/b601_rm65_mapping_150_v2.json
 ```
 
-其 `semantic_content_hash` 为
-`6d19eb1e0df109b050ca824d7031721994f54021491304db9e49712185a0365e`。现场验证必须显式
-使用该文件，并在结果 JSON 中记录 profile id/hash；不要继续使用 identity 的 `v1`。
+其 `semantic_content_hash` 由 canonical loader 重新计算并由 profile 测试锁定。现场验证必须显式
+使用该文件，并在结果 JSON 中记录 v3 profile id/hash；不要继续使用 identity 的 `v1` 或
+循环置换的旧 v2 语义。
 
 仿真只读连接可显式传 `--disable-teleop-residual-envelope`。它仅关闭 B601 binding 的
 “单 tick residual 平移/旋转幅度”预检，不关闭 RM65 的 canonical IK、关节、碰撞、速度、加速度、
