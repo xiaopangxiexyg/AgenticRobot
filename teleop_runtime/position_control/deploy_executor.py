@@ -2704,18 +2704,35 @@ class PositionDeployExecutor:
         vectors are never accepted as authoritative hardware feedback.
         """
 
-        strict_authoritative = self.dispatch_callback is not None or not bool(
-            self.config.allow_non_authoritative_collision_reset_in_dry_run
+        dry_run_fallback_allowed = (
+            self.dispatch_callback is None
+            and bool(self.config.allow_non_authoritative_collision_reset_in_dry_run)
         )
-        try:
-            return self._authoritative_collision_reset_qpos(
+        if dry_run_fallback_allowed:
+            # A dry-run must not capture an authoritative timestamp and then
+            # fail later when the reference worker applies the queued reset.
+            # The queue can legitimately outlive the hardware measurement even
+            # though no command will be dispatched.  Use the explicit
+            # observation-state compatibility path for the whole dry-run
+            # lifecycle instead of mixing authoritative capture with a later
+            # apply-time freshness gate.
+            return self._non_authoritative_collision_reset_qpos(
                 observation,
-                now_monotonic=now_monotonic,
+                fallback_reason="explicit_dry_run_observation_state",
             )
-        except ValueError as exc:
-            if strict_authoritative:
-                raise
-            fallback_reason = str(exc)
+
+        return self._authoritative_collision_reset_qpos(
+            observation,
+            now_monotonic=now_monotonic,
+        )
+
+    @staticmethod
+    def _non_authoritative_collision_reset_qpos(
+        observation: DeploymentObservation,
+        *,
+        fallback_reason: str,
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        """Build the explicitly non-authoritative dry-run planner reset state."""
 
         state = np.asarray(observation.state, dtype=np.float32).reshape(-1)
         state_valid = np.asarray(observation.state_valid, dtype=bool).reshape(-1)

@@ -1897,15 +1897,22 @@ def _hold_active_rtc_gap(
     """
 
     normalized_reason = None if reason is None else str(reason).strip()
-    if not send_actions or not normalized_reason:
+    if not normalized_reason:
         return {}
+
     try:
+        # A producer gap invalidates every queued position submission, including
+        # dry-run submissions.  Dry-run has no backend Hold to request, but it
+        # still owns a real PositionDeployExecutor queue whose entries can carry
+        # stale collision-reset metadata into the reference worker after recovery.
+        # Clear that queue before returning so a later re-arm starts a fresh
+        # generation.  Real dispatch keeps the same clear-before-Hold ordering.
         if position_deploy_executor is not None:
             position_state = position_deploy_executor.snapshot()
-            # clear() also invokes the backend Hold callback.  Repeating it
-            # every empty-plan tick would restart deceleration and invalidate
-            # the command sequence at the policy cadence.  The executor owns
-            # whether any queued/in-flight source work still needs clearing.
+            # clear() also invokes the backend Hold callback.  Repeating it every
+            # empty-plan tick would restart deceleration and invalidate the command
+            # sequence at the policy cadence.  The executor owns whether any
+            # queued/in-flight source work still needs clearing.
             if (
                 position_state.get("active")
                 or position_state.get("queue_depth")
@@ -1914,6 +1921,10 @@ def _hold_active_rtc_gap(
                 or position_state.get("hold_retry_required")
             ):
                 position_deploy_executor.clear()
+
+        if not send_actions:
+            return {}
+
         receipts = request_policy_inference_soft_hold(
             arm_backends,
             reason=normalized_reason,
