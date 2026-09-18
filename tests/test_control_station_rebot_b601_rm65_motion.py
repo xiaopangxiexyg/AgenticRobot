@@ -506,6 +506,49 @@ def test_session_current_tick_is_timestamped_after_slow_poll(
     )
 
 
+def test_session_accepts_anchor_cache_frame_measured_before_host_capture(
+    setup_motion, monkeypatch
+):
+    """A source frame may be measured before the host finishes activation.
+
+    The frame used to create an anchor is valid at the source barrier even
+    when a host-side poll/measurement delay makes ``anchor.captured_at`` later.
+    A receive-only cache may return that same frame for the first active tick;
+    it must produce a zero residual, not a false activation-barrier rejection.
+    """
+
+    clock, _, _, source, _, _, _ = setup_motion
+    session = _session(setup_motion)
+    original_poll = source.poll_pose
+    calls = 0
+    anchor_projection = None
+
+    def cached_activation_frame():
+        nonlocal calls, anchor_projection
+        if calls == 0:
+            anchor_projection = original_poll()
+            # The source was measured before the host completed the anchor
+            # transaction, as happens with a real CAN/cache poll.
+            clock.value += 0.01
+            calls += 1
+            return anchor_projection
+        calls += 1
+        assert anchor_projection is not None
+        return anchor_projection
+
+    monkeypatch.setattr(source, "poll_pose", cached_activation_frame)
+    session.activate()
+    clock.value += 0.05
+    receipt = session.step()
+
+    assert receipt.accepted, receipt.message
+    assert session.state == "active"
+    np.testing.assert_allclose(
+        receipt.proposal.action.values_by_component["right_arm"].values,
+        (0, 0, 0, 0, 0, 0, 1),
+    )
+
+
 def test_session_default_target_time_is_selected_by_final_admission_owner(
     setup_motion, monkeypatch
 ):

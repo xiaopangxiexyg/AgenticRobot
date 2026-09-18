@@ -419,8 +419,16 @@ class B601RM65MotionBinding:
             self._age(now, sample.measured_at, self.limits[0])
             self._age(now, state.receive_timestamp_sec, self.limits[0])
             self._age(now, receipt.adapted_at, self.limits[0])
-            if sample.measured_at < anchor.master_anchor.captured_at:
-                raise ValueError("Source predates the activation barrier.")
+            # ``captured_at`` is the host-side transaction cut taken after the
+            # source poll returns.  A real feedback frame is measured before
+            # that return (and may be the same fresh cache frame used to make
+            # the anchor), so comparing the source measurement timestamp to
+            # the host capture time rejects every normal activation by a few
+            # milliseconds.  The residual adapter already enforces the real
+            # source barrier: a proposal sample must not predate the source
+            # sample recorded in the anchor.  Keep that source-clock check as
+            # the single activation barrier and do not substitute a later
+            # host-clock timestamp for it.
             # The binding owns its final admission timestamp. A foreground
             # caller cannot safely pre-stamp an immediate target before source
             # adaptation, because real monotonic time advances during that
