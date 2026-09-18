@@ -163,12 +163,46 @@ class VisibleGraspScene:
         """Use the same separate palm/finger solids for filtering and checks."""
         g = self.geometry
         x, y, z = local.T
-        fingers = ((z > g.palm_z_m-distance_m) & (z < g.palm_z_m+g.finger_length_m)
-                   & (np.abs(x) > opening_m/2)
-                   & (np.abs(x) < opening_m/2+g.finger_thickness_m))
+        fingers = self._finger_mask(local, opening_m=opening_m, distance_m=distance_m)
         palm = ((z > g.palm_z_m-g.finger_thickness_m-distance_m)
                 & (z <= g.palm_z_m) & (np.abs(x) < opening_m/2+g.finger_thickness_m))
         return (np.abs(y) < g.pad_height_m/2) & (fingers | palm)
+
+    def _finger_mask(self, local: np.ndarray, *, opening_m: float,
+                     distance_m: float = 0) -> np.ndarray:
+        g = self.geometry
+        x, _y, z = local.T
+        return (
+            (z > g.palm_z_m - distance_m)
+            & (z < g.palm_z_m + g.finger_length_m)
+            & (np.abs(x) > opening_m / 2)
+            & (np.abs(x) < opening_m / 2 + g.finger_thickness_m)
+        )
+
+    def _terminal_target_contact_mask(
+        self,
+        local: np.ndarray,
+        *,
+        opening_m: float,
+        contact_depth_m: float,
+    ) -> np.ndarray:
+        """Return target points allowed to touch the fingertip at the goal."""
+        if (
+            not math.isfinite(contact_depth_m)
+            or contact_depth_m <= 0.0
+            or contact_depth_m > self.geometry.finger_length_m
+        ):
+            raise ValueError(
+                "contact_depth_m must be finite and within finger length"
+            )
+        _x, y, z = local.T
+        fingertip_z = self.geometry.palm_z_m + self.geometry.finger_length_m
+        return (
+            self._finger_mask(local, opening_m=opening_m)
+            & (z >= fingertip_z - contact_depth_m)
+            & (z <= fingertip_z)
+            & (np.abs(y) < self.geometry.pad_height_m / 2)
+        )
 
     def without_captured_gripper_observations(
         self,
@@ -236,8 +270,9 @@ class VisibleGraspScene:
                                   )),
                 int(np.count_nonzero(remove)))
 
-    def collision_counts(self, pose: np.ndarray, *, opening_m: float) -> tuple[int, int]:
-        """Count observed target/background points inside the nominal solids."""
+    def _collision_local_points(
+        self, pose: np.ndarray, *, opening_m: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
         g = self.geometry
         if not math.isfinite(opening_m) or not 0 < opening_m <= g.maximum_opening_m:
             raise ValueError("opening is outside the geometry bound")
@@ -248,13 +283,50 @@ class VisibleGraspScene:
                 or not np.isclose(np.linalg.det(pose[:3, :3]), 1)):
             raise ValueError("grasp pose must be rigid")
         pose = g.solid_pose(pose)
-        local, labels = self._local_points(pose, opening_m=opening_m)
+        return self._local_points(pose, opening_m=opening_m)
+
+    def collision_counts(self, pose: np.ndarray, *, opening_m: float) -> tuple[int, int]:
+        """Count observed target/background points inside the nominal solids."""
+        local, labels = self._collision_local_points(pose, opening_m=opening_m)
         occupied = self._solid_mask(local, opening_m=opening_m)
         return (int(np.count_nonzero(occupied & labels)),
                 int(np.count_nonzero(occupied & ~labels)))
 
-    def approach_collision_counts(self, grasp_pose: np.ndarray, *, opening_m: float,
-                                  distance_m: float) -> tuple[int, int]:
+    def collision_counts_with_terminal_target_contact(
+        self,
+        pose: np.ndarray,
+        *,
+        opening_m: float,
+        contact_depth_m: float,
+    ) -> tuple[int, int, int]:
+        """Separate allowed fingertip contact from target and background hits.
+
+        The target is still treated as an obstacle everywhere except the
+        terminal fingertip band.  This is the grasp-goal contact rule; callers
+        that need a strict no-contact check should continue using
+        :meth:`collision_counts`.
+        """
+        local, labels = self._collision_local_points(pose, opening_m=opening_m)
+        occupied = self._solid_mask(local, opening_m=opening_m)
+        target = occupied & labels
+        terminal_contact = self._terminal_target_contact_mask(
+            local, opening_m=opening_m, contact_depth_m=contact_depth_m
+        )
+        return (
+            int(np.count_nonzero(target & ~terminal_contact)),
+            int(np.count_nonzero(target & terminal_contact)),
+            int(np.count_nonzero(occupied & ~labels)),
+        )
+
+    def approach_collision_counts(
+        self,
+        grasp_pose: np.ndarray,
+        *,
+        opening_m: float,
+        distance_m: float,
+        allow_terminal_target_contact: bool = False,
+        terminal_target_contact_depth_m: float = 0.006,
+    ) -> tuple[int, int]:
         """Check the entire fixed-orientation +Z approach analytically.
 
         In the final TCP frame, a stationary point moves only along local Z;
@@ -268,5 +340,12 @@ class VisibleGraspScene:
         pose = self.geometry.solid_pose(np.asarray(grasp_pose))
         local, labels = self._local_points(pose, opening_m=opening_m, distance_m=distance_m)
         occupied = self._solid_mask(local, opening_m=opening_m, distance_m=distance_m)
-        return (int(np.count_nonzero(occupied & labels)),
+        target = occupied & labels
+        if allow_terminal_target_contact:
+            target &= ~self._terminal_target_contact_mask(
+                local,
+                opening_m=opening_m,
+                contact_depth_m=terminal_target_contact_depth_m,
+            )
+        return (int(np.count_nonzero(target)),
                 int(np.count_nonzero(occupied & ~labels)))

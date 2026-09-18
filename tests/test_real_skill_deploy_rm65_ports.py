@@ -194,6 +194,7 @@ class _ForceGuard:
         self.close_failures = int(close_failures)
         self.ready_on_start = bool(ready_on_start)
         self.events = events if events is not None else []
+        self.non_motion_token = 0
 
     def start(self, *, arm_stale_watchdog=True):
         self.starts += 1
@@ -208,6 +209,18 @@ class _ForceGuard:
             self.close_failures -= 1
             raise RuntimeError("force guard close failed")
         self.motion_ready = False
+
+    def suspend_stale_watchdog_for_non_motion(self):
+        self.non_motion_token += 1
+        self.motion_ready = False
+        self.events.append("force_guard_suspend_non_motion")
+        return self.non_motion_token
+
+    def resume_stale_watchdog_after_non_motion(self, token):
+        assert token == self.non_motion_token
+        self.motion_ready = bool(self.ready_on_start)
+        self.events.append("force_guard_resume_non_motion")
+        return {"motion_ready": self.motion_ready}
 
 
 def _ports(
@@ -648,6 +661,27 @@ def test_rm65_ports_use_checked_dispatch_and_lower_hold() -> None:
         for backend in backends.values()
     )
     assert all(backend.target_active is False for backend in backends.values())
+
+
+def test_rm65_ports_non_motion_read_window_blocks_commands_and_rearms_guard() -> None:
+    ports, _backends, _ = _ports()
+    ports.start()
+
+    with ports.non_motion_read_window():
+        assert ports.position_force_guard.motion_ready is False
+        with pytest.raises(RuntimeError, match="not motion-ready"):
+            ports.admit_command(
+                _command(),
+                TeleopObservation(timestamp=time.time()),
+                time.time(),
+            )
+
+    assert ports.position_force_guard.motion_ready is True
+    assert ports.position_force_guard.events[-2:] == [
+        "force_guard_suspend_non_motion",
+        "force_guard_resume_non_motion",
+    ]
+    ports.close()
 
 
 def test_rm65_ports_own_start_and_hold_before_close() -> None:

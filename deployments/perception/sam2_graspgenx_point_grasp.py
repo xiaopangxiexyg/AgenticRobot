@@ -8,7 +8,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -54,6 +54,7 @@ DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1: dict[str, object] = {
     "fingertip_depth": DMTAC_M_FINGER_LENGTH_M,
 }
 DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M = 0.006
+DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M = 0.006
 GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M = 0.015
 GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG = 15.0
 GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG = 20.0
@@ -396,7 +397,7 @@ class Sam2GraspGenXPointGraspPlanner:
                     ),
                 },
                 "candidate_selection": {
-                    "policy": "balanced_approach_family_and_scored_variants_v3",
+                    "policy": "all_distinct_approach_families_then_scored_variants_v4",
                     "approach_axis_deg": (
                         GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG
                     ),
@@ -410,6 +411,21 @@ class Sam2GraspGenXPointGraspPlanner:
                     "model_base_from_geometry_z_m": -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
                     "maximum_opening_m": self.max_gripper_width_m,
                     "width_clearance_m": DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
+                    "visible_collision_opening_basis": "maximum_opening",
+                    "terminal_target_contact_rule": "fingertip_band_only",
+                    "terminal_target_contact_depth_m": (
+                        DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
+                    ),
+                    "visible_collision_scope": (
+                        "target_surface_terminal_proxy_plus_optional_"
+                        "capture_filtered_background_terminal_proxy"
+                    ),
+                    "background_collision": (
+                        "optional_terminal_prefilter_then_motion_planner"
+                    ),
+                    "terminal_background_prefilter": (
+                        "runtime_visible_scene_factory"
+                    ),
                     "maximum_visible_collision_points": 0,
                     "visible_endpoint_opening_m": self.max_gripper_width_m,
                     "unscored_pose_translation_allowed": False,
@@ -472,6 +488,7 @@ class Sam2GraspGenXPointGraspPlanner:
         intrinsics: Mapping[str, float | int],
         base_from_camera: np.ndarray,
         max_candidates: int,
+        visible_scene_factory: Callable[..., VisibleGraspScene] | None = None,
     ) -> PointGraspResult:
         started = time.perf_counter()
         timing: dict[str, float] = {}
@@ -485,6 +502,8 @@ class Sam2GraspGenXPointGraspPlanner:
             raise ValueError("Depth must be a finite aligned HxW meter image.")
         if isinstance(max_candidates, bool) or not 1 <= int(max_candidates) <= 5:
             raise ValueError("max_candidates must be in [1, 5].")
+        if visible_scene_factory is not None and not callable(visible_scene_factory):
+            raise TypeError("visible_scene_factory must be callable or None.")
         u, v = pixel_uv
         if not (0 <= u < rgb.width and 0 <= v < rgb.height):
             raise ValueError("pixel_uv is outside the image.")
@@ -556,6 +575,26 @@ class Sam2GraspGenXPointGraspPlanner:
             top_k=self.server_top_k,
         )
         timing["graspgenx_inference"] = (time.perf_counter() - stage_started) * 1000.0
+        visible_scene = None
+        if visible_scene_factory is not None:
+            stage_started = time.perf_counter()
+            visible_scene = visible_scene_factory(
+                depth_m=depth,
+                target_mask=mask,
+                intrinsics=values,
+                geometry=replace(
+                    self.solid_geometry,
+                    tool_from_solid_xyz_m=(0, 0, 0),
+                    solid_yaw_rad=0,
+                ),
+            )
+            if not isinstance(visible_scene, VisibleGraspScene):
+                raise TypeError(
+                    "visible_scene_factory must return a VisibleGraspScene."
+                )
+            timing["visible_scene_construction"] = (
+                time.perf_counter() - stage_started
+            ) * 1000.0
         stage_started = time.perf_counter()
         filter_summary: dict[str, int | float | str | None] = {}
         candidates = self._rank(
@@ -568,6 +607,7 @@ class Sam2GraspGenXPointGraspPlanner:
             intrinsics=values,
             maximum=int(max_candidates),
             filter_summary=filter_summary,
+            visible_scene=visible_scene,
         )
         timing["candidate_ranking_and_visible_collision"] = (
             time.perf_counter() - stage_started
@@ -612,20 +652,36 @@ class Sam2GraspGenXPointGraspPlanner:
         intrinsics: Mapping[str, float],
         maximum: int,
         filter_summary: dict[str, int | float | str | None] | None = None,
+        visible_scene: VisibleGraspScene | None = None,
     ) -> tuple[PointGraspCandidate, ...]:
         model_base_from_tcp = np.eye(4, dtype=np.float64)
         model_base_from_tcp[2, 3] = -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
         camera_from_base = np.linalg.inv(base_from_camera)
-        scene = VisibleGraspScene.from_depth(
-            depth_m=depth,
-            target_mask=self.last_target_mask,
-            intrinsics=intrinsics,
-            reference_from_camera=np.eye(4),
+        # Target fit and fixed ingress remain target-only checks. A live real
+        # deployment may additionally provide the capture-filtered full scene;
+        # use that scene only for the terminal grasp proxy. This lets the
+        # generator remove candidates whose final gripper solids already hit a
+        # visible background point, while the motion planner still owns the
+        # full approach sweep and global path search.
+        grasp_geometry = replace(
+            self.solid_geometry,
+            tool_from_solid_xyz_m=(0, 0, 0),
+            solid_yaw_rad=0,
+        )
+        target_scene = VisibleGraspScene(
+            points=np.asarray(target_points_camera, dtype=np.float64),
+            target_mask=np.ones(len(target_points_camera), dtype=np.bool_),
             # Inference and capture checks use the +X-closing model geometry
             # frame. Convert to the real controller TCP only at the output.
-            geometry=replace(self.solid_geometry, tool_from_solid_xyz_m=(0, 0, 0),
-                             solid_yaw_rad=0),
+            geometry=grasp_geometry,
         )
+        terminal_scene = target_scene
+        if visible_scene is not None:
+            if visible_scene.geometry != grasp_geometry:
+                raise ValueError(
+                    "visible_scene geometry must use the GraspGenX grasp frame."
+                )
+            terminal_scene = visible_scene
         ranked: list[tuple[float, float, float, float, np.ndarray, np.ndarray]] = []
         counts: dict[str, int | float | str | None] = {
             "detected": 0,
@@ -634,6 +690,9 @@ class Sam2GraspGenXPointGraspPlanner:
             "click_distance_valid": 0,
             "visible_collision_valid": 0,
             "visible_approach_valid": 0,
+            "visible_approach_collision_candidates": 0,
+            "visible_approach_target_collision_candidates": 0,
+            "visible_approach_background_collision_candidates": 0,
             "target_solid_collision_rejected": 0,
             "background_solid_collision_rejected": 0,
             "width_valid_downward_approach_count": 0,
@@ -657,6 +716,32 @@ class Sam2GraspGenXPointGraspPlanner:
             ),
             "capture_half_pad_height_m": DMTAC_M_PAD_HEIGHT_M / 2.0,
             "capture_coordinate_frame": "grasp_geometry",
+            "visible_collision_scope": (
+                "target_surface_terminal_proxy_plus_capture_filtered_"
+                "background_terminal_proxy"
+                if visible_scene is not None
+                else "target_surface_grasp_proxy_only"
+            ),
+            "background_collision": (
+                "terminal_prefiltered_after_capture_self_filter"
+                if visible_scene is not None
+                else "deferred_to_motion_planner"
+            ),
+            "terminal_background_prefilter_enabled": visible_scene is not None,
+            "terminal_background_collision_rejected": 0,
+            "visible_scene_point_count": int(len(terminal_scene.points)),
+            "visible_scene_background_point_count": int(
+                np.count_nonzero(~terminal_scene.target_mask)
+            ),
+            "visible_collision_opening_basis": "maximum_opening",
+            "visible_collision_opening_m": self.max_gripper_width_m,
+            "terminal_target_contact_rule": "fingertip_band_only",
+            "terminal_target_contact_depth_m": (
+                DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
+            ),
+            "terminal_target_contact_points": 0,
+            "min_visible_collision_opening_m": None,
+            "max_visible_collision_opening_m": None,
         }
         for base_from_model_base, raw_score in zip(grasps, scores, strict=True):
             counts["detected"] = int(counts["detected"]) + 1
@@ -709,6 +794,21 @@ class Sam2GraspGenXPointGraspPlanner:
                     counts["width_valid_downward_approach_count"]
                 ) + 1
             width = max(0.005, requested_width)
+            # Candidate width is retained as proposal metadata and for the
+            # grasp-fit check. It is not an execution input today, so the
+            # visible collision proxy must match the open gripper used by the
+            # motion planner rather than a narrower candidate-specific proxy.
+            visible_collision_opening = self.max_gripper_width_m
+            for name, combine in (
+                ("min_visible_collision_opening_m", min),
+                ("max_visible_collision_opening_m", max),
+            ):
+                previous = counts[name]
+                counts[name] = (
+                    visible_collision_opening
+                    if previous is None
+                    else combine(float(previous), visible_collision_opening)
+                )
             palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
             fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
             capture_violation = max(
@@ -763,12 +863,23 @@ class Sam2GraspGenXPointGraspPlanner:
             if click_distance > self.max_click_distance_m:
                 continue
             counts["click_distance_valid"] = int(counts["click_distance_valid"]) + 1
-            target_hits, background_hits = scene.collision_counts(
-                # This is the noncontact end of approach, not a closure state.
-                # The percentile-derived width remains a proposal estimate;
-                # it is not measured jaw opening or validated contact geometry.
-                camera_from_tcp, opening_m=self.max_gripper_width_m
+            target_hits, target_contact_points, background_hits = (
+                terminal_scene.collision_counts_with_terminal_target_contact(
+                    # This is the terminal grasp-admission proxy. Use the
+                    # maximum opening used by the motion planner. Target
+                    # fingertip contact is the only permitted target exception;
+                    # a capture-filtered scene also rejects observed background
+                    # hits at this endpoint.
+                    camera_from_tcp,
+                    opening_m=visible_collision_opening,
+                    contact_depth_m=(
+                        DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
+                    ),
+                )
             )
+            counts["terminal_target_contact_points"] = int(
+                counts["terminal_target_contact_points"]
+            ) + target_contact_points
             if target_hits or background_hits:
                 counts["target_solid_collision_rejected"] = int(
                     counts["target_solid_collision_rejected"]
@@ -776,24 +887,41 @@ class Sam2GraspGenXPointGraspPlanner:
                 counts["background_solid_collision_rejected"] = int(
                     counts["background_solid_collision_rejected"]
                 ) + int(bool(background_hits))
+                if background_hits:
+                    counts["terminal_background_collision_rejected"] = int(
+                        counts["terminal_background_collision_rejected"]
+                    ) + 1
                 continue
             counts["visible_collision_valid"] = int(
                 counts["visible_collision_valid"]
             ) + 1
-            target_hits, background_hits = scene.approach_collision_counts(
-                camera_from_tcp,
-                opening_m=self.max_gripper_width_m,
-                distance_m=0.060,
+            approach_target_hits, approach_background_hits = (
+                terminal_scene.approach_collision_counts(
+                    camera_from_tcp,
+                    opening_m=visible_collision_opening,
+                    distance_m=0.060,
+                    allow_terminal_target_contact=True,
+                    terminal_target_contact_depth_m=(
+                        DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
+                    ),
+                )
             )
-            if target_hits or background_hits:
-                counts["target_solid_collision_rejected"] = int(
-                    counts["target_solid_collision_rejected"]
-                ) + int(bool(target_hits))
-                counts["background_solid_collision_rejected"] = int(
-                    counts["background_solid_collision_rejected"]
-                ) + int(bool(background_hits))
-                continue
-            counts["visible_approach_valid"] = int(counts["visible_approach_valid"]) + 1
+            if approach_target_hits or approach_background_hits:
+                # This fixed +Z sweep is a diagnostic only. A different
+                # ingress can still be valid and must be searched downstream.
+                counts["visible_approach_collision_candidates"] = int(
+                    counts["visible_approach_collision_candidates"]
+                ) + 1
+                counts["visible_approach_target_collision_candidates"] = int(
+                    counts["visible_approach_target_collision_candidates"]
+                ) + int(bool(approach_target_hits))
+                counts["visible_approach_background_collision_candidates"] = int(
+                    counts["visible_approach_background_collision_candidates"]
+                ) + int(bool(approach_background_hits))
+            else:
+                counts["visible_approach_valid"] = int(
+                    counts["visible_approach_valid"]
+                ) + 1
             for name, combine in (
                 ("min_downward_approach_cosine", min),
                 ("max_downward_approach_cosine", max),
@@ -931,8 +1059,11 @@ class Sam2GraspGenXPointGraspPlanner:
                 continue
             representative_indices.append(index)
 
-        direction_budget = maximum if maximum <= 2 else math.ceil(maximum / 2)
-        selected_indices = representative_indices[:direction_budget]
+        # If several approach cones survived the physical/proxy filters, keep
+        # every one before filling remaining slots with scored variants.  A
+        # half-budget here made five returned candidates look diverse in score
+        # while all sharing one approach direction.
+        selected_indices = representative_indices[:maximum]
         if len(selected_indices) < maximum:
             selected_set = set(selected_indices)
             represented = tuple(poses[index] for index in selected_indices)
@@ -963,6 +1094,7 @@ class Sam2GraspGenXPointGraspPlanner:
 
 __all__ = [
     "DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1",
+    "DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M",
     "GRASPGENX_ASSET_SCHEMA_V1",
     "GRASPGENX_CHECKPOINT_GIT_URL",
     "GRASPGENX_CHECKPOINT_REVIEWED_REVISION",

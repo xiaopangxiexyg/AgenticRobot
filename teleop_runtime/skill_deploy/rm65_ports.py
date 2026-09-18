@@ -11,7 +11,8 @@ import json
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -355,6 +356,41 @@ class ExclusiveRM65SkillDeployPorts:
     def resources_closed(self) -> bool:
         with self._resource_lock:
             return self._resources_closed
+
+    @contextmanager
+    def non_motion_read_window(self) -> Iterator[None]:
+        """Pause only stale trips while a read-only planner blocks.
+
+        The position-force guard keeps force/torque and reader-error checks
+        active in this window.  It also clears ``motion_ready``; therefore the
+        existing command admission boundary cannot accept a motion command.
+        Exiting the window requires fresh samples from every side before
+        motion readiness is restored.
+        """
+
+        if not self.resources_started:
+            raise RuntimeError(
+                "exclusive RM65 Skill resources are not started."
+            )
+        suspend = getattr(
+            self.position_force_guard,
+            "suspend_stale_watchdog_for_non_motion",
+            None,
+        )
+        resume = getattr(
+            self.position_force_guard,
+            "resume_stale_watchdog_after_non_motion",
+            None,
+        )
+        if not callable(suspend) or not callable(resume):
+            raise RuntimeError(
+                "position force guard does not support non-motion read windows"
+            )
+        token = suspend()
+        try:
+            yield
+        finally:
+            resume(token)
 
     @property
     def startup_hold_receipt(self) -> RealSkillMotionHoldReceipt | None:
@@ -973,6 +1009,15 @@ class ExclusiveRM65SkillDeployPorts:
                         dict(post_health.get("sides") or {})
                         .get(side, {})
                         .get("background_streaming")
+                        or {}
+                    )
+                    for side in ("left", "right")
+                },
+                "singularity_by_side": {
+                    side: dict(
+                        dict(post_health.get("sides") or {})
+                        .get(side, {})
+                        .get("singularity_metadata")
                         or {}
                     )
                     for side in ("left", "right")

@@ -20,6 +20,7 @@ from teleop_runtime.skill_deploy.rm65_lower_assembly import (
     assemble_exclusive_rm65_skill_lower,
 )
 from teleop_runtime.skill_deploy.rm65_profile import (
+    RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1,
     ExclusiveRM65SkillDeploymentProfile,
     resolve_exclusive_rm65_skill_deployment_profile,
 )
@@ -195,6 +196,13 @@ def test_lower_assembly_reuses_one_profile_and_starts_no_resources(
     assert set(
         assembly.target_safety.target_frame_binding.target_world_from_base_by_side
     ) == {"left", "right"}
+    assert set(
+        assembly.target_safety.target_frame_binding.reference_frame_by_side.values()
+    ) == {RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1}
+    np.testing.assert_allclose(
+        assembly.target_safety.target_frame_binding.target_world_from_solver_world,
+        np.linalg.inv(profile.scene_world_from_canonical_station),
+    )
     assert assembly.startup_admission.ports is assembly.ports
     assert assembly.startup_admission.target_safety is assembly.target_safety
     assert guard_inputs == [assembly.arm_backends]

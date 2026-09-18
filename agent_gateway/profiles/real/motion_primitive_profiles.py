@@ -69,6 +69,7 @@ from robot_motion.primitives import (
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
 from .grasp_approach_plan import (
+    DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_EXECUTOR_ID_V1,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ROUTE_ID_V1,
     REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1,
@@ -941,6 +942,7 @@ def build_real_agent_primitive_contract_bundle(
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
     ) = None,
+    grasp_execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     domain_emergency_stop_available: bool = False,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects."""
@@ -1096,6 +1098,7 @@ def build_real_agent_primitive_contract_bundle(
             max_measured_qpos_age_ms=convergence.max_measurement_age_ms,
             min_speed_scale=pose_target_profile.min_speed_scale,
             max_speed_scale=pose_target_profile.max_speed_scale,
+            execution_operation_timeout_sec=grasp_execution_operation_timeout_sec,
         )
         if grasp_approach_plan_enabled
         else None

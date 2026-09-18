@@ -33,6 +33,7 @@ from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
 _SIDES = ("left", "right")
 _CANONICAL_STATION_LINK_NAME = "workspace_near_boundary_frame"
 RM65_SKILL_SCENE_WORLD_FRAME_ID_V1 = "dual_arm_solver_world"
+RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1 = "canonical_station"
 
 
 def _absolute_file(value: str | Path, *, field_name: str) -> Path:
@@ -297,6 +298,7 @@ def resolve_exclusive_rm65_skill_deployment_profile(
 
 __all__ = [
     "ExclusiveRM65SkillDeploymentProfile",
+    "RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1",
     "RM65_SKILL_SCENE_WORLD_FRAME_ID_V1",
     "ResolvedExclusiveRM65SkillDeploymentProfile",
     "resolve_exclusive_rm65_skill_deployment_profile",

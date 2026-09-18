@@ -36,6 +36,9 @@ from teleop_runtime.skill_deploy.rm65_ports import (
 )
 
 from .localization_deployment import RealObjectLocalizationRegistration
+from .grasp_approach_plan import (
+    DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
+)
 from .localization_gateway import ObjectLocalizationProvider
 from .motion_gateway_session import (
     RealAgentPrimitiveGatewaySession,
@@ -154,6 +157,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     ) = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
+    non_motion_read_window: Callable[[], object] | None = None,
     perception_provider_factory: (
         Callable[
             [RealAgentMotionPort, Callable[[], int]],
@@ -163,6 +167,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
     ) = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
+    grasp_execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     max_retained_operations: int = 16,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
@@ -182,6 +187,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration
         ),
+        grasp_execution_operation_timeout_sec=grasp_execution_operation_timeout_sec,
         domain_emergency_stop_available=emergency_stop_controller is not None,
     )
     port = RealAgentMotionPort(
@@ -230,6 +236,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         ),
         grasp_trajectory_planner=grasp_trajectory_planner,
         captured_robot_observation_filter=captured_robot_observation_filter,
+        non_motion_read_window=non_motion_read_window,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
         revision_tracker=revision_tracker,
@@ -267,6 +274,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     ) = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
+    non_motion_read_window: Callable[[], object] | None = None,
     perception_provider_factory: (
         Callable[
             [RealAgentMotionPort, Callable[[], int]],
@@ -277,6 +285,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     measured_qpos_observer: RealSkillMeasuredQposObserver | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
+    grasp_execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     max_retained_operations: int = 16,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
@@ -318,9 +327,11 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         ),
         grasp_trajectory_planner=grasp_trajectory_planner,
         captured_robot_observation_filter=captured_robot_observation_filter,
+        non_motion_read_window=non_motion_read_window,
         perception_provider_factory=perception_provider_factory,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
+        grasp_execution_operation_timeout_sec=grasp_execution_operation_timeout_sec,
         max_retained_operations=max_retained_operations,
         clock=clock,
         sleep=sleep,

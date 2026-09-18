@@ -793,8 +793,56 @@ def test_start_envelope_preflight_distinguishes_current_tcp_from_grasp_target(
         with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
             planner._preflight_start_envelope(qpos_by_side=qpos, side="right")
         assert raised.value.reason_code == "start_state_safety_envelope_blocked"
-        assert raised.value.details["envelope_projection_subject"] == "current_measured_solver_tcp"
+        assert raised.value.details["envelope_projection_subject"] == "current_measured_tool_tcp_in_envelope_reference_frame"
         assert raised.value.details["maximum_path_envelope_ingress_distance_m"] == 0.16
+
+
+def test_envelope_ingress_interpolates_actual_tool_tcp_space() -> None:
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    builder = _ToolOffsetCartesianBuilder()
+    planner.target_builder = builder
+    planner.target_envelope_filter = _ToolSpaceAbsoluteEnvelopeFilter(
+        builder,
+        minimum_x=-0.39,
+    )
+    planner._target_envelope_projection_details = lambda _modified: {
+        "envelope_projection_by_side": {
+            "right": {
+                "translation_modified": True,
+                "rotation_modified": False,
+                "translation_adjustment_m": 0.1217,
+                "violated_translation_constraints": ["absolute:x:min"],
+            }
+        }
+    }
+    current = {
+        "left": np.zeros(6),
+        "right": np.array([-0.3717, 0.0, 0.0, 0.0, -np.pi / 2.0, 0.0]),
+    }
+    final_tool = np.eye(4)
+    final_tool[0, 3] = -0.28
+
+    ingress = planner._envelope_ingress_targets(
+        qpos_by_side=current,
+        side="right",
+        final_tool_tcp_world=final_tool,
+    )
+
+    assert ingress
+    fraction, first_tool = ingress[0]
+    assert fraction == pytest.approx(0.05)
+    # The first ingress waypoint must be inside the actual tool-TCP envelope.
+    assert first_tool[0, 3] == pytest.approx(-0.3845, abs=1e-8)
+    assert first_tool[0, 3] > -0.39
+    solver_waypoint = builder.solver_world_target_from_tool_tcp_world_target(
+        side="right",
+        tool_tcp_world_target=first_tool,
+    )
+    roundtrip_tool = builder.tool_tcp_world_target_from_solver_world_target(
+        side="right",
+        solver_world_target=solver_waypoint,
+    )
+    assert roundtrip_tool[0, 3] > -0.39
 
 
 def test_real_snapshot_plans_via_strict_envelope_ingress_waypoint(
@@ -1307,6 +1355,72 @@ class _CartesianQposBuilder(_MultistartBuilder):
         return self._poses(**kwargs)
 
 
+class _ToolOffsetCartesianBuilder(_CartesianQposBuilder):
+    """Small synthetic builder exposing the solver-endpoint/tool offset bug."""
+
+    @staticmethod
+    def _tool_offset() -> np.ndarray:
+        offset = np.eye(4)
+        offset[2, 3] = 0.14
+        return offset
+
+    def tool_tcp_world_target_from_solver_world_target(
+        self,
+        *,
+        side,
+        solver_world_target,
+    ):
+        assert side in {"left", "right"}
+        return np.asarray(solver_world_target, dtype=float) @ self._tool_offset()
+
+    def solver_world_target_from_tool_tcp_world_target(
+        self,
+        *,
+        side,
+        tool_tcp_world_target,
+    ):
+        assert side in {"left", "right"}
+        return np.asarray(tool_tcp_world_target, dtype=float) @ np.linalg.inv(
+            self._tool_offset()
+        )
+
+    def tool_tcp_world_targets_for_qpos_pair(self, **kwargs):
+        return {
+            side: self.tool_tcp_world_target_from_solver_world_target(
+                side=side,
+                solver_world_target=pose,
+            )
+            for side, pose in self._poses(**kwargs).items()
+        }
+
+
+class _ToolSpaceAbsoluteEnvelopeFilter:
+    def __init__(self, builder: _ToolOffsetCartesianBuilder, minimum_x: float) -> None:
+        self.builder = builder
+        self.minimum_x = float(minimum_x)
+
+    def __call__(self, targets):
+        projected = {
+            side: np.asarray(pose, dtype=float).copy()
+            for side, pose in targets.items()
+        }
+        for side, solver_pose in targets.items():
+            tool_pose = self.builder.tool_tcp_world_target_from_solver_world_target(
+                side=side,
+                solver_world_target=solver_pose,
+            )
+            if float(tool_pose[0, 3]) < self.minimum_x:
+                effective_tool_pose = tool_pose.copy()
+                effective_tool_pose[0, 3] = self.minimum_x
+                projected[side] = (
+                    self.builder.solver_world_target_from_tool_tcp_world_target(
+                        side=side,
+                        tool_tcp_world_target=effective_tool_pose,
+                    )
+                )
+        return projected
+
+
 class _MinimumRightXEnvelopeFilter:
     def __init__(self, minimum_x: float) -> None:
         self.minimum_x = float(minimum_x)
@@ -1517,6 +1631,118 @@ def test_real_grasp_capture_self_filter_margin_is_bounded_to_half_a_centimeter()
         grasp_trajectory_module.RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M
         == pytest.approx(.005)
     )
+
+
+def test_visible_grasp_diagnostics_separate_terminal_and_straight_ingress_collision():
+    from robot_motion.grasp_visible_scene import (
+        ParallelJawSolidGeometry,
+        VisibleGraspScene,
+    )
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    scene = VisibleGraspScene(
+        points=np.array([[.04, 0.0, -.08]]),
+        target_mask=np.array([False]),
+        geometry=ParallelJawSolidGeometry(-.043, .05, .01, .0255, .07),
+    )
+
+    diagnostics = planner._visible_grasp_collision_diagnostics(
+        scene,
+        grasp_tool_tcp_world=np.eye(4),
+        distance_m=.06,
+    )
+
+    assert diagnostics["terminal_target_noncontact_points"] == 0
+    assert diagnostics["terminal_background_points"] == 0
+    assert diagnostics["approach_background_points"] == 1
+    assert diagnostics["straight_ingress_only"] is True
+    assert diagnostics["terminal_collision_blocked"] is False
+
+
+def test_straight_ingress_collision_defers_to_global_grasp_target_search(monkeypatch):
+    from robot_motion.grasp_visible_scene import (
+        ParallelJawSolidGeometry,
+        VisibleGraspScene,
+    )
+
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
+    planner.profile.position_profile.ik_execution.joint_velocity_limit_profile = (
+        "test-velocity"
+    )
+    current = {side: np.zeros(6) for side in ("left", "right")}
+
+    class Builder:
+        def solver_world_targets_for_qpos_pair(self, **_kwargs):
+            return {side: np.eye(4) for side in ("left", "right")}
+
+        def solver_world_target_from_tool_tcp_world_target(self, *, tool_tcp_world_target, **_kwargs):
+            return np.asarray(tool_tcp_world_target, dtype=float)
+
+        def tool_tcp_world_targets_for_qpos_pair(self, *, left_qpos, right_qpos):
+            poses = {side: np.eye(4) for side in ("left", "right")}
+            poses["right"][0, 3] = float(np.asarray(right_qpos)[0])
+            return poses
+
+    planner.target_builder = Builder()
+    planner._require_unmodified_target_envelope = lambda *_args, **_kwargs: None
+    planner._preflight_start_envelope = lambda **_kwargs: None
+    planner._revalidate = lambda *_args, **_kwargs: {"sample_count": 2}
+    planner._plan_constrained_approach_leg = lambda **_kwargs: pytest.fail(
+        "a straight-sweep diagnostic must defer to the global target search"
+    )
+
+    target = np.eye(4)
+    target[0, 3] = .1
+    endpoint_qpos = {side: value.copy() for side, value in current.items()}
+    endpoint_qpos["right"][0] = .1
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=endpoint_qpos,
+        seed_index=0,
+        solve_cycles=1,
+        position_residual_m=0.0,
+        orientation_residual_deg=0.0,
+    )
+    leg = grasp_trajectory_module._PlannedPathLeg(
+        endpoint=endpoint,
+        path=SimpleNamespace(
+            waypoints=(current, endpoint_qpos),
+            metadata={"planning_phase": "grasp_target"},
+            semantic_content_hash="path:test",
+        ),
+        dense_revalidation={},
+        search_attempts=(),
+    )
+    calls = []
+
+    def direct_target_search(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["planning_phase"] == "grasp_target"
+        return leg
+
+    planner._plan_path_leg = direct_target_search
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "load_joint_velocity_limit_profiles",
+        lambda: {"test-velocity": SimpleNamespace(max_velocity_deg_s=(30.0,) * 6)},
+    )
+    scene = VisibleGraspScene(
+        points=np.array([[.14, 0.0, -.08]]),
+        target_mask=np.array([False]),
+        geometry=ParallelJawSolidGeometry(-.043, .05, .01, .0255, .07),
+    )
+
+    trajectory = planner(
+        qpos_by_side=current,
+        side="right",
+        target_tool_tcp_world=target,
+        speed_scale=.2,
+        visible_scene=scene,
+        monotonic=lambda: 0.0,
+    )
+
+    assert len(calls) == 1
+    np.testing.assert_allclose(trajectory.qpos_by_side["right"][-1][0], .1)
 
 
 def test_pregrasp_branch_selection_validates_local_stage_before_exact_global_connection():
@@ -1925,6 +2151,32 @@ def test_shared_goal_result_cannot_claim_a_different_endpoint(monkeypatch, selec
         )
 
 
+def test_singularity_replay_time_scaling_slows_without_rejecting_path() -> None:
+    planner = object.__new__(RM65GraspJointTrajectoryPlanner)
+    planner.config = RM65GraspTrajectoryPlanningConfig(
+        singularity_soft_margin_deg=6.0,
+        singularity_replay_slowdown=0.5,
+    )
+    samples = {
+        "left": [
+            np.array([0.0, 0.0, 0.20, 0.0, 0.20, 0.0]),
+            np.array([0.0, 0.0, 0.02, 0.0, 0.20, 0.0]),
+            np.array([0.0, 0.0, 0.20, 0.0, 0.20, 0.0]),
+        ],
+        "right": [np.zeros(6), np.zeros(6), np.zeros(6)],
+    }
+    original = np.asarray(samples["left"], dtype=float).copy()
+    scaled, metadata = planner._apply_singularity_replay_time_scaling(
+        times=[0.0, 1.0, 2.0],
+        samples=samples,
+        moving_side="left",
+    )
+
+    assert scaled == pytest.approx([0.0, 2.0, 4.0])
+    assert metadata["policy"] == "real_teleop_soft_traversal_v1"
+    assert metadata["scaled_interval_count"] == 2
+    assert metadata["collision_rechecked"] is True
+    np.testing.assert_allclose(np.asarray(samples["left"]), original)
 def test_pregrasp_backs_away_along_tool_approach_axis() -> None:
     planner = _planner_without_assets(
         config=RM65GraspTrajectoryPlanningConfig(pregrasp_distance_m=0.06)

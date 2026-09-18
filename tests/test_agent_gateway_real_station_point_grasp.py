@@ -129,6 +129,7 @@ class _Planner:
         self.starts = 0
         self.closes = 0
         self.base_from_camera = None
+        self.visible_scene_factory = None
 
     def start(self) -> None:
         self.starts += 1
@@ -149,6 +150,7 @@ class _Planner:
         intrinsics,
         base_from_camera,
         max_candidates,
+        visible_scene_factory=None,
     ) -> PointGraspResult:
         assert image.size == (4, 3)
         assert depth_m.shape == (3, 4)
@@ -156,6 +158,7 @@ class _Planner:
         assert intrinsics["width"] == 4
         assert max_candidates == 2
         self.base_from_camera = np.asarray(base_from_camera).copy()
+        self.visible_scene_factory = visible_scene_factory
         camera_from_tcp = np.eye(4)
         camera_from_tcp[:3, 3] = (0.0, 0.0, 0.5)
         reference_from_tcp = self.base_from_camera @ camera_from_tcp
@@ -223,7 +226,13 @@ def _frame_binding():
     )
 
 
-def _provider_stack(*, revision=None, arm_reachability_evaluator=None, backend_id="vgn"):
+def _provider_stack(
+    *,
+    revision=None,
+    arm_reachability_evaluator=None,
+    backend_id="vgn",
+    captured_robot_observation_filter=None,
+):
     source = _Source()
     binding = RealPerceptionSourceBinding(
         camera_sources={"front": source},
@@ -292,6 +301,7 @@ def _provider_stack(*, revision=None, arm_reachability_evaluator=None, backend_i
         frame_binding=frame_binding,
         current_station_revision=lambda: revision["value"],
         arm_reachability_evaluator=arm_reachability_evaluator,
+        captured_robot_observation_filter=captured_robot_observation_filter,
     )
     return source, revision, planner, registration, provider
 
@@ -311,6 +321,27 @@ def _request(*, include_arm_reachability=None):
         expected_station_revision=7,
     )
 
+
+def test_graspgenx_capture_filter_is_wired_to_planner() -> None:
+    qpos = SimpleNamespace(
+        qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
+        semantic_content_hash="measured-qpos:test",
+        measured_at=9.95,
+        available_at=9.952,
+        revision=1,
+        evidence_refs=("qpos:test",),
+    )
+    _, _, planner, _, provider = _provider_stack(
+        backend_id="graspgenx",
+        captured_robot_observation_filter=lambda **_kwargs: None,
+    )
+    provider.motion_port = SimpleNamespace(
+        latest_measured_qpos=lambda: qpos,
+    )
+
+    provider.plan_request(_request())
+
+    assert planner.visible_scene_factory is not None
 
 def test_station_point_grasp_route_is_live_bound_read_only_and_proposal_only() -> None:
     source, _revision, planner, registration, provider = _provider_stack()

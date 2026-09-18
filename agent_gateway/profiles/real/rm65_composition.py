@@ -48,6 +48,9 @@ from .exclusive_factory import (
     ExclusiveRealAgentPrimitiveDeployment,
     assemble_exclusive_rm65_agent_primitive_deployment,
 )
+from .grasp_approach_plan import (
+    DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
+)
 from .localization_deployment import (
     RealObjectLocalizationRegistration,
     build_real_object_localization_registration,
@@ -236,6 +239,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     runtime_session_id: str,
     control_domain_id: str,
     embodiment_instance_id: str,
+    grasp_execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     max_retained_operations: int = 16,
     peer_idle_timeout_sec: float = 10.0,
     grant_lifetime_sec: float = 5.0,
@@ -848,6 +852,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             captured_robot_observation_filter=(
                 captured_robot_observation_filter
             ),
+            non_motion_read_window=lower.ports.non_motion_read_window,
             perception_provider_factory=provider_factory,
             measured_qpos_observer=(
                 measured_qpos_observer if rgb_camera_geometry is not None else None
@@ -856,6 +861,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             # The aggregate application resource closes the shared store after
             # Gateway executors/models and cameras have settled.
             owns_artifact_store=False,
+            grasp_execution_operation_timeout_sec=grasp_execution_operation_timeout_sec,
             max_retained_operations=max_retained_operations,
             clock=clock,
             sleep=sleep,

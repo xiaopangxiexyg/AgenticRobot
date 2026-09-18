@@ -714,6 +714,12 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             profile=resolved,
             ports=SimpleNamespace(
                 last_emergency_stop_receipt=None,
+                position_force_guard=SimpleNamespace(
+                    snapshot=lambda: {
+                        "motion_ready": False,
+                        "fault": {"reason": "force_read_stale", "side": "right"},
+                    }
+                ),
                 arm_backend_diagnostics_snapshot=lambda: {
                     "left": {"background_fault": None},
                     "right": {
@@ -802,6 +808,11 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert events[1]["emergency_stop_latched"] is False
     assert events[1]["emergency_stop_confirmed"] is False
     assert events[1]["control_fault"] is None
+    assert events[1]["position_force_guard"] == {
+        "motion_ready": False,
+        "fault": {"reason": "force_read_stale", "side": "right"},
+    }
+    assert events[1]["position_force_guard_snapshot_error"] is None
     assert events[1]["measurement_sampler"]["sample_count"] == 7
     assert events[1]["arm_backend_diagnostics"]["right"] == {
         "background_fault": (

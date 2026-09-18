@@ -32,6 +32,13 @@ from dataset_contracts.grasp_rgbd_snapshot import (
     GRASP_RGBD_SNAPSHOT_MEDIA_TYPE, GRASP_RGBD_SNAPSHOT_ENCODING,
 )
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPort
+from robot_motion.grasp_visible_scene import (
+    ParallelJawSolidGeometry,
+    VisibleGraspScene,
+)
+from robot_motion.rm65.captured_robot_observations import (
+    RM65CapturedRobotObservationFilterResult,
+)
 from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
@@ -340,6 +347,7 @@ class StationBoundPointGraspProvider:
             | None
         ) = None,
         motion_port: RealAgentMotionPort | None = None,
+        captured_robot_observation_filter: Callable[..., object] | None = None,
     ) -> None:
         if not isinstance(registration, StationBoundPointGraspRegistration):
             raise TypeError("registration must be typed.")
@@ -390,6 +398,14 @@ class StationBoundPointGraspProvider:
         if motion_port is not None and not isinstance(motion_port, RealAgentMotionPort):
             raise TypeError("motion_port must be typed or None")
         self.motion_port = motion_port
+        if (
+            captured_robot_observation_filter is not None
+            and not callable(captured_robot_observation_filter)
+        ):
+            raise TypeError(
+                "captured_robot_observation_filter must be callable or None"
+            )
+        self.captured_robot_observation_filter = captured_robot_observation_filter
         self._lock = threading.Lock()
         self._started = False
 
@@ -474,6 +490,60 @@ class StationBoundPointGraspProvider:
                 qpos_cut is None or abs(qpos_cut.measured_at-capture.acquired_at) > 0.2
             ):
                 raise RuntimeError("Point-grasp snapshot lacks a camera-matched measured qpos cut")
+            visible_scene_factory = None
+            if (
+                self.registration.profile.backend_id == "graspgenx"
+                and self.captured_robot_observation_filter is not None
+            ):
+                if qpos_cut is None:
+                    raise RuntimeError(
+                        "GraspGenX terminal collision prefilter requires a "
+                        "camera-matched measured qpos cut"
+                    )
+                capture_qpos_by_side = qpos_cut.qpos_by_side
+                capture_filter = self.captured_robot_observation_filter
+                capture_source_from_camera = source_from_camera.copy()
+
+                def build_visible_scene(
+                    *,
+                    depth_m: np.ndarray,
+                    target_mask: np.ndarray,
+                    intrinsics: Mapping[str, float | int],
+                    geometry: ParallelJawSolidGeometry,
+                ) -> VisibleGraspScene:
+                    filtered = capture_filter(
+                        depth_m=depth_m,
+                        target_mask=target_mask,
+                        intrinsics=intrinsics,
+                        source_from_camera=capture_source_from_camera,
+                        capture_qpos_by_side=capture_qpos_by_side,
+                    )
+                    if not isinstance(
+                        filtered, RM65CapturedRobotObservationFilterResult
+                    ):
+                        raise TypeError(
+                            "captured_robot_observation_filter returned the wrong type"
+                        )
+                    # Candidate poses inside GraspGenX are camera-frame poses;
+                    # keep the scene in that same frame. The factory receives
+                    # the zero-offset grasp geometry used by the model, while
+                    # the output TCP/tool offset is restored by the planner.
+                    return VisibleGraspScene.from_depth(
+                        depth_m=filtered.depth_m,
+                        target_mask=np.asarray(target_mask, dtype=np.bool_),
+                        intrinsics=intrinsics,
+                        reference_from_camera=np.eye(4, dtype=np.float64),
+                        geometry=geometry,
+                        capture_qpos_by_side=capture_qpos_by_side,
+                        capture_self_observation_evidence=filtered.evidence,
+                    )
+
+                # Wire the capture-filtered visible scene into GraspGenX
+                # candidate generation. Without this assignment the factory
+                # above is defined but the planner silently receives None and
+                # terminal background prefiltering is skipped.
+                visible_scene_factory = build_visible_scene
+
             planned = self.planner.plan(
                 image,
                 capture.depth_m,
@@ -481,6 +551,11 @@ class StationBoundPointGraspProvider:
                 intrinsics=capture.intrinsics,
                 base_from_camera=reference_from_camera,
                 max_candidates=request.parameters["max_candidates"],
+                **(
+                    {"visible_scene_factory": visible_scene_factory}
+                    if visible_scene_factory is not None
+                    else {}
+                ),
             )
             if self._current_station_revision() != expected_revision:
                 raise RuntimeError(

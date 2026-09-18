@@ -39,6 +39,7 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
 )
 from deployments.perception.sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner
 from deployments.perception.dmtac_grasp_overlay import reviewed_4b2_cad_solid_geometry
+from robot_motion.grasp_visible_scene import VisibleGraspScene
 
 
 class _FakeSocket:
@@ -769,7 +770,7 @@ def test_candidate_selection_balances_approaches_and_closing_axis_variants() -> 
     )
 
     assert representatives == [0, 5, 6, 7]
-    assert selected == [0, 5, 1, 2]
+    assert selected == [0, 5, 6, 7]
 
 
 @pytest.mark.parametrize("maximum", [2, 4, 5])
@@ -931,7 +932,9 @@ def test_planner_normalizes_float32_model_rotation_for_strict_frame_contract(
     planner.close()
 
 
-def test_noncontact_endpoint_uses_open_jaws_not_estimated_closure_width(tmp_path: Path) -> None:
+def test_visible_collision_proxy_uses_open_gripper_and_keeps_ingress_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     depth = np.zeros((80, 80), dtype=np.float32)
     mask = np.zeros(depth.shape, dtype=bool)
     mask[38:43, 28:53] = True
@@ -943,22 +946,118 @@ def test_noncontact_endpoint_uses_open_jaws_not_estimated_closure_width(tmp_path
         model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(mask),
         client=_PlannerClient(model_pose[None], np.asarray([.9])),
     )
+    endpoint_openings = []
+    approach_openings = []
+
+    def _collision_with_terminal_contact(
+        _scene, _pose, *, opening_m, contact_depth_m,
+    ):
+        endpoint_openings.append(float(opening_m))
+        assert contact_depth_m == pytest.approx(.006)
+        return 0, 0, 0
+
+    def _approach(
+        _scene, _pose, *, opening_m, distance_m,
+        allow_terminal_target_contact, terminal_target_contact_depth_m,
+    ):
+        approach_openings.append((float(opening_m), float(distance_m)))
+        assert allow_terminal_target_contact is True
+        assert terminal_target_contact_depth_m == pytest.approx(.006)
+        return 1, 1
+
+    monkeypatch.setattr(
+        VisibleGraspScene,
+        "collision_counts_with_terminal_target_contact",
+        _collision_with_terminal_contact,
+    )
+    monkeypatch.setattr(
+        VisibleGraspScene, "approach_collision_counts", _approach
+    )
     planner.start()
     try:
         result = planner.plan(Image.new("RGB", (80, 80)), depth, pixel_uv=(40, 40),
             intrinsics={"width": 80, "height": 80, "fx": 1000., "fy": 1000., "cx": 40., "cy": 40.},
             base_from_camera=np.eye(4), max_candidates=1)
         candidate = result.candidates[0]
-        pose = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
-        from robot_motion.grasp_visible_scene import VisibleGraspScene
-        scene = VisibleGraspScene.from_depth(depth_m=depth, target_mask=mask,
-            intrinsics={"fx": 1000., "fy": 1000., "cx": 40., "cy": 40.},
-            reference_from_camera=np.eye(4), geometry=planner.solid_geometry)
-        assert scene.collision_counts(pose, opening_m=candidate.gripper_width_m)[0] > 0
-        assert scene.approach_collision_counts(pose, opening_m=.07, distance_m=.06) == (0, 0)
+        expected_opening = planner.max_gripper_width_m
+        assert endpoint_openings == pytest.approx([expected_opening])
+        assert approach_openings == pytest.approx([(expected_opening, .06)])
         assert candidate.visible_collision_free
         assert candidate.model_score == pytest.approx(.9)
-        np.testing.assert_allclose(pose[:2, 3], model_pose[:2, 3])
+    finally:
+        planner.close()
+
+
+def test_capture_filtered_visible_scene_prefilters_terminal_background_before_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    depth = np.zeros((40, 40), dtype=np.float32)
+    mask = np.zeros(depth.shape, dtype=bool)
+    mask[18:23, 18:23] = True
+    depth[mask] = 1.0
+    poses = []
+    for x in (0.0, 0.010):
+        pose = np.eye(4, dtype=np.float64)
+        pose[0, 3] = x
+        pose[2, 3] = 0.975
+        poses.append(pose)
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(mask),
+        client=_PlannerClient(
+            np.stack(poses), np.asarray((.9, .8), dtype=np.float64)
+        ),
+    )
+    endpoint_scene_sizes = []
+
+    def _terminal(scene, pose, *, opening_m, contact_depth_m):
+        del opening_m, contact_depth_m
+        endpoint_scene_sizes.append(len(scene.points))
+        if len(scene.points) == 2 and float(pose[0, 3]) < 0.005:
+            return 0, 0, 1
+        return 0, 0, 0
+
+    monkeypatch.setattr(
+        VisibleGraspScene,
+        "collision_counts_with_terminal_target_contact",
+        _terminal,
+    )
+    monkeypatch.setattr(
+        VisibleGraspScene,
+        "approach_collision_counts",
+        lambda *_args, **_kwargs: (0, 0),
+    )
+
+    factory_calls = []
+
+    def _factory(*, depth_m, target_mask, intrinsics, geometry):
+        del depth_m, intrinsics
+        factory_calls.append(target_mask.copy())
+        return VisibleGraspScene(
+            points=np.asarray(((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))),
+            target_mask=np.asarray((True, False), dtype=np.bool_),
+            geometry=geometry,
+        )
+
+    planner.start()
+    try:
+        result = planner.plan(
+            Image.new("RGB", (40, 40)), depth, pixel_uv=(20, 20),
+            intrinsics={
+                "width": 40, "height": 40,
+                "fx": 100.0, "fy": 100.0, "cx": 20.0, "cy": 20.0,
+            },
+            base_from_camera=np.eye(4), max_candidates=1,
+            visible_scene_factory=_factory,
+        )
+        assert len(factory_calls) == 1
+        np.testing.assert_array_equal(factory_calls[0], mask)
+        assert endpoint_scene_sizes == [2, 2]
+        assert len(result.candidates) == 1
+        assert result.candidates[0].model_score == pytest.approx(.8)
+        assert planner.last_filter_summary["terminal_background_prefilter_enabled"]
+        assert planner.last_filter_summary["terminal_background_collision_rejected"] == 1
+        assert planner.last_filter_summary["visible_scene_point_count"] == 2
+        assert planner.last_filter_summary["visible_scene_background_point_count"] == 1
     finally:
         planner.close()
 

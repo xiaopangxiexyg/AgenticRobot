@@ -1017,6 +1017,7 @@ def assemble_real_agent_primitive_gateway_session(
     station_point_grasp_reachability_evaluator: Callable[..., object] | None = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
+    non_motion_read_window: Callable[[], object] | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     revision_tracker: AgentStationRevisionTracker | None = None,
@@ -1305,6 +1306,9 @@ def assemble_real_agent_primitive_gateway_session(
                 current_station_revision=lambda: producer.current_station_revision,
                 arm_reachability_evaluator=(station_point_grasp_reachability_evaluator),
                 motion_port=port,
+                captured_robot_observation_filter=(
+                    captured_robot_observation_filter
+                ),
             )
             station_point_grasp_executor = build_station_bound_point_grasp_executor(
                 registration=point_grasp_registration,
@@ -1361,6 +1365,7 @@ def assemble_real_agent_primitive_gateway_session(
                         lambda: producer.current_station_revision
                     ),
                     clock=clock,
+                    non_motion_read_window=non_motion_read_window,
                 )
                 grasp_approach_plan_executor = build_real_grasp_approach_plan_executor(
                     registration=plan_registration,

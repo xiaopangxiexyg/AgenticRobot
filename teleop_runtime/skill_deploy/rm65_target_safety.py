@@ -112,6 +112,7 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
         station_world_from_arm_base_by_side: Mapping[str, np.ndarray],
         station_world_frame_id: str,
         envelope_profile_path: str | Path,
+        target_world_from_solver_world: np.ndarray | None = None,
         execution_epoch: int = 1,
         clock_domain_id: str = "python-time-time-wall-clock",
     ) -> ExclusiveRM65SkillTargetSafetyRuntime:
@@ -122,6 +123,7 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
                 side: station_world_frame_id for side in ("left", "right")
             },
             target_world_from_base_by_side=station_world_from_arm_base_by_side,
+            target_world_from_solver_world=target_world_from_solver_world,
         )
         profile = load_tcp_pose_envelope_profile_from_target_frame_binding(
             envelope_profile_path,
@@ -176,6 +178,12 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
         required_sides = tuple(self.envelope_profile.anchor_required_sides)
         if not set(required_sides).issubset(tool_targets):
             raise RuntimeError("target builder omitted a required TCP anchor side.")
+        reference_tool_targets = {
+            side: self.envelope_filter.reference_tool_tcp_world_target_from_solver_tool_tcp_world_target(
+                tool_targets[side]
+            )
+            for side in required_sides
+        }
         anchor = (
             None
             if not required_sides
@@ -184,9 +192,7 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
                 profile=self.envelope_profile,
                 execution_epoch=self.execution_epoch,
                 clock_domain_id=self.clock_domain_id,
-                tcp_pose_by_side={
-                    side: tool_targets[side] for side in required_sides
-                },
+                tcp_pose_by_side=reference_tool_targets,
                 captured_at_by_side={side: timestamp for side in required_sides},
             )
         )

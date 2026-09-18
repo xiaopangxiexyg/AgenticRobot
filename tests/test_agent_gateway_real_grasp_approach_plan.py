@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from agent_gateway.profiles.real.grasp_approach_plan import (
+    DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ROUTE_ID_V1,
     BoundedRealGraspApproachPlanStore,
     RealGraspApproachPlanLookupError,
@@ -109,7 +110,9 @@ def _no_op_point_grasp_validator(
     )
 
 
-def _planning_fixture(*, planner):
+def _planning_fixture(
+    *, planner, execution_operation_timeout_sec=DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC
+):
     from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
     # Explicit geometry fixture: route tests exercise control/plan lifecycles,
     # not physical grasp success. The real profile reads hash-bound Artifacts.
@@ -188,6 +191,7 @@ def _planning_fixture(*, planner):
         max_measured_qpos_age_ms=200,
         min_speed_scale=0.05,
         max_speed_scale=1.0,
+        execution_operation_timeout_sec=execution_operation_timeout_sec,
     )
     candidate_pose = np.eye(4, dtype=float)
     candidate_pose[:3, 3] = (0.25, -0.10, 0.30)
@@ -305,9 +309,19 @@ def test_planning_route_deadline_outlives_internal_planner_budget() -> None:
     assert route.max_operation_duration_ms > int(
         RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC * 1000.0
     )
+    execute_route = registration.execute_skill.routes[0]
+    assert execute_route.max_operation_duration_ms == int(
+        DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC * 1000.0
+    )
     assert route.control_effect_class == "read_only"
     assert route.may_move_robot is False
 
+def test_execution_route_deadline_is_configurable() -> None:
+    registration, *_ = _planning_fixture(
+        planner=lambda **_kwargs: None,
+        execution_operation_timeout_sec=180.0,
+    )
+    assert registration.execute_skill.routes[0].max_operation_duration_ms == 180_000
 
 def test_graspgenx_missing_snapshot_cannot_publish_an_executable_plan() -> None:
     calls = []
@@ -342,7 +356,7 @@ def test_graspgenx_snapshot_failure_is_retained_as_read_only_rejection(caplog, m
 def test_start_state_rejection_keeps_subject_and_unchanged_ingress_bound() -> None:
     def planner(**_kwargs):
         raise RM65GraspTrajectoryPlanningError("start_state_safety_envelope_blocked", details={
-            "envelope_projection_subject": "current_measured_solver_tcp",
+            "envelope_projection_subject": "current_measured_tool_tcp_in_envelope_reference_frame",
             "maximum_path_envelope_ingress_distance_m": 0.16,
             "path_envelope_ingress_distance_excess_m": 0.0007339041,
             "envelope_ingress_rejection": "initial_distance_exceeds_limit",
@@ -352,7 +366,7 @@ def test_start_state_rejection_keeps_subject_and_unchanged_ingress_bound() -> No
     registration.payload_validator.validate_execution_result(result)
     assert result["reason_code"] == "start_state_safety_envelope_blocked"
     assert result["diagnostics"]["maximum_path_envelope_ingress_distance_m"] == 0.16
-    assert result["diagnostics"]["envelope_projection_subject"] == "current_measured_solver_tcp"
+    assert result["diagnostics"]["envelope_projection_subject"] == "current_measured_tool_tcp_in_envelope_reference_frame"
     assert plan is None
 
 
@@ -411,6 +425,40 @@ def test_path_found_is_read_only_and_produces_one_use_immutable_plan() -> None:
             expected_station_revision=7,
             now=10.2,
         )
+
+
+def test_path_planning_uses_the_non_motion_read_window() -> None:
+    events = []
+
+    class Window:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            events.append("exit")
+            return False
+
+    registration, provider, _store, _port, request, operation = _planning_fixture(
+        planner=lambda **kwargs: _stationary_trajectory(kwargs["qpos_by_side"])
+    )
+    provider.non_motion_read_window = lambda: Window()
+
+    original_reader = provider.visible_scene_reader
+
+    def reader(source_operation, source_result):
+        events.append("reader")
+        assert original_reader is not None
+        return original_reader(source_operation, source_result)
+
+    provider.visible_scene_reader = reader
+
+    result, plan = provider.plan_request(request, operation)
+
+    assert result["planning_status"] == "path_found"
+    assert plan is not None
+    assert events == ["enter", "reader", "exit"]
+    registration.payload_validator.validate_execution_result(result)
 
 
 def test_planner_rejection_returns_evidence_without_motion_or_hold() -> None:

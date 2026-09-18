@@ -199,6 +199,10 @@ _BACKGROUND_WORKER_TERMINAL_STAGE = "rm65_background_stream_worker_terminal"
 # and no new motion can be admitted while these calls run.
 _EMERGENCY_STOP_RETRY_DELAY_SEC = 0.05
 _EMERGENCY_STOP_ARM_STOP_ATTEMPTS = 2
+# The RM65 SDK requires at least 50 ms between two actual force queries on one
+# handle.  Keep this as one backend-level contract: the guard poll period is
+# not the only possible caller of ``read_force_data``.
+_RM65_FORCE_DATA_MIN_INTERVAL_SEC = 0.05
 _RM65_HARDWARE_MEASUREMENT_CLOCK_DOMAIN_ID = "local_wall_time"
 
 
@@ -1133,11 +1137,21 @@ class RM65ArmBackend(EffectorBackend):
         self._send_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._solver_lock = threading.RLock()
-        # Dedicated state connections may serve both dataset qpos polling and
-        # the position-force safety guard.  The RM65 SDK handle is not safe for
-        # concurrent request/response calls, so serialize reads without
-        # contending with the independent command connection.
-        self._hardware_read_lock = threading.RLock()
+        # Each backend owns one Arm/RoboticArm SDK object and one underlying
+        # handle.  The vendor request/response calls are not safe to overlap
+        # with one another: a CANFD write can otherwise race a qpos or force
+        # read and make the force watchdog observe a false stale interval.
+        # Keep one lock for every synchronous call on that handle.  Retain the
+        # old read-lock attribute as an alias because diagnostics and tests use
+        # its name, but do not let it imply a separate state connection.
+        self._hardware_io_lock = threading.RLock()
+        self._hardware_read_lock = self._hardware_io_lock
+        # Serialize the pacing decision as well as the SDK call.  Without a
+        # dedicated force-query lock, concurrent readers can all observe the
+        # same previous timestamp, sleep, and then cascade through repeated
+        # 50 ms waits.  That turns a bounded SDK pacing interval into an
+        # unbounded application-level read delay.
+        self._force_query_lock = threading.Lock()
         self._last_force_query_monotonic: float | None = None
         self._singularity_analysis_lock = threading.RLock()
         self._emergency_stopped = False
@@ -6591,9 +6605,15 @@ class RM65ArmBackend(EffectorBackend):
     ) -> object:
         """Invoke one safety/lifecycle SDK call through the optional gate."""
 
+        def serialized_backend_call() -> object:
+            # The adapter is a pre-SDK admission seam; the actual vendor call
+            # still has to be serialized with qpos/force reads and CANFD sends.
+            with self._hardware_io_lock:
+                return backend_call()
+
         adapter = self._pre_sdk_control_adapter
         if adapter is None:
-            return backend_call()
+            return serialized_backend_call()
         context = RM65ControlDispatchContext.create(
             side=str(self.config.side),
             seam_id=seam_id,
@@ -6603,7 +6623,7 @@ class RM65ArmBackend(EffectorBackend):
             sdk_method=sdk_method,
             attempt_sequence=attempt_sequence,
         )
-        return adapter.invoke(context=context, backend_call=backend_call)
+        return adapter.invoke(context=context, backend_call=serialized_backend_call)
 
     def _send_joint_target(
         self,
@@ -6655,9 +6675,15 @@ class RM65ArmBackend(EffectorBackend):
                 radio=int(self.config.canfd_radio),
             )
 
+        def serialized_backend_call() -> object:
+            # RM65ArmBackend currently has one SDK handle per arm.  Do not
+            # overlap its high-rate CANFD write with a force or state query.
+            with self._hardware_io_lock:
+                return backend_call()
+
         adapter = self._pre_sdk_dispatch_adapter
         if adapter is None:
-            return backend_call()
+            return serialized_backend_call()
         source = str(command_source or "").strip()
         if not source:
             raise RuntimeError(
@@ -6673,7 +6699,7 @@ class RM65ArmBackend(EffectorBackend):
             target_sequence=target_sequence,
             execution_work_item=execution_work_item,
         )
-        return adapter.invoke(context=context, backend_call=backend_call)
+        return adapter.invoke(context=context, backend_call=serialized_backend_call)
 
     def refresh_state_from_hardware(
         self,
@@ -6856,53 +6882,69 @@ class RM65ArmBackend(EffectorBackend):
         # Get_Force_Data calls.  Pacing only the monitor loop is insufficient:
         # an intervening qpos read can shift one force call later and make the
         # next call occur less than 50 ms afterwards.  Enforce the interval at
-        # the serialized SDK boundary while leaving the lock free during the
-        # wait so qpos feedback can continue.
-        while True:
-            lock_wait_started = time.perf_counter()
-            lock_wait_cpu_started = time.thread_time()
-            with self._hardware_read_lock:
-                lock_acquired = time.perf_counter()
-                lock_wait_wall_sec += max(0.0, lock_acquired - lock_wait_started)
-                lock_wait_cpu_sec += max(
+        # the serialized SDK boundary while leaving the hardware I/O lock free
+        # during the wait so qpos feedback can continue.  The force-query lock
+        # prevents multiple callers from independently sleeping on the same
+        # previous timestamp.
+        with self._force_query_lock:
+            while True:
+                lock_wait_started = time.perf_counter()
+                lock_wait_cpu_started = time.thread_time()
+                with self._hardware_read_lock:
+                    lock_acquired = time.perf_counter()
+                    lock_wait_wall_sec += max(
+                        0.0, lock_acquired - lock_wait_started
+                    )
+                    lock_wait_cpu_sec += max(
+                        0.0,
+                        time.thread_time() - lock_wait_cpu_started,
+                    )
+                    query_now = time.monotonic()
+                    previous_query = self._last_force_query_monotonic
+                    if previous_query is None:
+                        wait_sec = 0.0
+                    else:
+                        elapsed_sec = query_now - previous_query
+                        if elapsed_sec < 0.0:
+                            # ``monotonic`` should not move backwards, but a
+                            # replaced clock in a test/runtime wrapper must
+                            # not turn a 50 ms contract into an unbounded
+                            # sleep.
+                            self._last_force_query_monotonic = None
+                            wait_sec = 0.0
+                        else:
+                            wait_sec = (
+                                _RM65_FORCE_DATA_MIN_INTERVAL_SEC
+                                - elapsed_sec
+                            )
+                    if wait_sec <= 0.0:
+                        self._last_force_query_monotonic = query_now
+                        sdk_call_started = time.perf_counter()
+                        sdk_call_cpu_started = time.thread_time()
+                        try:
+                            result = self.arm.Get_Force_Data()
+                        finally:
+                            sdk_call_wall_sec += max(
+                                0.0,
+                                time.perf_counter() - sdk_call_started,
+                            )
+                            sdk_call_cpu_sec += max(
+                                0.0,
+                                time.thread_time() - sdk_call_cpu_started,
+                            )
+                        break
+                pacing_wait_requested_sec += max(0.0, wait_sec)
+                pacing_wait_started = time.perf_counter()
+                pacing_wait_cpu_started = time.thread_time()
+                time.sleep(wait_sec)
+                pacing_wait_wall_sec += max(
                     0.0,
-                    time.thread_time() - lock_wait_cpu_started,
+                    time.perf_counter() - pacing_wait_started,
                 )
-                query_now = time.monotonic()
-                previous_query = self._last_force_query_monotonic
-                wait_sec = (
-                    0.0
-                    if previous_query is None
-                    else 0.05 - (query_now - previous_query)
+                pacing_wait_cpu_sec += max(
+                    0.0,
+                    time.thread_time() - pacing_wait_cpu_started,
                 )
-                if wait_sec <= 0.0:
-                    self._last_force_query_monotonic = query_now
-                    sdk_call_started = time.perf_counter()
-                    sdk_call_cpu_started = time.thread_time()
-                    try:
-                        result = self.arm.Get_Force_Data()
-                    finally:
-                        sdk_call_wall_sec += max(
-                            0.0,
-                            time.perf_counter() - sdk_call_started,
-                        )
-                        sdk_call_cpu_sec += max(
-                            0.0,
-                            time.thread_time() - sdk_call_cpu_started,
-                        )
-                    break
-            pacing_wait_requested_sec += max(0.0, wait_sec)
-            pacing_wait_started = time.perf_counter()
-            pacing_wait_cpu_started = time.thread_time()
-            time.sleep(wait_sec)
-            pacing_wait_wall_sec += max(
-                0.0,
-                time.perf_counter() - pacing_wait_started,
-            )
-            pacing_wait_cpu_sec += max(
-                0.0,
-                time.thread_time() - pacing_wait_cpu_started,
-            )
         validation_wall_started = time.perf_counter()
         validation_cpu_started = time.thread_time()
         if not isinstance(result, (tuple, list)) or len(result) != 5:

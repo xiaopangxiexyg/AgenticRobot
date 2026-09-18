@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -628,6 +629,65 @@ def test_rm65_backend_serializes_concurrent_force_reads():
         assert not thread.is_alive()
     assert arm.max_active_calls == 1
     assert arm.call_times[1] - arm.call_times[0] >= 0.045
+
+
+def test_rm65_backend_serializes_force_read_with_canfd_send():
+    class FakeArm:
+        def __init__(self):
+            self.active_calls = 0
+            self.max_active_calls = 0
+            self.lock = threading.Lock()
+            self.force_started = threading.Event()
+
+        def _enter(self):
+            with self.lock:
+                self.active_calls += 1
+                self.max_active_calls = max(self.max_active_calls, self.active_calls)
+
+        def _leave(self):
+            with self.lock:
+                self.active_calls -= 1
+
+        def Get_Force_Data(self):
+            self._enter()
+            self.force_started.set()
+            try:
+                time.sleep(0.03)
+                values = [0, 0, 0, 0, 0, 0]
+                return 0, values, values, values, values
+            finally:
+                self._leave()
+
+        def Movej_CANFD(self, _joint_deg, **_kwargs):
+            self._enter()
+            try:
+                time.sleep(0.03)
+                return 0
+            finally:
+                self._leave()
+
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="127.0.0.1",
+            side="left",
+            connect_hardware=False,
+        )
+    )
+    arm = FakeArm()
+    backend.arm = arm
+    force_thread = threading.Thread(target=backend.read_force_data)
+    force_thread.start()
+    assert arm.force_started.wait(timeout=0.5)
+    send_thread = threading.Thread(
+        target=lambda: backend._send_joint_target(np.zeros(6))
+    )
+    send_thread.start()
+    force_thread.join(timeout=0.5)
+    send_thread.join(timeout=0.5)
+
+    assert not force_thread.is_alive()
+    assert not send_thread.is_alive()
+    assert arm.max_active_calls == 1
 
 
 def test_bimanual_emergency_stop_requests_both_arms_in_parallel():

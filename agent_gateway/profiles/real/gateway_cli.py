@@ -57,6 +57,10 @@ from .point_grasp_deployment import (
     DEFAULT_POINT_GRASP_BACKEND_ID,
     SUPPORTED_POINT_GRASP_BACKEND_IDS,
 )
+from .grasp_approach_plan import (
+    DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
+    REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC,
+)
 from .rm65_composition import (
     ExclusiveRM65AgentPrimitiveComposition,
     assemble_exclusive_rm65_agent_primitive_composition,
@@ -204,6 +208,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_SKILL_MOTION_TRACE_MAX_DURATION_SEC,
         help="fixed preallocated trace duration (default: 120s)",
+    )
+    parser.add_argument(
+        "--execution-operation-timeout-sec",
+        type=float,
+        default=DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
+        help=(
+            "maximum grasp-approach execution operation duration "
+            "(default: 120s)"
+        ),
     )
     parser.add_argument(
         "--debug-motion-skill",
@@ -446,6 +459,17 @@ def _stopped_payload(
         composition.deployment.gateway_session.service.emergency_stop_receipt
     )
     control_fault = composition.application.control_fault
+    position_force_guard = getattr(composition.lower.ports, "position_force_guard", None)
+    position_force_guard_snapshot = None
+    position_force_guard_snapshot_error = None
+    snapshot_guard = getattr(position_force_guard, "snapshot", None)
+    if callable(snapshot_guard):
+        try:
+            position_force_guard_snapshot = snapshot_guard()
+        except Exception as exc:  # noqa: BLE001 - preserve shutdown evidence.
+            position_force_guard_snapshot_error = (
+                f"{type(exc).__name__}: {exc}"
+            )[:512]
     lower_hold_proved = bool(hold is not None and hold.succeeded)
     lower_emergency_stop_proved = bool(
         emergency_stop is not None
@@ -474,6 +498,8 @@ def _stopped_payload(
             if control_fault is None
             else f"{type(control_fault).__name__}: {control_fault}"[:512]
         ),
+        "position_force_guard": position_force_guard_snapshot,
+        "position_force_guard_snapshot_error": position_force_guard_snapshot_error,
         "measurement_sampler": (
             composition.lower.ports.measurement_sampler_snapshot()
         ),
@@ -637,6 +663,15 @@ def main(argv: list[str] | None = None) -> int:
         or args.motion_trace_max_duration_sec <= 0.0
     ):
         parser.error("--motion-trace-max-duration-sec must be positive and finite")
+    if (
+        not np.isfinite(float(args.execution_operation_timeout_sec))
+        or args.execution_operation_timeout_sec
+        <= REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC
+    ):
+        parser.error(
+            "--execution-operation-timeout-sec must be finite and exceed "
+            f"{REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC:g}s"
+        )
     if args.debug_motion_skill and args.motion_trace_root is None:
         parser.error("--debug-motion-skill requires --motion-trace-root")
 
@@ -904,6 +939,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_session_id=runtime_session_id,
         control_domain_id=args.control_domain_id,
         embodiment_instance_id=embodiment_instance_id,
+        grasp_execution_operation_timeout_sec=args.execution_operation_timeout_sec,
         max_retained_operations=args.max_retained_operations,
         peer_idle_timeout_sec=args.peer_idle_timeout_sec,
         grant_lifetime_sec=args.grant_lifetime_sec,

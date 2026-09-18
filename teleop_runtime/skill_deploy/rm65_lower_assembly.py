@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+import numpy as np
+
 from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
 )
@@ -32,7 +34,10 @@ from .rm65_ports import (
     RM65SkillTargetBuilder,
     build_exclusive_rm65_skill_position_force_guard,
 )
-from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
+from .rm65_profile import (
+    RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1,
+    ResolvedExclusiveRM65SkillDeploymentProfile,
+)
 from .rm65_target_safety import (
     ExclusiveRM65SkillStartupSafetyBinder,
     ExclusiveRM65SkillTargetSafetyRuntime,
@@ -310,13 +315,22 @@ def assemble_exclusive_rm65_skill_lower(
             ),
         ),
     )
+    canonical_station_from_solver_world = np.linalg.inv(
+        np.asarray(profile.scene_world_from_canonical_station, dtype=float)
+    )
+    canonical_station_from_arm_base_by_side = {
+        side: canonical_station_from_solver_world
+        @ np.asarray(profile.scene_world_from_arm_base_by_side[side], dtype=float)
+        for side in ("left", "right")
+    }
     target_safety = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
         target_builder=target_builder,
         station_world_from_arm_base_by_side=(
-            profile.scene_world_from_arm_base_by_side
+            canonical_station_from_arm_base_by_side
         ),
-        station_world_frame_id=profile.station_world_frame_id,
+        station_world_frame_id=RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1,
         envelope_profile_path=profile.envelope_profile_path,
+        target_world_from_solver_world=canonical_station_from_solver_world,
     )
     startup_admission = ExclusiveRM65SkillStartupSafetyBinder(
         ports=ports,

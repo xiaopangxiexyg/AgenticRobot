@@ -8,6 +8,7 @@ the resulting fresh, session-local immutable plan exactly once.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import numpy as np
 
 import logging
@@ -146,7 +147,11 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
         )
     return read
 
-_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = 15.0
+REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = 15.0
+_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = (
+    REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC
+)
+DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC = 120.0
 _LOGGER = logging.getLogger(__name__)
 
 REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1 = "real.rm65.perception.plan_grasp_approach"
@@ -394,6 +399,7 @@ def build_real_grasp_approach_plan_registration(
     max_measured_qpos_age_ms: int,
     min_speed_scale: float,
     max_speed_scale: float,
+    execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
 ) -> RealGraspApproachPlanRegistration:
     """Build both halves of the paired contract without runtime effects."""
 
@@ -402,6 +408,14 @@ def build_real_grasp_approach_plan_registration(
     source_profile = point_grasp_registration.profile
     source_binding = point_grasp_registration.binding
     source_route = point_grasp_registration.skill.routes[0]
+    execution_timeout_sec = _finite(
+        execution_operation_timeout_sec,
+        field_name="execution_operation_timeout_sec",
+    )
+    if execution_timeout_sec <= REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC:
+        raise ValueError(
+            "execution_operation_timeout_sec must exceed the activation/cleanup grace."
+        )
     profile = RealGraspApproachPlanProfile(
         component_id=component_id,
         side=side,
@@ -591,7 +605,7 @@ def build_real_grasp_approach_plan_registration(
         may_open_publication=False,
         requires_operator_confirmation=True,
         requires_deadman=False,
-        max_operation_duration_ms=60_000,
+        max_operation_duration_ms=int(math.ceil(execution_timeout_sec * 1000.0)),
         cancellation_policy="hold_on_cancel_disconnect_or_timeout",
         requires_task_evaluation=False,
         skill_io_contract_hash=execute_io.semantic_content_hash,
@@ -916,6 +930,7 @@ class RealGraspApproachPlanProvider:
         current_station_revision: Callable[[], int],
         clock: Callable[[], float] = time.time,
         visible_scene_reader: Callable | None = None,
+        non_motion_read_window: Callable[[], Any] | None = None,
     ) -> None:
         if not isinstance(registration, RealGraspApproachPlanRegistration):
             raise TypeError("registration must be typed.")
@@ -958,7 +973,13 @@ class RealGraspApproachPlanProvider:
         self.point_grasp_executor = point_grasp_executor
         if visible_scene_reader is not None and not callable(visible_scene_reader):
             raise TypeError("visible_scene_reader must be callable or None")
+        if (
+            non_motion_read_window is not None
+            and not callable(non_motion_read_window)
+        ):
+            raise TypeError("non_motion_read_window must be callable or None")
         self.visible_scene_reader = visible_scene_reader
+        self.non_motion_read_window = non_motion_read_window
         self.motion_port = motion_port
         self.frame_graph = frame_graph
         self.grasp_trajectory_planner = grasp_trajectory_planner
@@ -1224,29 +1245,53 @@ class RealGraspApproachPlanProvider:
                 None,
             )
         try:
-            visible_scene = None
-            if source_result["backend_id"] == "graspgenx":
-                if self.visible_scene_reader is None:
-                    raise RM65GraspTrajectoryPlanningError("grasp_scene_snapshot_unavailable")
-                try:
-                    visible_scene = self.visible_scene_reader(source_operation, source_result)
-                    if not isinstance(visible_scene, VisibleGraspScene):
-                        raise TypeError("snapshot reader did not return a typed visible scene")
-                except (ValueError, TypeError, KeyError, OSError) as error:
-                    raise RM65GraspTrajectoryPlanningError(
-                        "grasp_scene_snapshot_invalid", details={
-                            "exception_type": type(error).__name__,
-                            # Retain a bounded cause in logs, not new v1 fields.
-                            "exception_message": " ".join(str(error).split())[:512],
-                        }
-                    ) from error
-            trajectory = self.grasp_trajectory_planner(
-                qpos_by_side=qpos_cut.qpos_by_side,
-                side=profile.side,
-                target_tool_tcp_world=target_execution,
-                speed_scale=speed_scale,
-                **({"visible_scene": visible_scene} if visible_scene is not None else {}),
+            planning_window = (
+                self.non_motion_read_window()
+                if self.non_motion_read_window is not None
+                else nullcontext()
             )
+            with planning_window:
+                # Scene reconstruction may run the captured-robot URDF/FCL
+                # filter and is part of the same blocking, read-only planning
+                # operation as trajectory search.  Enter the window before
+                # this work; otherwise the force stale watchdog can trip while
+                # the planner has not even received its scene yet.
+                visible_scene = None
+                if source_result["backend_id"] == "graspgenx":
+                    if self.visible_scene_reader is None:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "grasp_scene_snapshot_unavailable"
+                        )
+                    try:
+                        visible_scene = self.visible_scene_reader(
+                            source_operation, source_result
+                        )
+                        if not isinstance(visible_scene, VisibleGraspScene):
+                            raise TypeError(
+                                "snapshot reader did not return a typed visible scene"
+                            )
+                    except (ValueError, TypeError, KeyError, OSError) as error:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "grasp_scene_snapshot_invalid",
+                            details={
+                                "exception_type": type(error).__name__,
+                                # Retain a bounded cause in logs, not new v1 fields.
+                                "exception_message": " ".join(
+                                    str(error).split()
+                                )[:512],
+                            },
+                        ) from error
+                trajectory = self.grasp_trajectory_planner(
+                    qpos_by_side=qpos_cut.qpos_by_side,
+                    side=profile.side,
+                    target_tool_tcp_world=target_execution,
+                    speed_scale=speed_scale,
+                    **(
+                        {"visible_scene": visible_scene}
+                        if visible_scene is not None
+                        else {}
+                    ),
+                )
         except RM65GraspTrajectoryPlanningError as exc:
             # The published v1 diagnostics object is intentionally bounded.
             # Preserve every new lower-stage rejection detail in the retained
@@ -1458,6 +1503,8 @@ __all__ = [
     "REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1",
     "BoundedRealGraspApproachPlanStore",
     "RealGraspApproachPlan",
+    "REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC",
+    "DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC",
     "RealGraspApproachPlanLookupError",
     "RealGraspApproachPlanProfile",
     "RealGraspApproachPlanProvider",

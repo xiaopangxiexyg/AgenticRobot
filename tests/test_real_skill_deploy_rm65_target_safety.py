@@ -127,6 +127,56 @@ def _runtime(builder: _TargetBuilder):
     return runtime
 
 
+def test_target_safety_projects_solver_targets_in_reference_frame(tmp_path) -> None:
+    profile_path = tmp_path / "absolute.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "teleop_runtime.tcp_pose_envelope.v1",
+                "profile_id": "test-absolute-reference-frame",
+                "sides": {
+                    "left": {
+                        "absolute_bounds": {
+                            "min_xyz_m": [1.0, -1.0, -1.0],
+                            "max_xyz_m": [1.2, 1.0, 1.0],
+                        }
+                    }
+                },
+            }
+        )
+    )
+    builder = _TargetBuilder()
+    solver_to_reference = np.eye(4)
+    solver_to_reference[0, 3] = 1.0
+
+    runtime = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
+        target_builder=builder,
+        station_world_from_arm_base_by_side={
+            "left": np.eye(4),
+            "right": np.eye(4),
+        },
+        station_world_frame_id="canonical_station",
+        envelope_profile_path=profile_path,
+        target_world_from_solver_world=solver_to_reference,
+    )
+    raw_targets = {"left": np.eye(4), "right": np.eye(4)}
+    raw_targets["left"][0, 3] = 0.5
+
+    projected = runtime.envelope_filter(raw_targets)
+
+    # The raw solver pose x=0.5 is x=1.5 in canonical_station, so the
+    # canonical max x=1.2 projects back to solver-world x=0.2.
+    assert projected["left"][0, 3] == pytest.approx(0.2)
+    np.testing.assert_array_equal(projected["right"], raw_targets["right"])
+    assert runtime.target_frame_binding.reference_frame_by_side["left"] == (
+        "canonical_station"
+    )
+    np.testing.assert_allclose(
+        runtime.target_frame_binding.target_world_from_solver_world,
+        solver_to_reference,
+    )
+
+
 def test_startup_binder_requires_hold_then_binds_fresh_active_anchor() -> None:
     builder = _TargetBuilder()
     runtime = _runtime(builder)
