@@ -790,3 +790,31 @@ MuJoCo 的 application runner，再以真实 B601 只读输入做现场验收。
 这一增量仍不包含本机实际安装标定数值，也不代表 Real→Sim runner 或真机验收已完成。
 下一步是将显式 profile 加载绑定到既有 `control_station sim-hil` 生命周期，并在未提供
 有效 profile 时保持默认关闭；现场的坐标方向、尺度与 clutch 验收需在该 runner 后单独进行。
+
+## M1 反馈故障与降级契约（当前批次）
+
+本批不改变既有控制律或保护阈值，只把已经由驱动器实现并由回归测试覆盖的故障语义收敛为
+`B601SimFaultPolicy`。它是不可变的仿真契约，不是可供调用方放宽保护的调参入口；Real2Sim
+effort driver 默认附带该契约，并通过 `execution_metadata["fault_policy"]` 输出，便于每次
+仿真结果审计实际采用的语义。未启用 Real2Sim 的理想 MIT 分支保持原有元数据和行为。
+
+契约固定如下：
+
+- 序号、source timestamp 或 receive timestamp 过旧的参考只拒绝，不抢占上一条合法参考；
+  直到本地 command watchdog 到期才撤销。
+- 非法参考或错误 frame 立即撤销当前参考，保留本地重力/阻尼 fallback；启动生命周期启用
+  时按既有状态机进入 protective hold。
+- watchdog 超时先撤销参考；只有启用 startup/lifecycle 的 Real2Sim 路径才进入 protective
+  hold，否则继续当前重力/阻尼 fallback。
+- 非有限状态或计算力矩锁存 simulation fault，不推进 MuJoCo physics；不从缓存的 transport
+  数据恢复。
+- protective hold 拒绝新的参考，重新使能只允许显式 `reset()`，不允许隐式 re-arm。
+
+`fault_policy` 的每个动作字符串都经过严格校验，拒绝未经设计的替代语义，因此不会出现
+“为了让仿真继续而把 stale/wrong-frame 当作合法参考”的隐式降级。该契约仍只说明仿真模型的
+行为，不构成 RobStride 固件、CAN 新鲜度或真机安全保证。
+
+验证：Real2Sim、MuJoCo MIT、基础 MuJoCo、动力学四个测试文件 **131 passed**（31.74 s），
+新增固定契约和 metadata 回归；Ruff、`py_compile`、`git diff --check` 通过。测试前按声明
+gitlink materialize 了 `hardware/reBotArm_control_py` 到 pinned commit `5ba28ace`，没有修改
+其内容。没有连接 CAN、没有使能或移动真机。当前批候选待合并，未 push、安装或修改总路线图。

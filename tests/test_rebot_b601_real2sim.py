@@ -11,6 +11,7 @@ from sim.mujoco.rebot_b601_rs.mit_driver import B601MujocoEffortDriver
 from sim.mujoco.rebot_b601_rs.real2sim import (
     B601Real2SimControllerProfile,
     B601Real2SimPlantProfile,
+    B601SimFaultPolicy,
     B601SimStartupProfile,
 )
 
@@ -130,6 +131,29 @@ def test_profile_compensation_and_input_validation():
             replace(profile, **{field: value})
 
 
+def test_real2sim_fault_policy_is_fixed_and_rejects_alternate_semantics():
+    policy = B601SimFaultPolicy()
+    metadata = policy.metadata()
+
+    assert metadata["name"] == "b601_real2sim_feedback_fault_v1"
+    assert metadata["scope"] == "real2sim_feedback_admission_and_lifecycle"
+    assert metadata["stale_reference_action"] == "reject_keep_until_watchdog"
+    assert metadata["invalid_or_wrong_frame_action"] == (
+        "revoke_reference_keep_local_fallback"
+    )
+    assert metadata["watchdog_timeout_action"] == (
+        "revoke_then_protective_hold_when_lifecycle_enabled"
+    )
+    assert metadata["nonfinite_state_or_torque_action"] == (
+        "latch_fault_without_physics_step"
+    )
+    assert metadata["cached_transport_recovery"] is False
+    assert metadata["hardware_safety_claim"] is False
+
+    with pytest.raises(ValueError, match="supported simulation contract"):
+        B601SimFaultPolicy(stale_reference_action="replace_with_cached_sample")
+
+
 @pytest.fixture
 def driver():
     pytest.importorskip("mujoco")
@@ -178,6 +202,21 @@ def test_host_zoh_and_physics_rate_damping(driver):
         updates += tick.host_torque_updated
         assert not tick.driver_faulted
     assert updates == 2
+
+
+def test_real2sim_driver_exposes_fault_policy_without_changing_runtime_defaults(driver):
+    metadata = driver.execution_metadata
+
+    assert metadata["fault_policy"] == B601SimFaultPolicy().metadata()
+    assert metadata["stale_sample_action"] == (
+        "reject_without_preemption_until_local_watchdog"
+    )
+    assert metadata["unexpected_frame_action"] == (
+        "deactivate_reference_keep_local_gravity_and_damping"
+    )
+    assert metadata["protective_hold_model"] == (
+        "live_feedback_only_no_cached_transport_recovery"
+    )
 
 
 def test_controller_compensation_does_not_change_plant_gravity_parity(driver):
