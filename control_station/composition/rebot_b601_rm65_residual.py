@@ -8,6 +8,7 @@ IK, safety limits, watchdog behavior, authority, or command dispatch.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from control_station.sources.rebot_b601_pose import (
@@ -193,6 +194,12 @@ class B601RM65ResidualSource:
             },
             domain=B601_RM65_RESIDUAL_SOURCE_HASH_DOMAIN_V1,
         )
+        # ``ObservationSampleTracker`` reuses an ID while a host cache still
+        # exposes the same device frame.  Keep that frame's first host receive
+        # cut so a faster consumer cannot extend its freshness merely by
+        # polling the cache again.
+        self._last_observation_sample_id: str | None = None
+        self._last_observation_host_receive_at: float | None = None
 
     def poll_pose(self) -> B601RM65PoseProjection:
         """Poll once; rejection never falls back to an older admitted sample."""
@@ -231,13 +238,33 @@ class B601RM65ResidualSource:
                 != self.pose_source.spec.clock_domain_id
             ):
                 raise ValueError("B601 pose observation clock domain is incompatible.")
+            # The vendor path does not provide a verified device timestamp:
+            # ``observed_at`` is reconstructed as ``receive_now - age`` and
+            # can therefore move backwards when the receive-age estimate
+            # jitters.  The backend has already admitted a complete,
+            # host-fresh snapshot and advances ``receive_timestamp_sec``
+            # monotonically.  Use that host receive cut for residual sample
+            # ordering while retaining the raw observation reference above for
+            # lineage and diagnostics.  This does not claim device-time
+            # freshness; the state freshness contract remains authoritative.
+            host_receive_at = float(source_step.state.receive_timestamp_sec)
+            if not math.isfinite(host_receive_at):
+                raise ValueError("B601 host receive time is non-finite.")
+            if observation.sample_id == self._last_observation_sample_id:
+                sample_measured_at = self._last_observation_host_receive_at
+                if sample_measured_at is None or not math.isfinite(sample_measured_at):
+                    raise ValueError(
+                        "B601 repeated observation lacks its host receive cut."
+                    )
+            else:
+                sample_measured_at = host_receive_at
             sample = HumanPoseSample(
                 component_id=self.component_id,
                 sample_id=(
                     f"b601-rm65-pose:{emission_hash}:"
                     f"{observation.sample_id}"
                 ),
-                measured_at=observation.measured_at,
+                measured_at=sample_measured_at,
                 measured_clock_domain_id=observation.measured_clock_domain_id,
                 source_reference_frame_id=self.pose_source.spec.reference_frame,
                 source_controlled_frame_id=B601_RS_END_EFFECTOR_FRAME,
@@ -247,6 +274,9 @@ class B601RM65ResidualSource:
                 ),
                 pose_source_reference_source_controlled=command.value,
             )
+            if observation.sample_id != self._last_observation_sample_id:
+                self._last_observation_sample_id = observation.sample_id
+                self._last_observation_host_receive_at = sample_measured_at
         except (TypeError, ValueError) as error:
             return self._rejected_projection(
                 source_step,

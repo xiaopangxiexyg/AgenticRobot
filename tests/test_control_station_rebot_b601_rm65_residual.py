@@ -314,6 +314,56 @@ def test_reference_frame_rotation_maps_b601_x_into_rm65_y() -> None:
     np.testing.assert_allclose(value[:3], (0.0, 0.1, 0.0), atol=1e-9)
 
 
+def test_host_receive_time_orders_samples_when_estimated_time_regresses() -> None:
+    """Receive-age jitter must not reject an advancing host-fresh frame."""
+
+    source = _source(
+        [
+            _state(
+                1,
+                qpos=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                observed_at=10.00,
+                receive_at=10.10,
+            ),
+            _state(
+                2,
+                qpos=(0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
+                # The reconstructed device-observation estimate regresses,
+                # while the verified host receive cut advances.
+                observed_at=9.99,
+                receive_at=10.20,
+            ),
+        ]
+    )
+    initial = source.poll_pose()
+    assert initial.pose_sample is not None
+    assert initial.pose_sample.measured_at == pytest.approx(10.10)
+    anchor = source.capture_anchor(
+        initial,
+        anchor_generation=1,
+        captured_at=11.0,
+        captured_clock_domain_id="station.monotonic",
+    )
+
+    current = source.poll_pose()
+    assert current.pose_sample is not None
+    assert current.pose_sample.measured_at == pytest.approx(10.20)
+    step = source.adapt(
+        current,
+        anchor=anchor,
+        adapted_at=11.1,
+        adapted_clock_domain_id="station.monotonic",
+    )
+
+    assert step.residual_available, step.rejection_reason
+    assert step.relative_action is not None
+    np.testing.assert_allclose(
+        np.asarray(step.relative_action.value("right_arm").values)[:3],
+        (0.1, 0.0, 0.0),
+        atol=1e-9,
+    )
+
+
 def test_rejected_current_sample_withdraws_residual_without_reuse() -> None:
     source = _source(
         [
