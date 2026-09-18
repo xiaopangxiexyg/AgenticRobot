@@ -240,24 +240,17 @@ def inspect_arm_backends_for_position_dispatch(
                 for reason in (background_state.get("health_reasons") or ())
             )
             if "low_send_rate" in health_reasons:
-                # The RM65 backend reports one late CANFD interval as a timing
-                # warning.  It is important telemetry, but it is not equivalent
-                # to a dead worker, a stale target, or a latched SDK fault.  A
-                # command can also be what re-establishes the target cadence, so
-                # treating this instantaneous warning as a dispatch interlock
-                # makes the executor fault permanently during an otherwise
-                # recoverable scheduling dip.
+                # Keep the warning in the receipt for diagnosis, but do not
+                # downgrade it: a measured stream below its contract rate is
+                # unsafe for position dispatch and must stop the lane.  The
+                # next command must never be used to "catch up" a late slot.
                 background_warnings.append("low_send_rate")
-            blocking_health_reasons = tuple(
-                reason for reason in health_reasons if reason != "low_send_rate"
-            )
+            blocking_health_reasons = health_reasons
             if background_state.get("healthy") is False:
                 if blocking_health_reasons:
                     reasons.append("background_unhealthy")
                 elif not health_reasons:
-                    # Unknown unhealthy states stay fail-closed.  Only the
-                    # explicitly identified low-send-rate warning is degraded
-                    # rather than blocking.
+                    # Unknown unhealthy states stay fail-closed.
                     reasons.append("background_unhealthy_unknown")
             if background_state.get("thread_alive") is not True:
                 reasons.append("background_thread_not_alive")
@@ -487,6 +480,7 @@ def _compact_background_streaming_state(state: Mapping[str, Any]) -> dict[str, A
         return {}
     keys = (
         "enabled",
+        "no_catch_up_after_send",
         "healthy",
         "health_reasons",
         "thread_alive",

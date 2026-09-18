@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,6 +13,7 @@ from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_LINEAR,
     POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
     SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP,
+    resolve_periodic_tick,
 )
 from teleop_runtime.backends.arms.rm65 import (
     RM65ArmBackend,
@@ -19,6 +21,7 @@ from teleop_runtime.backends.arms.rm65 import (
     RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
     RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
     _final_follow_qpos_target,
+    _next_background_stream_schedule_after_skipped_tick,
     _position_trajectory_policy,
 )
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
@@ -105,6 +108,158 @@ def test_sample_aligned_backend_builds_configured_source_latch_mode() -> None:
     assert second.metadata["sample_aligned_admission"]["source_latch_mode"] == (
         SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP
     )
+
+
+def test_rm65_skipped_tick_rebases_to_one_fresh_period_without_catchup() -> None:
+    assert np.isclose(
+        _next_background_stream_schedule_after_skipped_tick(
+            next_scheduled=10.04,
+            wakeup_monotonic=10.031,
+            skipped_tick_count=3,
+            period_sec=0.01,
+            no_catch_up_after_send=True,
+        ),
+        10.041,
+    )
+    assert _next_background_stream_schedule_after_skipped_tick(
+        next_scheduled=10.04,
+        wakeup_monotonic=10.031,
+        skipped_tick_count=3,
+        period_sec=0.01,
+        no_catch_up_after_send=False,
+    ) == 10.04
+
+
+def test_rm65_stream_skips_late_tick_without_sending_catchup_command(monkeypatch) -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            singularity_protection_enabled=False,
+            background_streaming_enabled=True,
+            background_streaming_hz=100.0,
+            background_streaming_target_max_age_sec=1.0,
+            background_streaming_no_catch_up_after_send=True,
+        )
+    )
+    arm = _FakeArm()
+    backend.arm = arm
+    backend.send_command(
+        EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=np.full(6, 0.1),
+        )
+    )
+    events: list[object] = []
+
+    def sink(event) -> None:
+        events.append(event)
+        if len(events) >= 2:
+            backend._stream_stop_event.set()
+
+    backend.set_position_audit_sink(sink)
+    real_resolve = resolve_periodic_tick
+    resolve_calls = 0
+
+    def delayed_first_tick(**kwargs):
+        nonlocal resolve_calls
+        decision = real_resolve(**kwargs)
+        if resolve_calls == 0:
+            decision = replace(decision, skipped_tick_count=1)
+        resolve_calls += 1
+        return decision
+
+    monkeypatch.setattr(
+        "teleop_runtime.backends.arms.rm65.resolve_periodic_tick",
+        delayed_first_tick,
+    )
+    backend._stream_stop_event.clear()
+    backend._background_stream_loop_impl()
+
+    assert len(events) == 2
+    assert len(arm.sent_joint_deg) == 1
+    assert events[0].sdk_attempted is False
+    assert events[0].metadata["late_tick_skipped"] is True
+    assert events[0].metadata["transport_block_reason"] == (
+        "late_tick_skipped_no_catch_up"
+    )
+    assert events[1].sdk_attempted is True
+    assert backend.get_state()["background_streaming"][
+        "no_catch_up_after_send"
+    ] is True
+
+
+def test_rm65_stream_rechecks_target_age_before_sdk_send(monkeypatch) -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            singularity_protection_enabled=False,
+            background_streaming_enabled=True,
+            background_streaming_hz=100.0,
+            background_streaming_target_max_age_sec=0.1,
+        )
+    )
+    arm = _FakeArm()
+    backend.arm = arm
+    target = np.full(6, 0.1, dtype=float)
+    with backend._state_lock:
+        backend._stream_planner.reset(
+            {"left": np.zeros(6)},
+            epoch=0,
+            monotonic_time=0.0,
+        )
+        backend._stream_planner.accept_qpos_target(
+            {"left": target},
+            epoch=0,
+            sequence=1,
+            published_monotonic_time=0.0,
+            monotonic_time=0.0,
+            source="stale_before_send_test",
+            anchor_qpos_by_side={"left": np.zeros(6)},
+        )
+        backend._stream_target_qpos = target.copy()
+        backend._stream_target_source = "stale_before_send_test"
+        backend._stream_target_timestamp = 100.0
+        backend._stream_target_monotonic = 0.0
+        backend._stream_target_sequence = 1
+        backend._stream_segment_start_qpos = np.zeros(6)
+        backend._stream_segment_start_time = 0.0
+
+    # The target is fresh at wakeup/planner sampling (0.01 s), then crosses
+    # its 100 ms deadline while waiting for the command lane (0.2 s).
+    clock_values = iter((0.0, 0.0, 0.0, 0.01, 0.2))
+
+    def monotonic() -> float:
+        try:
+            return next(clock_values)
+        except StopIteration:
+            return 0.2
+
+    monkeypatch.setattr("teleop_runtime.backends.arms.rm65.time.monotonic", monotonic)
+    events: list[object] = []
+
+    def sink(event) -> None:
+        events.append(event)
+        backend._stream_stop_event.set()
+
+    backend.set_position_audit_sink(sink)
+    backend._stream_stop_event.clear()
+    backend._background_stream_loop_impl()
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.sdk_attempted is False
+    assert event.stale_target_expired is True
+    assert event.metadata["target_stale_checked_before_send"] is True
+    assert event.metadata["transport_block_reason"] == "target_stale_before_send"
+    assert arm.sent_joint_deg == []
 
 
 def _backend(

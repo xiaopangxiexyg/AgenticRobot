@@ -3456,11 +3456,10 @@ class PositionDeployExecutor:
                     str(reason)
                     for reason in (background.get("health_reasons") or ())
                 )
-                blocking_health_reasons = tuple(
-                    reason
-                    for reason in health_reasons
-                    if reason != "low_send_rate"
-                )
+                # A stream below its declared command cadence is not a
+                # recoverable warning at this boundary.  Refuse the reference
+                # rather than letting a later command mask a missed deadline.
+                blocking_health_reasons = health_reasons
                 unhealthy_blocks_dispatch = bool(
                     background.get("healthy") is False
                     and (blocking_health_reasons or not health_reasons)

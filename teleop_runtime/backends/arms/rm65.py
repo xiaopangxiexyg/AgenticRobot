@@ -479,6 +479,36 @@ def _next_background_stream_schedule_after_send(
     return scheduled
 
 
+def _next_background_stream_schedule_after_skipped_tick(
+    *,
+    next_scheduled: float,
+    wakeup_monotonic: float,
+    skipped_tick_count: int,
+    period_sec: float,
+    no_catch_up_after_send: bool,
+) -> float:
+    """Rebase a late worker before planning or sending a replacement command.
+
+    ``resolve_periodic_tick`` deliberately reports missed slots without
+    replaying them.  A transport worker must also avoid using the first
+    wakeup after a stall as a catch-up slot: the target may have changed while
+    the worker was blocked and any command computed for the missed deadline is
+    already stale.  Waiting one complete period from the observed wakeup
+    gives the publisher a fresh target and preserves the 120 Hz command lane.
+    """
+
+    scheduled = float(next_scheduled)
+    wakeup = float(wakeup_monotonic)
+    period = float(period_sec)
+    if not all(math.isfinite(value) for value in (scheduled, wakeup, period)):
+        raise ValueError("background stream scheduler values must be finite.")
+    if period <= 0.0:
+        raise ValueError("background stream period must be positive.")
+    if not no_catch_up_after_send or int(skipped_tick_count) <= 0:
+        return scheduled
+    return max(scheduled, wakeup + period)
+
+
 @dataclass
 class RM65ArmBackendConfig:
     arm_ip: str
@@ -511,9 +541,10 @@ class RM65ArmBackendConfig:
     background_streaming_warning_ratio: float = 0.9
     background_streaming_target_max_age_sec: float = 0.25
     background_streaming_shutdown_timeout_sec: float = 1.0
-    # Default-off compatibility switch.  The exclusive real Skill enables it
-    # so a missed CANFD slot is followed by one full-rate interval instead of
-    # an immediate catch-up send with a materially different qcmd.
+    # Default-off compatibility switch.  Exclusive real Skill and policy
+    # deployment profiles enable it so a missed CANFD slot is followed by one
+    # full-rate interval instead of an immediate catch-up send with a
+    # materially different qcmd.
     background_streaming_no_catch_up_after_send: bool = False
     # Keep the backend-wide default compatible for teleop/replay callers.
     # Policy deployment explicitly selects latest_nonblocking so a slow SDK
@@ -1133,10 +1164,12 @@ class RM65ArmBackend(EffectorBackend):
         self._send_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._solver_lock = threading.RLock()
-        # Dedicated state connections may serve both dataset qpos polling and
-        # the position-force safety guard.  The RM65 SDK handle is not safe for
-        # concurrent request/response calls, so serialize reads without
-        # contending with the independent command connection.
+        # One RM65 SDK handle serves state, force, and command calls.  The
+        # vendor request/response API is not safe for concurrent calls, so all
+        # SDK operations are serialized at this boundary.  Deployment's
+        # default live 60 Hz reference / 120 Hz command path leaves the
+        # synchronous force guard disabled because a force read can occupy
+        # this lock for roughly one 50 ms SDK transaction.
         self._hardware_read_lock = threading.RLock()
         self._last_force_query_monotonic: float | None = None
         self._singularity_analysis_lock = threading.RLock()
@@ -5469,6 +5502,9 @@ class RM65ArmBackend(EffectorBackend):
         return {
             "enabled": bool(self.config.background_streaming_enabled),
             "hz": target_hz,
+            "no_catch_up_after_send": bool(
+                self.config.background_streaming_no_catch_up_after_send
+            ),
             "target_admission_mode": str(
                 self.config.background_streaming_target_admission_mode
             ),
@@ -5939,6 +5975,20 @@ class RM65ArmBackend(EffectorBackend):
                 period_sec=period_sec,
             )
             next_scheduled = tick_timing.deadline_monotonic_time
+            late_tick_skipped = bool(
+                self.config.background_streaming_no_catch_up_after_send
+                and tick_timing.skipped_tick_count > 0
+            )
+            if late_tick_skipped:
+                next_scheduled = _next_background_stream_schedule_after_skipped_tick(
+                    next_scheduled=next_scheduled,
+                    wakeup_monotonic=wakeup_monotonic,
+                    skipped_tick_count=tick_timing.skipped_tick_count,
+                    period_sec=period_sec,
+                    no_catch_up_after_send=(
+                        self.config.background_streaming_no_catch_up_after_send
+                    ),
+                )
             wakeup_gap_sec = (
                 None
                 if previous_wakeup is None
@@ -5981,7 +6031,7 @@ class RM65ArmBackend(EffectorBackend):
                 reference_sequence = self._stream_reference_sequence
                 execution_work_item = self._stream_execution_work_item
                 anchor_qpos = self._command_anchor_qpos_locked()
-                if target_qpos is None:
+                if target_qpos is None or late_tick_skipped:
                     planned_tick = None
                 elif isinstance(self._stream_planner, JointCommandInterpolator):
                     planned_tick = self._stream_planner.step(
@@ -6018,9 +6068,14 @@ class RM65ArmBackend(EffectorBackend):
             accepted_sequence: int | None = None
             transport_block_reason: str | None = None
             sdk_exception: Exception | None = None
+            target_stale_before_send = False
+            target_stale_check_monotonic: float | None = None
             break_after_event = False
 
-            if target_qpos is not None:
+            if late_tick_skipped and target_qpos is not None:
+                transport_block_reason = "late_tick_skipped_no_catch_up"
+
+            if target_qpos is not None and not late_tick_skipped:
                 if segment_start_qpos is None:
                     segment_start_qpos = (
                         np.zeros(6, dtype=float) if anchor_qpos is None else anchor_qpos.copy()
@@ -6074,24 +6129,51 @@ class RM65ArmBackend(EffectorBackend):
                             elif not target_is_current:
                                 transport_block_reason = "target_superseded_before_send"
                             else:
-                                sdk_attempt_wall_time = time.time()
-                                sdk_attempt_monotonic_time = time.monotonic()
-                                guard = self._execution_epoch_guard
-                                if guard is not None:
-                                    if execution_work_item is None:
-                                        transport_block_reason = (
-                                            "execution_work_item_missing"
-                                        )
-                                        self._execution_epoch_rejected_count += 1
-                                    else:
-                                        epoch_check = guard.check_before_backend_call(
-                                            execution_work_item
-                                        )
-                                        if not epoch_check.accepted:
-                                            transport_block_reason = epoch_check.status
+                                target_stale_check_monotonic = time.monotonic()
+                                current_target_monotonic = (
+                                    self._stream_target_monotonic
+                                )
+                                current_target_stale = True
+                                if current_target_monotonic is not None:
+                                    _, current_target_stale = reference_age_and_stale(
+                                        published_monotonic_time=float(
+                                            current_target_monotonic
+                                        ),
+                                        sample_monotonic_time=(
+                                            target_stale_check_monotonic
+                                        ),
+                                        stale_after_sec=float(
+                                            self.config.background_streaming_target_max_age_sec
+                                        ),
+                                    )
+                                if current_target_stale:
+                                    # The target was valid when the planner
+                                    # sampled it but expired while waiting for
+                                    # the command lane.  Do not issue one last
+                                    # SDK call with that stale qcmd.
+                                    transport_block_reason = (
+                                        "target_stale_before_send"
+                                    )
+                                    target_stale_before_send = True
+                                else:
+                                    sdk_attempt_wall_time = time.time()
+                                    sdk_attempt_monotonic_time = time.monotonic()
+                                    guard = self._execution_epoch_guard
+                                    if guard is not None:
+                                        if execution_work_item is None:
+                                            transport_block_reason = (
+                                                "execution_work_item_missing"
+                                            )
                                             self._execution_epoch_rejected_count += 1
-                                            if target_is_current:
-                                                self._reject_stale_target_locked()
+                                        else:
+                                            epoch_check = guard.check_before_backend_call(
+                                                execution_work_item
+                                            )
+                                            if not epoch_check.accepted:
+                                                transport_block_reason = epoch_check.status
+                                                self._execution_epoch_rejected_count += 1
+                                                if target_is_current:
+                                                    self._reject_stale_target_locked()
                                 if transport_block_reason is None:
                                     sdk_attempt_sequence = self._record_command_attempt_locked(
                                         next_qpos,
@@ -6205,6 +6287,11 @@ class RM65ArmBackend(EffectorBackend):
                                 self._stream_sdk_inflight_target_sequence = None
                 else:
                     transport_block_reason = "arm_not_connected"
+
+            if target_stale_before_send:
+                stale_target_expired = self._expire_stale_stream_target(
+                    now_monotonic=target_stale_check_monotonic
+                ) or stale_target_expired
 
             if sdk_result_monotonic_time is not None:
                 next_scheduled = _next_background_stream_schedule_after_send(
@@ -6333,6 +6420,10 @@ class RM65ArmBackend(EffectorBackend):
                                 tick_timing.original_scheduled_monotonic_time
                             ),
                             "scheduled_period_sec": period_sec,
+                            "late_tick_skipped": bool(late_tick_skipped),
+                            "target_stale_checked_before_send": bool(
+                                target_stale_check_monotonic is not None
+                            ),
                             "transport_block_reason": transport_block_reason,
                             "arm_follow_qpos_alpha": float(
                                 self.config.arm_follow_qpos_alpha
@@ -6591,9 +6682,16 @@ class RM65ArmBackend(EffectorBackend):
     ) -> object:
         """Invoke one safety/lifecycle SDK call through the optional gate."""
 
+        def serialized_backend_call() -> object:
+            # Lifecycle/safety calls use the same RM65 SDK handle as force,
+            # state, and command requests.  Keep the vendor transaction
+            # serialized even when a pre-SDK policy adapter is installed.
+            with self._hardware_read_lock:
+                return backend_call()
+
         adapter = self._pre_sdk_control_adapter
         if adapter is None:
-            return backend_call()
+            return serialized_backend_call()
         context = RM65ControlDispatchContext.create(
             side=str(self.config.side),
             seam_id=seam_id,
@@ -6603,7 +6701,7 @@ class RM65ArmBackend(EffectorBackend):
             sdk_method=sdk_method,
             attempt_sequence=attempt_sequence,
         )
-        return adapter.invoke(context=context, backend_call=backend_call)
+        return adapter.invoke(context=context, backend_call=serialized_backend_call)
 
     def _send_joint_target(
         self,
@@ -6639,21 +6737,28 @@ class RM65ArmBackend(EffectorBackend):
         joint_deg = qpos / np.pi * 180.0
 
         def backend_call() -> object:
-            if self.config.force_position_control:
-                return self.arm.Force_Position_Move_Joint(
+            # State, force, and command operations share one vendor SDK
+            # handle.  Serialize the actual request/response call so an
+            # explicitly enabled low-rate force monitor cannot race a command
+            # or corrupt the SDK transport.  Live 60/120 deployment leaves
+            # that monitor disabled by default and validates the combination
+            # at the CLI boundary.
+            with self._hardware_read_lock:
+                if self.config.force_position_control:
+                    return self.arm.Force_Position_Move_Joint(
+                        joint_deg,
+                        sensor=self.config.force_sensor,
+                        mode=self.config.force_mode,
+                        dir=self.config.force_dir,
+                        force=self.config.force,
+                        follow=self.config.force_follow,
+                    )
+                return self.arm.Movej_CANFD(
                     joint_deg,
-                    sensor=self.config.force_sensor,
-                    mode=self.config.force_mode,
-                    dir=self.config.force_dir,
-                    force=self.config.force,
-                    follow=self.config.force_follow,
+                    follow=bool(self.config.canfd_follow),
+                    trajectory_mode=int(self.config.canfd_trajectory_mode),
+                    radio=int(self.config.canfd_radio),
                 )
-            return self.arm.Movej_CANFD(
-                joint_deg,
-                follow=bool(self.config.canfd_follow),
-                trajectory_mode=int(self.config.canfd_trajectory_mode),
-                radio=int(self.config.canfd_radio),
-            )
 
         adapter = self._pre_sdk_dispatch_adapter
         if adapter is None:
@@ -7385,7 +7490,8 @@ class RM65ArmBackend(EffectorBackend):
             return
         try:
             if self.config.observation_only:
-                self.arm.RM_API_UnInit()
+                with self._hardware_read_lock:
+                    self.arm.RM_API_UnInit()
                 return
             force_stop_called = bool(self._force_position_active)
             if force_stop_called:
@@ -7429,9 +7535,11 @@ class RM65ArmBackend(EffectorBackend):
                         f"{self.name} {stop_label} failed before disconnect with "
                         f"return code {stop_text}"
                     )
-            self.arm.RM_API_UnInit()
+            with self._hardware_read_lock:
+                self.arm.RM_API_UnInit()
         finally:
             try:
-                self.arm.Arm_Socket_Close()
+                with self._hardware_read_lock:
+                    self.arm.Arm_Socket_Close()
             finally:
                 self.arm = None

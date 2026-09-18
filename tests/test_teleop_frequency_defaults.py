@@ -2524,6 +2524,7 @@ def test_deploy_dry_run_arm_backend_uses_position_control_default() -> None:
     assert backends["right"].config.background_streaming_target_admission_mode == (
         RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
     )
+    assert backends["right"].config.background_streaming_no_catch_up_after_send is True
     assert backends["right"].config.canfd_follow is True
 
 
@@ -2714,14 +2715,21 @@ def test_deploy_arm_limits_match_real_teleop_defaults() -> None:
 def test_deploy_position_force_guard_defaults_fail_closed() -> None:
     args = _parse_deploy_args([])
 
-    assert args.position_force_guard is True
+    assert args.position_force_guard is False
     assert args.position_force_guard_source == "tool"
     assert args.position_force_guard_max_force_n == pytest.approx(30.0)
     assert args.position_force_guard_max_torque_nm == pytest.approx(5.0)
-    assert args.position_force_guard_hz == pytest.approx(20.0)
+    assert args.position_force_guard_hz == pytest.approx(10.0)
     assert args.position_force_guard_consecutive_samples == 1
     assert args.position_force_guard_max_read_errors == 3
     assert args.position_force_guard_stale_sec == pytest.approx(0.4)
+
+
+def test_deploy_position_force_guard_is_explicitly_opt_in() -> None:
+    args = _parse_deploy_args(["--position-force-guard"])
+
+    assert args.position_force_guard is True
+    assert args.position_force_guard_hz == pytest.approx(10.0)
 
 
 def test_deploy_position_force_guard_rejects_unsafe_poll_rate_before_hardware() -> None:
@@ -2729,6 +2737,23 @@ def test_deploy_position_force_guard_rejects_unsafe_poll_rate_before_hardware() 
 
     with pytest.raises(ValueError, match="poll_hz must be <= 20 Hz"):
         run_policy.validate_args(args)
+
+
+def test_deploy_position_force_guard_rejects_live_shared_sdk_command_lane() -> None:
+    args = SimpleNamespace(
+        position_force_guard=True,
+        send_actions=True,
+        arms_enabled=True,
+        arm_control_mode="position",
+        left_arm_ip="",
+        right_arm_ip="192.0.2.20",
+    )
+
+    with pytest.raises(ValueError, match="shares the SDK handle"):
+        run_policy._validate_position_force_guard_transport(args, ("right",))
+
+    args.send_actions = False
+    run_policy._validate_position_force_guard_transport(args, ("right",))
 
 
 def test_deploy_ctrl_c_requests_arm_stop_only_for_real_position_output() -> None:

@@ -407,6 +407,7 @@ from .policy_binding import (
 )
 from .position_plan_cut import (
     DeploymentPositionPlanCutDetector,
+    DeploymentPositionPlanCutProposal,
     prepare_position_plan_cut_for_action_step as _prepare_position_plan_cut_for_action_step,
 )
 from .position_stream_handoff import (
@@ -625,6 +626,45 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     _register_deployment_cli_args(parser)
 
 
+def _validate_position_force_guard_transport(
+    args: argparse.Namespace,
+    active_sides: tuple[str, ...],
+) -> None:
+    """Reject a blocking force reader on a live RM65 position command lane.
+
+    ``RM65ArmBackend`` has one vendor SDK handle per arm.  ``Get_Force_Data``
+    is a synchronous request which may occupy that handle for about 50 ms;
+    merely lowering its polling rate does not make concurrent 120 Hz command
+    calls safe.  The deployment default is therefore off, and an explicit
+    opt-in is limited to dry-run/no-hardware paths.  This check runs before
+    backend construction so a bad combination cannot open a device and then
+    discover the timing conflict after startup.
+    """
+
+    if not (
+        bool(getattr(args, "position_force_guard", False))
+        and bool(getattr(args, "send_actions", False))
+        and bool(getattr(args, "arms_enabled", False))
+        and str(getattr(args, "arm_control_mode", "")).strip().lower()
+        == RM65_ARM_CONTROL_MODE_POSITION
+    ):
+        return
+    connected_sides = tuple(
+        side
+        for side in active_sides
+        if str(getattr(args, f"{side}_arm_ip", "") or "").strip()
+    )
+    if not connected_sides:
+        return
+    raise ValueError(
+        "--position-force-guard is not supported with live RM65 position "
+        "dispatch because Get_Force_Data shares the SDK handle with command "
+        "calls and can block the 60 Hz reference / 120 Hz command lane. "
+        "Omit --position-force-guard for live position deployment; the "
+        "10 Hz monitor remains available for dry-run or no-hardware diagnostics."
+    )
+
+
 def validate_args(
     args: argparse.Namespace,
     *,
@@ -656,11 +696,12 @@ def validate_args(
         args.policy_qpos_init_parquet = None
     else:
         args.policy_qpos_init_suppressed = False
-    if bool(getattr(args, "position_force_guard", False)):
-        # Resolve the complete config before any backend or device is created.
-        # In particular, RM65 force polling above 20 Hz must fail at CLI
-        # validation rather than after a real-arm connection is opened.
-        position_force_guard_config(args)
+    # Resolve the complete config before any backend or device is created.
+    # In particular, an explicitly supplied RM65 force polling rate above
+    # 20 Hz must fail at CLI validation even when the monitor itself is off;
+    # this prevents a later profile/flag change from carrying an unsafe rate
+    # into a live process.
+    position_force_guard_config(args)
     rtc_profile_id = str(getattr(args, "rtc_profile", "off")).strip()
     rtc_profile_enabled = rtc_profile_id != "off"
     minimum_rtc_emissions = int(
@@ -1039,6 +1080,7 @@ def validate_args(
     args.arm_control_hz = execution_config.arm_control_hz
     args.position_reference_hz = execution_config.position_reference_hz
     args.arm_follow_qpos_alpha = execution_config.arm_follow_qpos_alpha
+    _validate_position_force_guard_transport(args, active_sides)
     if bool(args.rm65_pose_observation):
         if not bool(args.arms_enabled):
             raise ValueError("--rm65-pose-observation requires enabled arms.")
@@ -2018,6 +2060,58 @@ def _prepare_position_lookahead_chain(
     return tuple(prepared)
 
 
+def _prepare_startup_position_plan_cut(
+    detector: DeploymentPositionPlanCutDetector,
+    position_deploy_executor: PositionDeployExecutor,
+    action: NormalizedAction,
+    *,
+    step_index: int,
+    detected_at: float,
+) -> DeploymentPositionPlanCutProposal:
+    """Attach typed source lineage to a startup position action.
+
+    Startup initialization is a deployment-owned position source, not a policy
+    chunk and therefore has no ``PolicyActionEmission``.  The position
+    executor still requires the same explicit reset/Hold cut as every other
+    source when stream-start acquisition is enabled.  Give startup its own
+    stable source plan and use the control-loop step as its local keyframe
+    index; the detector then preserves the normal clear/Hold acknowledgement
+    semantics without inventing model lineage.
+    """
+
+    if not isinstance(detector, DeploymentPositionPlanCutDetector):
+        raise TypeError("detector must be a DeploymentPositionPlanCutDetector.")
+    if not isinstance(position_deploy_executor, PositionDeployExecutor):
+        raise TypeError("position_deploy_executor must be a PositionDeployExecutor.")
+    if not isinstance(action, NormalizedAction):
+        raise TypeError("action must be a NormalizedAction.")
+    if (
+        isinstance(step_index, bool)
+        or int(step_index) != step_index
+        or int(step_index) < 0
+    ):
+        raise ValueError("step_index must be a non-negative integer.")
+    index = int(step_index)
+    metadata = dict(action.metadata)
+    metadata.update(
+        {
+            "deploy_action_chunk_id": 0,
+            "deploy_action_chunk_index": index,
+            "deploy_action_chunk_size": max(1, index + 1),
+            "deploy_action_chunk_source": "startup_init",
+        }
+    )
+    lineage_action = replace(action, metadata=metadata)
+    detector.observe_hold_generation(
+        int(position_deploy_executor.snapshot().get("clear_count", 0))
+    )
+    return detector.prepare_synchronous_action(
+        lineage_action,
+        policy_node_id="startup_init",
+        detected_at=float(detected_at),
+    )
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -2753,6 +2847,29 @@ def main(
             f"[StartupInit] source=current already satisfied by {current_pose_override_name}; "
             "press A to confirm ready and start policy execution."
         )
+
+    def reset_startup_initializer_for_activation(
+        *,
+        current_pose_start_allowed: bool,
+        preserve_completed: bool = True,
+    ) -> bool:
+        """Reset startup state without replaying an already completed init.
+
+        Activation recovery follows an acknowledged Hold and clears the
+        position stream.  Re-running a completed startup target in that
+        window would create an unnecessary second stream (and, for
+        ``source=current``, a no-op motion command).  Keep the completion
+        receipt intact; an incomplete initializer still gets the normal
+        explicit reset behavior.
+        """
+
+        if preserve_completed and startup_initializer.completed:
+            return False
+        return _reset_startup_initializer(
+            startup_initializer,
+            current_pose_start_allowed=current_pose_start_allowed,
+        )
+
     fixed_init_controller = (
         None
         if fixed_init_plan is None
@@ -2836,6 +2953,8 @@ def main(
         }
     )
     rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
+    rtc_active_latency_gate_rejected = False
+    rtc_active_latency_gate_failure_reason: str | None = None
     rtc_active_latency_samples: list[float] = []
     accepted_rtc_dispatch_steps = 0
     step_index = 0
@@ -3432,10 +3551,95 @@ def main(
         """Reset every policy-owned part of an activation stream once."""
 
         nonlocal rtc_active_latency_gate_passed
+        nonlocal rtc_active_latency_gate_rejected
+        nonlocal rtc_active_latency_gate_failure_reason
         policy.reset()
         policy_deploy_runtime.reset_stream()
         rtc_active_latency_samples.clear()
         rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
+        rtc_active_latency_gate_rejected = False
+        rtc_active_latency_gate_failure_reason = None
+
+    def pause_after_rtc_active_latency_gate_failure(
+        *,
+        reason: str,
+        message: str,
+        observation: DeploymentObservation,
+    ) -> None:
+        """Latch a recoverable Active-RTC latency failure without dispatching.
+
+        A warmup rejection is a deployment admission failure, not a process
+        failure.  Keep the runtime alive in a visible paused/hold state so the
+        operator can inspect the cause and use ``g`` to request a fresh stream.
+        If the backend-specific measured-qpos hold cannot be established, the
+        stronger bimanual emergency stop is attempted before the paused state
+        is retained; an unacknowledged emergency stop remains a hard error.
+        """
+
+        nonlocal policy_active, ready_confirmed, last_action
+        nonlocal rtc_active_latency_gate_passed
+        nonlocal rtc_active_latency_gate_rejected
+        nonlocal rtc_active_latency_gate_failure_reason
+        normalized_reason = str(reason).strip() or "rtc_active_latency_gate_rejected"
+        rtc_active_latency_gate_passed = False
+        rtc_active_latency_gate_rejected = True
+        rtc_active_latency_gate_failure_reason = normalized_reason
+        policy_active = False
+        ready_confirmed = False
+        policy_deploy_runtime.clear_action_queue()
+        last_action = observation.hold_action()
+
+        hold_error: str | None = None
+        try:
+            hold_rtc_if_eligible(
+                now=control_loop_started_at,
+                reason=normalized_reason,
+            )
+            _hold_active_rtc_gap(
+                reason=normalized_reason,
+                send_actions=send_actions,
+                arm_backends=arm_backends,
+                position_deploy_executor=position_deploy_executor,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve fail-closed behavior.
+            hold_error = f"{type(exc).__name__}: {exc}"
+            try:
+                emergency_stop_deploy_arm_backends(
+                    arm_backends,
+                    reason=f"{normalized_reason}:hold_fallback",
+                )
+            except Exception as stop_exc:  # noqa: BLE001 - hard safety failure.
+                raise RuntimeError(
+                    "RTC Active latency gate failure could not establish Hold and "
+                    "the fallback bimanual emergency stop was not acknowledged: "
+                    f"hold={hold_error}; stop={type(stop_exc).__name__}: {stop_exc}"
+                ) from exc
+            print(
+                "[RTC] measured-qpos Hold unavailable; fallback bimanual "
+                "emergency stop acknowledged; policy remains paused: "
+                f"{hold_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        event_payload = {
+            "schema": "dexteleop_rtc_active_latency_gate_v2",
+            "status": "blocked",
+            "reason": normalized_reason,
+            "message": str(message),
+            "configured_max_latency_sec": float(
+                args.rtc_active_max_inference_latency_sec
+            ),
+            "hold_error": hold_error,
+            "recovery": "press_g_for_fresh_latency_warmup",
+        }
+        debug_logger.log_event("rtc_active_latency_gate", event_payload)
+        console_log_event(
+            "RTC",
+            "ERROR: Active latency gate blocked policy; no action dispatched; "
+            f"{message} Press g to retry a fresh warmup.",
+            now=control_loop_started_at,
+        )
 
     def record_policy_prediction_result(
         prediction: PolicyChunkPredictionResult,
@@ -3974,8 +4178,7 @@ def main(
                         policy_active = False
                         continue
                     reset_policy_stream_for_activation()
-                    _reset_startup_initializer(
-                        startup_initializer,
+                    reset_startup_initializer_for_activation(
                         current_pose_start_allowed=current_pose_start_override,
                     )
                     ready_confirmed = not wait_for_ready_confirm
@@ -4027,6 +4230,12 @@ def main(
                         print(
                             "[Deploy] ready confirm ignored: impedance force guard is "
                             "latched; complete manual re-arm with r."
+                        )
+                    elif rtc_active_latency_gate_rejected:
+                        policy_active = False
+                        print(
+                            "[Deploy] ready confirm ignored: RTC Active latency "
+                            "gate is blocked; press g to retry a fresh warmup."
                         )
                     elif (
                         fixed_init_controller is not None
@@ -4396,8 +4605,7 @@ def main(
                                 )
                             )
                             reset_policy_stream_for_activation()
-                            _reset_startup_initializer(
-                                startup_initializer,
+                            reset_startup_initializer_for_activation(
                                 current_pose_start_allowed=current_pose_start_override,
                             )
                             ready_confirmed = not wait_for_ready_confirm
@@ -4457,8 +4665,7 @@ def main(
                             )
                             last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
                             reset_policy_stream_for_activation()
-                            _reset_startup_initializer(
-                                startup_initializer,
+                            reset_startup_initializer_for_activation(
                                 current_pose_start_allowed=current_pose_start_override,
                             )
                             ready_confirmed = not wait_for_ready_confirm
@@ -4510,8 +4717,7 @@ def main(
                         print(fixed_result.message)
                     if fixed_result.completed:
                         reset_policy_stream_for_activation()
-                        _reset_startup_initializer(
-                            startup_initializer,
+                        reset_startup_initializer_for_activation(
                             current_pose_start_allowed=current_pose_start_override,
                         )
                         ready_confirmed = not wait_for_ready_confirm
@@ -4624,10 +4830,15 @@ def main(
                         and policy_qpos_init_controller.blocks_policy
                     ):
                         can_run_policy = False
-                    if (
-                        startup_initializer.enabled
-                        and not startup_initializer.completed
-                    ):
+                    startup_init_pending = bool(
+                        startup_initializer.enabled and not startup_initializer.completed
+                    )
+                    rtc_active_latency_warmup_pending = bool(
+                        rtc_active_latency_gate_required
+                        and not rtc_active_latency_gate_passed
+                        and not rtc_active_latency_gate_rejected
+                    )
+                    if startup_init_pending and not rtc_active_latency_warmup_pending:
                         if can_run_policy:
                             init_action, init_faults, init_ready = (
                                 startup_initializer.next_action(
@@ -4659,17 +4870,57 @@ def main(
                                     canonical_action.command is not None
                                     and canonical_action.command.commands
                                 ):
-                                    execution = prepared_action_executor.execute(
-                                        canonical_action,
-                                        observation,
-                                        policy_name="startup_init",
-                                        source_decision_id=(
-                                            f"startup-init-decision:{step_index}"
-                                        ),
-                                        source_reference_segment_id=(
-                                            f"startup-init-reference:{step_index}"
-                                        ),
-                                    )
+                                    startup_plan_cut_proposal = None
+                                    if (
+                                        position_plan_cut_detector is not None
+                                        and prepared_action_position_executor is not None
+                                        and command_effector_kind_subset(
+                                            canonical_action.command,
+                                            kind="arm",
+                                        )
+                                        is not None
+                                    ):
+                                        startup_plan_cut_proposal = (
+                                            _prepare_startup_position_plan_cut(
+                                                position_plan_cut_detector,
+                                                prepared_action_position_executor,
+                                                canonical_action.action,
+                                                step_index=step_index,
+                                                detected_at=loop_started_at,
+                                            )
+                                        )
+                                    try:
+                                        execution = prepared_action_executor.execute(
+                                            canonical_action,
+                                            observation,
+                                            policy_name="startup_init",
+                                            source_decision_id=(
+                                                f"startup-init-decision:{step_index}"
+                                            ),
+                                            source_reference_segment_id=(
+                                                f"startup-init-reference:{step_index}"
+                                            ),
+                                            source_plan_cut=(
+                                                None
+                                                if startup_plan_cut_proposal is None
+                                                else startup_plan_cut_proposal.cut
+                                            ),
+                                        )
+                                    except Exception:
+                                        if startup_plan_cut_proposal is not None:
+                                            position_plan_cut_detector.reject(
+                                                startup_plan_cut_proposal
+                                            )
+                                        raise
+                                    if startup_plan_cut_proposal is not None:
+                                        if execution.accepted:
+                                            position_plan_cut_detector.commit(
+                                                startup_plan_cut_proposal
+                                            )
+                                        else:
+                                            position_plan_cut_detector.reject(
+                                                startup_plan_cut_proposal
+                                            )
                                     if execution.accepted:
                                         position_action_submitted_this_loop = (
                                             prepared_action_position_executor
@@ -4859,6 +5110,7 @@ def main(
                     rtc_active_latency_warmup = bool(
                         rtc_active_latency_gate_required
                         and not rtc_active_latency_gate_passed
+                        and not rtc_active_latency_gate_rejected
                         and can_run_policy
                         and not ik_action_gate.blocks_action_output
                         and not defer_position_action_until_fresh_cut
@@ -4940,6 +5192,11 @@ def main(
                         )
                         * 1000.0,
                     }
+                    # The execution guard is consulted by both the ordinary
+                    # synchronous path and the RTC path below.  Initialize it
+                    # before branching so a non-RTC deployment can never
+                    # observe an unbound per-step gate flag.
+                    rtc_active_latency_gate_failed_this_step = False
                     if rtc_frontend is None:
                         primary_prepare_started = time.monotonic()
                         primary_prepare_cpu_started = time.thread_time()
@@ -5000,6 +5257,7 @@ def main(
                             and rtc_step.completion is not None
                             and rtc_step.preflight_completion
                         ):
+                            timing_failure = False
                             try:
                                 latency_sec = _rtc_active_completion_latency_sec(
                                     inference_started_at=(
@@ -5011,81 +5269,73 @@ def main(
                                 invalid_timing_reason = (
                                     "rtc_active_completion_timestamp_invalid"
                                 )
-                                try:
-                                    hold_rtc_if_eligible(
-                                        now=control_loop_started_at,
-                                        reason=invalid_timing_reason,
-                                    )
-                                finally:
-                                    _hold_active_rtc_gap(
-                                        reason=invalid_timing_reason,
-                                        send_actions=send_actions,
-                                        arm_backends=arm_backends,
-                                        position_deploy_executor=(
-                                            position_deploy_executor
+                                timing_failure = True
+                                pause_after_rtc_active_latency_gate_failure(
+                                    reason=invalid_timing_reason,
+                                    message=(
+                                        "completion timestamps were invalid "
+                                        f"({type(exc).__name__}: {exc})"
+                                    ),
+                                    observation=observation,
+                                )
+                                rtc_active_latency_gate_failed_this_step = True
+                                rtc_active_latency_warmup = False
+                            if not timing_failure:
+                                rtc_active_latency_samples.append(latency_sec)
+                                gate_complete, gate_accepted, observed_max = (
+                                    _rtc_active_latency_gate_result(
+                                        rtc_active_latency_samples,
+                                        discard_completions=int(
+                                            args.rtc_active_warmup_discard_completions
+                                        ),
+                                        required_completions=int(
+                                            args.rtc_active_warmup_completions
+                                        ),
+                                        maximum_latency_sec=float(
+                                            args.rtc_active_max_inference_latency_sec
                                         ),
                                     )
-                                raise RuntimeError(
-                                    "RTC Active latency gate rejected invalid "
-                                    "completion timestamps."
-                                ) from exc
-                            rtc_active_latency_samples.append(latency_sec)
-                            gate_complete, gate_accepted, observed_max = (
-                                _rtc_active_latency_gate_result(
-                                    rtc_active_latency_samples,
-                                    discard_completions=int(
-                                        args.rtc_active_warmup_discard_completions
-                                    ),
-                                    required_completions=int(
-                                        args.rtc_active_warmup_completions
-                                    ),
-                                    maximum_latency_sec=float(
-                                        args.rtc_active_max_inference_latency_sec
-                                    ),
                                 )
-                            )
-                            if gate_complete:
-                                assert observed_max is not None
-                                if not gate_accepted:
-                                    _hold_active_rtc_gap(
-                                        reason="rtc_active_latency_gate_rejected",
-                                        send_actions=send_actions,
-                                        arm_backends=arm_backends,
-                                        position_deploy_executor=(
-                                            position_deploy_executor
-                                        ),
-                                    )
-                                    raise RuntimeError(
-                                        "RTC Active latency gate rejected dispatch: "
-                                        f"warm maximum {observed_max:.6f}s is not below "
-                                        "the exclusive configured bound "
-                                        f"{float(args.rtc_active_max_inference_latency_sec):.6f}s."
-                                    )
-                                rtc_active_latency_gate_passed = True
-                                console_log_event(
-                                    "RTC",
-                                    "READY: Active inference latency gate passed; "
-                                    f"warm_max={observed_max:.6f}s samples="
-                                    f"{int(args.rtc_active_warmup_completions)}.",
-                                    now=loop_started_at,
-                                )
+                                if gate_complete:
+                                    assert observed_max is not None
+                                    if not gate_accepted:
+                                        pause_after_rtc_active_latency_gate_failure(
+                                            reason="rtc_active_latency_gate_rejected",
+                                            message=(
+                                                "warm maximum "
+                                                f"{observed_max:.6f}s is not below "
+                                                "the exclusive configured bound "
+                                                f"{float(args.rtc_active_max_inference_latency_sec):.6f}s"
+                                            ),
+                                            observation=observation,
+                                        )
+                                        rtc_active_latency_gate_failed_this_step = True
+                                        rtc_active_latency_warmup = False
+                                    else:
+                                        rtc_active_latency_gate_passed = True
+                                        console_log_event(
+                                            "RTC",
+                                            "READY: Active inference latency gate passed; "
+                                            f"warm_max={observed_max:.6f}s samples="
+                                            f"{int(args.rtc_active_warmup_completions)}.",
+                                            now=loop_started_at,
+                                        )
                             # Reuse the drained RPC exchange between samples.
                             # No preflight result entered the executable plan;
                             # the next formal request uses a fresh observation.
-                        rtc_gap_reason = (
-                            "rtc_active_latency_warmup"
-                            if rtc_active_latency_warmup
-                            else (
-                                "rtc_producer_not_eligible"
-                            if rtc_step.state.lifecycle_state
+                        if rtc_active_latency_gate_failed_this_step:
+                            rtc_gap_reason = None
+                        elif rtc_active_latency_warmup:
+                            rtc_gap_reason = "rtc_active_latency_warmup"
+                        elif (
+                            rtc_step.state.lifecycle_state
                             != POLICY_ASYNC_PRODUCER_ELIGIBLE
-                            else (
-                                "rtc_plan_underrun"
-                                if rtc_step.underrun
-                                else None
-                            )
-                            )
-                        )
+                        ):
+                            rtc_gap_reason = "rtc_producer_not_eligible"
+                        elif rtc_step.underrun:
+                            rtc_gap_reason = "rtc_plan_underrun"
+                        else:
+                            rtc_gap_reason = None
                         rtc_hold_receipts = _hold_active_rtc_gap(
                             reason=rtc_gap_reason,
                             send_actions=send_actions,
@@ -5107,7 +5357,11 @@ def main(
                         if rtc_step_fanout is not None:
                             rtc_step_fanout.put_nowait(rtc_step)
                         emission = rtc_step.emission_result.emission
-                        if rtc_emission_publisher is not None and emission is not None:
+                        if (
+                            not rtc_active_latency_gate_failed_this_step
+                            and rtc_emission_publisher is not None
+                            and emission is not None
+                        ):
                             publication_receipt = (
                                 rtc_emission_publisher.publish_committed_emission(
                                     emission,
@@ -5137,7 +5391,11 @@ def main(
                                     "rejected: "
                                     f"{publication_receipt.reasons}"
                                 )
-                        if rtc_emission_fanout is not None and emission is not None:
+                        if (
+                            not rtc_active_latency_gate_failed_this_step
+                            and rtc_emission_fanout is not None
+                            and emission is not None
+                        ):
                             commit = rtc_step.emission_commit_transition
                             if (
                                 commit is None
@@ -5480,7 +5738,8 @@ def main(
                             )
                         try:
                             if (
-                                canonical_action.command is not None
+                                not rtc_active_latency_gate_failed_this_step
+                                and canonical_action.command is not None
                                 and canonical_action.command.commands
                             ):
                                 if (
@@ -5870,6 +6129,15 @@ def main(
                                 )
                             ),
                             position_executor_status,
+                            (
+                                "rtc_active_latency=blocked:"
+                                + str(
+                                    rtc_active_latency_gate_failure_reason
+                                    or "unknown"
+                                )
+                                if rtc_active_latency_gate_rejected
+                                else ""
+                            ),
                             (
                                 "rtc="
                                 f"{rtc_frontend.state.lifecycle_state.lower()} "

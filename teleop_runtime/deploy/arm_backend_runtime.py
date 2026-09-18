@@ -385,6 +385,11 @@ def build_arm_backends(
                 actual_send_dt_stall_reset_sec=float(args.arm_step_dt_stall_reset_sec),
                 background_streaming_enabled=bool(arm_ip) and bool(arm_canfd_follow),
                 background_streaming_hz=float(control_hz),
+                # A stalled 120 Hz worker must skip the already-missed slot
+                # and wait for a fresh target instead of issuing a catch-up
+                # command.  This is the deployment equivalent of the
+                # reviewed 60 Hz reference -> 120 Hz command teleop profile.
+                background_streaming_no_catch_up_after_send=True,
                 background_streaming_target_admission_mode=str(
                     getattr(
                         args,
