@@ -262,6 +262,32 @@ def test_active_rtc_gap_dry_run_clears_position_queue_without_backend_hold() -> 
     assert executor.clear_count == 1
 
 
+def test_active_rtc_gap_dry_run_clear_failure_does_not_hold_backend() -> None:
+    class _Executor:
+        def snapshot(self):
+            return {"active": True}
+
+        def clear(self) -> None:
+            raise RuntimeError("dry-run clear failed")
+
+    class _Arm:
+        def __init__(self) -> None:
+            self.holds = []
+
+        def hold_motion(self, reason):
+            self.holds.append(reason)
+
+    arm = _Arm()
+    with pytest.raises(RuntimeError, match="dry-run clear failed"):
+        run_policy._hold_active_rtc_gap(
+            reason="rtc_plan_underrun",
+            send_actions=False,
+            arm_backends={"left": arm},
+            position_deploy_executor=_Executor(),
+        )
+    assert arm.holds == []
+
+
 def test_active_rtc_latency_gate_discards_cold_sample_and_bounds_warm_max() -> None:
     pending = run_policy._rtc_active_latency_gate_result(
         [8.0, 0.20, 0.30],

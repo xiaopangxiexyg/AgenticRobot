@@ -1954,10 +1954,11 @@ def _hold_active_rtc_gap(
                 "Active RTC Hold was not established for sides: " + ", ".join(inactive)
             )
     except Exception:
-        hold_deploy_arm_backends(
-            arm_backends,
-            reason=f"{normalized_reason}:measured_qpos_hold_failed",
-        )
+        if send_actions:
+            hold_deploy_arm_backends(
+                arm_backends,
+                reason=f"{normalized_reason}:measured_qpos_hold_failed",
+            )
         raise
     return receipts
 
