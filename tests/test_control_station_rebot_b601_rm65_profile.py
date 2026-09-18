@@ -179,17 +179,30 @@ def test_controlled_frame_transform_maps_source_rotation_axis() -> None:
     )
 
 
-def test_tracked_v3_tool_tcp_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
+def test_tracked_urdf_frame_chain_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
     profile_path = (
         Path(__file__).resolve().parents[1]
         / "docs/hardware/profiles/b601_rm65_mapping_150_v2.json"
     )
     profile = load_b601_rm65_frame_mapping_profile(profile_path)
-    assert profile.profile_id == "b601-rm65-provisional-lab-150-v3-tool-tcp"
+    assert profile.profile_id == "b601-rm65-provisional-lab-150-v4-urdf-frame-chain"
+    expected_reference = np.array(
+        (
+            (0.0, 1.0, 0.0, -0.2625),
+            (-1.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        ),
+        dtype=np.float64,
+    )
+    np.testing.assert_array_equal(
+        profile.matrix_target_reference_source_reference,
+        expected_reference,
+    )
     expected_controlled = np.array(
         (
-            (0.0, -1.0, 0.0, 0.0),
-            (1.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0),
+            (-1.0, 0.0, 0.0, 0.0),
             (0.0, 0.0, 1.0, 0.0),
             (0.0, 0.0, 0.0, 1.0),
         ),
@@ -201,7 +214,7 @@ def test_tracked_v3_tool_tcp_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> 
     )
     assert (
         profile.semantic_content_hash
-        == "f602cf4f7fa3b4a3ff3f46f85dec5592ae6e95fef98c4c2f810f88120b56dc4a"
+        == "282d51eac24510722f3535f5237a61807da3e06f05ec7e435f705f903d502e36"
     )
     assert profile.translation_gain_target_reference_xyz == (1.5, 1.5, 1.5)
 
@@ -213,8 +226,8 @@ def test_tracked_v3_tool_tcp_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> 
         captured_clock_domain_id="test.monotonic",
     )
     expected_target_rotvec_by_source_axis = {
-        (0.1, 0.0, 0.0): (0.0, -0.1, 0.0),
-        (0.0, 0.1, 0.0): (0.1, 0.0, 0.0),
+        (0.1, 0.0, 0.0): (0.0, 0.1, 0.0),
+        (0.0, 0.1, 0.0): (-0.1, 0.0, 0.0),
         (0.0, 0.0, 0.1): (0.0, 0.0, 0.1),
     }
 
@@ -243,7 +256,53 @@ def test_tracked_v3_tool_tcp_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> 
         )
 
 
-def test_v3_profile_matches_rm65_mujoco_tool_tcp_zero_pose() -> None:
+def test_profile_controlled_rotation_is_a_json_tuning_parameter(tmp_path) -> None:
+    """Changing the profile matrix changes only the canonical axis mapping.
+
+    This is intentionally a file-level check: later axis calibration can use a
+    copied JSON profile without changing the session, adapter, or GUI code.
+    """
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/hardware/profiles/b601_rm65_mapping_150_v2.json"
+    )
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    payload["profile_id"] = "b601-rm65-profile-parameter-fixture"
+    payload["matrix_source_controlled_target_controlled"] = np.eye(4).tolist()
+    payload.pop("semantic_content_hash", None)
+    tuned_path = tmp_path / "tuned_mapping.json"
+    tuned_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    tuned = load_b601_rm65_frame_mapping_profile(tuned_path)
+    adapter = tuned.build_residual_adapter(_schema())
+    anchor = adapter.capture_anchor(
+        (_sample("anchor-tuned", 1.0, 0.0),),
+        anchor_generation=1,
+        captured_at=1.0,
+        captured_clock_domain_id="test.monotonic",
+    )
+    result = adapter.adapt(
+        (
+            _sample(
+                "current-tuned",
+                1.1,
+                0.0,
+                rotation=Rotation.from_rotvec((0.1, 0.0, 0.0)).as_matrix(),
+            ),
+        ),
+        anchor=anchor,
+        adapted_at=1.1,
+        adapted_clock_domain_id="test.monotonic",
+    )
+    value = np.asarray(result.relative_action.value("right_arm").values)
+    np.testing.assert_allclose(
+        Rotation.from_quat(value[3:]).as_rotvec(),
+        (0.1, 0.0, 0.0),
+        atol=1e-12,
+    )
+
+
+def test_urdf_frame_chain_profile_matches_rm65_mujoco_tool_tcp_zero_pose() -> None:
     """Derive the canonical tool_tcp mapping from the checked-in MuJoCo model.
 
     The visible ``right_realman`` assembly is intentionally not used as the
@@ -285,6 +344,15 @@ def test_v3_profile_matches_rm65_mujoco_tool_tcp_zero_pose() -> None:
         dtype=np.float64,
     )[:3, :3]
 
+    # The right-arm base is attached to world at +Y with Rz(+90 deg). The
+    # source B601 base is the identity world frame, so T_target_source is the
+    # inverse URDF attachment, not the target pose copied in the forward
+    # direction.
+    np.testing.assert_allclose(
+        np.asarray(profile.matrix_target_reference_source_reference),
+        np.linalg.inv(target_base),
+        atol=1e-5,
+    )
     # B601 gripper_end is identity at q=0. Therefore the controlled mapping
     # must turn the source identity into the RM65 tool_tcp zero orientation.
     np.testing.assert_allclose(

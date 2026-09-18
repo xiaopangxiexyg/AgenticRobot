@@ -1,9 +1,9 @@
 {
   "schema": "control_station.b601_rm65_frame_mapping.v1",
-  "profile_id": "b601-rm65-provisional-lab-150-v3-tool-tcp",
+  "profile_id": "b601-rm65-provisional-lab-150-v4-urdf-frame-chain",
   "enabled": true,
-  "calibration_source_id": "provisional-rm65-right-base-layout-v0",
-  "calibration_source_sha256": "48132776ece28ff5d96c06d11d69df459b13783cb4a871db4ef9d39981fe8c88",
+  "calibration_source_id": "rm65-dual-v3-right-frame-chain-urdf",
+  "calibration_source_sha256": "be771239031f6d94c40fd5cd5d1bef0dfe85abf589059e16dd3cbbf0c6a29f6b",
   "component_id": "right_arm",
   "source_reference_frame_id": "base_link",
   "source_controlled_frame_id": "gripper_end",
@@ -12,15 +12,15 @@
   "matrix_target_reference_source_reference": [
     [
       0.0,
-      -1.0,
-      0.0,
-      0.0
-    ],
-    [
       1.0,
       0.0,
+      -0.2625
+    ],
+    [
+      -1.0,
       0.0,
-      0.2625
+      0.0,
+      0.0
     ],
     [
       0.0,
@@ -38,12 +38,12 @@
   "matrix_source_controlled_target_controlled": [
     [
       0.0,
-      -1.0,
+      1.0,
       0.0,
       0.0
     ],
     [
-      1.0,
+      -1.0,
       0.0,
       0.0,
       0.0
@@ -67,5 +67,5 @@
     1.5
   ],
   "rotation_gain": 1.0,
-  "semantic_content_hash": "f602cf4f7fa3b4a3ff3f46f85dec5592ae6e95fef98c4c2f810f88120b56dc4a"
+  "semantic_content_hash": "282d51eac24510722f3535f5237a61807da3e06f05ec7e435f705f903d502e36"
 }
