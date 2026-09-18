@@ -226,7 +226,7 @@ def rtc_conditioned_client_inference_bundle_debug_payload(
     consumed_prefix_steps = len(
         consumption_receipt.consumed_generation_indices
     )
-    return {
+    payload = {
         "schema": "dexteleop_rtc_conditioned_client_exchange_debug_v1",
         "debug_only": True,
         "non_authoritative": True,
@@ -295,6 +295,16 @@ def rtc_conditioned_client_inference_bundle_debug_payload(
         "effective_delay_steps": int(result.effective_delay_steps or 0),
         "action_send_authority": False,
     }
+    timing = bundle.client_timing
+    if timing is not None:
+        payload["client_timing_sec"] = {
+            "capability_check": timing.capability_check_sec,
+            "encode_envelope": timing.encode_envelope_sec,
+            "backend_call": timing.backend_call_sec,
+            "response_validation": timing.response_validation_sec,
+            "result_decode": timing.result_decode_sec,
+        }
+    return payload
 
 
 def rtc_client_inference_bundle_debug_payload(
