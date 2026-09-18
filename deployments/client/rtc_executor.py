@@ -9,6 +9,7 @@ authority.  It only prepares one immutable observation cut for a negotiated
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Callable, Protocol, runtime_checkable
 
 import numpy as np
@@ -164,6 +165,7 @@ class RtcConditionedModelClientInferenceExecutorV3:
             raise ValueError(
                 "Model-RTC v3 work item is missing canonical conditioning."
             )
+        prepare_started_at = perf_counter()
         prepared = self.prepare_input(
             work_item.request,
             work_item.actor_observation,
@@ -174,11 +176,13 @@ class RtcConditionedModelClientInferenceExecutorV3:
             raise ValueError(
                 "Model-RTC v3 prefix mask comes only from canonical encoding."
             )
+        prepare_completed_at = perf_counter()
         result_bundle = self.client.infer(
             work_item.request,
             canonical_conditioning=bundle,
             model_input=prepared.model_input,
             model_input_hash=prepared.model_input_hash,
+            model_input_prepare_sec=(prepare_completed_at - prepare_started_at),
         )
         if self.observe_bundle is not None:
             self.observe_bundle(result_bundle)
@@ -304,6 +308,10 @@ def rtc_conditioned_client_inference_bundle_debug_payload(
             "response_validation": timing.response_validation_sec,
             "result_decode": timing.result_decode_sec,
         }
+        if timing.model_input_prepare_sec is not None:
+            payload["client_timing_sec"]["model_input_prepare"] = (
+                timing.model_input_prepare_sec
+            )
     return payload
 
 

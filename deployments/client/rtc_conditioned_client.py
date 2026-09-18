@@ -43,6 +43,7 @@ class RtcConditionedClientTiming:
     backend_call_sec: float
     response_validation_sec: float
     result_decode_sec: float
+    model_input_prepare_sec: float | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,7 @@ class RtcConditionedModelClientV3:
         canonical_conditioning: CanonicalRtcConditioningBundle,
         model_input: Any,
         model_input_hash: str,
+        model_input_prepare_sec: float | None = None,
     ) -> RtcConditionedClientInferenceBundleV3:
         timing_start = perf_counter()
         current_capability = self._backend.rtc_continuation_capability
@@ -348,7 +350,10 @@ class RtcConditionedModelClientV3:
                 capability_check_sec=capability_checked_at - timing_start,
                 encode_envelope_sec=envelope_built_at - capability_checked_at,
                 backend_call_sec=backend_returned_at - envelope_built_at,
-                response_validation_sec=response_validated_at - backend_returned_at,
-                result_decode_sec=result_built_at - response_validated_at,
+                response_validation_sec=(
+                    response_validated_at - backend_returned_at
+                ),
+                result_decode_sec=(result_built_at - response_validated_at),
+                model_input_prepare_sec=model_input_prepare_sec,
             ),
         )
