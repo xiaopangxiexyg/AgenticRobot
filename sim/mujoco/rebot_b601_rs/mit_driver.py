@@ -26,6 +26,7 @@ from sim.mujoco.scene import MujocoScene
 from .real2sim import (
     B601Real2SimControllerProfile,
     B601Real2SimPlantProfile,
+    B601SimFaultPolicy,
     B601SimStartupProfile,
 )
 from .scene import (
@@ -194,6 +195,7 @@ class B601MujocoEffortDriver:
         real2sim_profile: B601Real2SimControllerProfile | None = None,
         startup_profile: B601SimStartupProfile | None = None,
         plant_profile: B601Real2SimPlantProfile | None = None,
+        fault_policy: B601SimFaultPolicy | None = None,
     ) -> None:
         if not isinstance(scene, MujocoScene):
             raise TypeError("scene must be a MujocoScene")
@@ -219,7 +221,19 @@ class B601MujocoEffortDriver:
                 raise TypeError("startup_profile must be a B601SimStartupProfile")
             if real2sim_profile is None:
                 raise ValueError("startup_profile requires real2sim_profile")
+        if fault_policy is not None:
+            if not isinstance(fault_policy, B601SimFaultPolicy):
+                raise TypeError("fault_policy must be a B601SimFaultPolicy")
+            if real2sim_profile is None:
+                raise ValueError("fault_policy requires explicit real2sim_profile")
         self.startup_profile = startup_profile
+        self.fault_policy = (
+            fault_policy
+            if fault_policy is not None
+            else B601SimFaultPolicy()
+            if real2sim_profile is not None
+            else None
+        )
         if real2sim_profile is not None:
             self.execution_mode = "rebot_b601_rs_mujoco_host_zoh_local_damping"
             self.robot_dynamics = "unchanged_urdf_unidentified_motor_plant"
@@ -378,6 +392,9 @@ class B601MujocoEffortDriver:
             "network_transport": "out_of_scope",
             "timestamp_contract": "host_local_monotonic_observability",
             "watchdog_clock": "driver_owned_local_acceptance_time",
+            "fault_policy": (
+                None if self.fault_policy is None else self.fault_policy.metadata()
+            ),
             "stale_sample_action": ("reject_without_preemption_until_local_watchdog"),
             "unexpected_frame_action": (
                 "deactivate_reference_keep_local_gravity_and_damping"

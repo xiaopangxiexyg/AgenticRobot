@@ -145,6 +145,62 @@ class B601SimStartupProfile:
 
 
 @dataclass(frozen=True)
+class B601SimFaultPolicy:
+    """The fixed feedback-fault contract used by the Real2Sim driver.
+
+    This is deliberately a contract, not a tuning surface. The simulation
+    must expose the same conservative ownership boundaries as the wired
+    controller path: an out-of-order sample cannot preempt a newer accepted
+    reference, while a frame/validity error revokes the active reference.
+    A timeout only enters the lifecycle's protective hold when that lifecycle
+    is enabled; otherwise the controller remains on its local gravity/damping
+    fallback. Non-finite state or torque is a latched simulation fault and
+    cannot be recovered from cached transport data.
+    """
+
+    name: str = "b601_real2sim_feedback_fault_v1"
+    stale_reference_action: str = "reject_keep_until_watchdog"
+    invalid_or_wrong_frame_action: str = "revoke_reference_keep_local_fallback"
+    watchdog_timeout_action: str = "revoke_then_protective_hold_when_lifecycle_enabled"
+    nonfinite_state_or_torque_action: str = "latch_fault_without_physics_step"
+    protective_hold_reference_action: str = "reject_until_reset"
+    rearm_action: str = "explicit_reset_only"
+    cached_transport_recovery: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("name must be a non-empty string")
+        expected = {
+            "stale_reference_action": "reject_keep_until_watchdog",
+            "invalid_or_wrong_frame_action": "revoke_reference_keep_local_fallback",
+            "watchdog_timeout_action": (
+                "revoke_then_protective_hold_when_lifecycle_enabled"
+            ),
+            "nonfinite_state_or_torque_action": "latch_fault_without_physics_step",
+            "protective_hold_reference_action": "reject_until_reset",
+            "rearm_action": "explicit_reset_only",
+        }
+        for field, value in expected.items():
+            if getattr(self, field) != value:
+                raise ValueError(
+                    f"{field} does not match the supported simulation contract"
+                )
+        if not isinstance(self.cached_transport_recovery, bool):
+            raise TypeError("cached_transport_recovery must be a bool")
+        if self.cached_transport_recovery:
+            raise ValueError(
+                "cached transport recovery is not supported by the simulation contract"
+            )
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            **asdict(self),
+            "scope": "real2sim_feedback_admission_and_lifecycle",
+            "hardware_safety_claim": False,
+        }
+
+
+@dataclass(frozen=True)
 class B601Real2SimControllerProfile:
     """Host-held feedforward plus local zero-reference velocity damping.
 

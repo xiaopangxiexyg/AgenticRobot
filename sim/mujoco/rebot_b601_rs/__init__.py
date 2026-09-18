@@ -16,6 +16,7 @@ from .mit_driver import (
     default_b601_mit_profile,
     default_b601_mit_timing,
 )
+from .real2sim import B601SimFaultPolicy
 from .scene import (
     B601_RS_DEFAULT_ARM_QPOS,
     B601_RS_GRIPPER_OPEN_QPOS,
@@ -33,6 +34,7 @@ __all__ = [
     "B601MujocoEffortDriver",
     "B601PositionDriver",
     "B601PositionTick",
+    "B601SimFaultPolicy",
     "build_b601_mjcf_xml",
     "build_b601_mujoco_scene",
     "default_b601_mit_profile",
