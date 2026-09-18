@@ -104,7 +104,8 @@ T_source_controlled_target_controlled =
 
 该矩阵只作用于 `gripper_end → tool_tcp` 的受控旋转，不改变基座参考矩阵或位移倍率。
 因此源端小旋转的离线预期是：`+X → +Z`、`+Y → -Y`、`+Z → +X`；位移仍按
-`[1.5, 1.5, 1.5]` 解释。可复用的版本化 profile 位于：
+`[1.5, 1.5, 1.5]` 解释。可复用的版本化 profile 位于
+[b601_rm65_mapping_150_v2.json](./profiles/b601_rm65_mapping_150_v2.json)：
 
 ```text
 docs/hardware/profiles/b601_rm65_mapping_150_v2.json
