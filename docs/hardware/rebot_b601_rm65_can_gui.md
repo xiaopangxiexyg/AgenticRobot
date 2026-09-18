@@ -87,6 +87,33 @@ print(target)
 PY
 ```
 
+### B601 末端工具坐标校正（150% v2）
+
+上面的 `v1` 只解决位移倍率，且把 `gripper_end` 与 `tool_tcp` 的受控坐标系暂时当作
+同向（controlled matrix 为 identity）。这会让两个旋转轴在 RM65 上互换。B601 URDF 的
+`j_gripper_end` 固定关节相对 `link6` 使用 `rpy="3.1416 -1.5708 0"`，因此当前受控帧
+合同必须显式包含：
+
+```text
+T_source_controlled_target_controlled =
+[[ 0,  0,  1, 0],
+ [ 0, -1,  0, 0],
+ [ 1,  0,  0, 0],
+ [ 0,  0,  0, 1]]
+```
+
+该矩阵只作用于 `gripper_end → tool_tcp` 的受控旋转，不改变基座参考矩阵或位移倍率。
+因此源端小旋转的离线预期是：`+X → +Z`、`+Y → -Y`、`+Z → +X`；位移仍按
+`[1.5, 1.5, 1.5]` 解释。可复用的版本化 profile 位于：
+
+```text
+docs/hardware/profiles/b601_rm65_mapping_150_v2.json
+```
+
+其 `semantic_content_hash` 为
+`6d19eb1e0df109b050ca824d7031721994f54021491304db9e49712185a0365e`。现场验证必须显式
+使用该文件，并在结果 JSON 中记录 profile id/hash；不要继续使用 identity 的 `v1`。
+
 仿真只读连接可显式传 `--disable-teleop-residual-envelope`。它仅关闭 B601 binding 的
 “单 tick residual 平移/旋转幅度”预检，不关闭 RM65 的 canonical IK、关节、碰撞、速度、加速度、
 执行时域或 viewer fault 保护；该选项被限制为 `--connect-read-only`，不得用于真机运动 owner。

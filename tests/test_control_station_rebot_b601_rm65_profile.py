@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -176,6 +177,69 @@ def test_controlled_frame_transform_maps_source_rotation_axis() -> None:
         (0.0, -0.1, 0.0),
         atol=1e-12,
     )
+
+
+def test_tracked_v2_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/hardware/profiles/b601_rm65_mapping_150_v2.json"
+    )
+    profile = load_b601_rm65_frame_mapping_profile(profile_path)
+    expected_controlled = np.array(
+        (
+            (0.0, 0.0, 1.0, 0.0),
+            (0.0, -1.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        ),
+        dtype=np.float64,
+    )
+    np.testing.assert_array_equal(
+        profile.matrix_source_controlled_target_controlled,
+        expected_controlled,
+    )
+    assert (
+        profile.semantic_content_hash
+        == "6d19eb1e0df109b050ca824d7031721994f54021491304db9e49712185a0365e"
+    )
+    assert profile.translation_gain_target_reference_xyz == (1.5, 1.5, 1.5)
+
+    adapter = profile.build_residual_adapter(_schema())
+    anchor = adapter.capture_anchor(
+        (_sample("anchor-v2", 1.0, 0.0),),
+        anchor_generation=1,
+        captured_at=1.0,
+        captured_clock_domain_id="test.monotonic",
+    )
+    expected_target_rotvec_by_source_axis = {
+        (0.1, 0.0, 0.0): (0.0, 0.0, 0.1),
+        (0.0, 0.1, 0.0): (0.0, -0.1, 0.0),
+        (0.0, 0.0, 0.1): (0.1, 0.0, 0.0),
+    }
+
+    for index, (source_rotvec, expected_target_rotvec) in enumerate(
+        expected_target_rotvec_by_source_axis.items(),
+        start=1,
+    ):
+        result = adapter.adapt(
+            (
+                _sample(
+                    f"current-v2-{index}",
+                    1.0 + index / 10.0,
+                    0.0,
+                    rotation=Rotation.from_rotvec(source_rotvec).as_matrix(),
+                ),
+            ),
+            anchor=anchor,
+            adapted_at=1.0 + index / 10.0,
+            adapted_clock_domain_id="test.monotonic",
+        )
+        value = np.asarray(result.relative_action.value("right_arm").values)
+        np.testing.assert_allclose(
+            Rotation.from_quat(value[3:]).as_rotvec(),
+            expected_target_rotvec,
+            atol=1e-12,
+        )
 
 
 def test_payload_roundtrip_and_file_loader_verify_semantic_hash(tmp_path) -> None:

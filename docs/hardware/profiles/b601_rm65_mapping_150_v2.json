@@ -1,0 +1,71 @@
+{
+  "schema": "control_station.b601_rm65_frame_mapping.v1",
+  "profile_id": "b601-rm65-provisional-lab-150-v2-controlled-link6",
+  "enabled": true,
+  "calibration_source_id": "provisional-rm65-right-base-layout-v0",
+  "calibration_source_sha256": "48132776ece28ff5d96c06d11d69df459b13783cb4a871db4ef9d39981fe8c88",
+  "component_id": "right_arm",
+  "source_reference_frame_id": "base_link",
+  "source_controlled_frame_id": "gripper_end",
+  "target_reference_frame_id": "right_arm_base",
+  "target_controlled_frame_id": "tool_tcp",
+  "matrix_target_reference_source_reference": [
+    [
+      0.0,
+      -1.0,
+      0.0,
+      0.0
+    ],
+    [
+      1.0,
+      0.0,
+      0.0,
+      0.2625
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "matrix_source_controlled_target_controlled": [
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      -1.0,
+      0.0,
+      0.0
+    ],
+    [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "translation_gain_target_reference_xyz": [
+    1.5,
+    1.5,
+    1.5
+  ],
+  "rotation_gain": 1.0,
+  "semantic_content_hash": "6d19eb1e0df109b050ca824d7031721994f54021491304db9e49712185a0365e"
+}
