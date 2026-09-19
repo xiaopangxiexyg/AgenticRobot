@@ -24,6 +24,7 @@ from control_station.sim_hil_profile.rm65_b601_free_drive import (
     load_rm65_to_b601_mapping_profile,
 )
 from control_station.sources.rm65_free_drive import (
+    RM65FreeDriveRealtimePushSource,
     RM65FreeDriveSource,
     RM65FreeDriveSourceSpec,
 )
@@ -34,6 +35,9 @@ from teleop_runtime.backends.arms.rm65 import (
 )
 
 READ_ONLY_CONFIRMATION = "RM65_B601_READ_ONLY_FREE_DRIVE"
+READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION = (
+    "RM65_B601_READ_ONLY_CONFIGURE_TELEMETRY"
+)
 
 
 def _positive(value: str) -> float:
@@ -141,6 +145,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--source-poll-hz", type=_positive, default=20.0)
     parser.add_argument(
+        "--source-transport",
+        choices=("request-response", "realtime-push"),
+        default="request-response",
+        help=(
+            "RM65 observation transport; realtime-push consumes the vendor UDP "
+            "state callback and requires an already configured controller endpoint"
+        ),
+    )
+    parser.add_argument(
+        "--configure-realtime-push",
+        action="store_true",
+        help=(
+            "explicitly configure the RM65 UDP telemetry endpoint before registering "
+            "the read-only callback; this changes telemetry configuration only"
+        ),
+    )
+    parser.add_argument("--realtime-push-ip")
+    parser.add_argument("--realtime-push-port", type=int, default=8080)
+    parser.add_argument("--realtime-push-cycle-ms", type=int, default=5)
+    parser.add_argument(
         "--source-poll-mode",
         choices=("background", "synchronous"),
         default="background",
@@ -170,7 +194,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    if args.connect_read_only and args.confirmation != READ_ONLY_CONFIRMATION:
+    if args.configure_realtime_push:
+        if not args.connect_read_only:
+            parser.error("realtime push configuration requires --connect-read-only")
+        if args.source_transport != "realtime-push":
+            parser.error("realtime push configuration requires --source-transport realtime-push")
+        if args.confirmation != READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION:
+            parser.error(
+                "telemetry configuration requires "
+                f"--confirmation {READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION}"
+            )
+        if not str(args.realtime_push_ip or "").strip():
+            parser.error("--realtime-push-ip is required with --configure-realtime-push")
+    elif args.connect_read_only and args.confirmation != READ_ONLY_CONFIRMATION:
         parser.error(
             "read-only RM65 connection requires "
             f"--confirmation {READ_ONLY_CONFIRMATION}"
@@ -204,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
             "viewer_sync_hz": float(args.viewer_sync_hz),
             "source_poll_hz": float(args.source_poll_hz),
             "source_poll_mode": str(args.source_poll_mode),
+            "source_transport": str(args.source_transport),
+            "realtime_push_configure_requested": bool(args.configure_realtime_push),
+            "realtime_push_configuration_sent": False,
             "source_poll_clock": "monotonic_wall_time",
         }
 
@@ -225,14 +264,15 @@ def main(argv: list[str] | None = None) -> int:
                 arm_urdf_path=args.arm_urdf_path,
                 connect_hardware=bool(args.connect_read_only),
             )
-            source = RM65FreeDriveSource(
-                backend,
-                spec=RM65FreeDriveSourceSpec(
-                    maximum_measurement_age_sec=args.maximum_source_age_sec,
-                    maximum_receive_age_sec=args.maximum_receive_age_sec,
-                    maximum_future_skew_sec=args.maximum_future_skew_sec,
-                ),
+            source_spec = RM65FreeDriveSourceSpec(
+                maximum_measurement_age_sec=args.maximum_source_age_sec,
+                maximum_receive_age_sec=args.maximum_receive_age_sec,
+                maximum_future_skew_sec=args.maximum_future_skew_sec,
             )
+            if args.source_transport == "realtime-push":
+                source = RM65FreeDriveRealtimePushSource(backend, spec=source_spec)
+            else:
+                source = RM65FreeDriveSource(backend, spec=source_spec)
             bridge = build_rm65_to_b601_free_drive_bridge(
                 args.rebot_source_root,
                 source,
@@ -273,10 +313,27 @@ def main(argv: list[str] | None = None) -> int:
             )
             backend.start()
             result["backend_start_completed"] = True
+            if isinstance(source, RM65FreeDriveRealtimePushSource):
+                push_config = source.start(
+                    configure=bool(args.configure_realtime_push),
+                    cycle_ms=args.realtime_push_cycle_ms,
+                    port=args.realtime_push_port,
+                    ip=args.realtime_push_ip,
+                )
+                result["realtime_push_config"] = dict(push_config)
+                result["realtime_push_configuration_sent"] = bool(
+                    args.configure_realtime_push
+                )
+                emit(
+                    "[RM65→B601] realtime UDP observation callback registered; "
+                    "no RM65 motion command is issued."
+                )
             viewer = MujocoPassiveViewerSession(bridge.driver.scene)
             with ExitStack() as resources:
-                resources.callback(viewer.close)
                 resources.callback(backend.close)
+                if isinstance(source, RM65FreeDriveRealtimePushSource):
+                    resources.callback(source.close)
+                resources.callback(viewer.close)
                 viewer.start()
                 run_rm65_to_b601_foreground(
                     bridge,
@@ -325,6 +382,7 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "READ_ONLY_CONFIRMATION",
+    "READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION",
     "build_observation_only_rm65_backend",
     "main",
 ]

@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from .Robotic_Arm.rm_robot_interface import (
     RM_MOVE_MULTI_BLOCK,
     RM_MOVE_NBLOCK,
     RoboticArm,
-    rm_force_position_t,
-    rm_force_position_move_t,
-    rm_multi_drag_teach_t,
     rm_api_version,
+    rm_force_position_move_t,
+    rm_force_position_t,
     rm_frame_t,
     rm_inverse_kinematics_params_t,
+    rm_multi_drag_teach_t,
+    rm_realtime_arm_state_callback_ptr,
+    rm_realtime_push_config_t,
     rm_thread_mode_e,
 )
-
 
 RM65 = 65
 RM65_DOF = 6
@@ -81,6 +82,8 @@ class Arm:
         self.ip = ip
         self.port = port
         self._closed = False
+        self._realtime_push_callback = None
+        self._realtime_push_dispatch = None
         self._robot = RoboticArm(thread_mode)
         self._handle = self._robot.rm_create_robot_arm(ip, port, level=log_level)
         self.nSocket = getattr(self._handle, "id", -1)
@@ -125,6 +128,93 @@ class Arm:
         arm_err = int(err_values[0]) if err_values else 0
         sys_err = 0
         return ret, joint, pose, arm_err, sys_err
+
+    def Get_Realtime_Push_Config(self):
+        """Read the controller's UDP state-push configuration.
+
+        This is a read-only query.  The reverse teleop application uses it to
+        audit an already configured push destination without changing any
+        controller or motion state.
+        """
+
+        return self._robot.rm_get_realtime_push()
+
+    def Set_Realtime_Push_Config(
+        self,
+        *,
+        cycle_ms: int,
+        port: int,
+        ip: str,
+        enable: bool = True,
+    ):
+        """Configure the vendor UDP state push endpoint.
+
+        This method is intentionally separate from ``Get_Realtime_Push_Config``
+        because it changes controller telemetry configuration.  Callers must
+        require an explicit operator confirmation before using it; it never
+        enables motors or sends a motion command.
+        """
+
+        config = rm_realtime_push_config_t(
+            cycle=int(cycle_ms),
+            enable=bool(enable),
+            port=int(port),
+            force_coordinate=-1,
+            ip=str(ip),
+        )
+        return self._robot.rm_set_realtime_push(config)
+
+    def Realtime_Arm_Joint_State(self, callback):
+        """Register one vendor UDP state callback and retain its C reference."""
+
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+
+        def dispatch(raw_state):
+            joint_status = getattr(raw_state, "joint_status", None)
+            waypoint = getattr(raw_state, "waypoint", None)
+            if joint_status is None or waypoint is None:
+                callback({"error": "realtime_push_missing_state_fields"})
+                return
+            position = getattr(waypoint, "position", None)
+            euler = getattr(waypoint, "euler", None)
+            if position is None or euler is None:
+                callback({"error": "realtime_push_missing_pose_fields"})
+                return
+            err = getattr(raw_state, "err", None)
+            err_len = int(getattr(err, "err_len", 0)) if err is not None else 0
+            err_values = (
+                []
+                if err is None or err_len <= 0
+                else list(getattr(err, "err", []))[:err_len]
+            )
+            callback(
+                {
+                    "joint_deg": tuple(
+                        float(value)
+                        for value in list(joint_status.joint_position)[: self.arm_dof]
+                    ),
+                    "pose_6d": (
+                        float(position.x),
+                        float(position.y),
+                        float(position.z),
+                        float(euler.rx),
+                        float(euler.ry),
+                        float(euler.rz),
+                    ),
+                    "err_code": int(getattr(raw_state, "errCode", 0)),
+                    "arm_error": int(err_values[0]) if err_values else 0,
+                    "system_error": 0,
+                }
+            )
+
+        # ctypes callbacks are collected if the Python reference is not held
+        # for the lifetime of the native UDP worker.  Keep it on this adapter.
+        self._realtime_push_dispatch = dispatch
+        self._realtime_push_callback = rm_realtime_arm_state_callback_ptr(dispatch)
+        return self._robot.rm_realtime_arm_state_call_back(
+            self._realtime_push_callback
+        )
 
     def Get_Force_Data(self):
         ret, data = self._robot.rm_get_force_data()

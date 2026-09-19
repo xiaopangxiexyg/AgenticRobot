@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from control_station.sources.rm65_free_drive import (
+    RM65FreeDriveRealtimePushSource,
     RM65FreeDriveSource,
     RM65FreeDriveSourceSpec,
 )
@@ -46,6 +47,28 @@ class _Backend:
     def refresh_state_from_hardware(self, **kwargs: object) -> dict[str, object]:
         self.calls.append(dict(kwargs))
         return self.states.pop(0)
+
+
+class _PushBackend(_Backend):
+    def __init__(self) -> None:
+        super().__init__([_state()])
+        self.push_callback = None
+
+    def compute_tcp_pose(self, *, qpos):
+        assert len(qpos) == 6
+        return np.eye(4)
+
+    def start_realtime_push_observation(self, callback, **kwargs):
+        self.push_callback = callback
+        callback(
+            {
+                "joint_deg": (0.0, 5.72957795, 11.4591559, 17.18873385, 22.9183118, 28.64788976),
+                "err_code": 0,
+                "arm_error": 0,
+                "system_error": 0,
+            }
+        )
+        return {"cycle": 5, "enable": True, "port": 8080}
 
 
 def _source(
@@ -121,3 +144,61 @@ def test_source_rejects_non_rigid_pose_without_fallback() -> None:
 
     assert not step.admitted
     assert "current_tcp_pose is invalid" in (step.rejection_reason or "")
+
+
+def test_realtime_push_source_admits_complete_callback_without_sdk_poll() -> None:
+    backend = _PushBackend()
+    source = RM65FreeDriveRealtimePushSource(
+        backend,
+        spec=RM65FreeDriveSourceSpec(
+            maximum_measurement_age_sec=0.25,
+            maximum_receive_age_sec=0.25,
+        ),
+        wall_clock=lambda: 10.1,
+        monotonic_clock=lambda: 20.1,
+    )
+    source.start()
+    step = source.step()
+
+    assert step.admitted
+    assert step.sample is not None
+    assert step.sample.sequence == 1
+    assert np.allclose(step.sample.qpos_rad, (0.0, 0.1, 0.2, 0.3, 0.4, 0.5))
+    assert backend.calls == []
+    source.close()
+
+
+def test_realtime_push_source_rejects_duplicate_latest_packet() -> None:
+    backend = _PushBackend()
+    source = RM65FreeDriveRealtimePushSource(
+        backend,
+        wall_clock=lambda: 10.1,
+        monotonic_clock=lambda: 20.1,
+    )
+    source.start()
+    assert source.step().admitted
+    duplicate = source.step()
+    assert not duplicate.admitted
+    assert "measurement_not_advancing" in (duplicate.rejection_reason or "")
+
+
+def test_realtime_push_source_fails_closed_on_vendor_error() -> None:
+    backend = _PushBackend()
+    source = RM65FreeDriveRealtimePushSource(
+        backend,
+        wall_clock=lambda: 10.1,
+        monotonic_clock=lambda: 20.1,
+    )
+    source.start()
+    assert backend.push_callback is not None
+    backend.push_callback(
+        {
+            "joint_deg": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            "err_code": 9,
+            "arm_error": 0,
+            "system_error": 0,
+        }
+    )
+    step = source.step()
+    assert not step.admitted
+    assert "vendor error" in (step.rejection_reason or "")

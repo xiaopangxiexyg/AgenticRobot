@@ -260,6 +260,59 @@ GUI 验收证明 viewer、后台 40 Hz source poll、连续 IK 和 MuJoCo target
 后续若需要量化 viewer 性能，应单独测量 `viewer_sync_hz`，不要把 GUI 步频当成
 RM65 观测频率或硬件控制频率。
 
+### 2026-09-19 请求-响应延迟定位与可选 UDP 观测路径
+
+对远端 40 Hz GUI 运行的原始 `source_read_phase_timing` 记录进行了逐条分析。1480 次
+有效读取中，锁等待和解析验证都在亚毫秒量级，重试次数始终为 1，`retry_sleep` 始终为
+零；而 RealMan SDK 请求-响应阶段的 wall time 为：
+
+```text
+sdk_call_wall_ms: mean 6.545 / p95 10.357 / p99 43.189 / max 49.335
+total_wall_ms:    mean 6.585 / p95 10.386 / p99 43.225 / max 49.379
+```
+
+22 次 source schedule skip 全部对应 SDK wall time 超过 15 ms。它们不是 IK 或锁竞争
+造成的：retarget/IK 的 mean/p95/p99 约为 `0.979/1.287/1.464 ms`，source poll
+lateness 的 p99 约为 `0.13 ms`。因此 background poll 已经解决了主循环被同步 SDK
+调用阻塞的问题，但请求-响应协议本身仍然决定 RM65 新鲜观测的延迟尾部；单纯提高
+MuJoCo 频率、放宽目标速度或继续微调 IK 不能消除这部分延迟。
+
+候选现在增加了一个**可选** `realtime-push` source transport：
+
+- `RM65FreeDriveRealtimePushSource` 只保留 vendor UDP callback 的最新完整六轴样本；
+  callback 不做 FK、不运行 IK，也不持有第二个 target authority。
+- FK、freshness、错误码、sequence 递增和 fail-closed admission 仍在原有 bridge
+  owner 线程完成，保持现有 source/target 安全边界。
+- `RM65ArmBackend.start_realtime_push_observation()` 默认只查询已有 UDP 配置并注册
+  callback；不会写控制器配置、使能电机或发送运动命令。
+- 只有同时传入 `--configure-realtime-push`、目标 IP 和专用确认字符串
+  `RM65_B601_READ_ONLY_CONFIGURE_TELEMETRY` 才会写 UDP telemetry 配置。该操作仍是
+  观测配置，不是运动命令；在真机上必须由操作者单独确认并保存前台日志。
+- 默认 `request-response` 路径保持不变，可直接回退。新路径的故障（无样本、重复
+  sequence、vendor error、回调字段不完整）均进入 source rejection，不使用旧样本
+  冒险跟随。
+
+该接口复用 RealMan API2 已有的 UDP 状态主动上报、三线程模式和实时状态 callback，
+不是重新实现控制协议。官方 API2 文档也要求三线程模式和正确的 UDP 目标/防火墙配置；
+因此现场验收前先做只读配置查询，再决定是否进行显式 telemetry 配置。当前只完成离线
+source/application 测试，尚未在真机上启用或配置 UDP push。
+
+### 下一轮延迟验收
+
+先在远端只读运行 `--source-transport realtime-push`、不带
+`--configure-realtime-push`，确认控制器已有 push endpoint 且结果中的
+`source_transport=realtime-push`、`realtime_push_config`、source interval 和
+completion-to-dispatch 均连续。如果配置未启用，命令应明确失败并保持无运动命令；
+不得把失败伪装成 request-response 回退。只有在操作者确认后，才单独运行带专用确认的
+telemetry 配置命令，再重复同一 40 Hz 只读验收并比较 p95/p99。比较对象必须包含：
+
+```text
+request-response: sdk_call_wall_ms, source_to_target_dispatch_latency_sec
+realtime-push:    callback arrival interval, source_to_target_dispatch_latency_sec
+```
+
+两者都不包含物理执行器响应和 viewer 呈现延迟；这些仍需在后续双向真机阶段单独测量。
+
 ### P2 synthetic MuJoCo 自动化测试
 
 已增加 `tests/test_rebot_b601_rm65_free_drive_integration.py`。该用例使用真实
