@@ -605,9 +605,10 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - `arm-mode=real` 下会在开始 home capture 前读取真机当前关节状态，并把它作为本地 preview 的起始姿态；整个入口不会发送任何真机动作指令
 - `--load-initial-alignment` 会在你按下 `p` 时提供机器人侧的 home pose/qpos；如果没有它，而又连了真机，则 `p` 会同时采当前真机 arm home；如果既没有它也没连真机，则 `p` 用当前 preview arm pose 作为 robot home
 - 默认会启用 joint-space 双臂碰撞规避，scene profile 默认 `dual_arm_hand_proxy_open`；它使用明确指定的 12 对碰撞检测集合，覆盖固定张开手/arm-link3 proxy 与中央/左右 camera pole、table 的关键组合
+- DMTAC 装配使用 `dual_arm_hand_proxy_dmtac_strict` 显式切换；该 profile 保留原手部 proxy，并额外加载左右手各一个 DMTAC 末端 proxy box 及对应碰撞对，不改变上述默认 profile
 - 默认碰撞模式是 `boundary_slide`；如果要在接触阈值附近直接保持最近安全关节位姿，可改用 `--collision-avoidance-mode freeze_on_contact`
 - 如果想直接退回旧的独立双臂链路，可以加 `--no-collision`；旧参数 `--disable-dual-arm-collision-avoidance` 仍兼容
-- 当前预留的 scene profile 顺序是：`dual_arm` -> `dual_arm_hand_proxy_open` -> `dual_arm_hand` -> `dual_arm_cylinder_table`
+- 当前预留的 scene profile 顺序是：`dual_arm` -> `dual_arm_hand_proxy_open` -> `dual_arm_hand_proxy_dmtac_strict` -> `dual_arm_hand` -> `dual_arm_cylinder_table`
 - runtime home calibration 只负责 home 锚点，不负责完整 desk/world 对齐
 - 启动时会打印 `expecting ...` 和 `observed ...`，这是当前最直接的 tracker 绑定验收信息
 - 当前 action 主 frame 是 `tool_tcp`；`--tcp-mode hand_base` 只作为历史兼容参数保留

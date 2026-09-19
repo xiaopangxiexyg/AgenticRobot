@@ -1545,6 +1545,7 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "dual_arm",
             "dual_arm_hand_proxy_open",
+            "dual_arm_hand_proxy_dmtac_strict",
             "dual_arm_hand",
             "dual_arm_cylinder_table",
         ],

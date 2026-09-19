@@ -398,6 +398,7 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "dual_arm",
             "dual_arm_hand_proxy_open",
+            "dual_arm_hand_proxy_dmtac_strict",
             "dual_arm_hand",
             "dual_arm_cylinder_table",
         ],
@@ -405,7 +406,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Joint-space collision scene profile used by the dual-arm solver. "
             "'dual_arm_hand_proxy_open' keeps arm IK at 12DoF while attaching fixed open-hand "
-            "proxy geometry to both wrists and a fixed table box for collision."
+            "proxy geometry to both wrists and a fixed table box for collision. "
+            "'dual_arm_hand_proxy_dmtac_strict' is an explicit DMTAC opt-in."
         ),
     )
     parser.add_argument("--hz", type=_positive_float, default=30.0, help="Target control/update rate")

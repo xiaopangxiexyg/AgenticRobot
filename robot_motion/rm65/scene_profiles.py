@@ -41,6 +41,37 @@ DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES = (
     "table_0",
 )
 
+
+def _build_dmtac_hand_proxy_collision_pairs() -> tuple[tuple[str, str], ...]:
+    left_hand_geometries = ("left_hand_proxy_0", "left_hand_proxy_1")
+    right_hand_geometries = ("right_hand_proxy_0", "right_hand_proxy_1")
+    pairs: list[tuple[str, str]] = []
+    pairs.extend(("arm_link3_proxy_0", geometry) for geometry in right_hand_geometries)
+    pairs.extend((geometry, "right_arm_link3_proxy_0") for geometry in left_hand_geometries)
+    pairs.extend(
+        (left_geometry, right_geometry)
+        for left_geometry in left_hand_geometries
+        for right_geometry in right_hand_geometries
+    )
+    pairs.extend((geometry, "camera_pole_0") for geometry in left_hand_geometries)
+    pairs.extend((geometry, "camera_pole_0") for geometry in right_hand_geometries)
+    pairs.extend((geometry, "table_0") for geometry in left_hand_geometries)
+    pairs.extend((geometry, "table_0") for geometry in right_hand_geometries)
+    pairs.extend(
+        (
+            ("arm_link3_proxy_0", "table_0"),
+            ("right_arm_link3_proxy_0", "table_0"),
+            ("arm_link3_proxy_0", "left_camera_pole_0"),
+            ("right_arm_link3_proxy_0", "right_camera_pole_0"),
+        )
+    )
+    return tuple(pairs)
+
+
+DUAL_ARM_DMTAC_HAND_PROXY_CHECKED_COLLISION_PAIRS = (
+    _build_dmtac_hand_proxy_collision_pairs()
+)
+
 _POSE_TRANSFORM_LEFT = np.array(
     [
         [0, 1, 0, 0],
@@ -188,6 +219,19 @@ def _extract_link_color_rgba(link_element: ET.Element) -> tuple[float, float, fl
     return (0.8, 0.8, 0.8, 0.25)
 
 
+def _extract_link_visual_color_rgba(
+    link_element: ET.Element,
+    *,
+    visual_index: int,
+) -> tuple[float, float, float, float]:
+    visuals = link_element.findall("visual")
+    if 0 <= visual_index < len(visuals):
+        color = visuals[visual_index].find("material/color")
+        if color is not None:
+            return _parse_float_tuple(color.get("rgba"), count=4)
+    return _extract_link_color_rgba(link_element)
+
+
 def _find_fixed_joint_for_link(root: ET.Element, link_name: str) -> ET.Element:
     for candidate in root.findall("joint"):
         child = candidate.find("child")
@@ -196,31 +240,83 @@ def _find_fixed_joint_for_link(root: ET.Element, link_name: str) -> ET.Element:
     raise ValueError(f"Could not find fixed joint for link '{link_name}'.")
 
 
+def _build_hand_proxy_specs(
+    root: ET.Element,
+    *,
+    link_name: str,
+    side: Literal["left", "right"],
+    include_all_collision_boxes: bool = False,
+) -> tuple[HandProxyBoxSpec, ...]:
+    link_element = _find_named_xml_element(root, "link", link_name)
+    if include_all_collision_boxes:
+        containers = tuple(
+            container
+            for container in link_element.findall("collision")
+            if container.find("geometry/box") is not None
+        )
+        if not containers:
+            containers = tuple(
+                container
+                for container in link_element.findall("visual")
+                if container.find("geometry/box") is not None
+            )
+    else:
+        containers = ()
+        for container_tag in ("collision", "visual"):
+            containers = tuple(
+                container
+                for container in link_element.findall(container_tag)
+                if container.find("geometry/box") is not None
+            )
+            if containers:
+                containers = containers[:1]
+                break
+    if not containers:
+        raise ValueError(f"Link '{link_name}' does not contain a box geometry.")
+    joint_element = _find_fixed_joint_for_link(root, link_name)
+    parent = joint_element.find("parent")
+    if parent is None or parent.get("link") is None:
+        raise ValueError(f"Proxy link '{link_name}' is missing a parent link in its joint.")
+    joint_origin_xyz, joint_origin_rpy = _parse_origin(joint_element)
+    specs = []
+    for index, container in enumerate(containers):
+        size = _parse_float_tuple(container.find("geometry/box").get("size"), count=3)
+        box_origin_xyz, box_origin_rpy = _parse_origin(container)
+        specs.append(
+            HandProxyBoxSpec(
+                name=(
+                    link_name
+                    if index == 0 and not include_all_collision_boxes
+                    else f"{link_name}_{index}"
+                ),
+                side=side,
+                geometry_name=f"{link_name}_{index}",
+                parent_link_name=parent.get("link"),
+                box_size_xyz=size,
+                joint_origin_xyz=joint_origin_xyz,
+                joint_origin_rpy=joint_origin_rpy,
+                box_origin_xyz=box_origin_xyz,
+                box_origin_rpy=box_origin_rpy,
+                color_rgba=_extract_link_visual_color_rgba(
+                    link_element,
+                    visual_index=index,
+                ),
+            )
+        )
+    return tuple(specs)
+
+
 def _build_hand_proxy_spec(
     root: ET.Element,
     *,
     link_name: str,
     side: Literal["left", "right"],
 ) -> HandProxyBoxSpec:
-    link_element = _find_named_xml_element(root, "link", link_name)
-    size, box_origin_xyz, box_origin_rpy = _extract_link_box_geometry(link_element)
-    joint_element = _find_fixed_joint_for_link(root, link_name)
-    parent = joint_element.find("parent")
-    if parent is None or parent.get("link") is None:
-        raise ValueError(f"Proxy link '{link_name}' is missing a parent link in its joint.")
-    joint_origin_xyz, joint_origin_rpy = _parse_origin(joint_element)
-    return HandProxyBoxSpec(
-        name=link_name,
+    return _build_hand_proxy_specs(
+        root,
+        link_name=link_name,
         side=side,
-        geometry_name=f"{link_name}_0",
-        parent_link_name=parent.get("link"),
-        box_size_xyz=size,
-        joint_origin_xyz=joint_origin_xyz,
-        joint_origin_rpy=joint_origin_rpy,
-        box_origin_xyz=box_origin_xyz,
-        box_origin_rpy=box_origin_rpy,
-        color_rgba=_extract_link_color_rgba(link_element),
-    )
+    )[0]
 
 
 def _build_fixed_scene_box_spec(
@@ -248,11 +344,25 @@ def _build_fixed_scene_box_spec(
     )
 
 
-def _load_hand_proxy_boxes(urdf_path: Path) -> tuple[HandProxyBoxSpec, ...]:
+def _load_hand_proxy_boxes(
+    urdf_path: Path,
+    *,
+    include_all_collision_boxes: bool = False,
+) -> tuple[HandProxyBoxSpec, ...]:
     root = ET.parse(urdf_path).getroot()
     return (
-        _build_hand_proxy_spec(root, link_name="left_hand_proxy", side="left"),
-        _build_hand_proxy_spec(root, link_name="right_hand_proxy", side="right"),
+        *_build_hand_proxy_specs(
+            root,
+            link_name="left_hand_proxy",
+            side="left",
+            include_all_collision_boxes=include_all_collision_boxes,
+        ),
+        *_build_hand_proxy_specs(
+            root,
+            link_name="right_hand_proxy",
+            side="right",
+            include_all_collision_boxes=include_all_collision_boxes,
+        ),
     )
 
 
@@ -304,14 +414,23 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
             solution_layout="auto",
         )
 
-    if name in {"dual_arm_hand_proxy_open", "dual_arm_hand_proxy_strict"}:
-        urdf_name = (
-            "rm65_dual_arm_hand_proxy_strict.urdf"
-            if name == "dual_arm_hand_proxy_strict"
-            else "rm65_dual_arm_hand_proxy_open.urdf"
-        )
+    if name in {
+        "dual_arm_hand_proxy_open",
+        "dual_arm_hand_proxy_strict",
+        "dual_arm_hand_proxy_dmtac_strict",
+    }:
+        if name == "dual_arm_hand_proxy_strict":
+            urdf_name = "rm65_dual_arm_hand_proxy_strict.urdf"
+        elif name == "dual_arm_hand_proxy_dmtac_strict":
+            urdf_name = "rm65_dual_arm_hand_proxy_dmtac_strict.urdf"
+        else:
+            urdf_name = "rm65_dual_arm_hand_proxy_open.urdf"
         urdf_path = asset_dir / urdf_name
-        hand_proxy_boxes = _load_hand_proxy_boxes(urdf_path)
+        is_dmtac_profile = name == "dual_arm_hand_proxy_dmtac_strict"
+        hand_proxy_boxes = _load_hand_proxy_boxes(
+            urdf_path,
+            include_all_collision_boxes=is_dmtac_profile,
+        )
         link3_proxy_boxes = _load_link3_proxy_boxes(urdf_path)
         fixed_scene_boxes = (
             _load_fixed_scene_box(urdf_path, link_name="camera_pole"),
@@ -326,13 +445,26 @@ def build_dual_arm_scene_profile(name: str = DEFAULT_COLLISION_SCENE) -> DualArm
                 "Hand-proxy collision scene URDF no longer exposes the required "
                 f"fixed geometry set {DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES}."
             )
+        if is_dmtac_profile and tuple(box.geometry_name for box in hand_proxy_boxes) != (
+            "left_hand_proxy_0",
+            "left_hand_proxy_1",
+            "right_hand_proxy_0",
+            "right_hand_proxy_1",
+        ):
+            raise ValueError(
+                "DMTAC hand-proxy URDF must expose exactly two collision boxes per hand."
+            )
         return DualArmSceneProfile(
             name=name,
             urdf_path=urdf_path,
             package_dirs=(asset_dir,),
             left_frame_name="arm_link6",
             right_frame_name="right_arm_link6",
-            collision_pairs=DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS,
+            collision_pairs=(
+                DUAL_ARM_DMTAC_HAND_PROXY_CHECKED_COLLISION_PAIRS
+                if is_dmtac_profile
+                else DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS
+            ),
             hand_proxy_boxes=(*hand_proxy_boxes, *link3_proxy_boxes),
             fixed_scene_boxes=fixed_scene_boxes,
             left_pose_transform=_POSE_TRANSFORM_LEFT.copy(),
@@ -442,6 +574,7 @@ def build_rm65_dual_arm_scene_profile(
 
 
 __all__ = [
+    "DUAL_ARM_DMTAC_HAND_PROXY_CHECKED_COLLISION_PAIRS",
     "DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS",
     "DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES",
     "DualArmSceneProfile",

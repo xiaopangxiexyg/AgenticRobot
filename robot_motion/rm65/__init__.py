@@ -147,6 +147,7 @@ from .ik_tuning import (
     weighted_joint_distance_score,
 )
 from .scene_profiles import (
+    DUAL_ARM_DMTAC_HAND_PROXY_CHECKED_COLLISION_PAIRS,
     DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS,
     DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES,
     DualArmSceneProfile,
@@ -264,6 +265,7 @@ __all__ = [
     "DualArmTargetContext",
     "DualArmRecoveryConfig",
     "HAND_BASE_FRAME",
+    "DUAL_ARM_DMTAC_HAND_PROXY_CHECKED_COLLISION_PAIRS",
     "DUAL_ARM_HAND_PROXY_CHECKED_COLLISION_PAIRS",
     "DUAL_ARM_HAND_PROXY_COLLISION_FIXED_GEOMETRIES",
     "DualArmSceneProfile",
