@@ -23,7 +23,7 @@ def _build_kinematic_solver():
     )
 
 
-def test_set_configuration_q_refreshes_pink_kinematic_cache() -> None:
+def test_rebase_configuration_q_refreshes_pink_kinematic_cache() -> None:
     """A rebase must update frame placements, not only the public q vector."""
 
     bundle = _build_kinematic_solver()
@@ -40,7 +40,7 @@ def test_set_configuration_q_refreshes_pink_kinematic_cache() -> None:
     frame_id = solver.robot.model.getFrameId(frame_name)
     expected_transform = expected_data.oMf[frame_id]
 
-    solver.set_configuration_q(q)
+    solver.rebase_configuration_q(q)
     cached_transform = solver.configuration.get_transform_frame_to_world(frame_name)
 
     np.testing.assert_allclose(
@@ -55,7 +55,7 @@ def test_set_configuration_q_refreshes_pink_kinematic_cache() -> None:
     )
 
 
-def test_set_configuration_q_rebase_is_safe_for_both_arm_frames() -> None:
+def test_rebase_configuration_q_is_safe_for_both_arm_frames() -> None:
     """The shared setter refreshes both coupled arm branches after a rebase."""
 
     bundle = _build_kinematic_solver()
@@ -70,7 +70,7 @@ def test_set_configuration_q_rebase_is_safe_for_both_arm_frames() -> None:
     solver.pin.forwardKinematics(solver.robot.model, expected_data, q)
     solver.pin.updateFramePlacements(solver.robot.model, expected_data)
 
-    solver.set_configuration_q(q)
+    solver.rebase_configuration_q(q)
     for frame_name in (bundle.left_frame_name, bundle.right_frame_name):
         frame_id = solver.robot.model.getFrameId(frame_name)
         expected_transform = expected_data.oMf[frame_id]
