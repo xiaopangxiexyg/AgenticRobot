@@ -423,6 +423,129 @@ def _positive(value: str) -> float:
     return result
 
 
+def _finite_rotation_values(
+    values: object | None,
+    *,
+    count: int,
+    name: str,
+) -> tuple[float, ...] | None:
+    """Normalize a CLI rotation override without weakening frame validation."""
+
+    if values is None:
+        return None
+    try:
+        normalized = tuple(float(value) for value in values)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must contain numeric values.") from exc
+    if len(normalized) != count or any(not math.isfinite(value) for value in normalized):
+        raise ValueError(f"{name} must contain {count} finite values.")
+    return normalized
+
+
+def _rotation_matrix_from_rpy_degrees(values: tuple[float, ...]) -> tuple[tuple[float, ...], ...]:
+    """Build a row-major ``Rz(yaw) @ Ry(pitch) @ Rx(roll)`` matrix."""
+
+    roll, pitch, yaw = (math.radians(value) for value in values)
+    cx, sx = math.cos(roll), math.sin(roll)
+    cy, sy = math.cos(pitch), math.sin(pitch)
+    cz, sz = math.cos(yaw), math.sin(yaw)
+    rx = ((1.0, 0.0, 0.0), (0.0, cx, -sx), (0.0, sx, cx))
+    ry = ((cy, 0.0, sy), (0.0, 1.0, 0.0), (-sy, 0.0, cy))
+    rz = ((cz, -sz, 0.0), (sz, cz, 0.0), (0.0, 0.0, 1.0))
+
+    def multiply(left, right):
+        return tuple(
+            tuple(
+                sum(left[row][index] * right[index][column] for index in range(3))
+                for column in range(3)
+            )
+            for row in range(3)
+        )
+
+    matrix = multiply(multiply(rz, ry), rx)
+    return tuple(
+        tuple(0.0 if abs(value) < 1e-12 else float(value) for value in row)
+        for row in matrix
+    )
+
+
+def _mapping_rotation_override(
+    mapping: object,
+    *,
+    reference_rpy_deg: object | None,
+    reference_matrix: object | None,
+    controlled_rpy_deg: object | None,
+    controlled_matrix: object | None,
+) -> tuple[object, dict[str, object]]:
+    """Apply foreground frame tuning parameters to one loaded profile."""
+
+    reference_rpy = _finite_rotation_values(
+        reference_rpy_deg,
+        count=3,
+        name="--mapping-reference-rotation-rpy-deg",
+    )
+    controlled_rpy = _finite_rotation_values(
+        controlled_rpy_deg,
+        count=3,
+        name="--mapping-controlled-rotation-rpy-deg",
+    )
+    reference_values = _finite_rotation_values(
+        reference_matrix,
+        count=9,
+        name="--mapping-reference-rotation-matrix",
+    )
+    controlled_values = _finite_rotation_values(
+        controlled_matrix,
+        count=9,
+        name="--mapping-controlled-rotation-matrix",
+    )
+    reference_override = (
+        _rotation_matrix_from_rpy_degrees(reference_rpy)
+        if reference_rpy is not None
+        else (
+            tuple(
+                tuple(reference_values[row * 3 : row * 3 + 3])
+                for row in range(3)
+            )
+            if reference_values is not None
+            else None
+        )
+    )
+    controlled_override = (
+        _rotation_matrix_from_rpy_degrees(controlled_rpy)
+        if controlled_rpy is not None
+        else (
+            tuple(
+                tuple(controlled_values[row * 3 : row * 3 + 3])
+                for row in range(3)
+            )
+            if controlled_values is not None
+            else None
+        )
+    )
+    if reference_override is None and controlled_override is None:
+        return mapping, {}
+    apply_override = getattr(mapping, "with_rotation_overrides", None)
+    if not callable(apply_override):
+        raise TypeError(
+            "mapping profile does not support foreground rotation overrides."
+        )
+    tuned = apply_override(
+        reference_rotation_matrix=reference_override,
+        controlled_rotation_matrix=controlled_override,
+    )
+    metadata: dict[str, object] = {}
+    if reference_rpy is not None:
+        metadata["reference_rotation_rpy_deg"] = list(reference_rpy)
+    elif reference_values is not None:
+        metadata["reference_rotation_matrix"] = list(reference_values)
+    if controlled_rpy is not None:
+        metadata["controlled_rotation_rpy_deg"] = list(controlled_rpy)
+    elif controlled_values is not None:
+        metadata["controlled_rotation_matrix"] = list(controlled_values)
+    return tuned, metadata
+
+
 def _finite_float_or_none(value: object) -> float | None:
     if value is None:
         return None
@@ -453,6 +576,26 @@ def _mapping_contract_metadata(mapping: object, path: Path) -> dict[str, object]
     rotation_gain = _finite_float_or_none(getattr(mapping, "rotation_gain", None))
     if rotation_gain is not None:
         metadata["rotation_gain"] = rotation_gain
+    for field_name, output_name in (
+        (
+            "matrix_target_reference_source_reference",
+            "effective_reference_rotation_matrix",
+        ),
+        (
+            "matrix_source_controlled_target_controlled",
+            "effective_controlled_rotation_matrix",
+        ),
+    ):
+        matrix = getattr(mapping, field_name, None)
+        try:
+            rotation = [
+                [float(matrix[row][column]) for column in range(3)]
+                for row in range(3)
+            ]
+        except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+            continue
+        if all(math.isfinite(value) for row in rotation for value in row):
+            metadata[output_name] = rotation
     return metadata
 
 
@@ -599,7 +742,66 @@ def main(argv: list[str] | None = None) -> int:
             "freshness timeout; does not change the B601 owner"
         ),
     )
+    reference_rotation = parser.add_mutually_exclusive_group()
+    reference_rotation.add_argument(
+        "--mapping-reference-rotation-rpy-deg",
+        nargs=3,
+        type=float,
+        metavar=("ROLL", "PITCH", "YAW"),
+        help=(
+            "foreground override for the base-frame rotation, in degrees; "
+            "composition is Rz(yaw) @ Ry(pitch) @ Rx(roll)"
+        ),
+    )
+    reference_rotation.add_argument(
+        "--mapping-reference-rotation-matrix",
+        nargs=9,
+        type=float,
+        metavar="R",
+        help="foreground override for the base-frame 3x3 rotation, row-major",
+    )
+    controlled_rotation = parser.add_mutually_exclusive_group()
+    controlled_rotation.add_argument(
+        "--mapping-controlled-rotation-rpy-deg",
+        nargs=3,
+        type=float,
+        metavar=("ROLL", "PITCH", "YAW"),
+        help=(
+            "foreground override for the tool-frame rotation, in degrees; "
+            "composition is Rz(yaw) @ Ry(pitch) @ Rx(roll)"
+        ),
+    )
+    controlled_rotation.add_argument(
+        "--mapping-controlled-rotation-matrix",
+        nargs=9,
+        type=float,
+        metavar="R",
+        help="foreground override for the tool-frame 3x3 rotation, row-major",
+    )
     args = parser.parse_args(argv)
+    try:
+        _finite_rotation_values(
+            args.mapping_reference_rotation_rpy_deg,
+            count=3,
+            name="--mapping-reference-rotation-rpy-deg",
+        )
+        _finite_rotation_values(
+            args.mapping_reference_rotation_matrix,
+            count=9,
+            name="--mapping-reference-rotation-matrix",
+        )
+        _finite_rotation_values(
+            args.mapping_controlled_rotation_rpy_deg,
+            count=3,
+            name="--mapping-controlled-rotation-rpy-deg",
+        )
+        _finite_rotation_values(
+            args.mapping_controlled_rotation_matrix,
+            count=9,
+            name="--mapping-controlled-rotation-matrix",
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if (
         args.connect_read_only
         and args.confirmation != "B601_RM65_READ_ONLY_CAN_SIM_TARGET"
@@ -710,9 +912,20 @@ def main(argv: list[str] | None = None) -> int:
             from sim.mujoco.viewer import MujocoPassiveViewerSession
 
             mapping = _load_mapping(args.mapping_profile)
+            mapping, rotation_overrides = _mapping_rotation_override(
+                mapping,
+                reference_rpy_deg=args.mapping_reference_rotation_rpy_deg,
+                reference_matrix=args.mapping_reference_rotation_matrix,
+                controlled_rpy_deg=args.mapping_controlled_rotation_rpy_deg,
+                controlled_matrix=args.mapping_controlled_rotation_matrix,
+            )
             result["teleop_contract"].update(
                 _mapping_contract_metadata(mapping, args.mapping_profile)
             )
+            if rotation_overrides:
+                result["teleop_contract"]["mapping_rotation_overrides"] = (
+                    rotation_overrides
+                )
             model = B601PinocchioModel.from_rebot_source_root(args.rebot_source_root)
             config = B601RSBackendConfig.from_rs_yaml(args.config)
             simulation_feedback_timeout = args.simulation_feedback_timeout_sec

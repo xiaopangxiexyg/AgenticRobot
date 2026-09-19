@@ -194,6 +194,16 @@ assert 'mujoco' not in sys.modules
     assert "--connect-read-only" in result.stdout
     assert "--simulation-feedback-timeout-sec" in result.stdout
     assert "--disable-teleop-residual-envelope" in result.stdout
+    assert "--mapping-controlled-rotation-rpy-deg" in result.stdout
+    assert "--mapping-controlled-rotation-matrix" in result.stdout
+
+
+def test_rotation_override_helpers_use_row_major_rpy_parameters() -> None:
+    matrix = app._rotation_matrix_from_rpy_degrees((0.0, 0.0, 90.0))
+    assert matrix == ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+    assert app._finite_rotation_values(
+        (0.0, 0.0, 90.0), count=3, name="rotation"
+    ) == (0.0, 0.0, 90.0)
 
 
 def _args(tmp_path, mode):

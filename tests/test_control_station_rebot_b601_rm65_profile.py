@@ -370,7 +370,7 @@ def test_urdf_frame_chain_profile_matches_rm65_mujoco_tool_tcp_zero_pose() -> No
     )
 
 
-def test_payload_roundtrip_and_file_loader_verify_semantic_hash(tmp_path) -> None:
+def test_payload_roundtrip_and_file_loader_recomputes_semantic_hash(tmp_path) -> None:
     profile = _profile()
     payload = profile.to_payload()
     path = tmp_path / "b601_rm65_mapping.json"
@@ -385,8 +385,50 @@ def test_payload_roundtrip_and_file_loader_verify_semantic_hash(tmp_path) -> Non
     )
     payload["translation_gain_target_reference_xyz"] = [1.0, 1.0, 1.0]
     path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="semantic_content_hash mismatch"):
-        load_b601_rm65_frame_mapping_profile(path)
+    restored_tuned = load_b601_rm65_frame_mapping_profile(path)
+    assert restored_tuned.semantic_content_hash != profile.semantic_content_hash
+    assert restored_tuned.semantic_content_hash != payload["semantic_content_hash"]
+
+
+def test_stale_or_missing_declared_hash_does_not_block_matrix_tuning(tmp_path) -> None:
+    payload = _profile().to_payload()
+    tuned_rotation = np.diag((1.0, -1.0, -1.0))
+    tuned_pose = np.eye(4, dtype=np.float64)
+    tuned_pose[:3, :3] = tuned_rotation
+    payload["matrix_source_controlled_target_controlled"] = tuned_pose.tolist()
+    payload["semantic_content_hash"] = "stale-from-previous-tuning"
+    path = tmp_path / "tuned_mapping_with_stale_hash.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    tuned = load_b601_rm65_frame_mapping_profile(path)
+
+    assert tuned.semantic_content_hash != "stale-from-previous-tuning"
+    np.testing.assert_array_equal(
+        tuned.matrix_source_controlled_target_controlled,
+        tuned_pose,
+    )
+
+
+def test_foreground_rotation_override_recomputes_profile_without_file_edit() -> None:
+    controlled = np.asarray(
+        Rotation.from_euler("z", 90.0, degrees=True).as_matrix(),
+        dtype=np.float64,
+    )
+    tuned = _profile().with_rotation_overrides(
+        controlled_rotation_matrix=controlled,
+    )
+
+    np.testing.assert_allclose(
+        tuned.matrix_source_controlled_target_controlled,
+        np.block(
+            [
+                [controlled, np.zeros((3, 1))],
+                [np.zeros((1, 3)), np.ones((1, 1))],
+            ]
+        ),
+        atol=1e-12,
+    )
+    assert tuned.semantic_content_hash != _profile().semantic_content_hash
 
 
 @pytest.mark.parametrize(

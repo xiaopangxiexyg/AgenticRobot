@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +134,36 @@ def _translation_gain(value: object) -> tuple[float, float, float]:
             "axis direction belongs in the rigid frame transform."
         )
     return (normalized[0], normalized[1], normalized[2])
+
+
+def _replace_pose_rotation(
+    pose: object | None,
+    rotation: Sequence[Sequence[float]],
+    *,
+    name: str,
+) -> tuple[tuple[float, ...], ...]:
+    """Replace only the 3x3 rotation of an existing rigid pose."""
+
+    if pose is None:
+        raise ValueError(f"{name} cannot override a missing frame transform.")
+    try:
+        base = [list(row) for row in pose]
+        matrix = [
+            [float(item) for item in row]
+            for row in rotation
+        ]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a numeric 3x3 matrix.") from exc
+    if len(base) != 4 or any(len(row) != 4 for row in base):
+        raise ValueError(f"{name} cannot override a non-4x4 frame transform.")
+    if len(matrix) != 3 or any(len(row) != 3 for row in matrix):
+        raise ValueError(f"{name} must be a numeric 3x3 matrix.")
+    if any(not math.isfinite(item) for row in matrix for item in row):
+        raise ValueError(f"{name} must contain finite values.")
+    for row_index in range(3):
+        for column_index in range(3):
+            base[row_index][column_index] = matrix[row_index][column_index]
+    return tuple(tuple(float(item) for item in row) for row in base)
 
 
 @dataclass(frozen=True)
@@ -311,6 +341,44 @@ class B601RM65FrameMappingProfile:
                 payload[name] = [list(row) for row in value]
         return payload
 
+    def with_rotation_overrides(
+        self,
+        *,
+        reference_rotation_matrix: Sequence[Sequence[float]] | None = None,
+        controlled_rotation_matrix: Sequence[Sequence[float]] | None = None,
+    ) -> B601RM65FrameMappingProfile:
+        """Return a profile with in-memory frame-rotation overrides.
+
+        The profile JSON remains the durable calibration source.  This small
+        override port is intentionally application-neutral so a foreground
+        simulation/commissioning command can sweep frame orientation without
+        editing calibration files or maintaining a second mapping
+        implementation.  Translations and all non-rotation calibration facts
+        are preserved; construction still runs the normal rigid-transform
+        validation and derives a fresh semantic hash.
+        """
+
+        updates: dict[str, object] = {}
+        if reference_rotation_matrix is not None:
+            updates["matrix_target_reference_source_reference"] = (
+                _replace_pose_rotation(
+                    self.matrix_target_reference_source_reference,
+                    reference_rotation_matrix,
+                    name="reference_rotation_matrix",
+                )
+            )
+        if controlled_rotation_matrix is not None:
+            updates["matrix_source_controlled_target_controlled"] = (
+                _replace_pose_rotation(
+                    self.matrix_source_controlled_target_controlled,
+                    controlled_rotation_matrix,
+                    name="controlled_rotation_matrix",
+                )
+            )
+        if not updates:
+            return self
+        return replace(self, **updates)
+
     @classmethod
     def from_payload(
         cls,
@@ -347,13 +415,12 @@ class B601RM65FrameMappingProfile:
             ],
             rotation_gain=values["rotation_gain"],
         )
-        declared_hash = values.get("semantic_content_hash")
-        if (
-            declared_hash is not None
-            and _required(declared_hash, name="semantic_content_hash")
-            != profile.semantic_content_hash
-        ):
-            raise ValueError("B601/RM65 mapping semantic_content_hash mismatch.")
+        # ``semantic_content_hash`` is derived evidence, not an edit gate.  A
+        # calibration operator may tune matrix fields directly while keeping
+        # an old receipt in the JSON; the loaded profile always derives its
+        # current hash from the actual parameters above.  ``to_payload()``
+        # emits that fresh value for new evidence, but stale/missing declared
+        # values must not prevent foreground tuning.
         return profile
 
     def build_frame_graph(self) -> CoordinateFrameGraph:

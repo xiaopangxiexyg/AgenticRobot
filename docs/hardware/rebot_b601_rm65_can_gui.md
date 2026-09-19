@@ -140,8 +140,8 @@ T_source_controlled_target_controlled =
 docs/hardware/profiles/b601_rm65_mapping_150_v2.json
 ```
 
-其 `semantic_content_hash` 由 canonical loader 重新计算并由 profile 测试锁定。现场验证必须显式
-使用该文件，并在结果 JSON 中记录 v4 profile id/hash；不要继续使用 identity 的 `v1` 或
+其 `semantic_content_hash` 由 canonical loader 重新计算，用于结果追踪和证据比对，不是现场
+编辑或启动门禁。现场验证必须显式使用该文件，并在结果 JSON 中记录 v4 profile id/hash；不要继续使用 identity 的 `v1` 或
 循环置换的旧 v2/v3 语义。
 
 #### 后续只调 profile 参数，不改控制代码
@@ -154,9 +154,35 @@ docs/hardware/profiles/b601_rm65_mapping_150_v2.json
   定义发生变化时调整；正常旋转轴微调不要改它。
 - `translation_gain_target_reference_xyz`：位移倍率（当前 150%）。
 
-编辑后删除旧的 `semantic_content_hash`，canonical loader 会根据新参数计算新的 hash；运行
-结果 JSON 必须记录该新 hash。这样后续真机/仿真只需替换 `--mapping-profile` 指向的 profile，
-不需要再次修改控制逻辑，也不会把临时轴向试验混入 canonical runtime。
+`semantic_content_hash` 现在只是由实际 profile 参数派生的证据字段，不再是调参门禁。矩阵被
+直接修改后，即使 JSON 中还留有旧 hash，loader 也会按当前矩阵重新计算有效 hash；运行结果
+仍会记录派生后的 hash，但现场调试不需要手工维护它。
+
+更方便的现场调试方式是不改 JSON，直接给 `control_station b601-rm65` 传入临时旋转参数：
+
+```bash
+# 角度单位为 degree，顺序为 roll pitch yaw，内部使用 Rz(yaw) @ Ry(pitch) @ Rx(roll)
+--mapping-controlled-rotation-rpy-deg 0 0 90
+
+# 或直接输入 3x3 行主序矩阵（9 个数）
+--mapping-controlled-rotation-matrix \
+  0 -1 0 \
+  1  0 0 \
+  0  0 1
+```
+
+`controlled` 参数只覆盖 `matrix_source_controlled_target_controlled` 的旋转部分，保留
+原有平移；`reference` 参数对应 base-frame 的 `matrix_target_reference_source_reference`。
+一次只能为同一个矩阵选择 RPY 或 3x3 输入，且最终仍会经过刚体旋转、正交性和坐标帧校验。
+
+例如，验证当前矩阵的逆 Z 方向时，只需在原 GUI 命令末尾加入：
+
+```bash
+--mapping-controlled-rotation-rpy-deg 0 0 90
+```
+
+不需要复制 profile、删除字段或修改 Python 控制代码。临时覆盖会写入运行 JSON 的
+`teleop_contract.mapping_rotation_overrides`，并记录覆盖后的派生 profile hash。
 
 仿真只读连接可显式传 `--disable-teleop-residual-envelope`。它仅关闭 B601 binding 的
 “单 tick residual 平移/旋转幅度”预检，不关闭 RM65 的 canonical IK、关节、碰撞、速度、加速度、
