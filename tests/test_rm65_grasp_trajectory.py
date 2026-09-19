@@ -231,6 +231,52 @@ LATEST_BLUE_CUBE_CANDIDATE_3 = np.array(
     ]
 )
 
+# Exact measured HOLD state and selected candidate 0 from the 2026-09-19
+# blue-cube run.  The terminal grasp itself is reachable within the strict
+# 3 mm / 1 degree contract.  The old planner nevertheless rejected every
+# pregrasp distance because it also imposed the terminal 1-degree limit on
+# the intermediate pregrasp and approach waypoints.
+RECORDED_CANDIDATE_0_QPOS = {
+    "left": np.array(
+        [
+            2.3181637508776864,
+            0.6254911191676488,
+            1.9098614746682967,
+            2.0429602738380046,
+            -1.5188728081796763,
+            -0.4476071383685691,
+        ]
+    ),
+    "right": np.array(
+        [
+            -2.4927142529403135,
+            0.5396732497533673,
+            1.826958335198566,
+            -2.0757026410180384,
+            -1.4138213563462472,
+            0.3305478926541362,
+        ]
+    ),
+}
+RECORDED_CANDIDATE_0_TARGET = np.array(
+    [
+        [
+            0.7544351172666891,
+            0.6563746291827534,
+            0.0,
+            -0.3478102578835386,
+        ],
+        [
+            0.6563746291827535,
+            -0.7544351172666891,
+            0.0,
+            0.040734236366776144,
+        ],
+        [0.0, 0.0, -1.0, 0.16809674027061464],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+)
+
 
 def _field_trace_snapshot() -> AuthoritativeRobotStateSnapshot:
     identity = ShadowExecutionIdentity(
@@ -2577,7 +2623,41 @@ def test_endpoint_planner_uses_global_deterministic_seed_coverage_by_default() -
     assert config.path_planning_time_budget_sec == pytest.approx(120.0)
     assert config.pregrasp_distance_m == pytest.approx(0.06)
     assert config.minimum_pregrasp_distance_m == pytest.approx(0.02)
+    assert config.pregrasp_orientation_tolerance_deg == pytest.approx(3.0)
+    assert config.maximum_approach_orientation_error_deg == pytest.approx(3.0)
+    assert config.endpoint_orientation_tolerance_deg == pytest.approx(1.0)
     assert config.maximum_path_envelope_ingress_distance_m == pytest.approx(0.16)
+
+
+def test_recorded_candidate_zero_uses_bounded_pregrasp_convergence() -> None:
+    profile = _real_profile(
+        envelope_profile_name="agent_grasp_right_absolute_standard_v1.json"
+    )
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+    )
+
+    trajectory = planner(
+        qpos_by_side=RECORDED_CANDIDATE_0_QPOS,
+        side="right",
+        target_tool_tcp_world=RECORDED_CANDIDATE_0_TARGET,
+        speed_scale=0.2,
+    )
+
+    assert len(trajectory.time_from_start_sec) > 1
+    final_tcp = builder.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=trajectory.qpos_by_side["left"][-1],
+        right_qpos=trajectory.qpos_by_side["right"][-1],
+    )["right"]
+    position_error_m, orientation_error_deg = pose_delta_metrics(
+        final_tcp,
+        RECORDED_CANDIDATE_0_TARGET,
+    )
+    assert position_error_m <= planner.config.endpoint_position_tolerance_m
+    assert orientation_error_deg <= planner.config.endpoint_orientation_tolerance_deg
 
 
 def test_path_leg_shares_remaining_wall_time_and_stops_after_timeout(
