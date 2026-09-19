@@ -43,10 +43,8 @@ Options:
   --camera-frame-max-age-sec S
                               Maximum admitted RGB frame age (default: 0.25).
   --with-left-gripper         Also connect/capture the saved left DMTAC stack.
-  --left-gripper-port PATH    Explicit left DMTAC serial port (optional).
-  --right-gripper-port PATH   Explicit right DMTAC serial port (optional).
-  --left-gripper-id N         Override left Modbus id while keeping assignment data.
-  --right-gripper-id N        Override right Modbus id while keeping assignment data.
+  --left-gripper-port PATH    Override left DMTAC serial port (optional).
+  --right-gripper-port PATH   Override right DMTAC serial port (optional).
   --dry-run                   Print the command; do not start any device.
   -h, --help                  Show this help.
 
@@ -88,8 +86,6 @@ SPEED_M_S=""
 INITIAL_ALIGNMENT_SPEED_SCALE="1.0"
 LEFT_GRIPPER_PORT=""
 RIGHT_GRIPPER_PORT=""
-LEFT_GRIPPER_ID=""
-RIGHT_GRIPPER_ID=""
 TASK_NAME="rule_based_writing"
 TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-200}"
 CAMERA_FRAME_MAX_AGE_SEC="0.25"
@@ -119,8 +115,6 @@ declare -A VALUE_OPTION_TARGET=(
   [--initial-alignment-speed-scale]=INITIAL_ALIGNMENT_SPEED_SCALE
   [--left-gripper-port]=LEFT_GRIPPER_PORT
   [--right-gripper-port]=RIGHT_GRIPPER_PORT
-  [--left-gripper-id]=LEFT_GRIPPER_ID
-  [--right-gripper-id]=RIGHT_GRIPPER_ID
   [--task-name]=TASK_NAME
   [--tactile-min-free-gb]=TACTILE_MIN_FREE_GB
   [--camera-frame-max-age-sec]=CAMERA_FRAME_MAX_AGE_SEC
@@ -145,8 +139,6 @@ declare -A VALUE_OPTION_HINT=(
   [--initial-alignment-speed-scale]=S
   [--left-gripper-port]=PATH
   [--right-gripper-port]=PATH
-  [--left-gripper-id]=N
-  [--right-gripper-id]=N
   [--task-name]=NAME
   [--tactile-min-free-gb]=N
   [--camera-frame-max-age-sec]=S
@@ -223,14 +215,6 @@ fi
 if [[ -n "$LEFT_GRIPPER_PORT" && "$WITH_LEFT_GRIPPER" -ne 1 ]]; then
   die "--left-gripper-port requires --with-left-gripper."
 fi
-if [[ -n "$LEFT_GRIPPER_ID" && "$WITH_LEFT_GRIPPER" -ne 1 ]]; then
-  die "--left-gripper-id requires --with-left-gripper."
-fi
-for gripper_id in "$LEFT_GRIPPER_ID" "$RIGHT_GRIPPER_ID"; do
-  if [[ -n "$gripper_id" && ! "$gripper_id" =~ ^[1-9][0-9]*$ ]]; then
-    die "gripper id must be a positive integer."
-  fi
-done
 if [[ -n "$SOURCE_POOL_MANIFEST" ]]; then
   [[ -z "$SOURCE_DATASET" && -z "$SOURCE_EPISODE" && -z "$DETAIL_ANNOTATION_DIR" ]] || \
     die "source pool mode cannot be mixed with legacy single-source options."
@@ -354,12 +338,6 @@ fi
 if [[ -n "${RIGHT_GRIPPER_PORT:-}" ]]; then
   HAND_TOPOLOGY_ARGS+=(--right-gripper-port "$RIGHT_GRIPPER_PORT")
 fi
-if [[ -n "${LEFT_GRIPPER_ID:-}" ]]; then
-  HAND_TOPOLOGY_ARGS+=(--left-gripper-id "$LEFT_GRIPPER_ID")
-fi
-if [[ -n "${RIGHT_GRIPPER_ID:-}" ]]; then
-  HAND_TOPOLOGY_ARGS+=(--right-gripper-id "$RIGHT_GRIPPER_ID")
-fi
 
 PROGRESS_PROFILE_ID="dmtac_rm65_right_gripper_rule_writing_progress"
 STAGE_PROFILE_ID="dmtac_rm65_right_gripper_rule_writing_progress_detailed"
@@ -447,6 +425,7 @@ printf '%s\n' \
   "[RuleBased] pre_pen_down_replay=${PRE_PEN_DOWN_REPLAY_CANDIDATE_ID:-disabled} normal_episodes_between_replays=$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" \
   "[RuleBased] source_dataset=${SOURCE_DATASET:-pool_selected} episode=${SOURCE_EPISODE:-pool_selected}" \
   "[RuleBased] detail_annotation_dir=${DETAIL_ANNOTATION_DIR:-pool_selected}" \
+  "[RuleBased] gripper_port_override left=${LEFT_GRIPPER_PORT:-assignment} right=${RIGHT_GRIPPER_PORT:-assignment}" \
   "[RuleBased] trajectory=$TRAJECTORY catalog=${TRAJECTORY_CATALOG:-builtin} size_m=$SIZE_M direction=$DIRECTION speed_m_s=${SPEED_M_S:-source_average}" \
   "[RuleBased] output_dataset_root=$DATASET_BASE tactile_root=$TACTILE_BUNDLE_ROOT"
 exec "${RUN_COMMAND[@]}"

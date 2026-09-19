@@ -911,8 +911,6 @@ def test_fixed_writing_uses_calibrated_descent_endpoint_when_supplied() -> None:
         ("--initial-alignment-speed-scale", "S"),
         ("--left-gripper-port", "PATH"),
         ("--right-gripper-port", "PATH"),
-        ("--left-gripper-id", "N"),
-        ("--right-gripper-id", "N"),
         ("--task-name", "NAME"),
         ("--tactile-min-free-gb", "N"),
         ("--camera-frame-max-age-sec", "S"),
@@ -1311,7 +1309,7 @@ def test_launcher_can_enable_left_dmtac_later_without_enabling_q6(
     ) in output
 
 
-def test_launcher_forwards_assignment_preserving_gripper_id_overrides(
+def test_launcher_forwards_assignment_preserving_gripper_port_overrides(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source"
@@ -1333,10 +1331,10 @@ def test_launcher_forwards_assignment_preserving_gripper_id_overrides(
             "--tactile-bundle-root",
             str(tactile),
             "--with-left-gripper",
-            "--left-gripper-id",
-            "1",
-            "--right-gripper-id",
-            "2",
+            "--left-gripper-port",
+            "/dev/ttyUSB1",
+            "--right-gripper-port",
+            "/dev/ttyUSB2",
             "--dry-run",
         ],
         cwd=ROOT,
@@ -1347,8 +1345,8 @@ def test_launcher_forwards_assignment_preserving_gripper_id_overrides(
 
     assert result.returncode == 0, result.stderr
     output = result.stdout
-    assert "--left-gripper-id 1" in output
-    assert "--right-gripper-id 2" in output
+    assert "--left-gripper-port /dev/ttyUSB1" in output
+    assert "--right-gripper-port /dev/ttyUSB2" in output
 
 
 def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> None:

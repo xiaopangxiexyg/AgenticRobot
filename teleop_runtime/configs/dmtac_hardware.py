@@ -55,11 +55,8 @@ def add_dmtac_assignment_arguments(
         group.add_argument(
             f"--{side}-gripper-id",
             type=_positive_int_arg,
-            default=None,
-            help=(
-                f"Optional {side} Modbus id override. With an assignment, only "
-                f"the id changes; with --{side}-gripper-port, default is 1."
-            ),
+            default=1,
+            help=f"Modbus id used with --{side}-gripper-port (default: 1).",
         )
         group.add_argument(
             f"--{side}-gripper-baudrate",
@@ -446,27 +443,28 @@ def manual_dmtac_backend_config_for_side(
     )
 
 
-def apply_dmtac_gripper_id_overrides(
+def apply_dmtac_gripper_port_overrides(
     configs: Mapping[str, DMTacGripperBackendConfig],
     args: argparse.Namespace,
     *,
     active_sides: Sequence[str],
 ) -> dict[str, DMTacGripperBackendConfig]:
-    """Apply explicit slave-id overrides without replacing assignment metadata.
+    """Apply explicit ports without replacing assignment metadata.
 
     A manual port override is intentionally a gripper-only fallback and does
-    not attach tactile devices.  An id-only override is different: it keeps
-    the assigned port, tactile ids, and transport settings while correcting a
-    known per-device Modbus id.
+    not attach tactile devices.  When an assignment already resolves a side,
+    this override keeps its tactile ids and transport settings while changing
+    only the runtime serial endpoint.
     """
 
     resolved = dict(configs)
     for side in active_sides:
         side_name = str(side)
-        gripper_id = getattr(args, f"{side_name}_gripper_id", None)
-        if gripper_id is None or side_name not in resolved:
+        port = str(getattr(args, f"{side_name}_gripper_port", "") or "").strip()
+        if not port or side_name not in resolved:
             continue
-        resolved[side_name].gripper_id = int(gripper_id)
+        resolved[side_name].gripper_port = port
+        resolved[side_name].connect_hardware = True
     return resolved
 
 

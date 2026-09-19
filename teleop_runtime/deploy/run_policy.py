@@ -200,7 +200,7 @@ from ..collection.hand_state_polling import (
 from ..configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from ..configs.dmtac_hardware import (
     add_dmtac_assignment_arguments,
-    apply_dmtac_gripper_id_overrides,
+    apply_dmtac_gripper_port_overrides,
     dmtac_backend_configs_from_assignment,
     load_dmtac_hardware_assignment,
     manual_dmtac_backend_config_for_side,
@@ -552,12 +552,14 @@ def _dmtac_backend_configs(
                 flush=True,
             )
 
-    configs = apply_dmtac_gripper_id_overrides(
+    configs = apply_dmtac_gripper_port_overrides(
         configs,
         args,
         active_sides=dmtac_sides,
     )
     for side in dmtac_sides:
+        if side in configs:
+            continue
         manual = manual_dmtac_backend_config_for_side(args, side, policy)
         if manual is not None:
             configs[side] = manual
@@ -567,6 +569,13 @@ def _dmtac_backend_configs(
         for side, config in configs.items()
         if side in active_sides and (config.connect_hardware or config.connect_tactile)
     }
+    port_summary = ", ".join(
+        f"{side}={config.gripper_port}"
+        for side, config in resolved.items()
+        if config.connect_hardware
+    )
+    if port_summary:
+        print(f"[DMTAC] resolved gripper ports: {port_summary}", flush=True)
     if bool(getattr(args, "dmtac_config_required", False)):
         require_dmtac_sides_resolved(
             dmtac_sides,

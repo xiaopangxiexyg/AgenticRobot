@@ -17,7 +17,7 @@ if str(DMTAC_ROOT) not in sys.path:
     sys.path.insert(0, str(DMTAC_ROOT))
 
 from teleop_runtime.configs.dmtac_hardware import (
-    apply_dmtac_gripper_id_overrides,
+    apply_dmtac_gripper_port_overrides,
     dmtac_backend_configs_from_assignment,
 )
 from portable_dm_tac import DMTacDevice, DMTacMultiDevice, DeviceConfig, TacFrame  # noqa: E402
@@ -1014,7 +1014,7 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertTrue(configs["right"].connect_tactile)
         self.assertEqual(configs["right"].tactile_ids, ("R_IN", "R_OUT"))
 
-    def test_gripper_id_override_preserves_assignment_tactile_and_port(self) -> None:
+    def test_gripper_port_override_preserves_assignment_tactile(self) -> None:
         assignment = build_assignment_from_tokens(
             _scan(),
             right_gripper="1",
@@ -1026,17 +1026,14 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
             assignment,
             active_sides=("right",),
         )
-        overridden = apply_dmtac_gripper_id_overrides(
+        overridden = apply_dmtac_gripper_port_overrides(
             configs,
-            type("Args", (), {"right_gripper_id": 2})(),
+            type("Args", (), {"right_gripper_port": "/dev/ttyUSB2"})(),
             active_sides=("right",),
         )
 
-        self.assertEqual(overridden["right"].gripper_id, 2)
-        self.assertEqual(
-            overridden["right"].gripper_port,
-            configs["right"].gripper_port,
-        )
+        self.assertEqual(overridden["right"].gripper_port, "/dev/ttyUSB2")
+        self.assertTrue(overridden["right"].connect_hardware)
         self.assertTrue(overridden["right"].connect_tactile)
         self.assertEqual(overridden["right"].tactile_ids, ("R_IN", "R_OUT"))
 
