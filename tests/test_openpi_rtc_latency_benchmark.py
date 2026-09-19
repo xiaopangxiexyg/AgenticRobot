@@ -14,10 +14,12 @@ from deployments.openpi.client.rtc_conditioned import (
     OPENPI_CONDITIONED_RTC_WIRE_V1,
 )
 from deployments.openpi.client.transport import packb
+from scripts.probes.create_openpi_rtc_latency_request import build_request
 from scripts.probes.probe_openpi_rtc_latency import (
     load_conditioned_request,
     run_probe,
     validate_conditioned_response,
+    validate_deployment_state_contract,
 )
 
 
@@ -112,6 +114,41 @@ def test_load_conditioned_request_preserves_exact_arrays(tmp_path: Path) -> None
     )
     np.testing.assert_array_equal(loaded["prefix_mask"], [1.0, 1.0, 0.0, 0.0])
     assert loaded["observation"]["prompt"] == "write"
+
+
+def test_synthetic_masked_request_has_all_available_deployment_state() -> None:
+    request = build_request()
+
+    validate_deployment_state_contract(
+        request,
+        state_dim=16,
+        state_input_mode="masked_normalized_concat_v1",
+    )
+    state = np.asarray(request["observation"]["state"])
+    np.testing.assert_array_equal(state[:16], np.zeros(16, dtype=np.float32))
+    np.testing.assert_array_equal(state[16:], np.ones(16, dtype=np.float32))
+
+
+def test_deployment_state_contract_rejects_training_dropout_mask() -> None:
+    request = build_request()
+    request["observation"]["state"][16:] = 0.0
+
+    with pytest.raises(ValueError, match="availability mask must be all ones"):
+        validate_deployment_state_contract(
+            request,
+            state_dim=16,
+            state_input_mode="masked_normalized_concat_v1",
+        )
+
+
+def test_deployment_state_contract_accepts_raw_state() -> None:
+    request = build_request(state_input_mode="raw_state_v1")
+
+    validate_deployment_state_contract(
+        request,
+        state_dim=16,
+        state_input_mode="raw_state_v1",
+    )
 
 
 @pytest.mark.parametrize(
