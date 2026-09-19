@@ -1769,9 +1769,26 @@ class RtcPolicyShadowFrontend:
                 self.config.delay_estimator_spec,
                 latency,
             )
-            if completion.result.status == "fault" and (
-                result_transition.merge_receipt is not None
+            merge_receipt = result_transition.merge_receipt
+            merge_reasons = (
+                () if merge_receipt is None else merge_receipt.reasons
+            )
+            # A result that arrives after its request deadline must invalidate
+            # the producer before the pop phase below.  Without this state
+            # transition, already-committed keyframes could still be emitted
+            # on the same control tick even though the corresponding model
+            # result was late.  The committed prefix is not reused: the
+            # normal fault/rearm path retires this producer session and the
+            # operator can press ``g`` to start a fresh epoch.
+            if (
+                "request_deadline_expired" in merge_reasons
+                and self._state.lifecycle_state == POLICY_ASYNC_PRODUCER_ELIGIBLE
             ):
+                lifecycle_transition = self.fault(
+                    now=decision_at,
+                    reason="rtc_result_timeout",
+                )
+            elif completion.result.status == "fault" and merge_receipt is not None:
                 lifecycle_transition = self.fault(
                     now=decision_at,
                     reason=completion.result.fault_code or "policy_worker_fault",

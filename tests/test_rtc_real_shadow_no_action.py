@@ -4,6 +4,7 @@ import argparse
 import inspect
 import json
 import threading
+from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import numpy as np
@@ -94,6 +95,15 @@ def test_rtc_validity_and_bounded_close_overrides_are_explicit_only() -> None:
     )
     with pytest.raises(ValueError, match="require an explicit --rtc-profile"):
         run_policy.validate_args(ordinary)
+
+
+def test_500ms_rtc_latency_bound_is_explicit_diagnostic_only() -> None:
+    args, argv = _raw_args("--rtc-active-max-inference-latency-sec", "0.5")
+    run_policy.validate_args(args, raw_argv=argv)
+    assert args.rtc_active_max_inference_latency_sec == pytest.approx(0.5)
+
+    ordinary = _parser().parse_args([])
+    assert ordinary.rtc_active_max_inference_latency_sec == pytest.approx(0.4)
 
 
 def test_bounded_rtc_acceptance_requires_explicit_profile_and_limit() -> None:
@@ -320,6 +330,45 @@ def test_active_rtc_latency_gate_discards_cold_sample_and_bounds_warm_max() -> N
         maximum_latency_sec=0.4,
     )
     assert rejected == (True, False, 0.41)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ("rtc_preflight_timeout", "rtc_result_timeout", "request_deadline_expired"),
+)
+def test_recoverable_timeout_classifier_accepts_only_timeout_markers(reason: str) -> None:
+    step = SimpleNamespace(
+        lifecycle_transition=(
+            SimpleNamespace(
+                producer_transition=SimpleNamespace(
+                    state=SimpleNamespace(last_transition_reason=reason),
+                ),
+            )
+            if reason != "request_deadline_expired"
+            else None
+        ),
+        result_transition=(
+            SimpleNamespace(
+                receipt=SimpleNamespace(reasons=(reason,)),
+                merge_receipt=SimpleNamespace(reasons=(reason,)),
+            )
+            if reason == "request_deadline_expired"
+            else None
+        ),
+        completion=None,
+    )
+    assert run_policy._rtc_recoverable_timeout_reason(step) == reason
+
+    non_timeout = SimpleNamespace(
+        lifecycle_transition=SimpleNamespace(
+            producer_transition=SimpleNamespace(
+                state=SimpleNamespace(last_transition_reason="policy_worker_fault"),
+            ),
+        ),
+        result_transition=None,
+        completion=None,
+    )
+    assert run_policy._rtc_recoverable_timeout_reason(non_timeout) is None
 
 
 @pytest.mark.parametrize(

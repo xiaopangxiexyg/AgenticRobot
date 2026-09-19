@@ -270,7 +270,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=0.4,
         help=(
             "Exclusive upper bound for every admitted warm inference latency "
-            "in Active conditioned RTC (default: strictly below 0.4 s)."
+            "in Active conditioned RTC (default: strictly below 0.4 s). "
+            "CLI-only diagnostic/admission override; it is never written to "
+            "an RTC/profile artifact."
         ),
     )
     parser.add_argument(

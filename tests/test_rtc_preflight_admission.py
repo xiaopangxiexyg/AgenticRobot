@@ -6,7 +6,11 @@ import threading
 
 import pytest
 
-from robot_motion.deploy import POLICY_ASYNC_PRODUCER_FAULT
+from robot_motion.deploy import (
+    POLICY_ASYNC_PRODUCER_ELIGIBLE,
+    POLICY_ASYNC_PRODUCER_FAULT,
+    POLICY_WORKER_SESSION_DRAINED,
+)
 from teleop_runtime.deploy.rtc_frontend import RtcDecodedPolicyExecutor, RtcPolicyShadowFrontend
 from test_deploy_rtc_frontend_shadow import (
     _ChunkPolicy, _config, _observation, _pipeline, _runtime, _wait_for,
@@ -75,7 +79,28 @@ def test_preflight_outlives_action_ttl_without_merging_and_reuses_worker():
         )
         assert not expired.result_transition.receipt.accepted
         assert "request_deadline_expired" in expired.result_transition.receipt.reasons
+        assert expired.state.lifecycle_state == POLICY_ASYNC_PRODUCER_FAULT
+        assert (
+            expired.to_debug_payload()["lifecycle_transition_reason"]
+            == "rtc_result_timeout"
+        )
         assert expired.emission_result.emission is None
+
+        def refresh_worker_state():
+            frontend.step(
+                _observation(timestamp=base + 42.0, step_index=11),
+                now=request.valid_until + 0.02,
+                allow_output=False,
+                allow_request=False,
+            )
+            return frontend.state.worker_session_state == POLICY_WORKER_SESSION_DRAINED
+
+        _wait_for(refresh_worker_state)
+        rearmed = frontend.rearm(
+            now=request.valid_until + 0.02,
+            reason="test_timeout_recovery",
+        )
+        assert rearmed.state.lifecycle_state == POLICY_ASYNC_PRODUCER_ELIGIBLE
     finally:
         frontend.close()
 

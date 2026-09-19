@@ -2007,6 +2007,59 @@ def _rtc_active_latency_gate_result(
     return True, observed_max < maximum, observed_max
 
 
+def _rtc_recoverable_timeout_reason(step: Any) -> str | None:
+    """Return a timeout/deadline reason that is safe to recover in-process.
+
+    This deliberately does not classify arbitrary provider, protocol, shape,
+    or safety faults as recoverable.  Only the explicit preflight/result
+    timeout transitions and typed transport/deadline markers may enter the
+    pause-and-rearm path.
+    """
+
+    candidates: list[str] = []
+    transition = getattr(step, "lifecycle_transition", None)
+    if transition is not None:
+        producer_transition = getattr(transition, "producer_transition", None)
+        state = getattr(producer_transition, "state", None)
+        reason = getattr(state, "last_transition_reason", None)
+        if reason:
+            candidates.append(str(reason))
+
+    result_transition = getattr(step, "result_transition", None)
+    if result_transition is not None:
+        receipt = getattr(result_transition, "receipt", None)
+        merge_receipt = getattr(result_transition, "merge_receipt", None)
+        for source in (receipt, merge_receipt):
+            reasons = getattr(source, "reasons", ()) if source is not None else ()
+            candidates.extend(str(reason) for reason in reasons)
+
+    completion = getattr(step, "completion", None)
+    if completion is not None:
+        result = getattr(completion, "result", None)
+        for value in (
+            getattr(result, "fault_code", None),
+            getattr(result, "fault_detail", None),
+        ):
+            if value:
+                candidates.append(str(value))
+
+    for candidate in candidates:
+        normalized = candidate.strip().lower()
+        if normalized in {"rtc_preflight_timeout", "rtc_result_timeout"}:
+            return candidate
+        if any(
+            marker in normalized
+            for marker in (
+                "request_deadline_expired",
+                "deadline_exceeded",
+                "timeout",
+                "timedout",
+            )
+        ):
+            return candidate
+    return None
+
+
 def _bounded_policy_step_limit_reached(
     *,
     max_steps: int,
@@ -2967,6 +3020,11 @@ def main(
     rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
     rtc_active_latency_gate_rejected = False
     rtc_active_latency_gate_failure_reason: str | None = None
+    # Recoverable RTC failures keep this process alive in a visible Hold.  A
+    # fresh ``g`` activation retires the old worker epoch and clears this
+    # marker; no profile/default is changed by a diagnostic latency override.
+    rtc_recovery_required = False
+    rtc_recovery_reason: str | None = None
     rtc_active_latency_samples: list[float] = []
     accepted_rtc_dispatch_steps = 0
     step_index = 0
@@ -3565,12 +3623,60 @@ def main(
         nonlocal rtc_active_latency_gate_passed
         nonlocal rtc_active_latency_gate_rejected
         nonlocal rtc_active_latency_gate_failure_reason
+        nonlocal rtc_recovery_required
+        nonlocal rtc_recovery_reason
         policy.reset()
         policy_deploy_runtime.reset_stream()
         rtc_active_latency_samples.clear()
         rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
         rtc_active_latency_gate_rejected = False
         rtc_active_latency_gate_failure_reason = None
+        rtc_recovery_required = False
+        rtc_recovery_reason = None
+
+    def _pause_policy_and_hold_for_rtc_recovery(
+        *,
+        reason: str,
+        observation: DeploymentObservation,
+    ) -> str | None:
+        """Pause policy output and establish the existing backend-owned Hold."""
+
+        nonlocal policy_active, ready_confirmed, last_action
+        policy_active = False
+        ready_confirmed = False
+        policy_deploy_runtime.clear_action_queue()
+        last_action = observation.hold_action()
+
+        hold_error: str | None = None
+        try:
+            hold_rtc_if_eligible(now=control_loop_started_at, reason=reason)
+            _hold_active_rtc_gap(
+                reason=reason,
+                send_actions=send_actions,
+                arm_backends=arm_backends,
+                position_deploy_executor=position_deploy_executor,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve fail-closed behavior.
+            hold_error = f"{type(exc).__name__}: {exc}"
+            try:
+                emergency_stop_deploy_arm_backends(
+                    arm_backends,
+                    reason=f"{reason}:hold_fallback",
+                )
+            except Exception as stop_exc:  # noqa: BLE001 - hard safety failure.
+                raise RuntimeError(
+                    "RTC recoverable failure could not establish Hold and the "
+                    "fallback bimanual emergency stop was not acknowledged: "
+                    f"hold={hold_error}; stop={type(stop_exc).__name__}: {stop_exc}"
+                ) from exc
+            print(
+                "[RTC] measured-qpos Hold unavailable; fallback bimanual "
+                "emergency stop acknowledged; policy remains paused: "
+                f"{hold_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return hold_error
 
     def pause_after_rtc_active_latency_gate_failure(
         *,
@@ -3588,51 +3694,21 @@ def main(
         is retained; an unacknowledged emergency stop remains a hard error.
         """
 
-        nonlocal policy_active, ready_confirmed, last_action
         nonlocal rtc_active_latency_gate_passed
         nonlocal rtc_active_latency_gate_rejected
         nonlocal rtc_active_latency_gate_failure_reason
+        nonlocal rtc_recovery_required
+        nonlocal rtc_recovery_reason
         normalized_reason = str(reason).strip() or "rtc_active_latency_gate_rejected"
         rtc_active_latency_gate_passed = False
         rtc_active_latency_gate_rejected = True
         rtc_active_latency_gate_failure_reason = normalized_reason
-        policy_active = False
-        ready_confirmed = False
-        policy_deploy_runtime.clear_action_queue()
-        last_action = observation.hold_action()
-
-        hold_error: str | None = None
-        try:
-            hold_rtc_if_eligible(
-                now=control_loop_started_at,
-                reason=normalized_reason,
-            )
-            _hold_active_rtc_gap(
-                reason=normalized_reason,
-                send_actions=send_actions,
-                arm_backends=arm_backends,
-                position_deploy_executor=position_deploy_executor,
-            )
-        except Exception as exc:  # noqa: BLE001 - preserve fail-closed behavior.
-            hold_error = f"{type(exc).__name__}: {exc}"
-            try:
-                emergency_stop_deploy_arm_backends(
-                    arm_backends,
-                    reason=f"{normalized_reason}:hold_fallback",
-                )
-            except Exception as stop_exc:  # noqa: BLE001 - hard safety failure.
-                raise RuntimeError(
-                    "RTC Active latency gate failure could not establish Hold and "
-                    "the fallback bimanual emergency stop was not acknowledged: "
-                    f"hold={hold_error}; stop={type(stop_exc).__name__}: {stop_exc}"
-                ) from exc
-            print(
-                "[RTC] measured-qpos Hold unavailable; fallback bimanual "
-                "emergency stop acknowledged; policy remains paused: "
-                f"{hold_error}",
-                file=sys.stderr,
-                flush=True,
-            )
+        rtc_recovery_required = True
+        rtc_recovery_reason = normalized_reason
+        hold_error = _pause_policy_and_hold_for_rtc_recovery(
+            reason=normalized_reason,
+            observation=observation,
+        )
 
         event_payload = {
             "schema": "dexteleop_rtc_active_latency_gate_v2",
@@ -3650,6 +3726,45 @@ def main(
             "RTC",
             "ERROR: Active latency gate blocked policy; no action dispatched; "
             f"{message} Press g to retry a fresh warmup.",
+            now=control_loop_started_at,
+        )
+
+    def pause_after_rtc_recoverable_timeout(
+        *,
+        reason: str,
+        message: str,
+        observation: DeploymentObservation,
+    ) -> None:
+        """Pause on a typed RTC timeout and allow an in-process recovery.
+
+        Deadline expiry and transport/preflight timeouts are recoverable
+        producer failures.  The frontend has already retired the late result;
+        this boundary clears downstream queues, establishes Hold, and leaves
+        the operator a deterministic ``g`` path to rearm a new worker epoch.
+        Other protocol, shape, safety, or backend failures remain fail-closed.
+        """
+
+        nonlocal rtc_recovery_required, rtc_recovery_reason
+        normalized_reason = str(reason).strip() or "rtc_timeout"
+        rtc_recovery_required = True
+        rtc_recovery_reason = normalized_reason
+        hold_error = _pause_policy_and_hold_for_rtc_recovery(
+            reason=normalized_reason,
+            observation=observation,
+        )
+        event_payload = {
+            "schema": "dexteleop_rtc_recoverable_timeout_v1",
+            "status": "paused",
+            "reason": normalized_reason,
+            "message": str(message),
+            "hold_error": hold_error,
+            "recovery": "press_g_for_fresh_rtc_session",
+        }
+        debug_logger.log_event("rtc_recoverable_timeout", event_payload)
+        console_log_event(
+            "RTC",
+            "PAUSED: recoverable timeout; no action dispatched; "
+            f"{message} Press g to retry a fresh RTC session.",
             now=control_loop_started_at,
         )
 
@@ -4248,6 +4363,13 @@ def main(
                         print(
                             "[Deploy] ready confirm ignored: RTC Active latency "
                             "gate is blocked; press g to retry a fresh warmup."
+                        )
+                    elif rtc_recovery_required:
+                        policy_active = False
+                        print(
+                            "[Deploy] ready confirm ignored: RTC is paused after "
+                            f"{rtc_recovery_reason or 'a recoverable timeout'}; "
+                            "press g to rearm a fresh RTC session."
                         )
                     elif (
                         fixed_init_controller is not None
@@ -5264,6 +5386,23 @@ def main(
                                 >= int(args.rtc_active_warmup_discard_completions)
                             ),
                         )
+                        recoverable_timeout_reason = _rtc_recoverable_timeout_reason(
+                            rtc_step
+                        )
+                        if recoverable_timeout_reason is not None:
+                            pause_after_rtc_recoverable_timeout(
+                                reason=recoverable_timeout_reason,
+                                message=(
+                                    "RTC inference/preflight timed out "
+                                    f"({recoverable_timeout_reason})"
+                                ),
+                                observation=observation,
+                            )
+                            # Reuse the existing per-tick publication/dispatch
+                            # suppression used by a rejected Active warmup.  A
+                            # timeout must never publish or execute an emission
+                            # from that same control tick.
+                            rtc_active_latency_gate_failed_this_step = True
                         if (
                             rtc_active_latency_warmup
                             and rtc_step.completion is not None
@@ -6151,6 +6290,13 @@ def main(
                                 else ""
                             ),
                             (
+                                "rtc_recovery=paused:"
+                                + str(rtc_recovery_reason or "unknown")
+                                if rtc_recovery_required
+                                and not rtc_active_latency_gate_rejected
+                                else ""
+                            ),
+                            (
                                 "rtc="
                                 f"{rtc_frontend.state.lifecycle_state.lower()} "
                                 "rtc_worker="
@@ -6195,6 +6341,16 @@ def main(
                         else int(rtc_frontend.selected_emission_count)
                     )
                     if actual_emissions < required_emissions:
+                        if rtc_recovery_required or rtc_active_latency_gate_rejected:
+                            console_log_event(
+                                "RTC",
+                                "PAUSED: bounded run reached its step limit while "
+                                "RTC recovery is required; no action was dispatched. "
+                                "Re-run with a fresh session or press g before the "
+                                "next bounded run.",
+                                now=loop_started_at,
+                            )
+                            break
                         raise RuntimeError(
                             "Bounded RTC acceptance reached --max-steps before "
                             "the required committed emissions: "
