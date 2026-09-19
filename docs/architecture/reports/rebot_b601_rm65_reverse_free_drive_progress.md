@@ -200,8 +200,10 @@ source sequence/时间戳也完整新鲜；失败发生在 IK 第 0 次迭代。
 admission 和 dispatch 仍由同一个桥接主循环按顺序完成，避免引入第二个 IK 或目标
 authority。新增 `source_completion_to_consumption_latency_sec` 和
 `source_completion_to_target_dispatch_latency_sec` 用于识别 worker mailbox 等待，
-并继续保留 freshness、sequence、frame、IK 和 fail-closed admission。该 worker
-不是旧样本回退机制，也不改变 RM65 的 observation-only 约束。
+并继续保留 freshness、sequence、frame、IK 和 fail-closed admission。报告中完成→消费
+只在 worker 结果实际被消费的低频 tick 计数，完成→目标派发只在 position driver 接受
+命令的 tick 计数，避免同一源样本重复统计。该 worker 不是旧样本回退机制，也不改变
+RM65 的 observation-only 约束。
 
 ### 2026-09-19 40 Hz 完整反向桥接基线
 
@@ -223,9 +225,14 @@ maximum source interval:         107.97 ms
 
 该基线确认 IK 不是主要延迟来源；异常长尾来自 RM65 SDK read。同步主循环在这些
 长尾上会丢 source deadline，因此当前候选默认现场应用改用 background source poll。
-40 Hz 仍需在候选上重新采集，确认 `source_poll_schedule_skipped` 和
-`source_completion_to_consumption_latency_sec` 是否降为可接受范围后，才能考虑将其
-作为稳定默认频率；本候选尚未合并或安装。
+随后在同一远端硬件、同一 500 Hz MuJoCo null viewer 上以 background source poll 重测
+30 秒：source samples 1199、target dispatches 1199、拒绝 0、schedule skips 0；源间隔
+mean/p95/p99 为 25.002/29.074/31.157 ms，SDK read wall mean/p95/p99/max 为
+4.488/8.254/10.309/14.427 ms，完成→消费 mean/p95/p99/max 为
+0.975/1.567/1.598/1.944 ms，完成→派发 mean/p95/max 为 2.540/3.662/3.735 ms。
+该轮仍然不包含 GUI presentation latency 或物理执行器响应，但表明把 SDK read 移出
+物理主循环后，主循环不再承受 4–14 ms 的同步读阻塞，且 40 Hz 源调度没有丢期。
+候选仍未合并或安装。
 
 ### P2 synthetic MuJoCo 自动化测试
 

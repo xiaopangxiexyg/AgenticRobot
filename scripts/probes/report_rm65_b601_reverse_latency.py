@@ -160,6 +160,21 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "retarget_elapsed_sec",
             } and record.get("source_admitted") is None:
                 continue
+            # A background source result is represented by one bridge record
+            # when it is consumed and another when its queued command is
+            # dispatched.  Keep each phase tied to its owning event so the
+            # reported sample counts remain comparable to source/dispatch
+            # counts.
+            if (
+                name == "source_completion_to_consumption_latency_sec"
+                and record.get("source_admitted") is None
+            ):
+                continue
+            if (
+                name == "source_completion_to_target_dispatch_latency_sec"
+                and record.get("command_applied") is not True
+            ):
+                continue
             value = _finite_non_negative(record.get(name))
             if value is not None:
                 values.append(value)

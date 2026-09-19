@@ -89,3 +89,35 @@ def test_reverse_latency_report_uses_dispatch_samples_and_rejections() -> None:
         "over_10ms_count": 0,
         "over_20ms_count": 0,
     }
+
+
+def test_worker_consumption_latency_is_not_counted_on_dispatch_record() -> None:
+    report = summarize(
+        [
+            {
+                "event": "bridge_step",
+                "source_admitted": True,
+                "command_applied": False,
+                "source_completion_to_consumption_latency_sec": 0.001,
+                "source_completion_to_target_dispatch_latency_sec": None,
+            },
+            {
+                "event": "bridge_step",
+                "source_admitted": None,
+                "command_applied": True,
+                "source_completion_to_consumption_latency_sec": 0.001,
+                "source_completion_to_target_dispatch_latency_sec": 0.002,
+            },
+        ]
+    )
+
+    assert (
+        report["timings"]["source_completion_to_consumption_latency_sec"]["count"]
+        == 1
+    )
+    assert (
+        report["timings"]["source_completion_to_target_dispatch_latency_sec"][
+            "count"
+        ]
+        == 1
+    )
