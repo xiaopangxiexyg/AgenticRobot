@@ -16,7 +16,10 @@ DMTAC_ROOT = ROOT / "hardware" / "DMTAC_gripper"
 if str(DMTAC_ROOT) not in sys.path:
     sys.path.insert(0, str(DMTAC_ROOT))
 
-from teleop_runtime.configs.dmtac_hardware import dmtac_backend_configs_from_assignment
+from teleop_runtime.configs.dmtac_hardware import (
+    apply_dmtac_gripper_id_overrides,
+    dmtac_backend_configs_from_assignment,
+)
 from portable_dm_tac import DMTacDevice, DMTacMultiDevice, DeviceConfig, TacFrame  # noqa: E402
 from portable_dmtac_gripper.device import TactileConfig, tactile_device_config  # noqa: E402
 from portable_dmtac_gripper.cli import (  # noqa: E402
@@ -1010,6 +1013,32 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertFalse(configs["right"].connect_hardware)
         self.assertTrue(configs["right"].connect_tactile)
         self.assertEqual(configs["right"].tactile_ids, ("R_IN", "R_OUT"))
+
+    def test_gripper_id_override_preserves_assignment_tactile_and_port(self) -> None:
+        assignment = build_assignment_from_tokens(
+            _scan(),
+            right_gripper="1",
+            right_inner="R_IN",
+            right_outer="R_OUT",
+        )
+
+        configs = dmtac_backend_configs_from_assignment(
+            assignment,
+            active_sides=("right",),
+        )
+        overridden = apply_dmtac_gripper_id_overrides(
+            configs,
+            type("Args", (), {"right_gripper_id": 2})(),
+            active_sides=("right",),
+        )
+
+        self.assertEqual(overridden["right"].gripper_id, 2)
+        self.assertEqual(
+            overridden["right"].gripper_port,
+            configs["right"].gripper_port,
+        )
+        self.assertTrue(overridden["right"].connect_tactile)
+        self.assertEqual(overridden["right"].tactile_ids, ("R_IN", "R_OUT"))
 
 
     def test_assignment_legacy_timeout_above_probe_budget_remains_usable(self) -> None:

@@ -200,6 +200,7 @@ from ..collection.hand_state_polling import (
 from ..configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 from ..configs.dmtac_hardware import (
     add_dmtac_assignment_arguments,
+    apply_dmtac_gripper_id_overrides,
     dmtac_backend_configs_from_assignment,
     load_dmtac_hardware_assignment,
     manual_dmtac_backend_config_for_side,
@@ -551,6 +552,11 @@ def _dmtac_backend_configs(
                 flush=True,
             )
 
+    configs = apply_dmtac_gripper_id_overrides(
+        configs,
+        args,
+        active_sides=dmtac_sides,
+    )
     for side in dmtac_sides:
         manual = manual_dmtac_backend_config_for_side(args, side, policy)
         if manual is not None:
