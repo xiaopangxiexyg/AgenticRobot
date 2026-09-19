@@ -242,6 +242,7 @@ def run_b601_rm65_gui(
     viewer,
     rate_hz: float,
     poll_command: Callable[[float], str | None] | None = None,
+    auto_activate: bool = False,
     emit=print,
     record=None,
 ) -> None:
@@ -287,6 +288,7 @@ def run_b601_rm65_gui(
         advance_target=advance,
         rate_hz=rate_hz,
         poll_command=command,
+        auto_activate=auto_activate,
         emit=emit,
         record=record_with_feedback,
     )
@@ -742,6 +744,14 @@ def main(argv: list[str] | None = None) -> int:
             "freshness timeout; does not change the B601 owner"
         ),
     )
+    parser.add_argument(
+        "--auto-activate",
+        action="store_true",
+        help=(
+            "read-only simulation only: capture one fresh B601 pose and start "
+            "RM65 following without waiting for the a key"
+        ),
+    )
     reference_rotation = parser.add_mutually_exclusive_group()
     reference_rotation.add_argument(
         "--mapping-reference-rotation-rpy-deg",
@@ -813,6 +823,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--disable-teleop-residual-envelope is only valid with --connect-read-only"
         )
+    if args.auto_activate and not args.connect_read_only:
+        parser.error("--auto-activate is only valid with --connect-read-only")
     if args.simulation_feedback_timeout_sec is not None:
         if not args.connect_read_only:
             parser.error(
@@ -891,6 +903,9 @@ def main(argv: list[str] | None = None) -> int:
                     None
                     if args.simulation_feedback_timeout_sec is None
                     else float(args.simulation_feedback_timeout_sec)
+                ),
+                "activation_mode": (
+                    "auto_on_start" if args.auto_activate else "manual_key"
                 ),
                 "control_admission": "not_checked",
             },
@@ -1012,7 +1027,12 @@ def main(argv: list[str] | None = None) -> int:
                     viewer.start()
                     runtime.start()
                     run_b601_rm65_gui(
-                        session, viewer=viewer, rate_hz=rate, emit=emit, record=record
+                        session,
+                        viewer=viewer,
+                        rate_hz=rate,
+                        auto_activate=args.auto_activate,
+                        emit=emit,
+                        record=record,
                     )
                 result["status"] = "VALIDATED" if args.validate_only else "COMPLETED"
                 status = 0

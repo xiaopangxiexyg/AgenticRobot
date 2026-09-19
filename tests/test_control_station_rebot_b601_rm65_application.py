@@ -124,6 +124,37 @@ def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
     assert diagnostics[0]["freshness_margin_sec"] == 0.1
 
 
+def test_gui_can_auto_activate_receive_only_simulation(setup_motion):
+    session = _session(setup_motion)
+    clock, _, _, _, backend, _, _ = setup_motion
+    viewer = _Viewer()
+    records = []
+    commands = iter((None, "q"))
+
+    def poll(timeout):
+        clock.value += max(timeout, 0.05)
+        backend.q[0] += 0.002
+        return next(commands)
+
+    app.run_b601_rm65_gui(
+        session,
+        viewer=viewer,
+        rate_hz=20,
+        poll_command=poll,
+        auto_activate=True,
+        record=records.append,
+        emit=lambda message: None,
+    )
+
+    assert any(
+        event.get("event") == "operator_command"
+        and event.get("command") == "auto_activate"
+        for event in records
+    )
+    assert any(event.get("accepted") for event in records), records
+    assert session.state == "inactive"
+
+
 def test_missing_feedback_capability_is_recorded_as_retryable_admission_block():
     result = {"teleop_contract": {"control_admission": "not_checked"}}
     backend = SimpleNamespace(
@@ -194,6 +225,7 @@ assert 'mujoco' not in sys.modules
     assert "--connect-read-only" in result.stdout
     assert "--simulation-feedback-timeout-sec" in result.stdout
     assert "--disable-teleop-residual-envelope" in result.stdout
+    assert "--auto-activate" in result.stdout
     assert "--mapping-controlled-rotation-rpy-deg" in result.stdout
     assert "--mapping-controlled-rotation-matrix" in result.stdout
 
@@ -257,6 +289,12 @@ def test_simulation_feedback_override_requires_read_only_and_source_margin(tmp_p
                 "0.2",
             ]
         )
+    assert error.value.code == 2
+
+
+def test_auto_activate_requires_read_only_simulation(tmp_path):
+    with pytest.raises(SystemExit) as error:
+        app.main([*_args(tmp_path, "--validate-only"), "--auto-activate"])
     assert error.value.code == 2
     with pytest.raises(SystemExit) as error:
         app.main(

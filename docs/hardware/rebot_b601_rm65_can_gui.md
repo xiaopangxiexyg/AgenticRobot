@@ -209,6 +209,13 @@ report 或 watchdog。每个 `proposal_admission`/`target_step` 日志事件会�
 日志显式用 `--log` 指定，可追加实际 argv、状态和错误 traceback；结果 `--output` 必须是尚不存在的新文件。
 JSON 的 `target_cleanup_completed` 只有 lower runtime 的 `close()` 成功返回才设为 true。
 
+默认前台状态是 `inactive`，必须按 `a` 才会以当前两侧测量 pose 建立 fresh anchor；这不是
+故障，也不会自动移动 B601。为了只读 MuJoCo 调试时避免依赖终端按键，可显式加入
+`--auto-activate`。它只在 GUI 进程启动时执行一次相同的 fresh-anchor 事务，不能用于
+非 `--connect-read-only` 模式，也不会启用、失能或发送任何 B601 电机命令。若源尚未新鲜、
+target gate 未 ready 或反馈能力不可用，GUI 会保持 held/inactive 并显示可重试原因，仍可按
+`a` 手动重试；旧 anchor 不会复用。
+
 ## 已修复的时序缺陷（2026-09-16）
 
 初次标准离线回归为 **50 passed、2 failed**；失败没有被忽略或改成 skip。

@@ -134,15 +134,19 @@ def run_b601_rm65_foreground(
     advance_target: Callable[[], object],
     rate_hz: float,
     poll_command: Callable[[float], str | None] | None = None,
+    auto_activate: bool = False,
     emit: Callable[[str], None] = _print_status,
     record: Callable[[Mapping[str, object]], None] | None = None,
 ) -> None:
     """Run in the calling foreground process until q/EOF/exception/Ctrl-C.
 
     a activates at the two measured current poses, c clutches, r releases and
-    recenters, s deactivates, and q exits. On a real terminal these are
-    immediate single-key transitions; no Enter or shell history re-run is
-    needed. The target's existing runtime step belongs in advance_target.
+    recenters, s deactivates, and q exits. ``auto_activate`` is an explicit
+    receive-only simulation convenience: it performs the same fresh-anchor
+    transaction once at startup, without enabling or commanding the master.
+    On a real terminal these are immediate single-key transitions; no Enter or
+    shell history re-run is needed. The target's existing runtime step belongs
+    in advance_target.
     poll_command waits at most its supplied timeout; it must not run a blocking
     prompt or launch a background input thread.
     record receives events for an application-owned JSON/log sink. It must not
@@ -152,6 +156,8 @@ def run_b601_rm65_foreground(
         raise TypeError("session must be B601RM65MotionSession.")
     if not math.isfinite(rate_hz) or rate_hz <= 0:
         raise ValueError("rate_hz must be finite and positive.")
+    if not isinstance(auto_activate, bool):
+        raise TypeError("auto_activate must be bool.")
     if not all(callable(value) for value in (advance_target, emit)):
         raise TypeError("Target, terminal and status callbacks must be callable.")
     if poll_command is not None and not callable(poll_command):
@@ -227,6 +233,44 @@ def run_b601_rm65_foreground(
             retryable=True,
         )
 
+    def recoverable_activation_value_error(command: str, error: ValueError) -> None:
+        """Keep the receive-only UI alive when a fresh activation is unavailable."""
+
+        emit(f"[B601→RM65] activation held: {type(error).__name__}: {error}")
+        emit(
+            "[B601→RM65] no RM65 following; repair the current source, then "
+            "press a to retry."
+        )
+        event(
+            "activation_rejected",
+            command=command,
+            error_type=type(error).__name__,
+            error=str(error),
+            retryable=True,
+        )
+
+    def activate(command: str) -> bool:
+        """Capture a fresh anchor and report retryable activation failures."""
+
+        try:
+            session.activate()
+        except B601HardwareDependencyError as error:
+            recoverable_feedback_error(command, error)
+            return False
+        except B601RM65TargetExecutionGateError as error:
+            recoverable_target_gate_error(command, error)
+            return False
+        except ValueError as error:
+            # Freshness/source/anchor rejection is a normal retry state for a
+            # receive-only simulation. Never reuse the previous anchor.
+            recoverable_activation_value_error(command, error)
+            return False
+        emit(
+            f"[B601→RM65] active ({'auto' if command == 'auto_activate' else 'manual'})"
+        )
+        event("operator_command", command=command)
+        return True
+
     owns_terminal_reader = poll_command is None
     try:
         if poll_command is None:
@@ -236,6 +280,13 @@ def run_b601_rm65_foreground(
         instructions()
         event("foreground_started")
         next_tick = float(clock()) + period
+        if auto_activate:
+            emit(
+                "[B601→RM65] auto-activation requested; waiting for one fresh "
+                "source snapshot (no key required)."
+            )
+            if activate("auto_activate"):
+                next_tick = float(clock()) + period
         while True:
             command = poll_command(max(0.0, next_tick - float(clock())))
             if command is not None:
@@ -258,35 +309,38 @@ def run_b601_rm65_foreground(
                         emit(f"[B601→RM65] {command} rejected in {session.state}")
                         event("operator_command_rejected", command=command)
                     else:
-                        try:
-                            {
-                                "a": session.activate,
-                                "c": session.engage_clutch,
-                                "r": session.release_clutch,
-                                "s": session.deactivate,
-                            }[command]()
-                        except B601HardwareDependencyError as error:
-                            # A missing host observation capability is
-                            # recoverable for this receive-only application.
-                            # The session has already withdrawn its target
-                            # anchor before re-raising the backend error.
-                            recoverable_feedback_error(command, error)
-                            next_tick = float(clock()) + period
-                            continue
-                        except B601RM65TargetExecutionGateError as error:
-                            # A lower-owner fault/transition is retryable, but
-                            # never an implicit re-arm or permission to reuse a
-                            # previous target anchor.
-                            recoverable_target_gate_error(command, error)
-                            next_tick = float(clock()) + period
-                            continue
+                        if command == "a":
+                            if not activate(command):
+                                next_tick = float(clock()) + period
+                                continue
+                        else:
+                            try:
+                                {
+                                    "c": session.engage_clutch,
+                                    "r": session.release_clutch,
+                                    "s": session.deactivate,
+                                }[command]()
+                            except B601HardwareDependencyError as error:
+                                # A missing host observation capability is
+                                # recoverable for this receive-only application.
+                                recoverable_feedback_error(command, error)
+                                next_tick = float(clock()) + period
+                                continue
+                            except B601RM65TargetExecutionGateError as error:
+                                # A lower-owner fault/transition is retryable, but
+                                # never an implicit re-arm or permission to reuse
+                                # a previous target anchor.
+                                recoverable_target_gate_error(command, error)
+                                next_tick = float(clock()) + period
+                                continue
                         if command in {"a", "r"}:
                             # Activation/recenter consumes one complete master
                             # snapshot as the anchor. Do not immediately poll
                             # the same vendor cache frame again in this tick.
                             next_tick = float(clock()) + period
-                        emit(f"[B601→RM65] {session.state}")
-                        event("operator_command", command=command)
+                        if command != "a":
+                            emit(f"[B601→RM65] {session.state}")
+                            event("operator_command", command=command)
                 else:
                     emit("[B601→RM65] unknown command; ? for help")
                     event("operator_command_rejected", command=command)
