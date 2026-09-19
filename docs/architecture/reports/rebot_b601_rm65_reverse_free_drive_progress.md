@@ -52,6 +52,11 @@
   - live application 的 RM65 source poll 按 monotonic wall clock 调度（默认
     20 Hz），不再使用被 viewer 拖慢的仿真时间调度；synthetic tests 默认保留
     确定性的仿真时钟调度。
+  - 当前候选增加可选的 `source_poll_mode=background`：RM65 只读刷新由一个可关闭的
+    source worker 负责，桥接/IK/position-driver 主循环只按顺序消费完整结果，不再被
+    SDK 读取长尾阻塞。worker 使用固定 start-to-start deadline；坏帧、worker 异常或
+    mailbox overflow 都发布为显式 rejection 并进入 `held`，不会静默复用旧 qpos。
+    `source_poll_mode=synchronous` 仍保留用于离线对照和故障复现。
   - viewer 关闭、Ctrl-C、EOF 和 source/IK admission rejection 都会撤销
     pending target 并退出/保持 held；退出只关闭仿真 viewer，不触碰 RM65 或
     B601 真机。
@@ -191,10 +196,36 @@ source sequence/时间戳也完整新鲜；失败发生在 IK 第 0 次迭代。
 `ik_seed_qpos_rad`、目标误差和 `ik_iterations` 判断是否是新的数值条件，而不能再把它
 解释成 RM65 网络断线。
 
-这次修复仍没有引入后台 source/IK worker：live RM65 SDK 读取和 IK 的同步耗时先
-通过上述字段量化。若实测单次 source+IK 超过 source period，再单独设计 latest-only
-worker，并保留主线程的 freshness recheck 和 fail-closed admission；不能先用旧
-qpos 或静默重试掩盖该问题。
+当前候选只把 RM65 source read 移出物理主循环；IK、目标选择、position-driver
+admission 和 dispatch 仍由同一个桥接主循环按顺序完成，避免引入第二个 IK 或目标
+authority。新增 `source_completion_to_consumption_latency_sec` 和
+`source_completion_to_target_dispatch_latency_sec` 用于识别 worker mailbox 等待，
+并继续保留 freshness、sequence、frame、IK 和 fail-closed admission。该 worker
+不是旧样本回退机制，也不改变 RM65 的 observation-only 约束。
+
+### 2026-09-19 40 Hz 完整反向桥接基线
+
+在远端 `user@192.168.70.116` 的隔离候选工作树中完成了 30 秒、40 Hz source / 500 Hz
+MuJoCo physics 的完整桥接运行（`null_viewer`，因此不包含 GUI presentation latency）。
+RM65 处于只读观测，B601 仅为 MuJoCo position driver；没有 RM65/B601 真机运动命令。
+
+```text
+source samples:                  1190
+target dispatches:               1187
+rejection reasons:               none
+source interval mean/p95/p99:    25.20 / 31.62 / 35.88 ms
+read completion -> dispatch:     2.58 ms mean, 4.00 ms p95, 4.88 ms max
+retarget/IK:                     0.837 ms mean, 1.078 ms p95, 1.472 ms max
+SDK read:                        7.28 ms mean, 12.38 ms p95, 18.53 ms p99, 45.22 ms max
+source schedule skips:           5
+maximum source interval:         107.97 ms
+```
+
+该基线确认 IK 不是主要延迟来源；异常长尾来自 RM65 SDK read。同步主循环在这些
+长尾上会丢 source deadline，因此当前候选默认现场应用改用 background source poll。
+40 Hz 仍需在候选上重新采集，确认 `source_poll_schedule_skipped` 和
+`source_completion_to_consumption_latency_sec` 是否降为可接受范围后，才能考虑将其
+作为稳定默认频率；本候选尚未合并或安装。
 
 ### P2 synthetic MuJoCo 自动化测试
 

@@ -332,6 +332,12 @@ def run_rm65_to_b601_foreground(
                 source_admission_monotonic_sec=getattr(
                     tick, "source_admission_monotonic_sec", None
                 ),
+                source_consumption_monotonic_sec=getattr(
+                    tick, "source_consumption_monotonic_sec", None
+                ),
+                source_completion_to_consumption_latency_sec=getattr(
+                    tick, "source_completion_to_consumption_latency_sec", None
+                ),
                 target_dispatch_monotonic_sec=getattr(
                     tick, "target_dispatch_monotonic_sec", None
                 ),
@@ -341,6 +347,11 @@ def run_rm65_to_b601_foreground(
                 source_admission_to_target_dispatch_latency_sec=getattr(
                     tick,
                     "source_admission_to_target_dispatch_latency_sec",
+                    None,
+                ),
+                source_completion_to_target_dispatch_latency_sec=getattr(
+                    tick,
+                    "source_completion_to_target_dispatch_latency_sec",
                     None,
                 ),
                 source_poll_deadline_sec=getattr(

@@ -93,6 +93,8 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     timings: dict[str, list[float]] = {
         "source_to_target_dispatch_latency_sec": [],
         "source_admission_to_target_dispatch_latency_sec": [],
+        "source_completion_to_consumption_latency_sec": [],
+        "source_completion_to_target_dispatch_latency_sec": [],
         "source_interarrival_sec": [],
         "source_admission_interarrival_sec": [],
         "source_poll_lateness_sec": [],
@@ -201,6 +203,11 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "source_admission_to_target_dispatch_latency_sec starts when "
                 "the source step has completed freshness/frame validation and "
                 "ends at B601 MuJoCo position-driver command acceptance."
+            ),
+            "worker_queue_latency": (
+                "source_completion_to_consumption_latency_sec is the delay "
+                "between completion of the RM65 source read and consumption "
+                "by the MuJoCo bridge loop."
             ),
             "excluded": (
                 "RM65 measurement age before read completion, physical B601 "

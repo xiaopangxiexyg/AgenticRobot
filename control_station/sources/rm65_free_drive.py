@@ -10,8 +10,10 @@ target, enables a motor, starts a stream, or falls back to an older sample.
 from __future__ import annotations
 
 import math
+import threading
 import time
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -119,6 +121,198 @@ class RM65FreeDriveStep:
     @property
     def admitted(self) -> bool:
         return self.sample is not None
+
+
+@dataclass(frozen=True)
+class RM65FreeDrivePollResult:
+    """One source read produced by the optional observation worker."""
+
+    step: RM65FreeDriveStep
+    deadline_monotonic_sec: float
+    started_monotonic_sec: float
+    completed_monotonic_sec: float
+    lateness_sec: float
+    schedule_skipped: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.step, RM65FreeDriveStep):
+            raise TypeError("step must be RM65FreeDriveStep.")
+        for name in (
+            "deadline_monotonic_sec",
+            "started_monotonic_sec",
+            "completed_monotonic_sec",
+            "lateness_sec",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite.")
+        if self.completed_monotonic_sec < self.started_monotonic_sec:
+            raise ValueError("completed_monotonic_sec must not precede start.")
+        if self.lateness_sec < 0.0:
+            raise ValueError("lateness_sec must be non-negative.")
+
+
+class RM65FreeDriveSourcePoller:
+    """Poll one RM65 source without blocking the simulation/dispatch loop.
+
+    The worker is deliberately a source producer, not a second control owner.
+    It publishes every result in order; the bridge consumes those results from
+    the single mailbox owner.  A bounded mailbox fails closed if a consumer
+    stalls instead of silently dropping an invalid observation.
+    """
+
+    def __init__(
+        self,
+        source: RM65FreeDriveSource,
+        *,
+        poll_hz: float,
+        clock: Callable[[], float] = time.monotonic,
+        maximum_pending_results: int = 256,
+    ) -> None:
+        if not callable(getattr(source, "step", None)):
+            raise TypeError("source must provide step().")
+        normalized_hz = float(poll_hz)
+        if not math.isfinite(normalized_hz) or normalized_hz <= 0.0:
+            raise ValueError("poll_hz must be finite and positive.")
+        if not callable(clock):
+            raise TypeError("clock must be callable.")
+        if isinstance(maximum_pending_results, bool) or int(maximum_pending_results) <= 0:
+            raise ValueError("maximum_pending_results must be positive.")
+        self.source = source
+        self.poll_hz = normalized_hz
+        self._period_sec = 1.0 / normalized_hz
+        self._clock = clock
+        self._maximum_pending_results = int(maximum_pending_results)
+        self._lock = threading.RLock()
+        self._pending: deque[RM65FreeDrivePollResult] = deque()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return bool(self._thread is not None and self._thread.is_alive())
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None:
+                if self._thread.is_alive():
+                    raise RuntimeError("RM65 source poller is already running.")
+                self._thread = None
+            self._pending.clear()
+            self._stop_event.clear()
+            thread = threading.Thread(
+                target=self._run,
+                daemon=True,
+                name="rm65_free_drive_source",
+            )
+            self._thread = thread
+            thread.start()
+
+    def close(self) -> None:
+        self._stop_event.set()
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            raise RuntimeError(
+                "RM65 source poller did not stop within 1.000s; "
+                "backend close is intentionally deferred."
+            )
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
+
+    def take(self) -> RM65FreeDrivePollResult | None:
+        with self._lock:
+            if not self._pending:
+                return None
+            return self._pending.popleft()
+
+    def _run(self) -> None:
+        try:
+            next_deadline = float(self._clock()) + self._period_sec
+            while not self._stop_event.is_set():
+                now = float(self._clock())
+                if not math.isfinite(now):
+                    raise ValueError("source poll clock returned a non-finite value")
+                wait_sec = next_deadline - now
+                if wait_sec > 0.0:
+                    self._stop_event.wait(wait_sec)
+                    continue
+                started = float(self._clock())
+                lateness = max(0.0, started - next_deadline)
+                try:
+                    step = self.source.step()
+                except Exception as exc:  # noqa: BLE001 - publish failure to the owner.
+                    step = RM65FreeDriveStep(
+                        state={},
+                        sample=None,
+                        rejection_reason=(
+                            f"source_worker_exception:{type(exc).__name__}:{exc}"
+                        ),
+                    )
+                completed = float(self._clock())
+                if not math.isfinite(completed):
+                    raise ValueError("source poll clock returned a non-finite value")
+                candidate = next_deadline + self._period_sec
+                schedule_skipped = False
+                if candidate <= completed + 1e-12:
+                    candidate = completed + self._period_sec
+                    schedule_skipped = True
+                result = RM65FreeDrivePollResult(
+                    step=step,
+                    deadline_monotonic_sec=next_deadline,
+                    started_monotonic_sec=started,
+                    completed_monotonic_sec=completed,
+                    lateness_sec=lateness,
+                    schedule_skipped=schedule_skipped,
+                )
+                with self._lock:
+                    if len(self._pending) >= self._maximum_pending_results:
+                        self._pending.clear()
+                        overflow_step = RM65FreeDriveStep(
+                            state={},
+                            sample=None,
+                            rejection_reason="source_worker_mailbox_overflow",
+                        )
+                        result = RM65FreeDrivePollResult(
+                            step=overflow_step,
+                            deadline_monotonic_sec=next_deadline,
+                            started_monotonic_sec=started,
+                            completed_monotonic_sec=completed,
+                            lateness_sec=lateness,
+                            schedule_skipped=True,
+                        )
+                    self._pending.append(result)
+                next_deadline = candidate
+        except Exception as exc:  # noqa: BLE001 - fail closed at the bridge owner.
+            now = float(self._clock())
+            if not math.isfinite(now):
+                now = time.monotonic()
+            failure = RM65FreeDriveStep(
+                state={},
+                sample=None,
+                rejection_reason=f"source_worker_terminal:{type(exc).__name__}:{exc}",
+            )
+            result = RM65FreeDrivePollResult(
+                step=failure,
+                deadline_monotonic_sec=now,
+                started_monotonic_sec=now,
+                completed_monotonic_sec=now,
+                lateness_sec=0.0,
+                schedule_skipped=True,
+            )
+            with self._lock:
+                self._pending.clear()
+                self._pending.append(result)
 
 
 @runtime_checkable
@@ -297,7 +491,9 @@ __all__ = [
     "RM65_FREE_DRIVE_SOURCE_CONTRACT_ID_V1",
     "RM65_FREE_DRIVE_SOURCE_CONTROLLED_FRAME_V1",
     "RM65_FREE_DRIVE_SOURCE_REFERENCE_FRAME_V1",
+    "RM65FreeDrivePollResult",
     "RM65FreeDriveSource",
+    "RM65FreeDriveSourcePoller",
     "RM65FreeDriveSourceSpec",
     "RM65FreeDriveStep",
 ]

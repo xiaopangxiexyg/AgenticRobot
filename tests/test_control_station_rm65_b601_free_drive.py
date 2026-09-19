@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -465,3 +468,57 @@ def test_sim_config_keeps_reverse_gain_explicit() -> None:
     assert config.translation_gain_target_reference_xyz == (1.5, 1.0, 0.75)
     assert config.rotation_gain == 0.8
     assert config.target_velocity_limit_rad_s == 5.0
+
+
+def test_background_source_poll_does_not_block_physics_step() -> None:
+    class _BlockingSource(_Source):
+        def __init__(self) -> None:
+            super().__init__([_admitted(1), _admitted(2), _admitted(3)])
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+
+        def step(self) -> RM65FreeDriveStep:
+            self.calls += 1
+            if self.calls == 2:
+                self.started.set()
+                if not self.release.wait(timeout=1.0):
+                    raise RuntimeError("test source was not released")
+            return super().step()
+
+    source = _BlockingSource()
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = RM65ToB601FreeDriveBridge(
+        source,
+        retargeter,
+        driver,
+        source_poll_hz=100.0,
+        source_poll_in_background=True,
+    )
+    bridge.activate()
+    try:
+        assert source.started.wait(timeout=0.5)
+        started = time.perf_counter()
+        blocked_tick = bridge.step()
+        elapsed = time.perf_counter() - started
+        assert blocked_tick.source_step is None
+        assert elapsed < 0.05
+
+        source.release.set()
+        deadline = time.monotonic() + 1.0
+        completed_tick = None
+        while time.monotonic() < deadline:
+            candidate = bridge.step()
+            if candidate.source_step is not None:
+                completed_tick = candidate
+                break
+            time.sleep(0.001)
+        assert completed_tick is not None
+        assert completed_tick.source_step.sample is not None
+        assert completed_tick.source_step.sample.sequence == 2
+        assert completed_tick.source_completion_to_consumption_latency_sec is not None
+        assert completed_tick.source_completion_to_consumption_latency_sec >= 0.0
+    finally:
+        source.release.set()
+        bridge.deactivate()

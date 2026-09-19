@@ -140,6 +140,15 @@ def main(argv: list[str] | None = None) -> int:
         help="passive viewer refresh rate; physics remains at the B601 plant rate",
     )
     parser.add_argument("--source-poll-hz", type=_positive, default=20.0)
+    parser.add_argument(
+        "--source-poll-mode",
+        choices=("background", "synchronous"),
+        default="background",
+        help=(
+            "read RM65 observation in a dedicated source worker (background) "
+            "or synchronously in the MuJoCo loop"
+        ),
+    )
     parser.add_argument("--maximum-source-age-sec", type=_positive, default=0.25)
     parser.add_argument("--maximum-receive-age-sec", type=_positive, default=0.25)
     parser.add_argument("--maximum-future-skew-sec", type=_non_negative, default=0.05)
@@ -194,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
             "rate_hz": float(args.rate_hz),
             "viewer_sync_hz": float(args.viewer_sync_hz),
             "source_poll_hz": float(args.source_poll_hz),
+            "source_poll_mode": str(args.source_poll_mode),
             "source_poll_clock": "monotonic_wall_time",
         }
 
@@ -232,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                     rotation_gain=args.rotation_gain,
                     target_velocity_limit_rad_s=args.target_velocity_limit_rad_s,
                     source_poll_hz=args.source_poll_hz,
+                    source_poll_in_background=(args.source_poll_mode == "background"),
                     maximum_source_age_sec=args.maximum_source_age_sec,
                     maximum_receive_age_sec=args.maximum_receive_age_sec,
                     maximum_future_skew_sec=args.maximum_future_skew_sec,
