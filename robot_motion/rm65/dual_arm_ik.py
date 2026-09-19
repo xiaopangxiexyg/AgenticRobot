@@ -1536,10 +1536,12 @@ class MultiTaskIKSolver:
             raise ValueError(
                 f"Expected configuration shape {self.configuration.q.shape}, got {q_array.shape}."
             )
-        try:
-            self.configuration.q[:] = q_array
-        except Exception:
-            self.configuration.q = q_array.copy()
+        # Pink keeps FK, frame placements, Jacobians, and collision distances
+        # alongside ``configuration.q``.  Assigning the vector directly leaves
+        # those derived values at the previous state, so the next solve can
+        # emit a phantom first-step motion after a hardware/simulation rebase.
+        # Always use Pink's canonical update path at this trust boundary.
+        self.configuration.update(q_array)
         if self.viz is not None:
             self.viz.display(self.configuration.q)
 
