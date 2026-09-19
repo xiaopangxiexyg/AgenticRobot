@@ -175,12 +175,26 @@ def run_rm65_to_b601_foreground(
         event("foreground_started")
         next_tick = float(clock()) + period
         next_viewer_sync = float(clock())
+        viewer_sync_elapsed_sec = 0.0
         last_hold_reason: str | None = None
         last_hold_message_at = float("-inf")
         while True:
             now = float(clock())
             if viewer_period is None or now + 1e-12 >= next_viewer_sync:
-                if not bool(viewer.sync()):
+                viewer_sync_started = time.perf_counter()
+                viewer_alive = bool(viewer.sync())
+                viewer_sync_elapsed_sec = max(
+                    0.0,
+                    time.perf_counter() - viewer_sync_started,
+                )
+                event(
+                    "viewer_sync",
+                    elapsed_sec=viewer_sync_elapsed_sec,
+                    configured_hz=(
+                        None if viewer_period is None else 1.0 / viewer_period
+                    ),
+                )
+                if not viewer_alive:
                     status = viewer.status()
                     emit(f"[RM65→B601] viewer stopped: {status}")
                     event("viewer_stopped", viewer_status=status)
@@ -194,6 +208,7 @@ def run_rm65_to_b601_foreground(
             if now < next_tick:
                 sleeper(max(0.0, next_tick - now))
                 continue
+            control_tick_lateness_sec = max(0.0, now - next_tick)
             tick = bridge.step()
             position_tick = tick.position_tick
             retarget_result = tick.retarget_result
@@ -218,6 +233,7 @@ def run_rm65_to_b601_foreground(
                     # real dropout distinguishable from a valid sample that
                     # later failed IK.
                     "source_step_rejection_reason": tick.source_step.rejection_reason,
+                    "source_step_has_no_update": tick.source_step.has_no_update,
                     "source_state_measurement_sequence": source_state.get(
                         "hardware_measurement_sequence"
                     ),
@@ -253,7 +269,13 @@ def run_rm65_to_b601_foreground(
                         }
                     )
             position_debug = {}
-            if tick.source_step is not None or position_tick.rejection_reason is not None:
+            if (
+                (
+                    tick.source_step is not None
+                    and not tick.source_step.has_no_update
+                )
+                or position_tick.rejection_reason is not None
+            ):
                 position_debug = {
                     "sim_measured_qpos_rad": position_tick.measured_qpos,
                     "sim_measured_qvel_rad_s": position_tick.measured_qvel,
@@ -320,6 +342,8 @@ def run_rm65_to_b601_foreground(
                 retarget_elapsed_sec=getattr(tick, "retarget_elapsed_sec", 0.0),
                 position_step_elapsed_sec=getattr(tick, "position_step_elapsed_sec", 0.0),
                 step_elapsed_sec=getattr(tick, "step_elapsed_sec", 0.0),
+                control_tick_lateness_sec=control_tick_lateness_sec,
+                viewer_sync_elapsed_sec=viewer_sync_elapsed_sec,
                 source_receive_monotonic_sec=getattr(
                     tick, "source_receive_monotonic_sec", None
                 ),

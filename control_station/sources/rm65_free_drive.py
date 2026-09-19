@@ -99,15 +99,29 @@ class RM65FreeDriveSourceSpec:
 
 @dataclass(frozen=True)
 class RM65FreeDriveStep:
-    """One admitted sample or an explicit current-tick rejection."""
+    """One admitted sample, a harmless duplicate, or a rejection.
+
+    Realtime-push sources are latest-value mailboxes.  A bridge may consume the
+    same complete packet more than once when it polls faster than the vendor
+    publishes.  That is not a source fault and must not revoke the active
+    target.  ``unchanged`` represents that no-new-observation case explicitly
+    instead of overloading a rejection.
+    """
 
     state: Mapping[str, object]
     sample: RM65FreeDriveSample | None
     rejection_reason: str | None
+    unchanged: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, Mapping):
             raise TypeError("state must be a mapping.")
+        if not isinstance(self.unchanged, bool):
+            raise TypeError("unchanged must be bool.")
+        if self.unchanged:
+            if self.sample is not None or self.rejection_reason is not None:
+                raise ValueError("An unchanged step cannot contain a sample or rejection.")
+            return
         if (self.sample is None) == (self.rejection_reason is None):
             raise ValueError("A free-drive step requires exactly one sample or rejection.")
         if self.sample is not None and not isinstance(
@@ -121,6 +135,12 @@ class RM65FreeDriveStep:
     @property
     def admitted(self) -> bool:
         return self.sample is not None
+
+    @property
+    def has_no_update(self) -> bool:
+        """Whether this poll observed a valid, fresh packet already consumed."""
+
+        return self.unchanged
 
 
 @dataclass(frozen=True)
@@ -235,6 +255,22 @@ class RM65FreeDriveSourcePoller:
             if not self._pending:
                 return None
             return self._pending.popleft()
+
+    def take_latest(self) -> RM65FreeDrivePollResult | None:
+        """Take the newest queued observation and discard older ones.
+
+        This is only appropriate for a latest-value transport such as the
+        realtime-push mailbox.  It prevents a temporary consumer stall from
+        turning into avoidable queue latency while preserving the newest
+        rejection as the fail-closed result.
+        """
+
+        with self._lock:
+            if not self._pending:
+                return None
+            result = self._pending[-1]
+            self._pending.clear()
+            return result
 
     def _run(self) -> None:
         try:
@@ -497,6 +533,8 @@ class RM65FreeDriveRealtimePushSource(RM65FreeDriveSource):
     or a second control owner.
     """
 
+    latest_value_transport = True
+
     def __init__(
         self,
         backend: _RM65HardwareObservationBackend,
@@ -620,15 +658,6 @@ class RM65FreeDriveRealtimePushSource(RM65FreeDriveSource):
                 ),
             )
         sequence = int(payload["sequence"])
-        if self._last_measurement_sequence is not None and sequence <= self._last_measurement_sequence:
-            return RM65FreeDriveStep(
-                state={},
-                sample=None,
-                rejection_reason=(
-                    "realtime_push_measurement_not_advancing:"
-                    f"{sequence} <= {self._last_measurement_sequence}"
-                ),
-            )
         state: Mapping[str, object] = {}
         try:
             err_code = int(payload["err_code"])
@@ -642,10 +671,6 @@ class RM65FreeDriveRealtimePushSource(RM65FreeDriveSource):
             qpos = tuple(math.radians(float(value)) for value in payload["joint_deg"])
             if len(qpos) != 6 or any(not math.isfinite(value) for value in qpos):
                 raise ValueError("push joint position is not six finite values")
-            compute_pose = getattr(self.backend, "compute_tcp_pose", None)
-            if not callable(compute_pose):
-                raise TypeError("RM65 backend does not expose local TCP FK")
-            pose = _pose(compute_pose(qpos=qpos))
             source_timestamp = _finite(payload["received_wall"], name="received_wall")
             receive_timestamp = source_timestamp
             receive_monotonic = _finite(
@@ -663,7 +688,6 @@ class RM65FreeDriveRealtimePushSource(RM65FreeDriveSource):
                 "hardware_read_timestamp_monotonic": receive_monotonic,
                 "hardware_measurement_clock_domain_id": self.spec.clock_domain_id,
                 "hardware_qpos": qpos,
-                "current_tcp_pose": pose,
                 "hardware_result_code": 0,
                 "hardware_result_text": "realtime_push",
                 "hardware_arm_err": arm_error,
@@ -683,6 +707,27 @@ class RM65FreeDriveRealtimePushSource(RM65FreeDriveSource):
                 receive_timestamp,
                 receive_monotonic,
             )
+            if (
+                self._last_measurement_sequence is not None
+                and sequence <= self._last_measurement_sequence
+            ):
+                # The packet is still validated for vendor errors and
+                # freshness.  It is only a no-op because this exact packet was
+                # already admitted; do not run FK again and do not enter HOLD.
+                return RM65FreeDriveStep(
+                    state=state,
+                    sample=None,
+                    rejection_reason=None,
+                    unchanged=True,
+                )
+            compute_pose = getattr(self.backend, "compute_tcp_pose", None)
+            if not callable(compute_pose):
+                raise TypeError("RM65 backend does not expose local TCP FK")
+            pose = _pose(compute_pose(qpos=qpos))
+            state = {
+                **state,
+                "current_tcp_pose": pose,
+            }
             sample = RM65FreeDriveSample(
                 sequence=sequence,
                 source_timestamp_sec=source_timestamp,

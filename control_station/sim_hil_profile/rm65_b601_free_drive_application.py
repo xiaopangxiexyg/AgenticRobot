@@ -38,6 +38,8 @@ READ_ONLY_CONFIRMATION = "RM65_B601_READ_ONLY_FREE_DRIVE"
 READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION = (
     "RM65_B601_READ_ONLY_CONFIGURE_TELEMETRY"
 )
+DEFAULT_REQUEST_RESPONSE_SOURCE_POLL_HZ = 20.0
+DEFAULT_REALTIME_PUSH_SOURCE_POLL_HZ = 500.0
 
 
 def _positive(value: str) -> float:
@@ -143,7 +145,15 @@ def main(argv: list[str] | None = None) -> int:
         default=60.0,
         help="passive viewer refresh rate; physics remains at the B601 plant rate",
     )
-    parser.add_argument("--source-poll-hz", type=_positive, default=20.0)
+    parser.add_argument(
+        "--source-poll-hz",
+        type=_positive,
+        default=None,
+        help=(
+            "RM65 source-consumption rate; defaults to 20 Hz for request-response "
+            "and 500 Hz for realtime-push"
+        ),
+    )
     parser.add_argument(
         "--source-transport",
         choices=("request-response", "realtime-push"),
@@ -212,6 +222,15 @@ def main(argv: list[str] | None = None) -> int:
             f"--confirmation {READ_ONLY_CONFIRMATION}"
         )
     gains = _gain_triplet(list(args.translation_gain_target_reference_xyz))
+    effective_source_poll_hz = (
+        float(args.source_poll_hz)
+        if args.source_poll_hz is not None
+        else (
+            DEFAULT_REALTIME_PUSH_SOURCE_POLL_HZ
+            if args.source_transport == "realtime-push"
+            else DEFAULT_REQUEST_RESPONSE_SOURCE_POLL_HZ
+        )
+    )
     values = list(sys.argv[1:] if argv is None else argv)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.log.parent.mkdir(parents=True, exist_ok=True)
@@ -238,7 +257,8 @@ def main(argv: list[str] | None = None) -> int:
             "target_velocity_limit_rad_s": float(args.target_velocity_limit_rad_s),
             "rate_hz": float(args.rate_hz),
             "viewer_sync_hz": float(args.viewer_sync_hz),
-            "source_poll_hz": float(args.source_poll_hz),
+            "source_poll_hz": effective_source_poll_hz,
+            "source_poll_hz_explicit": args.source_poll_hz is not None,
             "source_poll_mode": str(args.source_poll_mode),
             "source_transport": str(args.source_transport),
             "realtime_push_configure_requested": bool(args.configure_realtime_push),
@@ -282,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
                     translation_gain_target_reference_xyz=gains,
                     rotation_gain=args.rotation_gain,
                     target_velocity_limit_rad_s=args.target_velocity_limit_rad_s,
-                    source_poll_hz=args.source_poll_hz,
+                    source_poll_hz=effective_source_poll_hz,
                     source_poll_in_background=(args.source_poll_mode == "background"),
                     maximum_source_age_sec=args.maximum_source_age_sec,
                     maximum_receive_age_sec=args.maximum_receive_age_sec,

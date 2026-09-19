@@ -207,6 +207,9 @@ class RM65ToB601FreeDriveBridge:
         if not isinstance(source_poll_in_background, bool):
             raise TypeError("source_poll_in_background must be bool.")
         self._source_poll_in_background = source_poll_in_background
+        self._source_poll_latest = bool(
+            getattr(source, "latest_value_transport", False)
+        )
         self._source_poller = (
             RM65FreeDriveSourcePoller(
                 source,
@@ -457,7 +460,11 @@ class RM65ToB601FreeDriveBridge:
         source_poll_result = None
         if self._state == "active":
             if self._source_poller is not None:
-                source_poll_result = self._source_poller.take()
+                source_poll_result = (
+                    self._source_poller.take_latest()
+                    if self._source_poll_latest
+                    else self._source_poller.take()
+                )
             elif self._source_poll_due():
                 source_poll_deadline_sec = self._source_poll_deadline()
                 source_poll_now = self._source_poll_now()
@@ -508,7 +515,13 @@ class RM65ToB601FreeDriveBridge:
                     )
                 self._last_source_step = source_step
             if source_step is not None:
-                if source_step.sample is None:
+                if source_step.has_no_update:
+                    # A realtime-push mailbox can be polled more frequently
+                    # than the vendor publishes.  A fresh duplicate is a
+                    # valid no-op, not a source rejection: keep the pending
+                    # target and continue the local MuJoCo plant.
+                    pass
+                elif source_step.sample is None:
                     self._clear_target()
                     tick_rejection_reason = (
                         source_step.rejection_reason or "RM65 source rejected the current sample"

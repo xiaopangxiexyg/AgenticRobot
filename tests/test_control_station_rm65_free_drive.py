@@ -168,7 +168,7 @@ def test_realtime_push_source_admits_complete_callback_without_sdk_poll() -> Non
     source.close()
 
 
-def test_realtime_push_source_rejects_duplicate_latest_packet() -> None:
+def test_realtime_push_source_treats_duplicate_latest_packet_as_no_update() -> None:
     backend = _PushBackend()
     source = RM65FreeDriveRealtimePushSource(
         backend,
@@ -179,7 +179,29 @@ def test_realtime_push_source_rejects_duplicate_latest_packet() -> None:
     assert source.step().admitted
     duplicate = source.step()
     assert not duplicate.admitted
-    assert "measurement_not_advancing" in (duplicate.rejection_reason or "")
+    assert duplicate.has_no_update
+    assert duplicate.rejection_reason is None
+
+
+def test_realtime_push_duplicate_still_rejects_stale_mailbox() -> None:
+    backend = _PushBackend()
+    now = [20.1]
+    source = RM65FreeDriveRealtimePushSource(
+        backend,
+        spec=RM65FreeDriveSourceSpec(
+            maximum_measurement_age_sec=0.25,
+            maximum_receive_age_sec=0.25,
+        ),
+        wall_clock=lambda: 10.1,
+        monotonic_clock=lambda: now[0],
+    )
+    source.start()
+    assert source.step().admitted
+    now[0] = 20.5
+    stale = source.step()
+    assert not stale.admitted
+    assert not stale.has_no_update
+    assert "hardware read is stale" in (stale.rejection_reason or "")
 
 
 def test_realtime_push_source_fails_closed_on_vendor_error() -> None:

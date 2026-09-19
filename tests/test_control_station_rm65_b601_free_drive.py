@@ -165,6 +165,15 @@ def _rejected(reason: str) -> RM65FreeDriveStep:
     )
 
 
+def _unchanged() -> RM65FreeDriveStep:
+    return RM65FreeDriveStep(
+        state={},
+        sample=None,
+        rejection_reason=None,
+        unchanged=True,
+    )
+
+
 def _bridge(
     source: _Source,
     driver: _Driver,
@@ -220,6 +229,27 @@ def test_source_rejection_enters_held_and_does_not_reissue_old_target() -> None:
     assert bridge.last_rejection_reason == "receive_stale"
     assert rejected.retarget_result is None
     assert bridge.pending_command is None
+
+
+def test_bridge_keeps_following_through_realtime_push_duplicate() -> None:
+    source = _Source([_admitted(1), _admitted(2), _unchanged(), _admitted(3)])
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = _bridge(source, driver, retargeter)
+
+    bridge.activate()
+    assert bridge.step().source_step is None
+    first = bridge.step()
+    duplicate = bridge.step()
+
+    assert first.state == "active"
+    assert first.position_tick.command_applied
+    assert duplicate.state == "active"
+    assert duplicate.source_step is not None
+    assert duplicate.source_step.has_no_update
+    assert duplicate.rejection_reason is None
+    assert duplicate.retarget_result is None
+    assert len(retargeter.seeds) == 1
 
 
 def test_activation_failure_is_explicit_and_recenter_requires_clutch() -> None:

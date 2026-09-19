@@ -95,6 +95,7 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "source_admission_to_target_dispatch_latency_sec": [],
         "source_completion_to_consumption_latency_sec": [],
         "source_completion_to_target_dispatch_latency_sec": [],
+        "source_receive_to_admission_latency_sec": [],
         "source_interarrival_sec": [],
         "source_admission_interarrival_sec": [],
         "source_poll_lateness_sec": [],
@@ -102,6 +103,8 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "retarget_elapsed_sec": [],
         "position_step_elapsed_sec": [],
         "step_elapsed_sec": [],
+        "control_tick_lateness_sec": [],
+        "viewer_sync_elapsed_sec": [],
     }
     source_read_phases_ms: dict[str, list[float]] = defaultdict(list)
     counts: Counter[str] = Counter()
@@ -109,6 +112,11 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     previous_source_read_monotonic: float | None = None
     previous_source_admission_monotonic: float | None = None
     for record in records:
+        if record.get("event") == "viewer_sync":
+            value = _finite_non_negative(record.get("elapsed_sec"))
+            if value is not None:
+                timings["viewer_sync_elapsed_sec"].append(value)
+            continue
         if record.get("event") != "bridge_step":
             continue
         counts["bridge_steps"] += 1
@@ -141,6 +149,20 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                     timings["source_admission_interarrival_sec"].append(interval)
             if source_admission_monotonic is not None:
                 previous_source_admission_monotonic = source_admission_monotonic
+            source_receive_monotonic = _finite_non_negative(
+                record.get("source_receive_monotonic_sec")
+            )
+            if (
+                source_receive_monotonic is not None
+                and source_admission_monotonic is not None
+            ):
+                receive_to_admission = (
+                    source_admission_monotonic - source_receive_monotonic
+                )
+                if math.isfinite(receive_to_admission) and receive_to_admission >= 0.0:
+                    timings["source_receive_to_admission_latency_sec"].append(
+                        receive_to_admission
+                    )
         if record.get("retarget_accepted") is True:
             counts["retarget_accepted"] += 1
         if record.get("command_applied") is True:
@@ -149,12 +171,18 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             counts["sim_slew_limited"] += 1
         if record.get("source_poll_schedule_skipped") is True:
             counts["source_poll_schedule_skipped"] += 1
+        if record.get("source_step_has_no_update") is True:
+            counts["source_no_update"] += 1
         reason = record.get("bridge_rejection_reason") or record.get(
             "retarget_rejection_reason"
         )
         if reason:
             rejection_reasons[str(reason)] += 1
         for name, values in timings.items():
+            if name == "viewer_sync_elapsed_sec":
+                # Viewer samples are emitted by the dedicated viewer_sync
+                # event, not repeated on every bridge_step.
+                continue
             if name in {
                 "source_step_elapsed_sec",
                 "retarget_elapsed_sec",
@@ -205,7 +233,10 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             in {
                 "source_to_target_dispatch_latency_sec",
                 "source_admission_to_target_dispatch_latency_sec",
+                "source_receive_to_admission_latency_sec",
                 "source_poll_lateness_sec",
+                "control_tick_lateness_sec",
+                "viewer_sync_elapsed_sec",
             }
         },
         "interpretation": {
@@ -223,6 +254,18 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "source_completion_to_consumption_latency_sec is the delay "
                 "between completion of the RM65 source read and consumption "
                 "by the MuJoCo bridge loop."
+            ),
+            "push_mailbox_latency": (
+                "source_receive_to_admission_latency_sec measures the delay "
+                "from realtime-push callback receipt to source admission; a "
+                "large value indicates source polling cadence or mailbox "
+                "consumption lag rather than IK computation."
+            ),
+            "foreground_jitter": (
+                "control_tick_lateness_sec measures the bridge-loop schedule "
+                "lateness; viewer_sync_elapsed_sec is recorded separately "
+                "because passive viewer presentation is outside the target "
+                "dispatch timestamp but can delay the next tick."
             ),
             "excluded": (
                 "RM65 measurement age before read completion, physical B601 "

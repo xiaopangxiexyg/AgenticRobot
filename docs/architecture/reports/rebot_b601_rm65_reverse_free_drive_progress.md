@@ -443,3 +443,37 @@ exact realtime-push target regression: converged_approximate
 目标已用只读 `/home/zc/HandMotion/Developing/reBotArm_control_py` 独立复现通过。
 候选尚未合并、push 或安装；合并前仍需在包含 vendor checkout 的环境重跑 IK/P2
 集成测试，并用前台只读 GUI 验证连续跟随不会因该近奇异帧立即进入 held。
+
+## 2026-09-19 延迟主路径诊断与 P1 优化
+
+本轮优先处理延迟，不把近奇异 IK 拒绝当作主要延迟来源。远端 realtime-push
+日志 `/tmp/rm65-b601-field/realtime-push-Qffh2X/gui.log` 的离线重算结果为：
+
+```text
+source_poll_hz=100 Hz
+push callback -> source admission: mean 3.701 ms, p95 4.477 ms, max 5.267 ms
+source admission -> target dispatch: mean 3.511 ms, p95 7.650 ms
+source callback -> target dispatch: mean 7.212 ms, p95 11.472 ms
+retarget/IK: p95 about 0.871 ms (accepted samples)
+```
+
+因此此前的主要瓶颈是 realtime-push latest mailbox 以 100 Hz 被消费，平均等待下一次
+消费，而不是 IK 计算本身。报告脚本现在新增
+`source_receive_to_admission_latency_sec`，并分别记录 `viewer_sync` 和
+`control_tick_lateness_sec`，可以把 push 消费、MuJoCo viewer 阻塞和控制线程抖动分开。
+
+P1 候选的改动保持单一控制所有者和 fail-closed 语义：
+
+- realtime-push 的重复但仍新鲜的 latest packet 变为显式 `unchanged` no-op，不再被
+  当成 `measurement_not_advancing` 故障，也不会撤销当前 MuJoCo 目标；真正的错误码、
+  非法帧和过期 packet 仍立即进入 held；
+- realtime-push 的后台 poller 使用 latest-only 消费，避免消费队列追赶旧样本；
+- CLI 未显式指定 `--source-poll-hz` 时，request-response 仍为 20 Hz，realtime-push
+  默认改为 500 Hz；显式值仍完全尊重；
+- latency report 增加 push mailbox、viewer sync 和 foreground tick lateness 分段，
+  便于用同一份现场日志判断优化是否生效。
+
+现场复测应优先比较 `source_receive_to_admission_latency_sec` 和
+`source_to_target_dispatch_latency_sec`，而不是只看 viewer 画面。预期在 5 ms
+realtime-push 周期、500 Hz 消费下，前者应降到约 0--2 ms；若仍高，才继续检查
+RM65 UDP 接收线程或操作系统调度。该候选目前仍未合并、push 或安装。
