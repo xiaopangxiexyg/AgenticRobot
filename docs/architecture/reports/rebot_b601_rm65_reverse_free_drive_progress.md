@@ -396,3 +396,50 @@ translation/rotation gain 由 `RM65ToB601FreeDriveSimConfig` 独立提供。
 该固定值只改变 frame calibration，不改变 B601 真机 owner、RM65 真机执行器或任何
 CAN/位置/力矩命令。离线反向集成测试必须验证 round-trip、连续 seed 和 rejection
 撤销；现场 `--connect-read-only` 仍然只读 RM65，并只驱动 B601 MuJoCo target。
+
+## 2026-09-19 realtime-push `max_iterations` 诊断与修复候选
+
+远端 `user@192.168.70.116` 的只读 realtime-push 运行中，首次拒绝发生在
+`/tmp/rm65-b601-field/realtime-push-Qffh2X/gui.log` 的 source sequence `5023`：
+
+```text
+source_state_measurement_valid = true
+source_completion_to_consumption = 0.337 ms
+target_seed_translation_delta = 0.409 mm
+target_seed_orientation_delta = 5.244 mrad
+ik_iterations = 120
+ik_position_error = 0.146 mm
+ik_orientation_error = 0.534 mrad
+ik_sigma_min = 2.75e-6
+ik_condition_number = 1.084e6
+ik_limit_projection_applied = false
+```
+
+因此这次不是 UDP 丢包、source freshness、关节越限或目标突变；它是 B601
+Jacobian 进入近奇异状态后，误差已经很小但无法继续降到严格 `10 um / 0.1 mrad`
+阈值。重复的 `held` 行是 bridge 的 fail-closed latch，不是每个 physics tick
+重新执行一次 IK。把 `max_iterations` 提高到 3000 只会增加耗时，残差仍约为
+`0.146 mm / 0.534 mrad`。
+
+当前候选在 `robot_motion/rebot_b601_rs/ik.py` 增加了明确的有界近似收敛契约：
+当状态为 `max_iterations` 或 `line_search_stalled`、没有发生 joint-limit
+projection，且残差不超过 `0.5 mm / 1 mrad` 时，结果为
+`converged_approximate` 并可继续 MuJoCo following；数值失败、越限投影和更大残差
+仍然拒绝。`rm65_retarget.py` 同时记录失败候选 qpos，便于区分奇异残差与真正不可达。
+该阈值是仿真桥接的明确数值边界，不是放宽 B601 真机硬件关节限位或发送未验证的
+硬件命令。
+
+离线检查结果：
+
+```text
+tests/test_rebot_b601_ik.py + tests/test_control_station_rm65_b601_free_drive.py
+12 passed, 9 skipped
+reverse-latency related suite
+30 passed, 1 warning
+exact realtime-push target regression: converged_approximate
+```
+
+`9` 个 skip 仅表示当前候选 checkout 的 gitlink vendor URDF 未初始化；精确现场
+目标已用只读 `/home/zc/HandMotion/Developing/reBotArm_control_py` 独立复现通过。
+候选尚未合并、push 或安装；合并前仍需在包含 vendor checkout 的环境重跑 IK/P2
+集成测试，并用前台只读 GUI 验证连续跟随不会因该近奇异帧立即进入 held。

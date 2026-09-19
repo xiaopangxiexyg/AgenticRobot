@@ -124,6 +124,67 @@ def test_reverse_teleop_wrist_correction_does_not_stall_at_default_step_limit(
     assert result.orientation_error_rad <= 1e-4
 
 
+def test_near_singular_reverse_target_accepts_bounded_approximate_solution(
+    b601_model: B601PinocchioModel,
+) -> None:
+    """A singularity residual below the explicit teleop bound is usable.
+
+    This target is the first ``max_iterations`` frame from the 2026-09-19
+    RM65 realtime-push run.  More iterations only drive the smallest
+    singular value toward zero while leaving the Cartesian residual at about
+    0.146 mm / 0.534 mrad.  Accepting that bounded qpos prevents a false
+    held latch; genuinely unreachable targets remain rejected below.
+    """
+
+    target_pose = np.array(
+        [
+            [
+                0.6592771892531681,
+                0.7187865960335879,
+                -0.2206794442010636,
+                0.556657485476964,
+            ],
+            [
+                -0.7515407838384679,
+                0.6390127630100744,
+                -0.16385706862290708,
+                0.025453490669677677,
+            ],
+            [
+                0.02323871678694786,
+                0.27387683011287856,
+                0.9614839800898498,
+                0.4754727596234055,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    seed_qpos = np.array(
+        [
+            -0.3963772020412047,
+            2.383800256336,
+            2.7914689680676465,
+            -0.33300796685939,
+            -1.2435246878835802,
+            -0.2022896023367876,
+        ]
+    )
+
+    result = B601DampedLeastSquaresIK(b601_model).solve(
+        target_pose,
+        seed_qpos=seed_qpos,
+    )
+
+    assert result.success is True
+    assert result.status == "converged_approximate"
+    assert result.position_error_m <= 5e-4
+    assert result.orientation_error_rad <= 1e-3
+    assert result.limit_projection_applied is False
+    lower, upper = b601_model.arm_position_limits()
+    np.testing.assert_array_less(lower - 1e-12, np.asarray(result.qpos))
+    np.testing.assert_array_less(np.asarray(result.qpos), upper + 1e-12)
+
+
 def test_previous_solution_seed_preserves_continuity_over_pose_stream(
     b601_model: B601PinocchioModel,
 ) -> None:
@@ -202,6 +263,10 @@ def test_seed_shape_finiteness_and_physical_limits_are_fail_closed(
         solver.solve(pose, seed_qpos=[3.0, 1.0, 1.0, 0.0, 0.0, 0.0])
     with pytest.raises(ValueError, match="positive integer"):
         B601IKConfig(max_iterations=1.5)
+    with pytest.raises(ValueError, match="approximate_position_tolerance_m"):
+        B601IKConfig(approximate_position_tolerance_m=1e-6)
+    with pytest.raises(ValueError, match="approximate_orientation_tolerance_rad"):
+        B601IKConfig(approximate_orientation_tolerance_rad=1e-5)
     with pytest.raises(ValueError, match="positive integer"):
         B601IKConfig(backtracking_steps=0)
     with pytest.raises(TypeError, match="positive integer"):

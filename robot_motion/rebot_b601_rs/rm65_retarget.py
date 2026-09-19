@@ -485,6 +485,9 @@ class RM65ToB601Retargeter:
             ik_result = self.ik_solver.solve(target_pose, seed_qpos=seed)
             if not isinstance(ik_result, B601IKResult):
                 raise TypeError("B601 IK solver returned an invalid result type.")
+            diagnostics["ik_result_qpos_rad"] = tuple(
+                float(value) for value in ik_result.qpos
+            )
             if ik_result.success is not True:
                 diagnostics["target_pose_candidate"] = tuple(
                     tuple(float(item) for item in row) for row in target_pose
@@ -496,7 +499,6 @@ class RM65ToB601Retargeter:
                     diagnostics=diagnostics,
                 )
             qpos = _finite_qpos(ik_result.qpos, name="ik_result.qpos")
-            diagnostics["ik_result_qpos_rad"] = qpos
         except (TypeError, ValueError, RuntimeError) as exc:
             return self._rejected(sample, f"retarget_rejected:{type(exc).__name__}:{exc}")
         return RM65ToB601RetargetResult(
