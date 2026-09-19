@@ -131,32 +131,36 @@ def _parser() -> argparse.ArgumentParser:
     reference_rotation = parser.add_mutually_exclusive_group()
     reference_rotation.add_argument(
         "--mapping-reference-rotation-rpy-deg",
+        "--reference-rpy-deg",
         nargs=3,
         type=float,
         metavar=("ROLL", "PITCH", "YAW"),
-        help="temporary source-base rotation override in degrees",
+        help="temporary source-base rotation override in degrees (short alias: --reference-rpy-deg)",
     )
     reference_rotation.add_argument(
         "--mapping-reference-rotation-matrix",
+        "--reference-matrix",
         nargs=9,
         type=float,
         metavar="R",
-        help="temporary source-base 3x3 rotation override, row-major",
+        help="temporary source-base 3x3 rotation override, row-major (short alias: --reference-matrix)",
     )
     controlled_rotation = parser.add_mutually_exclusive_group()
     controlled_rotation.add_argument(
         "--mapping-controlled-rotation-rpy-deg",
+        "--controlled-rpy-deg",
         nargs=3,
         type=float,
         metavar=("ROLL", "PITCH", "YAW"),
-        help="temporary controlled-tool rotation override in degrees",
+        help="temporary controlled-tool rotation override in degrees (short alias: --controlled-rpy-deg)",
     )
     controlled_rotation.add_argument(
         "--mapping-controlled-rotation-matrix",
+        "--controlled-matrix",
         nargs=9,
         type=float,
         metavar="R",
-        help="temporary controlled-tool 3x3 rotation override, row-major",
+        help="temporary controlled-tool 3x3 rotation override, row-major (short alias: --controlled-matrix)",
     )
     parser.add_argument(
         "--pause-on-exit",

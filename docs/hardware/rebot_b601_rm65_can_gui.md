@@ -241,8 +241,23 @@ PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
 
 ```bash
 "$PY" scripts/hardware/rebot_b601_rm65_mujoco_follow.py \
-  --mapping-controlled-rotation-rpy-deg 0 0 90
+  --controlled-rpy-deg 0 0 90
 ```
+
+这里的 `--controlled-rpy-deg ROLL PITCH YAW` 是
+`--mapping-controlled-rotation-rpy-deg` 的短别名；同样，
+`--controlled-matrix`、`--reference-rpy-deg`、`--reference-matrix` 分别对应四个完整
+参数。矩阵输入是 9 个行主序数值，例如：
+
+```bash
+"$PY" scripts/hardware/rebot_b601_rm65_mujoco_follow.py \
+  --controlled-matrix 0 -1 0 1 0 0 0 0 1
+```
+
+这些参数只覆盖本次 RM65 仿真的内存 profile；不会修改 JSON，也不要求维护
+`semantic_content_hash`。若希望把一组调参持久化，复制
+`docs/hardware/profiles/b601_rm65_mapping_150_v2.json` 到临时路径后修改两个矩阵字段，
+再将该路径传给 `--mapping-profile` 即可，canonical loader 会按当前内容重新计算派生 hash。
 
 若希望先摆位再按单键 `a` 激活，追加 `--manual-activate`；若要保留应用层单 tick
 位姿幅度预检，追加 `--keep-residual-envelope`。矩阵参数仍支持 9 个行主序数值，profile

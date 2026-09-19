@@ -24,11 +24,11 @@ def test_launcher_defaults_are_workspace_local_and_auto_activate() -> None:
 def test_launcher_builds_canonical_read_only_command_without_shell(tmp_path: Path) -> None:
     args = launcher._parser().parse_args(
         [
-            "--mapping-controlled-rotation-rpy-deg",
+            "--controlled-rpy-deg",
             "0",
             "0",
             "90",
-            "--mapping-reference-rotation-matrix",
+            "--reference-matrix",
             "0",
             "1",
             "0",
@@ -67,6 +67,39 @@ def test_launcher_builds_canonical_read_only_command_without_shell(tmp_path: Pat
     assert command[command.index("--mapping-reference-rotation-matrix") + 1 :]
     assert "--shell" not in command
     assert all(";" not in value for value in command)
+
+
+def test_launcher_rotation_aliases_feed_the_canonical_application_options() -> None:
+    args = launcher._parser().parse_args(
+        [
+            "--controlled-matrix",
+            "1",
+            "0",
+            "0",
+            "0",
+            "1",
+            "0",
+            "0",
+            "0",
+            "1",
+            "--reference-rpy-deg",
+            "0",
+            "0",
+            "90",
+        ]
+    )
+    assert args.mapping_controlled_rotation_matrix == [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+    assert args.mapping_reference_rotation_rpy_deg == [0.0, 0.0, 90.0]
 
 
 def test_manual_activation_and_envelope_are_explicit() -> None:
