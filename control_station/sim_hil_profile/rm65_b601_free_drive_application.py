@@ -150,6 +150,15 @@ def main(argv: list[str] | None = None) -> int:
         help="positive translation gains applied after clutch anchoring",
     )
     parser.add_argument("--rotation-gain", type=_positive, default=1.0)
+    parser.add_argument(
+        "--target-velocity-limit-rad-s",
+        type=_positive,
+        default=2.5,
+        help=(
+            "simulation-only per-joint MuJoCo target slew limit; does not "
+            "change any RM65/B601 hardware limit"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.connect_read_only and args.confirmation != READ_ONLY_CONFIRMATION:
         parser.error(
@@ -180,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
             "arm_urdf_path": str(args.arm_urdf_path),
             "translation_gain_target_reference_xyz": list(gains),
             "rotation_gain": float(args.rotation_gain),
+            "target_velocity_limit_rad_s": float(args.target_velocity_limit_rad_s),
             "rate_hz": float(args.rate_hz),
             "viewer_sync_hz": float(args.viewer_sync_hz),
             "source_poll_hz": float(args.source_poll_hz),
@@ -187,7 +197,11 @@ def main(argv: list[str] | None = None) -> int:
         }
 
         def emit(message: str) -> None:
-            print(message, flush=True)
+            try:
+                print(message, flush=True)
+            except BrokenPipeError:
+                # A closed tee/terminal must not prevent JSON/log cleanup.
+                pass
             record({"event": "terminal", "message": message})
 
         record({"event": "command", "argv": result["argv"]})
@@ -215,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
                 config=RM65ToB601FreeDriveSimConfig(
                     translation_gain_target_reference_xyz=gains,
                     rotation_gain=args.rotation_gain,
+                    target_velocity_limit_rad_s=args.target_velocity_limit_rad_s,
                     source_poll_hz=args.source_poll_hz,
                     maximum_source_age_sec=args.maximum_source_age_sec,
                     maximum_receive_age_sec=args.maximum_receive_age_sec,

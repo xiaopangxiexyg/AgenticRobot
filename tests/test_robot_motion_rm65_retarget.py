@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from control_station.composition.rebot_b601_rm65_profile import (
@@ -192,6 +193,9 @@ def test_ik_failure_is_rejected_without_command_target() -> None:
     assert result.target_pose is None
     assert result.ik_result is not None
     assert result.rejection_reason == "ik_rejected:max_iterations"
+    assert result.diagnostics["target_seed_translation_delta_m"] == pytest.approx(0.05)
+    assert result.diagnostics["target_seed_orientation_delta_rad"] == pytest.approx(0.0)
+    assert result.diagnostics["target_pose_candidate"] is not None
 
 
 def test_repeated_sequence_is_rejected_without_replaying_target() -> None:

@@ -10,7 +10,7 @@ MuJoCo scene.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -295,6 +295,7 @@ class RM65ToB601RetargetResult:
     target_pose: tuple[tuple[float, ...], ...] | None
     ik_result: B601IKResult | None
     rejection_reason: str | None
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.sample, RM65FreeDriveSample):
@@ -311,6 +312,9 @@ class RM65ToB601RetargetResult:
                 raise ValueError("Rejected retarget results require a reason.")
             if self.qpos_rad is not None or self.target_pose is not None:
                 raise ValueError("Rejected retarget results cannot carry a target.")
+        if not isinstance(self.diagnostics, Mapping):
+            raise TypeError("diagnostics must be a mapping.")
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
 
 
 class _B601ForwardKinematics(Protocol):
@@ -458,14 +462,33 @@ class RM65ToB601Retargeter:
                 delta_rotvec
             ).as_matrix()
             target_pose = _pose_array(target_pose, name="target_pose")
+            seed_pose = _pose_array(
+                self.model.forward_kinematics(seed),
+                name="seed_pose",
+            )
+            seed_rotation_delta = Rotation.from_matrix(
+                target_pose[:3, :3] @ seed_pose[:3, :3].T
+            ).as_rotvec()
+            diagnostics = {
+                "target_seed_translation_delta_m": float(
+                    np.linalg.norm(target_pose[:3, 3] - seed_pose[:3, 3])
+                ),
+                "target_seed_orientation_delta_rad": float(
+                    np.linalg.norm(seed_rotation_delta)
+                ),
+            }
             ik_result = self.ik_solver.solve(target_pose, seed_qpos=seed)
             if not isinstance(ik_result, B601IKResult):
                 raise TypeError("B601 IK solver returned an invalid result type.")
             if ik_result.success is not True:
+                diagnostics["target_pose_candidate"] = tuple(
+                    tuple(float(item) for item in row) for row in target_pose
+                )
                 return self._rejected(
                     sample,
                     f"ik_rejected:{ik_result.status}",
                     ik_result=ik_result,
+                    diagnostics=diagnostics,
                 )
             qpos = _finite_qpos(ik_result.qpos, name="ik_result.qpos")
         except (TypeError, ValueError, RuntimeError) as exc:
@@ -479,6 +502,7 @@ class RM65ToB601Retargeter:
             ),
             ik_result=ik_result,
             rejection_reason=None,
+            diagnostics=diagnostics,
         )
 
     def _validate_sample_identity(self, sample: RM65FreeDriveSample) -> None:
@@ -516,6 +540,7 @@ class RM65ToB601Retargeter:
         reason: str,
         *,
         ik_result: B601IKResult | None = None,
+        diagnostics: Mapping[str, object] | None = None,
     ) -> RM65ToB601RetargetResult:
         return RM65ToB601RetargetResult(
             sample=sample,
@@ -524,6 +549,7 @@ class RM65ToB601Retargeter:
             target_pose=None,
             ik_result=ik_result,
             rejection_reason=reason,
+            diagnostics={} if diagnostics is None else diagnostics,
         )
 
 

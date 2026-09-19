@@ -23,7 +23,7 @@ from .scene import (
 )
 
 B601_RS_JOINT_POSITION_FRAME = "b601_rs/joint_position"
-_B601_RS_PROVISIONAL_VISUALIZATION_MAX_VELOCITY_RAD_S = 0.5
+B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S = 2.5
 
 
 def default_b601_position_timing() -> TimingSpec:
@@ -40,10 +40,17 @@ def default_b601_position_timing() -> TimingSpec:
 
 def _default_b601_velocity_profile(
     timing: TimingSpec,
+    *,
+    max_velocity_rad_s: float = B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S,
 ) -> JointVelocityLimitProfile:
     """Build the provisional simulation-only position target rate profile."""
 
-    velocity_deg_s = math.degrees(_B601_RS_PROVISIONAL_VISUALIZATION_MAX_VELOCITY_RAD_S)
+    if isinstance(max_velocity_rad_s, bool):
+        raise TypeError("max_velocity_rad_s must be finite and positive")
+    normalized_velocity = float(max_velocity_rad_s)
+    if not math.isfinite(normalized_velocity) or normalized_velocity <= 0.0:
+        raise ValueError("max_velocity_rad_s must be finite and positive")
+    velocity_deg_s = math.degrees(normalized_velocity)
     return JointVelocityLimitProfile(
         name="b601_rs_visualization_only_provisional",
         max_velocity_deg_s=(velocity_deg_s,) * 6,
@@ -51,8 +58,8 @@ def _default_b601_velocity_profile(
         joint_names=B601_RS_ARM_JOINT_NAMES,
         metadata={
             "parameter_source": (
-                "pinned_rebotarm_safe_home_default_max_vel_0.5_rad_s_"
-                "used_as_visualization_seed_only"
+                "explicit_simulation_only_target_velocity_limit_"
+                f"{normalized_velocity:g}_rad_s"
             ),
             "hardware_safety_claim": False,
         },
@@ -178,6 +185,7 @@ class B601PositionDriver:
         timing: TimingSpec | None = None,
         *,
         velocity_profile: JointVelocityLimitProfile | None = None,
+        target_velocity_limit_rad_s: float | None = None,
         state_limit_tolerance_rad: float = 1e-4,
     ) -> None:
         if not isinstance(scene, MujocoScene):
@@ -199,8 +207,17 @@ class B601PositionDriver:
         if tuple(arm_spec.joint_names) != B601_RS_ARM_JOINT_NAMES:
             raise ValueError("scene B601-RS arm joint order does not match the model")
 
+        if velocity_profile is not None and target_velocity_limit_rad_s is not None:
+            raise ValueError(
+                "provide either velocity_profile or target_velocity_limit_rad_s, not both"
+            )
         resolved_velocity_profile = velocity_profile or _default_b601_velocity_profile(
-            resolved_timing
+            resolved_timing,
+            max_velocity_rad_s=(
+                B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S
+                if target_velocity_limit_rad_s is None
+                else target_velocity_limit_rad_s
+            ),
         )
         if not isinstance(resolved_velocity_profile, JointVelocityLimitProfile):
             raise TypeError("velocity_profile must be a JointVelocityLimitProfile")
@@ -520,6 +537,7 @@ class B601PositionDriver:
 
 
 __all__ = [
+    "B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S",
     "B601_RS_JOINT_POSITION_FRAME",
     "B601JointPositionCommand",
     "B601PositionDriver",

@@ -12,6 +12,7 @@ from .contact import (
     read_b601_contact_observation,
 )
 from .driver import (
+    B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S,
     B601JointPositionCommand,
     B601PositionDriver,
     B601PositionTick,
@@ -36,6 +37,7 @@ __all__ = [
     "B601_RS_CONTACT_SCENE_PROFILE_NAME",
     "B601_RS_CONTACT_SENSOR_NAME",
     "B601_RS_DEFAULT_ARM_QPOS",
+    "B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S",
     "B601_RS_GRIPPER_OPEN_QPOS",
     "B601_RS_SIM_ARM_KEY",
     "B601EffortTick",
@@ -44,8 +46,8 @@ __all__ = [
     "B601MujocoEffortDriver",
     "B601PositionDriver",
     "B601PositionTick",
-    "b601_contact_scene_spec",
     "B601SimFaultPolicy",
+    "b601_contact_scene_spec",
     "build_b601_mjcf_xml",
     "build_b601_mujoco_scene",
     "default_b601_mit_profile",

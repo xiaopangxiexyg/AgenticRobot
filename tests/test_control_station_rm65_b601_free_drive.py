@@ -265,3 +265,4 @@ def test_sim_config_keeps_reverse_gain_explicit() -> None:
     )
     assert config.translation_gain_target_reference_xyz == (1.5, 1.0, 0.75)
     assert config.rotation_gain == 0.8
+    assert config.target_velocity_limit_rad_s == 2.5

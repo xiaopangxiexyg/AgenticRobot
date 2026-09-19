@@ -76,6 +76,7 @@ class RM65ToB601FreeDriveSimConfig:
         1.0,
     )
     rotation_gain: float = 1.0
+    target_velocity_limit_rad_s: float = 2.5
     source_poll_hz: float = 20.0
     maximum_source_age_sec: float = 0.25
     maximum_receive_age_sec: float = 0.25
@@ -94,6 +95,14 @@ class RM65ToB601FreeDriveSimConfig:
             self,
             "rotation_gain",
             _positive_finite(self.rotation_gain, name="rotation_gain"),
+        )
+        object.__setattr__(
+            self,
+            "target_velocity_limit_rad_s",
+            _positive_finite(
+                self.target_velocity_limit_rad_s,
+                name="target_velocity_limit_rad_s",
+            ),
         )
         for name in (
             "source_poll_hz",
@@ -425,7 +434,10 @@ def build_rm65_to_b601_free_drive_bridge(
         initial_arm_qpos=initial_qpos,
         actuation_mode="position",
     )
-    driver = B601PositionDriver(scene)
+    driver = B601PositionDriver(
+        scene,
+        target_velocity_limit_rad_s=resolved_config.target_velocity_limit_rad_s,
+    )
     driver.reset(initial_qpos)
     retargeter = RM65ToB601Retargeter(
         RM65ToB601RetargetConfig(

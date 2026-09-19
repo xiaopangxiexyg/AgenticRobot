@@ -196,6 +196,31 @@ def run_rm65_to_b601_foreground(
                 continue
             tick = bridge.step()
             position_tick = tick.position_tick
+            retarget_result = tick.retarget_result
+            ik_result = None if retarget_result is None else retarget_result.ik_result
+            retarget_diagnostics = (
+                {}
+                if retarget_result is None
+                else dict(retarget_result.diagnostics)
+            )
+            rejected_source = (
+                tick.source_step is not None
+                and tick.source_step.sample is not None
+                and retarget_result is not None
+                and not retarget_result.accepted
+            )
+            source_debug = {}
+            if rejected_source:
+                assert tick.source_step is not None
+                assert tick.source_step.sample is not None
+                source_sample = tick.source_step.sample
+                source_debug = {
+                    "debug_source_sequence": source_sample.sequence,
+                    "debug_source_qpos_rad": source_sample.qpos_rad,
+                    "debug_source_pose": (
+                        source_sample.pose_source_reference_source_controlled
+                    ),
+                }
             event(
                 "bridge_step",
                 source_admitted=(
@@ -215,29 +240,43 @@ def run_rm65_to_b601_foreground(
                     else tick.retarget_result.rejection_reason
                 ),
                 ik_status=(
-                    None
-                    if getattr(tick, "retarget_result", None) is None or tick.retarget_result.ik_result is None
-                    else tick.retarget_result.ik_result.status
+                    None if ik_result is None else ik_result.status
                 ),
                 ik_iterations=(
-                    None
-                    if getattr(tick, "retarget_result", None) is None or tick.retarget_result.ik_result is None
-                    else tick.retarget_result.ik_result.iterations
+                    None if ik_result is None else ik_result.iterations
                 ),
                 ik_position_error_m=(
-                    None
-                    if getattr(tick, "retarget_result", None) is None or tick.retarget_result.ik_result is None
-                    else tick.retarget_result.ik_result.position_error_m
+                    None if ik_result is None else ik_result.position_error_m
                 ),
                 ik_orientation_error_rad=(
+                    None if ik_result is None else ik_result.orientation_error_rad
+                ),
+                ik_seed_distance_rad=(
+                    None if ik_result is None else ik_result.seed_distance_rad
+                ),
+                ik_sigma_min=(None if ik_result is None else ik_result.sigma_min),
+                ik_condition_number=(
+                    None if ik_result is None else ik_result.condition_number
+                ),
+                ik_limit_projection_applied=(
                     None
-                    if getattr(tick, "retarget_result", None) is None or tick.retarget_result.ik_result is None
-                    else tick.retarget_result.ik_result.orientation_error_rad
+                    if ik_result is None
+                    else ik_result.limit_projection_applied
+                ),
+                ik_target_seed_translation_delta_m=retarget_diagnostics.get(
+                    "target_seed_translation_delta_m"
+                ),
+                ik_target_seed_orientation_delta_rad=retarget_diagnostics.get(
+                    "target_seed_orientation_delta_rad"
+                ),
+                ik_target_pose_candidate=retarget_diagnostics.get(
+                    "target_pose_candidate"
                 ),
                 source_step_elapsed_sec=getattr(tick, "source_step_elapsed_sec", 0.0),
                 retarget_elapsed_sec=getattr(tick, "retarget_elapsed_sec", 0.0),
                 position_step_elapsed_sec=getattr(tick, "position_step_elapsed_sec", 0.0),
                 step_elapsed_sec=getattr(tick, "step_elapsed_sec", 0.0),
+                **source_debug,
             )
             if tick.state == "held":
                 reason = (

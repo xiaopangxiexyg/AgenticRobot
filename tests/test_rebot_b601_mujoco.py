@@ -18,6 +18,7 @@ from robot_motion.rebot_b601_rs import (
 )
 from sim.mujoco.rebot_b601_rs import (
     B601_RS_DEFAULT_ARM_QPOS,
+    B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S,
     B601_RS_GRIPPER_OPEN_QPOS,
     B601_RS_SIM_ARM_KEY,
     B601JointPositionCommand,
@@ -225,7 +226,7 @@ def test_driver_slew_limits_final_target_and_continues_without_repeated_input(
     first = driver.step_physics(_command(1, target, 0.0))
     held = driver.step_physics()
     continued = driver.step_physics()
-    allowed_step_rad = 0.5 / 500.0
+    allowed_step_rad = B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S / 500.0
 
     assert first.command_applied is True
     np.testing.assert_allclose(first.target_qpos, target)
@@ -272,7 +273,7 @@ def test_latest_target_preempts_inflight_slew_without_queue(model_and_scene) -> 
     assert preempted.actuator_target_qpos[0] < positive_tick.actuator_target_qpos[0]
     assert (
         abs(preempted.actuator_target_qpos[0] - positive_tick.actuator_target_qpos[0])
-        <= 0.5 / 500.0 + 1e-12
+        <= B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S / 500.0 + 1e-12
     )
     assert continued.actuator_target_qpos[0] < preempted.actuator_target_qpos[0]
 
@@ -306,7 +307,10 @@ def test_large_position_step_tracks_without_target_spike_or_state_excursion(
         previous_actuator_target = actuator_target
 
     assert tick is not None
-    assert max_actuator_step <= 0.5 / 500.0 + 1e-12
+    assert (
+        max_actuator_step
+        <= B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S / 500.0 + 1e-12
+    )
     assert peak_measured_velocity < 2.0
     assert tick.driver_faulted is False
     assert tick.state_within_limits is True
@@ -402,7 +406,10 @@ def test_driver_metadata_reports_provisional_slew_and_state_guard() -> None:
         == "simulation_only_position_target_conditioning"
     )
     profile = metadata["target_slew_profile"]
-    np.testing.assert_allclose(profile["max_velocity_deg_s"], np.degrees([0.5] * 6))
+    np.testing.assert_allclose(
+        profile["max_velocity_deg_s"],
+        np.degrees([B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S] * 6),
+    )
     assert profile["metadata"]["hardware_safety_claim"] is False
 
 
@@ -465,7 +472,10 @@ def test_dynamic_demo_streams_continuous_previous_seed_ik() -> None:
     assert continuous["final_waypoint_solved"] is True
     assert continuous["final_waypoint_accepted"] is True
     assert continuous["motion_completed"] is True
-    assert simulation["max_actuator_target_step_rad"] <= 0.5 / 500.0 + 1e-12
+    assert (
+        simulation["max_actuator_target_step_rad"]
+        <= B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S / 500.0 + 1e-12
+    )
     assert simulation["max_joint_tracking_error_rad"] < 2e-3
     assert simulation["final_joint_tracking_error_rad"] < 2e-3
     assert (
