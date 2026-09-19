@@ -24,6 +24,7 @@ from control_station.sim_hil_profile.rm65_b601_free_drive import (
     load_rm65_to_b601_mapping_profile,
 )
 from control_station.sources.rm65_free_drive import (
+    RM65FreeDriveRealtimePushSource,
     RM65FreeDriveSource,
     RM65FreeDriveSourceSpec,
 )
@@ -34,6 +35,11 @@ from teleop_runtime.backends.arms.rm65 import (
 )
 
 READ_ONLY_CONFIRMATION = "RM65_B601_READ_ONLY_FREE_DRIVE"
+READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION = (
+    "RM65_B601_READ_ONLY_CONFIGURE_TELEMETRY"
+)
+DEFAULT_REQUEST_RESPONSE_SOURCE_POLL_HZ = 20.0
+DEFAULT_REALTIME_PUSH_SOURCE_POLL_HZ = 500.0
 
 
 def _positive(value: str) -> float:
@@ -139,7 +145,44 @@ def main(argv: list[str] | None = None) -> int:
         default=60.0,
         help="passive viewer refresh rate; physics remains at the B601 plant rate",
     )
-    parser.add_argument("--source-poll-hz", type=_positive, default=20.0)
+    parser.add_argument(
+        "--source-poll-hz",
+        type=_positive,
+        default=None,
+        help=(
+            "RM65 source-consumption rate; defaults to 20 Hz for request-response "
+            "and 500 Hz for realtime-push"
+        ),
+    )
+    parser.add_argument(
+        "--source-transport",
+        choices=("request-response", "realtime-push"),
+        default="request-response",
+        help=(
+            "RM65 observation transport; realtime-push consumes the vendor UDP "
+            "state callback and requires an already configured controller endpoint"
+        ),
+    )
+    parser.add_argument(
+        "--configure-realtime-push",
+        action="store_true",
+        help=(
+            "explicitly configure the RM65 UDP telemetry endpoint before registering "
+            "the read-only callback; this changes telemetry configuration only"
+        ),
+    )
+    parser.add_argument("--realtime-push-ip")
+    parser.add_argument("--realtime-push-port", type=int, default=8080)
+    parser.add_argument("--realtime-push-cycle-ms", type=int, default=5)
+    parser.add_argument(
+        "--source-poll-mode",
+        choices=("background", "synchronous"),
+        default="background",
+        help=(
+            "read RM65 observation in a dedicated source worker (background) "
+            "or synchronously in the MuJoCo loop"
+        ),
+    )
     parser.add_argument("--maximum-source-age-sec", type=_positive, default=0.25)
     parser.add_argument("--maximum-receive-age-sec", type=_positive, default=0.25)
     parser.add_argument("--maximum-future-skew-sec", type=_non_negative, default=0.05)
@@ -161,12 +204,33 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    if args.connect_read_only and args.confirmation != READ_ONLY_CONFIRMATION:
+    if args.configure_realtime_push:
+        if not args.connect_read_only:
+            parser.error("realtime push configuration requires --connect-read-only")
+        if args.source_transport != "realtime-push":
+            parser.error("realtime push configuration requires --source-transport realtime-push")
+        if args.confirmation != READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION:
+            parser.error(
+                "telemetry configuration requires "
+                f"--confirmation {READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION}"
+            )
+        if not str(args.realtime_push_ip or "").strip():
+            parser.error("--realtime-push-ip is required with --configure-realtime-push")
+    elif args.connect_read_only and args.confirmation != READ_ONLY_CONFIRMATION:
         parser.error(
             "read-only RM65 connection requires "
             f"--confirmation {READ_ONLY_CONFIRMATION}"
         )
     gains = _gain_triplet(list(args.translation_gain_target_reference_xyz))
+    effective_source_poll_hz = (
+        float(args.source_poll_hz)
+        if args.source_poll_hz is not None
+        else (
+            DEFAULT_REALTIME_PUSH_SOURCE_POLL_HZ
+            if args.source_transport == "realtime-push"
+            else DEFAULT_REQUEST_RESPONSE_SOURCE_POLL_HZ
+        )
+    )
     values = list(sys.argv[1:] if argv is None else argv)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.log.parent.mkdir(parents=True, exist_ok=True)
@@ -193,7 +257,12 @@ def main(argv: list[str] | None = None) -> int:
             "target_velocity_limit_rad_s": float(args.target_velocity_limit_rad_s),
             "rate_hz": float(args.rate_hz),
             "viewer_sync_hz": float(args.viewer_sync_hz),
-            "source_poll_hz": float(args.source_poll_hz),
+            "source_poll_hz": effective_source_poll_hz,
+            "source_poll_hz_explicit": args.source_poll_hz is not None,
+            "source_poll_mode": str(args.source_poll_mode),
+            "source_transport": str(args.source_transport),
+            "realtime_push_configure_requested": bool(args.configure_realtime_push),
+            "realtime_push_configuration_sent": False,
             "source_poll_clock": "monotonic_wall_time",
         }
 
@@ -208,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         record({"event": "command", "argv": result["argv"]})
         backend: RM65ArmBackend | None = None
         bridge = None
+        cleanup_stack_entered = False
         try:
             mapping = load_rm65_to_b601_mapping_profile(args.mapping_profile)
             backend = build_observation_only_rm65_backend(
@@ -215,14 +285,15 @@ def main(argv: list[str] | None = None) -> int:
                 arm_urdf_path=args.arm_urdf_path,
                 connect_hardware=bool(args.connect_read_only),
             )
-            source = RM65FreeDriveSource(
-                backend,
-                spec=RM65FreeDriveSourceSpec(
-                    maximum_measurement_age_sec=args.maximum_source_age_sec,
-                    maximum_receive_age_sec=args.maximum_receive_age_sec,
-                    maximum_future_skew_sec=args.maximum_future_skew_sec,
-                ),
+            source_spec = RM65FreeDriveSourceSpec(
+                maximum_measurement_age_sec=args.maximum_source_age_sec,
+                maximum_receive_age_sec=args.maximum_receive_age_sec,
+                maximum_future_skew_sec=args.maximum_future_skew_sec,
             )
+            if args.source_transport == "realtime-push":
+                source = RM65FreeDriveRealtimePushSource(backend, spec=source_spec)
+            else:
+                source = RM65FreeDriveSource(backend, spec=source_spec)
             bridge = build_rm65_to_b601_free_drive_bridge(
                 args.rebot_source_root,
                 source,
@@ -231,7 +302,8 @@ def main(argv: list[str] | None = None) -> int:
                     translation_gain_target_reference_xyz=gains,
                     rotation_gain=args.rotation_gain,
                     target_velocity_limit_rad_s=args.target_velocity_limit_rad_s,
-                    source_poll_hz=args.source_poll_hz,
+                    source_poll_hz=effective_source_poll_hz,
+                    source_poll_in_background=(args.source_poll_mode == "background"),
                     maximum_source_age_sec=args.maximum_source_age_sec,
                     maximum_receive_age_sec=args.maximum_receive_age_sec,
                     maximum_future_skew_sec=args.maximum_future_skew_sec,
@@ -260,12 +332,30 @@ def main(argv: list[str] | None = None) -> int:
                 "[RM65→B601] MuJoCo B601 target is simulation-only; "
                 "Ctrl-C/EOF closes the viewer and leaves RM65 unchanged."
             )
-            backend.start()
-            result["backend_start_completed"] = True
-            viewer = MujocoPassiveViewerSession(bridge.driver.scene)
             with ExitStack() as resources:
-                resources.callback(viewer.close)
+                cleanup_stack_entered = True
                 resources.callback(backend.close)
+                if isinstance(source, RM65FreeDriveRealtimePushSource):
+                    resources.callback(source.close)
+                backend.start()
+                result["backend_start_completed"] = True
+                if isinstance(source, RM65FreeDriveRealtimePushSource):
+                    push_config = source.start(
+                        configure=bool(args.configure_realtime_push),
+                        cycle_ms=args.realtime_push_cycle_ms,
+                        port=args.realtime_push_port,
+                        ip=args.realtime_push_ip,
+                    )
+                    result["realtime_push_config"] = dict(push_config)
+                    result["realtime_push_configuration_sent"] = bool(
+                        args.configure_realtime_push
+                    )
+                    emit(
+                        "[RM65→B601] realtime UDP observation callback registered; "
+                        "no RM65 motion command is issued."
+                    )
+                viewer = MujocoPassiveViewerSession(bridge.driver.scene)
+                resources.callback(viewer.close)
                 viewer.start()
                 run_rm65_to_b601_foreground(
                     bridge,
@@ -297,10 +387,10 @@ def main(argv: list[str] | None = None) -> int:
             record({"event": "result", **result, "exit_code": 1})
             return 1
         finally:
-            # The ExitStack owns normal live cleanup.  If construction or start
-            # failed before it was entered, still close the observation backend
-            # without issuing any RM65 motion command.
-            if backend is not None and not bool(result.get("backend_start_completed")):
+            # The ExitStack owns normal live cleanup. If construction failed
+            # before it was entered, still close the observation backend without
+            # issuing any RM65 motion command.
+            if backend is not None and not cleanup_stack_entered:
                 try:
                     backend.close()
                 except Exception as cleanup_error:  # noqa: BLE001
@@ -314,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "READ_ONLY_CONFIRMATION",
+    "READ_ONLY_TELEMETRY_CONFIG_CONFIRMATION",
     "build_observation_only_rm65_backend",
     "main",
 ]

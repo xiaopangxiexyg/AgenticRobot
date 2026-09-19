@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -162,18 +165,28 @@ def _rejected(reason: str) -> RM65FreeDriveStep:
     )
 
 
+def _unchanged() -> RM65FreeDriveStep:
+    return RM65FreeDriveStep(
+        state={},
+        sample=None,
+        rejection_reason=None,
+        unchanged=True,
+    )
+
+
 def _bridge(
     source: _Source,
     driver: _Driver,
     retargeter: _Retargeter,
     *,
     source_poll_clock=None,
+    source_poll_hz: float = 1000.0,
 ):
     return RM65ToB601FreeDriveBridge(
         source,
         retargeter,
         driver,
-        source_poll_hz=1000.0,
+        source_poll_hz=source_poll_hz,
         source_poll_clock=source_poll_clock,
     )
 
@@ -216,6 +229,27 @@ def test_source_rejection_enters_held_and_does_not_reissue_old_target() -> None:
     assert bridge.last_rejection_reason == "receive_stale"
     assert rejected.retarget_result is None
     assert bridge.pending_command is None
+
+
+def test_bridge_keeps_following_through_realtime_push_duplicate() -> None:
+    source = _Source([_admitted(1), _admitted(2), _unchanged(), _admitted(3)])
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = _bridge(source, driver, retargeter)
+
+    bridge.activate()
+    assert bridge.step().source_step is None
+    first = bridge.step()
+    duplicate = bridge.step()
+
+    assert first.state == "active"
+    assert first.position_tick.command_applied
+    assert duplicate.state == "active"
+    assert duplicate.source_step is not None
+    assert duplicate.source_step.has_no_update
+    assert duplicate.rejection_reason is None
+    assert duplicate.retarget_result is None
+    assert len(retargeter.seeds) == 1
 
 
 def test_activation_failure_is_explicit_and_recenter_requires_clutch() -> None:
@@ -284,8 +318,136 @@ def test_bridge_reports_source_to_target_dispatch_latency() -> None:
 
     assert tick.position_tick.command_applied
     assert tick.source_receive_monotonic_sec == pytest.approx(10.0005)
+    assert tick.source_step_started_monotonic_sec == pytest.approx(10.001)
+    assert tick.source_step_completed_monotonic_sec == pytest.approx(10.001)
+    assert tick.source_admission_monotonic_sec == pytest.approx(10.001)
     assert tick.target_dispatch_monotonic_sec == pytest.approx(10.001)
     assert tick.source_to_target_dispatch_latency_sec == pytest.approx(0.0005)
+    assert tick.source_admission_to_target_dispatch_latency_sec == pytest.approx(0.0)
+
+
+def test_bridge_retains_admission_timestamp_until_late_target_dispatch() -> None:
+    class _OneTickLateDriver(_Driver):
+        def __init__(self) -> None:
+            super().__init__()
+            self._command_due_queries = 0
+
+        @property
+        def command_due(self) -> bool:
+            self._command_due_queries += 1
+            return self._command_due_queries >= 2
+
+    source = _Source([_admitted(1), _admitted(2)])
+    driver = _OneTickLateDriver()
+    retargeter = _Retargeter()
+    now = [10.0]
+    bridge = _bridge(
+        source,
+        driver,
+        retargeter,
+        source_poll_clock=lambda: now[0],
+        source_poll_hz=20.0,
+    )
+
+    bridge.activate()
+    now[0] = 10.05
+    not_dispatched = bridge.step()
+    assert not_dispatched.source_step is not None
+    assert not_dispatched.position_tick.command_applied is False
+    now[0] = 10.051
+    dispatched = bridge.step()
+
+    assert dispatched.source_step is None
+    assert dispatched.position_tick.command_applied is True
+    assert dispatched.source_admission_monotonic_sec == pytest.approx(10.05)
+    assert dispatched.source_admission_to_target_dispatch_latency_sec == pytest.approx(
+        0.001
+    )
+
+
+def test_live_source_poll_uses_fixed_start_to_start_deadline() -> None:
+    now = [0.0]
+
+    class _SlowSource(_Source):
+        def __init__(self, steps):
+            super().__init__(steps)
+            self.calls = 0
+
+        def step(self) -> RM65FreeDriveStep:
+            self.calls += 1
+            step = super().step()
+            if self.calls > 1:
+                now[0] += 0.006
+            return step
+
+    source = _SlowSource([_admitted(1), _admitted(2), _admitted(3)])
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = RM65ToB601FreeDriveBridge(
+        source,
+        retargeter,
+        driver,
+        source_poll_hz=20.0,
+        source_poll_clock=lambda: now[0],
+    )
+
+    bridge.activate()
+    now[0] = 0.05
+    first = bridge.step()
+    assert first.source_step is not None
+    assert first.source_poll_deadline_sec == pytest.approx(0.05)
+    assert first.source_poll_lateness_sec == pytest.approx(0.0)
+    assert first.source_poll_schedule_skipped is False
+
+    # The source read advanced wall time to 56 ms.  A completion-relative
+    # scheduler would wait until 106 ms; fixed deadline scheduling polls at
+    # 100 ms instead.
+    now[0] = 0.10
+    second = bridge.step()
+    assert second.source_step is not None
+    assert second.source_poll_deadline_sec == pytest.approx(0.10)
+
+
+def test_live_source_poll_skips_missed_deadline_without_catch_up_burst() -> None:
+    now = [0.0]
+
+    class _OverrunningSource(_Source):
+        def __init__(self, steps):
+            super().__init__(steps)
+            self.calls = 0
+
+        def step(self) -> RM65FreeDriveStep:
+            self.calls += 1
+            step = super().step()
+            if self.calls > 1:
+                now[0] += 0.060
+            return step
+
+    source = _OverrunningSource([_admitted(1), _admitted(2), _admitted(3)])
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = RM65ToB601FreeDriveBridge(
+        source,
+        retargeter,
+        driver,
+        source_poll_hz=20.0,
+        source_poll_clock=lambda: now[0],
+    )
+
+    bridge.activate()
+    now[0] = 0.05
+    first = bridge.step()
+    assert first.source_step is not None
+    assert first.source_poll_schedule_skipped is True
+
+    # The overrun was 60 ms against a 50 ms period, so the next deadline is
+    # 160 ms from the current clock cut, not a burst at 100 ms.
+    now[0] = 0.159
+    not_due = bridge.step()
+    assert not_due.source_step is None
+    now[0] = 0.160
+    second = bridge.step()
+    assert second.source_step is not None
 
 
 def test_bridge_seeds_ik_from_last_accepted_target_not_measured_qpos() -> None:
@@ -336,3 +498,57 @@ def test_sim_config_keeps_reverse_gain_explicit() -> None:
     assert config.translation_gain_target_reference_xyz == (1.5, 1.0, 0.75)
     assert config.rotation_gain == 0.8
     assert config.target_velocity_limit_rad_s == 5.0
+
+
+def test_background_source_poll_does_not_block_physics_step() -> None:
+    class _BlockingSource(_Source):
+        def __init__(self) -> None:
+            super().__init__([_admitted(1), _admitted(2), _admitted(3)])
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+
+        def step(self) -> RM65FreeDriveStep:
+            self.calls += 1
+            if self.calls == 2:
+                self.started.set()
+                if not self.release.wait(timeout=1.0):
+                    raise RuntimeError("test source was not released")
+            return super().step()
+
+    source = _BlockingSource()
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = RM65ToB601FreeDriveBridge(
+        source,
+        retargeter,
+        driver,
+        source_poll_hz=100.0,
+        source_poll_in_background=True,
+    )
+    bridge.activate()
+    try:
+        assert source.started.wait(timeout=0.5)
+        started = time.perf_counter()
+        blocked_tick = bridge.step()
+        elapsed = time.perf_counter() - started
+        assert blocked_tick.source_step is None
+        assert elapsed < 0.05
+
+        source.release.set()
+        deadline = time.monotonic() + 1.0
+        completed_tick = None
+        while time.monotonic() < deadline:
+            candidate = bridge.step()
+            if candidate.source_step is not None:
+                completed_tick = candidate
+                break
+            time.sleep(0.001)
+        assert completed_tick is not None
+        assert completed_tick.source_step.sample is not None
+        assert completed_tick.source_step.sample.sequence == 2
+        assert completed_tick.source_completion_to_consumption_latency_sec is not None
+        assert completed_tick.source_completion_to_consumption_latency_sec >= 0.0
+    finally:
+        source.release.set()
+        bridge.deactivate()

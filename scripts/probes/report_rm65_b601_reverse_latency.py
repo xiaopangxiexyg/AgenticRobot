@@ -6,6 +6,10 @@ RM65 connection, a CAN interface, or a MuJoCo viewer.  The primary latency is
 measured from the accepted RM65 hardware-read timestamp to the tick where the
 MuJoCo position driver accepts the retargeted qpos.  It excludes physical
 actuator response and the RM65 measurement age before the read completed.
+
+The report also exposes the post-validation ``source admission`` timestamp.
+That second latency separates source/backend state assembly from the actual
+target dispatch path while retaining the original field for compatibility.
 """
 
 from __future__ import annotations
@@ -77,20 +81,42 @@ def _scale_ms(value: float | None) -> float | None:
     return None if value is None else round(value * 1000.0, 3)
 
 
+def _diagnostics(values: list[float]) -> dict[str, float | int | None]:
+    return {
+        "min_ms": _scale_ms(min(values) if values else None),
+        "over_10ms_count": sum(value > 0.010 for value in values),
+        "over_20ms_count": sum(value > 0.020 for value in values),
+    }
+
+
 def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     timings: dict[str, list[float]] = {
         "source_to_target_dispatch_latency_sec": [],
+        "source_admission_to_target_dispatch_latency_sec": [],
+        "source_completion_to_consumption_latency_sec": [],
+        "source_completion_to_target_dispatch_latency_sec": [],
+        "source_receive_to_admission_latency_sec": [],
         "source_interarrival_sec": [],
+        "source_admission_interarrival_sec": [],
+        "source_poll_lateness_sec": [],
         "source_step_elapsed_sec": [],
         "retarget_elapsed_sec": [],
         "position_step_elapsed_sec": [],
         "step_elapsed_sec": [],
+        "control_tick_lateness_sec": [],
+        "viewer_sync_elapsed_sec": [],
     }
     source_read_phases_ms: dict[str, list[float]] = defaultdict(list)
     counts: Counter[str] = Counter()
     rejection_reasons: Counter[str] = Counter()
     previous_source_read_monotonic: float | None = None
+    previous_source_admission_monotonic: float | None = None
     for record in records:
+        if record.get("event") == "viewer_sync":
+            value = _finite_non_negative(record.get("elapsed_sec"))
+            if value is not None:
+                timings["viewer_sync_elapsed_sec"].append(value)
+            continue
         if record.get("event") != "bridge_step":
             continue
         counts["bridge_steps"] += 1
@@ -108,22 +134,74 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                     timings["source_interarrival_sec"].append(interval)
             if source_read_monotonic is not None:
                 previous_source_read_monotonic = source_read_monotonic
+            source_admission_monotonic = _finite_non_negative(
+                record.get("source_admission_monotonic_sec")
+            )
+            if (
+                source_admission_monotonic is not None
+                and previous_source_admission_monotonic is not None
+            ):
+                interval = (
+                    source_admission_monotonic
+                    - previous_source_admission_monotonic
+                )
+                if math.isfinite(interval) and interval >= 0.0:
+                    timings["source_admission_interarrival_sec"].append(interval)
+            if source_admission_monotonic is not None:
+                previous_source_admission_monotonic = source_admission_monotonic
+            source_receive_monotonic = _finite_non_negative(
+                record.get("source_receive_monotonic_sec")
+            )
+            if (
+                source_receive_monotonic is not None
+                and source_admission_monotonic is not None
+            ):
+                receive_to_admission = (
+                    source_admission_monotonic - source_receive_monotonic
+                )
+                if math.isfinite(receive_to_admission) and receive_to_admission >= 0.0:
+                    timings["source_receive_to_admission_latency_sec"].append(
+                        receive_to_admission
+                    )
         if record.get("retarget_accepted") is True:
             counts["retarget_accepted"] += 1
         if record.get("command_applied") is True:
             counts["target_dispatches"] += 1
         if record.get("sim_slew_limited") is True:
             counts["sim_slew_limited"] += 1
+        if record.get("source_poll_schedule_skipped") is True:
+            counts["source_poll_schedule_skipped"] += 1
+        if record.get("source_step_has_no_update") is True:
+            counts["source_no_update"] += 1
         reason = record.get("bridge_rejection_reason") or record.get(
             "retarget_rejection_reason"
         )
         if reason:
             rejection_reasons[str(reason)] += 1
         for name, values in timings.items():
+            if name == "viewer_sync_elapsed_sec":
+                # Viewer samples are emitted by the dedicated viewer_sync
+                # event, not repeated on every bridge_step.
+                continue
             if name in {
                 "source_step_elapsed_sec",
                 "retarget_elapsed_sec",
             } and record.get("source_admitted") is None:
+                continue
+            # A background source result is represented by one bridge record
+            # when it is consumed and another when its queued command is
+            # dispatched.  Keep each phase tied to its owning event so the
+            # reported sample counts remain comparable to source/dispatch
+            # counts.
+            if (
+                name == "source_completion_to_consumption_latency_sec"
+                and record.get("source_admitted") is None
+            ):
+                continue
+            if (
+                name == "source_completion_to_target_dispatch_latency_sec"
+                and record.get("command_applied") is not True
+            ):
                 continue
             value = _finite_non_negative(record.get(name))
             if value is not None:
@@ -148,11 +226,46 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             name: _statistics_ms(values)
             for name, values in sorted(source_read_phases_ms.items())
         },
+        "diagnostics": {
+            name: _diagnostics(values)
+            for name, values in timings.items()
+            if name
+            in {
+                "source_to_target_dispatch_latency_sec",
+                "source_admission_to_target_dispatch_latency_sec",
+                "source_receive_to_admission_latency_sec",
+                "source_poll_lateness_sec",
+                "control_tick_lateness_sec",
+                "viewer_sync_elapsed_sec",
+            }
+        },
         "interpretation": {
             "primary_latency": (
                 "source_to_target_dispatch_latency_sec is the interval from "
                 "the accepted RM65 hardware-read completion timestamp to "
                 "B601 MuJoCo position-driver command acceptance."
+            ),
+            "admission_latency": (
+                "source_admission_to_target_dispatch_latency_sec starts when "
+                "the source step has completed freshness/frame validation and "
+                "ends at B601 MuJoCo position-driver command acceptance."
+            ),
+            "worker_queue_latency": (
+                "source_completion_to_consumption_latency_sec is the delay "
+                "between completion of the RM65 source read and consumption "
+                "by the MuJoCo bridge loop."
+            ),
+            "push_mailbox_latency": (
+                "source_receive_to_admission_latency_sec measures the delay "
+                "from realtime-push callback receipt to source admission; a "
+                "large value indicates source polling cadence or mailbox "
+                "consumption lag rather than IK computation."
+            ),
+            "foreground_jitter": (
+                "control_tick_lateness_sec measures the bridge-loop schedule "
+                "lateness; viewer_sync_elapsed_sec is recorded separately "
+                "because passive viewer presentation is outside the target "
+                "dispatch timestamp but can delay the next tick."
             ),
             "excluded": (
                 "RM65 measurement age before read completion, physical B601 "

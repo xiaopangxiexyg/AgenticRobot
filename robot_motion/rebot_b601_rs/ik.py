@@ -25,6 +25,13 @@ class B601IKConfig:
     max_iterations: int = 120
     position_tolerance_m: float = 1e-5
     orientation_tolerance_rad: float = 1e-4
+    # A target can reach a well-bounded numerical residual while the Jacobian
+    # is close to rank deficient.  In that case extra iterations do not
+    # improve the pose (and can add avoidable teleoperation latency).  The
+    # approximate tolerances are deliberately explicit and tight; they are
+    # not a way to accept an unbounded or joint-limit-projected solution.
+    approximate_position_tolerance_m: float = 5e-4
+    approximate_orientation_tolerance_rad: float = 1e-3
     damping: float = 2e-3
     # This is a numerical IK step, not a hardware command or a simulation
     # actuator velocity limit.  The previous 0.05 rad default could clip one
@@ -53,6 +60,10 @@ class B601IKConfig:
         positive = {
             "position_tolerance_m": self.position_tolerance_m,
             "orientation_tolerance_rad": self.orientation_tolerance_rad,
+            "approximate_position_tolerance_m": self.approximate_position_tolerance_m,
+            "approximate_orientation_tolerance_rad": (
+                self.approximate_orientation_tolerance_rad
+            ),
             "damping": self.damping,
             "max_joint_step_rad": self.max_joint_step_rad,
             "characteristic_length_m": self.characteristic_length_m,
@@ -60,6 +71,19 @@ class B601IKConfig:
         for name, value in positive.items():
             if not np.isfinite(float(value)) or float(value) <= 0.0:
                 raise ValueError(f"{name} must be a positive finite number")
+        if float(self.approximate_position_tolerance_m) < float(
+            self.position_tolerance_m
+        ):
+            raise ValueError(
+                "approximate_position_tolerance_m must be >= position_tolerance_m"
+            )
+        if float(self.approximate_orientation_tolerance_rad) < float(
+            self.orientation_tolerance_rad
+        ):
+            raise ValueError(
+                "approximate_orientation_tolerance_rad must be >= "
+                "orientation_tolerance_rad"
+            )
         margin = float(self.joint_limit_margin_rad)
         if not np.isfinite(margin) or margin < 0.0:
             raise ValueError("joint_limit_margin_rad must be finite and non-negative")
@@ -206,9 +230,17 @@ class B601DampedLeastSquaresIK:
                 completed_iterations = iteration
                 break
 
+        approximate = (
+            status in {"max_iterations", "line_search_stalled"}
+            and not projected
+            and position_error
+            <= float(self.config.approximate_position_tolerance_m)
+            and orientation_error
+            <= float(self.config.approximate_orientation_tolerance_rad)
+        )
         return self._result(
-            success=False,
-            status=status,
+            success=approximate,
+            status="converged_approximate" if approximate else status,
             iterations=completed_iterations,
             qpos=qpos,
             seed=seed,

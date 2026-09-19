@@ -52,6 +52,11 @@
   - live application 的 RM65 source poll 按 monotonic wall clock 调度（默认
     20 Hz），不再使用被 viewer 拖慢的仿真时间调度；synthetic tests 默认保留
     确定性的仿真时钟调度。
+  - 当前候选增加可选的 `source_poll_mode=background`：RM65 只读刷新由一个可关闭的
+    source worker 负责，桥接/IK/position-driver 主循环只按顺序消费完整结果，不再被
+    SDK 读取长尾阻塞。worker 使用固定 start-to-start deadline；坏帧、worker 异常或
+    mailbox overflow 都发布为显式 rejection 并进入 `held`，不会静默复用旧 qpos。
+    `source_poll_mode=synchronous` 仍保留用于离线对照和故障复现。
   - viewer 关闭、Ctrl-C、EOF 和 source/IK admission rejection 都会撤销
     pending target 并退出/保持 held；退出只关闭仿真 viewer，不触碰 RM65 或
     B601 真机。
@@ -117,17 +122,28 @@ workspace、freshness 或 IK 安全门。
 每个 `bridge_step` 事件现在额外记录：
 
 - `source_receive_monotonic_sec`：本次被接受的 RM65 硬件读状态完成时间戳；
+- `source_step_started_monotonic_sec` / `source_step_completed_monotonic_sec`：一次
+  source refresh 从进入到完成 freshness/frame 校验的时间边界；
+- `source_admission_monotonic_sec`：该 source sample 完成校验并准入桥接器的时间戳；
 - `target_dispatch_monotonic_sec`：该 retarget qpos 被 B601 MuJoCo position
   driver 接受的时间戳；
 - `source_to_target_dispatch_latency_sec`：上述两者之差；只有真实发生
   `command_applied=true` 时才有值；
+- `source_admission_to_target_dispatch_latency_sec`：从 source step 完成准入到
+  target driver 接受的延迟。它与前一个字段同时保留，用来区分硬件 read 时间戳到
+  source 状态组装/校验的耗时；
+- `source_poll_deadline_sec` / `source_poll_lateness_sec`：source 固定 deadline
+  及本次实际开始读取时的迟到量；`source_poll_schedule_skipped=true` 表示读取跨过
+  了至少一个 deadline，调度器跳过 missed period 后重新建立 cadence；
 - `source_state_read_phase_timing`：RM65 backend 的 SDK、解析/校验、重试等读状态
   阶段耗时，用于把 source 读取成本与 retarget/driver 成本分开。
 
-因此该主指标测量的是“RM65 状态读完成 → B601 MuJoCo target driver 接受”，不把
+因此原主指标测量的是“RM65 backend read timestamp → B601 MuJoCo target driver 接受”，不把
 RM65 反馈在读之前已经积累的 measurement age、MuJoCo viewer 刷新或仿真机械臂的
 物理响应混入。它不是 B601 真机执行延迟；真机阶段还必须独立记录 CAN/driver
-ack 与实际反馈。
+ack 与实际反馈。新增的 `source_admission_to_target_dispatch_latency_sec` 则把
+freshness/frame 校验和 source 状态组装之后的准入点作为起点，避免将两个边界混称为
+单一“SDK 返回后延迟”。
 
 作为新字段上线前的基线，2026-09-19 的现场日志（尚未记录主指标）显示：RM65
 读状态间隔平均 `57.04 ms`、p95 `60.76 ms`；source read+校验平均 `6.33 ms`、
@@ -147,12 +163,21 @@ PYTHONDONTWRITEBYTECODE=1 "$PY" \
   --output "$RUN/reverse_latency_report.json"
 ```
 
-判读顺序固定为：先看 `source_to_target_dispatch_latency_sec`，再看
-`source_step_elapsed_sec` 与 `retarget_elapsed_sec`。若主指标稳定而
-`sim_slew_limited` 比例高，瓶颈是 target slew；若 source read 或 retarget p95
-接近/超过 20 Hz 的 50 ms 周期，才考虑 latest-only 读取/IK worker。任何 worker
-仍必须在主线程重新检查 sequence、freshness、frame 和 fail-closed rejection，
-不能用旧 qpos 或静默重试掩盖延迟。
+判读顺序固定为：先比较 `source_to_target_dispatch_latency_sec` 与
+`source_admission_to_target_dispatch_latency_sec`，再看 `source_poll_lateness_sec`、
+`source_step_elapsed_sec` 与 `retarget_elapsed_sec`。source 调度现在使用固定
+start-to-start deadline；读取跨过 deadline 时只跳过 missed period，不追赶 burst。
+若主指标稳定而 `sim_slew_limited` 比例高，瓶颈是 target slew；若 source read 或
+retarget p95 接近/超过 source period，才考虑 latest-only 读取/IK worker。任何 worker
+仍必须在主线程重新检查 sequence、freshness、frame 和 fail-closed rejection，不能用
+旧 qpos 或静默重试掩盖延迟。
+
+当前 P0/P1 候选已经落地但尚未做新的现场采集：P0 将 read、source admission
+和 target dispatch 三个时间边界同时写入 `bridge_step`；P1 将 source deadline
+从“本次读取完成时间”改为固定 start-to-start cadence。若 SDK 读取跨过一个或多个
+deadline，候选只跳过 missed period 并从当前时钟切片重新建立下一周期，不会为了追赶
+而连续发送读取请求。该调度改变不放宽 freshness、sequence、frame、IK 或 target
+driver 的任何安全门。
 
 这次具体拒绝是一次有效样本上的 `ik_rejected:line_search_stalled`：source 已准入、
 Jacobian 条件数约为 10，随后才进入 `held`。首个假设是上一版每次用 MuJoCo 实测
@@ -171,10 +196,125 @@ source sequence/时间戳也完整新鲜；失败发生在 IK 第 0 次迭代。
 `ik_seed_qpos_rad`、目标误差和 `ik_iterations` 判断是否是新的数值条件，而不能再把它
 解释成 RM65 网络断线。
 
-这次修复仍没有引入后台 source/IK worker：live RM65 SDK 读取和 IK 的同步耗时先
-通过上述字段量化。若实测单次 source+IK 超过 source period，再单独设计 latest-only
-worker，并保留主线程的 freshness recheck 和 fail-closed admission；不能先用旧
-qpos 或静默重试掩盖该问题。
+当前候选只把 RM65 source read 移出物理主循环；IK、目标选择、position-driver
+admission 和 dispatch 仍由同一个桥接主循环按顺序完成，避免引入第二个 IK 或目标
+authority。新增 `source_completion_to_consumption_latency_sec` 和
+`source_completion_to_target_dispatch_latency_sec` 用于识别 worker mailbox 等待，
+并继续保留 freshness、sequence、frame、IK 和 fail-closed admission。报告中完成→消费
+只在 worker 结果实际被消费的低频 tick 计数，完成→目标派发只在 position driver 接受
+命令的 tick 计数，避免同一源样本重复统计。该 worker 不是旧样本回退机制，也不改变
+RM65 的 observation-only 约束。
+
+### 2026-09-19 40 Hz 完整反向桥接基线
+
+在远端 `user@192.168.70.116` 的隔离候选工作树中完成了 30 秒、40 Hz source / 500 Hz
+MuJoCo physics 的完整桥接运行（`null_viewer`，因此不包含 GUI presentation latency）。
+RM65 处于只读观测，B601 仅为 MuJoCo position driver；没有 RM65/B601 真机运动命令。
+
+```text
+source samples:                  1190
+target dispatches:               1187
+rejection reasons:               none
+source interval mean/p95/p99:    25.20 / 31.62 / 35.88 ms
+read completion -> dispatch:     2.58 ms mean, 4.00 ms p95, 4.88 ms max
+retarget/IK:                     0.837 ms mean, 1.078 ms p95, 1.472 ms max
+SDK read:                        7.28 ms mean, 12.38 ms p95, 18.53 ms p99, 45.22 ms max
+source schedule skips:           5
+maximum source interval:         107.97 ms
+```
+
+该基线确认 IK 不是主要延迟来源；异常长尾来自 RM65 SDK read。同步主循环在这些
+长尾上会丢 source deadline，因此当前候选默认现场应用改用 background source poll。
+随后在同一远端硬件、同一 500 Hz MuJoCo null viewer 上以 background source poll 重测
+30 秒：source samples 1199、target dispatches 1199、拒绝 0、schedule skips 0；源间隔
+mean/p95/p99 为 25.002/29.074/31.157 ms，SDK read wall mean/p95/p99/max 为
+4.488/8.254/10.309/14.427 ms，完成→消费 mean/p95/p99/max 为
+0.975/1.567/1.598/1.944 ms，完成→派发 mean/p95/max 为 2.540/3.662/3.735 ms。
+该轮仍然不包含 GUI presentation latency 或物理执行器响应，但表明把 SDK read 移出
+物理主循环后，主循环不再承受 4–14 ms 的同步读阻塞，且 40 Hz 源调度没有丢期。
+候选仍未合并或安装。
+
+### 2026-09-19 GUI 40 Hz 只读验收
+
+在同一远端候选上以 `DISPLAY=:1` 启动 MuJoCo passive viewer，自动执行一次激活，运行
+约 30 秒后自动退出。RM65 使用 observation-only backend，B601 只运行 MuJoCo
+position driver；`rm65_commands_sent=false`、`b601_hardware_commands_sent=false`，
+没有任何真实执行器命令。
+
+```text
+execution status:                COMPLETED
+source samples / dispatches:     1170 / 1170
+rejection reasons:               none
+source interval mean/p95/p99:   25.002 / 29.100 / 31.180 ms
+source poll lateness p99:        0.109 ms
+read completion -> dispatch:     3.842 ms mean, 8.334 ms p95, 10.470 ms max
+worker completion -> consumption:
+                                  1.623 ms mean, 5.712 ms p95, 7.044 ms max
+retarget/IK:                     0.947 ms mean, 1.272 ms p95, 1.411 ms p99
+viewer bridge steps:             10213 in 30.287 s
+```
+
+GUI 验收证明 viewer、后台 40 Hz source poll、连续 IK 和 MuJoCo target dispatch 可以
+共同工作；但 passive viewer 的同步/呈现负载使实际 physics loop 低于名义 500 Hz，
+因此 GUI 结果不能替代 null-viewer 的时序基准，也不能代表真实 B601 执行器频率。
+后续若需要量化 viewer 性能，应单独测量 `viewer_sync_hz`，不要把 GUI 步频当成
+RM65 观测频率或硬件控制频率。
+
+### 2026-09-19 请求-响应延迟定位与可选 UDP 观测路径
+
+对远端 40 Hz GUI 运行的原始 `source_read_phase_timing` 记录进行了逐条分析。1480 次
+有效读取中，锁等待和解析验证都在亚毫秒量级，重试次数始终为 1，`retry_sleep` 始终为
+零；而 RealMan SDK 请求-响应阶段的 wall time 为：
+
+```text
+sdk_call_wall_ms: mean 6.545 / p95 10.357 / p99 43.189 / max 49.335
+total_wall_ms:    mean 6.585 / p95 10.386 / p99 43.225 / max 49.379
+```
+
+22 次 source schedule skip 全部对应 SDK wall time 超过 15 ms。它们不是 IK 或锁竞争
+造成的：retarget/IK 的 mean/p95/p99 约为 `0.979/1.287/1.464 ms`，source poll
+lateness 的 p99 约为 `0.13 ms`。因此 background poll 已经解决了主循环被同步 SDK
+调用阻塞的问题，但请求-响应协议本身仍然决定 RM65 新鲜观测的延迟尾部；单纯提高
+MuJoCo 频率、放宽目标速度或继续微调 IK 不能消除这部分延迟。
+
+候选现在增加了一个**可选** `realtime-push` source transport：
+
+- `RM65FreeDriveRealtimePushSource` 只保留 vendor UDP callback 的最新完整六轴样本；
+  callback 不做 FK、不运行 IK，也不持有第二个 target authority。
+- FK、freshness、错误码、sequence 递增和 fail-closed admission 仍在原有 bridge
+  owner 线程完成，保持现有 source/target 安全边界。
+- `RM65ArmBackend.start_realtime_push_observation()` 默认只查询已有 UDP 配置并注册
+  callback；不会写控制器配置、使能电机或发送运动命令。
+- 只有同时传入 `--configure-realtime-push`、目标 IP 和专用确认字符串
+  `RM65_B601_READ_ONLY_CONFIGURE_TELEMETRY` 才会写 UDP telemetry 配置。该操作仍是
+  观测配置，不是运动命令；在真机上必须由操作者单独确认并保存前台日志。
+- CLI 的 `--realtime-push-cycle-ms` 使用毫秒表达；适配器会按官方协议转换为
+  控制器 `cycle` 字段的 `5 ms` 单位计数，并在显式重配置时保留原有 custom telemetry
+  字段，避免把无关状态项恢复成默认值。
+- 默认 `request-response` 路径保持不变，可直接回退。新路径的故障（无样本、重复
+  sequence、vendor error、回调字段不完整）均进入 source rejection，不使用旧样本
+  冒险跟随。
+
+该接口复用 RealMan API2 已有的 UDP 状态主动上报、三线程模式和实时状态 callback，
+不是重新实现控制协议。官方 API2 文档也要求三线程模式和正确的 UDP 目标/防火墙配置；
+因此现场验收前先做只读配置查询，再决定是否进行显式 telemetry 配置。当前只完成离线
+source/application 测试，尚未在真机上启用或配置 UDP push。
+
+### 下一轮延迟验收
+
+先在远端只读运行 `--source-transport realtime-push`、不带
+`--configure-realtime-push`，确认控制器已有 push endpoint 且结果中的
+`source_transport=realtime-push`、`realtime_push_config`、source interval 和
+completion-to-dispatch 均连续。如果配置未启用，命令应明确失败并保持无运动命令；
+不得把失败伪装成 request-response 回退。只有在操作者确认后，才单独运行带专用确认的
+telemetry 配置命令，再重复同一 40 Hz 只读验收并比较 p95/p99。比较对象必须包含：
+
+```text
+request-response: sdk_call_wall_ms, source_to_target_dispatch_latency_sec
+realtime-push:    callback arrival interval, source_to_target_dispatch_latency_sec
+```
+
+两者都不包含物理执行器响应和 viewer 呈现延迟；这些仍需在后续双向真机阶段单独测量。
 
 ### P2 synthetic MuJoCo 自动化测试
 
@@ -256,3 +396,84 @@ translation/rotation gain 由 `RM65ToB601FreeDriveSimConfig` 独立提供。
 该固定值只改变 frame calibration，不改变 B601 真机 owner、RM65 真机执行器或任何
 CAN/位置/力矩命令。离线反向集成测试必须验证 round-trip、连续 seed 和 rejection
 撤销；现场 `--connect-read-only` 仍然只读 RM65，并只驱动 B601 MuJoCo target。
+
+## 2026-09-19 realtime-push `max_iterations` 诊断与修复候选
+
+远端 `user@192.168.70.116` 的只读 realtime-push 运行中，首次拒绝发生在
+`/tmp/rm65-b601-field/realtime-push-Qffh2X/gui.log` 的 source sequence `5023`：
+
+```text
+source_state_measurement_valid = true
+source_completion_to_consumption = 0.337 ms
+target_seed_translation_delta = 0.409 mm
+target_seed_orientation_delta = 5.244 mrad
+ik_iterations = 120
+ik_position_error = 0.146 mm
+ik_orientation_error = 0.534 mrad
+ik_sigma_min = 2.75e-6
+ik_condition_number = 1.084e6
+ik_limit_projection_applied = false
+```
+
+因此这次不是 UDP 丢包、source freshness、关节越限或目标突变；它是 B601
+Jacobian 进入近奇异状态后，误差已经很小但无法继续降到严格 `10 um / 0.1 mrad`
+阈值。重复的 `held` 行是 bridge 的 fail-closed latch，不是每个 physics tick
+重新执行一次 IK。把 `max_iterations` 提高到 3000 只会增加耗时，残差仍约为
+`0.146 mm / 0.534 mrad`。
+
+当前候选在 `robot_motion/rebot_b601_rs/ik.py` 增加了明确的有界近似收敛契约：
+当状态为 `max_iterations` 或 `line_search_stalled`、没有发生 joint-limit
+projection，且残差不超过 `0.5 mm / 1 mrad` 时，结果为
+`converged_approximate` 并可继续 MuJoCo following；数值失败、越限投影和更大残差
+仍然拒绝。`rm65_retarget.py` 同时记录失败候选 qpos，便于区分奇异残差与真正不可达。
+该阈值是仿真桥接的明确数值边界，不是放宽 B601 真机硬件关节限位或发送未验证的
+硬件命令。
+
+离线检查结果：
+
+```text
+tests/test_rebot_b601_ik.py + tests/test_control_station_rm65_b601_free_drive.py
+12 passed, 9 skipped
+reverse-latency related suite
+30 passed, 1 warning
+exact realtime-push target regression: converged_approximate
+```
+
+`9` 个 skip 仅表示当前候选 checkout 的 gitlink vendor URDF 未初始化；精确现场
+目标已用只读 `/home/zc/HandMotion/Developing/reBotArm_control_py` 独立复现通过。
+候选尚未合并、push 或安装；合并前仍需在包含 vendor checkout 的环境重跑 IK/P2
+集成测试，并用前台只读 GUI 验证连续跟随不会因该近奇异帧立即进入 held。
+
+## 2026-09-19 延迟主路径诊断与 P1 优化
+
+本轮优先处理延迟，不把近奇异 IK 拒绝当作主要延迟来源。远端 realtime-push
+日志 `/tmp/rm65-b601-field/realtime-push-Qffh2X/gui.log` 的离线重算结果为：
+
+```text
+source_poll_hz=100 Hz
+push callback -> source admission: mean 3.701 ms, p95 4.477 ms, max 5.267 ms
+source admission -> target dispatch: mean 3.511 ms, p95 7.650 ms
+source callback -> target dispatch: mean 7.212 ms, p95 11.472 ms
+retarget/IK: p95 about 0.871 ms (accepted samples)
+```
+
+因此此前的主要瓶颈是 realtime-push latest mailbox 以 100 Hz 被消费，平均等待下一次
+消费，而不是 IK 计算本身。报告脚本现在新增
+`source_receive_to_admission_latency_sec`，并分别记录 `viewer_sync` 和
+`control_tick_lateness_sec`，可以把 push 消费、MuJoCo viewer 阻塞和控制线程抖动分开。
+
+P1 候选的改动保持单一控制所有者和 fail-closed 语义：
+
+- realtime-push 的重复但仍新鲜的 latest packet 变为显式 `unchanged` no-op，不再被
+  当成 `measurement_not_advancing` 故障，也不会撤销当前 MuJoCo 目标；真正的错误码、
+  非法帧和过期 packet 仍立即进入 held；
+- realtime-push 的后台 poller 使用 latest-only 消费，避免消费队列追赶旧样本；
+- CLI 未显式指定 `--source-poll-hz` 时，request-response 仍为 20 Hz，realtime-push
+  默认改为 500 Hz；显式值仍完全尊重；
+- latency report 增加 push mailbox、viewer sync 和 foreground tick lateness 分段，
+  便于用同一份现场日志判断优化是否生效。
+
+现场复测应优先比较 `source_receive_to_admission_latency_sec` 和
+`source_to_target_dispatch_latency_sec`，而不是只看 viewer 画面。预期在 5 ms
+realtime-push 周期、500 Hz 消费下，前者应降到约 0--2 ms；若仍高，才继续检查
+RM65 UDP 接收线程或操作系统调度。该候选目前仍未合并、push 或安装。

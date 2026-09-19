@@ -2689,6 +2689,98 @@ class RM65ArmBackend(EffectorBackend):
         with self._lifecycle_lock:
             self._start_under_lifecycle_lock()
 
+    def start_realtime_push_observation(
+        self,
+        callback: Callable[[Mapping[str, object]], None],
+        *,
+        configure: bool = False,
+        cycle_ms: int = 5,
+        port: int = 8080,
+        ip: str | None = None,
+    ) -> Mapping[str, object]:
+        """Register the optional RealMan UDP observation callback.
+
+        The default path only queries the existing controller telemetry
+        configuration and registers a callback; it does not write controller
+        state.  ``configure=True`` is a separate, explicit telemetry
+        operation and is rejected unless an endpoint is supplied.  Neither
+        path enables a motor or sends a motion command.
+        """
+
+        if not self.config.observation_only:
+            raise RuntimeError(
+                "realtime push observation requires an observation-only backend"
+            )
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        arm = self.arm
+        if arm is None:
+            raise RuntimeError("realtime push observation requires a connected RM65")
+        get_config = getattr(arm, "Get_Realtime_Push_Config", None)
+        register_callback = getattr(arm, "Realtime_Arm_Joint_State", None)
+        set_config = getattr(arm, "Set_Realtime_Push_Config", None)
+        if not callable(get_config) or not callable(register_callback):
+            raise RuntimeError(
+                "RM65 SDK does not expose the realtime push observation capability"
+            )
+        if configure:
+            if not callable(set_config):
+                raise RuntimeError(
+                    "RM65 SDK does not expose realtime push configuration"
+                )
+            if isinstance(cycle_ms, bool) or int(cycle_ms) < 5 or int(cycle_ms) % 5:
+                raise ValueError("cycle_ms must be a positive multiple of 5")
+            if isinstance(port, bool) or not 1 <= int(port) <= 65535:
+                raise ValueError("port must be in the range 1..65535")
+            normalized_ip = str(ip or "").strip()
+            if not normalized_ip:
+                raise ValueError("ip is required when configuring realtime push")
+        with self._hardware_read_lock:
+            current_config: Mapping[str, object] | None = None
+            if configure:
+                current_result = get_config()
+                if (
+                    not isinstance(current_result, (tuple, list))
+                    or len(current_result) != 2
+                ):
+                    raise RuntimeError(
+                        "RM65 realtime push config returned an invalid result"
+                    )
+                current_code, current_config_value = current_result
+                current_parsed_code, current_text = _parse_rm65_result(current_code)
+                if (
+                    current_parsed_code != 0
+                    or not isinstance(current_config_value, Mapping)
+                ):
+                    raise RuntimeError(
+                        "RM65 realtime push config query failed before configure: "
+                        f"{current_text}"
+                    )
+                current_config = current_config_value
+                set_result = set_config(
+                    cycle_ms=int(cycle_ms),
+                    port=int(port),
+                    ip=normalized_ip,
+                    enable=True,
+                    custom_config=current_config.get("custom_config"),
+                )
+                set_code, set_text = _parse_rm65_result(set_result)
+                if set_code != 0:
+                    raise RuntimeError(
+                        f"RM65 realtime push configuration failed: {set_text}"
+                    )
+            config_result = get_config()
+            if not isinstance(config_result, (tuple, list)) or len(config_result) != 2:
+                raise RuntimeError("RM65 realtime push config returned an invalid result")
+            config_code, config = config_result
+            parsed_code, config_text = _parse_rm65_result(config_code)
+            if parsed_code != 0 or not isinstance(config, Mapping):
+                raise RuntimeError(
+                    f"RM65 realtime push config query failed: {config_text}"
+                )
+            register_callback(callback)
+        return dict(config)
+
     def _start_under_lifecycle_lock(self) -> None:
         if not self.config.connect_hardware:
             return
