@@ -932,6 +932,14 @@ def test_launcher_value_options_preserve_missing_value_errors(
     assert result.stderr == f"[RuleBased] {option} requires {value_hint}.\n"
 
 
+def test_real_teleop_parser_accepts_camera_frame_max_age_option() -> None:
+    args = real_teleop_entrypoint.build_real_teleop_argument_parser().parse_args(
+        ["--camera-frame-max-age-sec", "0.25"]
+    )
+
+    assert args.camera_frame_max_age_sec == pytest.approx(0.25)
+
+
 def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     tmp_path: Path,
 ) -> None:
