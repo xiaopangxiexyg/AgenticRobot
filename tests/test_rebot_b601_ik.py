@@ -66,6 +66,64 @@ def test_backtracking_converges_for_a_previously_oscillating_nearby_seed(
     assert result.orientation_error_rad <= 1e-4
 
 
+def test_reverse_teleop_wrist_correction_does_not_stall_at_default_step_limit(
+    b601_model: B601PinocchioModel,
+) -> None:
+    """Keep a valid reverse-following target from failing at iteration zero.
+
+    This target/seed pair is taken from the 2026-09-19 RM65 -> B601 MuJoCo
+    foreground log.  With the old 0.05 rad numerical step limit, the DLS
+    update was dominated by J4 (about -0.11 rad); clipping it made every
+    backtracking candidate worse and produced ``line_search_stalled`` despite
+    a well-conditioned Jacobian and a fresh target.  The numerical limit must
+    not be confused with the downstream actuator velocity limit.
+    """
+
+    seed_qpos = np.array(
+        [
+            -0.015385799063023621,
+            0.9834022502011215,
+            0.7071896497758362,
+            0.7248888518967218,
+            -0.028358181754827544,
+            0.008031282690399332,
+        ]
+    )
+    target_pose = np.array(
+        [
+            [
+                0.9284315525514186,
+                0.012006078596478231,
+                -0.37130944817456274,
+                0.3946867392017378,
+            ],
+            [
+                -0.012519325171647071,
+                0.9999211014984906,
+                0.001028238927763897,
+                0.00026397449194038496,
+            ],
+            [
+                0.37129249753288823,
+                0.0036938942569045463,
+                0.9285086086951541,
+                0.4656100567530777,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+
+    result = B601DampedLeastSquaresIK(b601_model).solve(
+        target_pose,
+        seed_qpos=seed_qpos,
+    )
+
+    assert result.success is True
+    assert result.status == "converged"
+    assert result.position_error_m <= 1e-5
+    assert result.orientation_error_rad <= 1e-4
+
+
 def test_previous_solution_seed_preserves_continuity_over_pose_stream(
     b601_model: B601PinocchioModel,
 ) -> None:

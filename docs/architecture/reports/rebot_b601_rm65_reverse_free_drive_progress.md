@@ -108,11 +108,21 @@ qpos、source measurement flags/sequence 以及各阶段耗时；在拿到这一
 workspace、freshness 或 IK 安全门。
 
 这次具体拒绝是一次有效样本上的 `ik_rejected:line_search_stalled`：source 已准入、
-Jacobian 条件数约为 10，随后才进入 `held`。根因是上一版每次用 MuJoCo 实测 qpos
-作为 IK seed；位置伺服的动态/目标 slew 滞后使 seed 落后于最近已接受目标，连续拖动
-时容易跨入不利的局部数值 basin。当前桥接器改为“首次激活或 recenter 使用实测
+Jacobian 条件数约为 10，随后才进入 `held`。首个假设是上一版每次用 MuJoCo 实测
+qpos 作为 IK seed；位置伺服的动态/目标 slew 滞后使 seed 落后于最近已接受目标，连续
+拖动时容易跨入不利的局部数值 basin。桥接器已改为“首次激活或 recenter 使用实测
 qpos，之后使用上一条已接受 IK qpos”，不改变 source freshness、joint limits、
 driver slew 或 fail-closed rejection 契约。
+
+随后对 2026-09-19 的最新现场日志进行了精确复现：新 seed 已经是上一条已接受目标，
+source sequence/时间戳也完整新鲜；失败发生在 IK 第 0 次迭代。该目标的初始位置误差
+约 0.0107 m、姿态误差约 0.0681 rad、Jacobian 条件数约 9.6，但 DLS 的主导 J4 步约
+为 -0.110 rad。旧的 0.05 rad 数值步长上限把它截断后，全部回溯候选都不能降低 merit，
+因此错误地进入 `line_search_stalled`。默认数值步长现调整为 0.10 rad；这不是硬件命令
+或 MuJoCo 执行速度限制，物理关节限位、位置 driver slew 和 fail-closed 仍保持不变。
+该精确 seed/target 已加入 IK 回归测试。后续若仍出现相同状态，应根据每条事件中的
+`ik_seed_qpos_rad`、目标误差和 `ik_iterations` 判断是否是新的数值条件，而不能再把它
+解释成 RM65 网络断线。
 
 这次修复仍没有引入后台 source/IK worker：live RM65 SDK 读取和 IK 的同步耗时先
 通过上述字段量化。若实测单次 source+IK 超过 source period，再单独设计 latest-only

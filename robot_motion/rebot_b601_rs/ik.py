@@ -26,7 +26,13 @@ class B601IKConfig:
     position_tolerance_m: float = 1e-5
     orientation_tolerance_rad: float = 1e-4
     damping: float = 2e-3
-    max_joint_step_rad: float = 0.05
+    # This is a numerical IK step, not a hardware command or a simulation
+    # actuator velocity limit.  The previous 0.05 rad default could clip one
+    # dominant wrist correction so severely that every backtracking candidate
+    # increased the merit and the solver stalled at iteration zero.  Keep
+    # physical joint limits enforced below, while allowing a normal reverse
+    # teleoperation target to make progress in one DLS update.
+    max_joint_step_rad: float = 0.10
     backtracking_steps: int = 8
     characteristic_length_m: float = 0.30
     joint_limit_margin_rad: float = 1e-6
