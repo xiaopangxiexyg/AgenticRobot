@@ -3617,15 +3617,26 @@ def main(
         submit_legacy_owner_state=submit_legacy_owner_state,
     )
 
-    def reset_policy_stream_for_activation() -> None:
-        """Reset every policy-owned part of an activation stream once."""
+    def reset_policy_stream_for_activation(
+        *,
+        reset_policy_state: bool = True,
+    ) -> None:
+        """Reset activation state, optionally preserving policy progress.
+
+        A fresh operator start intentionally resets the policy.  A recovery
+        from a typed RTC timeout/gate pause is different: the robot is held at
+        its current state and the next observation should continue there.  In
+        that path callers pass ``reset_policy_state=False`` so replay cursors
+        and other policy-owned progress are not silently rewound.
+        """
 
         nonlocal rtc_active_latency_gate_passed
         nonlocal rtc_active_latency_gate_rejected
         nonlocal rtc_active_latency_gate_failure_reason
         nonlocal rtc_recovery_required
         nonlocal rtc_recovery_reason
-        policy.reset()
+        if reset_policy_state:
+            policy.reset()
         policy_deploy_runtime.reset_stream()
         rtc_active_latency_samples.clear()
         rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
@@ -4295,6 +4306,7 @@ def main(
                             "trips require restart, other safety faults require manual re-arm."
                         )
                         continue
+                    preserve_policy_progress = bool(rtc_recovery_required)
                     if position_deploy_executor is not None:
                         position_deploy_executor.clear()
                         last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
@@ -4304,7 +4316,9 @@ def main(
                     ):
                         policy_active = False
                         continue
-                    reset_policy_stream_for_activation()
+                    reset_policy_stream_for_activation(
+                        reset_policy_state=not preserve_policy_progress,
+                    )
                     reset_startup_initializer_for_activation(
                         current_pose_start_allowed=current_pose_start_override,
                     )
@@ -4344,7 +4358,14 @@ def main(
                     else:
                         enable_deferred_impedance_force_control(trigger="g_policy")
                         policy_active = True
-                        print("[Deploy] policy active")
+                        if preserve_policy_progress:
+                            print(
+                                "[Deploy] RTC recovery resumed from the current "
+                                "state; trajectory/qpos initialization was not "
+                                "replayed and policy progress was preserved."
+                            )
+                        else:
+                            print("[Deploy] policy active")
                 elif key == "a":
                     if position_force_guard_fault_latched:
                         policy_active = False
