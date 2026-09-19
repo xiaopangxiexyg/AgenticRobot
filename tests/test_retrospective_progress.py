@@ -277,15 +277,26 @@ def test_writing_stage1_skill_is_dual_arm_and_shared_by_window_4_5() -> None:
         "dmtac_bimanual_writing_acquire_present_window_v1",
         "dmtac_rm65_bimanual_position_writing_four_stage_progress",
         "dmtac_rm65_bimanual_position_writing_five_stage_progress",
+        "dmtac_rm65_bimanual_position_writing_five_stage_progress_detailed",
     )
     bundles = tuple(load_managed_task_profile(value) for value in profile_ids)
-    progress_by_hash = {
-        bundle.progress_profile.semantic_content_hash: bundle
+    profiles_by_hash = {
+        (
+            bundle.progress_profile.semantic_content_hash,
+            bundle.stage_profile.semantic_content_hash
+            if bundle.stage_profile is not None
+            else None,
+        ): bundle
         for bundle in bundles
     }
-    assert len(catalog.projections) == 3
+    assert len(catalog.projections) == 4
     for projection in catalog.projections:
-        bundle = progress_by_hash[projection.source_progress_profile_hash]
+        bundle = profiles_by_hash[
+            (
+                projection.source_progress_profile_hash,
+                projection.source_stage_profile_hash,
+            )
+        ]
         assert bundle.stage_profile is not None
         validate_progress_skill_projection(
             progress_profile=bundle.progress_profile,
