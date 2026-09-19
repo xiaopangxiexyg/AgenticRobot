@@ -234,6 +234,32 @@ mean/p95/p99 为 25.002/29.074/31.157 ms，SDK read wall mean/p95/p99/max 为
 物理主循环后，主循环不再承受 4–14 ms 的同步读阻塞，且 40 Hz 源调度没有丢期。
 候选仍未合并或安装。
 
+### 2026-09-19 GUI 40 Hz 只读验收
+
+在同一远端候选上以 `DISPLAY=:1` 启动 MuJoCo passive viewer，自动执行一次激活，运行
+约 30 秒后自动退出。RM65 使用 observation-only backend，B601 只运行 MuJoCo
+position driver；`rm65_commands_sent=false`、`b601_hardware_commands_sent=false`，
+没有任何真实执行器命令。
+
+```text
+execution status:                COMPLETED
+source samples / dispatches:     1170 / 1170
+rejection reasons:               none
+source interval mean/p95/p99:   25.002 / 29.100 / 31.180 ms
+source poll lateness p99:        0.109 ms
+read completion -> dispatch:     3.842 ms mean, 8.334 ms p95, 10.470 ms max
+worker completion -> consumption:
+                                  1.623 ms mean, 5.712 ms p95, 7.044 ms max
+retarget/IK:                     0.947 ms mean, 1.272 ms p95, 1.411 ms p99
+viewer bridge steps:             10213 in 30.287 s
+```
+
+GUI 验收证明 viewer、后台 40 Hz source poll、连续 IK 和 MuJoCo target dispatch 可以
+共同工作；但 passive viewer 的同步/呈现负载使实际 physics loop 低于名义 500 Hz，
+因此 GUI 结果不能替代 null-viewer 的时序基准，也不能代表真实 B601 执行器频率。
+后续若需要量化 viewer 性能，应单独测量 `viewer_sync_hz`，不要把 GUI 步频当成
+RM65 观测频率或硬件控制频率。
+
 ### P2 synthetic MuJoCo 自动化测试
 
 已增加 `tests/test_rebot_b601_rm65_free_drive_integration.py`。该用例使用真实
