@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -19,6 +20,31 @@ from .core import (
     pack_binary_mask,
 )
 from .visualize import MaskStream, iter_mask_frames
+
+
+def _replace_directory_with_retry(
+    source: Path,
+    destination: Path,
+    *,
+    attempts: int = 6,
+) -> None:
+    """Atomically publish a directory, tolerating transient NFS EACCES."""
+
+    last_error: PermissionError | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 >= max(1, int(attempts)):
+                raise
+            # NAS metadata can briefly lag immediately after a staged directory
+            # is fsynced.  Keep the atomic publish contract and only retry this
+            # narrowly-scoped, plausibly transient failure.
+            time.sleep(0.25 * (2 ** min(attempt, 3)))
+    if last_error is not None:
+        raise last_error
 
 
 @dataclass(frozen=True)
@@ -491,10 +517,10 @@ def process_mask_stream(
     if rollback_dir is not None:
         os.replace(out_dir, rollback_dir)
     try:
-        os.replace(staging_dir, out_dir)
+        _replace_directory_with_retry(staging_dir, out_dir)
     except BaseException:
         if rollback_dir is not None and rollback_dir.exists() and not out_dir.exists():
-            os.replace(rollback_dir, out_dir)
+            _replace_directory_with_retry(rollback_dir, out_dir)
         raise
     return DepthMaskPostprocessResult(
         manifest_path=final_manifest_path,

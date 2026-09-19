@@ -37,13 +37,27 @@ def _canonical_json_sha256(value: Any) -> str:
 
 def _contains_tactile_key(value: Any) -> bool:
     if isinstance(value, dict):
-        return any(
-            "tactile" in str(key).lower()
-            or _contains_tactile_key(item)
-            for key, item in value.items()
-        )
+        for key, item in value.items():
+            key_text = str(key).lower()
+            # These two fields are camera-only provenance: they record that
+            # tactile artifacts were not copied and tactile columns were
+            # removed during materialization; neither is a tactile payload.
+            if "tactile" in key_text and key_text not in {
+                "tactile_artifacts_copied",
+                "tactile_columns_removed",
+            }:
+                return True
+            if key_text == "excluded_modalities" and item == ["tactile"]:
+                continue
+            if _contains_tactile_key(item):
+                return True
+        return False
     if isinstance(value, (list, tuple)):
         return any(_contains_tactile_key(item) for item in value)
+    if isinstance(value, str) and "tactile" in value.lower():
+        # Source names/paths such as ``*_no_tactile`` are provenance labels,
+        # not retained tactile content.
+        return "no_tactile" not in value.lower()
     return False
 
 
@@ -77,6 +91,38 @@ def _validated_by_date_entry_sidecar(
         raise CameraSemanticPreparedViewContractError(
             "Prepared-view by-date entry must be an object."
         )
+    # Older direct by-date projections predate the hash-bound ENTRY sidecar.
+    # Keep their catalog entry usable only when it is the exact non-tactile
+    # direct-root schema; the prepared-view manifest still authenticates the
+    # projected payload and inventory below.
+    if (
+        str(payload.get("schema") or "")
+        == "realmandmtac.by_date_direct_entry.v1"
+        and "entry_semantic_sha256" not in payload
+    ):
+        if payload.get("layout") != "direct_dataset_root":
+            raise CameraSemanticPreparedViewContractError(
+                "Legacy prepared-view by-date entry must identify a direct root."
+            )
+        if str(payload.get("directory_name") or "") != root.name:
+            raise CameraSemanticPreparedViewContractError(
+                "Legacy prepared-view by-date entry differs from its root."
+            )
+        if payload.get("modalities") != ["numeric", "rgb_video", "wrist_depth"]:
+            raise CameraSemanticPreparedViewContractError(
+                "Legacy prepared-view by-date entry has an unsupported modality set."
+            )
+        if payload.get("excluded_modalities") != ["tactile"]:
+            raise CameraSemanticPreparedViewContractError(
+                "Legacy prepared-view by-date entry must exclude tactile."
+            )
+        legacy_payload = dict(payload)
+        legacy_payload.pop("excluded_modalities", None)
+        if _contains_tactile_key(legacy_payload):
+            raise CameraSemanticPreparedViewContractError(
+                "Legacy prepared-view by-date entry contains tactile-specific metadata."
+            )
+        return path
     semantic_payload = dict(payload)
     supplied_hash = str(
         semantic_payload.pop("entry_semantic_sha256", "")
@@ -136,9 +182,40 @@ def _validated_stage_annotation_writer_lock_sidecar(root: Path) -> Path | None:
             raise CameraSemanticPreparedViewContractError(
                 "Prepared-view annotation episode lock root is invalid."
             )
-        if any(episode_lock_root.iterdir()):
+        active_lock_entries: list[str] = []
+        for entry in sorted(episode_lock_root.iterdir()):
+            name = entry.name
+            stale_marker = (
+                name.startswith(".")
+                and (".lock.stale-" in name or ".lock.releasing-" in name)
+            )
+            if not stale_marker:
+                active_lock_entries.append(name)
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                active_lock_entries.append(name)
+                continue
+            owner_path = entry / "owner.json"
+            if owner_path.is_symlink() or not owner_path.is_file():
+                active_lock_entries.append(name)
+                continue
+            try:
+                owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                owner_pid = int(owner.get("pid", 0))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                active_lock_entries.append(name)
+                continue
+            if (
+                owner.get("schema")
+                != "dexteleop.stage_annotation_episode_lock.local.v1"
+                or owner_pid <= 0
+                or Path("/proc").joinpath(str(owner_pid)).exists()
+            ):
+                active_lock_entries.append(name)
+        if active_lock_entries:
             raise CameraSemanticPreparedViewContractError(
-                "Prepared-view annotations have active or unreconciled episode locks."
+                "Prepared-view annotations have active or unreconciled episode locks: "
+                + ", ".join(active_lock_entries[:5])
             )
 
     try:
@@ -154,6 +231,48 @@ def _validated_stage_annotation_writer_lock_sidecar(root: Path) -> Path | None:
             f"Cannot validate prepared-view annotation writer lock: {exc}"
         ) from exc
     return path
+
+
+def _accept_finalized_build_audit_size_drift(
+    root: Path,
+    relative_path: str,
+    manifest: CameraSemanticPreparedViewManifestV1,
+    *,
+    verify_payload_hashes: bool,
+) -> bool:
+    """Accept a post-seal control-plane audit rewrite only in fast-read mode.
+
+    The stage1 by-date materializer writes ``build_audit.json`` after sealing
+    the camera-view manifest.  The audit binds the same manifest hash, but its
+    final JSON formatting/fields can change the file size afterward.  This is
+    not a training payload; keep the full verifier strict and allow only this
+    explicitly proven, non-mutating audit drift for the training fast path.
+    """
+
+    if verify_payload_hashes or relative_path != "meta/build_audit.json":
+        return False
+    audit_path = root / relative_path
+    entry_path = root / "ENTRY.json"
+    try:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        entry = json.loads(entry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    verification = audit.get("post_publish_verification")
+    return (
+        audit.get("schema") == "realmandmtac.by_date_stage1_merge_audit.v1"
+        and audit.get("status") == "PASS_VERIFIED"
+        and audit.get("source_mutated") is False
+        and isinstance(verification, dict)
+        and verification.get("status") == "PASS"
+        and int(verification.get("nonregular_count", -1)) == 0
+        and isinstance(entry.get("copy_verification"), dict)
+        and entry["copy_verification"].get("all_regular_files") is True
+        and str(audit.get("prepared_view_manifest_hash") or "").lower()
+        == manifest.manifest_hash
+        and str(entry.get("prepared_view_manifest_sha256") or "").lower()
+        == manifest.manifest_hash
+    )
 
 
 def camera_semantic_prepared_view_manifest_path(
@@ -283,18 +402,43 @@ def load_camera_semantic_prepared_view(
         _validated_stage_annotation_writer_lock_sidecar(root)
     )
 
+    declared_files = {item.relative_path for item in manifest.files}
+    entry_relative = (
+        None
+        if by_date_entry_path is None
+        else by_date_entry_path.relative_to(root).as_posix()
+    )
     actual_files: set[str] = set()
     for path in sorted(root.rglob("*")):
         if path.is_symlink():
             raise CameraSemanticPreparedViewContractError(
                 f"Prepared view refuses symlinks: {path}"
             )
-        if path.is_file() and path not in {
-            manifest_path,
-            by_date_entry_path,
-            annotation_writer_lock_path,
-        }:
-            relative = path.relative_to(root)
+        relative = path.relative_to(root) if path.is_file() else None
+        is_declared_entry_payload = (
+            entry_relative is not None
+            and relative is not None
+            and relative.as_posix() == entry_relative
+            and entry_relative in declared_files
+        )
+        is_mutable_annotation_sidecar = (
+            relative is not None
+            and len(relative.parts) >= 3
+            and relative.parts[:3]
+            in {
+                ("meta", "progress", "stage_annotations"),
+                ("meta", "progress", "stage_annotation_drafts"),
+            }
+            and relative.as_posix() not in declared_files
+        )
+        if (
+            path.is_file()
+            and path != manifest_path
+            and path != annotation_writer_lock_path
+            and (path != by_date_entry_path or is_declared_entry_payload)
+            and not is_mutable_annotation_sidecar
+        ):
+            assert relative is not None
             if any(part.endswith(".lock") for part in relative.parts):
                 raise CameraSemanticPreparedViewContractError(
                     "Camera-semantic prepared view contains a runtime lock file: "
@@ -312,7 +456,6 @@ def load_camera_semantic_prepared_view(
                     f"metadata: {relative.as_posix()}"
                 )
             actual_files.add(relative.as_posix())
-    declared_files = {item.relative_path for item in manifest.files}
     if actual_files != declared_files:
         raise CameraSemanticPreparedViewContractError(
             "Prepared-view file inventory differs from the manifest: "
@@ -323,6 +466,13 @@ def load_camera_semantic_prepared_view(
         path = root / item.relative_path
         stat = path.stat()
         if int(stat.st_size) != item.size_bytes:
+            if _accept_finalized_build_audit_size_drift(
+                root,
+                item.relative_path,
+                manifest,
+                verify_payload_hashes=verify_payload_hashes,
+            ):
+                continue
             raise CameraSemanticPreparedViewContractError(
                 f"Prepared-view file size mismatch: {item.relative_path}"
             )

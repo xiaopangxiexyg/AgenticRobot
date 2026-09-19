@@ -525,6 +525,195 @@ def _physical_devices_by_episode(
     audit = _read_json(audit_path)
     plan = audit.get("plan")
     if not isinstance(plan, Mapping) or not isinstance(plan.get("episodes"), list):
+        # Some by-date materializations have one audited, global camera
+        # binding but retain a provenance JSONL without the older per-episode
+        # build plan.  The regular dataset manifest is still safe to use when
+        # the audit records a PASS, protects the source, and its camera serial
+        # map exactly matches that manifest.  Keep this as an explicit,
+        # fail-closed contract; do not infer a default from a malformed audit.
+        verification = audit.get("post_publish_verification")
+        camera_binding = audit.get("camera_binding")
+        if (
+            default_path.is_file()
+            and not default_path.is_symlink()
+            and isinstance(verification, Mapping)
+            and verification.get("status") == "PASS"
+            and verification.get("all_nlink_one") is True
+            and verification.get("symlink_count") == 0
+            and verification.get("nonregular_count") == 0
+            and audit.get("source_mutated") is False
+            and isinstance(camera_binding, Mapping)
+        ):
+            default_payload = _read_json(default_path)
+            default_records = _camera_records(default_payload)
+            manifest_binding = {
+                str(camera_key): _camera_serial(record)
+                for camera_key, record in default_records.items()
+                if isinstance(record, Mapping)
+            }
+            audited_binding = {
+                str(camera_key): str(serial).strip()
+                for camera_key, serial in camera_binding.items()
+            }
+            if (
+                audited_binding
+                and manifest_binding == audited_binding
+                and int(audit.get("episode_count", -1))
+                == int(verification.get("progress_episode_count", -2))
+            ):
+                return None, {
+                    "schema": "dexteleop.camera_devices_binding.v2",
+                    "mode": "dataset_default_global_camera_binding_audited_v1",
+                    "manifest_path": str(default_path.resolve()),
+                    "manifest_sha256": _sha256(default_path),
+                    "source_dataset_root": str(dataset_root.resolve()),
+                    "build_audit_path": str(audit_path.resolve()),
+                    "build_audit_sha256": _sha256(audit_path),
+                    "camera_binding": audited_binding,
+                    "source_modified": False,
+                }
+        if audit.get("schema") == "realmandmtac.by_date_user_reviewed_merge_audit.v1":
+            info_path = dataset_root / "meta" / "info.json"
+            materialization_path = (
+                dataset_root / "meta" / "camera_semantics" / "materialization.json"
+            )
+            prepared_view_path = (
+                dataset_root / "meta" / "prepared_views" / "camera_semantics.json"
+            )
+            source_devices_root = dataset_root / "meta" / "source_devices"
+            if not all(
+                path.is_file() and not path.is_symlink()
+                for path in (info_path, materialization_path, prepared_view_path)
+            ) or not source_devices_root.is_dir() or source_devices_root.is_symlink():
+                raise TypeError(
+                    "reviewed merge audit lacks complete camera materialization "
+                    f"evidence: {dataset_root}"
+                )
+            info = _read_json(info_path)
+            materialization = _read_json(materialization_path)
+            prepared_view = _read_json(prepared_view_path)
+            merge_provenance = info.get("camera_only_merge_provenance")
+            if (
+                audit.get("artifact_materialization_policy") != "independent_copy"
+                or audit.get("provenance_flattened_to_original_sources") is not True
+                or materialization.get("schema")
+                != "realmandmtac.by_date_camera_merge_materialization.v1"
+                or materialization.get("complete") is not True
+                or materialization.get("source_mutated") is not False
+                or prepared_view.get("schema")
+                != "dexteleop.camera_semantic_prepared_view.v1"
+                or prepared_view.get("complete") is not True
+                or prepared_view.get("source_mutated") is not False
+                or materialization.get("camera_binding_hash")
+                != prepared_view.get("camera_binding_hash")
+                or not isinstance(merge_provenance, Mapping)
+                or materialization.get("camera_binding_hash")
+                != merge_provenance.get("camera_binding_hash")
+                or materialization.get("episode_count") != audit.get("episode_count")
+                or materialization.get("frame_count") != audit.get("frame_count")
+                or info.get("episode_count") != audit.get("episode_count")
+                or info.get("frame_count") != audit.get("frame_count")
+            ):
+                raise TypeError(
+                    "reviewed merge audit camera materialization evidence is "
+                    f"inconsistent: {dataset_root}"
+                )
+            intermediate_sources = audit.get("intermediate_source_datasets")
+            if not isinstance(intermediate_sources, list) or not intermediate_sources:
+                raise TypeError(
+                    "reviewed merge audit has no intermediate source inventory: "
+                    f"{audit_path}"
+                )
+            source_dirs = sorted(
+                path
+                for path in source_devices_root.iterdir()
+                if path.is_dir() and not path.is_symlink()
+            )
+            if len(source_dirs) != len(intermediate_sources):
+                raise TypeError(
+                    "reviewed merge audit/source-device counts differ: "
+                    f"audit={len(intermediate_sources)} manifests={len(source_dirs)}"
+                )
+            source_manifests: list[dict[str, Any]] = []
+            canonical_binding: dict[str, str] | None = None
+            manifest_paths: list[Path] = []
+            for source_dir in source_dirs:
+                manifest_path = source_dir / "devices" / "realsense.json"
+                if (
+                    not manifest_path.is_file()
+                    or manifest_path.is_symlink()
+                    or manifest_path.resolve().parent.parent != source_dir.resolve()
+                ):
+                    raise TypeError(
+                        "reviewed merge source-device manifest must be a regular "
+                        f"file inside its source directory: {manifest_path}"
+                    )
+                payload = _read_json(manifest_path)
+                records = _camera_records(payload)
+                if set(records) != set(WRIST_CAMERA_KEYS):
+                    raise TypeError(
+                        "reviewed merge source-device manifest must contain exactly "
+                        f"the wrist cameras: {manifest_path}"
+                    )
+                binding: dict[str, str] = {}
+                for camera_key in WRIST_CAMERA_KEYS:
+                    record = records.get(camera_key)
+                    if not isinstance(record, Mapping):
+                        raise TypeError(
+                            "reviewed merge source-device camera record is invalid: "
+                            f"{manifest_path}/{camera_key}"
+                        )
+                    serial = _camera_serial(record)
+                    if (
+                        record.get("materialized") is not True
+                        or record.get("semantic_role") != camera_key
+                        or not serial
+                        or str(record.get("serial_number", "")).strip() != serial
+                    ):
+                        raise TypeError(
+                            "reviewed merge source-device camera binding is not "
+                            f"materialized and serial-bound: {manifest_path}/{camera_key}"
+                        )
+                    binding[camera_key] = serial
+                if canonical_binding is None:
+                    canonical_binding = binding
+                elif binding != canonical_binding:
+                    raise ValueError(
+                        "reviewed merge source-device camera bindings differ: "
+                        f"{manifest_path}"
+                    )
+                resolved_manifest = manifest_path.resolve()
+                manifest_paths.append(resolved_manifest)
+                source_manifests.append(
+                    {
+                        "copied_manifest_path": str(resolved_manifest),
+                        "copied_manifest_sha256": _sha256(manifest_path),
+                        "camera_binding": binding,
+                        "original_manifest_state": "audited_global_materialized_copy",
+                    }
+                )
+            assert canonical_binding is not None
+            selected = {int(value) for value in episode_indices}
+            selected_manifest = manifest_paths[0]
+            mapping = {episode_index: selected_manifest for episode_index in selected}
+            return mapping, {
+                "schema": "dexteleop.camera_devices_binding.v2",
+                "mode": "consolidated_source_devices_global_camera_binding_audited_v1",
+                "source_dataset_root": str(dataset_root.resolve()),
+                "build_audit_path": str(audit_path.resolve()),
+                "build_audit_sha256": _sha256(audit_path),
+                "provenance_path": str(provenance_path.resolve()),
+                "provenance_sha256": _sha256(provenance_path),
+                "selected_episode_count": len(selected),
+                "camera_binding": canonical_binding,
+                "camera_binding_hash": materialization.get("camera_binding_hash"),
+                "camera_materialization_path": str(materialization_path.resolve()),
+                "camera_materialization_sha256": _sha256(materialization_path),
+                "prepared_view_path": str(prepared_view_path.resolve()),
+                "prepared_view_sha256": _sha256(prepared_view_path),
+                "source_manifests": source_manifests,
+                "source_modified": False,
+            }
         raise TypeError(f"physical build audit has no episode plan: {audit_path}")
     plan_rows = tuple(item for item in plan["episodes"] if isinstance(item, Mapping))
     provenance_rows = tuple(_read_jsonl(provenance_path))
