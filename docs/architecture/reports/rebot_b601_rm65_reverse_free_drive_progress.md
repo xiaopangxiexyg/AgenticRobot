@@ -44,9 +44,12 @@
 - `control_station.sim_hil_profile.rm65_b601_free_drive_foreground`
   - 复用既有 `B601RM65TerminalCommands` 的无 Enter 单键读取语义，并由新的
     反向前台协调器统一管理 `MujocoPassiveViewerSession` 生命周期。
-  - `a/c/r/s/q` 只改变桥接层的 inactive/active/clutched/held 状态；每个
-    MuJoCo tick 都调用现有 `RM65ToB601FreeDriveBridge.step()`，不会另起
-    source、IK、位置驱动或后台线程。
+  - `a/c/r/s/q` 只改变桥接层的 inactive/active/clutched/held 状态；物理环仍按
+    B601 既有节拍推进，native viewer 默认独立以 60 Hz 刷新，不再让 GUI vsync
+    把物理环压到约 185 Hz。
+  - live application 的 RM65 source poll 按 monotonic wall clock 调度（默认
+    20 Hz），不再使用被 viewer 拖慢的仿真时间调度；synthetic tests 默认保留
+    确定性的仿真时钟调度。
   - viewer 关闭、Ctrl-C、EOF 和 source/IK admission rejection 都会撤销
     pending target 并退出/保持 held；退出只关闭仿真 viewer，不触碰 RM65 或
     B601 真机。
@@ -66,9 +69,10 @@
 ```text
 tests/test_control_station_rm65_free_drive.py     5 passed
 tests/test_robot_motion_rm65_retarget.py          5 passed
-tests/test_control_station_rm65_b601_free_drive.py 4 passed
+tests/test_control_station_rm65_b601_free_drive.py 6 passed
 tests/test_control_station_rm65_b601_free_drive_foreground.py 3 passed
 tests/test_control_station_rm65_b601_free_drive_application.py 2 passed
+tests/test_rebot_b601_rm65_free_drive_integration.py 3 passed
 ruff (changed files)                               PASS
 git diff --check                                   PASS
 ```
@@ -78,6 +82,32 @@ MuJoCo GUI 已验收。
 
 当前候选的合并前相关切片（包含上述应用入口测试、集成、前台和边界测试）为
 `66 passed`；该数字仍只表示离线自动化证据，不表示现场硬件验收。
+
+## 现场延迟与 held 诊断（2026-09-19）
+
+现场一次运行中，MuJoCo 日志约 49 秒只推进了 9075 个 physics step（约
+185 Hz），而命令请求的是 1000 Hz。原因是旧前台循环在每个 physics step 都调用
+native viewer `sync()`，并且每条 JSON 事件都立即 flush；同时 source poll 以
+仿真时间计时，使 20 Hz source 在该现场实际只有约 3--4 Hz。RM65 读取和连续 seed
+IK 也在同一前台 tick 同步执行，因此会进一步造成可见延迟。
+
+当前实现已将 viewer 刷新和 source poll 时钟解耦，并将日志 flush 批量化；每个
+`bridge_step` 仍保留 source/retarget/position/total elapsed 字段，所以不会以
+降低证据粒度换取速度。下次现场日志应重点统计这些字段，不能仅凭终端刷新速度
+判断 IK 性能。
+
+同一现场日志还显示先有一条 `source_admitted=true`、`retarget_accepted=false`
+的 tick，之后桥接器进入 `held`，最后操作者才按 Ctrl-C。它不是自动断开或 RM65
+网络断线，而是当前目标被 retarget/IK 门拒绝后按 fail-closed 契约撤销 pending
+target。此前前台只打印了泛化的 `bridge rejected the target`，无法知道是
+`ik_rejected:*`、source freshness 还是 driver rejection。现在日志和首次/周期性
+held 提示会记录 `bridge_rejection_reason`、IK status/iterations/errors 以及各阶段
+耗时；在拿到这一证据前，不应放宽 workspace、freshness 或 IK 安全门。
+
+这次修复仍没有引入后台 source/IK worker：live RM65 SDK 读取和 IK 的同步耗时先
+通过上述字段量化。若实测单次 source+IK 超过 source period，再单独设计 latest-only
+worker，并保留主线程的 freshness recheck 和 fail-closed admission；不能先用旧
+qpos 或静默重试掩盖该问题。
 
 ### P2 synthetic MuJoCo 自动化测试
 

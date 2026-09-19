@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import sys
+import time
 import traceback
 from contextlib import ExitStack
 from pathlib import Path
@@ -91,10 +92,20 @@ def build_observation_only_rm65_backend(
     )
 
 
-def _record_factory(log):
+def _record_factory(log, *, flush_interval_sec: float = 0.25):
+    last_flush = time.monotonic()
+
     def record(event: object) -> None:
+        nonlocal last_flush
         log.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
-        log.flush()
+        now = time.monotonic()
+        event_name = event.get("event") if isinstance(event, dict) else None
+        if (
+            event_name in {"command", "error", "result", "cleanup_error"}
+            or now - last_flush >= float(flush_interval_sec)
+        ):
+            log.flush()
+            last_flush = now
 
     return record
 
@@ -121,6 +132,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rate-hz", type=_positive, default=1000.0)
+    parser.add_argument(
+        "--viewer-sync-hz",
+        type=_positive,
+        default=60.0,
+        help="passive viewer refresh rate; physics remains at the B601 plant rate",
+    )
     parser.add_argument("--source-poll-hz", type=_positive, default=20.0)
     parser.add_argument("--maximum-source-age-sec", type=_positive, default=0.25)
     parser.add_argument("--maximum-receive-age-sec", type=_positive, default=0.25)
@@ -164,7 +181,9 @@ def main(argv: list[str] | None = None) -> int:
             "translation_gain_target_reference_xyz": list(gains),
             "rotation_gain": float(args.rotation_gain),
             "rate_hz": float(args.rate_hz),
+            "viewer_sync_hz": float(args.viewer_sync_hz),
             "source_poll_hz": float(args.source_poll_hz),
+            "source_poll_clock": "monotonic_wall_time",
         }
 
         def emit(message: str) -> None:
@@ -201,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                     maximum_receive_age_sec=args.maximum_receive_age_sec,
                     maximum_future_skew_sec=args.maximum_future_skew_sec,
                 ),
+                source_poll_clock=time.monotonic,
             )
             result["execution_status"] = "VALIDATED"
             result["bridge_state"] = bridge.state
@@ -235,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
                     bridge,
                     viewer=viewer,
                     rate_hz=args.rate_hz,
+                    viewer_sync_hz=args.viewer_sync_hz,
                     emit=emit,
                     record=record,
                 )

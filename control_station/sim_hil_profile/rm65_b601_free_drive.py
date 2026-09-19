@@ -10,7 +10,8 @@ in the existing :class:`B601PositionDriver`.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,6 +122,11 @@ class RM65ToB601FreeDriveTick:
     retarget_result: RM65ToB601RetargetResult | None
     position_tick: B601PositionTick
     pending_command: bool
+    rejection_reason: str | None = None
+    source_step_elapsed_sec: float = 0.0
+    retarget_elapsed_sec: float = 0.0
+    position_step_elapsed_sec: float = 0.0
+    step_elapsed_sec: float = 0.0
 
     def __post_init__(self) -> None:
         if self.state not in RM65_TO_B601_FREE_DRIVE_STATES:
@@ -143,6 +149,7 @@ class RM65ToB601FreeDriveBridge:
         driver: B601PositionDriver,
         *,
         source_poll_hz: float = 20.0,
+        source_poll_clock: Callable[[], float] | None = None,
     ) -> None:
         if not callable(getattr(source, "step", None)):
             raise TypeError("source must provide step().")
@@ -163,8 +170,26 @@ class RM65ToB601FreeDriveBridge:
         self._state = "inactive"
         self._pending_command: B601JointPositionCommand | None = None
         self._next_source_poll_time_sec = 0.0
+        self._source_poll_clock: Callable[[], float] | None = None
+        self._next_source_poll_clock_sec: float | None = None
         self._last_source_step: RM65FreeDriveStep | None = None
         self._last_retarget_result: RM65ToB601RetargetResult | None = None
+        self._last_rejection_reason: str | None = None
+        self.set_source_poll_clock(source_poll_clock)
+
+    def set_source_poll_clock(self, clock: Callable[[], float] | None) -> None:
+        """Select wall-clock scheduling for a live source, if requested.
+
+        Synthetic bridge tests retain the deterministic simulation-clock
+        scheduler by default.  The live RM65 application supplies
+        ``time.monotonic`` so a slow viewer cannot silently reduce the source
+        observation cadence.
+        """
+
+        if clock is not None and not callable(clock):
+            raise TypeError("source poll clock must be callable or None")
+        self._source_poll_clock = clock
+        self._next_source_poll_clock_sec = None
 
     @property
     def state(self) -> str:
@@ -182,16 +207,51 @@ class RM65ToB601FreeDriveBridge:
     def last_retarget_result(self) -> RM65ToB601RetargetResult | None:
         return self._last_retarget_result
 
+    @property
+    def last_rejection_reason(self) -> str | None:
+        """Return the reason that latched the current held state, if any."""
+
+        return self._last_rejection_reason
+
+    def _schedule_next_source_poll(self) -> None:
+        if self._source_poll_clock is None:
+            self._next_source_poll_time_sec = (
+                self.driver.physics_time_sec + self._source_period_sec
+            )
+            self._next_source_poll_clock_sec = None
+            return
+        now = float(self._source_poll_clock())
+        if not math.isfinite(now):
+            raise ValueError("source poll clock returned a non-finite value")
+        self._next_source_poll_clock_sec = now + self._source_period_sec
+
+    def _source_poll_due(self) -> bool:
+        if self._source_poll_clock is None:
+            return self.driver.physics_time_sec + 1e-12 >= self._next_source_poll_time_sec
+        if self._next_source_poll_clock_sec is None:
+            return True
+        now = float(self._source_poll_clock())
+        if not math.isfinite(now):
+            raise ValueError("source poll clock returned a non-finite value")
+        return now + 1e-12 >= self._next_source_poll_clock_sec
+
+    def _enter_held(self, reason: str) -> None:
+        self._last_rejection_reason = str(reason).strip() or "bridge_rejected_target"
+        self._state = "held"
+
     def activate(self) -> None:
         """Capture a fresh RM65/B601 anchor and enter active following."""
 
         if self._state not in {"inactive", "held"}:
             raise RuntimeError(f"activate is invalid in state {self._state!r}")
+        self._last_rejection_reason = None
         self._clear_target()
         source_step = self.source.step()
         self._last_source_step = source_step
         if source_step.sample is None:
-            self._state = "held"
+            self._enter_held(
+                source_step.rejection_reason or "RM65 source did not provide an anchor"
+            )
             raise RM65FreeDriveAdmissionError(
                 source_step.rejection_reason or "RM65 source did not provide an anchor"
             )
@@ -201,12 +261,10 @@ class RM65ToB601FreeDriveBridge:
                 target_qpos_rad=self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY),
             )
         except (TypeError, ValueError, RuntimeError) as exc:
-            self._state = "held"
+            self._enter_held(str(exc))
             raise RM65FreeDriveAdmissionError(str(exc)) from exc
         self._state = "active"
-        self._next_source_poll_time_sec = (
-            self.driver.physics_time_sec + self._source_period_sec
-        )
+        self._schedule_next_source_poll()
 
     def engage_clutch(self) -> None:
         """Stop following and invalidate the source anchor without stepping."""
@@ -214,6 +272,7 @@ class RM65ToB601FreeDriveBridge:
         if self._state not in {"active", "clutched"}:
             raise RuntimeError(f"engage_clutch is invalid in state {self._state!r}")
         self._clear_target()
+        self._last_rejection_reason = None
         self._state = "clutched"
 
     def release_clutch(self) -> None:
@@ -222,10 +281,13 @@ class RM65ToB601FreeDriveBridge:
         if self._state != "clutched":
             raise RuntimeError(f"release_clutch is invalid in state {self._state!r}")
         self._clear_target()
+        self._last_rejection_reason = None
         source_step = self.source.step()
         self._last_source_step = source_step
         if source_step.sample is None:
-            self._state = "held"
+            self._enter_held(
+                source_step.rejection_reason or "RM65 source did not provide a recenter anchor"
+            )
             raise RM65FreeDriveAdmissionError(
                 source_step.rejection_reason or "RM65 source did not provide a recenter anchor"
             )
@@ -235,17 +297,16 @@ class RM65ToB601FreeDriveBridge:
                 target_qpos_rad=self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY),
             )
         except (TypeError, ValueError, RuntimeError) as exc:
-            self._state = "held"
+            self._enter_held(str(exc))
             raise RM65FreeDriveAdmissionError(str(exc)) from exc
         self._state = "active"
-        self._next_source_poll_time_sec = (
-            self.driver.physics_time_sec + self._source_period_sec
-        )
+        self._schedule_next_source_poll()
 
     def deactivate(self) -> None:
         """Stop following and discard all source-derived targets."""
 
         self._clear_target()
+        self._last_rejection_reason = None
         self._state = "inactive"
 
     def step(self) -> RM65ToB601FreeDriveTick:
@@ -256,27 +317,35 @@ class RM65ToB601FreeDriveBridge:
         for this physics tick, but no rejected or stale qpos is re-issued.
         """
 
+        step_started = time.perf_counter()
         source_step: RM65FreeDriveStep | None = None
         retarget_result: RM65ToB601RetargetResult | None = None
-        if self._state == "active" and (
-            self.driver.physics_time_sec + 1e-12 >= self._next_source_poll_time_sec
-        ):
+        source_step_elapsed_sec = 0.0
+        retarget_elapsed_sec = 0.0
+        position_step_elapsed_sec = 0.0
+        tick_rejection_reason: str | None = None
+        if self._state == "active" and self._source_poll_due():
+            source_started = time.perf_counter()
             source_step = self.source.step()
+            source_step_elapsed_sec = max(0.0, time.perf_counter() - source_started)
             self._last_source_step = source_step
             # A slow source read must not cause a burst of catch-up hardware
             # refreshes.  The target driver continues at its own physics rate;
-            # the next observation is scheduled from the current sim time.
-            self._next_source_poll_time_sec = (
-                self.driver.physics_time_sec + self._source_period_sec
-            )
+            # the next observation is scheduled from the current clock cut.
+            self._schedule_next_source_poll()
             if source_step.sample is None:
                 self._clear_target()
-                self._state = "held"
+                tick_rejection_reason = (
+                    source_step.rejection_reason or "RM65 source rejected the current sample"
+                )
+                self._enter_held(tick_rejection_reason)
             else:
+                retarget_started = time.perf_counter()
                 retarget_result = self.retargeter.retarget(
                     source_step.sample,
                     seed_qpos_rad=self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY),
                 )
+                retarget_elapsed_sec = max(0.0, time.perf_counter() - retarget_started)
                 self._last_retarget_result = retarget_result
                 if retarget_result.accepted:
                     assert retarget_result.qpos_rad is not None
@@ -286,13 +355,20 @@ class RM65ToB601FreeDriveBridge:
                         receive_timestamp_sec=source_step.sample.receive_timestamp_sec,
                         qpos=retarget_result.qpos_rad,
                     )
+                    self._last_rejection_reason = None
                 else:
                     self._pending_command = None
                     self.retargeter.clear_anchor()
-                    self._state = "held"
+                    tick_rejection_reason = (
+                        retarget_result.rejection_reason
+                        or "retargeter rejected the current target"
+                    )
+                    self._enter_held(tick_rejection_reason)
 
         command = self._pending_command if self.driver.command_due else None
+        position_started = time.perf_counter()
         position_tick = self.driver.step_physics(command)
+        position_step_elapsed_sec = max(0.0, time.perf_counter() - position_started)
         if command is not None:
             if position_tick.command_applied:
                 self._pending_command = None
@@ -301,13 +377,23 @@ class RM65ToB601FreeDriveBridge:
                 # retrying the same qpos would replay a possibly stale command.
                 self._pending_command = None
                 self.retargeter.clear_anchor()
-                self._state = "held"
+                tick_rejection_reason = (
+                    position_tick.rejection_reason or "position driver rejected the target"
+                )
+                self._enter_held(tick_rejection_reason)
+        if tick_rejection_reason is None and self._state == "held":
+            tick_rejection_reason = self._last_rejection_reason
         return RM65ToB601FreeDriveTick(
             state=self._state,
             source_step=source_step,
             retarget_result=retarget_result,
             position_tick=position_tick,
             pending_command=self._pending_command is not None,
+            rejection_reason=tick_rejection_reason,
+            source_step_elapsed_sec=source_step_elapsed_sec,
+            retarget_elapsed_sec=retarget_elapsed_sec,
+            position_step_elapsed_sec=position_step_elapsed_sec,
+            step_elapsed_sec=max(0.0, time.perf_counter() - step_started),
         )
 
     def _clear_target(self) -> None:
@@ -323,6 +409,7 @@ def build_rm65_to_b601_free_drive_bridge(
     *,
     initial_qpos: Sequence[float] = B601_RS_DEFAULT_ARM_QPOS,
     config: RM65ToB601FreeDriveSimConfig | None = None,
+    source_poll_clock: Callable[[], float] | None = None,
 ) -> RM65ToB601FreeDriveBridge:
     """Build the reverse sim bridge from the existing model/profile contracts."""
 
@@ -365,6 +452,7 @@ def build_rm65_to_b601_free_drive_bridge(
         retargeter,
         driver,
         source_poll_hz=resolved_config.source_poll_hz,
+        source_poll_clock=source_poll_clock,
     )
 
 

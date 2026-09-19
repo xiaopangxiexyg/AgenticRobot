@@ -117,6 +117,18 @@ class _Retargeter:
         )
 
 
+class _RejectingRetargeter(_Retargeter):
+    def retarget(self, sample, *, seed_qpos_rad):
+        return RM65ToB601RetargetResult(
+            sample=sample,
+            accepted=False,
+            qpos_rad=None,
+            target_pose=None,
+            ik_result=None,
+            rejection_reason="ik_rejected:line_search_stalled",
+        )
+
+
 def _admitted(sequence: int) -> RM65FreeDriveStep:
     return RM65FreeDriveStep(
         state={},
@@ -133,12 +145,19 @@ def _rejected(reason: str) -> RM65FreeDriveStep:
     )
 
 
-def _bridge(source: _Source, driver: _Driver, retargeter: _Retargeter):
+def _bridge(
+    source: _Source,
+    driver: _Driver,
+    retargeter: _Retargeter,
+    *,
+    source_poll_clock=None,
+):
     return RM65ToB601FreeDriveBridge(
         source,
         retargeter,
         driver,
         source_poll_hz=1000.0,
+        source_poll_clock=source_poll_clock,
     )
 
 
@@ -176,6 +195,8 @@ def test_source_rejection_enters_held_and_does_not_reissue_old_target() -> None:
     assert rejected.state == "held"
     assert rejected.source_step is not None
     assert rejected.source_step.rejection_reason == "receive_stale"
+    assert rejected.rejection_reason == "receive_stale"
+    assert bridge.last_rejection_reason == "receive_stale"
     assert rejected.retarget_result is None
     assert bridge.pending_command is None
 
@@ -200,6 +221,40 @@ def test_activation_failure_is_explicit_and_recenter_requires_clutch() -> None:
     bridge.release_clutch()
     assert bridge.state == "active"
     assert retargeter.anchor_captures >= 2
+
+
+def test_live_source_poll_clock_is_not_slowed_by_simulation_clock() -> None:
+    source = _Source([_admitted(1), _admitted(2)])
+    driver = _Driver()
+    retargeter = _Retargeter()
+    now = [10.0]
+    bridge = _bridge(
+        source,
+        driver,
+        retargeter,
+        source_poll_clock=lambda: now[0],
+    )
+
+    bridge.activate()
+    first = bridge.step()
+    assert first.source_step is None
+    now[0] += 0.001
+    second = bridge.step()
+    assert second.source_step is not None
+    assert source.steps is not None
+
+
+def test_retarget_rejection_is_exposed_and_latches_held_reason() -> None:
+    source = _Source([_admitted(1), _admitted(2)])
+    driver = _Driver()
+    bridge = _bridge(source, driver, _RejectingRetargeter())
+
+    bridge.activate()
+    bridge.step()
+    rejected = bridge.step()
+    assert rejected.state == "held"
+    assert rejected.rejection_reason == "ik_rejected:line_search_stalled"
+    assert bridge.last_rejection_reason == "ik_rejected:line_search_stalled"
 
 
 def test_sim_config_keeps_reverse_gain_explicit() -> None:

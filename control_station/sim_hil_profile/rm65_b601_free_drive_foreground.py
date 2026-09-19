@@ -70,6 +70,7 @@ def run_rm65_to_b601_foreground(
     *,
     viewer: Any,
     rate_hz: float,
+    viewer_sync_hz: float | None = None,
     poll_command: Callable[[float], str | None] | None = None,
     emit: Callable[[str], None] = _print_status,
     record: Callable[[Mapping[str, object]], None] | None = None,
@@ -93,6 +94,12 @@ def run_rm65_to_b601_foreground(
             raise TypeError(f"viewer must provide {name}().")
     if isinstance(rate_hz, bool) or not math.isfinite(float(rate_hz)) or float(rate_hz) <= 0.0:
         raise ValueError("rate_hz must be finite and positive.")
+    if viewer_sync_hz is not None and (
+        isinstance(viewer_sync_hz, bool)
+        or not math.isfinite(float(viewer_sync_hz))
+        or float(viewer_sync_hz) <= 0.0
+    ):
+        raise ValueError("viewer_sync_hz must be finite and positive when provided.")
     if poll_command is not None and not callable(poll_command):
         raise TypeError("poll_command must be callable or None.")
     if not callable(emit) or not callable(clock) or not callable(sleeper):
@@ -101,6 +108,9 @@ def run_rm65_to_b601_foreground(
         raise TypeError("record must be callable or None.")
 
     period = 1.0 / float(rate_hz)
+    viewer_period = (
+        None if viewer_sync_hz is None else 1.0 / float(viewer_sync_hz)
+    )
     owns_terminal_reader = poll_command is None
     if poll_command is None:
         poll_command = _default_terminal_commands()
@@ -164,12 +174,18 @@ def run_rm65_to_b601_foreground(
         _instructions(emit)
         event("foreground_started")
         next_tick = float(clock()) + period
+        next_viewer_sync = float(clock())
+        last_hold_reason: str | None = None
+        last_hold_message_at = float("-inf")
         while True:
-            if not bool(viewer.sync()):
-                status = viewer.status()
-                emit(f"[RM65→B601] viewer stopped: {status}")
-                event("viewer_stopped", viewer_status=status)
-                return
+            now = float(clock())
+            if viewer_period is None or now + 1e-12 >= next_viewer_sync:
+                if not bool(viewer.sync()):
+                    status = viewer.status()
+                    emit(f"[RM65→B601] viewer stopped: {status}")
+                    event("viewer_stopped", viewer_status=status)
+                    return
+                next_viewer_sync = now if viewer_period is None else now + viewer_period
             timeout = max(0.0, next_tick - float(clock()))
             command = poll_command(timeout)
             if command is not None and not handle_command(command):
@@ -192,14 +208,60 @@ def run_rm65_to_b601_foreground(
                 ),
                 command_applied=position_tick.command_applied,
                 command_rejected=position_tick.rejection_reason,
+                bridge_rejection_reason=getattr(tick, "rejection_reason", None),
+                retarget_rejection_reason=(
+                    None
+                    if getattr(tick, "retarget_result", None) is None
+                    else tick.retarget_result.rejection_reason
+                ),
+                ik_status=(
+                    None
+                    if getattr(tick, "retarget_result", None) is None or tick.retarget_result.ik_result is None
+                    else tick.retarget_result.ik_result.status
+                ),
+                ik_iterations=(
+                    None
+                    if getattr(tick, "retarget_result", None) is None or tick.retarget_result.ik_result is None
+                    else tick.retarget_result.ik_result.iterations
+                ),
+                ik_position_error_m=(
+                    None
+                    if getattr(tick, "retarget_result", None) is None or tick.retarget_result.ik_result is None
+                    else tick.retarget_result.ik_result.position_error_m
+                ),
+                ik_orientation_error_rad=(
+                    None
+                    if getattr(tick, "retarget_result", None) is None or tick.retarget_result.ik_result is None
+                    else tick.retarget_result.ik_result.orientation_error_rad
+                ),
+                source_step_elapsed_sec=getattr(tick, "source_step_elapsed_sec", 0.0),
+                retarget_elapsed_sec=getattr(tick, "retarget_elapsed_sec", 0.0),
+                position_step_elapsed_sec=getattr(tick, "position_step_elapsed_sec", 0.0),
+                step_elapsed_sec=getattr(tick, "step_elapsed_sec", 0.0),
             )
             if tick.state == "held":
                 reason = (
-                    None
-                    if tick.source_step is None
-                    else tick.source_step.rejection_reason
+                    getattr(tick, "rejection_reason", None)
+                    or getattr(bridge, "last_rejection_reason", None)
+                    or (
+                        None
+                        if tick.source_step is None
+                        else tick.source_step.rejection_reason
+                    )
                 )
-                emit(f"[RM65→B601] held: {reason or 'bridge rejected the target'}; inspect before a")
+                now = float(clock())
+                if (
+                    reason != last_hold_reason
+                    or now - last_hold_message_at >= 1.0
+                ):
+                    emit(
+                        f"[RM65→B601] held: {reason or 'bridge rejected the target'}; "
+                        "inspect before a"
+                    )
+                    last_hold_reason = reason
+                    last_hold_message_at = now
+            else:
+                last_hold_reason = None
             next_tick += period
             completed_at = float(clock())
             if next_tick <= completed_at:
