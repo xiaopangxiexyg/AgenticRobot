@@ -233,6 +233,9 @@ def run_rm65_to_b601_foreground(
                     "source_state_read_timestamp_monotonic": source_state.get(
                         "hardware_read_timestamp_monotonic"
                     ),
+                    "source_state_read_phase_timing": source_state.get(
+                        "hardware_read_phase_timing"
+                    ),
                     "source_state_background_streaming": source_state.get(
                         "background_streaming"
                     ),
@@ -317,6 +320,15 @@ def run_rm65_to_b601_foreground(
                 retarget_elapsed_sec=getattr(tick, "retarget_elapsed_sec", 0.0),
                 position_step_elapsed_sec=getattr(tick, "position_step_elapsed_sec", 0.0),
                 step_elapsed_sec=getattr(tick, "step_elapsed_sec", 0.0),
+                source_receive_monotonic_sec=getattr(
+                    tick, "source_receive_monotonic_sec", None
+                ),
+                target_dispatch_monotonic_sec=getattr(
+                    tick, "target_dispatch_monotonic_sec", None
+                ),
+                source_to_target_dispatch_latency_sec=getattr(
+                    tick, "source_to_target_dispatch_latency_sec", None
+                ),
                 **source_debug,
                 **position_debug,
             )

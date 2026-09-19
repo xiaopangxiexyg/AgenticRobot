@@ -32,6 +32,7 @@ from robot_motion.rebot_b601_rs import (
 )
 from sim.mujoco.rebot_b601_rs import (
     B601_RS_DEFAULT_ARM_QPOS,
+    B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S,
     B601_RS_SIM_ARM_KEY,
     B601JointPositionCommand,
     B601PositionDriver,
@@ -76,7 +77,9 @@ class RM65ToB601FreeDriveSimConfig:
         1.0,
     )
     rotation_gain: float = 1.0
-    target_velocity_limit_rad_s: float = 2.5
+    target_velocity_limit_rad_s: float = (
+        B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S
+    )
     source_poll_hz: float = 20.0
     maximum_source_age_sec: float = 0.25
     maximum_receive_age_sec: float = 0.25
@@ -136,6 +139,9 @@ class RM65ToB601FreeDriveTick:
     retarget_elapsed_sec: float = 0.0
     position_step_elapsed_sec: float = 0.0
     step_elapsed_sec: float = 0.0
+    source_receive_monotonic_sec: float | None = None
+    target_dispatch_monotonic_sec: float | None = None
+    source_to_target_dispatch_latency_sec: float | None = None
 
     def __post_init__(self) -> None:
         if self.state not in RM65_TO_B601_FREE_DRIVE_STATES:
@@ -181,6 +187,8 @@ class RM65ToB601FreeDriveBridge:
         self._next_source_poll_time_sec = 0.0
         self._source_poll_clock: Callable[[], float] | None = None
         self._next_source_poll_clock_sec: float | None = None
+        self._telemetry_clock: Callable[[], float] = time.monotonic
+        self._pending_source_receive_monotonic_sec: float | None = None
         self._last_source_step: RM65FreeDriveStep | None = None
         self._last_retarget_result: RM65ToB601RetargetResult | None = None
         self._last_rejection_reason: str | None = None
@@ -205,6 +213,7 @@ class RM65ToB601FreeDriveBridge:
         if clock is not None and not callable(clock):
             raise TypeError("source poll clock must be callable or None")
         self._source_poll_clock = clock
+        self._telemetry_clock = time.monotonic if clock is None else clock
         self._next_source_poll_clock_sec = None
 
     @property
@@ -350,6 +359,9 @@ class RM65ToB601FreeDriveBridge:
         retarget_elapsed_sec = 0.0
         position_step_elapsed_sec = 0.0
         tick_rejection_reason: str | None = None
+        source_receive_monotonic_sec: float | None = None
+        target_dispatch_monotonic_sec: float | None = None
+        source_to_target_dispatch_latency_sec: float | None = None
         if self._state == "active" and self._source_poll_due():
             source_started = time.perf_counter()
             source_step = self.source.step()
@@ -366,6 +378,9 @@ class RM65ToB601FreeDriveBridge:
                 )
                 self._enter_held(tick_rejection_reason)
             else:
+                source_receive_monotonic_sec = (
+                    source_step.sample.receive_timestamp_monotonic_sec
+                )
                 retarget_started = time.perf_counter()
                 seed_qpos = self._ik_seed_qpos_rad
                 if seed_qpos is None:
@@ -392,9 +407,13 @@ class RM65ToB601FreeDriveBridge:
                         receive_timestamp_sec=source_step.sample.receive_timestamp_sec,
                         qpos=retarget_result.qpos_rad,
                     )
+                    self._pending_source_receive_monotonic_sec = (
+                        source_step.sample.receive_timestamp_monotonic_sec
+                    )
                     self._last_rejection_reason = None
                 else:
                     self._pending_command = None
+                    self._pending_source_receive_monotonic_sec = None
                     self.retargeter.clear_anchor()
                     tick_rejection_reason = (
                         retarget_result.rejection_reason
@@ -408,11 +427,22 @@ class RM65ToB601FreeDriveBridge:
         position_step_elapsed_sec = max(0.0, time.perf_counter() - position_started)
         if command is not None:
             if position_tick.command_applied:
+                pending_receive = self._pending_source_receive_monotonic_sec
+                dispatch_time = float(self._telemetry_clock())
+                if math.isfinite(dispatch_time):
+                    target_dispatch_monotonic_sec = dispatch_time
+                    if pending_receive is not None and math.isfinite(pending_receive):
+                        latency = dispatch_time - pending_receive
+                        if math.isfinite(latency) and latency >= 0.0:
+                            source_to_target_dispatch_latency_sec = latency
+                source_receive_monotonic_sec = pending_receive
                 self._pending_command = None
+                self._pending_source_receive_monotonic_sec = None
             else:
                 # A lower-owner rejection is terminal for this source target;
                 # retrying the same qpos would replay a possibly stale command.
                 self._pending_command = None
+                self._pending_source_receive_monotonic_sec = None
                 self.retargeter.clear_anchor()
                 tick_rejection_reason = (
                     position_tick.rejection_reason or "position driver rejected the target"
@@ -431,10 +461,16 @@ class RM65ToB601FreeDriveBridge:
             retarget_elapsed_sec=retarget_elapsed_sec,
             position_step_elapsed_sec=position_step_elapsed_sec,
             step_elapsed_sec=max(0.0, time.perf_counter() - step_started),
+            source_receive_monotonic_sec=source_receive_monotonic_sec,
+            target_dispatch_monotonic_sec=target_dispatch_monotonic_sec,
+            source_to_target_dispatch_latency_sec=(
+                source_to_target_dispatch_latency_sec
+            ),
         )
 
     def _clear_target(self) -> None:
         self._pending_command = None
+        self._pending_source_receive_monotonic_sec = None
         self._last_retarget_result = None
         self._ik_seed_qpos_rad = None
         self.retargeter.clear_anchor()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from control_station.sim_hil_profile.rm65_b601_free_drive import (
     RM65FreeDriveAdmissionError,
@@ -16,12 +17,16 @@ from robot_motion.rebot_b601_rs import (
 from sim.mujoco.rebot_b601_rs import B601PositionTick
 
 
-def _sample(sequence: int) -> RM65FreeDriveSample:
+def _sample(
+    sequence: int,
+    *,
+    receive_timestamp_monotonic_sec: float = 20.0,
+) -> RM65FreeDriveSample:
     return RM65FreeDriveSample(
         sequence=sequence,
         source_timestamp_sec=10.0,
         receive_timestamp_sec=10.0,
-        receive_timestamp_monotonic_sec=20.0,
+        receive_timestamp_monotonic_sec=receive_timestamp_monotonic_sec,
         qpos_rad=(0.0, 0.1, 0.2, 0.3, 0.4, 0.5),
         pose_source_reference_source_controlled=tuple(
             tuple(float(item) for item in row)
@@ -134,10 +139,17 @@ class _RejectingRetargeter(_Retargeter):
         )
 
 
-def _admitted(sequence: int) -> RM65FreeDriveStep:
+def _admitted(
+    sequence: int,
+    *,
+    receive_timestamp_monotonic_sec: float = 20.0,
+) -> RM65FreeDriveStep:
     return RM65FreeDriveStep(
         state={},
-        sample=_sample(sequence),
+        sample=_sample(
+            sequence,
+            receive_timestamp_monotonic_sec=receive_timestamp_monotonic_sec,
+        ),
         rejection_reason=None,
     )
 
@@ -249,6 +261,33 @@ def test_live_source_poll_clock_is_not_slowed_by_simulation_clock() -> None:
     assert source.steps is not None
 
 
+def test_bridge_reports_source_to_target_dispatch_latency() -> None:
+    source = _Source(
+        [
+            _admitted(1),
+            _admitted(2, receive_timestamp_monotonic_sec=10.0005),
+        ]
+    )
+    driver = _Driver()
+    retargeter = _Retargeter()
+    now = [10.0]
+    bridge = _bridge(
+        source,
+        driver,
+        retargeter,
+        source_poll_clock=lambda: now[0],
+    )
+
+    bridge.activate()
+    now[0] = 10.001
+    tick = bridge.step()
+
+    assert tick.position_tick.command_applied
+    assert tick.source_receive_monotonic_sec == pytest.approx(10.0005)
+    assert tick.target_dispatch_monotonic_sec == pytest.approx(10.001)
+    assert tick.source_to_target_dispatch_latency_sec == pytest.approx(0.0005)
+
+
 def test_bridge_seeds_ik_from_last_accepted_target_not_measured_qpos() -> None:
     source = _Source([_admitted(1), _admitted(2), _admitted(3)])
     driver = _Driver()
@@ -296,4 +335,4 @@ def test_sim_config_keeps_reverse_gain_explicit() -> None:
     )
     assert config.translation_gain_target_reference_xyz == (1.5, 1.0, 0.75)
     assert config.rotation_gain == 0.8
-    assert config.target_velocity_limit_rad_s == 2.5
+    assert config.target_velocity_limit_rad_s == 5.0

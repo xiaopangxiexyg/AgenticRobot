@@ -27,6 +27,7 @@ from control_station.sources.rm65_free_drive import (
     RM65FreeDriveSource,
     RM65FreeDriveSourceSpec,
 )
+from sim.mujoco.rebot_b601_rs import B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S
 from teleop_runtime.backends.arms.rm65 import (
     RM65ArmBackend,
     RM65ArmBackendConfig,
@@ -153,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--target-velocity-limit-rad-s",
         type=_positive,
-        default=2.5,
+        default=B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S,
         help=(
             "simulation-only per-joint MuJoCo target slew limit; does not "
             "change any RM65/B601 hardware limit"

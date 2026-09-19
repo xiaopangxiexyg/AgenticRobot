@@ -107,6 +107,53 @@ held 提示会记录 `bridge_rejection_reason`、IK status/iterations/errors、I
 qpos、source measurement flags/sequence 以及各阶段耗时；在拿到这一证据前，不应放宽
 workspace、freshness 或 IK 安全门。
 
+### 现场延迟测量契约（RM65 qpos → B601 MuJoCo target）
+
+仿真目标限速的默认值已按现场观察调整为 `5.0 rad/s`。它是 MuJoCo
+`B601PositionDriver` 的可调、仿真专用 target slew limit，不改变 RM65 或 B601
+真机的任何速度/力矩限制；现场仍可通过
+`--target-velocity-limit-rad-s` 显式覆盖。
+
+每个 `bridge_step` 事件现在额外记录：
+
+- `source_receive_monotonic_sec`：本次被接受的 RM65 硬件读状态完成时间戳；
+- `target_dispatch_monotonic_sec`：该 retarget qpos 被 B601 MuJoCo position
+  driver 接受的时间戳；
+- `source_to_target_dispatch_latency_sec`：上述两者之差；只有真实发生
+  `command_applied=true` 时才有值；
+- `source_state_read_phase_timing`：RM65 backend 的 SDK、解析/校验、重试等读状态
+  阶段耗时，用于把 source 读取成本与 retarget/driver 成本分开。
+
+因此该主指标测量的是“RM65 状态读完成 → B601 MuJoCo target driver 接受”，不把
+RM65 反馈在读之前已经积累的 measurement age、MuJoCo viewer 刷新或仿真机械臂的
+物理响应混入。它不是 B601 真机执行延迟；真机阶段还必须独立记录 CAN/driver
+ack 与实际反馈。
+
+作为新字段上线前的基线，2026-09-19 的现场日志（尚未记录主指标）显示：RM65
+读状态间隔平均 `57.04 ms`、p95 `60.76 ms`；source read+校验平均 `6.33 ms`、
+p95 `8.97 ms`；连续 seed IK 平均 `0.919 ms`、p95 `1.081 ms`；position step
+p95 `0.137 ms`。因此在该日志中“读完成后到目标接受”只能估算为约 `7--10 ms`
+（不能当作精确验收值），而整体操作者动作到下一次目标的主要等待来自约 `57 ms`
+的 source 间隔。新日志必须使用 `source_to_target_dispatch_latency_sec` 取代
+这个估算。
+
+现场日志可用下面的离线报告得到 p50/p95/p99/max，并同时查看 source read、IK
+retarget 和 position-driver 各阶段：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$PY" \
+  scripts/probes/report_rm65_b601_reverse_latency.py \
+  "$RUN/gui.log" \
+  --output "$RUN/reverse_latency_report.json"
+```
+
+判读顺序固定为：先看 `source_to_target_dispatch_latency_sec`，再看
+`source_step_elapsed_sec` 与 `retarget_elapsed_sec`。若主指标稳定而
+`sim_slew_limited` 比例高，瓶颈是 target slew；若 source read 或 retarget p95
+接近/超过 20 Hz 的 50 ms 周期，才考虑 latest-only 读取/IK worker。任何 worker
+仍必须在主线程重新检查 sequence、freshness、frame 和 fail-closed rejection，
+不能用旧 qpos 或静默重试掩盖延迟。
+
 这次具体拒绝是一次有效样本上的 `ik_rejected:line_search_stalled`：source 已准入、
 Jacobian 条件数约为 10，随后才进入 `held`。首个假设是上一版每次用 MuJoCo 实测
 qpos 作为 IK seed；位置伺服的动态/目标 slew 滞后使 seed 落后于最近已接受目标，连续

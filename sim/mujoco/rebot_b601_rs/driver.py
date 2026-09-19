@@ -23,7 +23,7 @@ from .scene import (
 )
 
 B601_RS_JOINT_POSITION_FRAME = "b601_rs/joint_position"
-B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S = 2.5
+B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S = 5.0
 
 
 def default_b601_position_timing() -> TimingSpec:
