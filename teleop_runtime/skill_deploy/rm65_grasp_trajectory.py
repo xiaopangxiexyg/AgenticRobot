@@ -79,7 +79,8 @@ class RM65GraspTrajectoryPlanningConfig:
     approach_waypoint_spacing_m: float = 0.005
     maximum_approach_joint_step_rad: float = float(np.deg2rad(12.0))
     maximum_approach_lateral_error_m: float = 0.002
-    maximum_approach_orientation_error_deg: float = 1.0
+    pregrasp_orientation_tolerance_deg: float = 3.0
+    maximum_approach_orientation_error_deg: float = 3.0
     approach_progress_tolerance_m: float = 0.0005
     maximum_endpoint_solve_cycles: int = 180
     endpoint_seed_count: int = 24
@@ -117,6 +118,7 @@ class RM65GraspTrajectoryPlanningConfig:
             "approach_waypoint_spacing_m",
             "maximum_approach_joint_step_rad",
             "maximum_approach_lateral_error_m",
+            "pregrasp_orientation_tolerance_deg",
             "maximum_approach_orientation_error_deg",
             "approach_progress_tolerance_m",
             "endpoint_position_tolerance_m",
@@ -135,6 +137,21 @@ class RM65GraspTrajectoryPlanningConfig:
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
             object.__setattr__(self, name, value)
+        if (
+            self.pregrasp_orientation_tolerance_deg
+            > self.maximum_approach_orientation_error_deg
+        ):
+            raise ValueError(
+                "pregrasp orientation tolerance must fit the approach bound."
+            )
+        if (
+            self.pregrasp_orientation_tolerance_deg
+            < self.endpoint_orientation_tolerance_deg
+        ):
+            raise ValueError(
+                "pregrasp orientation tolerance must not be stricter than "
+                "the terminal endpoint tolerance."
+            )
         if self.singularity_soft_margin_deg <= RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG:
             raise ValueError(
                 "singularity_soft_margin_deg must exceed the hard threshold."
@@ -1437,6 +1454,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         prefer_closest_tolerance: bool = True,
+        orientation_tolerance_deg: float | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
@@ -1446,6 +1464,7 @@ class RM65GraspJointTrajectoryPlanner:
                 side=side,
                 target_tool_tcp_world=target_tool_tcp_world,
                 prefer_closest_tolerance=prefer_closest_tolerance,
+                orientation_tolerance_deg=orientation_tolerance_deg,
                 deadline=deadline,
                 monotonic=monotonic,
             )
@@ -1695,6 +1714,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         prefer_closest_tolerance: bool = True,
+        orientation_tolerance_deg: float | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
@@ -1713,6 +1733,18 @@ class RM65GraspJointTrajectoryPlanner:
             sides=(side,),
             phase="target",
         )
+        effective_orientation_tolerance_deg = (
+            self.config.endpoint_orientation_tolerance_deg
+            if orientation_tolerance_deg is None
+            else float(orientation_tolerance_deg)
+        )
+        if (
+            not math.isfinite(effective_orientation_tolerance_deg)
+            or effective_orientation_tolerance_deg <= 0.0
+        ):
+            raise ValueError(
+                "orientation_tolerance_deg must be finite and positive."
+            )
         inactive = "right" if side == "left" else "left"
         attempts: list[dict[str, object]] = []
         accepted: list[_EndpointIKCandidate] = []
@@ -1764,7 +1796,7 @@ class RM65GraspJointTrajectoryPlanner:
                 continue
             if (
                 position <= self.config.endpoint_position_tolerance_m
-                and orientation <= self.config.endpoint_orientation_tolerance_deg
+                and orientation <= effective_orientation_tolerance_deg
             ):
                 if not self._qpos_is_within_target_envelope(
                     candidate,
@@ -1863,7 +1895,7 @@ class RM65GraspJointTrajectoryPlanner:
                 float(item["best_position_residual_m"])
                 / self.config.endpoint_position_tolerance_m,
                 float(item["best_orientation_residual_deg"])
-                / self.config.endpoint_orientation_tolerance_deg,
+                / effective_orientation_tolerance_deg,
             ),
         )
         raise RM65GraspTrajectoryPlanningError(
@@ -1878,6 +1910,8 @@ class RM65GraspJointTrajectoryPlanner:
                 "maximum_cycles_per_seed": (self.config.maximum_endpoint_solve_cycles),
                 "endpoint_solver": "scipy_least_squares_fk_multistart",
                 "solve_unit": "function_evaluations",
+                "position_tolerance_m": self.config.endpoint_position_tolerance_m,
+                "orientation_tolerance_deg": effective_orientation_tolerance_deg,
                 "attempts": attempts,
             },
         )
@@ -2425,6 +2459,15 @@ class RM65GraspJointTrajectoryPlanner:
 
         with self._solver_lock:
             for waypoint_index, target in enumerate(targets, start=1):
+                approach_progress = float(waypoint_index) / float(len(targets))
+                orientation_tolerance_deg = (
+                    self.config.endpoint_orientation_tolerance_deg
+                    + (1.0 - approach_progress)
+                    * (
+                        self.config.pregrasp_orientation_tolerance_deg
+                        - self.config.endpoint_orientation_tolerance_deg
+                    )
+                )
                 if deadline is not None:
                     self._remaining_path_planning_time_sec(
                         deadline=deadline,
@@ -2469,11 +2512,12 @@ class RM65GraspJointTrajectoryPlanner:
                     "solve_cycles": cycles,
                     "position_residual_m": position,
                     "orientation_residual_deg": orientation,
+                    "orientation_tolerance_deg": orientation_tolerance_deg,
                 }
                 attempts.append(attempt)
                 if (
                     position > self.config.endpoint_position_tolerance_m
-                    or orientation > self.config.endpoint_orientation_tolerance_deg
+                    or orientation > orientation_tolerance_deg
                 ):
                     attempt["outcome"] = "ik_search_exhausted"
                     raise RM65GraspTrajectoryPlanningError(
@@ -2484,7 +2528,7 @@ class RM65GraspJointTrajectoryPlanner:
                                 self.config.endpoint_position_tolerance_m
                             ),
                             "endpoint_orientation_tolerance_deg": (
-                                self.config.endpoint_orientation_tolerance_deg
+                                orientation_tolerance_deg
                             ),
                             "attempts": attempts,
                         },
@@ -2630,6 +2674,9 @@ class RM65GraspJointTrajectoryPlanner:
                 side=side,
                 target_tool_tcp_world=pregrasp_tool_tcp_world,
                 prefer_closest_tolerance=False,
+                orientation_tolerance_deg=(
+                    self.config.pregrasp_orientation_tolerance_deg
+                ),
                 deadline=deadline,
                 monotonic=monotonic,
             )
