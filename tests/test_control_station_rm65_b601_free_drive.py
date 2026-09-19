@@ -43,8 +43,11 @@ class _Source:
 
 
 class _Scene:
+    def __init__(self) -> None:
+        self.qpos = np.asarray((0.0, 1.0, 1.0, 0.0, 0.0, 0.0), dtype=float)
+
     def get_arm_qpos(self, _side: str) -> np.ndarray:
-        return np.asarray((0.0, 1.0, 1.0, 0.0, 0.0, 0.0), dtype=float)
+        return self.qpos.copy()
 
 
 class _Driver:
@@ -85,6 +88,7 @@ class _Retargeter:
     def __init__(self) -> None:
         self.anchor_captures = 0
         self.clears = 0
+        self.seeds: list[tuple[float, ...]] = []
 
     def capture_anchor(self, sample, *, target_qpos_rad) -> None:
         self.anchor_captures += 1
@@ -93,6 +97,7 @@ class _Retargeter:
         self.clears += 1
 
     def retarget(self, sample, *, seed_qpos_rad):
+        self.seeds.append(tuple(float(value) for value in seed_qpos_rad))
         result = B601IKResult(
             success=True,
             status="converged",
@@ -242,6 +247,32 @@ def test_live_source_poll_clock_is_not_slowed_by_simulation_clock() -> None:
     second = bridge.step()
     assert second.source_step is not None
     assert source.steps is not None
+
+
+def test_bridge_seeds_ik_from_last_accepted_target_not_measured_qpos() -> None:
+    source = _Source([_admitted(1), _admitted(2), _admitted(3)])
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = _bridge(source, driver, retargeter)
+
+    bridge.activate()
+    bridge.step()
+    first = bridge.step()
+    assert first.retarget_result is not None
+    assert first.retarget_result.accepted
+
+    # The simulated plant can lag far behind the accepted position target.
+    # The next IK solve must remain continuous instead of reseeding from this
+    # lagging measured state.
+    driver.scene.qpos = np.asarray((1.0, 1.0, 1.0, 0.0, 0.0, 0.0), dtype=float)
+    second = bridge.step()
+    assert second.retarget_result is not None
+    assert second.retarget_result.accepted
+    assert len(retargeter.seeds) == 2
+    np.testing.assert_allclose(
+        retargeter.seeds[1],
+        (0.01, 1.01, 1.01, 0.01, 0.01, 0.01),
+    )
 
 
 def test_retarget_rejection_is_exposed_and_latches_held_reason() -> None:

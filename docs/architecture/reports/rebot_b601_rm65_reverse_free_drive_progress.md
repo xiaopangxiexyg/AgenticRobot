@@ -21,7 +21,9 @@
   - 复用已有 B601/RM65 `CoordinateFrameGraph`，通过图的逆向解析实现
     `RM65 right_arm_base/tool_tcp → B601 base_link/gripper_end`，没有复制矩阵
     约定或另建坐标系。
-  - 采用显式 source/target anchor、平移/旋转 gain、freshness 和连续 seed。
+  - 采用显式 source/target anchor、平移/旋转 gain、freshness 和连续 seed；连续
+    seed 由桥接层保存的上一条已接受 IK qpos 提供，不使用可能因位置伺服滞后而落后的
+    MuJoCo 实测 qpos。
   - 复用 `B601DampedLeastSquaresIK`；IK 失败、过期样本、重复 sequence 或
     frame/clock 不匹配只返回 rejection，不产生旧 qpos fallback。
   - 输出仍是纯 qpos candidate；不直接调用硬件或 MuJoCo。后续应用层应把成功
@@ -101,8 +103,16 @@ IK 也在同一前台 tick 同步执行，因此会进一步造成可见延迟�
 网络断线，而是当前目标被 retarget/IK 门拒绝后按 fail-closed 契约撤销 pending
 target。此前前台只打印了泛化的 `bridge rejected the target`，无法知道是
 `ik_rejected:*`、source freshness 还是 driver rejection。现在日志和首次/周期性
-held 提示会记录 `bridge_rejection_reason`、IK status/iterations/errors 以及各阶段
-耗时；在拿到这一证据前，不应放宽 workspace、freshness 或 IK 安全门。
+held 提示会记录 `bridge_rejection_reason`、IK status/iterations/errors、IK seed/结果
+qpos、source measurement flags/sequence 以及各阶段耗时；在拿到这一证据前，不应放宽
+workspace、freshness 或 IK 安全门。
+
+这次具体拒绝是一次有效样本上的 `ik_rejected:line_search_stalled`：source 已准入、
+Jacobian 条件数约为 10，随后才进入 `held`。根因是上一版每次用 MuJoCo 实测 qpos
+作为 IK seed；位置伺服的动态/目标 slew 滞后使 seed 落后于最近已接受目标，连续拖动
+时容易跨入不利的局部数值 basin。当前桥接器改为“首次激活或 recenter 使用实测
+qpos，之后使用上一条已接受 IK qpos”，不改变 source freshness、joint limits、
+driver slew 或 fail-closed rejection 契约。
 
 这次修复仍没有引入后台 source/IK worker：live RM65 SDK 读取和 IK 的同步耗时先
 通过上述字段量化。若实测单次 source+IK 超过 source period，再单独设计 latest-only

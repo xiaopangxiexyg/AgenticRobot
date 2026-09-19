@@ -470,6 +470,11 @@ class RM65ToB601Retargeter:
                 target_pose[:3, :3] @ seed_pose[:3, :3].T
             ).as_rotvec()
             diagnostics = {
+                # Keep the solver input/output in the 20 Hz source event.  A
+                # live bridge must be able to distinguish a source dropout
+                # from a numerically rejected target without reconstructing
+                # state from the high-rate MuJoCo ticks.
+                "ik_seed_qpos_rad": tuple(float(value) for value in seed),
                 "target_seed_translation_delta_m": float(
                     np.linalg.norm(target_pose[:3, 3] - seed_pose[:3, 3])
                 ),
@@ -491,6 +496,7 @@ class RM65ToB601Retargeter:
                     diagnostics=diagnostics,
                 )
             qpos = _finite_qpos(ik_result.qpos, name="ik_result.qpos")
+            diagnostics["ik_result_qpos_rad"] = qpos
         except (TypeError, ValueError, RuntimeError) as exc:
             return self._rejected(sample, f"retarget_rejected:{type(exc).__name__}:{exc}")
         return RM65ToB601RetargetResult(

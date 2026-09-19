@@ -210,16 +210,55 @@ def run_rm65_to_b601_foreground(
                 and not retarget_result.accepted
             )
             source_debug = {}
-            if rejected_source:
-                assert tick.source_step is not None
-                assert tick.source_step.sample is not None
-                source_sample = tick.source_step.sample
+            if tick.source_step is not None:
+                source_state = tick.source_step.state
                 source_debug = {
-                    "debug_source_sequence": source_sample.sequence,
-                    "debug_source_qpos_rad": source_sample.qpos_rad,
-                    "debug_source_pose": (
-                        source_sample.pose_source_reference_source_controlled
+                    # These fields are present only on the low-rate source
+                    # event, not on every 1 kHz physics tick.  They make a
+                    # real dropout distinguishable from a valid sample that
+                    # later failed IK.
+                    "source_step_rejection_reason": tick.source_step.rejection_reason,
+                    "source_state_measurement_sequence": source_state.get(
+                        "hardware_measurement_sequence"
                     ),
+                    "source_state_measurement_valid": source_state.get(
+                        "hardware_measurement_valid"
+                    ),
+                    "source_state_read_success": source_state.get(
+                        "hardware_read_success"
+                    ),
+                    "source_state_measurement_timestamp": source_state.get(
+                        "hardware_measurement_timestamp"
+                    ),
+                    "source_state_read_timestamp_monotonic": source_state.get(
+                        "hardware_read_timestamp_monotonic"
+                    ),
+                    "source_state_background_streaming": source_state.get(
+                        "background_streaming"
+                    ),
+                }
+                if rejected_source:
+                    assert tick.source_step.sample is not None
+                    source_sample = tick.source_step.sample
+                    source_debug.update(
+                        {
+                            "debug_source_sequence": source_sample.sequence,
+                            "debug_source_qpos_rad": source_sample.qpos_rad,
+                            "debug_source_pose": (
+                                source_sample.pose_source_reference_source_controlled
+                            ),
+                        }
+                    )
+            position_debug = {}
+            if tick.source_step is not None or position_tick.rejection_reason is not None:
+                position_debug = {
+                    "sim_measured_qpos_rad": position_tick.measured_qpos,
+                    "sim_measured_qvel_rad_s": position_tick.measured_qvel,
+                    "sim_target_qpos_rad": position_tick.target_qpos,
+                    "sim_actuator_target_qpos_rad": position_tick.actuator_target_qpos,
+                    "sim_slew_limited": position_tick.slew_limited,
+                    "sim_slew_limit_ratio": position_tick.slew_limit_ratio,
+                    "sim_accepted_sequence": position_tick.accepted_sequence,
                 }
             event(
                 "bridge_step",
@@ -272,11 +311,14 @@ def run_rm65_to_b601_foreground(
                 ik_target_pose_candidate=retarget_diagnostics.get(
                     "target_pose_candidate"
                 ),
+                ik_seed_qpos_rad=retarget_diagnostics.get("ik_seed_qpos_rad"),
+                ik_result_qpos_rad=retarget_diagnostics.get("ik_result_qpos_rad"),
                 source_step_elapsed_sec=getattr(tick, "source_step_elapsed_sec", 0.0),
                 retarget_elapsed_sec=getattr(tick, "retarget_elapsed_sec", 0.0),
                 position_step_elapsed_sec=getattr(tick, "position_step_elapsed_sec", 0.0),
                 step_elapsed_sec=getattr(tick, "step_elapsed_sec", 0.0),
                 **source_debug,
+                **position_debug,
             )
             if tick.state == "held":
                 reason = (

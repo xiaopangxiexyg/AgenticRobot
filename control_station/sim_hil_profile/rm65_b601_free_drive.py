@@ -184,6 +184,13 @@ class RM65ToB601FreeDriveBridge:
         self._last_source_step: RM65FreeDriveStep | None = None
         self._last_retarget_result: RM65ToB601RetargetResult | None = None
         self._last_rejection_reason: str | None = None
+        # IK must follow the last accepted target, not the measured MuJoCo
+        # qpos.  The position plant intentionally has dynamics and slew
+        # lag; using its measured state as the next seed can move the solver
+        # onto a different local basin while the source target is still
+        # perfectly valid.  A measured qpos is used only for the first anchor
+        # (or after an explicit clutch/recenter).
+        self._ik_seed_qpos_rad: tuple[float, ...] | None = None
         self.set_source_poll_clock(source_poll_clock)
 
     def set_source_poll_clock(self, clock: Callable[[], float] | None) -> None:
@@ -265,13 +272,18 @@ class RM65ToB601FreeDriveBridge:
                 source_step.rejection_reason or "RM65 source did not provide an anchor"
             )
         try:
+            anchor_qpos = tuple(
+                float(value)
+                for value in self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY)
+            )
             self.retargeter.capture_anchor(
                 source_step.sample,
-                target_qpos_rad=self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY),
+                target_qpos_rad=anchor_qpos,
             )
         except (TypeError, ValueError, RuntimeError) as exc:
             self._enter_held(str(exc))
             raise RM65FreeDriveAdmissionError(str(exc)) from exc
+        self._ik_seed_qpos_rad = anchor_qpos
         self._state = "active"
         self._schedule_next_source_poll()
 
@@ -301,13 +313,18 @@ class RM65ToB601FreeDriveBridge:
                 source_step.rejection_reason or "RM65 source did not provide a recenter anchor"
             )
         try:
+            anchor_qpos = tuple(
+                float(value)
+                for value in self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY)
+            )
             self.retargeter.capture_anchor(
                 source_step.sample,
-                target_qpos_rad=self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY),
+                target_qpos_rad=anchor_qpos,
             )
         except (TypeError, ValueError, RuntimeError) as exc:
             self._enter_held(str(exc))
             raise RM65FreeDriveAdmissionError(str(exc)) from exc
+        self._ik_seed_qpos_rad = anchor_qpos
         self._state = "active"
         self._schedule_next_source_poll()
 
@@ -350,14 +367,25 @@ class RM65ToB601FreeDriveBridge:
                 self._enter_held(tick_rejection_reason)
             else:
                 retarget_started = time.perf_counter()
+                seed_qpos = self._ik_seed_qpos_rad
+                if seed_qpos is None:
+                    # Defensive fallback for injected/test drivers that enter
+                    # active without going through activate().
+                    seed_qpos = tuple(
+                        float(value)
+                        for value in self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY)
+                    )
                 retarget_result = self.retargeter.retarget(
                     source_step.sample,
-                    seed_qpos_rad=self.driver.scene.get_arm_qpos(B601_RS_SIM_ARM_KEY),
+                    seed_qpos_rad=seed_qpos,
                 )
                 retarget_elapsed_sec = max(0.0, time.perf_counter() - retarget_started)
                 self._last_retarget_result = retarget_result
                 if retarget_result.accepted:
                     assert retarget_result.qpos_rad is not None
+                    self._ik_seed_qpos_rad = tuple(
+                        float(value) for value in retarget_result.qpos_rad
+                    )
                     self._pending_command = B601JointPositionCommand(
                         sequence=source_step.sample.sequence,
                         source_timestamp_sec=source_step.sample.source_timestamp_sec,
@@ -408,6 +436,7 @@ class RM65ToB601FreeDriveBridge:
     def _clear_target(self) -> None:
         self._pending_command = None
         self._last_retarget_result = None
+        self._ik_seed_qpos_rad = None
         self.retargeter.clear_anchor()
 
 
