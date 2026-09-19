@@ -18,11 +18,14 @@ from robot_motion.rebot_b601_rs import (
 )
 from sim.mujoco.rebot_b601_rs import (
     B601_RS_DEFAULT_ARM_QPOS,
+    B601_RS_DEFAULT_SIM_MAX_MEASURED_VELOCITY_RAD_S,
+    B601_RS_DEFAULT_SIM_MEASURED_VELOCITY_MARGIN_RATIO,
     B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S,
     B601_RS_GRIPPER_OPEN_QPOS,
     B601_RS_SIM_ARM_KEY,
     B601JointPositionCommand,
     B601PositionDriver,
+    b601_sim_measured_velocity_limit_rad_s,
     build_b601_mjcf_xml,
     build_b601_mujoco_scene,
 )
@@ -51,6 +54,12 @@ def _command(sequence: int, qpos, timestamp: float) -> B601JointPositionCommand:
         receive_timestamp_sec=timestamp,
         qpos=tuple(qpos),
     )
+
+
+@pytest.mark.parametrize("value", [True, 0.0, -1.0, float("nan")])
+def test_measured_velocity_envelope_rejects_invalid_target_limits(value) -> None:
+    with pytest.raises((TypeError, ValueError), match="finite and positive"):
+        b601_sim_measured_velocity_limit_rad_s(value)
 
 
 def test_command_rejects_boolean_sequence() -> None:
@@ -311,7 +320,7 @@ def test_large_position_step_tracks_without_target_spike_or_state_excursion(
         max_actuator_step
         <= B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S / 500.0 + 1e-12
     )
-    assert peak_measured_velocity < 2.0
+    assert peak_measured_velocity < B601_RS_DEFAULT_SIM_MAX_MEASURED_VELOCITY_RAD_S
     assert tick.driver_faulted is False
     assert tick.state_within_limits is True
     np.testing.assert_allclose(tick.measured_qpos, target, atol=2e-3)
@@ -411,6 +420,17 @@ def test_driver_metadata_reports_provisional_slew_and_state_guard() -> None:
         np.degrees([B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S] * 6),
     )
     assert profile["metadata"]["hardware_safety_claim"] is False
+    measured_envelope = metadata["measured_velocity_envelope"]
+    assert measured_envelope["max_velocity_rad_s"] == pytest.approx(
+        B601_RS_DEFAULT_SIM_MAX_MEASURED_VELOCITY_RAD_S
+    )
+    assert measured_envelope["response_margin_ratio"] == pytest.approx(
+        B601_RS_DEFAULT_SIM_MEASURED_VELOCITY_MARGIN_RATIO
+    )
+    assert measured_envelope["hardware_safety_claim"] is False
+    assert b601_sim_measured_velocity_limit_rad_s(
+        B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S
+    ) == pytest.approx(B601_RS_DEFAULT_SIM_MAX_MEASURED_VELOCITY_RAD_S)
 
 
 def test_ik_output_tracks_through_the_physical_position_servo(
