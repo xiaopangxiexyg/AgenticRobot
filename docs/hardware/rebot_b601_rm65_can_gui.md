@@ -216,6 +216,38 @@ JSON 的 `target_cleanup_completed` 只有 lower runtime 的 `close()` 成功返
 target gate 未 ready 或反馈能力不可用，GUI 会保持 held/inactive 并显示可重试原因，仍可按
 `a` 手动重试；旧 anchor 不会复用。
 
+## 一行前台启动器
+
+不需要每次粘贴一整段 shell 条件、路径和管道。仓库提供一个薄的操作启动器，它只负责解析
+本地默认路径、创建新的运行目录并调用上面的 canonical `control_station b601-rm65`；不会
+复制控制环、启动后台守护进程或在退出时关闭父 shell。请在一个已经打开的终端中运行：
+
+```bash
+cd /home/zc/HandMotion/Developing/AgenticRobot-development-mainline
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
+"$PY" scripts/hardware/rebot_b601_rm65_mujoco_follow.py
+```
+
+启动器默认使用 `REBOT_RS_CONFIG` 或相邻的
+`../reBotArm_control_py/config/rebotarm_rs.yaml`、150% canonical mapping profile，
+仿真反馈超时 `0.20 s`、source TTL `0.25 s`，自动以一帧新鲜 B601 pose 建立锚点并开始
+跟随；不会向真实 B601 发送使能、失能、位置、力矩或 active-report 命令。每次运行都会
+创建新的 `/tmp/b601-rs-commissioning/rm65-mujoco-follow-*/`，其中有 `gui_result.json`、
+`gui.log` 和实时镜像的 `terminal.log`。关闭 MuJoCo 窗口、按 `q` 或 Ctrl-C 后，启动器
+打印结果路径并返回当前 shell；若从会自动关闭的临时终端启动，可额外加
+`--pause-on-exit` 等待 Enter。
+
+现场只需改参数，不要复制长命令。例如旋转调试可以追加：
+
+```bash
+"$PY" scripts/hardware/rebot_b601_rm65_mujoco_follow.py \
+  --mapping-controlled-rotation-rpy-deg 0 0 90
+```
+
+若希望先摆位再按单键 `a` 激活，追加 `--manual-activate`；若要保留应用层单 tick
+位姿幅度预检，追加 `--keep-residual-envelope`。矩阵参数仍支持 9 个行主序数值，profile
+中的 `semantic_content_hash` 只是派生证据，不是现场调参门禁。
+
 ## 已修复的时序缺陷（2026-09-16）
 
 初次标准离线回归为 **50 passed、2 failed**；失败没有被忽略或改成 skip。
