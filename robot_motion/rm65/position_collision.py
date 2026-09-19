@@ -235,6 +235,10 @@ class RM65PositionCollisionPlannerConfig:
     collision_barrier_gain: float = DEFAULT_DUAL_ARM_COLLISION_BARRIER_GAIN
     collision_safe_displacement_gain: float = DEFAULT_DUAL_ARM_COLLISION_SAFE_DISPLACEMENT_GAIN
     collision_constraints_enabled: bool = True
+    # Real measured-qpos admission may refresh the solver's external FK cache.
+    # Keep the default false for simulation/replay, whose established planner
+    # path owns and recomputes its candidate state explicitly.
+    refresh_external_qpos_cache: bool = False
     max_joint_velocity_rad_s: tuple[float, ...] | Sequence[float] = (
         DEFAULT_POSITION_COLLISION_MAX_JOINT_VELOCITY_RAD_S
     )
@@ -260,6 +264,8 @@ class RM65PositionCollisionPlannerConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.collision_constraints_enabled, bool):
             raise TypeError("collision_constraints_enabled must be a bool.")
+        if not isinstance(self.refresh_external_qpos_cache, bool):
+            raise TypeError("refresh_external_qpos_cache must be a bool.")
         reference_hz = _finite_positive(self.reference_hz, name="reference_hz")
         scene_profile = str(self.scene_profile or DEFAULT_COLLISION_SCENE).strip()
         if not scene_profile:
@@ -1570,7 +1576,7 @@ class RM65PositionCollisionPlanner:
             reference = self._solver_current_q()
             full_q = self._embed_arm_qpos(reference, qpos)
             self._require_arm_qpos_within_limits(full_q, name="initial qpos")
-            self.solver.set_configuration_q(full_q.copy())
+            self._set_external_qpos(full_q)
             self._last_admitted_velocity_full = np.zeros_like(full_q)
             reset_motion_state = getattr(
                 self.solver,
@@ -2269,7 +2275,7 @@ class RM65PositionCollisionPlanner:
             reference_full_q = self._last_safe_full_q.copy()
             full_q = self._embed_arm_qpos(reference_full_q, committed)
             self._require_arm_qpos_within_limits(full_q, name="admitted qpos reference")
-            self.solver.set_configuration_q(full_q.copy())
+            self._set_external_qpos(full_q)
             self._commit_qp_admitted_velocity(
                 reference_full_q=reference_full_q,
                 admitted_full_q=full_q,
@@ -3035,6 +3041,19 @@ class RM65PositionCollisionPlanner:
         if current.size == 0 or not np.all(np.isfinite(current)):
             raise ValueError("dual-arm collision solver current_q must be finite and non-empty.")
         return current.copy()
+
+    def _set_external_qpos(self, full_q: np.ndarray) -> None:
+        """Set a caller-owned qpos, optionally refreshing the Pink FK cache."""
+
+        if self.config.refresh_external_qpos_cache:
+            rebase_configuration_q = getattr(
+                self.solver,
+                "rebase_configuration_q",
+                self.solver.set_configuration_q,
+            )
+            rebase_configuration_q(np.asarray(full_q, dtype=float).copy())
+            return
+        self.solver.set_configuration_q(np.asarray(full_q, dtype=float).copy())
 
     def _full_arm_tangent_limit(
         self,

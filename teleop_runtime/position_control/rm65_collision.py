@@ -106,6 +106,7 @@ def build_position_collision_planner_from_started_backends(
             scene_profile=str(scene_profile),
             collision_min_distance_m=float(collision_min_distance_m),
             collision_distance_epsilon_m=float(collision_distance_epsilon_m),
+            refresh_external_qpos_cache=True,
             max_joint_velocity_rad_s=_six_positive(
                 max_joint_velocity_rad_s,
                 name="max_joint_velocity_rad_s",
@@ -178,6 +179,7 @@ def build_official_all_ik_governor_from_started_backends(
         scene_profile=str(scene_profile),
         collision_min_distance_m=float(collision_min_distance_m),
         collision_distance_epsilon_m=float(collision_distance_epsilon_m),
+        refresh_external_qpos_cache=True,
         max_joint_velocity_rad_s=_six_positive(
             max_joint_velocity_rad_s,
             name="max_joint_velocity_rad_s",
