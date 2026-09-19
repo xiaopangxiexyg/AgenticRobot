@@ -118,6 +118,20 @@ def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
     assert target_steps and all(
         "status" in event and "source_reused" in event for event in target_steps
     )
+    bridge_steps = [
+        event for event in records if event.get("event") == "bridge_step"
+    ]
+    assert bridge_steps and all(
+        {
+            "source_receive_timestamp_sec",
+            "source_poll_elapsed_sec",
+            "session_step_elapsed_sec",
+            "target_step_elapsed_sec",
+            "source_to_target_dispatch_latency_sec",
+        }
+        <= event.keys()
+        for event in bridge_steps
+    )
     assert diagnostics[0]["max_receive_age_sec"] == 0.0
     assert diagnostics[0]["joint_receive_age_sec"]["joint1"] == 0.0
     assert diagnostics[0]["feedback_timeout_sec"] == 0.1

@@ -8,6 +8,7 @@ shadow evaluation is promoted, and no hardware command is issued here.
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
@@ -615,6 +616,7 @@ class B601RM65MotionSession:
         self._generation = 0
         self._last_residual_step: B601RM65ResidualStep | None = None
         self._last_source_reused = False
+        self._last_step_diagnostics: dict[str, object] = {}
 
     @property
     def state(self) -> str:
@@ -629,6 +631,17 @@ class B601RM65MotionSession:
         """Whether the latest step held one still-fresh source sample."""
 
         return self._last_source_reused
+
+    @property
+    def last_step_diagnostics(self) -> dict[str, object]:
+        """Return timing/lineage facts for the latest foreground source tick.
+
+        These are observational facts only.  They do not participate in source
+        admission, target safety, or dispatch, and callers receive a copy so a
+        log sink cannot mutate the session's state.
+        """
+
+        return dict(self._last_step_diagnostics)
 
     def activate(self) -> B601RM65MotionAnchor:
         """Explicitly engage from inactive/HOLD, always with new measured anchors."""
@@ -664,8 +677,40 @@ class B601RM65MotionSession:
             )
         assert self._anchor is not None
         self._last_source_reused = False
+        step_started = time.perf_counter()
+        diagnostics: dict[str, object] = {
+            "source_admitted": False,
+            "source_reused": False,
+            "proposal_accepted": False,
+        }
         try:
+            source_started = time.perf_counter()
+            diagnostics["source_poll_started_monotonic_sec"] = time.monotonic()
             projection = self.binding.source.poll_pose()
+            diagnostics["source_poll_completed_monotonic_sec"] = time.monotonic()
+            diagnostics["source_poll_elapsed_sec"] = max(
+                0.0, time.perf_counter() - source_started
+            )
+            source_state = projection.source_step.state
+            diagnostics.update(
+                {
+                    "source_sequence": source_state.sequence,
+                    "source_receive_timestamp_sec": (
+                        source_state.receive_timestamp_sec
+                    ),
+                    "source_observation_sample_id": (
+                        projection.source_observation_sample_id
+                    ),
+                    "source_admitted": projection.admitted,
+                    "feedback_poll_elapsed_sec": (
+                        projection.source_step.feedback_poll_elapsed_sec
+                    ),
+                    "fk_elapsed_sec": projection.source_step.fk_elapsed_sec,
+                    "emission_elapsed_sec": (
+                        projection.source_step.emission_elapsed_sec
+                    ),
+                }
+            )
             # Sample availability precedes adaptation; never stamp before polling.
             now = float(self.binding.runtime.clock())
             if self._can_reuse_latest_source(projection, now=now):
@@ -677,12 +722,17 @@ class B601RM65MotionSession:
                 assert self._last_residual_step is not None
                 step = self._last_residual_step
                 self._last_source_reused = True
+                diagnostics["source_reused"] = True
             else:
+                adapt_started = time.perf_counter()
                 step = self.binding.source.adapt(
                     projection,
                     anchor=self._anchor.master_anchor,
                     adapted_at=now,
                     adapted_clock_domain_id=self.binding.runtime.config.clock_domain_id,
+                )
+                diagnostics["source_adaptation_elapsed_sec"] = max(
+                    0.0, time.perf_counter() - adapt_started
                 )
                 if step.residual_available:
                     self._last_residual_step = step
@@ -697,6 +747,7 @@ class B601RM65MotionSession:
                     sample.measured_at if sample is not None else now
                 ) + self.binding.limits[0]
             assert effective_until is not None
+            submission_started = time.perf_counter()
             receipt = self.binding.submit(
                 step,
                 self._anchor,
@@ -704,11 +755,29 @@ class B601RM65MotionSession:
                 effective_until=effective_until,
                 allow_repeated_source=self._last_source_reused,
             )
+            diagnostics["proposal_submission_elapsed_sec"] = max(
+                0.0, time.perf_counter() - submission_started
+            )
+            diagnostics.update(
+                {
+                    "proposal_accepted": bool(receipt.accepted),
+                    "proposal_rejection_code": receipt.rejection_code,
+                    "proposal_message": receipt.message,
+                }
+            )
         except BaseException:
             # Cleanup only: including Ctrl-C, every interrupted source tick
             # withdraws the target reference before the original error escapes.
+            diagnostics["session_step_elapsed_sec"] = max(
+                0.0, time.perf_counter() - step_started
+            )
+            self._last_step_diagnostics = diagnostics
             self._hold("b601_motion_session_input_failure", state="held")
             raise
+        diagnostics["session_step_elapsed_sec"] = max(
+            0.0, time.perf_counter() - step_started
+        )
+        self._last_step_diagnostics = diagnostics
         if not receipt.accepted:
             self._hold("b601_motion_session_admission_rejected", state="held")
         return receipt

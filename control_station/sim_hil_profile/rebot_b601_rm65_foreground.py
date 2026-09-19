@@ -13,6 +13,7 @@ import os
 import select
 import sys
 import termios
+import time
 import tty
 from collections.abc import Callable, Mapping
 
@@ -347,9 +348,12 @@ def run_b601_rm65_foreground(
             now = float(clock())
             if now < next_tick:
                 continue
+            proposal_receipt = None
+            source_diagnostics: dict[str, object] = {}
+            session_step_started = time.perf_counter()
             if session.state == "active":
                 try:
-                    receipt = session.step()
+                    proposal_receipt = session.step()
                 except B601HardwareDependencyError as error:
                     # ``step`` has moved the session to held and cleared its
                     # anchor.  Keep advancing the lower target once below so
@@ -357,15 +361,118 @@ def run_b601_rm65_foreground(
                     # RM65 proposal.
                     recoverable_feedback_error("step", error)
                 else:
+                    source_diagnostics = session.last_step_diagnostics
                     event(
                         "proposal_admission",
-                        accepted=receipt.accepted,
-                        rejection_code=receipt.rejection_code,
-                        rejection_message=receipt.message,
+                        accepted=proposal_receipt.accepted,
+                        rejection_code=proposal_receipt.rejection_code,
+                        rejection_message=proposal_receipt.message,
+                        source_diagnostics=source_diagnostics,
                     )
-                    if not receipt.accepted:
-                        emit(f"[B601→RM65] held: {receipt.rejection_code}; inspect before a")
-            advance_target()
+                    if not proposal_receipt.accepted:
+                        emit(
+                            f"[B601→RM65] held: {proposal_receipt.rejection_code}; inspect before a"
+                        )
+            session_step_elapsed = max(
+                0.0, time.perf_counter() - session_step_started
+            )
+            target_details = advance_target()
+            if not isinstance(target_details, Mapping):
+                target_details = {}
+            source_diagnostics = (
+                source_diagnostics or session.last_step_diagnostics
+            )
+            bridge_step = {
+                "event": "bridge_step",
+                "state": session.state,
+                "source_admitted": source_diagnostics.get(
+                    "source_admitted", False
+                ),
+                "source_reused": bool(
+                    source_diagnostics.get("source_reused", False)
+                ),
+                "source_sequence": source_diagnostics.get("source_sequence"),
+                "source_receive_timestamp_sec": source_diagnostics.get(
+                    "source_receive_timestamp_sec"
+                ),
+                "source_observation_sample_id": source_diagnostics.get(
+                    "source_observation_sample_id"
+                ),
+                "source_poll_started_monotonic_sec": source_diagnostics.get(
+                    "source_poll_started_monotonic_sec"
+                ),
+                "source_poll_completed_monotonic_sec": source_diagnostics.get(
+                    "source_poll_completed_monotonic_sec"
+                ),
+                "source_poll_elapsed_sec": source_diagnostics.get(
+                    "source_poll_elapsed_sec"
+                ),
+                "feedback_poll_elapsed_sec": source_diagnostics.get(
+                    "feedback_poll_elapsed_sec"
+                ),
+                "fk_elapsed_sec": source_diagnostics.get("fk_elapsed_sec"),
+                "emission_elapsed_sec": source_diagnostics.get(
+                    "emission_elapsed_sec"
+                ),
+                "source_adaptation_elapsed_sec": source_diagnostics.get(
+                    "source_adaptation_elapsed_sec"
+                ),
+                "proposal_submission_elapsed_sec": source_diagnostics.get(
+                    "proposal_submission_elapsed_sec"
+                ),
+                "session_step_elapsed_sec": (
+                    source_diagnostics.get("session_step_elapsed_sec")
+                    if source_diagnostics.get("session_step_elapsed_sec") is not None
+                    else session_step_elapsed
+                ),
+                "proposal_accepted": (
+                    None
+                    if proposal_receipt is None
+                    else bool(proposal_receipt.accepted)
+                ),
+                "proposal_rejection_code": (
+                    None
+                    if proposal_receipt is None
+                    else proposal_receipt.rejection_code
+                ),
+                "target_dispatch_accepted": target_details.get(
+                    "target_dispatch_accepted", False
+                ),
+                "target_dispatch_monotonic_sec": target_details.get(
+                    "target_dispatch_monotonic_sec"
+                ),
+                "target_step_elapsed_sec": target_details.get(
+                    "target_step_elapsed_sec"
+                ),
+                "target_status": target_details.get("status"),
+                "target_resolution_failure": target_details.get(
+                    "resolution_failure"
+                ),
+            }
+            source_receive = bridge_step["source_receive_timestamp_sec"]
+            target_dispatch = bridge_step["target_dispatch_monotonic_sec"]
+            if (
+                isinstance(source_receive, (int, float))
+                and not isinstance(source_receive, bool)
+                and isinstance(target_dispatch, (int, float))
+                and not isinstance(target_dispatch, bool)
+                and math.isfinite(float(source_receive))
+                and math.isfinite(float(target_dispatch))
+                and float(target_dispatch) >= float(source_receive)
+            ):
+                bridge_step["source_to_target_dispatch_latency_sec"] = (
+                    float(target_dispatch) - float(source_receive)
+                )
+            else:
+                bridge_step["source_to_target_dispatch_latency_sec"] = None
+            event(
+                "bridge_step",
+                **{
+                    key: value
+                    for key, value in bridge_step.items()
+                    if key not in {"event", "state"}
+                },
+            )
             # Do not burst stale catch-up proposals after slow polling/IK.
             next_tick += period
             completed_at = float(clock())

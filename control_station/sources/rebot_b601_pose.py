@@ -9,6 +9,7 @@ six-joint snapshot and FK result pass their declared contracts.
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -162,6 +163,9 @@ class B601ReadOnlyPoseStep:
     rejection_reason: str | None
     command_dispatched: bool = False
     authoritative: bool = False
+    feedback_poll_elapsed_sec: float | None = None
+    fk_elapsed_sec: float | None = None
+    emission_elapsed_sec: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, _B601FeedbackSnapshot):
@@ -214,21 +218,31 @@ class B601ReadOnlyPoseSource:
     def step(self) -> B601ReadOnlyPoseStep:
         """Poll only the host-fresh cache path and emit one admitted FK pose."""
 
+        feedback_started = time.perf_counter()
         state = self.backend.poll_feedback(
             request_feedback=False,
             require_host_freshness=True,
         )
+        feedback_poll_elapsed = max(0.0, time.perf_counter() - feedback_started)
+        fk_elapsed: float | None = None
         try:
             self._admit_temporal_progress(state)
             qpos, measured_at, status_sequences = self._admit_state(state)
-            pose = self._validated_pose(self.model.forward_kinematics(qpos))
+            fk_started = time.perf_counter()
+            try:
+                pose = self._validated_pose(self.model.forward_kinematics(qpos))
+            finally:
+                fk_elapsed = max(0.0, time.perf_counter() - fk_started)
         except (TypeError, ValueError, RuntimeError) as error:
             return B601ReadOnlyPoseStep(
                 state=state,
                 emission=None,
                 rejection_reason=f"{type(error).__name__}:{error}",
+                feedback_poll_elapsed_sec=feedback_poll_elapsed,
+                fk_elapsed_sec=fk_elapsed,
             )
 
+        emission_started = time.perf_counter()
         channel_name = "b601_rs_arm_qpos"
         channel = ObservationChannel(
             channel_name=channel_name,
@@ -291,10 +305,14 @@ class B601ReadOnlyPoseSource:
             observation_sample_refs=sample_refs,
         )
         self._next_emission_sequence += 1
+        emission_elapsed = max(0.0, time.perf_counter() - emission_started)
         return B601ReadOnlyPoseStep(
             state=state,
             emission=emission,
             rejection_reason=None,
+            feedback_poll_elapsed_sec=feedback_poll_elapsed,
+            fk_elapsed_sec=fk_elapsed,
+            emission_elapsed_sec=emission_elapsed,
         )
 
     def _admit_temporal_progress(self, state: _B601FeedbackSnapshot) -> None:

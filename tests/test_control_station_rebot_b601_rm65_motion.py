@@ -504,6 +504,16 @@ def test_session_current_tick_is_timestamped_after_slow_poll(
     assert receipt.proposal.effective_until == (
         clock() - (0.08 if delayed_sample else 0) + session.binding.limits[0]
     )
+    diagnostics = session.last_step_diagnostics
+    assert diagnostics["source_admitted"] is True
+    assert diagnostics["proposal_accepted"] is True
+    assert diagnostics["source_sequence"] >= 1
+    assert diagnostics["source_receive_timestamp_sec"] <= clock()
+    assert diagnostics["source_poll_elapsed_sec"] >= 0.0
+    assert diagnostics["feedback_poll_elapsed_sec"] >= 0.0
+    assert diagnostics["fk_elapsed_sec"] >= 0.0
+    assert diagnostics["emission_elapsed_sec"] >= 0.0
+    assert diagnostics["session_step_elapsed_sec"] >= 0.0
 
 
 def test_session_accepts_anchor_cache_frame_measured_before_host_capture(

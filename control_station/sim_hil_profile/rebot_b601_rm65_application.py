@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+import time
 import traceback
 from collections.abc import Mapping
 from contextlib import ExitStack
@@ -261,7 +262,11 @@ def run_b601_rm65_gui(
         if record is None:
             return
         enriched = dict(event)
-        if event.get("event") in {"proposal_admission", "target_step"}:
+        if event.get("event") in {
+            "proposal_admission",
+            "target_step",
+            "bridge_step",
+        }:
             snapshot = _feedback_snapshot_details(session)
             if snapshot is not None:
                 enriched["feedback_snapshot"] = snapshot
@@ -275,13 +280,29 @@ def run_b601_rm65_gui(
             return "q"
         return commands(timeout)
 
-    def advance() -> None:
+    def advance() -> dict[str, object]:
+        target_started = time.perf_counter()
         result = session.binding.runtime.step()
+        target_completed = float(session.binding.runtime.clock())
         target_details = _target_step_details(result)
+        target_details["target_step_elapsed_sec"] = max(
+            0.0, time.perf_counter() - target_started
+        )
+        target_details["target_dispatch_accepted"] = (
+            str(getattr(result, "status", "")) == "dispatched"
+        )
+        completion = getattr(result, "target_completion_receipt", None)
+        dispatch_at = _finite_float_or_none(
+            getattr(completion, "available_at", None)
+        )
+        if dispatch_at is None and target_details["target_dispatch_accepted"]:
+            dispatch_at = target_completed
+        target_details["target_dispatch_monotonic_sec"] = dispatch_at
         target_details["source_reused"] = session.last_source_reused
         record_with_feedback(
             {"event": "target_step", **target_details}
         )
+        return target_details
 
     run_b601_rm65_foreground(
         session,
