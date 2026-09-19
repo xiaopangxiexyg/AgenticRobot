@@ -46,6 +46,15 @@ from .replay_gui import (
     ReplayGuiStationConsumer,
     ReplayGuiStationConsumerStatus,
 )
+from .rm65_free_drive import (
+    RM65_FREE_DRIVE_SOURCE_CLOCK_DOMAIN_V1,
+    RM65_FREE_DRIVE_SOURCE_CONTRACT_ID_V1,
+    RM65_FREE_DRIVE_SOURCE_CONTROLLED_FRAME_V1,
+    RM65_FREE_DRIVE_SOURCE_REFERENCE_FRAME_V1,
+    RM65FreeDriveSource,
+    RM65FreeDriveSourceSpec,
+    RM65FreeDriveStep,
+)
 from .rtc_policy import (
     RtcPolicyEmissionBinding,
     RtcPolicyStationConsumer,
@@ -92,6 +101,10 @@ __all__ = [
     "PASSIVE_TELEOP_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
     "PASSIVE_TELEOP_POSE_SOURCE_CONTRACT_ID_V1",
     "POLICY_COMPOSITION_INPUT_BINDING_HASH_DOMAIN_V1",
+    "RM65_FREE_DRIVE_SOURCE_CLOCK_DOMAIN_V1",
+    "RM65_FREE_DRIVE_SOURCE_CONTRACT_ID_V1",
+    "RM65_FREE_DRIVE_SOURCE_CONTROLLED_FRAME_V1",
+    "RM65_FREE_DRIVE_SOURCE_REFERENCE_FRAME_V1",
     "SYNTHETIC_HUMAN_POSE_GENERIC_SOURCE_CONTRACT_ID_V1",
     "SYNTHETIC_HUMAN_POSE_SOURCE_CONTRACT_ID_V1",
     "SYNTHETIC_HUMAN_QPOS_SOURCE_CONTRACT_ID_V1",
@@ -121,6 +134,9 @@ __all__ = [
     "PassiveTeleopPoseStep",
     "PolicyCompositionInputAdapter",
     "PolicyCompositionInputBinding",
+    "RM65FreeDriveSource",
+    "RM65FreeDriveSourceSpec",
+    "RM65FreeDriveStep",
     "ReplayGuiStationConsumer",
     "ReplayGuiStationConsumerStatus",
     "ReplaySourceObserverBinding",

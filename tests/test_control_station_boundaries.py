@@ -231,6 +231,12 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/sim_hil_profile/openpi_policy_source.py": ["sim"],
         # Concrete B601-to-RM65 GUI assembly; shared control remains sim-neutral.
         "control_station/sim_hil_profile/rebot_b601_rm65_application.py": ["sim"],
+        # Concrete RM65 free-drive to B601 MuJoCo reverse assembly.
+        "control_station/sim_hil_profile/rm65_b601_free_drive.py": ["sim"],
+        # Concrete RM65 free-drive to B601 MuJoCo application leaf.
+        "control_station/sim_hil_profile/rm65_b601_free_drive_application.py": [
+            "sim"
+        ],
         # Concrete state-BC Sim-HIL binding; the shared runtime remains neutral.
         "control_station/sim_hil_profile/state_bc_policy_source.py": ["sim"],
     }

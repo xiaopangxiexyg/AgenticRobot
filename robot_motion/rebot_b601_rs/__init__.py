@@ -42,6 +42,17 @@ from .model import (
     B601PinocchioModel,
     B601SingularityMetrics,
 )
+from .rm65_retarget import (
+    RM65_FREE_DRIVE_SAMPLE_HASH_DOMAIN_V1,
+    RM65_FREE_DRIVE_SAMPLE_SCHEMA_V1,
+    RM65_TO_B601_RETARGET_HASH_DOMAIN_V1,
+    RM65_TO_B601_RETARGET_SCHEMA_V1,
+    RM65FreeDriveSample,
+    RM65ToB601Anchor,
+    RM65ToB601RetargetConfig,
+    RM65ToB601Retargeter,
+    RM65ToB601RetargetResult,
+)
 
 __all__ = [
     "B601_RS_ARM_JOINT_NAMES",
@@ -54,6 +65,10 @@ __all__ = [
     "B601_RS_URDF_RELATIVE_PATH",
     "B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME",
     "B601_RS_WRENCH_ORDER",
+    "RM65_FREE_DRIVE_SAMPLE_HASH_DOMAIN_V1",
+    "RM65_FREE_DRIVE_SAMPLE_SCHEMA_V1",
+    "RM65_TO_B601_RETARGET_HASH_DOMAIN_V1",
+    "RM65_TO_B601_RETARGET_SCHEMA_V1",
     "B601DampedLeastSquaresIK",
     "B601HapticWrenchChannel",
     "B601HapticWrenchOutput",
@@ -75,6 +90,11 @@ __all__ = [
     "B601VirtualWall",
     "B601VirtualWallResult",
     "B601WrenchJointTorque",
+    "RM65FreeDriveSample",
+    "RM65ToB601Anchor",
+    "RM65ToB601RetargetConfig",
+    "RM65ToB601RetargetResult",
+    "RM65ToB601Retargeter",
     "compute_b601_mit_torque",
     "map_world_aligned_ee_wrench_to_joint_torque",
     "transform_spatial_twist",

@@ -12,6 +12,12 @@ def main(argv: list[str] | None = None) -> int:
         from .sim_hil_profile.rebot_b601_rm65_application import main as b601_rm65_main
 
         return int(b601_rm65_main(values[1:]))
+    if values and values[0] == "rm65-b601-free-drive":
+        from .sim_hil_profile.rm65_b601_free_drive_application import (
+            main as rm65_b601_free_drive_main,
+        )
+
+        return int(rm65_b601_free_drive_main(values[1:]))
     if values and values[0] == "sim-hil":
         from .sim_hil import main as sim_hil_main
 
@@ -45,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
         nargs="?",
         choices=(
             "b601-rm65",
+            "rm65-b601-free-drive",
             "sim-hil",
             "vive-calibration",
             "vive-deflection",

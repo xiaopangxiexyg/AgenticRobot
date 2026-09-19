@@ -1,6 +1,6 @@
 {
   "schema": "control_station.b601_rm65_frame_mapping.v1",
-  "profile_id": "b601-rm65-provisional-lab-150-v4-urdf-frame-chain",
+  "profile_id": "b601-rm65-provisional-lab-150-v5-operator-rpy",
   "enabled": true,
   "calibration_source_id": "rm65-dual-v3-right-frame-chain-urdf",
   "calibration_source_sha256": "be771239031f6d94c40fd5cd5d1bef0dfe85abf589059e16dd3cbbf0c6a29f6b",
@@ -12,12 +12,12 @@
   "matrix_target_reference_source_reference": [
     [
       0.0,
-      1.0,
+      -1.0,
       0.0,
       -0.2625
     ],
     [
-      -1.0,
+      1.0,
       0.0,
       0.0,
       0.0
@@ -38,6 +38,12 @@
   "matrix_source_controlled_target_controlled": [
     [
       0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
       1.0,
       0.0,
       0.0
@@ -46,12 +52,6 @@
       -1.0,
       0.0,
       0.0,
-      0.0
-    ],
-    [
-      0.0,
-      0.0,
-      1.0,
       0.0
     ],
     [
@@ -67,5 +67,5 @@
     1.5
   ],
   "rotation_gain": 1.0,
-  "semantic_content_hash": "282d51eac24510722f3535f5237a61807da3e06f05ec7e435f705f903d502e36"
+  "semantic_content_hash": "8fe6abbdae84721d3ba5b446949ee70846eebe9545167d3ea3f15a02444005d2"
 }

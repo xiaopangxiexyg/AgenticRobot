@@ -179,17 +179,17 @@ def test_controlled_frame_transform_maps_source_rotation_axis() -> None:
     )
 
 
-def test_tracked_urdf_frame_chain_profile_maps_b601_tool_axes_to_rm65_tool_axes() -> None:
+def test_canonical_profile_maps_confirmed_b601_tool_axes_to_rm65_tool_axes() -> None:
     profile_path = (
         Path(__file__).resolve().parents[1]
         / "docs/hardware/profiles/b601_rm65_mapping_150_v2.json"
     )
     profile = load_b601_rm65_frame_mapping_profile(profile_path)
-    assert profile.profile_id == "b601-rm65-provisional-lab-150-v4-urdf-frame-chain"
+    assert profile.profile_id == "b601-rm65-provisional-lab-150-v5-operator-rpy"
     expected_reference = np.array(
         (
-            (0.0, 1.0, 0.0, -0.2625),
-            (-1.0, 0.0, 0.0, 0.0),
+            (0.0, -1.0, 0.0, -0.2625),
+            (1.0, 0.0, 0.0, 0.0),
             (0.0, 0.0, 1.0, 0.0),
             (0.0, 0.0, 0.0, 1.0),
         ),
@@ -201,9 +201,9 @@ def test_tracked_urdf_frame_chain_profile_maps_b601_tool_axes_to_rm65_tool_axes(
     )
     expected_controlled = np.array(
         (
+            (0.0, 0.0, 1.0, 0.0),
             (0.0, 1.0, 0.0, 0.0),
             (-1.0, 0.0, 0.0, 0.0),
-            (0.0, 0.0, 1.0, 0.0),
             (0.0, 0.0, 0.0, 1.0),
         ),
         dtype=np.float64,
@@ -214,7 +214,7 @@ def test_tracked_urdf_frame_chain_profile_maps_b601_tool_axes_to_rm65_tool_axes(
     )
     assert (
         profile.semantic_content_hash
-        == "282d51eac24510722f3535f5237a61807da3e06f05ec7e435f705f903d502e36"
+        == "8fe6abbdae84721d3ba5b446949ee70846eebe9545167d3ea3f15a02444005d2"
     )
     assert profile.translation_gain_target_reference_xyz == (1.5, 1.5, 1.5)
 
@@ -226,9 +226,9 @@ def test_tracked_urdf_frame_chain_profile_maps_b601_tool_axes_to_rm65_tool_axes(
         captured_clock_domain_id="test.monotonic",
     )
     expected_target_rotvec_by_source_axis = {
-        (0.1, 0.0, 0.0): (0.0, 0.1, 0.0),
-        (0.0, 0.1, 0.0): (-0.1, 0.0, 0.0),
-        (0.0, 0.0, 0.1): (0.0, 0.0, 0.1),
+        (0.1, 0.0, 0.0): (0.0, 0.0, 0.1),
+        (0.0, 0.1, 0.0): (0.0, 0.1, 0.0),
+        (0.0, 0.0, 0.1): (-0.1, 0.0, 0.0),
     }
 
     for index, (source_rotvec, expected_target_rotvec) in enumerate(
@@ -254,6 +254,36 @@ def test_tracked_urdf_frame_chain_profile_maps_b601_tool_axes_to_rm65_tool_axes(
             expected_target_rotvec,
             atol=1e-12,
         )
+
+
+def test_canonical_profile_reverse_pose_uses_strict_graph_inverse() -> None:
+    profile = load_b601_rm65_frame_mapping_profile(
+        Path(__file__).resolve().parents[1]
+        / "docs/hardware/profiles/b601_rm65_mapping_150_v2.json"
+    )
+    graph = profile.build_frame_graph()
+    source_pose = np.eye(4, dtype=np.float64)
+    source_pose[:3, 3] = (0.12, -0.04, 0.3)
+    source_pose[:3, :3] = Rotation.from_rotvec((0.1, -0.05, 0.02)).as_matrix()
+
+    target_pose, _ = graph.transform_pose_between_frames(
+        source_pose,
+        source_reference_frame_id=profile.source_reference_frame_id,
+        source_controlled_frame_id=profile.source_controlled_frame_id,
+        target_reference_frame_id=profile.target_reference_frame_id,
+        target_controlled_frame_id=profile.target_controlled_frame_id,
+    )
+    round_trip, reverse_resolution = graph.transform_pose_between_frames(
+        target_pose,
+        source_reference_frame_id=profile.target_reference_frame_id,
+        source_controlled_frame_id=profile.target_controlled_frame_id,
+        target_reference_frame_id=profile.source_reference_frame_id,
+        target_controlled_frame_id=profile.source_controlled_frame_id,
+    )
+
+    np.testing.assert_allclose(round_trip, source_pose, atol=1e-12)
+    assert reverse_resolution.reference_resolution.traversals[0].direction == "inverse"
+    assert reverse_resolution.controlled_resolution.traversals[0].direction == "inverse"
 
 
 def test_profile_controlled_rotation_is_a_json_tuning_parameter(tmp_path) -> None:
@@ -302,13 +332,12 @@ def test_profile_controlled_rotation_is_a_json_tuning_parameter(tmp_path) -> Non
     )
 
 
-def test_urdf_frame_chain_profile_matches_rm65_mujoco_tool_tcp_zero_pose() -> None:
-    """Derive the canonical tool_tcp mapping from the checked-in MuJoCo model.
+def test_profile_keeps_urdf_mount_translation_and_confirmed_tool_axes() -> None:
+    """Keep the URDF mount translation and the operator-confirmed axes.
 
-    The visible ``right_realman`` assembly is intentionally not used as the
-    controlled frame. This regression keeps the profile tied to the same
-    ``right_arm_link6``/``tool_tcp`` body that the target projector and IK
-    runtime measure.
+    The source-base translation is tied to the checked-in MuJoCo mount.  The
+    rotational part is an operator-confirmed teleoperation calibration and is
+    intentionally not replaced by the visible flange or link6 CAD frame.
     """
     pytest.importorskip("mujoco")
     urdf_path = (
@@ -344,20 +373,22 @@ def test_urdf_frame_chain_profile_matches_rm65_mujoco_tool_tcp_zero_pose() -> No
         dtype=np.float64,
     )[:3, :3]
 
-    # The right-arm base is attached to world at +Y with Rz(+90 deg). The
-    # source B601 base is the identity world frame, so T_target_source is the
-    # inverse URDF attachment, not the target pose copied in the forward
-    # direction.
+    # The right-arm base is attached to world at +Y.  Keep the URDF-derived
+    # translation while the rotational calibration is independently confirmed
+    # from the foreground teleoperation check.
     np.testing.assert_allclose(
-        np.asarray(profile.matrix_target_reference_source_reference),
-        np.linalg.inv(target_base),
+        np.asarray(profile.matrix_target_reference_source_reference)[:3, 3],
+        np.linalg.inv(target_base)[:3, 3],
         atol=1e-5,
     )
-    # B601 gripper_end is identity at q=0. Therefore the controlled mapping
-    # must turn the source identity into the RM65 tool_tcp zero orientation.
     np.testing.assert_allclose(
-        reference_rotation @ controlled_rotation,
-        tool_pose[:3, :3],
+        reference_rotation,
+        Rotation.from_euler("z", 90.0, degrees=True).as_matrix(),
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        controlled_rotation,
+        Rotation.from_euler("y", 90.0, degrees=True).as_matrix(),
         atol=1e-5,
     )
     # The visible flange is a separate Rz(-90 deg) assembly frame; it must not

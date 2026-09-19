@@ -87,13 +87,13 @@ print(target)
 PY
 ```
 
-### B601 末端工具坐标校正（150% canonical tool_tcp v4）
+### B601 末端工具坐标校正（150% canonical tool_tcp v5）
 
 上面的 `v1` 只解决位移倍率，且把 `gripper_end` 与 `tool_tcp` 的受控坐标系暂时当作
-同向（controlled matrix 为 identity）。此前的 v2/v3 只看了末端局部姿态，遗漏了**右臂
-基座在双臂 URDF 中绕世界 Z 轴的 `+90°` 安装**，因此会出现平面旋转轴交换或两个轴反号。
-现在按双臂 URDF 逐级计算，canonical controlled frame 确认是
-`right_arm_link6/right_hand_base/tool_tcp`，不是可见的 `right_realman` 夹爪装配 frame。
+同向（controlled matrix 为 identity）。这次现场确认固定采用：
+`--controlled-rpy-deg 0 90 0 --reference-rpy-deg 0 0 90`。
+因此 canonical controlled frame 仍是 `right_arm_link6/right_hand_base/tool_tcp`，不是
+可见的 `right_realman` 夹爪装配 frame；旋转校正确认优先于仅由 CAD 姿态推导的旧 v4 值。
 
 #### URDF 证据和矩阵方向
 
@@ -109,31 +109,32 @@ T_right_arm_link6_right_realman  = Rz(-90°)
 T_right_arm_base_right_realman   = Rz(+90°) + z=0.8505 m
 ```
 
-源端 `00-arm-rs_asm-v3.urdf` 在 q=0 的 `gripper_end` 旋转是 identity；因此 profile
-的两项可调刚体参数必须是：
+源端 `00-arm-rs_asm-v3.urdf` 在 q=0 的 `gripper_end` 旋转是 identity。当前 profile
+保留 URDF 给出的 base 平移，并固定现场确认的 reference/controlled 旋转：
 
 ```text
 T_target_reference_source_reference =
-[[ 0,  1,  0, -0.2625],
- [-1,  0,  0, 0],
+[[ 0, -1,  0, -0.2625],
+ [ 1,  0,  0, 0],
  [ 0,  0,  1, 0],
  [ 0,  0,  0, 1]]
 
 T_source_controlled_target_controlled =
-[[ 0,  1,  0, 0],
+[[ 0,  0,  1, 0],
+ [ 0,  1,  0, 0],
  [-1,  0,  0, 0],
- [ 0,  0,  1, 0],
  [ 0,  0,  0, 1]]
 ```
 
 这不是把 `right_realman` 当作控制 frame；后者只是 `right_arm_link6` 下的固定装配 frame。
 `tool_tcp` 仍由 MuJoCo target projector/IK 以 `right_arm_link6/right_hand_base` 表达。
-因此当前 profile 下源端小旋转在 **RM65 tool_tcp/link6 控制 frame** 的离线预期是：
-`+X → +Y`、`+Y → -X`、`+Z → +Z`。如果直接观察 `right_realman` 可见装配 frame，
+因此当前 profile 下 source residual 的小旋转在 **RM65 tool_tcp/link6 控制 frame** 的预期是：
+`+X → +Z`、`+Y → +Y`、`+Z → -X`；source 平移则由 reference `Rz(+90°)` 变换。
+如果直接观察 `right_realman` 可见装配 frame，
 还要经过 URDF 明确给出的固定 `Rz(-90°)`，不能再额外手工交换轴。
 
 位移仍按 `[1.5, 1.5, 1.5]` 解释。为避免已有现场命令误加载旧语义，文件路径暂保持稳定，
-但 profile id 已升级为 `b601-rm65-provisional-lab-150-v4-urdf-frame-chain`。可复用的 profile 位于
+但 profile id 已升级为 `b601-rm65-provisional-lab-150-v5-operator-rpy`。可复用的 profile 位于
 [b601_rm65_mapping_150_v2.json](./profiles/b601_rm65_mapping_150_v2.json)：
 
 ```text
@@ -141,8 +142,8 @@ docs/hardware/profiles/b601_rm65_mapping_150_v2.json
 ```
 
 其 `semantic_content_hash` 由 canonical loader 重新计算，用于结果追踪和证据比对，不是现场
-编辑或启动门禁。现场验证必须显式使用该文件，并在结果 JSON 中记录 v4 profile id/hash；不要继续使用 identity 的 `v1` 或
-循环置换的旧 v2/v3 语义。
+编辑或启动门禁。现场验证必须显式使用该文件，并在结果 JSON 中记录 v5 profile id/hash；不要继续使用 identity 的 `v1` 或
+循环置换的旧 v2/v3/v4 语义。
 
 #### 后续只调 profile 参数，不改控制代码
 
@@ -162,23 +163,27 @@ docs/hardware/profiles/b601_rm65_mapping_150_v2.json
 
 ```bash
 # 角度单位为 degree，顺序为 roll pitch yaw，内部使用 Rz(yaw) @ Ry(pitch) @ Rx(roll)
---mapping-controlled-rotation-rpy-deg 0 0 90
+--mapping-controlled-rotation-rpy-deg 0 90 0
+
+# reference/base 校正
+--mapping-reference-rotation-rpy-deg 0 0 90
 
 # 或直接输入 3x3 行主序矩阵（9 个数）
 --mapping-controlled-rotation-matrix \
-  0 -1 0 \
-  1  0 0 \
-  0  0 1
+  0 0 1 \
+  0 1 0 \
+ -1 0 0
 ```
 
 `controlled` 参数只覆盖 `matrix_source_controlled_target_controlled` 的旋转部分，保留
 原有平移；`reference` 参数对应 base-frame 的 `matrix_target_reference_source_reference`。
 一次只能为同一个矩阵选择 RPY 或 3x3 输入，且最终仍会经过刚体旋转、正交性和坐标帧校验。
 
-例如，验证当前矩阵的逆 Z 方向时，只需在原 GUI 命令末尾加入：
+例如，临时复现当前 canonical 变换时，在原 GUI 命令末尾加入：
 
 ```bash
---mapping-controlled-rotation-rpy-deg 0 0 90
+--mapping-controlled-rotation-rpy-deg 0 90 0 \
+--mapping-reference-rotation-rpy-deg 0 0 90
 ```
 
 不需要复制 profile、删除字段或修改 Python 控制代码。临时覆盖会写入运行 JSON 的
@@ -187,6 +192,20 @@ docs/hardware/profiles/b601_rm65_mapping_150_v2.json
 仿真只读连接可显式传 `--disable-teleop-residual-envelope`。它仅关闭 B601 binding 的
 “单 tick residual 平移/旋转幅度”预检，不关闭 RM65 的 canonical IK、关节、碰撞、速度、加速度、
 执行时域或 viewer fault 保护；该选项被限制为 `--connect-read-only`，不得用于真机运动 owner。
+
+### RM65 free-drive → B601 MuJoCo 反向路径
+
+反向路径已经接入同一 Control Station 入口：
+`python -m control_station rm65-b601-free-drive`。它只读取 RM65 的 observation-only
+状态，把当前 profile 的 frame graph **反向解析**为 `RM65 right_arm_base/tool_tcp →
+B601 base_link/gripper_end`，再用连续 seed IK 和现有 B601 MuJoCo position driver；不会
+向 RM65 或 B601 真机发送使能、位置、力矩或停止命令。
+
+反向路径不把正向 `[1.5, 1.5, 1.5]` 静默当作命令倍率。现场调试时通过
+`--translation-gain-target-reference-xyz GX GY GZ` 和 `--rotation-gain` 明确给出独立
+参数；`a/c/r/s/q` 由应用内前台状态机处理，不依赖 shell 维护交互状态。当前只读 GUI、
+source freshness、IK rejection 和 MuJoCo target cleanup 的自动化证据见
+[反向 free-drive 进度记录](../architecture/reports/rebot_b601_rm65_reverse_free_drive_progress.md)。
 
 ## 反馈过期诊断
 
@@ -241,7 +260,8 @@ PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
 
 ```bash
 "$PY" scripts/hardware/rebot_b601_rm65_mujoco_follow.py \
-  --controlled-rpy-deg 0 0 90
+  --controlled-rpy-deg 0 90 0 \
+  --reference-rpy-deg 0 0 90
 ```
 
 这里的 `--controlled-rpy-deg ROLL PITCH YAW` 是
@@ -251,7 +271,7 @@ PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
 
 ```bash
 "$PY" scripts/hardware/rebot_b601_rm65_mujoco_follow.py \
-  --controlled-matrix 0 -1 0 1 0 0 0 0 1
+  --controlled-matrix 0 0 1 0 1 0 -1 0 0
 ```
 
 这些参数只覆盖本次 RM65 仿真的内存 profile；不会修改 JSON，也不要求维护
