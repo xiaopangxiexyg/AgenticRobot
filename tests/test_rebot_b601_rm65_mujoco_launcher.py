@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from scripts.hardware import rebot_b601_rm65_mujoco_follow as launcher
+from scripts.hardware import rebot_b601_rs_low_gain_probe as low_gain_probe
 from scripts.hardware import rebot_b601_rs_owner as owner
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -152,8 +153,17 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
     assert "--allow-active-report" in command
     assert "--auto-disable-active-report" in command
     assert "--apply-driver-torque-limits" in command
+    assert (
+        command[command.index("--confirmation") + 1]
+        == low_gain_probe.CONFIRMATION
+    )
     assert command[command.index("--velocity-abort-rad-s") + 1] == "2.5"
     assert command[command.index("--acceleration-abort-rad-s2") + 1] == "80.0"
+
+    # Re-parse the exact generated argv through the real probe contract.  This
+    # is deliberately offline: _validate_cli performs no CAN or motor I/O.
+    parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    low_gain_probe._validate_cli(parsed_probe_args)
 
 
 def test_owner_launcher_rejects_missing_motion_ack_before_resource_access(

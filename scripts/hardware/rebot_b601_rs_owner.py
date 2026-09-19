@@ -27,6 +27,7 @@ from scripts.hardware.rebot_b601_rm65_mujoco_follow import (
 DEFAULT_REBOT_SOURCE_ROOT = REPO_ROOT.parent / "reBotArm_control_py"
 DEFAULT_CONFIG = DEFAULT_REBOT_SOURCE_ROOT / "config" / "rebotarm_rs.yaml"
 DEFAULT_OUTPUT_ROOT = Path("/tmp/b601-rs-commissioning")
+DEFAULT_CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
 DEFAULT_DRIVER_KD = (0.20, 0.30, 0.20, 0.15, 0.10, 0.05)
 DEFAULT_GRAVITY_SCALES = (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
 DEFAULT_GRAVITY_OFFSETS = (0.0,) * 6
@@ -142,7 +143,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--confirmation",
-        default="B601_RS_FOREGROUND_GRAVITY_DAMPING_OWNER",
+        default=DEFAULT_CONFIRMATION,
     )
     parser.add_argument(
         "--pause-on-exit",
