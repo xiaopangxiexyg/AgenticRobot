@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -34,12 +35,25 @@ from .rtc_conditioning_protocol import (
 
 
 @dataclass(frozen=True)
+class RtcConditionedClientTiming:
+    """Passive local durations; never used for admission or action authority."""
+
+    capability_check_sec: float
+    encode_envelope_sec: float
+    backend_call_sec: float
+    response_validation_sec: float
+    result_decode_sec: float
+    model_input_prepare_sec: float | None = None
+
+
+@dataclass(frozen=True)
 class RtcConditionedClientInferenceBundleV3:
     canonical_conditioning: CanonicalRtcConditioningBundle
     envelope: RtcConditionedInferenceEnvelopeV3
     response: RtcConditionedModelResponseV3
     response_validation: RtcConditionedResponseValidationV3
     policy_chunk_result: PolicyChunkResult
+    client_timing: RtcConditionedClientTiming | None = None
 
     def __post_init__(self) -> None:
         envelope_hash = self.envelope.semantic_content_hash
@@ -201,7 +215,9 @@ class RtcConditionedModelClientV3:
         canonical_conditioning: CanonicalRtcConditioningBundle,
         model_input: Any,
         model_input_hash: str,
+        model_input_prepare_sec: float | None = None,
     ) -> RtcConditionedClientInferenceBundleV3:
+        timing_start = perf_counter()
         current_capability = self._backend.rtc_continuation_capability
         if (
             current_capability.semantic_content_hash
@@ -211,6 +227,7 @@ class RtcConditionedModelClientV3:
                 "conditioned capability drift",
                 ("capability_hash_changed",),
             )
+        capability_checked_at = perf_counter()
         encoded = encode_rtc_conditioning_bundle(
             self._codec,
             canonical_conditioning,
@@ -222,10 +239,12 @@ class RtcConditionedModelClientV3:
             encoded_conditioning=encoded,
             model_input_hash=model_input_hash,
         )
+        envelope_built_at = perf_counter()
         response = self._backend.infer_conditioned_rtc_v3(
             envelope,
             model_input,
         )
+        backend_returned_at = perf_counter()
         if not isinstance(response, RtcConditionedModelResponseV3):
             raise RtcClientProtocolError(
                 "conditioned model response",
@@ -240,6 +259,7 @@ class RtcConditionedModelClientV3:
                 "conditioned model response",
                 validation.reasons,
             )
+        response_validated_at = perf_counter()
 
         # This is the sole generation-prefix crop.  Timed-plan admission may
         # later discard rows that became obsolete at the actual cursor, but it
@@ -319,10 +339,21 @@ class RtcConditionedModelClientV3:
                 response.consumption_receipt.semantic_content_hash
             ),
         )
+        result_built_at = perf_counter()
         return RtcConditionedClientInferenceBundleV3(
             canonical_conditioning=canonical_conditioning,
             envelope=envelope,
             response=response,
             response_validation=validation,
             policy_chunk_result=result,
+            client_timing=RtcConditionedClientTiming(
+                capability_check_sec=capability_checked_at - timing_start,
+                encode_envelope_sec=envelope_built_at - capability_checked_at,
+                backend_call_sec=backend_returned_at - envelope_built_at,
+                response_validation_sec=(
+                    response_validated_at - backend_returned_at
+                ),
+                result_decode_sec=(result_built_at - response_validated_at),
+                model_input_prepare_sec=model_input_prepare_sec,
+            ),
         )
