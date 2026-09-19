@@ -117,17 +117,28 @@ workspace、freshness 或 IK 安全门。
 每个 `bridge_step` 事件现在额外记录：
 
 - `source_receive_monotonic_sec`：本次被接受的 RM65 硬件读状态完成时间戳；
+- `source_step_started_monotonic_sec` / `source_step_completed_monotonic_sec`：一次
+  source refresh 从进入到完成 freshness/frame 校验的时间边界；
+- `source_admission_monotonic_sec`：该 source sample 完成校验并准入桥接器的时间戳；
 - `target_dispatch_monotonic_sec`：该 retarget qpos 被 B601 MuJoCo position
   driver 接受的时间戳；
 - `source_to_target_dispatch_latency_sec`：上述两者之差；只有真实发生
   `command_applied=true` 时才有值；
+- `source_admission_to_target_dispatch_latency_sec`：从 source step 完成准入到
+  target driver 接受的延迟。它与前一个字段同时保留，用来区分硬件 read 时间戳到
+  source 状态组装/校验的耗时；
+- `source_poll_deadline_sec` / `source_poll_lateness_sec`：source 固定 deadline
+  及本次实际开始读取时的迟到量；`source_poll_schedule_skipped=true` 表示读取跨过
+  了至少一个 deadline，调度器跳过 missed period 后重新建立 cadence；
 - `source_state_read_phase_timing`：RM65 backend 的 SDK、解析/校验、重试等读状态
   阶段耗时，用于把 source 读取成本与 retarget/driver 成本分开。
 
-因此该主指标测量的是“RM65 状态读完成 → B601 MuJoCo target driver 接受”，不把
+因此原主指标测量的是“RM65 backend read timestamp → B601 MuJoCo target driver 接受”，不把
 RM65 反馈在读之前已经积累的 measurement age、MuJoCo viewer 刷新或仿真机械臂的
 物理响应混入。它不是 B601 真机执行延迟；真机阶段还必须独立记录 CAN/driver
-ack 与实际反馈。
+ack 与实际反馈。新增的 `source_admission_to_target_dispatch_latency_sec` 则把
+freshness/frame 校验和 source 状态组装之后的准入点作为起点，避免将两个边界混称为
+单一“SDK 返回后延迟”。
 
 作为新字段上线前的基线，2026-09-19 的现场日志（尚未记录主指标）显示：RM65
 读状态间隔平均 `57.04 ms`、p95 `60.76 ms`；source read+校验平均 `6.33 ms`、
@@ -147,12 +158,21 @@ PYTHONDONTWRITEBYTECODE=1 "$PY" \
   --output "$RUN/reverse_latency_report.json"
 ```
 
-判读顺序固定为：先看 `source_to_target_dispatch_latency_sec`，再看
-`source_step_elapsed_sec` 与 `retarget_elapsed_sec`。若主指标稳定而
-`sim_slew_limited` 比例高，瓶颈是 target slew；若 source read 或 retarget p95
-接近/超过 20 Hz 的 50 ms 周期，才考虑 latest-only 读取/IK worker。任何 worker
-仍必须在主线程重新检查 sequence、freshness、frame 和 fail-closed rejection，
-不能用旧 qpos 或静默重试掩盖延迟。
+判读顺序固定为：先比较 `source_to_target_dispatch_latency_sec` 与
+`source_admission_to_target_dispatch_latency_sec`，再看 `source_poll_lateness_sec`、
+`source_step_elapsed_sec` 与 `retarget_elapsed_sec`。source 调度现在使用固定
+start-to-start deadline；读取跨过 deadline 时只跳过 missed period，不追赶 burst。
+若主指标稳定而 `sim_slew_limited` 比例高，瓶颈是 target slew；若 source read 或
+retarget p95 接近/超过 source period，才考虑 latest-only 读取/IK worker。任何 worker
+仍必须在主线程重新检查 sequence、freshness、frame 和 fail-closed rejection，不能用
+旧 qpos 或静默重试掩盖延迟。
+
+当前 P0/P1 候选已经落地但尚未做新的现场采集：P0 将 read、source admission
+和 target dispatch 三个时间边界同时写入 `bridge_step`；P1 将 source deadline
+从“本次读取完成时间”改为固定 start-to-start cadence。若 SDK 读取跨过一个或多个
+deadline，候选只跳过 missed period 并从当前时钟切片重新建立下一周期，不会为了追赶
+而连续发送读取请求。该调度改变不放宽 freshness、sequence、frame、IK 或 target
+driver 的任何安全门。
 
 这次具体拒绝是一次有效样本上的 `ik_rejected:line_search_stalled`：source 已准入、
 Jacobian 条件数约为 10，随后才进入 `held`。首个假设是上一版每次用 MuJoCo 实测

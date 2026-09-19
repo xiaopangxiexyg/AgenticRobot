@@ -6,6 +6,10 @@ RM65 connection, a CAN interface, or a MuJoCo viewer.  The primary latency is
 measured from the accepted RM65 hardware-read timestamp to the tick where the
 MuJoCo position driver accepts the retargeted qpos.  It excludes physical
 actuator response and the RM65 measurement age before the read completed.
+
+The report also exposes the post-validation ``source admission`` timestamp.
+That second latency separates source/backend state assembly from the actual
+target dispatch path while retaining the original field for compatibility.
 """
 
 from __future__ import annotations
@@ -77,10 +81,21 @@ def _scale_ms(value: float | None) -> float | None:
     return None if value is None else round(value * 1000.0, 3)
 
 
+def _diagnostics(values: list[float]) -> dict[str, float | int | None]:
+    return {
+        "min_ms": _scale_ms(min(values) if values else None),
+        "over_10ms_count": sum(value > 0.010 for value in values),
+        "over_20ms_count": sum(value > 0.020 for value in values),
+    }
+
+
 def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     timings: dict[str, list[float]] = {
         "source_to_target_dispatch_latency_sec": [],
+        "source_admission_to_target_dispatch_latency_sec": [],
         "source_interarrival_sec": [],
+        "source_admission_interarrival_sec": [],
+        "source_poll_lateness_sec": [],
         "source_step_elapsed_sec": [],
         "retarget_elapsed_sec": [],
         "position_step_elapsed_sec": [],
@@ -90,6 +105,7 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     counts: Counter[str] = Counter()
     rejection_reasons: Counter[str] = Counter()
     previous_source_read_monotonic: float | None = None
+    previous_source_admission_monotonic: float | None = None
     for record in records:
         if record.get("event") != "bridge_step":
             continue
@@ -108,12 +124,29 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                     timings["source_interarrival_sec"].append(interval)
             if source_read_monotonic is not None:
                 previous_source_read_monotonic = source_read_monotonic
+            source_admission_monotonic = _finite_non_negative(
+                record.get("source_admission_monotonic_sec")
+            )
+            if (
+                source_admission_monotonic is not None
+                and previous_source_admission_monotonic is not None
+            ):
+                interval = (
+                    source_admission_monotonic
+                    - previous_source_admission_monotonic
+                )
+                if math.isfinite(interval) and interval >= 0.0:
+                    timings["source_admission_interarrival_sec"].append(interval)
+            if source_admission_monotonic is not None:
+                previous_source_admission_monotonic = source_admission_monotonic
         if record.get("retarget_accepted") is True:
             counts["retarget_accepted"] += 1
         if record.get("command_applied") is True:
             counts["target_dispatches"] += 1
         if record.get("sim_slew_limited") is True:
             counts["sim_slew_limited"] += 1
+        if record.get("source_poll_schedule_skipped") is True:
+            counts["source_poll_schedule_skipped"] += 1
         reason = record.get("bridge_rejection_reason") or record.get(
             "retarget_rejection_reason"
         )
@@ -148,11 +181,26 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             name: _statistics_ms(values)
             for name, values in sorted(source_read_phases_ms.items())
         },
+        "diagnostics": {
+            name: _diagnostics(values)
+            for name, values in timings.items()
+            if name
+            in {
+                "source_to_target_dispatch_latency_sec",
+                "source_admission_to_target_dispatch_latency_sec",
+                "source_poll_lateness_sec",
+            }
+        },
         "interpretation": {
             "primary_latency": (
                 "source_to_target_dispatch_latency_sec is the interval from "
                 "the accepted RM65 hardware-read completion timestamp to "
                 "B601 MuJoCo position-driver command acceptance."
+            ),
+            "admission_latency": (
+                "source_admission_to_target_dispatch_latency_sec starts when "
+                "the source step has completed freshness/frame validation and "
+                "ends at B601 MuJoCo position-driver command acceptance."
             ),
             "excluded": (
                 "RM65 measurement age before read completion, physical B601 "

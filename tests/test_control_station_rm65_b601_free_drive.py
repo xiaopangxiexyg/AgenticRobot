@@ -168,12 +168,13 @@ def _bridge(
     retargeter: _Retargeter,
     *,
     source_poll_clock=None,
+    source_poll_hz: float = 1000.0,
 ):
     return RM65ToB601FreeDriveBridge(
         source,
         retargeter,
         driver,
-        source_poll_hz=1000.0,
+        source_poll_hz=source_poll_hz,
         source_poll_clock=source_poll_clock,
     )
 
@@ -284,8 +285,136 @@ def test_bridge_reports_source_to_target_dispatch_latency() -> None:
 
     assert tick.position_tick.command_applied
     assert tick.source_receive_monotonic_sec == pytest.approx(10.0005)
+    assert tick.source_step_started_monotonic_sec == pytest.approx(10.001)
+    assert tick.source_step_completed_monotonic_sec == pytest.approx(10.001)
+    assert tick.source_admission_monotonic_sec == pytest.approx(10.001)
     assert tick.target_dispatch_monotonic_sec == pytest.approx(10.001)
     assert tick.source_to_target_dispatch_latency_sec == pytest.approx(0.0005)
+    assert tick.source_admission_to_target_dispatch_latency_sec == pytest.approx(0.0)
+
+
+def test_bridge_retains_admission_timestamp_until_late_target_dispatch() -> None:
+    class _OneTickLateDriver(_Driver):
+        def __init__(self) -> None:
+            super().__init__()
+            self._command_due_queries = 0
+
+        @property
+        def command_due(self) -> bool:
+            self._command_due_queries += 1
+            return self._command_due_queries >= 2
+
+    source = _Source([_admitted(1), _admitted(2)])
+    driver = _OneTickLateDriver()
+    retargeter = _Retargeter()
+    now = [10.0]
+    bridge = _bridge(
+        source,
+        driver,
+        retargeter,
+        source_poll_clock=lambda: now[0],
+        source_poll_hz=20.0,
+    )
+
+    bridge.activate()
+    now[0] = 10.05
+    not_dispatched = bridge.step()
+    assert not_dispatched.source_step is not None
+    assert not_dispatched.position_tick.command_applied is False
+    now[0] = 10.051
+    dispatched = bridge.step()
+
+    assert dispatched.source_step is None
+    assert dispatched.position_tick.command_applied is True
+    assert dispatched.source_admission_monotonic_sec == pytest.approx(10.05)
+    assert dispatched.source_admission_to_target_dispatch_latency_sec == pytest.approx(
+        0.001
+    )
+
+
+def test_live_source_poll_uses_fixed_start_to_start_deadline() -> None:
+    now = [0.0]
+
+    class _SlowSource(_Source):
+        def __init__(self, steps):
+            super().__init__(steps)
+            self.calls = 0
+
+        def step(self) -> RM65FreeDriveStep:
+            self.calls += 1
+            step = super().step()
+            if self.calls > 1:
+                now[0] += 0.006
+            return step
+
+    source = _SlowSource([_admitted(1), _admitted(2), _admitted(3)])
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = RM65ToB601FreeDriveBridge(
+        source,
+        retargeter,
+        driver,
+        source_poll_hz=20.0,
+        source_poll_clock=lambda: now[0],
+    )
+
+    bridge.activate()
+    now[0] = 0.05
+    first = bridge.step()
+    assert first.source_step is not None
+    assert first.source_poll_deadline_sec == pytest.approx(0.05)
+    assert first.source_poll_lateness_sec == pytest.approx(0.0)
+    assert first.source_poll_schedule_skipped is False
+
+    # The source read advanced wall time to 56 ms.  A completion-relative
+    # scheduler would wait until 106 ms; fixed deadline scheduling polls at
+    # 100 ms instead.
+    now[0] = 0.10
+    second = bridge.step()
+    assert second.source_step is not None
+    assert second.source_poll_deadline_sec == pytest.approx(0.10)
+
+
+def test_live_source_poll_skips_missed_deadline_without_catch_up_burst() -> None:
+    now = [0.0]
+
+    class _OverrunningSource(_Source):
+        def __init__(self, steps):
+            super().__init__(steps)
+            self.calls = 0
+
+        def step(self) -> RM65FreeDriveStep:
+            self.calls += 1
+            step = super().step()
+            if self.calls > 1:
+                now[0] += 0.060
+            return step
+
+    source = _OverrunningSource([_admitted(1), _admitted(2), _admitted(3)])
+    driver = _Driver()
+    retargeter = _Retargeter()
+    bridge = RM65ToB601FreeDriveBridge(
+        source,
+        retargeter,
+        driver,
+        source_poll_hz=20.0,
+        source_poll_clock=lambda: now[0],
+    )
+
+    bridge.activate()
+    now[0] = 0.05
+    first = bridge.step()
+    assert first.source_step is not None
+    assert first.source_poll_schedule_skipped is True
+
+    # The overrun was 60 ms against a 50 ms period, so the next deadline is
+    # 160 ms from the current clock cut, not a burst at 100 ms.
+    now[0] = 0.159
+    not_due = bridge.step()
+    assert not_due.source_step is None
+    now[0] = 0.160
+    second = bridge.step()
+    assert second.source_step is not None
 
 
 def test_bridge_seeds_ik_from_last_accepted_target_not_measured_qpos() -> None:

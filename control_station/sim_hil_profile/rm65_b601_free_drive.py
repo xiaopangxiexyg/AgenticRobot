@@ -140,8 +140,15 @@ class RM65ToB601FreeDriveTick:
     position_step_elapsed_sec: float = 0.0
     step_elapsed_sec: float = 0.0
     source_receive_monotonic_sec: float | None = None
+    source_step_started_monotonic_sec: float | None = None
+    source_step_completed_monotonic_sec: float | None = None
+    source_admission_monotonic_sec: float | None = None
     target_dispatch_monotonic_sec: float | None = None
     source_to_target_dispatch_latency_sec: float | None = None
+    source_admission_to_target_dispatch_latency_sec: float | None = None
+    source_poll_deadline_sec: float | None = None
+    source_poll_lateness_sec: float | None = None
+    source_poll_schedule_skipped: bool = False
 
     def __post_init__(self) -> None:
         if self.state not in RM65_TO_B601_FREE_DRIVE_STATES:
@@ -189,6 +196,7 @@ class RM65ToB601FreeDriveBridge:
         self._next_source_poll_clock_sec: float | None = None
         self._telemetry_clock: Callable[[], float] = time.monotonic
         self._pending_source_receive_monotonic_sec: float | None = None
+        self._pending_source_admission_monotonic_sec: float | None = None
         self._last_source_step: RM65FreeDriveStep | None = None
         self._last_retarget_result: RM65ToB601RetargetResult | None = None
         self._last_rejection_reason: str | None = None
@@ -238,17 +246,57 @@ class RM65ToB601FreeDriveBridge:
 
         return self._last_rejection_reason
 
-    def _schedule_next_source_poll(self) -> None:
+    def _source_poll_now(self) -> float:
         if self._source_poll_clock is None:
-            self._next_source_poll_time_sec = (
-                self.driver.physics_time_sec + self._source_period_sec
-            )
-            self._next_source_poll_clock_sec = None
-            return
-        now = float(self._source_poll_clock())
+            now = float(self.driver.physics_time_sec)
+        else:
+            now = float(self._source_poll_clock())
         if not math.isfinite(now):
             raise ValueError("source poll clock returned a non-finite value")
-        self._next_source_poll_clock_sec = now + self._source_period_sec
+        return now
+
+    def _source_poll_deadline(self) -> float:
+        if self._source_poll_clock is None:
+            return float(self._next_source_poll_time_sec)
+        if self._next_source_poll_clock_sec is None:
+            return float("nan")
+        return float(self._next_source_poll_clock_sec)
+
+    def _schedule_next_source_poll(self, *, anchor: bool = False) -> bool:
+        """Advance the source deadline without creating catch-up bursts.
+
+        A live source deadline is normally advanced from the previous deadline,
+        not from the completion time of the current SDK call.  This preserves
+        the configured start-to-start cadence when a read takes a few
+        milliseconds.  If the read overruns the next deadline, skip missed
+        periods and restart one period from the current clock cut instead of
+        issuing a burst of back-to-back reads.
+
+        ``anchor=True`` is used after activation/recenter so the first active
+        observation always starts a fresh cadence.
+        """
+
+        now = self._source_poll_now()
+        if self._source_poll_clock is None:
+            previous = None if anchor else self._next_source_poll_time_sec
+        else:
+            previous = None if anchor else self._next_source_poll_clock_sec
+        skipped = False
+        if previous is None:
+            next_deadline = now + self._source_period_sec
+        else:
+            candidate = float(previous) + self._source_period_sec
+            if candidate <= now + 1e-12:
+                next_deadline = now + self._source_period_sec
+                skipped = True
+            else:
+                next_deadline = candidate
+        if self._source_poll_clock is None:
+            self._next_source_poll_time_sec = next_deadline
+            self._next_source_poll_clock_sec = None
+        else:
+            self._next_source_poll_clock_sec = next_deadline
+        return skipped
 
     def _source_poll_due(self) -> bool:
         if self._source_poll_clock is None:
@@ -294,7 +342,7 @@ class RM65ToB601FreeDriveBridge:
             raise RM65FreeDriveAdmissionError(str(exc)) from exc
         self._ik_seed_qpos_rad = anchor_qpos
         self._state = "active"
-        self._schedule_next_source_poll()
+        self._schedule_next_source_poll(anchor=True)
 
     def engage_clutch(self) -> None:
         """Stop following and invalidate the source anchor without stepping."""
@@ -335,7 +383,7 @@ class RM65ToB601FreeDriveBridge:
             raise RM65FreeDriveAdmissionError(str(exc)) from exc
         self._ik_seed_qpos_rad = anchor_qpos
         self._state = "active"
-        self._schedule_next_source_poll()
+        self._schedule_next_source_poll(anchor=True)
 
     def deactivate(self) -> None:
         """Stop following and discard all source-derived targets."""
@@ -360,17 +408,34 @@ class RM65ToB601FreeDriveBridge:
         position_step_elapsed_sec = 0.0
         tick_rejection_reason: str | None = None
         source_receive_monotonic_sec: float | None = None
+        source_step_started_monotonic_sec: float | None = None
+        source_step_completed_monotonic_sec: float | None = None
+        source_admission_monotonic_sec: float | None = None
         target_dispatch_monotonic_sec: float | None = None
         source_to_target_dispatch_latency_sec: float | None = None
+        source_admission_to_target_dispatch_latency_sec: float | None = None
+        source_poll_deadline_sec: float | None = None
+        source_poll_lateness_sec: float | None = None
+        source_poll_schedule_skipped = False
         if self._state == "active" and self._source_poll_due():
+            source_poll_deadline_sec = self._source_poll_deadline()
+            source_poll_now = self._source_poll_now()
+            if math.isfinite(source_poll_deadline_sec):
+                source_poll_lateness_sec = max(
+                    0.0,
+                    source_poll_now - source_poll_deadline_sec,
+                )
+            source_step_started_monotonic_sec = self._clock_timestamp()
             source_started = time.perf_counter()
             source_step = self.source.step()
+            source_step_completed_monotonic_sec = self._clock_timestamp()
             source_step_elapsed_sec = max(0.0, time.perf_counter() - source_started)
             self._last_source_step = source_step
-            # A slow source read must not cause a burst of catch-up hardware
-            # refreshes.  The target driver continues at its own physics rate;
-            # the next observation is scheduled from the current clock cut.
-            self._schedule_next_source_poll()
+            # Advance from the prior fixed deadline.  A slow source read must
+            # not cause a burst of catch-up hardware refreshes; if it crosses
+            # a deadline, the scheduler skips the missed period and resumes
+            # one period from the current clock cut.
+            source_poll_schedule_skipped = self._schedule_next_source_poll()
             if source_step.sample is None:
                 self._clear_target()
                 tick_rejection_reason = (
@@ -378,6 +443,7 @@ class RM65ToB601FreeDriveBridge:
                 )
                 self._enter_held(tick_rejection_reason)
             else:
+                source_admission_monotonic_sec = source_step_completed_monotonic_sec
                 source_receive_monotonic_sec = (
                     source_step.sample.receive_timestamp_monotonic_sec
                 )
@@ -410,10 +476,14 @@ class RM65ToB601FreeDriveBridge:
                     self._pending_source_receive_monotonic_sec = (
                         source_step.sample.receive_timestamp_monotonic_sec
                     )
+                    self._pending_source_admission_monotonic_sec = (
+                        source_admission_monotonic_sec
+                    )
                     self._last_rejection_reason = None
                 else:
                     self._pending_command = None
                     self._pending_source_receive_monotonic_sec = None
+                    self._pending_source_admission_monotonic_sec = None
                     self.retargeter.clear_anchor()
                     tick_rejection_reason = (
                         retarget_result.rejection_reason
@@ -428,6 +498,7 @@ class RM65ToB601FreeDriveBridge:
         if command is not None:
             if position_tick.command_applied:
                 pending_receive = self._pending_source_receive_monotonic_sec
+                pending_admission = self._pending_source_admission_monotonic_sec
                 dispatch_time = float(self._telemetry_clock())
                 if math.isfinite(dispatch_time):
                     target_dispatch_monotonic_sec = dispatch_time
@@ -435,14 +506,23 @@ class RM65ToB601FreeDriveBridge:
                         latency = dispatch_time - pending_receive
                         if math.isfinite(latency) and latency >= 0.0:
                             source_to_target_dispatch_latency_sec = latency
+                    if pending_admission is not None and math.isfinite(pending_admission):
+                        admission_latency = dispatch_time - pending_admission
+                        if math.isfinite(admission_latency) and admission_latency >= 0.0:
+                            source_admission_to_target_dispatch_latency_sec = (
+                                admission_latency
+                            )
                 source_receive_monotonic_sec = pending_receive
+                source_admission_monotonic_sec = pending_admission
                 self._pending_command = None
                 self._pending_source_receive_monotonic_sec = None
+                self._pending_source_admission_monotonic_sec = None
             else:
                 # A lower-owner rejection is terminal for this source target;
                 # retrying the same qpos would replay a possibly stale command.
                 self._pending_command = None
                 self._pending_source_receive_monotonic_sec = None
+                self._pending_source_admission_monotonic_sec = None
                 self.retargeter.clear_anchor()
                 tick_rejection_reason = (
                     position_tick.rejection_reason or "position driver rejected the target"
@@ -462,15 +542,34 @@ class RM65ToB601FreeDriveBridge:
             position_step_elapsed_sec=position_step_elapsed_sec,
             step_elapsed_sec=max(0.0, time.perf_counter() - step_started),
             source_receive_monotonic_sec=source_receive_monotonic_sec,
+            source_step_started_monotonic_sec=source_step_started_monotonic_sec,
+            source_step_completed_monotonic_sec=source_step_completed_monotonic_sec,
+            source_admission_monotonic_sec=source_admission_monotonic_sec,
             target_dispatch_monotonic_sec=target_dispatch_monotonic_sec,
             source_to_target_dispatch_latency_sec=(
                 source_to_target_dispatch_latency_sec
             ),
+            source_admission_to_target_dispatch_latency_sec=(
+                source_admission_to_target_dispatch_latency_sec
+            ),
+            source_poll_deadline_sec=source_poll_deadline_sec,
+            source_poll_lateness_sec=source_poll_lateness_sec,
+            source_poll_schedule_skipped=source_poll_schedule_skipped,
         )
+
+    def _clock_timestamp(self) -> float | None:
+        """Return a finite telemetry timestamp without affecting control."""
+
+        try:
+            timestamp = float(self._telemetry_clock())
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return timestamp if math.isfinite(timestamp) else None
 
     def _clear_target(self) -> None:
         self._pending_command = None
         self._pending_source_receive_monotonic_sec = None
+        self._pending_source_admission_monotonic_sec = None
         self._last_retarget_result = None
         self._ik_seed_qpos_rad = None
         self.retargeter.clear_anchor()

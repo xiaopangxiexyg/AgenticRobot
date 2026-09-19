@@ -12,6 +12,9 @@ def test_reverse_latency_report_uses_dispatch_samples_and_rejections() -> None:
                 "retarget_accepted": True,
                 "command_applied": True,
                 "source_to_target_dispatch_latency_sec": 0.004,
+                "source_admission_to_target_dispatch_latency_sec": 0.001,
+                "source_admission_monotonic_sec": 10.003,
+                "source_poll_lateness_sec": 0.002,
                 "source_step_elapsed_sec": 0.006,
                 "retarget_elapsed_sec": 0.001,
                 "position_step_elapsed_sec": 0.0002,
@@ -54,4 +57,17 @@ def test_reverse_latency_report_uses_dispatch_samples_and_rejections() -> None:
         "p50_ms": 4.0,
         "p95_ms": 4.0,
         "p99_ms": 4.0,
+    }
+    assert report["timings"]["source_admission_to_target_dispatch_latency_sec"] == {
+        "count": 1,
+        "mean_ms": 1.0,
+        "max_ms": 1.0,
+        "p50_ms": 1.0,
+        "p95_ms": 1.0,
+        "p99_ms": 1.0,
+    }
+    assert report["diagnostics"]["source_to_target_dispatch_latency_sec"] == {
+        "min_ms": 4.0,
+        "over_10ms_count": 0,
+        "over_20ms_count": 0,
     }
