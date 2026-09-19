@@ -257,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         record({"event": "command", "argv": result["argv"]})
         backend: RM65ArmBackend | None = None
         bridge = None
+        cleanup_stack_entered = False
         try:
             mapping = load_rm65_to_b601_mapping_profile(args.mapping_profile)
             backend = build_observation_only_rm65_backend(
@@ -311,28 +312,29 @@ def main(argv: list[str] | None = None) -> int:
                 "[RM65→B601] MuJoCo B601 target is simulation-only; "
                 "Ctrl-C/EOF closes the viewer and leaves RM65 unchanged."
             )
-            backend.start()
-            result["backend_start_completed"] = True
-            if isinstance(source, RM65FreeDriveRealtimePushSource):
-                push_config = source.start(
-                    configure=bool(args.configure_realtime_push),
-                    cycle_ms=args.realtime_push_cycle_ms,
-                    port=args.realtime_push_port,
-                    ip=args.realtime_push_ip,
-                )
-                result["realtime_push_config"] = dict(push_config)
-                result["realtime_push_configuration_sent"] = bool(
-                    args.configure_realtime_push
-                )
-                emit(
-                    "[RM65→B601] realtime UDP observation callback registered; "
-                    "no RM65 motion command is issued."
-                )
-            viewer = MujocoPassiveViewerSession(bridge.driver.scene)
             with ExitStack() as resources:
+                cleanup_stack_entered = True
                 resources.callback(backend.close)
                 if isinstance(source, RM65FreeDriveRealtimePushSource):
                     resources.callback(source.close)
+                backend.start()
+                result["backend_start_completed"] = True
+                if isinstance(source, RM65FreeDriveRealtimePushSource):
+                    push_config = source.start(
+                        configure=bool(args.configure_realtime_push),
+                        cycle_ms=args.realtime_push_cycle_ms,
+                        port=args.realtime_push_port,
+                        ip=args.realtime_push_ip,
+                    )
+                    result["realtime_push_config"] = dict(push_config)
+                    result["realtime_push_configuration_sent"] = bool(
+                        args.configure_realtime_push
+                    )
+                    emit(
+                        "[RM65→B601] realtime UDP observation callback registered; "
+                        "no RM65 motion command is issued."
+                    )
+                viewer = MujocoPassiveViewerSession(bridge.driver.scene)
                 resources.callback(viewer.close)
                 viewer.start()
                 run_rm65_to_b601_foreground(
@@ -365,10 +367,10 @@ def main(argv: list[str] | None = None) -> int:
             record({"event": "result", **result, "exit_code": 1})
             return 1
         finally:
-            # The ExitStack owns normal live cleanup.  If construction or start
-            # failed before it was entered, still close the observation backend
-            # without issuing any RM65 motion command.
-            if backend is not None and not bool(result.get("backend_start_completed")):
+            # The ExitStack owns normal live cleanup. If construction failed
+            # before it was entered, still close the observation backend without
+            # issuing any RM65 motion command.
+            if backend is not None and not cleanup_stack_entered:
                 try:
                     backend.close()
                 except Exception as cleanup_error:  # noqa: BLE001
