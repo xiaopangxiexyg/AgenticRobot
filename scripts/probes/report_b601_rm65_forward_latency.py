@@ -30,6 +30,14 @@ _TIMING_FIELDS = (
     "proposal_submission_elapsed_sec",
     "session_step_elapsed_sec",
     "target_step_elapsed_sec",
+    "target_resolution_elapsed_sec",
+    "target_pose_transform_elapsed_sec",
+    "target_pose_smoothing_elapsed_sec",
+    "target_pose_safety_filter_elapsed_sec",
+    "target_pre_ik_elapsed_sec",
+    "target_ik_elapsed_sec",
+    "target_post_ik_elapsed_sec",
+    "target_post_resolution_elapsed_sec",
     "source_to_target_dispatch_latency_sec",
     "source_interarrival_sec",
 )
@@ -74,6 +82,8 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     timings = {name: [] for name in _TIMING_FIELDS}
     counts: Counter[str] = Counter()
     target_statuses: Counter[str] = Counter()
+    target_resolution_statuses: Counter[str] = Counter()
+    target_ik_statuses: Counter[str] = Counter()
     resolution_failures: Counter[str] = Counter()
     rejection_reasons: Counter[str] = Counter()
     previous_source_receive: float | None = None
@@ -99,6 +109,14 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             counts["proposal_accepted"] += 1
         if record.get("target_dispatch_accepted") is True:
             counts["target_dispatches"] += 1
+        if record.get("target_resolution_invoked") is True:
+            counts["target_resolution_invocations"] += 1
+        resolution_status = record.get("target_resolution_status")
+        if resolution_status:
+            target_resolution_statuses[str(resolution_status)] += 1
+        ik_status = record.get("target_ik_status")
+        if ik_status:
+            target_ik_statuses[str(ik_status)] += 1
         status = record.get("target_status")
         if status:
             target_statuses[str(status)] += 1
@@ -138,9 +156,13 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             )
 
     return {
-        "schema": "b601_rm65_forward_latency_report_v1",
+        "schema": "b601_rm65_forward_latency_report_v2",
         "counts": dict(sorted(counts.items())),
         "target_statuses": dict(sorted(target_statuses.items())),
+        "target_resolution_statuses": dict(
+            sorted(target_resolution_statuses.items())
+        ),
+        "target_ik_statuses": dict(sorted(target_ik_statuses.items())),
         "proposal_rejection_reasons": dict(sorted(rejection_reasons.items())),
         "target_resolution_failure_reasons": dict(
             sorted(resolution_failures.items())
@@ -163,6 +185,16 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "age reported by MotorBridge at the foreground tick; it is "
                 "separate from source-to-target dispatch work."
             ),
+                "target_resolution": (
+                    "target_resolution_elapsed_sec is the canonical MuJoCo pose "
+                    "resolver duration. Its pre_ik/pose-transform/smoothing/filter "
+                    "fields expose the preparation stages; target_ik_elapsed_sec "
+                    "is the coupled RM65 IK solver duration and "
+                    "target_post_ik_elapsed_sec is resolution construction/lineage. "
+                    "target_post_resolution_elapsed_sec "
+                    "is the remainder of the target step (dispatch, physics and "
+                    "measurement/trace work) after the resolver."
+                ),
             "excluded": (
                 "B601 feedback age before host receipt and MuJoCo viewer "
                 "presentation latency are not included in the primary value."

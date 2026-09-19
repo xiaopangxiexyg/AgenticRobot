@@ -19,6 +19,12 @@ def test_forward_latency_report_correlates_source_and_target_dispatch() -> None:
                 "target_dispatch_accepted": True,
                 "target_dispatch_monotonic_sec": 10.012,
                 "target_step_elapsed_sec": 0.008,
+                "target_resolution_invoked": True,
+                "target_resolution_elapsed_sec": 0.004,
+                "target_ik_elapsed_sec": 0.003,
+                "target_post_resolution_elapsed_sec": 0.004,
+                "target_resolution_status": "accepted",
+                "target_ik_status": "tracking",
                 "target_status": "dispatched",
                 "feedback_snapshot": {"max_receive_age_sec": 0.025},
             },
@@ -44,6 +50,7 @@ def test_forward_latency_report_correlates_source_and_target_dispatch() -> None:
         "source_admitted": 2,
         "source_reused": 1,
         "target_dispatches": 1,
+        "target_resolution_invocations": 1,
     }
     assert report["proposal_rejection_reasons"] == {
         "b601_motion_rejected": 1,
@@ -61,3 +68,7 @@ def test_forward_latency_report_correlates_source_and_target_dispatch() -> None:
     }
     assert report["timings"]["source_interarrival_sec"]["p50_ms"] == 50.0
     assert report["timings"]["feedback_cache_age_sec"]["p50_ms"] == 25.0
+    assert report["counts"]["target_resolution_invocations"] == 1
+    assert report["target_resolution_statuses"] == {"accepted": 1}
+    assert report["target_ik_statuses"] == {"tracking": 1}
+    assert report["timings"]["target_ik_elapsed_sec"]["p50_ms"] == 3.0

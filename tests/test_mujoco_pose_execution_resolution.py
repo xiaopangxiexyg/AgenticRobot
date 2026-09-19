@@ -168,6 +168,15 @@ def test_pose_resolution_preserves_safe_pose_and_emits_separate_qpos_command() -
     # Resolution is pure with respect to the MuJoCo plant.
     np.testing.assert_allclose(scene.qpos["left"], np.zeros(6))
     np.testing.assert_allclose(scene.qpos["right"], np.zeros(6))
+    timing = resolver.last_resolve_diagnostics
+    assert timing["resolve_invoked"] is True
+    assert timing["resolve_status"] == "accepted"
+    assert timing["ik_status"] == "tracking"
+    assert float(timing["resolve_total_elapsed_sec"]) >= float(
+        timing["ik_elapsed_sec"]
+    )
+    resolver.clear_last_resolve_diagnostics()
+    assert resolver.last_resolve_diagnostics == {}
 
 
 def test_pose_resolution_smooths_before_ik_and_resets_temporal_state() -> None:
@@ -424,6 +433,10 @@ def test_pose_resolution_hold_never_creates_executable_command() -> None:
         "right_hand_proxy_0"
     )
     assert failure.diagnostics["collision_geometry_2"] == "table_0"
+    timing = resolver.last_resolve_diagnostics
+    assert timing["resolve_status"] == "rejected"
+    assert timing["resolve_failure_reason_code"] == "collision_margin_low"
+    assert float(timing["ik_elapsed_sec"]) >= 0.0
 
 
 def test_resolution_lookup_rejects_untyped_command() -> None:

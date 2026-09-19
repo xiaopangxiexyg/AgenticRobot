@@ -281,12 +281,47 @@ def run_b601_rm65_gui(
         return commands(timeout)
 
     def advance() -> dict[str, object]:
+        pose_resolver = getattr(session.binding.runtime, "pose_resolver", None)
+        clear_resolve_diagnostics = getattr(
+            pose_resolver, "clear_last_resolve_diagnostics", None
+        )
+        if callable(clear_resolve_diagnostics):
+            clear_resolve_diagnostics()
         target_started = time.perf_counter()
         result = session.binding.runtime.step()
         target_completed = float(session.binding.runtime.clock())
         target_details = _target_step_details(result)
-        target_details["target_step_elapsed_sec"] = max(
+        target_step_elapsed_sec = max(
             0.0, time.perf_counter() - target_started
+        )
+        target_details["target_step_elapsed_sec"] = target_step_elapsed_sec
+        resolve_diagnostics = getattr(
+            pose_resolver, "last_resolve_diagnostics", {}
+        )
+        if isinstance(resolve_diagnostics, Mapping):
+            resolve_diagnostics = dict(resolve_diagnostics)
+        else:
+            resolve_diagnostics = {}
+        resolution_elapsed = _finite_float_or_none(
+            resolve_diagnostics.get("resolve_total_elapsed_sec")
+        )
+        target_details["target_resolution"] = resolve_diagnostics
+        target_details["target_resolution_invoked"] = bool(
+            resolve_diagnostics.get("resolve_invoked", False)
+        )
+        target_details["target_resolution_elapsed_sec"] = (
+            resolution_elapsed
+        )
+        target_details["target_ik_elapsed_sec"] = resolve_diagnostics.get(
+            "ik_elapsed_sec"
+        )
+        target_details["target_post_resolution_elapsed_sec"] = (
+            max(
+                0.0,
+                target_step_elapsed_sec - resolution_elapsed,
+            )
+            if resolution_elapsed is not None
+            else None
         )
         target_details["target_dispatch_accepted"] = (
             str(getattr(result, "status", "")) == "dispatched"

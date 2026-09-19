@@ -444,6 +444,58 @@ def run_b601_rm65_foreground(
                 "target_step_elapsed_sec": target_details.get(
                     "target_step_elapsed_sec"
                 ),
+                "target_resolution_invoked": target_details.get(
+                    "target_resolution_invoked", False
+                ),
+                "target_resolution_elapsed_sec": target_details.get(
+                    "target_resolution_elapsed_sec"
+                ),
+                "target_pose_transform_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("pose_transform_elapsed_sec"),
+                "target_pose_smoothing_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("pose_smoothing_elapsed_sec"),
+                "target_pose_safety_filter_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("pose_safety_filter_elapsed_sec"),
+                "target_pre_ik_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("pre_ik_elapsed_sec"),
+                "target_ik_elapsed_sec": target_details.get(
+                    "target_ik_elapsed_sec"
+                ),
+                "target_post_ik_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("post_ik_elapsed_sec"),
+                "target_post_resolution_elapsed_sec": target_details.get(
+                    "target_post_resolution_elapsed_sec"
+                ),
+                "target_resolution_status": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("resolve_status"),
+                "target_ik_status": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("ik_status"),
+                "target_ik_solver": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("ik_solver"),
                 "target_status": target_details.get("status"),
                 "target_resolution_failure": target_details.get(
                     "resolution_failure"

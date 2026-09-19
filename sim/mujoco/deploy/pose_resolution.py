@@ -14,10 +14,12 @@ verified transform; this module must not guess or silently apply one.
 
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-import threading
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -36,26 +38,25 @@ from robot_motion.action import (
     CompoundDispatchManifest,
     ResolvedExecutionTarget,
     RobotAction,
-    build_resolved_execution_target,
+    TargetProcessingFactReference,
     build_component_execution_target,
+    build_resolved_execution_target,
     hand_action_specs_from_metadata,
     project_robot_action_to_components,
     validate_compound_dispatch_manifest,
-    TargetProcessingFactReference,
 )
 from robot_motion.action.executor import RobotActionResolver, xyzquat_to_matrix
-from robot_motion.deploy.schema import pose_matrix_to_xyzquat
-from robot_motion.pose_smoothing import BimanualPoseSmoother
 from robot_motion.action.proposal import (
     freeze_robot_action,
     robot_action_semantic_payload,
 )
 from robot_motion.action.safety_anchor import safety_anchor_action_hash
+from robot_motion.deploy.schema import pose_matrix_to_xyzquat
+from robot_motion.pose_smoothing import BimanualPoseSmoother
 from robot_motion.rm65.constants import TOOL_TCP_FRAME
 from robot_motion.runtime import TeleopCommand
 
 from ..ik import IKResult, PoseTarget, RM65CanonicalIK, RM65RetargeterIK
-
 
 POSE_TO_QPOS_RESOLUTION_HASH_DOMAIN_V1 = (
     "dexteleop.mujoco.pose_to_qpos_execution_resolution.v1"
@@ -393,6 +394,23 @@ class MujocoCoupledPoseToQposResolver:
         self._command_resolver = RobotActionResolver()
         self._lock = threading.RLock()
         self._resolution_by_id: dict[str, MujocoPoseToQposResolution] = {}
+        # Runtime-only timing evidence.  These values are deliberately kept
+        # outside the semantic resolution payload/hash: measuring a resolve
+        # must never change command identity or acceptance behavior.
+        self._last_resolve_diagnostics: dict[str, object] = {}
+
+    @property
+    def last_resolve_diagnostics(self) -> Mapping[str, object]:
+        """Return timing/status evidence for the most recent resolve call."""
+
+        with self._lock:
+            return dict(self._last_resolve_diagnostics)
+
+    def clear_last_resolve_diagnostics(self) -> None:
+        """Clear the previous timing sample before a new runtime step."""
+
+        with self._lock:
+            self._last_resolve_diagnostics = {}
 
     def reset_temporal_state(self) -> None:
         """Clear stateful target shaping at HOLD/rebuild boundaries."""
@@ -410,18 +428,28 @@ class MujocoCoupledPoseToQposResolver:
         context: Any = None,
     ) -> TeleopCommand:
         del observation, context
+        resolve_started = time.perf_counter()
+        timing: dict[str, object] = {"resolve_invoked": True}
+        with self._lock:
+            self._last_resolve_diagnostics = {}
         safe_action = freeze_robot_action(action)
         if self.pose_transformer is None:
             solver_input = safe_action
             transform_result = None
+            timing["pose_transform_elapsed_sec"] = 0.0
         else:
+            transform_started = time.perf_counter()
             transform_result = self.pose_transformer.transform(safe_action)
             solver_input = transform_result.transformed_action
+            timing["pose_transform_elapsed_sec"] = max(
+                0.0, time.perf_counter() - transform_started
+            )
         target_pose_smoothing: dict[str, object] = {
             "enabled": False,
             "status": "not_configured",
         }
         if self.target_pose_smoother is not None:
+            smoothing_started = time.perf_counter()
             with self._lock:
                 smoothed_targets, target_pose_smoothing = (
                     self.target_pose_smoother.smooth_pair(
@@ -446,10 +474,21 @@ class MujocoCoupledPoseToQposResolver:
                     arm_pose_by_side=smoothed_vectors,
                 )
             )
+            timing["pose_smoothing_elapsed_sec"] = max(
+                0.0, time.perf_counter() - smoothing_started
+            )
+        else:
+            timing["pose_smoothing_elapsed_sec"] = 0.0
         if self.pose_target_safety_filter is not None:
+            safety_filter_started = time.perf_counter()
             solver_input = freeze_robot_action(
                 self.pose_target_safety_filter(solver_input)
             )
+            timing["pose_safety_filter_elapsed_sec"] = max(
+                0.0, time.perf_counter() - safety_filter_started
+            )
+        else:
+            timing["pose_safety_filter_elapsed_sec"] = 0.0
         self._validate_arm_base_input(solver_input)
         targets = {
             side: PoseTarget(
@@ -459,7 +498,36 @@ class MujocoCoupledPoseToQposResolver:
             )
             for side in ("left", "right")
         }
-        result = self.ik.solve(targets, active_sides=self.active_arm_sides)
+        timing["pre_ik_elapsed_sec"] = max(
+            0.0, time.perf_counter() - resolve_started
+        )
+        ik_started = time.perf_counter()
+        try:
+            result = self.ik.solve(targets, active_sides=self.active_arm_sides)
+        except BaseException as error:
+            timing.update(
+                {
+                    "ik_elapsed_sec": max(0.0, time.perf_counter() - ik_started),
+                    "ik_status": "exception",
+                    "ik_error_type": type(error).__name__,
+                    "resolve_status": "error",
+                    "resolve_total_elapsed_sec": max(
+                        0.0, time.perf_counter() - resolve_started
+                    ),
+                }
+            )
+            with self._lock:
+                self._last_resolve_diagnostics = dict(timing)
+            raise
+        timing.update(
+            {
+                "ik_elapsed_sec": max(0.0, time.perf_counter() - ik_started),
+                "ik_status": str(result.status),
+                "ik_solver": str(result.solver),
+                "ik_hold": bool(result.hold),
+            }
+        )
+        post_ik_started = time.perf_counter()
         if not result.success or result.hold:
             metadata = dict(result.metadata or {})
             failure = dict(metadata.get("failure") or {})
@@ -551,6 +619,20 @@ class MujocoCoupledPoseToQposResolver:
                     )
                 ),
             }
+            timing.update(
+                {
+                    "resolve_status": "rejected",
+                    "resolve_failure_reason_code": reason_code,
+                    "post_ik_elapsed_sec": max(
+                        0.0, time.perf_counter() - post_ik_started
+                    ),
+                    "resolve_total_elapsed_sec": max(
+                        0.0, time.perf_counter() - resolve_started
+                    ),
+                }
+            )
+            with self._lock:
+                self._last_resolve_diagnostics = dict(timing)
             raise ActionResolutionError(
                 ActionResolutionFailure(
                     reason_code=reason_code,
@@ -596,6 +678,18 @@ class MujocoCoupledPoseToQposResolver:
         )
         with self._lock:
             self._resolution_by_id[resolution.resolution_id] = resolution
+            timing.update(
+                {
+                    "resolve_status": "accepted",
+                    "post_ik_elapsed_sec": max(
+                        0.0, time.perf_counter() - post_ik_started
+                    ),
+                    "resolve_total_elapsed_sec": max(
+                        0.0, time.perf_counter() - resolve_started
+                    ),
+                }
+            )
+            self._last_resolve_diagnostics = dict(timing)
         return command
 
     def resolution_for_command(
@@ -992,11 +1086,11 @@ def build_mujoco_component_execution_target(
 
 
 __all__ = [
-    "MujocoCoupledPoseToQposResolver",
-    "MujocoPoseToQposResolution",
     "POSE_TO_QPOS_RESOLUTION_HASH_DOMAIN_V1",
     "POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1",
     "POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1",
-    "build_mujoco_pose_qpos_execution_target",
+    "MujocoCoupledPoseToQposResolver",
+    "MujocoPoseToQposResolution",
     "build_mujoco_component_execution_target",
+    "build_mujoco_pose_qpos_execution_target",
 ]

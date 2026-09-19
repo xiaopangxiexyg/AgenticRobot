@@ -127,6 +127,9 @@ def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
             "source_poll_elapsed_sec",
             "session_step_elapsed_sec",
             "target_step_elapsed_sec",
+            "target_resolution_elapsed_sec",
+            "target_ik_elapsed_sec",
+            "target_post_resolution_elapsed_sec",
             "source_to_target_dispatch_latency_sec",
         }
         <= event.keys()
