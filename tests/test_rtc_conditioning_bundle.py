@@ -1737,6 +1737,18 @@ def test_v3_work_item_client_crops_once_and_binds_result_receipts() -> None:
     assert debug_payload["consumed_prefix_steps"] == 3
     assert debug_payload["prefix_step_count_parity"] is True
     assert debug_payload["masked_output_max_abs_error"] == 0.0
+    phase_timings = debug_payload["client_timing_sec"]
+    assert set(phase_timings) == {
+        "model_input_prepare",
+        "capability_check",
+        "encode_envelope",
+        "backend_call",
+        "response_validation",
+        "result_decode",
+    }
+    assert all(value >= 0.0 for value in phase_timings.values())
+    assert phase_timings["backend_call"] > 0.0
+    assert phase_timings["model_input_prepare"] > 0.0
     assert (
         observed_bundle.response.semantic_content_hash
         == before_response_hash
