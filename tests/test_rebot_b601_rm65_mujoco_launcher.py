@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from scripts.hardware import rebot_b601_rm65_mujoco_follow as launcher
+from scripts.hardware import rebot_b601_rs_owner as owner
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
@@ -97,3 +98,36 @@ def test_launcher_help_is_available_without_runtime_imports() -> None:
     assert "--pause-on-exit" in help_text
     assert "--mapping-controlled-rotation-matrix" in help_text
     assert "receive-only" in help_text
+
+
+def test_owner_launcher_requires_explicit_motion_acknowledgement() -> None:
+    args = owner._parser().parse_args([])
+    assert args.allow_motion is False
+    assert args.mode == "hold"
+    assert args.feedback_source == "active-report"
+    assert args.driver_kd == owner.DEFAULT_DRIVER_KD
+
+
+def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path) -> None:
+    args = owner._parser().parse_args(["--allow-motion"])
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+
+    assert command[0] == launcher.sys.executable
+    assert command[1].endswith("scripts/hardware/rebot_b601_rs_low_gain_probe.py")
+    assert "--allow-motion" in command
+    assert "--auto-disable" in command
+    assert "--allow-active-report" in command
+    assert "--auto-disable-active-report" in command
+    assert "--apply-driver-torque-limits" in command
+    assert command[command.index("--velocity-abort-rad-s") + 1] == "2.5"
+    assert command[command.index("--acceleration-abort-rad-s2") + 1] == "80.0"
+
+
+def test_owner_launcher_rejects_missing_motion_ack_before_resource_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(owner, "DEFAULT_CONFIG", tmp_path / "missing.yaml")
+    with pytest.raises(SystemExit) as error:
+        owner.main([])
+    assert error.value.code == 2

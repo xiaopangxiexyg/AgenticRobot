@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
@@ -244,7 +245,13 @@ def _write_log(log: TextIO, text: str) -> None:
     log.flush()
 
 
-def _run_foreground(command: list[str], *, cwd: Path, terminal_log: Path) -> int:
+def _run_foreground(
+    command: list[str],
+    *,
+    cwd: Path,
+    terminal_log: Path,
+    environment_overrides: Mapping[str, str | None] | None = None,
+) -> int:
     """Run one child in the foreground while mirroring its output to a log."""
 
     environment = os.environ.copy()
@@ -255,6 +262,13 @@ def _run_foreground(command: list[str], *, cwd: Path, terminal_log: Path) -> int
         if not current_pythonpath
         else f"{cwd}{os.pathsep}{current_pythonpath}"
     )
+    for name, value in (environment_overrides or {}).items():
+        if value is None:
+            environment.pop(name, None)
+        elif name == "PYTHONPATH":
+            environment[name] = f"{cwd}{os.pathsep}{value}"
+        else:
+            environment[name] = value
     with terminal_log.open("x", encoding="utf-8") as log:
         _write_log(log, "command: " + " ".join(command))
         _write_log(log, f"cwd: {cwd}")

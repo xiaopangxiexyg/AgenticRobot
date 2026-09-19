@@ -248,6 +248,23 @@ PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
 位姿幅度预检，追加 `--keep-residual-envelope`。矩阵参数仍支持 9 个行主序数值，profile
 中的 `semantic_content_hash` 只是派生证据，不是现场调参门禁。
 
+B601 真机 owner 也有对应的短启动器。它仍然是**可能使能六个真实关节**的前台命令，
+因此必须显式写出 `--allow-motion`；启动器默认保留当前确认过的重力 scale/bias、六关节
+driver-Kd、0.40 torque envelope、2.5 rad/s 速度异常阈值、80 rad/s² 加速度异常阈值，
+并复用原 probe 的首次 Ctrl-C protective hold、第二次 Ctrl-C/SIGUSR1 全臂失能语义：
+
+```bash
+cd /home/zc/HandMotion/Developing/AgenticRobot-development-mainline
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
+"$PY" scripts/hardware/rebot_b601_rs_owner.py --allow-motion
+```
+
+该启动器默认优先使用 checkout 内的 MotorBridge Python binding/ABI，保留操作者显式设置
+的 `MOTORBRIDGE_LIB`；不会在后台运行。真机 owner 与 RM65 启动器必须分别在两个已经打开
+的终端中运行，先确认 B601 进入 `ACTIVE`，再启动上面的 RM65 跟随命令。若需要在临时
+终端窗口中保持窗口不闪退，可给任一命令追加 `--pause-on-exit`；在正常交互 shell 中不
+需要该参数，程序返回后父 shell 仍在，上一条短命令可以直接按上键取回。
+
 ## 已修复的时序缺陷（2026-09-16）
 
 初次标准离线回归为 **50 passed、2 failed**；失败没有被忽略或改成 skip。
