@@ -285,7 +285,7 @@ PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
 
 B601 真机 owner 也有对应的短启动器。它仍然是**可能使能六个真实关节**的前台命令，
 因此必须显式写出 `--allow-motion`；启动器默认保留当前确认过的重力 scale/bias、六关节
-driver-Kd、0.40 torque envelope、2.5 rad/s 速度异常阈值、80 rad/s² 加速度异常阈值，
+driver-Kd、0.40 torque envelope、5.0 rad/s 速度异常阈值、80 rad/s² 加速度异常阈值，
 并复用原 probe 的首次 Ctrl-C protective hold、第二次 Ctrl-C/SIGUSR1 全臂失能语义：
 
 ```bash

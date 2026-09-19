@@ -33,6 +33,7 @@ DEFAULT_GRAVITY_SCALES = (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
 DEFAULT_GRAVITY_OFFSETS = (0.0,) * 6
 DEFAULT_GRAVITY_BIAS = (0.0, -0.105, -0.1, -0.05, 0.0, 0.0)
 DEFAULT_COULOMB = (0.0,) * 6
+DEFAULT_VELOCITY_ABORT_RAD_S = 5.0
 
 
 def _env_path(name: str, fallback: Path) -> Path:
@@ -125,7 +126,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--torque-limit-scale", type=float, default=0.40)
     parser.add_argument("--torque-rise-time-sec", type=float, default=0.5)
-    parser.add_argument("--velocity-abort-rad-s", type=float, default=2.5)
+    parser.add_argument(
+        "--velocity-abort-rad-s",
+        type=float,
+        default=DEFAULT_VELOCITY_ABORT_RAD_S,
+        help=(
+            "normal-control finite-difference velocity abort threshold; "
+            "the default is a manual-drag commissioning envelope, not a "
+            "hardware-certified limit"
+        ),
+    )
     parser.add_argument("--acceleration-abort-rad-s2", type=float, default=80.0)
     parser.add_argument("--max-error-rad", type=float, default=2.0)
     parser.add_argument("--fault-hold-max-age-sec", type=float, default=0.15)

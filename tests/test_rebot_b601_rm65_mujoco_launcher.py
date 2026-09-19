@@ -157,7 +157,7 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
         command[command.index("--confirmation") + 1]
         == low_gain_probe.CONFIRMATION
     )
-    assert command[command.index("--velocity-abort-rad-s") + 1] == "2.5"
+    assert command[command.index("--velocity-abort-rad-s") + 1] == "5.0"
     assert command[command.index("--acceleration-abort-rad-s2") + 1] == "80.0"
 
     # Re-parse the exact generated argv through the real probe contract.  This
