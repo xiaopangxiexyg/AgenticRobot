@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1036,6 +1036,85 @@ def test_prepared_server_operator_stop_is_traceback_free(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "OpenPI policy server stopped by operator.\n"
+
+
+def test_rtc_startup_warmup_uses_prepared_masked_state_and_discards_result() -> None:
+    spec = prepared_server_runtime._RtcStartupWarmupSpec(
+        image_keys=("base_0_rgb", "left_wrist_0_rgb"),
+        image_shape=(4, 5, 3),
+        base_state_dim=3,
+        state_input_mode="masked_normalized_concat_v1",
+        action_dim=2,
+    )
+    calls: list[tuple[dict[str, object], dict[str, object]]] = []
+
+    class Policy:
+        def infer_rtc(self, observation, **kwargs):
+            calls.append((observation, kwargs))
+            return {"actions": np.zeros((2, 2), dtype=np.float32)}
+
+    elapsed = prepared_server_runtime._run_rtc_startup_warmup(
+        Policy(),
+        spec,
+    )
+
+    assert elapsed >= 0.0
+    assert len(calls) == 1
+    observation, kwargs = calls[0]
+    np.testing.assert_array_equal(
+        observation["state"],
+        np.array([0, 0, 0, 1, 1, 1], dtype=np.float32),
+    )
+    assert set(observation["image"]) == set(spec.image_keys)
+    assert all(
+        value.shape == spec.image_shape
+        for value in observation["image"].values()
+    )
+    assert all(bool(value) for value in observation["image_mask"].values())
+    np.testing.assert_array_equal(
+        kwargs["conditioning_actions"],
+        np.zeros((1, 2), dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        kwargs["prefix_mask"],
+        np.zeros((1,), dtype=np.bool_),
+    )
+    assert kwargs["conditioning_mode"] == "unconditioned_bootstrap_v1"
+    assert kwargs["receipt_context"] == {"warmup": "prepared_server_startup_v1"}
+
+
+def test_rtc_startup_warmup_runs_before_server_listen_and_restores_class() -> None:
+    spec = prepared_server_runtime._RtcStartupWarmupSpec(
+        image_keys=("base_0_rgb",),
+        image_shape=(2, 2, 3),
+        base_state_dim=1,
+        state_input_mode="raw_state_v1",
+        action_dim=1,
+    )
+    events: list[str] = []
+
+    class Policy:
+        def infer_rtc(self, _observation, **_kwargs):
+            events.append("warmup")
+            return {"actions": np.zeros((1, 1), dtype=np.float32)}
+
+    class Server:
+        def __init__(self, *, policy, **_kwargs):
+            self.policy = policy
+
+        def serve_forever(self):
+            events.append("serve")
+
+    module = SimpleNamespace(WebsocketPolicyServer=Server)
+    original = module.WebsocketPolicyServer
+    with prepared_server_runtime.install_openpi_rtc_startup_warmup_server_adapter(
+        module,
+        spec,
+    ):
+        module.WebsocketPolicyServer(policy=Policy()).serve_forever()
+        assert module.WebsocketPolicyServer is not original
+    assert events == ["warmup", "serve"]
+    assert module.WebsocketPolicyServer is original
 
 
 def test_prepared_server_dynamic_loader_restores_module_after_failure(

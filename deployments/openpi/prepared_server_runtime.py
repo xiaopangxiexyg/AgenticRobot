@@ -15,8 +15,16 @@ import importlib
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
+
+import numpy as np
+
+from dataset_contracts.state_input import (
+    STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+    deployment_state_input,
+)
 
 from deployments.openpi.image_wire import (
     OPENPI_IMAGE_WIRE_TRAINING_METADATA_KEY_V1,
@@ -638,6 +646,184 @@ def _serve_until_stopped(server_module: Any, server_args: Any) -> int:
     return 0
 
 
+@dataclasses.dataclass(frozen=True)
+class _RtcStartupWarmupSpec:
+    """The already-validated tensor contract needed for one RTC warmup."""
+
+    image_keys: tuple[str, ...]
+    image_shape: tuple[int, int, int]
+    base_state_dim: int
+    state_input_mode: str
+    action_dim: int
+    image_mask_value: bool = True
+
+
+def _prepared_rtc_startup_warmup_spec(
+    resolution: PreparedDeploymentResolution,
+    config: Any,
+    *,
+    state_only_bridge: OpenPIStateOnlyInputBridge | None,
+) -> _RtcStartupWarmupSpec:
+    """Derive the warmup shape from the validated artifact, not from guesses."""
+
+    artifact = resolution.deployment_artifact
+    layout = artifact.policy_io_layout
+    base_state_dim = int(layout.state_dim)
+    action_dim = int(layout.action_dim)
+    state_input_mode = str(artifact.state_input_mode)
+    state_input_dim = int(artifact.state_input_dim)
+    if base_state_dim <= 0 or action_dim <= 0:
+        raise ValueError(
+            "RTC startup warmup requires positive state and action dimensions."
+        )
+    expected_state_input_dim = (
+        base_state_dim * 2
+        if state_input_mode == STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT
+        else base_state_dim
+    )
+    if state_input_dim != expected_state_input_dim:
+        raise ValueError(
+            "RTC startup warmup state dimension disagrees with the prepared "
+            f"artifact: mode={state_input_mode!r} expected="
+            f"{expected_state_input_dim} actual={state_input_dim}."
+        )
+    image_keys = tuple(str(value) for value in config.model.image_keys)
+    if not image_keys or len(set(image_keys)) != len(image_keys):
+        raise ValueError(
+            "RTC startup warmup requires unique configured OpenPI image keys."
+        )
+    if state_only_bridge is not None:
+        image_shape = tuple(int(value) for value in state_only_bridge.image_shape)
+        image_mask_value = False
+    else:
+        # OpenPI's visual model contract is fixed at this resolution; the
+        # prepared image artifact has already validated the camera slots.
+        image_shape = (224, 224, 3)
+        image_mask_value = True
+    return _RtcStartupWarmupSpec(
+        image_keys=image_keys,
+        image_shape=image_shape,
+        base_state_dim=base_state_dim,
+        state_input_mode=state_input_mode,
+        action_dim=action_dim,
+        image_mask_value=image_mask_value,
+    )
+
+
+def _run_rtc_startup_warmup(
+    policy: Any,
+    spec: _RtcStartupWarmupSpec,
+) -> float:
+    """Compile the conditioned RTC path before the server accepts clients.
+
+    The all-zero prefix is an explicit provider bootstrap operation.  Its
+    result is deliberately never published or returned to a caller; this is a
+    server-local JAX/model warmup only.  Any failure is propagated so the
+    server does not expose a cold or partially initialized endpoint.
+    """
+
+    infer_rtc = getattr(policy, "infer_rtc", None)
+    if not callable(infer_rtc):
+        raise RuntimeError(
+            "RTC startup warmup requires a policy with infer_rtc()."
+        )
+    observation = {
+        "state": deployment_state_input(
+            np.zeros((spec.base_state_dim,), dtype=np.float32),
+            spec.state_input_mode,
+        ),
+        "image": {
+            key: np.zeros(spec.image_shape, dtype=np.uint8)
+            for key in spec.image_keys
+        },
+        "image_mask": {
+            key: np.bool_(spec.image_mask_value) for key in spec.image_keys
+        },
+    }
+    print(
+        "[OpenPIRuntime] RTC startup warmup starting; "
+        "server_listen=blocked; action_publication=none",
+        flush=True,
+    )
+    started = time.monotonic()
+    result = infer_rtc(
+        observation,
+        conditioning_actions=np.zeros(
+            (1, spec.action_dim), dtype=np.float32
+        ),
+        prefix_mask=np.zeros((1,), dtype=np.bool_),
+        conditioning_mode="unconditioned_bootstrap_v1",
+        receipt_context={"warmup": "prepared_server_startup_v1"},
+    )
+    elapsed = time.monotonic() - started
+    if not isinstance(result, Mapping):
+        raise RuntimeError("RTC startup warmup returned a non-mapping result.")
+    actions = np.asarray(result.get("actions"), dtype=np.float32)
+    if actions.ndim != 2 or actions.shape[1] != spec.action_dim:
+        raise RuntimeError(
+            "RTC startup warmup returned an unexpected action shape: "
+            f"expected second dimension {spec.action_dim}, got {actions.shape}."
+        )
+    if not np.all(np.isfinite(actions)):
+        raise RuntimeError("RTC startup warmup returned non-finite actions.")
+    print(
+        "[OpenPIRuntime] RTC startup warmup complete "
+        f"elapsed={elapsed:.3f}s; result_discarded=true; "
+        "action_publication=none; server_listen=starting",
+        flush=True,
+    )
+    return elapsed
+
+
+@contextmanager
+def install_openpi_rtc_startup_warmup_server_adapter(
+    websocket_policy_server_module: Any,
+    spec: _RtcStartupWarmupSpec | None,
+) -> Iterator[None]:
+    """Run one local RTC bootstrap before the delegated server listens."""
+
+    if spec is None:
+        yield
+        return
+    original = websocket_policy_server_module.WebsocketPolicyServer
+
+    class RtcStartupWarmupWebsocketPolicyServer(original):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            policy = kwargs.get("policy")
+            if policy is None and args:
+                policy = args[0]
+            if policy is None:
+                raise TypeError(
+                    "OpenPI WebsocketPolicyServer warmup wrapper requires policy."
+                )
+            super().__init__(*args, **kwargs)
+            self._prepared_rtc_warmup_policy = policy
+            self._prepared_rtc_warmup_done = False
+
+        def serve_forever(self) -> Any:
+            if not self._prepared_rtc_warmup_done:
+                _run_rtc_startup_warmup(
+                    self._prepared_rtc_warmup_policy,
+                    spec,
+                )
+                self._prepared_rtc_warmup_done = True
+            return super().serve_forever()
+
+    RtcStartupWarmupWebsocketPolicyServer.__name__ = original.__name__
+    RtcStartupWarmupWebsocketPolicyServer.__qualname__ = original.__qualname__
+    websocket_policy_server_module.WebsocketPolicyServer = (
+        RtcStartupWarmupWebsocketPolicyServer
+    )
+    try:
+        yield
+    finally:
+        if (
+            websocket_policy_server_module.WebsocketPolicyServer
+            is RtcStartupWarmupWebsocketPolicyServer
+        ):
+            websocket_policy_server_module.WebsocketPolicyServer = original
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Serve a checkpoint-bound prepared OpenPI config."
@@ -810,6 +996,15 @@ def main(argv: list[str] | None = None) -> int:
             "OpenPI config registry already contains a different config with "
             f"name {config.name!r}."
         )
+    rtc_warmup_spec = (
+        _prepared_rtc_startup_warmup_spec(
+            resolution,
+            config,
+            state_only_bridge=state_only_bridge,
+        )
+        if args.enable_rtc_continuation and not args.validate_only
+        else None
+    )
     registry[config.name] = config
     try:
         if args.validate_only:
@@ -866,6 +1061,9 @@ def main(argv: list[str] | None = None) -> int:
             training_config,
             config,
             resolution,
+        ), install_openpi_rtc_startup_warmup_server_adapter(
+            server_module.websocket_policy_server,
+            rtc_warmup_spec,
         ):
             return _serve_until_stopped(server_module, server_args)
     finally:
@@ -882,6 +1080,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "build_prepared_openpi_config",
+    "install_openpi_rtc_startup_warmup_server_adapter",
     "main",
     "prepared_config_summary",
 ]
