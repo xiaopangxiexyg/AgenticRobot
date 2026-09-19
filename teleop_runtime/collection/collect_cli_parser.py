@@ -955,11 +955,15 @@ def build_collection_parser() -> argparse.ArgumentParser:
         choices=[
             "dual_arm",
             "dual_arm_hand_proxy_open",
+            "dual_arm_hand_proxy_dmtac_strict",
             "dual_arm_hand",
             "dual_arm_cylinder_table",
         ],
         default="dual_arm_hand_proxy_open",
-        help="Dual-arm collision scene profile.",
+        help=(
+            "Dual-arm collision scene profile. "
+            "dual_arm_hand_proxy_dmtac_strict is an explicit DMTAC opt-in."
+        ),
     )
     parser.add_argument(
         "--rm65-ik-framework",

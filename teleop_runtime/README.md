@@ -532,6 +532,9 @@ from teleop_runtime import RM65ArmBackendConfig, InspireTacHandBackendConfig
 MuJoCo、contract 或 backend-neutral 工具；当前真机会话的 runtime home、恢复、碰撞和
 dispatch 语义继续由 real-teleop 运行时保有。
 
+DMTAC 装配可显式选择 `dual_arm_hand_proxy_dmtac_strict`；该 profile 在原严格
+手部 proxy 上增加左右 DMTAC 末端 proxy 及其碰撞对，不改变默认 profile。
+
 ## RM65 真机只读检查
 
 当前也补了一个只读真机状态的检查入口：

@@ -41,6 +41,13 @@ def test_collection_parser_builds_full_compatibility_option_surface() -> None:
     assert args.replay_group == ["a:0-3"]
     assert args.dmtac_tactile_worker_cpus == (2, 4)
     assert args.hand_joint_order == (5, 4, 3, 2, 1, 0)
+    assert parser.parse_args([]).collision_scene_profile == "dual_arm_hand_proxy_open"
+    assert (
+        parser.parse_args(
+            ["--collision-scene-profile", "dual_arm_hand_proxy_dmtac_strict"]
+        ).collision_scene_profile
+        == "dual_arm_hand_proxy_dmtac_strict"
+    )
 
 
 def test_collection_parser_factory_returns_fresh_mutable_defaults() -> None:

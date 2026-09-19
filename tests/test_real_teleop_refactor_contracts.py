@@ -887,6 +887,13 @@ def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary
     assert parser.parse_args([]).v25p_native_storage_layout == "record_cjson_v1"
     assert parser.parse_args([]).tactile_bundle_root == ""
     assert parser.parse_args([]).tactile_bundle_min_free_gb == 0.0
+    assert parser.parse_args([]).collision_scene_profile == "dual_arm_hand_proxy_open"
+    assert (
+        parser.parse_args(
+            ["--collision-scene-profile", "dual_arm_hand_proxy_dmtac_strict"]
+        ).collision_scene_profile
+        == "dual_arm_hand_proxy_dmtac_strict"
+    )
     assert parser.parse_args([]).collection_process_startup_timeout_sec == (
         defaults.DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC
     )

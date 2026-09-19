@@ -1223,6 +1223,7 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         choices=[
             "dual_arm",
             "dual_arm_hand_proxy_open",
+            "dual_arm_hand_proxy_dmtac_strict",
             "dual_arm_hand",
             "dual_arm_cylinder_table",
         ],
@@ -1230,7 +1231,8 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Joint-space collision scene profile used by the dual-arm solver. "
             "'dual_arm_hand_proxy_open' keeps arm IK at 12DoF while attaching fixed open-hand "
-            "proxy geometry to both wrists and a fixed table box for collision."
+            "proxy geometry to both wrists and a fixed table box for collision. "
+            "'dual_arm_hand_proxy_dmtac_strict' is an explicit DMTAC opt-in."
         ),
     )
     parser.add_argument(
