@@ -288,6 +288,9 @@ MuJoCo 频率、放宽目标速度或继续微调 IK 不能消除这部分延迟
 - 只有同时传入 `--configure-realtime-push`、目标 IP 和专用确认字符串
   `RM65_B601_READ_ONLY_CONFIGURE_TELEMETRY` 才会写 UDP telemetry 配置。该操作仍是
   观测配置，不是运动命令；在真机上必须由操作者单独确认并保存前台日志。
+- CLI 的 `--realtime-push-cycle-ms` 使用毫秒表达；适配器会按官方协议转换为
+  控制器 `cycle` 字段的 `5 ms` 单位计数，并在显式重配置时保留原有 custom telemetry
+  字段，避免把无关状态项恢复成默认值。
 - 默认 `request-response` 路径保持不变，可直接回退。新路径的故障（无样本、重复
   sequence、vendor error、回调字段不完整）均进入 source rejection，不使用旧样本
   冒险跟随。

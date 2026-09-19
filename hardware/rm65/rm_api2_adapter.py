@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from .Robotic_Arm.rm_robot_interface import (
     RM_MOVE_MULTI_BLOCK,
@@ -15,6 +15,7 @@ from .Robotic_Arm.rm_robot_interface import (
     rm_realtime_arm_state_callback_ptr,
     rm_realtime_push_config_t,
     rm_thread_mode_e,
+    rm_udp_custom_config_t,
 )
 
 RM65 = 65
@@ -146,6 +147,7 @@ class Arm:
         port: int,
         ip: str,
         enable: bool = True,
+        custom_config: Mapping[str, object] | None = None,
     ):
         """Configure the vendor UDP state push endpoint.
 
@@ -155,12 +157,34 @@ class Arm:
         enables motors or sends a motion command.
         """
 
+        cycle_value = int(cycle_ms)
+        if cycle_value <= 0 or cycle_value % 5:
+            raise ValueError("cycle_ms must be a positive multiple of 5")
+        custom = None
+        if isinstance(custom_config, Mapping):
+            custom = rm_udp_custom_config_t(
+                **{
+                    field: int(custom_config.get(field, -1))
+                    for field in (
+                        "joint_speed",
+                        "lift_state",
+                        "expand_state",
+                        "hand_state",
+                        "arm_current_status",
+                        "aloha_state",
+                        "plus_base",
+                        "plus_state",
+                    )
+                }
+            )
         config = rm_realtime_push_config_t(
-            cycle=int(cycle_ms),
+            # The vendor field is a count of 5 ms intervals, not milliseconds.
+            cycle=cycle_value // 5,
             enable=bool(enable),
             port=int(port),
             force_coordinate=-1,
             ip=str(ip),
+            custom_config=custom,
         )
         return self._robot.rm_set_realtime_push(config)
 

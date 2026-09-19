@@ -2736,12 +2736,33 @@ class RM65ArmBackend(EffectorBackend):
             if not normalized_ip:
                 raise ValueError("ip is required when configuring realtime push")
         with self._hardware_read_lock:
+            current_config: Mapping[str, object] | None = None
             if configure:
+                current_result = get_config()
+                if (
+                    not isinstance(current_result, (tuple, list))
+                    or len(current_result) != 2
+                ):
+                    raise RuntimeError(
+                        "RM65 realtime push config returned an invalid result"
+                    )
+                current_code, current_config_value = current_result
+                current_parsed_code, current_text = _parse_rm65_result(current_code)
+                if (
+                    current_parsed_code != 0
+                    or not isinstance(current_config_value, Mapping)
+                ):
+                    raise RuntimeError(
+                        "RM65 realtime push config query failed before configure: "
+                        f"{current_text}"
+                    )
+                current_config = current_config_value
                 set_result = set_config(
                     cycle_ms=int(cycle_ms),
                     port=int(port),
                     ip=normalized_ip,
                     enable=True,
+                    custom_config=current_config.get("custom_config"),
                 )
                 set_code, set_text = _parse_rm65_result(set_result)
                 if set_code != 0:
