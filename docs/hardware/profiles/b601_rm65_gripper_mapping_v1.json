@@ -1,0 +1,41 @@
+{
+  "schema": "b601_rm65_gripper_mapping.v1",
+  "profile_id": "b601-rm65-gripper-normalized-close-provisional-v1",
+  "canonical_semantics": {
+    "name": "normalized_close",
+    "open": 0.0,
+    "closed": 1.0
+  },
+  "b601_rs": {
+    "source": "b601_rs_gripper_motor_position_rad",
+    "open_position_rad": null,
+    "closed_position_rad": null,
+    "invert": false,
+    "calibration_status": "required_before_live",
+    "gripper_name": "b601_gripper"
+  },
+  "rm65": {
+    "source": "rm65_dmtac_normalized_close",
+    "min_close": 0.0,
+    "max_close": 1.0,
+    "gripper_name": "right_gripper"
+  },
+  "directions": {
+    "b601_to_rm65": {
+      "source_units": "b601_rs_gripper_motor_position_rad",
+      "target_units": "normalized_close",
+      "requires_b601_calibration": true
+    },
+    "rm65_to_b601": {
+      "source_units": "rm65_dmtac_normalized_close",
+      "target_units": "normalized_close",
+      "requires_b601_calibration": false
+    }
+  },
+  "notes": [
+    "This profile is for the pre-hardware MuJoCo mapping slice.",
+    "B601 open/closed motor positions are intentionally null until a read-only J7 calibration is performed.",
+    "No payload hash is required; calibration values are operator-tunable JSON data.",
+    "The profile does not change the six-joint B601 hardware owner or its default fixed-open MuJoCo scene."
+  ]
+}

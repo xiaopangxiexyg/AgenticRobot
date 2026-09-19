@@ -3,6 +3,16 @@
 Importing this package has no hardware or vendor-package side effects.
 """
 
+from .gripper_mapping import (
+    B601_RM65_GRIPPER_MAPPING_SCHEMA_V1,
+    B601_RS_GRIPPER_SOURCE_V1,
+    GRIPPER_CLOCK_DOMAIN_LOCAL_WALL_TIME,
+    RM65_DMTAC_GRIPPER_SOURCE_V1,
+    B601RM65GripperMappingProfile,
+    GripperMappingCalibrationRequired,
+    NormalizedGripperSample,
+    load_b601_rm65_gripper_mapping_profile,
+)
 from .haptics import (
     B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME,
     B601_RS_WRENCH_ORDER,
@@ -55,16 +65,20 @@ from .rm65_retarget import (
 )
 
 __all__ = [
+    "B601_RM65_GRIPPER_MAPPING_SCHEMA_V1",
     "B601_RS_ARM_JOINT_NAMES",
     "B601_RS_AUXILIARY_JOINT_NAMES",
     "B601_RS_BASE_FRAME",
     "B601_RS_END_EFFECTOR_FRAME",
+    "B601_RS_GRIPPER_SOURCE_V1",
     "B601_RS_JACOBIAN_REFERENCE",
     "B601_RS_JOINT_MIT_FRAME",
     "B601_RS_TWIST_ORDER",
     "B601_RS_URDF_RELATIVE_PATH",
     "B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME",
     "B601_RS_WRENCH_ORDER",
+    "GRIPPER_CLOCK_DOMAIN_LOCAL_WALL_TIME",
+    "RM65_DMTAC_GRIPPER_SOURCE_V1",
     "RM65_FREE_DRIVE_SAMPLE_HASH_DOMAIN_V1",
     "RM65_FREE_DRIVE_SAMPLE_SCHEMA_V1",
     "RM65_TO_B601_RETARGET_HASH_DOMAIN_V1",
@@ -83,6 +97,7 @@ __all__ = [
     "B601PinocchioModel",
     "B601PoseVirtualSpring",
     "B601PoseVirtualSpringResult",
+    "B601RM65GripperMappingProfile",
     "B601SingularityMetrics",
     "B601SpatialWrench",
     "B601TranslationalVirtualSpring",
@@ -90,12 +105,15 @@ __all__ = [
     "B601VirtualWall",
     "B601VirtualWallResult",
     "B601WrenchJointTorque",
+    "GripperMappingCalibrationRequired",
+    "NormalizedGripperSample",
     "RM65FreeDriveSample",
     "RM65ToB601Anchor",
     "RM65ToB601RetargetConfig",
     "RM65ToB601RetargetResult",
     "RM65ToB601Retargeter",
     "compute_b601_mit_torque",
+    "load_b601_rm65_gripper_mapping_profile",
     "map_world_aligned_ee_wrench_to_joint_torque",
     "transform_spatial_twist",
     "transform_spatial_wrench",

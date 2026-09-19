@@ -21,6 +21,13 @@ from .driver import (
     b601_sim_measured_velocity_limit_rad_s,
     default_b601_position_timing,
 )
+from .gripper import (
+    B601_RS_GRIPPER_CLOSED_QPOS,
+    B601_RS_GRIPPER_JOINT_NAMES,
+    B601_RS_GRIPPER_NAME,
+    B601GripperSimAdapter,
+    b601_gripper_spec,
+)
 from .mit_driver import (
     B601EffortTick,
     B601MujocoEffortDriver,
@@ -43,9 +50,13 @@ __all__ = [
     "B601_RS_DEFAULT_SIM_MAX_MEASURED_VELOCITY_RAD_S",
     "B601_RS_DEFAULT_SIM_MEASURED_VELOCITY_MARGIN_RATIO",
     "B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S",
+    "B601_RS_GRIPPER_CLOSED_QPOS",
+    "B601_RS_GRIPPER_JOINT_NAMES",
+    "B601_RS_GRIPPER_NAME",
     "B601_RS_GRIPPER_OPEN_QPOS",
     "B601_RS_SIM_ARM_KEY",
     "B601EffortTick",
+    "B601GripperSimAdapter",
     "B601JointPositionCommand",
     "B601MujocoContactObservation",
     "B601MujocoEffortDriver",
@@ -53,6 +64,7 @@ __all__ = [
     "B601PositionTick",
     "B601SimFaultPolicy",
     "b601_contact_scene_spec",
+    "b601_gripper_spec",
     "b601_sim_measured_velocity_limit_rad_s",
     "build_b601_mjcf_xml",
     "build_b601_mujoco_scene",

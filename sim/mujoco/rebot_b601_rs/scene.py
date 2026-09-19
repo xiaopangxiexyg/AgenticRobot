@@ -281,6 +281,7 @@ def _mjcf_xml_from_model(
     plant_profile: B601Real2SimPlantProfile | None = None,
     scene_spec: SceneSpec | None = None,
     enable_contact_observation: bool = False,
+    enable_gripper: bool = False,
 ) -> str:
     xml_text = convert_urdf_to_mjcf_xml(
         model,
@@ -298,7 +299,8 @@ def _mjcf_xml_from_model(
         _add_provisional_position_actuators(root, model)
     else:
         _add_ideal_effort_actuators(root, model)
-        _add_fixed_open_gripper_constraints(root)
+        if not enable_gripper:
+            _add_fixed_open_gripper_constraints(root)
     if plant_profile is not None:
         if not isinstance(plant_profile, B601Real2SimPlantProfile):
             raise TypeError("plant_profile must be a B601Real2SimPlantProfile")
@@ -329,6 +331,7 @@ def build_b601_mjcf_xml(
     plant_profile: B601Real2SimPlantProfile | None = None,
     scene_spec: SceneSpec | None = None,
     enable_contact_observation: bool = False,
+    enable_gripper: bool = False,
 ) -> str:
     """Return in-memory MJCF without modifying or copying upstream assets."""
 
@@ -339,6 +342,13 @@ def build_b601_mjcf_xml(
     if gravity.shape != (3,) or not np.all(np.isfinite(gravity)):
         raise ValueError("gravity_mps2 must contain three finite values")
     mode = _validate_actuation_mode(actuation_mode)
+    if not isinstance(enable_gripper, bool):
+        raise TypeError("enable_gripper must be a bool")
+    if enable_gripper and mode == "effort":
+        raise ValueError(
+            "enable_gripper is supported only by the position-mode mapping scene; "
+            "the ideal-effort driver keeps the upstream auxiliary equality model."
+        )
     _validate_contact_scene_contract(
         scene_spec=scene_spec,
         gravity=gravity,
@@ -353,6 +363,7 @@ def build_b601_mjcf_xml(
         plant_profile=plant_profile,
         scene_spec=scene_spec,
         enable_contact_observation=enable_contact_observation,
+        enable_gripper=enable_gripper,
     )
 
 
@@ -402,6 +413,7 @@ def build_b601_mujoco_scene(
     plant_profile: B601Real2SimPlantProfile | None = None,
     scene_spec: SceneSpec | None = None,
     enable_contact_observation: bool = False,
+    enable_gripper: bool = False,
 ) -> MujocoScene:
     """Compile the B601 plant and wrap it in the generic scene facade."""
 
@@ -421,6 +433,13 @@ def build_b601_mujoco_scene(
     if gravity.shape != (3,) or not np.all(np.isfinite(gravity)):
         raise ValueError("gravity_mps2 must contain three finite values")
     mode = _validate_actuation_mode(actuation_mode)
+    if not isinstance(enable_gripper, bool):
+        raise TypeError("enable_gripper must be a bool")
+    if enable_gripper and mode == "effort":
+        raise ValueError(
+            "enable_gripper is supported only by the position-mode mapping scene; "
+            "the ideal-effort driver keeps the upstream auxiliary equality model."
+        )
     _validate_contact_scene_contract(
         scene_spec=scene_spec,
         gravity=gravity,
@@ -434,6 +453,7 @@ def build_b601_mujoco_scene(
         plant_profile=plant_profile,
         scene_spec=scene_spec,
         enable_contact_observation=enable_contact_observation,
+        enable_gripper=enable_gripper,
     )
     model = mujoco.MjModel.from_xml_string(xml_text)
     data = mujoco.MjData(model)
@@ -463,6 +483,11 @@ def build_b601_mujoco_scene(
         controlled_body=B601_RS_END_EFFECTOR_FRAME,
         effector_name=B601_RS_SIM_EFFECTOR_NAME,
     )
+    grippers = {}
+    if enable_gripper:
+        from .gripper import B601_RS_GRIPPER_NAME, b601_gripper_spec
+
+        grippers[B601_RS_GRIPPER_NAME] = b601_gripper_spec()
     scene = MujocoScene(
         mujoco=mujoco,
         model=model,
@@ -471,7 +496,7 @@ def build_b601_mujoco_scene(
             conversion=conversion,
             cameras=(),
             arms={B601_RS_SIM_ARM_KEY: arm_spec},
-            grippers={},
+            grippers=grippers,
             scene_spec=scene_spec,
         ),
     )
