@@ -24,6 +24,38 @@ from .scene import (
 
 B601_RS_JOINT_POSITION_FRAME = "b601_rs/joint_position"
 B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S = 2.5
+# The current provisional position servo reaches about 1.09x target slew in
+# the large-step fixture; retain a documented 20% simulation-only transient
+# margin without presenting it as a hardware velocity limit.
+B601_RS_DEFAULT_SIM_MEASURED_VELOCITY_MARGIN_RATIO = 0.20
+
+
+def b601_sim_measured_velocity_limit_rad_s(
+    target_velocity_limit_rad_s: float,
+) -> float:
+    """Return the provisional plant-response envelope for a target slew.
+
+    The position actuator can transiently move faster than the conditioned
+    target while it closes the position error.  This envelope is deliberately
+    separate from the command slew limit and is only a MuJoCo visualization
+    contract; it is not a hardware velocity or safety limit.
+    """
+
+    if isinstance(target_velocity_limit_rad_s, bool):
+        raise TypeError("target_velocity_limit_rad_s must be finite and positive")
+    normalized_velocity = float(target_velocity_limit_rad_s)
+    if not math.isfinite(normalized_velocity) or normalized_velocity <= 0.0:
+        raise ValueError("target_velocity_limit_rad_s must be finite and positive")
+    return normalized_velocity * (
+        1.0 + B601_RS_DEFAULT_SIM_MEASURED_VELOCITY_MARGIN_RATIO
+    )
+
+
+B601_RS_DEFAULT_SIM_MAX_MEASURED_VELOCITY_RAD_S = (
+    b601_sim_measured_velocity_limit_rad_s(
+        B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S
+    )
+)
 
 
 def default_b601_position_timing() -> TimingSpec:
@@ -283,6 +315,9 @@ class B601PositionDriver:
 
     @property
     def execution_metadata(self) -> dict[str, object]:
+        maximum_target_velocity_rad_s = math.radians(
+            max(float(value) for value in self.velocity_profile.max_velocity_deg_s)
+        )
         return {
             "execution_mode": self.execution_mode,
             "robot_dynamics": self.robot_dynamics,
@@ -303,6 +338,18 @@ class B601PositionDriver:
                 ),
                 "max_dt_sec": float(self.velocity_profile.max_dt_sec),
                 "metadata": dict(self.velocity_profile.metadata),
+            },
+            "measured_velocity_envelope": {
+                "max_velocity_rad_s": b601_sim_measured_velocity_limit_rad_s(
+                    maximum_target_velocity_rad_s
+                ),
+                "response_margin_ratio": (
+                    B601_RS_DEFAULT_SIM_MEASURED_VELOCITY_MARGIN_RATIO
+                ),
+                "parameter_source": (
+                    "simulation_only_position_servo_response_margin"
+                ),
+                "hardware_safety_claim": False,
             },
             "state_limit_guard": "latched_simulated_joint_position_guard",
             "state_limit_tolerance_rad": self.state_limit_tolerance_rad,
@@ -537,10 +584,13 @@ class B601PositionDriver:
 
 
 __all__ = [
+    "B601_RS_DEFAULT_SIM_MAX_MEASURED_VELOCITY_RAD_S",
+    "B601_RS_DEFAULT_SIM_MEASURED_VELOCITY_MARGIN_RATIO",
     "B601_RS_DEFAULT_SIM_TARGET_MAX_VELOCITY_RAD_S",
     "B601_RS_JOINT_POSITION_FRAME",
     "B601JointPositionCommand",
     "B601PositionDriver",
     "B601PositionTick",
+    "b601_sim_measured_velocity_limit_rad_s",
     "default_b601_position_timing",
 ]
