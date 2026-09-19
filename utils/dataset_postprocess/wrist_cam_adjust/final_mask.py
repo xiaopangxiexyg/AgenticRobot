@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +23,28 @@ from .depth_mask.visualize import DEFAULT_WRIST_CAMERA_KEYS, load_mask_stream
 
 FINAL_KEEP_MASK_FAMILY = "wrist_final_keep"
 FINAL_KEEP_MASK_NAME = "postprocessed_depth_or_table_keep_mask"
+
+
+def _replace_directory_with_retry(
+    source: Path,
+    destination: Path,
+    *,
+    attempts: int = 6,
+) -> None:
+    """Atomically publish a directory, tolerating transient NFS EACCES."""
+
+    last_error: PermissionError | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 >= max(1, int(attempts)):
+                raise
+            time.sleep(0.25 * (2 ** min(attempt, 3)))
+    if last_error is not None:
+        raise last_error
 
 
 @dataclass(frozen=True)
@@ -353,14 +376,14 @@ def compose_final_mask(
     if rollback_dir is not None:
         os.replace(task.output_dir, rollback_dir)
     try:
-        os.replace(staging_dir, task.output_dir)
+        _replace_directory_with_retry(staging_dir, task.output_dir)
     except BaseException:
         if (
             rollback_dir is not None
             and rollback_dir.exists()
             and not task.output_dir.exists()
         ):
-            os.replace(rollback_dir, task.output_dir)
+            _replace_directory_with_retry(rollback_dir, task.output_dir)
         raise
     return FinalMaskResult(
         episode_index=task.episode_index,

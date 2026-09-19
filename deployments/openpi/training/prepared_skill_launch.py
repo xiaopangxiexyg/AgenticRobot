@@ -1028,15 +1028,58 @@ def _validate_profile_contracts(
     profile: Mapping[str, Any],
     view_manifest: Mapping[str, Any],
 ) -> None:
-    expected_progress = str(profile.get("expected_progress_profile_hash", ""))
-    expected_stage = str(profile.get("expected_stage_profile_hash", ""))
-    if (
-        view_manifest.get("progress_profile_hash") != expected_progress
-        or view_manifest.get("stage_profile_hash") != expected_stage
-    ):
-        raise ValueError(
-            "Prepared view Progress/Stage hashes differ from the profile."
+    # A view containing one source profile keeps the historical scalar hash
+    # contract.  Mixed-stage training views must bind the complete set of
+    # source hashes instead; their scalar manifest fields are intentionally
+    # null and are not interchangeable with one arbitrary source hash.
+    expected_progress_hashes = profile.get("expected_progress_profile_hashes")
+    expected_stage_hashes = profile.get("expected_stage_profile_hashes")
+    if expected_progress_hashes is not None or expected_stage_hashes is not None:
+        if expected_progress_hashes is None or expected_stage_hashes is None:
+            raise ValueError(
+                "Mixed prepared views require both expected progress and "
+                "stage profile hash sets."
+            )
+        if not isinstance(expected_progress_hashes, (list, tuple)) or not isinstance(
+            expected_stage_hashes, (list, tuple)
+        ):
+            raise ValueError(
+                "Expected mixed-view profile hashes must be lists or tuples."
+            )
+        expected_progress = sorted(
+            {str(value).strip() for value in expected_progress_hashes}
         )
+        expected_stage = sorted(
+            {str(value).strip() for value in expected_stage_hashes}
+        )
+        actual_progress = sorted(
+            {str(value).strip() for value in view_manifest.get("progress_profile_hashes", ())}
+        )
+        actual_stage = sorted(
+            {str(value).strip() for value in view_manifest.get("stage_profile_hashes", ())}
+        )
+        if (
+            not expected_progress
+            or not expected_stage
+            or actual_progress != expected_progress
+            or actual_stage != expected_stage
+            or view_manifest.get("progress_profile_hash") is not None
+            or view_manifest.get("stage_profile_hash") is not None
+        ):
+            raise ValueError(
+                "Prepared mixed view Progress/Stage hash sets differ from "
+                "the profile."
+            )
+    else:
+        expected_progress = str(profile.get("expected_progress_profile_hash", ""))
+        expected_stage = str(profile.get("expected_stage_profile_hash", ""))
+        if (
+            view_manifest.get("progress_profile_hash") != expected_progress
+            or view_manifest.get("stage_profile_hash") != expected_stage
+        ):
+            raise ValueError(
+                "Prepared view Progress/Stage hashes differ from the profile."
+            )
     projection = view_manifest.get("skill_projection")
     if not isinstance(projection, Mapping):
         raise ValueError("Prepared view has no Skill projection capability.")
@@ -1773,6 +1816,7 @@ def _openpi_config(
     exp_name: str | None,
     resume: bool,
     overwrite: bool,
+    require_norm_stats: bool = True,
 ) -> tuple[Any, Any, Path]:
     checkout = Path(str(profile["openpi_checkout"])).expanduser().resolve()
     training_config = _activate_openpi_checkout(profile)
@@ -1873,7 +1917,7 @@ def _openpi_config(
         norm_stats_path = (
             norm_stats_assets_dir / expected_asset_id / "norm_stats.json"
         )
-        if not norm_stats_path.is_file():
+        if require_norm_stats and not norm_stats_path.is_file():
             raise FileNotFoundError(
                 f"Prepared OpenPI norm_stats.json is missing: {norm_stats_path}."
             )
@@ -3227,6 +3271,7 @@ def main(argv: list[str] | None = None) -> int:
         exp_name=args.exp_name,
         resume=args.resume,
         overwrite=args.overwrite,
+        require_norm_stats=args.command != "norm-stats",
     )
     final_mask_contract = _final_mask_training_contract(
         launch_profile,
