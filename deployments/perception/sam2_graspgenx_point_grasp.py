@@ -35,7 +35,7 @@ from .sam2_vgn_point_grasp import (
 )
 
 GRASPGENX_GIT_URL = "https://github.com/NVlabs/GraspGenX.git"
-GRASPGENX_REVIEWED_REVISION = "b9429097728cb1c430dd78b92edf17ba318aad03"
+GRASPGENX_REVIEWED_REVISION = "d9464a263f2bcb7ad70b13d75de04cadde8d9ff7"
 GRASPGENX_CHECKPOINT_GIT_URL = "https://huggingface.co/adithyamurali/GraspGenXModel"
 GRASPGENX_CHECKPOINT_REVIEWED_REVISION = "7c834043c11a11417e31d6d5ea9355801e40a2c1"
 GRASPGENX_ASSET_SCHEMA_V1 = "dexteleop.perception_graspgenx_point_grasp_assets.v1"

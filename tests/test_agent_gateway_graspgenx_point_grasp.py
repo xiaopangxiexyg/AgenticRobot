@@ -15,6 +15,7 @@ from agent_gateway.profiles.real.point_grasp_deployment import (
 from deployments.perception.graspgenx_client import (
     GRASPGENX_DEFAULT_MODE,
     GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+    GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM,
     GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
     GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
     GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM,
@@ -339,9 +340,15 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
         == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
     )
     assert runner_calls[0][2]["moe_z_offsets_cm"] == GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
+    assert runner_calls[0][2]["moe_side_height_offsets_cm"] == (
+        GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+    )
     assert -3.0 in GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
     assert set((-8.0, -6.0, -4.0, -2.0, -1.0, 0.0)) <= set(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
     assert backend.semantic_config["graspmoe_sampling"]["z_offsets_cm"] == GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
+    assert backend.semantic_config["graspmoe_sampling"]["side_height_offsets_cm"] == (
+        GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+    )
     assert (
         runner_calls[0][2]["moe_obb_density"]
         == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
@@ -422,6 +429,9 @@ def test_client_sends_dmtac_sweep_volume_and_sorts_top_k() -> None:
     assert request["action"] == "infer_object"
     assert request["moe_num_yaws"] == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
     assert request["moe_z_offsets_cm"] == list(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
+    assert request["moe_side_height_offsets_cm"] == list(
+        GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+    )
     assert request["moe_obb_density"] == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
     assert request["moe_obb_position_spacing_cm"] == pytest.approx(
         GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -495,6 +505,10 @@ def test_moe_samples_five_mm_insertion_intervals_before_scoring() -> None:
     offsets = np.asarray(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
     assert set((-8., -6., -4., -2., -1., 0.)) <= set(offsets)
     np.testing.assert_allclose(np.diff(offsets[offsets >= -4.]), .5)
+
+
+def test_moe_samples_support_aware_side_heights_before_scoring() -> None:
+    assert GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM == (0.0, 1.0, 2.0)
 
 
 def test_client_rejects_score_threshold_outside_confidence_range() -> None:
