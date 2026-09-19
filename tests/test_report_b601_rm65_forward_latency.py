@@ -27,8 +27,10 @@ def test_forward_latency_report_correlates_source_and_target_dispatch() -> None:
                 "target_command_resolve_elapsed_sec": 0.0002,
                 "target_command_metadata_elapsed_sec": 0.0001,
                 "target_resolution_cache_insert_elapsed_sec": 0.00005,
+                "target_resolution_cache_release_elapsed_sec": 0.00001,
                 "target_resolution_cache_size_before": 4,
                 "target_resolution_cache_size_after": 5,
+                "target_resolution_cache_size_after_release": 4,
                 "target_gc_count_before": [10, 2, 0],
                 "target_gc_count_after": [12, 2, 0],
                 "target_post_resolution_elapsed_sec": 0.004,
@@ -102,6 +104,13 @@ def test_forward_latency_report_correlates_source_and_target_dispatch() -> None:
         "last": 5,
         "min": 5,
         "max": 5,
+    }
+    assert report["runtime_diagnostics"]["resolution_cache_size_after_release"] == {
+        "count": 1,
+        "first": 4,
+        "last": 4,
+        "min": 4,
+        "max": 4,
     }
     assert (
         report["runtime_diagnostics"]["gc_count_after"]["generation_0"]["last"]

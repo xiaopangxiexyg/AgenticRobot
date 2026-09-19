@@ -41,6 +41,7 @@ _TIMING_FIELDS = (
     "target_command_resolve_elapsed_sec",
     "target_command_metadata_elapsed_sec",
     "target_resolution_cache_insert_elapsed_sec",
+    "target_resolution_cache_release_elapsed_sec",
     "target_post_resolution_elapsed_sec",
     "source_to_target_dispatch_latency_sec",
     "source_interarrival_sec",
@@ -112,6 +113,7 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     rejection_reasons: Counter[str] = Counter()
     resolution_cache_sizes_before: list[int] = []
     resolution_cache_sizes_after: list[int] = []
+    resolution_cache_sizes_after_release: list[int] = []
     gc_count_before: list[tuple[int, int, int]] = []
     gc_count_after: list[tuple[int, int, int]] = []
     previous_source_receive: float | None = None
@@ -176,6 +178,10 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "target_resolution_cache_size_after",
                 resolution_cache_sizes_after,
             ),
+            (
+                "target_resolution_cache_size_after_release",
+                resolution_cache_sizes_after_release,
+            ),
         ):
             value = record.get(field_name)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -234,6 +240,9 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "resolution_cache_size_after": _integer_summary(
                 resolution_cache_sizes_after
             ),
+            "resolution_cache_size_after_release": _integer_summary(
+                resolution_cache_sizes_after_release
+            ),
             "gc_count_before": {
                 f"generation_{generation}": _integer_summary(
                     [sample[generation] for sample in gc_count_before]
@@ -269,7 +278,7 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "is the coupled RM65 IK solver duration and "
                 "target_post_ik_elapsed_sec is the complete post-IK segment. "
                 "The resolution_build, command_resolve, command_metadata and "
-                "resolution_cache_insert fields split that segment further; "
+                "cache insert/release fields split that segment further; "
                 "runtime_diagnostics reports cache growth and Python GC counters. "
                 "target_post_resolution_elapsed_sec "
                 "is the remainder of the target step (dispatch, physics and "

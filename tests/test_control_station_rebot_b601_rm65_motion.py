@@ -330,6 +330,9 @@ def test_admits_human_not_policy_and_only_target_dispatches(setup_motion):
     assert scene.writes, (outcome.dispatch_receipts, outcome.target_completion_receipt)
     assert np.linalg.norm(scene.qpos["right"]) > 0
     np.testing.assert_allclose(scene.qpos["left"], 0)
+    diagnostics = runtime.pose_resolver.last_resolve_diagnostics
+    assert diagnostics["resolution_cache_size_after_release"] == 0
+    assert diagnostics["resolution_cache_release_elapsed_sec"] >= 0.0
     assert runtime.composition_port is None
 
 

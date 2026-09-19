@@ -3546,6 +3546,18 @@ class MujocoDeployRuntime:
             )
             self.core.proposals.prune_expired(at_or_before=cutoff_at)
         result = self.core.run_decision(now=now)
+        if self._pose_execution_enabled and result.command is not None:
+            release = getattr(
+                self.pose_resolver,
+                "release_resolution_for_command",
+                None,
+            )
+            if callable(release):
+                # Resolution lineage is validated during dispatch. The
+                # immutable target/trace retains its hashes; the resolver's
+                # object cache is only an intra-step handoff and must not grow
+                # for the lifetime of a foreground session.
+                release(result.command)
         if result.target_execution_request is not None:
             self._latest_target_execution_step = result
         if result.status == "dispatched":

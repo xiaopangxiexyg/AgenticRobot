@@ -738,6 +738,47 @@ class MujocoCoupledPoseToQposResolver:
             raise ValueError("Command pose-to-qpos resolution hash mismatch.")
         return resolution
 
+    def release_resolution(
+        self,
+        resolution: MujocoPoseToQposResolution,
+    ) -> None:
+        """Release one synchronous dispatch resolution after target binding.
+
+        The runtime keeps the immutable resolution only between resolver output
+        and the same-step target dispatch. Durable lineage is already copied
+        into target and trace hashes; retaining every historical resolution
+        would make Python GC pauses grow with the session.
+        """
+
+        if not isinstance(resolution, MujocoPoseToQposResolution):
+            raise TypeError("resolution must be MujocoPoseToQposResolution.")
+        release_started = time.perf_counter()
+        with self._lock:
+            current = self._resolution_by_id.get(resolution.resolution_id)
+            released = current is resolution
+            if released:
+                del self._resolution_by_id[resolution.resolution_id]
+            if (
+                released
+                and self._last_resolve_diagnostics.get("resolve_status")
+                == "accepted"
+            ):
+                self._last_resolve_diagnostics.update(
+                    {
+                        "resolution_cache_release_elapsed_sec": max(
+                            0.0, time.perf_counter() - release_started
+                        ),
+                        "resolution_cache_size_after_release": len(
+                            self._resolution_by_id
+                        ),
+                    }
+                )
+
+    def release_resolution_for_command(self, command: TeleopCommand) -> None:
+        """Release the resolution identified by one dispatched command."""
+
+        self.release_resolution(self.resolution_for_command(command))
+
     @staticmethod
     def _validate_arm_base_input(action: RobotAction) -> None:
         if action.action_space not in {

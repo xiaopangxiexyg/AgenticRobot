@@ -191,6 +191,12 @@ def test_pose_resolution_preserves_safe_pose_and_emits_separate_qpos_command() -
         isinstance(value, int) and value >= 0
         for value in timing["gc_count_after"]
     )
+    resolver.release_resolution_for_command(command)
+    released_timing = resolver.last_resolve_diagnostics
+    assert released_timing["resolution_cache_size_after_release"] == 0
+    assert float(released_timing["resolution_cache_release_elapsed_sec"]) >= 0.0
+    with pytest.raises(ValueError, match="unknown pose-to-qpos resolution"):
+        resolver.resolution_for_command(command)
     resolver.clear_last_resolve_diagnostics()
     assert resolver.last_resolve_diagnostics == {}
 

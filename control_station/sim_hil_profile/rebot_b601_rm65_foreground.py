@@ -498,6 +498,11 @@ def run_b601_rm65_foreground(
                     if isinstance(target_details.get("target_resolution"), Mapping)
                     else {}
                 ).get("resolution_cache_insert_elapsed_sec"),
+                "target_resolution_cache_release_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("resolution_cache_release_elapsed_sec"),
                 "target_resolution_cache_size_before": (
                     target_details.get("target_resolution", {})
                     if isinstance(target_details.get("target_resolution"), Mapping)
@@ -508,6 +513,11 @@ def run_b601_rm65_foreground(
                     if isinstance(target_details.get("target_resolution"), Mapping)
                     else {}
                 ).get("resolution_cache_size_after"),
+                "target_resolution_cache_size_after_release": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("resolution_cache_size_after_release"),
                 "target_gc_count_before": (
                     target_details.get("target_resolution", {})
                     if isinstance(target_details.get("target_resolution"), Mapping)
