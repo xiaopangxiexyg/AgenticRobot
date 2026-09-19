@@ -130,6 +130,14 @@ def test_gui_observes_existing_dispatch_and_recenter(setup_motion):
             "target_resolution_elapsed_sec",
             "target_ik_elapsed_sec",
             "target_post_resolution_elapsed_sec",
+            "target_resolution_build_elapsed_sec",
+            "target_command_resolve_elapsed_sec",
+            "target_command_metadata_elapsed_sec",
+            "target_resolution_cache_insert_elapsed_sec",
+            "target_resolution_cache_size_before",
+            "target_resolution_cache_size_after",
+            "target_gc_count_before",
+            "target_gc_count_after",
             "source_to_target_dispatch_latency_sec",
         }
         <= event.keys()

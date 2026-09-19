@@ -478,6 +478,46 @@ def run_b601_rm65_foreground(
                     if isinstance(target_details.get("target_resolution"), Mapping)
                     else {}
                 ).get("post_ik_elapsed_sec"),
+                "target_resolution_build_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("resolution_build_elapsed_sec"),
+                "target_command_resolve_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("command_resolve_elapsed_sec"),
+                "target_command_metadata_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("command_metadata_elapsed_sec"),
+                "target_resolution_cache_insert_elapsed_sec": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("resolution_cache_insert_elapsed_sec"),
+                "target_resolution_cache_size_before": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("resolution_cache_size_before"),
+                "target_resolution_cache_size_after": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("resolution_cache_size_after"),
+                "target_gc_count_before": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("gc_count_before"),
+                "target_gc_count_after": (
+                    target_details.get("target_resolution", {})
+                    if isinstance(target_details.get("target_resolution"), Mapping)
+                    else {}
+                ).get("gc_count_after"),
                 "target_post_resolution_elapsed_sec": target_details.get(
                     "target_post_resolution_elapsed_sec"
                 ),

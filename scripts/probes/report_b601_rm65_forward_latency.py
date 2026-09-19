@@ -37,6 +37,10 @@ _TIMING_FIELDS = (
     "target_pre_ik_elapsed_sec",
     "target_ik_elapsed_sec",
     "target_post_ik_elapsed_sec",
+    "target_resolution_build_elapsed_sec",
+    "target_command_resolve_elapsed_sec",
+    "target_command_metadata_elapsed_sec",
+    "target_resolution_cache_insert_elapsed_sec",
     "target_post_resolution_elapsed_sec",
     "source_to_target_dispatch_latency_sec",
     "source_interarrival_sec",
@@ -78,6 +82,26 @@ def _statistics(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def _integer_summary(values: list[int]) -> dict[str, int]:
+    """Summarize non-negative runtime counters without converting to time."""
+
+    if not values:
+        return {
+            "count": 0,
+            "first": 0,
+            "last": 0,
+            "min": 0,
+            "max": 0,
+        }
+    return {
+        "count": len(values),
+        "first": values[0],
+        "last": values[-1],
+        "min": min(values),
+        "max": max(values),
+    }
+
+
 def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     timings = {name: [] for name in _TIMING_FIELDS}
     counts: Counter[str] = Counter()
@@ -86,6 +110,10 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     target_ik_statuses: Counter[str] = Counter()
     resolution_failures: Counter[str] = Counter()
     rejection_reasons: Counter[str] = Counter()
+    resolution_cache_sizes_before: list[int] = []
+    resolution_cache_sizes_after: list[int] = []
+    gc_count_before: list[tuple[int, int, int]] = []
+    gc_count_after: list[tuple[int, int, int]] = []
     previous_source_receive: float | None = None
 
     for record in records:
@@ -139,6 +167,35 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             value = _finite_non_negative(record.get(name))
             if value is not None:
                 timings[name].append(value)
+        for field_name, destination in (
+            (
+                "target_resolution_cache_size_before",
+                resolution_cache_sizes_before,
+            ),
+            (
+                "target_resolution_cache_size_after",
+                resolution_cache_sizes_after,
+            ),
+        ):
+            value = record.get(field_name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                destination.append(value)
+        for field_name, destination in (
+            ("target_gc_count_before", gc_count_before),
+            ("target_gc_count_after", gc_count_after),
+        ):
+            value = record.get(field_name)
+            if (
+                isinstance(value, (list, tuple))
+                and len(value) == 3
+                and all(
+                    isinstance(item, int)
+                    and not isinstance(item, bool)
+                    and item >= 0
+                    for item in value
+                )
+            ):
+                destination.append(tuple(int(item) for item in value))
         source_receive = _finite_non_negative(
             record.get("source_receive_timestamp_sec")
         )
@@ -156,7 +213,7 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             )
 
     return {
-        "schema": "b601_rm65_forward_latency_report_v2",
+        "schema": "b601_rm65_forward_latency_report_v3",
         "counts": dict(sorted(counts.items())),
         "target_statuses": dict(sorted(target_statuses.items())),
         "target_resolution_statuses": dict(
@@ -169,6 +226,26 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         ),
         "timings": {
             name: _statistics(values) for name, values in timings.items()
+        },
+        "runtime_diagnostics": {
+            "resolution_cache_size_before": _integer_summary(
+                resolution_cache_sizes_before
+            ),
+            "resolution_cache_size_after": _integer_summary(
+                resolution_cache_sizes_after
+            ),
+            "gc_count_before": {
+                f"generation_{generation}": _integer_summary(
+                    [sample[generation] for sample in gc_count_before]
+                )
+                for generation in range(3)
+            },
+            "gc_count_after": {
+                f"generation_{generation}": _integer_summary(
+                    [sample[generation] for sample in gc_count_after]
+                )
+                for generation in range(3)
+            },
         },
         "interpretation": {
             "primary_latency": (
@@ -185,16 +262,19 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "age reported by MotorBridge at the foreground tick; it is "
                 "separate from source-to-target dispatch work."
             ),
-                "target_resolution": (
-                    "target_resolution_elapsed_sec is the canonical MuJoCo pose "
-                    "resolver duration. Its pre_ik/pose-transform/smoothing/filter "
-                    "fields expose the preparation stages; target_ik_elapsed_sec "
-                    "is the coupled RM65 IK solver duration and "
-                    "target_post_ik_elapsed_sec is resolution construction/lineage. "
-                    "target_post_resolution_elapsed_sec "
-                    "is the remainder of the target step (dispatch, physics and "
-                    "measurement/trace work) after the resolver."
-                ),
+            "target_resolution": (
+                "target_resolution_elapsed_sec is the canonical MuJoCo pose "
+                "resolver duration. Its pre_ik/pose-transform/smoothing/filter "
+                "fields expose the preparation stages; target_ik_elapsed_sec "
+                "is the coupled RM65 IK solver duration and "
+                "target_post_ik_elapsed_sec is the complete post-IK segment. "
+                "The resolution_build, command_resolve, command_metadata and "
+                "resolution_cache_insert fields split that segment further; "
+                "runtime_diagnostics reports cache growth and Python GC counters. "
+                "target_post_resolution_elapsed_sec "
+                "is the remainder of the target step (dispatch, physics and "
+                "measurement/trace work) after the resolver."
+            ),
             "excluded": (
                 "B601 feedback age before host receipt and MuJoCo viewer "
                 "presentation latency are not included in the primary value."

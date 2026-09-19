@@ -22,6 +22,15 @@ def test_forward_latency_report_correlates_source_and_target_dispatch() -> None:
                 "target_resolution_invoked": True,
                 "target_resolution_elapsed_sec": 0.004,
                 "target_ik_elapsed_sec": 0.003,
+                "target_post_ik_elapsed_sec": 0.0008,
+                "target_resolution_build_elapsed_sec": 0.0004,
+                "target_command_resolve_elapsed_sec": 0.0002,
+                "target_command_metadata_elapsed_sec": 0.0001,
+                "target_resolution_cache_insert_elapsed_sec": 0.00005,
+                "target_resolution_cache_size_before": 4,
+                "target_resolution_cache_size_after": 5,
+                "target_gc_count_before": [10, 2, 0],
+                "target_gc_count_after": [12, 2, 0],
                 "target_post_resolution_elapsed_sec": 0.004,
                 "target_resolution_status": "accepted",
                 "target_ik_status": "tracking",
@@ -72,3 +81,29 @@ def test_forward_latency_report_correlates_source_and_target_dispatch() -> None:
     assert report["target_resolution_statuses"] == {"accepted": 1}
     assert report["target_ik_statuses"] == {"tracking": 1}
     assert report["timings"]["target_ik_elapsed_sec"]["p50_ms"] == 3.0
+    assert (
+        report["timings"]["target_resolution_build_elapsed_sec"]["p50_ms"]
+        == 0.4
+    )
+    assert (
+        report["timings"]["target_command_resolve_elapsed_sec"]["p50_ms"]
+        == 0.2
+    )
+    assert report["runtime_diagnostics"]["resolution_cache_size_before"] == {
+        "count": 1,
+        "first": 4,
+        "last": 4,
+        "min": 4,
+        "max": 4,
+    }
+    assert report["runtime_diagnostics"]["resolution_cache_size_after"] == {
+        "count": 1,
+        "first": 5,
+        "last": 5,
+        "min": 5,
+        "max": 5,
+    }
+    assert (
+        report["runtime_diagnostics"]["gc_count_after"]["generation_0"]["last"]
+        == 12
+    )

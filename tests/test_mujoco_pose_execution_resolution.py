@@ -175,6 +175,22 @@ def test_pose_resolution_preserves_safe_pose_and_emits_separate_qpos_command() -
     assert float(timing["resolve_total_elapsed_sec"]) >= float(
         timing["ik_elapsed_sec"]
     )
+    assert float(timing["resolution_build_elapsed_sec"]) >= 0.0
+    assert float(timing["command_resolve_elapsed_sec"]) >= 0.0
+    assert float(timing["command_metadata_elapsed_sec"]) >= 0.0
+    assert float(timing["resolution_cache_insert_elapsed_sec"]) >= 0.0
+    assert timing["resolution_cache_size_before"] == 0
+    assert timing["resolution_cache_size_after"] == 1
+    assert len(timing["gc_count_before"]) == 3
+    assert len(timing["gc_count_after"]) == 3
+    assert all(
+        isinstance(value, int) and value >= 0
+        for value in timing["gc_count_before"]
+    )
+    assert all(
+        isinstance(value, int) and value >= 0
+        for value in timing["gc_count_after"]
+    )
     resolver.clear_last_resolve_diagnostics()
     assert resolver.last_resolve_diagnostics == {}
 

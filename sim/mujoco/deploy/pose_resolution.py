@@ -14,6 +14,7 @@ verified transform; this module must not guess or silently apply one.
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -528,6 +529,12 @@ class MujocoCoupledPoseToQposResolver:
             }
         )
         post_ik_started = time.perf_counter()
+        # These are runtime-only observations.  They deliberately stay out of
+        # the semantic resolution payload so profiling cannot change command
+        # identity or acceptance behavior.
+        timing["gc_count_before"] = list(gc.get_count())
+        with self._lock:
+            timing["resolution_cache_size_before"] = len(self._resolution_by_id)
         if not result.success or result.hold:
             metadata = dict(result.metadata or {})
             failure = dict(metadata.get("failure") or {})
@@ -644,6 +651,7 @@ class MujocoCoupledPoseToQposResolver:
                     diagnostics=diagnostics,
                 )
             )
+        resolution_build_started = time.perf_counter()
         resolution = self._build_resolution(
             safe_action,
             solver_input,
@@ -660,7 +668,15 @@ class MujocoCoupledPoseToQposResolver:
             ),
             target_pose_smoothing=target_pose_smoothing,
         )
+        timing["resolution_build_elapsed_sec"] = max(
+            0.0, time.perf_counter() - resolution_build_started
+        )
+        command_resolve_started = time.perf_counter()
         command = self._command_resolver.resolve(resolution.output_qpos_action)
+        timing["command_resolve_elapsed_sec"] = max(
+            0.0, time.perf_counter() - command_resolve_started
+        )
+        command_metadata_started = time.perf_counter()
         command.metadata.update(
             {
                 "pose_to_qpos_resolution_id": resolution.resolution_id,
@@ -676,8 +692,18 @@ class MujocoCoupledPoseToQposResolver:
                 ),
             }
         )
+        timing["command_metadata_elapsed_sec"] = max(
+            0.0, time.perf_counter() - command_metadata_started
+        )
+        cache_insert_started = time.perf_counter()
         with self._lock:
             self._resolution_by_id[resolution.resolution_id] = resolution
+            timing["resolution_cache_size_after"] = len(self._resolution_by_id)
+        timing["resolution_cache_insert_elapsed_sec"] = max(
+            0.0, time.perf_counter() - cache_insert_started
+        )
+        timing["gc_count_after"] = list(gc.get_count())
+        with self._lock:
             timing.update(
                 {
                     "resolve_status": "accepted",
