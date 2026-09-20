@@ -212,6 +212,10 @@ class OpenPIImageWireEncodeReceipt:
     encode_ms: float
     packed_request_bytes: int | None = None
     response_bytes: int | None = None
+    source_shapes: tuple[tuple[int, int, int], ...] = ()
+    target_shape: tuple[int, int, int] | None = None
+    input_noncontiguous_count: int = 0
+    resize_required_count: int = 0
 
     def with_exchange_sizes(
         self,
@@ -232,6 +236,7 @@ class OpenPIImageWireDecodeReceipt:
     image_count: int
     encoded_image_bytes: int
     decoded_image_bytes: int
+    decode_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -735,13 +740,21 @@ def encode_openpi_image_wire_request(
     target_shape = tuple(int(value) for value in capability["target_shape"])
     source_bytes = 0
     encoded_bytes = 0
+    source_shapes: list[tuple[int, int, int]] = []
+    input_noncontiguous_count = 0
+    resize_required_count = 0
     for key in config.image_keys:
         if key not in observation:
             raise OpenPIImageWireError(
                 f"OpenPI request is missing configured image key {key!r}."
             )
+        raw_image = observation[key]
+        if isinstance(raw_image, np.ndarray):
+            input_noncontiguous_count += int(not raw_image.flags.c_contiguous)
         image = _validate_rgb8_image(observation[key])
         source_bytes += int(image.nbytes)
+        source_shapes.append(tuple(int(value) for value in image.shape))
+        resize_required_count += int(image.shape[:2] != target_shape[:2])
         resized = resize_openpi_image_with_pad_v1(
             image,
             target_shape[0],
@@ -760,6 +773,10 @@ def encode_openpi_image_wire_request(
         source_image_bytes=source_bytes,
         encoded_image_bytes=encoded_bytes,
         encode_ms=(time.perf_counter() - started) * 1000.0,
+        source_shapes=tuple(source_shapes),
+        target_shape=tuple(target_shape),
+        input_noncontiguous_count=input_noncontiguous_count,
+        resize_required_count=resize_required_count,
     )
 
 
@@ -771,6 +788,7 @@ def decode_openpi_image_wire_request(
 
     capability = validate_openpi_image_wire_capability(capability_value)
     root, observation = _copy_request_observation(request)
+    started = time.perf_counter()
     codecs: list[str] = []
     encoded_bytes = 0
     decoded_bytes = 0
@@ -790,6 +808,7 @@ def decode_openpi_image_wire_request(
         image_count=len(codecs),
         encoded_image_bytes=encoded_bytes,
         decoded_image_bytes=decoded_bytes,
+        decode_ms=(time.perf_counter() - started) * 1000.0,
     )
 
 

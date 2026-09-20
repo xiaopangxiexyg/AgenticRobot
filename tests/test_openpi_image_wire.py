@@ -139,8 +139,54 @@ def test_resize_raw_roundtrip_matches_versioned_openpi_resize() -> None:
     assert encode_receipt is not None
     assert encode_receipt.source_image_bytes == source.nbytes
     assert encode_receipt.encoded_image_bytes == expected.nbytes
+    assert encode_receipt.source_shapes == ((8, 12, 3),)
+    assert encode_receipt.target_shape == (6, 6, 3)
+    assert encode_receipt.input_noncontiguous_count == 0
+    assert encode_receipt.resize_required_count == 1
     assert decode_receipt is not None
     assert decode_receipt.decoded_image_bytes == expected.nbytes
+    assert decode_receipt.decode_ms >= 0.0
+
+
+def test_optimized_wire_receipt_audits_all_camera_shapes_without_changing_inputs() -> None:
+    image_keys = ("front", "left_wrist", "right_wrist")
+    capability = build_openpi_image_wire_capability(
+        OpenPIImageWireServerConfig(
+            profile="resize-raw",
+            target_height=6,
+            target_width=6,
+            jpeg_quality=90,
+        ),
+        image_keys=image_keys,
+    )
+    contiguous = _image()
+    noncontiguous = _image()[:, ::2, :]
+    request = {
+        key: value
+        for key, value in zip(
+            image_keys,
+            (contiguous, noncontiguous, _image()),
+            strict=True,
+        )
+    }
+
+    encoded, receipt = encode_openpi_image_wire_request(
+        request,
+        OpenPIImageWireClientConfig(
+            preferred_codec=OPENPI_IMAGE_WIRE_RESIZE_RAW_V1,
+            allow_legacy_fallback=False,
+            image_keys=image_keys,
+        ),
+        {OPENPI_IMAGE_WIRE_CAPABILITY_KEY_V1: capability},
+    )
+
+    assert receipt is not None
+    assert receipt.source_shapes == ((8, 12, 3), (8, 6, 3), (8, 12, 3))
+    assert receipt.target_shape == (6, 6, 3)
+    assert receipt.input_noncontiguous_count == 1
+    assert receipt.resize_required_count == 3
+    assert request["left_wrist"] is noncontiguous
+    assert encoded["front"]["shape"] == [6, 6, 3]
 
 
 def test_jpeg_roundtrip_is_bounded_rgb_and_reuses_training_function() -> None:
