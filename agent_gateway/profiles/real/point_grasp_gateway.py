@@ -284,7 +284,13 @@ class PointGraspProvider:
             ).reshape(4, 4),
             max_candidates=request.parameters["max_candidates"],
         )
-        annotated = _annotate(image, pixel_uv, planned, intrinsics)
+        annotated = _annotate(
+            image,
+            pixel_uv,
+            planned,
+            intrinsics,
+            solid_geometry=getattr(self.planner, "solid_geometry", None),
+        )
         if len(annotated) > self.registration.profile.max_annotated_bytes:
             raise RuntimeError("Annotated point-grasp image exceeds its bound.")
         candidates = []

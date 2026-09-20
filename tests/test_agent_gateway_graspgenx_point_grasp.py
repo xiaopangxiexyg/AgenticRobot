@@ -39,7 +39,10 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
     Sam2GraspGenXPointGraspPlanner,
 )
 from deployments.perception.sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner
-from deployments.perception.dmtac_grasp_overlay import reviewed_4b2_cad_solid_geometry
+from deployments.perception.dmtac_grasp_overlay import (
+    reviewed_4b2_cad_solid_geometry,
+    reviewed_graspgenx_dmtac_solid_geometry,
+)
 from robot_motion.grasp_visible_scene import VisibleGraspScene
 
 
@@ -439,7 +442,7 @@ def test_client_sends_dmtac_sweep_volume_and_sorts_top_k() -> None:
     assert request["sweep_volume_params"]["gripper_type"] == 0
     np.testing.assert_allclose(
         request["sweep_volume_params"]["extents_open"],
-        (0.070, 0.0255, 0.050),
+        (0.0705, 0.030, 0.100),
     )
     assert scores.tolist() == pytest.approx([0.8])
     np.testing.assert_allclose(grasps[0], second)
@@ -603,7 +606,7 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
         model_spec=_model_spec(tmp_path),
         point_segmenter=_Segmenter(mask),
         client=client,
-        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
+        solid_geometry=reviewed_graspgenx_dmtac_solid_geometry() if cad_bound else None,
     )
     planner.start()
 
@@ -646,13 +649,15 @@ def test_planner_infers_in_base_frame_and_converts_pose_to_calibrated_dmtac_tcp(
     camera_from_tcp = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
     camera_from_geometry = planner.solid_geometry.solid_pose(camera_from_tcp)
     expected_geometry = camera_from_model_base.copy()
-    expected_geometry[2, 3] += .042999
     np.testing.assert_allclose(camera_from_geometry, expected_geometry, atol=1e-9)
+    expected_tcp = expected_geometry @ np.linalg.inv(
+        planner.solid_geometry.solid_pose(np.eye(4))
+    )
+    np.testing.assert_allclose(camera_from_tcp, expected_tcp, atol=1e-9)
     np.testing.assert_allclose(np.asarray(candidate.base_from_tcp).reshape(4, 4),
                                base_from_camera @ camera_from_tcp, atol=1e-9)
-    assert camera_from_tcp[2, 3] == pytest.approx(1.017999 - (.0082 if cad_bound else 0), abs=1e-6)
     assert candidate.model_score == pytest.approx(.9)
-    assert 0.005 <= candidate.gripper_width_m <= 0.070
+    assert 0.005 <= candidate.gripper_width_m <= 0.0705
     assert candidate.visible_collision_free is True
     assert planner.last_target_mask is not None
     assert "graspgenx_inference" in planner.last_plan_timing_ms
@@ -707,7 +712,7 @@ def test_planner_preserves_scored_finger_exchange_for_independent_robot_validati
         model_spec=_model_spec(tmp_path),
         point_segmenter=_Segmenter(mask),
         client=client,
-        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
+        solid_geometry=reviewed_graspgenx_dmtac_solid_geometry() if cad_bound else None,
     )
     monkeypatch.setattr(
         Sam2VgnPointGraspPlanner,
@@ -737,15 +742,20 @@ def test_planner_preserves_scored_finger_exchange_for_independent_robot_validati
     )
     for candidate, scored_pose in zip(result.candidates, grasps, strict=True):
         expected = scored_pose.copy()
-        expected[:3, 3] += .042999 * expected[:3, 2]
         actual_tcp = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
         np.testing.assert_allclose(planner.solid_geometry.solid_pose(actual_tcp), expected, atol=1e-9)
     exchanged = np.asarray(result.candidates[3].camera_from_tcp).reshape(4, 4)
     first = np.asarray(result.candidates[0].camera_from_tcp).reshape(4, 4)
-    assert np.dot(first[:3, 0], exchanged[:3, 0]) == pytest.approx(-1)
-    assert np.linalg.norm(first[:3, 3] - exchanged[:3, 3]) == pytest.approx(.049 if cad_bound else 0, abs=1e-8)
+    first_model = planner.solid_geometry.solid_pose(first)
+    exchanged_model = planner.solid_geometry.solid_pose(exchanged)
+    assert np.dot(first_model[:3, 0], exchanged_model[:3, 0]) == pytest.approx(-1)
+    expected_first_tcp = grasps[0] @ np.linalg.inv(planner.solid_geometry.solid_pose(np.eye(4)))
+    expected_exchanged_tcp = grasps[3] @ np.linalg.inv(planner.solid_geometry.solid_pose(np.eye(4)))
+    np.testing.assert_allclose(first, expected_first_tcp, atol=1e-9)
+    np.testing.assert_allclose(exchanged, expected_exchanged_tcp, atol=1e-9)
     tilted_result = np.asarray(result.candidates[-1].camera_from_tcp).reshape(4, 4)
-    assert np.dot(first[:3, 2], tilted_result[:3, 2]) == pytest.approx(
+    tilted_model = planner.solid_geometry.solid_pose(tilted_result)
+    assert np.dot(first_model[:3, 2], tilted_model[:3, 2]) == pytest.approx(
         math.cos(tilted_angle)
     )
     planner.close()
@@ -805,7 +815,7 @@ def test_planner_retains_scored_depth_variants_after_family_priority(
     planner = Sam2GraspGenXPointGraspPlanner(
         model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(depth > 0),
         client=_PlannerClient(np.stack(poses), np.asarray((.9, .89, .8, .7, .6))),
-        solid_geometry=reviewed_4b2_cad_solid_geometry() if cad_bound else None,
+        solid_geometry=reviewed_graspgenx_dmtac_solid_geometry() if cad_bound else None,
     )
     planner.start()
     result = planner.plan(
@@ -817,7 +827,6 @@ def test_planner_retains_scored_depth_variants_after_family_priority(
     assert len(result.candidates) == len(expected_indices)
     for candidate, index in zip(result.candidates, expected_indices, strict=True):
         expected = poses[index].copy()
-        expected[:3, 3] += .042999 * expected[:3, 2]
         actual = planner.solid_geometry.solid_pose(
             np.asarray(candidate.camera_from_tcp).reshape(4, 4),
         )
@@ -942,7 +951,10 @@ def test_planner_normalizes_float32_model_rotation_for_strict_frame_contract(
             rtol=0.0,
         )
         assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-9)
-        np.testing.assert_allclose(rotation, original_rotation, atol=3e-8, rtol=0.0)
+        model_pose = planner.solid_geometry.solid_pose(pose)
+        np.testing.assert_allclose(
+            model_pose[:3, :3], original_rotation, atol=3e-8, rtol=0.0
+        )
     planner.close()
 
 
@@ -998,6 +1010,10 @@ def test_visible_collision_proxy_uses_open_gripper_and_keeps_ingress_diagnostic(
         assert approach_openings == pytest.approx([(expected_opening, .06)])
         assert candidate.visible_collision_free
         assert candidate.model_score == pytest.approx(.9)
+        pose = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
+        np.testing.assert_allclose(
+            planner.solid_geometry.solid_pose(pose), model_pose, atol=1e-9
+        )
     finally:
         planner.close()
 

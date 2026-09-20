@@ -18,6 +18,19 @@ from scipy.spatial import cKDTree
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 
+_IDENTITY_ROTATION_FLAT = (
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+)
+
+
 @dataclass(frozen=True)
 class ParallelJawSolidGeometry:
     palm_z_m: float
@@ -27,6 +40,7 @@ class ParallelJawSolidGeometry:
     maximum_opening_m: float
     tool_from_solid_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     solid_yaw_rad: float = 0.0
+    tool_from_solid_rotation: tuple[float, ...] = _IDENTITY_ROTATION_FLAT
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.palm_z_m):
@@ -40,17 +54,34 @@ class ParallelJawSolidGeometry:
             raise ValueError("solid frame offset must contain three finite meters")
         if not math.isfinite(self.solid_yaw_rad):
             raise ValueError("solid frame yaw must be finite")
+        rotation = np.asarray(self.tool_from_solid_rotation, dtype=float)
+        if rotation.size != 9 or not np.all(np.isfinite(rotation)):
+            raise ValueError("solid frame rotation must contain nine finite values")
+        rotation = rotation.reshape(3, 3)
+        if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-7, rtol=0.0):
+            raise ValueError("solid frame rotation must be orthonormal")
+        if not np.isclose(float(np.linalg.det(rotation)), 1.0, atol=1e-7, rtol=0.0):
+            raise ValueError("solid frame rotation must be right-handed")
         object.__setattr__(self, "tool_from_solid_xyz_m", tuple(float(x) for x in offset))
+        object.__setattr__(
+            self,
+            "tool_from_solid_rotation",
+            tuple(float(x) for x in rotation.reshape(-1)),
+        )
 
     def solid_pose(self, tool_pose: np.ndarray) -> np.ndarray:
         """Locate +X-closing solids without changing the controller TCP.
 
-        Only local yaw/translation are supported: +Z remains the approach axis,
-        so the analytic approach sweep uses the same direction in both frames.
+        The optional full rotation is used for calibrated end-tool frames.  The
+        legacy yaw remains additive for the original 4B2 proxy.  The analytic
+        scene checks still receive the local solid pose, so a calibrated
+        DMTAC model and the controller TCP cannot silently diverge.
         """
         transform = np.eye(4)
         c, s = math.cos(self.solid_yaw_rad), math.sin(self.solid_yaw_rad)
-        transform[:3, :3] = ((c, -s, 0), (s, c, 0), (0, 0, 1))
+        yaw = np.asarray(((c, -s, 0), (s, c, 0), (0, 0, 1)), dtype=float)
+        calibrated = np.asarray(self.tool_from_solid_rotation, dtype=float).reshape(3, 3)
+        transform[:3, :3] = calibrated @ yaw
         transform[:3, 3] = self.tool_from_solid_xyz_m
         return np.asarray(tool_pose) @ transform
 
