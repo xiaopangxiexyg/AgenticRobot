@@ -188,6 +188,7 @@ from .recording_admission import (
 )
 from .runtime_extension import (
     RealTeleopRuntimeExtension,
+    runtime_extension_collection_startup_blockers,
     runtime_extension_service_startup_control_plane,
 )
 from .runtime_home import (
@@ -1320,9 +1321,30 @@ def run_real_teleop(
         )
         hardware_requirement = device_retry_runtime.hardware_requirement
         hardware_status_item = device_retry_runtime.hardware_status_item
-        collection_startup_blockers = (
+        base_collection_startup_blockers = (
             device_retry_runtime.collection_startup_blockers
         )
+
+        def collection_startup_blockers() -> dict[str, str]:
+            """Merge generic and exclusive-source readiness before writer open."""
+
+            blockers = dict(base_collection_startup_blockers())
+            if runtime_extension is None:
+                return blockers
+            try:
+                extension_blockers = runtime_extension_collection_startup_blockers(
+                    runtime_extension
+                )
+            except Exception as exc:  # noqa: BLE001 - admission fails closed.
+                blockers.setdefault(
+                    "runtime.extension",
+                    "exclusive runtime readiness check failed: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                blockers.update(extension_blockers)
+            return blockers
+
         publish_runtime_hardware_status = (
             device_retry_runtime.publish_runtime_hardware_status
         )

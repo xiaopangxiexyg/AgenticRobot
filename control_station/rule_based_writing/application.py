@@ -1096,7 +1096,16 @@ class RuleBasedWritingApplication:
             self._state.held = held
             self._state.completed = completed
             self._state.aborted = aborted
-            if held or completed or aborted or self._state.startup_blockers:
+            if (
+                begun
+                or held
+                or completed
+                or aborted
+                or self._state.startup_blockers
+            ):
+                # Once the first rule command has actually begun execution,
+                # the pre-Episode writer exception has served its purpose and
+                # must not survive a later stale heartbeat.
                 self._pre_episode_start_admission_open = False
             if self._state.device_retry_pending:
                 self._project_device_retry_transaction_locked()
@@ -1138,6 +1147,28 @@ class RuleBasedWritingApplication:
                 else:
                     step = self._state.step_id or "等待下一步"
                     self._state.detail = f"当前规则步骤：{step}"
+            elif (
+                # A dedicated START intent is accepted before the first rule
+                # command is consumed.  During that short interval the rule
+                # runtime can legitimately publish an older ``armed=False``
+                # heartbeat.  Keep the application-owned admission window
+                # visible until an authoritative blocker or terminal state
+                # closes it; otherwise the writer countdown is cancelled by
+                # its own stale status refresh.
+                self._pre_episode_start_admission_open
+                and not self._state.writer_blocked
+                and not self._state.configuration_pending
+                and not self._state.writer_retry_pending
+                and not self._state.gripper_action_pending
+                and not self._state.height_calibration_pending
+                and str(self._state.session_state or "").upper()
+                in {"", "ARMED", "RUNNING"}
+            ):
+                self._state.phase = "armed"
+                self._state.title = "规则采集启动中"
+                self._state.detail = self._waiting_detail(
+                    waiting or "formal_episode_not_active"
+                )
             elif armed:
                 self._state.phase = "armed"
                 self._state.title = "规则采集启动中"

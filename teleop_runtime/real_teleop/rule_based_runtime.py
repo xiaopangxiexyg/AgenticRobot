@@ -1133,6 +1133,22 @@ class RuleBasedRealTeleopExtension:
             and not self._held
         )
 
+    def collection_startup_blockers(self) -> dict[str, str]:
+        """Expose rule-owned readiness before the formal writer is opened.
+
+        The generic device retry runtime cannot infer an exclusive rule plan's
+        required hand effectors.  Reuse the existing diagnostic path here so
+        a configured right DMTAC fault is rejected before writer preparation,
+        while Q6/input remains unrelated when the rule source disabled it.
+        """
+
+        status = self.status()
+        return {
+            str(key): str(value)
+            for key, value in status.readiness_blockers.items()
+            if str(value).strip()
+        }
+
     def allows_active_episode_bootstrap_without_dispatch(self) -> bool:
         """Identify the bounded pre-first-dispatch phase of an active Episode.
 

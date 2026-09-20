@@ -836,6 +836,47 @@ def test_rule_start_allows_only_pre_episode_armed_warmup_without_motion() -> Non
     assert not runtime_extension_allows_pre_episode_armed_warmup(extension)
 
 
+def test_rule_runtime_exposes_configured_hand_fault_before_writer_open() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6),
+                        right_arm=np.zeros(6),
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, _ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    class _UnreadyHandBackend(_HandBackend):
+        @staticmethod
+        def is_ready() -> bool:
+            return False
+
+        @staticmethod
+        def readiness_report() -> dict[str, object]:
+            return {"ready": False, "reason": "DMTAC fault"}
+
+    extension._components.right_hand_backend = _UnreadyHandBackend()
+    blockers = extension.collection_startup_blockers()
+
+    assert blockers == {"right_hand": "right_hand DMTAC fault"}
+    assert session.state_machine.state.value == "ARMED"
+
+
 def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),

@@ -107,6 +107,46 @@ def test_rule_ui_opens_only_its_armed_pre_episode_writer_window() -> None:
     assert application.allows_pre_episode_armed_warmup() is False
 
 
+def test_rule_ui_keeps_accepted_start_window_across_stale_status_heartbeat() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication(
+        {"active_controls": ["episode_start"]}
+    )
+    application.bind_rule_runtime()
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": False,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "rule_start_available": True,
+            "configuration_available": True,
+        }
+    )
+
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": False,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "rule_start_available": True,
+            "configuration_available": True,
+        }
+    )
+
+    state = application.snapshot()
+    assert state["phase"] == "armed"
+    assert application.allows_pre_episode_armed_warmup() is True
+
+
 def test_rule_runtime_bind_waits_for_first_readiness_status() -> None:
     """Binding the extension alone must not advertise a usable start gate."""
 
