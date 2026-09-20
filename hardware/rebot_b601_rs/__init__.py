@@ -75,6 +75,10 @@ from .shared_control import (
     B601SharedControlState,
     compute_b601_shared_control_step,
 )
+from .shared_control_runtime import (
+    B601SharedControlFrame,
+    B601SharedControlRuntime,
+)
 
 __all__ = [
     "B601_RS_ARM_JOINT_NAMES",
@@ -121,8 +125,10 @@ __all__ = [
     "B601RSGripperReader",
     "B601RSGripperReaderConfig",
     "B601SharedControlConfig",
+    "B601SharedControlFrame",
     "B601SharedControlMode",
     "B601SharedControlOutput",
+    "B601SharedControlRuntime",
     "B601SharedControlState",
     "FrequencyAcceptance",
     "FrequencyLedger",
