@@ -193,6 +193,64 @@ class RuleBasedWritingApplication:
         merged.update(self._rule_readiness_blockers)
         self._state.startup_blockers = merged
 
+    def _is_expected_pre_episode_session_blocker_locked(
+        self,
+        *,
+        key: str,
+        detail: str,
+    ) -> bool:
+        """Recognize only the command-inert rule-start admission projection.
+
+        The generic runtime publishes ``rig.session`` while Session is ARMED
+        and no generic arm command has been dispatched yet.  A dedicated rule
+        START deliberately opens the formal writer before its initial-alignment
+        planner emits that first command, so this one diagnostic is expected
+        during the bounded pre-Episode window.  Device/backend faults and all
+        other Session states remain real blockers.
+        """
+
+        rule_start_window_open = bool(
+            self._pre_episode_start_admission_open
+            or (
+                self._task_chain.phase is RuleWritingTaskChainPhase.READY_RULE
+                and self._task_chain.rule_start_waiting
+            )
+        )
+        if not (
+            rule_start_window_open
+            and str(key) == "rig.session"
+            and str(self._state.session_state or "").upper()
+            in {"", "ARMED", "RUNNING"}
+            and not self._state.held
+            and not self._state.completed
+            and not self._state.aborted
+            and not self._state.shutdown
+        ):
+            return False
+        normalized = " ".join(str(detail or "").lower().split())
+        return bool(
+            "runtime home" in normalized
+            and "hardware arm admission" in normalized
+            and (
+                "no command" in normalized
+                or "not dispatched" in normalized
+                or "dispatch" in normalized
+                or "before rule collection" in normalized
+            )
+        )
+
+    def _effective_startup_blockers_locked(self) -> dict[str, str]:
+        """Return blockers after the narrow accepted-rule-start exception."""
+
+        blockers = dict(self._state.startup_blockers)
+        for key, detail in tuple(blockers.items()):
+            if self._is_expected_pre_episode_session_blocker_locked(
+                key=key,
+                detail=detail,
+            ):
+                blockers.pop(key, None)
+        return blockers
+
     def observe_runtime_publication(self, updates: Mapping[str, object]) -> None:
         """Consume the generic projection without exposing its controls or progress."""
 
@@ -272,7 +330,7 @@ class RuleBasedWritingApplication:
                 self._project_device_retry_transaction_locked()
             elif self._state.runtime_home_pending:
                 self._set_runtime_home_pending_locked()
-            elif self._state.startup_blockers:
+            elif self._effective_startup_blockers_locked():
                 self._set_readiness_blocked_locked()
             elif self._state.phase == "preparing" and self._rule_runtime_bound:
                 self._project_prestart_readiness_locked()
@@ -301,8 +359,15 @@ class RuleBasedWritingApplication:
             return bool(
                 self._pre_episode_start_admission_open
                 and self._rule_runtime_bound
-                and self._state.phase == "armed"
-                and not self._state.startup_blockers
+                # The writer-preparation callback and the rule-runtime status
+                # heartbeat are asynchronous.  The accepted START latch is
+                # the authoritative fact here; requiring the UI phase to be
+                # exactly ``armed`` lets a stale/preparing projection cancel
+                # a command-inert writer countdown before the rule runtime
+                # has a chance to dispatch its first arm command.
+                and str(self._state.session_state or "").upper()
+                in {"", "ARMED", "RUNNING"}
+                and not self._effective_startup_blockers_locked()
                 and not self._state.held
                 and not self._state.completed
                 and not self._state.aborted
@@ -323,10 +388,11 @@ class RuleBasedWritingApplication:
         """
 
         with self._lock:
-            if self._state.startup_blockers:
+            effective_blockers = self._effective_startup_blockers_locked()
+            if effective_blockers:
                 detail_lines = "; ".join(
                     f"{key}: {value}"
-                    for key, value in sorted(self._state.startup_blockers.items())
+                    for key, value in sorted(effective_blockers.items())
                 )
                 return (
                     "规则采集启动门禁已关闭；请先完成设备恢复和安全初始化。\n"
@@ -1137,7 +1203,7 @@ class RuleBasedWritingApplication:
                 or held
                 or completed
                 or aborted
-                or self._state.startup_blockers
+                or self._effective_startup_blockers_locked()
             ):
                 # Once the first rule command has actually begun execution,
                 # the pre-Episode writer exception has served its purpose and
@@ -1151,7 +1217,7 @@ class RuleBasedWritingApplication:
                 self._state.detail = "正在后台读取并验证所选来源；完成前不会输出运动命令。"
             elif self._state.runtime_home_pending:
                 self._set_runtime_home_pending_locked()
-            elif self._state.startup_blockers and not begun:
+            elif self._effective_startup_blockers_locked() and not begun:
                 self._set_readiness_blocked_locked()
             elif self._state.writer_blocked and not begun:
                 self._state.phase = "blocked"
@@ -1252,7 +1318,7 @@ class RuleBasedWritingApplication:
             or self._state.gripper_action_pending
             or self._state.height_calibration_pending
             or self._state.runtime_home_pending
-            or self._state.startup_blockers
+            or self._effective_startup_blockers_locked()
         ):
             return False
         if not self._base_control_availability_locked()["start"]:
@@ -1441,7 +1507,10 @@ class RuleBasedWritingApplication:
         elif (
             self._task_chain.phase is RuleWritingTaskChainPhase.READY_RULE
             and not self._state.task_chain_can_advance
-            and (self._state.startup_blockers or self._state.runtime_home_pending)
+            and (
+                self._effective_startup_blockers_locked()
+                or self._state.runtime_home_pending
+            )
         ):
             task_chain_detail = self._task_chain_blocked_detail_locked(available)
         self._state.task_chain_detail = task_chain_detail
@@ -1482,6 +1551,16 @@ class RuleBasedWritingApplication:
             and not self._state.gripper_action_pending
             and not self._state.height_calibration_pending
         )
+        start_blockers = self._state.startup_blockers
+        if (
+            self._task_chain.phase is RuleWritingTaskChainPhase.READY_RULE
+            and self._task_chain.rule_start_waiting
+        ):
+            # Configuration has already been validated for this dedicated
+            # chain.  Permit its explicit START retry through the same narrow
+            # pre-dispatch Session projection used by the warmup gate; the
+            # ordinary manual START path still requires no startup blockers.
+            start_blockers = self._effective_startup_blockers_locked()
         start = bool(
             self._rule_runtime_bound
             and (self._state.rule_start_available or self._state.writer_blocked)
@@ -1491,7 +1570,7 @@ class RuleBasedWritingApplication:
             and not self._state.writer_retry_pending
             and not self._state.gripper_action_pending
             and not self._state.height_calibration_pending
-            and not self._state.startup_blockers
+            and not start_blockers
         )
         stop = bool(
             not terminal
@@ -1605,10 +1684,11 @@ class RuleBasedWritingApplication:
             return "当前采集模式不是 rule-based writing，任务链不可用。"
         if not self._rule_runtime_bound:
             return "等待规则运行时完成绑定；就绪前不能开始任务链。"
-        if self._state.startup_blockers:
+        effective_blockers = self._effective_startup_blockers_locked()
+        if effective_blockers:
             detail_lines = "; ".join(
                 f"{key}: {value}"
-                for key, value in sorted(self._state.startup_blockers.items())
+                for key, value in sorted(effective_blockers.items())
             )
             if self._has_retryable_device_blockers_locked():
                 if self._device_retry_request_available_locked():
@@ -1656,7 +1736,10 @@ class RuleBasedWritingApplication:
         if phase is RuleWritingTaskChainPhase.READY_HEIGHT:
             return bool(available["capture_height"])
         if phase is RuleWritingTaskChainPhase.READY_RULE:
-            if self._state.startup_blockers or self._state.runtime_home_pending:
+            if (
+                self._effective_startup_blockers_locked()
+                or self._state.runtime_home_pending
+            ):
                 return False
             if self._task_chain.rule_start_waiting:
                 return bool(available["start"])
@@ -1689,7 +1772,7 @@ class RuleBasedWritingApplication:
         if self._state.runtime_home_pending:
             self._set_runtime_home_pending_locked()
             return
-        if self._state.startup_blockers:
+        if self._effective_startup_blockers_locked():
             self._set_readiness_blocked_locked()
             return
         if self._session_requires_runtime_home_locked():
@@ -1795,21 +1878,22 @@ class RuleBasedWritingApplication:
         self._set_device_retry_running_locked()
 
     def _session_requires_runtime_home_locked(self) -> bool:
+        blockers = self._effective_startup_blockers_locked()
         if self._runtime_home_retry_available:
             return True
         state = str(self._state.session_state or "").upper()
         if state in {"", "ARMED", "RUNNING", "FAULT", "ESTOP", "INIT"}:
             return any(
                 self._is_runtime_home_requirement(key, detail)
-                for key, detail in self._state.startup_blockers.items()
+                for key, detail in blockers.items()
             )
         if state not in {"CALIBRATION", "DEBUG_ONLY", "FROZEN", "RECOVERING"}:
             return False
-        if not self._state.startup_blockers:
+        if not blockers:
             return bool(self._state.readiness_reason) or state != ""
         return all(
             self._is_runtime_home_requirement(key, detail)
-            for key, detail in self._state.startup_blockers.items()
+            for key, detail in blockers.items()
         )
 
     def _set_runtime_home_pending_locked(self) -> None:

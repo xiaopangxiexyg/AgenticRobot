@@ -192,6 +192,9 @@ class RuleBasedRealTeleopConfig:
     manual_gripper_resend_interval_sec: float = 0.25
     manual_gripper_timeout_sec: float = 20.0
     hand_state_max_age_sec: float = 0.5
+    # Keep this additive field after the established positional fields so
+    # compatibility fixtures and external callers retain their bindings.
+    manual_gripper_settle_samples: int = 3
 
     def __post_init__(self) -> None:
         if self.action_hz is not None and (
@@ -246,6 +249,14 @@ class RuleBasedRealTeleopConfig:
                 "manual_gripper_endpoint_tolerance must not exceed "
                 "manual_gripper_tolerance."
             )
+        settle_samples = self.manual_gripper_settle_samples
+        if (
+            isinstance(settle_samples, bool)
+            or not isinstance(settle_samples, (int, np.integer))
+            or int(settle_samples) <= 0
+        ):
+            raise ValueError("manual_gripper_settle_samples must be a positive integer.")
+        object.__setattr__(self, "manual_gripper_settle_samples", int(settle_samples))
         if float(self.initial_alignment_hand_start_drift_tolerance) > float(
             self.gripper_max_step
         ):
@@ -579,6 +590,10 @@ class RuleBasedRealTeleopExtension:
         self._manual_gripper_command_baseline_by_side: dict[str, float] = {}
         self._manual_gripper_last_dispatch_at_by_side: dict[str, float] = {}
         self._manual_gripper_last_progress_at_by_side: dict[str, float] = {}
+        self._manual_gripper_settle_samples_by_side: dict[str, int] = {}
+        self._manual_gripper_last_settle_feedback_token_by_side: dict[
+            str, tuple[str, float]
+        ] = {}
         self._admitted_capture_sequences: set[int] = set()
         self._height_calibration: RuleBasedWritingHeightCalibration | None = None
         self._height_calibration_error = ""
@@ -2153,6 +2168,8 @@ class RuleBasedRealTeleopExtension:
         self._manual_gripper_command_baseline_by_side.clear()
         self._manual_gripper_last_dispatch_at_by_side.clear()
         self._manual_gripper_last_progress_at_by_side.clear()
+        self._manual_gripper_settle_samples_by_side.clear()
+        self._manual_gripper_last_settle_feedback_token_by_side.clear()
 
     def _manual_gripper_state(
         self,
@@ -2267,6 +2284,123 @@ class RuleBasedRealTeleopExtension:
         if not 0.0 <= scalar <= max_action:
             return None, "实测夹爪位置越界"
         return measured.astype(np.float32, copy=True), ""
+
+    @staticmethod
+    def _manual_gripper_feedback_timestamp(
+        state: Mapping[str, Any],
+    ) -> float | None:
+        """Return the hardware-side timestamp carried by one hand snapshot."""
+
+        for key in (
+            "joint_timestamp",
+            "gripper_measurement_timestamp",
+            "telemetry_snapshot_source_timestamp",
+        ):
+            try:
+                value = float(state.get(key))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                return value
+        return None
+
+    @staticmethod
+    def _manual_gripper_feedback_token(
+        state: Mapping[str, Any],
+        *,
+        now: float,
+    ) -> tuple[str, float]:
+        """Identify one distinct cached feedback frame.
+
+        Production hand snapshots carry ``joint_timestamp`` or a telemetry
+        sequence.  The control-time fallback keeps compatibility fixtures
+        deterministic without pretending that a cached frame is fresh across
+        repeated calls with the same timestamp.
+        """
+
+        timestamp = RuleBasedRealTeleopExtension._manual_gripper_feedback_timestamp(
+            state
+        )
+        if timestamp is not None:
+            return ("hardware_timestamp", timestamp)
+        for key in ("telemetry_snapshot_sequence", "sequence"):
+            try:
+                sequence = float(state.get(key))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(sequence):
+                return (key, sequence)
+        return ("control_timestamp", float(now))
+
+    def _manual_gripper_endpoint_settled(
+        self,
+        state: Mapping[str, Any],
+        *,
+        side: str,
+        now: float,
+        final_target: float,
+    ) -> tuple[bool, str]:
+        """Require post-command, distinct feedback frames at an endpoint.
+
+        DMTAC position writes are asynchronous.  Endpoint position alone is
+        therefore insufficient: the cached value can be the last register
+        read from before the close command, while status code 4 still means
+        that the gripper is physically closing/holding.  A short fresh-frame
+        barrier preserves the existing command-inert handoff without adding a
+        second device loop.
+        """
+
+        recovery_phase = str(state.get("gripper_recovery_phase") or "").strip()
+        if recovery_phase in {"recovering", "failed"}:
+            return False, f"等待夹爪恢复({recovery_phase})"
+        raw_error_code = state.get("gripper_error_code", state.get("error_code"))
+        try:
+            error_code = None if raw_error_code is None else int(raw_error_code)
+        except (TypeError, ValueError):
+            return False, "夹爪反馈错误码无效"
+        if error_code not in (None, 0):
+            return False, f"等待夹爪故障清除(error_code={error_code})"
+        telemetry_error = str(state.get("telemetry_error") or "").strip()
+        if telemetry_error and not telemetry_error.lower().startswith("tactile_"):
+            return False, f"等待夹爪传输恢复({telemetry_error})"
+
+        status_code = state.get("gripper_status_code", state.get("status_code"))
+        try:
+            status_code = None if status_code is None else int(status_code)
+        except (TypeError, ValueError):
+            return False, "夹爪状态码无效"
+        if status_code in {4, 5}:
+            direction = "张开" if status_code == 5 else "闭合"
+            return False, f"夹爪仍在{direction}运动"
+        if bool(state.get("gripper_is_moving")):
+            return False, "夹爪反馈仍显示运动中"
+
+        feedback_timestamp = self._manual_gripper_feedback_timestamp(state)
+        last_dispatch = self._manual_gripper_last_dispatch_at_by_side.get(side)
+        if (
+            feedback_timestamp is not None
+            and last_dispatch is not None
+            and feedback_timestamp <= float(last_dispatch)
+        ):
+            return False, "等待夹爪命令后的新鲜反馈"
+
+        token = self._manual_gripper_feedback_token(state, now=float(now))
+        previous_token = self._manual_gripper_last_settle_feedback_token_by_side.get(
+            side
+        )
+        if previous_token == token:
+            count = self._manual_gripper_settle_samples_by_side.get(side, 0)
+            return False, (
+                "等待下一帧不同的实测反馈"
+                f"({count}/{self.config.manual_gripper_settle_samples})"
+            )
+        self._manual_gripper_last_settle_feedback_token_by_side[side] = token
+        count = self._manual_gripper_settle_samples_by_side.get(side, 0) + 1
+        self._manual_gripper_settle_samples_by_side[side] = count
+        required = int(self.config.manual_gripper_settle_samples)
+        if count < required:
+            return False, f"等待端点稳定反馈({count}/{required})"
+        return True, ""
 
     def _manual_gripper_feedback(
         self,
@@ -2514,8 +2648,17 @@ class RuleBasedRealTeleopExtension:
             if abs(measured_scalar - final_target) <= float(
                 self.config.manual_gripper_endpoint_tolerance
             ):
-                arrived.append(side)
-                self._manual_gripper_last_progress_at_by_side[side] = float(now)
+                settled, settle_reason = self._manual_gripper_endpoint_settled(
+                    feedback_state or {},
+                    side=side,
+                    now=float(now),
+                    final_target=final_target,
+                )
+                if settled:
+                    arrived.append(side)
+                    self._manual_gripper_last_progress_at_by_side[side] = float(now)
+                else:
+                    waiting.append(f"{side}:{settle_reason}")
                 continue
             if last_target is not None:
                 command_baseline = self._manual_gripper_command_baseline_by_side.get(side)
@@ -2760,6 +2903,16 @@ class RuleBasedRealTeleopExtension:
                     qpos[command_dim]
                 )
                 self._manual_gripper_last_dispatch_at_by_side[side] = float(now)
+                # A newly accepted asynchronous command invalidates all
+                # endpoint samples collected before it.  The next completion
+                # decision must be based on distinct feedback after this
+                # command, including when the backend accepts a threshold
+                # no-op as already at target.
+                self._manual_gripper_settle_samples_by_side[side] = 0
+                self._manual_gripper_last_settle_feedback_token_by_side.pop(
+                    side,
+                    None,
+                )
                 if side not in resend_sides:
                     self._manual_gripper_command_baseline_by_side[side] = float(
                         measured_scalar_by_side[side]
@@ -3710,6 +3863,16 @@ class RuleBasedRealTeleopExtension:
         planner = self._initial_alignment_planner
         if planner is None:
             raise RuntimeError("initial-alignment planner is not attached.")
+        if self._closed:
+            # ``close_before_session`` owns executor shutdown.  A late owner
+            # loop callback must not turn that normal lifecycle edge into
+            # ``cannot schedule new futures after shutdown`` and crash the
+            # GUI; it is a terminal, fail-closed runtime state instead.
+            self._aborted = True
+            self._armed = False
+            self._waiting_reason = "runtime_closed"
+            self._clear_current()
+            return
         if self._initial_alignment_future is not None:
             raise RuntimeError("initial-alignment planning is already active.")
         if self._initial_alignment_template is not None:
@@ -3757,11 +3920,29 @@ class RuleBasedRealTeleopExtension:
         self._initial_alignment_hand_target_by_side = hand_target
         self._initial_alignment_planning_started_at = float(now)
         self._waiting_reason = "initial_alignment_planning"
-        self._initial_alignment_future = self._initial_alignment_executor.submit(
-            planner.plan,
-            start_qpos_by_side=start,
-            target_qpos_by_side=target,
-        )
+        try:
+            self._initial_alignment_future = self._initial_alignment_executor.submit(
+                planner.plan,
+                start_qpos_by_side=start,
+                target_qpos_by_side=target,
+            )
+        except RuntimeError as exc:
+            # Shutdown can race one final callback during Session teardown.
+            # Preserve Hold/fail-closed semantics while keeping the GUI owner
+            # loop alive long enough to publish the actionable terminal state.
+            self._cancel_initial_alignment_planning()
+            self._aborted = True
+            self._armed = False
+            self._waiting_reason = "initial_alignment_executor_unavailable"
+            message = (
+                "规则初始化规划器已关闭，未派发机械臂命令；"
+                f"{type(exc).__name__}: {exc}"
+            )
+            self._establish_hold(message)
+            self._request_failure_stop()
+            append_message = getattr(self._control_ui, "append_message", None)
+            if callable(append_message):
+                append_message("RuleBased", message)
 
     def _prepare_initial_alignment_waypoint(
         self,
@@ -5733,6 +5914,45 @@ class RuleBasedRealTeleopExtension:
         self._last_status_publish_at = now
         self._last_status_publish_urgent_signature = urgent_signature
 
+    def _rule_pre_dispatch_session_blocker_is_expected(
+        self,
+        *,
+        session_state_value: str,
+        key: str,
+        detail: str,
+    ) -> bool:
+        """Classify the one expected pre-first-command Session diagnostic.
+
+        A dedicated rule start intentionally opens the formal writer before
+        the first arm command: the first command is produced by the rule
+        initial-alignment plan.  The generic Rig report may still describe
+        that ARMED/no-dispatch interval as missing arm admission.  Only this
+        exact, command-inert interval is filtered; hand/backend faults and
+        every non-ARMED Session state remain blocking.
+        """
+
+        if (
+            str(key) != "rig.session"
+            or str(session_state_value).upper() not in {"ARMED", "RUNNING"}
+            or not self._armed
+            or self._execution_begun
+            or self._completed
+            or self._aborted
+            or self._held
+        ):
+            return False
+        normalized = " ".join(str(detail or "").lower().split())
+        return bool(
+            "runtime home" in normalized
+            and "hardware arm admission" in normalized
+            and (
+                "no command" in normalized
+                or "not dispatched" in normalized
+                or "dispatch" in normalized
+                or "before rule collection" in normalized
+            )
+        )
+
     def _session_readiness_diagnosis(
         self,
         *,
@@ -5788,6 +6008,13 @@ class RuleBasedRealTeleopExtension:
                 report = candidate
 
         blockers = readiness_report_blockers(report or {})
+        for key, detail in tuple(blockers.items()):
+            if self._rule_pre_dispatch_session_blocker_is_expected(
+                session_state_value=session_state_value,
+                key=key,
+                detail=detail,
+            ):
+                blockers.pop(key, None)
         reported_blockers = set(blockers)
 
         # The rule plan's replay may contain a configured hand effector even

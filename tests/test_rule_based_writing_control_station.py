@@ -101,6 +101,37 @@ def test_rule_ui_opens_only_its_armed_pre_episode_writer_window() -> None:
     assert application.submit_intent(RuleBasedWritingIntent.START) is True
     assert application.allows_pre_episode_armed_warmup() is True
 
+    # Writer preparation and rule status publication are asynchronous.  The
+    # accepted dedicated START latch must remain authoritative even if a
+    # transient callback projects ``preparing`` instead of ``armed``.
+    application._state.phase = "preparing"
+    assert application.allows_pre_episode_armed_warmup() is True
+
+    application.observe_runtime_publication(
+        {
+            "startup_blockers": {
+                "rig.session": (
+                    "Session state=ARMED; runtime Home and hardware arm admission "
+                    "are required before rule collection."
+                )
+            }
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is True
+    assert application.pre_episode_start_admission_reason() is None
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": False,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is True
+
     application.observe_runtime_publication(
         {"startup_blockers": {"right_hand": "DMTAC fault"}}
     )
@@ -1415,6 +1446,20 @@ def test_task_chain_starts_after_stale_start_gate_recovers() -> None:
     assert "配置已验证" in state["task_chain_detail"]
     assert application.consume_rule_intents() == ()
     assert application.consume_configuration_requests() == ()
+
+    # The generic runtime can still publish its ARMED/no-command diagnostic
+    # while this validated chain waits for the dedicated START receipt.  That
+    # projection is expected here and must not strand the chain in READY_RULE.
+    application.observe_runtime_publication(
+        {
+            "startup_blockers": {
+                "rig.session": (
+                    "Session state=ARMED; runtime Home and hardware arm admission "
+                    "are required before rule collection."
+                )
+            }
+        }
+    )
 
     application.observe_rule_status(_task_chain_ready_status())
     assert application.consume_rule_intents() == ("rule_start",)

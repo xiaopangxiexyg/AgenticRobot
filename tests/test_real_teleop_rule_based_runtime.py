@@ -2803,7 +2803,88 @@ def test_manual_gripper_close_requires_strict_endpoint_and_sends_final_target() 
     assert command.metadata["dmtac_continuous_grasp_override"] is True
 
     backend.set_measured_scalar(1.0)
+    for now in (10.1, 10.2):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    session.command_override_provider(SimpleNamespace(), 10.3)
+    assert extension._pending_gripper_action is None
+    assert extension.status().gripper_action_status == "夹爪实测已闭紧"
+
+
+def test_manual_gripper_endpoint_waits_for_post_command_fresh_frames() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+
+    class TimestampedHandPoller:
+        def __init__(self) -> None:
+            self.value = 0.981
+            self.timestamp = 9.0
+            self.status_code = 2
+            self.is_moving = False
+
+        def latest_at_or_before(self, _now, **_kwargs):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = self.value
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": self.is_moving,
+                }
+            }
+
+    hand_poller = TimestampedHandPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_grippers")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+
+    hand_poller.value = 1.0
+    hand_poller.timestamp = 10.0  # The pre-dispatch cached frame is rejected.
     session.command_override_provider(SimpleNamespace(), 10.1)
+    assert extension._pending_gripper_action == "close_grippers"
+    assert "新鲜反馈" in extension.status().gripper_action_status
+
+    hand_poller.status_code = 4
+    hand_poller.is_moving = True
+    for timestamp, now in ((10.1, 10.2), (10.2, 10.3)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    assert "闭合运动" in extension.status().gripper_action_status
+
+    # Position=1 with status 4 is still the user's observed failure mode:
+    # the gripper is closing, not settled.  Only an idle closed status may
+    # contribute endpoint samples.
+    hand_poller.status_code = 2
+    hand_poller.is_moving = False
+    for timestamp, now in ((10.3, 10.4), (10.4, 10.5)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    hand_poller.timestamp = 10.5
+    session.command_override_provider(SimpleNamespace(), 10.6)
     assert extension._pending_gripper_action is None
     assert extension.status().gripper_action_status == "夹爪实测已闭紧"
 
@@ -2920,6 +3001,10 @@ def test_manual_gripper_close_then_release_recovers_from_real_backend_rate_limit
 
     def run_until_complete(*, deadline: float) -> None:
         while extension._pending_gripper_action is not None:
+            # With telemetry disabled this fixture has to advance the same
+            # hardware timestamp that production HandStateHistoryPoller
+            # advances after each fresh register read.
+            backend._latest_joint_timestamp = clock.now
             session.command_override_provider(SimpleNamespace(), clock.now)
             clock.now += 0.01
             assert clock.now < deadline
