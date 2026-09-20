@@ -1689,9 +1689,12 @@ class RtcPolicyShadowFrontend:
         self._preflight_request = None
         self._active_request_plan_coverage_steps = None
         self.deploy_runtime.reset_arm_hold_semantics()
-        stop = self._worker.stop(
-            timeout_sec=self.config.effective_worker_stop_timeout_sec
-        )
+        # A lifecycle transition is a control-path invalidation, not a worker
+        # shutdown barrier.  Signal cancellation and return immediately so the
+        # application can establish its backend-owned Hold without waiting for
+        # a blocked provider call.  Rearm already requires the retired session
+        # to reach DRAINED, while close() retains the configured bounded wait.
+        stop = self._worker.stop(timeout_sec=0.0)
         session = update_policy_worker_session_state(
             self._state,
             worker_session_state=stop.session_state,

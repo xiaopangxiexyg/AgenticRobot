@@ -772,7 +772,10 @@ def test_blocking_model_backend_does_not_block_rtc_control_step() -> None:
         assert time.perf_counter() - started < 0.05
         assert step.action_preparation.emission is None
 
+        hold_started = time.perf_counter()
         transition = frontend.hold(now=base + 0.002, reason="test_hold")
+        hold_elapsed = time.perf_counter() - hold_started
+        assert hold_elapsed < 0.05
         assert transition.worker_stop_receipt.status == "executing_call_not_drained"
         release.set()
         deadline = time.monotonic() + 1.0

@@ -222,6 +222,15 @@ class PreparedActionExecutor:
                     )
                     and int(position_snapshot.get("submitted_count", 0)) == 0
                 ):
+                    prepare_started = time.monotonic()
+                    position_deploy_executor.prepare_first_submission()
+                    if phase_timing is not None:
+                        phase_timing[
+                            "position_first_submission_prepare_ms"
+                        ] = max(
+                            0.0,
+                            time.monotonic() - prepare_started,
+                        ) * 1000.0
                     refresh_started = time.monotonic()
                     observation = refresh_observation(observation)
                     if not isinstance(observation, DeploymentObservation):

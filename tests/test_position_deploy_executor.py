@@ -663,6 +663,89 @@ def test_cyclic_gc_guard_is_active_before_authoritative_collision_reset(
         executor.close()
 
 
+def test_first_submission_preparation_collects_before_live_state_cut(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "_acquire_cyclic_gc_guard",
+        lambda: events.append("gc")
+        or {
+            "owner_count_before": 0,
+            "owner_count_after": 1,
+            "gc_enabled_before": True,
+            "gc_enabled_after": False,
+        },
+    )
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "_release_cyclic_gc_guard",
+        lambda: events.append("release")
+        or {
+            "owner_count_before": 1,
+            "owner_count_after": 0,
+            "gc_restore_requested": True,
+            "gc_enabled_after": True,
+        },
+    )
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(cyclic_gc_guard_enabled=True),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    try:
+        prepared = executor.prepare_first_submission()
+        events.append("live_state_cut")
+        executor.submit(
+            _filtered_pose("left", _pose(0.11)),
+            _observation(),
+            "unit",
+        )
+        assert prepared["cyclic_gc_guard_activated"] is True
+        assert events[:2] == ["gc", "live_state_cut"]
+        assert executor.snapshot()["cyclic_gc_guard_activation_count"] == 1
+    finally:
+        executor.close()
+
+
+def test_first_submission_preparation_is_idempotent(monkeypatch) -> None:
+    acquire_count = 0
+
+    def acquire() -> dict[str, object]:
+        nonlocal acquire_count
+        acquire_count += 1
+        return {
+            "owner_count_before": 0,
+            "owner_count_after": 1,
+            "gc_enabled_before": True,
+            "gc_enabled_after": False,
+        }
+
+    monkeypatch.setattr(deploy_executor_module, "_acquire_cyclic_gc_guard", acquire)
+    monkeypatch.setattr(
+        deploy_executor_module,
+        "_release_cyclic_gc_guard",
+        lambda: {
+            "owner_count_before": 1,
+            "owner_count_after": 0,
+            "gc_restore_requested": True,
+            "gc_enabled_after": True,
+        },
+    )
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(cyclic_gc_guard_enabled=True),
+        canonical_pipeline=_pipeline(("left",)),
+    )
+    try:
+        first = executor.prepare_first_submission()
+        second = executor.prepare_first_submission()
+        assert first["cyclic_gc_guard_activated"] is True
+        assert second["cyclic_gc_guard_activated"] is False
+        assert acquire_count == 1
+    finally:
+        executor.close()
+
+
 def test_cyclic_gc_guard_is_not_restored_after_failed_close(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
@@ -1997,7 +2080,8 @@ def test_collision_required_pose_reference_becomes_dual_joint_command() -> None:
             _observation(sides=("left", "right")),
             "collision_policy_after_clear",
         )
-        _wait_until(lambda: len(planner.reset_calls) == 2)
+        _wait_until(lambda: planner.prepare_staged_source_horizon_calls == 2)
+        assert len(planner.reset_calls) == 2
         assert executor.snapshot()["collision_reset_count"] == 2
     finally:
         executor.close()
@@ -2418,7 +2502,7 @@ def test_collision_reset_preflight_waits_without_mutating_planner_or_stream() ->
         executor.close()
 
 
-def test_authoritative_collision_reset_is_rechecked_when_worker_applies_it() -> None:
+def test_authoritative_collision_reset_is_rechecked_at_submission_admission() -> None:
     planner = _FakePositionCollisionPlanner()
     executor = PositionDeployExecutor(
         config=PositionDeployExecutorConfig(
@@ -2444,15 +2528,61 @@ def test_authoritative_collision_reset_is_rechecked_when_worker_applies_it() -> 
                 },
             },
         )
+        with pytest.raises(RuntimeError, match="became stale before planner reset"):
+            executor.submit(
+                _filtered_bimanual_pose(0.16, 0.18),
+                observation,
+                "apply_freshness",
+                timestamp_monotonic=10.0,
+            )
+        assert planner.reset_calls == []
+        assert executor.snapshot()["submitted_count"] == 0
+    finally:
+        executor.close()
+
+
+def test_reference_worker_delay_cannot_age_an_admitted_collision_reset() -> None:
+    now = {"value": 10.0}
+    planner = _FakePositionCollisionPlanner()
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            collision_required=True,
+            collision_reset_measurement_max_age_sec=0.25,
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        dispatch_callback=lambda command: _accepted_collision_arm_dispatch([], command),
+        collision_planner_factory=lambda: planner,
+        clock=lambda: now["value"],
+    )
+    try:
+        observation = _observation(
+            sides=("left", "right"),
+            arm_state_overrides={
+                side: {
+                    "hardware_read_timestamp_monotonic": 10.0,
+                    "measured_timestamp_monotonic": 10.0,
+                }
+                for side in ("left", "right")
+            },
+        )
         executor.submit(
             _filtered_bimanual_pose(0.16, 0.18),
             observation,
-            "apply_freshness",
+            "delayed_reference_worker",
             timestamp_monotonic=10.0,
         )
-        with pytest.raises(RuntimeError, match="became stale before planner reset"):
-            executor._drain_submissions()
-        assert planner.reset_calls == []
+        assert len(planner.reset_calls) == 1
+        assert executor.snapshot()["last_collision_reset"]["planner_reset_stage"] == (
+            "submission_admission"
+        )
+
+        # The queued submission no longer owns the freshness-bounded qpos.
+        # Advancing beyond the reset age budget before the worker drains must
+        # therefore not reinterpret or reject the already-admitted state cut.
+        now["value"] = 10.30
+        assert executor._drain_submissions() == 1
+        assert len(planner.reset_calls) == 1
+        assert executor.snapshot()["collision_planner_initialized"] is True
     finally:
         executor.close()
 

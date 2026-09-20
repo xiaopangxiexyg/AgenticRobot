@@ -29,6 +29,11 @@ class _PositionExecutor:
         self.collision_planner_initialized = collision_planner_initialized
         self.submissions: list[tuple[tuple[object, ...], dict[str, object]]] = []
         self.clear_count = 0
+        self.prepare_first_submission_count = 0
+
+    def prepare_first_submission(self) -> dict[str, object]:
+        self.prepare_first_submission_count += 1
+        return {"prepared": True}
 
     def submit(self, *args: object, **kwargs: object) -> int:
         self.submissions.append((args, kwargs))
@@ -244,8 +249,10 @@ def test_first_collision_stream_refreshes_observation_before_submit() -> None:
     )
 
     assert execution.accepted is True
+    assert position.prepare_first_submission_count == 1
     assert refresh_calls == [original_observation]
     assert position.submissions[0][0] == ("filtered", refreshed_observation)
+    assert float(phase_timing["position_first_submission_prepare_ms"]) >= 0.0
     assert float(phase_timing["first_position_stream_observation_refresh_ms"]) >= 0.0
 
 
@@ -273,6 +280,7 @@ def test_initialized_collision_stream_does_not_refresh_observation() -> None:
     )
 
     assert execution.accepted is True
+    assert position.prepare_first_submission_count == 0
     refresh.assert_not_called()
     assert position.submissions[0][0] == ("filtered", observation)
 
