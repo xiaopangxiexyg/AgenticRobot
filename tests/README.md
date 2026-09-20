@@ -202,22 +202,18 @@ planner parses the source without importing it, assigns every statically
 discovered top-level `test_*` function exactly once, and fails closed on test
 classes or dynamic collection hooks. Parameterized functions remain a single
 target, so their complete case matrix stays together. The manifest records both
-source modules and exact pytest targets. The temp pipeline, replay active
-pipeline, and MuJoCo fast runtime use this exception to share shard capacity
-without reducing test coverage or physics work. Replay tests create their own temporary logs and
+source modules and exact pytest targets. The temp pipeline and replay active
+pipeline use this exception to share shard capacity without reducing test
+coverage or physics work. Replay tests create their own temporary logs and
 fresh runtimes; the four-rollout combined-control test and each parameterized
-envelope matrix remain indivisible. MuJoCo fast runtime's model-cache consumers
-form an explicit affinity group so its module-scoped fixture is instantiated
-once; a missing or duplicated member makes planning fail closed. Grasp trajectory stays module-local to
+envelope matrix remain indivisible. Grasp trajectory stays module-local to
 preserve its shared planning fixture instead of repeating that expensive plan.
 The sparse full-suite weights come from testcase durations in a complete,
 socket-capable green Run and cover only modules that contributed at least five
 seconds there. Refresh them only from another exact green full-suite artifact;
 failed, capability-limited, or focused runs are not representative inputs.
 Current module and replay-function weights use the green six-shard baseline at
-`47d7be6e`; the MuJoCo fast runtime function weights were refreshed from the
-accepted `65bb09af` successor baseline. They are scheduling estimates, not
-timeouts or acceptance thresholds.
+`47d7be6e`; they are scheduling estimates, not timeouts or acceptance thresholds.
 The default remains four shards. Each shard has separate pytest, Python, XDG,
 Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
 Run share only its content-addressed MuJoCo model cache; that cache uses process
