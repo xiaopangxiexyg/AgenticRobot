@@ -29,6 +29,7 @@ from robot_motion.position_control import (
     DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
     PositionAuditFanout,
 )
+from robot_motion.runtime import run_best_effort_cleanup
 from teleop_runtime.backends.grippers import GRIPPER_ACTION_MAX, DMTacGripperBackend
 from teleop_runtime.cli_value_parsers import _active_sides_from_args
 from teleop_runtime.collection.camera_preview import (
@@ -70,6 +71,7 @@ from .arm_tool_config import (
 from .artifact_context import materialize_real_teleop_artifact_context
 from .camera_runtime import (
     _build_camera_sources,
+    _close_camera_sources,
     _select_preview_camera_sources,
     _start_camera_sources,
     _start_camera_sources_best_effort,
@@ -158,7 +160,11 @@ from .hand_runtime import (
     _tactile_solving_available,
     _tactile_visualization_available,
 )
-from .impedance_force_runtime import _emergency_stop_real_arms
+from .impedance_force_runtime import (
+    _emergency_stop_real_arms,
+    _position_force_guard_collision_summary,
+    _terminal_force_collision_summary,
+)
 from .main_loop_watchdog import MainLoopStallWatchdog
 from .operator_control_runtime import RealTeleopControlInput
 from .position_admittance_shadow import (

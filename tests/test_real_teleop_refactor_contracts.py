@@ -1396,6 +1396,16 @@ def test_extracted_application_runtime_preserves_entrypoint_support_contract() -
     assert set(runtime._REQUIRED_SUPPORT_NAMES).issubset(vars(legacy_entrypoint))
 
 
+def test_real_teleop_runtime_exposes_shutdown_support() -> None:
+    for name in (
+        "_close_camera_sources",
+        "_position_force_guard_collision_summary",
+        "_terminal_force_collision_summary",
+        "run_best_effort_cleanup",
+    ):
+        assert callable(getattr(runtime, name))
+
+
 def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
