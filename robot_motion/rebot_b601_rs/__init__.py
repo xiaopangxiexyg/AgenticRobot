@@ -75,6 +75,10 @@ from .shared_control import (
     B601SharedControlState,
     compute_b601_shared_control_step,
 )
+from .shared_control_runtime import (
+    B601SharedControlFrame,
+    B601SharedControlRuntime,
+)
 
 __all__ = [
     "B601_RM65_GRIPPER_MAPPING_SCHEMA_V1",
@@ -116,8 +120,10 @@ __all__ = [
     "B601PoseVirtualSpringResult",
     "B601RM65GripperMappingProfile",
     "B601SharedControlConfig",
+    "B601SharedControlFrame",
     "B601SharedControlMode",
     "B601SharedControlOutput",
+    "B601SharedControlRuntime",
     "B601SharedControlState",
     "B601SingularityMetrics",
     "B601SpatialWrench",

@@ -31,6 +31,10 @@ from .contact import build_b601_contact_box_fixture, read_b601_contact_observati
 from .mit_driver import B601MujocoEffortDriver, default_b601_mit_profile
 from .real2sim import B601Real2SimControllerProfile, B601SimStartupProfile
 from .scene import B601_RS_PHYSICS_HZ, build_b601_mujoco_scene
+from .shared_control_demo import (
+    SHARED_CONTROL_FIXTURE,
+    run_b601_shared_control_demo,
+)
 
 DEFAULT_HAPTIC_ANCHOR_QPOS = (0.15, 1.0, 1.1, 0.1, -0.15, 0.2)
 DEFAULT_HAPTIC_INITIAL_QPOS = (0.23, 0.94, 1.15, 0.1, -0.15, 0.2)
@@ -68,7 +72,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fixture",
-        choices=("spring", "wall", CONTACT_FIXTURE, REFLECTION_FIXTURE, *POSE_FIXTURES),
+        choices=(
+            "spring",
+            "wall",
+            CONTACT_FIXTURE,
+            REFLECTION_FIXTURE,
+            SHARED_CONTROL_FIXTURE,
+            *POSE_FIXTURES,
+        ),
         default="spring",
     )
     parser.add_argument(
@@ -844,6 +855,29 @@ def _accumulate_power(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.fixture == SHARED_CONTROL_FIXTURE:
+        if (
+            args.real2sim_controller
+            or args.gravity_control_baseline != "operator"
+            or args.startup_lock_kp is not None
+            or args.startup_lock_kd is not None
+            or args.fixture_stiffness_scale != 1.0
+            or args.fixture_damping_scale != 1.0
+            or args.torque_rise_time_sec is not None
+            or args.feedback_delay_sec != 0.0
+            or args.trace_jsonl is not None
+        ):
+            parser.error(
+                "policy-assist uses its fixed offline lifecycle profile; unrelated fixture tuning is unsupported"
+            )
+        code, payload = run_b601_shared_control_demo(
+            source_root=args.rebot_source_root,
+            duration_sec=args.duration_sec,
+            viewer=bool(args.viewer),
+            host_hz=args.host_hz,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return code
     if args.fixture == REFLECTION_FIXTURE:
         if (
             args.real2sim_controller

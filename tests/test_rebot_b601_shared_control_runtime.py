@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from hardware.rebot_b601_rs import B601SharedControlRuntime
 from robot_motion.rebot_b601_rs import (
     B601MitControlProfile,
     B601PolicyAssistCommand,
     B601SharedControlConfig,
     B601SharedControlMode,
+    B601SharedControlRuntime,
     compute_b601_mit_torque,
 )
 

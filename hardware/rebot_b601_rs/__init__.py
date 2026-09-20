@@ -63,10 +63,6 @@ from .gripper_control import (
     B601RSGripperControlConfig,
     B601RSGripperController,
 )
-from .shared_control_runtime import (
-    B601SharedControlFrame,
-    B601SharedControlRuntime,
-)
 
 __all__ = [
     "B601_RS_ARM_JOINT_NAMES",
@@ -107,8 +103,6 @@ __all__ = [
     "B601RSGripperPositionObservation",
     "B601RSGripperReader",
     "B601RSGripperReaderConfig",
-    "B601SharedControlFrame",
-    "B601SharedControlRuntime",
     "FrequencyAcceptance",
     "FrequencyLedger",
     "FrequencyStats",

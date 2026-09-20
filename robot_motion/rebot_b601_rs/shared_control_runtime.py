@@ -12,8 +12,8 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from robot_motion.rebot_b601_rs import (
-    B601MitReference,
+from .mit import B601MitReference
+from .shared_control import (
     B601PolicyAssistCommand,
     B601PolicyCommandBuffer,
     B601PolicyCommandReceipt,
