@@ -43,6 +43,8 @@ def test_shared_control_fixture_runs_existing_effort_plant(
     assert acceptance["final_mode"] == "passive"
     assert acceptance["maximum_override_assist_torque_nm"] == 0.0
     assert acceptance["maximum_await_rebase_assist_torque_nm"] == 0.0
+    assert acceptance["minimum_joint6_assist_torque_nm"] == 0.0
+    assert acceptance["joint6_assist_direction_reversed"] is False
     assert abs(acceptance["joint6_displacement_rad"]) > 1e-4
     assert acceptance["maximum_noncommanded_displacement_rad"] <= acceptance[
         "maximum_noncommanded_displacement_limit_rad"

@@ -88,11 +88,13 @@ def _policy_target(
         return tuple(target)
     if phase == "recovery":
         # The first post-clutch sample is exactly current state.  Subsequent
-        # references introduce only a small local increment, never the old
-        # pre-clutch target.
+        # references introduce only a small local increment in the original
+        # assist direction, never the old pre-clutch target.  Reversing the
+        # increment here would look exactly like unsafe old-target snapback in
+        # the viewer even though it was a new command.
         progress = min(1.0, max(0.0, (elapsed_sec - 1.00) / 0.20))
         target = list(qpos)
-        target[5] -= 0.025 * progress
+        target[5] += 0.025 * progress
         return tuple(target)
     return None
 
@@ -166,6 +168,7 @@ def run_b601_shared_control_demo(
     maximum_assist_nm = 0.0
     maximum_override_assist_nm = 0.0
     maximum_await_assist_nm = 0.0
+    minimum_joint6_assist_nm = 0.0
     applied_references = 0
     advanced_ticks = 0
     viewer_closed_early = False
@@ -201,6 +204,10 @@ def run_b601_shared_control_demo(
                 sequence += 1
                 assist = max(abs(value) for value in frame.decision.assist_torque_nm)
                 maximum_assist_nm = max(maximum_assist_nm, assist)
+                minimum_joint6_assist_nm = min(
+                    minimum_joint6_assist_nm,
+                    frame.decision.assist_torque_nm[5],
+                )
                 if phase == "human_override":
                     maximum_override_assist_nm = max(maximum_override_assist_nm, assist)
                 if phase == "await_rebased_policy":
@@ -254,6 +261,7 @@ def run_b601_shared_control_demo(
         and maximum_assist_nm <= max(assist_config.max_abs_assist_torque_nm) + 1e-12
         and maximum_override_assist_nm == 0.0
         and maximum_await_assist_nm == 0.0
+        and minimum_joint6_assist_nm >= -1e-12
         and modes
         and modes[-1] == B601SharedControlMode.PASSIVE.value
         and abs(displacement[5]) > 1e-4
@@ -276,6 +284,8 @@ def run_b601_shared_control_demo(
             "maximum_assist_torque_nm": maximum_assist_nm,
             "maximum_override_assist_torque_nm": maximum_override_assist_nm,
             "maximum_await_rebase_assist_torque_nm": maximum_await_assist_nm,
+            "minimum_joint6_assist_torque_nm": minimum_joint6_assist_nm,
+            "joint6_assist_direction_reversed": minimum_joint6_assist_nm < -1e-12,
             "joint6_displacement_rad": float(displacement[5]),
             "maximum_noncommanded_displacement_rad": (
                 maximum_noncommanded_displacement_rad
