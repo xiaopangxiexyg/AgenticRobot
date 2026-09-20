@@ -890,7 +890,7 @@ def test_blocking_worker_never_blocks_control_step_and_late_completion_cannot_re
     frontend.close(now=base + 1.3)
 
 
-def test_expired_matching_result_settles_only_itself_and_reports_underrun() -> None:
+def test_expired_matching_result_faults_producer_without_popping_plan() -> None:
     runtime = _runtime()
     policy = _ChunkPolicy(chunk_size=1)
     completed = threading.Event()
@@ -942,8 +942,12 @@ def test_expired_matching_result_settles_only_itself_and_reports_underrun() -> N
     assert debug_payload["plan_merge_accepted"] is False
     assert debug_payload["plan_merge_reasons"] == ["request_deadline_expired"]
     assert debug_payload["plan_merge_admitted_keyframe_count"] == 0
+    assert expired.state.lifecycle_state == POLICY_ASYNC_PRODUCER_FAULT
+    assert expired.lifecycle_transition is not None
+    assert debug_payload["lifecycle_transition_reason"] == "rtc_result_timeout"
+    assert expired.pop_transition is None
     assert expired.action_preparation.emission is None
-    assert expired.underrun
+    assert not expired.underrun
     frontend.close(now=request.valid_until + 0.02)
 
 
