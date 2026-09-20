@@ -224,7 +224,12 @@ if [[ "$COLLECT_TACTILE" == "1" && -z "$TACTILE_ROOT" ]]; then
   die "--collect-tactile requires --tactile-bundle-root."
 fi
 if [[ -z "$TACTILE_ROOT" && "$TACTILE_MIN_FREE_EXPLICIT" -eq 1 && "$TACTILE_MIN_FREE_GB" != "0" ]]; then
-  die "--tactile-min-free-gb requires --tactile-bundle-root."
+  if [[ "$COLLECT_TACTILE" == "0" ]]; then
+    printf '[RuleBased] --tactile-min-free-gb is ignored because --no-collect-tactile is active.\n' >&2
+    TACTILE_MIN_FREE_GB="0"
+  else
+    die "--tactile-min-free-gb requires --tactile-bundle-root."
+  fi
 fi
 if [[ -z "$TACTILE_ROOT" && "$TACTILE_MIN_FREE_EXPLICIT" -eq 0 ]]; then
   TACTILE_MIN_FREE_GB="0"

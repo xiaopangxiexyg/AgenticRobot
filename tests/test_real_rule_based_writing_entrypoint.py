@@ -1253,6 +1253,8 @@ def test_launcher_supports_explicit_tactile_modes_and_ten_gib_default(
             "--detail-annotation-dir",
             str(detail),
             "--no-collect-tactile",
+            "--tactile-min-free-gb",
+            "10",
             "--dry-run",
         ],
         cwd=ROOT,
@@ -1283,6 +1285,7 @@ def test_launcher_supports_explicit_tactile_modes_and_ten_gib_default(
     assert "--tactile-bundle-min-free-gb 10" in enabled.stdout
     assert "--rule-collect-tactile" not in enabled.stdout
     assert disabled.returncode == 0, disabled.stderr
+    assert "--tactile-min-free-gb is ignored" in disabled.stderr
     assert "--no-rule-collect-tactile" in disabled.stdout
     assert "--dmtac-no-tactile" in disabled.stdout
     assert "--ignore-tactile left" in disabled.stdout
