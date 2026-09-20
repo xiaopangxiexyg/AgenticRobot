@@ -116,6 +116,22 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(report["details"]["gripper_port"], "/dev/ttyUSB1")
         self.assertEqual(report["details"]["gripper_id"], 7)
 
+    def test_dmtac_transport_telemetry_error_closes_readiness_even_with_zero_code(self) -> None:
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+            )
+        )
+        backend.device = SimpleNamespace(gripper=object())
+        backend._telemetry_error = "telemetry_failed: Write timeout"
+
+        self.assertFalse(backend.is_ready())
+        report = backend.readiness_report()
+        self.assertFalse(report["ready"])
+        self.assertIn("Write timeout", report["reason"])
+
     def test_stabilized_startup_fault_ack_waits_for_fresh_zero_state(self) -> None:
         class _Device:
             gripper = object()

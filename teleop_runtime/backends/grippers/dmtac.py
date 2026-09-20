@@ -1726,6 +1726,7 @@ class DMTacGripperBackend(EffectorBackend):
                 and self.device is not None
                 and getattr(self.device, "gripper", None) is not None
                 and self._latest_gripper_error_code in (None, 0)
+                and not self._hardware_telemetry_error_active()
             )
         if self.config.connect_tactile:
             return (
@@ -1733,6 +1734,22 @@ class DMTacGripperBackend(EffectorBackend):
                 and getattr(self.device, "tactile", None) is not None
             )
         return True
+
+    def _hardware_telemetry_error_active(self) -> bool:
+        """Return whether the latest error invalidates hardware admission.
+
+        Tactile-worker failures are reported through the same state payload but
+        are governed by the tactile modality gate.  Serial/command telemetry
+        failures, however, mean the gripper transport is not trustworthy even
+        when the device object and the last vendor error code still look
+        healthy.  Keep that distinction local to the DMTAC backend so all
+        callers share the same fail-closed readiness predicate.
+        """
+
+        if not self.config.connect_hardware:
+            return False
+        error = str(self._telemetry_error or "").strip().lower()
+        return bool(error and not error.startswith("tactile_"))
 
     def readiness_report(self) -> dict[str, object]:
         """Return the current gripper admission state without changing it.

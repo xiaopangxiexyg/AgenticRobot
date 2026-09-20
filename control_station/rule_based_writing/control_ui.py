@@ -177,6 +177,11 @@ class RuleBasedWritingWebUi:
 
         return self._application.allows_pre_episode_armed_warmup()
 
+    def pre_episode_start_admission_reason(self) -> str | None:
+        """Expose the rule-owned admission diagnostic without owning the gate."""
+
+        return self._application.pre_episode_start_admission_reason()
+
     def consume_rule_intents(self) -> tuple[str, ...]:
         return self._application.consume_rule_intents()
 

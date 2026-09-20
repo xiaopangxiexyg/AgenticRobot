@@ -1557,6 +1557,24 @@ def build_episode_recording_runtime(
             episode_start_warmup_ready_since = None
             episode_start_warmup_last_message = None
             return
+        # Hardware can fail after the initial START admission while the
+        # writer is being prepared.  Reuse the canonical collection gate at
+        # every countdown tick so a newly stale DMTAC/arm backend cannot be
+        # hidden by the pre-Episode warmup exception.
+        hardware_blockers = collection_startup_blockers()
+        if hardware_blockers:
+            detail = "; ".join(
+                f"{key}: {value}"
+                for key, value in sorted(hardware_blockers.items())
+            )
+            reason = f"数采启动门禁在倒计时期间关闭：{detail}"
+            _log("Dataset", reason, now=now)
+            publish_hardware_status_observation(
+                context="recording countdown hardware admission changed",
+                now=now,
+            )
+            cancel_recording_countdown(now, reason=reason)
+            return
         admitted, admission_message = clutch_input.episode_start_admission()
         if not admitted:
             cancel_recording_countdown(

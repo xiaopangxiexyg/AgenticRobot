@@ -183,6 +183,13 @@ def recording_warmup_status(
             return False, (
                 f"等待 {side} 夹爪故障恢复：error_code={error_code}{status_suffix}。"
             )
+        telemetry_error = str(state.get("telemetry_error") or "").strip()
+        # DMTAC shares one telemetry field for gripper transport and tactile
+        # worker diagnostics.  The latter is handled by the modality-specific
+        # gate below; a serial/command telemetry error must block the episode
+        # even when the cached vendor error_code is still zero.
+        if telemetry_error and not telemetry_error.lower().startswith("tactile_"):
+            return False, f"等待 {side} 夹爪传输故障恢复：{telemetry_error}。"
     for side in components.active_sides:
         if (
             side

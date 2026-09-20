@@ -107,6 +107,23 @@ def test_rule_ui_opens_only_its_armed_pre_episode_writer_window() -> None:
     assert application.allows_pre_episode_armed_warmup() is False
 
 
+def test_rule_ui_preserves_dynamic_blocker_for_pre_episode_admission_diagnostic() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication({"active_controls": ["episode_start"]})
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+
+    application.observe_runtime_publication(
+        {"startup_blockers": {"hand.right": "right_hand telemetry_failed: Write timeout"}}
+    )
+
+    reason = application.pre_episode_start_admission_reason()
+    assert reason is not None
+    assert "hand.right" in reason
+    assert "Write timeout" in reason
+
+
 def test_rule_ui_keeps_accepted_start_window_across_stale_status_heartbeat() -> None:
     application = RuleBasedWritingApplication()
     application.observe_runtime_publication(

@@ -313,6 +313,42 @@ class RuleBasedWritingApplication:
                 and not self._state.height_calibration_pending
             )
 
+    def pre_episode_start_admission_reason(self) -> str | None:
+        """Explain why the rule-owned pre-Episode window is not admissible.
+
+        The lower RealTeleop gate still owns the actual admission decision.
+        This small diagnostic seam only preserves the application-owned
+        blocker when a stale/non-dispatch heartbeat closes the window; without
+        it the lower layer can only report its generic arm-dispatch message.
+        """
+
+        with self._lock:
+            if self._state.startup_blockers:
+                detail_lines = "; ".join(
+                    f"{key}: {value}"
+                    for key, value in sorted(self._state.startup_blockers.items())
+                )
+                return (
+                    "规则采集启动门禁已关闭；请先完成设备恢复和安全初始化。\n"
+                    + detail_lines
+                )
+            if self._state.runtime_home_pending:
+                return "正在重新确认 runtime Home；完成前不能开始规则采集。"
+            if self._state.held:
+                return "机械臂处于 Hold；请重新完成 runtime Home 后再开始规则采集。"
+            if self._state.gripper_action_pending:
+                return "夹爪动作仍在执行；收到完成回执前不能开始规则采集。"
+            if self._state.height_calibration_pending:
+                return "高度标定仍在执行；完成后才能开始规则采集。"
+            if self._state.detail and self._state.phase in {
+                "blocked",
+                "preparing",
+                "configuring",
+                "stopping",
+            }:
+                return str(self._state.detail)
+            return None
+
     def submit_intent(self, intent: RuleBasedWritingIntent) -> bool:
         if not isinstance(intent, RuleBasedWritingIntent):
             raise TypeError("intent must be RuleBasedWritingIntent.")

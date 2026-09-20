@@ -3306,6 +3306,54 @@ def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
     assert message == "等待 right 夹爪故障恢复：error_code=16，status=5:正在张开。"
 
 
+def test_recording_admission_blocks_dmtac_transport_error_with_zero_vendor_code() -> None:
+    backend = legacy_entrypoint.DMTacGripperBackend(
+        legacy_entrypoint.DMTacGripperBackendConfig(
+            side="right",
+            connect_hardware=True,
+            connect_tactile=False,
+        )
+    )
+    backend.device = SimpleNamespace(gripper=object())
+    backend._telemetry_error = "telemetry_failed: Write timeout"
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="none",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        left_hand_backend=None,
+        right_hand_backend=backend,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
+        channels={},
+    )
+
+    ready, message = recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        args=args,
+        components=components_snapshot,
+        clutch_input=SimpleNamespace(hold_active=lambda: False),
+        dataset_recorder=None,
+        camera_sources={},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=recording_admission.recording_auto_stop_reason,
+        gripper_warmup_probe_status=lambda now, *, reason: (True, "ready"),
+        camera_status_blocking_message=lambda status: None,
+    )
+
+    assert ready is False
+    assert message == "等待 right 夹爪传输故障恢复：telemetry_failed: Write timeout。"
+
+
 def test_position_episode_debug_detaches_before_deferred_close(
     tmp_path: Path,
 ) -> None:
@@ -3668,6 +3716,36 @@ def test_rule_ui_can_open_writer_before_first_arm_dispatch() -> None:
     control._fix_hold_active = False
 
     assert control.episode_start_admission() == (True, "")
+
+
+def test_rule_ui_reports_its_blocker_when_pre_episode_dispatch_is_not_confirmed() -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.components = SimpleNamespace(
+        session=SimpleNamespace(
+            state_machine=SimpleNamespace(
+                state=SimpleNamespace(value="ARMED"),
+            ),
+        ),
+    )
+    control.ui = SimpleNamespace(
+        allows_pre_episode_armed_warmup=lambda: False,
+        pre_episode_start_admission_reason=lambda: (
+            "规则采集启动门禁已关闭；hand.right: telemetry_failed: Write timeout"
+        ),
+    )
+    control._dataset_selection_pending = False
+    control._teleop_started = True
+    control._teleop_dispatch_confirmed = False
+    control._hold_active = False
+    control._fix_hold_active = False
+
+    admitted, message = control.episode_start_admission()
+
+    assert admitted is False
+    assert "hand.right" in message
+    assert "Write timeout" in message
 
 
 def test_two_pedal_transition_cannot_bypass_missing_dispatch_receipt() -> None:

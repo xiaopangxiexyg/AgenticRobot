@@ -1005,6 +1005,24 @@ class RealTeleopControlInput:
 
         return self._pre_episode_armed_warmup_allowed()
 
+    def _pre_episode_armed_warmup_failure_reason(self) -> str | None:
+        """Read an optional rule-UI explanation for a closed warmup window."""
+
+        hook = getattr(self.ui, "pre_episode_start_admission_reason", None)
+        if not callable(hook):
+            return None
+        try:
+            reason = hook()
+        except Exception as exc:  # noqa: BLE001 - admission remains fail-closed.
+            _log(
+                "Dataset",
+                "optional pre-Episode warmup diagnostic failed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        normalized = str(reason or "").strip()
+        return normalized or None
+
     def _progress_configuration_selection_enabled(self) -> bool:
         """Keep progress configuration on the same idle transaction boundary."""
 
@@ -1029,7 +1047,10 @@ class RealTeleopControlInput:
             not self._teleop_arm_dispatch_confirmed()
             and not self.allows_pre_episode_armed_warmup()
         ):
-            return False, "机械臂命令尚未实际派发，不能开始数采。"
+            return False, (
+                self._pre_episode_armed_warmup_failure_reason()
+                or "机械臂命令尚未实际派发，不能开始数采。"
+            )
         if bool(getattr(self, "_hold_active", False)):
             return False, "常规 Hold 期间不能开始数采；请先重采 runtime Home。"
         init_controller = getattr(self.components, "init_arm_controller", None)
