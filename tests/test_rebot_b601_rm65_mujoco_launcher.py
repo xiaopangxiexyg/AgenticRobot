@@ -211,6 +211,50 @@ def test_owner_launcher_rejects_assist_without_second_confirmation() -> None:
     assert error.value.code == 2
 
 
+def test_owner_launcher_builds_cartesian_assist_inside_existing_owner(
+    tmp_path: Path,
+) -> None:
+    args = owner._parser().parse_args(
+        [
+            "--allow-motion",
+            "--cartesian-assist",
+            "--cartesian-assist-axis",
+            "z",
+            "--cartesian-assist-offset-m",
+            "0.008",
+            "--cartesian-assist-max-rotation-drift-rad",
+            "0.06",
+            "--cartesian-assist-confirmation",
+            owner.DEFAULT_CARTESIAN_ASSIST_CONFIRMATION,
+        ]
+    )
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+
+    assert "--cartesian-assist" in command
+    assert command[command.index("--cartesian-assist-axis") + 1] == "z"
+    assert command[command.index("--cartesian-assist-offset-m") + 1] == "0.008"
+    assert (
+        command[command.index("--cartesian-assist-max-rotation-drift-rad") + 1]
+        == "0.06"
+    )
+    assert (
+        command[command.index("--cartesian-assist-confirmation") + 1]
+        == low_gain_probe.CARTESIAN_ASSIST_CONFIRMATION
+    )
+    parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    low_gain_probe._validate_cli(parsed_probe_args)
+    session = low_gain_probe._build_cartesian_assist(parsed_probe_args)
+    assert session is not None
+    assert session.config.axis == "z"
+    assert session.config.offset_m == pytest.approx(0.008)
+
+
+def test_owner_launcher_rejects_cartesian_assist_without_confirmation() -> None:
+    with pytest.raises(SystemExit) as error:
+        owner.main(["--allow-motion", "--cartesian-assist"])
+    assert error.value.code == 2
+
+
 def test_owner_launcher_rejects_missing_motion_ack_before_resource_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

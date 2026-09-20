@@ -33,10 +33,10 @@ def test_passive_viewer_session_owns_handle_and_uses_lock_aware_sync() -> None:
     scene.model = object()
     scene.data = object()
     handle = _FakeViewerHandle()
-    launches: list[tuple[object, object, bool, bool]] = []
+    launches: list[tuple[object, object, object, bool, bool]] = []
 
-    def launch(model, data, *, show_left_ui, show_right_ui):
-        launches.append((model, data, show_left_ui, show_right_ui))
+    def launch(model, data, *, key_callback, show_left_ui, show_right_ui):
+        launches.append((model, data, key_callback, show_left_ui, show_right_ui))
         return handle
 
     sync_calls: list[object] = []
@@ -45,9 +45,13 @@ def test_passive_viewer_session_owns_handle_and_uses_lock_aware_sync() -> None:
         sync_calls.append(viewer_handle)
         viewer_handle.sync()
 
+    def on_key(_keycode: int) -> None:
+        return None
+
     viewer = MujocoPassiveViewerSession(
         scene,
         sync_callback=sync,
+        key_callback=on_key,
         show_left_ui=False,
         show_right_ui=True,
         launch_callback=launch,
@@ -55,7 +59,7 @@ def test_passive_viewer_session_owns_handle_and_uses_lock_aware_sync() -> None:
 
     assert viewer.status()["state"] == "not_started"
     assert viewer.start()["running"] is True
-    assert launches == [(scene.model, scene.data, False, True)]
+    assert launches == [(scene.model, scene.data, on_key, False, True)]
     assert viewer.sync() is True
     assert sync_calls == [handle]
     assert handle.sync_count == 1

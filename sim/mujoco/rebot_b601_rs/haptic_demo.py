@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import queue
 import tempfile
 import time
 from collections.abc import Sequence
@@ -17,16 +18,19 @@ from scipy.spatial.transform import Rotation
 
 from robot_motion.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
+    B601CartesianAssistConfig,
     B601DampedLeastSquaresIK,
     B601MitReference,
     B601PinocchioModel,
     B601PoseVirtualSpring,
+    B601SpatialWrench,
     B601TranslationalVirtualSpring,
     B601VirtualWall,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
 from sim.contracts import TimingSpec
 from sim.mujoco.viewer import MujocoPassiveViewerSession
+from utils.terminal_commands import ImmediateTerminalCommands
 
 from .contact import build_b601_contact_box_fixture, read_b601_contact_observation
 from .mit_driver import B601MujocoEffortDriver, default_b601_mit_profile
@@ -47,6 +51,9 @@ DEFAULT_MAX_OVERLAY_TORQUE_NM = 6.0
 DEFAULT_WALL_PENETRATION_M = 0.025
 CONTACT_FIXTURE = "contact-box"
 REFLECTION_FIXTURE = "force-reflection"
+CARTESIAN_ASSIST_FIXTURE = "cartesian-assist"
+CARTESIAN_ASSIST_SETTLE_SEC = 1.0
+CARTESIAN_ASSIST_OPERATOR_WAIT_TIMEOUT_SEC = 300.0
 POSE_FIXTURES = (
     "pose-tx",
     "pose-ty",
@@ -79,6 +86,7 @@ def _parser() -> argparse.ArgumentParser:
             CONTACT_FIXTURE,
             REFLECTION_FIXTURE,
             SHARED_CONTROL_FIXTURE,
+            CARTESIAN_ASSIST_FIXTURE,
             *POSE_FIXTURES,
         ),
         default="spring",
@@ -112,6 +120,44 @@ def _parser() -> argparse.ArgumentParser:
         "--viewer",
         action="store_true",
         help="Open the passive MuJoCo viewer and pace physics in real time.",
+    )
+    parser.add_argument(
+        "--cartesian-assist-axis",
+        choices=("x", "y", "z"),
+        help="Cartesian-assist only: world-aligned translation axis.",
+    )
+    parser.add_argument(
+        "--cartesian-assist-offset-m",
+        type=float,
+        help=(
+            "Cartesian-assist only: signed target displacement from the "
+            "operator-captured TCP, limited by the shared commissioning contract."
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist-stiffness-n-per-m",
+        type=float,
+        help="Cartesian-assist only: target-axis spring stiffness.",
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-force-n",
+        type=float,
+        help="Cartesian-assist only: per-axis force cap.",
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-joint-torque-nm",
+        type=float,
+        help="Cartesian-assist only: per-joint projected overlay cap.",
+    )
+    parser.add_argument(
+        "--cartesian-assist-lateral-stiffness-n-per-m",
+        type=float,
+        help="Cartesian-assist only: non-target-axis holding stiffness.",
+    )
+    parser.add_argument(
+        "--cartesian-assist-lateral-damping-n-s-per-m",
+        type=float,
+        help="Cartesian-assist only: non-target-axis holding damping.",
     )
     parser.add_argument(
         "--real2sim-controller",
@@ -188,7 +234,11 @@ def _fixture_metrics(
         result = fixture.evaluate(pose[:3, 3], spatial_velocity[:3])
         translation_metric = (
             float(np.linalg.norm(result.displacement_m))
-            if fixture_name in {"spring", CONTACT_FIXTURE}
+            if fixture_name in {
+                "spring",
+                CONTACT_FIXTURE,
+                CARTESIAN_ASSIST_FIXTURE,
+            }
             else float(result.penetration_m)
         )
         rotation_metric = 0.0
@@ -236,10 +286,17 @@ def run_haptic_fixture_demo(
     torque_rise_time_sec: float | None = None,
     controller_profile: B601Real2SimControllerProfile | None = None,
     trace_jsonl: str | Path | None = None,
+    cartesian_assist_config: B601CartesianAssistConfig | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
-    if fixture_name not in {"spring", "wall", CONTACT_FIXTURE, *POSE_FIXTURES}:
+    if fixture_name not in {
+        "spring",
+        "wall",
+        CONTACT_FIXTURE,
+        CARTESIAN_ASSIST_FIXTURE,
+        *POSE_FIXTURES,
+    }:
         raise ValueError(
             "fixture_name must name a supported spring, wall, or pose fixture"
         )
@@ -247,6 +304,11 @@ def run_haptic_fixture_demo(
         raise TypeError("viewer must be a bool")
     if trace_jsonl is not None and fixture_name != CONTACT_FIXTURE:
         raise ValueError("trace_jsonl requires contact-box")
+    if (
+        cartesian_assist_config is not None
+        and fixture_name != CARTESIAN_ASSIST_FIXTURE
+    ):
+        raise ValueError("cartesian_assist_config requires cartesian-assist")
     if startup_profile is not None and not real2sim_controller:
         raise ValueError("startup_profile requires real2sim_controller")
     if controller_profile is not None:
@@ -284,6 +346,12 @@ def run_haptic_fixture_demo(
     model = B601PinocchioModel.from_rebot_source_root(source_root)
     initial_qpos = np.asarray(DEFAULT_HAPTIC_INITIAL_QPOS, dtype=float)
     anchor_qpos = np.asarray(DEFAULT_HAPTIC_ANCHOR_QPOS, dtype=float)
+    if fixture_name == CARTESIAN_ASSIST_FIXTURE:
+        cartesian_assist_config = (
+            cartesian_assist_config or B601CartesianAssistConfig()
+        )
+    if cartesian_assist_config is not None:
+        initial_qpos = anchor_qpos.copy()
     anchor_pose = model.forward_kinematics(anchor_qpos)
     anchor_position = anchor_pose[:3, 3]
     disturbance_contract: dict[str, object] | None = None
@@ -312,21 +380,61 @@ def run_haptic_fixture_demo(
             "ik_orientation_error_rad": ik_result.orientation_error_rad,
         }
     initial_position = model.forward_kinematics(initial_qpos)[:3, 3]
-    if fixture_name in {"spring", CONTACT_FIXTURE}:
+    if fixture_name in {
+        "spring",
+        CONTACT_FIXTURE,
+        CARTESIAN_ASSIST_FIXTURE,
+    }:
         if fixture_name == CONTACT_FIXTURE:
             anchor_position = initial_position.copy()
+        elif cartesian_assist_config is not None:
+            anchor_position = initial_position.copy()
+            anchor_position[cartesian_assist_config.axis_index] += (
+                cartesian_assist_config.offset_m
+            )
+            stiffness = [
+                cartesian_assist_config.lateral_stiffness_n_per_m
+            ] * 3
+            damping = [cartesian_assist_config.lateral_damping_n_s_per_m] * 3
+            stiffness[cartesian_assist_config.axis_index] = (
+                cartesian_assist_config.stiffness_n_per_m
+            )
+            damping[cartesian_assist_config.axis_index] = (
+                cartesian_assist_config.damping_n_s_per_m
+            )
+            stiffness = tuple(stiffness)
+            damping = tuple(damping)
         fixture = B601TranslationalVirtualSpring(
             anchor_position_m=tuple(float(value) for value in anchor_position),
             stiffness_n_per_m=stiffness,
             damping_n_s_per_m=damping,
-            max_abs_force_n=(DEFAULT_MAX_FORCE_N,) * 3,
+            max_abs_force_n=(
+                (cartesian_assist_config.max_abs_force_n,) * 3
+                if cartesian_assist_config is not None
+                else (DEFAULT_MAX_FORCE_N,) * 3
+            ),
         )
         fixture_contract: dict[str, object] = {
             "anchor_position_m": [float(value) for value in anchor_position],
             "stiffness_n_per_m": list(stiffness),
             "damping_n_s_per_m": list(damping),
-            "max_abs_force_n": [DEFAULT_MAX_FORCE_N] * 3,
+            "max_abs_force_n": list(fixture.max_abs_force_n),
         }
+        if cartesian_assist_config is not None:
+            fixture_contract.update(
+                commissioning_semantics=(
+                    "captured_current_tcp_plus_world_aligned_axis_offset"
+                ),
+                axis=cartesian_assist_config.axis,
+                offset_m=cartesian_assist_config.offset_m,
+                max_abs_joint_torque_nm=(
+                    cartesian_assist_config.max_abs_joint_torque_nm
+                ),
+                authority_rise_per_sec=(
+                    cartesian_assist_config.authority_rise_per_sec
+                ),
+                hardware_claim=False,
+            )
     elif fixture_name == "wall":
         wall_normal = np.asarray((1.0, 0.0, 0.0), dtype=float)
         wall_offset = float(wall_normal @ initial_position) - DEFAULT_WALL_PENETRATION_M
@@ -399,7 +507,11 @@ def run_haptic_fixture_demo(
         damping_kd_nm_s_per_rad=(
             (0.0,) * 6 if real2sim_controller else base_profile.damping_kd_nm_s_per_rad
         ),
-        max_abs_overlay_torque_nm=(DEFAULT_MAX_OVERLAY_TORQUE_NM,) * 6,
+        max_abs_overlay_torque_nm=(
+            (cartesian_assist_config.max_abs_joint_torque_nm,) * 6
+            if cartesian_assist_config is not None
+            else (DEFAULT_MAX_OVERLAY_TORQUE_NM,) * 6
+        ),
         max_abs_state_acceleration_rad_s2=(250.0,) * 6,
         metadata={
             **base_profile.metadata,
@@ -437,7 +549,34 @@ def run_haptic_fixture_demo(
         qvel=np.zeros(6, dtype=float),
     )
     requested_steps = math.ceil(duration * B601_RS_PHYSICS_HZ)
-    viewer_session = MujocoPassiveViewerSession(scene) if viewer else None
+    maximum_steps = requested_steps
+    operator_keys: queue.SimpleQueue[str] = queue.SimpleQueue()
+
+    def _on_viewer_key(keycode: int) -> None:
+        if keycode in (ord("A"), ord("C")):
+            operator_keys.put(chr(keycode).lower())
+
+    if cartesian_assist_config is not None:
+        preactivation_budget_sec = (
+            CARTESIAN_ASSIST_OPERATOR_WAIT_TIMEOUT_SEC
+            if viewer
+            else CARTESIAN_ASSIST_SETTLE_SEC
+        )
+        maximum_steps += math.ceil(
+            preactivation_budget_sec * B601_RS_PHYSICS_HZ
+        )
+    viewer_session = (
+        MujocoPassiveViewerSession(
+            scene,
+            key_callback=(
+                _on_viewer_key
+                if cartesian_assist_config is not None
+                else None
+            ),
+        )
+        if viewer
+        else None
+    )
 
     next_sequence = 0
     command_count = 0
@@ -461,6 +600,17 @@ def run_haptic_fixture_demo(
     minimum_rotation_metric = initial_rotation_metric
     final_tick = None
     viewer_closed_early = False
+    cartesian_capture_pose: np.ndarray | None = None
+    cartesian_active_at_sec: float | None = None
+    cartesian_activation_source: str | None = None
+    cartesian_operator_events: list[dict[str, object]] = []
+    operator_quit_requested = False
+    viewer_teardown_error: str | None = None
+    maximum_cartesian_axis_displacement_m = 0.0
+    maximum_cartesian_signed_displacement_m = 0.0
+    maximum_cartesian_lateral_drift_m = 0.0
+    maximum_cartesian_rotation_drift_rad = 0.0
+    cartesian_assist_withdrawn = False
     contact_diagnostics = {
         "sample_count": 0, "nonzero_wrench_samples": 0,
         "peak_force_norm_n": 0.0, "max_power_identity_error_w": 0.0,
@@ -479,17 +629,202 @@ def run_haptic_fixture_demo(
     ]
     with ExitStack() as cleanup:
         if viewer_session is not None:
-            cleanup.callback(viewer_session.close)
+            def close_viewer() -> None:
+                nonlocal viewer_teardown_error
+                try:
+                    viewer_session.close()
+                except TimeoutError as error:
+                    viewer_teardown_error = f"{type(error).__name__}:{error}"
+                    print(
+                        "[B601-SIM] WARNING: viewer teardown was not confirmed; "
+                        "the simulation result is rejected",
+                        flush=True,
+                    )
+
+            cleanup.callback(close_viewer)
             viewer_session.start()
+            if cartesian_assist_config is not None:
+                terminal_commands = ImmediateTerminalCommands(
+                    allowed_commands={"a", "c", "q", "?"},
+                )
+                cleanup.callback(terminal_commands.close)
+                print(
+                    "[B601-SIM] [CARTESIAN ASSIST READY] force is zero; "
+                    "reposition and settle the arm, then press A in this "
+                    "terminal without Enter. C=withdraw, Q=quit.",
+                    flush=True,
+                )
+                print(
+                    "[B601-SIM] [CARTESIAN ASSIST LIMITS] "
+                    f"axis={cartesian_assist_config.axis} "
+                    f"offset={cartesian_assist_config.offset_m:.6f}m "
+                    f"max_force={cartesian_assist_config.max_abs_force_n:.6f}N "
+                    "max_joint_overlay="
+                    f"{cartesian_assist_config.max_abs_joint_torque_nm:.6f}Nm",
+                    flush=True,
+                )
+            else:
+                terminal_commands = None
+        else:
+            terminal_commands = None
         trace_stream = (
             None if trace_jsonl is None else cleanup.enter_context(Path(trace_jsonl).open("x"))
         )
-        for step in range(requested_steps):
+        for step in range(maximum_steps):
             reference = None
             contact_record = None
             if driver.command_due:
                 qpos = scene.get_arm_qpos("b601_rs")
                 qvel = _arm_qvel(scene)
+                viewer_pressed_keys: set[str] = set()
+                while not operator_keys.empty():
+                    viewer_pressed_keys.add(operator_keys.get_nowait())
+                terminal_pressed_keys: set[str] = set()
+                if terminal_commands is not None:
+                    for _ in range(16):
+                        command = terminal_commands(0.0)
+                        if command is None:
+                            break
+                        terminal_pressed_keys.add(command)
+                        if command == "q":
+                            break
+                pressed_keys = viewer_pressed_keys | terminal_pressed_keys
+                if "?" in pressed_keys:
+                    print(
+                        "[B601-SIM] terminal keys (no Enter): "
+                        "A=capture/start C=withdraw Q=quit",
+                        flush=True,
+                    )
+                if "q" in pressed_keys:
+                    operator_quit_requested = True
+                    cartesian_assist_withdrawn = True
+                    cartesian_operator_events.append(
+                        {
+                            "event": "operator_quit",
+                            "time_sec": driver.physics_time_sec,
+                        }
+                    )
+                    print(
+                        "[B601-SIM] [QUIT] assist withdrawn; closing Viewer",
+                        flush=True,
+                    )
+                if (
+                    cartesian_assist_config is not None
+                    and "c" in pressed_keys
+                    and cartesian_active_at_sec is not None
+                    and not cartesian_assist_withdrawn
+                ):
+                    cartesian_assist_withdrawn = True
+                    cartesian_operator_events.append(
+                        {
+                            "event": "cancelled",
+                            "time_sec": driver.physics_time_sec,
+                        }
+                    )
+                    print(
+                        "[B601-SIM] [CARTESIAN ASSIST CANCELLED] "
+                        "force withdrawn; gravity/damping remain",
+                        flush=True,
+                    )
+                deterministic_headless_activation = bool(
+                    cartesian_assist_config is not None
+                    and not viewer
+                    and driver.physics_time_sec >= CARTESIAN_ASSIST_SETTLE_SEC
+                )
+                activation_requested = bool(
+                    "a" in pressed_keys or deterministic_headless_activation
+                )
+                if (
+                    cartesian_assist_config is not None
+                    and cartesian_capture_pose is None
+                    and activation_requested
+                ):
+                    max_abs_qvel = float(np.max(np.abs(qvel)))
+                    if (
+                        max_abs_qvel
+                        > cartesian_assist_config.stationarity_limit_rad_s
+                    ):
+                        cartesian_operator_events.append(
+                            {
+                                "event": "activation_rejected",
+                                "time_sec": driver.physics_time_sec,
+                                "max_abs_qvel_rad_s": max_abs_qvel,
+                            }
+                        )
+                        if "a" in pressed_keys:
+                            print(
+                                "[B601-SIM] [A REJECTED] arm is still moving: "
+                                f"max_abs_qvel={max_abs_qvel:.6f}rad/s; "
+                                "settle and press A again",
+                                flush=True,
+                            )
+                    else:
+                        cartesian_capture_pose = np.asarray(
+                            model.forward_kinematics(qpos),
+                            dtype=float,
+                        )
+                        target_position = cartesian_capture_pose[:3, 3].copy()
+                        target_position[cartesian_assist_config.axis_index] += (
+                            cartesian_assist_config.offset_m
+                        )
+                        axis_stiffness = [
+                            cartesian_assist_config.lateral_stiffness_n_per_m
+                        ] * 3
+                        axis_damping = [
+                            cartesian_assist_config.lateral_damping_n_s_per_m
+                        ] * 3
+                        axis_stiffness[cartesian_assist_config.axis_index] = (
+                            cartesian_assist_config.stiffness_n_per_m
+                        )
+                        axis_damping[cartesian_assist_config.axis_index] = (
+                            cartesian_assist_config.damping_n_s_per_m
+                        )
+                        fixture = B601TranslationalVirtualSpring(
+                            anchor_position_m=tuple(
+                                float(value) for value in target_position
+                            ),
+                            stiffness_n_per_m=tuple(axis_stiffness),
+                            damping_n_s_per_m=tuple(axis_damping),
+                            max_abs_force_n=(
+                                cartesian_assist_config.max_abs_force_n,
+                            )
+                            * 3,
+                        )
+                        cartesian_active_at_sec = driver.physics_time_sec
+                        cartesian_activation_source = (
+                            "terminal_key_a"
+                            if "a" in terminal_pressed_keys
+                            else (
+                                "viewer_key_a"
+                                if "a" in viewer_pressed_keys
+                                else "deterministic_headless"
+                            )
+                        )
+                        cartesian_operator_events.append(
+                            {
+                                "event": "activated",
+                                "time_sec": driver.physics_time_sec,
+                                "source": cartesian_activation_source,
+                            }
+                        )
+                        initial_metric = abs(cartesian_assist_config.offset_m)
+                        minimum_metric = initial_metric
+                        maximum_metric = initial_metric
+                        fixture_contract.update(
+                            capture_semantics=(
+                                "operator_A_current_stationary_TCP"
+                                if viewer
+                                else "deterministic_headless_after_settle"
+                            ),
+                            captured_pose=cartesian_capture_pose.tolist(),
+                            target_position_m=target_position.tolist(),
+                        )
+                        if viewer:
+                            print(
+                                "[B601-SIM] [CARTESIAN ASSIST ACTIVE] "
+                                "captured current TCP; press C to withdraw",
+                                flush=True,
+                            )
                 fixture_result, metric, rotation_metric = _fixture_metrics(
                     fixture_name=fixture_name,
                     model=model,
@@ -497,10 +832,79 @@ def run_haptic_fixture_demo(
                     qpos=qpos,
                     qvel=qvel,
                 )
+                commanded_wrench = fixture_result.wrench
+                if cartesian_assist_config is not None:
+                    active_elapsed_sec = (
+                        None
+                        if cartesian_active_at_sec is None
+                        else max(
+                            0.0,
+                            driver.physics_time_sec - cartesian_active_at_sec,
+                        )
+                    )
+                    if (
+                        active_elapsed_sec is not None
+                        and active_elapsed_sec
+                        >= cartesian_assist_config.assist_duration_sec
+                    ):
+                        cartesian_assist_withdrawn = True
+                    authority = (
+                        0.0
+                        if active_elapsed_sec is None or cartesian_assist_withdrawn
+                        else min(
+                            1.0,
+                            active_elapsed_sec
+                            * cartesian_assist_config.authority_rise_per_sec,
+                        )
+                    )
+                    commanded_wrench = B601SpatialWrench(
+                        force_n=tuple(
+                            authority * float(value)
+                            for value in fixture_result.wrench.force_n
+                        ),
+                        torque_nm=(0.0, 0.0, 0.0),
+                        frame_id=fixture_result.wrench.frame_id,
+                    )
+                    if cartesian_capture_pose is not None:
+                        current_pose = np.asarray(
+                            model.forward_kinematics(qpos),
+                            dtype=float,
+                        )
+                        translation = (
+                            current_pose[:3, 3]
+                            - cartesian_capture_pose[:3, 3]
+                        )
+                        axis_index = cartesian_assist_config.axis_index
+                        maximum_cartesian_axis_displacement_m = max(
+                            maximum_cartesian_axis_displacement_m,
+                            abs(float(translation[axis_index])),
+                        )
+                        maximum_cartesian_signed_displacement_m = max(
+                            maximum_cartesian_signed_displacement_m,
+                            cartesian_assist_config.direction
+                            * float(translation[axis_index]),
+                        )
+                        maximum_cartesian_lateral_drift_m = max(
+                            maximum_cartesian_lateral_drift_m,
+                            float(
+                                np.linalg.norm(
+                                    np.delete(translation, axis_index)
+                                )
+                            ),
+                        )
+                        maximum_cartesian_rotation_drift_rad = max(
+                            maximum_cartesian_rotation_drift_rad,
+                            float(
+                                Rotation.from_matrix(
+                                    current_pose[:3, :3]
+                                    @ cartesian_capture_pose[:3, :3].T
+                                ).magnitude()
+                            ),
+                        )
                 mapping = map_world_aligned_ee_wrench_to_joint_torque(
                     model,
                     qpos,
-                    fixture_result.wrench,
+                    commanded_wrench,
                     qvel_rad_s=qvel,
                 )
                 timestamp = driver.physics_time_sec
@@ -579,7 +983,7 @@ def run_haptic_fixture_demo(
                 )
                 peak_force_n = max(
                     peak_force_n,
-                    float(np.linalg.norm(fixture_result.wrench.force_n)),
+                    float(np.linalg.norm(commanded_wrench.force_n)),
                 )
                 peak_cartesian_torque_nm = max(
                     peak_cartesian_torque_nm,
@@ -659,11 +1063,18 @@ def run_haptic_fixture_demo(
             )
             if final_tick.driver_faulted:
                 break
+            if operator_quit_requested:
+                break
             if viewer_session is not None:
                 if step % 16 == 0 and not viewer_session.sync():
                     viewer_closed_early = True
                     break
                 time.sleep(1.0 / B601_RS_PHYSICS_HZ)
+            if (
+                cartesian_active_at_sec is not None
+                and driver.physics_time_sec - cartesian_active_at_sec >= duration
+            ):
+                break
     if final_tick is None:
         raise RuntimeError("haptic fixture demo did not execute a physics tick")
     final_qpos = np.asarray(final_tick.measured_qpos, dtype=float)
@@ -679,9 +1090,23 @@ def run_haptic_fixture_demo(
     minimum_metric = min(minimum_metric, final_metric)
     maximum_rotation_metric = max(maximum_rotation_metric, final_rotation_metric)
     minimum_rotation_metric = min(minimum_rotation_metric, final_rotation_metric)
-    run_completed = advanced_ticks == requested_steps and not viewer_closed_early
+    run_completed = bool(
+        not viewer_closed_early
+        and (
+            (
+                cartesian_assist_config is not None
+                and cartesian_active_at_sec is not None
+                and driver.physics_time_sec - cartesian_active_at_sec >= duration
+            )
+            or (
+                cartesian_assist_config is None
+                and advanced_ticks == requested_steps
+            )
+        )
+    )
     common_pass = bool(
         run_completed
+        and viewer_teardown_error is None
         and final_tick.control_phase == "ACTIVE"
         and not final_tick.driver_faulted
         and final_tick.state_valid
@@ -700,6 +1125,95 @@ def run_haptic_fixture_demo(
             "power_identity_tolerance_w": 1e-9,
             "contact_force_reapplied": False,
         }
+    elif fixture_name == CARTESIAN_ASSIST_FIXTURE:
+        if cartesian_capture_pose is None:
+            effect_pass = False
+            effect_contract = {
+                "metric": "world_aligned_tcp_displacement_from_captured_pose",
+                "axis": cartesian_assist_config.axis,
+                "rejection_reason": (
+                    "viewer_closed_before_activation"
+                    if viewer_closed_early
+                    else (
+                        "operator_quit_before_activation"
+                        if operator_quit_requested
+                        else "operator_activation_timeout"
+                    )
+                ),
+                "activation_source": None,
+                "operator_events": tuple(cartesian_operator_events),
+                "force_limit_n": cartesian_assist_config.max_abs_force_n,
+                "joint_overlay_limit_nm": (
+                    cartesian_assist_config.max_abs_joint_torque_nm
+                ),
+            }
+        else:
+            final_pose = np.asarray(
+                model.forward_kinematics(final_qpos),
+                dtype=float,
+            )
+            final_translation = (
+                final_pose[:3, 3] - cartesian_capture_pose[:3, 3]
+            )
+            axis_index = cartesian_assist_config.axis_index
+            signed_final_displacement = (
+                cartesian_assist_config.direction
+                * float(final_translation[axis_index])
+            )
+            final_lateral_drift = float(
+                np.linalg.norm(np.delete(final_translation, axis_index))
+            )
+            final_rotation_drift = float(
+                Rotation.from_matrix(
+                    final_pose[:3, :3] @ cartesian_capture_pose[:3, :3].T
+                ).magnitude()
+            )
+            maximum_response_m = min(
+                0.05,
+                abs(cartesian_assist_config.offset_m) * 1.5,
+            )
+            effect_pass = bool(
+                cartesian_assist_withdrawn
+                and maximum_cartesian_signed_displacement_m >= 0.001
+                and maximum_cartesian_axis_displacement_m <= maximum_response_m
+                and maximum_cartesian_lateral_drift_m <= 0.005
+                and maximum_cartesian_rotation_drift_rad <= math.radians(5.0)
+                and peak_force_n
+                <= cartesian_assist_config.max_abs_force_n + 1e-12
+                and peak_requested_overlay_torque_nm
+                <= cartesian_assist_config.max_abs_joint_torque_nm + 1e-12
+            )
+            effect_contract = {
+                "metric": "world_aligned_tcp_displacement_from_captured_pose",
+                "axis": cartesian_assist_config.axis,
+                "minimum_signed_final_displacement_m": 0.001,
+                "signed_final_displacement_m": signed_final_displacement,
+                "maximum_signed_displacement_m": (
+                    maximum_cartesian_signed_displacement_m
+                ),
+                "assist_withdrawn": cartesian_assist_withdrawn,
+                "assist_duration_sec": (
+                    cartesian_assist_config.assist_duration_sec
+                ),
+                "activation_source": cartesian_activation_source,
+                "operator_events": tuple(cartesian_operator_events),
+                "maximum_axis_displacement_m": (
+                    maximum_cartesian_axis_displacement_m
+                ),
+                "maximum_axis_displacement_limit_m": maximum_response_m,
+                "final_lateral_drift_m": final_lateral_drift,
+                "maximum_lateral_drift_m": maximum_cartesian_lateral_drift_m,
+                "maximum_lateral_drift_limit_m": 0.005,
+                "final_rotation_drift_rad": final_rotation_drift,
+                "maximum_rotation_drift_rad": (
+                    maximum_cartesian_rotation_drift_rad
+                ),
+                "maximum_rotation_drift_limit_rad": math.radians(5.0),
+                "force_limit_n": cartesian_assist_config.max_abs_force_n,
+                "joint_overlay_limit_nm": (
+                    cartesian_assist_config.max_abs_joint_torque_nm
+                ),
+            }
     elif fixture_name == "spring":
         effect_pass = bool(
             initial_metric > 0.02
@@ -793,10 +1307,13 @@ def run_haptic_fixture_demo(
             "requested_physics_ticks": requested_steps,
             "advanced_physics_ticks": advanced_ticks,
             "command_count": command_count,
-            "expected_command_count": math.ceil(
-                duration * float(driver.timing.command_hz)
+            "expected_command_count": (
+                command_count
+                if cartesian_assist_config is not None
+                else math.ceil(duration * float(driver.timing.command_hz))
             ),
             "viewer_closed_early": viewer_closed_early,
+            "viewer_teardown_error": viewer_teardown_error,
             "driver_faulted": final_tick.driver_faulted,
             "phase_transitions": phase_transitions,
             "final_control_phase": final_tick.control_phase,
@@ -898,6 +1415,26 @@ def _emit_payload(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    cartesian_overrides = {
+        "axis": args.cartesian_assist_axis,
+        "offset_m": args.cartesian_assist_offset_m,
+        "stiffness_n_per_m": args.cartesian_assist_stiffness_n_per_m,
+        "max_abs_force_n": args.cartesian_assist_max_force_n,
+        "max_abs_joint_torque_nm": (
+            args.cartesian_assist_max_joint_torque_nm
+        ),
+        "lateral_stiffness_n_per_m": (
+            args.cartesian_assist_lateral_stiffness_n_per_m
+        ),
+        "lateral_damping_n_s_per_m": (
+            args.cartesian_assist_lateral_damping_n_s_per_m
+        ),
+    }
+    if (
+        args.fixture != CARTESIAN_ASSIST_FIXTURE
+        and any(value is not None for value in cartesian_overrides.values())
+    ):
+        parser.error("cartesian-assist tuning requires --fixture cartesian-assist")
     if args.fixture == SHARED_CONTROL_FIXTURE:
         if (
             args.real2sim_controller
@@ -964,6 +1501,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         startup = B601SimStartupProfile(
             tuple(args.startup_lock_kp), tuple(args.startup_lock_kd)
         )
+    cartesian_config = None
+    if args.fixture == CARTESIAN_ASSIST_FIXTURE:
+        explicit_overrides = {
+            name: value
+            for name, value in cartesian_overrides.items()
+            if value is not None
+        }
+        try:
+            cartesian_config = replace(
+                B601CartesianAssistConfig(),
+                **explicit_overrides,
+            )
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
     code, payload = run_haptic_fixture_demo(
         source_root=args.rebot_source_root,
         fixture_name=args.fixture,
@@ -977,17 +1528,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         torque_rise_time_sec=args.torque_rise_time_sec,
         controller_profile=controller,
         trace_jsonl=args.trace_jsonl,
+        cartesian_assist_config=cartesian_config,
     )
     return _emit_payload(args=args, code=code, payload=payload)
 
 
+def cli(argv: Sequence[str] | None = None) -> int:
+    """Run the foreground CLI without leaking Ctrl-C teardown tracebacks."""
+
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        print(
+            "\n[B601-SIM] interrupted; terminal mode restored; "
+            "shell remains active",
+            flush=True,
+        )
+        return 130
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())
 
 
 __all__ = [
     "DEFAULT_HAPTIC_ANCHOR_QPOS",
     "DEFAULT_HAPTIC_DURATION_SEC",
     "DEFAULT_HAPTIC_INITIAL_QPOS",
+    "cli",
     "run_haptic_fixture_demo",
 ]

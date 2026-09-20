@@ -8,6 +8,9 @@ import pytest
 from robot_motion.rebot_b601_rs import (
     B601_RS_URDF_RELATIVE_PATH,
     B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME,
+    B601AssistCommissioningState,
+    B601CartesianAssistConfig,
+    B601CartesianAssistSession,
     B601HapticWrenchChannel,
     B601HapticWrenchSample,
     B601PinocchioModel,
@@ -58,6 +61,54 @@ def test_haptic_channel_ramps_from_zero_and_expires_original_source_age() -> Non
     expired = channel.update(None, now_sec=0.100001)
     assert expired.rejection_reason == "expired_source"
     np.testing.assert_array_equal(expired.wrench.as_vector(), np.zeros(6))
+
+
+def test_cartesian_assist_reuses_jacobian_mapping_and_independent_overlay_slew(
+    b601_model: B601PinocchioModel,
+) -> None:
+    qpos = (0.0,) * 6
+    anchor_pose = np.asarray(b601_model.forward_kinematics(qpos), dtype=float)
+    anchor = anchor_pose[:3, 3]
+    session = B601CartesianAssistSession(
+        B601CartesianAssistConfig(
+            axis="x",
+            offset_m=0.01,
+            stiffness_n_per_m=50.0,
+            damping_n_s_per_m=0.0,
+            max_abs_force_n=0.5,
+            max_abs_joint_torque_nm=0.15,
+            max_joint_torque_rate_nm_s=0.10,
+            authority_rise_per_sec=1.0,
+        )
+    )
+    session.anchor_position_m = tuple(float(value) for value in anchor)
+    session.anchor_rotation = tuple(
+        tuple(float(value) for value in row)
+        for row in anchor_pose[:3, :3]
+    )
+    session.target_position_m = (
+        float(anchor[0] + 0.01),
+        float(anchor[1]),
+        float(anchor[2]),
+    )
+    session.active_at_sec = 1.0
+    session.state = B601AssistCommissioningState.ACTIVE
+
+    overlay, audit = low_gain_probe.compute_cartesian_assist_overlay(
+        b601_model,
+        session,
+        qpos_rad=qpos,
+        qvel_rad_s=(0.0,) * 6,
+        timestamp_sec=2.0,
+        previous_overlay_nm=(0.0,) * 6,
+        dt_sec=0.05,
+        maximum_lateral_drift_m=0.005,
+    )
+
+    assert audit["commanded_force_n"] == pytest.approx((0.5, 0.0, 0.0))
+    assert any(abs(value) > 0.0 for value in audit["raw_joint_torque_overlay_nm"])
+    assert max(abs(value) for value in overlay) <= 0.005 + 1e-12
+    assert audit["joint_torque_slew_limited"] is True
 
 
 @pytest.mark.parametrize(

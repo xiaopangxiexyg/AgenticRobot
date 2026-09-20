@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from robot_motion.rebot_b601_rs import (
     B601_SHARED_POLICY_FRAME,
     B601AssistCommissioningState,
     B601AssistResponseCriteria,
+    B601CartesianAssistConfig,
+    B601CartesianAssistResponseCriteria,
+    B601CartesianAssistSession,
     B601PolicyAssistCommand,
     B601PolicyCommandBuffer,
     B601PolicyCommandSample,
@@ -16,6 +21,7 @@ from robot_motion.rebot_b601_rs import (
     B601SingleJointAssistConfig,
     B601SingleJointAssistSession,
     compute_b601_shared_control_step,
+    evaluate_cartesian_assist_response,
     evaluate_single_joint_assist_response,
 )
 
@@ -269,6 +275,111 @@ def test_single_joint_countdown_motion_requires_a_new_anchor() -> None:
     assert [event.event for event in events] == ["COUNTDOWN_REJECTED"]
     assert session.state is B601AssistCommissioningState.WAITING
     assert runtime.clear_policy() is None
+
+
+def _pose(x: float = 0.0, y: float = 0.0, z: float = 0.0):
+    return (
+        (1.0, 0.0, 0.0, x),
+        (0.0, 1.0, 0.0, y),
+        (0.0, 0.0, 1.0, z),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+
+
+def test_cartesian_assist_captures_world_axis_target_and_withdraws() -> None:
+    config = B601CartesianAssistConfig(
+        axis="y",
+        offset_m=-0.01,
+        countdown_sec=1.0,
+        assist_duration_sec=2.0,
+    )
+    session = B601CartesianAssistSession(config)
+
+    armed = session.arm(
+        measured_pose=_pose(0.2, -0.1, 0.3),
+        measured_qvel_rad_s=ZERO,
+        timestamp_sec=10.0,
+    )
+    assert armed.event == "ARMED"
+    assert session.anchor_position_m == pytest.approx((0.2, -0.1, 0.3))
+    assert session.target_position_m == pytest.approx((0.2, -0.11, 0.3))
+    assert session.step(
+        measured_qvel_rad_s=ZERO,
+        timestamp_sec=11.0,
+    )[0].event == "ACTIVE"
+    assert session.authority(timestamp_sec=11.5) == pytest.approx(0.25)
+    completed = session.step(
+        measured_qvel_rad_s=ZERO,
+        timestamp_sec=13.01,
+    )
+    assert completed[0].event == "COMPLETE"
+    assert session.authority(timestamp_sec=13.01) == 0.0
+
+
+def test_cartesian_assist_guard_rejects_wrong_axis_and_lateral_motion() -> None:
+    criteria = B601CartesianAssistResponseCriteria(
+        minimum_response_m=0.001,
+        maximum_lateral_drift_m=0.003,
+    )
+    session = B601CartesianAssistSession(
+        B601CartesianAssistConfig(axis="x", countdown_sec=1.0)
+    )
+    session.anchor_position_m = (0.0, 0.0, 0.0)
+    session.state = B601AssistCommissioningState.ACTIVE
+
+    with pytest.raises(ValueError, match="wrong direction"):
+        session.validate_active_position((-0.002, 0.0, 0.0), criteria=criteria)
+    with pytest.raises(ValueError, match="lateral drift"):
+        session.validate_active_position((0.002, 0.004, 0.0), criteria=criteria)
+    with pytest.raises(ValueError, match="excursion"):
+        session.validate_active_position((0.016, 0.0, 0.0), criteria=criteria)
+
+    session.anchor_rotation = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    angle = 0.10
+    rotated = (
+        (math.cos(angle), -math.sin(angle), 0.0, 0.002),
+        (math.sin(angle), math.cos(angle), 0.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+    with pytest.raises(ValueError, match="orientation drift"):
+        session.validate_active_pose(rotated, criteria=criteria)
+
+
+def test_cartesian_assist_response_requires_force_and_task_space_motion() -> None:
+    config = B601CartesianAssistConfig(
+        axis="z",
+        offset_m=0.01,
+        stiffness_n_per_m=50.0,
+        max_abs_force_n=0.5,
+    )
+    criteria = B601CartesianAssistResponseCriteria(minimum_response_m=0.001)
+    response = evaluate_cartesian_assist_response(
+        config=config,
+        state=B601AssistCommissioningState.COMPLETE,
+        anchor_position_m=(0.0, 0.0, 0.0),
+        measured_position_samples_m=((0.0, 0.0, 0.002),) * 6,
+        force_samples_n=((0.0, 0.0, 0.5),) * 6,
+        rotation_drift_samples_rad=(0.0,) * 6,
+        criteria=criteria,
+    )
+    missing_force = evaluate_cartesian_assist_response(
+        config=config,
+        state=B601AssistCommissioningState.COMPLETE,
+        anchor_position_m=(0.0, 0.0, 0.0),
+        measured_position_samples_m=((0.0, 0.0, 0.002),) * 6,
+        force_samples_n=((0.0, 0.0, 0.1),) * 6,
+        rotation_drift_samples_rad=(0.0,) * 6,
+        criteria=criteria,
+    )
+
+    assert response["status"] == "PASS"
+    assert response["passed"] is True
+    assert missing_force["status"] == "ASSIST_NOT_DELIVERED"
 
 
 def test_policy_command_rejects_wrong_frame_and_clock_order() -> None:

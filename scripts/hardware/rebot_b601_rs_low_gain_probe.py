@@ -176,6 +176,9 @@ from hardware.rebot_b601_rs.active_report import B601ActiveReportControlGate
 from robot_motion.rebot_b601_rs import (
     B601AssistCommissioningState,
     B601AssistResponseCriteria,
+    B601CartesianAssistConfig,
+    B601CartesianAssistResponseCriteria,
+    B601CartesianAssistSession,
     B601MitControlProfile,
     B601MitReference,
     B601MitTorqueBreakdown,
@@ -187,12 +190,14 @@ from robot_motion.rebot_b601_rs import (
     B601SingleJointAssistSession,
     B601TranslationalVirtualSpring,
     compute_b601_mit_torque,
+    evaluate_cartesian_assist_response,
     evaluate_single_joint_assist_response,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
 
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
 SINGLE_JOINT_ASSIST_CONFIRMATION = "B601_RS_SINGLE_JOINT_POLICY_ASSIST"
+CARTESIAN_ASSIST_CONFIRMATION = "B601_RS_CARTESIAN_POLICY_ASSIST"
 FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
 DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
@@ -263,6 +268,10 @@ _DEFAULT_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
 _DEFAULT_ASSIST_MIN_RESPONSE_RAD = math.radians(0.1)
 _DEFAULT_ASSIST_MAX_RESPONSE_RATIO = 1.5
 _DEFAULT_ASSIST_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
+_DEFAULT_CARTESIAN_ASSIST_MIN_RESPONSE_M = 0.001
+_DEFAULT_CARTESIAN_ASSIST_MAX_RESPONSE_RATIO = 1.5
+_DEFAULT_CARTESIAN_ASSIST_MAX_LATERAL_DRIFT_M = 0.005
+_DEFAULT_CARTESIAN_ASSIST_MAX_ROTATION_DRIFT_RAD = math.radians(5.0)
 _DEFAULT_VELOCITY_ABORT_RAD_S = 5.0
 _DEFAULT_ACCELERATION_ABORT_RAD_S2 = 80.0
 _DEFAULT_MAX_ERROR_RAD = 0.15
@@ -3531,6 +3540,7 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 
 def _validate_cli(args: argparse.Namespace) -> None:
     _validate_single_joint_assist_cli(args)
+    _validate_cartesian_assist_cli(args)
     feedback_source = getattr(args, "feedback_source", "parameter")
     if feedback_source not in ("parameter", "active-report"):
         raise LowGainProbeError(f"unknown feedback source: {feedback_source}")
@@ -5193,6 +5203,85 @@ def _validate_single_joint_assist_cli(args: argparse.Namespace) -> None:
     )
 
 
+def _cartesian_assist_config_from_args(
+    args: argparse.Namespace,
+) -> B601CartesianAssistConfig:
+    return B601CartesianAssistConfig(
+        axis=args.cartesian_assist_axis,
+        offset_m=args.cartesian_assist_offset_m,
+        stiffness_n_per_m=args.cartesian_assist_stiffness_n_per_m,
+        damping_n_s_per_m=args.cartesian_assist_damping_n_s_per_m,
+        lateral_stiffness_n_per_m=(
+            args.cartesian_assist_lateral_stiffness_n_per_m
+        ),
+        lateral_damping_n_s_per_m=(
+            args.cartesian_assist_lateral_damping_n_s_per_m
+        ),
+        max_abs_force_n=args.cartesian_assist_max_force_n,
+        max_abs_joint_torque_nm=args.cartesian_assist_max_joint_torque_nm,
+        max_joint_torque_rate_nm_s=(
+            args.cartesian_assist_joint_torque_slew_nm_s
+        ),
+        authority_rise_per_sec=args.cartesian_assist_authority_rise_per_sec,
+        countdown_sec=args.cartesian_assist_countdown_sec,
+        assist_duration_sec=args.cartesian_assist_duration_sec,
+        stationarity_limit_rad_s=(
+            args.cartesian_assist_stationarity_limit_rad_s
+        ),
+    )
+
+
+def _build_cartesian_assist(
+    args: argparse.Namespace,
+) -> B601CartesianAssistSession | None:
+    if not getattr(args, "cartesian_assist", False):
+        return None
+    return B601CartesianAssistSession(_cartesian_assist_config_from_args(args))
+
+
+def _validate_cartesian_assist_cli(args: argparse.Namespace) -> None:
+    enabled = bool(getattr(args, "cartesian_assist", False))
+    confirmation = str(getattr(args, "cartesian_assist_confirmation", ""))
+    if not enabled:
+        if confirmation:
+            raise LowGainProbeError(
+                "--cartesian-assist-confirmation requires --cartesian-assist"
+            )
+        return
+    if getattr(args, "single_joint_assist", False):
+        raise LowGainProbeError(
+            "--cartesian-assist and --single-joint-assist are mutually exclusive"
+        )
+    if args.mode != "hold":
+        raise LowGainProbeError("Cartesian assist requires --mode hold")
+    if confirmation != CARTESIAN_ASSIST_CONFIRMATION:
+        raise LowGainProbeError(
+            "Cartesian assist requires --cartesian-assist-confirmation "
+            f"{CARTESIAN_ASSIST_CONFIRMATION}"
+        )
+    if float(args.kp) != 0.0 or float(args.kd) != 0.0:
+        raise LowGainProbeError(
+            "Cartesian assist requires zero software --kp and --kd"
+        )
+    if getattr(args, "guided_pose_axis_protocol", False) or getattr(
+        args,
+        "interactive_pose_axis_protocol",
+        False,
+    ):
+        raise LowGainProbeError(
+            "Cartesian assist cannot be combined with a pose-axis protocol"
+        )
+    _cartesian_assist_config_from_args(args)
+    B601CartesianAssistResponseCriteria(
+        minimum_response_m=args.cartesian_assist_min_response_m,
+        maximum_response_ratio=args.cartesian_assist_max_response_ratio,
+        maximum_lateral_drift_m=args.cartesian_assist_max_lateral_drift_m,
+        maximum_rotation_drift_rad=(
+            args.cartesian_assist_max_rotation_drift_rad
+        ),
+    )
+
+
 def _shared_control_config_payload(
     runtime: B601SharedControlRuntime,
 ) -> dict[str, object]:
@@ -5445,6 +5534,81 @@ def compute_cartesian_impedance_overlay(
         "joint_power_w": mapping.joint_power_w,
         "power_error_w": power_error_w,
     }
+
+
+def compute_cartesian_assist_overlay(
+    model: B601PinocchioModel,
+    session: B601CartesianAssistSession,
+    *,
+    qpos_rad: Sequence[float],
+    qvel_rad_s: Sequence[float],
+    timestamp_sec: float,
+    previous_overlay_nm: Sequence[float],
+    dt_sec: float,
+    maximum_lateral_drift_m: float,
+) -> tuple[tuple[float, ...], dict[str, object]]:
+    """Map one bounded world-axis spring into independently bounded J.T torque."""
+
+    if session.state is not B601AssistCommissioningState.ACTIVE:
+        return _ZERO_SIX, {
+            "enabled": False,
+            "state": session.state.value,
+            "commanded_force_n": (0.0, 0.0, 0.0),
+            "joint_torque_overlay_nm": _ZERO_SIX,
+        }
+    config = session.config
+    if session.target_position_m is None:
+        raise LowGainProbeError("active Cartesian assist has no target position")
+    stiffness = [config.lateral_stiffness_n_per_m] * 3
+    damping = [config.lateral_damping_n_s_per_m] * 3
+    stiffness[config.axis_index] = config.stiffness_n_per_m
+    damping[config.axis_index] = config.damping_n_s_per_m
+    spring = B601TranslationalVirtualSpring(
+        anchor_position_m=session.target_position_m,
+        stiffness_n_per_m=tuple(stiffness),
+        damping_n_s_per_m=tuple(damping),
+        max_abs_force_n=(config.max_abs_force_n,) * 3,
+    )
+    raw_overlay, audit = compute_cartesian_impedance_overlay(
+        model,
+        spring,
+        qpos_rad=qpos_rad,
+        qvel_rad_s=qvel_rad_s,
+        max_displacement_m=(
+            2.0 * abs(config.offset_m) + maximum_lateral_drift_m
+        ),
+    )
+    authority = session.authority(timestamp_sec=timestamp_sec)
+    authority_overlay = tuple(authority * value for value in raw_overlay)
+    conditioned_overlay, torque_limited, slew_limited = condition_torque(
+        authority_overlay,
+        previous_overlay_nm,
+        absolute_limits_nm=(config.max_abs_joint_torque_nm,) * 6,
+        max_rate_nm_s=(config.max_joint_torque_rate_nm_s,) * 6,
+        dt_sec=dt_sec,
+    )
+    commanded_force = tuple(
+        authority * float(value) for value in audit["force_n"]
+    )
+    measured_pose = np.asarray(model.forward_kinematics(qpos_rad), dtype=float)
+    rotation_drift_rad = session.rotation_drift_rad(measured_pose)
+    audit.update(
+        {
+            "enabled": True,
+            "state": session.state.value,
+            "axis": config.axis,
+            "target_position_m": session.target_position_m,
+            "authority": authority,
+            "commanded_force_n": commanded_force,
+            "rotation_drift_rad": rotation_drift_rad,
+            "raw_joint_torque_overlay_nm": raw_overlay,
+            "authority_joint_torque_overlay_nm": authority_overlay,
+            "joint_torque_overlay_nm": conditioned_overlay,
+            "joint_torque_limited": torque_limited,
+            "joint_torque_slew_limited": slew_limited,
+        }
+    )
+    return conditioned_overlay, audit
 
 
 def compute_pose_impedance_overlay(
@@ -5795,6 +5959,78 @@ def format_assist_response_notice(response: Mapping[str, object]) -> str:
         f"{math.degrees(minimum_rad):.3f}deg "
         f"peak_assist={peak_torque_nm:.6f}Nm "
         f"max_support_drift={support_drift_rad:.6f}rad"
+    )
+
+
+def evaluate_cartesian_assist_commissioning_response(
+    *,
+    session: B601CartesianAssistSession | None,
+    samples: Sequence[Mapping[str, object]],
+    minimum_response_m: float = _DEFAULT_CARTESIAN_ASSIST_MIN_RESPONSE_M,
+    maximum_response_ratio: float = _DEFAULT_CARTESIAN_ASSIST_MAX_RESPONSE_RATIO,
+    maximum_lateral_drift_m: float = (
+        _DEFAULT_CARTESIAN_ASSIST_MAX_LATERAL_DRIFT_M
+    ),
+    maximum_rotation_drift_rad: float = (
+        _DEFAULT_CARTESIAN_ASSIST_MAX_ROTATION_DRIFT_RAD
+    ),
+) -> dict[str, object]:
+    if session is None:
+        return {"status": "NOT_APPLICABLE", "passed": True}
+    active_samples = tuple(
+        sample
+        for sample in samples
+        if sample.get("cartesian_assist_commissioning_state") == "active"
+    )
+    audits = tuple(
+        audit
+        for sample in active_samples
+        for audit in (sample.get("cartesian_assist"),)
+        if isinstance(audit, Mapping)
+    )
+    if len(active_samples) != len(audits):
+        return {
+            "status": "MISSING_CARTESIAN_ASSIST_AUDIT",
+            "passed": False,
+            "commissioning_state": session.state.value,
+            "sample_count": len(active_samples),
+            "assist_sample_count": len(audits),
+        }
+    return evaluate_cartesian_assist_response(
+        config=session.config,
+        state=session.state,
+        anchor_position_m=session.anchor_position_m,
+        measured_position_samples_m=tuple(audit["position_m"] for audit in audits),
+        force_samples_n=tuple(audit["commanded_force_n"] for audit in audits),
+        rotation_drift_samples_rad=tuple(
+            audit["rotation_drift_rad"] for audit in audits
+        ),
+        criteria=B601CartesianAssistResponseCriteria(
+            minimum_response_m=minimum_response_m,
+            maximum_response_ratio=maximum_response_ratio,
+            maximum_lateral_drift_m=maximum_lateral_drift_m,
+            maximum_rotation_drift_rad=maximum_rotation_drift_rad,
+        ),
+    )
+
+
+def format_cartesian_assist_response_notice(
+    response: Mapping[str, object],
+) -> str:
+    status = str(response.get("status", "UNKNOWN"))
+    displacement_m = float(response.get("settled_signed_displacement_m", 0.0))
+    minimum_m = float(response.get("minimum_response_m", 0.0))
+    peak_force_n = float(response.get("peak_signed_force_n", 0.0))
+    lateral_m = float(response.get("max_lateral_drift_m", 0.0))
+    rotation_rad = float(response.get("max_rotation_drift_rad", 0.0))
+    return (
+        "[B601] [CARTESIAN ASSIST RESPONSE] "
+        f"status={status} "
+        f"displacement={1000.0 * displacement_m:.3f}mm "
+        f"minimum={1000.0 * minimum_m:.3f}mm "
+        f"peak_force={peak_force_n:.3f}N "
+        f"max_lateral_drift={1000.0 * lateral_m:.3f}mm "
+        f"max_rotation_drift={math.degrees(rotation_rad):.3f}deg"
     )
 
 
@@ -6768,6 +7004,7 @@ def run_probe(
     *,
     shared_control_runtime: B601SharedControlRuntime | None = None,
     shared_control_commissioning: B601SingleJointAssistSession | None = None,
+    cartesian_assist_commissioning: B601CartesianAssistSession | None = None,
 ) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
@@ -6782,6 +7019,13 @@ def run_probe(
             raise LowGainProbeError(
                 "commissioning session and hardware owner must share one runtime"
             )
+    if (
+        shared_control_commissioning is not None
+        and cartesian_assist_commissioning is not None
+    ):
+        raise LowGainProbeError(
+            "joint and Cartesian assist commissioning are mutually exclusive"
+        )
     feedback_source = getattr(args, "feedback_source", "parameter")
     driver_kd_arg = getattr(args, "driver_kd", None)
     driver_kd_nm_s_per_rad = (
@@ -6870,6 +7114,15 @@ def run_probe(
             shared_control_runtime,
             total_torque_limits_nm=torque_limits,
         )
+    elif cartesian_assist_commissioning is not None:
+        cartesian_joint_limit = (
+            cartesian_assist_commissioning.config.max_abs_joint_torque_nm
+        )
+        if any(cartesian_joint_limit > limit for limit in torque_limits):
+            raise LowGainProbeError(
+                "Cartesian assist joint-torque cap exceeds the final torque envelope"
+            )
+        overlay_limits = (cartesian_joint_limit,) * 6
     elif args.mode in ("cartesian-hold", "pose-hold"):
         overlay_limits = tuple(
             value * args.cartesian_overlay_limit_scale
@@ -6928,6 +7181,7 @@ def run_probe(
     previous_feedback_time: float | None = None
     previous_guard_qvel: tuple[float, ...] | None = None
     previous_tau = _ZERO_SIX
+    previous_cartesian_assist_overlay = _ZERO_SIX
     last_verified_gravity_tau: tuple[float, ...] | None = None
     pre_enable_q: tuple[float, ...] | None = None
     initial_q: tuple[float, ...] | None = None
@@ -6964,6 +7218,9 @@ def run_probe(
     stop_reason: str | None = None
     control_completion_reason: str | None = None
     assist_commissioning_response: dict[str, object] | None = None
+    cartesian_assist_commissioning_response: dict[str, object] | None = None
+    assist_guard_rejection: dict[str, object] | None = None
+    cartesian_assist_guard_rejection: dict[str, object] | None = None
     primary_error: Exception | None = None
     preflight_disable: B601ModeReceipt | None = None
     mode_receipt: B601ModeReceipt | None = None
@@ -7053,6 +7310,7 @@ def run_probe(
     calibration_ready = False
     startup_replay_ready = False
     assist_ready = False
+    cartesian_assist_ready = False
     last_control_elapsed_sec = 0.0
     connected = False
     enabled = False
@@ -7124,6 +7382,7 @@ def run_probe(
             or startup_replay_capture is not None
             or interactive_pose_axis_guide is not None
             or shared_control_commissioning is not None
+            or cartesian_assist_commissioning is not None
         ):
             # Establish the interactive input path before opening the backend or
             # changing any drive state.
@@ -8067,7 +8326,149 @@ def run_probe(
                         f"[B601] [ASSIST {assist_event.event}] "
                         f"{assist_event.detail}"
                     )
-                    raise LowGainProbeError(assist_event.detail) from exc
+                    assist_guard_rejection = {
+                        "reason": str(exc),
+                        "detail": assist_event.detail,
+                        "feedback_timestamp_sec": state.receive_timestamp_sec,
+                        "measured_qpos_rad": q,
+                        "measured_qvel_rad_s": qvel,
+                        "anchor_qpos_rad": (
+                            shared_control_commissioning.anchor_qpos_rad
+                        ),
+                        "command_dispatched": False,
+                    }
+                    stop_reason = assist_event.detail
+                    break
+            if (
+                cartesian_assist_commissioning is not None
+                and handoff_fraction >= 1.0
+            ):
+                if not cartesian_assist_ready:
+                    if operator_keys is None:
+                        raise LowGainProbeError(
+                            "Cartesian assist operator terminal is unavailable"
+                        )
+                    operator_keys.flush()
+                    cartesian_assist_ready = True
+                    config_value = cartesian_assist_commissioning.config
+                    _operator_notice(
+                        "[B601] [CARTESIAN ASSIST READY] gravity and damping only. "
+                        "Release the arm, wait until stationary, then press A "
+                        "once without Enter. Press C to withdraw active assist."
+                    )
+                    _operator_notice(
+                        "[B601] [CARTESIAN ASSIST LIMITS] "
+                        f"axis={config_value.axis} "
+                        f"offset={config_value.offset_m:.6f}m "
+                        f"force_cap={config_value.max_abs_force_n:.3f}N "
+                        "effective_static_peak="
+                        f"{config_value.maximum_static_force_n:.3f}N "
+                        "joint_torque_cap="
+                        f"{config_value.max_abs_joint_torque_nm:.3f}Nm "
+                        f"duration={config_value.assist_duration_sec:.3f}s"
+                    )
+                keys = (
+                    operator_keys.poll_keys()
+                    if operator_keys is not None
+                    else frozenset()
+                )
+                cartesian_state = cartesian_assist_commissioning.state
+                if "c" in keys and cartesian_state in {
+                    B601AssistCommissioningState.COUNTDOWN,
+                    B601AssistCommissioningState.ACTIVE,
+                }:
+                    event = cartesian_assist_commissioning.cancel(
+                        timestamp_sec=state.receive_timestamp_sec,
+                        detail=(
+                            "operator C withdrew Cartesian assist; no return "
+                            "target; gravity and damping remain"
+                        ),
+                    )
+                    previous_cartesian_assist_overlay = _ZERO_SIX
+                    _operator_notice(
+                        f"[B601] [CARTESIAN ASSIST {event.event}] {event.detail}"
+                    )
+                elif (
+                    "a" in keys
+                    and cartesian_state is B601AssistCommissioningState.WAITING
+                ):
+                    measured_pose = np.asarray(
+                        model.forward_kinematics(q),
+                        dtype=float,
+                    )
+                    try:
+                        event = cartesian_assist_commissioning.arm(
+                            measured_pose=measured_pose,
+                            measured_qvel_rad_s=qvel,
+                            timestamp_sec=state.receive_timestamp_sec,
+                        )
+                    except ValueError as exc:
+                        _operator_notice(
+                            f"[B601] [CARTESIAN ASSIST NOT ARMED] {exc}"
+                        )
+                    else:
+                        _operator_notice(
+                            f"[B601] [CARTESIAN ASSIST {event.event}] "
+                            f"{event.detail}"
+                        )
+                for event in cartesian_assist_commissioning.step(
+                    measured_qvel_rad_s=qvel,
+                    timestamp_sec=state.receive_timestamp_sec,
+                ):
+                    _operator_notice(
+                        f"[B601] [CARTESIAN ASSIST {event.event}] {event.detail}"
+                    )
+                measured_pose = np.asarray(
+                    model.forward_kinematics(q),
+                    dtype=float,
+                )
+                try:
+                    cartesian_assist_commissioning.validate_active_pose(
+                        measured_pose,
+                        criteria=B601CartesianAssistResponseCriteria(
+                            minimum_response_m=(
+                                args.cartesian_assist_min_response_m
+                            ),
+                            maximum_response_ratio=(
+                                args.cartesian_assist_max_response_ratio
+                            ),
+                            maximum_lateral_drift_m=(
+                                args.cartesian_assist_max_lateral_drift_m
+                            ),
+                            maximum_rotation_drift_rad=(
+                                args.cartesian_assist_max_rotation_drift_rad
+                            ),
+                        ),
+                    )
+                except ValueError as exc:
+                    event = cartesian_assist_commissioning.cancel(
+                        timestamp_sec=state.receive_timestamp_sec,
+                        detail=f"active Cartesian motion guard withdrew assist: {exc}",
+                    )
+                    previous_cartesian_assist_overlay = _ZERO_SIX
+                    _operator_notice(
+                        f"[B601] [CARTESIAN ASSIST {event.event}] {event.detail}"
+                    )
+                    cartesian_assist_guard_rejection = {
+                        "reason": str(exc),
+                        "detail": event.detail,
+                        "feedback_timestamp_sec": state.receive_timestamp_sec,
+                        "measured_qpos_rad": q,
+                        "measured_qvel_rad_s": qvel,
+                        "measured_pose": measured_pose.tolist(),
+                        "anchor_position_m": (
+                            cartesian_assist_commissioning.anchor_position_m
+                        ),
+                        "anchor_rotation": (
+                            cartesian_assist_commissioning.anchor_rotation
+                        ),
+                        "target_position_m": (
+                            cartesian_assist_commissioning.target_position_m
+                        ),
+                        "command_dispatched": False,
+                    }
+                    stop_reason = event.detail
+                    break
             if calibration_capture is not None:
                 if handoff_fraction >= 1.0 and not calibration_ready:
                     if operator_keys is None:
@@ -8224,12 +8625,29 @@ def run_probe(
                 break
             cartesian_audit: dict[str, object] | None = None
             pose_audit: dict[str, object] | None = None
+            cartesian_assist_audit: dict[str, object] | None = None
             joint_torque_overlay_nm = (
                 shared_reference.joint_torque_overlay_nm
                 if shared_reference is not None
                 else _ZERO_SIX
             )
-            if args.mode == "cartesian-hold":
+            if cartesian_assist_commissioning is not None:
+                joint_torque_overlay_nm, cartesian_assist_audit = (
+                    compute_cartesian_assist_overlay(
+                        model,
+                        cartesian_assist_commissioning,
+                        qpos_rad=q,
+                        qvel_rad_s=qvel,
+                        timestamp_sec=state.receive_timestamp_sec,
+                        previous_overlay_nm=previous_cartesian_assist_overlay,
+                        dt_sec=dt,
+                        maximum_lateral_drift_m=(
+                            args.cartesian_assist_max_lateral_drift_m
+                        ),
+                    )
+                )
+                previous_cartesian_assist_overlay = joint_torque_overlay_nm
+            elif args.mode == "cartesian-hold":
                 if cartesian_spring is None:
                     raise LowGainProbeError(
                         "Cartesian impedance spring was not armed"
@@ -8410,6 +8828,12 @@ def run_probe(
                         if shared_control_commissioning is not None
                         else None
                     ),
+                    "cartesian_assist": cartesian_assist_audit,
+                    "cartesian_assist_commissioning_state": (
+                        cartesian_assist_commissioning.state.value
+                        if cartesian_assist_commissioning is not None
+                        else None
+                    ),
                     "startup_state": startup_state_history[-1],
                     "gravity_ramp_fraction": gravity_ramp,
                     "startup_handoff_fraction": handoff_fraction,
@@ -8526,6 +8950,12 @@ def run_probe(
                 is B601AssistCommissioningState.COMPLETE
             ):
                 break
+            if (
+                cartesian_assist_commissioning is not None
+                and cartesian_assist_commissioning.state
+                is B601AssistCommissioningState.COMPLETE
+            ):
+                break
         if stop_reason is None:
             if (
                 interactive_pose_axis_guide is not None
@@ -8566,6 +8996,41 @@ def run_probe(
                     "protective hold with assist zero and no return target. "
                     "Ctrl-C or SIGUSR1 requests final full disable."
                 )
+            elif (
+                cartesian_assist_commissioning is not None
+                and cartesian_assist_commissioning.state
+                is B601AssistCommissioningState.COMPLETE
+            ):
+                stop["requested"] = True
+                control_completion_reason = "cartesian_assist_complete"
+                cartesian_assist_commissioning_response = (
+                    evaluate_cartesian_assist_commissioning_response(
+                        session=cartesian_assist_commissioning,
+                        samples=samples,
+                        minimum_response_m=args.cartesian_assist_min_response_m,
+                        maximum_response_ratio=(
+                            args.cartesian_assist_max_response_ratio
+                        ),
+                        maximum_lateral_drift_m=(
+                            args.cartesian_assist_max_lateral_drift_m
+                        ),
+                        maximum_rotation_drift_rad=(
+                            args.cartesian_assist_max_rotation_drift_rad
+                        ),
+                    )
+                )
+                _operator_notice(
+                    format_cartesian_assist_response_notice(
+                        cartesian_assist_commissioning_response
+                    )
+                )
+                _operator_notice(
+                    "[B601] CARTESIAN ASSIST TRIAL COMPLETE: command flow "
+                    "completed; mechanical acceptance="
+                    f"{cartesian_assist_commissioning_response['status']}. "
+                    "Entering protective hold with assist zero and no return "
+                    "target. Ctrl-C or SIGUSR1 requests final full disable."
+                )
             else:
                 if shared_control_commissioning is not None:
                     assist_state = shared_control_commissioning.state
@@ -8593,6 +9058,34 @@ def run_probe(
                         _operator_notice(
                             "[B601] [ASSIST INCOMPLETE] trial was cancelled; "
                             "assist is zero and gravity/damping remain active."
+                        )
+                if cartesian_assist_commissioning is not None:
+                    cartesian_state = cartesian_assist_commissioning.state
+                    if cartesian_state in {
+                        B601AssistCommissioningState.WAITING,
+                        B601AssistCommissioningState.COUNTDOWN,
+                        B601AssistCommissioningState.ACTIVE,
+                    }:
+                        event = cartesian_assist_commissioning.cancel(
+                            timestamp_sec=(
+                                previous_feedback_time
+                                if previous_feedback_time is not None
+                                else time.monotonic()
+                            ),
+                            detail=(
+                                "control duration expired before the one-shot "
+                                "Cartesian assist trial completed"
+                            ),
+                        )
+                        _operator_notice(
+                            "[B601] [CARTESIAN ASSIST INCOMPLETE] "
+                            f"{event.detail}; assist is zero and gravity/damping "
+                            "remain active."
+                        )
+                    elif cartesian_state is B601AssistCommissioningState.CANCELLED:
+                        _operator_notice(
+                            "[B601] [CARTESIAN ASSIST INCOMPLETE] trial was "
+                            "cancelled; assist is zero and gravity/damping remain active."
                         )
                 control_completion_reason = complete_active_duration(
                     stop=stop,
@@ -9039,6 +9532,24 @@ def run_probe(
     shared_control_commissioning_passed = bool(
         assist_commissioning_response["passed"]
     )
+    if cartesian_assist_commissioning_response is None:
+        cartesian_assist_commissioning_response = (
+            evaluate_cartesian_assist_commissioning_response(
+                session=cartesian_assist_commissioning,
+                samples=samples,
+                minimum_response_m=args.cartesian_assist_min_response_m,
+                maximum_response_ratio=args.cartesian_assist_max_response_ratio,
+                maximum_lateral_drift_m=(
+                    args.cartesian_assist_max_lateral_drift_m
+                ),
+                maximum_rotation_drift_rad=(
+                    args.cartesian_assist_max_rotation_drift_rad
+                ),
+            )
+        )
+    cartesian_assist_commissioning_passed = bool(
+        cartesian_assist_commissioning_response["passed"]
+    )
     acceptance_passed = (
         control_passed
         and response_passed
@@ -9046,6 +9557,7 @@ def run_probe(
         and startup_replay_passed
         and operator_guidance_passed
         and shared_control_commissioning_passed
+        and cartesian_assist_commissioning_passed
     )
     max_abs_requested = max(
         (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
@@ -9603,6 +10115,55 @@ def run_probe(
                 assist_commissioning_response["status"]
             ),
             "commissioning_response": assist_commissioning_response,
+            "guard_rejection": assist_guard_rejection,
+        },
+        "cartesian_assist": {
+            "enabled": cartesian_assist_commissioning is not None,
+            "frame": "base_link world-aligned translation",
+            "mapping": "bounded wrench -> LOCAL_WORLD_ALIGNED J.T -> bounded joint overlay",
+            "commissioning": (
+                cartesian_assist_commissioning.audit()
+                if cartesian_assist_commissioning is not None
+                else None
+            ),
+            "config": (
+                {
+                    "axis": cartesian_assist_commissioning.config.axis,
+                    "offset_m": cartesian_assist_commissioning.config.offset_m,
+                    "stiffness_n_per_m": (
+                        cartesian_assist_commissioning.config.stiffness_n_per_m
+                    ),
+                    "damping_n_s_per_m": (
+                        cartesian_assist_commissioning.config.damping_n_s_per_m
+                    ),
+                    "lateral_stiffness_n_per_m": (
+                        cartesian_assist_commissioning.config.lateral_stiffness_n_per_m
+                    ),
+                    "lateral_damping_n_s_per_m": (
+                        cartesian_assist_commissioning.config.lateral_damping_n_s_per_m
+                    ),
+                    "max_abs_force_n": (
+                        cartesian_assist_commissioning.config.max_abs_force_n
+                    ),
+                    "max_abs_joint_torque_nm": (
+                        cartesian_assist_commissioning.config.max_abs_joint_torque_nm
+                    ),
+                    "max_joint_torque_rate_nm_s": (
+                        cartesian_assist_commissioning.config.max_joint_torque_rate_nm_s
+                    ),
+                    "maximum_rotation_drift_rad": (
+                        args.cartesian_assist_max_rotation_drift_rad
+                    ),
+                }
+                if cartesian_assist_commissioning is not None
+                else None
+            ),
+            "commissioning_acceptance": (
+                cartesian_assist_commissioning_response["status"]
+            ),
+            "commissioning_response": cartesian_assist_commissioning_response,
+            "guard_rejection": cartesian_assist_guard_rejection,
+            "hardware_acceptance": "NOT_CLAIMED",
         },
         "cartesian_impedance": {
             "enabled": args.mode == "cartesian-hold",
@@ -9976,6 +10537,102 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cartesian-assist",
+        action="store_true",
+        help=(
+            "opt in to one operator-armed world-aligned translational assist "
+            "trial inside the existing gravity/damping owner"
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist-axis",
+        choices=("x", "y", "z"),
+        default="x",
+    )
+    parser.add_argument("--cartesian-assist-offset-m", type=float, default=0.01)
+    parser.add_argument(
+        "--cartesian-assist-stiffness-n-per-m",
+        type=float,
+        default=50.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-damping-n-s-per-m",
+        type=float,
+        default=3.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-lateral-stiffness-n-per-m",
+        type=float,
+        default=30.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-lateral-damping-n-s-per-m",
+        type=float,
+        default=2.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-force-n",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-joint-torque-nm",
+        type=float,
+        default=0.15,
+    )
+    parser.add_argument(
+        "--cartesian-assist-joint-torque-slew-nm-s",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--cartesian-assist-authority-rise-per-sec",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--cartesian-assist-countdown-sec",
+        type=float,
+        default=3.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-duration-sec",
+        type=float,
+        default=6.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-stationarity-limit-rad-s",
+        type=float,
+        default=0.02,
+    )
+    parser.add_argument(
+        "--cartesian-assist-min-response-m",
+        type=float,
+        default=_DEFAULT_CARTESIAN_ASSIST_MIN_RESPONSE_M,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-response-ratio",
+        type=float,
+        default=_DEFAULT_CARTESIAN_ASSIST_MAX_RESPONSE_RATIO,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-lateral-drift-m",
+        type=float,
+        default=_DEFAULT_CARTESIAN_ASSIST_MAX_LATERAL_DRIFT_M,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-rotation-drift-rad",
+        type=float,
+        default=_DEFAULT_CARTESIAN_ASSIST_MAX_ROTATION_DRIFT_RAD,
+    )
+    parser.add_argument(
+        "--cartesian-assist-confirmation",
+        default="",
+        help=(
+            "second exact acknowledgement required by --cartesian-assist"
+        ),
+    )
+    parser.add_argument(
         "--protective-hold-kd",
         type=float,
         default=_DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
@@ -10262,10 +10919,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 commissioning_session = None
             else:
                 shared_runtime, commissioning_session = commissioning_pair
+            cartesian_commissioning_session = _build_cartesian_assist(args)
             payload = run_probe(
                 args,
                 shared_control_runtime=shared_runtime,
                 shared_control_commissioning=commissioning_session,
+                cartesian_assist_commissioning=(
+                    cartesian_commissioning_session
+                ),
             )
         except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
             payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
