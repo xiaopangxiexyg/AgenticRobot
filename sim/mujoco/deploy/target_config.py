@@ -55,6 +55,11 @@ class MujocoSimHILTargetConfig:
     # trajectories. Existing CubeLift Sim-HIL profiles retain their behavior.
     allow_scripted_task_reset: bool = True
     agent_skill_producer_id: str = "control-station-agent-skill"
+    # Optional application-owned scene asset overrides. Keep these at the end
+    # of the dataclass so existing positional construction remains stable.
+    scene_urdf_path_override: Path | None = None
+    scene_camera_registry_path_override: Path | None = None
+    scene_gripper_actuation_profile_name_override: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -62,6 +67,26 @@ class MujocoSimHILTargetConfig:
             "task_config_path",
             Path(self.task_config_path).expanduser(),
         )
+        for name in (
+            "scene_urdf_path_override",
+            "scene_camera_registry_path_override",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, Path(value).expanduser())
+        if self.scene_gripper_actuation_profile_name_override is not None:
+            profile_name = str(
+                self.scene_gripper_actuation_profile_name_override
+            ).strip()
+            if not profile_name:
+                raise ValueError(
+                    "scene_gripper_actuation_profile_name_override must be non-empty."
+                )
+            object.__setattr__(
+                self,
+                "scene_gripper_actuation_profile_name_override",
+                profile_name,
+            )
         if self.station_pose_contract_path is not None:
             object.__setattr__(
                 self,

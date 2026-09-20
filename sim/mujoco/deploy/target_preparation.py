@@ -8,7 +8,7 @@ existing target profiles consume the same preparation contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -77,6 +77,29 @@ def prepare_mujoco_sim_hil_target(
 
     task_config = CubeLiftTaskConfig.load(config.task_config_path)
     contract = task_config.base_contract()
+    scene_overrides = {}
+    for name, label in (
+        ("scene_urdf_path_override", "MuJoCo target URDF"),
+        ("scene_camera_registry_path_override", "MuJoCo target camera registry"),
+    ):
+        value = getattr(config, name)
+        if value is None:
+            continue
+        resolved = value.expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"{label} override must be an existing file: {resolved}"
+            )
+        scene_overrides[
+            "urdf_path"
+            if name == "scene_urdf_path_override"
+            else "camera_registry_path"
+        ] = str(resolved)
+    if scene_overrides:
+        contract = replace(
+            contract,
+            scene=replace(contract.scene, **scene_overrides),
+        )
     if (
         not config.allow_scripted_task_reset
         and (
@@ -137,10 +160,19 @@ def prepare_mujoco_sim_hil_target(
         task_config.position_actuation_profile()
         or rm65_bimanual_udp_feedback_profile()
     )
-    gripper_profile = (
-        task_config.gripper_actuation_profile()
-        or identified_bimanual_dmtac_gripper_profile()
-    )
+    if config.scene_gripper_actuation_profile_name_override is not None:
+        from sim.mujoco.tasks.cube_lift.config import (
+            resolve_dmtac_gripper_actuation_profile,
+        )
+
+        gripper_profile = resolve_dmtac_gripper_actuation_profile(
+            config.scene_gripper_actuation_profile_name_override
+        )
+    else:
+        gripper_profile = (
+            task_config.gripper_actuation_profile()
+            or identified_bimanual_dmtac_gripper_profile()
+        )
     scene = MujocoScene.from_contract(
         contract,
         position_actuation_profile=arm_profile,
@@ -195,7 +227,31 @@ def prepare_mujoco_sim_hil_target(
                 "right": task_config.right_home_qpos,
             }
         )
-        for name, close in task_config.initial_gripper_close_by_name.items():
+        initial_gripper_close_by_name = dict(
+            task_config.initial_gripper_close_by_name
+        )
+        if config.scene_gripper_actuation_profile_name_override is not None:
+            # A reviewed scene asset may use a different physical gripper
+            # naming catalog than the task it replaces.  Preserve the task's
+            # side-specific initial value while addressing the selected
+            # profile's canonical gripper names; do not alter task metadata.
+            initial_gripper_close_by_name = {
+                gripper_name: float(
+                    initial_gripper_close_by_name.get(
+                        gripper_name,
+                        initial_gripper_close_by_name.get(
+                            getattr(
+                                task_config,
+                                f"{side}_gripper_name",
+                                gripper_name,
+                            ),
+                            0.0,
+                        ),
+                    )
+                )
+                for gripper_name, side in gripper_profile.side_by_gripper.items()
+            }
+        for name, close in initial_gripper_close_by_name.items():
             scene.set_gripper_close(name, float(close))
         scene.set_freejoint_state(
             task_config.object_freejoint_name,

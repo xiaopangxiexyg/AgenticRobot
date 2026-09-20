@@ -97,3 +97,31 @@ RM65 MuJoCo target 中，右臂 residual + J7 normalized close 同一 proposal
    双臂 baseline 后，再规划 RM65→B601 的只读仿真路径。
 4. 最后才规划单独的真机夹爪命令与安全/限速验收。夹爪命令不能借用六轴
    B601 owner 的 protective-hold 假设。
+
+## v4/4b2 目标资产与 J7 阻尼边界（本候选）
+
+`b601-rm65` 的 MuJoCo target 现在默认选择已审核的 v4/4b2 组合：
+
+- URDF：`assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf`
+- camera registry：`robot_motion/configs/rm65_camera_registry_v4.json`
+- gripper profile：`dmtac_bimanual_position_eg2_4b2_cad_20260818.v1`
+
+三个值都可以通过 `b601-rm65` 的 `--target-urdf`、
+`--target-camera-registry` 和 `--target-gripper-profile` 显式覆盖，方便离线
+比较而不复制或修改 task JSON。旧 task/mapping 中的
+`left_gripper`/`right_gripper` 逻辑名在场景只有一个对应侧 gripper 时会解析到
+v4/4b2 的实际 CAD 名称；多个候选时仍然拒绝猜测。
+
+J7 是夹爪，不属于当前 B601 J1--J6 gravity/damping owner。当前只读 J7
+reader 不发送任何 MIT/POS-VEL 帧，因此修改六轴 owner 的 `--driver-kd` 不会
+改变 J7，也不会让 J7 进入 protective hold。官方 `reBotArm_control_py` 路径
+中，J7 的阻尼来自 `config/rebotarm_rs.yaml` 的
+`joints[name=gripper].MIT.kd`（当前为 `4.0`），并在每个
+`gripper.send_mit(..., kd=...)` 帧中生效；`JointGroup.mode_mit(kd=...)` 可在
+运行时覆盖它。建议先以 `kd=1.0` 做现场小范围验收，确认无明显回弹后再考虑
+`0.5`，不应把 `0x700B` 当作阻尼参数（它是 torque limit）。
+
+由于该配置位于 pinned vendor submodule，当前候选没有直接改写厂商文件；需要
+真实 J7 控制时，应在官方 gripper owner 中显式设置运行时 `kd`，或另建一个有
+独立审查记录的 vendor 子模块提交。B601→RM65 read-only 遥操路径不会因为
+v4/4b2 目标切换而隐式使能或控制 J7。

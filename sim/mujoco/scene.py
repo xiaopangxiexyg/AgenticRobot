@@ -839,6 +839,24 @@ class MujocoScene:
             key = str(name)
             if key in self.gripper_specs:
                 return key
+            # Task and mapping contracts historically used the logical
+            # ``left_gripper``/``right_gripper`` names.  Reviewed CAD scene
+            # assets expose the physical module as
+            # ``*_eg2_4b2_cad`` instead.  Resolve the legacy logical name
+            # only when the scene has exactly one gripper on that side; an
+            # ambiguous scene still fails closed instead of guessing.
+            legacy_side = {
+                "left_gripper": "left",
+                "right_gripper": "right",
+            }.get(key)
+            if legacy_side is not None:
+                side_matches = tuple(
+                    candidate
+                    for candidate, spec in self.gripper_specs.items()
+                    if spec.side == legacy_side
+                )
+                if len(side_matches) == 1:
+                    return side_matches[0]
             raise KeyError(f"Scene has no gripper spec named {key!r}.")
         if len(self.gripper_specs) == 1:
             return next(iter(self.gripper_specs))

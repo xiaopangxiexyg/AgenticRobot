@@ -21,6 +21,32 @@ if TYPE_CHECKING:
     from control_station.sources.rebot_b601_rm65_motion import B601RM65MotionSession
 
 
+# The B601 -> RM65 simulation target is the concrete application boundary for
+# this asset choice.  Keep the generic task contracts reusable, while using
+# the reviewed v4/4b2 assembly by default for this read-only teleoperation
+# path.  Both paths remain explicit CLI overrides for offline comparisons.
+DEFAULT_B601_RM65_TARGET_URDF = (
+    Path(__file__).resolve().parents[2]
+    / "assets/rm65_inspire_gripper_v4/"
+    "rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf"
+)
+DEFAULT_B601_RM65_TARGET_CAMERA_REGISTRY = (
+    Path(__file__).resolve().parents[2]
+    / "robot_motion/configs/rm65_camera_registry_v4.json"
+)
+DEFAULT_B601_RM65_TARGET_GRIPPER_PROFILE = (
+    "dmtac_bimanual_position_eg2_4b2_cad_20260818.v1"
+)
+
+
+def _resolve_target_asset(path: Path | None, default: Path, label: str) -> Path:
+    selected = default if path is None else Path(path).expanduser()
+    resolved = selected.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} does not exist: {resolved}")
+    return resolved
+
+
 def assemble_b601_rm65_session(
     runtime,
     *,
@@ -82,6 +108,9 @@ def build_b601_rm65_sim_target(
     task_config_path: Path,
     *,
     enable_gripper: bool = False,
+    target_urdf_path: Path | None = None,
+    target_camera_registry_path: Path | None = None,
+    target_gripper_profile_name: str | None = None,
 ):
     """Prepare one existing actuated rig, canonical coupled IK and pose reader.
 
@@ -133,9 +162,29 @@ def build_b601_rm65_sim_target(
     from sim.mujoco.deploy.target_preparation import prepare_mujoco_sim_hil_target
     from sim.mujoco.ik import RM65CanonicalIK
 
+    selected_target_urdf = _resolve_target_asset(
+        target_urdf_path,
+        DEFAULT_B601_RM65_TARGET_URDF,
+        "B601->RM65 MuJoCo target URDF",
+    )
+    selected_camera_registry = _resolve_target_asset(
+        target_camera_registry_path,
+        DEFAULT_B601_RM65_TARGET_CAMERA_REGISTRY,
+        "B601->RM65 MuJoCo target camera registry",
+    )
+    selected_gripper_profile = (
+        DEFAULT_B601_RM65_TARGET_GRIPPER_PROFILE
+        if target_gripper_profile_name is None
+        else str(target_gripper_profile_name).strip()
+    )
+    if not selected_gripper_profile:
+        raise ValueError("B601->RM65 target gripper profile must be non-empty.")
     prepared = prepare_mujoco_sim_hil_target(
         MujocoSimHILTargetConfig(
             task_config_path=task_config_path,
+            scene_urdf_path_override=selected_target_urdf,
+            scene_camera_registry_path_override=selected_camera_registry,
+            scene_gripper_actuation_profile_name_override=selected_gripper_profile,
             allow_scripted_task_reset=False,
             # B601 feedback arrives at roughly 20 Hz, while the RM65 target
             # has a validated 60 Hz IK/reference clock.  The motion session
@@ -196,12 +245,15 @@ def build_b601_rm65_sim_target(
             timing=prepared.timing,
             actuation_profile=prepared.arm_profile,
             gripper_actuation_profile=prepared.gripper_profile,
-            # The calibrated B601 closed endpoint maps to the RM65 CAD
-            # gripper's expected finger contact. Its mesh overlaps slightly
-            # at that endpoint, so allow only 4:4 finger self-contact in this
-            # explicit arm+gripper simulation path; environment and robot
+            # The selected CAD gripper mesh overlaps slightly at its
+            # normalized closed endpoint. Allow only 4:4 finger self-contact
+            # for that reviewed CAD profile; this is independent of whether
+            # the B601 J7 source is enabled because the target scene still
+            # contains the CAD gripper actuators. Environment and robot
             # collision guards remain enabled.
-            allow_gripper_self_contact=bool(enable_gripper),
+            allow_gripper_self_contact=prepared.gripper_profile.name.startswith(
+                "dmtac_bimanual_position_eg2_4b2_cad_"
+            ),
             realtime_worker=prepared.config.realtime_worker,
         ),
     )
@@ -969,6 +1021,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--maximum-translation-m", type=_positive, default=0.1)
     parser.add_argument("--maximum-rotation-rad", type=_positive, default=0.3)
     parser.add_argument(
+        "--target-urdf",
+        type=Path,
+        default=None,
+        help=(
+            "read-only MuJoCo target URDF override; defaults to the reviewed "
+            "RM65 v4/4b2 assembly"
+        ),
+    )
+    parser.add_argument(
+        "--target-camera-registry",
+        type=Path,
+        default=None,
+        help=(
+            "read-only MuJoCo target camera registry override; defaults to "
+            "the RM65 v4 registry"
+        ),
+    )
+    parser.add_argument(
+        "--target-gripper-profile",
+        default=None,
+        help=(
+            "MuJoCo target gripper actuation profile override; defaults to "
+            "the reviewed EG2-4B2 CAD profile"
+        ),
+    )
+    parser.add_argument(
         "--disable-teleop-residual-envelope",
         action="store_true",
         help=(
@@ -1214,6 +1292,15 @@ def main(argv: list[str] | None = None) -> int:
                     if args.enable_b601_gripper
                     else None
                 ),
+                "target_urdf_override": (
+                    str(args.target_urdf) if args.target_urdf is not None else None
+                ),
+                "target_camera_registry_override": (
+                    str(args.target_camera_registry)
+                    if args.target_camera_registry is not None
+                    else None
+                ),
+                "target_gripper_profile_override": args.target_gripper_profile,
             },
         }
         status = 1
@@ -1299,16 +1386,43 @@ def main(argv: list[str] | None = None) -> int:
             )
             backend = B601RSBackend(config)
             with ExitStack() as resources:
+                target_kwargs = {}
+                if args.target_urdf is not None:
+                    target_kwargs["target_urdf_path"] = args.target_urdf
+                if args.target_camera_registry is not None:
+                    target_kwargs["target_camera_registry_path"] = (
+                        args.target_camera_registry
+                    )
+                if args.target_gripper_profile is not None:
+                    target_kwargs["target_gripper_profile_name"] = (
+                        args.target_gripper_profile
+                    )
                 if args.enable_b601_gripper:
                     runtime, measure, rate = build_b601_rm65_sim_target(
                         args.task_config,
                         enable_gripper=True,
+                        **target_kwargs,
                     )
                 else:
                     runtime, measure, rate = build_b601_rm65_sim_target(
                         args.task_config,
+                        **target_kwargs,
                     )
                 result["teleop_contract"]["target_control_hz"] = float(rate)
+                target_scene = getattr(getattr(runtime, "rig", None), "scene", None)
+                target_scene_spec = getattr(target_scene, "scene_spec", None)
+                if target_scene_spec is not None:
+                    result["teleop_contract"].update(
+                        {
+                            "target_urdf_path": str(target_scene_spec.urdf_path),
+                            "target_camera_registry_path": str(
+                                target_scene_spec.camera_registry_path
+                            ),
+                            "target_gripper_profile_name": str(
+                                runtime.rig.config.gripper_actuation_profile.name
+                            ),
+                        }
+                    )
 
                 def close_target() -> None:
                     runtime.close()

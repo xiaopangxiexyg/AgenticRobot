@@ -167,9 +167,7 @@ class NormalizedGripperSimBridge:
             raise TypeError("mapping must be a B601RM65GripperMappingProfile.")
         if direction not in {"b601_to_rm65", "rm65_to_b601"}:
             raise ValueError(f"unsupported direction: {direction!r}")
-        name = str(target_gripper_name).strip()
-        if name not in scene.gripper_specs:
-            raise KeyError(f"scene has no gripper spec {name!r}.")
+        name = scene._resolve_gripper_name(str(target_gripper_name).strip())
         default_source_id = (
             B601_RS_GRIPPER_SOURCE_V1
             if direction == "b601_to_rm65"

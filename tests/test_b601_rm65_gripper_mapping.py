@@ -253,6 +253,21 @@ def test_forward_and_reverse_sim_bridges_use_same_normalized_contract() -> None:
     assert GRIPPER_CLOCK_DOMAIN_LOCAL_WALL_TIME == "local_wall_time"
 
 
+def test_legacy_rm65_gripper_name_resolves_to_single_cad_side() -> None:
+    scene = _synthetic_scene(name="right_eg2_4b2_cad")
+    profile = _mapping()
+    bridge = B601ToRM65GripperSimBridge(
+        scene,
+        profile,
+        target_gripper_name="right_gripper",
+    )
+
+    assert bridge.target_gripper_name == "right_eg2_4b2_cad"
+    assert scene._resolve_gripper_name("right_gripper") == "right_eg2_4b2_cad"
+    assert bridge.apply_b601_sample(_sample(0.4, 1)).accepted is True
+    assert scene.get_gripper_close("right_gripper") == pytest.approx(0.4)
+
+
 def test_b601_opt_in_scene_registers_gripper_without_changing_default() -> None:
     pytest.importorskip("mujoco")
     if not (REBOT_SOURCE_ROOT / B601_RS_URDF_RELATIVE_PATH).is_file():
