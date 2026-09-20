@@ -781,9 +781,10 @@ def test_blocking_model_backend_does_not_block_rtc_control_step() -> None:
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline and frontend.pending_completion_count == 0:
             time.sleep(0.001)
+        late_at = max(base + 0.003, time.monotonic())
         late = frontend.step(
-            _observation(timestamp=base + 0.003, step_index=2),
-            now=base + 0.003,
+            _observation(timestamp=late_at, step_index=2),
+            now=late_at,
             allow_output=False,
         )
         assert late.result_transition is not None

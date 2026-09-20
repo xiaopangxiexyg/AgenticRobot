@@ -130,6 +130,57 @@ def test_rm65_skipped_tick_rebases_to_one_fresh_period_without_catchup() -> None
     ) == 10.04
 
 
+def test_rm65_new_target_does_not_count_idle_gap_as_low_send_rate() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            background_streaming_hz=120.0,
+            background_streaming_warning_ratio=0.9,
+            singularity_protection_enabled=False,
+        )
+    )
+    backend._record_background_stream_send(
+        qpos_rad=np.zeros(6),
+        sent_at_perf=100.0,
+        call_ms=0.1,
+        deadline_lag_ms=0.0,
+    )
+    backend._record_background_stream_send(
+        qpos_rad=np.zeros(6),
+        sent_at_perf=100.02,
+        call_ms=0.1,
+        deadline_lag_ms=0.0,
+    )
+    before_idle = backend.get_state()["background_streaming"]
+    assert before_idle["warning"]["active"] is True
+    assert before_idle["low_rate_count"] == 1
+
+    with backend._state_lock:
+        backend._clear_stream_target_locked()
+    after_clear = backend.get_state()["background_streaming"]
+    assert after_clear["actual_hz"] is None
+    assert after_clear["warning"] is None
+    assert after_clear["low_rate_count"] == 1
+
+    # Ten seconds of target-free idle time is not a send interval.  The first
+    # send of the next target establishes a new cadence baseline and must not
+    # add a false low-rate health fault.
+    backend._record_background_stream_send(
+        qpos_rad=np.ones(6) * 0.01,
+        sent_at_perf=110.0,
+        call_ms=0.1,
+        deadline_lag_ms=0.0,
+    )
+    restarted = backend.get_state()["background_streaming"]
+    assert restarted["actual_hz"] is None
+    assert restarted["warning"]["active"] is False
+    assert restarted["low_rate_count"] == 1
+
+
 def test_rm65_stream_skips_late_tick_without_sending_catchup_command(monkeypatch) -> None:
     backend = RM65ArmBackend(
         RM65ArmBackendConfig(

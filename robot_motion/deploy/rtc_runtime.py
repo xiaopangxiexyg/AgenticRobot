@@ -608,6 +608,95 @@ class RtcProducerActivationReadinessReceipt:
 
 
 @dataclass(frozen=True)
+class RtcCompletionTiming:
+    """Stage-separated local timing for one completed inference request."""
+
+    request_admitted_at: float
+    work_submitted_at: float
+    worker_started_at: float
+    worker_completed_at: float
+    worker_released_at: float
+    result_admitted_at: float
+
+    def __post_init__(self) -> None:
+        ordered = tuple(
+            _finite(getattr(self, name), field_name=name)
+            for name in (
+                "request_admitted_at",
+                "work_submitted_at",
+                "worker_started_at",
+                "worker_completed_at",
+                "worker_released_at",
+                "result_admitted_at",
+            )
+        )
+        if any(current < previous for previous, current in zip(ordered, ordered[1:])):
+            raise ValueError(
+                "RTC completion timing stages must be monotonically ordered."
+            )
+
+    @property
+    def request_build_and_submit_sec(self) -> float:
+        return self.work_submitted_at - self.request_admitted_at
+
+    @property
+    def worker_queue_sec(self) -> float:
+        return self.worker_started_at - self.work_submitted_at
+
+    @property
+    def provider_sec(self) -> float:
+        return self.worker_completed_at - self.worker_started_at
+
+    @property
+    def worker_release_sec(self) -> float:
+        return self.worker_released_at - self.worker_completed_at
+
+    @property
+    def release_to_admission_sec(self) -> float:
+        return self.result_admitted_at - self.worker_released_at
+
+    @property
+    def request_to_release_sec(self) -> float:
+        return self.worker_released_at - self.request_admitted_at
+
+    @property
+    def request_to_admission_sec(self) -> float:
+        return self.result_admitted_at - self.request_admitted_at
+
+    def to_payload(self) -> dict[str, float]:
+        return {
+            "request_admitted_at": self.request_admitted_at,
+            "work_submitted_at": self.work_submitted_at,
+            "worker_started_at": self.worker_started_at,
+            "worker_completed_at": self.worker_completed_at,
+            "worker_released_at": self.worker_released_at,
+            "result_admitted_at": self.result_admitted_at,
+            "request_build_and_submit_sec": self.request_build_and_submit_sec,
+            "worker_queue_sec": self.worker_queue_sec,
+            "provider_sec": self.provider_sec,
+            "worker_release_sec": self.worker_release_sec,
+            "release_to_admission_sec": self.release_to_admission_sec,
+            "request_to_release_sec": self.request_to_release_sec,
+            "request_to_admission_sec": self.request_to_admission_sec,
+        }
+
+
+def _rtc_completion_timing(
+    completion: PolicyWorkerCompletion,
+    *,
+    result_admitted_at: float,
+) -> RtcCompletionTiming:
+    return RtcCompletionTiming(
+        request_admitted_at=float(completion.request_admitted_at),
+        work_submitted_at=float(completion.work_submitted_at),
+        worker_started_at=float(completion.worker_started_at),
+        worker_completed_at=float(completion.worker_completed_at),
+        worker_released_at=float(completion.released_at),
+        result_admitted_at=float(result_admitted_at),
+    )
+
+
+@dataclass(frozen=True)
 class RtcFrontendStep:
     state: PolicyAsyncProducerSnapshot
     completion: PolicyWorkerCompletion | None
@@ -629,6 +718,7 @@ class RtcFrontendStep:
     effective_request_trigger_coverage_steps: int = 0
     plan_coverage_steps: int = 0
     completion_coverage_assessment: RtcExecutionCoverageAssessment | None = None
+    completion_timing: RtcCompletionTiming | None = None
     timing_contract_hash: str = ""
     preflight_completion: bool = False
 
@@ -717,6 +807,11 @@ class RtcFrontendStep:
             ),
             "completion_released_at": (
                 None if self.completion is None else self.completion.released_at
+            ),
+            "completion_timing": (
+                None
+                if self.completion_timing is None
+                else self.completion_timing.to_payload()
             ),
             "result_transition_hash": (
                 None
@@ -1830,6 +1925,7 @@ class RtcPolicyShadowFrontend:
         lifecycle_transition = None
         preflight_completion = False
         completion_coverage_assessment = None
+        completion_timing = None
         pending_preflight = self._preflight_request
         if pending_preflight is not None and completion is not None:
             # Preflight uses the model protocol, never producer admission/merge.
@@ -1851,14 +1947,22 @@ class RtcPolicyShadowFrontend:
                 )
             else:
                 preflight_completion = True
+                completion_timing = _rtc_completion_timing(
+                    completion,
+                    result_admitted_at=decision_at,
+                )
                 if self._preflight_record_latency:
                     self._delay_state = self._delay_state.record(
                         self.config.delay_estimator_spec,
-                        max(0.0, completion.released_at - completion.worker_started_at),
+                        completion_timing.request_to_admission_sec,
                     )
         elif pending_preflight is not None and decision_at >= pending_preflight.valid_until:
             lifecycle_transition = self.fault(now=decision_at, reason="rtc_preflight_timeout")
         elif completion is not None:
+            completion_timing = _rtc_completion_timing(
+                completion,
+                result_admitted_at=decision_at,
+            )
             lifecycle_before_result = self._state.lifecycle_state
             completion_request = self._state.active_request
             completion_request_plan_coverage_steps = (
@@ -1877,10 +1981,11 @@ class RtcPolicyShadowFrontend:
                 and not result_transition.receipt.accepted
             ):
                 self._late_completion_rejection_count += 1
-            latency = max(
-                0.0,
-                completion.released_at - completion.worker_started_at,
-            )
+            # Plan coverage is consumed until the result is admitted by the
+            # control loop, not merely until the provider thread releases it.
+            # Include request construction, worker scheduling, provider time,
+            # result release, and poll/admission quantization in this budget.
+            latency = completion_timing.request_to_admission_sec
             next_delay_state = self._delay_state.record(
                 self.config.delay_estimator_spec,
                 latency,
@@ -2170,6 +2275,7 @@ class RtcPolicyShadowFrontend:
             completion_coverage_assessment=(
                 completion_coverage_assessment
             ),
+            completion_timing=completion_timing,
             timing_contract_hash=self.config.timing_contract_hash,
             preflight_completion=preflight_completion,
         )
@@ -2352,6 +2458,7 @@ __all__ = [
     "RTC_TIMING_CONTRACT_HASH_DOMAIN_V1",
     "RTC_TYPED_CANONICAL_SOURCE_ADAPTER_CONTRACT_HASH_V1",
     "PolicyActionEmissionCommitReceipt",
+    "RtcCompletionTiming",
     "RtcDecodedPolicyExecutor",
     "RtcFrontendLifecycleTransition",
     "RtcFrontendStep",

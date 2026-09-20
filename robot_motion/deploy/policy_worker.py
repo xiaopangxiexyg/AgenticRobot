@@ -333,6 +333,8 @@ class PolicyWorkerCompletion:
     worker_session_id: str
     request_id: str
     work_item_hash: str
+    request_admitted_at: float
+    work_submitted_at: float
     worker_started_at: float
     worker_completed_at: float
     released_at: float
@@ -355,6 +357,9 @@ class PolicyWorkerCompletion:
                 "released_at": self.released_at,
                 "result_hash": self.result.semantic_content_hash,
             },
+            # request_admitted_at and work_submitted_at are already bound by
+            # work_item_hash.  Keep them as direct diagnostic fields without
+            # introducing another redundant completion hash domain.
             domain=POLICY_WORKER_COMPLETION_HASH_DOMAIN_V2,
         )
 
@@ -811,6 +816,8 @@ class BoundedPolicyInferenceWorker:
                     worker_session_id=self.worker_session_id,
                     request_id=work_item.request.request_id,
                     work_item_hash=work_item.semantic_content_hash,
+                    request_admitted_at=work_item.request.admitted_at,
+                    work_submitted_at=work_item.submitted_at,
                     worker_started_at=started_at,
                     worker_completed_at=completed_at,
                     released_at=released_at,

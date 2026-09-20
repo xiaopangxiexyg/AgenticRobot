@@ -1966,18 +1966,18 @@ def _hold_active_rtc_gap(
 
 def _rtc_active_completion_latency_sec(
     *,
-    inference_started_at: float,
-    released_at: float,
+    request_admitted_at: float,
+    result_admitted_at: float,
 ) -> float:
-    """Return one trustworthy end-to-end Active RTC latency sample."""
+    """Return one full request-to-control-admission RTC latency sample."""
 
-    started = float(inference_started_at)
-    released = float(released_at)
-    if not math.isfinite(started) or not math.isfinite(released):
+    request_at = float(request_admitted_at)
+    result_at = float(result_admitted_at)
+    if not math.isfinite(request_at) or not math.isfinite(result_at):
         raise ValueError("RTC Active completion timestamps must be finite.")
-    if released < started:
-        raise ValueError("RTC Active completion release predates inference start.")
-    return released - started
+    if result_at < request_at:
+        raise ValueError("RTC Active result admission predates request admission.")
+    return result_at - request_at
 
 
 def _rtc_active_latency_gate_result(
@@ -5750,11 +5750,17 @@ def main(
                         ):
                             timing_failure = False
                             try:
+                                if rtc_step.completion_timing is None:
+                                    raise ValueError(
+                                        "completion timing decomposition is missing"
+                                    )
                                 latency_sec = _rtc_active_completion_latency_sec(
-                                    inference_started_at=(
-                                        rtc_step.completion.worker_started_at
+                                    request_admitted_at=(
+                                        rtc_step.completion_timing.request_admitted_at
                                     ),
-                                    released_at=rtc_step.completion.released_at,
+                                    result_admitted_at=(
+                                        rtc_step.completion_timing.result_admitted_at
+                                    ),
                                 )
                             except (TypeError, ValueError) as exc:
                                 invalid_timing_reason = (

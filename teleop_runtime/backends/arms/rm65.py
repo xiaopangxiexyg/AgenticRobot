@@ -1832,6 +1832,18 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_planner_policy_mode = "linear"
         self._stream_planner_policy_speed_scale = 1.0
         self._stream_planner_policy_reason = "normal"
+        # Ending a target also ends its contiguous send-rate interval.  An
+        # operator may legitimately leave the stream idle while confirming
+        # readiness or while RTC has no executable reference.  Carrying the
+        # previous send timestamp/warning across that idle gap makes the first
+        # command of the next target look like a 0.x Hz stream and can
+        # incorrectly fail backend health admission before its first periodic
+        # send.  Preserve cumulative counters/statistics, but start the next
+        # target with a fresh cadence baseline.
+        self._stream_last_send_perf_time = None
+        self._stream_last_send_dt_sec = None
+        self._stream_actual_hz = None
+        self._stream_warning = None
 
     def _reject_stale_target_locked(self) -> None:
         """Preserve the rejected lineage until cancellation drain observes it."""

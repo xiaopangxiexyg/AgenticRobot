@@ -396,7 +396,7 @@ def test_rtc_position_executor_recovery_classifier_is_narrow() -> None:
 
 
 @pytest.mark.parametrize(
-    ("inference_started_at", "released_at"),
+    ("request_admitted_at", "result_admitted_at"),
     (
         (float("nan"), 10.0),
         (10.0, float("nan")),
@@ -405,35 +405,35 @@ def test_rtc_position_executor_recovery_classifier_is_narrow() -> None:
     ),
 )
 def test_active_rtc_completion_latency_rejects_nonfinite_timestamps(
-    inference_started_at: float,
-    released_at: float,
+    request_admitted_at: float,
+    result_admitted_at: float,
 ) -> None:
     with pytest.raises(ValueError, match="timestamps must be finite"):
         run_policy._rtc_active_completion_latency_sec(
-            inference_started_at=inference_started_at,
-            released_at=released_at,
+            request_admitted_at=request_admitted_at,
+            result_admitted_at=result_admitted_at,
         )
 
 
 def test_active_rtc_completion_latency_preserves_valid_elapsed_time() -> None:
     assert run_policy._rtc_active_completion_latency_sec(
-        inference_started_at=10.0,
-        released_at=10.399999,
+        request_admitted_at=10.0,
+        result_admitted_at=10.399999,
     ) == pytest.approx(0.399999)
     assert (
         run_policy._rtc_active_completion_latency_sec(
-            inference_started_at=10.0,
-            released_at=10.0,
+            request_admitted_at=10.0,
+            result_admitted_at=10.0,
         )
         == 0.0
     )
 
 
 def test_active_rtc_completion_latency_rejects_reversed_timestamps() -> None:
-    with pytest.raises(ValueError, match="release predates inference start"):
+    with pytest.raises(ValueError, match="result admission predates request admission"):
         run_policy._rtc_active_completion_latency_sec(
-            inference_started_at=10.0,
-            released_at=9.999999,
+            request_admitted_at=10.0,
+            result_admitted_at=9.999999,
         )
 
 
