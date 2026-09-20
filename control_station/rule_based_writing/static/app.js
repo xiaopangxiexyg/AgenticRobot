@@ -49,7 +49,7 @@ let collectionMode = "rule_based_writing";
 const configurationInputs = () => [
   "full-replay-source", "pre-pen-down-source", "pre-pen-down-normal-episodes", "pen-down-source", "write-source", "pen-up-source", "trajectory",
   "direction", "writing-size", "writing-speed", "alignment-speed-input",
-  "tactile-bundle-root", "tactile-min-free", "tactile-compression",
+  "collect-tactile", "tactile-bundle-root", "tactile-min-free", "tactile-compression",
   "writer-workers", "writer-queue-size", "process-queue-size",
   "storage-queue-size", "storage-queue-enqueue-timeout", "camera-frame-max-age", "collection-warning-hz", "write-parquet", "write-video",
   "collection-flush-timeout", "sample-drain-timeout", "terminal-event-timeout",
@@ -150,6 +150,11 @@ async function loadOptions() {
   });
   const info = options.runtime_info || {};
   const free = info.tactile_bundle_free_gb;
+  const collectTactile = document.getElementById("collect-tactile");
+  collectTactile.disabled = Boolean(info.tactile_capture_locked);
+  collectTactile.title = info.tactile_capture_locked
+    ? `当前数据集已锁定触觉模式：${info.tactile_capture_mode || "existing"}`
+    : "空数据集可选择是否采集触觉";
   text("sample-hz", info.sample_hz == null ? null : `${Number(info.sample_hz).toFixed(1)} Hz`);
   text(
     "position-reference-hz",
@@ -158,7 +163,8 @@ async function loadOptions() {
   text("arm-control-hz", info.arm_control_hz == null ? null : `${Number(info.arm_control_hz).toFixed(1)} Hz`);
   text(
     "storage-status",
-    `正式数据集：${info.dataset_root || "—"}；触觉盘当前可用：${free == null ? "未知" : `${Number(free).toFixed(1)} GiB`}`,
+    `正式数据集：${info.dataset_root || "—"}；触觉模式：${info.tactile_capture_mode || "—"}`
+      + `；触觉盘当前可用：${free == null ? "未知" : `${Number(free).toFixed(1)} GiB`}`,
   );
   optionsLoaded = true;
   if (latestState) syncConfiguration(latestState);
@@ -178,6 +184,7 @@ function syncConfiguration(state) {
   if (selected.writing_size_m != null) document.getElementById("writing-size").value = selected.writing_size_m;
   if (selected.writing_speed_m_s != null) document.getElementById("writing-speed").value = selected.writing_speed_m_s;
   if (selected.initial_alignment_speed_scale != null) document.getElementById("alignment-speed-input").value = selected.initial_alignment_speed_scale;
+  document.getElementById("collect-tactile").checked = Boolean(selected.collect_tactile);
   document.getElementById("tactile-bundle-root").value = selected.tactile_bundle_root || "";
   if (selected.tactile_bundle_min_free_gb != null) document.getElementById("tactile-min-free").value = selected.tactile_bundle_min_free_gb;
   if (selected.tactile_compression != null) document.getElementById("tactile-compression").value = selected.tactile_compression;
@@ -198,6 +205,7 @@ function syncConfiguration(state) {
 function currentConfiguration() {
   const shared = {
     initial_alignment_speed_scale: Number(document.getElementById("alignment-speed-input").value),
+    collect_tactile: document.getElementById("collect-tactile").checked,
     tactile_bundle_root: document.getElementById("tactile-bundle-root").value.trim(),
     tactile_bundle_min_free_gb: Number(document.getElementById("tactile-min-free").value),
     tactile_compression: document.getElementById("tactile-compression").value,

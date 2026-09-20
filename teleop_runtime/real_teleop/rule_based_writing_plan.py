@@ -22,6 +22,11 @@ from typing import Any
 
 import numpy as np
 
+from dataset_contracts.capture_modalities import CaptureModalityContract
+from dataset_interface.capture_modalities import (
+    dataset_is_blank,
+    read_capture_modality_contract,
+)
 from dataset_contracts.rule_based_writing_sources import (
     RULE_BASED_WRITING_SOURCE_PHASES_V1,
     RuleBasedWritingSourceCandidateV1,
@@ -107,6 +112,7 @@ DEFAULT_COLLECTION_FLUSH_TIMEOUT_SEC = 30.0
 DEFAULT_COLLECTION_SAMPLE_DRAIN_TIMEOUT_SEC = 30.0
 DEFAULT_COLLECTION_TERMINAL_EVENT_PUT_TIMEOUT_SEC = 0.5
 DEFAULT_COLLECTION_STORAGE_QUEUE_ENQUEUE_TIMEOUT_SEC = 1.0
+DEFAULT_RULE_TACTILE_MIN_FREE_GB = 10.0
 
 RULE_COLLECTION_MODE_WRITING = "rule_based_writing"
 RULE_COLLECTION_MODE_FULL_REPLAY = "full_trajectory_replay"
@@ -123,6 +129,7 @@ PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID = (
 )
 
 _RULE_GUI_SHARED_RUNTIME_CONFIGURATION_FIELDS = (
+    "collect_tactile",
     "tactile_bundle_root",
     "tactile_bundle_min_free_gb",
     "tactile_compression",
@@ -236,6 +243,157 @@ class _LoadedWritingSource:
     actual_tcp: Mapping[str, np.ndarray]
     source_contract_hash: str
     metadata: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class RuleTactileCaptureResolution:
+    """Effective tactile policy for one rule-based dataset target.
+
+    The dataset-level capture contract is authoritative once a target contains
+    data.  This keeps a later run from appending tactile and non-tactile
+    episodes to the same dataset even when the operator changes the CLI/GUI
+    toggle.
+    """
+
+    contract: CaptureModalityContract
+    mode: str
+    source: str
+    locked: bool
+
+    @property
+    def collect_tactile(self) -> bool:
+        return set(self.contract.ignored_tactile_keys) != {"left", "right"}
+
+
+def _resolve_rule_tactile_capture(
+    args: argparse.Namespace,
+    *,
+    requested: bool | None = None,
+) -> RuleTactileCaptureResolution:
+    """Resolve rule tactile capture without mixing a populated dataset.
+
+    A blank target follows the explicit rule toggle, existing ``--ignore-tactile``
+    values, or (for backwards compatibility) whether a tactile bundle root was
+    supplied.  A populated target always follows its persisted contract; legacy
+    populated targets without that declaration retain the historical complete
+    tactile contract.
+    """
+
+    dataset_text = str(getattr(args, "dataset_root", "") or "").strip()
+    if not dataset_text:
+        raise ValueError("rule-based tactile resolution requires --dataset-root.")
+    dataset_root = Path(dataset_text).expanduser()
+    current_camera_keys = tuple(getattr(args, "ignore_camera", ()) or ())
+    existing = read_capture_modality_contract(dataset_root)
+    blank = dataset_is_blank(dataset_root)
+    if not blank:
+        if existing is None:
+            contract = CaptureModalityContract(
+                ignored_camera_keys=current_camera_keys,
+                ignored_tactile_keys=(),
+            )
+            source = "legacy_populated_dataset"
+        else:
+            contract = existing
+            source = "existing_dataset_contract"
+        mode = (
+            "enabled"
+            if not contract.ignored_tactile_keys
+            else "disabled"
+            if set(contract.ignored_tactile_keys) == {"left", "right"}
+            else "existing_partial"
+        )
+        return RuleTactileCaptureResolution(
+            contract=contract,
+            mode=mode,
+            source=source,
+            locked=True,
+        )
+
+    if requested is None:
+        requested = getattr(args, "rule_collect_tactile", None)
+    if requested is not None:
+        ignored_tactile_keys = () if bool(requested) else ("left", "right")
+        source = "rule_option"
+    else:
+        current_tactile_keys = tuple(getattr(args, "ignore_tactile", ()) or ())
+        if current_tactile_keys:
+            ignored_tactile_keys = current_tactile_keys
+            source = "cli_ignore_tactile"
+        else:
+            explicit_dmtac_tactile = getattr(args, "dmtac_tactile", None)
+            if explicit_dmtac_tactile is not None:
+                ignored_tactile_keys = (
+                    () if bool(explicit_dmtac_tactile) else ("left", "right")
+                )
+                source = "cli_dmtac_tactile"
+            else:
+                # The previous rule launcher always required a tactile root.
+                # Keep that behavior when a root is present, while making a
+                # root-less invocation a valid explicit no-tactile collection.
+                has_tactile_root = bool(
+                    str(getattr(args, "tactile_bundle_root", "") or "").strip()
+                )
+                ignored_tactile_keys = () if has_tactile_root else ("left", "right")
+                source = "default_with_root" if has_tactile_root else "default_without_root"
+    contract = CaptureModalityContract(
+        ignored_camera_keys=current_camera_keys,
+        ignored_tactile_keys=ignored_tactile_keys,
+    )
+    mode = (
+        "enabled"
+        if not contract.ignored_tactile_keys
+        else "disabled"
+        if set(contract.ignored_tactile_keys) == {"left", "right"}
+        else "partial"
+    )
+    return RuleTactileCaptureResolution(
+        contract=contract,
+        mode=mode,
+        source=source,
+        locked=False,
+    )
+
+
+def _apply_rule_tactile_capture_resolution(
+    args: argparse.Namespace,
+    resolution: RuleTactileCaptureResolution,
+) -> RuleTactileCaptureResolution:
+    """Apply one resolved policy to the existing runtime argument namespace."""
+
+    # The persisted contract covers camera omissions as well.  Restore the
+    # complete contract before the recorder binds it again, otherwise an old
+    # dataset with a camera ignore rule could fail append admission even when
+    # only the tactile setting was changed in the UI.
+    args.ignore_camera = list(resolution.contract.ignored_camera_keys)
+    args.ignore_tactile = list(resolution.contract.ignored_tactile_keys)
+    args.rule_collect_tactile = bool(resolution.collect_tactile)
+    args.rule_tactile_capture_mode = resolution.mode
+    args.rule_tactile_capture_source = resolution.source
+    if not resolution.collect_tactile:
+        args.dmtac_tactile = False
+        args.tactile_bundle_root = ""
+        args.tactile_bundle_min_free_gb = 0.0
+        args.tactile_artifact_integrity = False
+        args.idle_tactile_compression = False
+        return resolution
+
+    tactile_root = str(getattr(args, "tactile_bundle_root", "") or "").strip()
+    if not tactile_root:
+        raise ValueError(
+            "当前规则数据集要求采集触觉，但未配置 --tactile-bundle-root；"
+            "请提供已有触觉 Bundle 根目录，不能与无触觉数据混采。"
+        )
+    args.dmtac_tactile = True
+    minimum_source = str(
+        getattr(args, "tactile_bundle_min_free_source", "default") or "default"
+    )
+    minimum_free_gb = float(
+        getattr(args, "tactile_bundle_min_free_gb", 0.0) or 0.0
+    )
+    if minimum_source == "default" and minimum_free_gb <= 0.0:
+        args.tactile_bundle_min_free_gb = DEFAULT_RULE_TACTILE_MIN_FREE_GB
+    return resolution
 
 
 def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
@@ -370,6 +528,16 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Initial dual-arm-to-source-start speed multiplier in (0, 1]. "
             "The certified RM65 joint/position limits remain the upper bound."
+        ),
+    )
+    group.add_argument(
+        "--rule-collect-tactile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether this rule-based run records DMTAC tactile data. On a "
+            "populated dataset, the existing dataset modality contract takes "
+            "precedence and prevents mixed tactile/non-tactile Episodes."
         ),
     )
 
@@ -1640,6 +1808,7 @@ def _rule_configuration_options(
     source_specs: Mapping[str, ResolvedRuleBasedWritingSourceCandidate],
     resolved_writing_speed_m_s: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    tactile_resolution = _resolve_rule_tactile_capture(args)
     additional_catalog_path = _additional_fixed_trajectory_catalog_path(args)
     manifest = getattr(args, "rule_source_pool_manifest", None)
     if manifest is None:
@@ -1659,9 +1828,11 @@ def _rule_configuration_options(
         ]
         for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1
     }
-    tactile_bundle_root = str(
-        getattr(args, "tactile_bundle_root", "") or ""
-    ).strip()
+    tactile_bundle_root = (
+        str(getattr(args, "tactile_bundle_root", "") or "").strip()
+        if tactile_resolution.collect_tactile
+        else ""
+    )
     tactile_bundle_free_gb: float | None = None
     if tactile_bundle_root:
         try:
@@ -1774,7 +1945,7 @@ def _rule_configuration_options(
         "select_fields": {
             "tactile_compression": ["none", "lz4", "zstd"],
         },
-        "boolean_fields": ["write_parquet", "write_video"],
+        "boolean_fields": ["collect_tactile", "write_parquet", "write_video"],
         "text_fields": ["tactile_bundle_root"],
         "numeric_bounds": {
             "writing_size_m": [
@@ -1832,6 +2003,9 @@ def _rule_configuration_options(
         "runtime_info": {
             "dataset_root": str(getattr(args, "dataset_root", "") or ""),
             "tactile_bundle_free_gb": tactile_bundle_free_gb,
+            "tactile_capture_mode": tactile_resolution.mode,
+            "tactile_capture_source": tactile_resolution.source,
+            "tactile_capture_locked": bool(tactile_resolution.locked),
             "sample_hz": float(getattr(args, "hz", 15.0)),
             "position_reference_hz": effective_position_reference_hz(args),
             "outer_control_hz": effective_outer_control_hz(args),
@@ -1857,6 +2031,7 @@ def _rule_configuration_options(
             "initial_alignment_speed_scale": float(
                 getattr(args, "rule_initial_alignment_speed_scale", 1.0)
             ),
+            "collect_tactile": bool(tactile_resolution.collect_tactile),
             "tactile_bundle_root": tactile_bundle_root,
             "tactile_bundle_min_free_gb": current_min_free_gb,
             "tactile_compression": str(
@@ -1942,9 +2117,29 @@ def _apply_rule_gui_runtime_configuration(
         value = configuration.get(name, getattr(target, name, default))
         return float(value)
 
+    requested_tactile = configuration.get(
+        "collect_tactile",
+        getattr(target, "rule_collect_tactile", None),
+    )
+    tactile_resolution = _resolve_rule_tactile_capture(
+        target,
+        requested=(None if requested_tactile is None else bool(requested_tactile)),
+    )
     patch: dict[str, object] = {
+        "collect_tactile": bool(tactile_resolution.collect_tactile),
+        "ignore_tactile": list(tactile_resolution.contract.ignored_tactile_keys),
+        "rule_collect_tactile": bool(tactile_resolution.collect_tactile),
+        "rule_tactile_capture_mode": tactile_resolution.mode,
+        "rule_tactile_capture_source": tactile_resolution.source,
         "tactile_bundle_min_free_gb": float(
-            configuration["tactile_bundle_min_free_gb"]
+            configuration.get(
+                "tactile_bundle_min_free_gb",
+                getattr(
+                    target,
+                    "tactile_bundle_min_free_gb",
+                    DEFAULT_RULE_TACTILE_MIN_FREE_GB,
+                ),
+            )
         ),
         "tactile_compression": str(configuration["tactile_compression"]),
         "writer_workers": int(configuration["writer_workers"]),
@@ -1989,7 +2184,18 @@ def _apply_rule_gui_runtime_configuration(
     }
     if "writing_speed_m_s" in configuration:
         patch["rule_writing_speed_m_s"] = float(configuration["writing_speed_m_s"])
-    configured_root = str(configuration["tactile_bundle_root"] or "").strip()
+    if not tactile_resolution.collect_tactile:
+        patch["dmtac_tactile"] = False
+        patch["tactile_bundle_root"] = ""
+        patch["tactile_bundle_min_free_gb"] = 0.0
+        patch["tactile_artifact_integrity"] = False
+        patch["idle_tactile_compression"] = False
+        for key, value in patch.items():
+            setattr(target, key, value)
+        return patch
+
+    patch["dmtac_tactile"] = True
+    configured_root = str(configuration.get("tactile_bundle_root", "") or "").strip()
     minimum_free_gb = float(patch["tactile_bundle_min_free_gb"])
     if not configured_root:
         if minimum_free_gb > 0.0:
@@ -2402,6 +2608,15 @@ def build_rule_based_writing(
     deployment: RuleBasedRealTeleopDeployment | None = None,
     enable_prestart_configuration: bool = True,
 ) -> RuleBasedWritingBuild:
+    tactile_resolution = _resolve_rule_tactile_capture(args)
+    _apply_rule_tactile_capture_resolution(args, tactile_resolution)
+    print(
+        "[RuleBased] tactile_capture="
+        f"{tactile_resolution.mode} "
+        f"source={tactile_resolution.source} "
+        f"locked={str(tactile_resolution.locked).lower()} "
+        f"ignored_sides={list(tactile_resolution.contract.ignored_tactile_keys)}"
+    )
     deployment = deployment or preflight_rule_based_real_teleop_deployment(args)
     collection_mode = str(
         getattr(args, "rule_collection_mode", RULE_COLLECTION_MODE_WRITING)
@@ -3051,6 +3266,7 @@ __all__ = [
     "FixedWritingActionSource",
     "HEIGHT_DESCENT_STEP_ID",
     "RuleBasedWritingBuild",
+    "RuleTactileCaptureResolution",
     "StageSpan",
     "add_rule_based_writing_arguments",
     "build_rule_based_writing",

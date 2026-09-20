@@ -5,8 +5,7 @@ usage() {
   cat <<'EOF'
 Usage:
   bash scripts/run_rule_based_writing_collection.sh \
-    --source-pool-manifest /absolute/source-pool.json \
-    --tactile-bundle-root /absolute/tactile/root [options]
+    --source-pool-manifest /absolute/source-pool.json [options]
 
 Required:
   --source-pool-manifest P    Cross-dataset source candidate pool; or
@@ -14,7 +13,8 @@ Required:
   --source-episode N          source episode index.
   --detail-annotation-dir P   Exact immutable annotation-set directory; required
                               only in rule-based-writing legacy mode.
-  --tactile-bundle-root PATH  Existing external tactile output root.
+  --tactile-bundle-root PATH  Existing external tactile output root; required
+                              only when effective tactile capture is enabled.
 
 Options:
   --mode NAME                 rule-based-writing (default) or full-replay.
@@ -30,6 +30,11 @@ Options:
   --speed-m-s MPS             Writing mode only; override source average speed.
   --initial-alignment-speed-scale S
                               Initial dual-arm alignment speed multiplier in (0, 1].
+  --collect-tactile            Request tactile capture for a new/blank dataset.
+  --no-collect-tactile         Request no tactile capture for a new/blank dataset.
+                              A populated target always follows its existing
+                              dataset modality contract. Without a tactile root,
+                              the launcher defaults to this mode.
   --source-pool-range A:B     Half-open candidate range (default: whole pool).
   --selection-seed N          Deterministic source selection seed (default: 0).
   --pre-pen-down-replay-candidate-id ID
@@ -39,7 +44,7 @@ Options:
                               Successful normal Episodes before one configured
                               pre-pen-down replay (default: 0, replay every Episode).
   --task-name NAME            Output collection task name.
-  --tactile-min-free-gb N     Required tactile free space (default: 200).
+  --tactile-min-free-gb N     Required tactile free space (default: 10).
   --camera-frame-max-age-sec S
                               Maximum admitted RGB frame age (default: 0.25).
   --with-left-gripper         Also connect/capture the saved left DMTAC stack.
@@ -87,7 +92,9 @@ INITIAL_ALIGNMENT_SPEED_SCALE="1.0"
 LEFT_GRIPPER_PORT=""
 RIGHT_GRIPPER_PORT=""
 TASK_NAME="rule_based_writing"
-TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-200}"
+TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-10}"
+TACTILE_MIN_FREE_EXPLICIT=0
+COLLECT_TACTILE=""
 CAMERA_FRAME_MAX_AGE_SEC="0.25"
 WITH_LEFT_GRIPPER=0
 DRY_RUN=0
@@ -148,11 +155,26 @@ while [[ $# -gt 0 ]]; do
   option="$1"
   if [[ -n "${VALUE_OPTION_TARGET[$option]+present}" ]]; then
     [[ $# -ge 2 ]] || die "$option requires ${VALUE_OPTION_HINT[$option]}."
+    if [[ "$option" == "--tactile-min-free-gb" ]]; then
+      TACTILE_MIN_FREE_EXPLICIT=1
+    fi
     printf -v "${VALUE_OPTION_TARGET[$option]}" '%s' "$2"
     shift 2
     continue
   fi
   case "$1" in
+    --collect-tactile)
+      [[ -z "$COLLECT_TACTILE" ]] || die \
+        "--collect-tactile and --no-collect-tactile are mutually exclusive."
+      COLLECT_TACTILE=1
+      shift
+      ;;
+    --no-collect-tactile)
+      [[ -z "$COLLECT_TACTILE" ]] || die \
+        "--collect-tactile and --no-collect-tactile are mutually exclusive."
+      COLLECT_TACTILE=0
+      shift
+      ;;
     --with-left-gripper)
       WITH_LEFT_GRIPPER=1
       shift
@@ -193,10 +215,20 @@ if [[ "$COLLECTION_MODE" == "full-replay" && "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISOD
   die "--pre-pen-down-replay-normal-episodes is not valid in full-replay mode."
 fi
 
-[[ -n "$TACTILE_ROOT" ]] || die "--tactile-bundle-root is required."
-[[ "$TACTILE_ROOT" == /* ]] || die "tactile root must be absolute."
-[[ -d "$TACTILE_ROOT" ]] || die "tactile root does not exist: $TACTILE_ROOT"
-[[ ! -L "$TACTILE_ROOT" ]] || die "tactile root must not be a symlink."
+if [[ -n "$TACTILE_ROOT" ]]; then
+  [[ "$TACTILE_ROOT" == /* ]] || die "tactile root must be absolute."
+  [[ -d "$TACTILE_ROOT" ]] || die "tactile root does not exist: $TACTILE_ROOT"
+  [[ ! -L "$TACTILE_ROOT" ]] || die "tactile root must not be a symlink."
+fi
+if [[ "$COLLECT_TACTILE" == "1" && -z "$TACTILE_ROOT" ]]; then
+  die "--collect-tactile requires --tactile-bundle-root."
+fi
+if [[ -z "$TACTILE_ROOT" && "$TACTILE_MIN_FREE_EXPLICIT" -eq 1 && "$TACTILE_MIN_FREE_GB" != "0" ]]; then
+  die "--tactile-min-free-gb requires --tactile-bundle-root."
+fi
+if [[ -z "$TACTILE_ROOT" && "$TACTILE_MIN_FREE_EXPLICIT" -eq 0 ]]; then
+  TACTILE_MIN_FREE_GB="0"
+fi
 [[ "$SELECTION_SEED" =~ ^-?[0-9]+$ ]] || die "selection seed must be an integer."
 [[ "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" =~ ^[0-9]+$ ]] || \
   die "pre-pen-down replay normal Episodes must be a non-negative integer."
@@ -281,6 +313,12 @@ RULE_ARGS=(
   --rule-collection-mode "$RULE_COLLECTION_MODE"
   --rule-initial-alignment-speed-scale "$INITIAL_ALIGNMENT_SPEED_SCALE"
 )
+if [[ "$COLLECT_TACTILE" == "1" ]]; then
+  RULE_ARGS+=(--rule-collect-tactile --dmtac-with-tactile)
+elif [[ "$COLLECT_TACTILE" == "0" || -z "$TACTILE_ROOT" ]]; then
+  RULE_ARGS+=(--no-rule-collect-tactile --dmtac-no-tactile)
+  RULE_ARGS+=(--ignore-tactile left --ignore-tactile right)
+fi
 if [[ "$COLLECTION_MODE" == "rule-based-writing" ]]; then
   RULE_ARGS+=(
     --rule-writing-trajectory "$TRAJECTORY"
@@ -318,6 +356,15 @@ else
 fi
 if [[ -n "$SPEED_M_S" && "$COLLECTION_MODE" == "rule-based-writing" ]]; then
   RULE_ARGS+=(--rule-writing-speed-m-s "$SPEED_M_S")
+fi
+
+TACTILE_RUNTIME_ARGS=()
+if [[ -n "$TACTILE_ROOT" && "$COLLECT_TACTILE" != "0" ]]; then
+  TACTILE_RUNTIME_ARGS=(
+    "${DMTAC_CAPTURE_COMMON_ARGS[@]}"
+    "${DMTAC_A_ARGS[@]}"
+    "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}"
+  )
 fi
 
 LEFT_HAND_BACKEND=none
@@ -363,9 +410,7 @@ fi
 
 TELEOP_ARGS=(
   "${RULE_COMMON_REAL_TELEOP_ARGS[@]}"
-  "${DMTAC_CAPTURE_COMMON_ARGS[@]}"
-  "${DMTAC_A_ARGS[@]}"
-  "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}"
+  "${TACTILE_RUNTIME_ARGS[@]}"
   "${DATASET_COMMON_ARGS[@]}"
   # Rule replay already publishes one safe 60 Hz reference stream and the
   # established acceleration planner updates it without blocking the 120 Hz
@@ -427,5 +472,5 @@ printf '%s\n' \
   "[RuleBased] detail_annotation_dir=${DETAIL_ANNOTATION_DIR:-pool_selected}" \
   "[RuleBased] gripper_port_override left=${LEFT_GRIPPER_PORT:-assignment} right=${RIGHT_GRIPPER_PORT:-assignment}" \
   "[RuleBased] trajectory=$TRAJECTORY catalog=${TRAJECTORY_CATALOG:-builtin} size_m=$SIZE_M direction=$DIRECTION speed_m_s=${SPEED_M_S:-source_average}" \
-  "[RuleBased] output_dataset_root=$DATASET_BASE tactile_root=$TACTILE_BUNDLE_ROOT"
+  "[RuleBased] output_dataset_root=$DATASET_BASE tactile_request=${COLLECT_TACTILE:-dataset_contract_or_default} tactile_root=$TACTILE_BUNDLE_ROOT min_free_gb=$TACTILE_MIN_FREE_GB"
 exec "${RUN_COMMAND[@]}"

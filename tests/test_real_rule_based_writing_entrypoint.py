@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -555,6 +556,7 @@ def test_gui_writer_configuration_is_staged_then_committed_to_live_args(
     assert options["runtime_info"]["arm_control_hz"] == pytest.approx(120.0)
     configured = {
         **selected,
+        "collect_tactile": True,
         "writing_speed_m_s": 0.05,
         "tactile_bundle_root": str(tactile_root),
         "tactile_bundle_min_free_gb": 0.0,
@@ -609,6 +611,7 @@ def test_gui_tactile_threshold_validation_rejects_currently_unavailable_reserve(
         lambda _path: SimpleNamespace(free=10 * 1024**3),
     )
     configuration = {
+        "collect_tactile": True,
         "writing_speed_m_s": 0.05,
         "tactile_bundle_root": str(tactile_root),
         "tactile_bundle_min_free_gb": 20.0,
@@ -628,6 +631,128 @@ def test_gui_tactile_threshold_validation_rejects_currently_unavailable_reserve(
             configuration,
         )
     assert not hasattr(target, "rule_writing_speed_m_s")
+
+
+def test_rule_tactile_toggle_is_explicit_for_blank_dataset(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "formal"
+    tactile_root = tmp_path / "tactile"
+    dataset_root.mkdir()
+    tactile_root.mkdir()
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=False,
+        tactile_bundle_root=str(tactile_root),
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=True,
+    )
+
+    resolution = rule_based_plan._resolve_rule_tactile_capture(args)
+    assert resolution.mode == "disabled"
+    rule_based_plan._apply_rule_tactile_capture_resolution(args, resolution)
+
+    assert args.ignore_tactile == ["left", "right"]
+    assert args.dmtac_tactile is False
+    assert args.tactile_bundle_root == ""
+    assert args.tactile_bundle_min_free_gb == 0.0
+
+
+def test_rule_tactile_toggle_defaults_to_ten_gib_when_root_is_present(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "formal"
+    tactile_root = tmp_path / "tactile"
+    dataset_root.mkdir()
+    tactile_root.mkdir()
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=None,
+        tactile_bundle_root=str(tactile_root),
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=False,
+    )
+
+    resolution = rule_based_plan._resolve_rule_tactile_capture(args)
+    rule_based_plan._apply_rule_tactile_capture_resolution(args, resolution)
+
+    assert resolution.mode == "enabled"
+    assert args.dmtac_tactile is True
+    assert args.tactile_bundle_min_free_gb == pytest.approx(10.0)
+
+
+def test_rule_tactile_cli_disable_wins_over_legacy_root_default(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "formal"
+    tactile_root = tmp_path / "tactile"
+    dataset_root.mkdir()
+    tactile_root.mkdir()
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=None,
+        dmtac_tactile=False,
+        tactile_bundle_root=str(tactile_root),
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=True,
+    )
+
+    resolution = rule_based_plan._resolve_rule_tactile_capture(args)
+
+    assert resolution.mode == "disabled"
+    assert resolution.source == "cli_dmtac_tactile"
+    rule_based_plan._apply_rule_tactile_capture_resolution(args, resolution)
+    assert args.dmtac_tactile is False
+    assert args.tactile_bundle_root == ""
+
+
+def test_populated_dataset_contract_overrides_requested_tactile_mode(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "formal"
+    dataset_root.mkdir()
+    (dataset_root / "meta").mkdir()
+    from dataset_interface.capture_modalities import bind_capture_modality_contract
+    from dataset_contracts.capture_modalities import CaptureModalityContract
+
+    bind_capture_modality_contract(
+        dataset_root,
+        CaptureModalityContract(
+            ignored_camera_keys=("front",),
+            ignored_tactile_keys=("left", "right"),
+        ),
+    )
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps({"episode_count": 1}),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=True,
+        tactile_bundle_root="",
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=True,
+    )
+
+    resolution = rule_based_plan._resolve_rule_tactile_capture(args)
+
+    assert resolution.locked is True
+    assert resolution.source == "existing_dataset_contract"
+    assert resolution.mode == "disabled"
+    rule_based_plan._apply_rule_tactile_capture_resolution(args, resolution)
+    assert args.ignore_camera == ["front"]
+    assert args.rule_collect_tactile is False
+    assert args.ignore_tactile == ["left", "right"]
 
 
 def test_dual_dmtac_plan_replays_continuous_three_phase_gripper_trajectories(
@@ -1086,6 +1211,85 @@ def test_launcher_accepts_latin_and_additional_trajectory_catalog(
     assert result.returncode == 0, result.stderr
     assert f"--rule-writing-trajectory-catalog {catalog}" in result.stdout
     assert "--rule-writing-trajectory custom_zigzag_v1" in result.stdout
+
+
+def test_launcher_supports_explicit_tactile_modes_and_ten_gib_default(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+
+    enabled = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    disabled = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--no-collect-tactile",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    default_no_root = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, TACTILE_BUNDLE_ROOT="", TACTILE_BUNDLE_MIN_FREE_GB=""),
+    )
+
+    assert enabled.returncode == 0, enabled.stderr
+    assert "--tactile-bundle-min-free-gb 10" in enabled.stdout
+    assert "--rule-collect-tactile" not in enabled.stdout
+    assert disabled.returncode == 0, disabled.stderr
+    assert "--no-rule-collect-tactile" in disabled.stdout
+    assert "--dmtac-no-tactile" in disabled.stdout
+    assert "--ignore-tactile left" in disabled.stdout
+    assert "--tactile-bundle-min-free-gb 0" in disabled.stdout
+    assert default_no_root.returncode == 0, default_no_root.stderr
+    assert "--dmtac-with-tactile" not in default_no_root.stdout
+    assert "--tactile-bundle-min-free-gb 0" in default_no_root.stdout
 
 
 def test_build_appends_custom_catalog_and_records_provenance(
