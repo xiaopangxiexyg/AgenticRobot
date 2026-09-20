@@ -879,8 +879,8 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 451
-    assert sum(len(action.option_strings) for action in parser._actions) == 512
+    assert len(parser._actions) == 452
+    assert sum(len(action.option_strings) for action in parser._actions) == 513
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
     assert parser.parse_args([]).artifact_layout == "legacy"
