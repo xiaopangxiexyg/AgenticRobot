@@ -117,6 +117,32 @@ def test_injected_shared_control_leaves_existing_hold_contract_unchanged() -> No
     probe._validate_shared_control_integration(args, None)
 
 
+def test_gravity_debug_profile_copies_tuning_parameters_as_immutable_snapshot() -> None:
+    scales = [0.91, 0.92, 0.93, 0.94, 0.95, 0.96]
+    offsets = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06]
+    profile = probe.B601GravityCompensationDebugProfile.capture(
+        gravity_scale=0.87,
+        gravity_joint_scales=scales,
+        gravity_joint_offsets_rad=offsets,
+        gravity_joint_bias_nm=(0.0, -0.02, -0.03, -0.04, 0.0, 0.01),
+        gravity_coulomb_friction_nm=(0.01,) * 6,
+        gravity_coulomb_velocity_threshold_rad_s=0.02,
+        driver_kd_nm_s_per_rad=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+    )
+    scales[0] = 99.0
+    offsets[0] = 99.0
+
+    assert profile.gravity_scale == pytest.approx(0.87)
+    assert profile.gravity_joint_scales == pytest.approx(
+        (0.91, 0.92, 0.93, 0.94, 0.95, 0.96)
+    )
+    assert profile.gravity_joint_offsets_rad == pytest.approx(
+        (0.01, 0.02, 0.03, 0.04, 0.05, 0.06)
+    )
+    with pytest.raises(AttributeError):
+        profile.gravity_scale = 1.0  # type: ignore[misc]
+
+
 def test_condition_torque_applies_absolute_then_slew_limits() -> None:
     conditioned, torque_limited, slew_limited = probe.condition_torque(
         (10.0, -10.0, 0.1, 0.0, 0.0, 0.0),
@@ -3472,6 +3498,80 @@ def test_latched_fault_hold_uses_explicit_protective_hold_profile(
     assert non_hold is None
     assert full is None
     assert errors == []
+
+
+def test_gravity_debug_hold_uses_frozen_profile_over_mutable_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    frozen = probe.B601GravityCompensationDebugProfile.capture(
+        gravity_scale=0.83,
+        gravity_joint_scales=(0.8, 0.81, 0.82, 0.83, 0.84, 0.85),
+        gravity_joint_offsets_rad=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        gravity_joint_bias_nm=(0.01, -0.02, -0.03, -0.04, 0.05, 0.06),
+        gravity_coulomb_friction_nm=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        gravity_coulomb_velocity_threshold_rad_s=0.07,
+        driver_kd_nm_s_per_rad=(0.11, 0.12, 0.13, 0.14, 0.15, 0.16),
+    )
+    observed: dict[str, object] = {}
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        observed.update(kwargs)
+        return _fault_hold_command_receipt(accepted=True), (0.0,) * 6, (0.0,) * 6
+
+    class FakeBackend:
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            raise AssertionError(f"unexpected safe_stop for {joint_names}")
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=object(),
+        # Deliberately conflicting mutable/legacy arguments.  The explicit
+        # debug snapshot is the only source allowed to win in this mode.
+        gravity_scale=1.0,
+        gravity_joint_scales=(1.0,) * 6,
+        gravity_joint_offsets_rad=(0.0,) * 6,
+        gravity_joint_bias_nm=(0.0,) * 6,
+        gravity_coulomb_friction_nm=(0.0,) * 6,
+        gravity_coulomb_velocity_threshold_rad_s=0.0,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+        gravity_debug_profile=frozen,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=1,
+        operator_interrupt=True,
+    )
+
+    assert result[0] == 1
+    assert result[-1] == []
+    assert observed["gravity_scale"] == pytest.approx(0.83)
+    assert observed["gravity_joint_scales"] == frozen.gravity_joint_scales
+    assert observed["gravity_joint_offsets_rad"] == frozen.gravity_joint_offsets_rad
+    assert observed["gravity_joint_bias_nm"] == frozen.gravity_joint_bias_nm
+    assert observed["gravity_coulomb_friction_nm"] == (
+        frozen.gravity_coulomb_friction_nm
+    )
+    assert observed["gravity_coulomb_velocity_threshold_rad_s"] == pytest.approx(
+        0.07
+    )
+    assert observed["driver_kd_nm_s_per_rad"] == frozen.driver_kd_nm_s_per_rad
 
 
 def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(

@@ -145,6 +145,7 @@ def test_owner_launcher_requires_explicit_motion_acknowledgement() -> None:
     assert args.mode == "hold"
     assert args.feedback_source == "active-report"
     assert args.driver_kd == owner.DEFAULT_DRIVER_KD
+    assert args.gravity_debug_mode is False
 
 
 def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path) -> None:
@@ -158,6 +159,7 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
     assert "--allow-active-report" in command
     assert "--auto-disable-active-report" in command
     assert "--apply-driver-torque-limits" in command
+    assert "--gravity-debug-mode" not in command
     assert (
         command[command.index("--confirmation") + 1]
         == low_gain_probe.CONFIRMATION
@@ -168,6 +170,18 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
     # Re-parse the exact generated argv through the real probe contract.  This
     # is deliberately offline: _validate_cli performs no CAN or motor I/O.
     parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    low_gain_probe._validate_cli(parsed_probe_args)
+
+
+def test_owner_launcher_forwards_explicit_gravity_debug_mode(tmp_path: Path) -> None:
+    args = owner._parser().parse_args(
+        ["--allow-motion", "--gravity-debug-mode"]
+    )
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+
+    assert "--gravity-debug-mode" in command
+    parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    assert parsed_probe_args.gravity_debug_mode is True
     low_gain_probe._validate_cli(parsed_probe_args)
 
 

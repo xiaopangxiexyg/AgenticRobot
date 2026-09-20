@@ -302,6 +302,91 @@ _DEFAULT_GUIDED_POSE_ACTION_SEC = 6.0
 _DEFAULT_GUIDED_POSE_REST_SEC = 4.0
 
 
+@dataclass(frozen=True)
+class B601GravityCompensationDebugProfile:
+    """Immutable gravity-tuning parameters for one explicit debug run.
+
+    The profile is intentionally separate from ``B601MitControlProfile``:
+    the latter describes the torque envelope and impedance gains, while this
+    object records the gravity-model parameters that an operator is tuning.
+    In the explicit gravity-debug mode the same snapshot is used by the
+    active loop and by both live and degraded protective hold paths.  Normal
+    modes do not construct or consume this object.
+    """
+
+    gravity_scale: float
+    gravity_joint_scales: tuple[float, ...]
+    gravity_joint_offsets_rad: tuple[float, ...]
+    gravity_joint_bias_nm: tuple[float, ...]
+    gravity_coulomb_friction_nm: tuple[float, ...]
+    gravity_coulomb_velocity_threshold_rad_s: float
+    driver_kd_nm_s_per_rad: tuple[float, ...]
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        gravity_scale: float,
+        gravity_joint_scales: Sequence[float],
+        gravity_joint_offsets_rad: Sequence[float],
+        gravity_joint_bias_nm: Sequence[float],
+        gravity_coulomb_friction_nm: Sequence[float],
+        gravity_coulomb_velocity_threshold_rad_s: float,
+        driver_kd_nm_s_per_rad: Sequence[float],
+    ) -> B601GravityCompensationDebugProfile:
+        """Validate and copy command-line values before hardware is enabled."""
+
+        return cls(
+            gravity_scale=_non_negative(gravity_scale, name="gravity_scale"),
+            gravity_joint_scales=_non_negative_six(
+                tuple(gravity_joint_scales),
+                name="gravity_joint_scales",
+            ),
+            gravity_joint_offsets_rad=_six(
+                tuple(gravity_joint_offsets_rad),
+                name="gravity_joint_offsets_rad",
+            ),
+            gravity_joint_bias_nm=_six(
+                tuple(gravity_joint_bias_nm),
+                name="gravity_joint_bias_nm",
+            ),
+            gravity_coulomb_friction_nm=_non_negative_six(
+                tuple(gravity_coulomb_friction_nm),
+                name="gravity_coulomb_friction_nm",
+            ),
+            gravity_coulomb_velocity_threshold_rad_s=_non_negative(
+                gravity_coulomb_velocity_threshold_rad_s,
+                name="gravity_coulomb_velocity_threshold_rad_s",
+            ),
+            driver_kd_nm_s_per_rad=_non_negative_six(
+                tuple(driver_kd_nm_s_per_rad),
+                name="driver_kd_nm_s_per_rad",
+            ),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return an evidence-safe representation of the frozen snapshot."""
+
+        return {
+            "mode": "gravity_compensation_tuning",
+            "gravity_scale": self.gravity_scale,
+            "gravity_joint_scales": self.gravity_joint_scales,
+            "gravity_joint_offsets_rad": self.gravity_joint_offsets_rad,
+            "gravity_joint_bias_nm": self.gravity_joint_bias_nm,
+            "gravity_coulomb_friction_nm": self.gravity_coulomb_friction_nm,
+            "gravity_coulomb_velocity_threshold_rad_s": (
+                self.gravity_coulomb_velocity_threshold_rad_s
+            ),
+            "driver_kd_nm_s_per_rad": self.driver_kd_nm_s_per_rad,
+            "hold_semantics": (
+                "live_and_degraded_protective_hold_reuse_this_run_snapshot"
+            ),
+            "safety_semantics": (
+                "safety_limits_watchdogs_and_full_disable_rules_unchanged"
+            ),
+        }
+
+
 class LowGainProbeError(RuntimeError):
     """A guarded probe precondition, safety stop, or vendor operation failed."""
 
@@ -3541,6 +3626,7 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 def _validate_cli(args: argparse.Namespace) -> None:
     _validate_single_joint_assist_cli(args)
     _validate_cartesian_assist_cli(args)
+    gravity_debug_mode = bool(getattr(args, "gravity_debug_mode", False))
     feedback_source = getattr(args, "feedback_source", "parameter")
     if feedback_source not in ("parameter", "active-report"):
         raise LowGainProbeError(f"unknown feedback source: {feedback_source}")
@@ -3570,6 +3656,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
             "active-report acknowledgements require --feedback-source active-report"
         )
     if args.mode == "gravity-calibration-fit":
+        if gravity_debug_mode:
+            raise LowGainProbeError(
+                "gravity-debug-mode is an active tuning mode and rejects the "
+                "offline gravity-calibration-fit path"
+            )
         if getattr(args, "allow_motion", False):
             raise LowGainProbeError(
                 "gravity-calibration-fit is offline and rejects --allow-motion"
@@ -3617,6 +3708,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 _positive(value, name=name)
         return
     if args.mode == "feedback-stability":
+        if gravity_debug_mode:
+            raise LowGainProbeError(
+                "gravity-debug-mode requires a motion-capable gravity controller"
+            )
         driver_kd_arg = getattr(args, "driver_kd", None)
         if driver_kd_arg is not None and any(
             value > 0.0
@@ -3660,6 +3755,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
         )
         return
     if args.mode == "driver-torque-limit-roundtrip":
+        if gravity_debug_mode:
+            raise LowGainProbeError(
+                "gravity-debug-mode is not applicable to the driver limit roundtrip"
+            )
         if not args.allow_motion:
             raise LowGainProbeError(
                 "driver-torque-limit-roundtrip requires --allow-motion"
@@ -6320,6 +6419,7 @@ def _run_latched_fault_hold(
     gravity_joint_bias_nm: Sequence[float] = _ZERO_SIX,
     gravity_coulomb_friction_nm: Sequence[float] = _ZERO_SIX,
     gravity_coulomb_velocity_threshold_rad_s: float = 0.0,
+    gravity_debug_profile: B601GravityCompensationDebugProfile | None = None,
     feedback_reader: Callable[[], B601HardwareState] | None = None,
 ) -> tuple[
     int,
@@ -6363,6 +6463,22 @@ def _run_latched_fault_hold(
         if command_position_limits_rad is None
         else command_position_limits_rad
     )
+    if gravity_debug_profile is not None:
+        # The debug profile is an immutable copy captured before enable.  Do
+        # not read mutable argparse lists or a later overlay while deciding
+        # what to send after a fault: tuning evidence must remain comparable
+        # across ACTIVE, protective, degraded, and recovered hold states.
+        gravity_scale = gravity_debug_profile.gravity_scale
+        driver_kd_nm_s_per_rad = gravity_debug_profile.driver_kd_nm_s_per_rad
+        gravity_joint_scales = gravity_debug_profile.gravity_joint_scales
+        gravity_joint_offsets_rad = gravity_debug_profile.gravity_joint_offsets_rad
+        gravity_joint_bias_nm = gravity_debug_profile.gravity_joint_bias_nm
+        gravity_coulomb_friction_nm = (
+            gravity_debug_profile.gravity_coulomb_friction_nm
+        )
+        gravity_coulomb_velocity_threshold_rad_s = (
+            gravity_debug_profile.gravity_coulomb_velocity_threshold_rad_s
+        )
     latest_tau = previous_tau
     command_profile = profile if hold_profile is None else hold_profile
     monitor_velocity_limit = _positive(
@@ -6407,6 +6523,18 @@ def _run_latched_fault_hold(
     telemetry.setdefault("last_recovery_reset_reason", None)
     telemetry.setdefault("state", "LIVE")
     telemetry.setdefault("last_transition", "entry")
+    telemetry.setdefault(
+        "gravity_parameter_source",
+        (
+            "frozen_debug_run_snapshot"
+            if gravity_debug_profile is not None
+            else "active_controller_arguments"
+        ),
+    )
+    telemetry.setdefault(
+        "gravity_debug_mode",
+        gravity_debug_profile is not None,
+    )
     driver_damping_available = any(
         value > 0.0
         for value in _six(
@@ -6775,6 +6903,11 @@ def _run_latched_fault_hold(
             "FULL DISABLE: press Ctrl-C again or send SIGUSR1.",
         )
     )
+    if gravity_debug_profile is not None:
+        _operator_notice(
+            "[B601] GRAVITY DEBUG HOLD: frozen tuning parameters remain active "
+            "in live/degraded hold; safety limits and full-disable rules are unchanged."
+        )
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
     monitor_observed_at = time.monotonic() - max(0.0, observed_age_sec)
@@ -7061,6 +7194,37 @@ def run_probe(
         getattr(args, "gravity_coulomb_velocity_threshold_rad_s", 0.0),
         name="gravity_coulomb_velocity_threshold_rad_s",
     )
+    gravity_scale = _non_negative(args.gravity_scale, name="gravity_scale")
+    gravity_debug_profile = (
+        B601GravityCompensationDebugProfile.capture(
+            gravity_scale=gravity_scale,
+            gravity_joint_scales=gravity_joint_scales,
+            gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+            gravity_joint_bias_nm=gravity_joint_bias_nm,
+            gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+            gravity_coulomb_velocity_threshold_rad_s=(
+                gravity_coulomb_velocity_threshold_rad_s
+            ),
+            driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+        )
+        if getattr(args, "gravity_debug_mode", False)
+        else None
+    )
+    if gravity_debug_profile is not None:
+        # Use the same immutable values for ACTIVE and protective paths.  This
+        # is intentionally a no-op for normal modes, which retain the existing
+        # argument-derived behavior and safety contracts.
+        gravity_scale = gravity_debug_profile.gravity_scale
+        driver_kd_nm_s_per_rad = gravity_debug_profile.driver_kd_nm_s_per_rad
+        gravity_joint_scales = gravity_debug_profile.gravity_joint_scales
+        gravity_joint_offsets_rad = gravity_debug_profile.gravity_joint_offsets_rad
+        gravity_joint_bias_nm = gravity_debug_profile.gravity_joint_bias_nm
+        gravity_coulomb_friction_nm = (
+            gravity_debug_profile.gravity_coulomb_friction_nm
+        )
+        gravity_coulomb_velocity_threshold_rad_s = (
+            gravity_debug_profile.gravity_coulomb_velocity_threshold_rad_s
+        )
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
     model, position_limits = _resolve_model_and_limits(source_root)
@@ -7322,6 +7486,12 @@ def run_probe(
         if feedback_source == "active-report"
         else None
     )
+    if gravity_debug_profile is not None:
+        _operator_notice(
+            "[B601] GRAVITY DEBUG MODE: this run freezes gravity/driver-Kd "
+            "parameters through protective/degraded hold; safety limits and "
+            "full-disable rules are unchanged."
+        )
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigusr1 = signal.getsignal(signal.SIGUSR1)
 
@@ -7586,7 +7756,7 @@ def run_probe(
             measured_qpos_rad=arming_q,
             measured_qvel_rad_s=arming_qvel,
             profile=startup_lock_profile,
-            gravity_scale=args.gravity_scale,
+            gravity_scale=gravity_scale,
             gravity_joint_scales=gravity_joint_scales,
             gravity_joint_offsets_rad=gravity_joint_offsets_rad,
             gravity_joint_bias_nm=gravity_joint_bias_nm,
@@ -7735,7 +7905,7 @@ def run_probe(
                 measured_qpos_rad=arming_settle_previous_q,
                 measured_qvel_rad_s=arming_settle_last_qvel,
                 profile=startup_lock_profile,
-                gravity_scale=args.gravity_scale,
+                gravity_scale=gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
                 gravity_joint_offsets_rad=gravity_joint_offsets_rad,
                 gravity_joint_bias_nm=gravity_joint_bias_nm,
@@ -8694,7 +8864,7 @@ def run_probe(
                 measured_qpos_rad=q,
                 measured_qvel_rad_s=qvel,
                 profile=profile,
-                gravity_scale=args.gravity_scale,
+                gravity_scale=gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
                 gravity_joint_offsets_rad=gravity_joint_offsets_rad,
                 gravity_joint_bias_nm=gravity_joint_bias_nm,
@@ -8731,7 +8901,7 @@ def run_probe(
                 measured_qpos_rad=q,
                 measured_qvel_rad_s=qvel,
                 profile=startup_lock_profile,
-                gravity_scale=args.gravity_scale,
+                gravity_scale=gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
                 gravity_joint_offsets_rad=gravity_joint_offsets_rad,
                 gravity_joint_bias_nm=gravity_joint_bias_nm,
@@ -9323,7 +9493,7 @@ def run_probe(
                             max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
                             max_rebase_rad=args.fault_hold_max_rebase_rad,
                             profile=profile,
-                            gravity_scale=args.gravity_scale,
+                            gravity_scale=gravity_scale,
                             previous_tau=previous_tau,
                             torque_limits_nm=torque_limits,
                             rate_hz=args.rate_hz,
@@ -9353,6 +9523,7 @@ def run_probe(
                             gravity_coulomb_velocity_threshold_rad_s=(
                                 gravity_coulomb_velocity_threshold_rad_s
                             ),
+                            gravity_debug_profile=gravity_debug_profile,
                             feedback_reader=read_admitted_control_feedback,
                         )
                         cleanup_errors.extend(hold_errors)
@@ -9684,6 +9855,24 @@ def run_probe(
         },
         "transport": "motorbridge_wired_local",
         "feedback_source": feedback_source,
+        "gravity_debug": {
+            "enabled": gravity_debug_profile is not None,
+            "parameter_source": (
+                "frozen_run_snapshot"
+                if gravity_debug_profile is not None
+                else "normal_controller_arguments"
+            ),
+            "frozen_profile": (
+                gravity_debug_profile.as_dict()
+                if gravity_debug_profile is not None
+                else None
+            ),
+            "protective_hold_semantics": (
+                "live_and_degraded_hold_reuse_the_frozen_snapshot"
+                if gravity_debug_profile is not None
+                else "existing_normal_hold_path_unchanged"
+            ),
+        },
         "feedback_freshness": {
             "control_admitted": active_report_gate is not None,
             "host_receive_sequence_and_age_verified": (
@@ -9892,6 +10081,12 @@ def run_probe(
         },
         "protective_hold": {
             "latched": protective_hold_latched,
+            "gravity_debug_mode": gravity_debug_profile is not None,
+            "gravity_parameter_source": (
+                "frozen_debug_run_snapshot"
+                if gravity_debug_profile is not None
+                else "active_controller_arguments"
+            ),
             "entry_reason": protective_hold_entry_reason,
             "joint_names": _FAULT_HOLD_JOINTS,
             "reference_source": protective_hold_reference_source,
@@ -9984,7 +10179,7 @@ def run_probe(
         "profile": {
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
-            "gravity_scale": args.gravity_scale,
+            "gravity_scale": gravity_scale,
             "gravity_joint_scales": gravity_joint_scales,
             "gravity_joint_offsets_rad": gravity_joint_offsets_rad,
             "gravity_joint_bias_nm": gravity_joint_bias_nm,
@@ -9996,13 +10191,13 @@ def run_probe(
                 "scale*joint_scale*g(q+offset)+bias+friction*direction(qvel)"
             ),
             "effective_gravity_multipliers": tuple(
-                args.gravity_scale * value for value in gravity_joint_scales
+                gravity_scale * value for value in gravity_joint_scales
             ),
             "gravity_ramp": {
                 "type": "full_vector_immediate_with_total_torque_slew",
                 "duration_sec": args.torque_rise_time_sec,
                 "applies_to": "complete_six_joint_gravity_vector",
-                "scalar_gravity_at_first_active_frame": args.gravity_scale,
+                "scalar_gravity_at_first_active_frame": gravity_scale,
                 "joint_multipliers_at_first_active_frame": gravity_joint_scales,
                 "independent_scalar_ramp": False,
                 "non_gravity_terms_scaled": False,
@@ -10639,6 +10834,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "software damping used by the draggable Ctrl-C protective hold "
             "while feedback remains valid and no non-zero --driver-kd is selected"
+        ),
+    )
+    parser.add_argument(
+        "--gravity-debug-mode",
+        action="store_true",
+        help=(
+            "explicit gravity-compensation tuning mode: freeze the supplied "
+            "gravity and driver-Kd parameters for ACTIVE, protective, and "
+            "degraded hold; safety limits and full-disable rules are unchanged"
         ),
     )
     parser.add_argument("--gravity-scale", type=float, default=_DEFAULT_GRAVITY_SCALE)

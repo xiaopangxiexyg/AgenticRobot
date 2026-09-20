@@ -245,6 +245,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gravity-scale", type=float, default=1.0)
     parser.add_argument(
+        "--gravity-debug-mode",
+        action="store_true",
+        help=(
+            "freeze this run's gravity/driver-Kd tuning parameters in live and "
+            "protective hold; all safety limits and full-disable rules remain active"
+        ),
+    )
+    parser.add_argument(
         "--gravity-joint-scales",
         type=float,
         nargs=6,
@@ -385,6 +393,8 @@ def build_probe_command(
         command.extend(("--allow-active-report", "--auto-disable-active-report"))
     if not args.without_driver_torque_limits:
         command.append("--apply-driver-torque-limits")
+    if args.gravity_debug_mode:
+        command.append("--gravity-debug-mode")
     if args.single_joint_assist:
         command.extend(
             (
