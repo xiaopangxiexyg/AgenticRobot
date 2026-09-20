@@ -188,7 +188,13 @@ def test_failure_pause_resume_retry_uses_first_accepted_sample(tmp_path: Path) -
             AcceptedSampleReceipt(4, 10, 10, 14.1),
         )
     )
-    retried = workflow.consume_sample_acceptance(available_at=14.2)
+    # The control loop drains terminal events before handing accepted receipts
+    # to the workflow.  The workflow must not try to drain the recorder again.
+    terminal_receipts = tuple(recorder.drain_accepted_sample_receipts())
+    retried = workflow.consume_sample_acceptance(
+        available_at=14.2,
+        receipts=terminal_receipts,
+    )
     assert retried.handled
     assert retried.phase == "ACTIVE_ATTEMPT"
     assert episode.state.current_progress_step_id == "pick"
