@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from robot_motion.rebot_b601_rs import B601_RS_ARM_JOINT_NAMES
+from .model import B601_RS_ARM_JOINT_NAMES
 
 B601_SHARED_POLICY_FRAME = "b601_rs/joint_policy_assist"
 _ZERO_SIX = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)

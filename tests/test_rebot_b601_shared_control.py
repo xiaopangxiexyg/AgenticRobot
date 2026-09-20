@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from hardware.rebot_b601_rs import (
+from robot_motion.rebot_b601_rs import (
     B601_SHARED_POLICY_FRAME,
     B601PolicyAssistCommand,
     B601PolicyCommandBuffer,
