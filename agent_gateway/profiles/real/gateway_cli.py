@@ -57,6 +57,8 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65_GRASP_ENDPOINT_ORDER_MODES,
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES,
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES,
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM,
 )
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
@@ -232,6 +234,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "grasp path timing mode; continuous_c2 preserves motion through "
             "internal waypoints but still stops at semantic stage boundaries"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-trajectory-speed-profile",
+        choices=RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES,
+        default=RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM,
+        help=(
+            "grasp path speed profile; far_4x_approach_1x accelerates only "
+            "envelope ingress and pregrasp while retaining the base speed "
+            "for the final approach"
         ),
     )
     parser.add_argument(
@@ -979,6 +991,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
         grasp_trajectory_config=RM65GraspTrajectoryPlanningConfig(
             trajectory_parameterization=(args.grasp_trajectory_parameterization),
+            trajectory_speed_profile=(args.grasp_trajectory_speed_profile),
             endpoint_candidate_ordering=(args.grasp_endpoint_candidate_ordering),
         ),
     )
@@ -1013,6 +1026,9 @@ def main(argv: list[str] | None = None) -> int:
                     "debug_motion_skill": args.debug_motion_skill,
                     "grasp_trajectory_parameterization": (
                         args.grasp_trajectory_parameterization
+                    ),
+                    "grasp_trajectory_speed_profile": (
+                        args.grasp_trajectory_speed_profile
                     ),
                     "grasp_endpoint_candidate_ordering": (
                         args.grasp_endpoint_candidate_ordering

@@ -61,6 +61,8 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X,
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM,
 )
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
     build_exclusive_rm65_skill_target_builder,
@@ -2359,6 +2361,33 @@ def test_grasp_trajectory_parameterization_defaults_to_legacy_until_promoted() -
     )
     with pytest.raises(ValueError, match="endpoint_candidate_ordering"):
         RM65GraspTrajectoryPlanningConfig(endpoint_candidate_ordering="unknown")
+
+
+def test_grasp_trajectory_speed_profile_accelerates_only_far_field() -> None:
+    planner = RM65GraspJointTrajectoryPlanner.__new__(RM65GraspJointTrajectoryPlanner)
+    planner.config = RM65GraspTrajectoryPlanningConfig(
+        trajectory_speed_profile=RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X
+    )
+
+    assert planner._effective_trajectory_speed_scale(
+        base_speed_scale=0.20, planning_phase="envelope_ingress"
+    ) == 0.80
+    assert planner._effective_trajectory_speed_scale(
+        base_speed_scale=0.20, planning_phase="pregrasp_target"
+    ) == 0.80
+    assert planner._effective_trajectory_speed_scale(
+        base_speed_scale=0.20, planning_phase="constrained_approach"
+    ) == 0.20
+    assert planner._effective_trajectory_speed_scale(
+        base_speed_scale=0.20, planning_phase="grasp_target"
+    ) == 0.20
+
+    planner.config = RM65GraspTrajectoryPlanningConfig(
+        trajectory_speed_profile=RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM
+    )
+    assert planner._effective_trajectory_speed_scale(
+        base_speed_scale=0.20, planning_phase="pregrasp_target"
+    ) == 0.20
 
 
 def test_estimated_execution_time_orders_ik_branches_by_joint_speed(

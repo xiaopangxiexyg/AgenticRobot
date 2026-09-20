@@ -65,6 +65,14 @@ RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES = (
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
 )
+RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM = "uniform"
+RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X = (
+    "far_4x_approach_1x"
+)
+RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES = (
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM,
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X,
+)
 RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE = "joint_distance"
 RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME = (
     "estimated_execution_time"
@@ -123,6 +131,7 @@ class RM65GraspTrajectoryPlanningConfig:
     trajectory_parameterization: str = (
         RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP
     )
+    trajectory_speed_profile: str = RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM
     endpoint_candidate_ordering: str = RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE
     path_envelope_ingress_waypoint_fractions: tuple[float, ...] = (
         0.05,
@@ -196,6 +205,13 @@ class RM65GraspTrajectoryPlanningConfig:
             "trajectory_parameterization",
             parameterization,
         )
+        speed_profile = str(self.trajectory_speed_profile).strip().lower()
+        if speed_profile not in RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES:
+            raise ValueError(
+                "trajectory_speed_profile must be one of "
+                f"{RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES}."
+            )
+        object.__setattr__(self, "trajectory_speed_profile", speed_profile)
         endpoint_ordering = str(self.endpoint_candidate_ordering).strip().lower()
         if endpoint_ordering not in RM65_GRASP_ENDPOINT_ORDER_MODES:
             raise ValueError(
@@ -1012,6 +1028,27 @@ class RM65GraspJointTrajectoryPlanner:
             "rotation_deg": float(rotation_deg),
             "maximum_joint_delta_rad": float(np.max(delta)),
         }
+
+    def _effective_trajectory_speed_scale(
+        self,
+        *,
+        base_speed_scale: float,
+        planning_phase: str,
+    ) -> float:
+        """Return the configured speed for a semantic trajectory phase.
+
+        The accelerated profile only affects the collision-checked far-field
+        ingress and pregrasp legs.  The final constrained approach and the
+        terminal grasp leg retain the caller's conservative base scale.
+        """
+
+        if (
+            self.config.trajectory_speed_profile
+            == RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X
+            and planning_phase in {"envelope_ingress", "pregrasp_target"}
+        ):
+            return min(1.0, 4.0 * float(base_speed_scale))
+        return float(base_speed_scale)
 
     def _continuous_leg_trajectory(
         self,
@@ -3514,9 +3551,8 @@ class RM65GraspJointTrajectoryPlanner:
         velocity_profile = load_joint_velocity_limit_profiles()[
             self.profile.position_profile.ik_execution.joint_velocity_limit_profile
         ]
-        joint_velocity = (
-            np.deg2rad(np.asarray(velocity_profile.max_velocity_deg_s, dtype=float))
-            * scale
+        joint_velocity_limit = np.deg2rad(
+            np.asarray(velocity_profile.max_velocity_deg_s, dtype=float)
         )
         reference_hz = float(self.profile.position_profile.rates.ik_hz)
         times = [0.0]
@@ -3537,14 +3573,21 @@ class RM65GraspJointTrajectoryPlanner:
                 phase = str(
                     leg.path.metadata.get("planning_phase", leg_phases[leg_index])
                 )
+                effective_speed_scale = self._effective_trajectory_speed_scale(
+                    base_speed_scale=scale,
+                    planning_phase=phase,
+                )
+                effective_joint_velocity = (
+                    joint_velocity_limit * effective_speed_scale
+                )
                 leg_waypoints = tuple(leg.path.waypoints)
                 if len(leg_waypoints) >= 2:
                     continuous, leg_segments, tcp_time_scale = (
                         self._continuous_leg_trajectory(
                             waypoints=leg_waypoints,
                             moving_side=selected_side,
-                            speed_scale=scale,
-                            joint_velocity_rad_s=joint_velocity,
+                            speed_scale=effective_speed_scale,
+                            joint_velocity_rad_s=effective_joint_velocity,
                             reference_hz=reference_hz,
                         )
                     )
@@ -3567,6 +3610,7 @@ class RM65GraspJointTrajectoryPlanner:
                         {
                             **dict(item),
                             "planning_phase": phase,
+                            "effective_speed_scale": float(effective_speed_scale),
                             "leg_index": leg_index,
                         }
                         for item in leg_segments
@@ -3626,6 +3670,8 @@ class RM65GraspJointTrajectoryPlanner:
                 "mode": RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
                 "internal_path_waypoint_stops": False,
                 "stage_boundary_stops": True,
+                "speed_profile": self.config.trajectory_speed_profile,
+                "base_speed_scale": float(scale),
                 "legs": tuple(leg_parameterization),
                 "segments": tuple(segment_diagnostics),
             }
@@ -3639,26 +3685,32 @@ class RM65GraspJointTrajectoryPlanner:
                     monotonic=monotonic,
                     planning_phase="trajectory_parameterization",
                 )
+                segment_phase = next(
+                    (
+                        phase
+                        for waypoint_index, phase in sorted(
+                            leg_end_waypoint_indices.items()
+                        )
+                        if end_waypoint_index <= waypoint_index
+                    ),
+                    leg_phases[-1],
+                )
+                effective_speed_scale = self._effective_trajectory_speed_scale(
+                    base_speed_scale=scale,
+                    planning_phase=segment_phase,
+                )
                 duration, diagnostic = self._segment_duration_diagnostics(
                     start=start,
                     end=end,
                     moving_side=selected_side,
-                    speed_scale=scale,
-                    joint_velocity_rad_s=joint_velocity,
+                    speed_scale=effective_speed_scale,
+                    joint_velocity_rad_s=joint_velocity_limit * effective_speed_scale,
                 )
                 diagnostic.update(
                     {
                         "segment_index": end_waypoint_index - 1,
-                        "planning_phase": next(
-                            (
-                                phase
-                                for waypoint_index, phase in sorted(
-                                    leg_end_waypoint_indices.items()
-                                )
-                                if end_waypoint_index <= waypoint_index
-                            ),
-                            leg_phases[-1],
-                        ),
+                        "planning_phase": segment_phase,
+                        "effective_speed_scale": float(effective_speed_scale),
                     }
                 )
                 segment_diagnostics.append(diagnostic)
@@ -3708,6 +3760,8 @@ class RM65GraspJointTrajectoryPlanner:
                 "mode": RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
                 "internal_path_waypoint_stops": True,
                 "stage_boundary_stops": True,
+                "speed_profile": self.config.trajectory_speed_profile,
+                "base_speed_scale": float(scale),
                 "segments": tuple(segment_diagnostics),
             }
         if len(times) == 1:
@@ -3841,6 +3895,7 @@ class RM65GraspJointTrajectoryPlanner:
                 ),
                 "target_tool_tcp_world": target_pose,
                 "speed_scale": scale,
+                "trajectory_speed_profile": self.config.trajectory_speed_profile,
                 "reference_hz": reference_hz,
             },
             domain="dexteleop.real_agent_motion.rm65_grasp_path.v1",
@@ -3895,6 +3950,9 @@ __all__ = [
     "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2",
     "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES",
     "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP",
+    "RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X",
+    "RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES",
+    "RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM",
     "RM65GraspTrajectoryPlanningConfig",
     "RM65GraspTrajectoryPlanningError",
 ]
