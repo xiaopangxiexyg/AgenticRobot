@@ -85,20 +85,20 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     module = _load_sharding_module()
 
     assert module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"] == pytest.approx(
-        131.879
+        134.914
     )
     assert module.FULL_WEIGHTS[
         "tests/test_replay_position_admittance_active_pipeline.py"
-    ] == pytest.approx(106.650)
+    ] == pytest.approx(108.657)
     assert module.FULL_WEIGHTS["tests/test_mujoco_fast_runtime.py"] == pytest.approx(
-        58.974
+        48.101
     )
     assert module.FULL_WEIGHTS["tests/test_rm65_grasp_trajectory.py"] == pytest.approx(
-        92.781
+        91.046
     )
     assert module.FULL_WEIGHTS[
         "tests/test_mujoco_formal_compound_authority.py"
-    ] == pytest.approx(5.863)
+    ] == pytest.approx(6.681)
     assert (
         module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"]
         > module.FULL_WEIGHTS[
@@ -107,26 +107,49 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     )
     assert module.FULL_WEIGHTS[
         "tests/test_sim_point_grasp_experiment.py"
-    ] == pytest.approx(16.246)
+    ] == pytest.approx(16.729)
     assert module.FULL_WEIGHTS["tests/test_mujoco_cube_lift.py"] == pytest.approx(
-        11.573
+        11.965
     )
     assert module.FULL_WEIGHTS["tests/test_rebot_b601_real2sim.py"] == pytest.approx(
-        21.898
+        23.742
     )
-    assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] > 14.0
-    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 6.0
+    assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] > 26.0
+    assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 7.0
 
 
+def test_fast_integration_profile_tracks_its_unsharded_critical_path() -> None:
+    module = _load_sharding_module()
+
+    assert module.FAST_INTEGRATION_WEIGHTS[
+        "tests/test_rm65_grasp_trajectory.py"
+    ] == pytest.approx(74.288)
+    assert module.FAST_INTEGRATION_WEIGHTS[
+        "tests/test_runtime_artifact_migration.py"
+    ] == pytest.approx(25.525)
+    assert module.FAST_INTEGRATION_WEIGHTS[
+        "tests/test_collection_process_writer.py"
+    ] == pytest.approx(14.611)
+    assert "fast-integration" in module.WEIGHT_PROFILES
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "tests/test_mujoco_temp_pipeline.py",
+        "tests/test_replay_position_admittance_active_pipeline.py",
+    ),
+)
 def test_full_plan_splits_registered_large_module_without_losing_tests(
     tmp_path: Path,
+    relative_path: str,
 ) -> None:
     module = _load_sharding_module()
     repository = tmp_path / "checkout"
     tests_root = repository / "tests"
     tests_root.mkdir(parents=True)
-    split_path = tests_root / "test_mujoco_temp_pipeline.py"
-    registered = module.FULL_SPLIT_NODE_WEIGHTS["tests/test_mujoco_temp_pipeline.py"]
+    split_path = repository / relative_path
+    registered = module.FULL_SPLIT_NODE_WEIGHTS[relative_path]
     test_names = sorted(registered) + ["test_new_profile_is_still_collected"]
     split_path.write_text(
         "\n\n".join(f"def {name}():\n    pass" for name in test_names) + "\n",
@@ -143,9 +166,20 @@ def test_full_plan_splits_registered_large_module_without_losing_tests(
     assert {
         target.split("::", 1)[1]
         for target in targets
-        if target.startswith("tests/test_mujoco_temp_pipeline.py::")
+        if target.startswith(f"{relative_path}::")
     } == set(test_names)
     assert "tests/test_small.py" in targets
+    assert all(
+        any(target.startswith(f"{relative_path}::") for target, _, _ in shard)
+        for shard in shards
+    )
+    assert module.plan_shards(repository, tests_root, 2, "full") == shards
+    fast_targets = [
+        target
+        for shard in module.plan_shards(repository, tests_root, 2, "fast")
+        for target, _, _ in shard
+    ]
+    assert set(fast_targets) == {relative_path, "tests/test_small.py"}
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ INTEGRATION_MARKER = (
     "integration and not optional and not hardware and not slow_sim"
 )
 DEFAULT_UNIT_SHARDS = 2
+DEFAULT_INTEGRATION_SHARDS = 2
 
 
 def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -66,7 +67,7 @@ esac
 
 report_name="${junit##*/}"
 report_name="${report_name%.xml}"
-if [[ "$tier" == "unit" && "$report_name" == unit-* ]]; then
+if [[ "$report_name" == unit-* || "$report_name" == integration-* ]]; then
   name="$report_name"
 else
   name="$tier"
@@ -109,12 +110,14 @@ def _run_wrapper(
     fail_tier: str = "",
     extra_arguments: tuple[str, ...] = (),
     unit_shards: str | None = None,
+    integration_shards: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     # A wrapper contract test must not inherit the shard count of an outer
     # fast-feedback run.  Tests that exercise a non-default count opt in via
     # the explicit unit_shards argument below.
     environment.pop("DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS", None)
+    environment.pop("DEXTELEOP_FAST_FEEDBACK_INTEGRATION_SHARDS", None)
     environment.update(
         {
             "DEXTELEOP_ASSET_ROOT": str(asset_root.resolve()),
@@ -125,6 +128,10 @@ def _run_wrapper(
     )
     if unit_shards is not None:
         environment["DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS"] = unit_shards
+    if integration_shards is not None:
+        environment["DEXTELEOP_FAST_FEEDBACK_INTEGRATION_SHARDS"] = (
+            integration_shards
+        )
     return subprocess.run(
         [str(wrapper), *extra_arguments],
         check=False,
@@ -160,21 +167,28 @@ def test_wrapper_writes_parallel_tier_evidence_to_declared_run_root(
     assert "fast integration (status=0)" in completed.stdout
     assert f"artifacts: {run_root}" in completed.stdout
     unit_log = (run_root / "unit.log").read_text(encoding="utf-8")
+    integration_log = (run_root / "integration.log").read_text(encoding="utf-8")
     unit_shards = DEFAULT_UNIT_SHARDS
+    integration_shards = DEFAULT_INTEGRATION_SHARDS
     for index in range(unit_shards):
         assert f"===== unit shard {index} =====" in unit_log
         assert f"fake tier: unit-{index}" in unit_log
-    assert (run_root / "integration.log").read_text(encoding="utf-8").strip() == (
-        "fake tier: integration"
-    )
+    for index in range(integration_shards):
+        assert f"===== integration shard {index} =====" in integration_log
+        assert f"fake tier: integration-{index}" in integration_log
     assert (run_root / "unit.xml").is_file()
     assert (run_root / "integration.xml").is_file()
+    assert (run_root / "shard-plan.json").is_file()
+    assert (run_root / "integration-shard-plan.json").is_file()
 
     unit_arguments = [
         _recorded_arguments(fake_sync_root, f"unit-{index}")
         for index in range(unit_shards)
     ]
-    integration_arguments = _recorded_arguments(fake_sync_root, "integration")
+    integration_arguments = [
+        _recorded_arguments(fake_sync_root, f"integration-{index}")
+        for index in range(integration_shards)
+    ]
     for index, arguments in enumerate(unit_arguments):
         assert UNIT_MARKER in arguments
         assert f"cache_dir={run_root / f'unit-{index}-pytest-cache'}" in arguments
@@ -186,18 +200,24 @@ def test_wrapper_writes_parallel_tier_evidence_to_declared_run_root(
             encoding="utf-8"
         ).strip() == str(run_root / f"unit-{index}-mujoco-cache")
         assert (fake_sync_root / f"unit-{index}.umask").read_text().strip() == "0022"
-    assert INTEGRATION_MARKER in integration_arguments
-    assert f"cache_dir={run_root / 'integration-pytest-cache'}" in integration_arguments
-    assert f"--junitxml={run_root / 'integration.xml'}" in integration_arguments
+    for index, arguments in enumerate(integration_arguments):
+        assert INTEGRATION_MARKER in arguments
+        assert (
+            f"cache_dir={run_root / f'integration-{index}-pytest-cache'}"
+            in arguments
+        )
+        assert f"--junitxml={run_root / f'integration-{index}.xml'}" in arguments
+        assert (fake_sync_root / f"integration-{index}.python-cache").read_text(
+            encoding="utf-8"
+        ).strip() == str(run_root / f"integration-{index}-python-bytecode")
+        assert (fake_sync_root / f"integration-{index}.mujoco-cache").read_text(
+            encoding="utf-8"
+        ).strip() == str(run_root / f"integration-{index}-mujoco-cache")
+        assert (
+            fake_sync_root / f"integration-{index}.umask"
+        ).read_text().strip() == "0022"
     assert all("--durations=2" in arguments for arguments in unit_arguments)
-    assert "--durations=2" in integration_arguments
-    assert (fake_sync_root / "integration.python-cache").read_text(
-        encoding="utf-8"
-    ).strip() == str(run_root / "integration-python-bytecode")
-    assert (fake_sync_root / "integration.mujoco-cache").read_text(
-        encoding="utf-8"
-    ).strip() == str(run_root / "integration-mujoco-cache")
-    assert (fake_sync_root / "integration.umask").read_text().strip() == "0022"
+    assert all("--durations=2" in arguments for arguments in integration_arguments)
     shard_paths = [
         set((run_root / f"unit-{index}-paths.txt").read_text().splitlines())
         for index in range(unit_shards)
@@ -214,9 +234,24 @@ def test_wrapper_writes_parallel_tier_evidence_to_declared_run_root(
             for other_index, other in enumerate(shard_paths)
             if index != other_index
         )
+    integration_paths = [
+        set((run_root / f"integration-{index}-paths.txt").read_text().splitlines())
+        for index in range(integration_shards)
+    ]
+    assert sum(len(paths) for paths in integration_paths) == len(expected_paths)
+    assert set().union(*integration_paths) == expected_paths
+    for index, paths in enumerate(integration_paths):
+        assert all(
+            paths.isdisjoint(other)
+            for other_index, other in enumerate(integration_paths)
+            if index != other_index
+        )
     merged = ET.parse(run_root / "unit.xml").getroot()
     assert merged.attrib["tests"] == str(unit_shards)
     assert merged.attrib["failures"] == "0"
+    merged_integration = ET.parse(run_root / "integration.xml").getroot()
+    assert merged_integration.attrib["tests"] == str(integration_shards)
+    assert merged_integration.attrib["failures"] == "0"
     assert not os.path.lexists(checkout / "assets")
 
 
@@ -278,15 +313,15 @@ def test_wrapper_waits_for_both_tiers_and_propagates_a_tier_failure(
         fake_sync_root,
         run_root=str(run_root),
         asset_root=asset_root,
-        fail_tier="integration",
+        fail_tier="integration-1",
     )
 
     assert completed.returncode == 1
     assert "fast unit (status=0)" in completed.stdout
-    assert "fast integration (status=7)" in completed.stdout
+    assert "fast integration (status=1)" in completed.stdout
     assert (run_root / "unit.xml").is_file()
     assert (run_root / "integration.xml").is_file()
-    assert "requested failure: integration" in (
+    assert "requested failure: integration-1" in (
         run_root / "integration.log"
     ).read_text(encoding="utf-8")
     assert not os.path.lexists(checkout / "assets")
@@ -362,9 +397,18 @@ def test_wrapper_falls_back_to_one_unit_child_for_a_targeted_test(
 
     assert completed.returncode == 0, completed.stderr
     assert "unit sharding disabled for explicit test target" in completed.stderr
+    assert "integration sharding disabled for explicit test target" in completed.stderr
     assert (fake_sync_root / "unit.args").is_file()
     assert not (fake_sync_root / "unit-0.args").exists()
+    assert (fake_sync_root / "integration.args").is_file()
+    assert not (fake_sync_root / "integration-0.args").exists()
     assert _recorded_arguments(fake_sync_root, "unit").count("tests/test_alpha.py") == 1
+    assert (
+        _recorded_arguments(fake_sync_root, "integration").count(
+            "tests/test_alpha.py"
+        )
+        == 1
+    )
     assert (run_root / "unit.xml").is_file()
     assert (run_root / "integration.xml").is_file()
     assert not os.path.lexists(checkout / "assets")
@@ -387,5 +431,26 @@ def test_wrapper_rejects_an_invalid_unit_shard_count_before_starting_tiers(
 
     assert completed.returncode == 2
     assert "DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS" in completed.stderr
+    assert not list(fake_sync_root.glob("*.started"))
+    assert not os.path.lexists(checkout / "assets")
+
+
+def test_wrapper_rejects_an_invalid_integration_shard_count_before_starting_tiers(
+    tmp_path: Path,
+) -> None:
+    checkout, wrapper, fake_sync_root = _wrapper_checkout(tmp_path)
+    asset_root = tmp_path / "logical-assets"
+    asset_root.mkdir()
+
+    completed = _run_wrapper(
+        wrapper,
+        fake_sync_root,
+        run_root=str(tmp_path / "invalid-integration-run"),
+        asset_root=asset_root,
+        integration_shards="5",
+    )
+
+    assert completed.returncode == 2
+    assert "DEXTELEOP_FAST_FEEDBACK_INTEGRATION_SHARDS" in completed.stderr
     assert not list(fake_sync_root.glob("*.started"))
     assert not os.path.lexists(checkout / "assets")

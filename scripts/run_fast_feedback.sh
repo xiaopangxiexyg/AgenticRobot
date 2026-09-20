@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Run the bounded edit-feedback tiers concurrently.  Each child still goes
 # through run_pytest.sh, which owns the Python selection and basetemp.  The
-# unit tier is split by test module into a small number of deterministic file
-# shards; the aggregate JUnit/log keep the historical evidence paths intact.
+# unit and integration tiers are split by test module into small deterministic
+# file shards; aggregate JUnit/logs keep the historical evidence paths intact.
 # This wrapper owns the concurrency, per-child pytest cache, report paths, and
 # the temporary shared assets link needed by a clean worktree.
 # DEXTELEOP_FAST_FEEDBACK_RUN_ROOT may name a new absolute directory when a
@@ -37,7 +37,12 @@ UNIT_SHARD_XMLS=()
 UNIT_SHARD_PIDS=()
 UNIT_SHARD_STATUSES=()
 UNIT_EXPLICIT_TEST_TARGET=0
-INTEGRATION_PID=""
+INTEGRATION_SHARD_COUNT=""
+INTEGRATION_SHARD_PATHS=()
+INTEGRATION_SHARD_LOGS=()
+INTEGRATION_SHARD_XMLS=()
+INTEGRATION_SHARD_PIDS=()
+INTEGRATION_SHARD_STATUSES=()
 
 prepare_run_root() {
   local requested_root="${DEXTELEOP_FAST_FEEDBACK_RUN_ROOT:-}"
@@ -93,6 +98,7 @@ prepare_asset_compat_link() {
 
 configure_unit_shards() {
   local requested_count="${DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS:-2}"
+  local requested_integration_count="${DEXTELEOP_FAST_FEEDBACK_INTEGRATION_SHARDS:-2}"
   local argument
   local explicit_test_target=0
 
@@ -100,11 +106,15 @@ configure_unit_shards() {
     1|2|3|4) ;;
     *) die "DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS must be an integer from 1 to 4: $requested_count" ;;
   esac
+  case "$requested_integration_count" in
+    1|2|3|4) ;;
+    *) die "DEXTELEOP_FAST_FEEDBACK_INTEGRATION_SHARDS must be an integer from 1 to 4: $requested_integration_count" ;;
+  esac
 
   # The normal command accepts shared pytest options.  A path/nodeid is a
   # targeted invocation, however, and adding the complete shard file list
   # would duplicate that target.  Preserve the old targeted behavior by using
-  # one unit child in that case.
+  # one child per tier in that case.
   for argument in "$@"; do
     case "$argument" in
       --|.|./|tests/*|./tests/*|*/tests/*|*::* )
@@ -113,12 +123,17 @@ configure_unit_shards() {
     esac
   done
   UNIT_SHARD_COUNT="$requested_count"
+  INTEGRATION_SHARD_COUNT="$requested_integration_count"
   UNIT_EXPLICIT_TEST_TARGET=0
   if ((explicit_test_target)); then
     if ((UNIT_SHARD_COUNT > 1)); then
       echo "[dexteleop-fast-feedback] unit sharding disabled for explicit test target" >&2
     fi
+    if ((INTEGRATION_SHARD_COUNT > 1)); then
+      echo "[dexteleop-fast-feedback] integration sharding disabled for explicit test target" >&2
+    fi
     UNIT_SHARD_COUNT=1
+    INTEGRATION_SHARD_COUNT=1
     UNIT_EXPLICIT_TEST_TARGET=1
   fi
 }
@@ -152,9 +167,39 @@ prepare_unit_shards() {
     --prefix unit || die "could not build a complete weighted unit shard plan"
 }
 
+prepare_integration_shards() {
+  local index=0
+
+  INTEGRATION_SHARD_PATHS=()
+  INTEGRATION_SHARD_LOGS=()
+  INTEGRATION_SHARD_XMLS=()
+  if ((UNIT_EXPLICIT_TEST_TARGET)); then
+    INTEGRATION_SHARD_PATHS[0]="$RUN_ROOT/integration-target-paths.txt"
+    INTEGRATION_SHARD_LOGS[0]="$RUN_ROOT/integration.log"
+    INTEGRATION_SHARD_XMLS[0]="$RUN_ROOT/integration.xml"
+    : >"${INTEGRATION_SHARD_PATHS[0]}"
+    return
+  fi
+  for ((index = 0; index < INTEGRATION_SHARD_COUNT; index++)); do
+    INTEGRATION_SHARD_PATHS[index]="$RUN_ROOT/integration-${index}-paths.txt"
+    INTEGRATION_SHARD_LOGS[index]="$RUN_ROOT/integration-${index}.log"
+    INTEGRATION_SHARD_XMLS[index]="$RUN_ROOT/integration-${index}.xml"
+    : >"${INTEGRATION_SHARD_PATHS[index]}"
+  done
+
+  python3 "$REPO_ROOT/scripts/pytest_sharding.py" plan \
+    --repository "$REPO_ROOT" \
+    --tests-root "$REPO_ROOT/tests" \
+    --output-dir "$RUN_ROOT" \
+    --shards "$INTEGRATION_SHARD_COUNT" \
+    --profile fast-integration \
+    --manifest-name integration-shard-plan.json \
+    --prefix integration || die "could not build a complete weighted integration shard plan"
+}
+
 stop_children() {
   local pid
-  for pid in "${UNIT_SHARD_PIDS[@]}" "$INTEGRATION_PID"; do
+  for pid in "${UNIT_SHARD_PIDS[@]}" "${INTEGRATION_SHARD_PIDS[@]}"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -166,7 +211,8 @@ cleanup() {
   local current_root
 
   trap - EXIT INT TERM
-  if ((${#UNIT_SHARD_PIDS[@]} > 0)) || [[ -n "$INTEGRATION_PID" ]]; then
+  if ((${#UNIT_SHARD_PIDS[@]} > 0)) || \
+    ((${#INTEGRATION_SHARD_PIDS[@]} > 0)); then
     stop_children
   fi
   if ((ASSET_LINK_CREATED)); then
@@ -195,9 +241,11 @@ on_signal() {
   for pid in "${UNIT_SHARD_PIDS[@]}"; do
     wait "$pid" 2>/dev/null || true
   done
-  wait "$INTEGRATION_PID" 2>/dev/null || true
+  for pid in "${INTEGRATION_SHARD_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
   UNIT_SHARD_PIDS=()
-  INTEGRATION_PID=""
+  INTEGRATION_SHARD_PIDS=()
   exit 130
 }
 
@@ -305,16 +353,38 @@ merge_unit_logs() {
   done
 }
 
+merge_integration_logs() {
+  local index
+  if ((UNIT_EXPLICIT_TEST_TARGET)); then
+    return
+  fi
+  : >"$RUN_ROOT/integration.log"
+  for ((index = 0; index < INTEGRATION_SHARD_COUNT; index++)); do
+    {
+      echo "===== integration shard $index ====="
+      if [[ -f "${INTEGRATION_SHARD_LOGS[index]}" ]]; then
+        cat "${INTEGRATION_SHARD_LOGS[index]}"
+      else
+        echo "missing integration shard log: ${INTEGRATION_SHARD_LOGS[index]}" >&2
+        INTEGRATION_STATUS=1
+      fi
+    } >>"$RUN_ROOT/integration.log"
+  done
+}
+
 trap cleanup EXIT
 prepare_run_root
 prepare_asset_compat_link
 configure_unit_shards "$@"
 prepare_unit_shards
+prepare_integration_shards
 trap on_signal INT TERM
 
 if ((UNIT_EXPLICIT_TEST_TARGET)); then
   run_tier unit 'unit and not optional and not hardware and not slow_sim' "$@" &
   UNIT_SHARD_PIDS[0]=$!
+  run_tier integration 'integration and not optional and not hardware and not slow_sim' "$@" &
+  INTEGRATION_SHARD_PIDS[0]=$!
 else
   for ((index = 0; index < UNIT_SHARD_COUNT; index++)); do
     mapfile -t shard_paths <"${UNIT_SHARD_PATHS[index]}"
@@ -322,9 +392,14 @@ else
       "${shard_paths[@]}" "$@" &
     UNIT_SHARD_PIDS[index]=$!
   done
+  for ((index = 0; index < INTEGRATION_SHARD_COUNT; index++)); do
+    mapfile -t shard_paths <"${INTEGRATION_SHARD_PATHS[index]}"
+    run_tier "integration-${index}" \
+      'integration and not optional and not hardware and not slow_sim' \
+      "${shard_paths[@]}" "$@" &
+    INTEGRATION_SHARD_PIDS[index]=$!
+  done
 fi
-run_tier integration 'integration and not optional and not hardware and not slow_sim' "$@" &
-INTEGRATION_PID=$!
 
 set +e
 UNIT_STATUS=0
@@ -338,17 +413,31 @@ for ((index = 0; index < UNIT_SHARD_COUNT; index++)); do
   fi
 done
 UNIT_SHARD_PIDS=()
-wait "$INTEGRATION_PID"
-INTEGRATION_STATUS=$?
-INTEGRATION_PID=""
+INTEGRATION_STATUS=0
+INTEGRATION_SHARD_STATUSES=()
+for ((index = 0; index < INTEGRATION_SHARD_COUNT; index++)); do
+  wait "${INTEGRATION_SHARD_PIDS[index]}"
+  shard_status=$?
+  INTEGRATION_SHARD_STATUSES[index]=$shard_status
+  if ((shard_status != 0)); then
+    INTEGRATION_STATUS=1
+  fi
+done
+INTEGRATION_SHARD_PIDS=()
 set -e
 
 merge_unit_logs
+merge_integration_logs
 if ((UNIT_EXPLICIT_TEST_TARGET)); then
   [[ -f "$RUN_ROOT/unit.xml" ]] || UNIT_STATUS=1
+  [[ -f "$RUN_ROOT/integration.xml" ]] || INTEGRATION_STATUS=1
 else
   if ! merge_junit_reports "$RUN_ROOT/unit.xml" "${UNIT_SHARD_XMLS[@]}"; then
     UNIT_STATUS=1
+  fi
+  if ! merge_junit_reports \
+    "$RUN_ROOT/integration.xml" "${INTEGRATION_SHARD_XMLS[@]}"; then
+    INTEGRATION_STATUS=1
   fi
 fi
 

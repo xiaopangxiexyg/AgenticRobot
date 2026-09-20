@@ -88,6 +88,12 @@ def test_m0_adds_no_parent_runtime_import_of_rebot_vendor_code() -> None:
     violations: dict[str, list[str]] = {}
 
     for path in _parent_python_files():
+        # A forbidden import must contain one of these exact module names in
+        # its source. Keep the AST helper authoritative for candidates, while
+        # avoiding a full parse of thousands of unrelated parent files.
+        source = path.read_text(encoding="utf-8")
+        if not any(root in source for root in forbidden):
+            continue
         imports = absolute_import_modules(path)
         matched = sorted(
             module

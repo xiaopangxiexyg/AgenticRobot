@@ -126,6 +126,11 @@ class _ArtifactReferenceSummary:
 _IDENTIFIER_FIELDS = frozenset(
     {"arg", "asname", "attr", "id", "module", "name", "names", "rest"}
 )
+_ARTIFACT_SCAN_TOKENS = (
+    "teleop_records_root",
+    "teleop_records",
+    "logs",
+)
 
 
 @lru_cache(maxsize=None)
@@ -133,11 +138,20 @@ def _artifact_reference_summary(path: Path) -> _ArtifactReferenceSummary:
     """Scan one source once for both runtime-artifact boundary assertions."""
 
     source = path.read_text(encoding="utf-8")
+    # Files without a relevant identifier or literal cannot contribute to
+    # either boundary result. Preserve the AST checks for every candidate.
+    if not any(token in source for token in _ARTIFACT_SCAN_TOKENS):
+        return _ArtifactReferenceSummary(
+            mentions_legacy_root=False,
+            logs_literal_scopes=frozenset(),
+        )
     tree = ast.parse(source, filename=str(path))
     has_raw_legacy_identifier = "teleop_records_root" in source
     has_raw_teleop_records = "teleop_records" in source
-    source_lines = tuple(
-        line.encode("utf-8") for line in source.splitlines(keepends=True)
+    source_lines = (
+        tuple(line.encode("utf-8") for line in source.splitlines(keepends=True))
+        if has_raw_teleop_records
+        else ()
     )
 
     def raw_source_segment(node: ast.AST) -> str:

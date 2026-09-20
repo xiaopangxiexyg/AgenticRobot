@@ -88,7 +88,23 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### 分类逻辑与架构检查的覆盖归属
+
+禁止下层反向依赖 `control_station` 的检查统一由
+`test_control_station_boundaries.py::test_lower_packages_do_not_reverse_depend_on_control_station`
+负责。它使用相同 import 扫描器和三个历史 shim 白名单，覆盖原 contracts 检查的
+全部七个包，并额外覆盖 `collection_runtime`、`control_composition`；删除 contracts
+中较窄的重复用例，不改变 canonical 检查、白名单或验收 selector。
+
 ### 同输入仿真与模型构建去重
+
+`test_mujoco_trajectory_composition_publication.py` 在同一真实 MuJoCo session 中
+先验证 `residual_effective_until == target_effective_at` 的到期拒绝，再以相同
+producer sequence 0 验证有效发布。拒绝发生在输入登记前；显式检查 editor hash、
+proposal 数量与 trace 数量不变，且两路 input admission 均为空。随后保留原有真实
+dispatch、FK 观测、因果链、重复发布、Hold 和旧 activation 拒绝检查，不再为
+无副作用的到期负例单独建场/reset。底层纯逻辑到期用例仍独立保留；这里减少一个
+独立测试结果，前置负例失败时后续闭环断言不会执行。physics tick、TTL 和安全条件不变。
 
 `test_mujoco_fast_runtime.py` 的 direct / arm-only / fully-actuated 缓存隔离
 使用同一空缓存中的三个真实首次构建，复用中间的 arm-only 结果做两组比较，
@@ -156,19 +172,17 @@ has been measured into the same tier. A filename, loop bound, optional
 dependency, or `mujoco` import alone is not sufficient evidence. Do not share
 `.pytest_cache` between worktrees or invoke independent pytest processes over
 overlapping modules. `scripts/run_fast_feedback.sh` is the reviewed parallel
-entrypoint for the two bounded selectors. It splits the unit selector into two
-duration-weighted, deterministic test-module shards by default, starts those
-shards alongside the integration child, and merges the shard reports back to
-the historical `unit.log` and `unit.xml` evidence paths. Each child gets its
-own pytest cache and JUnit report under `/tmp`. Set
-`DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS=1` to
-reproduce one unit process.  A three-shard run has been validated on the
-current 32-CPU development host; choose it only when the machine's CPU and
-memory budget supports the extra pytest process.  Four shards remain
-experimental and are not part of the current integration default.  Explicit
-test paths or node IDs
-automatically disable unit sharding for that targeted invocation so a test is
-never selected twice.  If a clean worktree does not already have the reviewed
+entrypoint for the two bounded selectors. It splits both unit and integration
+selectors into two duration-weighted, deterministic test-module shards by
+default, runs the four children concurrently, and merges reports back to the
+historical `unit.{log,xml}` and `integration.{log,xml}` evidence paths. Each
+child gets its own pytest cache, bytecode/cache roots, log, and JUnit report
+under `/tmp`. Set `DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS=1` or
+`DEXTELEOP_FAST_FEEDBACK_INTEGRATION_SHARDS=1` to reproduce a single process
+for that tier. Three or four shards per tier remain opt-in because they add
+pytest processes and are not part of the measured default. Explicit test paths
+or node IDs automatically disable both tiers' sharding for that targeted
+invocation so a test is never selected twice. If a clean worktree does not already have the reviewed
 `assets/` link, set `DEXTELEOP_ASSET_ROOT` to an absolute shared asset root
 before invoking it; the wrapper creates one shared temporary link for all
 children and removes only that link after the run.  Additional pytest options
@@ -188,12 +202,18 @@ planner parses the source without importing it, assigns every statically
 discovered top-level `test_*` function exactly once, and fails closed on test
 classes or dynamic collection hooks. Parameterized functions remain a single
 target, so their complete case matrix stays together. The manifest records both
-source modules and exact pytest targets; this allows the current temp pipeline
-to share six-shard capacity without reducing test coverage or physics work.
+source modules and exact pytest targets. The temp pipeline and replay active
+pipeline use this exception to share shard capacity without reducing test
+coverage or physics work. Replay tests create their own temporary logs and
+fresh runtimes; the four-rollout combined-control test and each parameterized
+envelope matrix remain indivisible. Grasp trajectory stays module-local to
+preserve its shared planning fixture instead of repeating that expensive plan.
 The sparse full-suite weights come from testcase durations in a complete,
 socket-capable green Run and cover only modules that contributed at least five
 seconds there. Refresh them only from another exact green full-suite artifact;
 failed, capability-limited, or focused runs are not representative inputs.
+Current module and replay-function weights use the green six-shard baseline at
+`47d7be6e`; they are scheduling estimates, not timeouts or acceptance thresholds.
 The default remains four shards. Each shard has separate pytest, Python, XDG,
 Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
 Run share only its content-addressed MuJoCo model cache; that cache uses process

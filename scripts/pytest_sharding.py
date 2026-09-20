@@ -20,55 +20,62 @@ from pathlib import Path
 # here makes the default plan useful in a clean checkout without depending on
 # mutable Harness history.
 FULL_WEIGHTS = {
-    "tests/test_mujoco_temp_pipeline.py": 131.879,
-    "tests/test_replay_position_admittance_active_pipeline.py": 106.650,
-    "tests/test_mujoco_fast_runtime.py": 58.974,
-    "tests/test_control_station_mujoco_sim_hil.py": 49.169,
-    # Refreshed from green six-shard acceptance at 95b954db after new grasp
-    # safety cases; the previous 31.391s estimate predates that coverage.
-    "tests/test_rm65_grasp_trajectory.py": 92.781,
-    "tests/test_rebot_b601_real2sim.py": 21.898,
-    "tests/test_control_station_sim_hil_allocation_profile.py": 21.484,
-    "tests/test_v25p_dual_write_shadow.py": 20.941,
-    "tests/test_replay_position_admittance_ik_trace.py": 17.800,
-    "tests/test_mujoco_collision_safety.py": 17.446,
-    "tests/test_rebot_b601_submodule_boundary.py": 16.450,
-    "tests/test_sim_point_grasp_experiment.py": 16.246,
-    "tests/test_runtime_artifact_migration.py": 14.741,
-    "tests/test_mujoco_trajectory_composition_publication.py": 14.662,
-    "tests/test_real_shadow_acceptance.py": 13.509,
-    "tests/test_collection_process_writer.py": 12.475,
-    "tests/test_mujoco_state_bc_evaluation.py": 12.203,
-    "tests/test_agent_gateway_real_rm65_composition.py": 12.172,
-    "tests/test_camera_semantic_materialize.py": 11.711,
-    "tests/test_mujoco_cube_lift.py": 11.573,
-    "tests/test_mujoco.py": 11.138,
-    "tests/test_position_admittance_active_shared_ik.py": 10.467,
-    "tests/test_runtime_artifact_migration_boundaries.py": 9.543,
-    "tests/test_mujoco_actuated_position.py": 9.514,
-    "tests/test_refinement_annotation_gui.py": 9.490,
-    "tests/test_runtime_domain_boundaries.py": 7.753,
-    "tests/test_rebot_b601_mujoco_haptics.py": 7.476,
-    "tests/test_control_station_exclusive_hitl.py": 7.360,
-    "tests/test_mujoco_pose_execution_observation.py": 7.302,
-    "tests/test_mujoco_state_bc_live_hitl.py": 7.148,
-    "tests/test_dmtac_viewer.py": 6.745,
-    "tests/test_control_station_boundaries.py": 6.665,
-    "tests/test_mujoco_component_action_profile.py": 6.665,
-    "tests/test_modality_storage.py": 6.595,
-    "tests/test_mujoco_physics_scene.py": 6.456,
-    "tests/test_mujoco_cube_drop.py": 6.409,
-    "tests/test_openpi_policy_emission_source.py": 6.210,
-    "tests/test_v25p_producer_dual_write.py": 5.877,
-    "tests/test_mujoco_formal_compound_authority.py": 5.863,
-    "tests/test_rebot_b601_mujoco_mit.py": 5.790,
+    # Exact testcase sums from the green six-shard baseline at 47d7be6e.
+    # These are scheduling estimates only; they do not change test selection.
+    "tests/test_mujoco_temp_pipeline.py": 134.914,
+    "tests/test_replay_position_admittance_active_pipeline.py": 108.657,
+    "tests/test_rm65_grasp_trajectory.py": 91.046,
+    "tests/test_mujoco_fast_runtime.py": 48.101,
+    "tests/test_control_station_mujoco_sim_hil.py": 36.534,
+    "tests/test_runtime_artifact_migration.py": 26.372,
+    "tests/test_rebot_b601_real2sim.py": 23.742,
+    "tests/test_collection_process_writer.py": 22.553,
+    "tests/test_rebot_b601_mujoco_haptics.py": 22.540,
+    "tests/test_control_station_sim_hil_allocation_profile.py": 21.878,
+    "tests/test_replay_position_admittance_ik_trace.py": 17.637,
+    "tests/test_sim_point_grasp_experiment.py": 16.729,
+    "tests/test_agent_gateway_real_rm65_composition.py": 16.526,
+    "tests/test_mujoco_trajectory_composition_publication.py": 14.943,
+    "tests/test_real_shadow_acceptance.py": 14.336,
+    "tests/test_camera_semantic_materialize.py": 13.292,
+    "tests/test_runtime_domain_boundaries.py": 13.279,
+    "tests/test_mujoco_state_bc_evaluation.py": 12.778,
+    "tests/test_mujoco_cube_lift.py": 11.965,
+    "tests/test_refinement_annotation_gui.py": 11.865,
+    "tests/test_mujoco.py": 11.759,
+    "tests/test_rebot_b601_submodule_boundary.py": 11.348,
+    "tests/test_runtime_artifact_migration_boundaries.py": 11.004,
+    "tests/test_position_admittance_active_shared_ik.py": 10.218,
+    "tests/test_mujoco_actuated_position.py": 10.211,
+    "tests/test_mujoco_state_bc_live_hitl.py": 9.473,
+    "tests/test_mujoco_collision_safety.py": 8.356,
+    "tests/test_runtime_artifact_resolution.py": 8.129,
+    "tests/test_v25p_producer_dual_write.py": 8.031,
+    "tests/test_control_station_exclusive_hitl.py": 7.844,
+    "tests/test_sim_point_grasp_terminal.py": 7.738,
+    "tests/test_mujoco_pose_execution_observation.py": 7.538,
+    "tests/test_modality_storage.py": 7.527,
+    "tests/test_mujoco_component_action_profile.py": 7.347,
+    "tests/test_v25p_dual_write_shadow.py": 7.181,
+    "tests/test_agent_gateway_real_station_point_grasp.py": 7.160,
+    "tests/test_mujoco_physics_scene.py": 7.152,
+    "tests/test_control_station_boundaries.py": 7.042,
+    "tests/test_dmtac_viewer.py": 6.917,
+    "tests/test_rebot_b601_mujoco_mit.py": 6.894,
+    "tests/test_mujoco_cube_drop.py": 6.884,
+    "tests/test_real_teleop_progress_adapter.py": 6.784,
+    "tests/test_mujoco_formal_compound_authority.py": 6.681,
+    "tests/test_openpi_policy_emission_source.py": 6.172,
+    "tests/test_run_pytest_asset_root.py": 6.149,
+    "tests/test_lazy_package_root_exports.py": 5.736,
+    "tests/test_control_station_contracts.py": 5.593,
+    "tests/test_policy_learning_boundaries.py": 5.103,
 }
 
-# A test module normally remains the isolation unit.  This one is an explicit
-# exception because its 121 independent top-level tests account for roughly
-# two thirds of the six-shard critical path.  The sparse function weights come
-# from the original complete green Run that seeded FULL_WEIGHTS. Unlisted
-# functions share the small measured residual so new tests remain covered.
+# Modules normally remain the isolation unit. These two long-running modules
+# have independent top-level tests: replay uses function-local tmp_path logs
+# and fresh runtimes, not shared rollout fixtures. Parameter matrices remain
+# intact. Unlisted functions share the measured residual and stay collected.
 FULL_SPLIT_NODE_WEIGHTS = {
     "tests/test_mujoco_temp_pipeline.py": {
         "test_contact_curriculum_reset_retries_recoverable_failure": 3.289,
@@ -96,7 +103,17 @@ FULL_SPLIT_NODE_WEIGHTS = {
         "test_separate_actor_observation_critic_cannot_update_actor_backbone": 1.598,
         "test_settled_snapshot_preserves_first_actuated_policy_step": 2.652,
         "test_temp_policy_checkpoint_round_trip": 1.616,
-    }
+    },
+    "tests/test_replay_position_admittance_active_pipeline.py": {
+        "test_larger_envelope_mujoco_abrupt_release_retains_frozen_catchup_gate": 27.246,
+        "test_right_combined_formal_active_runs_through_physical_mujoco": 27.142,
+        "test_half_normal_mujoco_endpoint_guard_holds_before_larger_qref_dispatch": 15.085,
+        "test_named_larger_active_envelopes_close_through_shared_ik_and_release": 13.590,
+        "test_raw_wrench_active_pipeline_runs_through_physical_mujoco": 13.003,
+        "test_raw_wrench_active_pipeline_exercises_shared_ik": 4.441,
+        "test_normal_shadow_envelope_is_replayed_under_cautious_active_caps": 4.218,
+        "test_sub_hold_wrench_is_not_promoted_as_active_ik_coverage": 3.924,
+    },
 }
 
 FAST_WEIGHTS = {
@@ -117,7 +134,40 @@ FAST_WEIGHTS = {
     "tests/test_position_admittance_active_shared_ik.py": 2.598,
 }
 
-WEIGHT_PROFILES = {"fast": FAST_WEIGHTS, "full": FULL_WEIGHTS}
+FAST_INTEGRATION_WEIGHTS = {
+    # Exact module sums from the unsharded integration tier at 47d7be6e.
+    # Unit-heavy modules deliberately do not influence this plan.
+    "tests/test_rm65_grasp_trajectory.py": 74.288,
+    "tests/test_runtime_artifact_migration.py": 25.525,
+    "tests/test_collection_process_writer.py": 14.611,
+    "tests/test_runtime_artifact_resolution.py": 8.269,
+    "tests/test_v25p_producer_dual_write.py": 6.729,
+    "tests/test_agent_gateway_mujoco_long_move_trace.py": 5.382,
+    "tests/test_v25p_dual_write_shadow.py": 3.672,
+    "tests/test_mujoco.py": 3.477,
+    "tests/test_writer_v21_import_path.py": 3.145,
+    "tests/test_handeye_utils.py": 2.990,
+    "tests/test_position_deploy_executor.py": 2.812,
+    "tests/test_dmtac_spawn_import_path.py": 2.554,
+    "tests/test_worktree_coordination.py": 1.956,
+    "tests/test_run_full_acceptance.py": 1.948,
+    "tests/test_collection_progress_runtime.py": 1.715,
+    "tests/test_mujoco_formal_capture.py": 1.206,
+    "tests/test_v25p_native_store.py": 0.923,
+    "tests/test_run_fast_feedback.py": 0.886,
+    "tests/test_position_force_guard.py": 0.840,
+    "tests/test_progress_timeline.py": 0.820,
+    "tests/test_v25p_sidecar_store.py": 0.670,
+    "tests/test_control_trace_episode.py": 0.638,
+    "tests/test_tactile_external_storage.py": 0.569,
+    "tests/test_control_station_vive_deflection.py": 0.511,
+}
+
+WEIGHT_PROFILES = {
+    "fast": FAST_WEIGHTS,
+    "fast-integration": FAST_INTEGRATION_WEIGHTS,
+    "full": FULL_WEIGHTS,
+}
 
 
 def check_required_local_sockets() -> None:
@@ -317,9 +367,12 @@ def write_plan(
     shard_count: int,
     profile: str,
     prefix: str,
+    manifest_name: str = "shard-plan.json",
 ) -> None:
     if not output_dir.is_dir():
         raise ValueError(f"output directory does not exist: {output_dir}")
+    if Path(manifest_name).name != manifest_name or not manifest_name.endswith(".json"):
+        raise ValueError(f"invalid shard manifest name: {manifest_name}")
     shards = plan_shards(repository, tests_root, shard_count, profile)
     manifest_shards = []
     for index, shard in enumerate(shards):
@@ -353,7 +406,7 @@ def write_plan(
         ),
         "shards": manifest_shards,
     }
-    (output_dir / "shard-plan.json").write_text(
+    (output_dir / manifest_name).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
@@ -417,6 +470,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--shards", type=int, required=True)
     plan.add_argument("--profile", choices=sorted(WEIGHT_PROFILES), required=True)
     plan.add_argument("--prefix", default="shard")
+    plan.add_argument("--manifest-name", default="shard-plan.json")
     merge = commands.add_parser("merge-junit", help="merge and validate shard JUnit")
     merge.add_argument("--output", type=Path, required=True)
     merge.add_argument("sources", type=Path, nargs="+")
@@ -438,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.shards,
                 arguments.profile,
                 arguments.prefix,
+                arguments.manifest_name,
             )
         elif arguments.command == "merge-junit":
             merge_junit(arguments.output, arguments.sources)
