@@ -146,3 +146,48 @@ fault/transitioning 不降级。首轮合成 fixture 因同一时间重复采样
 应用入口选择显式 frame/TCP profile、绑定只读硬件与 target measurement、连接 command/output
 日志并给现场操作者 exact-source 启动命令；不得将本文的 pytest 命令当成真机验收命令。
 真实设备前仍需确认 source profile 与实际工具/坐标绑定，并保留原 gravity/protective-hold 回退。
+
+## 7. 合并后 M4 验收基线（2026-09-18）
+
+本节只记录当前进度，不修改总路线图。B601 feedback fault contract 的来源
+`8098f176ec63a798f98dc37c0a0415532a161efb` 已经进入本地 `development`；当前
+development 在该合并之后又经过一次受控集成，当前复核快照为
+`e52504fdd556f9028b08f194d0a857be9e5a0e69`（tree
+`37df470ce2e7d599191617de8a6615dd1a5d369e`）。工作树干净，不能把更早的
+候选 Run 当作当前 source 的最终证据。
+
+### 离线与仿真复核
+
+在当前 development 快照、项目 Python 和已绑定 RM65 资产上执行了：
+
+```text
+tests/test_control_station_rebot_b601_rm65_application.py
+tests/test_control_station_rebot_b601_rm65_motion.py
+tests/test_control_station_rebot_b601_rm65_profile.py
+tests/test_control_station_rebot_b601_rm65_mujoco_session.py
+```
+
+结果为 **97 passed**。随后使用真实 `rm65_right_cube_lift_rl_actuated_v1.json`
+和现场生成的 150% 平移 profile 做 `python -m control_station b601-rm65
+--validate-only`，结果为 `VALIDATED`，`target_cleanup_completed=true`，目标控制
+频率为 60 Hz，profile 记录为平移 `[1.5, 1.5, 1.5]`、旋转 `1.0`。两次复核都没有
+打开 CAN、启动 GUI、使能电机或发送运动命令。
+
+因此 M4 的源码接缝已经具备现场验收条件：B601 只读反馈由独立的 gravity/damping
+owner 提供；RM65 是唯一的 MuJoCo target owner；GUI 的 `a/c/r/s/q` 状态机、freshness
+重试、目标 gate、canonical IK/碰撞/速度/加速度保护和日志/JSON 已由现有应用维护。
+`--disable-teleop-residual-envelope` 只适用于只读仿真入口，不能用于真机控制 owner。
+
+### 尚未完成的证据
+
+- 真机 B601 gravity/damping owner 与该入口同时运行时的 RM65 MuJoCo 人工观察仍为
+  `NOT_RUN`；不能用离线 97 passed 代替。
+- 需要现场确认静止、平移、旋转、clutch/recenter、stale/retry、退出和异常路径；每次
+  首次 Ctrl-C 仍应由原 B601 owner 保持六轴 gravity+damping protective hold，第二次
+  Ctrl-C/SIGUSR1 才全臂失能。
+- 需要保留 GUI 的 `result.json`、`command_and_output.log` 及 B601 owner 的完整日志，
+  并核对 mapping hash、反馈最大 age、`source_reused`、`target_step.status` 和
+  `resolution_failure`。这一步只由现场操作者在确认机械支撑和物理急停可用后执行。
+
+现场验收完成前，不推进 M5 policy→ReBot sim，也不把任何 profile/GUI 结果宣称为
+双真机或 haptic PASS。
