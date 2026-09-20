@@ -1094,6 +1094,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.enable_rtc_continuation
             ),
         }
+        # Newer OpenPI server revisions expose the sampler budget on their
+        # Args dataclass.  Bind the prepared runtime's explicit CLI value
+        # when that field exists; older revisions are handled by the policy
+        # factory adapter below and must not receive an unknown constructor
+        # keyword.
+        server_args_fields = getattr(server_module.Args, "__dataclass_fields__", {})
+        if "rtc_inference_steps" in server_args_fields:
+            server_kwargs["rtc_inference_steps"] = int(args.rtc_inference_steps)
         server_args = server_module.Args(**server_kwargs)
         rtc_steps_adapter = (
             install_openpi_rtc_inference_steps_server_adapter(
