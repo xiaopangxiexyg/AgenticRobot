@@ -20,13 +20,16 @@ from pathlib import Path
 # here makes the default plan useful in a clean checkout without depending on
 # mutable Harness history.
 FULL_WEIGHTS = {
-    # Exact testcase sums from the green six-shard baseline at 47d7be6e.
+    # Exact testcase sums from green six-shard runs. The five dominant modules
+    # were refreshed from the accepted 65bb09af successor baseline; the
+    # remaining sparse estimates retain the 47d7be6e baseline until another
+    # complete green run materially changes their placement.
     # These are scheduling estimates only; they do not change test selection.
-    "tests/test_mujoco_temp_pipeline.py": 134.914,
-    "tests/test_replay_position_admittance_active_pipeline.py": 108.657,
-    "tests/test_rm65_grasp_trajectory.py": 91.046,
-    "tests/test_mujoco_fast_runtime.py": 48.101,
-    "tests/test_control_station_mujoco_sim_hil.py": 36.534,
+    "tests/test_mujoco_temp_pipeline.py": 132.808,
+    "tests/test_replay_position_admittance_active_pipeline.py": 106.015,
+    "tests/test_rm65_grasp_trajectory.py": 89.265,
+    "tests/test_mujoco_fast_runtime.py": 45.701,
+    "tests/test_control_station_mujoco_sim_hil.py": 35.860,
     "tests/test_runtime_artifact_migration.py": 26.372,
     "tests/test_rebot_b601_real2sim.py": 23.742,
     "tests/test_collection_process_writer.py": 22.553,
@@ -72,10 +75,11 @@ FULL_WEIGHTS = {
     "tests/test_policy_learning_boundaries.py": 5.103,
 }
 
-# Modules normally remain the isolation unit. These two long-running modules
-# have independent top-level tests: replay uses function-local tmp_path logs
-# and fresh runtimes, not shared rollout fixtures. Parameter matrices remain
-# intact. Unlisted functions share the measured residual and stay collected.
+# Modules normally remain the isolation unit. These long-running modules have
+# independent top-level tests. Explicit affinity groups below keep the only
+# module-scoped fixture consumers together, so splitting cannot repeat their
+# expensive setup. Parameter matrices remain intact. Unlisted functions share
+# the measured residual and stay collected.
 FULL_SPLIT_NODE_WEIGHTS = {
     "tests/test_mujoco_temp_pipeline.py": {
         "test_contact_curriculum_reset_retries_recoverable_failure": 3.289,
@@ -105,15 +109,76 @@ FULL_SPLIT_NODE_WEIGHTS = {
         "test_temp_policy_checkpoint_round_trip": 1.616,
     },
     "tests/test_replay_position_admittance_active_pipeline.py": {
-        "test_larger_envelope_mujoco_abrupt_release_retains_frozen_catchup_gate": 27.246,
-        "test_right_combined_formal_active_runs_through_physical_mujoco": 27.142,
-        "test_half_normal_mujoco_endpoint_guard_holds_before_larger_qref_dispatch": 15.085,
-        "test_named_larger_active_envelopes_close_through_shared_ik_and_release": 13.590,
-        "test_raw_wrench_active_pipeline_runs_through_physical_mujoco": 13.003,
-        "test_raw_wrench_active_pipeline_exercises_shared_ik": 4.441,
-        "test_normal_shadow_envelope_is_replayed_under_cautious_active_caps": 4.218,
-        "test_sub_hold_wrench_is_not_promoted_as_active_ik_coverage": 3.924,
+        "test_right_combined_formal_active_runs_through_physical_mujoco": 29.334,
+        "test_larger_envelope_mujoco_abrupt_release_retains_frozen_catchup_gate": 27.171,
+        "test_half_normal_mujoco_endpoint_guard_holds_before_larger_qref_dispatch": 14.381,
+        "test_named_larger_active_envelopes_close_through_shared_ik_and_release": 13.675,
+        "test_raw_wrench_active_pipeline_runs_through_physical_mujoco": 9.079,
+        "test_normal_shadow_envelope_is_replayed_under_cautious_active_caps": 4.229,
+        "test_raw_wrench_active_pipeline_exercises_shared_ik": 4.146,
+        "test_sub_hold_wrench_is_not_promoted_as_active_ik_coverage": 3.989,
     },
+    "tests/test_rm65_grasp_trajectory.py": {
+        "test_real_snapshot_plans_via_strict_envelope_ingress_waypoint": 22.530,
+        "test_field_trace_grasp_trajectory_executes_as_exact_qpos_in_mujoco": 15.953,
+        "test_latest_blue_cube_candidate_has_short_strict_read_only_path": 13.745,
+        "test_field_trace_grasp_target_is_fully_planned_before_motion": 9.857,
+        "test_reachability_classification_uses_one_solution_residual_pair": 5.304,
+        "test_urdf_grasp_planner_handles_hold_and_moving_paths_without_mujoco": 3.868,
+        "test_endpoint_planner_solves_real_workspace_pose_outside_local_qp_basin": 1.925,
+        "test_dense_grasp_path_rejects_motion_away_from_envelope": 1.905,
+        "test_grasp_oracle_preserves_true_link3_link5_clearance_without_loading_mujoco": 1.872,
+        "test_real_snapshot_ingress_does_not_admit_an_outside_grasp_target": 1.798,
+        "test_dense_grasp_path_rejects_submillimeter_excursion_after_starting_inside": 1.765,
+        "test_reachability_stops_on_wall_time_budget_and_returns_best_basic_solution": 1.762,
+        "test_dense_grasp_path_rejects_larger_new_constraint_during_ingress": 1.730,
+        "test_dense_grasp_path_accepts_bounded_monotonic_envelope_ingress": 1.727,
+        "test_dense_grasp_path_cannot_bypass_tcp_safety_envelope": 1.726,
+        "test_dense_grasp_path_allows_submillimeter_tangent_during_ingress": 1.723,
+    },
+    "tests/test_mujoco_fast_runtime.py": {
+        "test_model_artifact_cache_separates_direct_arm_and_gripper_profiles": 9.889,
+        "test_model_artifact_cache_hits_and_recovers_from_corruption": 6.903,
+        "test_fast_kernel_matches_reference_action_trace": 6.837,
+        "test_pose_planner_recovers_only_small_mujoco_joint_limit_residual": 5.337,
+        "test_model_artifact_cache_publishes_one_valid_artifact_across_processes": 4.313,
+        "test_actuated_cube_lift_uses_measured_arm_state_and_shared_viewer_kernel": 3.897,
+        "test_vector_executor_is_deterministic_and_preserves_terminal_observation": 2.347,
+        "test_default_cube_lift_uses_measured_identified_gripper_state": 2.133,
+        "test_pose_planner_uses_sim_clearance_and_terminates_hard_limit_episode": 2.027,
+        "test_vector_env_exposes_batched_gymnasium_spaces": 1.597,
+        "test_fast_kernel_settled_snapshot_avoids_repeated_settle": 0.262,
+        "test_fast_env_passes_gymnasium_checker": 0.157,
+        "test_worker_runtime_library_path_restores_parent_environment": 0.002,
+    },
+    "tests/test_control_station_mujoco_sim_hil.py": {
+        "test_sim_hil_target_accepts_a_profile_selected_compose_rate": 7.455,
+        "test_sim_hil_target_binds_non_off_execution_observation_plan": 7.447,
+        "test_sim_hil_default_target_rates_and_measured_reset_session_home": 7.387,
+        "test_sim_hil_residual_schema_wiring_and_relative_human_submission": 7.324,
+        "test_selected_v5_target_reuses_task_owned_scripted_pregrasp_reset": 6.190,
+    },
+}
+
+# Each tuple is an indivisible scheduling bundle. All listed functions are
+# still separate pytest targets and JUnit identities; the planner only assigns
+# them to the same worker so a module-scoped fixture is instantiated once.
+FULL_SPLIT_NODE_GROUPS = {
+    "tests/test_rm65_grasp_trajectory.py": (
+        (
+            "test_field_trace_grasp_target_is_fully_planned_before_motion",
+            "test_field_trace_grasp_trajectory_executes_as_exact_qpos_in_mujoco",
+        ),
+    ),
+    "tests/test_mujoco_fast_runtime.py": (
+        (
+            "test_fast_kernel_matches_reference_action_trace",
+            "test_fast_kernel_settled_snapshot_avoids_repeated_settle",
+            "test_vector_executor_is_deterministic_and_preserves_terminal_observation",
+            "test_fast_env_passes_gymnasium_checker",
+            "test_vector_env_exposes_batched_gymnasium_spaces",
+        ),
+    ),
 }
 
 FAST_WEIGHTS = {
@@ -305,6 +370,48 @@ def _shard_items(
     ]
 
 
+def _shard_bundles(
+    weighted: list[tuple[str, Path, float]],
+    profile: str,
+) -> list[list[tuple[str, Path, float]]]:
+    """Bundle split targets that must share a module-scoped fixture."""
+
+    if profile != "full":
+        return [[item] for item in weighted]
+
+    item_by_target = {item[0]: item for item in weighted}
+    grouped_targets: set[str] = set()
+    bundles: list[list[tuple[str, Path, float]]] = []
+    for relative_path, groups in sorted(FULL_SPLIT_NODE_GROUPS.items()):
+        module_targets = {
+            target
+            for target in item_by_target
+            if target.startswith(f"{relative_path}::")
+        }
+        if not module_targets:
+            continue
+        for names in groups:
+            targets = tuple(f"{relative_path}::{name}" for name in names)
+            missing = set(targets) - module_targets
+            if missing:
+                raise ValueError(
+                    f"split affinity group names missing tests in {relative_path}: "
+                    f"{sorted(missing)}"
+                )
+            duplicate = set(targets) & grouped_targets
+            if duplicate:
+                raise ValueError(
+                    f"split affinity group repeats tests in {relative_path}: "
+                    f"{sorted(duplicate)}"
+                )
+            bundles.append([item_by_target[target] for target in targets])
+            grouped_targets.update(targets)
+    bundles.extend(
+        [item] for item in weighted if item[0] not in grouped_targets
+    )
+    return bundles
+
+
 def plan_shards(
     repository: Path,
     tests_root: Path,
@@ -335,7 +442,14 @@ def plan_shards(
 
     shards: list[list[tuple[str, Path, float]]] = [[] for _ in range(shard_count)]
     totals = [0.0] * shard_count
-    for item in sorted(weighted, key=lambda value: (-value[2], value[0])):
+    bundles = _shard_bundles(weighted, profile)
+    for bundle in sorted(
+        bundles,
+        key=lambda value: (
+            -sum(item[2] for item in value),
+            tuple(item[0] for item in value),
+        ),
+    ):
         index = min(
             range(shard_count),
             key=lambda candidate: (
@@ -344,8 +458,8 @@ def plan_shards(
                 candidate,
             ),
         )
-        shards[index].append(item)
-        totals[index] += item[2]
+        shards[index].extend(bundle)
+        totals[index] += sum(item[2] for item in bundle)
 
     planned = [target for shard in shards for target, _, _ in shard]
     if len(planned) != len(set(planned)):

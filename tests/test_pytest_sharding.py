@@ -85,17 +85,20 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     module = _load_sharding_module()
 
     assert module.FULL_WEIGHTS["tests/test_mujoco_temp_pipeline.py"] == pytest.approx(
-        134.914
+        132.808
     )
     assert module.FULL_WEIGHTS[
         "tests/test_replay_position_admittance_active_pipeline.py"
-    ] == pytest.approx(108.657)
+    ] == pytest.approx(106.015)
     assert module.FULL_WEIGHTS["tests/test_mujoco_fast_runtime.py"] == pytest.approx(
-        48.101
+        45.701
     )
     assert module.FULL_WEIGHTS["tests/test_rm65_grasp_trajectory.py"] == pytest.approx(
-        91.046
+        89.265
     )
+    assert module.FULL_WEIGHTS[
+        "tests/test_control_station_mujoco_sim_hil.py"
+    ] == pytest.approx(35.860)
     assert module.FULL_WEIGHTS[
         "tests/test_mujoco_formal_compound_authority.py"
     ] == pytest.approx(6.681)
@@ -138,6 +141,9 @@ def test_fast_integration_profile_tracks_its_unsharded_critical_path() -> None:
     (
         "tests/test_mujoco_temp_pipeline.py",
         "tests/test_replay_position_admittance_active_pipeline.py",
+        "tests/test_rm65_grasp_trajectory.py",
+        "tests/test_mujoco_fast_runtime.py",
+        "tests/test_control_station_mujoco_sim_hil.py",
     ),
 )
 def test_full_plan_splits_registered_large_module_without_losing_tests(
@@ -173,6 +179,17 @@ def test_full_plan_splits_registered_large_module_without_losing_tests(
         any(target.startswith(f"{relative_path}::") for target, _, _ in shard)
         for shard in shards
     )
+    for affinity_group in module.FULL_SPLIT_NODE_GROUPS.get(relative_path, ()):
+        group_targets = {
+            f"{relative_path}::{test_name}" for test_name in affinity_group
+        }
+        group_shards = {
+            index
+            for index, shard in enumerate(shards)
+            if group_targets
+            & {target for target, _path, _weight in shard}
+        }
+        assert len(group_shards) == 1
     assert module.plan_shards(repository, tests_root, 2, "full") == shards
     fast_targets = [
         target
@@ -180,6 +197,30 @@ def test_full_plan_splits_registered_large_module_without_losing_tests(
         for target, _, _ in shard
     ]
     assert set(fast_targets) == {relative_path, "tests/test_small.py"}
+
+
+def test_full_plan_rejects_missing_split_affinity_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_sharding_module()
+    relative_path = "tests/test_mujoco_fast_runtime.py"
+    repository = tmp_path / "checkout"
+    split_path = repository / relative_path
+    split_path.parent.mkdir(parents=True)
+    registered = module.FULL_SPLIT_NODE_WEIGHTS[relative_path]
+    split_path.write_text(
+        "\n\n".join(f"def {name}():\n    pass" for name in registered) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(
+        module.FULL_SPLIT_NODE_GROUPS,
+        relative_path,
+        (("test_missing_fixture_consumer",),),
+    )
+
+    with pytest.raises(ValueError, match="affinity group names missing tests"):
+        module.plan_shards(repository, split_path.parent, 1, "full")
 
 
 @pytest.mark.parametrize(
