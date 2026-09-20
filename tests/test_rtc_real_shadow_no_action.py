@@ -371,6 +371,30 @@ def test_recoverable_timeout_classifier_accepts_only_timeout_markers(reason: str
     assert run_policy._rtc_recoverable_timeout_reason(non_timeout) is None
 
 
+def test_rtc_position_executor_recovery_classifier_is_narrow() -> None:
+    stale = {
+        "fault_latched": True,
+        "fault_stage": "reference_worker",
+        "fault_type": "TimeoutError",
+        "fault": (
+            "15 Hz position keyframe stream is stale: "
+            "age=0.251713s limit=0.250000s"
+        ),
+    }
+    assert (
+        run_policy._rtc_recoverable_position_executor_fault_reason(stale)
+        == "rtc_position_reference_stale"
+    )
+
+    for rejected in (
+        {**stale, "fault": "reference deadline burst exceeded"},
+        {**stale, "fault_stage": "safety_gate"},
+        {**stale, "fault_type": "RuntimeError"},
+        {**stale, "fault_latched": False},
+    ):
+        assert run_policy._rtc_recoverable_position_executor_fault_reason(rejected) is None
+
+
 @pytest.mark.parametrize(
     ("inference_started_at", "released_at"),
     (

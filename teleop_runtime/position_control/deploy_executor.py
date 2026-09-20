@@ -1649,6 +1649,89 @@ class PositionDeployExecutor:
                     self._invoke_hold()
         self._wake.set()
 
+    def recover_stale_reference_fault(self, *, reason: str) -> Mapping[str, Any]:
+        """Recover one explicitly classified RTC source-stream stale fault.
+
+        A slow RTC exchange can outlive the position reference queue while the
+        reference worker is still running.  The worker then latches its
+        ``TimeoutError`` before the deployment loop gets a chance to observe
+        the corresponding RTC deadline result.  ``clear()`` intentionally
+        does not clear latched faults, so without a narrow recovery seam the
+        deployment exits on the next loop even though the producer failure is
+        recoverable.
+
+        This method is deliberately *not* a general executor re-arm.  It only
+        accepts the exact background fault produced by the stale-source guard;
+        reference deadline overruns, backend failures, collision/safety gates,
+        and every other fault remain restart/manual-rearm paths.  Clearing the
+        stream first preserves the existing generation invalidation and Hold
+        ordering.  A real-hardware Hold callback must succeed before the
+        stale fault is released.
+        """
+
+        self._reject_worker_lifecycle_call("recover_stale_reference_fault")
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("reason must be non-empty")
+
+        with self._lock:
+            fault = self._fault
+            fault_stage = self._fault_stage
+            fault_text = "" if fault is None else str(fault)
+            recoverable = bool(
+                isinstance(fault, TimeoutError)
+                and fault_stage == "reference_worker"
+                and "position keyframe stream is stale" in fault_text
+            )
+            fault_payload = {
+                "fault_type": None if fault is None else type(fault).__name__,
+                "fault_stage": fault_stage,
+                "fault": fault_text or None,
+                "fault_metadata": (
+                    None if self._fault_metadata is None else dict(self._fault_metadata)
+                ),
+            }
+        if not recoverable:
+            raise PositionDeployExecutorFault(
+                "only the explicit stale reference-worker TimeoutError can be "
+                "recovered; restart/manual re-arm is required for the current "
+                f"executor fault ({fault_stage or 'none'}: {fault_text or 'none'})"
+            )
+
+        # clear() invalidates every queued/in-flight generation and performs
+        # the normal backend Hold ordering.  If the Hold callback fails, the
+        # original fault remains latched and this method propagates that error.
+        self.clear()
+        with self._dispatch_lock:
+            with self._lock:
+                current_fault = self._fault
+                current_text = "" if current_fault is None else str(current_fault)
+                if not (
+                    isinstance(current_fault, TimeoutError)
+                    and self._fault_stage == "reference_worker"
+                    and "position keyframe stream is stale" in current_text
+                ):
+                    raise PositionDeployExecutorFault(
+                        "stale reference fault changed while recovery was in progress"
+                    )
+                self._fault = None
+                self._fault_stage = None
+                self._fault_metadata = None
+                self._fault_pending = False
+                self._fault_pending_stage = None
+                self._fault_pending_error = None
+                recovery_payload = {
+                    "reason": normalized_reason,
+                    **fault_payload,
+                    "generation": int(self._generation),
+                }
+                self._append_debug_event_locked(
+                    "recoverable_stale_reference_fault_cleared",
+                    recovery_payload,
+                )
+        self._wake.set()
+        return recovery_payload
+
     def pause(self) -> None:
         self.clear()
 

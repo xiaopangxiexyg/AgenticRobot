@@ -2060,6 +2060,31 @@ def _rtc_recoverable_timeout_reason(step: Any) -> str | None:
     return None
 
 
+def _rtc_recoverable_position_executor_fault_reason(
+    snapshot: Mapping[str, Any] | None,
+) -> str | None:
+    """Classify only the position fault caused by an RTC source-stream gap.
+
+    The position executor intentionally latches background faults.  A slow
+    RTC exchange can make its stale-source watchdog win the race against the
+    deployment loop's deadline result, so the loop needs a typed hand-off
+    rather than treating that one producer-timing fault as a process failure.
+    Do not broaden this to generic ``TimeoutError``: reference deadline
+    overruns, backend failures, and safety faults must remain fail-closed.
+    """
+
+    if not isinstance(snapshot, Mapping) or not bool(snapshot.get("fault_latched")):
+        return None
+    if str(snapshot.get("fault_stage") or "") != "reference_worker":
+        return None
+    if str(snapshot.get("fault_type") or "") != "TimeoutError":
+        return None
+    fault_text = str(snapshot.get("fault") or "")
+    if "position keyframe stream is stale" not in fault_text:
+        return None
+    return "rtc_position_reference_stale"
+
+
 def _bounded_policy_step_limit_reached(
     *,
     max_steps: int,
@@ -3660,6 +3685,11 @@ def main(
 
         hold_error: str | None = None
         try:
+            # The reference worker can win the race against the RTC deadline
+            # while the model call is still blocking this control loop.  Clear
+            # only that explicitly typed stale-source fault before the normal
+            # gap Hold path; all other executor faults remain fail-closed.
+            _recover_rtc_position_executor_stale_fault(reason=reason)
             hold_rtc_if_eligible(now=control_loop_started_at, reason=reason)
             _hold_active_rtc_gap(
                 reason=reason,
@@ -3778,6 +3808,37 @@ def main(
             f"{message} Press g to retry a fresh RTC session.",
             now=control_loop_started_at,
         )
+
+    def _recover_rtc_position_executor_stale_fault(
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Clear one stale RTC reference-worker fault after its Hold is safe."""
+
+        if rtc_frontend is None or position_deploy_executor is None:
+            return None
+        snapshot = position_deploy_executor.snapshot()
+        stale_reason = _rtc_recoverable_position_executor_fault_reason(snapshot)
+        if stale_reason is None:
+            return None
+        recovery = position_deploy_executor.recover_stale_reference_fault(
+            reason=str(reason).strip() or stale_reason,
+        )
+        debug_logger.log_event(
+            "rtc_position_executor_stale_recovery",
+            {
+                "schema": "dexteleop_rtc_position_executor_stale_recovery_v1",
+                "status": "cleared",
+                **dict(recovery),
+            },
+        )
+        console_log_event(
+            "RTC",
+            "RECOVERABLE: stale position reference stream cleared; policy will "
+            "remain paused until g is pressed.",
+            now=control_loop_started_at,
+        )
+        return recovery
 
     def record_policy_prediction_result(
         prediction: PolicyChunkPredictionResult,
@@ -4189,6 +4250,7 @@ def main(
         tcp_pose_envelope_execution_epoch = 0
         tcp_pose_envelope_last_bind_error: str | None = None
         tcp_pose_envelope_fault_latched = False
+        pending_rtc_position_fault_reason: str | None = None
         with NonBlockingKeyboard() as keyboard:
             while True:
                 loop_started_at = time.time()
@@ -4221,6 +4283,18 @@ def main(
                             "reference_anchor_safety",
                         }:
                             position_safety_fault_latched = True
+                        elif rtc_frontend is not None and (
+                            _rtc_recoverable_position_executor_fault_reason(
+                                executor_fault
+                            )
+                            is not None
+                        ):
+                            pending_rtc_position_fault_reason = (
+                                "rtc_position_reference_stale"
+                            )
+                            _recover_rtc_position_executor_stale_fault(
+                                reason=pending_rtc_position_fault_reason,
+                            )
                         else:
                             position_deploy_executor.raise_if_fault()
                 pre_action_executor_completed_at = time.monotonic()
@@ -4563,6 +4637,17 @@ def main(
                 )
                 pre_action_observation_completed_at = time.monotonic()
                 faults = list(observation.faults)
+                if pending_rtc_position_fault_reason is not None:
+                    stale_reason = pending_rtc_position_fault_reason
+                    pending_rtc_position_fault_reason = None
+                    pause_after_rtc_recoverable_timeout(
+                        reason=stale_reason,
+                        message=(
+                            "position reference worker lost its RTC source stream "
+                            f"({stale_reason})"
+                        ),
+                        observation=observation,
+                    )
                 if tcp_pose_envelope_fault_latched:
                     faults.append("tcp_pose_envelope_restart_required")
                 envelope_init_blocks = bool(

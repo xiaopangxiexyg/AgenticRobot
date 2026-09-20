@@ -2569,6 +2569,43 @@ def test_dispatch_fault_is_latched_and_requests_hold() -> None:
         executor.close()
 
 
+def test_stale_reference_fault_has_narrow_rtc_recovery_seam() -> None:
+    holds: list[str] = []
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(stale_after_sec=0.5),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=lambda _command: None,
+        hold_callback=lambda: holds.append("hold"),
+    )
+    try:
+        executor._latch_fault(
+            TimeoutError(
+                "15 Hz position keyframe stream is stale: "
+                "age=0.251713s limit=0.250000s"
+            ),
+            stage="reference_worker",
+            metadata={"source": "test"},
+        )
+        receipt = executor.recover_stale_reference_fault(
+            reason="rtc_result_timeout",
+        )
+        assert receipt["fault_type"] == "TimeoutError"
+        assert receipt["fault_stage"] == "reference_worker"
+        assert executor.snapshot()["fault_latched"] is False
+        assert executor.snapshot()["active"] is False
+        assert holds == ["hold", "hold"]
+
+        executor._latch_fault(
+            TimeoutError("reference deadline burst exceeded"),
+            stage="reference_worker",
+        )
+        with pytest.raises(PositionDeployExecutorFault, match="only the explicit stale"):
+            executor.recover_stale_reference_fault(reason="rtc_result_timeout")
+        assert executor.snapshot()["fault_latched"] is True
+    finally:
+        executor.close()
+
+
 def test_reference_deadline_burst_faults_instead_of_catching_up() -> None:
     hold_called = threading.Event()
 
