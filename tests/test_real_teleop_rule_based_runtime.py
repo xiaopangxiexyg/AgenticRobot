@@ -877,6 +877,62 @@ def test_rule_runtime_exposes_configured_hand_fault_before_writer_open() -> None
     assert session.state_machine.state.value == "ARMED"
 
 
+def test_pre_dispatch_hand_fault_cancels_armed_attempt_instead_of_stranding_countdown() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6),
+                        right_arm=np.zeros(6),
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+    session, clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=True,
+        hand_sides=("right",),
+    )
+    session.rig = SimpleNamespace(
+        readiness_report=lambda: {
+            "ready": False,
+            "reason": "unready backends: right_hand",
+            "backends": {
+                "right_hand": {
+                    "ready": False,
+                    "reason": "telemetry_failed: Write timeout",
+                }
+            },
+        }
+    )
+    right_backend = extension._components.right_hand_backend
+    right_backend.is_ready = lambda: False
+    right_backend.readiness_report = lambda: {
+        "ready": False,
+        "reason": "telemetry_failed: Write timeout",
+    }
+
+    extension.after_control_input_poll(now=1.0)
+
+    status = extension.status()
+    assert status.armed is False
+    assert status.aborted is True
+    assert status.held is True
+    assert status.waiting_reason == "session_readiness_failure"
+    assert session.hold_reasons
+    assert clutch.reasons == ["rule_based_runtime_hold"]
+    assert ui.failure_stop_requests == 1
+    assert any("Write timeout" in message for _tag, message in ui.messages)
+
+
 def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),

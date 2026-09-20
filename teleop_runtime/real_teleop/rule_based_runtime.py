@@ -1249,6 +1249,58 @@ class RuleBasedRealTeleopExtension:
             )
         return True
 
+    def _abort_pre_dispatch_readiness_loss(self) -> bool:
+        """Fail closed when a started rule attempt loses hardware admission.
+
+        The dedicated rule UI intentionally permits a short ARMED window so
+        the formal writer can open before the first rule arm command. That
+        exception must not leave an attempt armed after a hand/Rig fault: the
+        next countdown tick would otherwise report only the generic missing
+        dispatch receipt and strand the task chain. Once any command has been
+        dispatched, the normal Session/Rule failure path owns the fault.
+        """
+
+        if (
+            not self._armed
+            or self._execution_begun
+            or self._completed
+            or self._aborted
+            or self._held
+        ):
+            return False
+        session = getattr(self._components, "session", None)
+        session_state = getattr(getattr(session, "state_machine", None), "state", None)
+        session_state_value = str(
+            getattr(session_state, "value", session_state) or ""
+        ).upper()
+        blockers, readiness_reason = self._session_readiness_diagnosis(
+            session_state_value=session_state_value,
+        )
+        if not blockers:
+            return False
+        detail = "; ".join(
+            f"{key}: {value}" for key, value in sorted(blockers.items())
+        )
+        if not detail:
+            detail = readiness_reason or "Rig is not ready"
+        message = (
+            "规则采集在首条机械臂命令派发前被安全取消："
+            + detail
+            + "。请先恢复设备并重新完成 runtime Home。"
+        )
+        self._aborted = True
+        self._armed = False
+        self._waiting_reason = "session_readiness_failure"
+        self._clear_current()
+        self._clear_replay_reference_schedule()
+        self._cancel_initial_alignment_planning()
+        self._establish_hold(message)
+        self._request_failure_stop()
+        append_message = getattr(self._control_ui, "append_message", None)
+        if callable(append_message):
+            append_message("RuleBased", message)
+        return True
+
     def after_control_input_poll(self, *, now: float) -> None:
         self._frame_emission = None
         self._paused_hold_emission = None
@@ -1367,6 +1419,9 @@ class RuleBasedRealTeleopExtension:
                             else "已排队：闭紧夹爪"
                         )
                     )
+        if self._abort_pre_dispatch_readiness_loss():
+            self._publish_status(force=True)
+            return
         self._publish_status()
 
     def _height_calibration_mutation_idle(self) -> bool:
