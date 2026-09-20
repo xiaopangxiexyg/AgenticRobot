@@ -57,6 +57,8 @@ from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspReachabilityConfig,
     RM65GraspTrajectoryPlanningConfig,
     RM65GraspTrajectoryPlanningError,
+    RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME,
+    RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
 )
@@ -407,6 +409,37 @@ def field_trace_plan() -> tuple[RealAgentJointTrajectory, RM65SkillTargetBuilder
         profile=profile,
         planning_target_builder=builder,
         target_envelope_filter=builder.pre_ik_target_safety_filter,
+    )(
+        qpos_by_side=FIELD_TRACE_QPOS,
+        side="right",
+        target_tool_tcp_world=xyzquat_to_pose_matrix(
+            FIELD_TRACE_TARGET_XYZQUAT,
+            name="field_trace_grasp_target",
+        ),
+        speed_scale=0.2,
+    )
+    return trajectory, builder
+
+
+@pytest.fixture(scope="module")
+def continuous_field_trace_plan() -> tuple[
+    RealAgentJointTrajectory,
+    RM65SkillTargetBuilder,
+]:
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    trajectory = RM65GraspJointTrajectoryPlanner(
+        profile=profile,
+        planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+        config=RM65GraspTrajectoryPlanningConfig(
+            trajectory_parameterization=(
+                RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+            ),
+            endpoint_candidate_ordering=(
+                RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME
+            ),
+        ),
     )(
         qpos_by_side=FIELD_TRACE_QPOS,
         side="right",
@@ -1073,7 +1106,10 @@ def test_latest_blue_cube_candidate_supports_continuous_c2_parameterization() ->
         config=RM65GraspTrajectoryPlanningConfig(
             trajectory_parameterization=(
                 RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
-            )
+            ),
+            endpoint_candidate_ordering=(
+                RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME
+            ),
         ),
     )
 
@@ -1171,10 +1207,15 @@ def test_field_trace_grasp_target_is_fully_planned_before_motion(
     not DEFAULT_INSPIRE_V3_DUAL_ARM_URDF.is_file(),
     reason="local canonical Inspire-v3 MuJoCo asset is unavailable",
 )
+@pytest.mark.parametrize(
+    "plan_fixture_name",
+    ("field_trace_plan", "continuous_field_trace_plan"),
+)
 def test_field_trace_grasp_trajectory_executes_as_exact_qpos_in_mujoco(
-    field_trace_plan: tuple[RealAgentJointTrajectory, RM65SkillTargetBuilder],
+    request,
+    plan_fixture_name: str,
 ) -> None:
-    planned, _builder = field_trace_plan
+    planned, _builder = request.getfixturevalue(plan_fixture_name)
     obstacle_scene = ObstacleSceneSnapshot(
         reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
         reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
@@ -1182,7 +1223,7 @@ def test_field_trace_grasp_trajectory_executes_as_exact_qpos_in_mujoco(
     )
     snapshot = _field_trace_snapshot()
     registered = RegisteredShadowJointTrajectory(
-        trajectory_id="field-trace-grasp:exact-qpos",
+        trajectory_id=f"field-trace-grasp:{plan_fixture_name}:exact-qpos",
         created_at=2.0,
         initial_snapshot=snapshot,
         scene_hash=obstacle_scene.semantic_content_hash,
@@ -2312,6 +2353,56 @@ def test_grasp_trajectory_parameterization_defaults_to_legacy_until_promoted() -
 
     with pytest.raises(ValueError, match="trajectory_parameterization"):
         RM65GraspTrajectoryPlanningConfig(trajectory_parameterization="unknown")
+
+    assert config.endpoint_candidate_ordering == (
+        RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE
+    )
+    with pytest.raises(ValueError, match="endpoint_candidate_ordering"):
+        RM65GraspTrajectoryPlanningConfig(endpoint_candidate_ordering="unknown")
+
+
+def test_estimated_execution_time_orders_ik_branches_by_joint_speed(
+    monkeypatch,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            endpoint_candidate_ordering=(
+                RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME
+            )
+        )
+    )
+    current = np.zeros(6)
+
+    def candidate(seed_index: int, joint_index: int, value: float):
+        right = current.copy()
+        right[joint_index] = value
+        return grasp_trajectory_module._EndpointIKCandidate(
+            qpos_by_side={"left": current.copy(), "right": right},
+            seed_index=seed_index,
+            solve_cycles=1,
+            position_residual_m=0.0,
+            orientation_residual_deg=0.0,
+        )
+
+    smaller_joint_distance_but_slow = candidate(0, 1, 0.30)
+    larger_joint_distance_but_fast = candidate(1, 0, 0.40)
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "load_joint_velocity_limit_profiles",
+        lambda: {
+            "test-velocity": SimpleNamespace(
+                max_velocity_deg_s=(100.0, 10.0, 100.0, 100.0, 100.0, 100.0)
+            )
+        },
+    )
+
+    ordered = planner._ordered_endpoint_candidates(
+        candidates=(smaller_joint_distance_but_slow, larger_joint_distance_but_fast),
+        current_qpos=current,
+        side="right",
+    )
+
+    assert tuple(item.seed_index for item in ordered) == (1, 0)
 
 
 def test_planner_entrypoint_records_continuous_parameterization(

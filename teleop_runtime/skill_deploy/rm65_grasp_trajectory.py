@@ -65,6 +65,14 @@ RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES = (
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
     RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
 )
+RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE = "joint_distance"
+RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME = (
+    "estimated_execution_time"
+)
+RM65_GRASP_ENDPOINT_ORDER_MODES = (
+    RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
+    RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME,
+)
 
 
 class RM65GraspTrajectoryPlanningError(RuntimeError):
@@ -115,6 +123,7 @@ class RM65GraspTrajectoryPlanningConfig:
     trajectory_parameterization: str = (
         RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP
     )
+    endpoint_candidate_ordering: str = RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE
     path_envelope_ingress_waypoint_fractions: tuple[float, ...] = (
         0.05,
         0.10,
@@ -186,6 +195,17 @@ class RM65GraspTrajectoryPlanningConfig:
             self,
             "trajectory_parameterization",
             parameterization,
+        )
+        endpoint_ordering = str(self.endpoint_candidate_ordering).strip().lower()
+        if endpoint_ordering not in RM65_GRASP_ENDPOINT_ORDER_MODES:
+            raise ValueError(
+                "endpoint_candidate_ordering must be one of "
+                f"{RM65_GRASP_ENDPOINT_ORDER_MODES}."
+            )
+        object.__setattr__(
+            self,
+            "endpoint_candidate_ordering",
+            endpoint_ordering,
         )
         if self.minimum_pregrasp_distance_m > self.pregrasp_distance_m:
             raise ValueError(
@@ -887,6 +907,57 @@ class RM65GraspJointTrajectoryPlanner:
             return 1.0
         fraction = (soft_rad - distance_rad) / (soft_rad - hard_rad)
         return 1.0 + fraction * (maximum_scale - 1.0)
+
+    def _ordered_endpoint_candidates(
+        self,
+        *,
+        candidates: tuple[_EndpointIKCandidate, ...],
+        current_qpos: np.ndarray,
+        side: str,
+    ) -> tuple[_EndpointIKCandidate, ...]:
+        """Order valid IK branches without adding another path-search pass."""
+
+        current = np.asarray(current_qpos, dtype=float).reshape(6)
+        if self.config.endpoint_candidate_ordering == (
+            RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE
+        ):
+            return tuple(
+                sorted(
+                    candidates,
+                    key=lambda item: float(
+                        np.linalg.norm(
+                            np.asarray(item.qpos_by_side[side], dtype=float)
+                            - current
+                        )
+                    ),
+                )
+            )
+
+        velocity_profile_name = (
+            self.profile.position_profile.ik_execution.joint_velocity_limit_profile
+        )
+        velocity_profile = load_joint_velocity_limit_profiles()[
+            velocity_profile_name
+        ]
+        velocity_limit = np.deg2rad(
+            np.asarray(velocity_profile.max_velocity_deg_s, dtype=float)
+        )
+        if velocity_limit.shape != (6,) or not np.all(velocity_limit > 0.0):
+            raise ValueError(
+                "joint velocity profile must expose six positive limits."
+            )
+
+        def key(item: _EndpointIKCandidate) -> tuple[float, float, int]:
+            target = np.asarray(item.qpos_by_side[side], dtype=float)
+            delta = np.abs(target - current)
+            minimum_joint_time = float(np.max(delta / velocity_limit))
+            estimated_time = minimum_joint_time * self._singularity_interval_scale(
+                current,
+                target,
+            )
+            return estimated_time, float(np.linalg.norm(delta)), item.seed_index
+
+        return tuple(sorted(candidates, key=key))
 
     def _segment_duration_diagnostics(
         self,
@@ -2107,12 +2178,12 @@ class RM65GraspJointTrajectoryPlanner:
             )
         if accepted:
             current = np.asarray(qpos_by_side[side], dtype=float)
-            accepted.sort(
-                key=lambda item: float(
-                    np.linalg.norm(np.asarray(item.qpos_by_side[side]) - current)
-                )
+            ordered = self._ordered_endpoint_candidates(
+                candidates=tuple(accepted),
+                current_qpos=current,
+                side=side,
             )
-            return tuple(accepted[: self.config.maximum_endpoint_candidates])
+            return ordered[: self.config.maximum_endpoint_candidates]
         if collision_unavailable:
             reason = "endpoint_collision_check_unavailable"
         elif endpoint_envelope_blocked:
@@ -2563,6 +2634,9 @@ class RM65GraspJointTrajectoryPlanner:
             attempt_record: dict[str, object] = {
                 "planning_phase": planning_phase,
                 "search_collision_model": "ik_sparse_proxy_pairs",
+                "endpoint_candidate_ordering": (
+                    self.config.endpoint_candidate_ordering
+                ),
                 "endpoint_seed_indices": tuple(e.seed_index for e in search_candidates),
                 "path_attempt": path_attempt,
                 "search_seed": attempt_config.seed,
@@ -3789,6 +3863,9 @@ class RM65GraspJointTrajectoryPlanner:
 
 __all__ = [
     "RM65GraspJointTrajectoryPlanner",
+    "RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME",
+    "RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE",
+    "RM65_GRASP_ENDPOINT_ORDER_MODES",
     "RM65GraspReachabilityConfig",
     "RM65GraspReachabilityResult",
     "RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC",

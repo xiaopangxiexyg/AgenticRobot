@@ -38,6 +38,7 @@ from teleop_runtime.skill_deploy import (
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspJointTrajectoryPlanner,
     RM65GraspReachabilityConfig,
+    RM65GraspTrajectoryPlanningConfig,
 )
 
 from .exclusive_application import (
@@ -252,6 +253,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     point_grasp_planner: object | None = None,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
+    grasp_trajectory_config: RM65GraspTrajectoryPlanningConfig | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> ExclusiveRM65AgentPrimitiveComposition:
@@ -263,6 +265,14 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("debug_render_object_coordinates must be bool.")
     if not isinstance(enable_point_grasp_arm_reachability, bool):
         raise TypeError("enable_point_grasp_arm_reachability must be bool.")
+    if grasp_trajectory_config is not None and not isinstance(
+        grasp_trajectory_config,
+        RM65GraspTrajectoryPlanningConfig,
+    ):
+        raise TypeError(
+            "grasp_trajectory_config must be RM65GraspTrajectoryPlanningConfig "
+            "or None."
+        )
     side = str(authorized_side).strip().lower()
     if side not in {"left", "right"}:
         raise ValueError("authorized_side must be left or right.")
@@ -810,6 +820,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 lower.profile
             ),
             target_envelope_filter=(lower.target_builder.pre_ik_target_safety_filter),
+            config=grasp_trajectory_config,
             reachability_config=reachability_config,
             trajectory_record_dir=planned_trajectory_dir,
         )

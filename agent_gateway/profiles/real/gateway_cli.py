@@ -51,6 +51,13 @@ from teleop_runtime.skill_deploy.motion_trace import (
     SkillMotionTraceConfig,
     SkillMotionTraceRecorder,
 )
+from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65GraspTrajectoryPlanningConfig,
+    RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
+    RM65_GRASP_ENDPOINT_ORDER_MODES,
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES,
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+)
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
 from .point_grasp_deployment import (
@@ -216,6 +223,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "maximum grasp-approach execution operation duration "
             "(default: 120s)"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-trajectory-parameterization",
+        choices=RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES,
+        default=RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+        help=(
+            "grasp path timing mode; continuous_c2 preserves motion through "
+            "internal waypoints but still stops at semantic stage boundaries"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-endpoint-candidate-ordering",
+        choices=RM65_GRASP_ENDPOINT_ORDER_MODES,
+        default=RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
+        help=(
+            "valid IK branch preference; estimated_execution_time uses the "
+            "configured per-joint velocity limits without adding path searches"
         ),
     )
     parser.add_argument(
@@ -952,6 +977,10 @@ def main(argv: list[str] | None = None) -> int:
         point_grasp_planner=point_grasp_planner,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
+        grasp_trajectory_config=RM65GraspTrajectoryPlanningConfig(
+            trajectory_parameterization=(args.grasp_trajectory_parameterization),
+            endpoint_candidate_ordering=(args.grasp_endpoint_candidate_ordering),
+        ),
     )
 
     motion_trace: SkillMotionTraceRecorder | None = None
@@ -982,6 +1011,12 @@ def main(argv: list[str] | None = None) -> int:
                     "collision_scene_profile": args.collision_scene_profile,
                     "lower_profile_hash": resolved.semantic_content_hash,
                     "debug_motion_skill": args.debug_motion_skill,
+                    "grasp_trajectory_parameterization": (
+                        args.grasp_trajectory_parameterization
+                    ),
+                    "grasp_endpoint_candidate_ordering": (
+                        args.grasp_endpoint_candidate_ordering
+                    ),
                 },
             )
         )
