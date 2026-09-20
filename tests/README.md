@@ -216,8 +216,8 @@ socket-capable green Run and cover only modules that contributed at least five
 seconds there. Refresh them only from another exact green full-suite artifact;
 failed, capability-limited, or focused runs are not representative inputs.
 The dominant module and function weights are refreshed only from exact green
-six-shard runs; the current critical-path refresh is based on the green
-`a32ceccd` calibration run. They are scheduling estimates, not timeouts or
+six-shard runs; the current critical-path refresh is based on the accepted
+`65bb09af` successor baseline. They are scheduling estimates, not timeouts or
 acceptance thresholds.
 The default remains four shards. Each shard has separate pytest, Python, XDG,
 Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
