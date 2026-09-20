@@ -32,6 +32,8 @@ def assemble_b601_rm65_session(
     maximum_measurement_age_sec: float = 0.1,
     maximum_translation_m: float | None = 0.1,
     maximum_rotation_rad: float | None = 0.3,
+    gripper_sample_provider=None,
+    gripper_mapping=None,
 ) -> B601RM65MotionSession:
     """Bind existing owners; do not start or close any injected resource."""
     from control_station.composition.rebot_b601_rm65_residual import (
@@ -69,20 +71,38 @@ def assemble_b601_rm65_session(
         maximum_measurement_age_sec=maximum_measurement_age_sec,
         maximum_translation_m=maximum_translation_m,
         maximum_rotation_rad=maximum_rotation_rad,
+        gripper_sample_provider=gripper_sample_provider,
+        gripper_mapping=gripper_mapping,
         enabled=True,
     )
     return B601RM65MotionSession(binding, measure_target=measure_target)
 
 
-def build_b601_rm65_sim_target(task_config_path: Path):
+def build_b601_rm65_sim_target(
+    task_config_path: Path,
+    *,
+    enable_gripper: bool = False,
+):
     """Prepare one existing actuated rig, canonical coupled IK and pose reader.
 
-    Task-specific scripted resets are forbidden. No policy, composition,
-    gripper primitive or direct-qpos diagnostic is enabled by this factory.
+    Task-specific scripted resets are forbidden. No policy, composition or
+    direct-qpos diagnostic is enabled by this factory.  The optional
+    ``enable_gripper`` path adds the existing DM-Tac one-scalar hand component
+    and canonical shared safety; it does not change the default arm-only
+    target.
     The returned runtime is not started; its caller owns start/close.
     """
-    from robot_motion.action import ExecutionMeasurementObservation
-    from robot_motion.position_control import POSITION_60_120_PROFILE_NAME
+    from robot_motion.action import (
+        CanonicalKeyframeSafetyProfile,
+        ExecutionMeasurementObservation,
+        HandActionSpec,
+        HandQposSafetyLimits,
+        apply_canonical_keyframe_safety,
+    )
+    from robot_motion.position_control import (
+        POSITION_60_120_PROFILE_NAME,
+        PositionKeyframeSafetyConfig,
+    )
     from robot_motion.rm65 import (
         DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
         RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
@@ -107,6 +127,9 @@ def build_b601_rm65_sim_target(task_config_path: Path):
         build_mujoco_pose_observation_projector,
     )
     from sim.mujoco.deploy.target_config import MujocoSimHILTargetConfig
+    from sim.mujoco.deploy.target_measurement import (
+        capture_mujoco_sim_hil_safety_anchor,
+    )
     from sim.mujoco.deploy.target_preparation import prepare_mujoco_sim_hil_target
     from sim.mujoco.ik import RM65CanonicalIK
 
@@ -162,6 +185,11 @@ def build_b601_rm65_sim_target(task_config_path: Path):
             collision_constraints_enabled=prepared.config.collision_stop_enabled,
         ),
     )
+    hand_specs = (
+        {"right": HandActionSpec.dmtac_gripper("right")}
+        if enable_gripper
+        else {}
+    )
     rig = MujocoPositionExecutionRig(
         scene,
         MujocoPositionExecutionConfig(
@@ -171,17 +199,54 @@ def build_b601_rm65_sim_target(task_config_path: Path):
             realtime_worker=prepared.config.realtime_worker,
         ),
     )
+    safety_profile = None
+    if hand_specs:
+        safety_profile = CanonicalKeyframeSafetyProfile(
+            profile_id="b601-rm65-readonly-gripper-safety-v1",
+            limits=PositionKeyframeSafetyConfig(workspace_enabled=False),
+            hand_limits_by_side={
+                side: HandQposSafetyLimits.uniform(
+                    spec,
+                    lower=0.0,
+                    upper=1.0,
+                )
+                for side, spec in hand_specs.items()
+            },
+        )
+
+    def shared_safety(action, input_id):
+        if safety_profile is None:
+            return action
+        anchor = rig.capture_scene(
+            lambda captured_scene: capture_mujoco_sim_hil_safety_anchor(
+                captured_scene,
+                prepared.task_config,
+                hand_specs,
+                now=time.monotonic(),
+            )
+        )
+        return apply_canonical_keyframe_safety(
+            action,
+            input_action_id=input_id,
+            anchor=anchor,
+            profile=safety_profile,
+        )
+
+    runtime_config_kwargs = {
+        "producer_id": "b601-readonly-human",
+        "initial_control_mode": "human",
+        "decision_hz": prepared.compose_target_hz,
+        "pose_frame_contract_hash": prepared.tool_frame_profile.semantic_content_hash,
+        "enable_component_execution_handoff": True,
+        "prune_expired_proposals": True,
+    }
+    if hand_specs:
+        runtime_config_kwargs["compound_hand_action_specs_by_side"] = hand_specs
     runtime = MujocoDeployRuntime(
         rig,
-        MujocoDeployConfig(
-            producer_id="b601-readonly-human",
-            initial_control_mode="human",
-            decision_hz=prepared.compose_target_hz,
-            pose_frame_contract_hash=prepared.tool_frame_profile.semantic_content_hash,
-            enable_component_execution_handoff=True,
-            prune_expired_proposals=True,
-        ),
+        MujocoDeployConfig(**runtime_config_kwargs),
         pose_resolver=MujocoCoupledPoseToQposResolver(ik),
+        shared_safety=shared_safety if hand_specs else None,
     )
     sources = {f"{side}_arm": side for side in ("left", "right")}
     projector = build_mujoco_pose_observation_projector(
@@ -218,7 +283,16 @@ def build_b601_rm65_sim_target(task_config_path: Path):
         values = projector.project(
             model_qpos=cut.model_qpos,
             qpos_by_source=cut.measured_qpos_by_source,
-            component_ids=runtime.action_schema.component_ids,
+            # The J7 hand is not a pose source, but the RM65 arm selection
+            # group is atomic.  Keep both measured arm poses in the baseline
+            # so a combined right-arm+right-hand proposal also carries a
+            # stationary left-arm value; never request a hand pose from FK.
+            component_ids=(
+                tuple(component for component in runtime.action_schema.component_ids
+                      if component.endswith("_arm"))
+                if hand_specs
+                else runtime.action_schema.component_ids
+            ),
         )
         return ExecutionMeasurementObservation(
             measurement_id=f"fk-pose:{measurement.measurement_id}",
@@ -231,7 +305,10 @@ def build_b601_rm65_sim_target(task_config_path: Path):
             representation_by_component={
                 component: "cartesian_pose" for component in values
             },
-            schema_hash_by_component=projector.schema_hash_by_component,
+            schema_hash_by_component={
+                component: projector.schema_hash_by_component[component]
+                for component in values
+            },
         )
 
     return runtime, measure_target, prepared.compose_target_hz
@@ -334,6 +411,13 @@ def run_b601_rm65_gui(
             dispatch_at = target_completed
         target_details["target_dispatch_monotonic_sec"] = dispatch_at
         target_details["source_reused"] = session.last_source_reused
+        binding_gripper_details = getattr(
+            session.binding,
+            "last_gripper_details",
+            None,
+        )
+        if isinstance(binding_gripper_details, Mapping):
+            target_details["gripper"] = dict(binding_gripper_details)
         record_with_feedback(
             {"event": "target_step", **target_details}
         )
@@ -808,6 +892,44 @@ def main(argv: list[str] | None = None) -> int:
             "RM65 following without waiting for the a key"
         ),
     )
+    parser.add_argument(
+        "--enable-b601-gripper",
+        action="store_true",
+        help=(
+            "read-only simulation only: add the calibrated B601 J7 position "
+            "source and map it to the RM65 right DM-Tac gripper"
+        ),
+    )
+    parser.add_argument(
+        "--gripper-mapping-profile",
+        type=Path,
+        default=Path(__file__).resolve().parents[2]
+        / "docs/hardware/profiles/b601_rm65_gripper_mapping_v1.json",
+        help="human-tunable B601/RM65 normalized gripper mapping JSON",
+    )
+    parser.add_argument(
+        "--gripper-open-position-rad",
+        type=float,
+        default=None,
+        help="optional calibrated B601 J7 mechPos for fully open",
+    )
+    parser.add_argument(
+        "--gripper-closed-position-rad",
+        type=float,
+        default=None,
+        help="optional calibrated B601 J7 mechPos for fully closed",
+    )
+    parser.add_argument(
+        "--gripper-invert",
+        action="store_true",
+        help="invert the calibrated B601 open-to-closed direction",
+    )
+    parser.add_argument(
+        "--gripper-poll-hz",
+        type=_positive,
+        default=20.0,
+        help="foreground J7 read-only polling rate; target remains 60 Hz",
+    )
     reference_rotation = parser.add_mutually_exclusive_group()
     reference_rotation.add_argument(
         "--mapping-reference-rotation-rpy-deg",
@@ -881,6 +1003,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.auto_activate and not args.connect_read_only:
         parser.error("--auto-activate is only valid with --connect-read-only")
+    if (args.gripper_open_position_rad is None) != (
+        args.gripper_closed_position_rad is None
+    ):
+        parser.error(
+            "--gripper-open-position-rad and --gripper-closed-position-rad "
+            "must be supplied together"
+        )
     if args.simulation_feedback_timeout_sec is not None:
         if not args.connect_read_only:
             parser.error(
@@ -964,6 +1093,17 @@ def main(argv: list[str] | None = None) -> int:
                     "auto_on_start" if args.auto_activate else "manual_key"
                 ),
                 "control_admission": "not_checked",
+                "gripper_enabled": bool(args.enable_b601_gripper),
+                "gripper_mapping_profile": (
+                    str(args.gripper_mapping_profile)
+                    if args.enable_b601_gripper
+                    else None
+                ),
+                "gripper_poll_hz": (
+                    float(args.gripper_poll_hz)
+                    if args.enable_b601_gripper
+                    else None
+                ),
             },
         }
         status = 1
@@ -978,8 +1118,16 @@ def main(argv: list[str] | None = None) -> int:
                 result["teleop_contract"]["motorbridge_runtime_selection"] = (
                     _prepare_bundled_motorbridge_runtime()
                 )
-            from hardware.rebot_b601_rs import B601RSBackend, B601RSBackendConfig
+            from hardware.rebot_b601_rs import (
+                B601RSBackend,
+                B601RSBackendConfig,
+                B601RSGripperReader,
+                B601RSGripperReaderConfig,
+            )
             from robot_motion.rebot_b601_rs import B601PinocchioModel
+            from robot_motion.rebot_b601_rs.gripper_mapping import (
+                load_b601_rm65_gripper_mapping_profile,
+            )
             from sim.mujoco.viewer import MujocoPassiveViewerSession
 
             mapping = _load_mapping(args.mapping_profile)
@@ -1041,7 +1189,15 @@ def main(argv: list[str] | None = None) -> int:
             )
             backend = B601RSBackend(config)
             with ExitStack() as resources:
-                runtime, measure, rate = build_b601_rm65_sim_target(args.task_config)
+                if args.enable_b601_gripper:
+                    runtime, measure, rate = build_b601_rm65_sim_target(
+                        args.task_config,
+                        enable_gripper=True,
+                    )
+                else:
+                    runtime, measure, rate = build_b601_rm65_sim_target(
+                        args.task_config,
+                    )
                 result["teleop_contract"]["target_control_hz"] = float(rate)
 
                 def close_target() -> None:
@@ -1049,6 +1205,87 @@ def main(argv: list[str] | None = None) -> int:
                     result["target_cleanup_completed"] = True
 
                 resources.callback(close_target)
+                gripper_mapping = None
+                gripper_reader = None
+                gripper_source = None
+                gripper_sample_provider = None
+                if args.enable_b601_gripper:
+                    gripper_mapping = load_b601_rm65_gripper_mapping_profile(
+                        args.gripper_mapping_profile
+                    )
+                    if (
+                        args.gripper_open_position_rad is not None
+                        and args.gripper_closed_position_rad is not None
+                    ):
+                        gripper_mapping = replace(
+                            gripper_mapping,
+                            b601_open_position_rad=float(
+                                args.gripper_open_position_rad
+                            ),
+                            b601_closed_position_rad=float(
+                                args.gripper_closed_position_rad
+                            ),
+                            invert_b601=bool(args.gripper_invert),
+                            calibration_status="operator_cli_override",
+                        )
+                    elif args.gripper_invert:
+                        gripper_mapping = replace(
+                            gripper_mapping,
+                            invert_b601=True,
+                            calibration_status="profile_with_cli_invert",
+                        )
+                    if not gripper_mapping.b601_calibrated:
+                        raise ValueError(
+                            "B601 gripper mapping is uncalibrated; supply "
+                            "--gripper-open-position-rad and "
+                            "--gripper-closed-position-rad after a read-only J7 calibration."
+                        )
+                    result["teleop_contract"].update(
+                        {
+                            "gripper_mapping": gripper_mapping.to_dict(),
+                            "gripper_open_position_rad": gripper_mapping.b601_open_position_rad,
+                            "gripper_closed_position_rad": gripper_mapping.b601_closed_position_rad,
+                            "gripper_invert": gripper_mapping.invert_b601,
+                        }
+                    )
+                    from control_station.sources.rebot_b601_gripper import (
+                        B601ReadOnlyGripperSource,
+                    )
+
+                    gripper_reader = B601RSGripperReader(
+                        B601RSGripperReaderConfig.from_rs_yaml(args.config)
+                    )
+                    resources.callback(gripper_reader.close)
+                    gripper_source = B601ReadOnlyGripperSource(
+                        gripper_reader,
+                        gripper_mapping,
+                        clock_domain_id=runtime.config.clock_domain_id,
+                    )
+                    gripper_next_poll = -math.inf
+                    gripper_last_sample = None
+
+                    def gripper_sample_provider():
+                        nonlocal gripper_next_poll, gripper_last_sample
+                        now = float(runtime.clock())
+                        if now >= gripper_next_poll:
+                            gripper_next_poll = now + 1.0 / float(args.gripper_poll_hz)
+                            source_step = gripper_source.step()
+                            if source_step.sample is None:
+                                raise ValueError(
+                                    "B601 J7 gripper source rejected: "
+                                    f"{source_step.rejection_reason}"
+                                )
+                            gripper_last_sample = source_step.sample
+                            # The parameter read completes after the poll cut;
+                            # refresh the host clock before checking that the
+                            # newly returned sample is not from the future.
+                            now = float(runtime.clock())
+                        if gripper_last_sample is None:
+                            raise ValueError("B601 J7 gripper sample is unavailable")
+                        if not 0.0 <= now - gripper_last_sample.receive_timestamp_sec <= args.maximum_source_age_sec:
+                            raise ValueError("B601 J7 gripper sample is stale")
+                        return gripper_last_sample
+
                 session = assemble_b601_rm65_session(
                     runtime,
                     backend=backend,
@@ -1067,6 +1304,8 @@ def main(argv: list[str] | None = None) -> int:
                         if args.disable_teleop_residual_envelope
                         else args.maximum_rotation_rad
                     ),
+                    gripper_sample_provider=gripper_sample_provider,
+                    gripper_mapping=gripper_mapping,
                 )
                 if not args.validate_only:
                     emit(
@@ -1075,6 +1314,12 @@ def main(argv: list[str] | None = None) -> int:
                     resources.callback(backend.close)
                     backend.connect()
                     _record_motorbridge_capability(result, backend, emit=emit)
+                    if gripper_reader is not None:
+                        gripper_reader.connect()
+                        emit(
+                            "[B601→RM65] J7 gripper: read-only mechPos mapping "
+                            "enabled; no J7 motor command will be sent."
+                        )
                     viewer = MujocoPassiveViewerSession(
                         runtime.rig.scene, sync_callback=runtime.rig.sync_viewer
                     )
@@ -1082,6 +1327,7 @@ def main(argv: list[str] | None = None) -> int:
                     # Launch before starting the sole physics worker.
                     viewer.start()
                     runtime.start()
+
                     run_b601_rm65_gui(
                         session,
                         viewer=viewer,

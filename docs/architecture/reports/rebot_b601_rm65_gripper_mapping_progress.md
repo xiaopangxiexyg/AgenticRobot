@@ -2,7 +2,8 @@
 
 ## 当前阶段
 
-本候选只实现夹爪的公共 scalar contract 和 MuJoCo-only target adapters：
+本候选实现公共 scalar contract、J7 只读采样，以及本地真 B601 → RM65
+MuJoCo（机械臂+夹爪）的可选接入：
 
 ```text
 B601 J7 read-only source --calibrated--> normalized_close
@@ -16,11 +17,20 @@ RM65 DMTAC read-only source -----------> normalized_close
 `normalized_close=0` 表示打开，`1` 表示闭合。映射只处理夹爪，不进入
 B601 J1–J6 的 FK、重力补偿、阻尼、保护保持或故障兜底状态机。
 
-当前候选已在独立 worktree 完成，不代表已合并或已接入真机：
+当前候选已在独立 worktree 完成离线验证，不代表已合并或已完成真机夹爪验收：
 
 - B601→RM65 适配器只接受 `b601_rs_gripper_motor_position_rad` 经过显式
   open/closed 标定后的样本；RM65→B601 适配器只接受
   `rm65_dmtac_normalized_close` 样本。
+- `b601-rm65` application 的 `--enable-b601-gripper` 是显式 opt-in：它为
+  J7 创建独立 MotorBridge 只读 reader，只调用 `mechPos (0x7019)` 参数读取，
+  不调用 J7 enable、mode、MIT/POS-VEL、active-report 或 disable。J1–J6
+  仍由原有 owner 独立负责。
+- 夹爪样本与右臂 residual 在同一份 human proposal 中提交；RM65 的双臂
+  atomic selection group 因此同时携带测量得到的 left-arm baseline，避免
+  “只发 right-arm+right-hand”被目标 arbiter 拒绝。目标仍由既有 MuJoCo
+  compound hand resolver 执行，夹爪值使用 `HandActionSpec.dmtac_gripper`
+  的 normalized scalar。
 - 适配器对非法样本、错误 source-id、未来/过期时间戳和不递增 sequence
   fail-closed，拒绝时不改变仿真目标。
 - 样本默认声明 `clock_domain_id=local_wall_time`；设备单调时钟或其他时钟域
@@ -45,9 +55,8 @@ B601 J1–J6 的 FK、重力补偿、阻尼、保护保持或故障兜底状态�
 - B601 J7 的真实 open/closed motor-angle 标定；profile 中保持 `null`。
 - RealMan DMTAC 实时读取接入 RM65↔B601 GUI；这需要在不复制现有 DMTAC
   backend 的前提下增加独立 observation port，并且必须先做 read-only 现场验收。
-- B601 real↔RM65 sim 两个既有 arm application 的完整 GUI wiring；当前先用
-  typed adapters 和 MuJoCo tests 验证方向、顺序、失效和 stale 行为，再接入
-  arm session，避免夹爪 source 破坏已有六轴控制链。
+- B601 real↔RM65 sim 的夹爪路径已接入现有 `b601-rm65` receive-only GUI；
+  反向 RM65→B601 目前仍只保留 MuJoCo adapter，尚未接入真实 B601 J7 写入。
 - 任何真实夹爪运动、串口写入、CAN 写入或硬件验收。
 
 ## 已完成的离线证据
@@ -55,11 +64,16 @@ B601 J1–J6 的 FK、重力补偿、阻尼、保护保持或故障兜底状态�
 在候选 worktree、Python 3.10 `dexteleop310` 环境中：
 
 ```text
-focused gripper + affected B601/RM65 suites: 181 passed, 2 warnings
-boundary suites: 65 passed
+focused gripper + affected B601/RM65 suites: 42 passed, 2 warnings
+boundary + affected motion/model suites: 255 passed, 5 warnings
 ruff: PASS
 py_compile: PASS
 git diff --check: PASS
+
+另外完成了一次组合 proposal 运行时检查：在 `enable_gripper=True` 的实际
+RM65 MuJoCo target 中，右臂 residual + J7 normalized close 同一 proposal
+被接收，target `runtime.step()` 返回 `dispatched`。这只是离线证据，不是
+真机夹爪运动证据。
 ```
 
 其中 1 个 gripper test 使用现有 RM65 MuJoCo task scene 和真实 B601 URDF
@@ -69,9 +83,10 @@ git diff --check: PASS
 
 1. 运行 focused offline/MuJoCo tests，确认默认 scene 不变、双向 scalar 单调、
    过期/非法样本 fail-closed。
-2. 在现场对 B601 J7 只读采集 open/closed 两端和中间点，填写 profile 的
-   `open_position_rad`、`closed_position_rad`，再用独立 JSON 做方向验收。
-3. 复用现有 RM65 DMTAC observation backend 建立 read-only scalar source，接入
-   两个 arm application 的可选 gripper port；默认关闭，直到两端 sim 证据齐全。
+2. 在现场对 B601 J7 只读采集 open/closed 两端和中间点，填写命令中的
+   `--gripper-open-position-rad`、`--gripper-closed-position-rad`，再用独立
+   JSON 做方向验收。
+3. 先执行本地 B601→RM65 MuJoCo（臂+夹爪）前台验收；确认 scalar 方向和
+   双臂 baseline 后，再规划 RM65→B601 的只读仿真路径。
 4. 最后才规划单独的真机夹爪命令与安全/限速验收。夹爪命令不能借用六轴
    B601 owner 的 protective-hold 假设。

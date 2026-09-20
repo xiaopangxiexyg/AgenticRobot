@@ -51,6 +51,14 @@ from .frequency import (
     evaluate_frequency_target,
     summarize_timestamps,
 )
+from .gripper import (
+    B601_RS_GRIPPER_CLOCK_DOMAIN,
+    B601_RS_GRIPPER_JOINT_NAME,
+    B601_RS_GRIPPER_SOURCE_ID,
+    B601RSGripperPositionObservation,
+    B601RSGripperReader,
+    B601RSGripperReaderConfig,
+)
 
 __all__ = [
     "B601_RS_ARM_JOINT_NAMES",
@@ -83,6 +91,12 @@ __all__ = [
     "B601MotionAuthorizationError",
     "B601RSBackend",
     "B601RSBackendConfig",
+    "B601_RS_GRIPPER_CLOCK_DOMAIN",
+    "B601_RS_GRIPPER_JOINT_NAME",
+    "B601_RS_GRIPPER_SOURCE_ID",
+    "B601RSGripperPositionObservation",
+    "B601RSGripperReader",
+    "B601RSGripperReaderConfig",
     "FrequencyAcceptance",
     "FrequencyLedger",
     "FrequencyStats",

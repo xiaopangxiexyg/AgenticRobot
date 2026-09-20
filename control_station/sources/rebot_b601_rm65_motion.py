@@ -24,11 +24,16 @@ from robot_motion.action import (
     ComponentAction,
     ComponentActionSchema,
     ExecutionMeasurementObservation,
+    HandActionSpec,
 )
 from robot_motion.action.components import ActionComponentCatalog
 from robot_motion.action.proposal import ActionProposalDraft, ProposalAdmissionReceipt
 from robot_motion.action.relative import apply_relative_pose_component_value
 from robot_motion.pose import pose_delta_metrics
+from robot_motion.rebot_b601_rs.gripper_mapping import (
+    B601_RS_GRIPPER_SOURCE_V1,
+    NormalizedGripperSample,
+)
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from robot_motion.runtime.execution_gate import ExecutionGateSnapshot
 from robot_motion.transforms import (
@@ -159,6 +164,8 @@ class B601RM65MotionBinding:
         maximum_measurement_age_sec: float,
         maximum_translation_m: float | None,
         maximum_rotation_rad: float | None,
+        gripper_sample_provider: Callable[[], NormalizedGripperSample | None] | None = None,
+        gripper_mapping=None,
         enabled: bool = False,
     ) -> None:
         if not isinstance(runtime, B601RM65MotionTarget):
@@ -172,6 +179,20 @@ class B601RM65MotionBinding:
         self.runtime = runtime
         self.source = source
         self.enabled = enabled
+        if gripper_sample_provider is not None and not callable(gripper_sample_provider):
+            raise TypeError("gripper_sample_provider must be callable or None")
+        if gripper_sample_provider is not None and gripper_mapping is None:
+            raise ValueError("gripper_mapping is required with a gripper sample provider")
+        if gripper_sample_provider is not None and "right_hand" not in runtime.action_schema.component_ids:
+            raise ValueError("gripper sample provider requires the right_hand target component")
+        self._gripper_sample_provider = gripper_sample_provider
+        self._gripper_mapping = gripper_mapping
+        self._gripper_hand_spec = (
+            HandActionSpec.dmtac_gripper("right")
+            if gripper_sample_provider is not None
+            else None
+        )
+        self._last_gripper_details: dict[str, object] | None = None
         source_age = float(maximum_source_age_sec)
         measurement_age = float(maximum_measurement_age_sec)
         translation_limit = self._optional_positive(
@@ -260,9 +281,18 @@ class B601RM65MotionBinding:
                         )
                         for side in ("left", "right")
                     },
+                    hand_specs=(
+                        {"right": self._gripper_hand_spec}
+                        if self._gripper_hand_spec is not None
+                        else None
+                    ),
                 ),
             )
         )
+
+    @property
+    def last_gripper_details(self) -> dict[str, object] | None:
+        return None if self._last_gripper_details is None else dict(self._last_gripper_details)
 
     def capture_anchor(
         self,
@@ -291,10 +321,21 @@ class B601RM65MotionBinding:
             raise ValueError("Anchor domain/component binding differs.")
         self._validate_anchor_freshness(now, master_anchor, measurement)
         values = {}
-        for (
-            component_id,
-            payload,
-        ) in self.runtime.action_schema.payload_schema_by_component.items():
+        # Preserve the existing arms-only anchor scope.  The optional J7
+        # proposal must still carry both arm components because RM65's arm
+        # selection group is atomic; the right-arm residual changes only the
+        # right value while the left value remains at its measured baseline.
+        source_components = (
+            tuple(
+                component
+                for component in self.runtime.action_schema.component_ids
+                if component.endswith("_arm")
+            )
+            if self._gripper_sample_provider is not None
+            else self.runtime.action_schema.component_ids
+        )
+        for component_id in source_components:
+            payload = self.runtime.action_schema.payload_schema_by_component[component_id]
             if (
                 measurement.representation_by_component.get(component_id)
                 != "cartesian_pose"
@@ -430,24 +471,6 @@ class B601RM65MotionBinding:
             # sample recorded in the anchor.  Keep that source-clock check as
             # the single activation barrier and do not substitute a later
             # host-clock timestamp for it.
-            # The binding owns its final admission timestamp. A foreground
-            # caller cannot safely pre-stamp an immediate target before source
-            # adaptation, because real monotonic time advances during that
-            # work. Explicit scheduled times remain subject to the same strict
-            # future/TTL validation below.
-            target_time = (
-                now if target_effective_at is None else float(target_effective_at)
-            )
-            expires = float(effective_until)
-            if (
-                not math.isfinite(target_time)
-                or not math.isfinite(expires)
-                or not now
-                <= target_time
-                < expires
-                <= sample.measured_at + self.limits[0]
-            ):
-                raise ValueError("Proposal outlives its source or has impossible time.")
             delta = self._pose(
                 step.relative_action.values_by_component[self.component_id].values
             )
@@ -485,6 +508,73 @@ class B601RM65MotionBinding:
                         ].reference_frame,
                     )
                 )
+            self._last_gripper_details = None
+            if self._gripper_sample_provider is not None:
+                gripper_sample = self._gripper_sample_provider()
+                if gripper_sample is None:
+                    raise ValueError("B601 J7 gripper sample is unavailable")
+                if not isinstance(gripper_sample, NormalizedGripperSample):
+                    raise TypeError("gripper sample provider returned an invalid sample")
+                if (
+                    gripper_sample.source_id != B601_RS_GRIPPER_SOURCE_V1
+                    or gripper_sample.clock_domain_id
+                    != self.runtime.config.clock_domain_id
+                ):
+                    raise ValueError("B601 J7 gripper sample lineage differs from target")
+                # The provider performs a fresh CAN read after the initial
+                # transaction cut. Refresh the cut before validating its
+                # receive timestamp; otherwise every successful read appears
+                # to come from the future by the read-call duration.
+                now = max(now, float(self.runtime.clock()))
+                self._age(now, gripper_sample.receive_timestamp_sec, self.limits[0])
+                assert self._gripper_mapping is not None
+                target_close = self._gripper_mapping.canonical_to_normalized_rm65(
+                    gripper_sample.close
+                )
+                assert self._gripper_hand_spec is not None
+                hand_values = [0.0] * self._gripper_hand_spec.slot_count
+                hand_values[
+                    self._gripper_hand_spec.slot_map["gripper_close"]
+                ] = target_close
+                command.add_command(
+                    EffectorCommand(
+                        effector_name="right_hand",
+                        side="right",
+                        command_type="joint_vector",
+                        value=tuple(hand_values),
+                        metadata={
+                            "hand_action_spec": self._gripper_hand_spec.to_metadata(),
+                            "gripper_slot": int(
+                                self._gripper_hand_spec.slot_map["gripper_close"]
+                            ),
+                        },
+                    )
+                )
+                self._last_gripper_details = {
+                    "accepted": True,
+                    "source_sequence": gripper_sample.sequence,
+                    "source_receive_timestamp_sec": gripper_sample.receive_timestamp_sec,
+                    "source_close": gripper_sample.close,
+                    "target_close": target_close,
+                }
+            # The binding owns its final admission timestamp. A foreground
+            # caller cannot safely pre-stamp an immediate target before source
+            # adaptation or the optional J7 read, because real monotonic time
+            # advances during that work. Explicit scheduled times remain
+            # subject to the same strict future/TTL validation below.
+            target_time = (
+                now if target_effective_at is None else float(target_effective_at)
+            )
+            expires = float(effective_until)
+            if (
+                not math.isfinite(target_time)
+                or not math.isfinite(expires)
+                or not now
+                <= target_time
+                < expires
+                <= sample.measured_at + self.limits[0]
+            ):
+                raise ValueError("Proposal outlives its source or has impossible time.")
             emission = HumanCommandEmission.capture(
                 emission_sequence=self._next_proposal_sequence,
                 emitted_at=now,

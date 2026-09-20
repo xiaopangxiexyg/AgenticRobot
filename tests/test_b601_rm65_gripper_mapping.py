@@ -12,6 +12,10 @@ from control_station.sim_hil_profile.rebot_b601_rm65_gripper import (
 from control_station.sim_hil_profile.rm65_b601_gripper import (
     RM65ToB601GripperSimBridge,
 )
+from hardware.rebot_b601_rs import (
+    B601RSGripperReader,
+    B601RSGripperReaderConfig,
+)
 from robot_motion.rebot_b601_rs import (
     B601_RS_GRIPPER_SOURCE_V1,
     B601_RS_URDF_RELATIVE_PATH,
@@ -150,6 +154,43 @@ def test_normalized_sample_rejects_invalid_order_and_timestamps() -> None:
         )
     with pytest.raises(ValueError, match=r"in \[0, 1\]"):
         _sample(1.1, 1)
+
+
+def test_b601_j7_reader_is_parameter_only_and_never_commands_motor() -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class Motor:
+        def robstride_get_param_f32_host_id(self, *args):
+            calls.append(("read", args))
+            return -6.0
+
+    class Controller:
+        def __init__(self, channel):
+            calls.append(("controller", (channel,)))
+
+        def add_robstride_motor(self, *args):
+            calls.append(("add", args))
+            return Motor()
+
+        def close(self):
+            calls.append(("close", ()))
+
+    config = B601RSGripperReaderConfig.from_rs_yaml(
+        REBOT_SOURCE_ROOT / "config/rebotarm_rs.yaml"
+    )
+    reader = B601RSGripperReader(config, controller_factory=Controller)
+    reader.connect()
+    observation = reader.read_position()
+    reader.close()
+
+    assert observation.position_rad == pytest.approx(-6.0)
+    assert calls[:3] == [
+        ("controller", ("can0",)),
+        ("add", (7, 0xFD, "rs-00")),
+        ("read", (0x7019, 0xFD, 100)),
+    ]
+    assert calls[-1] == ("close", ())
+    assert not {name for name, _ in calls} & {"enable", "disable", "mode"}
 
 
 def test_forward_and_reverse_sim_bridges_use_same_normalized_contract() -> None:
