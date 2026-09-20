@@ -1315,6 +1315,16 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
 
         self.assertEqual(configs["right"].gripper_port, "/dev/ttyUSB3")
 
+        overlay_args = SimpleNamespace(**vars(args))
+        overlay_args.right_gripper_port = "/dev/ttyUSB2"
+        real_teleop._clear_gripper_policy_cache(overlay_args)
+        overlay_configs = real_teleop._dmtac_backend_configs(
+            overlay_args,
+            ("right",),
+        )
+
+        self.assertEqual(overlay_configs["right"].gripper_port, "/dev/ttyUSB2")
+
     def test_real_teleop_keeps_gripper_gui_visible_without_backend(self) -> None:
         components = SimpleNamespace(
             hand_backend_mode=real_teleop.HAND_BACKEND_DMTAC_GRIPPER,
