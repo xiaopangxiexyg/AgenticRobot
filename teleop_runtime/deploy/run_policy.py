@@ -2007,6 +2007,85 @@ def _rtc_active_latency_gate_result(
     return True, observed_max < maximum, observed_max
 
 
+def _rtc_active_latency_admission_result(
+    samples_sec: list[float] | tuple[float, ...],
+    *,
+    discard_completions: int,
+    required_completions: int,
+    performance_slo_sec: float,
+    coverage_assessments: list[Any] | tuple[Any, ...] | None = None,
+) -> tuple[bool, bool, float | None, Any | None]:
+    """Combine warm-sample completeness with optional plan coverage admission.
+
+    Raw RTC retains the historical strict SLO gate. Conditioned model-RTC
+    reports that SLO independently and admits execution only when the actual
+    post-prefix, post-cursor suffix can sustain another request cycle.
+    """
+
+    complete, slo_met, observed_max = _rtc_active_latency_gate_result(
+        samples_sec,
+        discard_completions=discard_completions,
+        required_completions=required_completions,
+        maximum_latency_sec=performance_slo_sec,
+    )
+    if not complete:
+        return False, False, None, None
+    assert observed_max is not None
+    if coverage_assessments is None:
+        return True, slo_met, observed_max, None
+    assessments = tuple(coverage_assessments)
+    if len(assessments) != len(samples_sec):
+        raise ValueError(
+            "RTC latency samples and request-bound coverage assessments "
+            "must have identical lengths."
+        )
+    admitted_assessments = assessments[
+        discard_completions : discard_completions + required_completions
+    ]
+    for latency, assessment in zip(
+        tuple(samples_sec)[
+            discard_completions : discard_completions + required_completions
+        ],
+        admitted_assessments,
+        strict=True,
+    ):
+        execution_usable = getattr(assessment, "execution_usable", None)
+        if not isinstance(execution_usable, bool):
+            raise TypeError(
+                "RTC coverage assessment must expose boolean execution_usable."
+            )
+        if not math.isclose(
+            float(getattr(assessment, "observed_latency_sec", math.nan)),
+            float(latency),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "RTC coverage assessment is not bound to its latency sample."
+            )
+    rejected = tuple(
+        assessment
+        for assessment in admitted_assessments
+        if not assessment.execution_usable
+    )
+    if rejected:
+        # Report the smallest stable-cycle margin, not merely the slowest RPC:
+        # different requests may have used different forecast-prefix lengths.
+        selected = min(
+            rejected,
+            key=lambda assessment: (
+                assessment.usable_result_suffix_steps
+                - assessment.effective_trigger_coverage_steps
+            ),
+        )
+        return True, False, observed_max, selected
+    selected = max(
+        admitted_assessments,
+        key=lambda assessment: assessment.observed_latency_sec,
+    )
+    return True, True, observed_max, selected
+
+
 def _rtc_recoverable_timeout_reason(step: Any) -> str | None:
     """Return a timeout/deadline reason that is safe to recover in-process.
 
@@ -2058,6 +2137,27 @@ def _rtc_recoverable_timeout_reason(step: Any) -> str | None:
         ):
             return candidate
     return None
+
+
+def _rtc_recoverable_coverage_reason(step: Any) -> str | None:
+    """Return the typed in-process recovery reason for coverage starvation."""
+
+    assessment = getattr(step, "completion_coverage_assessment", None)
+    if assessment is None or bool(getattr(assessment, "execution_usable", True)):
+        return None
+    transition = getattr(step, "lifecycle_transition", None)
+    producer_transition = (
+        None if transition is None else getattr(transition, "producer_transition", None)
+    )
+    state = (
+        None if producer_transition is None else getattr(producer_transition, "state", None)
+    )
+    reason = None if state is None else getattr(state, "last_transition_reason", None)
+    return (
+        "rtc_latency_starvation_risk"
+        if reason == "rtc_latency_starvation_risk"
+        else None
+    )
 
 
 def _rtc_recoverable_position_executor_fault_reason(
@@ -3051,6 +3151,7 @@ def main(
     rtc_recovery_required = False
     rtc_recovery_reason: str | None = None
     rtc_active_latency_samples: list[float] = []
+    rtc_active_coverage_assessments: list[Any] = []
     accepted_rtc_dispatch_steps = 0
     step_index = 0
     loop_rate = LoopRate()
@@ -3664,6 +3765,7 @@ def main(
             policy.reset()
         policy_deploy_runtime.reset_stream()
         rtc_active_latency_samples.clear()
+        rtc_active_coverage_assessments.clear()
         rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
         rtc_active_latency_gate_rejected = False
         rtc_active_latency_gate_failure_reason = None
@@ -3770,23 +3872,24 @@ def main(
             now=control_loop_started_at,
         )
 
-    def pause_after_rtc_recoverable_timeout(
+    def pause_after_rtc_recoverable_condition(
         *,
         reason: str,
         message: str,
         observation: DeploymentObservation,
+        condition_kind: str,
     ) -> None:
-        """Pause on a typed RTC timeout and allow an in-process recovery.
+        """Pause on a typed RTC condition and allow in-process recovery.
 
-        Deadline expiry and transport/preflight timeouts are recoverable
-        producer failures.  The frontend has already retired the late result;
-        this boundary clears downstream queues, establishes Hold, and leaves
-        the operator a deterministic ``g`` path to rearm a new worker epoch.
-        Other protocol, shape, safety, or backend failures remain fail-closed.
+        The frontend has already invalidated the affected plan and retired its
+        worker. This boundary clears downstream queues, establishes Hold, and
+        leaves ``g`` as the deterministic path to a fresh worker epoch without
+        replaying qpos initialization. Other failures remain fail-closed.
         """
 
         nonlocal rtc_recovery_required, rtc_recovery_reason
-        normalized_reason = str(reason).strip() or "rtc_timeout"
+        normalized_reason = str(reason).strip() or "rtc_recoverable_condition"
+        normalized_kind = str(condition_kind).strip() or "condition"
         rtc_recovery_required = True
         rtc_recovery_reason = normalized_reason
         hold_error = _pause_policy_and_hold_for_rtc_recovery(
@@ -3794,19 +3897,33 @@ def main(
             observation=observation,
         )
         event_payload = {
-            "schema": "dexteleop_rtc_recoverable_timeout_v1",
+            "schema": "dexteleop_rtc_recoverable_pause_v1",
             "status": "paused",
+            "condition_kind": normalized_kind,
             "reason": normalized_reason,
             "message": str(message),
             "hold_error": hold_error,
             "recovery": "press_g_for_fresh_rtc_session",
         }
-        debug_logger.log_event("rtc_recoverable_timeout", event_payload)
+        debug_logger.log_event("rtc_recoverable_pause", event_payload)
         console_log_event(
             "RTC",
-            "PAUSED: recoverable timeout; no action dispatched; "
+            f"PAUSED: recoverable {normalized_kind}; no action dispatched; "
             f"{message} Press g to retry a fresh RTC session.",
             now=control_loop_started_at,
+        )
+
+    def pause_after_rtc_recoverable_timeout(
+        *,
+        reason: str,
+        message: str,
+        observation: DeploymentObservation,
+    ) -> None:
+        pause_after_rtc_recoverable_condition(
+            reason=reason,
+            message=message,
+            observation=observation,
+            condition_kind="timeout",
         )
 
     def _recover_rtc_position_executor_stale_fault(
@@ -5492,10 +5609,50 @@ def main(
                                 >= int(args.rtc_active_warmup_discard_completions)
                             ),
                         )
-                        recoverable_timeout_reason = _rtc_recoverable_timeout_reason(
-                            rtc_step
+                        recoverable_coverage_reason = (
+                            _rtc_recoverable_coverage_reason(rtc_step)
                         )
-                        if recoverable_timeout_reason is not None:
+                        recoverable_timeout_reason = None
+                        if recoverable_coverage_reason is not None:
+                            coverage = rtc_step.completion_coverage_assessment
+                            assert coverage is not None
+                            debug_logger.log_event(
+                                "rtc_runtime_coverage_pause",
+                                {
+                                    **coverage.to_payload(),
+                                    "recovery_reason": (
+                                        recoverable_coverage_reason
+                                    ),
+                                },
+                            )
+                            pause_after_rtc_recoverable_condition(
+                                reason=recoverable_coverage_reason,
+                                message=(
+                                    "conditioned RTC completion cannot sustain "
+                                    "the next request cycle "
+                                    f"(latency={coverage.observed_latency_sec:.6f}s "
+                                    "trigger_steps="
+                                    f"{coverage.effective_trigger_coverage_steps} "
+                                    "suffix_steps="
+                                    f"{coverage.usable_result_suffix_steps} "
+                                    "reasons="
+                                    f"{','.join(coverage.reasons)})"
+                                ),
+                                observation=observation,
+                                condition_kind="coverage starvation",
+                            )
+                            # The frontend invalidated the merged plan before
+                            # its pop phase.  Suppress every downstream path on
+                            # this same control tick while Hold is established.
+                            rtc_active_latency_gate_failed_this_step = True
+                        else:
+                            recoverable_timeout_reason = (
+                                _rtc_recoverable_timeout_reason(rtc_step)
+                            )
+                        if (
+                            recoverable_coverage_reason is None
+                            and recoverable_timeout_reason is not None
+                        ):
                             pause_after_rtc_recoverable_timeout(
                                 reason=recoverable_timeout_reason,
                                 message=(
@@ -5539,30 +5696,88 @@ def main(
                                 rtc_active_latency_warmup = False
                             if not timing_failure:
                                 rtc_active_latency_samples.append(latency_sec)
-                                gate_complete, gate_accepted, observed_max = (
-                                    _rtc_active_latency_gate_result(
-                                        rtc_active_latency_samples,
-                                        discard_completions=int(
-                                            args.rtc_active_warmup_discard_completions
-                                        ),
-                                        required_completions=int(
-                                            args.rtc_active_warmup_completions
-                                        ),
-                                        maximum_latency_sec=float(
+                                conditioned_assessment = (
+                                    rtc_frontend.assess_latency_envelope(
+                                        latency_sec,
+                                        performance_slo_sec=float(
                                             args.rtc_active_max_inference_latency_sec
                                         ),
                                     )
+                                    if rtc_frontend.config.model_continuation
+                                    is not None
+                                    else None
+                                )
+                                if conditioned_assessment is not None:
+                                    rtc_active_coverage_assessments.append(
+                                        conditioned_assessment
+                                    )
+                                (
+                                    gate_complete,
+                                    gate_accepted,
+                                    observed_max,
+                                    latency_assessment,
+                                ) = _rtc_active_latency_admission_result(
+                                    rtc_active_latency_samples,
+                                    discard_completions=int(
+                                        args.rtc_active_warmup_discard_completions
+                                    ),
+                                    required_completions=int(
+                                        args.rtc_active_warmup_completions
+                                    ),
+                                    performance_slo_sec=float(
+                                        args.rtc_active_max_inference_latency_sec
+                                    ),
+                                    coverage_assessments=(
+                                        rtc_active_coverage_assessments
+                                        if conditioned_assessment is not None
+                                        else None
+                                    ),
                                 )
                                 if gate_complete:
                                     assert observed_max is not None
+                                    if latency_assessment is not None:
+                                        debug_logger.log_event(
+                                            "rtc_active_latency_envelope",
+                                            {
+                                                **latency_assessment.to_payload(),
+                                                "warmup_discard_completions": int(
+                                                    args.rtc_active_warmup_discard_completions
+                                                ),
+                                                "warmup_admitted_completions": int(
+                                                    args.rtc_active_warmup_completions
+                                                ),
+                                            },
+                                        )
                                     if not gate_accepted:
+                                        assessment_detail = (
+                                            ""
+                                            if latency_assessment is None
+                                            else (
+                                                "; coverage assessment="
+                                                f"{latency_assessment.status} "
+                                                "assessment_latency="
+                                                f"{latency_assessment.observed_latency_sec:.6f}s "
+                                                "trigger_steps="
+                                                f"{latency_assessment.effective_trigger_coverage_steps} "
+                                                "suffix_steps="
+                                                f"{latency_assessment.usable_result_suffix_steps} "
+                                                "reasons="
+                                                f"{','.join(latency_assessment.reasons)}"
+                                            )
+                                        )
                                         pause_after_rtc_active_latency_gate_failure(
-                                            reason="rtc_active_latency_gate_rejected",
+                                            reason=(
+                                                "rtc_active_latency_coverage_rejected"
+                                                if latency_assessment is not None
+                                                else "rtc_active_latency_gate_rejected"
+                                            ),
                                             message=(
-                                                "warm maximum "
-                                                f"{observed_max:.6f}s is not below "
-                                                "the exclusive configured bound "
+                                                "warm sample set cannot sustain "
+                                                "the configured RTC execution envelope "
+                                                f"(warm_max={observed_max:.6f}s; "
+                                                "performance SLO "
                                                 f"{float(args.rtc_active_max_inference_latency_sec):.6f}s"
+                                                f"{assessment_detail})"
                                             ),
                                             observation=observation,
                                         )
@@ -5570,13 +5785,35 @@ def main(
                                         rtc_active_latency_warmup = False
                                     else:
                                         rtc_active_latency_gate_passed = True
-                                        console_log_event(
-                                            "RTC",
-                                            "READY: Active inference latency gate passed; "
-                                            f"warm_max={observed_max:.6f}s samples="
-                                            f"{int(args.rtc_active_warmup_completions)}.",
-                                            now=loop_started_at,
-                                        )
+                                        if (
+                                            latency_assessment is not None
+                                            and not latency_assessment.performance_slo_met
+                                        ):
+                                            warmup_bridge_steps = (
+                                                latency_assessment.bridge_steps_at_completion
+                                            )
+                                            console_log_event(
+                                                "RTC",
+                                                "WARNING: inference exceeds the "
+                                                "performance SLO but remains coverage-"
+                                                "usable; warm_max="
+                                                f"{observed_max:.6f}s trigger_steps="
+                                                f"{latency_assessment.effective_trigger_coverage_steps} "
+                                                "bridge_steps="
+                                                f"{warmup_bridge_steps if warmup_bridge_steps is not None else 'preflight'} "
+                                                "suffix_steps="
+                                                f"{latency_assessment.usable_result_suffix_steps}.",
+                                                now=loop_started_at,
+                                            )
+                                        else:
+                                            console_log_event(
+                                                "RTC",
+                                                "READY: Active inference latency SLO "
+                                                "and coverage admission passed; "
+                                                f"warm_max={observed_max:.6f}s samples="
+                                                f"{int(args.rtc_active_warmup_completions)}.",
+                                                now=loop_started_at,
+                                            )
                             # Reuse the drained RPC exchange between samples.
                             # No preflight result entered the executable plan;
                             # the next formal request uses a fresh observation.

@@ -890,6 +890,105 @@ def test_blocking_worker_never_blocks_control_step_and_late_completion_cannot_re
     frontend.close(now=base + 1.3)
 
 
+def test_conditioned_completion_starvation_holds_before_same_tick_emission() -> None:
+    """A formally admitted late result cannot leak one action before Hold.
+
+    The lightweight virtual executor does not implement model conditioning, so
+    this test enables the conditioned-coverage branch only after submitting the
+    request.  Conditioning crop/merge integration is exercised separately by
+    ``test_plan_merge_rejects_conditioned_result_binding_tampering``.
+    """
+
+    runtime = _runtime()
+    policy = _ChunkPolicy(chunk_size=32)
+    started = threading.Event()
+    release = threading.Event()
+
+    def executor_factory(_worker_session_id: str):
+        decoded = RtcDecodedPolicyExecutor(
+            policy=policy,
+            deploy_runtime=runtime,
+        )
+
+        def execute(request, actor_observation):
+            started.set()
+            if not release.wait(timeout=2.0):
+                raise TimeoutError("test worker release timed out")
+            return decoded(request, actor_observation)
+
+        return execute
+
+    base = time.monotonic()
+    config = replace(
+        _config(session="rtc-conditioned-coverage-hold"),
+        prediction_horizon_steps=32,
+        request_validity_steps=60,
+        request_trigger_coverage_steps=4,
+    )
+    frontend = RtcPolicyShadowFrontend(
+        config=config,
+        deploy_runtime=runtime,
+        policy=policy,
+        preparer=_pipeline(),
+        created_at=base,
+        executor_factory=executor_factory,
+    )
+    frontend.start()
+    submitted = frontend.step(
+        _observation(timestamp=60.0, step_index=0),
+        now=base,
+        allow_output=False,
+        allow_request=True,
+    )
+    assert submitted.worker_submission is not None
+    assert submitted.worker_submission.accepted
+    assert started.wait(timeout=1.0)
+
+    # Deterministically place this completion in the 500 ms class while its
+    # request TTL remains valid.  With H32 and a B16 latency budget, the
+    # request-bound crop leaves less coverage than the next trigger requires.
+    object.__setattr__(frontend.config, "model_continuation", object())
+    time.sleep(0.5)
+    release.set()
+    _wait_for(lambda: frontend.pending_completion_count == 1)
+
+    old_epoch = frontend.state.plan.producer_epoch
+    starved = frontend.step(
+        _observation(timestamp=60.55, step_index=1),
+        now=base + 0.55,
+        allow_output=True,
+    )
+    assert starved.result_transition is not None
+    assert starved.result_transition.receipt.accepted
+    assert starved.completion_coverage_assessment is not None
+    assert not starved.completion_coverage_assessment.execution_usable
+    assert starved.state.lifecycle_state == POLICY_ASYNC_PRODUCER_HOLD
+    assert starved.lifecycle_transition is not None
+    assert (
+        starved.lifecycle_transition.producer_transition.state.last_transition_reason
+        == "rtc_latency_starvation_risk"
+    )
+    assert starved.emission_result.emission is None
+    assert starved.pop_transition is None
+    assert not starved.state.plan.keyframes
+
+    def worker_drained() -> bool:
+        frontend.step(
+            _observation(timestamp=60.6, step_index=2),
+            now=base + 0.6,
+            allow_output=False,
+        )
+        return frontend.state.worker_session_state == POLICY_WORKER_SESSION_DRAINED
+
+    _wait_for(worker_drained)
+    object.__setattr__(frontend.config, "model_continuation", None)
+    rearmed = frontend.rearm(now=base + 0.7, reason="operator_g_rearm")
+    assert rearmed.receipt.accepted
+    assert frontend.state.plan.producer_epoch > old_epoch
+    assert not frontend.state.plan.keyframes
+    frontend.close(now=base + 0.8)
+
+
 def test_expired_matching_result_faults_producer_without_popping_plan() -> None:
     runtime = _runtime()
     policy = _ChunkPolicy(chunk_size=1)
