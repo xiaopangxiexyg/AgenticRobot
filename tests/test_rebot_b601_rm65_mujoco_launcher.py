@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -215,3 +216,53 @@ def test_owner_launcher_rejects_missing_motion_ack_before_resource_access(
     with pytest.raises(SystemExit) as error:
         owner.main([])
     assert error.value.code == 2
+
+
+def test_foreground_launcher_does_not_duplicate_sigint_or_close_output_early(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_handler: object | None = None
+    old_handler = object()
+
+    def fake_signal(_signum: int, handler: object) -> object:
+        nonlocal installed_handler
+        previous = old_handler if installed_handler is None else installed_handler
+        installed_handler = handler
+        return previous
+
+    class InterruptingOutput:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed = False
+
+        def readline(self) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                assert callable(installed_handler)
+                installed_handler(launcher.signal.SIGINT, None)
+                return "child result after Ctrl-C\n"
+            return ""
+
+        def close(self) -> None:
+            self.closed = True
+
+    output = InterruptingOutput()
+    process = SimpleNamespace(stdout=output, wait=lambda: 1)
+    monkeypatch.setattr(launcher.signal, "getsignal", lambda _signum: old_handler)
+    monkeypatch.setattr(launcher.signal, "signal", fake_signal)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    status = launcher._run_foreground(
+        ["fake-child"],
+        cwd=tmp_path,
+        terminal_log=tmp_path / "terminal.log",
+    )
+
+    assert status == 1
+    assert output.closed is True
+    assert installed_handler is old_handler
+    log = (tmp_path / "terminal.log").read_text(encoding="utf-8")
+    assert "child result after Ctrl-C" in log
+    assert "child owned the signal lifecycle" in log
+    assert "forwarding SIGINT" not in log

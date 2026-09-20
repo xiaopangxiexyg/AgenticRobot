@@ -121,6 +121,17 @@ gravity/damping owner 独占 CAN。协议不复用会固定启动位置的 `slow
 助力力矩变化率 `0.10 Nm/s`，权限上升 `0.5/s`，持续 `4 s`。这些是可调整的调试参数，
 不是硬件认证限值。自动测试不连接 CAN，也不构成真机通过证据。
 
+首轮现场运行 `/tmp/b601-rs-commissioning/b601-owner-efstt0pz` 证明六轴启动、20 Hz
+gravity/damping 控制、protective hold、驱动器限矩恢复和最终 safe stop 完整；但协议事件为空、
+状态停留在 `waiting`，因此没有发送 J6 assist，不能作为助力验收。顶层 `FAIL` 来自
+`commissioning_acceptance=INCOMPLETE`，不是控制或 cleanup 失败。
+
+该次还暴露了前台 launcher 的 SIGINT 缺陷：父子进程同属前台 process group，均已直接
+收到 Ctrl-C，父进程又重复转发并提前关闭 stdout，导致子进程结果输出出现 broken pipe，
+表现为退出码 120。修复后父进程只观察 SIGINT，由子进程独占两阶段停止语义，并持续读取
+输出至 EOF；控制时限届满但助力未完成时也会显式撤销 policy 并显示
+`ASSIST INCOMPLETE`。
+
 ## 3. 当前证据边界
 
 - 纯控制、runtime、MuJoCo 和低增益 probe 单元/契约测试通过；

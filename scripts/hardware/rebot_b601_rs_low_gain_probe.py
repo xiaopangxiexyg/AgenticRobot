@@ -8430,6 +8430,33 @@ def run_probe(
                     "Ctrl-C or SIGUSR1 requests final full disable."
                 )
             else:
+                if shared_control_commissioning is not None:
+                    assist_state = shared_control_commissioning.state
+                    if assist_state in {
+                        B601AssistCommissioningState.WAITING,
+                        B601AssistCommissioningState.COUNTDOWN,
+                        B601AssistCommissioningState.ACTIVE,
+                    }:
+                        assist_event = shared_control_commissioning.cancel(
+                            timestamp_sec=(
+                                previous_feedback_time
+                                if previous_feedback_time is not None
+                                else time.monotonic()
+                            ),
+                            detail=(
+                                "control duration expired before the one-shot "
+                                "assist trial completed"
+                            ),
+                        )
+                        _operator_notice(
+                            f"[B601] [ASSIST INCOMPLETE] {assist_event.detail}; "
+                            "assist is zero and gravity/damping remain active."
+                        )
+                    elif assist_state is B601AssistCommissioningState.CANCELLED:
+                        _operator_notice(
+                            "[B601] [ASSIST INCOMPLETE] trial was cancelled; "
+                            "assist is zero and gravity/damping remain active."
+                        )
                 control_completion_reason = complete_active_duration(
                     stop=stop,
                     calibration_capture=calibration_capture,

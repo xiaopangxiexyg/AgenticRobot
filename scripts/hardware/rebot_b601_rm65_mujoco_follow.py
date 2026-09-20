@@ -295,21 +295,42 @@ def _run_foreground(
             return 127
 
         assert process.stdout is not None
+        old_sigint_handler = signal.getsignal(signal.SIGINT)
+        parent_sigint_seen = False
+
+        def observe_parent_sigint(_signum: int, _frame: object) -> None:
+            nonlocal parent_sigint_seen
+            # The child shares the foreground process group and receives the
+            # same terminal SIGINT directly.  The launcher must neither raise
+            # KeyboardInterrupt nor forward a duplicate signal: doing either
+            # can collapse a child's intentional two-stage stop into one event.
+            parent_sigint_seen = True
+
+        signal.signal(signal.SIGINT, observe_parent_sigint)
         try:
-            for line in process.stdout:
+            while True:
+                try:
+                    line = process.stdout.readline()
+                except KeyboardInterrupt:
+                    # Defensive race fallback before the parent handler became
+                    # active.  The child already received the group signal.
+                    parent_sigint_seen = True
+                    continue
+                if not line:
+                    break
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 _write_log(log, line)
-        except KeyboardInterrupt:
-            _write_log(log, "launcher: operator interrupt; forwarding SIGINT")
-            if process.poll() is None:
-                try:
-                    process.send_signal(signal.SIGINT)
-                except ProcessLookupError:
-                    pass
+            status = process.wait()
         finally:
+            signal.signal(signal.SIGINT, old_sigint_handler)
             process.stdout.close()
-        return process.wait()
+        if parent_sigint_seen:
+            _write_log(
+                log,
+                "launcher: terminal SIGINT observed; child owned the signal lifecycle",
+            )
+        return status
 
 
 def main(argv: list[str] | None = None) -> int:
