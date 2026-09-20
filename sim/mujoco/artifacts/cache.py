@@ -139,7 +139,16 @@ class ModelArtifactCache:
         lock_path = directory / ".build.lock"
         with lock_path.open("a+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            if self._valid(manifest_path, mjb_path, mjcf_path, key):
+            manifest = self._manifest_for_key(manifest_path, key)
+            mjb_valid = self._artifact_matches(
+                mjb_path,
+                None if manifest is None else manifest.get("mjb_sha256"),
+            )
+            mjcf_valid = self._artifact_matches(
+                mjcf_path,
+                None if manifest is None else manifest.get("mjcf_sha256"),
+            )
+            if mjb_valid and mjcf_valid:
                 try:
                     model = mujoco.MjModel.from_binary_path(str(mjb_path))
                     scene = MujocoScene.from_compiled_contract(
@@ -155,24 +164,45 @@ class ModelArtifactCache:
                         key, directory, mjb_path, mjcf_path, manifest_path, True
                     )
 
+            # A corrupt or missing binary does not invalidate a checksummed
+            # MJCF source artifact. Recompile that exact XML instead of
+            # repeating URDF conversion, mesh discovery and MJCF generation.
+            # The cache lock keeps the replacement atomic for other processes;
+            # untrusted or corrupt MJCF still falls through to a full rebuild.
+            if mjcf_valid:
+                try:
+                    model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+                    scene = MujocoScene.from_compiled_contract(
+                        contract,
+                        model=model,
+                        mjcf_path=mjcf_path,
+                    )
+                except Exception:
+                    manifest_path.unlink(missing_ok=True)
+                    mjb_path.unlink(missing_ok=True)
+                else:
+                    self._publish_mjb(scene.model, directory, mjb_path)
+                    self._atomic_json(
+                        manifest_path,
+                        {
+                            "schema_version": ARTIFACT_KEY_VERSION,
+                            "artifact_key": key,
+                            "fingerprint": fingerprint,
+                            "mjb_sha256": _sha256(mjb_path),
+                            "mjcf_sha256": _sha256(mjcf_path),
+                        },
+                    )
+                    return scene, ModelArtifact(
+                        key, directory, mjb_path, mjcf_path, manifest_path, False
+                    )
+
             scene = MujocoScene.from_contract(
                 contract,
                 mjcf_path=mjcf_path,
                 position_actuation_profile=position_actuation_profile,
                 gripper_actuation_profile=gripper_actuation_profile,
             )
-            with tempfile.NamedTemporaryFile(
-                dir=directory,
-                prefix="model.",
-                suffix=".mjb.tmp",
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-            try:
-                mujoco.mj_saveModel(scene.model, str(temporary_path))
-                os.replace(temporary_path, mjb_path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+            self._publish_mjb(scene.model, directory, mjb_path)
             manifest = {
                 "schema_version": ARTIFACT_KEY_VERSION,
                 "artifact_key": key,
@@ -182,6 +212,23 @@ class ModelArtifactCache:
             }
             self._atomic_json(manifest_path, manifest)
             return scene, ModelArtifact(key, directory, mjb_path, mjcf_path, manifest_path, False)
+
+    @staticmethod
+    def _publish_mjb(model, directory: Path, mjb_path: Path) -> None:
+        import mujoco
+
+        with tempfile.NamedTemporaryFile(
+            dir=directory,
+            prefix="model.",
+            suffix=".mjb.tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        try:
+            mujoco.mj_saveModel(model, str(temporary_path))
+            os.replace(temporary_path, mjb_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def clear(self, key: str | None = None) -> None:
         """Explicitly remove one artifact or the complete configured cache."""
@@ -201,18 +248,28 @@ class ModelArtifactCache:
             shutil.rmtree(target)
 
     @staticmethod
-    def _valid(manifest_path: Path, mjb_path: Path, mjcf_path: Path, key: str) -> bool:
-        if not manifest_path.is_file() or not mjb_path.is_file() or not mjcf_path.is_file():
-            return False
+    def _manifest_for_key(manifest_path: Path, key: str) -> dict[str, object] | None:
+        if not manifest_path.is_file():
+            return None
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            return bool(
-                manifest.get("schema_version") == ARTIFACT_KEY_VERSION
-                and manifest.get("artifact_key") == key
-                and manifest.get("mjb_sha256") == _sha256(mjb_path)
-                and manifest.get("mjcf_sha256") == _sha256(mjcf_path)
-            )
+            if not isinstance(manifest, dict):
+                return None
+            if manifest.get("schema_version") != ARTIFACT_KEY_VERSION:
+                return None
+            if manifest.get("artifact_key") != key:
+                return None
+            return manifest
         except (OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _artifact_matches(path: Path, expected_sha256: object) -> bool:
+        if not isinstance(expected_sha256, str) or not path.is_file():
+            return False
+        try:
+            return expected_sha256 == _sha256(path)
+        except OSError:
             return False
 
     @staticmethod

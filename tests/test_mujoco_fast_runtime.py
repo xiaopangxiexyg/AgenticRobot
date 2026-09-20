@@ -132,9 +132,13 @@ def test_fast_kernel_settled_snapshot_avoids_repeated_settle(runtime_model_cache
         env.close()
 
 
-def test_model_artifact_cache_hits_and_recovers_from_corruption(tmp_path: Path) -> None:
+def test_model_artifact_cache_hits_and_recovers_from_corruption(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     pytest.importorskip("mujoco")
     from sim.mujoco.artifacts import ModelArtifactCache
+    from sim.mujoco.scene import MujocoScene
     from sim.mujoco.tasks.cube_lift import CubeLiftTaskConfig
 
     contract = CubeLiftTaskConfig.load(TASK_CONFIG).base_contract()
@@ -152,10 +156,22 @@ def test_model_artifact_cache_hits_and_recovers_from_corruption(tmp_path: Path) 
     assert second_scene.data is not first_scene.data
     np.testing.assert_allclose(second_scene.model.opt.timestep, first_scene.model.opt.timestep)
 
+    original_mjcf = first.mjcf_path.read_bytes()
     first.mjb_path.write_bytes(b"corrupt")
-    _third_scene, third = cache.load_scene(contract)
+
+    def fail_full_rebuild(*_args, **_kwargs):
+        raise AssertionError("valid cached MJCF must avoid a full URDF rebuild")
+
+    monkeypatch.setattr(MujocoScene, "from_contract", fail_full_rebuild)
+    third_scene, third = cache.load_scene(contract)
     assert not third.cache_hit
     assert third.mjb_path.stat().st_size > len(b"corrupt")
+    assert third.mjcf_path.read_bytes() == original_mjcf
+
+    fourth_scene, fourth = cache.load_scene(contract)
+    assert fourth.cache_hit
+    assert fourth.key == third.key
+    assert fourth_scene.data is not third_scene.data
 
 
 def test_model_artifact_cache_publishes_one_valid_artifact_across_processes(
