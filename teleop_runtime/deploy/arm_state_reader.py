@@ -105,6 +105,7 @@ def _read_backend_state(
         "include_derived_pose": False,
         "include_timing_percentiles": False,
         "include_pose_source_attestation": False,
+        "include_background_streaming": False,
     }
     try:
         parameters = inspect.signature(method).parameters
@@ -584,6 +585,7 @@ class ArmStateReader:
             )
         concurrent_ready: dict[str, bool] = {}
         concurrent_refresh_errors: dict[str, str] = {}
+        refreshed_states: dict[str, Mapping[str, Any]] = {}
         if concurrent_sides:
             for side in concurrent_sides:
                 backend = self.backends[side]
@@ -608,7 +610,9 @@ class ArmStateReader:
                         error=exc,
                     )
 
-            def refresh_one(side: str) -> str | None:
+            def refresh_one(
+                side: str,
+            ) -> tuple[Mapping[str, Any] | None, str | None]:
                 try:
                     refresh = getattr(
                         self.backends[side],
@@ -616,13 +620,15 @@ class ArmStateReader:
                         None,
                     )
                     if callable(refresh):
-                        _read_backend_state(
+                        refreshed = _read_backend_state(
                             refresh,
                             raw_hardware_qpos_only=not self.compute_tcp_pose,
                         )
+                        if isinstance(refreshed, Mapping):
+                            return refreshed, None
                 except Exception as exc:  # noqa: BLE001
-                    return f"refresh_failed:{type(exc).__name__}:{exc}"
-                return None
+                    return None, f"refresh_failed:{type(exc).__name__}:{exc}"
+                return None, None
 
             ready_sides = tuple(
                 side
@@ -643,7 +649,9 @@ class ArmStateReader:
                         for side in ready_sides
                     }
                     for side, future in futures.items():
-                        refresh_error = future.result()
+                        refreshed_state, refresh_error = future.result()
+                        if refreshed_state is not None:
+                            refreshed_states[side] = refreshed_state
                         if refresh_error is not None:
                             concurrent_refresh_errors[side] = refresh_error
                         self._last_refresh_at[side] = now
@@ -691,10 +699,15 @@ class ArmStateReader:
                 try:
                     refresh = getattr(backend, "refresh_state_from_hardware", None)
                     if callable(refresh):
-                        _read_backend_state(
+                        refreshed = _read_backend_state(
                             refresh,
                             raw_hardware_qpos_only=not self.compute_tcp_pose,
                         )
+                        refreshed_state = (
+                            refreshed if isinstance(refreshed, Mapping) else None
+                        )
+                        if refreshed_state is not None:
+                            refreshed_states[side] = refreshed_state
                 except Exception as exc:  # noqa: BLE001
                     refresh_error = f"refresh_failed:{type(exc).__name__}:{exc}"
                     if projection is not None:
@@ -715,12 +728,24 @@ class ArmStateReader:
             try:
                 pose_state_read = self.pose_state_read_by_side.get(side)
                 if pose_state_read is None:
-                    state = dict(
-                        _read_backend_state(
-                            backend.get_state,
-                            raw_hardware_qpos_only=not self.compute_tcp_pose,
+                    refreshed_state = refreshed_states.get(side)
+                    if (
+                        not self.compute_tcp_pose
+                        and isinstance(refreshed_state, Mapping)
+                        and "hardware_qpos" in refreshed_state
+                        and "hardware_measurement_timestamp" in refreshed_state
+                    ):
+                        # RM65 refresh already captured the authoritative qpos
+                        # state. Reusing it avoids a second backend snapshot and
+                        # keeps the measurement timestamp close to the SDK read.
+                        state = dict(refreshed_state)
+                    else:
+                        state = dict(
+                            _read_backend_state(
+                                backend.get_state,
+                                raw_hardware_qpos_only=not self.compute_tcp_pose,
+                            )
                         )
-                    )
                 else:
                     state_read = pose_state_read(backend)
                     if not isinstance(state_read, ArmPoseStateReadResult):
@@ -765,6 +790,14 @@ class ArmStateReader:
                 raise
             if refresh_error is not None:
                 state["state_error"] = refresh_error
+            observation_phase_timing = state.get(
+                "hardware_observation_phase_timing"
+            )
+            state["hardware_observation_phase_timing"] = (
+                dict(observation_phase_timing)
+                if isinstance(observation_phase_timing, Mapping)
+                else {}
+            )
             state["actual_tcp_pose"] = None
             state["actual_tcp_pose_source"] = None
             state["actual_tcp_pose_timestamp"] = None

@@ -85,17 +85,43 @@ class RM65PointGraspReachabilityAdapter:
         self.monotonic = monotonic
 
     def __call__(
-        self, candidate_reference_from_tool_tcp: tuple[np.ndarray, ...]
+        self,
+        candidate_reference_from_tool_tcp: tuple[np.ndarray, ...],
+        *,
+        measured_qpos_cut: Any | None = None,
+        measurement_reference_time: float | None = None,
     ) -> tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
         if not 1 <= len(candidate_reference_from_tool_tcp) <= 5:
             raise ValueError("Reachability requires one to five candidates.")
-        qpos_cut = self.motion_port.latest_measured_qpos()
+        qpos_cut = (
+            measured_qpos_cut
+            if measured_qpos_cut is not None
+            else self.motion_port.latest_measured_qpos()
+        )
         if qpos_cut is None:
             raise RuntimeError("Arm reachability measured qpos is unavailable.")
-        now = float(self.clock())
-        age_ms = (now - qpos_cut.measured_at) * 1_000.0
-        if not math.isfinite(age_ms) or age_ms < 0.0:
+        try:
+            measured_at = float(qpos_cut.measured_at)
+            reference_time = (
+                float(self.clock())
+                if measurement_reference_time is None
+                else float(measurement_reference_time)
+            )
+            age_offset_ms = (reference_time - measured_at) * 1_000.0
+        except (TypeError, ValueError, OverflowError):
             raise RuntimeError("Arm reachability measured qpos age is invalid.")
+        if not math.isfinite(age_offset_ms):
+            raise RuntimeError("Arm reachability measured qpos age is invalid.")
+        if measured_qpos_cut is None:
+            if age_offset_ms < 0.0:
+                raise RuntimeError("Arm reachability measured qpos age is invalid.")
+            age_ms = age_offset_ms
+        else:
+            if abs(age_offset_ms) > self.profile.max_measured_qpos_age_ms:
+                raise RuntimeError(
+                    "Arm reachability measured qpos is not camera-matched."
+                )
+            age_ms = max(0.0, age_offset_ms)
         if age_ms > self.profile.max_measured_qpos_age_ms:
             raise RuntimeError("Arm reachability measured qpos is stale.")
 

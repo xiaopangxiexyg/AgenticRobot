@@ -889,6 +889,15 @@ def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
         assert context["candidate_reference_frame_id"] == "canonical_station"
         assert context["measured_qpos_age_ms"] == pytest.approx(50.0)
         assert annotations[0]["classification"] == "standard_reachable"
+        evaluator.clock = lambda: 10.3
+        matched_cut = session.port.latest_measured_qpos()
+        assert matched_cut is not None
+        matched_context, _ = evaluator(
+            (np.eye(4),),
+            measured_qpos_cut=matched_cut,
+            measurement_reference_time=10.0,
+        )
+        assert matched_context["measured_qpos_age_ms"] == pytest.approx(50.0)
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())
         assert guard.starts == 0
     finally:

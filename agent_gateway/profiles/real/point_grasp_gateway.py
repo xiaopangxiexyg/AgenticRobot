@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import logging
 import threading
@@ -334,6 +335,33 @@ class PointGraspProvider:
         return PreparedPointGrasp(result, annotated)
 
 
+def _call_arm_reachability_evaluator(
+    evaluator: Callable[..., object],
+    candidates: tuple[np.ndarray, ...],
+    *,
+    measured_qpos_cut: object | None,
+    measurement_reference_time: float | None,
+) -> object:
+    optional: dict[str, object] = {}
+    if measured_qpos_cut is not None:
+        try:
+            parameters = inspect.signature(evaluator).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if accepts_kwargs or "measured_qpos_cut" in parameters:
+            optional["measured_qpos_cut"] = measured_qpos_cut
+        if (
+            measurement_reference_time is not None
+            and (accepts_kwargs or "measurement_reference_time" in parameters)
+        ):
+            optional["measurement_reference_time"] = float(measurement_reference_time)
+    return evaluator(candidates, **optional)
+
+
 class StationBoundPointGraspProvider:
     """Plan from one trusted live RGB-D cut and return proposals only."""
 
@@ -610,14 +638,18 @@ class StationBoundPointGraspProvider:
             if request.parameters.get("include_arm_reachability", False):
                 if self.arm_reachability_evaluator is None:
                     raise RuntimeError("Arm reachability evaluator is unavailable.")
-                reachability_context, annotations = self.arm_reachability_evaluator(
-                    tuple(
-                        np.asarray(
-                            candidate["T_reference_from_tool_tcp"],
-                            dtype=np.float64,
-                        ).reshape(4, 4)
-                        for candidate in candidates
-                    )
+                candidate_poses = tuple(
+                    np.asarray(
+                        candidate["T_reference_from_tool_tcp"],
+                        dtype=np.float64,
+                    ).reshape(4, 4)
+                    for candidate in candidates
+                )
+                reachability_context, annotations = _call_arm_reachability_evaluator(
+                    self.arm_reachability_evaluator,
+                    candidate_poses,
+                    measured_qpos_cut=qpos_cut,
+                    measurement_reference_time=float(capture.acquired_at),
                 )
                 if len(annotations) != len(candidates):
                     raise RuntimeError(

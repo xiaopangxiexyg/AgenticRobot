@@ -338,6 +338,7 @@ class ExclusiveRM65SkillDeployPorts:
             RealSkillMotionEmergencyStopReceipt | None
         ) = None
         self._measurement_lock = threading.Lock()
+        self._measurement_read_lock = threading.Lock()
         self._measurement_stop = threading.Event()
         self._measurement_thread: threading.Thread | None = None
         self._latest_observation_cut: RealSkillMotionObservationCut | None = None
@@ -768,6 +769,10 @@ class ExclusiveRM65SkillDeployPorts:
         return cut
 
     def _read_hardware_cut(self) -> RealSkillMotionObservationCut:
+        with self._measurement_read_lock:
+            return self._read_hardware_cut_unlocked()
+
+    def _read_hardware_cut_unlocked(self) -> RealSkillMotionObservationCut:
         """Read one fresh dual hardware cut; command/preview qpos is forbidden."""
 
         if not self.resources_started:
@@ -786,6 +791,7 @@ class ExclusiveRM65SkillDeployPorts:
         qpos_by_side: dict[str, np.ndarray] = {}
         measured_at_by_side: dict[str, float] = {}
         hardware_read_phase_timing_by_side: dict[str, dict[str, float]] = {}
+        hardware_observation_phase_timing_by_side: dict[str, dict[str, float]] = {}
         evidence_payload: dict[str, Any] = {}
         source_sequence_by_side: dict[str, int] = {}
         for side in ("left", "right"):
@@ -821,6 +827,7 @@ class ExclusiveRM65SkillDeployPorts:
             age_sec = max(0.0, available_at - measured_at)
             if age_sec > self.profile.max_measurement_age_sec:
                 timing_by_side = {}
+                observation_timing_by_side = {}
                 age_by_side = {}
                 measured_by_side = {}
                 for diagnostic_side in ("left", "right"):
@@ -847,6 +854,17 @@ class ExclusiveRM65SkillDeployPorts:
                             and not isinstance(value, bool)
                             and math.isfinite(float(value))
                         }
+                    raw_observation_timing = diagnostic_state.get(
+                        "hardware_observation_phase_timing"
+                    )
+                    if isinstance(raw_observation_timing, Mapping):
+                        observation_timing_by_side[diagnostic_side] = {
+                            str(key): float(value)
+                            for key, value in raw_observation_timing.items()
+                            if isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value))
+                        }
                 diagnostic = {
                     "available_at": available_at,
                     "measurement_age_sec_by_side": age_by_side,
@@ -858,6 +876,9 @@ class ExclusiveRM65SkillDeployPorts:
                     ),
                     "concurrently_refreshed_sides": ["left", "right"],
                     "hardware_read_phase_timing_by_side": timing_by_side,
+                    "hardware_observation_phase_timing_by_side": (
+                        observation_timing_by_side
+                    ),
                 }
                 raise RealSkillMotionObservationUnavailable(
                     f"{side} RM65 hardware qpos cut is stale: {age_sec:.6f}s; "
@@ -872,6 +893,17 @@ class ExclusiveRM65SkillDeployPorts:
                 hardware_read_phase_timing_by_side[side] = {
                     str(key): float(value)
                     for key, value in raw_timing.items()
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                }
+            raw_observation_timing = state.get(
+                "hardware_observation_phase_timing"
+            )
+            if isinstance(raw_observation_timing, Mapping):
+                hardware_observation_phase_timing_by_side[side] = {
+                    str(key): float(value)
+                    for key, value in raw_observation_timing.items()
                     if isinstance(value, (int, float))
                     and not isinstance(value, bool)
                     and math.isfinite(float(value))
@@ -903,6 +935,9 @@ class ExclusiveRM65SkillDeployPorts:
                     "hardware_measurement_span_sec": measurement_span_sec,
                     "hardware_read_phase_timing_by_side": (
                         hardware_read_phase_timing_by_side
+                    ),
+                    "hardware_observation_phase_timing_by_side": (
+                        hardware_observation_phase_timing_by_side
                     ),
                 },
             ),

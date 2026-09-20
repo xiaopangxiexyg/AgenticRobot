@@ -6709,6 +6709,7 @@ class RM65ArmBackend(EffectorBackend):
         include_derived_pose: bool = True,
         include_timing_percentiles: bool = True,
         include_pose_source_attestation: bool | None = None,
+        include_background_streaming: bool = True,
     ) -> dict[str, object]:
         if self.arm is None:
             return self.get_state(
@@ -6717,6 +6718,7 @@ class RM65ArmBackend(EffectorBackend):
                 include_pose_source_attestation=(
                     include_pose_source_attestation
                 ),
+                include_background_streaming=bool(include_background_streaming),
             )
         refresh_wall_started = time.perf_counter()
         refresh_cpu_started = time.thread_time()
@@ -6857,11 +6859,25 @@ class RM65ArmBackend(EffectorBackend):
                 if self.config.connect_hardware and self.arm is not None:
                     self._hardware_ready = True
                     self._hardware_ready_source = "hardware_feedback"
-        return self.get_state(
+        snapshot_wall_started = time.perf_counter()
+        snapshot_cpu_started = time.thread_time()
+        state = self.get_state(
             include_derived_pose=bool(include_derived_pose),
             include_timing_percentiles=bool(include_timing_percentiles),
             include_pose_source_attestation=include_pose_source_attestation,
+            include_background_streaming=bool(include_background_streaming),
         )
+        state["hardware_observation_phase_timing"] = {
+            "refresh_to_state_snapshot_wall_ms": max(
+                0.0,
+                (time.perf_counter() - snapshot_wall_started) * 1000.0,
+            ),
+            "refresh_to_state_snapshot_thread_cpu_ms": max(
+                0.0,
+                (time.thread_time() - snapshot_cpu_started) * 1000.0,
+            ),
+        }
+        return state
 
     def read_force_data(self) -> dict[str, object]:
         """Read one validated RM65 force sample from this backend connection."""
@@ -7018,12 +7034,15 @@ class RM65ArmBackend(EffectorBackend):
         include_derived_pose: bool = True,
         include_timing_percentiles: bool = True,
         include_pose_source_attestation: bool | None = None,
+        include_background_streaming: bool = True,
     ) -> dict[str, object]:
         """Return a backend snapshot.
 
         The compatibility default remains the complete diagnostic snapshot.
         High-rate callers may omit FK-derived poses and percentile sorting;
-        neither field participates in command admission or transport safety.
+        Raw-qpos readers may omit background diagnostics and timing
+        aggregation when they only need the authoritative measurement.
+        Neither field participates in command admission or transport safety.
         Exact pose-source attestation is independently opt-in because its full
         model/tool revalidation is materially more expensive than FK alone.
         """
@@ -7067,8 +7086,12 @@ class RM65ArmBackend(EffectorBackend):
             hardware_ready_source = str(self._hardware_ready_source)
             singularity_metadata = dict(self._last_singularity_metadata)
             emergency_stopped = bool(self._emergency_stopped)
-            background_streaming = self._background_stream_snapshot_locked()
-        if include_timing_percentiles:
+            background_streaming = (
+                self._background_stream_snapshot_locked()
+                if include_background_streaming
+                else {}
+            )
+        if include_background_streaming and include_timing_percentiles:
             background_streaming["timing_percentiles"] = (
                 self._background_stream_timing_percentiles_snapshot()
             )

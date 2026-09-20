@@ -813,6 +813,14 @@ def test_rm65_reachability_adapter_accepts_normalized_graspnet_candidate() -> No
 
     assert context["candidate_order_effect"] == "annotation_only_order_unchanged"
     assert annotations[0]["classification"] == "standard_reachable"
+    adapter.clock = lambda: 10.3
+    matched_cut = adapter.motion_port.latest_measured_qpos()
+    capture_context, _ = adapter(
+        (normalized,),
+        measured_qpos_cut=matched_cut,
+        measurement_reference_time=10.0,
+    )
+    assert capture_context["measured_qpos_age_ms"] == pytest.approx(50.0)
 
 
 def test_station_point_grasp_fails_if_revision_changes_during_inference() -> None:
