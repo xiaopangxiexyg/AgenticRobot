@@ -1249,7 +1249,7 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert state["task_chain_can_advance"] is True
 
 
-def test_task_chain_keeps_validated_configuration_when_start_gate_is_stale() -> None:
+def test_task_chain_starts_after_stale_start_gate_recovers() -> None:
     application = RuleBasedWritingApplication()
     options, first, _second = _task_chain_configuration()
     application.bind_rule_runtime()
@@ -1275,11 +1275,15 @@ def test_task_chain_keeps_validated_configuration_when_start_gate_is_stale() -> 
     assert application.consume_configuration_requests() == ()
 
     application.observe_rule_status(_task_chain_ready_status())
-    assert application.snapshot()["task_chain_can_advance"] is True
-    assert application.submit_task_chain_advance({"event": "advance"}) is True
     assert application.consume_rule_intents() == ("rule_start",)
     assert application.consume_runtime_events() == ["episode_start"]
     assert application.snapshot()["task_chain_phase"] == "rule_pending"
+
+    # Later status heartbeats must not submit a second START for the same
+    # validated chain selection.
+    application.observe_rule_status(_task_chain_ready_status())
+    assert application.consume_rule_intents() == ()
+    assert application.consume_runtime_events() == []
 
 
 def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() -> None:

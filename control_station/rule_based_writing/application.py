@@ -244,6 +244,7 @@ class RuleBasedWritingApplication:
                 self._set_readiness_blocked_locked()
             elif self._state.phase == "preparing" and self._rule_runtime_bound:
                 self._project_prestart_readiness_locked()
+            self._try_start_waiting_task_chain_locked()
             self._rebuild_controls()
             self._touch()
 
@@ -1077,6 +1078,7 @@ class RuleBasedWritingApplication:
                     self._state.detail = self._state.configuration_error
                 elif self._state.gripper_action_status:
                     self._state.detail = self._state.gripper_action_status
+            self._try_start_waiting_task_chain_locked()
             self._observe_task_chain_status_locked(
                 begun=begun,
                 completed=completed,
@@ -1085,6 +1087,40 @@ class RuleBasedWritingApplication:
             )
             self._rebuild_controls()
             self._touch()
+
+    def _try_start_waiting_task_chain_locked(self) -> bool:
+        """Commit a deferred chain start after a fresh lower-layer receipt.
+
+        Configuration completion and Session/Rig readiness are asynchronous.
+        If the configuration callback observes a stale start receipt, the
+        chain deliberately enters ``READY_RULE`` with ``rule_start_waiting``.
+        A later authoritative status update can now complete that same pending
+        transition without requiring a second operator click or bypassing the
+        normal start admission predicate.
+
+        This method is called only while ``self._lock`` is held.  It must stay
+        narrow: it may submit the existing START intents, but it does not
+        synthesize readiness or dispatch a robot command.
+        """
+
+        if (
+            self._task_chain.phase is not RuleWritingTaskChainPhase.READY_RULE
+            or not self._task_chain.rule_start_waiting
+            or self._state.writer_blocked
+            or self._state.configuration_pending
+            or self._state.writer_retry_pending
+            or self._state.gripper_action_pending
+            or self._state.height_calibration_pending
+            or self._state.runtime_home_pending
+            or self._state.startup_blockers
+        ):
+            return False
+        if not self._base_control_availability_locked()["start"]:
+            return False
+        if not self._submit_intent_locked(RuleBasedWritingIntent.START):
+            return False
+        self._task_chain.begin_rule_after_wait()
+        return True
 
     def _observe_task_chain_status_locked(
         self,

@@ -339,6 +339,7 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         lambda path, **_kwargs: tcp_by_path[Path(path).resolve()],
     )
     args = argparse.Namespace(
+        dataset_root=str(tmp_path / "collection"),
         rule_source_pool_manifest=str(manifest),
         rule_source_pool_range=None,
         rule_source_selection_seed=5,

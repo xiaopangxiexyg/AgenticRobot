@@ -262,8 +262,8 @@ class RuleWritingTaskChain:
             detail = f"上一步未完成：{self.last_error} 请确认安全后重试当前步骤。"
         elif self.rule_start_waiting:
             detail = (
-                "配置已验证，等待现有安全门禁放行；门禁就绪后点击“继续任务链”"
-                "开始规则采集，不会自动绕过安全检查。"
+                "配置已验证，等待现有安全门禁放行；门禁就绪后将自动开始规则采集，"
+                "不会自动绕过安全检查。"
             )
         return {
             "active": self.active,
