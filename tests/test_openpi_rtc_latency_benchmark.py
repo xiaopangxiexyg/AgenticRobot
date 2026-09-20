@@ -17,6 +17,7 @@ from deployments.openpi.client.transport import packb
 from scripts.probes.create_openpi_rtc_latency_request import build_request
 from scripts.probes.probe_openpi_rtc_latency import (
     load_conditioned_request,
+    measure_dispatch_and_device_ready,
     run_probe,
     validate_conditioned_response,
     validate_deployment_state_contract,
@@ -54,8 +55,20 @@ def _response(request: dict[str, Any], *, policy_ms: float) -> dict[str, Any]:
             "consumed_external_shape": list(request["conditioning_actions"].shape),
             "consumed_generation_indices": [0, 1],
         },
-        "policy_timing": {"infer_ms": policy_ms},
-        "server_timing": {"infer_ms": policy_ms + 1.0},
+        "policy_timing": {
+            "infer_ms": policy_ms,
+            "python_dispatch_ms": policy_ms - 5.0,
+            "jax_device_ready_ms": policy_ms,
+            "jax_device_ready_wait_ms": 5.0,
+            "device_ready_semantics": "explicit_block_until_ready",
+        },
+        "server_timing": {
+            "infer_ms": policy_ms + 1.0,
+            "python_dispatch_ms": policy_ms - 4.0,
+            "jax_device_ready_ms": policy_ms + 1.0,
+            "jax_device_ready_wait_ms": 5.0,
+            "device_ready_semantics": "explicit_block_until_ready",
+        },
     }
 
 
@@ -199,6 +212,21 @@ def test_run_probe_excludes_warmup_and_reports_observed_budget() -> None:
     assert result["latency_ms"]["wall"]["mean"] == pytest.approx(30.0)
     assert result["latency_ms"]["policy_infer"]["mean"] == pytest.approx(25.0)
     assert result["latency_ms"]["non_policy_wall"]["mean"] == pytest.approx(5.0)
+    assert result["latency_ms"]["policy_python_dispatch"]["mean"] == pytest.approx(
+        20.0
+    )
+    assert result["latency_ms"]["policy_jax_device_ready"]["mean"] == pytest.approx(
+        25.0
+    )
+    assert result["latency_ms"]["policy_jax_device_ready_wait"]["mean"] == pytest.approx(
+        5.0
+    )
+    assert result["timing_truth"]["missing_fields"] == {
+        "policy_python_dispatch": False,
+        "policy_jax_device_ready": False,
+        "server_python_dispatch": False,
+        "server_jax_device_ready": False,
+    }
     assert result["budget_observation"] == {
         "budget_ms": 30.0,
         "within_budget_count": 1,
@@ -233,3 +261,98 @@ def test_run_probe_rejects_request_shape_incompatible_with_server() -> None:
             measured_requests=1,
             latency_budget_ms=400.0,
         )
+
+
+def test_measure_dispatch_and_device_ready_uses_explicit_blocker() -> None:
+    class _LazyResult:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def block_until_ready(self) -> None:
+            self.ready = True
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.values = iter((1.0, 1.02, 1.08))
+
+        def __call__(self) -> float:
+            return next(self.values)
+
+    result = measure_dispatch_and_device_ready(
+        lambda: _LazyResult(),
+        clock=_Clock(),
+    )
+
+    assert result == {
+        "python_dispatch_ms": pytest.approx(20.0),
+        "jax_device_ready_wait_ms": pytest.approx(60.0),
+        "jax_device_ready_ms": pytest.approx(80.0),
+        "device_ready_observed": True,
+        "device_ready_semantics": "explicit_block_until_ready",
+    }
+
+
+def test_measure_dispatch_and_device_ready_does_not_guess_for_host_value() -> None:
+    class _Clock:
+        def __init__(self) -> None:
+            self.values = iter((1.0, 1.02))
+
+        def __call__(self) -> float:
+            return next(self.values)
+
+    result = measure_dispatch_and_device_ready(
+        lambda: np.zeros((2,), dtype=np.float32),
+        clock=_Clock(),
+    )
+
+    assert result["python_dispatch_ms"] == pytest.approx(20.0)
+    assert result["jax_device_ready_wait_ms"] is None
+    assert result["jax_device_ready_ms"] is None
+    assert result["device_ready_observed"] is False
+    assert result["device_ready_semantics"] == "not_observed"
+
+
+def test_run_probe_does_not_promote_legacy_infer_ms_to_device_ready() -> None:
+    request = _request()
+
+    class _LegacyOnlyTransport(_FakeTransport):
+        def infer(self, request: dict[str, Any]) -> dict[str, Any]:
+            response = super().infer(request)
+            response["policy_timing"] = {"infer_ms": 25.0}
+            response["server_timing"] = {"infer_ms": 26.0}
+            return response
+
+    result = run_probe(
+        transport=_LegacyOnlyTransport(),
+        request=request,
+        warmup_requests=0,
+        measured_requests=1,
+        latency_budget_ms=400.0,
+        clock=_Clock(),
+    )
+
+    assert result["latency_ms"]["policy_infer"]["mean"] == pytest.approx(25.0)
+    assert result["latency_ms"]["policy_jax_device_ready"] is None
+    assert result["timing_truth"]["missing_fields"]["policy_jax_device_ready"] is True
+
+
+def test_run_probe_requires_provider_device_ready_semantics_marker() -> None:
+    request = _request()
+
+    class _UnmarkedDeviceTimingTransport(_FakeTransport):
+        def infer(self, request: dict[str, Any]) -> dict[str, Any]:
+            response = super().infer(request)
+            response["policy_timing"]["device_ready_semantics"] = "unknown"
+            return response
+
+    result = run_probe(
+        transport=_UnmarkedDeviceTimingTransport(),
+        request=request,
+        warmup_requests=0,
+        measured_requests=1,
+        latency_budget_ms=400.0,
+        clock=_Clock(),
+    )
+
+    assert result["latency_ms"]["policy_jax_device_ready"] is None
+    assert result["timing_truth"]["missing_fields"]["policy_jax_device_ready"] is True

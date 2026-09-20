@@ -6,6 +6,15 @@ checkpoint, start an OpenPI server, open cameras, initialize robot backends, or
 dispatch actions.  Reusing the same request file makes separate 8-step and
 10-step server runs comparable without binding the client to either model or
 checkpoint identity.
+
+For a diagnostic provider that exposes them, ``policy_timing`` and
+``server_timing`` may additionally contain ``python_dispatch_ms``,
+``jax_device_ready_ms`` and ``jax_device_ready_wait_ms``.  The latter two are
+trusted as device timing only when the provider measured them after an
+explicit ``block_until_ready`` and marks
+``device_ready_semantics='explicit_block_until_ready'``; the legacy
+``infer_ms`` field is reported for compatibility but is never treated as proof
+of device readiness.
 """
 
 from __future__ import annotations
@@ -282,6 +291,103 @@ def _optional_timing_ms(response: Mapping[str, Any], key: str) -> float | None:
     return parsed if math.isfinite(parsed) and parsed >= 0.0 else None
 
 
+def _optional_explicit_timing_ms(
+    response: Mapping[str, Any],
+    container_key: str,
+    field: str,
+) -> float | None:
+    """Read one explicitly named provider timing field.
+
+    ``infer_ms`` predates this probe's timing truth work and has no stable
+    promise about whether the provider waited for a JAX device result.  The
+    fields read here deliberately use explicit names so a diagnostic server
+    can distinguish Python dispatch from a measurement taken after
+    ``block_until_ready``.  Missing fields stay missing; the probe never
+    infers device timing from a wall clock or from ``infer_ms``.
+    """
+
+    timing = response.get(container_key)
+    if not isinstance(timing, Mapping):
+        return None
+    value = timing.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else None
+
+
+def _optional_device_ready_timing_ms(
+    response: Mapping[str, Any],
+    container_key: str,
+    field: str,
+) -> float | None:
+    """Read device timing only when the provider declares synchronization."""
+
+    timing = response.get(container_key)
+    if not isinstance(timing, Mapping):
+        return None
+    if timing.get("device_ready_semantics") != "explicit_block_until_ready":
+        return None
+    return _optional_explicit_timing_ms(response, container_key, field)
+
+
+def measure_dispatch_and_device_ready(
+    operation: Callable[[], Any],
+    *,
+    block_until_ready: Callable[[Any], Any] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> dict[str, Any]:
+    """Measure Python dispatch separately from optional device readiness.
+
+    This helper is intentionally only for benchmark/diagnostic code.  A
+    JAX/Flax operation may return before device execution completes, so the
+    interval ending at ``operation()`` is *not* a device-compute measurement.
+    When ``block_until_ready`` is supplied (for example ``jax.block_until_ready``)
+    it is called on the returned value and the second interval is reported.
+    If no blocker is supplied, an object's bound ``block_until_ready`` method
+    is used when available.  Otherwise device readiness is explicitly marked
+    unavailable rather than guessed.
+    """
+
+    started = float(clock())
+    result = operation()
+    dispatched = float(clock())
+    if (
+        not math.isfinite(started)
+        or not math.isfinite(dispatched)
+        or dispatched < started
+    ):
+        raise ValueError("Benchmark clock regressed or returned a non-finite value.")
+
+    blocker = block_until_ready
+    if blocker is None:
+        bound_blocker = getattr(result, "block_until_ready", None)
+        if callable(bound_blocker):
+            blocker = lambda value: value.block_until_ready()
+
+    dispatch_ms = (dispatched - started) * 1000.0
+    if blocker is None:
+        return {
+            "python_dispatch_ms": dispatch_ms,
+            "jax_device_ready_wait_ms": None,
+            "jax_device_ready_ms": None,
+            "device_ready_observed": False,
+            "device_ready_semantics": "not_observed",
+        }
+
+    blocker(result)
+    ready = float(clock())
+    if not math.isfinite(ready) or ready < dispatched:
+        raise ValueError("Benchmark clock regressed after device-ready wait.")
+    return {
+        "python_dispatch_ms": dispatch_ms,
+        "jax_device_ready_wait_ms": (ready - dispatched) * 1000.0,
+        "jax_device_ready_ms": (ready - started) * 1000.0,
+        "device_ready_observed": True,
+        "device_ready_semantics": "explicit_block_until_ready",
+    }
+
+
 def _statistics(values: Sequence[float]) -> dict[str, float]:
     samples = np.asarray(tuple(float(value) for value in values), dtype=np.float64)
     if samples.ndim != 1 or not samples.size or not np.all(np.isfinite(samples)):
@@ -339,6 +445,12 @@ def run_probe(
     policy_ms: list[float] = []
     server_ms: list[float] = []
     non_policy_wall_ms: list[float] = []
+    policy_python_dispatch_ms: list[float] = []
+    policy_jax_device_ready_ms: list[float] = []
+    policy_jax_device_ready_wait_ms: list[float] = []
+    server_python_dispatch_ms: list[float] = []
+    server_jax_device_ready_ms: list[float] = []
+    server_jax_device_ready_wait_ms: list[float] = []
     for _ in range(measured_requests):
         started = float(clock())
         response = transport.infer(request)
@@ -361,6 +473,51 @@ def run_probe(
         server_value = _optional_timing_ms(response, "server_timing")
         if server_value is not None:
             server_ms.append(server_value)
+        for values, container_key, field, reader in (
+            (
+                policy_python_dispatch_ms,
+                "policy_timing",
+                "python_dispatch_ms",
+                _optional_explicit_timing_ms,
+            ),
+            (
+                policy_jax_device_ready_ms,
+                "policy_timing",
+                "jax_device_ready_ms",
+                _optional_device_ready_timing_ms,
+            ),
+            (
+                policy_jax_device_ready_wait_ms,
+                "policy_timing",
+                "jax_device_ready_wait_ms",
+                _optional_device_ready_timing_ms,
+            ),
+            (
+                server_python_dispatch_ms,
+                "server_timing",
+                "python_dispatch_ms",
+                _optional_explicit_timing_ms,
+            ),
+            (
+                server_jax_device_ready_ms,
+                "server_timing",
+                "jax_device_ready_ms",
+                _optional_device_ready_timing_ms,
+            ),
+            (
+                server_jax_device_ready_wait_ms,
+                "server_timing",
+                "jax_device_ready_wait_ms",
+                _optional_device_ready_timing_ms,
+            ),
+        ):
+            timing_value = reader(
+                response,
+                container_key,
+                field,
+            )
+            if timing_value is not None:
+                values.append(timing_value)
 
     if packb(request) != baseline_wire:
         raise RuntimeError("Benchmark request was mutated during replay.")
@@ -407,6 +564,60 @@ def run_probe(
                 if len(non_policy_wall_ms) != measured_requests
                 else _statistics(non_policy_wall_ms)
             ),
+            "policy_python_dispatch": (
+                None
+                if len(policy_python_dispatch_ms) != measured_requests
+                else _statistics(policy_python_dispatch_ms)
+            ),
+            "policy_jax_device_ready": (
+                None
+                if len(policy_jax_device_ready_ms) != measured_requests
+                else _statistics(policy_jax_device_ready_ms)
+            ),
+            "policy_jax_device_ready_wait": (
+                None
+                if len(policy_jax_device_ready_wait_ms) != measured_requests
+                else _statistics(policy_jax_device_ready_wait_ms)
+            ),
+            "server_python_dispatch": (
+                None
+                if len(server_python_dispatch_ms) != measured_requests
+                else _statistics(server_python_dispatch_ms)
+            ),
+            "server_jax_device_ready": (
+                None
+                if len(server_jax_device_ready_ms) != measured_requests
+                else _statistics(server_jax_device_ready_ms)
+            ),
+            "server_jax_device_ready_wait": (
+                None
+                if len(server_jax_device_ready_wait_ms) != measured_requests
+                else _statistics(server_jax_device_ready_wait_ms)
+            ),
+        },
+        "timing_truth": {
+            "policy_infer_ms": (
+                "legacy provider infer_ms; it does not establish JAX device "
+                "readiness unless the provider documents that semantic."
+            ),
+            "python_dispatch_ms": (
+                "explicit provider field: Python/model call returned; this is "
+                "not a synchronized device-compute measurement."
+            ),
+            "jax_device_ready_ms": (
+                "explicit provider field: provider must have waited for "
+                "block_until_ready before reporting it."
+            ),
+            "missing_fields": {
+                "policy_python_dispatch": len(policy_python_dispatch_ms)
+                != measured_requests,
+                "policy_jax_device_ready": len(policy_jax_device_ready_ms)
+                != measured_requests,
+                "server_python_dispatch": len(server_python_dispatch_ms)
+                != measured_requests,
+                "server_jax_device_ready": len(server_jax_device_ready_ms)
+                != measured_requests,
+            },
         },
         "budget_observation": {
             "budget_ms": float(latency_budget_ms),
