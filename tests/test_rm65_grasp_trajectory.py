@@ -2498,6 +2498,11 @@ def test_planner_entrypoint_records_continuous_parameterization(
         RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
     )
     assert recorded["parameterization"]["internal_path_waypoint_stops"] is False
+    assert recorded["planning_timing"]["clock"] == "host_perf_counter"
+    assert recorded["planning_timing"]["path_search_wall_duration_sec"] >= 0.0
+    assert recorded["planning_timing"]["planning_wall_duration_sec"] >= recorded[
+        "planning_timing"
+    ]["path_search_wall_duration_sec"]
     assert tuple(
         item["planning_phase"] for item in recorded["stage_boundaries"]
     ) == ("pregrasp_target", "constrained_approach")

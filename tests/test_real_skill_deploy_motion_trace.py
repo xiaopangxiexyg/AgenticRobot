@@ -32,6 +32,14 @@ def _command(*, index: int) -> TeleopCommand:
                 "request_id": "request:long-move",
                 "side": "left",
                 "speed_scale": 0.2,
+                "trajectory_sample_index": index,
+                "trajectory_next_sample_index": index + 1,
+                "trajectory_sample_count": 3,
+                "trajectory_time_from_start_sec": index * 0.1,
+                "trajectory_elapsed_sec": index * 0.1,
+                "trajectory_duration_sec": 0.2,
+                "trajectory_clock_advance_sec": 0.01,
+                "trajectory_clock_advance_capped": index == 2,
                 "target_tool_tcp_pose_world": target,
             },
             "collision_avoidance_status": "tracking",
@@ -149,7 +157,10 @@ def _sample(*, index: int) -> RealSkillControlTraceSample:
         ),
         command=_command(index=index),
         dispatch_receipt=receipt,
-        port_snapshot=SimpleNamespace(phase=SimpleNamespace(value="active")),
+        port_snapshot=SimpleNamespace(
+            phase=SimpleNamespace(value="active"),
+            trajectory_clock_rebased_count=index,
+        ),
         command_present=True,
         admitted=True,
         dispatch_attempted=True,
@@ -225,6 +236,12 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
             "ik_profile_min_distance_total_ms"
         ] == pytest.approx(5.0)
         assert arrays["reference"][1]["measurement_span_ms"] == pytest.approx(2.0)
+        assert arrays["reference"][2]["trajectory_sample_index"] == 2
+        assert arrays["reference"][2]["trajectory_duration_sec"] == pytest.approx(
+            0.2
+        )
+        assert arrays["reference"][2]["trajectory_clock_advance_capped"] == 1
+        assert arrays["reference"][2]["trajectory_clock_rebased_count"] == 2
         np.testing.assert_allclose(
             arrays["reference"][1]["hardware_read_sdk_call_wall_ms"],
             [8.0, 9.0],
@@ -236,6 +253,24 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
     inspected = inspect_trace(output)
     summary = inspected["summary"]
     assert summary["operation_ids"] == ["operation:long-move"]
+    execution_timing = summary["execution_timing"]
+    assert execution_timing["available"] is True
+    operation_timing = execution_timing["operations"]["operation:long-move"]
+    assert operation_timing["planned_trajectory_duration_sec"] == pytest.approx(
+        0.2
+    )
+    assert operation_timing["dispatch_wall_minus_planned_sec"] == pytest.approx(
+        -0.18
+    )
+    assert operation_timing["dispatch_wall_to_planned_ratio"] == pytest.approx(
+        0.1
+    )
+    assert operation_timing["trajectory_elapsed_sec_max"] == pytest.approx(0.2)
+    assert operation_timing["trajectory_completion_observed"] is True
+    assert operation_timing["operation_wall_duration_sec"] == pytest.approx(0.02)
+    assert operation_timing["dispatch_wall_duration_sec"] == pytest.approx(0.02)
+    assert operation_timing["trajectory_clock_advance_capped_count"] == 1
+    assert operation_timing["trajectory_clock_rebased_count_max"] == 2
     assert summary["dispatch_succeeded_count"] == 3
     assert summary["ik_time_budget_exceeded_count"] == 1
     assert summary["ik_branch_switch_count"] == 0
@@ -244,6 +279,10 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
     assert summary["ik_profile"]["min_distance_total_ms"][
         "max"
     ] == pytest.approx(5.0)
+    assert summary["trajectory_tracking"]["valid_cycle_count"] == 3
+    assert summary["trajectory_tracking"]["final_max_joint_error_deg"] == pytest.approx(
+        0.004 * 180.0 / np.pi
+    )
     assert summary["actuator_timing"]["left"]["accepted_count"] == 3
     assert summary["actuator_timing"]["left"]["post_stall_burst_count"] == 0
     assert summary["actuator_timing"]["left"]["moving_send_under_4ms_count"] == 0
@@ -262,7 +301,7 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
         "closed"
     ] is True
     assert json.loads((output / "manifest.json").read_text())["schema"].endswith(
-        ".v2"
+        ".v3"
     )
 
 

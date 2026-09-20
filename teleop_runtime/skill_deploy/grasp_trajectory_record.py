@@ -86,6 +86,7 @@ def write_grasp_trajectory_record(
     speed_scale: float,
     stage_boundaries: tuple[Mapping[str, object], ...],
     parameterization: Mapping[str, object] | None = None,
+    planning_timing: Mapping[str, object] | None = None,
     source_waypoints_by_side: Mapping[str, np.ndarray] | None = None,
 ) -> Path:
     """Publish a full plan once, without replacing an earlier record."""
@@ -132,6 +133,18 @@ def write_grasp_trajectory_record(
             )
         )
     )
+    planning_timing_payload = (
+        None
+        if planning_timing is None
+        else json.loads(
+            json.dumps(
+                dict(planning_timing),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    )
     metadata = {
         "schema": SCHEMA,
         "trajectory_hash": identity,
@@ -148,6 +161,8 @@ def write_grasp_trajectory_record(
     }
     if parameterization_payload is not None:
         metadata["parameterization"] = parameterization_payload
+    if planning_timing_payload is not None:
+        metadata["planning_timing"] = planning_timing_payload
     if source_waypoints is not None:
         metadata.update(
             {

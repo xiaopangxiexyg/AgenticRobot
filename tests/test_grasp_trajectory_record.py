@@ -41,6 +41,11 @@ def _write(directory, trajectory):
             "mode": "continuous_c2",
             "internal_path_waypoint_stops": False,
         },
+        planning_timing={
+            "clock": "host_perf_counter",
+            "path_search_wall_duration_sec": 1.25,
+            "planning_wall_duration_sec": 2.5,
+        },
         source_waypoints_by_side={
             "left": np.zeros((2, 6)),
             "right": np.arange(12, dtype=float).reshape(2, 6) * 0.01,
@@ -62,6 +67,9 @@ def test_exact_grasp_plan_samples_survive_restart_and_are_immutable(tmp_path):
     assert metadata["collision_scope"] == "profile_sparse_proxy_pairs"
     assert metadata["collision_scene_profile"] == "dual_arm_hand_proxy_strict"
     assert metadata["parameterization"]["mode"] == "continuous_c2"
+    assert metadata["planning_timing"]["path_search_wall_duration_sec"] == pytest.approx(
+        1.25
+    )
     assert metadata["source_waypoint_count"] == 2
     with np.load(path, allow_pickle=False) as record:
         np.testing.assert_array_equal(record["source_left_qpos"], np.zeros((2, 6)))

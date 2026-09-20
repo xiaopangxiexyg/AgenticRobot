@@ -3254,6 +3254,7 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        planning_started_at = time.perf_counter()
         capture_self_observation_evidence = (
             None
             if visible_scene is None
@@ -3318,6 +3319,7 @@ class RM65GraspJointTrajectoryPlanner:
         route_mode: str | None = "already_at_grasp" if already_at_grasp else None
         direct_fallback_attempt: dict[str, object] | None = None
         direct_fallback_tried = False
+        path_search_started_at = time.perf_counter()
         if already_at_grasp:
             selected_legs = (
                 self._plan_path_leg(
@@ -3466,6 +3468,7 @@ class RM65GraspJointTrajectoryPlanner:
                 ) from route_error
 
         assert selected_legs is not None
+        path_search_finished_at = time.perf_counter()
         self._remaining_path_planning_time_sec(
             deadline=deadline,
             monotonic=monotonic,
@@ -3774,6 +3777,24 @@ class RM65GraspJointTrajectoryPlanner:
                 "opening_m": visible_scene.geometry.maximum_opening_m,
                 "scope": "observed_points_nominal_parallel_jaw_solids_only",
             }
+        planning_timing = {
+            "clock": "host_perf_counter",
+            "pre_path_search_wall_duration_sec": float(
+                path_search_started_at - planning_started_at
+            ),
+            "path_search_wall_duration_sec": float(
+                path_search_finished_at - path_search_started_at
+            ),
+            "trajectory_parameterization_wall_duration_sec": float(
+                time.perf_counter() - path_search_finished_at
+            ),
+            "planning_wall_duration_sec": float(
+                time.perf_counter() - planning_started_at
+            ),
+            "path_planning_time_budget_sec": float(
+                self.config.path_planning_time_budget_sec
+            ),
+        }
         evidence_hash = canonical_content_hash(
             {
                 "scene_hash": self.scene.semantic_content_hash,
@@ -3842,6 +3863,7 @@ class RM65GraspJointTrajectoryPlanner:
                     speed_scale=scale,
                     stage_boundaries=tuple(stage_boundaries),
                     parameterization=parameterization_metadata,
+                    planning_timing=planning_timing,
                     source_waypoints_by_side={
                         side: np.stack(
                             [

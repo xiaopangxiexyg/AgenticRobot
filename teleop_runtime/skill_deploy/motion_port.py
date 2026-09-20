@@ -1258,6 +1258,9 @@ class RealAgentMotionPort:
                     "trajectory_sample_count": int(
                         trajectory.time_from_start_sec.size
                     ),
+                    "trajectory_duration_sec": float(
+                        trajectory.time_from_start_sec[-1]
+                    ),
                     "trajectory_time_from_start_sec": float(
                         trajectory.time_from_start_sec[sample_index]
                     ),
