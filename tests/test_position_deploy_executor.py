@@ -2294,6 +2294,48 @@ def test_collision_reset_dry_run_fallback_is_explicit_and_observable() -> None:
         executor.close()
 
 
+def test_collision_reset_dry_run_never_carries_authoritative_age_gate() -> None:
+    planner = _FakePositionCollisionPlanner()
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            collision_required=True,
+            stale_after_sec=0.5,
+            collision_reset_measurement_max_age_sec=0.25,
+            allow_non_authoritative_collision_reset_in_dry_run=True,
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        collision_planner_factory=lambda: planner,
+        clock=lambda: 10.30,
+    )
+    try:
+        executor.start()
+        executor.submit(
+            _filtered_bimanual_pose(0.16, 0.18),
+            _observation(
+                sides=("left", "right"),
+                arm_state_overrides={
+                    side: {
+                        "hardware_read_timestamp_monotonic": 10.0,
+                        "measured_timestamp_monotonic": 10.0,
+                    }
+                    for side in ("left", "right")
+                },
+            ),
+            "dry_run_authoritative_capture_then_stale",
+            timestamp_monotonic=10.0,
+        )
+        _wait_until(lambda: executor.snapshot()["collision_reset_count"] == 1)
+        snapshot = executor.snapshot()
+        reset = snapshot["last_collision_reset"]
+        assert reset["authoritative"] is False
+        assert reset["source"] == "dry_run_observation_state_vector"
+        assert reset["fallback_reason"] == "explicit_dry_run_observation_state"
+        assert snapshot["fault_latched"] is False
+        assert planner.reset_calls
+    finally:
+        executor.close()
+
+
 def test_collision_reset_preflight_waits_without_mutating_planner_or_stream() -> None:
     planner = _FakePositionCollisionPlanner()
     executor = PositionDeployExecutor(
