@@ -446,7 +446,7 @@ def test_application_root_orders_binding_after_start_and_before_snapshot() -> No
         "assemble_rm65_pose_observation("
     )
     assert source.index("assemble_rm65_pose_observation(") < source.index(
-        "arm_reader.snapshot("
+        "arm_states = arm_reader.snapshot(loop_started_at)"
     )
     assert source.index("invalidate_pose_measurements(") < source.index(
         "resource_lifecycle.close("

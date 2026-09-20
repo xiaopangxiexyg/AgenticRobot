@@ -653,6 +653,11 @@ def test_cyclic_gc_guard_is_active_before_authoritative_collision_reset(
 
     monkeypatch.setattr(executor, "_collision_reset_qpos", capture_reset)
     try:
+        # Live callers finish the potentially long process-wide GC collection
+        # before acquiring the freshness-bounded hardware cut.  Capture this
+        # test observation after the same preparation boundary; otherwise a
+        # slow full-suite GC can legitimately age it past the 250 ms limit.
+        executor.prepare_first_submission()
         executor.submit(
             _filtered_bimanual_pose(0.16, 0.18),
             _observation(sides=("left", "right")),
