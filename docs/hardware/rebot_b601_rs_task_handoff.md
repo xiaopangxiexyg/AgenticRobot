@@ -139,6 +139,10 @@ ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结�
 因此既有严格故障语义保持不变。结果 JSON 的 `gravity_debug` 和
 `protective_hold.gravity_parameter_source` 是验收时的证据字段。
 
+在该显式调试模式中，保护保持也不会为冻结快照中 `driver Kd=0` 的关节补入默认
+`protective_hold_kd`；`protective_hold.software_kd_nm_s_per_rad` 应与本次调试的
+单一阻尼 owner 一致。普通模式的默认阻尼 fallback 保持不变。
+
 重要 owner 规则：
 
 - 最终 active、protective hold 和 degraded hold 的 vendor MIT `kp` 始终为零。只有边界明确的

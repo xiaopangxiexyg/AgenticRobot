@@ -570,6 +570,14 @@ profile，操作者可以把姿态变化归因于当前正在测试的参数。d
 限制、active-report 门禁、完整六轴发送重试、protective hold 的二次失能规则或
 物理急停要求；显式取消该开关的普通 `hold`、遥操和其他模式完全沿用原路径。
 
+调试模式还会关闭 protective hold 的默认主机阻尼 fallback：如果冻结快照中的某个
+`driver Kd` 为零，live protective hold 和 degraded cached hold 都保持该关节的
+`Kd=0`，不会在故障边界偷偷加入 `protective_hold_kd`。这样保护阶段不会改变正在
+调试的手感。普通模式仍保持原有语义：`driver Kd=0` 的关节使用
+`protective_hold_kd` 作为保护保持阻尼；这条差异只由显式 `--gravity-debug-mode`
+触发，并记录在 `protective_hold` 的 `gain_source`、
+`software_damping_fallback_enabled` 和 `preserve_zero_driver_damping` 字段中。
+
 典型调试命令只需在现有前台 owner 命令中加入：
 
 ```text

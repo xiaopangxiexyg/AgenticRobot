@@ -1588,6 +1588,30 @@ def test_protective_hold_default_damping_can_be_selected_for_drag_test() -> None
     assert hold.metadata["default_software_damping_kd_nm_s_per_rad"] == 1.4
 
 
+def test_gravity_debug_protective_hold_preserves_zero_driver_damping() -> None:
+    startup = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0,) * 6,
+        mit_kd_nm_s_per_rad=(3.0,) * 6,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=1.0,
+    )
+
+    hold = probe.build_protective_hold_profile(
+        startup,
+        driver_kd_nm_s_per_rad=(0.0, 0.0, 0.2, 0.15, 0.1, 0.05),
+        # The debug run must not acquire a new host damping term on J1/J2.
+        default_damping_kd_nm_s_per_rad=1.0,
+        preserve_zero_driver_damping=True,
+    )
+
+    assert hold.damping_kd_nm_s_per_rad == (0.0,) * 6
+    assert hold.metadata["gain_source"] == "gravity_debug_frozen_driver_kd"
+    assert hold.metadata["software_damping_fallback_enabled"] is False
+    assert hold.metadata["preserve_zero_driver_damping"] is True
+    assert hold.metadata["default_software_damping_kd_nm_s_per_rad"] == 0.0
+
+
 def test_startup_lock_blend_preserves_full_gravity_and_handoffs_final_terms() -> None:
     startup = probe.B601MitTorqueBreakdown(
         position_torque_nm=(0.0,) * 6,

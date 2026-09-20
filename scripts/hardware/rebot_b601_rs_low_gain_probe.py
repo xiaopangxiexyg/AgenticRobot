@@ -5002,6 +5002,7 @@ def build_protective_hold_profile(
     *,
     driver_kd_nm_s_per_rad: Sequence[float],
     default_damping_kd_nm_s_per_rad: float = _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+    preserve_zero_driver_damping: bool = False,
 ) -> B601MitControlProfile:
     """Build the draggable all-arm gravity/damping protective hold.
 
@@ -5016,6 +5017,11 @@ def build_protective_hold_profile(
     term; joints without driver damping use ``default_damping_kd`` in the
     host-composed torque.  The startup profile still supplies the absolute and
     slew bounds, so this helper introduces no additional safety threshold.
+
+    ``preserve_zero_driver_damping`` is reserved for the explicit gravity
+    tuning mode.  It prevents this helper from inventing a host ``Kd`` on a
+    joint whose frozen debug snapshot selected ``driver Kd=0``.  Normal
+    protective holds retain the historical default software damping fallback.
     """
 
     if not isinstance(startup_profile, B601MitControlProfile):
@@ -5028,19 +5034,32 @@ def build_protective_hold_profile(
         default_damping_kd_nm_s_per_rad,
         name="default_damping_kd_nm_s_per_rad",
     )
+    if not isinstance(preserve_zero_driver_damping, bool):
+        raise TypeError("preserve_zero_driver_damping must be bool")
+    software_damping_fallback = (
+        0.0 if preserve_zero_driver_damping else default_damping_kd
+    )
     software_kd = tuple(
-        0.0 if driver_value > 0.0 else default_damping_kd
+        0.0 if driver_value > 0.0 else software_damping_fallback
         for driver_value in driver_kd
     )
     metadata = dict(startup_profile.metadata)
     metadata.update(
         {
-            "gain_source": "protective_hold_default_or_explicit_driver_kd",
+            "gain_source": (
+                "gravity_debug_frozen_driver_kd"
+                if preserve_zero_driver_damping
+                else "protective_hold_default_or_explicit_driver_kd"
+            ),
             "torque_owner": "software_gravity_plus_single_damping_owner",
             "software_damping_disabled_where_driver_kd_nonzero": True,
+            "software_damping_fallback_enabled": not preserve_zero_driver_damping,
+            "preserve_zero_driver_damping": preserve_zero_driver_damping,
             "driver_kd_nm_s_per_rad": driver_kd,
             "position_stiffness_disabled": True,
-            "default_software_damping_kd_nm_s_per_rad": default_damping_kd,
+            "default_software_damping_kd_nm_s_per_rad": (
+                software_damping_fallback
+            ),
             "reference_semantics": "current_feedback_pose_each_cycle",
         }
     )
@@ -7333,6 +7352,7 @@ def run_probe(
             "protective_hold_kd",
             _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
         ),
+        preserve_zero_driver_damping=gravity_debug_profile is not None,
     )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
@@ -10120,12 +10140,29 @@ def run_probe(
             "software_kp_nm_per_rad": protective_hold_profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": protective_hold_profile.damping_kd_nm_s_per_rad,
             "damping_owner": (
-                "driver_kd_where_nonzero_else_protective_hold_software_kd"
+                "frozen_debug_driver_kd_exact"
+                if gravity_debug_profile is not None
+                else "driver_kd_where_nonzero_else_protective_hold_software_kd"
             ),
-            "default_software_damping_kd_nm_s_per_rad": getattr(
-                args,
-                "protective_hold_kd",
-                _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+            "software_damping_fallback_enabled": bool(
+                protective_hold_profile.metadata.get(
+                    "software_damping_fallback_enabled",
+                    True,
+                )
+            ),
+            "preserve_zero_driver_damping": bool(
+                protective_hold_profile.metadata.get(
+                    "preserve_zero_driver_damping",
+                    False,
+                )
+            ),
+            "default_software_damping_kd_nm_s_per_rad": protective_hold_profile.metadata.get(
+                "default_software_damping_kd_nm_s_per_rad",
+                getattr(
+                    args,
+                    "protective_hold_kd",
+                    _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+                ),
             ),
             "reference_semantics": "current_feedback_pose_each_cycle",
             "position_lock": False,
