@@ -32,6 +32,7 @@ from .scene import (
 SHARED_CONTROL_FIXTURE = "policy-assist"
 DEFAULT_SHARED_CONTROL_DURATION_SEC = 1.5
 DEFAULT_SHARED_CONTROL_HOST_HZ = 100.0
+MAX_NONCOMMANDED_DISPLACEMENT_RAD = 5e-3
 
 
 def default_b601_shared_control_config() -> B601SharedControlConfig:
@@ -145,7 +146,10 @@ def run_b601_shared_control_demo(
         ),
         profile=profile,
         enable_gravity_compensation=True,
-        real2sim_profile=B601Real2SimControllerProfile(),
+        # This fixture isolates shared-control lifecycle behavior on the ideal
+        # URDF plant.  Operator-calibrated bias/scale terms belong to hardware
+        # validation and would deliberately mismatch this unidentified plant.
+        real2sim_profile=B601Real2SimControllerProfile.raw_model_baseline(),
     )
     driver.reset(initial_qpos)
     runtime = B601SharedControlRuntime(assist_config)
@@ -233,6 +237,9 @@ def run_b601_shared_control_demo(
         raise RuntimeError("shared-control fixture did not execute a physics tick")
     final_qpos = np.asarray(final_tick.measured_qpos, dtype=float)
     displacement = final_qpos - np.asarray(initial_qpos, dtype=float)
+    maximum_noncommanded_displacement_rad = float(
+        np.max(np.abs(displacement[:5]))
+    )
     required_modes = {
         B601SharedControlMode.PASSIVE.value,
         B601SharedControlMode.POLICY_ASSIST.value,
@@ -250,6 +257,8 @@ def run_b601_shared_control_demo(
         and modes
         and modes[-1] == B601SharedControlMode.PASSIVE.value
         and abs(displacement[5]) > 1e-4
+        and maximum_noncommanded_displacement_rad
+        <= MAX_NONCOMMANDED_DISPLACEMENT_RAD
     )
     payload = {
         "fixture": SHARED_CONTROL_FIXTURE,
@@ -268,6 +277,12 @@ def run_b601_shared_control_demo(
             "maximum_override_assist_torque_nm": maximum_override_assist_nm,
             "maximum_await_rebase_assist_torque_nm": maximum_await_assist_nm,
             "joint6_displacement_rad": float(displacement[5]),
+            "maximum_noncommanded_displacement_rad": (
+                maximum_noncommanded_displacement_rad
+            ),
+            "maximum_noncommanded_displacement_limit_rad": (
+                MAX_NONCOMMANDED_DISPLACEMENT_RAD
+            ),
         },
         "shared_control_config": {
             "position_kp_nm_per_rad": assist_config.position_kp_nm_per_rad,
@@ -284,7 +299,8 @@ def run_b601_shared_control_demo(
         "driver": driver.execution_metadata,
         "fidelity": (
             "Deterministic simulation-only shared-control lifecycle fixture on the "
-            "existing unidentified ideal-effort B601 plant. It validates command "
+            "existing unidentified ideal-effort B601 plant with raw-model gravity "
+            "compensation. It validates command "
             "freshness, authority, clutch/rebase semantics, bounded overlay and "
             "qualitative motion only; it does not validate hardware force, timing, "
             "human feel, passivity or safety."

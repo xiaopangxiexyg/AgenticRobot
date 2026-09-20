@@ -44,6 +44,9 @@ def test_shared_control_fixture_runs_existing_effort_plant(
     assert acceptance["maximum_override_assist_torque_nm"] == 0.0
     assert acceptance["maximum_await_rebase_assist_torque_nm"] == 0.0
     assert abs(acceptance["joint6_displacement_rad"]) > 1e-4
+    assert acceptance["maximum_noncommanded_displacement_rad"] <= acceptance[
+        "maximum_noncommanded_displacement_limit_rad"
+    ]
 
 
 def test_existing_haptic_entrypoint_exposes_policy_assist_without_changing_defaults(
@@ -60,5 +63,31 @@ def test_existing_haptic_entrypoint_exposes_policy_assist_without_changing_defau
 
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
+    assert payload["fixture"] == SHARED_CONTROL_FIXTURE
+    assert payload["simulation_acceptance"]["passed"] is True
+
+
+def test_haptic_entrypoint_can_save_full_result_and_print_short_summary(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    code = haptic_main(
+        [
+            "--rebot-source-root",
+            str(REBOT_SOURCE_ROOT),
+            "--fixture",
+            SHARED_CONTROL_FIXTURE,
+            "--output-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert code == 0
+    terminal = capsys.readouterr().out
+    assert "status=PASS exit_code=0" in terminal
+    assert '"driver"' not in terminal
+    result_paths = list(tmp_path.glob("b601-policy-assist-*/result.json"))
+    assert len(result_paths) == 1
+    payload = json.loads(result_paths[0].read_text(encoding="utf-8"))
     assert payload["fixture"] == SHARED_CONTROL_FIXTURE
     assert payload["simulation_acceptance"]["passed"] is True

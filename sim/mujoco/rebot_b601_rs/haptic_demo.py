@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import tempfile
 import time
 from collections.abc import Sequence
 from contextlib import ExitStack
@@ -86,6 +87,15 @@ def _parser() -> argparse.ArgumentParser:
         "--trace-jsonl",
         type=Path,
         help="Contact-box/reflection: create an exclusive same-state command-tick trace file.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        help=(
+            "Create a unique run directory below this root, save the full JSON as "
+            "result.json, and print only a short terminal summary. Omission preserves "
+            "the existing full-JSON stdout behavior."
+        ),
     )
     parser.add_argument(
         "--feedback-delay-sec",
@@ -852,6 +862,39 @@ def _accumulate_power(
     record["peak_positive_power_w"] = max(record["peak_positive_power_w"], power_w)
 
 
+def _emit_payload(
+    *,
+    args: argparse.Namespace,
+    code: int,
+    payload: dict[str, object],
+) -> int:
+    serialized = json.dumps(payload, indent=2, sort_keys=True)
+    if args.output_root is None:
+        print(serialized)
+        return code
+
+    output_root = Path(args.output_root).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(
+        tempfile.mkdtemp(prefix=f"b601-{args.fixture}-", dir=str(output_root))
+    )
+    result_path = run_dir / "result.json"
+    result_path.write_text(serialized + "\n", encoding="utf-8")
+    acceptance = payload.get("simulation_acceptance")
+    passed = (
+        acceptance.get("passed")
+        if isinstance(acceptance, dict)
+        else code == 0
+    )
+    status = "PASS" if code == 0 and passed is True else "FAIL"
+    print(
+        f"[B601-SIM] fixture={args.fixture} status={status} exit_code={code}"
+    )
+    print(f"[B601-SIM] full result: {result_path}")
+    print("[B601-SIM] shell remains active")
+    return code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -876,8 +919,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             viewer=bool(args.viewer),
             host_hz=args.host_hz,
         )
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return code
+        return _emit_payload(args=args, code=code, payload=payload)
     if args.fixture == REFLECTION_FIXTURE:
         if (
             args.real2sim_controller
@@ -901,8 +943,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             trace_jsonl=args.trace_jsonl,
             feedback_delay_sec=args.feedback_delay_sec,
         )
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return code
+        return _emit_payload(args=args, code=code, payload=payload)
     if args.feedback_delay_sec != 0.0:
         parser.error("feedback-delay-sec requires force-reflection")
     controller = None
@@ -937,8 +978,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         controller_profile=controller,
         trace_jsonl=args.trace_jsonl,
     )
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    return code
+    return _emit_payload(args=args, code=code, payload=payload)
 
 
 if __name__ == "__main__":
