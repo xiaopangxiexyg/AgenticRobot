@@ -29,6 +29,13 @@ keep software joint stiffness at zero so there is only one spring owner.
 An optional pose-axis guide prints operator-only acquisition phases and labels
 samples; it never changes either task-space anchor or any motion reference.
 
+An application leaf may inject the I/O-free ``B601SharedControlRuntime`` into
+``run_probe``.  That opt-in path is restricted to passive ``hold`` with zero
+software position/damping gains.  It follows current measured position and
+adds only the runtime's independently bounded policy-assist overlay before the
+existing gravity, final torque conditioning and sole MIT dispatch.  The normal
+CLI does not construct this runtime, so commissioning behavior is unchanged.
+
 The dispatched RobStride MIT ``kp`` is zero in the final active and protective
 controllers.  The temporary startup/replay lock is the one explicit exception:
 it applies the pinned YAML MIT Kp/Kd in the drive's local loop while the host
@@ -170,6 +177,8 @@ from robot_motion.rebot_b601_rs import (
     B601MitTorqueBreakdown,
     B601PinocchioModel,
     B601PoseVirtualSpring,
+    B601SharedControlFrame,
+    B601SharedControlRuntime,
     B601TranslationalVirtualSpring,
     compute_b601_mit_torque,
     map_world_aligned_ee_wrench_to_joint_torque,
@@ -5072,6 +5081,118 @@ def build_reference(
     )
 
 
+def _validate_shared_control_integration(
+    args: argparse.Namespace,
+    runtime: B601SharedControlRuntime | None,
+) -> None:
+    """Keep injected policy assist compatible with the passive hold owner.
+
+    The ordinary CLI never constructs this runtime.  A future application leaf
+    may inject one in-process, but it cannot stack shared assist with another
+    position/task-space controller or change the existing default hold path.
+    """
+
+    if runtime is None:
+        return
+    if not isinstance(runtime, B601SharedControlRuntime):
+        raise TypeError("shared_control_runtime must be a B601SharedControlRuntime")
+    if args.mode != "hold":
+        raise LowGainProbeError("shared policy assist requires --mode hold")
+    if float(args.kp) != 0.0 or float(args.kd) != 0.0:
+        raise LowGainProbeError(
+            "shared policy assist requires zero software position/damping gains"
+        )
+    if getattr(args, "guided_pose_axis_protocol", False) or getattr(
+        args,
+        "interactive_pose_axis_protocol",
+        False,
+    ):
+        raise LowGainProbeError(
+            "shared policy assist cannot be combined with a pose-axis protocol"
+        )
+
+
+def _shared_control_config_payload(
+    runtime: B601SharedControlRuntime,
+) -> dict[str, object]:
+    config = runtime.config
+    return {
+        "position_kp_nm_per_rad": config.position_kp_nm_per_rad,
+        "velocity_kd_nm_s_per_rad": config.velocity_kd_nm_s_per_rad,
+        "max_target_error_rad": config.max_target_error_rad,
+        "max_abs_assist_torque_nm": config.max_abs_assist_torque_nm,
+        "max_assist_torque_rate_nm_s": config.max_assist_torque_rate_nm_s,
+        "authority_rise_per_sec": config.authority_rise_per_sec,
+        "policy_stale_timeout_sec": config.policy_stale_timeout_sec,
+        "maximum_future_skew_sec": config.maximum_future_skew_sec,
+        "joint_names": config.joint_names,
+    }
+
+
+def _shared_control_overlay_limits(
+    runtime: B601SharedControlRuntime,
+    *,
+    total_torque_limits_nm: Sequence[float],
+) -> tuple[float, ...]:
+    total_limits = _non_negative_six(
+        total_torque_limits_nm,
+        name="total_torque_limits_nm",
+    )
+    assist_limits = runtime.config.max_abs_assist_torque_nm
+    if any(
+        assist_limit > total_limit
+        for assist_limit, total_limit in zip(
+            assist_limits,
+            total_limits,
+            strict=True,
+        )
+    ):
+        raise LowGainProbeError(
+            "shared policy assist limit exceeds the final software torque limit"
+        )
+    return assist_limits
+
+
+def _shared_control_frame_payload(
+    frame: B601SharedControlFrame,
+) -> dict[str, object]:
+    decision = frame.decision
+    return {
+        "mode": decision.state.mode.value,
+        "authority": decision.state.authority,
+        "reason": decision.reason,
+        "last_policy_sequence": decision.state.last_policy_sequence,
+        "resume_after_sequence": decision.state.resume_after_sequence,
+        "assist_torque_nm": decision.assist_torque_nm,
+        "raw_target_error_rad": decision.raw_target_error_rad,
+        "bounded_target_error_rad": decision.bounded_target_error_rad,
+        "target_error_limited": decision.target_error_limited,
+        "torque_limited": decision.torque_limited,
+        "slew_limited": decision.slew_limited,
+    }
+
+
+def _step_shared_control_runtime(
+    runtime: B601SharedControlRuntime,
+    *,
+    control_sequence: int,
+    control_timestamp_sec: float,
+    measured_qpos_rad: Sequence[float],
+    measured_qvel_rad_s: Sequence[float],
+    dt_sec: float,
+) -> tuple[B601MitReference, dict[str, object]]:
+    """Produce one auditable assist reference for the sole hardware owner."""
+
+    frame = runtime.step(
+        control_sequence=control_sequence,
+        control_timestamp_sec=control_timestamp_sec,
+        measured_qpos_rad=measured_qpos_rad,
+        measured_qvel_rad_s=measured_qvel_rad_s,
+        dt_sec=dt_sec,
+    )
+    return frame.reference, _shared_control_frame_payload(frame)
+
+
 def compute_software_torque_breakdown(
     model: B601PinocchioModel,
     *,
@@ -6493,10 +6614,15 @@ def _run_latched_fault_hold(
     )
 
 
-def run_probe(args: argparse.Namespace) -> dict[str, object]:
+def run_probe(
+    args: argparse.Namespace,
+    *,
+    shared_control_runtime: B601SharedControlRuntime | None = None,
+) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
     _validate_cli(args)
+    _validate_shared_control_integration(args, shared_control_runtime)
     feedback_source = getattr(args, "feedback_source", "parameter")
     driver_kd_arg = getattr(args, "driver_kd", None)
     driver_kd_nm_s_per_rad = (
@@ -6580,14 +6706,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             position_limits=position_limits,
             torque_limits_nm=torque_limits,
         )
-    overlay_limits = (
-        tuple(
+    if shared_control_runtime is not None:
+        overlay_limits = _shared_control_overlay_limits(
+            shared_control_runtime,
+            total_torque_limits_nm=torque_limits,
+        )
+    elif args.mode in ("cartesian-hold", "pose-hold"):
+        overlay_limits = tuple(
             value * args.cartesian_overlay_limit_scale
             for value in torque_limits
         )
-        if args.mode in ("cartesian-hold", "pose-hold")
-        else _ZERO_SIX
-    )
+    else:
+        overlay_limits = _ZERO_SIX
     profile = build_software_profile(
         kp=args.kp,
         kd=args.kd,
@@ -7813,6 +7943,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     step_direction=args.step_direction,
                     position_limits_rad=position_limits,
                 )
+            shared_reference: B601MitReference | None = None
+            shared_control_audit: dict[str, object] | None = None
+            if shared_control_runtime is not None:
+                shared_reference, shared_control_audit = (
+                    _step_shared_control_runtime(
+                        shared_control_runtime,
+                        control_sequence=state.sequence,
+                        control_timestamp_sec=state.receive_timestamp_sec,
+                        measured_qpos_rad=q,
+                        measured_qvel_rad_s=qvel,
+                        dt_sec=dt,
+                    )
+                )
+                qref = shared_reference.qpos_rad
+                qvel_ref = shared_reference.qvel_rad_s
             max_error = max(
                 abs(current - reference)
                 for index, (current, reference) in enumerate(
@@ -7828,7 +7973,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 break
             cartesian_audit: dict[str, object] | None = None
             pose_audit: dict[str, object] | None = None
-            joint_torque_overlay_nm = _ZERO_SIX
+            joint_torque_overlay_nm = (
+                shared_reference.joint_torque_overlay_nm
+                if shared_reference is not None
+                else _ZERO_SIX
+            )
             if args.mode == "cartesian-hold":
                 if cartesian_spring is None:
                     raise LowGainProbeError(
@@ -8004,6 +8153,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "qref_rad": qref,
                     "dispatch_qref_rad": dispatch_reference.qpos_rad,
                     "qvel_ref_rad_s": qvel_ref,
+                    "shared_control": shared_control_audit,
                     "startup_state": startup_state_history[-1],
                     "gravity_ramp_fraction": gravity_ramp,
                     "startup_handoff_fraction": handoff_fraction,
@@ -9021,7 +9171,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "vendor_kp_nm_per_rad": _ZERO_SIX,
             "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
             "torque_owner": (
-                "software_position_gravity_task_wrench; optional_driver_damping"
+                "software_gravity_policy_assist; optional_driver_damping"
+                if shared_control_runtime is not None
+                else "software_position_gravity_task_wrench; optional_driver_damping"
             ),
             "startup_lock_profile": {
                 "software_kp_nm_per_rad": startup_lock_profile.position_kp_nm_per_rad,
@@ -9038,13 +9190,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "slow_step_response": slow_step_response,
         "joint_impedance": {
-            "enabled": args.mode in (
-                "hold",
-                "gravity-calibration",
-                "startup-replay",
+            "enabled": (
+                shared_control_runtime is None
+                and args.mode
+                in (
+                    "hold",
+                    "gravity-calibration",
+                    "startup-replay",
+                )
             ),
             "reference_source": (
-                "interactive_current_or_R_captured_qpos"
+                "current_measured_q_each_tick"
+                if shared_control_runtime is not None
+                else "interactive_current_or_R_captured_qpos"
                 if args.mode == "gravity-calibration"
                 else (
                     "operator_R_captured_replay_qpos"
@@ -9053,7 +9211,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 )
             ),
             "reference_qpos_rad": (
-                startup_replay_capture.reference_qpos_rad
+                None
+                if shared_control_runtime is not None
+                else startup_replay_capture.reference_qpos_rad
                 if startup_replay_capture is not None
                 else (initial_q if args.mode == "hold" else None)
             ),
@@ -9075,6 +9235,34 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 getattr(args, "apply_driver_torque_limits", False)
             ),
             "absolute_pose_commanded": False,
+        },
+        "shared_control": {
+            "enabled": shared_control_runtime is not None,
+            "injection": (
+                "in_process_runtime_to_existing_single_owner"
+                if shared_control_runtime is not None
+                else None
+            ),
+            "config": (
+                _shared_control_config_payload(shared_control_runtime)
+                if shared_control_runtime is not None
+                else None
+            ),
+            "final_state": (
+                {
+                    "mode": shared_control_runtime.state.mode.value,
+                    "authority": shared_control_runtime.state.authority,
+                    "last_policy_sequence": (
+                        shared_control_runtime.state.last_policy_sequence
+                    ),
+                    "resume_after_sequence": (
+                        shared_control_runtime.state.resume_after_sequence
+                    ),
+                }
+                if shared_control_runtime is not None
+                else None
+            ),
+            "hardware_acceptance": "NOT_CLAIMED",
         },
         "cartesian_impedance": {
             "enabled": args.mode == "cartesian-hold",

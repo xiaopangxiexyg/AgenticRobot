@@ -12,10 +12,109 @@ import numpy as np
 import pytest
 
 from hardware.rebot_b601_rs import B601HardwareState, B601JointState
-from robot_motion.rebot_b601_rs import B601_RS_ARM_JOINT_NAMES
+from robot_motion.rebot_b601_rs import (
+    B601_RS_ARM_JOINT_NAMES,
+    B601PolicyAssistCommand,
+    B601SharedControlConfig,
+    B601SharedControlRuntime,
+)
 from scripts.hardware import rebot_b601_rs_low_gain_probe as probe
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def _shared_runtime() -> B601SharedControlRuntime:
+    return B601SharedControlRuntime(
+        B601SharedControlConfig(
+            position_kp_nm_per_rad=(2.0,) * 6,
+            velocity_kd_nm_s_per_rad=(0.0,) * 6,
+            max_target_error_rad=(0.04,) * 6,
+            max_abs_assist_torque_nm=(0.10,) * 6,
+            max_assist_torque_rate_nm_s=(0.50,) * 6,
+            authority_rise_per_sec=5.0,
+            policy_stale_timeout_sec=0.08,
+        )
+    )
+
+
+def test_injected_shared_control_uses_current_state_and_bounded_overlay() -> None:
+    runtime = _shared_runtime()
+    qpos = (0.0, 1.0, 1.0, 0.0, 0.0, 0.0)
+    target = (*qpos[:5], 0.04)
+    receipt = runtime.publish_policy(
+        B601PolicyAssistCommand(
+            sequence=1,
+            source_timestamp_sec=1.0,
+            receive_timestamp_sec=1.0,
+            qpos_target_rad=target,
+        )
+    )
+    assert receipt.accepted
+
+    reference, audit = probe._step_shared_control_runtime(
+        runtime,
+        control_sequence=7,
+        control_timestamp_sec=1.0,
+        measured_qpos_rad=qpos,
+        measured_qvel_rad_s=(0.0,) * 6,
+        dt_sec=0.01,
+    )
+
+    assert reference.qpos_rad == qpos
+    assert reference.qvel_rad_s == (0.0,) * 6
+    assert reference.joint_torque_overlay_nm == pytest.approx(
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.004)
+    )
+    assert audit["mode"] == "policy_assist"
+    assert audit["authority"] == pytest.approx(0.05)
+    assert audit["last_policy_sequence"] == 1
+
+
+def test_injected_shared_control_rejects_stacked_position_controller() -> None:
+    args = probe.build_parser().parse_args(
+        [
+            "--mode",
+            "hold",
+            "--config",
+            "unused.yaml",
+            "--rebot-source-root",
+            "unused",
+            "--kp",
+            "1.0",
+        ]
+    )
+
+    with pytest.raises(probe.LowGainProbeError, match="zero software"):
+        probe._validate_shared_control_integration(args, _shared_runtime())
+
+
+def test_injected_shared_control_must_fit_inside_final_torque_envelope() -> None:
+    runtime = _shared_runtime()
+
+    assert probe._shared_control_overlay_limits(
+        runtime,
+        total_torque_limits_nm=(1.0,) * 6,
+    ) == (0.1,) * 6
+    with pytest.raises(probe.LowGainProbeError, match="final software torque"):
+        probe._shared_control_overlay_limits(
+            runtime,
+            total_torque_limits_nm=(0.05,) * 6,
+        )
+
+
+def test_injected_shared_control_leaves_existing_hold_contract_unchanged() -> None:
+    args = probe.build_parser().parse_args(
+        [
+            "--mode",
+            "hold",
+            "--config",
+            "unused.yaml",
+            "--rebot-source-root",
+            "unused",
+        ]
+    )
+
+    probe._validate_shared_control_integration(args, None)
 
 
 def test_condition_torque_applies_absolute_then_slew_limits() -> None:
