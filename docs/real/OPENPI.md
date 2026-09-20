@@ -144,21 +144,39 @@ ready、碰撞、力限或观测新鲜度门。不要加入 `--auto-start`、`--
 `--no-wait-for-ready-confirm` 来缩短正式流程。
 
 model-RTC Active 还会在 qpos-init 完成后保持测量 qpos，丢弃默认 1 次冷启动 completion，
-用随后 3 次 completion 做推理延迟门；默认上界为 0.4 秒，且每次 warm completion 都必须
-严格小于该值。在该门通过且操作者完成 ready
-确认之前不会下发策略动作。计划 underrun、producer 不可用或延迟超限都会清空待执行计划并
-保持最新测量 qpos；无法建立该 Hold 时升级到更强 Hold 并报错退出。`--max-steps` 验收可配合
+用随后 3 次 completion 做预热准入。`--rtc-active-max-inference-latency-sec` 的默认
+0.4 秒仍是独立的性能 SLO；raw RTC 继续把它作为严格准入门。trained conditioned
+model-RTC 则同时使用真实可执行覆盖做安全准入：设模型预测长度为 `H`，训练/推理 forecast
+前缀为 `F`，包含网络与控制 jitter 的实测延迟预算为 `B`，则 client 已先裁掉 `F` 行，
+timed-plan 还会裁掉 `max(0, B-F)` 行，最终可执行后缀严格为
+`H-F-max(0,B-F) = H-max(F,B)`。该后缀必须覆盖动态提前请求点和 bridge guard；因此
+“超过 0.4 秒”本身只表示性能未达标，不能单独证明计划不可执行，反之放宽 SLO 也不能让
+覆盖不足的结果获得动作权限。每个正式 request 发出时还会记录旧 plan 的实际剩余 coverage；
+completion 到达时若这段真实 bridge 已耗尽，即使新结果自身后缀足够，也会暂停而不会自动续发。
+
+以 30 Hz、`H32/F12`、1 tick jitter guard 为例，466 ms 对应 `B15`，动态请求点为 16，
+后缀为 17，属于“性能 SLO 未达标但本轮覆盖仍可接续”；500 ms 对应 `B16`，请求点为 17，
+后缀仅 16，必须进入 starvation HOLD；623 ms 的后缀进一步降为 12，同样不可执行。
+这不是固定延迟白名单：runtime 会用滚动实测值在每个正式 completion 上重新计算。
+
+在预热通过且操作者完成 ready 确认之前不会下发策略动作。正式运行中每个 completion 都会在
+同一 control tick 的 plan pop 之前重做覆盖判定；若不足，刚合入的计划立即失效、该 tick
+零 emission、下游队列清空并保持最新测量 qpos。操作者按 `g` 只会在旧 worker 已排空后创建
+新的 producer epoch 并重新预热，不会重跑已经完成的 qpos-init，也不会把旧 completion 或旧
+计划带入新 epoch。计划 underrun、producer 不可用或 deadline timeout 使用同一类显式
+pause/HOLD 恢复边界；无法建立该 Hold 时升级到更强 Hold 并报错退出。`--max-steps` 验收可配合
 `--min-rtc-emissions-before-exit`；第 23 节的有界 no-action 和 Active 验收都显式要求至少 1 个
 committed emission，避免“进程正常退出但零有效 emission”的假通过。
 
-trained model-RTC sampler 默认保持 10 step。若 10-step warm latency 无法通过 `<0.4 s` 门，
-可在同一轮 server 与 client 命令中都显式加入 `--rtc-inference-steps 8`。这不是修改 checkpoint
+trained model-RTC sampler 默认保持 10 step。若要验证 8-step 的性能收益，可在同一轮
+server 与 client 命令中都显式加入 `--rtc-inference-steps 8`；无论使用 8 或 10 step，
+上述真实覆盖判定都不会被关闭。这不是修改 checkpoint
 或训练 profile：client 会根据 loaded provider 的完整实现参数生成 deployment-only binding
 receipt，并要求把步数恢复为 10 后精确复现训练契约哈希；任何其它参数漂移或两端步数不一致
 都会在动作派发前失败。server 还必须用 `--rtc-runtime-openpi-root` 显式选择当前不可变部署
 快照中 gitlink 固定的 `model/openpi`，而 `--openpi-root` 仍指向 profile 固定的训练 checkout；
 两者不能靠修改旧训练 checkout 合并。不要通过放宽
-`--rtc-active-max-inference-latency-sec` 代替该绑定。
+`--rtc-active-max-inference-latency-sec` 掩盖覆盖不足或替代实现一致性检查。
 
 ## 6. 更换 checkpoint 或 server 模型
 

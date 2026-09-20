@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -26,8 +27,8 @@ from dataset_contracts.policy_action_semantics import (
 )
 from robot_motion.relative_action import normalize_action_pose_mode
 
-from .action_representation import PolicyActionRepresentationContext
 from .action_adapter import DeployRobotActionAdapter
+from .action_representation import PolicyActionRepresentationContext
 from .async_producer import (
     POLICY_ASYNC_PRODUCER_ELIGIBLE,
     POLICY_ASYNC_PRODUCER_FAULT,
@@ -52,22 +53,15 @@ from .async_producer import (
 )
 from .chunk_plan import empty_policy_action_plan
 from .inference import (
+    INFERENCE_DELAY_VALIDITY_POLICY_V1,
+    RTC_FLOW_INPAINT_MODE_V1,
     InferenceDelayEstimatorSpec,
     InferenceDelayEstimatorState,
-    INFERENCE_DELAY_VALIDITY_POLICY_V1,
     PolicyChunkResult,
     PolicyInferenceRequest,
-    RTC_FLOW_INPAINT_MODE_V1,
 )
 from .observation import DeploymentObservation
 from .observation_view import PolicyObservationView
-from .runtime import (
-    PolicyActionEmission,
-    PolicyActionEmissionResult,
-    PolicyActionPreparationResult,
-    PolicyDeployRuntime,
-)
-
 from .policy_worker import (
     BoundedPolicyInferenceWorker,
     PolicyInferenceExecutor,
@@ -76,7 +70,14 @@ from .policy_worker import (
     PolicyWorkerStopReceipt,
     PolicyWorkerSubmissionReceipt,
 )
-from .rtc.profile import RtcProducerProfile
+from .rtc.admission import (
+    RTC_REQUEST_BRIDGE_GUARD_STEPS,
+    RtcExecutionCoverageAssessment,
+    RtcLatencyEnvelopeAssessment,
+    assess_rtc_execution_coverage,
+    assess_rtc_latency_envelope,
+    rtc_latency_budget_steps,
+)
 from .rtc.conditioning import (
     CanonicalRtcConditioningBundle,
     RtcModelContinuationRuntimeSpec,
@@ -86,7 +87,13 @@ from .rtc.continuation import (
     RtcContinuationTimeline,
     select_rtc_plan_continuation,
 )
-
+from .rtc.profile import RtcProducerProfile
+from .runtime import (
+    PolicyActionEmission,
+    PolicyActionEmissionResult,
+    PolicyActionPreparationResult,
+    PolicyDeployRuntime,
+)
 
 RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V1 = (
     "dexteleop.deploy.rtc_3c_frontend_config.v1"
@@ -619,6 +626,9 @@ class RtcFrontendStep:
     late_completion_rejection_count: int
     forecast_delay_steps: int | None = None
     request_validity_steps: int | None = None
+    effective_request_trigger_coverage_steps: int = 0
+    plan_coverage_steps: int = 0
+    completion_coverage_assessment: RtcExecutionCoverageAssessment | None = None
     timing_contract_hash: str = ""
     preflight_completion: bool = False
 
@@ -809,6 +819,15 @@ class RtcFrontendStep:
             ),
             "forecast_delay_steps": self.forecast_delay_steps,
             "request_validity_steps": self.request_validity_steps,
+            "effective_request_trigger_coverage_steps": (
+                self.effective_request_trigger_coverage_steps
+            ),
+            "plan_coverage_steps": self.plan_coverage_steps,
+            "completion_coverage_assessment": (
+                None
+                if self.completion_coverage_assessment is None
+                else self.completion_coverage_assessment.to_payload()
+            ),
             "timing_contract_hash": self.timing_contract_hash,
             "position_lookahead_enabled": False,
             "send_actions": False,
@@ -1215,6 +1234,7 @@ class RtcPolicyShadowFrontend:
         self._late_completion_rejection_count = 0
         self._last_forecast_delay_steps: int | None = None
         self._last_request_validity_steps: int | None = None
+        self._active_request_plan_coverage_steps: int | None = None
         self._preflight_request: PolicyInferenceRequest | None = None
         self._preflight_record_latency = False
         self._emitted_keyframe_ids: set[tuple[str, int, int]] = set()
@@ -1266,6 +1286,92 @@ class RtcPolicyShadowFrontend:
         """Expose bounded-mailbox occupancy without leaking worker ownership."""
 
         return self._worker.pending_completion_count
+
+    def _latency_budget_steps(
+        self,
+        delay_state: InferenceDelayEstimatorState | None = None,
+    ) -> int:
+        """Return the unclamped measured latency budget for request timing."""
+
+        spec = self.config.delay_estimator_spec
+        state = self._delay_state if delay_state is None else delay_state
+        samples = state.latency_samples_sec
+        latency_sec = max(samples) if samples else spec.warmup_latency_sec
+        return rtc_latency_budget_steps(
+            latency_sec,
+            action_period_sec=spec.action_period_sec,
+            network_guard_sec=spec.network_guard_sec,
+            control_jitter_guard_steps=spec.control_jitter_guard_steps,
+        )
+
+    @property
+    def effective_request_trigger_coverage_steps(self) -> int:
+        """Start the next conditioned request early enough to retain a bridge."""
+
+        configured = self.config.request_trigger_coverage_steps
+        if self.config.model_continuation is None:
+            return configured
+        return max(
+            configured,
+            self._latency_budget_steps()
+            + RTC_REQUEST_BRIDGE_GUARD_STEPS,
+        )
+
+    def _assess_execution_coverage(
+        self,
+        latency_sec: float,
+        *,
+        model_forecast_delay_steps: int,
+        request_plan_coverage_steps: int | None,
+    ) -> RtcExecutionCoverageAssessment:
+        spec = self.config.delay_estimator_spec
+        return assess_rtc_execution_coverage(
+            latency_sec,
+            action_period_sec=spec.action_period_sec,
+            prediction_horizon_steps=self.config.prediction_horizon_steps,
+            model_forecast_delay_steps=model_forecast_delay_steps,
+            configured_trigger_coverage_steps=(
+                self.config.request_trigger_coverage_steps
+            ),
+            minimum_execution_horizon_steps=(
+                self.config.minimum_execution_horizon_steps
+            ),
+            network_guard_sec=spec.network_guard_sec,
+            control_jitter_guard_steps=spec.control_jitter_guard_steps,
+            bridge_guard_steps=RTC_REQUEST_BRIDGE_GUARD_STEPS,
+            request_plan_coverage_steps=request_plan_coverage_steps,
+        )
+
+    def assess_latency_envelope(
+        self,
+        latency_sec: float,
+        *,
+        performance_slo_sec: float,
+    ) -> RtcLatencyEnvelopeAssessment:
+        """Assess one measured latency against plan coverage and the SLO."""
+
+        spec = self.config.delay_estimator_spec
+        forecast_steps = self._last_forecast_delay_steps
+        if forecast_steps is None:
+            raise RuntimeError(
+                "RTC latency envelope has no request-bound forecast delay."
+            )
+        return assess_rtc_latency_envelope(
+            latency_sec,
+            performance_slo_sec=performance_slo_sec,
+            action_period_sec=spec.action_period_sec,
+            prediction_horizon_steps=self.config.prediction_horizon_steps,
+            model_forecast_delay_steps=forecast_steps,
+            configured_trigger_coverage_steps=(
+                self.config.request_trigger_coverage_steps
+            ),
+            minimum_execution_horizon_steps=(
+                self.config.minimum_execution_horizon_steps
+            ),
+            network_guard_sec=spec.network_guard_sec,
+            control_jitter_guard_steps=spec.control_jitter_guard_steps,
+            bridge_guard_steps=RTC_REQUEST_BRIDGE_GUARD_STEPS,
+        )
 
     def _worker_session_id(self, sequence: int) -> str:
         return (
@@ -1358,7 +1464,7 @@ class RtcPolicyShadowFrontend:
             and self._state.active_request is None
             and observation_due
             and self._coverage_steps(now)
-            <= self.config.request_trigger_coverage_steps
+            <= self.effective_request_trigger_coverage_steps
         )
 
     def _build_request_and_conditioning(
@@ -1581,6 +1687,7 @@ class RtcPolicyShadowFrontend:
         )
         self._state = transition.state
         self._preflight_request = None
+        self._active_request_plan_coverage_steps = None
         self.deploy_runtime.reset_arm_hold_semantics()
         stop = self._worker.stop(
             timeout_sec=self.config.effective_worker_stop_timeout_sec
@@ -1674,6 +1781,7 @@ class RtcPolicyShadowFrontend:
         self._last_request_triggered_at = None
         self._last_forecast_delay_steps = None
         self._last_request_validity_steps = None
+        self._active_request_plan_coverage_steps = None
         return transition
 
     def step(
@@ -1718,6 +1826,7 @@ class RtcPolicyShadowFrontend:
         result_transition = None
         lifecycle_transition = None
         preflight_completion = False
+        completion_coverage_assessment = None
         pending_preflight = self._preflight_request
         if pending_preflight is not None and completion is not None:
             # Preflight uses the model protocol, never producer admission/merge.
@@ -1748,6 +1857,10 @@ class RtcPolicyShadowFrontend:
             lifecycle_transition = self.fault(now=decision_at, reason="rtc_preflight_timeout")
         elif completion is not None:
             lifecycle_before_result = self._state.lifecycle_state
+            completion_request = self._state.active_request
+            completion_request_plan_coverage_steps = (
+                self._active_request_plan_coverage_steps
+            )
             result_transition = admit_policy_chunk_result(
                 self._state,
                 completion.result,
@@ -1765,10 +1878,30 @@ class RtcPolicyShadowFrontend:
                 0.0,
                 completion.released_at - completion.worker_started_at,
             )
-            self._delay_state = self._delay_state.record(
+            next_delay_state = self._delay_state.record(
                 self.config.delay_estimator_spec,
                 latency,
             )
+            self._delay_state = next_delay_state
+            if (
+                self.config.model_continuation is not None
+                and result_transition.receipt.accepted
+            ):
+                if completion_request is None:
+                    raise RuntimeError(
+                        "Accepted conditioned RTC completion has no active request."
+                    )
+                completion_coverage_assessment = (
+                    self._assess_execution_coverage(
+                        latency,
+                        model_forecast_delay_steps=(
+                            completion_request.forecast_delay_steps
+                        ),
+                        request_plan_coverage_steps=(
+                            completion_request_plan_coverage_steps
+                        ),
+                    )
+                )
             merge_receipt = result_transition.merge_receipt
             merge_reasons = (
                 () if merge_receipt is None else merge_receipt.reasons
@@ -1793,6 +1926,20 @@ class RtcPolicyShadowFrontend:
                     now=decision_at,
                     reason=completion.result.fault_code or "policy_worker_fault",
                 )
+            elif (
+                completion_coverage_assessment is not None
+                and not completion_coverage_assessment.execution_usable
+                and self._state.lifecycle_state == POLICY_ASYNC_PRODUCER_ELIGIBLE
+            ):
+                # The result may have passed identity/TTL admission, but its
+                # post-prefix, post-cursor suffix cannot bridge another request.
+                # Invalidate the just-merged plan before the pop phase so no
+                # action from this completion can be emitted on the same tick.
+                lifecycle_transition = self.hold(
+                    now=decision_at,
+                    reason="rtc_latency_starvation_risk",
+                )
+            self._active_request_plan_coverage_steps = None
         self._refresh_worker_session_state(now=decision_at)
 
         pop_transition = None
@@ -1933,6 +2080,11 @@ class RtcPolicyShadowFrontend:
             and not (preflight and completion is not None)
             and self._should_request(decision_at)
         ):
+            request_plan_coverage_steps = self._coverage_steps(decision_at)
+            request_uses_bootstrap_gap = (
+                self._selected_emission_count == 0
+                and not self._state.plan.keyframes
+            )
             policy_observation = self.deploy_runtime.prepare_policy_observation(
                 observation
             )
@@ -1959,9 +2111,16 @@ class RtcPolicyShadowFrontend:
                     request = replace(request, valid_until=decision_at + timeout)
                     self._preflight_request = request
                     self._preflight_record_latency = bool(preflight_record_latency)
+                    self._active_request_plan_coverage_steps = None
                 else:
                     request_transition = admit_policy_inference_request(self._state, request)
                     self._state = request_transition.state
+                    if request_transition.receipt.accepted:
+                        self._active_request_plan_coverage_steps = (
+                            None
+                            if request_uses_bootstrap_gap
+                            else request_plan_coverage_steps
+                        )
                 if preflight or request_transition.receipt.accepted:
                     self._last_request_triggered_at = decision_at
                     work_item = PolicyInferenceWorkItem(
@@ -2001,6 +2160,13 @@ class RtcPolicyShadowFrontend:
             ),
             forecast_delay_steps=self._last_forecast_delay_steps,
             request_validity_steps=self._last_request_validity_steps,
+            effective_request_trigger_coverage_steps=(
+                self.effective_request_trigger_coverage_steps
+            ),
+            plan_coverage_steps=self._coverage_steps(decision_at),
+            completion_coverage_assessment=(
+                completion_coverage_assessment
+            ),
             timing_contract_hash=self.config.timing_contract_hash,
             preflight_completion=preflight_completion,
         )
