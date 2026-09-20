@@ -6,6 +6,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 
 from robot_motion.runtime import EffectorCommand, TeleopCommand
+from robot_motion.deploy.observation import DeploymentObservation
 from teleop_runtime.deploy import action_execution
 from teleop_runtime.deploy.action_execution import PreparedActionExecutor
 from teleop_runtime.position_control import PositionDeployExecutorFault
@@ -18,10 +19,14 @@ class _PositionExecutor:
         source_index: int = 17,
         error: Exception | None = None,
         fault_stage: str = "",
+        collision_required: bool = False,
+        collision_planner_initialized: bool = False,
     ) -> None:
         self.source_index = source_index
         self.error = error
         self.fault_stage = fault_stage
+        self.collision_required = collision_required
+        self.collision_planner_initialized = collision_planner_initialized
         self.submissions: list[tuple[tuple[object, ...], dict[str, object]]] = []
         self.clear_count = 0
 
@@ -32,7 +37,12 @@ class _PositionExecutor:
         return self.source_index
 
     def snapshot(self) -> dict[str, object]:
-        return {"fault_stage": self.fault_stage}
+        return {
+            "fault_stage": self.fault_stage,
+            "collision_required": self.collision_required,
+            "collision_planner_initialized": self.collision_planner_initialized,
+            "submitted_count": len(self.submissions),
+        }
 
     def clear(self) -> None:
         self.clear_count += 1
@@ -71,9 +81,13 @@ def _executor(
     send_actions: bool = False,
     position_worker_binding: object | None = None,
     owner_submit: Mock | None = None,
+    first_position_stream_observation_refresh=None,
 ) -> PreparedActionExecutor:
     return PreparedActionExecutor(
         position_deploy_executor=position_executor,
+        first_position_stream_observation_refresh=(
+            first_position_stream_observation_refresh
+        ),
         send_actions=send_actions,
         arm_backends={"left": object()},
         hand_backends={"left": object()},
@@ -194,6 +208,73 @@ def test_position_arm_path_forwards_existing_submit_contract(
     assert kwargs["lookahead_execution_work_item"] is None
     assert kwargs["source_plan_cut"] is None
     assert float(phase_timing["position_submit_ms"]) >= 0.0
+
+
+def test_first_collision_stream_refreshes_observation_before_submit() -> None:
+    position = _PositionExecutor(collision_required=True)
+    original_observation = DeploymentObservation(
+        timestamp=1.0,
+        step_index=0,
+        active_sides=("left",),
+        arms_enabled=True,
+        hands_enabled=False,
+    )
+    refreshed_observation = DeploymentObservation(
+        timestamp=2.0,
+        step_index=0,
+        active_sides=("left",),
+        arms_enabled=True,
+        hands_enabled=False,
+    )
+    refresh_calls: list[DeploymentObservation] = []
+
+    def refresh(observation: DeploymentObservation) -> DeploymentObservation:
+        refresh_calls.append(observation)
+        return refreshed_observation
+
+    phase_timing: dict[str, object] = {}
+    execution = _executor(
+        position_executor=position,
+        first_position_stream_observation_refresh=refresh,
+    ).execute(
+        _canonical(_command("arm"), filtered="filtered"),
+        original_observation,
+        policy_name="first-stream",
+        phase_timing=phase_timing,
+    )
+
+    assert execution.accepted is True
+    assert refresh_calls == [original_observation]
+    assert position.submissions[0][0] == ("filtered", refreshed_observation)
+    assert float(phase_timing["first_position_stream_observation_refresh_ms"]) >= 0.0
+
+
+def test_initialized_collision_stream_does_not_refresh_observation() -> None:
+    position = _PositionExecutor(
+        collision_required=True,
+        collision_planner_initialized=True,
+    )
+    refresh = Mock(side_effect=AssertionError("refresh must not run"))
+    observation = DeploymentObservation(
+        timestamp=1.0,
+        step_index=0,
+        active_sides=("left",),
+        arms_enabled=True,
+        hands_enabled=False,
+    )
+
+    execution = _executor(
+        position_executor=position,
+        first_position_stream_observation_refresh=refresh,
+    ).execute(
+        _canonical(_command("arm"), filtered="filtered"),
+        observation,
+        policy_name="steady-stream",
+    )
+
+    assert execution.accepted is True
+    refresh.assert_not_called()
+    assert position.submissions[0][0] == ("filtered", observation)
 
 
 def test_position_safety_fault_is_the_only_executor_fault_converted_to_result() -> None:

@@ -631,6 +631,38 @@ def test_cyclic_gc_guard_preserves_an_externally_disabled_collector(
     assert calls == []
 
 
+def test_cyclic_gc_guard_is_active_before_authoritative_collision_reset(
+    monkeypatch,
+) -> None:
+    planner = _FakePositionCollisionPlanner()
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            collision_required=True,
+            cyclic_gc_guard_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        dispatch_callback=lambda _command: None,
+        collision_planner_factory=lambda: planner,
+    )
+    observed_guard_state: list[bool] = []
+    original_reset = executor._collision_reset_qpos
+
+    def capture_reset(*args, **kwargs):
+        observed_guard_state.append(bool(executor._cyclic_gc_guard_acquired))
+        return original_reset(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "_collision_reset_qpos", capture_reset)
+    try:
+        executor.submit(
+            _filtered_bimanual_pose(0.16, 0.18),
+            _observation(sides=("left", "right")),
+            "gc_order",
+        )
+        assert observed_guard_state == [True]
+    finally:
+        executor.close()
+
+
 def test_cyclic_gc_guard_is_not_restored_after_failed_close(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(

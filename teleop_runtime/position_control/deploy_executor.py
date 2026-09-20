@@ -901,6 +901,72 @@ class PositionDeployExecutor:
         lookahead_execution_work_item: ExecutionWorkItem | None = None,
         source_plan_cut: PositionSourcePlanCut | None = None,
     ) -> int:
+        """Admit one keyframe, priming the first-stream GC guard early.
+
+        The cyclic-GC guard performs one bounded full collection.  It must run
+        before the first authoritative qpos timestamp is captured; otherwise
+        that synchronous collection can consume the entire freshness budget
+        and make an otherwise valid collision reset stale before the worker
+        applies it.  The implementation keeps the guard lease transactional:
+        failed admission releases a lease acquired by this call, while a
+        successfully queued first keyframe retains it for the stream.
+        """
+
+        with self._lock:
+            first = not self._submission_stream_initialized
+            guard_acquired_before_submit = self._cyclic_gc_guard_acquired
+            guard_acquired_here = bool(
+                first
+                and self.config.cyclic_gc_guard_enabled
+                and not guard_acquired_before_submit
+            )
+            if guard_acquired_here:
+                self._activate_cyclic_gc_guard_locked()
+            try:
+                return self._submit_impl(
+                    filtered,
+                    observation,
+                    policy_name,
+                    timestamp_monotonic=timestamp_monotonic,
+                    discrete_command=discrete_command,
+                    lookahead_filtered=lookahead_filtered,
+                    lookahead_observation=lookahead_observation,
+                    lookahead_discrete_command=lookahead_discrete_command,
+                    second_lookahead_filtered=second_lookahead_filtered,
+                    second_lookahead_observation=second_lookahead_observation,
+                    third_lookahead_filtered=third_lookahead_filtered,
+                    third_lookahead_observation=third_lookahead_observation,
+                    execution_work_item=execution_work_item,
+                    lookahead_execution_work_item=lookahead_execution_work_item,
+                    source_plan_cut=source_plan_cut,
+                )
+            except BaseException:
+                if (
+                    guard_acquired_here
+                    and self._cyclic_gc_guard_acquired
+                    and not self._submission_stream_initialized
+                ):
+                    self._release_cyclic_gc_guard_locked()
+                raise
+
+    def _submit_impl(
+        self,
+        filtered: FilteredNormalizedAction,
+        observation: DeploymentObservation,
+        policy_name: str,
+        timestamp_monotonic: float | None = None,
+        discrete_command: TeleopCommand | None = None,
+        lookahead_filtered: FilteredNormalizedAction | None = None,
+        lookahead_observation: DeploymentObservation | None = None,
+        lookahead_discrete_command: TeleopCommand | None = None,
+        second_lookahead_filtered: FilteredNormalizedAction | None = None,
+        second_lookahead_observation: DeploymentObservation | None = None,
+        third_lookahead_filtered: FilteredNormalizedAction | None = None,
+        third_lookahead_observation: DeploymentObservation | None = None,
+        execution_work_item: ExecutionWorkItem | None = None,
+        lookahead_execution_work_item: ExecutionWorkItem | None = None,
+        source_plan_cut: PositionSourcePlanCut | None = None,
+    ) -> int:
         """Enqueue one safe keyframe without applying its safety filter again.
 
         Returns the non-negative source index assigned to the keyframe.  Queue
@@ -1469,18 +1535,10 @@ class PositionDeployExecutor:
                 plan_splice_decision=plan_splice_decision,
                 stream_start_prelude=stream_start_prelude,
             )
-            guard_acquired_before_submit = self._cyclic_gc_guard_acquired
-            if first and self.config.cyclic_gc_guard_enabled:
-                self._activate_cyclic_gc_guard_locked()
             try:
                 self._queue.put_nowait(submission)
             except queue.Full as exc:
                 self._queue_full_count += 1
-                if (
-                    not guard_acquired_before_submit
-                    and self._cyclic_gc_guard_acquired
-                ):
-                    self._release_cyclic_gc_guard_locked()
                 raise PositionDeployQueueFullError(
                     f"position deploy input FIFO is full ({self.config.queue_size})"
                 ) from exc

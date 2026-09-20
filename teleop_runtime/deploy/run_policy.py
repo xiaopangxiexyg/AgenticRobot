@@ -88,6 +88,7 @@ from robot_motion.deploy.observation import (
     DEFAULT_HAND_STATE_MAX_AGE_SEC,
     DeploymentObservation,
     build_deployment_observation,
+    build_state_vector,
 )
 from robot_motion.deploy.pose_adapter import (
     convert_policy_absolute_vector_to_runtime_raw,
@@ -3745,9 +3746,72 @@ def main(
             )
         return outcome
 
+    def refresh_first_position_stream_observation(
+        observation: DeploymentObservation,
+    ) -> DeploymentObservation:
+        """Refresh the live dual-arm cut used by the first position keyframe.
+
+        The policy observation is captured before model inference.  On a
+        collision-required stream, the first queued keyframe must instead use
+        a successful, coherent hardware qpos sample at the execution cut;
+        otherwise a long model/RTC inference can make the reset state stale
+        before the reference worker applies it.  This refresh is intentionally
+        limited to the first stream submission and never changes policy input
+        images or the policy-produced action.
+        """
+
+        if not isinstance(observation, DeploymentObservation):
+            raise TypeError("observation must be a DeploymentObservation")
+        if arm_reader is None:
+            raise RuntimeError(
+                "first position stream refresh requires the live ArmStateReader"
+            )
+        fresh_timestamp = time.time()
+        fresh_arm_states = arm_reader.snapshot(
+            fresh_timestamp,
+            cut_after_refresh=True,
+            concurrent_refresh_sides=tuple(active_sides),
+        )
+        fresh_state, fresh_state_dict, fresh_state_valid = build_state_vector(
+            active_sides=tuple(observation.active_sides),
+            arms_enabled=bool(observation.arms_enabled),
+            hands_enabled=bool(observation.hands_enabled),
+            end_effector_sides=observation.end_effector_sides,
+            arm_states=fresh_arm_states,
+            hand_states=observation.hand_states,
+        )
+        metadata = dict(observation.metadata)
+        metadata.update(
+            {
+                "position_first_stream_arm_refresh": True,
+                "position_first_stream_arm_refresh_timestamp": float(
+                    fresh_timestamp
+                ),
+                "position_first_stream_arm_refresh_sides": list(active_sides),
+            }
+        )
+        return replace(
+            observation,
+            timestamp=float(fresh_timestamp),
+            state=fresh_state,
+            state_dict=fresh_state_dict,
+            state_valid=fresh_state_valid,
+            arm_states={
+                str(side): dict(state or {})
+                for side, state in fresh_arm_states.items()
+            },
+            metadata=metadata,
+        )
+
     prepared_action_position_executor = position_deploy_executor
     prepared_action_executor = PreparedActionExecutor(
         position_deploy_executor=prepared_action_position_executor,
+        first_position_stream_observation_refresh=(
+            refresh_first_position_stream_observation
+            if position_deploy_executor is not None
+            and arm_reader is not None
+            else None
+        ),
         send_actions=send_actions,
         arm_backends=arm_backends,
         hand_backends=hand_backends,
