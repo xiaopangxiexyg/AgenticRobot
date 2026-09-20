@@ -5,12 +5,18 @@ import pytest
 
 from deployments.perception.dmtac_grasp_overlay import (
     DMTAC_M_FINGER_LENGTH_M,
+    DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
+    DMTAC_M_GRASPGENX_FINGER_THICKNESS_M,
+    DMTAC_M_GRASPGENX_MAX_OPENING_M,
+    DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
+    DMTAC_M_GRASPGENX_PALM_Z_M,
     DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
     DmtacGraspOverlayCandidate,
     _wireframe_segments,
     camera_from_reference_poses,
     project_dmtac_grasp,
     render_dmtac_grasp_overlays,
+    reviewed_graspgenx_dmtac_solid_geometry,
     reviewed_4b2_cad_solid_geometry,
 )
 
@@ -84,6 +90,23 @@ def test_cad_geometry_moves_body_not_controlled_tcp_axes() -> None:
     # The flange mating offset lifts the 97.001 mm internal marker to
     # 105.201 mm; the real controller still controls its calibrated 140 mm TCP.
     assert geometry.solid_pose(np.eye(4))[2, 3] + geometry.palm_z_m == pytest.approx(-.034799)
+
+
+def test_graspgenx_dmtac_profile_is_separate_from_legacy_4b2_profile() -> None:
+    legacy = reviewed_4b2_cad_solid_geometry()
+    graspgenx = reviewed_graspgenx_dmtac_solid_geometry()
+
+    assert legacy.maximum_opening_m == pytest.approx(0.070)
+    assert legacy.finger_length_m == pytest.approx(0.050)
+    assert legacy.finger_thickness_m == pytest.approx(0.010)
+    assert legacy.pad_height_m == pytest.approx(0.0255)
+    assert graspgenx.maximum_opening_m == pytest.approx(DMTAC_M_GRASPGENX_MAX_OPENING_M)
+    assert graspgenx.palm_z_m == pytest.approx(DMTAC_M_GRASPGENX_PALM_Z_M)
+    assert graspgenx.finger_length_m == pytest.approx(DMTAC_M_GRASPGENX_FINGER_LENGTH_M)
+    assert graspgenx.finger_thickness_m == pytest.approx(DMTAC_M_GRASPGENX_FINGER_THICKNESS_M)
+    assert graspgenx.pad_height_m == pytest.approx(DMTAC_M_GRASPGENX_PAD_HEIGHT_M)
+    assert graspgenx != legacy
+    assert graspgenx.solid_pose(np.eye(4)).shape == (4, 4)
 
 
 def test_projection_classifies_full_partial_outside_and_behind() -> None:

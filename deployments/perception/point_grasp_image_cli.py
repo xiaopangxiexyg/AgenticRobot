@@ -14,6 +14,7 @@ from PIL import Image
 from deployments.perception.dmtac_grasp_overlay import (
     DmtacGraspOverlayCandidate,
     render_dmtac_grasp_overlays,
+    reviewed_graspgenx_dmtac_solid_geometry,
 )
 
 from .graspgenx_client import GraspGenXInProcessBackend
@@ -154,6 +155,7 @@ def _annotated_jpeg(
     pixel_uv: tuple[int, int],
     planned: object,
     intrinsics: dict[str, float | int],
+    solid_geometry: object | None = None,
 ) -> bytes:
     # JSON retains all ranked proposals; the human preview shows only ordinal 0.
     candidates = tuple(
@@ -173,6 +175,7 @@ def _annotated_jpeg(
         intrinsics=intrinsics,
         target_pixel_uv=pixel_uv,
         target_bbox_xyxy=tuple(planned.target_mask_bbox_xyxy),
+        solid_geometry=solid_geometry,
     )
     stream = io.BytesIO()
     output.save(stream, format="JPEG", quality=90, optimize=True)
@@ -206,6 +209,7 @@ def _build_point_grasp_planner(
             model_spec=grasp_spec,
             point_segmenter=localizer,
             client=backend,
+            solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
         )
     if args.point_grasp_backend == "graspnet":
         grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(grasp_bundle)
@@ -306,7 +310,13 @@ def run(args: argparse.Namespace) -> dict:
                 "visible_collision_free": candidate.visible_collision_free,
             }
         )
-    annotated = _annotated_jpeg(image, pixel_uv, planned, intrinsics)
+    annotated = _annotated_jpeg(
+        image,
+        pixel_uv,
+        planned,
+        intrinsics,
+        solid_geometry=getattr(planner, "solid_geometry", None),
+    )
     payload = {
         "schema_version": OUTPUT_SCHEMA_V1,
         "input_source": "local_path",

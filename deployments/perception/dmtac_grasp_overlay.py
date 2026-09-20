@@ -45,6 +45,44 @@ DMTAC_M_FINGER_LENGTH_M = 0.050
 DMTAC_M_FINGER_THICKNESS_M = 0.010
 DMTAC_M_PAD_HEIGHT_M = 0.0255
 
+# The saved DMTAC-GraspGenX alignment is a separate model profile.  The
+# legacy constants above remain the original 4B2 proxy used by the older
+# VGN/GraspNet and diagnostic paths.  These values are copied from the
+# reviewed ``graspgenx-dmtac-alignment-right.json`` payload and are expressed
+# in the GraspGenX model frame, not in the legacy 4B2 solid frame.
+DMTAC_M_GRASPGENX_MAX_OPENING_M = 0.0705
+DMTAC_M_GRASPGENX_PALM_Z_M = -0.029
+DMTAC_M_GRASPGENX_FINGER_LENGTH_M = 0.100
+DMTAC_M_GRASPGENX_FINGER_THICKNESS_M = 0.0199
+DMTAC_M_GRASPGENX_PAD_HEIGHT_M = 0.030
+DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M = (0.0, 0.0, -0.022)
+DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_Z_M = (
+    DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M[2]
+)
+DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID = "DMTAC_M_graspgenx_alignment_v4_q0"
+
+# T_tool_tcp_from_graspgenx_model at the reviewed URDF pose (q=0, master q=0).
+# Keeping this as a full rigid transform preserves the small CAD/tactile frame
+# tilt that a yaw-only proxy cannot represent.  It is a fixed deployment
+# calibration; the current point-grasp contract does not yet carry a live
+# DMTAC opening/q-position into the perception planner.
+DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION = (
+    -0.005883664976856,
+    0.9999446749409,
+    0.008719492172192,
+    -0.9999826899785,
+    -0.005883853041647,
+    -0.000004084338666,
+    0.00004722009784,
+    -0.008719365268476,
+    0.9999619844972,
+)
+DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_XYZ_M = (
+    0.02283489505130,
+    -0.000005278121116,
+    0.02618158377488,
+)
+
 
 def reviewed_4b2_cad_solid_geometry(*, maximum_opening_m: float = 0.070) -> ParallelJawSolidGeometry:
     """Bind the reviewed full 4B2 assembly to the unchanged 140 mm real TCP.
@@ -63,6 +101,27 @@ def reviewed_4b2_cad_solid_geometry(*, maximum_opening_m: float = 0.070) -> Para
         maximum_opening_m=maximum_opening_m,
         tool_from_solid_xyz_m=(0.0245, -8.9993525e-8, 0.0082),
         solid_yaw_rad=math.pi / 2,
+    )
+
+
+def reviewed_graspgenx_dmtac_solid_geometry(
+    *, maximum_opening_m: float = DMTAC_M_GRASPGENX_MAX_OPENING_M
+) -> ParallelJawSolidGeometry:
+    """Return the saved DMTAC-specific GraspGenX geometry profile.
+
+    This profile is intentionally independent of ``reviewed_4b2_cad_solid_geometry``.
+    Its local dimensions and the calibrated TCP-to-model transform come from
+    the saved GUI alignment; the legacy proxy remains available to consumers
+    that explicitly request it.
+    """
+    return ParallelJawSolidGeometry(
+        palm_z_m=DMTAC_M_GRASPGENX_PALM_Z_M,
+        finger_length_m=DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
+        finger_thickness_m=DMTAC_M_GRASPGENX_FINGER_THICKNESS_M,
+        pad_height_m=DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
+        maximum_opening_m=maximum_opening_m,
+        tool_from_solid_xyz_m=DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_XYZ_M,
+        tool_from_solid_rotation=DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION,
     )
 
 
@@ -126,8 +185,14 @@ class DmtacGraspOverlayCandidate:
         width = float(self.gripper_width_m)
         if not math.isfinite(score):
             raise ValueError("score must be finite.")
-        if not math.isfinite(width) or not 0.005 <= width <= 0.070:
-            raise ValueError("gripper_width_m must be in [0.005, 0.070].")
+        if (
+            not math.isfinite(width)
+            or not 0.005 <= width <= DMTAC_M_GRASPGENX_MAX_OPENING_M
+        ):
+            raise ValueError(
+                "gripper_width_m must be in "
+                f"[0.005, {DMTAC_M_GRASPGENX_MAX_OPENING_M:.4f}]."
+            )
         pose = _rigid_transform(
             self.reference_from_tcp, field_name="reference_from_tcp"
         )
@@ -239,14 +304,17 @@ def _box_segments(
 
 def _wireframe_segments(
     width_m: float,
+    *,
+    geometry: ParallelJawSolidGeometry | None = None,
 ) -> tuple[tuple[str, np.ndarray, np.ndarray], ...]:
     # Geometry is expressed about the actual calibrated tool_tcp.  The palm
     # boundary is behind it; the fingertips extend slightly beyond it.
+    geometry = geometry or reviewed_4b2_cad_solid_geometry()
     half_opening = width_m / 2.0
-    finger_thickness = DMTAC_M_FINGER_THICKNESS_M
-    half_height = DMTAC_M_PAD_HEIGHT_M / 2.0
-    palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
-    fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
+    finger_thickness = geometry.finger_thickness_m
+    half_height = geometry.pad_height_m / 2.0
+    palm_z = geometry.palm_z_m
+    fingertip_z = palm_z + geometry.finger_length_m
     segments: list[tuple[str, np.ndarray, np.ndarray]] = []
     segments.extend(
         _box_segments(
@@ -357,7 +425,10 @@ def project_dmtac_grasp(
         reference_from_tcp=candidate.reference_from_tcp,
         reference_from_camera=reference_from_camera,
     )
-    local_segments = _wireframe_segments(candidate.gripper_width_m)
+    local_segments = _wireframe_segments(
+        candidate.gripper_width_m,
+        geometry=solid_geometry,
+    )
     projected: list[ProjectedGraspSegment] = []
     front_count = 0
     clipped_count = 0
@@ -539,6 +610,16 @@ def render_dmtac_grasp_overlays(
 
 
 __all__ = [
+    "DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID",
+    "DMTAC_M_GRASPGENX_FINGER_LENGTH_M",
+    "DMTAC_M_GRASPGENX_FINGER_THICKNESS_M",
+    "DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M",
+    "DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_Z_M",
+    "DMTAC_M_GRASPGENX_MAX_OPENING_M",
+    "DMTAC_M_GRASPGENX_PAD_HEIGHT_M",
+    "DMTAC_M_GRASPGENX_PALM_Z_M",
+    "DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_ROTATION",
+    "DMTAC_M_GRASPGENX_TOOL_FROM_MODEL_XYZ_M",
     "GRASP_VISIBILITY_STATES",
     "DmtacGraspOverlayCandidate",
     "DmtacGraspProjection",
@@ -546,4 +627,6 @@ __all__ = [
     "camera_from_reference_poses",
     "project_dmtac_grasp",
     "render_dmtac_grasp_overlays",
+    "reviewed_graspgenx_dmtac_solid_geometry",
+    "reviewed_4b2_cad_solid_geometry",
 ]

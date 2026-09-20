@@ -35,6 +35,7 @@ from agent_gateway.skills.perception.point_grasp_schemas import (
 from deployments.perception.dmtac_grasp_overlay import (
     DmtacGraspOverlayCandidate,
     render_dmtac_grasp_overlays,
+    reviewed_graspgenx_dmtac_solid_geometry,
 )
 from deployments.perception.graspgenx_client import (
     GraspGenXClient,
@@ -966,6 +967,7 @@ def draw_grasp_overlay(
     intrinsics: Mapping[str, float | int],
     click_uv: tuple[int, int],
     bbox_xyxy: tuple[int, int, int, int],
+    solid_geometry: object | None = None,
 ) -> np.ndarray:
     """Compatibility wrapper around the shared DMTAC M wireframe renderer."""
 
@@ -984,6 +986,7 @@ def draw_grasp_overlay(
         intrinsics=intrinsics,
         target_pixel_uv=click_uv,
         target_bbox_xyxy=bbox_xyxy,
+        solid_geometry=solid_geometry,
     )
     return np.asarray(image)
 
@@ -1400,6 +1403,7 @@ def _make_provider(
             model_spec=grasp_spec,
             point_segmenter=localizer,
             client=graspgenx_backend,
+            solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
         )
     registration = build_real_point_grasp_registration(
         backend_id=planner.backend_id,
@@ -1698,6 +1702,11 @@ def _trial(
             intrinsics=parameters["camera_intrinsics"],
             click_uv=tuple(int(value) for value in candidate["_prompt_uv"]),
             bbox_xyxy=bbox,
+            solid_geometry=(
+                reviewed_graspgenx_dmtac_solid_geometry()
+                if config.point_grasp_backend == "graspgenx"
+                else None
+            ),
         )
         Image.fromarray(overlay).save(trial_dir / "grasp_pose_overlay.png")
         keyframes.append(("Skill selected grasp", overlay))

@@ -33,6 +33,9 @@ from deployments.perception import (
     Sam2VgnPointGraspPlanner,
     VgnPointGraspModelSpec,
 )
+from deployments.perception.dmtac_grasp_overlay import (
+    reviewed_graspgenx_dmtac_solid_geometry,
+)
 from robot_motion.rm65 import (
     build_rm65_dual_arm_scene_profile,
     load_world_from_arm_base_transforms,
@@ -332,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
                     model_spec=point_grasp_spec,
                     point_segmenter=object_localizer,
                     client=graspgenx_backend,
+                    solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid point-grasp model bundle: {error}")
