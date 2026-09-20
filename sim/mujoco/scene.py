@@ -243,6 +243,9 @@ class MujocoScene:
             for offset, address in enumerate(self._kinematic_qpos_indices)
         }
         self._collision_projector = None
+        self._collision_projectors_by_gripper_self_contact: dict[
+            bool, object
+        ] = {}
         self.forward()
 
     @classmethod
@@ -683,10 +686,21 @@ class MujocoScene:
                 target[self._kinematic_qpos_offset[address]] = value
         return target
 
-    def collision_projector(self):
+    def collision_projector(self, *, allow_gripper_self_contact: bool = False):
         if not self.collision_safety_available:
             return None
-        if self._collision_projector is None:
+        if not isinstance(allow_gripper_self_contact, bool):
+            raise TypeError("allow_gripper_self_contact must be a bool.")
+        if not allow_gripper_self_contact and self._collision_projector is not None:
+            return self._collision_projector
+        if (
+            allow_gripper_self_contact
+            in self._collision_projectors_by_gripper_self_contact
+        ):
+            return self._collision_projectors_by_gripper_self_contact[
+                allow_gripper_self_contact
+            ]
+        if self._collision_projector is None or allow_gripper_self_contact:
             from .collision_safety import (
                 CollisionSafetyPolicy,
                 KinematicCollisionProjector,
@@ -694,7 +708,7 @@ class MujocoScene:
 
             collision = self.scene_spec.collision
 
-            self._collision_projector = KinematicCollisionProjector(
+            projector = KinematicCollisionProjector(
                 self.mujoco,
                 self.model,
                 self._kinematic_qpos_indices,
@@ -703,9 +717,18 @@ class MujocoScene:
                     hard_penetration_m=collision.safety_hard_penetration_m,
                     sweep_max_joint_step_rad=collision.safety_sweep_max_joint_step_rad,
                     projection_iterations=collision.safety_projection_iterations,
+                    allow_gripper_self_contact=allow_gripper_self_contact,
                 ),
             )
-        return self._collision_projector
+            self._collision_projectors_by_gripper_self_contact[
+                allow_gripper_self_contact
+            ] = projector
+            if not allow_gripper_self_contact:
+                self._collision_projector = projector
+        return self._collision_projectors_by_gripper_self_contact.get(
+            allow_gripper_self_contact,
+            self._collision_projector,
+        )
 
     def write_kinematic_controlled_qpos(
         self,

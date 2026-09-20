@@ -196,6 +196,12 @@ def build_b601_rm65_sim_target(
             timing=prepared.timing,
             actuation_profile=prepared.arm_profile,
             gripper_actuation_profile=prepared.gripper_profile,
+            # The calibrated B601 closed endpoint maps to the RM65 CAD
+            # gripper's expected finger contact. Its mesh overlaps slightly
+            # at that endpoint, so allow only 4:4 finger self-contact in this
+            # explicit arm+gripper simulation path; environment and robot
+            # collision guards remain enabled.
+            allow_gripper_self_contact=bool(enable_gripper),
             realtime_worker=prepared.config.realtime_worker,
         ),
     )
