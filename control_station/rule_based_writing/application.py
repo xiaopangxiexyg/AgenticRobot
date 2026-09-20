@@ -26,6 +26,7 @@ class RuleBasedWritingIntent(str, Enum):
     RUNTIME_HOME_RETRY = "runtime_home_retry"
     RELEASE_GRIPPERS = "release_grippers"
     CLOSE_GRIPPERS = "close_grippers"
+    CLOSE_RIGHT_GRIPPER = "close_right_gripper"
     DEBUG_TOGGLE = "debug_toggle"
     QUIT = "q"
 
@@ -261,6 +262,7 @@ class RuleBasedWritingApplication:
                 RuleBasedWritingIntent.START,
                 RuleBasedWritingIntent.RELEASE_GRIPPERS,
                 RuleBasedWritingIntent.CLOSE_GRIPPERS,
+                RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER,
             }:
                 return False
             return self._submit_intent_locked(intent)
@@ -328,11 +330,16 @@ class RuleBasedWritingApplication:
         elif intent in {
             RuleBasedWritingIntent.RELEASE_GRIPPERS,
             RuleBasedWritingIntent.CLOSE_GRIPPERS,
+            RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER,
         }:
             control = (
                 "release_grippers"
                 if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
-                else "close_grippers"
+                else (
+                    "close_right_gripper"
+                    if intent is RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
+                    else "close_grippers"
+                )
             )
             if not available[control]:
                 return False
@@ -341,7 +348,11 @@ class RuleBasedWritingApplication:
             self._state.gripper_action_status = (
                 "正在松开夹爪…"
                 if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
-                else "正在闭紧夹爪…"
+                else (
+                    "正在闭紧右夹爪…"
+                    if intent is RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
+                    else "正在闭紧夹爪…"
+                )
             )
             self._state.detail = self._state.gripper_action_status
         elif intent is RuleBasedWritingIntent.DEBUG_TOGGLE:
@@ -480,9 +491,12 @@ class RuleBasedWritingApplication:
                 elif self._submit_intent_locked(RuleBasedWritingIntent.START):
                     self._task_chain.begin_rule()
                 else:
-                    self._task_chain.fail_rule_preparation(
-                        "配置已验证，但现有安全门禁未允许开始规则采集。"
-                    )
+                    # Configuration completion and the lower Session/Rig
+                    # admission receipt are asynchronous.  Keep the validated
+                    # choice and wait for an explicit operator retry instead
+                    # of treating a stale start receipt as a config failure or
+                    # bypassing the safety gate.
+                    self._task_chain.wait_for_rule_start()
                 self._rebuild_controls()
             self._touch()
 
@@ -582,7 +596,7 @@ class RuleBasedWritingApplication:
             elif phase is RuleWritingTaskChainPhase.READY_CLOSE:
                 status_baseline = self._state.gripper_action_status
                 if not self._submit_intent_locked(
-                    RuleBasedWritingIntent.CLOSE_GRIPPERS
+                    RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
                 ):
                     return False
                 self._task_chain.begin_close(status_baseline=status_baseline)
@@ -598,22 +612,27 @@ class RuleBasedWritingApplication:
                     return False
                 self._task_chain.begin_height()
             elif phase is RuleWritingTaskChainPhase.READY_RULE:
-                if not available["configure"] or not self._task_chain_configuration_pool:
-                    return False
-                count = len(self._task_chain_configuration_pool)
-                index = int(self._task_chain_choice_index(count))
-                if not 0 <= index < count:
-                    raise ValueError("task_chain_choice_index returned an invalid index.")
-                selected = dict(self._task_chain_configuration_pool[index])
-                # Revalidate at the same trust boundary used by manual GUI
-                # configuration; the chain never promotes cached UI state.
-                selected = self._validate_configuration_request(
-                    selected,
-                    options=self._configuration_options,
-                )
-                if not self._submit_configuration_locked(selected):
-                    return False
-                self._task_chain.begin_configuration(index=index, selected=selected)
+                if self._task_chain.rule_start_waiting:
+                    if not self._submit_intent_locked(RuleBasedWritingIntent.START):
+                        return False
+                    self._task_chain.begin_rule_after_wait()
+                else:
+                    if not available["configure"] or not self._task_chain_configuration_pool:
+                        return False
+                    count = len(self._task_chain_configuration_pool)
+                    index = int(self._task_chain_choice_index(count))
+                    if not 0 <= index < count:
+                        raise ValueError("task_chain_choice_index returned an invalid index.")
+                    selected = dict(self._task_chain_configuration_pool[index])
+                    # Revalidate at the same trust boundary used by manual GUI
+                    # configuration; the chain never promotes cached UI state.
+                    selected = self._validate_configuration_request(
+                        selected,
+                        options=self._configuration_options,
+                    )
+                    if not self._submit_configuration_locked(selected):
+                        return False
+                    self._task_chain.begin_configuration(index=index, selected=selected)
             elif phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE:
                 status_baseline = self._state.gripper_action_status
                 if not self._submit_intent_locked(
@@ -1103,6 +1122,10 @@ class RuleBasedWritingApplication:
             error = (
                 None
                 if self._state.gripper_action_status == expected
+                or (
+                    phase is RuleWritingTaskChainPhase.CLOSE_PENDING
+                    and self._state.gripper_action_status == "右夹爪实测已闭紧"
+                )
                 else self._state.gripper_action_status or "夹爪动作未返回成功回执。"
             )
             if phase is RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING:
@@ -1321,6 +1344,9 @@ class RuleBasedWritingApplication:
             grippers_ready and not terminal and self._state.phase == "ready"
             and not self._state.height_calibration_pending
         )
+        close_right_gripper = bool(
+            close_grippers and "right" in self._state.gripper_sides
+        )
         toggle_debug = bool(
             self._rule_runtime_bound
             and not self._state.shutdown
@@ -1352,6 +1378,7 @@ class RuleBasedWritingApplication:
             "runtime_home": runtime_home,
             "release_grippers": release_grippers,
             "close_grippers": close_grippers,
+            "close_right_gripper": close_right_gripper,
             "toggle_debug": toggle_debug,
             "capture_height": capture_height,
             "clear_height": clear_height,
@@ -1367,7 +1394,7 @@ class RuleBasedWritingApplication:
             and available["configure"]
             and available["start"]
             and available["release_grippers"]
-            and available["close_grippers"]
+            and available["close_right_gripper"]
             and available["capture_height"]
         )
 
@@ -1382,10 +1409,12 @@ class RuleBasedWritingApplication:
         }:
             return self._task_chain_initially_available_locked(available)
         if phase is RuleWritingTaskChainPhase.READY_CLOSE:
-            return bool(available["close_grippers"])
+            return bool(available["close_right_gripper"])
         if phase is RuleWritingTaskChainPhase.READY_HEIGHT:
             return bool(available["capture_height"])
         if phase is RuleWritingTaskChainPhase.READY_RULE:
+            if self._task_chain.rule_start_waiting:
+                return bool(available["start"])
             return bool(available["configure"] and self._task_chain_configuration_pool)
         if phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE:
             return bool(available["release_grippers"])

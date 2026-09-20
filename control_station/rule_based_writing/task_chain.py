@@ -40,13 +40,13 @@ _PHASE_PRESENTATION: dict[RuleWritingTaskChainPhase, tuple[str, str, str]] = {
     ),
     RuleWritingTaskChainPhase.READY_CLOSE: (
         "2 / 5",
-        "等待闭紧夹爪",
-        "确认工件和工作区安全后继续。",
+        "等待闭紧右夹爪",
+        "右夹爪用于抓笔和书写；左侧保持当前状态。确认工件和工作区安全后继续。",
     ),
     RuleWritingTaskChainPhase.CLOSE_PENDING: (
         "2 / 5",
-        "正在闭紧夹爪",
-        "等待现有夹爪反馈链确认实测闭紧。",
+        "正在闭紧右夹爪",
+        "等待现有夹爪反馈链确认右夹爪实测闭紧；左侧不发送闭合命令。",
     ),
     RuleWritingTaskChainPhase.READY_HEIGHT: (
         "3 / 5",
@@ -103,6 +103,7 @@ class RuleWritingTaskChain:
     rule_execution_seen: bool = False
     gripper_pending_seen: bool = False
     gripper_status_baseline: str = ""
+    rule_start_waiting: bool = False
 
     @property
     def active(self) -> bool:
@@ -123,6 +124,7 @@ class RuleWritingTaskChain:
         self.gripper_pending_seen = False
         self.gripper_status_baseline = str(status_baseline)
         self.last_error = ""
+        self.rule_start_waiting = False
 
     def finish_initial_release(self, *, error: str | None = None) -> None:
         self._require(RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING)
@@ -139,6 +141,7 @@ class RuleWritingTaskChain:
         self.gripper_pending_seen = False
         self.gripper_status_baseline = str(status_baseline)
         self.last_error = ""
+        self.rule_start_waiting = False
 
     def finish_close(self, *, error: str | None = None) -> None:
         self._require(RuleWritingTaskChainPhase.CLOSE_PENDING)
@@ -148,6 +151,7 @@ class RuleWritingTaskChain:
             else RuleWritingTaskChainPhase.READY_CLOSE
         )
         self.last_error = str(error or "")
+        self.rule_start_waiting = False
 
     def begin_height(self) -> None:
         self._require(RuleWritingTaskChainPhase.READY_HEIGHT)
@@ -175,17 +179,39 @@ class RuleWritingTaskChain:
         self.selected_configuration = dict(selected)
         self.rule_execution_seen = False
         self.last_error = ""
+        self.rule_start_waiting = False
 
     def begin_rule(self) -> None:
         self._require(RuleWritingTaskChainPhase.CONFIGURATION_PENDING)
         self.phase = RuleWritingTaskChainPhase.RULE_PENDING
         self.rule_execution_seen = False
         self.last_error = ""
+        self.rule_start_waiting = False
+
+    def begin_rule_after_wait(self) -> None:
+        """Start the validated rule only after a later explicit gate retry."""
+
+        self._require(RuleWritingTaskChainPhase.READY_RULE)
+        if not self.rule_start_waiting:
+            raise RuntimeError("rule start is not waiting for a gate retry.")
+        self.phase = RuleWritingTaskChainPhase.RULE_PENDING
+        self.rule_execution_seen = False
+        self.last_error = ""
+        self.rule_start_waiting = False
+
+    def wait_for_rule_start(self) -> None:
+        """Keep validated configuration while the lower start gate is closed."""
+
+        self._require(RuleWritingTaskChainPhase.CONFIGURATION_PENDING)
+        self.phase = RuleWritingTaskChainPhase.READY_RULE
+        self.last_error = ""
+        self.rule_start_waiting = True
 
     def fail_rule_preparation(self, error: str) -> None:
         self._require(RuleWritingTaskChainPhase.CONFIGURATION_PENDING)
         self.phase = RuleWritingTaskChainPhase.READY_RULE
         self.last_error = str(error)
+        self.rule_start_waiting = False
 
     def observe_rule_execution(self) -> None:
         self._require(RuleWritingTaskChainPhase.RULE_PENDING)
@@ -203,11 +229,13 @@ class RuleWritingTaskChain:
         self._require(RuleWritingTaskChainPhase.RULE_PENDING)
         self.phase = RuleWritingTaskChainPhase.READY_FINAL_RELEASE
         self.last_error = ""
+        self.rule_start_waiting = False
 
     def fail_rule(self, error: str) -> None:
         self._require(RuleWritingTaskChainPhase.RULE_PENDING)
         self.phase = RuleWritingTaskChainPhase.READY_RULE
         self.last_error = str(error)
+        self.rule_start_waiting = False
 
     def begin_final_release(self, *, status_baseline: str) -> None:
         self._require(RuleWritingTaskChainPhase.READY_FINAL_RELEASE)
@@ -215,6 +243,7 @@ class RuleWritingTaskChain:
         self.gripper_pending_seen = False
         self.gripper_status_baseline = str(status_baseline)
         self.last_error = ""
+        self.rule_start_waiting = False
 
     def finish_final_release(self, *, error: str | None = None) -> None:
         self._require(RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING)
@@ -225,11 +254,17 @@ class RuleWritingTaskChain:
         self.phase = RuleWritingTaskChainPhase.COMPLETE
         self.cycle_count += 1
         self.last_error = ""
+        self.rule_start_waiting = False
 
     def presentation(self) -> dict[str, object]:
         step, title, detail = _PHASE_PRESENTATION[self.phase]
         if self.last_error:
             detail = f"上一步未完成：{self.last_error} 请确认安全后重试当前步骤。"
+        elif self.rule_start_waiting:
+            detail = (
+                "配置已验证，等待现有安全门禁放行；门禁就绪后点击“继续任务链”"
+                "开始规则采集，不会自动绕过安全检查。"
+            )
         return {
             "active": self.active,
             "phase": self.phase.value,

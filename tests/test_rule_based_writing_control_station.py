@@ -1151,7 +1151,7 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert application.snapshot()["task_chain_phase"] == "ready_close"
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_rule_intents() == ("close_grippers",)
+    assert application.consume_rule_intents() == ("close_right_gripper",)
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
@@ -1247,6 +1247,39 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert state["task_chain_phase"] == "complete"
     assert state["task_chain_cycle_count"] == 1
     assert state["task_chain_can_advance"] is True
+
+
+def test_task_chain_keeps_validated_configuration_when_start_gate_is_stale() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            configuration_available=True,
+        )
+    )
+
+    # Model the asynchronous configuration callback: the previous status
+    # receipt still says that START is unavailable, even though validation has
+    # succeeded.  This must not become a configuration failure or reconfigure
+    # the same choice on the next click.
+    application._task_chain.phase = RuleWritingTaskChainPhase.CONFIGURATION_PENDING
+    application.complete_configuration(selected=first, error=None)
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "ready_rule"
+    assert state["task_chain_can_advance"] is False
+    assert "配置已验证" in state["task_chain_detail"]
+    assert application.consume_rule_intents() == ()
+    assert application.consume_configuration_requests() == ()
+
+    application.observe_rule_status(_task_chain_ready_status())
+    assert application.snapshot()["task_chain_can_advance"] is True
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    assert application.snapshot()["task_chain_phase"] == "rule_pending"
 
 
 def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() -> None:

@@ -2351,6 +2351,56 @@ def test_manual_dual_gripper_buttons_use_typed_non_recorded_dispatch_and_lock_af
     assert "没有活动 Episode" in extension.status().gripper_action_status
 
 
+def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("left", "right")),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("left", "right"),
+    )
+    backends = {
+        side: getattr(extension._components, f"{side}_hand_backend")
+        for side in ("left", "right")
+    }
+    for backend in backends.values():
+        backend.set_measured_scalar(0.5)
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    now = 10.0
+    while extension._pending_gripper_action is not None:
+        command_count = len(session.external_commands)
+        session.command_override_provider(SimpleNamespace(), now)
+        if len(session.external_commands) > command_count:
+            close = session.external_commands[-1]
+            assert set(close.commands) == {"right_hand"}
+            assert close.metadata["rule_based_manual_gripper_sides"] == ["right"]
+            command = close.commands["right_hand"]
+            assert command.metadata["dmtac_continuous_grasp_override"] is True
+            backends["right"].set_measured_scalar(float(command.value[0]))
+            assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
+        now += 0.05
+        assert now < 20.0
+
+    assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
+    assert float(backends["right"].measured_joint_pos[0]) == pytest.approx(1.0)
+    assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+
+
 def test_manual_gripper_reset_uses_recorder_hand_history_without_backend_read() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),

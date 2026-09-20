@@ -1309,7 +1309,11 @@ class RuleBasedRealTeleopExtension:
                 self._clear_manual_gripper_action()
                 self._cancel_initial_alignment_planning()
                 self._establish_hold("rule-based operator stop")
-            elif intent in {"release_grippers", "close_grippers"}:
+            elif intent in {
+                "release_grippers",
+                "close_grippers",
+                "close_right_gripper",
+            }:
                 session = getattr(self._components, "session", None)
                 state = getattr(
                     getattr(session, "state_machine", None),
@@ -1329,12 +1333,23 @@ class RuleBasedRealTeleopExtension:
                     self._gripper_action_status = (
                         "夹爪独立控制仅在没有活动 Episode 的采集前或轮次间可用。"
                     )
+                elif (
+                    intent == "close_right_gripper"
+                    and "right" not in self.config.gripper_sides
+                ):
+                    self._gripper_action_status = "当前拓扑没有已启用的右夹爪。"
                 else:
                     self._pending_gripper_action = str(intent)
                     self._manual_gripper_started_at = None
                     self._manual_gripper_last_command_by_side.clear()
                     self._gripper_action_status = (
-                        "已排队：松开夹爪" if intent == "release_grippers" else "已排队：闭紧夹爪"
+                        "已排队：松开夹爪"
+                        if intent == "release_grippers"
+                        else (
+                            "已排队：闭紧右夹爪"
+                            if intent == "close_right_gripper"
+                            else "已排队：闭紧夹爪"
+                        )
                     )
         self._publish_status()
 
@@ -2306,6 +2321,18 @@ class RuleBasedRealTeleopExtension:
         suffix = f"/{skip_reason}" if skip_reason else ""
         return "failed", f"{side}:{label}{suffix}"
 
+    def _manual_gripper_action_sides(self, intent: str) -> tuple[str, ...]:
+        """Return the hand scope for one maintenance intent.
+
+        Generic GUI gripper actions retain their configured all-side behavior.
+        The task chain uses the explicit right-only intent because only the
+        right hand owns the pen; the left hand must not receive a close command.
+        """
+
+        if intent == "close_right_gripper":
+            return ("right",) if "right" in self.config.gripper_sides else ()
+        return tuple(self.config.gripper_sides)
+
     def _dispatch_pending_gripper_action(self, observation: object, now: float) -> None:
         """Advance one feedback-gated reset increment through the Session Rig.
 
@@ -2320,6 +2347,11 @@ class RuleBasedRealTeleopExtension:
 
         intent = self._pending_gripper_action
         if intent is None:
+            return
+        action_sides = self._manual_gripper_action_sides(intent)
+        if not action_sides:
+            self._gripper_action_status = "当前拓扑没有可用的目标夹爪。"
+            self._clear_manual_gripper_action()
             return
         session = getattr(self._components, "session", None)
         if session is None:
@@ -2346,7 +2378,7 @@ class RuleBasedRealTeleopExtension:
         if self._manual_gripper_started_at is None:
             self._manual_gripper_started_at = float(now)
             self._manual_gripper_last_progress_at_by_side = {
-                side: float(now) for side in self.config.gripper_sides
+                side: float(now) for side in action_sides
             }
 
         hand_qpos: dict[str, np.ndarray] = {}
@@ -2359,7 +2391,7 @@ class RuleBasedRealTeleopExtension:
         resend_sides: set[str] = set()
         target_scalar = 0.0 if intent == "release_grippers" else 1.0
         direction = -1.0 if intent == "release_grippers" else 1.0
-        for side in self.config.gripper_sides:
+        for side in action_sides:
             backend = getattr(self._components, f"{side}_hand_backend", None)
             if backend is None:
                 unavailable.append(side)
@@ -2482,7 +2514,7 @@ class RuleBasedRealTeleopExtension:
             return
         timed_out = [
             side
-            for side in self.config.gripper_sides
+            for side in action_sides
             if side not in arrived
             and (
                 float(now)
@@ -2505,13 +2537,27 @@ class RuleBasedRealTeleopExtension:
             self._clear_manual_gripper_action()
             return
         if not hand_qpos:
-            if len(arrived) == len(self.config.gripper_sides):
+            if len(arrived) == len(action_sides):
                 self._gripper_action_status = (
-                    "夹爪实测已松开" if intent == "release_grippers" else "夹爪实测已闭紧"
+                    "夹爪实测已松开"
+                    if intent == "release_grippers"
+                    else (
+                        "右夹爪实测已闭紧"
+                        if intent == "close_right_gripper"
+                        else "夹爪实测已闭紧"
+                    )
                 )
                 self._clear_manual_gripper_action()
             elif waiting:
-                action_label = "松开" if intent == "release_grippers" else "闭紧"
+                action_label = (
+                    "松开"
+                    if intent == "release_grippers"
+                    else (
+                        "闭紧右夹爪"
+                        if intent == "close_right_gripper"
+                        else "闭紧"
+                    )
+                )
                 self._gripper_action_status = (
                     f"正在{action_label}夹爪：等待逐段实测到位（"
                     + ",".join(waiting)
@@ -2530,6 +2576,7 @@ class RuleBasedRealTeleopExtension:
                 source="rule_based_manual_gripper",
                 metadata={
                     "rule_based_manual_gripper_action": intent,
+                    "rule_based_manual_gripper_sides": list(action_sides),
                     "rule_based_manual_gripper_max_step": float(
                         self.config.gripper_max_step
                     ),
@@ -2546,7 +2593,10 @@ class RuleBasedRealTeleopExtension:
                 },
             )
             command = self.adapter.resolver.resolve(action)
-            manual_continuous_grasp = intent == "close_grippers"
+            manual_continuous_grasp = intent in {
+                "close_grippers",
+                "close_right_gripper",
+            }
             for side in hand_qpos:
                 effector = command.commands.get(f"{side}_hand")
                 if effector is None:
@@ -2564,6 +2614,7 @@ class RuleBasedRealTeleopExtension:
             command.metadata.update(
                 {
                     "rule_based_manual_gripper_action": intent,
+                    "rule_based_manual_gripper_sides": list(action_sides),
                     "rule_based_capture_enabled": False,
                     "rule_based_arm_motion": False,
                     "external_gripper_motion": True,
@@ -2648,7 +2699,15 @@ class RuleBasedRealTeleopExtension:
                 retrying.append(detail)
             else:
                 failed.append(detail)
-        action_label = "松开" if intent == "release_grippers" else "闭紧"
+        action_label = (
+            "松开"
+            if intent == "release_grippers"
+            else (
+                "闭紧右夹爪"
+                if intent == "close_right_gripper"
+                else "闭紧"
+            )
+        )
         if failed:
             partial = (
                 "；部分侧已发送 " + ",".join(sorted(accepted))
