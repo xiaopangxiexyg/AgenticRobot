@@ -4,12 +4,16 @@ import pytest
 
 from robot_motion.rebot_b601_rs import (
     B601_SHARED_POLICY_FRAME,
+    B601AssistCommissioningState,
     B601PolicyAssistCommand,
     B601PolicyCommandBuffer,
     B601PolicyCommandSample,
     B601SharedControlConfig,
     B601SharedControlMode,
+    B601SharedControlRuntime,
     B601SharedControlState,
+    B601SingleJointAssistConfig,
+    B601SingleJointAssistSession,
     compute_b601_shared_control_step,
 )
 
@@ -44,6 +48,121 @@ def _config() -> B601SharedControlConfig:
 
 def _accepted(command: B601PolicyAssistCommand) -> B601PolicyCommandSample:
     return B601PolicyCommandSample(command, True, "accepted", 0.01)
+
+
+def _assist_session(
+    **overrides: object,
+) -> tuple[B601SingleJointAssistConfig, B601SharedControlRuntime, B601SingleJointAssistSession]:
+    config = B601SingleJointAssistConfig(
+        countdown_sec=1.0,
+        assist_duration_sec=2.0,
+        **overrides,
+    )
+    runtime = B601SharedControlRuntime(config.shared_control_config())
+    return config, runtime, B601SingleJointAssistSession(config, runtime)
+
+
+def test_single_joint_commissioning_uses_only_target_joint_gains() -> None:
+    config = B601SingleJointAssistConfig(joint_name="joint6")
+    shared = config.shared_control_config()
+
+    assert shared.position_kp_nm_per_rad == (0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    assert shared.velocity_kd_nm_s_per_rad == ZERO
+
+
+def test_single_joint_commissioning_rejects_motion_and_out_of_limit_target() -> None:
+    _config_value, _runtime, session = _assist_session()
+    limits = ((-1.0, 1.0),) * 6
+
+    with pytest.raises(ValueError, match="not stationary"):
+        session.arm(
+            measured_qpos_rad=ZERO,
+            measured_qvel_rad_s=(0.0, 0.0, 0.0, 0.0, 0.0, 0.03),
+            position_limits_rad=limits,
+            timestamp_sec=1.0,
+        )
+
+    with pytest.raises(ValueError, match="outside"):
+        session.arm(
+            measured_qpos_rad=(0.0, 0.0, 0.0, 0.0, 0.0, 0.95),
+            measured_qvel_rad_s=ZERO,
+            position_limits_rad=limits,
+            timestamp_sec=1.0,
+        )
+
+
+def test_single_joint_commissioning_is_one_shot_and_has_no_return_target() -> None:
+    config, runtime, session = _assist_session()
+    limits = ((-1.0, 1.0),) * 6
+    anchor = (0.0, 0.0, 0.0, 0.0, 0.0, 0.20)
+
+    armed = session.arm(
+        measured_qpos_rad=anchor,
+        measured_qvel_rad_s=ZERO,
+        position_limits_rad=limits,
+        timestamp_sec=10.0,
+    )
+    assert armed.event == "ARMED"
+    assert session.target_qpos_rad == pytest.approx((*anchor[:5], 0.30))
+    assert session.step(
+        measured_qpos_rad=anchor,
+        measured_qvel_rad_s=ZERO,
+        timestamp_sec=10.5,
+    ) == ()
+
+    events = session.step(
+        measured_qpos_rad=anchor,
+        measured_qvel_rad_s=ZERO,
+        timestamp_sec=11.0,
+    )
+    assert [event.event for event in events] == ["ACTIVE"]
+    active = runtime.step(
+        control_sequence=1,
+        control_timestamp_sec=11.0,
+        measured_qpos_rad=anchor,
+        measured_qvel_rad_s=ZERO,
+        dt_sec=0.05,
+    )
+    assert active.decision.assist_torque_nm[-1] > 0.0
+    assert active.reference.qpos_rad == anchor
+
+    completed = session.step(
+        measured_qpos_rad=(*anchor[:5], 0.25),
+        measured_qvel_rad_s=ZERO,
+        timestamp_sec=13.01,
+    )
+    assert [event.event for event in completed] == ["COMPLETE"]
+    assert session.state is B601AssistCommissioningState.COMPLETE
+    passive = runtime.step(
+        control_sequence=2,
+        control_timestamp_sec=13.01,
+        measured_qpos_rad=(*anchor[:5], 0.25),
+        measured_qvel_rad_s=ZERO,
+        dt_sec=0.05,
+    )
+    assert passive.decision.assist_torque_nm == ZERO
+    assert passive.reference.qpos_rad == (*anchor[:5], 0.25)
+    assert config.offset_rad > 0.0
+
+
+def test_single_joint_countdown_motion_requires_a_new_anchor() -> None:
+    _config_value, runtime, session = _assist_session()
+    session.arm(
+        measured_qpos_rad=ZERO,
+        measured_qvel_rad_s=ZERO,
+        position_limits_rad=((-1.0, 1.0),) * 6,
+        timestamp_sec=1.0,
+    )
+
+    events = session.step(
+        measured_qpos_rad=ZERO,
+        measured_qvel_rad_s=(0.0, 0.0, 0.0, 0.0, 0.0, 0.03),
+        timestamp_sec=1.1,
+    )
+
+    assert [event.event for event in events] == ["COUNTDOWN_REJECTED"]
+    assert session.state is B601AssistCommissioningState.WAITING
+    assert runtime.clear_policy() is None
 
 
 def test_policy_command_rejects_wrong_frame_and_clock_order() -> None:

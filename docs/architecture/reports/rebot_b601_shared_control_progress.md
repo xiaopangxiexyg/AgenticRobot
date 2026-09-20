@@ -103,20 +103,38 @@ JSONL 轮询、第二个 CAN owner 或后台进程。
 该阶段建立的是“RM65 运动意图 → B601 bounded assist”的纯软件接线，并不表示已经接入
 真实 policy provider 或真机执行。
 
+### P5：真机单关节助力调试协议（待人工验收）
+
+现有 `rebot_b601_rs_owner.py` 增加默认关闭、二次确认的一次性单关节助力协议，仍由原
+gravity/damping owner 独占 CAN。协议不复用会固定启动位置的 `slow-step`：
+
+- 到达 `STARTUP ACTIVE` 后仍保持纯重力补偿和 driver-local damping；
+- 操作者释放机械臂并按 `A` 后，才从当帧完整、新鲜且静止的实测 q 捕获相对目标；
+- 倒计时内检测到运动会拒绝该锚点，保持零助力并要求重新按 `A`；
+- 助力只作用于显式目标关节，并经过 target-error、assist-torque、assist-slew、authority
+  ramp 以及原 owner 的最终总力矩限制；
+- `C`、试验时长完成、stale/fault 或 owner 退出都会撤销 policy assist；撤销后 reference
+  继续跟随当前实测 q，不生成返回捕获位置的目标；
+- 原第一 Ctrl-C/protective hold、第二 Ctrl-C/SIGUSR1 全失能语义不变。
+
+首轮默认面向 J6：相对偏移 `0.10 rad`，误差上限 `0.05 rad`，助力上限 `0.05 Nm`，
+助力力矩变化率 `0.10 Nm/s`，权限上升 `0.5/s`，持续 `4 s`。这些是可调整的调试参数，
+不是硬件认证限值。自动测试不连接 CAN，也不构成真机通过证据。
+
 ## 3. 当前证据边界
 
 - 纯控制、runtime、MuJoCo 和低增益 probe 单元/契约测试通过；
 - MuJoCo 只证明方向、生命周期、边界和定性运动；
-- P3/P4 尚未连接真实 policy provider，也未执行真机；
+- P3/P4 尚未连接真实 policy provider；P5 尚未执行真机；
 - 没有自动人工外力检测、policy replan、真实 torque sensing 或 passivity 声明；
 - 当前候选不合并、不 push、不安装。
 
 ## 4. 下一步
 
-1. 在 application leaf 中复用 P4 bridge 装配 scripted policy producer、显式 policy clutch 与
+1. 由现场操作者前台运行 P5 的 J6 低助力协议，先确认重力/阻尼稳定，再按 `A`；记录方向、
+   可见位移、人工阻挡手感、撤销后无回拉及完整 cleanup receipt。
+2. P5 通过后再逐级调整 J6 助力上限/偏移；未获得独立证据前不扩展到 J1--J5。
+3. 在 application leaf 中复用 P4 bridge 装配真实 policy producer、显式 policy clutch 与
    同进程 runtime；不得让 producer 获得 backend/CAN handle。
-2. 用 MuJoCo 验证跨频率 latest-value、stale、clutch、rebase、
-   无回弹和日志，再决定本地进程间传输是否真的需要。
-3. 增加 shadow-only 真机观察：计算但不发送 assist，验证符号、量级、freshness 和 deadline。
-4. 只有 shadow evidence 通过后，才提供前台、低权限、单关节起步的真机命令；退出仍进入原
-   gravity+damping protective hold，第二次停止才允许全失能。
+4. 增加自动人工干预检测 shadow，验证符号、量级、freshness 和 deadline 后才允许其改变
+   authority。

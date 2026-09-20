@@ -28,6 +28,7 @@ DEFAULT_REBOT_SOURCE_ROOT = REPO_ROOT / "hardware" / "reBotArm_control_py"
 DEFAULT_CONFIG = DEFAULT_REBOT_SOURCE_ROOT / "config" / "rebotarm_rs.yaml"
 DEFAULT_OUTPUT_ROOT = Path("/tmp/b601-rs-commissioning")
 DEFAULT_CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
+DEFAULT_ASSIST_CONFIRMATION = "B601_RS_SINGLE_JOINT_POLICY_ASSIST"
 DEFAULT_DRIVER_KD = (0.20, 0.30, 0.20, 0.15, 0.10, 0.05)
 DEFAULT_GRAVITY_SCALES = (1.0, 0.95, 1.0, 1.0, 1.0, 1.0)
 DEFAULT_GRAVITY_OFFSETS = (0.0,) * 6
@@ -83,6 +84,46 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--kp", type=float, default=0.0)
     parser.add_argument("--kd", type=float, default=0.0)
+    parser.add_argument(
+        "--single-joint-assist",
+        action="store_true",
+        help=(
+            "run one operator-armed relative joint assist trial inside this "
+            "same gravity/damping owner"
+        ),
+    )
+    parser.add_argument(
+        "--assist-joint",
+        choices=("joint1", "joint2", "joint3", "joint4", "joint5", "joint6"),
+        default="joint6",
+    )
+    parser.add_argument("--assist-offset-rad", type=float, default=0.10)
+    parser.add_argument("--assist-kp-nm-per-rad", type=float, default=1.0)
+    parser.add_argument("--assist-kd-nm-s-per-rad", type=float, default=0.0)
+    parser.add_argument("--assist-max-target-error-rad", type=float, default=0.05)
+    parser.add_argument("--assist-max-torque-nm", type=float, default=0.05)
+    parser.add_argument("--assist-torque-slew-nm-s", type=float, default=0.10)
+    parser.add_argument("--assist-authority-rise-per-sec", type=float, default=0.5)
+    parser.add_argument(
+        "--assist-command-stale-timeout-sec",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument("--assist-countdown-sec", type=float, default=3.0)
+    parser.add_argument("--assist-duration-sec", type=float, default=4.0)
+    parser.add_argument(
+        "--assist-stationarity-limit-rad-s",
+        type=float,
+        default=0.02,
+    )
+    parser.add_argument(
+        "--assist-confirmation",
+        default="",
+        help=(
+            "required exact acknowledgement for --single-joint-assist: "
+            f"{DEFAULT_ASSIST_CONFIRMATION}"
+        ),
+    )
     parser.add_argument(
         "--driver-kd",
         type=float,
@@ -232,6 +273,38 @@ def build_probe_command(
         command.extend(("--allow-active-report", "--auto-disable-active-report"))
     if not args.without_driver_torque_limits:
         command.append("--apply-driver-torque-limits")
+    if args.single_joint_assist:
+        command.extend(
+            (
+                "--single-joint-assist",
+                "--assist-joint",
+                args.assist_joint,
+                "--assist-offset-rad",
+                str(args.assist_offset_rad),
+                "--assist-kp-nm-per-rad",
+                str(args.assist_kp_nm_per_rad),
+                "--assist-kd-nm-s-per-rad",
+                str(args.assist_kd_nm_s_per_rad),
+                "--assist-max-target-error-rad",
+                str(args.assist_max_target_error_rad),
+                "--assist-max-torque-nm",
+                str(args.assist_max_torque_nm),
+                "--assist-torque-slew-nm-s",
+                str(args.assist_torque_slew_nm_s),
+                "--assist-authority-rise-per-sec",
+                str(args.assist_authority_rise_per_sec),
+                "--assist-command-stale-timeout-sec",
+                str(args.assist_command_stale_timeout_sec),
+                "--assist-countdown-sec",
+                str(args.assist_countdown_sec),
+                "--assist-duration-sec",
+                str(args.assist_duration_sec),
+                "--assist-stationarity-limit-rad-s",
+                str(args.assist_stationarity_limit_rad_s),
+                "--assist-confirmation",
+                args.assist_confirmation,
+            )
+        )
     return command
 
 
@@ -255,6 +328,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         _parser().error(
             "real B601 owner is motion-capable; rerun with explicit --allow-motion"
         )
+    if args.single_joint_assist:
+        if args.mode != "hold":
+            _parser().error("--single-joint-assist requires --mode hold")
+        if args.assist_confirmation != DEFAULT_ASSIST_CONFIRMATION:
+            _parser().error(
+                "--single-joint-assist requires --assist-confirmation "
+                f"{DEFAULT_ASSIST_CONFIRMATION}"
+            )
+    elif args.assist_confirmation:
+        _parser().error(
+            "--assist-confirmation requires --single-joint-assist"
+        )
     config = Path(args.config).expanduser()
     source_root = Path(args.rebot_source_root).expanduser()
     missing = [
@@ -267,6 +352,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_dir = Path(tempfile.mkdtemp(prefix="b601-owner-", dir=output_root))
     command = build_probe_command(args, run_dir=run_dir)
     print("[B601] foreground gravity/damping owner starts", flush=True)
+    if args.single_joint_assist:
+        print(
+            "[B601] one-shot relative joint assist is enabled; press A only "
+            "after STARTUP ACTIVE and ASSIST READY",
+            flush=True,
+        )
     print("[B601] THIS COMMAND MAY ENABLE SIX REAL JOINTS; keep E-stop ready", flush=True)
     print("[B601] first Ctrl-C requests protective hold; second Ctrl-C/SIGUSR1 requests full disable", flush=True)
     print(f"[B601] run directory: {run_dir}", flush=True)

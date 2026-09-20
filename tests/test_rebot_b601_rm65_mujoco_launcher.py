@@ -170,6 +170,43 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
     low_gain_probe._validate_cli(parsed_probe_args)
 
 
+def test_owner_launcher_builds_one_shot_assist_inside_existing_owner(
+    tmp_path: Path,
+) -> None:
+    args = owner._parser().parse_args(
+        [
+            "--allow-motion",
+            "--single-joint-assist",
+            "--assist-joint",
+            "joint6",
+            "--assist-offset-rad",
+            "0.1",
+            "--assist-confirmation",
+            owner.DEFAULT_ASSIST_CONFIRMATION,
+        ]
+    )
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+
+    assert "--single-joint-assist" in command
+    assert command[command.index("--assist-joint") + 1] == "joint6"
+    assert command[command.index("--assist-offset-rad") + 1] == "0.1"
+    assert (
+        command[command.index("--assist-confirmation") + 1]
+        == low_gain_probe.SINGLE_JOINT_ASSIST_CONFIRMATION
+    )
+    parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    low_gain_probe._validate_cli(parsed_probe_args)
+    runtime, session = low_gain_probe._build_single_joint_assist(parsed_probe_args)
+    assert session.runtime is runtime
+    low_gain_probe._validate_shared_control_integration(parsed_probe_args, runtime)
+
+
+def test_owner_launcher_rejects_assist_without_second_confirmation() -> None:
+    with pytest.raises(SystemExit) as error:
+        owner.main(["--allow-motion", "--single-joint-assist"])
+    assert error.value.code == 2
+
+
 def test_owner_launcher_rejects_missing_motion_ack_before_resource_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

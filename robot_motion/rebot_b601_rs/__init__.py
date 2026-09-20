@@ -3,6 +3,12 @@
 Importing this package has no hardware or vendor-package side effects.
 """
 
+from .assist_commissioning import (
+    B601AssistCommissioningEvent,
+    B601AssistCommissioningState,
+    B601SingleJointAssistConfig,
+    B601SingleJointAssistSession,
+)
 from .gripper_mapping import (
     B601_RM65_GRIPPER_MAPPING_SCHEMA_V1,
     B601_RS_GRIPPER_SOURCE_V1,
@@ -104,6 +110,8 @@ __all__ = [
     "RM65_FREE_DRIVE_SAMPLE_SCHEMA_V1",
     "RM65_TO_B601_RETARGET_HASH_DOMAIN_V1",
     "RM65_TO_B601_RETARGET_SCHEMA_V1",
+    "B601AssistCommissioningEvent",
+    "B601AssistCommissioningState",
     "B601DampedLeastSquaresIK",
     "B601HapticWrenchChannel",
     "B601HapticWrenchOutput",
@@ -129,6 +137,8 @@ __all__ = [
     "B601SharedControlOutput",
     "B601SharedControlRuntime",
     "B601SharedControlState",
+    "B601SingleJointAssistConfig",
+    "B601SingleJointAssistSession",
     "B601SingularityMetrics",
     "B601SpatialWrench",
     "B601TranslationalVirtualSpring",

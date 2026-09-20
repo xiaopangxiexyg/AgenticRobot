@@ -34,7 +34,9 @@ An application leaf may inject the I/O-free ``B601SharedControlRuntime`` into
 software position/damping gains.  It follows current measured position and
 adds only the runtime's independently bounded policy-assist overlay before the
 existing gravity, final torque conditioning and sole MIT dispatch.  The normal
-CLI does not construct this runtime, so commissioning behavior is unchanged.
+CLI does not construct this runtime unless the separate single-joint assist
+flag and confirmation are both supplied, so default commissioning behavior is
+unchanged.
 
 The dispatched RobStride MIT ``kp`` is zero in the final active and protective
 controllers.  The temporary startup/replay lock is the one explicit exception:
@@ -172,6 +174,7 @@ from hardware.rebot_b601_rs import (
 )
 from hardware.rebot_b601_rs.active_report import B601ActiveReportControlGate
 from robot_motion.rebot_b601_rs import (
+    B601AssistCommissioningState,
     B601MitControlProfile,
     B601MitReference,
     B601MitTorqueBreakdown,
@@ -179,12 +182,15 @@ from robot_motion.rebot_b601_rs import (
     B601PoseVirtualSpring,
     B601SharedControlFrame,
     B601SharedControlRuntime,
+    B601SingleJointAssistConfig,
+    B601SingleJointAssistSession,
     B601TranslationalVirtualSpring,
     compute_b601_mit_torque,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
 
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
+SINGLE_JOINT_ASSIST_CONFIRMATION = "B601_RS_SINGLE_JOINT_POLICY_ASSIST"
 FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
 DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
@@ -3519,6 +3525,7 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
+    _validate_single_joint_assist_cli(args)
     feedback_source = getattr(args, "feedback_source", "parameter")
     if feedback_source not in ("parameter", "active-report"):
         raise LowGainProbeError(f"unknown feedback source: {feedback_source}")
@@ -5112,6 +5119,70 @@ def _validate_shared_control_integration(
         )
 
 
+def _single_joint_assist_config_from_args(
+    args: argparse.Namespace,
+) -> B601SingleJointAssistConfig:
+    return B601SingleJointAssistConfig(
+        joint_name=args.assist_joint,
+        offset_rad=args.assist_offset_rad,
+        position_kp_nm_per_rad=args.assist_kp_nm_per_rad,
+        velocity_kd_nm_s_per_rad=args.assist_kd_nm_s_per_rad,
+        max_target_error_rad=args.assist_max_target_error_rad,
+        max_abs_assist_torque_nm=args.assist_max_torque_nm,
+        max_assist_torque_rate_nm_s=args.assist_torque_slew_nm_s,
+        authority_rise_per_sec=args.assist_authority_rise_per_sec,
+        command_stale_timeout_sec=args.assist_command_stale_timeout_sec,
+        countdown_sec=args.assist_countdown_sec,
+        assist_duration_sec=args.assist_duration_sec,
+        stationarity_limit_rad_s=args.assist_stationarity_limit_rad_s,
+    )
+
+
+def _build_single_joint_assist(
+    args: argparse.Namespace,
+) -> tuple[B601SharedControlRuntime, B601SingleJointAssistSession] | None:
+    """Build the explicit CLI commissioning producer inside the sole owner."""
+
+    if not getattr(args, "single_joint_assist", False):
+        return None
+    config = _single_joint_assist_config_from_args(args)
+    runtime = B601SharedControlRuntime(config.shared_control_config())
+    return runtime, B601SingleJointAssistSession(config, runtime)
+
+
+def _validate_single_joint_assist_cli(args: argparse.Namespace) -> None:
+    enabled = bool(getattr(args, "single_joint_assist", False))
+    confirmation = str(getattr(args, "assist_confirmation", ""))
+    if not enabled:
+        if confirmation:
+            raise LowGainProbeError(
+                "--assist-confirmation requires --single-joint-assist"
+            )
+        return
+    if args.mode != "hold":
+        raise LowGainProbeError("single-joint assist requires --mode hold")
+    if confirmation != SINGLE_JOINT_ASSIST_CONFIRMATION:
+        raise LowGainProbeError(
+            "single-joint assist requires --assist-confirmation "
+            f"{SINGLE_JOINT_ASSIST_CONFIRMATION}"
+        )
+    if float(args.kp) != 0.0 or float(args.kd) != 0.0:
+        raise LowGainProbeError(
+            "single-joint assist requires zero software --kp and --kd"
+        )
+    if getattr(args, "guided_pose_axis_protocol", False) or getattr(
+        args,
+        "interactive_pose_axis_protocol",
+        False,
+    ):
+        raise LowGainProbeError(
+            "single-joint assist cannot be combined with a pose-axis protocol"
+        )
+    # Constructing the pure config here validates all numeric bounds without
+    # opening CAN or creating a hardware backend.
+    _single_joint_assist_config_from_args(args)
+
+
 def _shared_control_config_payload(
     runtime: B601SharedControlRuntime,
 ) -> dict[str, object]:
@@ -6618,11 +6689,21 @@ def run_probe(
     args: argparse.Namespace,
     *,
     shared_control_runtime: B601SharedControlRuntime | None = None,
+    shared_control_commissioning: B601SingleJointAssistSession | None = None,
 ) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
     _validate_cli(args)
     _validate_shared_control_integration(args, shared_control_runtime)
+    if shared_control_commissioning is not None:
+        if shared_control_runtime is None:
+            raise LowGainProbeError(
+                "shared-control commissioning requires a shared-control runtime"
+            )
+        if shared_control_commissioning.runtime is not shared_control_runtime:
+            raise LowGainProbeError(
+                "commissioning session and hardware owner must share one runtime"
+            )
     feedback_source = getattr(args, "feedback_source", "parameter")
     driver_kd_arg = getattr(args, "driver_kd", None)
     driver_kd_nm_s_per_rad = (
@@ -6892,6 +6973,7 @@ def run_probe(
     operator_keys: OperatorKeyReader | None = None
     calibration_ready = False
     startup_replay_ready = False
+    assist_ready = False
     last_control_elapsed_sec = 0.0
     connected = False
     enabled = False
@@ -6962,6 +7044,7 @@ def run_probe(
             calibration_capture is not None
             or startup_replay_capture is not None
             or interactive_pose_axis_guide is not None
+            or shared_control_commissioning is not None
         ):
             # Establish the interactive input path before opening the backend or
             # changing any drive state.
@@ -7817,6 +7900,72 @@ def run_probe(
                             action_count=len(interactive_pose_axis_guide.actions),
                         )
                     )
+            if (
+                shared_control_commissioning is not None
+                and handoff_fraction >= 1.0
+            ):
+                if not assist_ready:
+                    if operator_keys is None:
+                        raise LowGainProbeError(
+                            "single-joint assist operator terminal is unavailable"
+                        )
+                    operator_keys.flush()
+                    assist_ready = True
+                    assist_config = shared_control_commissioning.config
+                    _operator_notice(
+                        "[B601] [ASSIST READY] gravity and damping only. "
+                        "Release the arm, wait until stationary, then press A "
+                        "once without Enter. Press C to withdraw active assist."
+                    )
+                    _operator_notice(
+                        "[B601] [ASSIST LIMITS] "
+                        f"joint={assist_config.joint_name} "
+                        f"offset={assist_config.offset_rad:.6f}rad "
+                        f"max_torque={assist_config.max_abs_assist_torque_nm:.6f}Nm "
+                        f"duration={assist_config.assist_duration_sec:.3f}s"
+                    )
+                keys = operator_keys.poll_keys() if operator_keys is not None else frozenset()
+                assist_state = shared_control_commissioning.state
+                if "c" in keys and assist_state in {
+                    B601AssistCommissioningState.COUNTDOWN,
+                    B601AssistCommissioningState.ACTIVE,
+                }:
+                    assist_event = shared_control_commissioning.cancel(
+                        timestamp_sec=state.receive_timestamp_sec,
+                        detail=(
+                            "operator C withdrew assist; no return target; "
+                            "gravity and damping remain"
+                        ),
+                    )
+                    _operator_notice(
+                        f"[B601] [ASSIST {assist_event.event}] {assist_event.detail}"
+                    )
+                elif (
+                    "a" in keys
+                    and assist_state is B601AssistCommissioningState.WAITING
+                ):
+                    try:
+                        assist_event = shared_control_commissioning.arm(
+                            measured_qpos_rad=q,
+                            measured_qvel_rad_s=qvel,
+                            position_limits_rad=position_limits,
+                            timestamp_sec=state.receive_timestamp_sec,
+                        )
+                    except ValueError as exc:
+                        _operator_notice(f"[B601] [ASSIST NOT ARMED] {exc}")
+                    else:
+                        _operator_notice(
+                            f"[B601] [ASSIST {assist_event.event}] "
+                            f"{assist_event.detail}"
+                        )
+                for assist_event in shared_control_commissioning.step(
+                    measured_qpos_rad=q,
+                    measured_qvel_rad_s=qvel,
+                    timestamp_sec=state.receive_timestamp_sec,
+                ):
+                    _operator_notice(
+                        f"[B601] [ASSIST {assist_event.event}] {assist_event.detail}"
+                    )
             if calibration_capture is not None:
                 if handoff_fraction >= 1.0 and not calibration_ready:
                     if operator_keys is None:
@@ -8154,6 +8303,11 @@ def run_probe(
                     "dispatch_qref_rad": dispatch_reference.qpos_rad,
                     "qvel_ref_rad_s": qvel_ref,
                     "shared_control": shared_control_audit,
+                    "shared_control_commissioning_state": (
+                        shared_control_commissioning.state.value
+                        if shared_control_commissioning is not None
+                        else None
+                    ),
                     "startup_state": startup_state_history[-1],
                     "gravity_ramp_fraction": gravity_ramp,
                     "startup_handoff_fraction": handoff_fraction,
@@ -8709,12 +8863,18 @@ def run_probe(
             or interactive_pose_axis_guide.completed
         )
     )
+    shared_control_commissioning_passed = (
+        shared_control_commissioning is None
+        or shared_control_commissioning.state
+        is B601AssistCommissioningState.COMPLETE
+    )
     acceptance_passed = (
         control_passed
         and response_passed
         and calibration_passed
         and startup_replay_passed
         and operator_guidance_passed
+        and shared_control_commissioning_passed
     )
     max_abs_requested = max(
         (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
@@ -9263,6 +9423,14 @@ def run_probe(
                 else None
             ),
             "hardware_acceptance": "NOT_CLAIMED",
+            "commissioning": (
+                shared_control_commissioning.audit()
+                if shared_control_commissioning is not None
+                else None
+            ),
+            "commissioning_acceptance": (
+                "PASS" if shared_control_commissioning_passed else "INCOMPLETE"
+            ),
         },
         "cartesian_impedance": {
             "enabled": args.mode == "cartesian-hold",
@@ -9559,6 +9727,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional software damping gain override for --joint only",
     )
     parser.add_argument(
+        "--single-joint-assist",
+        action="store_true",
+        help=(
+            "opt in to one operator-armed relative joint policy-assist trial "
+            "inside the existing gravity/damping owner"
+        ),
+    )
+    parser.add_argument(
+        "--assist-joint",
+        choices=_ALL_JOINTS,
+        default="joint6",
+    )
+    parser.add_argument(
+        "--assist-offset-rad",
+        type=float,
+        default=0.10,
+        help="signed relative target offset captured from fresh measured state",
+    )
+    parser.add_argument("--assist-kp-nm-per-rad", type=float, default=1.0)
+    parser.add_argument("--assist-kd-nm-s-per-rad", type=float, default=0.0)
+    parser.add_argument(
+        "--assist-max-target-error-rad",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument("--assist-max-torque-nm", type=float, default=0.05)
+    parser.add_argument(
+        "--assist-torque-slew-nm-s",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--assist-authority-rise-per-sec",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--assist-command-stale-timeout-sec",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument("--assist-countdown-sec", type=float, default=3.0)
+    parser.add_argument("--assist-duration-sec", type=float, default=4.0)
+    parser.add_argument(
+        "--assist-stationarity-limit-rad-s",
+        type=float,
+        default=0.02,
+    )
+    parser.add_argument(
+        "--assist-confirmation",
+        default="",
+        help=(
+            "second exact acknowledgement required by --single-joint-assist"
+        ),
+    )
+    parser.add_argument(
         "--protective-hold-kd",
         type=float,
         default=_DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
@@ -9839,7 +10063,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
         try:
-            payload = run_probe(args)
+            commissioning_pair = _build_single_joint_assist(args)
+            if commissioning_pair is None:
+                shared_runtime = None
+                commissioning_session = None
+            else:
+                shared_runtime, commissioning_session = commissioning_pair
+            payload = run_probe(
+                args,
+                shared_control_runtime=shared_runtime,
+                shared_control_commissioning=commissioning_session,
+            )
         except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
             payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
             exit_code = 2
