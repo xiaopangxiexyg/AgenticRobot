@@ -207,18 +207,39 @@ class B601RM65GripperMappingProfile:
         position_rad: float,
         *,
         clamp: bool = False,
+        calibration_tolerance_rad: float = 0.0,
     ) -> float:
-        """Convert a B601 motor position; reject uncalibrated/out-of-range input."""
+        """Convert a B601 motor position with explicit endpoint tolerance.
+
+        The default remains fail-closed.  A positive tolerance is intended for
+        a read-only simulation input where the RobStride position can overshoot
+        a manually sampled open/closed endpoint by a small amount; such a
+        sample is clamped to the corresponding endpoint.  Values beyond that
+        tolerance still reject the proposal.
+        """
 
         open_position, closed_position = self._require_b601_calibration()
         position = _finite(position_rad, name="b601_position_rad")
+        tolerance = _finite(
+            calibration_tolerance_rad,
+            name="calibration_tolerance_rad",
+        )
+        if tolerance < 0.0:
+            raise ValueError("calibration_tolerance_rad must be non-negative.")
         denominator = closed_position - open_position
         normalized = (position - open_position) / denominator
-        if not clamp and not -1e-9 <= normalized <= 1.0 + 1e-9:
+        lower = min(open_position, closed_position)
+        upper = max(open_position, closed_position)
+        outside = not -1e-9 <= normalized <= 1.0 + 1e-9
+        within_tolerance = lower - tolerance <= position <= upper + tolerance
+        if outside and not clamp and not within_tolerance:
             raise ValueError(
-                "B601 gripper position is outside the calibrated open/closed range."
+                "B601 gripper position is outside the calibrated open/closed "
+                f"range: position={position:.9g} rad, "
+                f"range=[{lower:.9g}, {upper:.9g}] rad, "
+                f"tolerance={tolerance:.9g} rad."
             )
-        if clamp:
+        if clamp or (outside and within_tolerance):
             normalized = min(1.0, max(0.0, normalized))
         if self.invert_b601:
             normalized = 1.0 - normalized
@@ -269,9 +290,14 @@ class B601RM65GripperMappingProfile:
         source_id: str = B601_RS_GRIPPER_SOURCE_V1,
         clock_domain_id: str = GRIPPER_CLOCK_DOMAIN_LOCAL_WALL_TIME,
         clamp: bool = False,
+        calibration_tolerance_rad: float = 0.0,
     ) -> NormalizedGripperSample:
         return NormalizedGripperSample(
-            close=self.b601_position_to_canonical(position_rad, clamp=clamp),
+            close=self.b601_position_to_canonical(
+                position_rad,
+                clamp=clamp,
+                calibration_tolerance_rad=calibration_tolerance_rad,
+            ),
             sequence=sequence,
             source_timestamp_sec=source_timestamp_sec,
             receive_timestamp_sec=receive_timestamp_sec,

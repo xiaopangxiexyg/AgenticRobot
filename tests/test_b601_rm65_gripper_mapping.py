@@ -137,6 +137,19 @@ def test_b601_position_mapping_is_explicit_and_round_trips() -> None:
     assert profile.b601_position_to_canonical(-0.1, clamp=True) == pytest.approx(1.0)
 
 
+def test_b601_position_mapping_allows_only_explicit_endpoint_tolerance() -> None:
+    profile = _mapping()
+    assert profile.b601_position_to_canonical(
+        1.05,
+        calibration_tolerance_rad=0.1,
+    ) == pytest.approx(0.0)
+    with pytest.raises(ValueError, match=r"position=1.2.*tolerance=0.1"):
+        profile.b601_position_to_canonical(
+            1.2,
+            calibration_tolerance_rad=0.1,
+        )
+
+
 def test_uncalibrated_b601_position_fails_closed() -> None:
     profile = load_b601_rm65_gripper_mapping_profile(PROFILE_PATH)
     with pytest.raises(GripperMappingCalibrationRequired):

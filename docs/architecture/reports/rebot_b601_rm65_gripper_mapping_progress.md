@@ -33,6 +33,10 @@ B601 J1–J6 的 FK、重力补偿、阻尼、保护保持或故障兜底状态�
   的 normalized scalar。
 - 适配器对非法样本、错误 source-id、未来/过期时间戳和不递增 sequence
   fail-closed，拒绝时不改变仿真目标。
+- B601 端点范围默认仍严格拒绝；只读 MuJoCo 入口可通过显式
+  `--gripper-calibration-tolerance-rad` 允许手工开合标定端点附近的小幅
+  越界，并钳制到对应端点。容差不会传入 B601 owner，也不会改变真实电机
+  的安全边界；超出容差仍会使整份 arm+hand proposal 进入 hold。
 - 样本默认声明 `clock_domain_id=local_wall_time`；设备单调时钟或其他时钟域
   必须在 source adapter 内先转换，不能由仿真 target 猜测。
 - B601 仿真夹爪是显式 opt-in；默认场景和默认 `B601PositionDriver` 仍保持
@@ -69,6 +73,9 @@ boundary + affected motion/model suites: 255 passed, 5 warnings
 ruff: PASS
 py_compile: PASS
 git diff --check: PASS
+
+端点容差回归及受影响组合：148 passed, 1 warning；ruff、py_compile 和
+git diff --check 继续通过。
 
 另外完成了一次组合 proposal 运行时检查：在 `enable_gripper=True` 的实际
 RM65 MuJoCo target 中，右臂 residual + J7 normalized close 同一 proposal

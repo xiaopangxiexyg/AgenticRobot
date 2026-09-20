@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -43,6 +44,7 @@ class B601ReadOnlyGripperSource:
         *,
         clock_domain_id: str,
         clamp: bool = False,
+        calibration_tolerance_rad: float = 0.0,
     ) -> None:
         if not isinstance(reader, _GripperReader):
             raise TypeError("reader must provide the read_position port")
@@ -52,10 +54,19 @@ class B601ReadOnlyGripperSource:
             raise ValueError("clock_domain_id must be non-empty")
         if not isinstance(clamp, bool):
             raise TypeError("clamp must be bool")
+        try:
+            tolerance = float(calibration_tolerance_rad)
+        except (TypeError, ValueError) as error:
+            raise TypeError("calibration_tolerance_rad must be finite") from error
+        if not math.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError(
+                "calibration_tolerance_rad must be finite and non-negative"
+            )
         self.reader = reader
         self.mapping = mapping
         self.clock_domain_id = str(clock_domain_id)
         self.clamp = clamp
+        self.calibration_tolerance_rad = tolerance
         self.last_step: B601ReadOnlyGripperStep | None = None
 
     def step(self) -> B601ReadOnlyGripperStep:
@@ -69,6 +80,7 @@ class B601ReadOnlyGripperSource:
                 source_id=B601_RS_GRIPPER_SOURCE_ID,
                 clock_domain_id=self.clock_domain_id,
                 clamp=self.clamp,
+                calibration_tolerance_rad=self.calibration_tolerance_rad,
             )
         except (TypeError, ValueError, RuntimeError) as error:
             result = B601ReadOnlyGripperStep(

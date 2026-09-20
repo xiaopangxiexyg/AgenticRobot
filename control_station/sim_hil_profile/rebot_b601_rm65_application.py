@@ -565,6 +565,13 @@ def _positive(value: str) -> float:
     return result
 
 
+def _nonnegative(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("value must be finite and non-negative")
+    return result
+
+
 def _finite_rotation_values(
     values: object | None,
     *,
@@ -925,6 +932,15 @@ def main(argv: list[str] | None = None) -> int:
         help="invert the calibrated B601 open-to-closed direction",
     )
     parser.add_argument(
+        "--gripper-calibration-tolerance-rad",
+        type=_nonnegative,
+        default=0.0,
+        help=(
+            "read-only simulation only: clamp a J7 position that is within "
+            "this many radians of a calibrated endpoint; default is strict 0"
+        ),
+    )
+    parser.add_argument(
         "--gripper-poll-hz",
         type=_positive,
         default=20.0,
@@ -1246,6 +1262,9 @@ def main(argv: list[str] | None = None) -> int:
                             "gripper_open_position_rad": gripper_mapping.b601_open_position_rad,
                             "gripper_closed_position_rad": gripper_mapping.b601_closed_position_rad,
                             "gripper_invert": gripper_mapping.invert_b601,
+                            "gripper_calibration_tolerance_rad": float(
+                                args.gripper_calibration_tolerance_rad
+                            ),
                         }
                     )
                     from control_station.sources.rebot_b601_gripper import (
@@ -1260,6 +1279,9 @@ def main(argv: list[str] | None = None) -> int:
                         gripper_reader,
                         gripper_mapping,
                         clock_domain_id=runtime.config.clock_domain_id,
+                        calibration_tolerance_rad=(
+                            args.gripper_calibration_tolerance_rad
+                        ),
                     )
                     gripper_next_poll = -math.inf
                     gripper_last_sample = None
