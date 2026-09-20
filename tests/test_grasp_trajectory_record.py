@@ -37,6 +37,14 @@ def _write(directory, trajectory):
             {"planning_phase": "pregrasp", "end_sample_index": 1, "end_time_sec": 0.2},
             {"planning_phase": "local_approach", "end_sample_index": 2, "end_time_sec": 0.4},
         ),
+        parameterization={
+            "mode": "continuous_c2",
+            "internal_path_waypoint_stops": False,
+        },
+        source_waypoints_by_side={
+            "left": np.zeros((2, 6)),
+            "right": np.arange(12, dtype=float).reshape(2, 6) * 0.01,
+        },
     )
 
 
@@ -53,6 +61,14 @@ def test_exact_grasp_plan_samples_survive_restart_and_are_immutable(tmp_path):
     assert metadata["stage_boundaries"][-1]["end_sample_index"] == 2
     assert metadata["collision_scope"] == "profile_sparse_proxy_pairs"
     assert metadata["collision_scene_profile"] == "dual_arm_hand_proxy_strict"
+    assert metadata["parameterization"]["mode"] == "continuous_c2"
+    assert metadata["source_waypoint_count"] == 2
+    with np.load(path, allow_pickle=False) as record:
+        np.testing.assert_array_equal(record["source_left_qpos"], np.zeros((2, 6)))
+        np.testing.assert_array_equal(
+            record["source_right_qpos"],
+            np.arange(12, dtype=float).reshape(2, 6) * 0.01,
+        )
     assert _write(tmp_path, original) == path
     assert path.stat().st_ino == stat_before.st_ino
 

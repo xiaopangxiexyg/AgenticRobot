@@ -14,6 +14,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from dataset_contracts.canonical_encoding import canonical_content_hash
+
 from .motion_port import RealAgentJointTrajectory
 
 
@@ -35,6 +37,31 @@ def load_grasp_trajectory_record(
             },
             planner_evidence_refs=tuple(metadata["planner_evidence_refs"]),
         )
+        if "source_waypoint_hash" in metadata:
+            if not {"source_left_qpos", "source_right_qpos"} <= set(data.files):
+                raise ValueError("Grasp trajectory record lost its source waypoints.")
+            source_waypoints = {
+                side: np.asarray(data[f"source_{side}_qpos"], dtype=float)
+                for side in ("left", "right")
+            }
+            if (
+                source_waypoints["left"].shape
+                != source_waypoints["right"].shape
+                or source_waypoints["left"].ndim != 2
+                or source_waypoints["left"].shape[1] != 6
+                or not all(np.all(np.isfinite(value)) for value in source_waypoints.values())
+                or source_waypoints["left"].shape[0]
+                != int(metadata["source_waypoint_count"])
+                or canonical_content_hash(
+                    {
+                        side: source_waypoints[side]
+                        for side in ("left", "right")
+                    },
+                    domain="dexteleop.real_agent_motion.grasp_source_waypoints.v1",
+                )
+                != metadata["source_waypoint_hash"]
+            ):
+                raise ValueError("Grasp trajectory source waypoints do not match metadata.")
     if metadata["schema"] != SCHEMA:
         raise ValueError("Unknown grasp trajectory record schema.")
     if (
@@ -58,6 +85,8 @@ def write_grasp_trajectory_record(
     target_tool_tcp_world: np.ndarray,
     speed_scale: float,
     stage_boundaries: tuple[Mapping[str, object], ...],
+    parameterization: Mapping[str, object] | None = None,
+    source_waypoints_by_side: Mapping[str, np.ndarray] | None = None,
 ) -> Path:
     """Publish a full plan once, without replacing an earlier record."""
 
@@ -73,6 +102,36 @@ def write_grasp_trajectory_record(
         raise ValueError("target_tool_tcp_world must be a finite 4x4 matrix.")
     identity = trajectory.semantic_content_hash
     destination = output_dir / f"{identity}.npz"
+    source_waypoints: dict[str, np.ndarray] | None = None
+    if source_waypoints_by_side is not None:
+        if set(source_waypoints_by_side) != {"left", "right"}:
+            raise ValueError("source_waypoints_by_side must contain left and right.")
+        source_waypoints = {
+            side: np.asarray(source_waypoints_by_side[side], dtype=float).copy()
+            for side in ("left", "right")
+        }
+        if (
+            source_waypoints["left"].shape != source_waypoints["right"].shape
+            or source_waypoints["left"].ndim != 2
+            or source_waypoints["left"].shape[0] < 1
+            or source_waypoints["left"].shape[1] != 6
+            or not all(np.all(np.isfinite(value)) for value in source_waypoints.values())
+        ):
+            raise ValueError(
+                "source waypoints must be matching finite waypoint_count x 6 arrays."
+            )
+    parameterization_payload = (
+        None
+        if parameterization is None
+        else json.loads(
+            json.dumps(
+                dict(parameterization),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    )
     metadata = {
         "schema": SCHEMA,
         "trajectory_hash": identity,
@@ -87,6 +146,18 @@ def write_grasp_trajectory_record(
         "speed_scale": float(speed_scale),
         "stage_boundaries": [dict(item) for item in stage_boundaries],
     }
+    if parameterization_payload is not None:
+        metadata["parameterization"] = parameterization_payload
+    if source_waypoints is not None:
+        metadata.update(
+            {
+                "source_waypoint_count": int(source_waypoints["left"].shape[0]),
+                "source_waypoint_hash": canonical_content_hash(
+                    source_waypoints,
+                    domain="dexteleop.real_agent_motion.grasp_source_waypoints.v1",
+                ),
+            }
+        )
     payload = json.dumps(
         metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -97,13 +168,20 @@ def write_grasp_trajectory_record(
             delete=False,
         ) as stream:
             temporary_path = Path(stream.name)
-            np.savez_compressed(
-                stream,
-                metadata_json=np.frombuffer(payload, dtype=np.uint8),
-                time_from_start_sec=trajectory.time_from_start_sec,
-                left_qpos=trajectory.qpos_by_side["left"],
-                right_qpos=trajectory.qpos_by_side["right"],
-            )
+            arrays = {
+                "metadata_json": np.frombuffer(payload, dtype=np.uint8),
+                "time_from_start_sec": trajectory.time_from_start_sec,
+                "left_qpos": trajectory.qpos_by_side["left"],
+                "right_qpos": trajectory.qpos_by_side["right"],
+            }
+            if source_waypoints is not None:
+                arrays.update(
+                    {
+                        "source_left_qpos": source_waypoints["left"],
+                        "source_right_qpos": source_waypoints["right"],
+                    }
+                )
+            np.savez_compressed(stream, **arrays)
             stream.flush()
             os.fsync(stream.fileno())
         try:

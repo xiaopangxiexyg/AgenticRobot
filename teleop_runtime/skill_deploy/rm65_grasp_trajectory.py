@@ -27,12 +27,19 @@ from robot_motion.path_planning import (
     plan_collision_aware_joint_path,
 )
 from robot_motion.pose import pose_delta_metrics
+from robot_motion.position_control.horizon_governor import JointHorizonLimits
+from robot_motion.position_control.offline_waypoint_trajectory import (
+    OFFLINE_WAYPOINT_TIMING_SAFE_RETIME_GLOBAL,
+    OfflineWaypointTrajectoryInfeasibleError,
+    build_offline_quintic_waypoint_trajectory,
+)
 from robot_motion.rm65 import (
     DEFAULT_GRASP_PATH_COLLISION_SCENE,
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
+    RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
     build_dual_arm_scene_profile,
 )
 from robot_motion.rm65.obstacle_collision import (
@@ -52,6 +59,12 @@ _PATH_COLLISION_SCENE_PROFILE = DEFAULT_GRASP_PATH_COLLISION_SCENE
 RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
 RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M = 0.005
 RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG = 3.0
+RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP = "segmented_stop"
+RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2 = "continuous_c2"
+RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES = (
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
+)
 
 
 class RM65GraspTrajectoryPlanningError(RuntimeError):
@@ -99,6 +112,9 @@ class RM65GraspTrajectoryPlanningConfig:
     path_envelope_ingress_tangent_tolerance_m: float = 0.0005
     singularity_soft_margin_deg: float = 6.0
     singularity_replay_slowdown: float = 0.5
+    trajectory_parameterization: str = (
+        RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP
+    )
     path_envelope_ingress_waypoint_fractions: tuple[float, ...] = (
         0.05,
         0.10,
@@ -160,6 +176,17 @@ class RM65GraspTrajectoryPlanningConfig:
         if not math.isfinite(slowdown) or not 0.0 < slowdown <= 1.0:
             raise ValueError("singularity_replay_slowdown must be in (0, 1].")
         object.__setattr__(self, "singularity_replay_slowdown", slowdown)
+        parameterization = str(self.trajectory_parameterization).strip().lower()
+        if parameterization not in RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES:
+            raise ValueError(
+                "trajectory_parameterization must be one of "
+                f"{RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES}."
+            )
+        object.__setattr__(
+            self,
+            "trajectory_parameterization",
+            parameterization,
+        )
         if self.minimum_pregrasp_distance_m > self.pregrasp_distance_m:
             raise ValueError(
                 "minimum_pregrasp_distance_m must not exceed pregrasp_distance_m."
@@ -831,6 +858,231 @@ class RM65GraspJointTrajectoryPlanner:
         if values[-1] > minimum + 1e-12:
             values.append(minimum)
         return tuple(values)
+
+    def _singularity_interval_scale(
+        self,
+        start_qpos: np.ndarray,
+        end_qpos: np.ndarray,
+    ) -> float:
+        """Return the established soft singularity slowdown for one path edge."""
+
+        start = np.asarray(start_qpos, dtype=float).reshape(6)
+        end = np.asarray(end_qpos, dtype=float).reshape(6)
+        distances: list[float] = []
+        for joint_index in (2, 4):
+            left = float(start[joint_index])
+            right = float(end[joint_index])
+            distances.append(
+                0.0
+                if left == 0.0 or right == 0.0 or left * right < 0.0
+                else min(abs(left), abs(right))
+            )
+        distance_rad = min(distances)
+        hard_rad = math.radians(RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG)
+        soft_rad = math.radians(self.config.singularity_soft_margin_deg)
+        maximum_scale = 1.0 / self.config.singularity_replay_slowdown
+        if distance_rad <= hard_rad:
+            return maximum_scale
+        if distance_rad >= soft_rad:
+            return 1.0
+        fraction = (soft_rad - distance_rad) / (soft_rad - hard_rad)
+        return 1.0 + fraction * (maximum_scale - 1.0)
+
+    def _segment_duration_diagnostics(
+        self,
+        *,
+        start: Mapping[str, np.ndarray],
+        end: Mapping[str, np.ndarray],
+        moving_side: str,
+        speed_scale: float,
+        joint_velocity_rad_s: np.ndarray,
+    ) -> tuple[float, dict[str, object]]:
+        """Compute the legacy conservative duration and name its active limiter."""
+
+        start_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=start["left"], right_qpos=start["right"]
+        )[moving_side]
+        end_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=end["left"], right_qpos=end["right"]
+        )[moving_side]
+        translation_m, rotation_deg = pose_delta_metrics(start_tcp, end_tcp)
+        delta = np.abs(
+            np.asarray(end[moving_side], dtype=float)
+            - np.asarray(start[moving_side], dtype=float)
+        )
+        candidates = {
+            "minimum_segment_duration": self.config.minimum_segment_duration_sec,
+            "tcp_translation": (
+                1.875
+                * translation_m
+                / (self.config.linear_speed_m_s * speed_scale)
+            ),
+            "tcp_rotation": (
+                1.875
+                * rotation_deg
+                / (self.config.angular_speed_deg_s * speed_scale)
+            ),
+            "joint_velocity": 1.875
+            * float(np.max(delta / joint_velocity_rad_s)),
+        }
+        duration = max(candidates.values())
+        active_limiters = tuple(
+            name
+            for name, value in candidates.items()
+            if math.isclose(value, duration, rel_tol=1e-9, abs_tol=1e-12)
+        )
+        return duration, {
+            "duration_sec": float(duration),
+            "active_limiters": active_limiters,
+            "limiter_duration_sec": {
+                name: float(value) for name, value in candidates.items()
+            },
+            "translation_m": float(translation_m),
+            "rotation_deg": float(rotation_deg),
+            "maximum_joint_delta_rad": float(np.max(delta)),
+        }
+
+    def _continuous_leg_trajectory(
+        self,
+        *,
+        waypoints: tuple[Mapping[str, np.ndarray], ...],
+        moving_side: str,
+        speed_scale: float,
+        joint_velocity_rad_s: np.ndarray,
+        reference_hz: float,
+    ):
+        """Build one stop-to-stop C2 leg with non-zero internal knot velocities."""
+
+        if len(waypoints) < 2:
+            raise ValueError("continuous trajectory leg requires at least two waypoints.")
+        source_times = [0.0]
+        segment_diagnostics: list[dict[str, object]] = []
+        for segment_index, (start, end) in enumerate(pairwise(waypoints)):
+            base_duration, diagnostic = self._segment_duration_diagnostics(
+                start=start,
+                end=end,
+                moving_side=moving_side,
+                speed_scale=speed_scale,
+                joint_velocity_rad_s=joint_velocity_rad_s,
+            )
+            singularity_scale = self._singularity_interval_scale(
+                np.asarray(start[moving_side], dtype=float),
+                np.asarray(end[moving_side], dtype=float),
+            )
+            duration = base_duration * singularity_scale
+            diagnostic.update(
+                {
+                    "segment_index": segment_index,
+                    "singularity_time_scale": float(singularity_scale),
+                    "scaled_duration_sec": float(duration),
+                }
+            )
+            segment_diagnostics.append(diagnostic)
+            source_times.append(source_times[-1] + duration)
+
+        source_q = np.stack(
+            [
+                np.concatenate(
+                    (
+                        np.asarray(waypoint["left"], dtype=float),
+                        np.asarray(waypoint["right"], dtype=float),
+                    )
+                )
+                for waypoint in waypoints
+            ],
+            axis=0,
+        )
+        acceleration = np.tile(
+            np.asarray(RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2, dtype=float),
+            2,
+        )
+        limits = JointHorizonLimits(
+            min_position_rad=np.tile(RM65_ABSOLUTE_Q_MIN_RAD, 2),
+            max_position_rad=np.tile(RM65_ABSOLUTE_Q_MAX_RAD, 2),
+            max_velocity_rad_s=np.tile(joint_velocity_rad_s, 2),
+            max_acceleration_rad_s2=acceleration,
+            max_jerk_rad_s3=acceleration / 0.05,
+        )
+
+        def build(timestamps: np.ndarray):
+            return build_offline_quintic_waypoint_trajectory(
+                timestamps,
+                source_q,
+                command_hz=reference_hz,
+                limits=limits,
+                timing_mode=OFFLINE_WAYPOINT_TIMING_SAFE_RETIME_GLOBAL,
+                max_time_scale=16.0,
+            )
+
+        try:
+            continuous = build(np.asarray(source_times, dtype=float))
+        except OfflineWaypointTrajectoryInfeasibleError as error:
+            raise RM65GraspTrajectoryPlanningError(
+                "trajectory_parameterization_failed",
+                details={
+                    "parameterization": (
+                        RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+                    ),
+                    "error": str(error),
+                },
+            ) from error
+
+        # Joint-space extrema are certified analytically by the shared C2
+        # builder.  TCP speed is nonlinear in q, so certify the sampled curve
+        # and conservatively retime the complete leg if needed.
+        def required_tcp_time_scale(candidate) -> float:
+            tcp_poses = [
+                self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=np.asarray(row[:6], dtype=float).copy(),
+                    right_qpos=np.asarray(row[6:], dtype=float).copy(),
+                )[moving_side]
+                for row in candidate.q_rad
+            ]
+            required = 1.0
+            for index, (start_tcp, end_tcp) in enumerate(pairwise(tcp_poses)):
+                dt = float(
+                    candidate.timestamps[index + 1]
+                    - candidate.timestamps[index]
+                )
+                translation_m, rotation_deg = pose_delta_metrics(
+                    start_tcp,
+                    end_tcp,
+                )
+                required = max(
+                    required,
+                    translation_m
+                    / (dt * self.config.linear_speed_m_s * speed_scale),
+                    rotation_deg
+                    / (dt * self.config.angular_speed_deg_s * speed_scale),
+                )
+            return float(required)
+
+        tcp_time_scale = 1.0
+        for _ in range(3):
+            required_tcp_scale = required_tcp_time_scale(continuous)
+            if required_tcp_scale <= 1.0 + 1e-6:
+                break
+            incremental_scale = required_tcp_scale * 1.01
+            tcp_time_scale *= incremental_scale
+            continuous = build(
+                np.asarray(continuous.waypoint_timestamps, dtype=float)
+                * incremental_scale
+            )
+        else:
+            raise RM65GraspTrajectoryPlanningError(
+                "trajectory_parameterization_failed",
+                details={
+                    "parameterization": (
+                        RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+                    ),
+                    "reason": "sampled_tcp_speed_limit_not_certified",
+                    "required_tcp_time_scale": required_tcp_time_scale(
+                        continuous
+                    ),
+                },
+            )
+        return continuous, tuple(segment_diagnostics), float(tcp_time_scale)
+
     def _apply_singularity_replay_time_scaling(
         self,
         *,
@@ -3193,70 +3445,217 @@ class RM65GraspJointTrajectoryPlanner:
         times = [0.0]
         samples = {name: [current[name].copy()] for name in _SIDES}
         stage_boundaries: list[dict[str, object]] = []
-        elapsed = 0.0
-        for end_waypoint_index, (start, end) in enumerate(pairwise(waypoints), start=1):
-            self._remaining_path_planning_time_sec(
-                deadline=deadline,
-                monotonic=monotonic,
-                planning_phase="trajectory_parameterization",
-            )
-            start_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                left_qpos=start["left"], right_qpos=start["right"]
-            )[selected_side]
-            end_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                left_qpos=end["left"], right_qpos=end["right"]
-            )[selected_side]
-            translation, rotation_deg = pose_delta_metrics(start_tcp, end_tcp)
-            delta = np.abs(
-                np.asarray(end[selected_side]) - np.asarray(start[selected_side])
-            )
-            duration = max(
-                self.config.minimum_segment_duration_sec,
-                1.875 * translation / (self.config.linear_speed_m_s * scale),
-                1.875 * rotation_deg / (self.config.angular_speed_deg_s * scale),
-                1.875 * float(np.max(delta / joint_velocity)),
-            )
-            frame_count = max(
-                2,
-                math.ceil(duration * reference_hz) + 1,
-                math.ceil(
-                    1.875
-                    * float(np.max(delta))
-                    / self.config.final_edge_resolution_rad
+        parameterization_metadata: dict[str, object]
+        segment_diagnostics: list[dict[str, object]] = []
+        if self.config.trajectory_parameterization == (
+            RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+        ):
+            leg_parameterization: list[dict[str, object]] = []
+            for leg_index, leg in enumerate(selected_legs):
+                self._remaining_path_planning_time_sec(
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    planning_phase="trajectory_parameterization",
                 )
-                + 1,
-            )
-            for frame_index in range(1, frame_count):
-                unit = float(frame_index) / float(frame_count - 1)
-                progress = unit**3 * (10.0 - 15.0 * unit + 6.0 * unit**2)
-                elapsed += duration / float(frame_count - 1)
-                times.append(elapsed)
-                for name in _SIDES:
-                    samples[name].append(
-                        np.asarray(start[name])
-                        + progress * (np.asarray(end[name]) - np.asarray(start[name]))
+                phase = str(
+                    leg.path.metadata.get("planning_phase", leg_phases[leg_index])
+                )
+                leg_waypoints = tuple(leg.path.waypoints)
+                if len(leg_waypoints) >= 2:
+                    continuous, leg_segments, tcp_time_scale = (
+                        self._continuous_leg_trajectory(
+                            waypoints=leg_waypoints,
+                            moving_side=selected_side,
+                            speed_scale=scale,
+                            joint_velocity_rad_s=joint_velocity,
+                            reference_hz=reference_hz,
+                        )
                     )
-            if end_waypoint_index in leg_end_waypoint_indices:
+                    offset = float(times[-1])
+                    for sample_index in range(1, continuous.timestamps.size):
+                        times.append(
+                            offset
+                            + float(
+                                continuous.timestamps[sample_index]
+                                - continuous.timestamps[0]
+                            )
+                        )
+                        samples["left"].append(
+                            np.asarray(continuous.q_rad[sample_index, :6], dtype=float)
+                        )
+                        samples["right"].append(
+                            np.asarray(continuous.q_rad[sample_index, 6:], dtype=float)
+                        )
+                    segment_diagnostics.extend(
+                        {
+                            **dict(item),
+                            "planning_phase": phase,
+                            "leg_index": leg_index,
+                        }
+                        for item in leg_segments
+                    )
+                    leg_parameterization.append(
+                        {
+                            "planning_phase": phase,
+                            "source_waypoint_count": len(leg_waypoints),
+                            "sample_count": int(continuous.timestamps.size),
+                            "source_duration_sec": float(
+                                continuous.metadata["source_duration_sec"]
+                            ),
+                            "execution_duration_sec": float(
+                                continuous.metadata["execution_duration_sec"]
+                            ),
+                            "joint_limit_time_scale": float(
+                                continuous.metadata["time_scale"]
+                            ),
+                            "tcp_limit_time_scale": tcp_time_scale,
+                            "internal_knot_zero_velocity_required": False,
+                            "continuous_hard_limit_certificate": (
+                                continuous.metadata[
+                                    "continuous_hard_limit_certificate"
+                                ]
+                            ),
+                        }
+                    )
                 stage_boundaries.append(
                     {
-                        "planning_phase": leg_end_waypoint_indices[end_waypoint_index],
+                        "planning_phase": phase,
                         "end_sample_index": len(times) - 1,
                         "end_time_sec": float(times[-1]),
                     }
                 )
+            singularity_scales = [
+                float(item["singularity_time_scale"])
+                for item in segment_diagnostics
+            ]
+            singularity_replay_metadata = {
+                "policy": "real_teleop_soft_traversal_v1",
+                "hard_threshold_deg": float(
+                    RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG
+                ),
+                "soft_margin_deg": float(self.config.singularity_soft_margin_deg),
+                "replay_slowdown": float(
+                    self.config.singularity_replay_slowdown
+                ),
+                "scaled_interval_count": sum(
+                    value > 1.0 + 1e-12 for value in singularity_scales
+                ),
+                "maximum_interval_scale": max(singularity_scales, default=1.0),
+                "spatial_path_unchanged": True,
+                "collision_rechecked": True,
+                "applied_before_continuous_parameterization": True,
+            }
+            parameterization_metadata = {
+                "mode": RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
+                "internal_path_waypoint_stops": False,
+                "stage_boundary_stops": True,
+                "legs": tuple(leg_parameterization),
+                "segments": tuple(segment_diagnostics),
+            }
+        else:
+            elapsed = 0.0
+            for end_waypoint_index, (start, end) in enumerate(
+                pairwise(waypoints), start=1
+            ):
+                self._remaining_path_planning_time_sec(
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    planning_phase="trajectory_parameterization",
+                )
+                duration, diagnostic = self._segment_duration_diagnostics(
+                    start=start,
+                    end=end,
+                    moving_side=selected_side,
+                    speed_scale=scale,
+                    joint_velocity_rad_s=joint_velocity,
+                )
+                diagnostic.update(
+                    {
+                        "segment_index": end_waypoint_index - 1,
+                        "planning_phase": next(
+                            (
+                                phase
+                                for waypoint_index, phase in sorted(
+                                    leg_end_waypoint_indices.items()
+                                )
+                                if end_waypoint_index <= waypoint_index
+                            ),
+                            leg_phases[-1],
+                        ),
+                    }
+                )
+                segment_diagnostics.append(diagnostic)
+                delta = np.abs(
+                    np.asarray(end[selected_side])
+                    - np.asarray(start[selected_side])
+                )
+                frame_count = max(
+                    2,
+                    math.ceil(duration * reference_hz) + 1,
+                    math.ceil(
+                        1.875
+                        * float(np.max(delta))
+                        / self.config.final_edge_resolution_rad
+                    )
+                    + 1,
+                )
+                for frame_index in range(1, frame_count):
+                    unit = float(frame_index) / float(frame_count - 1)
+                    progress = unit**3 * (10.0 - 15.0 * unit + 6.0 * unit**2)
+                    elapsed += duration / float(frame_count - 1)
+                    times.append(elapsed)
+                    for name in _SIDES:
+                        samples[name].append(
+                            np.asarray(start[name])
+                            + progress
+                            * (np.asarray(end[name]) - np.asarray(start[name]))
+                        )
+                if end_waypoint_index in leg_end_waypoint_indices:
+                    stage_boundaries.append(
+                        {
+                            "planning_phase": leg_end_waypoint_indices[
+                                end_waypoint_index
+                            ],
+                            "end_sample_index": len(times) - 1,
+                            "end_time_sec": float(times[-1]),
+                        }
+                    )
+            times, singularity_replay_metadata = (
+                self._apply_singularity_replay_time_scaling(
+                    times=times,
+                    samples=samples,
+                    moving_side=selected_side,
+                )
+            )
+            parameterization_metadata = {
+                "mode": RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+                "internal_path_waypoint_stops": True,
+                "stage_boundary_stops": True,
+                "segments": tuple(segment_diagnostics),
+            }
         if len(times) == 1:
             elapsed = self.config.minimum_segment_duration_sec
             times.append(elapsed)
             for name in _SIDES:
                 samples[name].append(current[name].copy())
-        times, singularity_replay_metadata = self._apply_singularity_replay_time_scaling(
-            times=times,
-            samples=samples,
-            moving_side=selected_side,
-        )
         for boundary in stage_boundaries:
             boundary["end_time_sec"] = float(
                 times[int(boundary["end_sample_index"])]
+            )
+        if self.config.trajectory_parameterization == (
+            RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+        ):
+            dense["parameterized_trajectory_revalidation"] = self._revalidate(
+                tuple(
+                    {
+                        side: np.asarray(samples[side][index], dtype=float)
+                        for side in _SIDES
+                    }
+                    for index in range(len(times))
+                ),
+                moving_side=selected_side,
+                deadline=deadline,
+                monotonic=monotonic,
             )
         if visible_scene is not None:
             for index in range(len(times)):
@@ -3310,6 +3709,7 @@ class RM65GraspJointTrajectoryPlanner:
                 ],
                 "dense_revalidation": dense,
                 "singularity_replay": singularity_replay_metadata,
+                "trajectory_parameterization": parameterization_metadata,
                 "envelope_ingress_route": ingress_route,
                 "envelope_ingress_route_attempts": ingress_route_attempts,
                 "pregrasp_route_attempts": pregrasp_route_attempts,
@@ -3367,6 +3767,17 @@ class RM65GraspJointTrajectoryPlanner:
                     target_tool_tcp_world=target_pose,
                     speed_scale=scale,
                     stage_boundaries=tuple(stage_boundaries),
+                    parameterization=parameterization_metadata,
+                    source_waypoints_by_side={
+                        side: np.stack(
+                            [
+                                np.asarray(waypoint[side], dtype=float)
+                                for waypoint in waypoints
+                            ],
+                            axis=0,
+                        )
+                        for side in _SIDES
+                    },
                 )
             except (OSError, ValueError, BadZipFile) as error:
                 raise RM65GraspTrajectoryPlanningError(
@@ -3382,6 +3793,9 @@ __all__ = [
     "RM65GraspReachabilityResult",
     "RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC",
     "RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG",
+    "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2",
+    "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES",
+    "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP",
     "RM65GraspTrajectoryPlanningConfig",
     "RM65GraspTrajectoryPlanningError",
 ]
