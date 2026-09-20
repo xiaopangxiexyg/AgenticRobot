@@ -123,5 +123,59 @@ reader 不发送任何 MIT/POS-VEL 帧，因此修改六轴 owner 的 `--driver-
 
 由于该配置位于 pinned vendor submodule，当前候选没有直接改写厂商文件；需要
 真实 J7 控制时，应在官方 gripper owner 中显式设置运行时 `kd`，或另建一个有
-独立审查记录的 vendor 子模块提交。B601→RM65 read-only 遥操路径不会因为
-v4/4b2 目标切换而隐式使能或控制 J7。
+ 独立审查记录的 vendor 子模块提交。B601→RM65 read-only 遥操路径不会因为
+ v4/4b2 目标切换而隐式使能或控制 J7。
+
+## J7 运行时 Kp/Kd 与配置路径
+
+本候选新增了独立的前台 `scripts/hardware/rebot_b601_rs_gripper_owner.py`。
+它只注册 RobStride motor 7，启动前读取当前 `mechPos` 作为保持参考，调用单电机
+`ensure_mode(MIT)`、`enable`、`send_mit`，退出时只对 motor 7 `disable`；绝不调用
+`Controller.enable_all()`、`disable_all()`，也不进入六轴 B601 owner 的 protective
+hold。运行时参数为：
+
+```text
+--gripper-kp 50.0
+--gripper-kd 1.0
+```
+
+省略时从 `joints[name=gripper].MIT.kp/kd` 读取（当前 `50.0/4.0`）。这些参数
+只作用于本次 MIT 帧，不写回驱动器非易失参数，也不会改变 J1–J6 的重力补偿。
+命令仍必须显式给出 `--allow-motion --auto-disable
+--confirmation B601_RS_J7_MIT_GRIPPER`；当前只完成离线/模拟验证，未执行真机。
+
+例如只把本次 J7 阻尼从配置中的 `4.0` 改为 `1.0`，而不改 YAML：
+
+```bash
+cd <AgenticRobot>
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
+PYTHONDONTWRITEBYTECODE=1 "$PY" \
+  scripts/hardware/rebot_b601_rs_gripper_owner.py \
+  --config "$PWD/hardware/reBotArm_control_py/config/rebotarm_rs.yaml" \
+  --channel can0 \
+  --gripper-kp 50.0 \
+  --gripper-kd 1.0 \
+  --duration-sec 30 \
+  --rate-hz 20 \
+  --allow-motion \
+  --auto-disable \
+  --confirmation B601_RS_J7_MIT_GRIPPER
+```
+
+该命令是前台、单 J7、短时 hold；它不是 B601 六轴 owner，也不是夹爪开合
+轨迹播放器。现场执行前必须确认没有其他进程拥有 J7，并保持物理急停可用。
+
+此前命令显示的
+`/home/zc/HandMotion/Developing/reBotArm_control_py/config/rebotarm_rs.yaml`
+是历史 commissioning 流程使用的 sibling checkout。它与项目内的
+`hardware/reBotArm_control_py` 是两个独立工作树，虽然当前都固定在同一个上游
+commit；外部路径不是运行时必须依赖，也不应成为项目默认。当前候选已把 owner 和
+MuJoCo launcher 的默认值切换为项目内 pinned submodule：
+
+```text
+<AgenticRobot>/hardware/reBotArm_control_py/config/rebotarm_rs.yaml
+```
+
+这样可由父仓库 gitlink 固定 vendor 版本、避免复制厂商代码，同时保留显式
+`--config`/`--rebot-source-root` 覆盖，方便现场使用已安装的 sibling checkout。
+因此外部路径仍可用于人工验收，但不再是代码隐含的默认路径。

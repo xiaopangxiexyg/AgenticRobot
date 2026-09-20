@@ -48,6 +48,13 @@ def _positive(value: object, *, name: str) -> float:
     return normalized
 
 
+def _nonnegative(value: object, *, name: str) -> float:
+    normalized = _finite(value, name=name)
+    if normalized < 0.0:
+        raise ValueError(f"{name} must be non-negative")
+    return normalized
+
+
 def _integer(value: object, *, name: str) -> int:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be an integer")
@@ -89,6 +96,8 @@ class B601RSGripperReaderConfig:
     vendor: str = "robstride"
     parameter_id: int = B601_RS_MECH_POS_PARAM_ID
     timeout_sec: float = 0.10
+    mit_kp: float = 50.0
+    mit_kd: float = 4.0
     source_config: str | None = None
 
     def __post_init__(self) -> None:
@@ -112,6 +121,8 @@ class B601RSGripperReaderConfig:
         if self.parameter_id != B601_RS_MECH_POS_PARAM_ID:
             raise ValueError("J7 reader is fixed to the RobStride mechPos parameter")
         object.__setattr__(self, "timeout_sec", _positive(self.timeout_sec, name="timeout_sec"))
+        object.__setattr__(self, "mit_kp", _nonnegative(self.mit_kp, name="mit_kp"))
+        object.__setattr__(self, "mit_kd", _nonnegative(self.mit_kd, name="mit_kd"))
         if self.source_config is not None:
             source = str(self.source_config).strip()
             object.__setattr__(self, "source_config", source or None)
@@ -149,12 +160,15 @@ class B601RSGripperReaderConfig:
                 selected = joint
         if selected is None:
             raise ValueError("missing B601-RS gripper joint")
+        mit = _mapping(selected.get("MIT", {}), name="gripper.MIT")
         return cls(
             channel=str(data.get("channel", "can0")),
             motor_id=_integer(selected.get("motor_id"), name="gripper.motor_id"),
             feedback_id=_integer(selected.get("feedback_id"), name="gripper.feedback_id"),
             model=str(selected.get("model", "")).strip(),
             vendor=str(selected.get("vendor", "robstride")),
+            mit_kp=mit.get("kp", 50.0),
+            mit_kd=mit.get("kd", 4.0),
             source_config=str(config_path),
         )
 

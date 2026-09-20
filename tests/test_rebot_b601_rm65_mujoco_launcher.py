@@ -20,6 +20,10 @@ def test_launcher_defaults_are_workspace_local_and_auto_activate() -> None:
     assert paths.mapping_profile.name == "b601_rm65_mapping_150_v2.json"
     assert paths.task_config.name == "rm65_right_cube_lift_rl_normal_v1.json"
     assert paths.config.name == "rebotarm_rs.yaml"
+    assert paths.rebot_source_root == launcher.REPO_ROOT / "hardware" / "reBotArm_control_py"
+    assert owner._parser().parse_args([]).rebot_source_root == (
+        owner.REPO_ROOT / "hardware" / "reBotArm_control_py"
+    )
 
 
 def test_launcher_builds_canonical_read_only_command_without_shell(tmp_path: Path) -> None:

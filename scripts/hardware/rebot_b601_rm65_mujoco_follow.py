@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_REBOT_SOURCE_ROOT = REPO_ROOT.parent / "reBotArm_control_py"
+DEFAULT_REBOT_SOURCE_ROOT = REPO_ROOT / "hardware" / "reBotArm_control_py"
 DEFAULT_CONFIG = DEFAULT_REBOT_SOURCE_ROOT / "config" / "rebotarm_rs.yaml"
 DEFAULT_TASK_CONFIG = (
     REPO_ROOT / "sim" / "configs" / "tasks" / "rm65_right_cube_lift_rl_normal_v1.json"
@@ -74,13 +74,13 @@ def _parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=_env_path("REBOT_RS_CONFIG", DEFAULT_CONFIG),
-        help="B601 RS YAML (default: REBOT_RS_CONFIG or the sibling reBotArm checkout)",
+        help="B601 RS YAML (default: REBOT_RS_CONFIG or the pinned project submodule)",
     )
     parser.add_argument(
         "--rebot-source-root",
         type=Path,
         default=_env_path("REBOT_SOURCE_ROOT", DEFAULT_REBOT_SOURCE_ROOT),
-        help="reBotArm_control_py root (default: sibling checkout)",
+        help="reBotArm_control_py root (default: pinned hardware/reBotArm_control_py submodule)",
     )
     parser.add_argument(
         "--task-config",

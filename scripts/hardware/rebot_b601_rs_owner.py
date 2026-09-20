@@ -24,7 +24,7 @@ from scripts.hardware.rebot_b601_rm65_mujoco_follow import (
     _run_foreground,
 )
 
-DEFAULT_REBOT_SOURCE_ROOT = REPO_ROOT.parent / "reBotArm_control_py"
+DEFAULT_REBOT_SOURCE_ROOT = REPO_ROOT / "hardware" / "reBotArm_control_py"
 DEFAULT_CONFIG = DEFAULT_REBOT_SOURCE_ROOT / "config" / "rebotarm_rs.yaml"
 DEFAULT_OUTPUT_ROOT = Path("/tmp/b601-rs-commissioning")
 DEFAULT_CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
