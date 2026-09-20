@@ -294,6 +294,8 @@ def build_device_retry_runtime(
             return "required_for_collection"
         if key.startswith("dataset."):
             return "required_for_collection"
+        if key == "device.preflight":
+            return "required_for_collection"
         if key == "angle_trigger":
             return (
                 "required_for_collection"
@@ -935,6 +937,7 @@ def build_device_retry_runtime(
                     continue
                 elif key in {
                     "dmtac.assignment",
+                    "device.preflight",
                     "camera.config",
                     "angle_trigger",
                 }:

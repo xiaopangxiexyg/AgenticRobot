@@ -178,8 +178,36 @@ def _run_gui_device_preflight(
                 f"press 'retry failed devices' after reconnecting: {detail}",
             )
             return
+        if _gui_capability_admission(args):
+            # GUI capability admission owns the non-fatal startup boundary.
+            # Keep the process and operator UI alive so the failure is visible
+            # and the existing Hold/retry flow remains available.  Runtime
+            # construction still records this as a collection blocker; no
+            # arm/hand command backend is admitted from a failed preflight.
+            args.device_preflight_startup_error = (
+                f"DevicePreflightError: {detail}"
+            )
+            _log(
+                "DevicePreflight",
+                "WARNING: device preflight failure was isolated from GUI startup; "
+                "repair the device/configuration and use the existing retry or "
+                f"restart flow: {detail}",
+            )
+            return
         parser.error(f"device preflight failed: {exc}")
     if not bool(getattr(result, "ok", True)):
+        if _gui_capability_admission(args):
+            detail = (
+                "device preflight permission fix did not complete; rerun the "
+                "permission repair outside the active runtime"
+            )
+            args.device_preflight_startup_error = detail
+            _log(
+                "DevicePreflight",
+                "WARNING: device permission preflight was isolated from GUI startup; "
+                f"repair and retry/restart: {detail}",
+            )
+            return
         parser.error("device preflight permission fix failed; rerun the permission script with sudo.")
     for message in result.messages:
         for line in str(message).splitlines():

@@ -1168,6 +1168,10 @@ def run_real_teleop(
             _log("TactileStorage", tactile_capacity_summary)
         if getattr(args, "dmtac_startup_error", ""):
             startup_device_errors["dmtac.assignment"] = str(args.dmtac_startup_error)
+        if getattr(args, "device_preflight_startup_error", ""):
+            startup_device_errors["device.preflight"] = str(
+                args.device_preflight_startup_error
+            )
         if getattr(args, "angle_trigger_startup_error", ""):
             startup_device_errors["angle_trigger"] = str(args.angle_trigger_startup_error)
         if getattr(args, "q6_startup_error", ""):
