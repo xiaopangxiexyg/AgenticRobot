@@ -90,6 +90,12 @@ EVALUATION_CUBE_SCENE_CONTRACT = Path(
 EVALUATION_CUBE_SCENE_CONTRACT_SHA256 = (
     "70fe5c7b9e3906633be3f673c5c49f547e40ba389c5dd89f711f73454e70dd3d"
 )
+EVALUATION_BLUE_CUBE_SCENE_CONTRACT = Path(
+    "experiments/sim_point_grasp/configs/rm65_bimanual_blue_cube_v1.json"
+)
+EVALUATION_BLUE_CUBE_SCENE_CONTRACT_SHA256 = (
+    "464ca35b7d2764442e74ddeb4f28fa10c31f76fd72b1dc6c404f4272b823296b"
+)
 EVALUATION_RIGHT_TOOL_PROFILE = Path(
     "experiments/sim_point_grasp/configs/rm65_right_DMTAC_M_4b2_cad_tool_tcp.json"
 )
@@ -130,6 +136,7 @@ CAMERA_NAME = "front"
 POINT_GRASP_BACKENDS = frozenset({"vgn", "graspnet", "graspgenx"})
 GENERATION_VIEWS = frozenset({"front", "selected_wrist"})
 OBJECT_PROFILES = frozenset({"tall_box", "cube"})
+OBJECT_COLORS = frozenset({"red", "blue"})
 
 # Collision-safe homes found through the same MuJoCo pose-action/IK path used
 # below.  At reset, the selected physical wrist optical axis points at the
@@ -163,6 +170,7 @@ class SimPointGraspEvaluationConfig:
     point_grasp_backend: str = "graspnet"
     generation_view: str = "front"
     object_profile: str = "tall_box"
+    object_color: str = "red"
     use_terminal_observation_home: bool = False
     graspgenx_mode: str = "service"
     graspgenx_host: str = "127.0.0.1"
@@ -226,6 +234,14 @@ class SimPointGraspEvaluationConfig:
                 f"object_profile must be one of {sorted(OBJECT_PROFILES)}."
             )
         object.__setattr__(self, "object_profile", object_profile)
+        object_color = str(self.object_color).strip().lower()
+        if object_color not in OBJECT_COLORS:
+            raise ValueError(f"object_color must be one of {sorted(OBJECT_COLORS)}.")
+        if object_profile != "cube" and object_color != "red":
+            raise ValueError(
+                "object_color=blue is only defined for object_profile=cube."
+            )
+        object.__setattr__(self, "object_color", object_color)
         if not isinstance(self.use_terminal_observation_home, bool):
             raise TypeError("use_terminal_observation_home must be a bool.")
         mode = str(self.graspgenx_mode).strip().lower()
@@ -565,6 +581,7 @@ def build_sim_point_grasp_task_config(
     cube_spawn_xy_jitter_m: tuple[float, float],
     cube_spawn_yaw_jitter_rad: float,
     object_profile: str = "tall_box",
+    object_color: str = "red",
     controlled_home_qpos: tuple[float, ...] | None = None,
     max_episode_steps: int | None = None,
 ) -> CubeLiftTaskConfig:
@@ -578,18 +595,27 @@ def build_sim_point_grasp_task_config(
     profile = str(object_profile).strip().lower()
     if profile not in OBJECT_PROFILES:
         raise ValueError(f"object_profile must be one of {sorted(OBJECT_PROFILES)}.")
-    contract_by_profile_and_mass = {
-        ("tall_box", 0.08): (
+    color = str(object_color).strip().lower()
+    if color not in OBJECT_COLORS:
+        raise ValueError(f"object_color must be one of {sorted(OBJECT_COLORS)}.")
+    if profile != "cube" and color != "red":
+        raise ValueError("object_color=blue is only defined for object_profile=cube.")
+    contract_by_profile_mass_and_color = {
+        ("tall_box", 0.08, "red"): (
             EVALUATION_LIGHT_SCENE_CONTRACT,
             EVALUATION_LIGHT_SCENE_CONTRACT_SHA256,
         ),
-        ("tall_box", 0.20): (
+        ("tall_box", 0.20, "red"): (
             EVALUATION_HEAVY_SCENE_CONTRACT,
             EVALUATION_HEAVY_SCENE_CONTRACT_SHA256,
         ),
-        ("cube", 0.08): (
+        ("cube", 0.08, "red"): (
             EVALUATION_CUBE_SCENE_CONTRACT,
             EVALUATION_CUBE_SCENE_CONTRACT_SHA256,
+        ),
+        ("cube", 0.08, "blue"): (
+            EVALUATION_BLUE_CUBE_SCENE_CONTRACT,
+            EVALUATION_BLUE_CUBE_SCENE_CONTRACT_SHA256,
         ),
     }
     mass = float(object_mass_kg)
@@ -597,8 +623,8 @@ def build_sim_point_grasp_task_config(
         raise ValueError("object_mass_kg must be one of {0.08, 0.20}.")
     if profile == "cube" and mass != 0.08:
         raise ValueError("The terminal cube profile currently supports 0.08 kg only.")
-    contract_relative, expected_contract_sha256 = contract_by_profile_and_mass[
-        (profile, mass)
+    contract_relative, expected_contract_sha256 = contract_by_profile_mass_and_color[
+        (profile, mass, color)
     ]
     if gripper_force_profile == "standard":
         gripper_profile_name = EVALUATION_GRIPPER_PROFILE_NAME
@@ -1974,6 +2000,7 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
         cube_spawn_xy_jitter_m=config.cube_spawn_xy_jitter_m,
         cube_spawn_yaw_jitter_rad=config.cube_spawn_yaw_jitter_rad,
         object_profile=config.object_profile,
+        object_color=config.object_color,
         controlled_home_qpos=(
             TERMINAL_OBSERVATION_HOME_QPOS_BY_SIDE[config.arm_side]
             if config.use_terminal_observation_home
@@ -2114,8 +2141,10 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
             "urdf_path": str(scene_contract.scene.urdf_path),
             "urdf_sha256": hashlib.sha256(scene_urdf_path.read_bytes()).hexdigest(),
             "object_body_name": task_config.object_body_name,
+            "object_color": config.object_color,
             "object_shape": "box",
             "object_size_m": list(task_config.object_size_m),
+            "object_rgba": list(scene_contract.scene.objects[0].rgba),
             "object_mass_kg": scene_contract.scene.objects[0].mass_kg,
             "object_inertia_diagonal_kg_m2": list(
                 scene_contract.scene.objects[0].inertia_diagonal_kg_m2

@@ -19,6 +19,10 @@ candidate annotation and selected-grasp overlay, and executes pregrasp, grasp,
 close, and lift through the existing CubeLift motion owner. It never connects
 to real cameras or robot hardware.
 
+Pass `--cube-color blue` to use the versioned blue-cube scene contract. The
+blue and red contracts have identical 40 mm geometry, mass, inertia, contact,
+and spawn pose; only their visual identity and evidence hash differ.
+
 The default matches the real backend direction: GraspGenX over a loopback
 service, using the selected wrist view. Start the reviewed service separately,
 then run:
@@ -28,6 +32,9 @@ bash scripts/run_graspgenx_server.sh \
   --host 127.0.0.1 --port 5556
 
 MUJOCO_GL=egl python -m experiments.sim_point_grasp.commands.run_terminal
+
+MUJOCO_GL=egl python -m experiments.sim_point_grasp.commands.run_terminal \
+  --cube-color blue
 ```
 
 GraspNet and VGN are selectable without changing the terminal or motion path:

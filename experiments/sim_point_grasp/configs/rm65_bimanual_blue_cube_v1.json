@@ -1,0 +1,107 @@
+{
+  "schema_version": "dexteleop.sim.contract.v1",
+  "name": "rm65_bimanual_point_grasp_blue_cube_v1",
+  "action": {
+    "schema_version": "dexteleop.sim.action_spec.v1"
+  },
+  "observation": {
+    "schema_version": "dexteleop.sim.observation_spec.v1",
+    "image_keys": ["front", "left_wrist", "right_wrist"]
+  },
+  "timing": {
+    "schema_version": "dexteleop.sim.timing_spec.v1",
+    "physics_hz": 1000.0,
+    "camera_hz": 30.0,
+    "parameter_source": "project_default_pending_real_system_id"
+  },
+  "scene": {
+    "schema_version": "dexteleop.sim.scene_spec.v1",
+    "profile_name": "rm65_bimanual_point_grasp_blue_cube_v1",
+    "backend": "mujoco",
+    "backend_role": "canonical_task_physics",
+    "urdf_path": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf",
+    "camera_registry_path": "robot_motion/configs/rm65_camera_registry.json",
+    "gravity_mps2": [0.0, 0.0, -9.81],
+    "ground": {
+      "enabled": true,
+      "name": "ground",
+      "z_m": -0.05,
+      "half_size_xy_m": [2.0, 2.0],
+      "contact": {
+        "friction": [1.0, 0.005, 0.0001],
+        "solref": [0.02, 1.0],
+        "solimp": [0.9, 0.95, 0.001],
+        "condim": 4,
+        "restitution_target": 0.0
+      }
+    },
+    "objects": [
+      {
+        "name": "debug_cube",
+        "shape": "box",
+        "size_m": [0.04, 0.04, 0.04],
+        "initial_position_m": [-0.272, 0.0, 0.031],
+        "initial_quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "mass_kg": 0.08,
+        "inertia_diagonal_kg_m2": [0.0000213333333333, 0.0000213333333333, 0.0000213333333333],
+        "rgba": [0.08, 0.24, 0.90, 1.0],
+        "contact": {
+          "friction": [1.0, 0.005, 0.0001],
+          "solref": [0.02, 1.0],
+          "solimp": [0.9, 0.95, 0.001],
+          "condim": 4,
+          "restitution_target": 0.0
+        }
+      }
+    ],
+    "collision": {
+      "enabled": true,
+      "profile_version": "dexteleop.mujoco.collision_groups.v1",
+      "self_collision_enabled": true,
+      "exclude_parent_child": true,
+      "excluded_body_pairs": [
+        ["left_eg2_4b2_cad_base_link", "left_eg2_4b2_cad_l_3"],
+        ["left_eg2_4b2_cad_l_1", "left_eg2_4b2_cad_l_2"],
+        ["left_eg2_4b2_cad_l_2", "left_eg2_4b2_cad_l_3"],
+        ["left_eg2_4b2_cad_l_22", "left_eg2_4b2_cad_l_3"],
+        ["left_eg2_4b2_cad_l_2", "left_eg2_4b2_cad_l_4"],
+        ["left_eg2_4b2_cad_l_22", "left_eg2_4b2_cad_l_4"],
+        ["left_eg2_4b2_cad_r_2", "left_eg2_4b2_cad_r_3"],
+        ["left_eg2_4b2_cad_r_22", "left_eg2_4b2_cad_r_3"],
+        ["left_eg2_4b2_cad_base_link", "left_eg2_4b2_cad_r_3"],
+        ["left_eg2_4b2_cad_r_1", "left_eg2_4b2_cad_r_2"],
+        ["left_eg2_4b2_cad_r_1", "left_eg2_4b2_cad_r_22"],
+        ["left_eg2_4b2_cad_r_3", "left_eg2_4b2_cad_ee_link_4"],
+        ["right_eg2_4b2_cad_base_link", "right_eg2_4b2_cad_l_3"],
+        ["right_eg2_4b2_cad_l_1", "right_eg2_4b2_cad_l_2"],
+        ["right_eg2_4b2_cad_l_2", "right_eg2_4b2_cad_l_3"],
+        ["right_eg2_4b2_cad_l_22", "right_eg2_4b2_cad_l_3"],
+        ["right_eg2_4b2_cad_l_2", "right_eg2_4b2_cad_l_4"],
+        ["right_eg2_4b2_cad_l_22", "right_eg2_4b2_cad_l_4"],
+        ["right_eg2_4b2_cad_r_2", "right_eg2_4b2_cad_r_3"],
+        ["right_eg2_4b2_cad_r_22", "right_eg2_4b2_cad_r_3"],
+        ["right_eg2_4b2_cad_base_link", "right_eg2_4b2_cad_r_3"],
+        ["right_eg2_4b2_cad_r_1", "right_eg2_4b2_cad_r_2"],
+        ["right_eg2_4b2_cad_r_1", "right_eg2_4b2_cad_r_22"],
+        ["right_eg2_4b2_cad_r_3", "right_eg2_4b2_cad_ee_link_4"]
+      ],
+      "safety_minimum_clearance_m": 0.0,
+      "safety_hard_penetration_m": 0.005,
+      "safety_sweep_max_joint_step_rad": 0.01,
+      "safety_projection_iterations": 8,
+      "contact": {
+        "friction": [1.0, 0.005, 0.0001],
+        "solref": [0.02, 1.0],
+        "solimp": [0.9, 0.95, 0.001],
+        "condim": 4,
+        "restitution_target": 0.0
+      }
+    }
+  },
+  "metadata": {
+    "experiment": "sim_point_grasp_terminal",
+    "object_role": "free_blue_40mm_cube_for_physical_parallel_jaw_evaluation",
+    "robot_dynamics_status": "rm65_general_actuator_fourteen_trace_distal_refit_force_contact_provisional",
+    "real_120hz_arm_system_id_status": "v4_stage_fit_complete_new_clean_held_out_pending"
+  }
+}

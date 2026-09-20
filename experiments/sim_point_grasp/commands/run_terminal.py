@@ -66,6 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-candidates", type=int, default=5)
     parser.add_argument(
+        "--cube-color",
+        choices=("red", "blue"),
+        default="red",
+        help=(
+            "Versioned MuJoCo cube scene to use. blue changes only the object "
+            "appearance and evidence identity; geometry and dynamics stay identical."
+        ),
+    )
+    parser.add_argument(
         "--cube-center-x-m",
         type=float,
         default=EVALUATION_OBJECT_CENTER_XY_M[0],
@@ -120,6 +129,7 @@ def run(args: argparse.Namespace) -> dict:
         point_grasp_backend=args.backend,
         generation_view=args.view,
         object_profile="cube",
+        object_color=args.cube_color,
         use_terminal_observation_home=True,
         graspgenx_mode=args.graspgenx_mode,
         graspgenx_host=args.graspgenx_host,

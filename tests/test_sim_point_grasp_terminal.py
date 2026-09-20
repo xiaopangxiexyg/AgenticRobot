@@ -25,6 +25,7 @@ def test_terminal_defaults_to_real_like_graspgenx_wrist_cycle() -> None:
     assert args.view == "selected_wrist"
     assert args.graspgenx_mode == "service"
     assert args.max_candidates == 5
+    assert args.cube_color == "red"
     assert args.minimum_downward_approach_cosine == 0.5
     assert args.cube_center_x_m == -0.272
     assert args.cube_center_y_m == 0.0
@@ -83,6 +84,8 @@ def test_terminal_run_builds_one_deterministic_cube_trial(
             "-0.222",
             "--cube-center-y-m",
             "0.05",
+            "--cube-color",
+            "blue",
         ]
     )
     terminal_module.run(args)
@@ -92,6 +95,7 @@ def test_terminal_run_builds_one_deterministic_cube_trial(
     assert config.point_grasp_backend == "vgn"
     assert config.generation_camera_name == "front"
     assert config.object_profile == "cube"
+    assert config.object_color == "blue"
     assert config.use_terminal_observation_home
     assert config.cube_spawn_xy_jitter_m == (0.0, 0.0)
     assert config.cube_spawn_yaw_jitter_rad == 0.0
@@ -113,6 +117,24 @@ def test_cube_task_uses_40mm_contract_and_terminal_home(arm_side: str) -> None:
     assert contract.scene.objects[0].size_m == (0.04, 0.04, 0.04)
     assert contract.scene.objects[0].rgba == (0.85, 0.18, 0.12, 1.0)
     assert config.right_home_qpos == TERMINAL_OBSERVATION_HOME_QPOS_BY_SIDE[arm_side]
+
+
+@pytest.mark.parametrize("arm_side", ("left", "right"))
+def test_blue_cube_task_preserves_geometry_and_changes_scene_identity(
+    arm_side: str,
+) -> None:
+    config = build_sim_point_grasp_task_config(
+        controlled_side=arm_side,
+        cube_spawn_xy_jitter_m=(0.0, 0.0),
+        cube_spawn_yaw_jitter_rad=0.0,
+        object_profile="cube",
+        object_color="blue",
+        controlled_home_qpos=TERMINAL_OBSERVATION_HOME_QPOS_BY_SIDE[arm_side],
+    )
+    contract = config.base_contract()
+    assert config.object_size_m == (0.04, 0.04, 0.04)
+    assert contract.name == "rm65_bimanual_point_grasp_blue_cube_v1"
+    assert contract.scene.objects[0].rgba == (0.08, 0.24, 0.90, 1.0)
 
 
 @pytest.mark.optional
