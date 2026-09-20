@@ -13,7 +13,7 @@ from typing import Any
 
 from robot_motion.deploy.async_producer import (
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
-    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
+    model_rtc_flow_inpaint_shadow_profile_for_action_hz,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
@@ -32,7 +32,10 @@ def _runtime_action_keyframe_period_sec(args: argparse.Namespace) -> float:
     if profile_id == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
         return 1.0 / RAW_RTC_FINAL_CHUNK_PROFILE_V1.action_hz
     if profile_id == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1:
-        return 1.0 / MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1.action_hz
+        profile = model_rtc_flow_inpaint_shadow_profile_for_action_hz(
+            getattr(args, "rtc_action_hz", None)
+        )
+        return 1.0 / profile.action_hz
     # Preserve the historical PolicyDeployRuntimeConfig default for sync_queue_v1.
     return 1.0 / 15.0
 

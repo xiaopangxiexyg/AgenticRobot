@@ -45,6 +45,16 @@ def test_runtime_action_keyframe_period_preserves_profile_binding(
     ) == pytest.approx(expected)
 
 
+def test_model_rtc_runtime_action_hz_override_changes_only_keyframe_period() -> None:
+    args = SimpleNamespace(
+        rtc_profile=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+        rtc_action_hz=15.0,
+    )
+    assert runtime_timing._runtime_action_keyframe_period_sec(args) == pytest.approx(
+        1.0 / 15.0
+    )
+
+
 def _rate_args(**overrides):
     values = {
         "action_hz": 0.0,

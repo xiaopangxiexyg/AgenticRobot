@@ -62,7 +62,7 @@ from robot_motion.deploy.actions import (
 )
 from robot_motion.deploy.async_producer import (
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
-    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
+    model_rtc_flow_inpaint_shadow_profile_for_action_hz,
     POLICY_ASYNC_PRODUCER_ELIGIBLE,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_V1,
@@ -2641,6 +2641,17 @@ def main(
         action_hz=float(effective_action_hz),
         action_hz_source=str(action_hz_info.get("source", "")),
     )
+    if (
+        str(args.rtc_profile) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+        and getattr(args, "rtc_action_hz", None) is not None
+    ):
+        print(
+            "[RTC] model-RTC runtime cadence override: "
+            f"action/request={float(effective_action_hz):.1f}Hz "
+            f"decision={float(effective_policy_hz):.1f}Hz; "
+            "position reference/command remain 60/120Hz.",
+            flush=True,
+        )
 
     policy_arbiter_shadow: PassivePolicyArbiterShadow | None = None
     replay_proposal_shadow_adapter: DatasetReplayProposalShadowAdapter | None = None
@@ -2998,7 +3009,9 @@ def main(
             policy_name=policy.name,
             preparer=rtc_action_preparer,
             created_at=time.monotonic(),
-            profile=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
+            profile=model_rtc_flow_inpaint_shadow_profile_for_action_hz(
+                getattr(args, "rtc_action_hz", None)
+            ),
             request_validity_steps=int(args.rtc_request_validity_steps),
             worker_stop_timeout_sec=float(args.rtc_worker_stop_timeout_sec),
             observe_bundle=observe_rtc_transport_exchange,

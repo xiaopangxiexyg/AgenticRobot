@@ -4568,18 +4568,24 @@ class RM65ArmBackend(EffectorBackend):
                 target_admission_mode
                 == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
                 and command_source in _SERIALIZED_QPOS_INIT_TARGET_SOURCES
+                and not isinstance(
+                    self._stream_planner,
+                    AccelerationLimitedJointTrajectoryPlanner,
+                )
             ):
-                # G-triggered qpos initialization publishes a slow, ordered
-                # reference trajectory. Do not let a new reference supersede
-                # an SDK call already in flight: the conservative preemption
-                # recovery must reset planner velocity to zero because the
-                # physical application time is unknown, which turns repeated
-                # preemptions into a perceptible stop-start vibration.
+                # Linear and sample-aligned planners cannot reconcile a target
+                # published while the SDK call is in flight. Keep their
+                # qpos-init path serialized until they have an explicit
+                # accepted-qcmd rebase operation. The acceleration-limited
+                # planner below already supports a deferred latest target and
+                # verifies that its committed velocity is preserved, so it may
+                # share the nonblocking 120 Hz command lane during qpos-init.
                 effective_target_admission_mode = (
                     RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
                 )
                 target_admission_fallback_reason = (
-                    "qpos_init_requires_serialized_velocity_continuity"
+                    f"{self._stream_planner_mode}_planner_requires_"
+                    "synchronous_activation"
                 )
             elif (
                 target_admission_mode

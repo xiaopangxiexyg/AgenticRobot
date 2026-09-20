@@ -82,6 +82,9 @@ RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1 = "raw_rtc_final_chunk_15_30_60_120_v1"
 MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1 = (
     "model_rtc_flow_inpaint_shadow_15_30_60_120_v1"
 )
+MODEL_RTC_FLOW_INPAINT_SHADOW_RUNTIME_15HZ_PROFILE_ID_V1 = (
+    "model_rtc_flow_inpaint_shadow_15_15_60_120_runtime_v1"
+)
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -259,6 +262,41 @@ MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1 = PolicyAsyncExecutionProfile(
     profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     rtc_mode=RTC_FLOW_INPAINT_MODE_V1,
 )
+
+
+def model_rtc_flow_inpaint_shadow_profile_for_action_hz(
+    action_hz: float | None = None,
+) -> PolicyAsyncExecutionProfile:
+    """Return the model-RTC producer profile for an explicit runtime cadence.
+
+    The prepared model/artifact contract is unchanged by this helper.  The
+    15 Hz variant only changes the client-side keyframe/request period so a
+    long but still valid inference has enough H32 suffix coverage.  The
+    decision clock and the 60/120 Hz position-control clocks remain unchanged.
+    ``None`` and 30 Hz intentionally return the canonical profile used by the
+    existing deployment contract.
+    """
+
+    if action_hz is None:
+        return MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1
+    normalized = _positive_rate(action_hz, field_name="action_hz")
+    if math.isclose(
+        normalized,
+        MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1.action_hz,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        return MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1
+    if not math.isclose(normalized, 15.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            "model-RTC runtime action cadence must be 15 or 30 Hz; "
+            f"got {normalized!r}."
+        )
+    return replace(
+        MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
+        profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_RUNTIME_15HZ_PROFILE_ID_V1,
+        action_hz=15.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -905,7 +943,9 @@ __all__ = [
     "RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1",
     "RAW_RTC_FINAL_CHUNK_PROFILE_V1",
     "MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1",
+    "MODEL_RTC_FLOW_INPAINT_SHADOW_RUNTIME_15HZ_PROFILE_ID_V1",
     "MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1",
+    "model_rtc_flow_inpaint_shadow_profile_for_action_hz",
     "PolicyAsyncExecutionProfile",
     "PolicyAsyncProducerSnapshot",
     "PolicyAsyncProducerTransitionOutcome",

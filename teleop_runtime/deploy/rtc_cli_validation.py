@@ -58,6 +58,15 @@ def validate_rtc_cli_args(
         RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
         MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     }
+    requested_model_rtc_action_hz = getattr(args, "rtc_action_hz", None)
+    if requested_model_rtc_action_hz is not None:
+        if rtc_profile_id != MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1:
+            raise ValueError(
+                "--rtc-action-hz is only supported with the conditioned "
+                "model-RTC profile."
+            )
+        if float(requested_model_rtc_action_hz) not in {15.0, 30.0}:
+            raise ValueError("--rtc-action-hz must be 15 or 30 Hz.")
     if rtc_real_shadow and rtc_profile_id not in model_transport_profiles:
         raise ValueError(
             "--rtc-real-shadow requires an explicit model-backed RTC profile; "
@@ -145,11 +154,23 @@ def validate_rtc_cli_args(
                 "Model-backed RTC with live hardware endpoints requires explicit "
                 "--rtc-real-shadow; otherwise use synthetic/local inputs."
             )
-        if float(args.action_hz) not in {
-            0.0,
-            RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz,
-        }:
-            raise ValueError("RTC shadow action rate is fixed at 30 Hz.")
+        requested_action_hz = float(args.action_hz)
+        effective_action_hz = float(
+            RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz
+            if requested_model_rtc_action_hz is None
+            else requested_model_rtc_action_hz
+        )
+        if requested_model_rtc_action_hz is None:
+            if requested_action_hz not in {
+                0.0,
+                RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz,
+            }:
+                raise ValueError("RTC shadow action rate is fixed at 30 Hz.")
+        elif requested_action_hz not in {0.0, effective_action_hz}:
+            raise ValueError(
+                "--action-hz conflicts with --rtc-action-hz; omit --action-hz "
+                "or use the same runtime cadence."
+            )
         if args.policy_hz is not None and not math.isclose(
             float(args.policy_hz),
             RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.decision_hz,
@@ -158,7 +179,7 @@ def validate_rtc_cli_args(
         ):
             raise ValueError("RTC shadow decision rate is fixed at 30 Hz.")
         args.position_chunk_lookahead = False
-        args.action_hz = RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.action_hz
+        args.action_hz = effective_action_hz
         args.policy_hz = RTC_3C_VIRTUAL_SHADOW_PROFILE_V1.decision_hz
     elif (
         int(getattr(args, "rtc_request_validity_steps", 10)) != 10
