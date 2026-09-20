@@ -52,6 +52,10 @@ from .model import (
     B601PinocchioModel,
     B601SingularityMetrics,
 )
+from .rm65_policy_assist import (
+    RM65ToB601PolicyAssistBridge,
+    RM65ToB601PolicyAssistResult,
+)
 from .rm65_retarget import (
     RM65_FREE_DRIVE_SAMPLE_HASH_DOMAIN_V1,
     RM65_FREE_DRIVE_SAMPLE_SCHEMA_V1,
@@ -136,6 +140,8 @@ __all__ = [
     "NormalizedGripperSample",
     "RM65FreeDriveSample",
     "RM65ToB601Anchor",
+    "RM65ToB601PolicyAssistBridge",
+    "RM65ToB601PolicyAssistResult",
     "RM65ToB601RetargetConfig",
     "RM65ToB601RetargetResult",
     "RM65ToB601Retargeter",

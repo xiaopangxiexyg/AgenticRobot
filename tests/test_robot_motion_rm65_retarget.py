@@ -14,7 +14,13 @@ from robot_motion.coordinate_frames import (
     CoordinateFrameSpec,
     RigidFrameTransformSpec,
 )
-from robot_motion.rebot_b601_rs import B601IKResult
+from robot_motion.rebot_b601_rs import (
+    B601IKResult,
+    B601SharedControlConfig,
+    B601SharedControlMode,
+    B601SharedControlRuntime,
+    RM65ToB601PolicyAssistBridge,
+)
 from robot_motion.rebot_b601_rs.rm65_retarget import (
     RM65FreeDriveSample,
     RM65ToB601RetargetConfig,
@@ -136,6 +142,20 @@ def _retargeter(ik: _IK) -> RM65ToB601Retargeter:
     )
 
 
+def _shared_control_runtime() -> B601SharedControlRuntime:
+    return B601SharedControlRuntime(
+        B601SharedControlConfig(
+            position_kp_nm_per_rad=(2.0,) * 6,
+            velocity_kd_nm_s_per_rad=(0.0,) * 6,
+            max_target_error_rad=(0.1,) * 6,
+            max_abs_assist_torque_nm=(0.2,) * 6,
+            max_assist_torque_rate_nm_s=(1.0,) * 6,
+            authority_rise_per_sec=10.0,
+            policy_stale_timeout_sec=0.25,
+        )
+    )
+
+
 def test_reverse_mapping_reuses_graph_inverse_and_seeded_ik() -> None:
     ik = _IK()
     retargeter = _retargeter(ik)
@@ -242,3 +262,91 @@ def test_existing_b601_rm65_profile_is_reused_in_reverse_direction() -> None:
 
     assert retargeter.anchor is not None
     assert retargeter.anchor.frame_graph_hash == profile.build_frame_graph().semantic_content_hash
+
+
+def test_reverse_retarget_result_publishes_shared_control_intent() -> None:
+    retargeter = _retargeter(_IK())
+    runtime = _shared_control_runtime()
+    bridge = RM65ToB601PolicyAssistBridge(retargeter, runtime)
+    qpos = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+
+    bridge.capture_anchor(_sample(1), measured_b601_qpos_rad=qpos)
+    result = bridge.process_sample(
+        _sample(2, translation=(0.1, 0.0, 0.0)),
+        measured_b601_qpos_rad=qpos,
+    )
+
+    assert result.accepted is True
+    assert result.policy_command is not None
+    assert result.policy_command.sequence == 2
+    assert result.policy_command.source_timestamp_sec == 20.0
+    assert result.policy_command.receive_timestamp_sec == 20.1
+    assert result.policy_command.qpos_target_rad == qpos
+    frame = runtime.step(
+        control_sequence=1,
+        control_timestamp_sec=20.11,
+        measured_qpos_rad=qpos,
+        measured_qvel_rad_s=(0.0,) * 6,
+        dt_sec=0.01,
+    )
+    assert frame.decision.state.mode is B601SharedControlMode.POLICY_ASSIST
+
+
+def test_retarget_rejection_revokes_previous_policy_immediately() -> None:
+    retargeter = _retargeter(_IK())
+    runtime = _shared_control_runtime()
+    bridge = RM65ToB601PolicyAssistBridge(retargeter, runtime)
+    qpos = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+
+    bridge.capture_anchor(_sample(1), measured_b601_qpos_rad=qpos)
+    assert bridge.process_sample(
+        _sample(2),
+        measured_b601_qpos_rad=qpos,
+    ).accepted
+    rejected = bridge.process_sample(
+        _sample(3, source_timestamp=9.0, receive_monotonic=19.0),
+        measured_b601_qpos_rad=qpos,
+    )
+
+    assert rejected.accepted is False
+    assert rejected.revoked_policy_sequence == 2
+    assert "stale" in rejected.reason
+    frame = runtime.step(
+        control_sequence=1,
+        control_timestamp_sec=20.11,
+        measured_qpos_rad=qpos,
+        measured_qvel_rad_s=(0.0,) * 6,
+        dt_sec=0.01,
+    )
+    assert frame.decision.state.mode is B601SharedControlMode.PASSIVE
+    assert frame.decision.reason == "no_policy_command"
+    assert frame.reference.joint_torque_overlay_nm == (0.0,) * 6
+
+
+def test_policy_clutch_clears_anchor_and_requires_explicit_recenter() -> None:
+    retargeter = _retargeter(_IK())
+    runtime = _shared_control_runtime()
+    bridge = RM65ToB601PolicyAssistBridge(retargeter, runtime)
+    qpos = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+
+    bridge.capture_anchor(_sample(1), measured_b601_qpos_rad=qpos)
+    assert bridge.process_sample(
+        _sample(2),
+        measured_b601_qpos_rad=qpos,
+    ).accepted
+    bridge.set_policy_clutch(True)
+    bridge.set_policy_clutch(False)
+
+    rejected = bridge.process_sample(
+        _sample(3),
+        measured_b601_qpos_rad=qpos,
+    )
+    assert rejected.accepted is False
+    assert rejected.reason == "retarget_rejected:anchor_not_captured"
+    assert runtime.step(
+        control_sequence=1,
+        control_timestamp_sec=20.11,
+        measured_qpos_rad=qpos,
+        measured_qvel_rad_s=(0.0,) * 6,
+        dt_sec=0.01,
+    ).reference.joint_torque_overlay_nm == (0.0,) * 6

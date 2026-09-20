@@ -73,6 +73,11 @@ class B601SharedControlRuntime:
     ) -> B601PolicyCommandReceipt:
         return self._commands.publish(command)
 
+    def clear_policy(self) -> int | None:
+        """Withdraw current policy assist while retaining replay protection."""
+
+        return self._commands.clear()
+
     def step(
         self,
         *,

@@ -86,21 +86,37 @@ gravity scale/bias 仍属于真机 controller profile。自动验收额外要求
 这只是程序内接线边界，还不是可运行的真机 shared-policy application。当前没有新增 socket、
 JSONL 轮询、第二个 CAN owner 或后台进程。
 
+### P4：复用 RM65→B601 重定向作为 policy 意图
+
+`robot_motion/rebot_b601_rs/rm65_policy_assist.py` 复用既有
+`RM65ToB601Retargeter` 的坐标变换、anchor-relative mapping 和连续种子 IK，不另建映射或
+求解器。它只把当前 tick 接受的 B601 qpos 目标发布到同进程
+`B601SharedControlRuntime`：
+
+- policy sequence 直接继承已验证递增的 RM65 sample sequence；
+- policy source timestamp 使用 host-local monotonic receive timestamp，不混用设备 wall clock；
+- stale、frame、replay、IK 或 policy publish 拒绝会立即撤销上一条 assist；
+- 撤销保留已接受 sequence 高水位，迟到旧包不能重新激活；
+- policy clutch 同时撤销 assist 并清空 retarget anchor，释放后必须显式 recenter；
+- bridge 不持有 CAN、MotorBridge、MuJoCo 或 gravity/dispatch 生命周期。
+
+该阶段建立的是“RM65 运动意图 → B601 bounded assist”的纯软件接线，并不表示已经接入
+真实 policy provider 或真机执行。
+
 ## 3. 当前证据边界
 
 - 纯控制、runtime、MuJoCo 和低增益 probe 单元/契约测试通过；
 - MuJoCo 只证明方向、生命周期、边界和定性运动；
-- P3 尚未连接真实 policy provider，也未执行真机；
+- P3/P4 尚未连接真实 policy provider，也未执行真机；
 - 没有自动人工外力检测、policy replan、真实 torque sensing 或 passivity 声明；
 - 当前候选不合并、不 push、不安装。
 
 ## 4. 下一步
 
-1. 在 application leaf 中装配 policy producer、显式 policy clutch 与同进程 runtime；不得让
-   producer 获得 backend/CAN handle。
-2. 先用离线 scripted producer 和 MuJoCo 验证跨频率 latest-value、stale、clutch、rebase、
+1. 在 application leaf 中复用 P4 bridge 装配 scripted policy producer、显式 policy clutch 与
+   同进程 runtime；不得让 producer 获得 backend/CAN handle。
+2. 用 MuJoCo 验证跨频率 latest-value、stale、clutch、rebase、
    无回弹和日志，再决定本地进程间传输是否真的需要。
 3. 增加 shadow-only 真机观察：计算但不发送 assist，验证符号、量级、freshness 和 deadline。
 4. 只有 shadow evidence 通过后，才提供前台、低权限、单关节起步的真机命令；退出仍进入原
    gravity+damping protective hold，第二次停止才允许全失能。
-

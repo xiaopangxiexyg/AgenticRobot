@@ -65,21 +65,23 @@ def test_policy_command_rejects_wrong_frame_and_clock_order() -> None:
         )
 
 
-def test_latest_value_buffer_rejects_replay_and_discards_stale_command() -> None:
+def test_latest_value_buffer_rejects_replay_and_revokes_previous_command() -> None:
     buffer = B601PolicyCommandBuffer()
     assert buffer.publish(_command(2)).accepted is True
     replay = buffer.publish(_command(2, source_timestamp_sec=1.1))
     assert replay.accepted is False
     assert replay.reason == "non_advancing_sequence"
 
-    fresh = buffer.sample(
+    revoked = buffer.sample(
         now_sec=1.15,
         maximum_age_sec=0.2,
         maximum_future_skew_sec=0.01,
     )
-    assert fresh.accepted is True
-    assert fresh.command is not None
-    assert fresh.command.sequence == 2
+    assert revoked.accepted is False
+    assert revoked.command is None
+    assert revoked.reason == "no_policy_command"
+
+    assert buffer.publish(_command(3, source_timestamp_sec=1.0)).accepted is True
 
     stale = buffer.sample(
         now_sec=1.21,
@@ -89,6 +91,25 @@ def test_latest_value_buffer_rejects_replay_and_discards_stale_command() -> None
     assert stale.accepted is False
     assert stale.command is None
     assert stale.reason == "policy_command_stale"
+
+
+def test_buffer_clear_withdraws_command_without_reopening_replay() -> None:
+    buffer = B601PolicyCommandBuffer()
+    assert buffer.publish(_command(2)).accepted is True
+
+    assert buffer.clear() == 2
+    sample = buffer.sample(
+        now_sec=1.05,
+        maximum_age_sec=0.2,
+        maximum_future_skew_sec=0.01,
+    )
+    assert sample.accepted is False
+    assert sample.reason == "no_policy_command"
+
+    replay = buffer.publish(_command(2, source_timestamp_sec=1.1))
+    assert replay.accepted is False
+    assert replay.reason == "non_advancing_sequence"
+    assert buffer.publish(_command(3, source_timestamp_sec=1.1)).accepted is True
 
 
 def test_buffer_can_sample_with_owner_selected_watchdog_config() -> None:
@@ -121,6 +142,25 @@ def test_buffer_rejects_future_and_invalid_samples() -> None:
     )
     assert sample.accepted is False
     assert sample.reason == "policy_command_from_future"
+
+
+def test_invalid_new_command_revokes_previous_valid_command() -> None:
+    buffer = B601PolicyCommandBuffer()
+    assert buffer.publish(_command(1)).accepted is True
+    invalid = B601PolicyAssistCommand(
+        sequence=2,
+        source_timestamp_sec=1.0,
+        receive_timestamp_sec=1.01,
+        qpos_target_rad=ZERO,
+        valid=False,
+    )
+
+    assert buffer.publish(invalid).reason == "command_marked_invalid"
+    assert buffer.sample(
+        now_sec=1.02,
+        maximum_age_sec=0.2,
+        maximum_future_skew_sec=0.01,
+    ).reason == "no_policy_command"
 
 
 def test_assist_applies_error_torque_authority_and_slew_bounds() -> None:

@@ -173,30 +173,48 @@ class B601PolicyCommandBuffer:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._latest: B601PolicyAssistCommand | None = None
+        self._highest_accepted_sequence: int | None = None
 
     def publish(self, command: B601PolicyAssistCommand) -> B601PolicyCommandReceipt:
         if not isinstance(command, B601PolicyAssistCommand):
             raise TypeError("command must be a B601PolicyAssistCommand")
         with self._lock:
-            latest = self._latest
-            if latest is not None and command.sequence <= latest.sequence:
+            highest_sequence = self._highest_accepted_sequence
+            if highest_sequence is not None and command.sequence <= highest_sequence:
+                self._latest = None
                 return B601PolicyCommandReceipt(
                     accepted=False,
                     reason="non_advancing_sequence",
                     sequence=command.sequence,
                 )
             if not command.valid:
+                self._latest = None
                 return B601PolicyCommandReceipt(
                     accepted=False,
                     reason="command_marked_invalid",
                     sequence=command.sequence,
                 )
             self._latest = command
+            self._highest_accepted_sequence = command.sequence
         return B601PolicyCommandReceipt(
             accepted=True,
             reason="accepted",
             sequence=command.sequence,
         )
+
+    def clear(self) -> int | None:
+        """Withdraw the active command without reopening replayed sequences.
+
+        Rejection at an upstream mapping or IK boundary must remove the last
+        valid assist target immediately.  The accepted sequence high-water
+        mark is intentionally retained so a delayed producer cannot restore
+        the withdrawn command after the fault clears.
+        """
+
+        with self._lock:
+            latest = self._latest
+            self._latest = None
+            return None if latest is None else latest.sequence
 
     def sample(
         self,

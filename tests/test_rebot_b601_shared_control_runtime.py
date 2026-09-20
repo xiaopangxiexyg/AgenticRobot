@@ -97,6 +97,26 @@ def test_runtime_stale_policy_emits_zero_overlay() -> None:
     assert frame.decision.reason == "policy_command_stale"
 
 
+def test_runtime_clear_policy_withdraws_overlay_and_preserves_replay_guard() -> None:
+    runtime = B601SharedControlRuntime(_config())
+    assert runtime.publish_policy(_command(1, 1.0)).accepted is True
+    assert runtime.clear_policy() == 1
+
+    frame = runtime.step(
+        control_sequence=1,
+        control_timestamp_sec=1.01,
+        measured_qpos_rad=ZERO,
+        measured_qvel_rad_s=ZERO,
+        dt_sec=0.01,
+    )
+    assert frame.reference.joint_torque_overlay_nm == ZERO
+    assert frame.decision.state.mode is B601SharedControlMode.PASSIVE
+    assert frame.decision.reason == "no_policy_command"
+    assert runtime.publish_policy(_command(1, 1.02)).reason == (
+        "non_advancing_sequence"
+    )
+
+
 def test_runtime_reference_reuses_existing_gravity_and_total_torque_path() -> None:
     runtime = B601SharedControlRuntime(_config())
     runtime.publish_policy(_command(1, 1.0))
