@@ -1049,6 +1049,17 @@ def _dmtac_gripper_paths(item: Mapping[str, Any]) -> set[str]:
     }
 
 
+def _stable_dmtac_gripper_port(item: Mapping[str, Any]) -> str:
+    """Prefer a topology-stable alias when explaining a port mismatch."""
+
+    paths = _dmtac_gripper_paths(item)
+    for prefix in ("/dev/serial/by-path/", "/dev/serial/by-id/"):
+        stable = sorted(path for path in paths if path.startswith(prefix))
+        if stable:
+            return stable[0]
+    return _dmtac_gripper_port(item)
+
+
 def _validate_dmtac_gripper_override_identities(
     *,
     options: DevicePreflightOptions,
@@ -1094,37 +1105,6 @@ def _validate_dmtac_gripper_override_identities(
         # flow must establish roles through its existing confirmation path.
         if not isinstance(configured_gripper, Mapping):
             continue
-        current = next(
-            (
-                item
-                for item in scanned
-                if explicit_port in _dmtac_gripper_paths(item)
-            ),
-            None,
-        )
-        if current is None:
-            raise DevicePreflightError(
-                f"DMTAC {requested_side} gripper override {explicit_port!r} "
-                "does not resolve to a scanned USB gripper; refusing a "
-                "side-unverified runtime endpoint."
-            )
-        if (current.get("probe") or {}).get("reachable") is not True:
-            raise DevicePreflightError(
-                f"DMTAC {requested_side} gripper override {explicit_port!r} "
-                "did not produce a successful read-only probe; refusing to "
-                "construct the runtime backend."
-            )
-        current_paths = _dmtac_gripper_paths(current)
-        identity_sides = {
-            str(item.get("side"))
-            for item in matched
-            if isinstance(item.get("current"), Mapping)
-            and current_paths.intersection(
-                _dmtac_gripper_paths(item["current"])
-            )
-        }
-        if requested_side in identity_sides:
-            continue
         expected = next(
             (
                 item.get("current")
@@ -1139,6 +1119,74 @@ def _validate_dmtac_gripper_override_identities(
             if isinstance(expected, Mapping)
             else str(configured_gripper.get("port") or "")
         )
+        expected_stable_port = (
+            _stable_dmtac_gripper_port(expected)
+            if isinstance(expected, Mapping)
+            else ""
+        )
+        current = next(
+            (
+                item
+                for item in scanned
+                if explicit_port in _dmtac_gripper_paths(item)
+            ),
+            None,
+        )
+        if current is None:
+            reachable = [
+                _stable_dmtac_gripper_port(item)
+                for item in scanned
+                if (item.get("probe") or {}).get("reachable") is True
+            ]
+            hint = (
+                f" The configured {requested_side} identity is currently reachable at "
+                f"{expected_stable_port or expected_port or '<unresolved>'!r}; "
+                "use that stable endpoint or omit the manual override so the saved "
+                "assignment can remap it."
+                if reachable and (expected_stable_port or expected_port)
+                else ""
+            )
+            raise DevicePreflightError(
+                f"DMTAC {requested_side} gripper override {explicit_port!r} "
+                "does not resolve to a scanned USB gripper; refusing a "
+                "side-unverified runtime endpoint."
+                + hint
+                + (
+                    f" Reachable gripper endpoint(s): {', '.join(sorted(set(reachable)))}."
+                    if reachable
+                    else ""
+                )
+            )
+        if (current.get("probe") or {}).get("reachable") is not True:
+            hint = ""
+            if expected_stable_port or expected_port:
+                expected_probe = (
+                    expected.get("probe") if isinstance(expected, Mapping) else None
+                )
+                if isinstance(expected_probe, Mapping) and expected_probe.get("reachable") is True:
+                    hint = (
+                        f" The configured {requested_side} identity is reachable at "
+                        f"{expected_stable_port or expected_port!r}; use that stable "
+                        "endpoint or omit the manual override so the saved assignment "
+                        "can remap it."
+                    )
+            raise DevicePreflightError(
+                f"DMTAC {requested_side} gripper override {explicit_port!r} "
+                "did not produce a successful read-only probe; refusing to "
+                "construct the runtime backend."
+                + hint
+            )
+        current_paths = _dmtac_gripper_paths(current)
+        identity_sides = {
+            str(item.get("side"))
+            for item in matched
+            if isinstance(item.get("current"), Mapping)
+            and current_paths.intersection(
+                _dmtac_gripper_paths(item["current"])
+            )
+        }
+        if requested_side in identity_sides:
+            continue
         detected_role = ",".join(sorted(identity_sides)) or "unknown"
         raise DevicePreflightError(
             f"DMTAC {requested_side} gripper override {explicit_port!r} "
