@@ -411,13 +411,25 @@ def manual_dmtac_backend_config_for_side(
     args: argparse.Namespace,
     side: str,
     policy: Mapping[str, Any],
+    *,
+    base_config: DMTacGripperBackendConfig | None = None,
 ) -> DMTacGripperBackendConfig | None:
-    """Build one gripper-only backend config from an explicit port override."""
+    """Apply an explicit port override to one side's backend config.
+
+    When ``base_config`` comes from the saved assignment or GUI preflight,
+    preserve its tactile binding and transport settings and replace only the
+    serial endpoint.  Without a base config, retain the legacy gripper-only
+    manual-port fallback.
+    """
 
     side_name = str(side)
     port = str(getattr(args, f"{side_name}_gripper_port", "") or "").strip()
     if not port:
         return None
+    if base_config is not None:
+        base_config.gripper_port = port
+        base_config.connect_hardware = True
+        return base_config
     return DMTacGripperBackendConfig(
         side=side_name,
         effector_name=f"{side_name}_hand",

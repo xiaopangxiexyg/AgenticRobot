@@ -19,6 +19,7 @@ if str(DMTAC_ROOT) not in sys.path:
 from teleop_runtime.configs.dmtac_hardware import (
     apply_dmtac_gripper_port_overrides,
     dmtac_backend_configs_from_assignment,
+    manual_dmtac_backend_config_for_side,
 )
 from portable_dm_tac import DMTacDevice, DMTacMultiDevice, DeviceConfig, TacFrame  # noqa: E402
 from portable_dmtac_gripper.device import TactileConfig, tactile_device_config  # noqa: E402
@@ -1036,6 +1037,32 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertTrue(overridden["right"].connect_hardware)
         self.assertTrue(overridden["right"].connect_tactile)
         self.assertEqual(overridden["right"].tactile_ids, ("R_IN", "R_OUT"))
+
+    def test_manual_port_overlay_accepts_base_assignment_config(self) -> None:
+        assignment = build_assignment_from_tokens(
+            _scan(),
+            right_gripper="1",
+            right_inner="R_IN",
+            right_outer="R_OUT",
+        )
+        configs = dmtac_backend_configs_from_assignment(
+            assignment,
+            active_sides=("right",),
+        )
+        args = type("Args", (), {"right_gripper_port": "/dev/ttyUSB2"})()
+
+        overridden = manual_dmtac_backend_config_for_side(
+            args,
+            "right",
+            {},
+            base_config=configs["right"],
+        )
+
+        self.assertIs(overridden, configs["right"])
+        self.assertEqual(overridden.gripper_port, "/dev/ttyUSB2")
+        self.assertTrue(overridden.connect_hardware)
+        self.assertTrue(overridden.connect_tactile)
+        self.assertEqual(overridden.tactile_ids, ("R_IN", "R_OUT"))
 
 
     def test_assignment_legacy_timeout_above_probe_budget_remains_usable(self) -> None:

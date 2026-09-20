@@ -512,6 +512,13 @@ def _dmtac_backend_configs(
         for side, config in configs.items()
         if side in dmtac_sides and (config.connect_hardware or config.connect_tactile)
     }
+    port_summary = ", ".join(
+        f"{side}={config.gripper_port}"
+        for side, config in resolved.items()
+        if config.connect_hardware
+    )
+    if port_summary:
+        _log("DMTAC", f"resolved gripper ports: {port_summary}")
     if bool(getattr(args, "dmtac_config_required", False)):
         require_dmtac_sides_resolved(
             dmtac_sides,
