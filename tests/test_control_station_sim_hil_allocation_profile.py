@@ -569,26 +569,36 @@ def test_allocation_profiles_virtual_policy_and_human_run_button_operations(
             # source choice.
             assert first_cycle.execution.status == "execution_cancelled"
 
-        admitted_cycle = (
-            first_cycle
-            if first_cycle.publication.proposal_publication.status
-            == "proposal_admitted"
-            else None
-        )
-        for _ in range(10):
-            if admitted_cycle is not None:
-                break
-            candidate = step_when_due()
-            if candidate.publication.proposal_publication.status == (
-                "proposal_admitted"
-            ):
-                admitted_cycle = candidate
-        assert admitted_cycle is not None
-        assert admitted_cycle.execution.status in {
+        accepted_execution_statuses = {
             "dispatched",
             "execution_kept_existing",
             "not_due",
         }
+
+        def accept_executable_admission(candidate):
+            if candidate.publication.proposal_publication.status != (
+                "proposal_admitted"
+            ):
+                return None
+            if candidate.execution.status == (
+                "target_lifecycle_rejected_keep_existing"
+            ):
+                # The 250 ms virtual emission may expire while the real
+                # MuJoCo/IK target is resolving under full-suite CPU load.
+                # Preserve that fail-closed result and request a fresh
+                # emission; this operation test must still observe a later
+                # executable admission before it continues.
+                return None
+            assert candidate.execution.status in accepted_execution_statuses
+            return candidate
+
+        admitted_cycle = accept_executable_admission(first_cycle)
+        for _ in range(10):
+            if admitted_cycle is not None:
+                break
+            candidate = step_when_due()
+            admitted_cycle = accept_executable_admission(candidate)
+        assert admitted_cycle is not None
         if not supports_absolute:
             with pytest.raises(ValueError, match="Unsupported allocation button"):
                 app.submit_allocation_button_operation(
