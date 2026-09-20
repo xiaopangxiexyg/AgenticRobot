@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 import inspect
 import threading
@@ -2236,6 +2237,16 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
     ).read_text(encoding="utf-8")
     assert "from teleop_runtime.debug" not in source
     assert "from ..debug" not in source
+
+
+def test_startup_state_reader_executor_remains_available_for_later_maintenance() -> None:
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        components = SimpleNamespace(arm_state_read_executor=executor)
+        startup_runtime._release_runtime_state_readers(components)
+        assert executor.submit(lambda: "height-read").result(timeout=1) == "height-read"
+    finally:
+        executor.shutdown(wait=True)
 
 
 def test_startup_qpos_hold_failure_is_contained_after_ownership_stops(

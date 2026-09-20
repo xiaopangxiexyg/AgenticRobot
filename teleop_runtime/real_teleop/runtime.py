@@ -2215,7 +2215,8 @@ def run_real_teleop(
         _release_runtime_state_readers(components)
         _log(
             "ArmMode",
-            "runtime arm state source=last_commanded_action; startup hardware-state readers are now idle after calibration.",
+            "runtime arm state source=last_commanded_action; startup hardware-state reads are now idle after calibration; "
+            "the shared state-read executor remains available for recovery and maintenance reads until normal shutdown.",
         )
         if startup_home_captured:
             _emit_home_alignment_logs(components)
