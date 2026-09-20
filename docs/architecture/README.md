@@ -29,6 +29,7 @@
   [`reports/`](reports/README.md) 保存带日期的审计和已完成实施台账；
   [`evidence/`](evidence/README.md) 是按批次冻结的历史收据索引。计划、报告和 evidence
   的状态与验证范围不能相互替代。
+- B601-RS / RM65 的开发交接：[Real2Sim / HITL 开发交接文档](./reports/rebot_b601_real2sim_handoff_20260911.md)。
 - [`evidence/`](evidence/) 中 evidence JSON 内出现的旧 `todos/evidence/` 路径和哈希是历史收据的
   一部分；迁移版本控制位置时不回写这些记录。
 
