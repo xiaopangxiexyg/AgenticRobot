@@ -357,7 +357,10 @@ def run_b601_rm65_gui(
             return "q"
         return commands(timeout)
 
+    reported_target_worker_error: str | None = None
+
     def advance() -> dict[str, object]:
+        nonlocal reported_target_worker_error
         pose_resolver = getattr(session.binding.runtime, "pose_resolver", None)
         clear_resolve_diagnostics = getattr(
             pose_resolver, "clear_last_resolve_diagnostics", None
@@ -403,6 +406,22 @@ def run_b601_rm65_gui(
         target_details["target_dispatch_accepted"] = (
             str(getattr(result, "status", "")) == "dispatched"
         )
+        if target_details.get("status") == "dispatch_failed":
+            runtime_details = _target_runtime_failure_details(session)
+            if runtime_details is not None:
+                target_details["target_runtime"] = runtime_details
+                worker_error = runtime_details.get("last_worker_error")
+                if (
+                    isinstance(worker_error, str)
+                    and worker_error
+                    and worker_error != reported_target_worker_error
+                ):
+                    emit(
+                        "[B601→RM65] MuJoCo target worker fault: "
+                        f"{worker_error}; following is held. "
+                        "Inspect target_runtime in the JSONL log before retrying."
+                    )
+                    reported_target_worker_error = worker_error
         completion = getattr(result, "target_completion_receipt", None)
         dispatch_at = _finite_float_or_none(
             getattr(completion, "available_at", None)
@@ -843,6 +862,75 @@ def _target_step_details(step: object) -> dict[str, object]:
         details["target_completion"] = {
             "status": str(getattr(completion, "status", "")),
             "outcome_code": str(getattr(completion, "outcome_code", "")),
+        }
+    return details
+
+
+def _target_runtime_failure_details(
+    session: object,
+) -> dict[str, object] | None:
+    """Return bounded MuJoCo worker diagnostics after a dispatch failure.
+
+    The authoritative target receipt intentionally keeps its stable failure
+    code (``target_dispatch_exception``).  The receive-only B601/RM65 leaf
+    still needs the lower worker's concrete fault to distinguish a collision
+    latch, a planner invariant failure, and a gripper/physics exception.  Do
+    not serialize the full runtime snapshot: it contains unbounded histories
+    and private trace state.  This projection is read-only and has no effect
+    on target admission or recovery.
+    """
+
+    runtime = getattr(getattr(session, "binding", None), "runtime", None)
+    rig = getattr(runtime, "rig", None)
+    snapshot = getattr(rig, "snapshot", None)
+    if not callable(snapshot):
+        return None
+    try:
+        raw = snapshot()
+    except Exception as error:  # noqa: BLE001 - diagnostics must not mask failure
+        return {
+            "snapshot_error": f"{type(error).__name__}: {error}",
+        }
+    if not isinstance(raw, Mapping):
+        return {"snapshot_error": "MuJoCo rig snapshot is not a mapping."}
+
+    details: dict[str, object] = {}
+    for key in (
+        "ready",
+        "stopping",
+        "last_worker_error",
+        "physics_ticks",
+        "deadline_misses",
+        "last_reference_sequence",
+        "pending_reference_sequence",
+        "pending_reference_activate_at",
+        "pending_reference_segment_id",
+        "accepted_qcmd_by_side",
+        "measured_qpos_by_side",
+        "accepted_minus_measured_qpos_by_side",
+        "last_requested_qcmd_by_side",
+    ):
+        if key in raw:
+            details[key] = raw[key]
+    collision = raw.get("collision_safety_state")
+    if isinstance(collision, Mapping):
+        details["collision_safety_state"] = dict(collision)
+    gripper = raw.get("gripper_execution")
+    if isinstance(gripper, Mapping):
+        # Keep only bounded state useful for identifying a hand-side fault;
+        # the complete actuator-core history is deliberately not copied.
+        details["gripper_execution"] = {
+            key: gripper[key]
+            for key in (
+                "physics_time_sec",
+                "pending_close_by_gripper",
+                "accepted_close_by_gripper",
+                "servo_goal_close_by_gripper",
+                "actuator_target_close_by_gripper",
+                "measured_close_by_gripper",
+                "last_status_by_gripper",
+            )
+            if key in gripper
         }
     return details
 

@@ -265,6 +265,45 @@ def test_rotation_override_helpers_use_row_major_rpy_parameters() -> None:
     ) == (0.0, 0.0, 90.0)
 
 
+def test_target_runtime_failure_details_project_worker_fault_without_history() -> None:
+    rig = SimpleNamespace(
+        snapshot=lambda: {
+            "ready": False,
+            "stopping": True,
+            "last_worker_error": "RuntimeError: synthetic hard contact",
+            "physics_ticks": 42,
+            "deadline_misses": 3,
+            "last_reference_sequence": 9,
+            "pending_reference_sequence": None,
+            "accepted_qcmd_by_side": {"right": [0.1] * 6},
+            "measured_qpos_by_side": {"right": [0.09] * 6},
+            "accepted_minus_measured_qpos_by_side": {"right": [0.01] * 6},
+            "last_requested_qcmd_by_side": {"right": [0.11] * 6},
+            "collision_safety_state": {
+                "status": "hard_contact",
+                "hard_contact_latched": True,
+            },
+            "gripper_execution": {
+                "physics_time_sec": 0.42,
+                "accepted_close_by_gripper": {"right_gripper": 1.0},
+                "measured_close_by_gripper": {"right_gripper": 0.9},
+                "core": {"unbounded": "history"},
+            },
+        }
+    )
+    session = SimpleNamespace(binding=SimpleNamespace(runtime=SimpleNamespace(rig=rig)))
+
+    details = app._target_runtime_failure_details(session)
+
+    assert details is not None
+    assert details["last_worker_error"] == "RuntimeError: synthetic hard contact"
+    assert details["collision_safety_state"]["hard_contact_latched"] is True
+    assert details["gripper_execution"]["measured_close_by_gripper"] == {
+        "right_gripper": 0.9
+    }
+    assert "core" not in details["gripper_execution"]
+
+
 def _args(tmp_path, mode):
     return [
         mode,

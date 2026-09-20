@@ -550,6 +550,7 @@ def run_b601_rm65_foreground(
                 "target_resolution_failure": target_details.get(
                     "resolution_failure"
                 ),
+                "target_runtime": target_details.get("target_runtime"),
             }
             source_receive = bridge_step["source_receive_timestamp_sec"]
             target_dispatch = bridge_step["target_dispatch_monotonic_sec"]
