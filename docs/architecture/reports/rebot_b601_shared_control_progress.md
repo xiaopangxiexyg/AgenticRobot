@@ -133,19 +133,37 @@ gravity/damping 控制、protective hold、驱动器限矩恢复和最终 safe s
 `ASSIST INCOMPLETE`。一次性助力正常完成后会直接进入 protective hold，不再要求操作者
 等待总 duration；duration 仅作为等待 `A`/完成试验的最长窗口。
 
+第二轮现场运行 `/tmp/b601-rs-commissioning/b601-owner-6s8jamp5` 已完成按键、倒计时、
+assist 注入、撤销、protective hold 和最终 safe stop。控制环为 `20.012 Hz`，81 个 active
+sample 中 J6 assist 确实达到 `0.05 Nm`，无 torque/slew/overlay limit，所有完整六轴命令
+均已发送。但 J6 峰值位移仅 `0.000383 rad`（`0.022 deg`，一个 Type-24 位置量化台阶），
+末五帧均值仅 `0.000153 rad`（`0.009 deg`）。因此这不是按键或 dispatch 故障，而是该
+姿态下 `0.05 Nm` 未克服 J6 的静摩擦/死区。
+
+该证据同时暴露了原验收口径缺陷：状态机进入 `COMPLETE` 曾被直接写成 `PASS`。当前候选
+已将协议完成与机械验收分离；真机 PASS 还要求助力实际达到配置比例、目标关节产生至少
+`0.1 deg` 的正确方向稳定响应、响应不过量且 J1--J5 漂移均不超过 `0.5 deg`。终端只显示
+一行 `ASSIST RESPONSE` 摘要，完整测量保存在结果 JSON。旧证据按新口径为
+`INSUFFICIENT_RESPONSE`，不能再冒充真机助力通过。
+相同边界也在 active 阶段逐帧生效：错误方向、目标关节过量位移或任一支撑关节过量漂移
+会先撤销 assist，再进入既有 protective-hold 故障路径，而不是等试验结束后才报告。
+
 ## 3. 当前证据边界
 
 - 纯控制、runtime、MuJoCo 和低增益 probe 单元/契约测试通过；
 - MuJoCo 只证明方向、生命周期、边界和定性运动；
-- P3/P4 尚未连接真实 policy provider；P5 尚未执行真机；
+- P3/P4 尚未连接真实 policy provider；P5 的命令链已在真机验证，但 `0.05 Nm` 试验缺少
+  可接受的机械响应；
 - 没有自动人工外力检测、policy replan、真实 torque sensing 或 passivity 声明；
 - 当前候选不合并、不 push、不安装。
 
 ## 4. 下一步
 
-1. 由现场操作者前台运行 P5 的 J6 低助力协议，先确认重力/阻尼稳定，再按 `A`；记录方向、
-   可见位移、人工阻挡手感、撤销后无回拉及完整 cleanup receipt。
-2. P5 通过后再逐级调整 J6 助力上限/偏移；未获得独立证据前不扩展到 J1--J5。
+1. 保持 J6、`0.10 rad` 相对目标和全部既有安全边界不变，仅把助力上限按独立前台试验从
+   `0.05 Nm` 提升到 `0.15 Nm`；验收终端 `ASSIST RESPONSE` 和结果 JSON，而不是肉眼或
+   状态机完成。若仍为 `INSUFFICIENT_RESPONSE`，先分析实测曲线再决定是否进入下一档。
+2. P5 出现正确方向、受限、可重复的机械响应后，再固化默认值并扩展到其他关节；未获得
+   独立证据前不扩展到 J1--J5。
 3. 在 application leaf 中复用 P4 bridge 装配真实 policy producer、显式 policy clutch 与
    同进程 runtime；不得让 producer 获得 backend/CAN handle。
 4. 增加自动人工干预检测 shadow，验证符号、量级、freshness 和 deadline 后才允许其改变

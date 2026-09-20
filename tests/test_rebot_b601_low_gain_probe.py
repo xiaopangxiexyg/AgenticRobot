@@ -4376,6 +4376,41 @@ def test_slow_step_response_rejects_support_joint_drift() -> None:
     assert result["support_peak_drift_rad"]["joint1"] == pytest.approx(0.01)
 
 
+def test_assist_commissioning_response_does_not_accept_state_machine_only() -> None:
+    config = probe.B601SingleJointAssistConfig(
+        joint_name="joint6",
+        offset_rad=0.1,
+        max_abs_assist_torque_nm=0.05,
+        countdown_sec=1.0,
+        assist_duration_sec=2.0,
+    )
+    runtime = probe.B601SharedControlRuntime(config.shared_control_config())
+    session = probe.B601SingleJointAssistSession(config, runtime)
+    session.anchor_qpos_rad = (0.0,) * 6
+    session.state = probe.B601AssistCommissioningState.COMPLETE
+    samples = tuple(
+        {
+            "qpos_rad": (0.0, 0.0, 0.0, 0.0, 0.0, 0.00038),
+            "shared_control_commissioning_state": "active",
+            "shared_control": {
+                "assist_torque_nm": (0.0, 0.0, 0.0, 0.0, 0.0, 0.05)
+            },
+        }
+        for _ in range(6)
+    )
+
+    result = probe.evaluate_assist_commissioning_response(
+        session=session,
+        samples=samples,
+        active_joint_names=probe.resolve_active_joint_names(),
+        minimum_response_rad=0.001,
+    )
+
+    assert result["status"] == "INSUFFICIENT_RESPONSE"
+    assert result["passed"] is False
+    assert "0.022deg" in probe.format_assist_response_notice(result)
+
+
 def test_effort_limits_are_read_from_urdf_and_scaled(tmp_path) -> None:
     effort_values = (36.0, 36.0, 36.0, 14.0, 14.0, 14.0)
     joints = "".join(

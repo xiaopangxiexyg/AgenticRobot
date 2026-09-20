@@ -117,6 +117,19 @@ def _parser() -> argparse.ArgumentParser:
         default=0.02,
     )
     parser.add_argument(
+        "--assist-min-response-rad",
+        type=float,
+        default=0.0017453292519943296,
+        help="minimum settled response required for hardware acceptance (0.1 deg)",
+    )
+    parser.add_argument("--assist-max-response-ratio", type=float, default=1.5)
+    parser.add_argument(
+        "--assist-max-support-drift-rad",
+        type=float,
+        default=0.008726646259971648,
+        help="maximum non-target joint drift accepted during the trial (0.5 deg)",
+    )
+    parser.add_argument(
         "--assist-confirmation",
         default="",
         help=(
@@ -301,6 +314,12 @@ def build_probe_command(
                 str(args.assist_duration_sec),
                 "--assist-stationarity-limit-rad-s",
                 str(args.assist_stationarity_limit_rad_s),
+                "--assist-min-response-rad",
+                str(args.assist_min_response_rad),
+                "--assist-max-response-ratio",
+                str(args.assist_max_response_ratio),
+                "--assist-max-support-drift-rad",
+                str(args.assist_max_support_drift_rad),
                 "--assist-confirmation",
                 args.assist_confirmation,
             )

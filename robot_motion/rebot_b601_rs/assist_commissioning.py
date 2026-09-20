@@ -20,6 +20,10 @@ from .shared_control_runtime import B601SharedControlRuntime
 
 _ZERO_SIX = (0.0,) * 6
 _MAX_COMMISSIONING_OFFSET_RAD = math.radians(20.0)
+_DEFAULT_MINIMUM_RESPONSE_RAD = math.radians(0.1)
+_DEFAULT_MAXIMUM_RESPONSE_RATIO = 1.5
+_DEFAULT_MAXIMUM_SUPPORT_DRIFT_RAD = math.radians(0.5)
+_DEFAULT_MINIMUM_ASSIST_DELIVERY_RATIO = 0.9
 
 
 def _finite(value: object, *, name: str) -> float:
@@ -112,6 +116,21 @@ class B601SingleJointAssistConfig:
     def joint_index(self) -> int:
         return B601_RS_ARM_JOINT_NAMES.index(self.joint_name)
 
+    @property
+    def maximum_static_assist_torque_nm(self) -> float:
+        """Maximum target-direction torque reachable from rest.
+
+        The explicit torque cap alone can overstate the applied assist when
+        ``Kp * max_target_error`` is smaller.  Commissioning reports and
+        acceptance use this effective value so an inert parameter change is
+        never mistaken for a stronger trial.
+        """
+
+        return min(
+            self.max_abs_assist_torque_nm,
+            self.position_kp_nm_per_rad * self.max_target_error_rad,
+        )
+
     def shared_control_config(self) -> B601SharedControlConfig:
         """Build the existing bounded assist contract without a second path."""
 
@@ -138,6 +157,170 @@ class B601SingleJointAssistConfig:
             policy_stale_timeout_sec=self.command_stale_timeout_sec,
             maximum_future_skew_sec=self.maximum_future_skew_sec,
         )
+
+
+@dataclass(frozen=True)
+class B601AssistResponseCriteria:
+    """Mechanical evidence required to accept a real assist trial.
+
+    Completing the command state machine is intentionally insufficient: a
+    commissioning run must show a measurable, correctly directed response
+    while the other enabled arm joints remain bounded.
+    """
+
+    minimum_response_rad: float = _DEFAULT_MINIMUM_RESPONSE_RAD
+    maximum_response_ratio: float = _DEFAULT_MAXIMUM_RESPONSE_RATIO
+    maximum_support_drift_rad: float = _DEFAULT_MAXIMUM_SUPPORT_DRIFT_RAD
+    minimum_assist_delivery_ratio: float = _DEFAULT_MINIMUM_ASSIST_DELIVERY_RATIO
+
+    def __post_init__(self) -> None:
+        for name in (
+            "minimum_response_rad",
+            "maximum_response_ratio",
+            "maximum_support_drift_rad",
+            "minimum_assist_delivery_ratio",
+        ):
+            object.__setattr__(self, name, _positive(getattr(self, name), name=name))
+        if self.minimum_response_rad > _MAX_COMMISSIONING_OFFSET_RAD:
+            raise ValueError("minimum_response_rad must be within 20 degrees")
+        if self.maximum_response_ratio < 1.0:
+            raise ValueError("maximum_response_ratio must be >= 1")
+        if self.minimum_assist_delivery_ratio > 1.0:
+            raise ValueError("minimum_assist_delivery_ratio must be <= 1")
+
+
+def evaluate_single_joint_assist_response(
+    *,
+    config: B601SingleJointAssistConfig,
+    state: B601AssistCommissioningState,
+    anchor_qpos_rad: Sequence[float] | None,
+    measured_qpos_samples_rad: Sequence[Sequence[float]],
+    assist_torque_samples_nm: Sequence[Sequence[float]],
+    active_joint_names: Sequence[str] = B601_RS_ARM_JOINT_NAMES,
+    criteria: B601AssistResponseCriteria | None = None,
+) -> dict[str, object]:
+    """Classify real mechanical response separately from command completion."""
+
+    acceptance = criteria or B601AssistResponseCriteria()
+    if state is not B601AssistCommissioningState.COMPLETE:
+        return {
+            "status": "INCOMPLETE",
+            "passed": False,
+            "commissioning_state": state.value,
+            "sample_count": len(measured_qpos_samples_rad),
+        }
+    if anchor_qpos_rad is None:
+        return {
+            "status": "NO_ANCHOR",
+            "passed": False,
+            "commissioning_state": state.value,
+            "sample_count": len(measured_qpos_samples_rad),
+        }
+    positions = tuple(
+        _six(sample, name="measured_qpos_sample_rad")
+        for sample in measured_qpos_samples_rad
+    )
+    assist_torques = tuple(
+        _six(sample, name="assist_torque_sample_nm")
+        for sample in assist_torque_samples_nm
+    )
+    if len(positions) != len(assist_torques):
+        raise ValueError("position and assist-torque sample counts must match")
+    if not positions:
+        return {
+            "status": "NO_ACTIVE_SAMPLES",
+            "passed": False,
+            "commissioning_state": state.value,
+            "sample_count": 0,
+        }
+
+    anchor = _six(anchor_qpos_rad, name="anchor_qpos_rad")
+    target_index = config.joint_index
+    direction = 1 if config.offset_rad > 0.0 else -1
+    tail_size = min(5, len(positions))
+    settled_qpos = tuple(
+        sum(sample[index] for sample in positions[-tail_size:]) / tail_size
+        for index in range(6)
+    )
+    settled_signed_displacement = direction * (
+        settled_qpos[target_index] - anchor[target_index]
+    )
+    peak_signed_displacement = max(
+        direction * (sample[target_index] - anchor[target_index])
+        for sample in positions
+    )
+    max_abs_target_excursion = max(
+        abs(sample[target_index] - anchor[target_index]) for sample in positions
+    )
+    peak_signed_assist_torque = max(
+        direction * sample[target_index] for sample in assist_torques
+    )
+    expected_peak_assist_torque = config.maximum_static_assist_torque_nm
+    assist_delivery_ratio = max(0.0, peak_signed_assist_torque) / (
+        expected_peak_assist_torque
+    )
+    support_names = tuple(
+        name
+        for name in active_joint_names
+        if name in B601_RS_ARM_JOINT_NAMES and name != config.joint_name
+    )
+    support_peak_drift = {
+        name: max(
+            abs(
+                sample[B601_RS_ARM_JOINT_NAMES.index(name)]
+                - anchor[B601_RS_ARM_JOINT_NAMES.index(name)]
+            )
+            for sample in positions
+        )
+        for name in support_names
+    }
+    max_support_drift = max(support_peak_drift.values(), default=0.0)
+    maximum_response_rad = min(
+        _MAX_COMMISSIONING_OFFSET_RAD,
+        abs(config.offset_rad) * acceptance.maximum_response_ratio,
+    )
+
+    if max_abs_target_excursion > _MAX_COMMISSIONING_OFFSET_RAD:
+        status = "HARD_EXCURSION_LIMIT_EXCEEDED"
+    elif max_abs_target_excursion > maximum_response_rad:
+        status = "EXCESSIVE_RESPONSE"
+    elif max_support_drift > acceptance.maximum_support_drift_rad:
+        status = "SUPPORT_DRIFT_EXCEEDED"
+    elif assist_delivery_ratio < acceptance.minimum_assist_delivery_ratio:
+        status = "ASSIST_NOT_DELIVERED"
+    elif settled_signed_displacement < -acceptance.minimum_response_rad:
+        status = "WRONG_DIRECTION"
+    elif settled_signed_displacement < acceptance.minimum_response_rad:
+        status = "INSUFFICIENT_RESPONSE"
+    else:
+        status = "PASS"
+
+    return {
+        "status": status,
+        "passed": status == "PASS",
+        "commissioning_state": state.value,
+        "sample_count": len(positions),
+        "settled_sample_count": tail_size,
+        "target_joint": config.joint_name,
+        "direction": direction,
+        "commanded_offset_rad": config.offset_rad,
+        "settled_signed_displacement_rad": settled_signed_displacement,
+        "peak_signed_displacement_rad": peak_signed_displacement,
+        "max_abs_target_excursion_rad": max_abs_target_excursion,
+        "minimum_response_rad": acceptance.minimum_response_rad,
+        "maximum_response_rad": maximum_response_rad,
+        "configured_max_assist_torque_nm": config.max_abs_assist_torque_nm,
+        "expected_peak_static_assist_torque_nm": expected_peak_assist_torque,
+        "peak_signed_assist_torque_nm": peak_signed_assist_torque,
+        "assist_delivery_ratio": assist_delivery_ratio,
+        "minimum_assist_delivery_ratio": (
+            acceptance.minimum_assist_delivery_ratio
+        ),
+        "support_joint_names": support_names,
+        "support_peak_drift_rad": support_peak_drift,
+        "max_support_drift_rad": max_support_drift,
+        "max_support_drift_limit_rad": acceptance.maximum_support_drift_rad,
+    }
 
 
 @dataclass(frozen=True)
@@ -231,6 +414,57 @@ class B601SingleJointAssistSession:
         self.state = B601AssistCommissioningState.CANCELLED
         self.completed_at_sec = timestamp
         return self._event("CANCELLED", timestamp, detail)
+
+    def validate_active_motion(
+        self,
+        measured_qpos_rad: Sequence[float],
+        *,
+        criteria: B601AssistResponseCriteria,
+    ) -> None:
+        """Fail before another assist command if observed motion is unsafe."""
+
+        if self.state is not B601AssistCommissioningState.ACTIVE:
+            return
+        if self.anchor_qpos_rad is None:
+            raise ValueError("active assist has no measured anchor")
+        qpos = _six(measured_qpos_rad, name="measured_qpos_rad")
+        direction = 1 if self.config.offset_rad > 0.0 else -1
+        target_displacement = (
+            qpos[self.config.joint_index]
+            - self.anchor_qpos_rad[self.config.joint_index]
+        )
+        signed_displacement = direction * target_displacement
+        maximum_response = min(
+            _MAX_COMMISSIONING_OFFSET_RAD,
+            abs(self.config.offset_rad) * criteria.maximum_response_ratio,
+        )
+        if abs(target_displacement) > maximum_response:
+            raise ValueError(
+                f"{self.config.joint_name} excursion "
+                f"{abs(target_displacement):.6f}rad exceeds "
+                f"{maximum_response:.6f}rad"
+            )
+        if signed_displacement < -criteria.minimum_response_rad:
+            raise ValueError(
+                f"{self.config.joint_name} moved in the wrong direction by "
+                f"{abs(signed_displacement):.6f}rad"
+            )
+        support_drift = max(
+            (
+                abs(current - anchor)
+                for index, (current, anchor) in enumerate(
+                    zip(qpos, self.anchor_qpos_rad, strict=True)
+                )
+                if index != self.config.joint_index
+            ),
+            default=0.0,
+        )
+        if support_drift > criteria.maximum_support_drift_rad:
+            raise ValueError(
+                "support-joint drift "
+                f"{support_drift:.6f}rad exceeds "
+                f"{criteria.maximum_support_drift_rad:.6f}rad"
+            )
 
     def step(
         self,
@@ -345,6 +579,8 @@ class B601SingleJointAssistSession:
 __all__ = [
     "B601AssistCommissioningEvent",
     "B601AssistCommissioningState",
+    "B601AssistResponseCriteria",
     "B601SingleJointAssistConfig",
     "B601SingleJointAssistSession",
+    "evaluate_single_joint_assist_response",
 ]

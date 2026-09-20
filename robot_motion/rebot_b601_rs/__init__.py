@@ -6,8 +6,10 @@ Importing this package has no hardware or vendor-package side effects.
 from .assist_commissioning import (
     B601AssistCommissioningEvent,
     B601AssistCommissioningState,
+    B601AssistResponseCriteria,
     B601SingleJointAssistConfig,
     B601SingleJointAssistSession,
+    evaluate_single_joint_assist_response,
 )
 from .gripper_mapping import (
     B601_RM65_GRIPPER_MAPPING_SCHEMA_V1,
@@ -112,6 +114,7 @@ __all__ = [
     "RM65_TO_B601_RETARGET_SCHEMA_V1",
     "B601AssistCommissioningEvent",
     "B601AssistCommissioningState",
+    "B601AssistResponseCriteria",
     "B601DampedLeastSquaresIK",
     "B601HapticWrenchChannel",
     "B601HapticWrenchOutput",
@@ -157,6 +160,7 @@ __all__ = [
     "RM65ToB601Retargeter",
     "compute_b601_mit_torque",
     "compute_b601_shared_control_step",
+    "evaluate_single_joint_assist_response",
     "load_b601_rm65_gripper_mapping_profile",
     "map_world_aligned_ee_wrench_to_joint_torque",
     "transform_spatial_twist",

@@ -5,6 +5,7 @@ import pytest
 from robot_motion.rebot_b601_rs import (
     B601_SHARED_POLICY_FRAME,
     B601AssistCommissioningState,
+    B601AssistResponseCriteria,
     B601PolicyAssistCommand,
     B601PolicyCommandBuffer,
     B601PolicyCommandSample,
@@ -15,6 +16,7 @@ from robot_motion.rebot_b601_rs import (
     B601SingleJointAssistConfig,
     B601SingleJointAssistSession,
     compute_b601_shared_control_step,
+    evaluate_single_joint_assist_response,
 )
 
 ZERO = (0.0,) * 6
@@ -68,6 +70,22 @@ def test_single_joint_commissioning_uses_only_target_joint_gains() -> None:
 
     assert shared.position_kp_nm_per_rad == (0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
     assert shared.velocity_kd_nm_s_per_rad == ZERO
+
+
+def test_single_joint_commissioning_reports_effective_static_torque() -> None:
+    gain_limited = B601SingleJointAssistConfig(
+        position_kp_nm_per_rad=1.0,
+        max_target_error_rad=0.05,
+        max_abs_assist_torque_nm=0.20,
+    )
+    cap_limited = B601SingleJointAssistConfig(
+        position_kp_nm_per_rad=10.0,
+        max_target_error_rad=0.05,
+        max_abs_assist_torque_nm=0.20,
+    )
+
+    assert gain_limited.maximum_static_assist_torque_nm == pytest.approx(0.05)
+    assert cap_limited.maximum_static_assist_torque_nm == pytest.approx(0.20)
 
 
 def test_single_joint_commissioning_rejects_motion_and_out_of_limit_target() -> None:
@@ -143,6 +161,94 @@ def test_single_joint_commissioning_is_one_shot_and_has_no_return_target() -> No
     assert passive.decision.assist_torque_nm == ZERO
     assert passive.reference.qpos_rad == (*anchor[:5], 0.25)
     assert config.offset_rad > 0.0
+
+
+def test_assist_response_requires_delivered_torque_and_mechanical_motion() -> None:
+    config = B601SingleJointAssistConfig(
+        joint_name="joint6",
+        offset_rad=0.1,
+        max_abs_assist_torque_nm=0.05,
+    )
+    criteria = B601AssistResponseCriteria(minimum_response_rad=0.001)
+    anchor = ZERO
+    no_motion = evaluate_single_joint_assist_response(
+        config=config,
+        state=B601AssistCommissioningState.COMPLETE,
+        anchor_qpos_rad=anchor,
+        measured_qpos_samples_rad=((0.0, 0.0, 0.0, 0.0, 0.0, 0.00038),) * 6,
+        assist_torque_samples_nm=((0.0, 0.0, 0.0, 0.0, 0.0, 0.05),) * 6,
+        criteria=criteria,
+    )
+    not_delivered = evaluate_single_joint_assist_response(
+        config=config,
+        state=B601AssistCommissioningState.COMPLETE,
+        anchor_qpos_rad=anchor,
+        measured_qpos_samples_rad=((0.0, 0.0, 0.0, 0.0, 0.0, 0.002),) * 6,
+        assist_torque_samples_nm=((0.0, 0.0, 0.0, 0.0, 0.0, 0.01),) * 6,
+        criteria=criteria,
+    )
+    passed = evaluate_single_joint_assist_response(
+        config=config,
+        state=B601AssistCommissioningState.COMPLETE,
+        anchor_qpos_rad=anchor,
+        measured_qpos_samples_rad=((0.0, 0.0, 0.0, 0.0, 0.0, 0.002),) * 6,
+        assist_torque_samples_nm=((0.0, 0.0, 0.0, 0.0, 0.0, 0.05),) * 6,
+        criteria=criteria,
+    )
+
+    assert no_motion["status"] == "INSUFFICIENT_RESPONSE"
+    assert no_motion["passed"] is False
+    assert not_delivered["status"] == "ASSIST_NOT_DELIVERED"
+    assert passed["status"] == "PASS"
+    assert passed["passed"] is True
+
+
+def test_assist_response_rejects_wrong_direction_and_support_drift() -> None:
+    config = B601SingleJointAssistConfig(joint_name="joint6", offset_rad=0.1)
+    criteria = B601AssistResponseCriteria(minimum_response_rad=0.001)
+    assist = ((0.0, 0.0, 0.0, 0.0, 0.0, 0.05),) * 6
+    wrong_direction = evaluate_single_joint_assist_response(
+        config=config,
+        state=B601AssistCommissioningState.COMPLETE,
+        anchor_qpos_rad=ZERO,
+        measured_qpos_samples_rad=((0.0, 0.0, 0.0, 0.0, 0.0, -0.002),) * 6,
+        assist_torque_samples_nm=assist,
+        criteria=criteria,
+    )
+    support_drift = evaluate_single_joint_assist_response(
+        config=config,
+        state=B601AssistCommissioningState.COMPLETE,
+        anchor_qpos_rad=ZERO,
+        measured_qpos_samples_rad=((0.01, 0.0, 0.0, 0.0, 0.0, 0.002),) * 6,
+        assist_torque_samples_nm=assist,
+        criteria=criteria,
+    )
+
+    assert wrong_direction["status"] == "WRONG_DIRECTION"
+    assert support_drift["status"] == "SUPPORT_DRIFT_EXCEEDED"
+
+
+@pytest.mark.parametrize(
+    ("measured", "reason"),
+    [
+        ((0.0, 0.0, 0.0, 0.0, 0.0, -0.002), "wrong direction"),
+        ((0.01, 0.0, 0.0, 0.0, 0.0, 0.002), "support-joint drift"),
+        ((0.0, 0.0, 0.0, 0.0, 0.0, 0.16), "excursion"),
+    ],
+)
+def test_active_assist_motion_guard_fails_before_another_command(
+    measured: tuple[float, ...],
+    reason: str,
+) -> None:
+    _config_value, _runtime, session = _assist_session()
+    session.anchor_qpos_rad = ZERO
+    session.state = B601AssistCommissioningState.ACTIVE
+
+    with pytest.raises(ValueError, match=reason):
+        session.validate_active_motion(
+            measured,
+            criteria=B601AssistResponseCriteria(minimum_response_rad=0.001),
+        )
 
 
 def test_single_joint_countdown_motion_requires_a_new_anchor() -> None:

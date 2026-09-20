@@ -175,6 +175,7 @@ from hardware.rebot_b601_rs import (
 from hardware.rebot_b601_rs.active_report import B601ActiveReportControlGate
 from robot_motion.rebot_b601_rs import (
     B601AssistCommissioningState,
+    B601AssistResponseCriteria,
     B601MitControlProfile,
     B601MitReference,
     B601MitTorqueBreakdown,
@@ -186,6 +187,7 @@ from robot_motion.rebot_b601_rs import (
     B601SingleJointAssistSession,
     B601TranslationalVirtualSpring,
     compute_b601_mit_torque,
+    evaluate_single_joint_assist_response,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
 
@@ -258,6 +260,9 @@ _DEFAULT_MIN_STEP_RESPONSE_RATIO = 0.10
 _DEFAULT_MAX_STEP_RESPONSE_RATIO = 1.50
 _DEFAULT_MIN_STEP_RESPONSE_RAD = math.radians(0.1)
 _DEFAULT_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
+_DEFAULT_ASSIST_MIN_RESPONSE_RAD = math.radians(0.1)
+_DEFAULT_ASSIST_MAX_RESPONSE_RATIO = 1.5
+_DEFAULT_ASSIST_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
 _DEFAULT_VELOCITY_ABORT_RAD_S = 5.0
 _DEFAULT_ACCELERATION_ABORT_RAD_S2 = 80.0
 _DEFAULT_MAX_ERROR_RAD = 0.15
@@ -5181,6 +5186,11 @@ def _validate_single_joint_assist_cli(args: argparse.Namespace) -> None:
     # Constructing the pure config here validates all numeric bounds without
     # opening CAN or creating a hardware backend.
     _single_joint_assist_config_from_args(args)
+    B601AssistResponseCriteria(
+        minimum_response_rad=args.assist_min_response_rad,
+        maximum_response_ratio=args.assist_max_response_ratio,
+        maximum_support_drift_rad=args.assist_max_support_drift_rad,
+    )
 
 
 def _shared_control_config_payload(
@@ -5718,6 +5728,74 @@ def evaluate_slow_step_response(
         "max_support_drift_rad": max_support_drift,
         "max_support_drift_limit_rad": support_limit,
     }
+
+
+def evaluate_assist_commissioning_response(
+    *,
+    session: B601SingleJointAssistSession | None,
+    samples: Sequence[Mapping[str, object]],
+    active_joint_names: Sequence[str],
+    minimum_response_rad: float = _DEFAULT_ASSIST_MIN_RESPONSE_RAD,
+    maximum_response_ratio: float = _DEFAULT_ASSIST_MAX_RESPONSE_RATIO,
+    maximum_support_drift_rad: float = _DEFAULT_ASSIST_MAX_SUPPORT_DRIFT_RAD,
+) -> dict[str, object]:
+    """Project probe samples into the pure mechanical-response evaluator."""
+
+    if session is None:
+        return {"status": "NOT_APPLICABLE", "passed": True}
+    active_samples = tuple(
+        sample
+        for sample in samples
+        if sample.get("shared_control_commissioning_state") == "active"
+    )
+    measured_qpos_samples = tuple(sample["qpos_rad"] for sample in active_samples)
+    assist_torque_samples = tuple(
+        shared_control["assist_torque_nm"]
+        for sample in active_samples
+        for shared_control in (sample.get("shared_control"),)
+        if isinstance(shared_control, Mapping)
+    )
+    if len(measured_qpos_samples) != len(assist_torque_samples):
+        return {
+            "status": "MISSING_ASSIST_AUDIT",
+            "passed": False,
+            "commissioning_state": session.state.value,
+            "sample_count": len(measured_qpos_samples),
+            "assist_sample_count": len(assist_torque_samples),
+        }
+    return evaluate_single_joint_assist_response(
+        config=session.config,
+        state=session.state,
+        anchor_qpos_rad=session.anchor_qpos_rad,
+        measured_qpos_samples_rad=measured_qpos_samples,
+        assist_torque_samples_nm=assist_torque_samples,
+        active_joint_names=active_joint_names,
+        criteria=B601AssistResponseCriteria(
+            minimum_response_rad=minimum_response_rad,
+            maximum_response_ratio=maximum_response_ratio,
+            maximum_support_drift_rad=maximum_support_drift_rad,
+        ),
+    )
+
+
+def format_assist_response_notice(response: Mapping[str, object]) -> str:
+    """Return one concise operator line; full evidence remains in JSON/log."""
+
+    status = str(response.get("status", "UNKNOWN"))
+    displacement_rad = float(response.get("settled_signed_displacement_rad", 0.0))
+    minimum_rad = float(response.get("minimum_response_rad", 0.0))
+    peak_torque_nm = float(response.get("peak_signed_assist_torque_nm", 0.0))
+    support_drift_rad = float(response.get("max_support_drift_rad", 0.0))
+    return (
+        "[B601] [ASSIST RESPONSE] "
+        f"status={status} "
+        f"displacement={displacement_rad:.6f}rad/"
+        f"{math.degrees(displacement_rad):.3f}deg "
+        f"minimum={minimum_rad:.6f}rad/"
+        f"{math.degrees(minimum_rad):.3f}deg "
+        f"peak_assist={peak_torque_nm:.6f}Nm "
+        f"max_support_drift={support_drift_rad:.6f}rad"
+    )
 
 
 def _output_payload(payload: dict[str, object], output: Path | None) -> None:
@@ -6885,6 +6963,7 @@ def run_probe(
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
     control_completion_reason: str | None = None
+    assist_commissioning_response: dict[str, object] | None = None
     primary_error: Exception | None = None
     preflight_disable: B601ModeReceipt | None = None
     mode_receipt: B601ModeReceipt | None = None
@@ -7921,7 +8000,9 @@ def run_probe(
                         "[B601] [ASSIST LIMITS] "
                         f"joint={assist_config.joint_name} "
                         f"offset={assist_config.offset_rad:.6f}rad "
-                        f"max_torque={assist_config.max_abs_assist_torque_nm:.6f}Nm "
+                        f"torque_cap={assist_config.max_abs_assist_torque_nm:.6f}Nm "
+                        "effective_static_peak="
+                        f"{assist_config.maximum_static_assist_torque_nm:.6f}Nm "
                         f"duration={assist_config.assist_duration_sec:.3f}s"
                     )
                 keys = operator_keys.poll_keys() if operator_keys is not None else frozenset()
@@ -7966,6 +8047,27 @@ def run_probe(
                     _operator_notice(
                         f"[B601] [ASSIST {assist_event.event}] {assist_event.detail}"
                     )
+                try:
+                    shared_control_commissioning.validate_active_motion(
+                        q,
+                        criteria=B601AssistResponseCriteria(
+                            minimum_response_rad=args.assist_min_response_rad,
+                            maximum_response_ratio=args.assist_max_response_ratio,
+                            maximum_support_drift_rad=(
+                                args.assist_max_support_drift_rad
+                            ),
+                        ),
+                    )
+                except ValueError as exc:
+                    assist_event = shared_control_commissioning.cancel(
+                        timestamp_sec=state.receive_timestamp_sec,
+                        detail=f"active motion guard withdrew assist: {exc}",
+                    )
+                    _operator_notice(
+                        f"[B601] [ASSIST {assist_event.event}] "
+                        f"{assist_event.detail}"
+                    )
+                    raise LowGainProbeError(assist_event.detail) from exc
             if calibration_capture is not None:
                 if handoff_fraction >= 1.0 and not calibration_ready:
                     if operator_keys is None:
@@ -8442,10 +8544,27 @@ def run_probe(
             ):
                 stop["requested"] = True
                 control_completion_reason = "single_joint_assist_complete"
+                assist_commissioning_response = (
+                    evaluate_assist_commissioning_response(
+                        session=shared_control_commissioning,
+                        samples=samples,
+                        active_joint_names=active_joint_names,
+                        minimum_response_rad=args.assist_min_response_rad,
+                        maximum_response_ratio=args.assist_max_response_ratio,
+                        maximum_support_drift_rad=(
+                            args.assist_max_support_drift_rad
+                        ),
+                    )
+                )
                 _operator_notice(
-                    "[B601] ASSIST TRIAL COMPLETE: entering protective hold; "
-                    "assist is zero and no return target exists. Ctrl-C or "
-                    "SIGUSR1 requests final full disable."
+                    format_assist_response_notice(assist_commissioning_response)
+                )
+                _operator_notice(
+                    "[B601] ASSIST TRIAL COMPLETE: command flow completed; "
+                    f"mechanical acceptance="
+                    f"{assist_commissioning_response['status']}. Entering "
+                    "protective hold with assist zero and no return target. "
+                    "Ctrl-C or SIGUSR1 requests final full disable."
                 )
             else:
                 if shared_control_commissioning is not None:
@@ -8908,10 +9027,17 @@ def run_probe(
             or interactive_pose_axis_guide.completed
         )
     )
-    shared_control_commissioning_passed = (
-        shared_control_commissioning is None
-        or shared_control_commissioning.state
-        is B601AssistCommissioningState.COMPLETE
+    if assist_commissioning_response is None:
+        assist_commissioning_response = evaluate_assist_commissioning_response(
+            session=shared_control_commissioning,
+            samples=samples,
+            active_joint_names=active_joint_names,
+            minimum_response_rad=args.assist_min_response_rad,
+            maximum_response_ratio=args.assist_max_response_ratio,
+            maximum_support_drift_rad=args.assist_max_support_drift_rad,
+        )
+    shared_control_commissioning_passed = bool(
+        assist_commissioning_response["passed"]
     )
     acceptance_passed = (
         control_passed
@@ -9474,8 +9600,9 @@ def run_probe(
                 else None
             ),
             "commissioning_acceptance": (
-                "PASS" if shared_control_commissioning_passed else "INCOMPLETE"
+                assist_commissioning_response["status"]
             ),
+            "commissioning_response": assist_commissioning_response,
         },
         "cartesian_impedance": {
             "enabled": args.mode == "cartesian-hold",
@@ -9819,6 +9946,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--assist-stationarity-limit-rad-s",
         type=float,
         default=0.02,
+    )
+    parser.add_argument(
+        "--assist-min-response-rad",
+        type=float,
+        default=_DEFAULT_ASSIST_MIN_RESPONSE_RAD,
+        help=(
+            "minimum settled correct-direction joint response required for "
+            "real commissioning acceptance"
+        ),
+    )
+    parser.add_argument(
+        "--assist-max-response-ratio",
+        type=float,
+        default=_DEFAULT_ASSIST_MAX_RESPONSE_RATIO,
+        help="maximum measured response relative to the requested offset",
+    )
+    parser.add_argument(
+        "--assist-max-support-drift-rad",
+        type=float,
+        default=_DEFAULT_ASSIST_MAX_SUPPORT_DRIFT_RAD,
+        help="maximum observed drift of any non-target arm joint",
     )
     parser.add_argument(
         "--assist-confirmation",

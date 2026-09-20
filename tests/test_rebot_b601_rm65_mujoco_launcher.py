@@ -182,6 +182,8 @@ def test_owner_launcher_builds_one_shot_assist_inside_existing_owner(
             "joint6",
             "--assist-offset-rad",
             "0.1",
+            "--assist-min-response-rad",
+            "0.002",
             "--assist-confirmation",
             owner.DEFAULT_ASSIST_CONFIRMATION,
         ]
@@ -191,6 +193,7 @@ def test_owner_launcher_builds_one_shot_assist_inside_existing_owner(
     assert "--single-joint-assist" in command
     assert command[command.index("--assist-joint") + 1] == "joint6"
     assert command[command.index("--assist-offset-rad") + 1] == "0.1"
+    assert command[command.index("--assist-min-response-rad") + 1] == "0.002"
     assert (
         command[command.index("--assist-confirmation") + 1]
         == low_gain_probe.SINGLE_JOINT_ASSIST_CONFIRMATION
