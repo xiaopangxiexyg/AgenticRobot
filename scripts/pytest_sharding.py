@@ -20,12 +20,14 @@ from pathlib import Path
 # here makes the default plan useful in a clean checkout without depending on
 # mutable Harness history.
 FULL_WEIGHTS = {
-    # Exact testcase sums from the green six-shard baseline at 47d7be6e.
+    # Exact testcase sums from green six-shard runs. MuJoCo fast runtime was
+    # refreshed from the accepted 65bb09af successor baseline; the remaining
+    # sparse estimates retain the 47d7be6e baseline.
     # These are scheduling estimates only; they do not change test selection.
     "tests/test_mujoco_temp_pipeline.py": 134.914,
     "tests/test_replay_position_admittance_active_pipeline.py": 108.657,
     "tests/test_rm65_grasp_trajectory.py": 91.046,
-    "tests/test_mujoco_fast_runtime.py": 48.101,
+    "tests/test_mujoco_fast_runtime.py": 45.701,
     "tests/test_control_station_mujoco_sim_hil.py": 36.534,
     "tests/test_runtime_artifact_migration.py": 26.372,
     "tests/test_rebot_b601_real2sim.py": 23.742,
@@ -72,7 +74,7 @@ FULL_WEIGHTS = {
     "tests/test_policy_learning_boundaries.py": 5.103,
 }
 
-# Modules normally remain the isolation unit. These two long-running modules
+# Modules normally remain the isolation unit. These long-running modules
 # have independent top-level tests: replay uses function-local tmp_path logs
 # and fresh runtimes, not shared rollout fixtures. Parameter matrices remain
 # intact. Unlisted functions share the measured residual and stay collected.
@@ -114,6 +116,36 @@ FULL_SPLIT_NODE_WEIGHTS = {
         "test_normal_shadow_envelope_is_replayed_under_cautious_active_caps": 4.218,
         "test_sub_hold_wrench_is_not_promoted_as_active_ik_coverage": 3.924,
     },
+    "tests/test_mujoco_fast_runtime.py": {
+        "test_model_artifact_cache_separates_direct_arm_and_gripper_profiles": 9.889,
+        "test_model_artifact_cache_hits_and_recovers_from_corruption": 6.903,
+        "test_fast_kernel_matches_reference_action_trace": 6.837,
+        "test_pose_planner_recovers_only_small_mujoco_joint_limit_residual": 5.337,
+        "test_model_artifact_cache_publishes_one_valid_artifact_across_processes": 4.313,
+        "test_actuated_cube_lift_uses_measured_arm_state_and_shared_viewer_kernel": 3.897,
+        "test_vector_executor_is_deterministic_and_preserves_terminal_observation": 2.347,
+        "test_default_cube_lift_uses_measured_identified_gripper_state": 2.133,
+        "test_pose_planner_uses_sim_clearance_and_terminates_hard_limit_episode": 2.027,
+        "test_vector_env_exposes_batched_gymnasium_spaces": 1.597,
+        "test_fast_kernel_settled_snapshot_avoids_repeated_settle": 0.262,
+        "test_fast_env_passes_gymnasium_checker": 0.157,
+        "test_worker_runtime_library_path_restores_parent_environment": 0.002,
+    },
+}
+
+# All functions remain separate pytest targets and JUnit identities. This
+# indivisible scheduling bundle only keeps the module-scoped model cache on one
+# worker, preventing repeated compilation and settled-snapshot setup.
+FULL_SPLIT_NODE_GROUPS = {
+    "tests/test_mujoco_fast_runtime.py": (
+        (
+            "test_fast_kernel_matches_reference_action_trace",
+            "test_fast_kernel_settled_snapshot_avoids_repeated_settle",
+            "test_vector_executor_is_deterministic_and_preserves_terminal_observation",
+            "test_fast_env_passes_gymnasium_checker",
+            "test_vector_env_exposes_batched_gymnasium_spaces",
+        ),
+    ),
 }
 
 FAST_WEIGHTS = {
@@ -289,12 +321,12 @@ def _shard_items(
     measured_weight = sum(node_weights.values())
     unmeasured = len(functions) - len(node_weights)
     residual = module_weight - measured_weight
-    if residual < 0.0 or (unmeasured == 0 and residual > 1e-6):
+    if residual < -1e-6 or (unmeasured == 0 and residual > 1e-6):
         raise ValueError(
             f"split timing profile does not match module weight for {relative_path}: "
             f"module={module_weight} measured={measured_weight}"
         )
-    fallback = residual / unmeasured if unmeasured else 0.0
+    fallback = max(0.0, residual) / unmeasured if unmeasured else 0.0
     return [
         (
             f"{relative_path}::{name}",
@@ -303,6 +335,48 @@ def _shard_items(
         )
         for name in functions
     ]
+
+
+def _shard_bundles(
+    weighted: list[tuple[str, Path, float]],
+    profile: str,
+) -> list[list[tuple[str, Path, float]]]:
+    """Bundle split targets that must share a module-scoped fixture."""
+
+    if profile != "full":
+        return [[item] for item in weighted]
+
+    item_by_target = {item[0]: item for item in weighted}
+    grouped_targets: set[str] = set()
+    bundles: list[list[tuple[str, Path, float]]] = []
+    for relative_path, groups in sorted(FULL_SPLIT_NODE_GROUPS.items()):
+        module_targets = {
+            target
+            for target in item_by_target
+            if target.startswith(f"{relative_path}::")
+        }
+        if not module_targets:
+            continue
+        for names in groups:
+            targets = tuple(f"{relative_path}::{name}" for name in names)
+            missing = set(targets) - module_targets
+            if missing:
+                raise ValueError(
+                    f"split affinity group names missing tests in {relative_path}: "
+                    f"{sorted(missing)}"
+                )
+            duplicate = set(targets) & grouped_targets
+            if duplicate:
+                raise ValueError(
+                    f"split affinity group repeats tests in {relative_path}: "
+                    f"{sorted(duplicate)}"
+                )
+            bundles.append([item_by_target[target] for target in targets])
+            grouped_targets.update(targets)
+    bundles.extend(
+        [item] for item in weighted if item[0] not in grouped_targets
+    )
+    return bundles
 
 
 def plan_shards(
@@ -335,7 +409,14 @@ def plan_shards(
 
     shards: list[list[tuple[str, Path, float]]] = [[] for _ in range(shard_count)]
     totals = [0.0] * shard_count
-    for item in sorted(weighted, key=lambda value: (-value[2], value[0])):
+    bundles = _shard_bundles(weighted, profile)
+    for bundle in sorted(
+        bundles,
+        key=lambda value: (
+            -sum(item[2] for item in value),
+            tuple(item[0] for item in value),
+        ),
+    ):
         index = min(
             range(shard_count),
             key=lambda candidate: (
@@ -344,8 +425,8 @@ def plan_shards(
                 candidate,
             ),
         )
-        shards[index].append(item)
-        totals[index] += item[2]
+        shards[index].extend(bundle)
+        totals[index] += sum(item[2] for item in bundle)
 
     planned = [target for shard in shards for target, _, _ in shard]
     if len(planned) != len(set(planned)):
