@@ -107,6 +107,72 @@ def test_rule_runtime_bind_waits_for_first_readiness_status() -> None:
     assert ready["can_start"] is True
 
 
+def test_task_chain_explains_missing_right_gripper_instead_of_inviting_click() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application.observe_rule_status(
+        {
+            "collection_mode": "rule_based_writing",
+            "rule_start_available": True,
+            "configuration_available": True,
+            "gripper_control_available": False,
+            "gripper_sides": [],
+            "height_calibration_available": True,
+        }
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_can_advance"] is False
+    assert "等待夹爪控制拓扑就绪" in state["task_chain_detail"]
+    assert "按“继续任务链”" not in state["task_chain_detail"]
+
+
+def test_failed_runtime_home_returns_to_a_retryable_blocked_state() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application.observe_rule_status(
+        {
+            "started": True,
+            "session_state": "DEBUG_ONLY",
+            "rule_start_available": False,
+            "readiness_blockers": {
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required"
+            },
+        }
+    )
+
+    assert application.snapshot()["can_runtime_home"] is True
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is True
+    assert application.snapshot()["runtime_home_pending"] is True
+    application.observe_rule_status({"session_state": "ARMED"})
+    assert application.snapshot()["runtime_home_pending"] is True
+    application.observe_runtime_publication(
+        {
+            "capture_stage": "runtime_home",
+            "capture_phase": "ready",
+            "control_hint": "已禁止新的机械臂/夹爪命令，正在等待底层停机确认。",
+        }
+    )
+    assert application.snapshot()["runtime_home_pending"] is True
+
+    application.observe_runtime_publication(
+        {
+            "capture_stage": "runtime_home",
+            "capture_phase": "failed",
+            "home_ready": False,
+            "control_hint": "实时 qpos 快照失败；机械臂保持 Hold。",
+        }
+    )
+    failed = application.snapshot()
+    assert failed["runtime_home_pending"] is False
+    assert failed["can_runtime_home"] is True
+    assert failed["phase"] == "blocked"
+    assert "实时 qpos 快照失败" in failed["detail"]
+
+    # A second click is a genuine retry, not a permanently consumed request.
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is True
+
+
 def test_rule_start_does_not_depend_on_generic_episode_control_projection() -> None:
     application = RuleBasedWritingApplication()
     application.observe_runtime_publication(
@@ -430,7 +496,8 @@ def test_rule_ui_asset_contains_no_teleop_episode_progress_or_pedal_controls() -
     assert 'data-event="runtime_home_retry"' in asset
     assert 'id="task-chain-advance"' in asset
     assert "Alt+N" in asset
-    assert 'fetch("/task-chain"' in script
+    assert 'postJson("/task-chain"' in script
+    assert 'pendingRequests.has("task-chain")' in script
     assert "event.altKey" in script
     assert '"/task-chain"' in transport
     for forbidden in ("开始遥操", "Episode", "长程进度", "踏板", "夹爪控制"):

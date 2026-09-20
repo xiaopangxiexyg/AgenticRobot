@@ -275,6 +275,10 @@ class RealTeleopControlInput:
         self._init_qpos_emergency_stop_requested = False
         self._calibration_requested = False
         self._calibration_request_from_hold = False
+        # Dedicated rule-collection Home requests use live RM65 state only;
+        # the control loop consumes this marker to select its existing
+        # robot-state snapshot path instead of the VIVE-gated path.
+        self._rule_runtime_home_retry_requested = False
         self._last_calibration_started_from_hold = False
         self._tracker_side_check: dict[str, object] = {
             "status": "unavailable",
@@ -1462,6 +1466,10 @@ class RealTeleopControlInput:
                     self._cancel_tracker_side_warning()
                 elif event == "p":
                     self._request_calibration_with_tracker_side_guard(source="gui")
+                elif event == "runtime_home_retry":
+                    # Rule collection does not consume VIVE poses.  Keep this
+                    # path distinct from the normal tracker-gated Home flow.
+                    self._request_rule_runtime_home_retry()
                 elif event == "two_pedal_b":
                     self._handle_two_pedal_b_event(now=current_time)
                 elif event == "two_pedal_c":
@@ -3256,6 +3264,135 @@ class RealTeleopControlInput:
             request_kind=request_kind,
         )
 
+    def _request_rule_runtime_home_retry(self) -> None:
+        """Queue a guarded robot-state-only Home for the rule-writing GUI.
+
+        This is only an input bridge.  The existing control loop still owns
+        Hold admission, Home capture, Session validation, and dispatch.  The
+        dedicated marker merely tells that loop not to wait for VIVE.
+        """
+
+        if self._calibration_requested or self._rule_runtime_home_retry_requested:
+            return
+
+        def reject(message: str, *, tag: str = "Calibration") -> None:
+            self._append_ui_message_observation(
+                tag,
+                message,
+                context="rule robot-state-only Home admission",
+            )
+            self._publish_ui_observation(
+                context="rule robot-state-only Home admission",
+                active_controls=self._current_active_controls(),
+                control_hint=message,
+                teleop_running=False,
+                gripper_control_enabled=False,
+                capture_stage="runtime_home",
+                capture_phase="failed",
+                home_ready=False,
+                capturing=False,
+                capture_waiting_for_samples=False,
+            )
+
+        if self._episode_busy():
+            reject("规则 runtime Home 未执行：数采、倒计时或后台保存仍在进行。")
+            return
+
+        init_controller = getattr(self.components, "init_arm_controller", None)
+        if bool(getattr(init_controller, "qpos_active", False)):
+            reject(
+                "规则 runtime Home 未执行：精确 Init qpos 正在规划、执行或保持；"
+                "请等待归位结束后重试。"
+            )
+            return
+
+        session = getattr(self.components, "session", None)
+        state = getattr(getattr(session, "state_machine", None), "state", None)
+        state_value = str(getattr(state, "value", state) or "").upper()
+        if state_value in {"FAULT", "ESTOP"}:
+            reject(
+                "规则 runtime Home 未执行：Session 当前处于 "
+                f"{state_value or 'UNKNOWN'}；请先处理故障并重新启动。"
+            )
+            return
+
+        # A running session needs a positive lower Hold receipt.  At startup,
+        # do not consume an unconfirmed Hold request or an unconfirmed latch.
+        if self._teleop_started and not self.hardware_hold_confirmed():
+            reject(
+                "运行中规则重采前请先点击 Hold / 冻结，并等待底层停机确认。",
+                tag="Hold",
+            )
+            return
+        if not self._teleop_started and self._hold_requested:
+            reject(
+                "规则 runtime Home 未执行：正在等待已有 Hold 请求完成；"
+                "请等待底层停机确认后重试。",
+                tag="Hold",
+            )
+            return
+        if (
+            not self._teleop_started
+            and self._hold_active
+            and not self.hardware_hold_confirmed()
+        ):
+            reject(
+                "规则 runtime Home 未执行：应用 Hold 尚未获得底层停机回执；"
+                "请等待停机确认后重试。",
+                tag="Hold",
+            )
+            return
+
+        gate = self._tracker_side_gate_state()
+        # The rule collector uses the current dual-arm qpos snapshot.  It does
+        # not weaken the robot/session safety gates, but VIVE side validation
+        # is not a prerequisite for this dedicated path.
+        gate.initial_check_completed = True
+        gate.pending_request = None
+        gate.pending_confirmation = None
+        gate.final_recheck_required = False
+        gate.confirmation_result = "not_required_rule_based"
+        gate.confirmation_message = ""
+        self._tracker_side_check.update(
+            {
+                "status": "not_required",
+                "warning_required": False,
+                "home_request_pending": False,
+                "confirmation_required": False,
+                "confirmation_result": "not_required_rule_based",
+                "session_check_completed": True,
+                "monitoring_active": False,
+                "message": "规则采集使用双臂实时 qpos；VIVE Tracker 左右检查不适用。",
+            }
+        )
+        self._rule_runtime_home_retry_requested = True
+        self._queue_runtime_home_request(
+            from_hold=bool(self._hold_active),
+            request_kind="rule",
+        )
+        self._gripper_control_enabled = False
+        message = (
+            "已确认规则采集 robot-state-only runtime Home；"
+            "VIVE Tracker 不参与本次安全初始化。"
+        )
+        self._publish_ui_observation(
+            context="rule robot-state-only Home requested",
+            tracker_side_check=self._tracker_side_check_payload(),
+            stage="准备重新确认安全初始化",
+            active_controls=["q"],
+            control_hint=message,
+            teleop_running=False,
+            home_ready=False,
+            capture_stage="runtime_home",
+            capture_phase="preparing",
+            gripper_control_enabled=False,
+        )
+        self._append_ui_message_observation(
+            "Calibration",
+            message,
+            context="rule robot-state-only Home requested",
+        )
+
     def _confirm_tracker_side_warning(self) -> None:
         gate = self._tracker_side_gate_state()
         request = gate.pending_confirmation
@@ -3549,6 +3686,13 @@ class RealTeleopControlInput:
                     home_ready=False,
                     gripper_control_enabled=False,
                 )
+        return requested
+
+    def consume_rule_runtime_home_retry_request(self) -> bool:
+        """Consume the rule-specific robot-state-only Home marker."""
+
+        requested = bool(self._rule_runtime_home_retry_requested)
+        self._rule_runtime_home_retry_requested = False
         return requested
 
     def consume_hitl_source_requests(self) -> tuple[str, ...]:
@@ -5461,6 +5605,7 @@ class RealTeleopControlInput:
         )
         self._calibration_requested = False
         self._calibration_request_from_hold = False
+        self._rule_runtime_home_retry_requested = False
         self._last_calibration_started_from_hold = False
         gate = self._tracker_side_gate_state()
         gate.pending_confirmation = None
@@ -5495,6 +5640,7 @@ class RealTeleopControlInput:
             ),
             capture_stage="runtime_home",
             capture_phase="ready",
+            runtime_home_failure=bool(message),
             teleop_running=False,
             home_ready=False,
             capturing=False,

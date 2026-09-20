@@ -74,7 +74,16 @@ def prioritize_input_batch(
             events=tuple(
                 event
                 for event in sampled
-                if event in {"h", "two_pedal_c", "episode_stop"}
+                if event in {
+                    "h",
+                    "two_pedal_c",
+                    "episode_stop",
+                    # Keep the explicit rule Home request observable so the
+                    # lower runtime can reject it with a retryable state after
+                    # Hold admission, instead of leaving the UI pending when
+                    # both clicks arrived in one sampled batch.
+                    "runtime_home_retry",
+                }
             ),
             barrier="hold",
         )

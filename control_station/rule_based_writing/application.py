@@ -100,7 +100,7 @@ class RuleBasedWritingUiState:
     task_chain_phase: str = "idle"
     task_chain_step: str = "0 / 5"
     task_chain_title: str = "任务链未启动"
-    task_chain_detail: str = "按“继续任务链”后先松开夹爪。"
+    task_chain_detail: str = "等待右夹爪、安全门禁和轨迹配置就绪。"
     task_chain_can_advance: bool = False
     task_chain_cycle_count: int = 0
     task_chain_selected_configuration: dict[str, object] = field(default_factory=dict)
@@ -157,6 +157,12 @@ class RuleBasedWritingApplication:
         self._configuration_options: dict[str, object] = {}
         self._runtime_controls: frozenset[str] = frozenset()
         self._runtime_controls_seen = False
+        # A failed runtime-Home attempt is a retryable safety state, not a
+        # transient preparing state.  Keep this latch separate from the
+        # in-flight flag so a lower runtime failure cannot strand the GUI with
+        # every control disabled.
+        self._runtime_home_retry_available = False
+        self._runtime_home_retry_reason = ""
         self._device_retry_waiting_for_hold = False
         self._rule_runtime_bound = False
         # Binding the extension only wires the UI to the runtime.  It is not a
@@ -187,15 +193,36 @@ class RuleBasedWritingApplication:
 
         with self._lock:
             device_retry_hold_rejected = False
+            runtime_home_was_pending = bool(self._state.runtime_home_pending)
             capture_stage = str(updates.get("capture_stage", "") or "")
             capture_phase = str(updates.get("capture_phase", "") or "").lower()
             if bool(updates.get("home_ready", False)):
                 self._state.runtime_home_pending = False
+                self._runtime_home_retry_available = False
+                self._runtime_home_retry_reason = ""
             elif capture_stage == "runtime_home":
                 if capture_phase in {"preparing", "capturing"}:
                     self._state.runtime_home_pending = True
+                    self._runtime_home_retry_available = False
                 elif capture_phase in {"ready", "idle", "failed"}:
-                    self._state.runtime_home_pending = False
+                    runtime_home_failed = bool(
+                        capture_phase == "failed"
+                        or bool(updates.get("runtime_home_failure", False))
+                    )
+                    # A normal Hold projection also uses runtime_home/ready.
+                    # Keep an explicit retry pending until the lower runtime
+                    # publishes either a Home failure or home_ready=True.
+                    if runtime_home_was_pending and not runtime_home_failed:
+                        self._state.runtime_home_pending = True
+                    else:
+                        self._state.runtime_home_pending = False
+                    if runtime_home_was_pending and runtime_home_failed:
+                        self._runtime_home_retry_available = True
+                        self._runtime_home_retry_reason = str(
+                            updates.get("control_hint")
+                            or updates.get("readiness_reason")
+                            or "上一次安全初始化未完成；请确认机械臂处于安全位置后重试。"
+                        )
             if "active_controls" in updates:
                 controls = updates.get("active_controls") or ()
                 self._runtime_controls = frozenset(str(item) for item in controls)
@@ -320,6 +347,8 @@ class RuleBasedWritingApplication:
         elif intent is RuleBasedWritingIntent.RUNTIME_HOME_RETRY:
             if not available["runtime_home"]:
                 return False
+            self._runtime_home_retry_available = False
+            self._runtime_home_retry_reason = ""
             self._runtime_events.put("runtime_home_retry")
             self._state.runtime_home_pending = True
             self._state.phase = "preparing"
@@ -859,7 +888,14 @@ class RuleBasedWritingApplication:
             waiting = str(status.get("waiting_reason", "") or "")
             if "session_state" in status:
                 self._state.session_state = str(status.get("session_state") or "").upper()
-                if self._state.session_state in {"ARMED", "RUNNING"}:
+                # A rule-status heartbeat can lag the generic Home
+                # publication.  Do not let that stale session label clear an
+                # in-flight safety initialization; only the generic
+                # ``home_ready`` receipt may do that.
+                if (
+                    self._state.session_state in {"ARMED", "RUNNING"}
+                    and not self._state.runtime_home_pending
+                ):
                     self._state.runtime_home_pending = False
             if "readiness_reason" in status:
                 self._state.readiness_reason = str(
@@ -1274,7 +1310,6 @@ class RuleBasedWritingApplication:
         self._state.task_chain_phase = str(chain["phase"])
         self._state.task_chain_step = str(chain["step"])
         self._state.task_chain_title = str(chain["title"])
-        self._state.task_chain_detail = str(chain["detail"])
         self._state.task_chain_cycle_count = int(chain["cycle_count"])
         selected_configuration = chain["selected_configuration"]
         self._state.task_chain_selected_configuration = (
@@ -1289,6 +1324,17 @@ class RuleBasedWritingApplication:
         self._state.task_chain_can_advance = self._task_chain_can_advance_locked(
             available
         )
+        task_chain_detail = str(chain["detail"])
+        if (
+            self._task_chain.phase
+            in {
+                RuleWritingTaskChainPhase.IDLE,
+                RuleWritingTaskChainPhase.COMPLETE,
+            }
+            and not self._state.task_chain_can_advance
+        ):
+            task_chain_detail = self._task_chain_blocked_detail_locked(available)
+        self._state.task_chain_detail = task_chain_detail
 
         chain_owns_manual_step = self._task_chain.active
         self._state.can_configure = bool(
@@ -1433,6 +1479,39 @@ class RuleBasedWritingApplication:
             and available["close_right_gripper"]
             and available["capture_height"]
         )
+
+    def _task_chain_blocked_detail_locked(
+        self,
+        available: Mapping[str, bool],
+    ) -> str:
+        """Explain the first unmet task-chain admission condition.
+
+        The button remains fail-closed.  This projection only tells the
+        operator why the first step is unavailable; it must not turn a
+        disabled manual gripper action into an unsafe skip.
+        """
+
+        if self._state.collection_mode != "rule_based_writing":
+            return "当前采集模式不是 rule-based writing，任务链不可用。"
+        if not self._rule_runtime_bound:
+            return "等待规则运行时完成绑定；就绪前不能开始任务链。"
+        if not self._state.gripper_control_available:
+            return "等待夹爪控制拓扑就绪；任务链第一步需要先实测松开右夹爪。"
+        if "right" not in self._state.gripper_sides:
+            return "当前没有右夹爪控制；任务链需要右夹爪抓笔，不能跳过松开步骤。"
+        if not available["release_grippers"]:
+            return "等待右夹爪松开操作的安全门禁就绪；就绪后才能开始任务链。"
+        if not available["close_right_gripper"]:
+            return "等待右夹爪闭合操作的安全门禁就绪；不能跳过夹爪步骤。"
+        if not available["capture_height"]:
+            return "等待高度标定能力和安全状态就绪；就绪前不能开始任务链。"
+        if not self._task_chain_configuration_pool:
+            return "等待可用轨迹组合完成预验证；就绪前不能开始任务链。"
+        if not available["configure"]:
+            return "等待轨迹配置事务可用；完成前不会输出规则运动命令。"
+        if not available["start"]:
+            return "等待现有安全门禁放行；安全就绪后才能开始任务链。"
+        return "任务链尚未满足全部前置条件；请查看上方设备与安全消息。"
 
     def _task_chain_can_advance_locked(
         self,
@@ -1586,6 +1665,8 @@ class RuleBasedWritingApplication:
         self._set_device_retry_running_locked()
 
     def _session_requires_runtime_home_locked(self) -> bool:
+        if self._runtime_home_retry_available:
+            return True
         state = str(self._state.session_state or "").upper()
         if state in {"", "ARMED", "RUNNING", "FAULT", "ESTOP", "INIT"}:
             return any(
@@ -1615,6 +1696,13 @@ class RuleBasedWritingApplication:
             return
         self._state.phase = "blocked"
         self._state.title = "机械臂安全接入未完成"
+        if self._runtime_home_retry_available:
+            self._state.detail = (
+                "规则采集保持禁用；上一次安全初始化未完成。"
+                "确认机械臂处于安全位置后点击“重新安全初始化”。\n"
+                + self._runtime_home_retry_reason
+            )
+            return
         details = self._state.startup_blockers
         reason = self._state.readiness_reason
         if details and self._has_retryable_device_blockers_locked():

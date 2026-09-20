@@ -31,7 +31,7 @@ _PHASE_PRESENTATION: dict[RuleWritingTaskChainPhase, tuple[str, str, str]] = {
     RuleWritingTaskChainPhase.IDLE: (
         "0 / 5",
         "任务链未启动",
-        "按“继续任务链”后先松开夹爪。",
+        "等待右夹爪、安全门禁和轨迹配置就绪。",
     ),
     RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING: (
         "1 / 5",

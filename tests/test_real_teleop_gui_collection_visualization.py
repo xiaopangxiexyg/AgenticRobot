@@ -2965,6 +2965,32 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(control.consume_tactile_visualization_toggle_request())
         self.assertTrue(control.consume_tactile_solving_enable_request())
 
+    def test_rule_runtime_home_retry_event_uses_robot_state_only_bridge(self) -> None:
+        ui = _FakeUi(["runtime_home_retry"])
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+
+        control.poll()
+
+        self.assertTrue(control.consume_rule_runtime_home_retry_request())
+        self.assertTrue(control.consume_calibration_request())
+        self.assertFalse(control.consume_rule_runtime_home_retry_request())
+        requested = next(
+            published
+            for published in reversed(ui.published)
+            if published.get("capture_stage") == "runtime_home"
+        )
+        self.assertEqual(requested["capture_phase"], "preparing")
+        self.assertFalse(requested["home_ready"])
+        self.assertEqual(
+            requested["tracker_side_check"]["confirmation_result"],
+            "not_required_rule_based",
+        )
+
     def test_progress_gui_without_profile_does_not_block_episode_start(self) -> None:
         control = real_teleop.RealTeleopControlInput(
             terminal=_FakeTerminal(),
