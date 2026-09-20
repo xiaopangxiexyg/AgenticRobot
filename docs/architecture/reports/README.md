@@ -9,6 +9,7 @@
 - [RTC 历史落地台账（原审计日期 2026-07-25）](./rtc_landing_ledger_20260725.md)
 - [HITL 与 chunk-relative 历史实施台账（更新至 2026-08-07）](./hitl_chunk_relative_ledger_20260807.md)
 - [B601 MuJoCo 接触力观测开发进度](./rebot_b601_mujoco_contact_wrench_progress.md)
+- [B601 真机 → RealMan 真机目标开发进度](./rebot_b601_rm65_real_target_progress.md)
 - [RTC 历史实现与规划图示（更新至 2026-07-25）](./rtc_visual_guide_20260725.md)
 - [控制、数据与训练历史闭环图示（更新至 2026-07-25）](./architecture_visual_guide_20260725.md)
 
