@@ -1038,6 +1038,34 @@ def test_prepared_server_operator_stop_is_traceback_free(
     assert captured.err == "OpenPI policy server stopped by operator.\n"
 
 
+def test_prepared_server_rtc_steps_adapter_binds_policy_factory_and_restores() -> None:
+    calls: list[dict[str, object]] = []
+
+    def create_trained_policy(*_args: object, **kwargs: object) -> object:
+        calls.append(dict(kwargs))
+        return object()
+
+    policy_config = SimpleNamespace(create_trained_policy=create_trained_policy)
+    module = SimpleNamespace(_policy_config=policy_config)
+    with prepared_server_runtime.install_openpi_rtc_inference_steps_server_adapter(
+        module,
+        rtc_inference_steps=8,
+    ):
+        module._policy_config.create_trained_policy(
+            object(),
+            "checkpoint",
+            default_prompt="prompt",
+        )
+        assert calls[-1]["sample_kwargs"] == {"num_steps": 8}
+        with pytest.raises(ValueError, match="differ from"):
+            module._policy_config.create_trained_policy(
+                object(),
+                "checkpoint",
+                sample_kwargs={"num_steps": 10},
+            )
+    assert policy_config.create_trained_policy is create_trained_policy
+
+
 def test_rtc_startup_warmup_uses_prepared_masked_state_and_discards_result() -> None:
     spec = prepared_server_runtime._RtcStartupWarmupSpec(
         image_keys=("base_0_rgb", "left_wrist_0_rgb"),
