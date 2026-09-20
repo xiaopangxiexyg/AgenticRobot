@@ -55,6 +55,7 @@ def recording_warmup_status(
     recording_auto_stop_reason_fn: Callable[[TeleopRunState | str], str | None],
     gripper_warmup_probe_status: Callable[..., tuple[bool, str]],
     camera_status_blocking_message: Callable[[Mapping[str, object]], str | None],
+    allow_pre_episode_armed_warmup: bool = False,
 ) -> tuple[bool, str]:
     """Return the historical fail-closed recording admission result."""
 
@@ -69,14 +70,19 @@ def recording_warmup_status(
         return False, f"等待恢复，当前状态会自动停止数采：{stop_reason}。"
     if clutch_input.hold_active():
         return False, "等待 hold 解除并重采 runtime home。"
-    if step_result.state != TeleopRunState.RUNNING:
+    pre_episode_armed_warmup = bool(
+        allow_pre_episode_armed_warmup
+        and step_result.state == TeleopRunState.ARMED
+    )
+    if step_result.state != TeleopRunState.RUNNING and not pre_episode_armed_warmup:
         return False, f"等待遥操进入 RUNNING，当前状态：{step_result.state.value}。"
     if step_result.observation is None:
         return False, "等待 observation 可用。"
-    if step_result.command is None:
-        return False, "等待 action command 可用。"
-    if not session_step_arm_dispatch_confirmed(step_result):
-        return False, "等待机械臂命令通过最终 admission 并实际派发。"
+    if not pre_episode_armed_warmup:
+        if step_result.command is None:
+            return False, "等待 action command 可用。"
+        if not session_step_arm_dispatch_confirmed(step_result):
+            return False, "等待机械臂命令通过最终 admission 并实际派发。"
     if dataset_recorder is not None:
         actual_ready, actual_message = dataset_recorder.actual_feedback_warmup_status(now)
         if not actual_ready:

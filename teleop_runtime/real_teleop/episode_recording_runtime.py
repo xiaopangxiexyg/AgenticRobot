@@ -1564,7 +1564,18 @@ def build_episode_recording_runtime(
                 reason=f"start admission changed: {admission_message}",
             )
             return
-        ready, warmup_message = recording_warmup_status(now, step_result=step_result)
+        pre_episode_warmup = getattr(
+            clutch_input,
+            "allows_pre_episode_armed_warmup",
+            None,
+        )
+        ready, warmup_message = recording_warmup_status(
+            now,
+            step_result=step_result,
+            allow_pre_episode_armed_warmup=bool(
+                callable(pre_episode_warmup) and pre_episode_warmup()
+            ),
+        )
         remaining_sec = _episode_start_countdown_remaining(now, episode_start_countdown_deadline)
         if not ready:
             episode_start_warmup_ready_since = None

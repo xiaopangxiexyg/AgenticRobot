@@ -89,6 +89,24 @@ def test_rule_application_exposes_one_start_and_translates_to_writer_intent() ->
     assert application.consume_rule_intents() == ("rule_start",)
 
 
+def test_rule_ui_opens_only_its_armed_pre_episode_writer_window() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication(
+        {"active_controls": ["episode_start"]}
+    )
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+
+    assert application.allows_pre_episode_armed_warmup() is False
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+    assert application.allows_pre_episode_armed_warmup() is True
+
+    application.observe_runtime_publication(
+        {"startup_blockers": {"right_hand": "DMTAC fault"}}
+    )
+    assert application.allows_pre_episode_armed_warmup() is False
+
+
 def test_rule_runtime_bind_waits_for_first_readiness_status() -> None:
     """Binding the extension alone must not advertise a usable start gate."""
 
@@ -1351,6 +1369,34 @@ def test_task_chain_starts_after_stale_start_gate_recovers() -> None:
     application.observe_rule_status(_task_chain_ready_status())
     assert application.consume_rule_intents() == ()
     assert application.consume_runtime_events() == []
+
+
+def test_task_chain_does_not_offer_rule_retry_while_device_is_blocked() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    assert application.submit_configuration({"batch": [first]}) is True
+    assert application.consume_configuration_requests() == ({"batch": [first]},)
+    application._task_chain.phase = RuleWritingTaskChainPhase.CONFIGURATION_PENDING
+    application.complete_configuration(selected={"batch": [first]}, error=None)
+    assert application.snapshot()["task_chain_phase"] == "rule_pending"
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            aborted=True,
+            held=True,
+            session_state="DEBUG_ONLY",
+            rule_start_available=False,
+            readiness_blockers={"right_hand": "DMTAC fault"},
+        )
+    )
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "ready_rule"
+    assert state["task_chain_can_advance"] is False
+    assert "DMTAC fault" in state["task_chain_detail"]
 
 
 def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() -> None:

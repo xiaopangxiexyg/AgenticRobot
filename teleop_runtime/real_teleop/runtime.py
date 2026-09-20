@@ -2477,6 +2477,7 @@ def run_real_teleop(
             now: float,
             *,
             step_result: SessionStepResult | None,
+            allow_pre_episode_armed_warmup: bool = False,
         ) -> tuple[bool, str]:
             return _recording_warmup_status(
                 now,
@@ -2491,6 +2492,7 @@ def run_real_teleop(
                 recording_auto_stop_reason_fn=recording_auto_stop_reason,
                 gripper_warmup_probe_status=gripper_warmup_probe_status,
                 camera_status_blocking_message=_camera_status_blocking_message,
+                allow_pre_episode_armed_warmup=allow_pre_episode_armed_warmup,
             )
 
         position_episode_debug_runtime = build_position_episode_debug_runtime(

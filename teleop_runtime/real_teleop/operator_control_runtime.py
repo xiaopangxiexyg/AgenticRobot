@@ -977,6 +977,34 @@ class RealTeleopControlInput:
 
         return bool(getattr(self, "_dataset_selection_pending", False))
 
+    def _pre_episode_armed_warmup_allowed(self) -> bool:
+        """Read an optional application-owned pre-Episode admission window.
+
+        Ordinary RealTeleop must still prove an actual arm dispatch before
+        opening an Episode.  A dedicated rule UI can expose a bounded,
+        command-inert writer-open window while Session is ARMED; the UI owns
+        the lifecycle fact so this lower runtime does not infer rule state or
+        broaden the generic admission contract.
+        """
+
+        hook = getattr(self.ui, "allows_pre_episode_armed_warmup", None)
+        if not callable(hook):
+            return False
+        try:
+            return bool(hook())
+        except Exception as exc:  # noqa: BLE001 - admission must fail closed.
+            _log(
+                "Dataset",
+                "optional pre-Episode warmup admission failed closed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+
+    def allows_pre_episode_armed_warmup(self) -> bool:
+        """Expose the rule-owned pre-Episode writer-open capability."""
+
+        return self._pre_episode_armed_warmup_allowed()
+
     def _progress_configuration_selection_enabled(self) -> bool:
         """Keep progress configuration on the same idle transaction boundary."""
 
@@ -997,7 +1025,10 @@ class RealTeleopControlInput:
             return False, "数据集任务/profile 正在后台准备，完成后才能开始数采。"
         if not bool(getattr(self, "_teleop_started", False)):
             return False, "遥操尚未进入 RUNNING，不能开始数采。"
-        if not self._teleop_arm_dispatch_confirmed():
+        if (
+            not self._teleop_arm_dispatch_confirmed()
+            and not self.allows_pre_episode_armed_warmup()
+        ):
             return False, "机械臂命令尚未实际派发，不能开始数采。"
         if bool(getattr(self, "_hold_active", False)):
             return False, "常规 Hold 期间不能开始数采；请先重采 runtime Home。"

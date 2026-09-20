@@ -165,6 +165,11 @@ class RuleBasedWritingApplication:
         self._runtime_home_retry_reason = ""
         self._device_retry_waiting_for_hold = False
         self._rule_runtime_bound = False
+        # A dedicated rule start owns a short pre-Episode writer-open window.
+        # The lower RealTeleop admission may consult this capability while the
+        # Session is still ARMED; it is cleared on stop/abort/hold and never
+        # applies to the generic teleoperation UI.
+        self._pre_episode_start_admission_open = False
         # Binding the extension only wires the UI to the runtime.  It is not a
         # readiness receipt: the extension publishes its first status only
         # after the shared Session/Rig admission path has been evaluated.  Keep
@@ -282,6 +287,32 @@ class RuleBasedWritingApplication:
             self._rebuild_controls()
             self._touch()
 
+    def allows_pre_episode_armed_warmup(self) -> bool:
+        """Admit only this UI's already-accepted rule start before dispatch.
+
+        The normal RealTeleop start gate remains dispatch-based.  Rule-based
+        collection has one bounded exception: its formal writer must open
+        before the first rule command can be produced, while the Session is
+        still ARMED.  This method exposes that application-owned lifecycle
+        fact without making the lower runtime infer it from a stale phase.
+        """
+
+        with self._lock:
+            return bool(
+                self._pre_episode_start_admission_open
+                and self._rule_runtime_bound
+                and self._state.phase == "armed"
+                and not self._state.startup_blockers
+                and not self._state.held
+                and not self._state.completed
+                and not self._state.aborted
+                and not self._state.shutdown
+                and not self._state.configuration_pending
+                and not self._state.writer_retry_pending
+                and not self._state.gripper_action_pending
+                and not self._state.height_calibration_pending
+            )
+
     def submit_intent(self, intent: RuleBasedWritingIntent) -> bool:
         if not isinstance(intent, RuleBasedWritingIntent):
             raise TypeError("intent must be RuleBasedWritingIntent.")
@@ -307,6 +338,9 @@ class RuleBasedWritingApplication:
             if not retry_writer_only:
                 self._completion_stop_queued = False
                 self._rule_intents.put(intent)
+                self._pre_episode_start_admission_open = True
+            else:
+                self._pre_episode_start_admission_open = False
             self._runtime_events.put("episode_start")
             self._state.phase = "armed"
             self._state.writer_retry_pending = retry_writer_only
@@ -321,6 +355,7 @@ class RuleBasedWritingApplication:
         elif intent is RuleBasedWritingIntent.STOP:
             if not available["stop"]:
                 return False
+            self._pre_episode_start_admission_open = False
             self._rule_intents.put(intent)
             self._runtime_events.put("episode_stop:rule_based_hold_cancel")
             self._runtime_events.put("h")
@@ -1061,6 +1096,8 @@ class RuleBasedWritingApplication:
             self._state.held = held
             self._state.completed = completed
             self._state.aborted = aborted
+            if held or completed or aborted or self._state.startup_blockers:
+                self._pre_episode_start_admission_open = False
             if self._state.device_retry_pending:
                 self._project_device_retry_transaction_locked()
             elif self._state.configuration_pending:
@@ -1334,6 +1371,12 @@ class RuleBasedWritingApplication:
             and not self._state.task_chain_can_advance
         ):
             task_chain_detail = self._task_chain_blocked_detail_locked(available)
+        elif (
+            self._task_chain.phase is RuleWritingTaskChainPhase.READY_RULE
+            and not self._state.task_chain_can_advance
+            and (self._state.startup_blockers or self._state.runtime_home_pending)
+        ):
+            task_chain_detail = self._task_chain_blocked_detail_locked(available)
         self._state.task_chain_detail = task_chain_detail
 
         chain_owns_manual_step = self._task_chain.active
@@ -1495,6 +1538,24 @@ class RuleBasedWritingApplication:
             return "当前采集模式不是 rule-based writing，任务链不可用。"
         if not self._rule_runtime_bound:
             return "等待规则运行时完成绑定；就绪前不能开始任务链。"
+        if self._state.startup_blockers:
+            detail_lines = "; ".join(
+                f"{key}: {value}"
+                for key, value in sorted(self._state.startup_blockers.items())
+            )
+            if self._has_retryable_device_blockers_locked():
+                if self._device_retry_request_available_locked():
+                    action = "请先重连失败设备，并重新完成 runtime Home。"
+                else:
+                    action = (
+                        "底层当前未提供安全重连控制；请保持 Hold，"
+                        "等待底层恢复后再重试。"
+                    )
+            else:
+                action = "请重新完成 runtime Home；完成前不能继续任务链。"
+            return "规则采集保持禁用；" + action + "\n" + detail_lines
+        if self._state.runtime_home_pending:
+            return "正在重新确认 runtime Home；完成前不能继续任务链。"
         if not self._state.gripper_control_available:
             return "等待夹爪控制拓扑就绪；任务链第一步需要先实测松开右夹爪。"
         if "right" not in self._state.gripper_sides:
@@ -1528,6 +1589,8 @@ class RuleBasedWritingApplication:
         if phase is RuleWritingTaskChainPhase.READY_HEIGHT:
             return bool(available["capture_height"])
         if phase is RuleWritingTaskChainPhase.READY_RULE:
+            if self._state.startup_blockers or self._state.runtime_home_pending:
+                return False
             if self._task_chain.rule_start_waiting:
                 return bool(available["start"])
             return bool(available["configure"] and self._task_chain_configuration_pool)
@@ -1709,11 +1772,17 @@ class RuleBasedWritingApplication:
             detail_lines = "; ".join(
                 f"{key}: {value}" for key, value in sorted(details.items())
             )
-            self._state.detail = (
-                "规则采集保持禁用；请检查故障设备后点击“重连失败设备”，"
-                "并重新完成 runtime Home。\n"
-                + detail_lines
-            )
+            if self._device_retry_request_available_locked():
+                recovery = (
+                    "请检查故障设备后点击“重连失败设备”，"
+                    "并重新完成 runtime Home。"
+                )
+            else:
+                recovery = (
+                    "底层当前未提供安全重连控制；请保持 Hold，"
+                    "等待底层恢复后再重试，不能绕过设备故障开始规则采集。"
+                )
+            self._state.detail = "规则采集保持禁用；" + recovery + "\n" + detail_lines
         elif details:
             detail_lines = "; ".join(
                 f"{key}: {value}" for key, value in sorted(details.items())

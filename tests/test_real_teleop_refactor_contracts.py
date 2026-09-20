@@ -3233,6 +3233,20 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         **common,
     ) == (False, "等待机械臂命令通过最终 admission 并实际派发。")
 
+    armed_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.ARMED,
+        observation=object(),
+        command=None,
+        command_dispatched=False,
+        channels={},
+    )
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=armed_step,
+        allow_pre_episode_armed_warmup=True,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
 
 def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
     backend = legacy_entrypoint.DMTacGripperBackend(
@@ -3631,6 +3645,29 @@ def test_teleop_running_projection_requires_an_actual_arm_dispatch(
     )
     assert control._teleop_dispatch_confirmed is False
     assert control.gripper_control_enabled() is False
+
+
+def test_rule_ui_can_open_writer_before_first_arm_dispatch() -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.components = SimpleNamespace(
+        session=SimpleNamespace(
+            state_machine=SimpleNamespace(
+                state=SimpleNamespace(value="ARMED"),
+            ),
+        ),
+    )
+    control.ui = SimpleNamespace(
+        allows_pre_episode_armed_warmup=lambda: True,
+    )
+    control._dataset_selection_pending = False
+    control._teleop_started = True
+    control._teleop_dispatch_confirmed = False
+    control._hold_active = False
+    control._fix_hold_active = False
+
+    assert control.episode_start_admission() == (True, "")
 
 
 def test_two_pedal_transition_cannot_bypass_missing_dispatch_receipt() -> None:
