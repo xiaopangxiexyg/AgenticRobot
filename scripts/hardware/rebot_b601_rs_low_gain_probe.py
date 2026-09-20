@@ -8418,6 +8418,12 @@ def run_probe(
                 and interactive_pose_axis_guide.completed
             ):
                 break
+            if (
+                shared_control_commissioning is not None
+                and shared_control_commissioning.state
+                is B601AssistCommissioningState.COMPLETE
+            ):
+                break
         if stop_reason is None:
             if (
                 interactive_pose_axis_guide is not None
@@ -8428,6 +8434,18 @@ def run_probe(
                 _operator_notice(
                     "[B601] INTERACTIVE CAPTURE COMPLETE: entering protective hold; "
                     "Ctrl-C or SIGUSR1 requests final full disable."
+                )
+            elif (
+                shared_control_commissioning is not None
+                and shared_control_commissioning.state
+                is B601AssistCommissioningState.COMPLETE
+            ):
+                stop["requested"] = True
+                control_completion_reason = "single_joint_assist_complete"
+                _operator_notice(
+                    "[B601] ASSIST TRIAL COMPLETE: entering protective hold; "
+                    "assist is zero and no return target exists. Ctrl-C or "
+                    "SIGUSR1 requests final full disable."
                 )
             else:
                 if shared_control_commissioning is not None:

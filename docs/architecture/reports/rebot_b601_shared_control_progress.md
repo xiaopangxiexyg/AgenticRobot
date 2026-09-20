@@ -130,7 +130,8 @@ gravity/damping 控制、protective hold、驱动器限矩恢复和最终 safe s
 收到 Ctrl-C，父进程又重复转发并提前关闭 stdout，导致子进程结果输出出现 broken pipe，
 表现为退出码 120。修复后父进程只观察 SIGINT，由子进程独占两阶段停止语义，并持续读取
 输出至 EOF；控制时限届满但助力未完成时也会显式撤销 policy 并显示
-`ASSIST INCOMPLETE`。
+`ASSIST INCOMPLETE`。一次性助力正常完成后会直接进入 protective hold，不再要求操作者
+等待总 duration；duration 仅作为等待 `A`/完成试验的最长窗口。
 
 ## 3. 当前证据边界
 
