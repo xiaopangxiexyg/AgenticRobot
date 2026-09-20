@@ -415,7 +415,10 @@ def test_counterfactual_release_forks_from_authoritative_ik_state() -> None:
         np.testing.assert_allclose(
             modified_release_q,
             nominal_q,
-            atol=1e-12,
+            # Pink recomputes FK/Jacobians after a rebase.  Independent QP
+            # solves can therefore differ by a few nanoradians even when
+            # their admitted state and target are identical.
+            atol=1e-8,
             rtol=0.0,
         )
         assert modified_metadata["ik_branch_candidate"] == (

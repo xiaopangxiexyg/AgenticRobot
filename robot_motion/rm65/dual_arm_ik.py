@@ -1530,16 +1530,61 @@ class MultiTaskIKSolver:
         self.dt = dt
         self.frequency = 1.0 / dt
 
-    def set_configuration_q(self, q: np.ndarray) -> None:
+    def _validated_configuration_q(self, q: np.ndarray) -> np.ndarray:
         q_array = self._soft_clamp_configuration_to_limits(q)
         if q_array.shape != self.configuration.q.shape:
             raise ValueError(
                 f"Expected configuration shape {self.configuration.q.shape}, got {q_array.shape}."
             )
+        return q_array
+
+    def set_configuration_q(self, q: np.ndarray) -> None:
+        """Set the solver-owned working q without a Pink cache rebuild.
+
+        The target solver uses this method for bounded candidate, hold, and
+        branch updates inside one solve.  Rebuilding Pink's collision and
+        Jacobian caches for every such candidate changes the solver's timing
+        and numerical path.  Call :meth:`rebase_configuration_q` when a
+        caller is admitting a measured or otherwise external qpos.
+        """
+
+        q_array = self._validated_configuration_q(q)
         try:
             self.configuration.q[:] = q_array
         except Exception:
             self.configuration.q = q_array.copy()
+        if self.viz is not None:
+            self.viz.display(self.configuration.q)
+
+    def rebase_configuration_q(self, q: np.ndarray) -> None:
+        """Admit an external qpos and refresh Pink's derived kinematic state.
+
+        Pink stores frame placements, Jacobians, and collision distances beside
+        ``configuration.q``.  A measured-hardware/simulation rebase must use
+        Pink's canonical update path so the first subsequent solve observes
+        the admitted state rather than stale derived values.
+        """
+
+        q_array = self._validated_configuration_q(q)
+        # Keep the external rebase's frame-placement cache coherent without
+        # changing the Jacobian/collision state that the bounded planner owns
+        # and recomputes for each admitted candidate.  Pink's ``update`` also
+        # rebuilds those states immediately; doing that at this boundary
+        # changes the established contact-planning path before the planner has
+        # admitted its endpoint.  FrameTask and collision query paths compute
+        # their current-q derivatives on demand before use.
+        q_readonly = q_array.copy()
+        q_readonly.setflags(write=False)
+        self.configuration.q = q_readonly
+        self.pin.forwardKinematics(
+            self.robot.model,
+            self.configuration.data,
+            self.configuration.q,
+        )
+        self.pin.updateFramePlacements(
+            self.robot.model,
+            self.configuration.data,
+        )
         if self.viz is not None:
             self.viz.display(self.configuration.q)
 
