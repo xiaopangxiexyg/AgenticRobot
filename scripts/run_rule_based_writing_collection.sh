@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Conda activation on collection hosts can leave a PATH containing only the
+# environment's bin directory.  Preserve that interpreter precedence while
+# restoring the standard system command locations required by the launcher.
+# The script must not depend on the caller having started bash or zsh as a
+# login shell.
+SYSTEM_COMMAND_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="${PATH:+$PATH:}$SYSTEM_COMMAND_PATH"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -63,13 +71,30 @@ die() {
   exit 2
 }
 
+is_positive_decimal() {
+  local value="$1"
+  [[ "$value" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || return 1
+  [[ ! "$value" =~ ^0*([.]0*)?$ ]]
+}
+
+is_unit_interval_decimal() {
+  local value="$1"
+  is_positive_decimal "$value" || return 1
+  [[ "$value" =~ ^0*1([.]0*)?$ || "$value" =~ ^0*[.][0-9]*[1-9][0-9]*$ ]]
+}
+
 print_command() {
   printf '[dry-run]'
   printf ' %q' "$@"
   printf '\n'
 }
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+SCRIPT_PARENT="${SCRIPT_SOURCE%/*}"
+if [[ "$SCRIPT_PARENT" == "$SCRIPT_SOURCE" ]]; then
+  SCRIPT_PARENT="."
+fi
+SCRIPT_DIR="$(cd -- "$SCRIPT_PARENT" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 TCP_POSE_ENVELOPE_PROFILE="teleop_runtime/configs/real_teleop/rule_based_writing_bimanual_workspace_v1.json"
 SOURCE_DATASET=""
@@ -237,16 +262,10 @@ fi
 [[ "$SELECTION_SEED" =~ ^-?[0-9]+$ ]] || die "selection seed must be an integer."
 [[ "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" =~ ^[0-9]+$ ]] || \
   die "pre-pen-down replay normal Episodes must be a non-negative integer."
-if ! [[ "$INITIAL_ALIGNMENT_SPEED_SCALE" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-  die "initial alignment speed scale must be a positive decimal in (0, 1]."
-fi
-if ! awk "BEGIN { exit !($INITIAL_ALIGNMENT_SPEED_SCALE > 0 && $INITIAL_ALIGNMENT_SPEED_SCALE <= 1) }"; then
+if ! is_unit_interval_decimal "$INITIAL_ALIGNMENT_SPEED_SCALE"; then
   die "initial alignment speed scale must be in (0, 1]."
 fi
-if ! [[ "$CAMERA_FRAME_MAX_AGE_SEC" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-  die "camera frame max age must be a positive decimal."
-fi
-if ! awk "BEGIN { exit !($CAMERA_FRAME_MAX_AGE_SEC > 0) }"; then
+if ! is_positive_decimal "$CAMERA_FRAME_MAX_AGE_SEC"; then
   die "camera frame max age must be greater than zero."
 fi
 if [[ -n "$LEFT_GRIPPER_PORT" && "$WITH_LEFT_GRIPPER" -ne 1 ]]; then
@@ -462,6 +481,11 @@ RUN_COMMAND=(
   python -m control_station.real_rule_based_writing_entrypoint
   "${TELEOP_ARGS[@]}"
 )
+
+for required_command in taskset python; do
+  command -v "$required_command" >/dev/null 2>&1 || \
+    die "required command is unavailable after PATH normalization: $required_command"
+done
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   print_command "${RUN_COMMAND[@]}"
