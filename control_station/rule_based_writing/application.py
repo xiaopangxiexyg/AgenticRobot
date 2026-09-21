@@ -239,14 +239,63 @@ class RuleBasedWritingApplication:
             )
         )
 
+    def _is_expected_pre_episode_lifecycle_blocker_locked(
+        self,
+        *,
+        key: str,
+        detail: str,
+    ) -> bool:
+        """Recognize only the writer-settling transition owned by this START.
+
+        The rule start intentionally prepares the formal writer before the
+        first rule arm command can be dispatched.  During that bounded
+        command-inert interval the rule runtime reports its collection
+        control-plane transition as ``dataset.lifecycle``.  This is not a
+        hardware/readiness fault and must not revoke the already accepted
+        pre-Episode admission.  The exact settling diagnostic is filtered;
+        active/awaiting-discard lifecycle states remain blocking.
+        """
+
+        rule_start_window_open = bool(
+            self._pre_episode_start_admission_open
+            or (
+                self._task_chain.phase is RuleWritingTaskChainPhase.READY_RULE
+                and self._task_chain.rule_start_waiting
+            )
+        )
+        if not (
+            rule_start_window_open
+            and str(key) == "dataset.lifecycle"
+            and str(self._state.session_state or "").upper()
+            in {"", "ARMED", "RUNNING"}
+            and not self._state.held
+            and not self._state.completed
+            and not self._state.aborted
+            and not self._state.shutdown
+        ):
+            return False
+        normalized = " ".join(str(detail or "").lower().split())
+        return bool(
+            normalized.startswith(
+                "cancelled rule episode lifecycle is still settling"
+            )
+            and "awaiting discard" not in normalized
+        )
+
     def _effective_startup_blockers_locked(self) -> dict[str, str]:
-        """Return blockers after the narrow accepted-rule-start exception."""
+        """Return blockers after the narrow accepted-rule-start exceptions."""
 
         blockers = dict(self._state.startup_blockers)
         for key, detail in tuple(blockers.items()):
-            if self._is_expected_pre_episode_session_blocker_locked(
-                key=key,
-                detail=detail,
+            if (
+                self._is_expected_pre_episode_session_blocker_locked(
+                    key=key,
+                    detail=detail,
+                )
+                or self._is_expected_pre_episode_lifecycle_blocker_locked(
+                    key=key,
+                    detail=detail,
+                )
             ):
                 blockers.pop(key, None)
         return blockers

@@ -122,6 +122,24 @@ def test_rule_ui_opens_only_its_armed_pre_episode_writer_window() -> None:
     application.observe_rule_status(
         {
             "started": True,
+            "armed": True,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "readiness_blockers": {
+                "dataset.lifecycle": (
+                    "cancelled rule Episode lifecycle is still settling"
+                )
+            },
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is True
+    assert application.pre_episode_start_admission_reason() is None
+    application.observe_rule_status(
+        {
+            "started": True,
             "armed": False,
             "execution_begun": False,
             "completed": False,
@@ -136,6 +154,59 @@ def test_rule_ui_opens_only_its_armed_pre_episode_writer_window() -> None:
         {"startup_blockers": {"right_hand": "DMTAC fault"}}
     )
     assert application.allows_pre_episode_armed_warmup() is False
+
+
+def test_rule_ui_does_not_ignore_discard_lifecycle_or_device_faults() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication({"active_controls": ["episode_start"]})
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": True,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "readiness_blockers": {
+                "dataset.lifecycle": (
+                    "cancelled rule Episode is still active and awaiting discard"
+                )
+            },
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is False
+
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication({"active_controls": ["episode_start"]})
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": True,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "readiness_blockers": {
+                "hand.right": "right_hand telemetry_failed: Write timeout",
+                "dataset.lifecycle": (
+                    "cancelled rule Episode lifecycle is still settling"
+                ),
+            },
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is False
+    reason = application.pre_episode_start_admission_reason()
+    assert reason is not None
+    assert "hand.right" in reason
 
 
 def test_rule_ui_preserves_dynamic_blocker_for_pre_episode_admission_diagnostic() -> None:
