@@ -10,6 +10,9 @@ from control_station.rule_based_writing import (
     RuleBasedWritingWebUi,
     RuleWritingTaskChainPhase,
 )
+from teleop_runtime.real_teleop.rule_based_writing_plan import (
+    RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+)
 
 
 def _task_chain_configuration() -> tuple[
@@ -1094,6 +1097,52 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
         {**changed, "pre_pen_down_replay_normal_episodes": 1.5}
     ) is False
     assert "必须是整数" in application.snapshot()["configuration_error"]
+
+
+def test_rule_configuration_accepts_random_source_pool_default() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+    options = {
+        "configuration_core_fields": [
+            "pen_down_candidate_id",
+            "write_candidate_id",
+            "pen_up_candidate_id",
+            "trajectory_id",
+            "direction",
+            "writing_size_m",
+            "initial_alignment_speed_scale",
+        ],
+        "source_candidates_by_phase": {
+            phase: [
+                {
+                    "value": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+                    "label": "随机选择（默认）",
+                },
+                {"value": "a", "label": "A"},
+            ]
+            for phase in ("pen_down", "write", "pen_up")
+        },
+        "trajectory_ids": ["digit_1_v1"],
+        "directions": ["up"],
+        "numeric_bounds": {
+            "writing_size_m": [0.005, 0.2],
+            "initial_alignment_speed_scale": [0.05, 1.0],
+        },
+    }
+    selected = {
+        "pen_down_candidate_id": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+        "write_candidate_id": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+        "pen_up_candidate_id": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+        "trajectory_id": "digit_1_v1",
+        "direction": "up",
+        "writing_size_m": 0.08,
+        "initial_alignment_speed_scale": 1.0,
+    }
+
+    application.configure_rule_options(options, selected)
+
+    assert application.snapshot()["rule_configuration"] == selected
 
 
 def test_rule_configuration_rejects_out_of_range_speed_without_queueing() -> None:

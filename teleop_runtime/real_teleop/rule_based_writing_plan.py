@@ -120,6 +120,11 @@ RULE_COLLECTION_MODES = (
     RULE_COLLECTION_MODE_WRITING,
     RULE_COLLECTION_MODE_FULL_REPLAY,
 )
+# This is a UI-only value.  It is never used as a dataset candidate ID; the
+# source resolver turns it into a seeded source-pool choice before loading any
+# replay data.  Keeping the sentinel explicit lets the GUI distinguish the
+# default random policy from an operator-selected fixed candidate.
+RULE_BASED_RANDOM_SOURCE_SELECTION_ID = "__rule_source_pool_random__"
 FULL_REPLAY_INITIALIZE_STEP_ID = "execute_task.replay_initial_alignment"
 FULL_REPLAY_STEP_ID = "execute_task.manipulate"
 PRE_PEN_DOWN_ALIGNMENT_STEP_ID = "right_write.pre_pen_down.alignment"
@@ -1512,12 +1517,31 @@ def _resolve_source_specs(
     if requested_ids is not None:
         if not isinstance(requested_ids, Mapping):
             raise ValueError("rule source candidate overrides must be a mapping.")
-        if set(requested_ids) != set(RULE_BASED_WRITING_SOURCE_PHASES_V1):
-            raise ValueError("rule source candidate overrides must cover all phases.")
+        normalized_requested_ids = {
+            str(phase): value for phase, value in requested_ids.items()
+        }
+        unknown_phases = set(normalized_requested_ids) - set(
+            RULE_BASED_WRITING_SOURCE_PHASES_V1
+        )
+        if unknown_phases:
+            raise ValueError(
+                "rule source candidate overrides contain unknown phases: "
+                f"{sorted(unknown_phases)!r}."
+            )
         by_id = {value.candidate.candidate_id: value for value in ranged}
         selected: dict[str, ResolvedRuleBasedWritingSourceCandidate] = {}
+        used: set[str] = set()
+        random_phases: list[str] = []
         for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1:
-            candidate_id = str(requested_ids[phase])
+            raw_candidate_id = normalized_requested_ids.get(phase)
+            candidate_id = (
+                ""
+                if raw_candidate_id is None
+                else str(raw_candidate_id).strip()
+            )
+            if not candidate_id or candidate_id == RULE_BASED_RANDOM_SOURCE_SELECTION_ID:
+                random_phases.append(phase)
+                continue
             spec = by_id.get(candidate_id)
             if spec is None or phase not in spec.candidate.phases:
                 raise ValueError(
@@ -1525,6 +1549,32 @@ def _resolve_source_specs(
                     "inside the selected source-pool range."
                 )
             selected[phase] = spec
+            used.add(candidate_id)
+        for phase in random_phases:
+            eligible = [value for value in ranged if phase in value.candidate.phases]
+            if not eligible:
+                raise ValueError(
+                    f"selected source-pool range has no candidate for phase {phase!r}."
+                )
+            unused = [
+                value
+                for value in eligible
+                if value.candidate.candidate_id not in used
+            ]
+            choices = unused or eligible
+            index = _stable_candidate_index(
+                pool_hash=loaded_pool.contract.semantic_content_hash,
+                seed=int(getattr(args, "rule_source_selection_seed", 0)),
+                phase=phase,
+                candidate_count=len(choices),
+            )
+            selected[phase] = choices[index]
+            used.add(choices[index].candidate.candidate_id)
+        selection_seed = (
+            None
+            if not random_phases
+            else int(getattr(args, "rule_source_selection_seed", 0))
+        )
         return (
             selected,
             {
@@ -1534,7 +1584,7 @@ def _resolve_source_specs(
                 "pool_manifest_path": str(loaded_pool.manifest_path),
                 "pool_manifest_hash": loaded_pool.contract.semantic_content_hash,
                 "pool_range": {"start": start, "end": end},
-                "selection_seed": None,
+                "selection_seed": selection_seed,
             },
         )
     selected: dict[str, ResolvedRuleBasedWritingSourceCandidate] = {}
@@ -1821,11 +1871,23 @@ def _rule_configuration_options(
         )
         candidates = loaded_pool.candidates[start:end]
     source_options = {
-        phase: [
-            _configuration_option_entry(spec)
-            for spec in candidates
-            if phase in spec.candidate.phases
-        ]
+        phase: (
+            (
+                [
+                    {
+                        "value": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+                        "label": "随机选择（默认）",
+                    }
+                ]
+                if manifest is not None
+                else []
+            )
+            + [
+                _configuration_option_entry(spec)
+                for spec in candidates
+                if phase in spec.candidate.phases
+            ]
+        )
         for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1
     }
     tactile_bundle_root = (
@@ -2013,7 +2075,11 @@ def _rule_configuration_options(
         },
     }
     selected = {
-        f"{phase}_candidate_id": source_specs[phase].candidate.candidate_id
+        f"{phase}_candidate_id": (
+            RULE_BASED_RANDOM_SOURCE_SELECTION_ID
+            if manifest is not None
+            else source_specs[phase].candidate.candidate_id
+        )
         for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1
     }
     selected.update(
@@ -3260,6 +3326,7 @@ __all__ = [
     "PRE_PEN_DOWN_ALIGNMENT_STEP_ID",
     "PRE_PEN_DOWN_REPLAY_STEP_ID",
     "PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID",
+    "RULE_BASED_RANDOM_SOURCE_SELECTION_ID",
     "RULE_COLLECTION_MODE_FULL_REPLAY",
     "RULE_COLLECTION_MODE_WRITING",
     "DetailWritingSelection",

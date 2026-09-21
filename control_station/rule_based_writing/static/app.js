@@ -260,10 +260,13 @@ function currentConfiguration() {
   };
 }
 
+const sourceLabel = (value) =>
+  value === "__rule_source_pool_random__" ? "随机" : (value || "—");
+
 const batchLabel = (entry, index) =>
   fullReplayMode()
     ? `${index + 1}. 完整 Episode · ${entry.full_replay_candidate_id}`
-    : `${index + 1}. ${entry.trajectory_id} · 前置:${entry.pre_pen_down_replay_candidate_id || "关闭"} · 间隔:${entry.pre_pen_down_replay_normal_episodes || 0} · ${entry.pen_down_candidate_id} / ${entry.write_candidate_id} / ${entry.pen_up_candidate_id}`;
+    : `${index + 1}. ${entry.trajectory_id} · 前置:${entry.pre_pen_down_replay_candidate_id || "关闭"} · 间隔:${entry.pre_pen_down_replay_normal_episodes || 0} · ${sourceLabel(entry.pen_down_candidate_id)} / ${sourceLabel(entry.write_candidate_id)} / ${sourceLabel(entry.pen_up_candidate_id)}`;
 
 function renderBatch() {
   const validated = latestState && Array.isArray(latestState.rule_configuration_batch)
