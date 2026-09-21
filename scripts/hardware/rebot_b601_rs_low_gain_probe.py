@@ -54,6 +54,12 @@ per-motor sequences advance atomically.  RobStride still provides no device
 acquisition timestamp, so this is a wired-host freshness contract rather than
 a source-clock claim.
 
+The velocity used by this module is always the bounded finite difference of
+normalized ``mechPos`` samples over their feedback timestamps.  The cached
+MotorBridge operation-status velocity is retained only as explicitly marked
+diagnostic evidence; it is never used for Kd, Coulomb friction, motion
+guards, reversal decisions, or protective-hold admission.
+
 ``gravity-calibration`` hands the startup lock to a normal draggable
 gravity/damping controller.  Once ACTIVE, the operator may move joint1..joint6,
 release the arm, and press ``R`` without Enter.  That fresh feedback pose becomes
@@ -201,6 +207,11 @@ CARTESIAN_ASSIST_CONFIRMATION = "B601_RS_CARTESIAN_POLICY_ASSIST"
 FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
 DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
+# The pinned MotorBridge operation-status velocity is not a verified control
+# signal.  Keep the authoritative host-side velocity contract in one place so
+# diagnostics cannot be mistaken for the value used by Kd, friction, or guards.
+_QVEL_SOURCE = "normalized_qpos_finite_difference_over_feedback_dt"
+_VENDOR_STATUS_VELOCITY_SOURCE = "motorbridge_operation_status_cache_unverified"
 _ONE_SIX = (1.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = _ALL_JOINTS
@@ -4649,9 +4660,13 @@ def vendor_status_cache_diagnostics(state: object) -> dict[str, object]:
         "freshness_verified": bool(
             getattr(state, "freshness_verified", False)
         ),
+        "velocity_source": _VENDOR_STATUS_VELOCITY_SOURCE,
+        "velocity_role": "diagnostic_only_not_used_for_control",
+        "control_qvel_source": _QVEL_SOURCE,
         "semantics": (
             "passive_motorbridge_operation_status_cache_unverified; "
-            "no_extra_can_request; not command-response correlated"
+            "no_extra_can_request; not command-response correlated; "
+            "diagnostic_only_not_used_for_control"
         ),
     }
 
@@ -4730,6 +4745,7 @@ def build_startup_diagnostic_observation(
         ),
         "qpos_rad": qpos,
         "qvel_fd_rad_s": qvel,
+        "qvel_source": _QVEL_SOURCE,
         "vendor_status": vendor_status_cache_diagnostics(state),
         "command": command,
     }
@@ -10194,7 +10210,7 @@ def run_probe(
             "velocity_abort_rad_s": args.velocity_abort_rad_s,
             "acceleration_abort_rad_s2": args.acceleration_abort_rad_s2,
             "acceleration_threshold_status": "commissioning_seed_not_hardware_certified",
-            "qvel_source": "normalized_qpos_finite_difference_over_feedback_dt",
+            "qvel_source": _QVEL_SOURCE,
             "qacc_source": "consecutive_qvel_finite_difference_over_feedback_dt",
             "first_sample_qacc_semantics": "unavailable_without_previous_control_qvel",
             "rejected_sample_count": rejected_motion_sample_count,

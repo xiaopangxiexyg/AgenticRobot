@@ -1178,6 +1178,13 @@ Kd 作为速度耗散，但这些调参值不属于代码契约；ID7 仍不参�
 在 `0x701B` 的真实设备量纲、符号和 freshness 经独立验证前，控制侧仍应使用新鲜位置的
 有界差分速度。当前不能用约 20 Hz 的同步参数读取直接闭合 125 Hz 重力/阻尼控制。
 
+这条约束也适用于调参和保护路径：当前 B601 owner 的 Kd、Coulomb friction、速度/加速度
+守护、反转判断和 protective-hold admission 均只接受
+`normalized_qpos_finite_difference_over_feedback_dt`。MotorBridge operation-status cache
+中的 vendor velocity 只作为带有 `diagnostic_only_not_used_for_control` 标记的被动证据，不能
+被解释为已经验证的 rad/s。Pinned `reBotArm_control_py` 子模块保持原始 gitlink 不变；其中
+旧标定脚本的 `mechVel/0x701A` 兼容性字段不属于 B601 控制契约，不能作为本项目控制或验收依据。
+
 启动诊断可设置 `MOTORBRIDGE_DEBUG_MODE=robstride-startup` 和
 `MOTORBRIDGE_DEBUG_LOG=<path>`，被动保存 type-1 operation-control、type-2 operation-status
 与 type-17 参数帧；
