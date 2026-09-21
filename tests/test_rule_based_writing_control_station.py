@@ -269,6 +269,53 @@ def test_rule_ui_keeps_accepted_start_window_across_stale_status_heartbeat() -> 
     assert application.allows_pre_episode_armed_warmup() is True
 
 
+def test_rule_ui_projects_writer_owned_pre_motion_wait_detail() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication(
+        {"active_controls": ["episode_start", "episode_stop", "h"]}
+    )
+    application.bind_rule_runtime()
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": False,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "rule_start_available": True,
+        }
+    )
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+
+    writer_detail = "数采 warmup 等待中：等待相机 front 新鲜帧；倒计时已完成。"
+    application.observe_runtime_publication(
+        {
+            "episode_event_status": "preparing",
+            "episode_event_message": writer_detail,
+        }
+    )
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": True,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "waiting_reason": "formal_episode_not_active",
+        }
+    )
+
+    state = application.snapshot()
+    assert state["phase"] == "armed"
+    assert state["detail"] == writer_detail
+    assert state["episode_event_status"] == "preparing"
+    assert state["episode_event_message"] == writer_detail
+
+
 def test_rule_runtime_bind_waits_for_first_readiness_status() -> None:
     """Binding the extension alone must not advertise a usable start gate."""
 
@@ -493,8 +540,8 @@ def test_rule_stop_atomically_blocks_rule_and_requests_writer_stop_and_hold() ->
     assert application.consume_rule_intents() == ("rule_stop",)
     assert application.consume_runtime_events() == [
         "episode_stop:rule_based_hold_cancel",
-        "h",
     ]
+    assert "停止并 Hold" in application.snapshot()["messages"][-1]["message"]
     assert application.snapshot()["can_stop"] is False
 
     application.observe_runtime_publication(
@@ -1657,8 +1704,8 @@ def test_task_chain_stop_enters_hold_then_releases_sequence_ownership() -> None:
     assert application.consume_rule_intents() == ("rule_stop",)
     assert application.consume_runtime_events() == [
         "episode_stop:rule_based_hold_cancel",
-        "h",
     ]
+    assert "停止并 Hold" in application.snapshot()["messages"][-1]["message"]
     assert application.submit_intent(RuleBasedWritingIntent.STOP) is False
 
     application.observe_rule_status(

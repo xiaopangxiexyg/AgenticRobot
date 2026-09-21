@@ -66,6 +66,8 @@ class RuleBasedWritingUiState:
     writer_blocked: bool = False
     writer_warning: str = ""
     writer_retry_pending: bool = False
+    episode_event_status: str = ""
+    episode_event_message: str = ""
     gripper_sides: list[str] = field(default_factory=list)
     control_topology: str = "双臂（无夹爪）"
     gripper_control_available: bool = False
@@ -346,6 +348,14 @@ class RuleBasedWritingApplication:
                 self._runtime_controls = frozenset(str(item) for item in controls)
                 self._runtime_controls_seen = True
                 self._advance_device_retry_transaction_locked()
+            if "episode_event_status" in updates:
+                self._state.episode_event_status = str(
+                    updates.get("episode_event_status", "") or ""
+                )
+            if "episode_event_message" in updates:
+                self._state.episode_event_message = str(
+                    updates.get("episode_event_message", "") or ""
+                )
             if (
                 self._state.device_retry_pending
                 and self._device_retry_waiting_for_hold
@@ -481,7 +491,10 @@ class RuleBasedWritingApplication:
                 self._pre_episode_start_admission_open = False
                 self._rule_intents.put(intent)
                 self._runtime_events.put("episode_stop:rule_based_hold_cancel")
-                self._runtime_events.put("h")
+                self._append_message_locked(
+                    "RuleBased",
+                    "已收到“停止并 Hold”操作请求；正在取消当前任务链。",
+                )
                 self._state.phase = "stopping"
                 self._state.title = "正在取消任务链并进入 Hold"
                 self._state.detail = (
@@ -513,6 +526,8 @@ class RuleBasedWritingApplication:
                 self._completion_stop_queued = False
                 self._rule_intents.put(intent)
                 self._pre_episode_start_admission_open = True
+                self._state.episode_event_status = ""
+                self._state.episode_event_message = ""
             else:
                 self._pre_episode_start_admission_open = False
             self._runtime_events.put("episode_start")
@@ -532,7 +547,10 @@ class RuleBasedWritingApplication:
             self._pre_episode_start_admission_open = False
             self._rule_intents.put(intent)
             self._runtime_events.put("episode_stop:rule_based_hold_cancel")
-            self._runtime_events.put("h")
+            self._append_message_locked(
+                "RuleBased",
+                "已收到“停止并 Hold”操作请求；正在取消当前规则采集。",
+            )
             self._state.phase = "stopping"
             self._state.title = "规则采集停止中"
             self._state.detail = "正在进入 Hold 并取消本轮规则采集。"
@@ -1349,7 +1367,7 @@ class RuleBasedWritingApplication:
                     "formal_writer_paused",
                     "initial_alignment_tracking_lag",
                 }:
-                    self._state.detail = self._waiting_detail(waiting)
+                    self._state.detail = self._waiting_detail_locked(waiting)
                 else:
                     step = self._state.step_id or "等待下一步"
                     self._state.detail = f"当前规则步骤：{step}"
@@ -1372,13 +1390,13 @@ class RuleBasedWritingApplication:
             ):
                 self._state.phase = "armed"
                 self._state.title = "规则采集启动中"
-                self._state.detail = self._waiting_detail(
+                self._state.detail = self._waiting_detail_locked(
                     waiting or "formal_episode_not_active"
                 )
             elif armed:
                 self._state.phase = "armed"
                 self._state.title = "规则采集启动中"
-                self._state.detail = self._waiting_detail(waiting)
+                self._state.detail = self._waiting_detail_locked(waiting)
             elif self._rule_runtime_bound:
                 self._project_prestart_readiness_locked(
                     status_started=bool(status.get("started", False))
@@ -1539,6 +1557,25 @@ class RuleBasedWritingApplication:
             )
         return "规则任务已确认，正在通过运行前门禁。"
 
+    def _waiting_detail_locked(self, waiting: str) -> str:
+        """Prefer the writer owner's live lifecycle explanation while waiting.
+
+        The generic recording runtime owns writer warmup, countdown and
+        Episode-open transitions.  Its publication is more actionable than
+        the rule runtime's intentionally coarse ``formal_episode_not_active``
+        marker, so project it without copying any writer state machine here.
+        """
+
+        if waiting in {
+            "formal_episode_not_active",
+            "formal_writer_not_recording",
+            "formal_writer_paused",
+        }:
+            detail = str(self._state.episode_event_message or "").strip()
+            if detail:
+                return detail
+        return self._waiting_detail(waiting)
+
     def request_completion_stop(self) -> None:
         """Ask the existing writer owner to finalize after the plan completes."""
 
@@ -1567,11 +1604,12 @@ class RuleBasedWritingApplication:
         if normalized_tag not in self._VISIBLE_MESSAGE_TAGS:
             return
         with self._lock:
-            self._state.messages.append(
-                {"tag": normalized_tag, "message": str(message)}
-            )
-            self._state.messages = self._state.messages[-32:]
+            self._append_message_locked(normalized_tag, message)
             self._touch()
+
+    def _append_message_locked(self, tag: str, message: str) -> None:
+        self._state.messages.append({"tag": str(tag), "message": str(message)})
+        self._state.messages = self._state.messages[-32:]
 
     def mark_shutdown(self, message: str) -> None:
         with self._lock:
@@ -1622,6 +1660,13 @@ class RuleBasedWritingApplication:
             )
         ):
             task_chain_detail = self._task_chain_blocked_detail_locked(available)
+        elif (
+            self._task_chain.phase is RuleWritingTaskChainPhase.RULE_PENDING
+            and self._state.phase == "armed"
+        ):
+            task_chain_detail = self._waiting_detail_locked(
+                "formal_episode_not_active"
+            )
         self._state.task_chain_detail = task_chain_detail
 
         chain_owns_manual_step = self._task_chain.active
