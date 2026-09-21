@@ -1910,6 +1910,7 @@ def test_run_policy_factory_is_default_off_narrow_and_ordered() -> None:
         "quest_paired_pose_capture_factory"
     ]
     source = inspect.getsource(run_policy.main)
+    control_loop_snapshot = "arm_states = arm_reader.snapshot(loop_started_at)"
 
     assert parameter.default is None
     assert source.count("quest_paired_pose_capture.poll()") == 1
@@ -1920,9 +1921,9 @@ def test_run_policy_factory_is_default_off_narrow_and_ordered() -> None:
         "bind_passive_robot_pose_journal_source("
     )
     assert source.index("bind_passive_robot_pose_journal_source(") < source.index(
-        "arm_reader.snapshot("
+        control_loop_snapshot
     )
-    assert source.index("arm_reader.snapshot(") < source.index(
+    assert source.index(control_loop_snapshot) < source.index(
         "quest_paired_pose_capture.poll()"
     )
     assert source.index("quest_paired_pose_capture.poll()") < source.index(

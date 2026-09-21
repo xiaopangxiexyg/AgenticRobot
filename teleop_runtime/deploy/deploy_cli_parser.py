@@ -276,6 +276,20 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--rtc-action-hz",
+        type=float,
+        choices=(15.0, 30.0),
+        default=None,
+        help=(
+            "Explicit model-RTC runtime action/request cadence. 15 Hz keeps "
+            "the prepared H32 artifact unchanged while providing additional "
+            "latency coverage; 30 Hz preserves the canonical profile. This "
+            "is a CLI-only runtime override and is valid only with the "
+            "conditioned model-RTC profile. Position reference/command rates "
+            "remain 60/120 Hz."
+        ),
+    )
+    parser.add_argument(
         "--policy-artifact-json",
         type=Path,
         default=None,

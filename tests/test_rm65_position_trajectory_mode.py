@@ -130,6 +130,57 @@ def test_rm65_skipped_tick_rebases_to_one_fresh_period_without_catchup() -> None
     ) == 10.04
 
 
+def test_rm65_new_target_does_not_count_idle_gap_as_low_send_rate() -> None:
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            background_streaming_hz=120.0,
+            background_streaming_warning_ratio=0.9,
+            singularity_protection_enabled=False,
+        )
+    )
+    backend._record_background_stream_send(
+        qpos_rad=np.zeros(6),
+        sent_at_perf=100.0,
+        call_ms=0.1,
+        deadline_lag_ms=0.0,
+    )
+    backend._record_background_stream_send(
+        qpos_rad=np.zeros(6),
+        sent_at_perf=100.02,
+        call_ms=0.1,
+        deadline_lag_ms=0.0,
+    )
+    before_idle = backend.get_state()["background_streaming"]
+    assert before_idle["warning"]["active"] is True
+    assert before_idle["low_rate_count"] == 1
+
+    with backend._state_lock:
+        backend._clear_stream_target_locked()
+    after_clear = backend.get_state()["background_streaming"]
+    assert after_clear["actual_hz"] is None
+    assert after_clear["warning"] is None
+    assert after_clear["low_rate_count"] == 1
+
+    # Ten seconds of target-free idle time is not a send interval.  The first
+    # send of the next target establishes a new cadence baseline and must not
+    # add a false low-rate health fault.
+    backend._record_background_stream_send(
+        qpos_rad=np.ones(6) * 0.01,
+        sent_at_perf=110.0,
+        call_ms=0.1,
+        deadline_lag_ms=0.0,
+    )
+    restarted = backend.get_state()["background_streaming"]
+    assert restarted["actual_hz"] is None
+    assert restarted["warning"]["active"] is False
+    assert restarted["low_rate_count"] == 1
+
+
 def test_rm65_stream_skips_late_tick_without_sending_catchup_command(monkeypatch) -> None:
     backend = RM65ArmBackend(
         RM65ArmBackendConfig(
@@ -267,6 +318,7 @@ def _backend(
     result: int = 0,
     target_max_age_sec: float = 1.0,
     target_admission_mode: str = RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
+    planner: str = POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
 ) -> tuple[RM65ArmBackend, _FakeArm]:
     backend = RM65ArmBackend(
         RM65ArmBackendConfig(
@@ -281,7 +333,7 @@ def _backend(
             background_streaming_hz=150.0,
             background_streaming_target_max_age_sec=target_max_age_sec,
             background_streaming_target_admission_mode=target_admission_mode,
-            position_command_planner=POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            position_command_planner=planner,
             position_velocity_ramp_sec=0.10,
             position_degraded_speed_scale=0.10,
         )
@@ -401,7 +453,7 @@ def test_latest_target_admission_does_not_wait_for_inflight_sdk_send_lock() -> N
     "source",
     ("replay_qpos_init", "replay_qpos_init_final_hold"),
 )
-def test_qpos_init_serializes_target_admission_for_velocity_continuity(
+def test_qpos_init_acceleration_planner_keeps_target_admission_nonblocking(
     source: str,
 ) -> None:
     backend, _arm = _backend(
@@ -422,8 +474,7 @@ def test_qpos_init_serializes_target_admission_for_velocity_continuity(
     with backend._send_lock:
         thread = threading.Thread(target=admit_target, daemon=True)
         thread.start()
-        assert not completed.wait(0.03)
-    assert completed.wait(0.25)
+        assert completed.wait(0.25), "acceleration qpos admission waited for _send_lock"
     thread.join(timeout=0.25)
 
     assert not errors
@@ -432,9 +483,43 @@ def test_qpos_init_serializes_target_admission_for_velocity_continuity(
     assert timing["requested_mode"] == (
         RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
     )
+    assert timing["mode"] == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+    assert timing["fallback_reason"] is None
+    assert timing["send_lock_wait_ms"] == 0.0
+
+
+def test_qpos_init_linear_planner_keeps_synchronous_rollback() -> None:
+    backend, _arm = _backend(
+        target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+        planner=POSITION_COMMAND_PLANNER_LINEAR,
+    )
+    completed = threading.Event()
+    receipts = []
+    errors: list[BaseException] = []
+
+    def admit_target() -> None:
+        try:
+            receipts.append(
+                backend.send_command(_command(0.05, source="replay_qpos_init"))
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    with backend._send_lock:
+        thread = threading.Thread(target=admit_target, daemon=True)
+        thread.start()
+        assert not completed.wait(0.03)
+    assert completed.wait(0.25)
+    thread.join(timeout=0.25)
+
+    assert not errors
+    assert len(receipts) == 1
+    timing = receipts[0].metadata["target_admission_timing"]
     assert timing["mode"] == RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
     assert timing["fallback_reason"] == (
-        "qpos_init_requires_serialized_velocity_continuity"
+        "linear_planner_requires_synchronous_activation"
     )
     assert timing["send_lock_wait_ms"] >= 20.0
 
@@ -508,7 +593,10 @@ def test_synchronous_target_admission_remains_explicit_rollback() -> None:
     assert timing["send_lock_wait_ms"] >= 20.0
 
 
-def test_inflight_sdk_completion_activates_latest_target_without_velocity_reset() -> None:
+@pytest.mark.parametrize("source", ("openpi_v22_policy", "replay_qpos_init"))
+def test_inflight_sdk_completion_activates_latest_target_without_velocity_reset(
+    source: str,
+) -> None:
     class BlockingFirstSendArm(_FakeArm):
         def __init__(self) -> None:
             super().__init__()
@@ -532,7 +620,7 @@ def test_inflight_sdk_completion_activates_latest_target_without_velocity_reset(
     )
     blocking_arm = BlockingFirstSendArm()
     backend.arm = blocking_arm
-    first_receipt = backend.send_command(_command(0.04))
+    first_receipt = backend.send_command(_command(0.04, source=source))
     backend._stream_thread = threading.Thread(
         target=backend._background_stream_loop,
         daemon=True,
@@ -541,13 +629,13 @@ def test_inflight_sdk_completion_activates_latest_target_without_velocity_reset(
     try:
         assert blocking_arm.first_send_entered.wait(0.25)
         admitted_started = time.perf_counter()
-        deferred_receipt = backend.send_command(_command(0.08))
+        deferred_receipt = backend.send_command(_command(0.08, source=source))
         admission_ms = (time.perf_counter() - admitted_started) * 1000.0
         assert admission_ms < 20.0
         assert deferred_receipt.metadata["target_admission_timing"][
             "target_activation_deferred"
         ] is True
-        latest_receipt = backend.send_command(_command(0.12))
+        latest_receipt = backend.send_command(_command(0.12, source=source))
         assert latest_receipt.metadata["target_admission_timing"][
             "target_activation_deferred"
         ] is True

@@ -110,12 +110,13 @@ def _continuation_contract(
     *,
     bootstrap: bool = False,
     action_codec_hash: str = "codec:test",
+    prediction_horizon_steps: int = 6,
 ) -> ModelContinuationDataContract:
     return ModelContinuationDataContract(
         continuation_mode=MODEL_CONTINUATION_FLOW_INPAINT_V1,
         continuation_implementation_id="fake.flow-inpaint.v1",
         continuation_implementation_parameters_hash="sha256:implementation",
-        prediction_horizon_steps=6,
+        prediction_horizon_steps=prediction_horizon_steps,
         minimum_forecast_delay_steps=1,
         maximum_forecast_delay_steps=4,
         minimum_prefix_steps=0 if bootstrap else 1,
@@ -249,21 +250,29 @@ def _plan(indices: tuple[int, ...]) -> TimedPolicyActionPlanSnapshot:
     )
 
 
-def _timeline() -> RtcContinuationTimeline:
+def _timeline(
+    *, prediction_horizon_steps: int = 6
+) -> RtcContinuationTimeline:
     return RtcContinuationTimeline(
         clock_domain_id="clock:test",
         generation_start_at=10.0,
         first_target_effective_at=10.3,
         action_period_sec=0.1,
-        prediction_horizon_steps=6,
+        prediction_horizon_steps=prediction_horizon_steps,
         forecast_delay_steps=3,
     )
 
 
-def _selection(indices: tuple[int, ...]):
+def _selection(
+    indices: tuple[int, ...],
+    *,
+    prediction_horizon_steps: int = 6,
+):
     return select_rtc_plan_continuation(
         _plan(indices),
-        timeline=_timeline(),
+        timeline=_timeline(
+            prediction_horizon_steps=prediction_horizon_steps
+        ),
         spec=RtcContinuationSelectionSpec(
             prefix_horizon_steps=3,
             minimum_selected_steps=1,
@@ -278,6 +287,7 @@ def _bundle(
     relative: bool = False,
     schedule: str | None = None,
     continuation_contract: ModelContinuationContract | None = None,
+    prediction_horizon_steps: int = 6,
 ) -> CanonicalRtcConditioningBundle:
     kwargs = {}
     if schedule is not None:
@@ -286,13 +296,21 @@ def _bundle(
         runtime_session_id="session:test",
         control_domain_id="domain:test",
         artifact_hash="artifact:test",
-        timeline=_timeline(),
-        selection=_selection(indices),
+        timeline=_timeline(
+            prediction_horizon_steps=prediction_horizon_steps
+        ),
+        selection=_selection(
+            indices,
+            prediction_horizon_steps=prediction_horizon_steps,
+        ),
         action_representation_context=_representation_context(
             relative=relative,
         ),
         continuation_contract=(
-            _continuation_contract(bootstrap=bootstrap)
+            _continuation_contract(
+                bootstrap=bootstrap,
+                prediction_horizon_steps=prediction_horizon_steps,
+            )
             if continuation_contract is None
             else continuation_contract
         ),
@@ -2168,16 +2186,27 @@ def test_v3_client_cancel_rejects_nonboolean_provider_result() -> None:
 
 
 def test_v3_adapter_runs_bootstrap_then_prefix_on_shared_timed_plan() -> None:
+    # The loop intentionally advances a synthetic 30 Hz control clock much
+    # faster than wall time.  H8 leaves a valid continuation suffix after the
+    # truthful request-to-control-admission latency; H6 correctly exhausts it.
+    prediction_horizon_steps = 8
     contract = ModelContinuationDataContractV2(
         conditioning_origin=MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
         runtime=ModelContinuationRuntimeContractV2.from_v1(
-            _continuation_contract(bootstrap=True)
+            _continuation_contract(
+                bootstrap=True,
+                prediction_horizon_steps=prediction_horizon_steps,
+            )
         ),
     )
     runtime_contract = normalize_model_continuation_contract(contract).runtime
     codec = _FakeConditioningCodec()
     capability = _client_transform_capability(
-        _bundle(bootstrap=True, continuation_contract=contract),
+        _bundle(
+            bootstrap=True,
+            continuation_contract=contract,
+            prediction_horizon_steps=prediction_horizon_steps,
+        ),
         codec,
     )
     observed_bundles = []

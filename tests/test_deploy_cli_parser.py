@@ -25,7 +25,7 @@ def test_deployment_parser_preserves_compatibility_option_surface() -> None:
     compatibility = _fingerprint(run_policy.add_args)
 
     assert extracted == compatibility
-    assert extracted[0:2] == (276, 306)
+    assert extracted[0:2] == (277, 307)
 
 
 def test_rtc_preflight_deadline_is_independent_from_executable_ttl() -> None:

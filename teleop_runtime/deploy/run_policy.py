@@ -62,7 +62,7 @@ from robot_motion.deploy.actions import (
 )
 from robot_motion.deploy.async_producer import (
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
-    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
+    model_rtc_flow_inpaint_shadow_profile_for_action_hz,
     POLICY_ASYNC_PRODUCER_ELIGIBLE,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_V1,
@@ -88,6 +88,7 @@ from robot_motion.deploy.observation import (
     DEFAULT_HAND_STATE_MAX_AGE_SEC,
     DeploymentObservation,
     build_deployment_observation,
+    build_state_vector,
 )
 from robot_motion.deploy.pose_adapter import (
     convert_policy_absolute_vector_to_runtime_raw,
@@ -1965,18 +1966,18 @@ def _hold_active_rtc_gap(
 
 def _rtc_active_completion_latency_sec(
     *,
-    inference_started_at: float,
-    released_at: float,
+    request_admitted_at: float,
+    result_admitted_at: float,
 ) -> float:
-    """Return one trustworthy end-to-end Active RTC latency sample."""
+    """Return one full request-to-control-admission RTC latency sample."""
 
-    started = float(inference_started_at)
-    released = float(released_at)
-    if not math.isfinite(started) or not math.isfinite(released):
+    request_at = float(request_admitted_at)
+    result_at = float(result_admitted_at)
+    if not math.isfinite(request_at) or not math.isfinite(result_at):
         raise ValueError("RTC Active completion timestamps must be finite.")
-    if released < started:
-        raise ValueError("RTC Active completion release predates inference start.")
-    return released - started
+    if result_at < request_at:
+        raise ValueError("RTC Active result admission predates request admission.")
+    return result_at - request_at
 
 
 def _rtc_active_latency_gate_result(
@@ -2641,6 +2642,17 @@ def main(
         action_hz=float(effective_action_hz),
         action_hz_source=str(action_hz_info.get("source", "")),
     )
+    if (
+        str(args.rtc_profile) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+        and getattr(args, "rtc_action_hz", None) is not None
+    ):
+        print(
+            "[RTC] model-RTC runtime cadence override: "
+            f"action/request={float(effective_action_hz):.1f}Hz "
+            f"decision={float(effective_policy_hz):.1f}Hz; "
+            "position reference/command remain 60/120Hz.",
+            flush=True,
+        )
 
     policy_arbiter_shadow: PassivePolicyArbiterShadow | None = None
     replay_proposal_shadow_adapter: DatasetReplayProposalShadowAdapter | None = None
@@ -2998,7 +3010,9 @@ def main(
             policy_name=policy.name,
             preparer=rtc_action_preparer,
             created_at=time.monotonic(),
-            profile=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
+            profile=model_rtc_flow_inpaint_shadow_profile_for_action_hz(
+                getattr(args, "rtc_action_hz", None)
+            ),
             request_validity_steps=int(args.rtc_request_validity_steps),
             worker_stop_timeout_sec=float(args.rtc_worker_stop_timeout_sec),
             observe_bundle=observe_rtc_transport_exchange,
@@ -3732,9 +3746,72 @@ def main(
             )
         return outcome
 
+    def refresh_first_position_stream_observation(
+        observation: DeploymentObservation,
+    ) -> DeploymentObservation:
+        """Refresh the live dual-arm cut used by the first position keyframe.
+
+        The policy observation is captured before model inference.  On a
+        collision-required stream, the first queued keyframe must instead use
+        a successful, coherent hardware qpos sample at the execution cut;
+        otherwise a long model/RTC inference can make the reset state stale
+        before the reference worker applies it.  This refresh is intentionally
+        limited to the first stream submission and never changes policy input
+        images or the policy-produced action.
+        """
+
+        if not isinstance(observation, DeploymentObservation):
+            raise TypeError("observation must be a DeploymentObservation")
+        if arm_reader is None:
+            raise RuntimeError(
+                "first position stream refresh requires the live ArmStateReader"
+            )
+        fresh_timestamp = time.time()
+        fresh_arm_states = arm_reader.snapshot(
+            fresh_timestamp,
+            cut_after_refresh=True,
+            concurrent_refresh_sides=tuple(active_sides),
+        )
+        fresh_state, fresh_state_dict, fresh_state_valid = build_state_vector(
+            active_sides=tuple(observation.active_sides),
+            arms_enabled=bool(observation.arms_enabled),
+            hands_enabled=bool(observation.hands_enabled),
+            end_effector_sides=observation.end_effector_sides,
+            arm_states=fresh_arm_states,
+            hand_states=observation.hand_states,
+        )
+        metadata = dict(observation.metadata)
+        metadata.update(
+            {
+                "position_first_stream_arm_refresh": True,
+                "position_first_stream_arm_refresh_timestamp": float(
+                    fresh_timestamp
+                ),
+                "position_first_stream_arm_refresh_sides": list(active_sides),
+            }
+        )
+        return replace(
+            observation,
+            timestamp=float(fresh_timestamp),
+            state=fresh_state,
+            state_dict=fresh_state_dict,
+            state_valid=fresh_state_valid,
+            arm_states={
+                str(side): dict(state or {})
+                for side, state in fresh_arm_states.items()
+            },
+            metadata=metadata,
+        )
+
     prepared_action_position_executor = position_deploy_executor
     prepared_action_executor = PreparedActionExecutor(
         position_deploy_executor=prepared_action_position_executor,
+        first_position_stream_observation_refresh=(
+            refresh_first_position_stream_observation
+            if position_deploy_executor is not None
+            and arm_reader is not None
+            else None
+        ),
         send_actions=send_actions,
         arm_backends=arm_backends,
         hand_backends=hand_backends,
@@ -5673,11 +5750,17 @@ def main(
                         ):
                             timing_failure = False
                             try:
+                                if rtc_step.completion_timing is None:
+                                    raise ValueError(
+                                        "completion timing decomposition is missing"
+                                    )
                                 latency_sec = _rtc_active_completion_latency_sec(
-                                    inference_started_at=(
-                                        rtc_step.completion.worker_started_at
+                                    request_admitted_at=(
+                                        rtc_step.completion_timing.request_admitted_at
                                     ),
-                                    released_at=rtc_step.completion.released_at,
+                                    result_admitted_at=(
+                                        rtc_step.completion_timing.result_admitted_at
+                                    ),
                                 )
                             except (TypeError, ValueError) as exc:
                                 invalid_timing_reason = (

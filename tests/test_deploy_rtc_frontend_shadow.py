@@ -989,6 +989,48 @@ def test_conditioned_completion_starvation_holds_before_same_tick_emission() -> 
     frontend.close(now=base + 0.8)
 
 
+def test_completion_timing_includes_control_poll_before_result_admission() -> None:
+    runtime = _runtime()
+    policy = _ChunkPolicy(chunk_size=4)
+    base = time.monotonic()
+    frontend = RtcPolicyShadowFrontend(
+        config=_config(session="rtc-completion-stage-timing"),
+        deploy_runtime=runtime,
+        policy=policy,
+        preparer=_pipeline(),
+        created_at=base,
+    )
+    frontend.start()
+    try:
+        submitted = frontend.step(
+            _observation(timestamp=70.0, step_index=0),
+            now=base,
+            allow_output=False,
+            allow_request=True,
+        )
+        assert submitted.worker_submission is not None
+        assert submitted.worker_submission.accepted
+        _wait_for(lambda: frontend.pending_completion_count == 1)
+
+        completed = frontend.step(
+            _observation(timestamp=70.2, step_index=1),
+            now=base + 0.2,
+            allow_output=False,
+            allow_request=False,
+        )
+        timing = completed.completion_timing
+        assert timing is not None
+        assert timing.request_to_admission_sec == pytest.approx(0.2)
+        assert timing.provider_sec < timing.request_to_admission_sec
+        assert timing.release_to_admission_sec > 0.0
+        assert completed.to_debug_payload()["completion_timing"] == (
+            timing.to_payload()
+        )
+        assert frontend._delay_state.latency_samples_sec[-1] == pytest.approx(0.2)
+    finally:
+        frontend.close(now=base + 0.3)
+
+
 def test_expired_matching_result_faults_producer_without_popping_plan() -> None:
     runtime = _runtime()
     policy = _ChunkPolicy(chunk_size=1)

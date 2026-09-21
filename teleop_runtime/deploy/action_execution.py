@@ -122,6 +122,9 @@ class PreparedActionExecutor:
         self,
         *,
         position_deploy_executor: PositionDeployExecutor | None,
+        first_position_stream_observation_refresh: (
+            Callable[[DeploymentObservation], DeploymentObservation] | None
+        ) = None,
         send_actions: bool,
         arm_backends: Mapping[str, EffectorBackend],
         hand_backends: Mapping[str, EffectorBackend],
@@ -130,6 +133,9 @@ class PreparedActionExecutor:
         submit_legacy_owner_state: Callable[..., Any],
     ) -> None:
         self._position_deploy_executor = position_deploy_executor
+        self._first_position_stream_observation_refresh = (
+            first_position_stream_observation_refresh
+        )
         self._send_actions = bool(send_actions)
         self._arm_backends = arm_backends
         self._hand_backends = hand_backends
@@ -198,6 +204,47 @@ class PreparedActionExecutor:
                 kind="hand",
             )
         if arm_command is not None:
+            # A collision-required position stream must reset its coupled
+            # planner from a fresh authoritative hardware cut.  Model/RTC
+            # inference can take longer than that cut's freshness budget, so
+            # the control loop may hand us an observation captured before the
+            # inference completed.  Refresh only the first arm keyframe; once
+            # the planner is initialized, the normal reference stream owns
+            # the subsequent causal state and no extra hardware read is
+            # introduced into the 15 Hz path.
+            refresh_observation = self._first_position_stream_observation_refresh
+            if refresh_observation is not None:
+                position_snapshot = position_deploy_executor.snapshot()
+                if isinstance(position_snapshot, Mapping) and (
+                    bool(position_snapshot.get("collision_required"))
+                    and not bool(
+                        position_snapshot.get("collision_planner_initialized")
+                    )
+                    and int(position_snapshot.get("submitted_count", 0)) == 0
+                ):
+                    prepare_started = time.monotonic()
+                    position_deploy_executor.prepare_first_submission()
+                    if phase_timing is not None:
+                        phase_timing[
+                            "position_first_submission_prepare_ms"
+                        ] = max(
+                            0.0,
+                            time.monotonic() - prepare_started,
+                        ) * 1000.0
+                    refresh_started = time.monotonic()
+                    observation = refresh_observation(observation)
+                    if not isinstance(observation, DeploymentObservation):
+                        raise TypeError(
+                            "first_position_stream_observation_refresh must return "
+                            "a DeploymentObservation"
+                        )
+                    if phase_timing is not None:
+                        phase_timing[
+                            "first_position_stream_observation_refresh_ms"
+                        ] = max(
+                            0.0,
+                            time.monotonic() - refresh_started,
+                        ) * 1000.0
             filtered = _position_filtered_action(canonical_action, observation)
             resolved_lookahead_observation = (
                 observation if lookahead_observation is None else lookahead_observation

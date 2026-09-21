@@ -450,8 +450,7 @@ class _Submission:
     anchor_timestamp: float | None = None
     anchor_pose_by_side: Mapping[str, np.ndarray] | None = None
     anchor_qpos_by_side: Mapping[str, np.ndarray] | None = None
-    collision_reset_qpos_by_side: Mapping[str, np.ndarray] | None = None
-    collision_reset_metadata: Mapping[str, Any] | None = None
+    collision_stream_start: bool = False
     logical_timestamp: float | None = None
     current_already_staged: bool = False
     lookahead_sources: tuple[_LookaheadSource, ...] = ()
@@ -883,7 +882,155 @@ class PositionDeployExecutor:
                     f"{self._reference_worker_affinity_error}"
                 )
 
+    def prepare_first_submission(self) -> dict[str, Any]:
+        """Finish process-wide stream setup before capturing live robot state.
+
+        The cyclic-GC guard deliberately performs one full collection before it
+        disables cyclic collection for an active reference stream.  Running
+        that collection from :meth:`submit` is too late for callers that first
+        acquire a freshness-bounded hardware cut: the collection can age the
+        cut before the collision planner consumes it.  Live callers therefore
+        invoke this idempotent preparation immediately before their execution-
+        cut read.  ``submit`` retains its fallback activation for offline and
+        compatibility callers that do not acquire live state.
+
+        The returned mapping is diagnostic evidence only.  It does not admit a
+        keyframe or change the executor generation.
+        """
+
+        with self._lock:
+            if self._closing or self._closed:
+                raise RuntimeError("position deploy executor is closed")
+            if self._submission_stream_initialized:
+                return {
+                    "prepared": False,
+                    "reason": "stream_already_initialized",
+                    "cyclic_gc_guard_acquired": bool(
+                        self._cyclic_gc_guard_acquired
+                    ),
+                }
+            prepare_collision_planner = bool(
+                self.config.collision_required
+                and self._collision_planner is None
+            )
+
+        # Planner construction may load the active coupled-IK/collision model.
+        # Finish that allocation before the caller captures a freshness-bounded
+        # hardware state cut; otherwise the preparation itself consumes the
+        # qpos freshness budget.
+        if prepare_collision_planner:
+            self.prepare_collision_planner()
+
+        with self._lock:
+            if self._closing or self._closed:
+                raise RuntimeError("position deploy executor is closed")
+            if self._submission_stream_initialized:
+                return {
+                    "prepared": False,
+                    "reason": "stream_already_initialized",
+                    "collision_planner_prepared": bool(
+                        self._collision_planner is not None
+                    ),
+                    "cyclic_gc_guard_acquired": bool(
+                        self._cyclic_gc_guard_acquired
+                    ),
+                }
+            activated = False
+            if (
+                self.config.cyclic_gc_guard_enabled
+                and not self._cyclic_gc_guard_acquired
+            ):
+                self._activate_cyclic_gc_guard_locked()
+                activated = True
+            return {
+                "prepared": True,
+                "reason": "first_submission_ready",
+                "collision_planner_prepared": bool(
+                    self._collision_planner is not None
+                ),
+                "cyclic_gc_guard_activated": activated,
+                "cyclic_gc_guard_acquired": bool(
+                    self._cyclic_gc_guard_acquired
+                ),
+            }
+
     def submit(
+        self,
+        filtered: FilteredNormalizedAction,
+        observation: DeploymentObservation,
+        policy_name: str,
+        timestamp_monotonic: float | None = None,
+        discrete_command: TeleopCommand | None = None,
+        lookahead_filtered: FilteredNormalizedAction | None = None,
+        lookahead_observation: DeploymentObservation | None = None,
+        lookahead_discrete_command: TeleopCommand | None = None,
+        second_lookahead_filtered: FilteredNormalizedAction | None = None,
+        second_lookahead_observation: DeploymentObservation | None = None,
+        third_lookahead_filtered: FilteredNormalizedAction | None = None,
+        third_lookahead_observation: DeploymentObservation | None = None,
+        execution_work_item: ExecutionWorkItem | None = None,
+        lookahead_execution_work_item: ExecutionWorkItem | None = None,
+        source_plan_cut: PositionSourcePlanCut | None = None,
+    ) -> int:
+        """Admit one keyframe, with a compatibility GC-guard fallback.
+
+        Live callers that capture freshness-bounded robot state must call
+        :meth:`prepare_first_submission` before that capture.  Direct/offline
+        callers retain the historical fallback here.  A fallback lease remains
+        transactional: failed admission releases a lease acquired by this
+        call, while a successfully queued first keyframe retains it.
+        """
+
+        with self._lock:
+            prepare_collision_planner = bool(
+                not self._submission_stream_initialized
+                and self.config.collision_required
+                and self._collision_planner is None
+            )
+        if prepare_collision_planner:
+            # Live application callers prepare this before their hardware cut.
+            # Keep direct/offline callers correct without forcing them through
+            # the application-specific preparation API.
+            self.prepare_collision_planner()
+
+        with self._lock:
+            first = not self._submission_stream_initialized
+            guard_acquired_before_submit = self._cyclic_gc_guard_acquired
+            guard_acquired_here = bool(
+                first
+                and self.config.cyclic_gc_guard_enabled
+                and not guard_acquired_before_submit
+            )
+            if guard_acquired_here:
+                self._activate_cyclic_gc_guard_locked()
+            try:
+                return self._submit_impl(
+                    filtered,
+                    observation,
+                    policy_name,
+                    timestamp_monotonic=timestamp_monotonic,
+                    discrete_command=discrete_command,
+                    lookahead_filtered=lookahead_filtered,
+                    lookahead_observation=lookahead_observation,
+                    lookahead_discrete_command=lookahead_discrete_command,
+                    second_lookahead_filtered=second_lookahead_filtered,
+                    second_lookahead_observation=second_lookahead_observation,
+                    third_lookahead_filtered=third_lookahead_filtered,
+                    third_lookahead_observation=third_lookahead_observation,
+                    execution_work_item=execution_work_item,
+                    lookahead_execution_work_item=lookahead_execution_work_item,
+                    source_plan_cut=source_plan_cut,
+                )
+            except BaseException:
+                if (
+                    guard_acquired_here
+                    and self._cyclic_gc_guard_acquired
+                    and not self._submission_stream_initialized
+                ):
+                    self._release_cyclic_gc_guard_locked()
+                raise
+
+    def _submit_impl(
         self,
         filtered: FilteredNormalizedAction,
         observation: DeploymentObservation,
@@ -1460,8 +1607,7 @@ class PositionDeployExecutor:
                 anchor_timestamp=anchor_timestamp,
                 anchor_pose_by_side=anchor_pose,
                 anchor_qpos_by_side=anchor_qpos,
-                collision_reset_qpos_by_side=collision_reset_qpos,
-                collision_reset_metadata=collision_reset_metadata,
+                collision_stream_start=collision_reset_qpos is not None,
                 logical_timestamp=float(logical_timestamp),
                 current_already_staged=bool(current_already_staged),
                 lookahead_sources=lookahead_sources,
@@ -1469,18 +1615,17 @@ class PositionDeployExecutor:
                 plan_splice_decision=plan_splice_decision,
                 stream_start_prelude=stream_start_prelude,
             )
-            guard_acquired_before_submit = self._cyclic_gc_guard_acquired
-            if first and self.config.cyclic_gc_guard_enabled:
-                self._activate_cyclic_gc_guard_locked()
+            if collision_reset_qpos is not None:
+                self._reset_collision_planner_locked(
+                    collision_reset_qpos,
+                    collision_reset_metadata,
+                    generation=self._generation,
+                    source_index=source_index,
+                )
             try:
                 self._queue.put_nowait(submission)
             except queue.Full as exc:
                 self._queue_full_count += 1
-                if (
-                    not guard_acquired_before_submit
-                    and self._cyclic_gc_guard_acquired
-                ):
-                    self._release_cyclic_gc_guard_locked()
                 raise PositionDeployQueueFullError(
                     f"position deploy input FIFO is full ({self.config.queue_size})"
                 ) from exc
@@ -3665,8 +3810,6 @@ class PositionDeployExecutor:
                         },
                     )
                 return
-        if submission.collision_reset_qpos_by_side is not None:
-            self.prepare_collision_planner()
         with self._lock:
             if (
                 submission.generation != self._generation
@@ -3674,28 +3817,13 @@ class PositionDeployExecutor:
                 or self._closed
             ):
                 return
-            if submission.collision_reset_qpos_by_side is not None:
-                planner = self._collision_planner
-                if planner is None:
-                    raise RuntimeError("required collision planner was not prepared")
-                applied_reset_metadata = self._collision_reset_metadata_at_apply(
-                    submission.collision_reset_metadata
-                )
-                planner_reset_metadata = dict(
-                    planner.reset(submission.collision_reset_qpos_by_side)
-                )
-                reset_metadata = {
-                    **applied_reset_metadata,
-                    "planner_reset": planner_reset_metadata,
-                    "generation": int(submission.generation),
-                    "source_index": int(submission.source_index),
-                }
-                self._collision_planner_initialized = True
-                self._collision_reset_count += 1
-                self._last_collision_reset_metadata = dict(reset_metadata)
-                self._append_debug_event_locked(
-                    "collision_planner_reset",
-                    reset_metadata,
+            if (
+                submission.collision_stream_start
+                and not self._collision_planner_initialized
+            ):
+                raise RuntimeError(
+                    "collision stream reached the reference worker before its "
+                    "planner state was initialized"
                 )
             planner = self._collision_planner
             stage_source_pose = (
@@ -3760,7 +3888,7 @@ class PositionDeployExecutor:
                     if plan_splice_decision is not None:
                         stage_kwargs["plan_splice_decision"] = plan_splice_decision
                     stage_source_pose(**stage_kwargs)
-            if submission.collision_reset_qpos_by_side is not None:
+            if submission.collision_stream_start:
                 prepare_staged_source_horizon = (
                     None
                     if planner is None
@@ -3822,6 +3950,7 @@ class PositionDeployExecutor:
                             ),
                         },
                     )
+
             template = _ReferenceTemplate(
                 filtered=submission.filtered,
                 observation=submission.observation,
@@ -4061,6 +4190,48 @@ class PositionDeployExecutor:
                     first_motion_timestamp,
                     self._clock(),
                 )
+
+    def _reset_collision_planner_locked(
+        self,
+        qpos_by_side: Mapping[str, np.ndarray],
+        metadata: Mapping[str, Any] | None,
+        *,
+        generation: int,
+        source_index: int,
+    ) -> None:
+        """Consume the first authoritative state at submission admission.
+
+        The first reset is deliberately synchronous with admission.  Passing a
+        freshness-bounded qpos cut through the reference-worker queue lets an
+        unrelated scheduler delay invalidate state which was valid when the
+        action was admitted.  The worker therefore receives only a typed
+        ``collision_stream_start`` marker and never owns stale hardware state.
+        """
+
+        planner = self._collision_planner
+        if planner is None:
+            raise RuntimeError("required collision planner was not prepared")
+        applied_reset_metadata = self._collision_reset_metadata_at_apply(metadata)
+        reset_started = self._clock()
+        planner_reset_metadata = dict(planner.reset(qpos_by_side))
+        reset_completed = self._clock()
+        reset_metadata = {
+            **applied_reset_metadata,
+            "planner_reset": planner_reset_metadata,
+            "planner_reset_stage": "submission_admission",
+            "planner_reset_elapsed_sec": float(
+                max(0.0, reset_completed - reset_started)
+            ),
+            "generation": int(generation),
+            "source_index": int(source_index),
+        }
+        self._collision_planner_initialized = True
+        self._collision_reset_count += 1
+        self._last_collision_reset_metadata = dict(reset_metadata)
+        self._append_debug_event_locked(
+            "collision_planner_reset",
+            reset_metadata,
+        )
 
     def _collision_reset_metadata_at_apply(
         self,

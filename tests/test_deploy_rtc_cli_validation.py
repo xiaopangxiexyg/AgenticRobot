@@ -33,6 +33,7 @@ def _args(**overrides: object) -> SimpleNamespace:
         "hands_enabled": False,
         "action_hz": 0.0,
         "policy_hz": None,
+        "rtc_action_hz": None,
         "position_chunk_lookahead": True,
         "rtc_request_validity_steps": 10,
         "rtc_worker_stop_timeout_sec": 0.0,
@@ -207,6 +208,41 @@ def test_model_rtc_profiles_allow_explicit_actions_and_qpos_init(
     assert args.send_actions is True
     assert args.policy_qpos_init_dataset == "dataset"
     assert args.policy_qpos_init_parquet is None
+
+
+def test_conditioned_model_rtc_allows_explicit_15hz_runtime_cadence() -> None:
+    args = _args(
+        policy_artifact_json="artifact.json",
+        policy_qpos_init_dataset="dataset",
+        rtc_action_hz=15.0,
+    )
+    _validate(
+        args,
+        profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+        profile_enabled=True,
+        real_shadow=True,
+    )
+    assert args.action_hz == 15.0
+    assert args.policy_hz == 30.0
+
+
+def test_rtc_action_hz_override_is_model_only_and_conflict_checked() -> None:
+    with pytest.raises(ValueError, match="only supported with the conditioned"):
+        _validate(
+            _args(rtc_action_hz=15.0),
+            profile_id=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+            profile_enabled=True,
+        )
+    with pytest.raises(ValueError, match="conflicts with --rtc-action-hz"):
+        _validate(
+            _args(
+                policy_artifact_json="artifact.json",
+                rtc_action_hz=15.0,
+                action_hz=30.0,
+            ),
+            profile_id=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+            profile_enabled=True,
+        )
 
 
 def test_model_rtc_explicit_actions_without_live_endpoints_remain_synthetic() -> None:

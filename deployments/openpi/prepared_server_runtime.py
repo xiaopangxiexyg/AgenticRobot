@@ -9,7 +9,7 @@ only for this process, and then delegates to OpenPI's existing server script.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import dataclasses
 import importlib
 import importlib.util
@@ -646,6 +646,55 @@ def _serve_until_stopped(server_module: Any, server_args: Any) -> int:
     return 0
 
 
+@contextmanager
+def install_openpi_rtc_inference_steps_server_adapter(
+    server_module: Any,
+    *,
+    rtc_inference_steps: int,
+) -> Iterator[None]:
+    """Bind the prepared RTC sampler budget across OpenPI server revisions.
+
+    The OpenPI ``serve_dexteleop_policy.Args`` dataclass is not the model
+    contract: older checkouts do not expose an ``rtc_inference_steps`` CLI
+    field, while the policy factory already accepts the canonical
+    ``sample_kwargs={"num_steps": ...}`` binding.  Passing the deployment
+    option through ``Args`` therefore crashes before the server can listen.
+    Inject the validated budget at the policy-construction seam instead and
+    restore the imported module after the foreground server exits.
+    """
+
+    steps = int(rtc_inference_steps)
+    policy_config = getattr(server_module, "_policy_config", None)
+    create_trained_policy = getattr(policy_config, "create_trained_policy", None)
+    if not callable(create_trained_policy):
+        raise RuntimeError(
+            "OpenPI server module does not expose policy_config.create_trained_policy"
+        )
+
+    def create_prepared_policy(*args: Any, **kwargs: Any) -> Any:
+        sample_kwargs_value = kwargs.get("sample_kwargs")
+        sample_kwargs = (
+            {}
+            if sample_kwargs_value is None
+            else dict(sample_kwargs_value)
+        )
+        existing_steps = sample_kwargs.get("num_steps")
+        if existing_steps is not None and int(existing_steps) != steps:
+            raise ValueError(
+                "prepared RTC inference steps differ from the OpenPI policy "
+                f"factory request: requested={steps} existing={existing_steps}"
+            )
+        sample_kwargs["num_steps"] = steps
+        kwargs["sample_kwargs"] = sample_kwargs
+        return create_trained_policy(*args, **kwargs)
+
+    policy_config.create_trained_policy = create_prepared_policy
+    try:
+        yield
+    finally:
+        policy_config.create_trained_policy = create_trained_policy
+
+
 @dataclasses.dataclass(frozen=True)
 class _RtcStartupWarmupSpec:
     """The already-validated tensor contract needed for one RTC warmup."""
@@ -1045,11 +1094,23 @@ def main(argv: list[str] | None = None) -> int:
                 args.enable_rtc_continuation
             ),
         }
-        if args.rtc_inference_steps != 10:
-            server_kwargs["rtc_inference_steps"] = int(
-                args.rtc_inference_steps
-            )
+        # Newer OpenPI server revisions expose the sampler budget on their
+        # Args dataclass.  Bind the prepared runtime's explicit CLI value
+        # when that field exists; older revisions are handled by the policy
+        # factory adapter below and must not receive an unknown constructor
+        # keyword.
+        server_args_fields = getattr(server_module.Args, "__dataclass_fields__", {})
+        if "rtc_inference_steps" in server_args_fields:
+            server_kwargs["rtc_inference_steps"] = int(args.rtc_inference_steps)
         server_args = server_module.Args(**server_kwargs)
+        rtc_steps_adapter = (
+            install_openpi_rtc_inference_steps_server_adapter(
+                server_module,
+                rtc_inference_steps=int(args.rtc_inference_steps),
+            )
+            if args.enable_rtc_continuation
+            else nullcontext()
+        )
         with install_openpi_image_wire_server_adapter(
             server_module.websocket_policy_server,
             image_wire_config,
@@ -1061,7 +1122,7 @@ def main(argv: list[str] | None = None) -> int:
             training_config,
             config,
             resolution,
-        ), install_openpi_rtc_startup_warmup_server_adapter(
+        ), rtc_steps_adapter, install_openpi_rtc_startup_warmup_server_adapter(
             server_module.websocket_policy_server,
             rtc_warmup_spec,
         ):
