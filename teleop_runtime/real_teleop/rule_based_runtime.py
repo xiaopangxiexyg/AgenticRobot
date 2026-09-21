@@ -407,7 +407,7 @@ class _DeferredProgressArmControlContract:
 
 @dataclass(frozen=True)
 class _ReplayReferenceCarrier:
-    """Lightweight immutable carrier materialized only at its dispatch cut."""
+    """Lightweight immutable pose reference materialized at its dispatch cut."""
 
     resampler: MotionTargetResampler
     reference_sequence: int
@@ -416,10 +416,12 @@ class _ReplayReferenceCarrier:
     projected_parent: RobotAction
     directive: RuleBasedCollectionDirective
     next_offset_sec: float
-    right_parent_frame_index: int
+    left_parent_source_index: int
+    right_parent_source_index: int
     captures_source_frame: bool
     keyframe_hz: float
     reference_hz: float
+    source_kind: str
 
 
 class RuleBasedRealTeleopExtension:
@@ -3243,6 +3245,30 @@ class RuleBasedRealTeleopExtension:
                     "60 Hz replay reference planning failed: "
                     f"{type(exc).__name__}: {exc}"
                 )
+        elif (
+            emission.directive.kind == "custom_action"
+            and emission.action.arm_pose_by_side
+            and bool(
+                emission.action.metadata.get(
+                    "rule_based_position_reference_resample",
+                    False,
+                )
+            )
+            and "rule_based_reference_sequence" not in emission.action.metadata
+        ):
+            try:
+                self._prepare_custom_action_reference_queue(
+                    emission,
+                    observation=observation,
+                    runtime_context=runtime_context,
+                    now=float(now),
+                )
+                emission = self._pop_due_replay_reference(float(now))
+            except Exception as exc:  # noqa: BLE001 - planning fails closed.
+                self._abort_coupled_pose(
+                    "60 Hz custom-action reference planning failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         if emission.directive.kind == "replay":
             try:
                 emission = self._bound_full_replay_hand_emission(
@@ -3434,34 +3460,174 @@ class RuleBasedRealTeleopExtension:
                 )
             source_emissions.append(following)
 
+        first_source_time = float(group.relative_time_sec(first_frame_index))
+        source_emissions = [
+            self._project_writing_replay_height(source_emission)
+            for source_emission in source_emissions
+        ]
+        source_indices = [
+            int(source_emission.directive.replay_frame_index or 0)
+            for source_emission in source_emissions
+        ]
+        source_times = [
+            float(group.relative_time_sec(source_index)) - first_source_time
+            for source_index in source_indices
+        ]
+        self._install_pose_reference_queue(
+            source_emissions,
+            source_times=source_times,
+            source_indices=source_indices,
+            keyframe_hz=keyframe_hz,
+            reference_hz=reference_hz,
+            source_kind="replay",
+            now=float(now),
+        )
+
+    def _prepare_custom_action_reference_queue(
+        self,
+        first: RuleBasedCollectionEmission,
+        *,
+        observation: object,
+        runtime_context: Mapping[str, Any],
+        now: float,
+    ) -> None:
+        """Expand one opted-in finite action segment onto the reference clock."""
+
+        directive = first.directive
+        try:
+            plan_step_index = int(directive.metadata["rule_based_step_index"])
+            step = self.plan.steps[plan_step_index]
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "custom-action directive lacks a valid plan-step identity"
+            ) from exc
+        if not isinstance(step, RuleBasedActionSegment):
+            raise TypeError(
+                "resampled custom-action directive does not resolve to an action segment"
+            )
+        keyframe_hz = float(
+            first.action.metadata.get("rule_based_position_keyframe_hz", math.nan)
+        )
+        reference_hz = float(self.config.position_reference_hz)
+        if not np.isfinite(keyframe_hz) or keyframe_hz <= 0.0:
+            raise ValueError(
+                "resampled custom action requires a finite positive keyframe rate"
+            )
+        if reference_hz + 1e-9 < keyframe_hz:
+            raise ValueError(
+                "position reference_hz must be >= custom-action keyframe rate; "
+                f"got reference_hz={reference_hz:g}, keyframe_hz={keyframe_hz:g}"
+            )
+
+        source_emissions = [first]
+        while not source_emissions[-1].directive.segment_terminal:
+            following = self.adapter.next_runtime(
+                observation,
+                context=runtime_context,
+            )
+            following_directive = following.directive
+            following_keyframe_hz = float(
+                following.action.metadata.get(
+                    "rule_based_position_keyframe_hz",
+                    math.nan,
+                )
+            )
+            if (
+                following_directive.kind != "custom_action"
+                or following_directive.step_id != directive.step_id
+                or not bool(
+                    following.action.metadata.get(
+                        "rule_based_position_reference_resample",
+                        False,
+                    )
+                )
+                or not math.isclose(
+                    following_keyframe_hz,
+                    keyframe_hz,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise RuntimeError(
+                    "rule cursor changed stages or reference contract during "
+                    "finite custom-action expansion"
+                )
+            source_emissions.append(following)
+
+        first_source_time = float(source_emissions[0].action.timestamp)
+        source_times = [
+            float(source_emission.action.timestamp) - first_source_time
+            for source_emission in source_emissions
+        ]
+        source_indices = list(range(len(source_emissions)))
+        self._install_pose_reference_queue(
+            source_emissions,
+            source_times=source_times,
+            source_indices=source_indices,
+            keyframe_hz=keyframe_hz,
+            reference_hz=reference_hz,
+            source_kind="custom_action",
+            now=float(now),
+        )
+
+    def _install_pose_reference_queue(
+        self,
+        source_emissions: list[RuleBasedCollectionEmission],
+        *,
+        source_times: list[float],
+        source_indices: list[int],
+        keyframe_hz: float,
+        reference_hz: float,
+        source_kind: str,
+        now: float,
+    ) -> None:
+        """Build the shared reference queue without duplicating cursor ownership."""
+
+        if source_kind not in {"replay", "custom_action"}:
+            raise ValueError(
+                f"unsupported pose reference source kind: {source_kind!r}"
+            )
+        if (
+            not source_emissions
+            or len(source_times) != len(source_emissions)
+            or len(source_indices) != len(source_emissions)
+        ):
+            raise ValueError(
+                "pose reference source arrays must be non-empty and aligned"
+            )
+        source_time_array = np.asarray(source_times, dtype=float)
+        if (
+            not np.all(np.isfinite(source_time_array))
+            or not math.isclose(float(source_time_array[0]), 0.0, abs_tol=1e-9)
+            or (
+                len(source_time_array) > 1
+                and np.any(np.diff(source_time_array) <= 0.0)
+            )
+        ):
+            raise ValueError(
+                "pose reference source timestamps must start at zero and increase"
+            )
+
         resolver = self.adapter.resolver
         if not isinstance(resolver, RealTeleopPoseFrameActionResolver):
             raise RuntimeError("rule pose-frame resolver was replaced")
-        first_source_time = float(group.relative_time_sec(first_frame_index))
         projected_actions: list[RobotAction] = []
         targets: list[TimestampedMotionTarget] = []
         for local_index, source_emission in enumerate(source_emissions):
-            source_emission = self._project_writing_replay_height(source_emission)
-            source_directive = source_emission.directive
-            source_frame_index = int(source_directive.replay_frame_index or 0)
             projected = resolver.project_action(source_emission.action)
             projected_actions.append(projected)
             targets.append(
                 TimestampedMotionTarget(
-                    timestamp=(
-                        float(group.relative_time_sec(source_frame_index))
-                        - first_source_time
-                    ),
-                    available_timestamp=(
-                        float(group.relative_time_sec(source_frame_index))
-                        - first_source_time
-                    ),
+                    timestamp=float(source_time_array[local_index]),
+                    available_timestamp=float(source_time_array[local_index]),
                     source_index=local_index,
                     pose_by_side=projected.arm_pose_by_side,
                     metadata={
-                        "rule_based_source_frame_index": source_frame_index,
+                        "rule_based_source_frame_index": int(
+                            source_indices[local_index]
+                        ),
                         "rule_based_source_sequence_index": int(
-                            source_directive.sequence_index
+                            source_emission.directive.sequence_index
                         ),
                     },
                 )
@@ -3509,11 +3675,12 @@ class RuleBasedRealTeleopExtension:
             captures_source_frame = source_local_index not in captured_source_indices
             if captures_source_frame:
                 captured_source_indices.add(source_local_index)
-            # Every 60 Hz reference in a recordable source interval remains
-            # eligible for the independent 15 Hz sampler.  The former code
-            # exposed only the exact source keyframe and then held motion until
-            # its asynchronous writer ACK arrived.  That made camera/writer
-            # latency an accidental motion clock and produced 20 Hz bursts.
+            # Every dense reference in a recordable source interval remains
+            # eligible for the independent source-cadence sampler.  The
+            # former code exposed only the exact source keyframe and then
+            # held motion until its asynchronous writer ACK arrived.  That
+            # made camera/writer latency an accidental motion clock and
+            # produced 20 Hz bursts.
             # Directive sequence de-duplication still commits at most one
             # formal sample per source interval.
             reference_directive = (
@@ -3531,8 +3698,6 @@ class RuleBasedRealTeleopExtension:
                 if reference_index + 1 < len(reference_timestamps)
                 else float(reference_timestamp) + 1.0 / reference_hz
             )
-            right_parent = source_emissions[right_source_local_index]
-            right_frame_index = int(right_parent.directive.replay_frame_index or 0)
             queue.append(
                 _ReplayReferenceCarrier(
                     resampler=resampler,
@@ -3542,17 +3707,23 @@ class RuleBasedRealTeleopExtension:
                     projected_parent=projected_parent,
                     directive=reference_directive,
                     next_offset_sec=next_offset,
-                    right_parent_frame_index=right_frame_index,
+                    left_parent_source_index=int(
+                        source_indices[source_local_index]
+                    ),
+                    right_parent_source_index=int(
+                        source_indices[right_source_local_index]
+                    ),
                     captures_source_frame=captures_source_frame,
                     keyframe_hz=keyframe_hz,
                     reference_hz=reference_hz,
+                    source_kind=str(source_kind),
                 )
             )
 
         if captured_source_indices != set(range(len(source_emissions))):
             missing = sorted(set(range(len(source_emissions))) - captured_source_indices)
             raise RuntimeError(
-                "60 Hz replay clock skipped source frames; increase reference_hz: "
+                "pose reference clock skipped source frames; increase reference_hz: "
                 f"missing_local_indices={missing}"
             )
         self._replay_reference_queue = deque(queue)
@@ -3625,7 +3796,7 @@ class RuleBasedRealTeleopExtension:
         )
         parent = carrier.parent
         projected_parent = carrier.projected_parent
-        parent_frame_index = int(parent.directive.replay_frame_index or 0)
+        parent_source_index = int(carrier.left_parent_source_index)
         pose_vectors: dict[str, np.ndarray] = {}
         for side, pose in reference.pose_by_side.items():
             xyzquat = pose_matrix_to_xyzquat(pose)
@@ -3645,9 +3816,10 @@ class RuleBasedRealTeleopExtension:
             "rule_based_reference_captures_source_frame": bool(
                 carrier.captures_source_frame
             ),
-            "rule_based_reference_left_source_frame_index": parent_frame_index,
+            "rule_based_reference_source_kind": carrier.source_kind,
+            "rule_based_reference_left_source_frame_index": parent_source_index,
             "rule_based_reference_right_source_frame_index": (
-                carrier.right_parent_frame_index
+                carrier.right_parent_source_index
             ),
             "rule_based_parent_source_action_timestamp": parent.action.timestamp,
             "position_pipeline": (
@@ -3657,8 +3829,8 @@ class RuleBasedRealTeleopExtension:
             "position_keyframe_hz": carrier.keyframe_hz,
             "position_reference_hz": carrier.reference_hz,
             "position_reference_sequence": int(reference.sequence),
-            "left_source_index": parent_frame_index,
-            "right_source_index": carrier.right_parent_frame_index,
+            "left_source_index": parent_source_index,
+            "right_source_index": carrier.right_parent_source_index,
             "left_source_timestamp": float(reference.left_source_timestamp),
             "right_source_timestamp": float(reference.right_source_timestamp),
             "interpolation_alpha": float(reference.interpolation_alpha),
@@ -3678,7 +3850,11 @@ class RuleBasedRealTeleopExtension:
                 projected_parent.end_effector_targets_by_side
             ),
             active_effectors=projected_parent.active_effectors,
-            source="rule_based_replay_position_reference",
+            source=(
+                "rule_based_replay_position_reference"
+                if carrier.source_kind == "replay"
+                else "rule_based_custom_action_position_reference"
+            ),
             metadata=reference_metadata,
         )
         return RuleBasedCollectionEmission(

@@ -1180,6 +1180,12 @@ class FixedWritingActionSource:
             source="rule_based_fixed_writing",
             metadata={
                 **dict(target.metadata),
+                # Motion and dataset clocks are intentionally independent.
+                # The runtime expands these source-cadence keyframes onto the
+                # shared position-reference clock while retaining this
+                # segment's cursor sequence as the dataset capture identity.
+                "rule_based_position_reference_resample": True,
+                "rule_based_position_keyframe_hz": self.reference_hz,
                 "hand_action_specs_by_side": {
                     side: spec.to_metadata()
                     for side, spec in self.hand_action_specs_by_side.items()

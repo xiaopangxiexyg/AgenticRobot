@@ -928,6 +928,10 @@ def test_fixed_writing_anchors_in_canonical_desk_and_resamples_source_rate() -> 
     assert interval_velocity["by_side"]["left"][
         "linear_speed_p90_m_s"
     ] == pytest.approx(0.0)
+    assert actions[0].metadata["rule_based_position_reference_resample"] is True
+    assert actions[0].metadata["rule_based_position_keyframe_hz"] == pytest.approx(
+        10.0
+    )
 
 
 def test_calibrated_height_descent_is_optional_pure_z_and_c2_bounded() -> None:

@@ -5198,6 +5198,148 @@ def test_replay_uses_source_duration_with_dense_60hz_coupled_references() -> Non
     } == {0, 1}
 
 
+def test_opted_in_custom_segment_uses_dense_reference_clock_and_source_capture_ids() -> None:
+    source_actions = iter(
+        (
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                timestamp=0.0,
+                arm_pose_by_side={
+                    "left": _pose(0.0),
+                    "right": _pose(0.0),
+                },
+                frame_by_effector={
+                    "left_arm": "canonical_desk",
+                    "right_arm": "canonical_desk",
+                },
+                controlled_frame_by_effector={
+                    "left_arm": "tool_tcp",
+                    "right_arm": "tool_tcp",
+                },
+                source="writing_keyframe",
+                metadata={
+                    "rule_based_position_reference_resample": True,
+                    "rule_based_position_keyframe_hz": 15.0,
+                },
+            ),
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                timestamp=1.0 / 15.0,
+                arm_pose_by_side={
+                    "left": _pose(0.0),
+                    "right": _pose(0.02),
+                },
+                frame_by_effector={
+                    "left_arm": "canonical_desk",
+                    "right_arm": "canonical_desk",
+                },
+                controlled_frame_by_effector={
+                    "left_arm": "tool_tcp",
+                    "right_arm": "tool_tcp",
+                },
+                source="writing_keyframe",
+                metadata={
+                    "rule_based_position_reference_resample": True,
+                    "rule_based_position_keyframe_hz": 15.0,
+                },
+            ),
+        )
+    )
+    source_calls = 0
+
+    def produce(_observation):
+        nonlocal source_calls
+        source_calls += 1
+        return next(source_actions)
+
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedActionSegment(
+                    step_id="right_write.write",
+                    action_source=CallableActionSource(produce),
+                    stop_condition=RuleBasedSegmentStopCondition(max_steps=2),
+                    capture=RuleBasedCaptureSelection(enabled=True),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            action_hz=15.0,
+            position_reference_hz=60.0,
+        ),
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    references = []
+    admitted_sequences = []
+    for index in range(5):
+        now = 3200.0 + index / 60.0 + 1e-6
+        command = session.command_override_provider(SimpleNamespace(), now).command
+        assert command is not None
+        references.append(command)
+        extension.after_session_step(
+            step_result=SimpleNamespace(command_dispatched=True),
+            now=now,
+        )
+        admission = extension.dataset_sample_admission(
+            step_result=SimpleNamespace(command_dispatched=True),
+            now=now,
+        )
+        if admission.allowed:
+            admitted_sequences.append(
+                int(admission.metadata["rule_based_sequence_index"])
+            )
+            extension.after_dataset_sample_attempt(
+                admission=admission,
+                accepted=True,
+                now=now,
+            )
+
+    assert source_calls == 2
+    assert [
+        item.metadata["rule_based_reference_sequence"] for item in references
+    ] == list(range(5))
+    assert references[0].metadata["rule_based_reference_timestamp_sec"] == pytest.approx(
+        0.0
+    )
+    assert references[-1].metadata[
+        "rule_based_reference_timestamp_sec"
+    ] == pytest.approx(1.0 / 15.0)
+    assert all(
+        item.metadata["rule_based_reference_source_kind"] == "custom_action"
+        for item in references
+    )
+    assert all(
+        item.metadata["rule_based_phase"] == "write_rule_base"
+        for item in references
+    )
+    assert all(
+        item.metadata["rule_based_coupled_pose_safety"] for item in references
+    )
+    right_positions = np.stack(
+        [
+            item.metadata["rule_based_target_pose_base_by_side"]["right"][:3, 3]
+            for item in references
+        ]
+    )
+    left_positions = np.stack(
+        [
+            item.metadata["rule_based_target_pose_base_by_side"]["left"][:3, 3]
+            for item in references
+        ]
+    )
+    assert np.max(np.linalg.norm(np.diff(right_positions, axis=0), axis=1)) <= 0.005001
+    assert np.allclose(np.diff(left_positions, axis=0), 0.0)
+    assert {
+        item.metadata["rule_based_sequence_index"] for item in references
+    } == {0, 1}
+    assert admitted_sequences == [0, 1]
+
+
 def test_replay_queue_resolves_only_source_keyframes_and_live_references() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
