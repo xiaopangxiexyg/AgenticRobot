@@ -8,6 +8,7 @@ import io
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import asdict
@@ -382,6 +383,7 @@ class StationBoundPointGraspProvider:
         ) = None,
         motion_port: RealAgentMotionPort | None = None,
         captured_robot_observation_filter: Callable[..., object] | None = None,
+        non_motion_read_window: Callable[[], object] | None = None,
     ) -> None:
         if not isinstance(registration, StationBoundPointGraspRegistration):
             raise TypeError("registration must be typed.")
@@ -440,6 +442,12 @@ class StationBoundPointGraspProvider:
                 "captured_robot_observation_filter must be callable or None"
             )
         self.captured_robot_observation_filter = captured_robot_observation_filter
+        if (
+            non_motion_read_window is not None
+            and not callable(non_motion_read_window)
+        ):
+            raise TypeError("non_motion_read_window must be callable or None")
+        self.non_motion_read_window = non_motion_read_window
         self._lock = threading.Lock()
         self._started = False
 
@@ -462,6 +470,24 @@ class StationBoundPointGraspProvider:
             self._started = False
 
     def plan_request(self, request: Any, *, input_snapshot_sink: Callable[[bytes], None] | None = None) -> PreparedPointGrasp:
+        window_factory = self.non_motion_read_window
+        window = (
+            window_factory()
+            if window_factory is not None
+            else nullcontext()
+        )
+        with window:
+            return self._plan_request_unwindowed(
+                request,
+                input_snapshot_sink=input_snapshot_sink,
+            )
+
+    def _plan_request_unwindowed(
+        self,
+        request: Any,
+        *,
+        input_snapshot_sink: Callable[[bytes], None] | None = None,
+    ) -> PreparedPointGrasp:
         if request.input_artifact_bindings:
             raise ValueError("Live Station point-grasp accepts no input Artifacts.")
         expected_revision = request.expected_station_revision

@@ -322,6 +322,26 @@ def _request(*, include_arm_reachability=None):
     )
 
 
+def test_station_point_grasp_plan_runs_inside_non_motion_read_window() -> None:
+    _source, _revision, _planner, _registration, provider = _provider_stack()
+    events: list[str] = []
+
+    class _Window:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            events.append("exit")
+            return False
+
+    provider.non_motion_read_window = lambda: _Window()
+    provider.plan_request(_request())
+
+    assert events == ["enter", "exit"]
+
+
 def test_graspgenx_capture_filter_is_wired_to_planner() -> None:
     qpos = SimpleNamespace(
         qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},

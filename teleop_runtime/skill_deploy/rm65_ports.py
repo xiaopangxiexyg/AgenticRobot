@@ -360,13 +360,16 @@ class ExclusiveRM65SkillDeployPorts:
 
     @contextmanager
     def non_motion_read_window(self) -> Iterator[None]:
-        """Pause only stale trips while a read-only planner blocks.
+        """Pause stale trips and background qpos refresh for read-only work.
 
         The position-force guard keeps force/torque and reader-error checks
         active in this window.  It also clears ``motion_ready``; therefore the
         existing command admission boundary cannot accept a motion command.
-        Exiting the window requires fresh samples from every side before
-        motion readiness is restored.
+        When background measurement sampling is enabled, the sampler's read
+        lock is held for the whole window.  This gives the force pollers sole
+        access to the shared RM65 SDK I/O path instead of allowing a slow qpos
+        refresh to block a force read.  Exiting the window requires one fresh
+        dual-arm qpos cut before motion readiness is restored.
         """
 
         if not self.resources_started:
@@ -388,10 +391,105 @@ class ExclusiveRM65SkillDeployPorts:
                 "position force guard does not support non-motion read windows"
             )
         token = suspend()
+        measurement_lock_acquired = False
+        previous_sample_count: int | None = None
+        primary_error: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
         try:
-            yield
+            if self.profile.background_measurement_sampling:
+                # If a sampler read is already in flight, wait for that one
+                # read to finish after stale admission has been suspended.
+                # Thereafter no new qpos SDK call can start while the
+                # read-only operation is running.
+                self._measurement_read_lock.acquire()
+                measurement_lock_acquired = True
+                with self._measurement_lock:
+                    previous_sample_count = self._measurement_sample_count
+            try:
+                yield
+            except BaseException as exc:  # noqa: BLE001 - preserve the primary failure.
+                primary_error = exc
         finally:
-            resume(token)
+            if measurement_lock_acquired:
+                self._measurement_read_lock.release()
+                try:
+                    assert previous_sample_count is not None
+                    self._wait_for_fresh_measurement_sample(
+                        previous_sample_count
+                    )
+                except BaseException as exc:  # noqa: BLE001 - fail closed.
+                    cleanup_errors.append(exc)
+                    with self._measurement_lock:
+                        if self._measurement_fault is None:
+                            self._measurement_fault = (
+                                f"post-window measurement freshness failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+            try:
+                # Re-arm only after the post-window qpos cut is available.
+                # Force/torque and reader-error protection stayed active
+                # throughout the window and during this wait.
+                resume(token)
+            except BaseException as exc:  # noqa: BLE001 - retain evidence.
+                cleanup_errors.append(exc)
+
+            if primary_error is not None:
+                for cleanup_error in cleanup_errors:
+                    add_note = getattr(primary_error, "add_note", None)
+                    note = (
+                        "non-motion read window cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    if callable(add_note):
+                        add_note(note)
+                    else:
+                        notes = getattr(primary_error, "__notes__", None)
+                        if notes is None:
+                            notes = []
+                            setattr(primary_error, "__notes__", notes)
+                        notes.append(note)
+                raise primary_error
+            if cleanup_errors:
+                raise RuntimeError(
+                    "RM65 non-motion read window cleanup failed: "
+                    + "; ".join(
+                        f"{type(error).__name__}: {error}"
+                        for error in cleanup_errors
+                    )
+                ) from cleanup_errors[0]
+
+    def _wait_for_fresh_measurement_sample(
+        self,
+        previous_sample_count: int,
+    ) -> None:
+        """Require one sampler cut published after a read-only window."""
+
+        timeout_sec = max(1.0, 4.0 / self.profile.state_refresh_hz)
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            with self._measurement_lock:
+                fault = self._measurement_fault
+                sample_count = self._measurement_sample_count
+            if fault is not None:
+                raise RuntimeError(
+                    "RM65 measurement sampler failed after non-motion read: "
+                    + fault
+                )
+            if sample_count > previous_sample_count:
+                return
+            thread = self._measurement_thread
+            if thread is None or not thread.is_alive():
+                raise RuntimeError(
+                    "RM65 measurement sampler stopped before publishing a "
+                    "fresh post-window qpos cut."
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise RuntimeError(
+                    "RM65 measurement sampler did not publish a fresh "
+                    f"post-window qpos cut within {timeout_sec:.3f}s."
+                )
+            self._measurement_stop.wait(min(0.01, remaining))
 
     @property
     def startup_hold_receipt(self) -> RealSkillMotionHoldReceipt | None:

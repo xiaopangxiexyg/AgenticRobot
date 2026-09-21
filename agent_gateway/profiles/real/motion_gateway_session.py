@@ -1309,6 +1309,7 @@ def assemble_real_agent_primitive_gateway_session(
                 captured_robot_observation_filter=(
                     captured_robot_observation_filter
                 ),
+                non_motion_read_window=non_motion_read_window,
             )
             station_point_grasp_executor = build_station_bound_point_grasp_executor(
                 registration=point_grasp_registration,

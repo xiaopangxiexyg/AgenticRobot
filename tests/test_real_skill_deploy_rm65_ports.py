@@ -684,6 +684,40 @@ def test_rm65_ports_non_motion_read_window_blocks_commands_and_rearms_guard() ->
     ports.close()
 
 
+def test_non_motion_read_window_pauses_background_qpos_refresh_until_exit() -> None:
+    ports, backends, _ = _ports(
+        background_measurement_sampling=True,
+        state_refresh_hz=100.0,
+    )
+    ports.clock = time.time
+    ports.arm_state_reader.clock = time.time
+    sequences = {"left": 10, "right": 20}
+    for side, backend in backends.items():
+        original_get_state = backend.get_state
+
+        def get_state(*, _side=side, _original=original_get_state):
+            state = _original()
+            state["hardware_measurement_timestamp"] = time.time()
+            state["hardware_measurement_sequence"] = sequences[_side]
+            sequences[_side] += 1
+            return state
+
+        backend.get_state = get_state
+        backend.refresh_state_from_hardware = get_state
+
+    ports.start()
+    before = ports.measurement_sampler_snapshot()["sample_count"]
+    with ports.non_motion_read_window():
+        paused_at = ports.measurement_sampler_snapshot()["sample_count"]
+        time.sleep(0.08)
+        assert ports.measurement_sampler_snapshot()["sample_count"] == paused_at
+    after = ports.measurement_sampler_snapshot()["sample_count"]
+    ports.close()
+
+    assert paused_at >= before
+    assert after > paused_at
+
+
 def test_rm65_ports_own_start_and_hold_before_close() -> None:
     ports, backends, _ = _ports()
 
