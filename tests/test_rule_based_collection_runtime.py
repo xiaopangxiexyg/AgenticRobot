@@ -132,6 +132,53 @@ def test_adapter_runtime_path_reuses_the_same_resolution_boundary() -> None:
     )
 
 
+def test_runtime_segment_uses_global_monotonic_directive_sequence() -> None:
+    source = CallableActionSource(
+        lambda observation: RobotAction.bimanual_qpos(
+            right_arm=np.full(6, float(observation["value"])),
+            source="runtime_fixture",
+        )
+    )
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedReplay(
+                step_id="approach",
+                group_key="source",
+                start_index=0,
+                end_index=2,
+            ),
+            RuleBasedActionSegment(
+                step_id="write",
+                action_source=source,
+                stop_condition=RuleBasedSegmentStopCondition(max_steps=3),
+            ),
+            RuleBasedReplay(
+                step_id="depart",
+                group_key="source",
+                start_index=0,
+                end_index=2,
+            ),
+        )
+    )
+    cursor = RuleBasedCollectionCursor(plan, {"source": _group()})
+
+    directives = [
+        cursor.next_runtime({"value": float(index)})
+        for index in range(7)
+    ]
+
+    assert [directive.step_id for directive in directives] == [
+        "approach",
+        "approach",
+        "write",
+        "write",
+        "write",
+        "depart",
+        "depart",
+    ]
+    assert [directive.sequence_index for directive in directives] == list(range(7))
+
+
 def test_optional_empty_runtime_segment_skips_without_emitting_and_resets_sources() -> None:
     class OptionalSource:
         def __init__(self) -> None:
