@@ -1074,9 +1074,13 @@ def test_vendor_status_cache_diagnostics_is_passive_and_explicitly_unverified() 
         "complete": True,
         "errors": (),
         "freshness_verified": False,
+        "velocity_source": "motorbridge_operation_status_cache_unverified",
+        "velocity_role": "diagnostic_only_not_used_for_control",
+        "control_qvel_source": "normalized_qpos_finite_difference_over_feedback_dt",
         "semantics": (
             "passive_motorbridge_operation_status_cache_unverified; "
-            "no_extra_can_request; not command-response correlated"
+            "no_extra_can_request; not command-response correlated; "
+            "diagnostic_only_not_used_for_control"
         ),
     }
 
@@ -1087,10 +1091,37 @@ def test_vendor_status_cache_diagnostics_does_not_fail_when_cache_is_absent() ->
     assert result["complete"] is False
     assert result["velocity_rad_s"] is None
     assert result["torque_nm"] is None
+    assert result["velocity_role"] == "diagnostic_only_not_used_for_control"
+    assert result["control_qvel_source"] == (
+        "normalized_qpos_finite_difference_over_feedback_dt"
+    )
     assert result["errors"] == (
         "vendor_status_velocity_rad_s: unavailable",
         "vendor_status_torque_nm: unavailable",
     )
+
+
+def test_startup_diagnostic_labels_finite_difference_velocity_contract() -> None:
+    result = probe.build_startup_diagnostic_observation(
+        phase="ACTIVE",
+        state=SimpleNamespace(
+            sequence=4,
+            receive_timestamp_sec=12.5,
+            velocities_reported=(99.0,) * 6,
+            torques_reported_nm=(0.0,) * 6,
+            freshness_verified=False,
+        ),
+        qpos_rad=(0.1,) * 6,
+        qvel_fd_rad_s=(0.02,) * 6,
+    )
+
+    assert result["qvel_source"] == (
+        "normalized_qpos_finite_difference_over_feedback_dt"
+    )
+    assert result["vendor_status"]["velocity_role"] == (
+        "diagnostic_only_not_used_for_control"
+    )
+    assert result["vendor_status"]["control_qvel_source"] == result["qvel_source"]
 
 
 def test_startup_diagnostics_reports_observed_deltas_without_a_numeric_gate() -> None:
