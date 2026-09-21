@@ -1630,6 +1630,52 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert state["task_chain_can_advance"] is True
 
 
+def test_task_chain_can_reach_gripper_close_when_rule_owner_is_not_initialized() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": (
+                    "右夹爪尚未建立书写用的一次性闭合 owner。"
+                )
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_can_advance"] is True
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("release_right_gripper",)
+
+
+def test_ready_rule_owner_blocker_exposes_gripper_recovery_without_starting_rule() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.READY_RULE
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": (
+                    "右夹爪尚未建立书写用的一次性闭合 owner。"
+                )
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["phase"] == "ready"
+    assert state["can_start"] is False
+    assert state["can_close_grippers"] is True
+    assert state["can_release_grippers"] is True
+
+
 def test_task_chain_starts_after_stale_start_gate_recovers() -> None:
     application = RuleBasedWritingApplication()
     options, first, _second = _task_chain_configuration()

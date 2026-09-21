@@ -1155,6 +1155,66 @@ class RuleBasedRealTeleopExtension:
             and not self._completed
             and not self._aborted
             and not self._held
+            and self._right_gripper_hold_owner_ready()[0]
+        )
+
+    def _right_gripper_hold_owner_ready(self) -> tuple[bool, str]:
+        """Return the command-inert receipt required by writing hand holds.
+
+        A writing frame carries a right-hand action for the dataset contract,
+        but its physical hand command is deliberately preserved.  The DMTAC
+        backend must therefore have already accepted the task-chain close in
+        one-shot mode.  This check is deliberately local and has no serial
+        side effects.  A backend that cannot provide this receipt is rejected
+        for writing rather than being allowed to guess that its physical grip
+        is owned.
+        """
+
+        if (
+            str(self.source_selection.get("collection_mode") or "")
+            != "rule_based_writing"
+            or "right" not in self.config.gripper_sides
+        ):
+            return True, ""
+        backend = getattr(self._components, "right_hand_backend", None)
+        if backend is None:
+            return False, "右夹爪 backend 不可用。"
+        is_ready = getattr(backend, "is_ready", None)
+        if callable(is_ready):
+            try:
+                if not bool(is_ready()):
+                    # The normal readiness diagnosis owns transport/fault
+                    # errors.  Do not replace those precise blockers with a
+                    # secondary hold-owner message.
+                    return True, ""
+            except Exception:
+                return True, ""
+        receipt = getattr(backend, "fixed_closed_one_shot_ready", None)
+        if not callable(receipt):
+            return False, "右夹爪 backend 未提供固定闭合 owner receipt。"
+        try:
+            ready = bool(receipt())
+        except Exception as exc:  # noqa: BLE001 - admission fails closed.
+            return False, f"右夹爪固定闭合 owner 检查失败：{type(exc).__name__}: {exc}。"
+        if ready:
+            return True, ""
+        return (
+            False,
+            "右夹爪尚未建立书写用的一次性闭合 owner；"
+            "请先完成“闭紧右夹爪”并等待“实测已闭紧”。",
+        )
+
+    def _rule_frame_requires_right_gripper_hold_owner(
+        self,
+        emission: RuleBasedCollectionEmission,
+    ) -> bool:
+        """Return whether this frame would use the command-inert grip hold."""
+
+        return bool(
+            str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+            and "right" in self.config.gripper_sides
+            and "right_hand" in emission.command.commands
         )
 
     def collection_startup_blockers(self) -> dict[str, str]:
@@ -2158,6 +2218,21 @@ class RuleBasedRealTeleopExtension:
             # control loop, force guard, and causal state poller keep running.
             self._publish_status(recording_ready=ready)
             return TeleopCommandOverride(None)
+        if self._rule_frame_requires_right_gripper_hold_owner(self._current):
+            owner_ready, owner_detail = self._right_gripper_hold_owner_ready()
+            if not owner_ready:
+                self._waiting_reason = "right_gripper_hold_owner_pending"
+                if self._execution_begun:
+                    raise RuntimeError(
+                        "rule-based writing lost its right-gripper hold owner: "
+                        + (owner_detail or "owner receipt is no longer valid")
+                    )
+                # Do not let an arm qref reach Session while the matching
+                # command-inert hand hold would be rejected by DMTAC.  Keep
+                # the immutable current emission for the next control tick;
+                # a successful task-chain close will make it dispatchable.
+                self._publish_status(recording_ready=False)
+                return TeleopCommandOverride(None)
         self._prepare_live_dispatch(self._current, float(now))
         self._frame_emission = self._current
         self._publish_status(recording_ready=True)
@@ -2972,6 +3047,15 @@ class RuleBasedRealTeleopExtension:
             # operations. The writing replay keeps the same mode and target;
             # it must not restore continuous catch or re-drive the hand.
             manual_continuous_grasp = intent == "close_grippers"
+            manual_motion_mode = (
+                "one_shot_open"
+                if is_release
+                else (
+                    "one_shot_close"
+                    if task_chain_right_only
+                    else "continuous_close"
+                )
+            )
             for side in hand_qpos:
                 effector = command.commands.get(f"{side}_hand")
                 if effector is None:
@@ -2987,15 +3071,24 @@ class RuleBasedRealTeleopExtension:
                 effector.metadata["dmtac_continuous_grasp_override"] = bool(
                     manual_continuous_grasp
                 )
+                # Never inherit the writing replay's command-inert hold for a
+                # manual release.  The open command must reach DMTAC so the
+                # backend can switch back to its explicit one-shot mode even
+                # when the target value is already cached at the endpoint.
+                effector.metadata["dmtac_preserve_existing_grip"] = False
                 effector.metadata["rule_based_manual_gripper_dispatch_mode"] = (
                     "single_endpoint_feedback_gated"
                     if task_chain_right_only
                     else "bounded_incremental_feedback_gated"
                 )
+                effector.metadata["rule_based_manual_gripper_motion_mode"] = (
+                    manual_motion_mode
+                )
             command.metadata.update(
                 {
                     "rule_based_manual_gripper_action": intent,
                     "rule_based_manual_gripper_sides": list(action_sides),
+                    "rule_based_manual_gripper_motion_mode": manual_motion_mode,
                     "rule_based_capture_enabled": False,
                     "rule_based_arm_motion": False,
                     "external_gripper_motion": True,
@@ -6604,6 +6697,19 @@ class RuleBasedRealTeleopExtension:
                 for part in (readiness_reason, self._progress_scope_admission_error)
                 if part
             )
+        hold_owner_ready, hold_owner_detail = self._right_gripper_hold_owner_ready()
+        if not hold_owner_ready:
+            readiness_blockers = dict(readiness_blockers)
+            readiness_blockers.setdefault(
+                "rule.right_hand_hold_owner",
+                hold_owner_detail
+                or "右夹爪尚未建立书写用的一次性闭合 owner。",
+            )
+            readiness_reason = "; ".join(
+                part
+                for part in (readiness_reason, hold_owner_detail)
+                if part
+            )
         gripper_backends_ready = True
         for side in self.config.gripper_sides:
             backend = getattr(self._components, f"{side}_hand_backend", None)
@@ -6617,9 +6723,14 @@ class RuleBasedRealTeleopExtension:
         # gate.  RUNNING is valid only in the inter-Episode state produced by
         # the successful reset above; an active/finalizing writer remains a
         # hard blocker.
+        hardware_readiness_blockers = {
+            key: value
+            for key, value in readiness_blockers.items()
+            if key != "rule.right_hand_hold_owner"
+        }
         gripper_control_available = bool(
             gripper_backends_ready
-            and not readiness_blockers
+            and not hardware_readiness_blockers
             and self._manual_gripper_lifecycle_available(
                 session_state_value=session_state_value,
             )
@@ -6648,12 +6759,17 @@ class RuleBasedRealTeleopExtension:
             and not gripper_action_pending
             and not fixed_sides
             and not readiness_blockers
+            and hold_owner_ready
         )
         height_mutation_idle = self._height_calibration_mutation_idle()
         height_calibration_available = bool(
             height_mutation_idle
             and session_state_value in {"ARMED", "RUNNING"}
-            and not readiness_blockers
+            # The rule-start-only hold-owner receipt must not disable the
+            # command-inert height step before the task chain has performed
+            # its explicit right-gripper close.  Transport/session faults do
+            # remain hard blockers through this filtered view.
+            and not hardware_readiness_blockers
         )
         calibration = self._height_calibration
         waiting_reason = self._waiting_reason
@@ -6665,7 +6781,10 @@ class RuleBasedRealTeleopExtension:
             and not self._completed
             and not self._aborted
         ):
-            waiting_reason = "session_readiness_failure"
+            if set(readiness_blockers) == {"rule.right_hand_hold_owner"}:
+                waiting_reason = "right_gripper_hold_owner_pending"
+            else:
+                waiting_reason = "session_readiness_failure"
         side_labels = {"left": "左夹爪", "right": "右夹爪"}
         topology = (
             "双臂（无夹爪）"

@@ -304,9 +304,51 @@ class RuleBasedWritingApplication:
                     key=key,
                     detail=detail,
                 )
+                or self._is_expected_task_chain_gripper_blocker_locked(key=key)
             ):
                 blockers.pop(key, None)
         return blockers
+
+    def _is_expected_task_chain_gripper_blocker_locked(self, *, key: str) -> bool:
+        """Keep the pre-rule gripper steps available while owner is absent.
+
+        The writing runtime correctly blocks rule START until the one-shot
+        closed right-gripper owner exists.  The task chain itself must still
+        be able to perform its first release and close steps, and its final
+        release must be allowed to end a cycle.  This exception is limited to
+        a configured task-chain pool and never applies in the READY_RULE or
+        active-rule phases.
+        """
+
+        return bool(
+            str(key) == "rule.right_hand_hold_owner"
+            and self._task_chain_configuration_pool
+            and self._task_chain.phase
+            in {
+                RuleWritingTaskChainPhase.IDLE,
+                RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING,
+                RuleWritingTaskChainPhase.READY_CLOSE,
+                RuleWritingTaskChainPhase.CLOSE_PENDING,
+                RuleWritingTaskChainPhase.READY_HEIGHT,
+                RuleWritingTaskChainPhase.HEIGHT_PENDING,
+                RuleWritingTaskChainPhase.READY_FINAL_RELEASE,
+                RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING,
+                RuleWritingTaskChainPhase.COMPLETE,
+            }
+        )
+
+    def _rule_owner_recovery_window_locked(self) -> bool:
+        """Return whether READY_RULE may expose a safe gripper retry."""
+
+        blockers = self._effective_startup_blockers_locked()
+        return bool(
+            self._task_chain.phase is RuleWritingTaskChainPhase.READY_RULE
+            and set(blockers) == {"rule.right_hand_hold_owner"}
+            and not self._state.held
+            and not self._state.completed
+            and not self._state.aborted
+            and not self._state.shutdown
+        )
 
     def observe_runtime_publication(self, updates: Mapping[str, object]) -> None:
         """Consume the generic projection without exposing its controls or progress."""
@@ -1340,7 +1382,14 @@ class RuleBasedWritingApplication:
             elif self._state.runtime_home_pending:
                 self._set_runtime_home_pending_locked()
             elif self._effective_startup_blockers_locked() and not begun:
-                self._set_readiness_blocked_locked()
+                if self._rule_owner_recovery_window_locked():
+                    self._set_ready_locked()
+                    self._state.detail = (
+                        "规则启动暂不可用；请重新执行右夹爪一次性闭合，"
+                        "并等待实测闭紧反馈后再继续。"
+                    )
+                else:
+                    self._set_readiness_blocked_locked()
             elif self._state.writer_blocked and not begun:
                 self._state.phase = "blocked"
                 self._state.title = "正式 Writer 已阻塞"
@@ -1543,6 +1592,11 @@ class RuleBasedWritingApplication:
                 "首条初始化 qref 正在通过 runtime Home 连续性验证；"
                 "连续验证完成前不会下发运动或写入样本。"
             )
+        if waiting == "right_gripper_hold_owner_pending":
+            return (
+                "右夹爪尚未建立书写用的一次性闭合 owner；"
+                "请先完成“闭紧右夹爪”并等待“实测已闭紧”。"
+            )
         if waiting == "initial_alignment_safety_rejected":
             return "双臂初始化路径未通过安全验证，机械臂已进入 Hold。"
         if waiting == "coupled_pose_safety_rejected":
@@ -1687,10 +1741,18 @@ class RuleBasedWritingApplication:
         self._state.can_retry_devices = available["retry_devices"]
         self._state.can_runtime_home = available["runtime_home"]
         self._state.can_release_grippers = bool(
-            available["release_grippers"] and not chain_owns_manual_step
+            available["release_grippers"]
+            and (
+                not chain_owns_manual_step
+                or self._rule_owner_recovery_window_locked()
+            )
         )
         self._state.can_close_grippers = bool(
-            available["close_grippers"] and not chain_owns_manual_step
+            available["close_grippers"]
+            and (
+                not chain_owns_manual_step
+                or self._rule_owner_recovery_window_locked()
+            )
         )
         self._state.can_toggle_debug = available["toggle_debug"]
         self._state.can_capture_height = bool(
@@ -1824,7 +1886,6 @@ class RuleBasedWritingApplication:
             self._state.collection_mode == "rule_based_writing"
             and self._task_chain_configuration_pool
             and available["configure"]
-            and available["start"]
             and available["release_grippers"]
             and available["close_right_gripper"]
             and available["capture_height"]
@@ -1847,6 +1908,12 @@ class RuleBasedWritingApplication:
             return "等待规则运行时完成绑定；就绪前不能开始任务链。"
         effective_blockers = self._effective_startup_blockers_locked()
         if effective_blockers:
+            if "rule.right_hand_hold_owner" in effective_blockers:
+                return (
+                    "规则采集保持禁用；请先完成任务链中的“闭紧右夹爪”，"
+                    "并等待右夹爪反馈确认实测闭紧。\n"
+                    + effective_blockers["rule.right_hand_hold_owner"]
+                )
             detail_lines = "; ".join(
                 f"{key}: {value}"
                 for key, value in sorted(effective_blockers.items())
@@ -1934,7 +2001,14 @@ class RuleBasedWritingApplication:
             self._set_runtime_home_pending_locked()
             return
         if self._effective_startup_blockers_locked():
-            self._set_readiness_blocked_locked()
+            if self._rule_owner_recovery_window_locked():
+                self._set_ready_locked()
+                self._state.detail = (
+                    "规则启动暂不可用；请重新执行右夹爪一次性闭合，"
+                    "并等待实测闭紧反馈后再继续。"
+                )
+            else:
+                self._set_readiness_blocked_locked()
             return
         if self._session_requires_runtime_home_locked():
             self._set_readiness_blocked_locked()
@@ -1947,6 +2021,18 @@ class RuleBasedWritingApplication:
             return
         if not self._rule_status_seen:
             self._set_preparing_status_locked()
+            return
+        if (
+            self._task_chain_configuration_pool
+            and self._is_expected_task_chain_gripper_blocker_locked(
+                key="rule.right_hand_hold_owner"
+            )
+            and "rule.right_hand_hold_owner" in self._state.startup_blockers
+        ):
+            # The dedicated chain is intentionally ready for its command-inert
+            # release/close gates even though rule START itself remains
+            # disabled until the close receipt establishes the hold owner.
+            self._set_ready_locked()
             return
         if self._state.rule_start_available or self._state.writer_blocked:
             if self._state.writer_blocked:

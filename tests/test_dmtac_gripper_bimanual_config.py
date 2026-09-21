@@ -2712,6 +2712,35 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         )
         self.assertEqual(fake.moves, [])
 
+    def test_fixed_closed_one_shot_ready_requires_sent_closed_mode_receipt(self) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                continuous_grasp=True,
+            )
+        )
+        backend.device = _FakeDevice()
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._last_sent_command = np.asarray(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
+        backend._applied_continuous_grasp = True
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._applied_continuous_grasp = False
+        self.assertTrue(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_gripper_error_code = 16
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
     def test_deploy_builds_dmtac_gripper_backend_from_assignment(self) -> None:
         parser = argparse.ArgumentParser()
         deploy_run_policy.add_args(parser)

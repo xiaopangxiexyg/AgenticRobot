@@ -249,6 +249,7 @@ class _HandBackend:
         self.config = SimpleNamespace(command_dim=0, max_action=1.0)
         self.measured_joint_pos = np.zeros(6, dtype=np.float32)
         self.joint_age_sec = 0.0
+        self.fixed_closed_one_shot_owner = True
 
     @staticmethod
     def send_command(_values) -> None:
@@ -268,6 +269,9 @@ class _HandBackend:
     @staticmethod
     def is_ready() -> bool:
         return True
+
+    def fixed_closed_one_shot_ready(self) -> bool:
+        return bool(self.fixed_closed_one_shot_owner)
 
 
 class _HandPoller:
@@ -834,6 +838,37 @@ def test_rule_start_allows_only_pre_episode_armed_warmup_without_motion() -> Non
 
     extension._held = True
     assert not runtime_extension_allows_pre_episode_armed_warmup(extension)
+
+
+def test_rule_start_waits_for_right_one_shot_grip_owner_without_disabling_release() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedInitialize(step_id="init", group_key="source"),
+            )
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, _ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+    extension._components.right_hand_backend.fixed_closed_one_shot_ready = (
+        lambda: False
+    )
+
+    status = extension.status()
+    assert status.rule_start_available is False
+    assert status.gripper_control_available is True
+    assert status.readiness_blockers["rule.right_hand_hold_owner"]
+    assert extension.allows_pre_episode_armed_warmup() is False
+    assert session.external_commands == []
 
 
 def test_rule_runtime_exposes_configured_hand_fault_before_writer_open() -> None:
@@ -2496,8 +2531,12 @@ def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
             # Admission closes in one-shot mode so a real idle/force-stop
             # receipt is required. Writing retains this same fixed mode.
             assert command.metadata["dmtac_continuous_grasp_override"] is False
+            assert command.metadata["dmtac_preserve_existing_grip"] is False
             assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
                 "single_endpoint_feedback_gated"
+            )
+            assert command.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_close"
             )
             assert float(command.value[0]) == pytest.approx(1.0)
             backends["right"].set_measured_scalar(float(command.value[0]))
@@ -2551,8 +2590,15 @@ def test_task_chain_release_right_gripper_preserves_left_hand() -> None:
             assert set(release.commands) == {"right_hand"}
             command = release.commands["right_hand"]
             assert command.metadata["dmtac_continuous_grasp_override"] is False
+            assert command.metadata["dmtac_preserve_existing_grip"] is False
             assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
                 "single_endpoint_feedback_gated"
+            )
+            assert command.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_open"
+            )
+            assert release.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_open"
             )
             assert float(command.value[0]) == pytest.approx(0.0)
             right.set_measured_scalar(float(command.value[0]))

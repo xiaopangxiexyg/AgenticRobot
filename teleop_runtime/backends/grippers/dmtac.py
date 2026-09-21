@@ -1735,6 +1735,56 @@ class DMTacGripperBackend(EffectorBackend):
             )
         return True
 
+    def fixed_closed_one_shot_ready(self) -> bool:
+        """Report whether the rule-writing hold owner is already established.
+
+        Rule-writing frames intentionally preserve the physical right-gripper
+        command instead of issuing a serial write on every arm frame.  That
+        optimization is safe only after this backend has successfully sent a
+        closed command with ``continuous=False``.  Keep this a local,
+        command-inert receipt: it never reads or writes the device.
+        """
+
+        if not self.is_ready():
+            return False
+        last_sent = self._last_sent_command
+        if last_sent is None:
+            return False
+        values = np.asarray(last_sent, dtype=float).reshape(-1)
+        command_dim = int(self.config.command_dim)
+        if (
+            values.shape != (6,)
+            or not np.all(np.isfinite(values))
+            or command_dim < 0
+            or command_dim >= values.size
+            or abs(
+                float(values[command_dim]) - float(self.config.max_action)
+            )
+            > max(float(self.config.send_threshold), 1e-6)
+        ):
+            return False
+        measured = self._latest_measured_joint_pos
+        if measured is not None:
+            measured_values = np.asarray(measured, dtype=float).reshape(-1)
+            if (
+                measured_values.shape == (6,)
+                and np.all(np.isfinite(measured_values))
+                and abs(
+                    float(measured_values[command_dim])
+                    - float(self.config.max_action)
+                )
+                > max(float(self.config.send_threshold), 1e-6)
+            ):
+                return False
+        if self._latest_gripper_is_moving is True:
+            return False
+        if self._latest_gripper_status_code in {4, 5}:
+            return False
+        return bool(
+            self._applied_continuous_grasp is not None
+            and not bool(self._applied_continuous_grasp)
+        )
+
     def _hardware_telemetry_error_active(self) -> bool:
         """Return whether the latest error invalidates hardware admission.
 
