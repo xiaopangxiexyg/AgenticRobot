@@ -553,6 +553,41 @@ ACTIVE 中临时修正，否则第一次 Ctrl-C 或一般异常会产生力矩�
 只有启用非零摩擦项时才有实际影响。这些配置和比例一样贯穿启动、ACTIVE 与 protective
 hold，并完整写入结果 `profile`；省略参数时使用上述默认值。
 
+### 重力参数调试模式的保持契约
+
+当现场需要比较重力比例、offset、bias、Coulomb 或 driver Kd 对手感的影响时，
+必须显式给 active probe/owner 增加 `--gravity-debug-mode`。该开关只改变参数
+来源的可审计语义，不放宽任何安全门禁：程序在使能前把本次命令中的
+`gravity_scale`、六轴 scales/offsets/bias/friction、Coulomb 速度阈值和
+`driver_kd` 复制为不可变的 run snapshot。ACTIVE、首次 protective hold、
+反馈恢复后的 live hold，以及无可信反馈时的 degraded cached hold 都只能使用
+这个 snapshot；结果 JSON 的 `gravity_debug` 和 `protective_hold` 会记录其来源。
+
+因此，调试期间第一次 Ctrl-C、普通故障或 duration 到期不会偷偷切回默认重力
+profile，操作者可以把姿态变化归因于当前正在测试的参数。degraded hold 仍只
+重放最后一帧已验证的 gravity torque（不伪造软件速度阻尼），这是反馈不可信时
+的既有安全语义。`--gravity-debug-mode` 不改变反馈年龄/速度/加速度/位置/力矩
+限制、active-report 门禁、完整六轴发送重试、protective hold 的二次失能规则或
+物理急停要求；显式取消该开关的普通 `hold`、遥操和其他模式完全沿用原路径。
+
+调试模式还会关闭 protective hold 的默认主机阻尼 fallback：如果冻结快照中的某个
+`driver Kd` 为零，live protective hold 和 degraded cached hold 都保持该关节的
+`Kd=0`，不会在故障边界偷偷加入 `protective_hold_kd`。这样保护阶段不会改变正在
+调试的手感。普通模式仍保持原有语义：`driver Kd=0` 的关节使用
+`protective_hold_kd` 作为保护保持阻尼；这条差异只由显式 `--gravity-debug-mode`
+触发，并记录在 `protective_hold` 的 `gain_source`、
+`software_damping_fallback_enabled` 和 `preserve_zero_driver_damping` 字段中。
+
+典型调试命令只需在现有前台 owner 命令中加入：
+
+```text
+--gravity-debug-mode
+```
+
+每次改变参数都应重新启动一次调试 run，不能在同一 run 中修改命令行列表或
+依赖运行时外部文件热改；这样 live 与 protective/degraded 证据始终属于同一
+组冻结参数。
+
 这些参数现在组成操作者确认的默认重力补偿 profile；原始 URDF 模型不再是省略参数时的
 默认行为。Seeed 的 RS 实机报告曾得到 J2/J3 约
 `0.948/0.952` 的有效重力比例；本机第 10 个无接触窗口也观察到 J2 在正重力方向发生延迟

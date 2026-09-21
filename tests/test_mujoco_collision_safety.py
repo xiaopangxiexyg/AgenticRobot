@@ -99,6 +99,19 @@ def test_forbidden_collision_pair_classes_have_semantic_categories(
     assert check.to_dict()["collision_category"] == expected
 
 
+def test_gripper_self_contact_exception_is_explicit_and_narrow() -> None:
+    from sim.mujoco.collision_safety import CollisionSafetyPolicy
+
+    strict = CollisionSafetyPolicy()
+    relaxed = CollisionSafetyPolicy(allow_gripper_self_contact=True)
+
+    assert strict.pair_is_forbidden(4, 4)
+    assert not relaxed.pair_is_forbidden(4, 4)
+    assert relaxed.pair_is_forbidden(1, 4)
+    assert relaxed.pair_is_forbidden(2, 4)
+    assert relaxed.pair_is_forbidden(2, 2)
+
+
 def test_clearance_recovery_only_accepts_monotonic_retreat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

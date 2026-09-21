@@ -29,6 +29,15 @@ keep software joint stiffness at zero so there is only one spring owner.
 An optional pose-axis guide prints operator-only acquisition phases and labels
 samples; it never changes either task-space anchor or any motion reference.
 
+An application leaf may inject the I/O-free ``B601SharedControlRuntime`` into
+``run_probe``.  That opt-in path is restricted to passive ``hold`` with zero
+software position/damping gains.  It follows current measured position and
+adds only the runtime's independently bounded policy-assist overlay before the
+existing gravity, final torque conditioning and sole MIT dispatch.  The normal
+CLI does not construct this runtime unless the separate single-joint assist
+flag and confirmation are both supplied, so default commissioning behavior is
+unchanged.
+
 The dispatched RobStride MIT ``kp`` is zero in the final active and protective
 controllers.  The temporary startup/replay lock is the one explicit exception:
 it applies the pinned YAML MIT Kp/Kd in the drive's local loop while the host
@@ -171,17 +180,30 @@ from hardware.rebot_b601_rs import (
 )
 from hardware.rebot_b601_rs.active_report import B601ActiveReportControlGate
 from robot_motion.rebot_b601_rs import (
+    B601AssistCommissioningState,
+    B601AssistResponseCriteria,
+    B601CartesianAssistConfig,
+    B601CartesianAssistResponseCriteria,
+    B601CartesianAssistSession,
     B601MitControlProfile,
     B601MitReference,
     B601MitTorqueBreakdown,
     B601PinocchioModel,
     B601PoseVirtualSpring,
+    B601SharedControlFrame,
+    B601SharedControlRuntime,
+    B601SingleJointAssistConfig,
+    B601SingleJointAssistSession,
     B601TranslationalVirtualSpring,
     compute_b601_mit_torque,
+    evaluate_cartesian_assist_response,
+    evaluate_single_joint_assist_response,
     map_world_aligned_ee_wrench_to_joint_torque,
 )
 
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
+SINGLE_JOINT_ASSIST_CONFIRMATION = "B601_RS_SINGLE_JOINT_POLICY_ASSIST"
+CARTESIAN_ASSIST_CONFIRMATION = "B601_RS_CARTESIAN_POLICY_ASSIST"
 FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
 DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
@@ -254,6 +276,13 @@ _DEFAULT_MIN_STEP_RESPONSE_RATIO = 0.10
 _DEFAULT_MAX_STEP_RESPONSE_RATIO = 1.50
 _DEFAULT_MIN_STEP_RESPONSE_RAD = math.radians(0.1)
 _DEFAULT_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
+_DEFAULT_ASSIST_MIN_RESPONSE_RAD = math.radians(0.1)
+_DEFAULT_ASSIST_MAX_RESPONSE_RATIO = 1.5
+_DEFAULT_ASSIST_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
+_DEFAULT_CARTESIAN_ASSIST_MIN_RESPONSE_M = 0.001
+_DEFAULT_CARTESIAN_ASSIST_MAX_RESPONSE_RATIO = 1.5
+_DEFAULT_CARTESIAN_ASSIST_MAX_LATERAL_DRIFT_M = 0.005
+_DEFAULT_CARTESIAN_ASSIST_MAX_ROTATION_DRIFT_RAD = math.radians(5.0)
 _DEFAULT_VELOCITY_ABORT_RAD_S = 5.0
 _DEFAULT_ACCELERATION_ABORT_RAD_S2 = 80.0
 _DEFAULT_MAX_ERROR_RAD = 0.15
@@ -282,6 +311,91 @@ _DEFAULT_GUIDED_POSE_ROTATION_RAD = math.radians(8.0)
 _DEFAULT_GUIDED_POSE_SETTLE_SEC = 5.0
 _DEFAULT_GUIDED_POSE_ACTION_SEC = 6.0
 _DEFAULT_GUIDED_POSE_REST_SEC = 4.0
+
+
+@dataclass(frozen=True)
+class B601GravityCompensationDebugProfile:
+    """Immutable gravity-tuning parameters for one explicit debug run.
+
+    The profile is intentionally separate from ``B601MitControlProfile``:
+    the latter describes the torque envelope and impedance gains, while this
+    object records the gravity-model parameters that an operator is tuning.
+    In the explicit gravity-debug mode the same snapshot is used by the
+    active loop and by both live and degraded protective hold paths.  Normal
+    modes do not construct or consume this object.
+    """
+
+    gravity_scale: float
+    gravity_joint_scales: tuple[float, ...]
+    gravity_joint_offsets_rad: tuple[float, ...]
+    gravity_joint_bias_nm: tuple[float, ...]
+    gravity_coulomb_friction_nm: tuple[float, ...]
+    gravity_coulomb_velocity_threshold_rad_s: float
+    driver_kd_nm_s_per_rad: tuple[float, ...]
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        gravity_scale: float,
+        gravity_joint_scales: Sequence[float],
+        gravity_joint_offsets_rad: Sequence[float],
+        gravity_joint_bias_nm: Sequence[float],
+        gravity_coulomb_friction_nm: Sequence[float],
+        gravity_coulomb_velocity_threshold_rad_s: float,
+        driver_kd_nm_s_per_rad: Sequence[float],
+    ) -> B601GravityCompensationDebugProfile:
+        """Validate and copy command-line values before hardware is enabled."""
+
+        return cls(
+            gravity_scale=_non_negative(gravity_scale, name="gravity_scale"),
+            gravity_joint_scales=_non_negative_six(
+                tuple(gravity_joint_scales),
+                name="gravity_joint_scales",
+            ),
+            gravity_joint_offsets_rad=_six(
+                tuple(gravity_joint_offsets_rad),
+                name="gravity_joint_offsets_rad",
+            ),
+            gravity_joint_bias_nm=_six(
+                tuple(gravity_joint_bias_nm),
+                name="gravity_joint_bias_nm",
+            ),
+            gravity_coulomb_friction_nm=_non_negative_six(
+                tuple(gravity_coulomb_friction_nm),
+                name="gravity_coulomb_friction_nm",
+            ),
+            gravity_coulomb_velocity_threshold_rad_s=_non_negative(
+                gravity_coulomb_velocity_threshold_rad_s,
+                name="gravity_coulomb_velocity_threshold_rad_s",
+            ),
+            driver_kd_nm_s_per_rad=_non_negative_six(
+                tuple(driver_kd_nm_s_per_rad),
+                name="driver_kd_nm_s_per_rad",
+            ),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return an evidence-safe representation of the frozen snapshot."""
+
+        return {
+            "mode": "gravity_compensation_tuning",
+            "gravity_scale": self.gravity_scale,
+            "gravity_joint_scales": self.gravity_joint_scales,
+            "gravity_joint_offsets_rad": self.gravity_joint_offsets_rad,
+            "gravity_joint_bias_nm": self.gravity_joint_bias_nm,
+            "gravity_coulomb_friction_nm": self.gravity_coulomb_friction_nm,
+            "gravity_coulomb_velocity_threshold_rad_s": (
+                self.gravity_coulomb_velocity_threshold_rad_s
+            ),
+            "driver_kd_nm_s_per_rad": self.driver_kd_nm_s_per_rad,
+            "hold_semantics": (
+                "live_and_degraded_protective_hold_reuse_this_run_snapshot"
+            ),
+            "safety_semantics": (
+                "safety_limits_watchdogs_and_full_disable_rules_unchanged"
+            ),
+        }
 
 
 class LowGainProbeError(RuntimeError):
@@ -3521,6 +3635,9 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
+    _validate_single_joint_assist_cli(args)
+    _validate_cartesian_assist_cli(args)
+    gravity_debug_mode = bool(getattr(args, "gravity_debug_mode", False))
     feedback_source = getattr(args, "feedback_source", "parameter")
     if feedback_source not in ("parameter", "active-report"):
         raise LowGainProbeError(f"unknown feedback source: {feedback_source}")
@@ -3550,6 +3667,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
             "active-report acknowledgements require --feedback-source active-report"
         )
     if args.mode == "gravity-calibration-fit":
+        if gravity_debug_mode:
+            raise LowGainProbeError(
+                "gravity-debug-mode is an active tuning mode and rejects the "
+                "offline gravity-calibration-fit path"
+            )
         if getattr(args, "allow_motion", False):
             raise LowGainProbeError(
                 "gravity-calibration-fit is offline and rejects --allow-motion"
@@ -3597,6 +3719,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 _positive(value, name=name)
         return
     if args.mode == "feedback-stability":
+        if gravity_debug_mode:
+            raise LowGainProbeError(
+                "gravity-debug-mode requires a motion-capable gravity controller"
+            )
         driver_kd_arg = getattr(args, "driver_kd", None)
         if driver_kd_arg is not None and any(
             value > 0.0
@@ -3640,6 +3766,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
         )
         return
     if args.mode == "driver-torque-limit-roundtrip":
+        if gravity_debug_mode:
+            raise LowGainProbeError(
+                "gravity-debug-mode is not applicable to the driver limit roundtrip"
+            )
         if not args.allow_motion:
             raise LowGainProbeError(
                 "driver-torque-limit-roundtrip requires --allow-motion"
@@ -4888,6 +5018,7 @@ def build_protective_hold_profile(
     *,
     driver_kd_nm_s_per_rad: Sequence[float],
     default_damping_kd_nm_s_per_rad: float = _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+    preserve_zero_driver_damping: bool = False,
 ) -> B601MitControlProfile:
     """Build the draggable all-arm gravity/damping protective hold.
 
@@ -4902,6 +5033,11 @@ def build_protective_hold_profile(
     term; joints without driver damping use ``default_damping_kd`` in the
     host-composed torque.  The startup profile still supplies the absolute and
     slew bounds, so this helper introduces no additional safety threshold.
+
+    ``preserve_zero_driver_damping`` is reserved for the explicit gravity
+    tuning mode.  It prevents this helper from inventing a host ``Kd`` on a
+    joint whose frozen debug snapshot selected ``driver Kd=0``.  Normal
+    protective holds retain the historical default software damping fallback.
     """
 
     if not isinstance(startup_profile, B601MitControlProfile):
@@ -4914,19 +5050,32 @@ def build_protective_hold_profile(
         default_damping_kd_nm_s_per_rad,
         name="default_damping_kd_nm_s_per_rad",
     )
+    if not isinstance(preserve_zero_driver_damping, bool):
+        raise TypeError("preserve_zero_driver_damping must be bool")
+    software_damping_fallback = (
+        0.0 if preserve_zero_driver_damping else default_damping_kd
+    )
     software_kd = tuple(
-        0.0 if driver_value > 0.0 else default_damping_kd
+        0.0 if driver_value > 0.0 else software_damping_fallback
         for driver_value in driver_kd
     )
     metadata = dict(startup_profile.metadata)
     metadata.update(
         {
-            "gain_source": "protective_hold_default_or_explicit_driver_kd",
+            "gain_source": (
+                "gravity_debug_frozen_driver_kd"
+                if preserve_zero_driver_damping
+                else "protective_hold_default_or_explicit_driver_kd"
+            ),
             "torque_owner": "software_gravity_plus_single_damping_owner",
             "software_damping_disabled_where_driver_kd_nonzero": True,
+            "software_damping_fallback_enabled": not preserve_zero_driver_damping,
+            "preserve_zero_driver_damping": preserve_zero_driver_damping,
             "driver_kd_nm_s_per_rad": driver_kd,
             "position_stiffness_disabled": True,
-            "default_software_damping_kd_nm_s_per_rad": default_damping_kd,
+            "default_software_damping_kd_nm_s_per_rad": (
+                software_damping_fallback
+            ),
             "reference_semantics": "current_feedback_pose_each_cycle",
         }
     )
@@ -5086,6 +5235,266 @@ def build_reference(
             name="joint_torque_overlay_nm",
         ),
     )
+
+
+def _validate_shared_control_integration(
+    args: argparse.Namespace,
+    runtime: B601SharedControlRuntime | None,
+) -> None:
+    """Keep injected policy assist compatible with the passive hold owner.
+
+    The ordinary CLI never constructs this runtime.  A future application leaf
+    may inject one in-process, but it cannot stack shared assist with another
+    position/task-space controller or change the existing default hold path.
+    """
+
+    if runtime is None:
+        return
+    if not isinstance(runtime, B601SharedControlRuntime):
+        raise TypeError("shared_control_runtime must be a B601SharedControlRuntime")
+    if args.mode != "hold":
+        raise LowGainProbeError("shared policy assist requires --mode hold")
+    if float(args.kp) != 0.0 or float(args.kd) != 0.0:
+        raise LowGainProbeError(
+            "shared policy assist requires zero software position/damping gains"
+        )
+    if getattr(args, "guided_pose_axis_protocol", False) or getattr(
+        args,
+        "interactive_pose_axis_protocol",
+        False,
+    ):
+        raise LowGainProbeError(
+            "shared policy assist cannot be combined with a pose-axis protocol"
+        )
+
+
+def _single_joint_assist_config_from_args(
+    args: argparse.Namespace,
+) -> B601SingleJointAssistConfig:
+    return B601SingleJointAssistConfig(
+        joint_name=args.assist_joint,
+        offset_rad=args.assist_offset_rad,
+        position_kp_nm_per_rad=args.assist_kp_nm_per_rad,
+        velocity_kd_nm_s_per_rad=args.assist_kd_nm_s_per_rad,
+        max_target_error_rad=args.assist_max_target_error_rad,
+        max_abs_assist_torque_nm=args.assist_max_torque_nm,
+        max_assist_torque_rate_nm_s=args.assist_torque_slew_nm_s,
+        authority_rise_per_sec=args.assist_authority_rise_per_sec,
+        command_stale_timeout_sec=args.assist_command_stale_timeout_sec,
+        countdown_sec=args.assist_countdown_sec,
+        assist_duration_sec=args.assist_duration_sec,
+        stationarity_limit_rad_s=args.assist_stationarity_limit_rad_s,
+    )
+
+
+def _build_single_joint_assist(
+    args: argparse.Namespace,
+) -> tuple[B601SharedControlRuntime, B601SingleJointAssistSession] | None:
+    """Build the explicit CLI commissioning producer inside the sole owner."""
+
+    if not getattr(args, "single_joint_assist", False):
+        return None
+    config = _single_joint_assist_config_from_args(args)
+    runtime = B601SharedControlRuntime(config.shared_control_config())
+    return runtime, B601SingleJointAssistSession(config, runtime)
+
+
+def _validate_single_joint_assist_cli(args: argparse.Namespace) -> None:
+    enabled = bool(getattr(args, "single_joint_assist", False))
+    confirmation = str(getattr(args, "assist_confirmation", ""))
+    if not enabled:
+        if confirmation:
+            raise LowGainProbeError(
+                "--assist-confirmation requires --single-joint-assist"
+            )
+        return
+    if args.mode != "hold":
+        raise LowGainProbeError("single-joint assist requires --mode hold")
+    if confirmation != SINGLE_JOINT_ASSIST_CONFIRMATION:
+        raise LowGainProbeError(
+            "single-joint assist requires --assist-confirmation "
+            f"{SINGLE_JOINT_ASSIST_CONFIRMATION}"
+        )
+    if float(args.kp) != 0.0 or float(args.kd) != 0.0:
+        raise LowGainProbeError(
+            "single-joint assist requires zero software --kp and --kd"
+        )
+    if getattr(args, "guided_pose_axis_protocol", False) or getattr(
+        args,
+        "interactive_pose_axis_protocol",
+        False,
+    ):
+        raise LowGainProbeError(
+            "single-joint assist cannot be combined with a pose-axis protocol"
+        )
+    # Constructing the pure config here validates all numeric bounds without
+    # opening CAN or creating a hardware backend.
+    _single_joint_assist_config_from_args(args)
+    B601AssistResponseCriteria(
+        minimum_response_rad=args.assist_min_response_rad,
+        maximum_response_ratio=args.assist_max_response_ratio,
+        maximum_support_drift_rad=args.assist_max_support_drift_rad,
+    )
+
+
+def _cartesian_assist_config_from_args(
+    args: argparse.Namespace,
+) -> B601CartesianAssistConfig:
+    return B601CartesianAssistConfig(
+        axis=args.cartesian_assist_axis,
+        offset_m=args.cartesian_assist_offset_m,
+        stiffness_n_per_m=args.cartesian_assist_stiffness_n_per_m,
+        damping_n_s_per_m=args.cartesian_assist_damping_n_s_per_m,
+        lateral_stiffness_n_per_m=(
+            args.cartesian_assist_lateral_stiffness_n_per_m
+        ),
+        lateral_damping_n_s_per_m=(
+            args.cartesian_assist_lateral_damping_n_s_per_m
+        ),
+        max_abs_force_n=args.cartesian_assist_max_force_n,
+        max_abs_joint_torque_nm=args.cartesian_assist_max_joint_torque_nm,
+        max_joint_torque_rate_nm_s=(
+            args.cartesian_assist_joint_torque_slew_nm_s
+        ),
+        authority_rise_per_sec=args.cartesian_assist_authority_rise_per_sec,
+        countdown_sec=args.cartesian_assist_countdown_sec,
+        assist_duration_sec=args.cartesian_assist_duration_sec,
+        stationarity_limit_rad_s=(
+            args.cartesian_assist_stationarity_limit_rad_s
+        ),
+    )
+
+
+def _build_cartesian_assist(
+    args: argparse.Namespace,
+) -> B601CartesianAssistSession | None:
+    if not getattr(args, "cartesian_assist", False):
+        return None
+    return B601CartesianAssistSession(_cartesian_assist_config_from_args(args))
+
+
+def _validate_cartesian_assist_cli(args: argparse.Namespace) -> None:
+    enabled = bool(getattr(args, "cartesian_assist", False))
+    confirmation = str(getattr(args, "cartesian_assist_confirmation", ""))
+    if not enabled:
+        if confirmation:
+            raise LowGainProbeError(
+                "--cartesian-assist-confirmation requires --cartesian-assist"
+            )
+        return
+    if getattr(args, "single_joint_assist", False):
+        raise LowGainProbeError(
+            "--cartesian-assist and --single-joint-assist are mutually exclusive"
+        )
+    if args.mode != "hold":
+        raise LowGainProbeError("Cartesian assist requires --mode hold")
+    if confirmation != CARTESIAN_ASSIST_CONFIRMATION:
+        raise LowGainProbeError(
+            "Cartesian assist requires --cartesian-assist-confirmation "
+            f"{CARTESIAN_ASSIST_CONFIRMATION}"
+        )
+    if float(args.kp) != 0.0 or float(args.kd) != 0.0:
+        raise LowGainProbeError(
+            "Cartesian assist requires zero software --kp and --kd"
+        )
+    if getattr(args, "guided_pose_axis_protocol", False) or getattr(
+        args,
+        "interactive_pose_axis_protocol",
+        False,
+    ):
+        raise LowGainProbeError(
+            "Cartesian assist cannot be combined with a pose-axis protocol"
+        )
+    _cartesian_assist_config_from_args(args)
+    B601CartesianAssistResponseCriteria(
+        minimum_response_m=args.cartesian_assist_min_response_m,
+        maximum_response_ratio=args.cartesian_assist_max_response_ratio,
+        maximum_lateral_drift_m=args.cartesian_assist_max_lateral_drift_m,
+        maximum_rotation_drift_rad=(
+            args.cartesian_assist_max_rotation_drift_rad
+        ),
+    )
+
+
+def _shared_control_config_payload(
+    runtime: B601SharedControlRuntime,
+) -> dict[str, object]:
+    config = runtime.config
+    return {
+        "position_kp_nm_per_rad": config.position_kp_nm_per_rad,
+        "velocity_kd_nm_s_per_rad": config.velocity_kd_nm_s_per_rad,
+        "max_target_error_rad": config.max_target_error_rad,
+        "max_abs_assist_torque_nm": config.max_abs_assist_torque_nm,
+        "max_assist_torque_rate_nm_s": config.max_assist_torque_rate_nm_s,
+        "authority_rise_per_sec": config.authority_rise_per_sec,
+        "policy_stale_timeout_sec": config.policy_stale_timeout_sec,
+        "maximum_future_skew_sec": config.maximum_future_skew_sec,
+        "joint_names": config.joint_names,
+    }
+
+
+def _shared_control_overlay_limits(
+    runtime: B601SharedControlRuntime,
+    *,
+    total_torque_limits_nm: Sequence[float],
+) -> tuple[float, ...]:
+    total_limits = _non_negative_six(
+        total_torque_limits_nm,
+        name="total_torque_limits_nm",
+    )
+    assist_limits = runtime.config.max_abs_assist_torque_nm
+    if any(
+        assist_limit > total_limit
+        for assist_limit, total_limit in zip(
+            assist_limits,
+            total_limits,
+            strict=True,
+        )
+    ):
+        raise LowGainProbeError(
+            "shared policy assist limit exceeds the final software torque limit"
+        )
+    return assist_limits
+
+
+def _shared_control_frame_payload(
+    frame: B601SharedControlFrame,
+) -> dict[str, object]:
+    decision = frame.decision
+    return {
+        "mode": decision.state.mode.value,
+        "authority": decision.state.authority,
+        "reason": decision.reason,
+        "last_policy_sequence": decision.state.last_policy_sequence,
+        "resume_after_sequence": decision.state.resume_after_sequence,
+        "assist_torque_nm": decision.assist_torque_nm,
+        "raw_target_error_rad": decision.raw_target_error_rad,
+        "bounded_target_error_rad": decision.bounded_target_error_rad,
+        "target_error_limited": decision.target_error_limited,
+        "torque_limited": decision.torque_limited,
+        "slew_limited": decision.slew_limited,
+    }
+
+
+def _step_shared_control_runtime(
+    runtime: B601SharedControlRuntime,
+    *,
+    control_sequence: int,
+    control_timestamp_sec: float,
+    measured_qpos_rad: Sequence[float],
+    measured_qvel_rad_s: Sequence[float],
+    dt_sec: float,
+) -> tuple[B601MitReference, dict[str, object]]:
+    """Produce one auditable assist reference for the sole hardware owner."""
+
+    frame = runtime.step(
+        control_sequence=control_sequence,
+        control_timestamp_sec=control_timestamp_sec,
+        measured_qpos_rad=measured_qpos_rad,
+        measured_qvel_rad_s=measured_qvel_rad_s,
+        dt_sec=dt_sec,
+    )
+    return frame.reference, _shared_control_frame_payload(frame)
 
 
 def compute_software_torque_breakdown(
@@ -5259,6 +5668,81 @@ def compute_cartesian_impedance_overlay(
         "joint_power_w": mapping.joint_power_w,
         "power_error_w": power_error_w,
     }
+
+
+def compute_cartesian_assist_overlay(
+    model: B601PinocchioModel,
+    session: B601CartesianAssistSession,
+    *,
+    qpos_rad: Sequence[float],
+    qvel_rad_s: Sequence[float],
+    timestamp_sec: float,
+    previous_overlay_nm: Sequence[float],
+    dt_sec: float,
+    maximum_lateral_drift_m: float,
+) -> tuple[tuple[float, ...], dict[str, object]]:
+    """Map one bounded world-axis spring into independently bounded J.T torque."""
+
+    if session.state is not B601AssistCommissioningState.ACTIVE:
+        return _ZERO_SIX, {
+            "enabled": False,
+            "state": session.state.value,
+            "commanded_force_n": (0.0, 0.0, 0.0),
+            "joint_torque_overlay_nm": _ZERO_SIX,
+        }
+    config = session.config
+    if session.target_position_m is None:
+        raise LowGainProbeError("active Cartesian assist has no target position")
+    stiffness = [config.lateral_stiffness_n_per_m] * 3
+    damping = [config.lateral_damping_n_s_per_m] * 3
+    stiffness[config.axis_index] = config.stiffness_n_per_m
+    damping[config.axis_index] = config.damping_n_s_per_m
+    spring = B601TranslationalVirtualSpring(
+        anchor_position_m=session.target_position_m,
+        stiffness_n_per_m=tuple(stiffness),
+        damping_n_s_per_m=tuple(damping),
+        max_abs_force_n=(config.max_abs_force_n,) * 3,
+    )
+    raw_overlay, audit = compute_cartesian_impedance_overlay(
+        model,
+        spring,
+        qpos_rad=qpos_rad,
+        qvel_rad_s=qvel_rad_s,
+        max_displacement_m=(
+            2.0 * abs(config.offset_m) + maximum_lateral_drift_m
+        ),
+    )
+    authority = session.authority(timestamp_sec=timestamp_sec)
+    authority_overlay = tuple(authority * value for value in raw_overlay)
+    conditioned_overlay, torque_limited, slew_limited = condition_torque(
+        authority_overlay,
+        previous_overlay_nm,
+        absolute_limits_nm=(config.max_abs_joint_torque_nm,) * 6,
+        max_rate_nm_s=(config.max_joint_torque_rate_nm_s,) * 6,
+        dt_sec=dt_sec,
+    )
+    commanded_force = tuple(
+        authority * float(value) for value in audit["force_n"]
+    )
+    measured_pose = np.asarray(model.forward_kinematics(qpos_rad), dtype=float)
+    rotation_drift_rad = session.rotation_drift_rad(measured_pose)
+    audit.update(
+        {
+            "enabled": True,
+            "state": session.state.value,
+            "axis": config.axis,
+            "target_position_m": session.target_position_m,
+            "authority": authority,
+            "commanded_force_n": commanded_force,
+            "rotation_drift_rad": rotation_drift_rad,
+            "raw_joint_torque_overlay_nm": raw_overlay,
+            "authority_joint_torque_overlay_nm": authority_overlay,
+            "joint_torque_overlay_nm": conditioned_overlay,
+            "joint_torque_limited": torque_limited,
+            "joint_torque_slew_limited": slew_limited,
+        }
+    )
+    return conditioned_overlay, audit
 
 
 def compute_pose_impedance_overlay(
@@ -5542,6 +6026,146 @@ def evaluate_slow_step_response(
         "max_support_drift_rad": max_support_drift,
         "max_support_drift_limit_rad": support_limit,
     }
+
+
+def evaluate_assist_commissioning_response(
+    *,
+    session: B601SingleJointAssistSession | None,
+    samples: Sequence[Mapping[str, object]],
+    active_joint_names: Sequence[str],
+    minimum_response_rad: float = _DEFAULT_ASSIST_MIN_RESPONSE_RAD,
+    maximum_response_ratio: float = _DEFAULT_ASSIST_MAX_RESPONSE_RATIO,
+    maximum_support_drift_rad: float = _DEFAULT_ASSIST_MAX_SUPPORT_DRIFT_RAD,
+) -> dict[str, object]:
+    """Project probe samples into the pure mechanical-response evaluator."""
+
+    if session is None:
+        return {"status": "NOT_APPLICABLE", "passed": True}
+    active_samples = tuple(
+        sample
+        for sample in samples
+        if sample.get("shared_control_commissioning_state") == "active"
+    )
+    measured_qpos_samples = tuple(sample["qpos_rad"] for sample in active_samples)
+    assist_torque_samples = tuple(
+        shared_control["assist_torque_nm"]
+        for sample in active_samples
+        for shared_control in (sample.get("shared_control"),)
+        if isinstance(shared_control, Mapping)
+    )
+    if len(measured_qpos_samples) != len(assist_torque_samples):
+        return {
+            "status": "MISSING_ASSIST_AUDIT",
+            "passed": False,
+            "commissioning_state": session.state.value,
+            "sample_count": len(measured_qpos_samples),
+            "assist_sample_count": len(assist_torque_samples),
+        }
+    return evaluate_single_joint_assist_response(
+        config=session.config,
+        state=session.state,
+        anchor_qpos_rad=session.anchor_qpos_rad,
+        measured_qpos_samples_rad=measured_qpos_samples,
+        assist_torque_samples_nm=assist_torque_samples,
+        active_joint_names=active_joint_names,
+        criteria=B601AssistResponseCriteria(
+            minimum_response_rad=minimum_response_rad,
+            maximum_response_ratio=maximum_response_ratio,
+            maximum_support_drift_rad=maximum_support_drift_rad,
+        ),
+    )
+
+
+def format_assist_response_notice(response: Mapping[str, object]) -> str:
+    """Return one concise operator line; full evidence remains in JSON/log."""
+
+    status = str(response.get("status", "UNKNOWN"))
+    displacement_rad = float(response.get("settled_signed_displacement_rad", 0.0))
+    minimum_rad = float(response.get("minimum_response_rad", 0.0))
+    peak_torque_nm = float(response.get("peak_signed_assist_torque_nm", 0.0))
+    support_drift_rad = float(response.get("max_support_drift_rad", 0.0))
+    return (
+        "[B601] [ASSIST RESPONSE] "
+        f"status={status} "
+        f"displacement={displacement_rad:.6f}rad/"
+        f"{math.degrees(displacement_rad):.3f}deg "
+        f"minimum={minimum_rad:.6f}rad/"
+        f"{math.degrees(minimum_rad):.3f}deg "
+        f"peak_assist={peak_torque_nm:.6f}Nm "
+        f"max_support_drift={support_drift_rad:.6f}rad"
+    )
+
+
+def evaluate_cartesian_assist_commissioning_response(
+    *,
+    session: B601CartesianAssistSession | None,
+    samples: Sequence[Mapping[str, object]],
+    minimum_response_m: float = _DEFAULT_CARTESIAN_ASSIST_MIN_RESPONSE_M,
+    maximum_response_ratio: float = _DEFAULT_CARTESIAN_ASSIST_MAX_RESPONSE_RATIO,
+    maximum_lateral_drift_m: float = (
+        _DEFAULT_CARTESIAN_ASSIST_MAX_LATERAL_DRIFT_M
+    ),
+    maximum_rotation_drift_rad: float = (
+        _DEFAULT_CARTESIAN_ASSIST_MAX_ROTATION_DRIFT_RAD
+    ),
+) -> dict[str, object]:
+    if session is None:
+        return {"status": "NOT_APPLICABLE", "passed": True}
+    active_samples = tuple(
+        sample
+        for sample in samples
+        if sample.get("cartesian_assist_commissioning_state") == "active"
+    )
+    audits = tuple(
+        audit
+        for sample in active_samples
+        for audit in (sample.get("cartesian_assist"),)
+        if isinstance(audit, Mapping)
+    )
+    if len(active_samples) != len(audits):
+        return {
+            "status": "MISSING_CARTESIAN_ASSIST_AUDIT",
+            "passed": False,
+            "commissioning_state": session.state.value,
+            "sample_count": len(active_samples),
+            "assist_sample_count": len(audits),
+        }
+    return evaluate_cartesian_assist_response(
+        config=session.config,
+        state=session.state,
+        anchor_position_m=session.anchor_position_m,
+        measured_position_samples_m=tuple(audit["position_m"] for audit in audits),
+        force_samples_n=tuple(audit["commanded_force_n"] for audit in audits),
+        rotation_drift_samples_rad=tuple(
+            audit["rotation_drift_rad"] for audit in audits
+        ),
+        criteria=B601CartesianAssistResponseCriteria(
+            minimum_response_m=minimum_response_m,
+            maximum_response_ratio=maximum_response_ratio,
+            maximum_lateral_drift_m=maximum_lateral_drift_m,
+            maximum_rotation_drift_rad=maximum_rotation_drift_rad,
+        ),
+    )
+
+
+def format_cartesian_assist_response_notice(
+    response: Mapping[str, object],
+) -> str:
+    status = str(response.get("status", "UNKNOWN"))
+    displacement_m = float(response.get("settled_signed_displacement_m", 0.0))
+    minimum_m = float(response.get("minimum_response_m", 0.0))
+    peak_force_n = float(response.get("peak_signed_force_n", 0.0))
+    lateral_m = float(response.get("max_lateral_drift_m", 0.0))
+    rotation_rad = float(response.get("max_rotation_drift_rad", 0.0))
+    return (
+        "[B601] [CARTESIAN ASSIST RESPONSE] "
+        f"status={status} "
+        f"displacement={1000.0 * displacement_m:.3f}mm "
+        f"minimum={1000.0 * minimum_m:.3f}mm "
+        f"peak_force={peak_force_n:.3f}N "
+        f"max_lateral_drift={1000.0 * lateral_m:.3f}mm "
+        f"max_rotation_drift={math.degrees(rotation_rad):.3f}deg"
+    )
 
 
 def _output_payload(payload: dict[str, object], output: Path | None) -> None:
@@ -5830,6 +6454,7 @@ def _run_latched_fault_hold(
     gravity_joint_bias_nm: Sequence[float] = _ZERO_SIX,
     gravity_coulomb_friction_nm: Sequence[float] = _ZERO_SIX,
     gravity_coulomb_velocity_threshold_rad_s: float = 0.0,
+    gravity_debug_profile: B601GravityCompensationDebugProfile | None = None,
     feedback_reader: Callable[[], B601HardwareState] | None = None,
 ) -> tuple[
     int,
@@ -5873,6 +6498,22 @@ def _run_latched_fault_hold(
         if command_position_limits_rad is None
         else command_position_limits_rad
     )
+    if gravity_debug_profile is not None:
+        # The debug profile is an immutable copy captured before enable.  Do
+        # not read mutable argparse lists or a later overlay while deciding
+        # what to send after a fault: tuning evidence must remain comparable
+        # across ACTIVE, protective, degraded, and recovered hold states.
+        gravity_scale = gravity_debug_profile.gravity_scale
+        driver_kd_nm_s_per_rad = gravity_debug_profile.driver_kd_nm_s_per_rad
+        gravity_joint_scales = gravity_debug_profile.gravity_joint_scales
+        gravity_joint_offsets_rad = gravity_debug_profile.gravity_joint_offsets_rad
+        gravity_joint_bias_nm = gravity_debug_profile.gravity_joint_bias_nm
+        gravity_coulomb_friction_nm = (
+            gravity_debug_profile.gravity_coulomb_friction_nm
+        )
+        gravity_coulomb_velocity_threshold_rad_s = (
+            gravity_debug_profile.gravity_coulomb_velocity_threshold_rad_s
+        )
     latest_tau = previous_tau
     command_profile = profile if hold_profile is None else hold_profile
     monitor_velocity_limit = _positive(
@@ -5917,6 +6558,18 @@ def _run_latched_fault_hold(
     telemetry.setdefault("last_recovery_reset_reason", None)
     telemetry.setdefault("state", "LIVE")
     telemetry.setdefault("last_transition", "entry")
+    telemetry.setdefault(
+        "gravity_parameter_source",
+        (
+            "frozen_debug_run_snapshot"
+            if gravity_debug_profile is not None
+            else "active_controller_arguments"
+        ),
+    )
+    telemetry.setdefault(
+        "gravity_debug_mode",
+        gravity_debug_profile is not None,
+    )
     driver_damping_available = any(
         value > 0.0
         for value in _six(
@@ -6285,6 +6938,11 @@ def _run_latched_fault_hold(
             "FULL DISABLE: press Ctrl-C again or send SIGUSR1.",
         )
     )
+    if gravity_debug_profile is not None:
+        _operator_notice(
+            "[B601] GRAVITY DEBUG HOLD: frozen tuning parameters remain active "
+            "in live/degraded hold; safety limits and full-disable rules are unchanged."
+        )
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
     monitor_observed_at = time.monotonic() - max(0.0, observed_age_sec)
@@ -6509,10 +7167,33 @@ def _run_latched_fault_hold(
     )
 
 
-def run_probe(args: argparse.Namespace) -> dict[str, object]:
+def run_probe(
+    args: argparse.Namespace,
+    *,
+    shared_control_runtime: B601SharedControlRuntime | None = None,
+    shared_control_commissioning: B601SingleJointAssistSession | None = None,
+    cartesian_assist_commissioning: B601CartesianAssistSession | None = None,
+) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
     _validate_cli(args)
+    _validate_shared_control_integration(args, shared_control_runtime)
+    if shared_control_commissioning is not None:
+        if shared_control_runtime is None:
+            raise LowGainProbeError(
+                "shared-control commissioning requires a shared-control runtime"
+            )
+        if shared_control_commissioning.runtime is not shared_control_runtime:
+            raise LowGainProbeError(
+                "commissioning session and hardware owner must share one runtime"
+            )
+    if (
+        shared_control_commissioning is not None
+        and cartesian_assist_commissioning is not None
+    ):
+        raise LowGainProbeError(
+            "joint and Cartesian assist commissioning are mutually exclusive"
+        )
     feedback_source = getattr(args, "feedback_source", "parameter")
     driver_kd_arg = getattr(args, "driver_kd", None)
     driver_kd_nm_s_per_rad = (
@@ -6548,6 +7229,37 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         getattr(args, "gravity_coulomb_velocity_threshold_rad_s", 0.0),
         name="gravity_coulomb_velocity_threshold_rad_s",
     )
+    gravity_scale = _non_negative(args.gravity_scale, name="gravity_scale")
+    gravity_debug_profile = (
+        B601GravityCompensationDebugProfile.capture(
+            gravity_scale=gravity_scale,
+            gravity_joint_scales=gravity_joint_scales,
+            gravity_joint_offsets_rad=gravity_joint_offsets_rad,
+            gravity_joint_bias_nm=gravity_joint_bias_nm,
+            gravity_coulomb_friction_nm=gravity_coulomb_friction_nm,
+            gravity_coulomb_velocity_threshold_rad_s=(
+                gravity_coulomb_velocity_threshold_rad_s
+            ),
+            driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+        )
+        if getattr(args, "gravity_debug_mode", False)
+        else None
+    )
+    if gravity_debug_profile is not None:
+        # Use the same immutable values for ACTIVE and protective paths.  This
+        # is intentionally a no-op for normal modes, which retain the existing
+        # argument-derived behavior and safety contracts.
+        gravity_scale = gravity_debug_profile.gravity_scale
+        driver_kd_nm_s_per_rad = gravity_debug_profile.driver_kd_nm_s_per_rad
+        gravity_joint_scales = gravity_debug_profile.gravity_joint_scales
+        gravity_joint_offsets_rad = gravity_debug_profile.gravity_joint_offsets_rad
+        gravity_joint_bias_nm = gravity_debug_profile.gravity_joint_bias_nm
+        gravity_coulomb_friction_nm = (
+            gravity_debug_profile.gravity_coulomb_friction_nm
+        )
+        gravity_coulomb_velocity_threshold_rad_s = (
+            gravity_debug_profile.gravity_coulomb_velocity_threshold_rad_s
+        )
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
     model, position_limits = _resolve_model_and_limits(source_root)
@@ -6596,14 +7308,27 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             position_limits=position_limits,
             torque_limits_nm=torque_limits,
         )
-    overlay_limits = (
-        tuple(
+    if shared_control_runtime is not None:
+        overlay_limits = _shared_control_overlay_limits(
+            shared_control_runtime,
+            total_torque_limits_nm=torque_limits,
+        )
+    elif cartesian_assist_commissioning is not None:
+        cartesian_joint_limit = (
+            cartesian_assist_commissioning.config.max_abs_joint_torque_nm
+        )
+        if any(cartesian_joint_limit > limit for limit in torque_limits):
+            raise LowGainProbeError(
+                "Cartesian assist joint-torque cap exceeds the final torque envelope"
+            )
+        overlay_limits = (cartesian_joint_limit,) * 6
+    elif args.mode in ("cartesian-hold", "pose-hold"):
+        overlay_limits = tuple(
             value * args.cartesian_overlay_limit_scale
             for value in torque_limits
         )
-        if args.mode in ("cartesian-hold", "pose-hold")
-        else _ZERO_SIX
-    )
+    else:
+        overlay_limits = _ZERO_SIX
     profile = build_software_profile(
         kp=args.kp,
         kd=args.kd,
@@ -6643,6 +7368,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "protective_hold_kd",
             _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
         ),
+        preserve_zero_driver_damping=gravity_debug_profile is not None,
     )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
@@ -6655,6 +7381,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     previous_feedback_time: float | None = None
     previous_guard_qvel: tuple[float, ...] | None = None
     previous_tau = _ZERO_SIX
+    previous_cartesian_assist_overlay = _ZERO_SIX
     last_verified_gravity_tau: tuple[float, ...] | None = None
     pre_enable_q: tuple[float, ...] | None = None
     initial_q: tuple[float, ...] | None = None
@@ -6690,6 +7417,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
     control_completion_reason: str | None = None
+    assist_commissioning_response: dict[str, object] | None = None
+    cartesian_assist_commissioning_response: dict[str, object] | None = None
+    assist_guard_rejection: dict[str, object] | None = None
+    cartesian_assist_guard_rejection: dict[str, object] | None = None
     primary_error: Exception | None = None
     preflight_disable: B601ModeReceipt | None = None
     mode_receipt: B601ModeReceipt | None = None
@@ -6778,6 +7509,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     operator_keys: OperatorKeyReader | None = None
     calibration_ready = False
     startup_replay_ready = False
+    assist_ready = False
+    cartesian_assist_ready = False
     last_control_elapsed_sec = 0.0
     connected = False
     enabled = False
@@ -6789,6 +7522,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         if feedback_source == "active-report"
         else None
     )
+    if gravity_debug_profile is not None:
+        _operator_notice(
+            "[B601] GRAVITY DEBUG MODE: this run freezes gravity/driver-Kd "
+            "parameters through protective/degraded hold; safety limits and "
+            "full-disable rules are unchanged."
+        )
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigusr1 = signal.getsignal(signal.SIGUSR1)
 
@@ -6848,6 +7587,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             calibration_capture is not None
             or startup_replay_capture is not None
             or interactive_pose_axis_guide is not None
+            or shared_control_commissioning is not None
+            or cartesian_assist_commissioning is not None
         ):
             # Establish the interactive input path before opening the backend or
             # changing any drive state.
@@ -7051,7 +7792,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             measured_qpos_rad=arming_q,
             measured_qvel_rad_s=arming_qvel,
             profile=startup_lock_profile,
-            gravity_scale=args.gravity_scale,
+            gravity_scale=gravity_scale,
             gravity_joint_scales=gravity_joint_scales,
             gravity_joint_offsets_rad=gravity_joint_offsets_rad,
             gravity_joint_bias_nm=gravity_joint_bias_nm,
@@ -7200,7 +7941,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 measured_qpos_rad=arming_settle_previous_q,
                 measured_qvel_rad_s=arming_settle_last_qvel,
                 profile=startup_lock_profile,
-                gravity_scale=args.gravity_scale,
+                gravity_scale=gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
                 gravity_joint_offsets_rad=gravity_joint_offsets_rad,
                 gravity_joint_bias_nm=gravity_joint_bias_nm,
@@ -7703,6 +8444,237 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             action_count=len(interactive_pose_axis_guide.actions),
                         )
                     )
+            if (
+                shared_control_commissioning is not None
+                and handoff_fraction >= 1.0
+            ):
+                if not assist_ready:
+                    if operator_keys is None:
+                        raise LowGainProbeError(
+                            "single-joint assist operator terminal is unavailable"
+                        )
+                    operator_keys.flush()
+                    assist_ready = True
+                    assist_config = shared_control_commissioning.config
+                    _operator_notice(
+                        "[B601] [ASSIST READY] gravity and damping only. "
+                        "Release the arm, wait until stationary, then press A "
+                        "once without Enter. Press C to withdraw active assist."
+                    )
+                    _operator_notice(
+                        "[B601] [ASSIST LIMITS] "
+                        f"joint={assist_config.joint_name} "
+                        f"offset={assist_config.offset_rad:.6f}rad "
+                        f"torque_cap={assist_config.max_abs_assist_torque_nm:.6f}Nm "
+                        "effective_static_peak="
+                        f"{assist_config.maximum_static_assist_torque_nm:.6f}Nm "
+                        f"duration={assist_config.assist_duration_sec:.3f}s"
+                    )
+                keys = operator_keys.poll_keys() if operator_keys is not None else frozenset()
+                assist_state = shared_control_commissioning.state
+                if "c" in keys and assist_state in {
+                    B601AssistCommissioningState.COUNTDOWN,
+                    B601AssistCommissioningState.ACTIVE,
+                }:
+                    assist_event = shared_control_commissioning.cancel(
+                        timestamp_sec=state.receive_timestamp_sec,
+                        detail=(
+                            "operator C withdrew assist; no return target; "
+                            "gravity and damping remain"
+                        ),
+                    )
+                    _operator_notice(
+                        f"[B601] [ASSIST {assist_event.event}] {assist_event.detail}"
+                    )
+                elif (
+                    "a" in keys
+                    and assist_state is B601AssistCommissioningState.WAITING
+                ):
+                    try:
+                        assist_event = shared_control_commissioning.arm(
+                            measured_qpos_rad=q,
+                            measured_qvel_rad_s=qvel,
+                            position_limits_rad=position_limits,
+                            timestamp_sec=state.receive_timestamp_sec,
+                        )
+                    except ValueError as exc:
+                        _operator_notice(f"[B601] [ASSIST NOT ARMED] {exc}")
+                    else:
+                        _operator_notice(
+                            f"[B601] [ASSIST {assist_event.event}] "
+                            f"{assist_event.detail}"
+                        )
+                for assist_event in shared_control_commissioning.step(
+                    measured_qpos_rad=q,
+                    measured_qvel_rad_s=qvel,
+                    timestamp_sec=state.receive_timestamp_sec,
+                ):
+                    _operator_notice(
+                        f"[B601] [ASSIST {assist_event.event}] {assist_event.detail}"
+                    )
+                try:
+                    shared_control_commissioning.validate_active_motion(
+                        q,
+                        criteria=B601AssistResponseCriteria(
+                            minimum_response_rad=args.assist_min_response_rad,
+                            maximum_response_ratio=args.assist_max_response_ratio,
+                            maximum_support_drift_rad=(
+                                args.assist_max_support_drift_rad
+                            ),
+                        ),
+                    )
+                except ValueError as exc:
+                    assist_event = shared_control_commissioning.cancel(
+                        timestamp_sec=state.receive_timestamp_sec,
+                        detail=f"active motion guard withdrew assist: {exc}",
+                    )
+                    _operator_notice(
+                        f"[B601] [ASSIST {assist_event.event}] "
+                        f"{assist_event.detail}"
+                    )
+                    assist_guard_rejection = {
+                        "reason": str(exc),
+                        "detail": assist_event.detail,
+                        "feedback_timestamp_sec": state.receive_timestamp_sec,
+                        "measured_qpos_rad": q,
+                        "measured_qvel_rad_s": qvel,
+                        "anchor_qpos_rad": (
+                            shared_control_commissioning.anchor_qpos_rad
+                        ),
+                        "command_dispatched": False,
+                    }
+                    stop_reason = assist_event.detail
+                    break
+            if (
+                cartesian_assist_commissioning is not None
+                and handoff_fraction >= 1.0
+            ):
+                if not cartesian_assist_ready:
+                    if operator_keys is None:
+                        raise LowGainProbeError(
+                            "Cartesian assist operator terminal is unavailable"
+                        )
+                    operator_keys.flush()
+                    cartesian_assist_ready = True
+                    config_value = cartesian_assist_commissioning.config
+                    _operator_notice(
+                        "[B601] [CARTESIAN ASSIST READY] gravity and damping only. "
+                        "Release the arm, wait until stationary, then press A "
+                        "once without Enter. Press C to withdraw active assist."
+                    )
+                    _operator_notice(
+                        "[B601] [CARTESIAN ASSIST LIMITS] "
+                        f"axis={config_value.axis} "
+                        f"offset={config_value.offset_m:.6f}m "
+                        f"force_cap={config_value.max_abs_force_n:.3f}N "
+                        "effective_static_peak="
+                        f"{config_value.maximum_static_force_n:.3f}N "
+                        "joint_torque_cap="
+                        f"{config_value.max_abs_joint_torque_nm:.3f}Nm "
+                        f"duration={config_value.assist_duration_sec:.3f}s"
+                    )
+                keys = (
+                    operator_keys.poll_keys()
+                    if operator_keys is not None
+                    else frozenset()
+                )
+                cartesian_state = cartesian_assist_commissioning.state
+                if "c" in keys and cartesian_state in {
+                    B601AssistCommissioningState.COUNTDOWN,
+                    B601AssistCommissioningState.ACTIVE,
+                }:
+                    event = cartesian_assist_commissioning.cancel(
+                        timestamp_sec=state.receive_timestamp_sec,
+                        detail=(
+                            "operator C withdrew Cartesian assist; no return "
+                            "target; gravity and damping remain"
+                        ),
+                    )
+                    previous_cartesian_assist_overlay = _ZERO_SIX
+                    _operator_notice(
+                        f"[B601] [CARTESIAN ASSIST {event.event}] {event.detail}"
+                    )
+                elif (
+                    "a" in keys
+                    and cartesian_state is B601AssistCommissioningState.WAITING
+                ):
+                    measured_pose = np.asarray(
+                        model.forward_kinematics(q),
+                        dtype=float,
+                    )
+                    try:
+                        event = cartesian_assist_commissioning.arm(
+                            measured_pose=measured_pose,
+                            measured_qvel_rad_s=qvel,
+                            timestamp_sec=state.receive_timestamp_sec,
+                        )
+                    except ValueError as exc:
+                        _operator_notice(
+                            f"[B601] [CARTESIAN ASSIST NOT ARMED] {exc}"
+                        )
+                    else:
+                        _operator_notice(
+                            f"[B601] [CARTESIAN ASSIST {event.event}] "
+                            f"{event.detail}"
+                        )
+                for event in cartesian_assist_commissioning.step(
+                    measured_qvel_rad_s=qvel,
+                    timestamp_sec=state.receive_timestamp_sec,
+                ):
+                    _operator_notice(
+                        f"[B601] [CARTESIAN ASSIST {event.event}] {event.detail}"
+                    )
+                measured_pose = np.asarray(
+                    model.forward_kinematics(q),
+                    dtype=float,
+                )
+                try:
+                    cartesian_assist_commissioning.validate_active_pose(
+                        measured_pose,
+                        criteria=B601CartesianAssistResponseCriteria(
+                            minimum_response_m=(
+                                args.cartesian_assist_min_response_m
+                            ),
+                            maximum_response_ratio=(
+                                args.cartesian_assist_max_response_ratio
+                            ),
+                            maximum_lateral_drift_m=(
+                                args.cartesian_assist_max_lateral_drift_m
+                            ),
+                            maximum_rotation_drift_rad=(
+                                args.cartesian_assist_max_rotation_drift_rad
+                            ),
+                        ),
+                    )
+                except ValueError as exc:
+                    event = cartesian_assist_commissioning.cancel(
+                        timestamp_sec=state.receive_timestamp_sec,
+                        detail=f"active Cartesian motion guard withdrew assist: {exc}",
+                    )
+                    previous_cartesian_assist_overlay = _ZERO_SIX
+                    _operator_notice(
+                        f"[B601] [CARTESIAN ASSIST {event.event}] {event.detail}"
+                    )
+                    cartesian_assist_guard_rejection = {
+                        "reason": str(exc),
+                        "detail": event.detail,
+                        "feedback_timestamp_sec": state.receive_timestamp_sec,
+                        "measured_qpos_rad": q,
+                        "measured_qvel_rad_s": qvel,
+                        "measured_pose": measured_pose.tolist(),
+                        "anchor_position_m": (
+                            cartesian_assist_commissioning.anchor_position_m
+                        ),
+                        "anchor_rotation": (
+                            cartesian_assist_commissioning.anchor_rotation
+                        ),
+                        "target_position_m": (
+                            cartesian_assist_commissioning.target_position_m
+                        ),
+                        "command_dispatched": False,
+                    }
+                    stop_reason = event.detail
+                    break
             if calibration_capture is not None:
                 if handoff_fraction >= 1.0 and not calibration_ready:
                     if operator_keys is None:
@@ -7829,6 +8801,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     step_direction=args.step_direction,
                     position_limits_rad=position_limits,
                 )
+            shared_reference: B601MitReference | None = None
+            shared_control_audit: dict[str, object] | None = None
+            if shared_control_runtime is not None:
+                shared_reference, shared_control_audit = (
+                    _step_shared_control_runtime(
+                        shared_control_runtime,
+                        control_sequence=state.sequence,
+                        control_timestamp_sec=state.receive_timestamp_sec,
+                        measured_qpos_rad=q,
+                        measured_qvel_rad_s=qvel,
+                        dt_sec=dt,
+                    )
+                )
+                qref = shared_reference.qpos_rad
+                qvel_ref = shared_reference.qvel_rad_s
             max_error = max(
                 abs(current - reference)
                 for index, (current, reference) in enumerate(
@@ -7844,8 +8831,29 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 break
             cartesian_audit: dict[str, object] | None = None
             pose_audit: dict[str, object] | None = None
-            joint_torque_overlay_nm = _ZERO_SIX
-            if args.mode == "cartesian-hold":
+            cartesian_assist_audit: dict[str, object] | None = None
+            joint_torque_overlay_nm = (
+                shared_reference.joint_torque_overlay_nm
+                if shared_reference is not None
+                else _ZERO_SIX
+            )
+            if cartesian_assist_commissioning is not None:
+                joint_torque_overlay_nm, cartesian_assist_audit = (
+                    compute_cartesian_assist_overlay(
+                        model,
+                        cartesian_assist_commissioning,
+                        qpos_rad=q,
+                        qvel_rad_s=qvel,
+                        timestamp_sec=state.receive_timestamp_sec,
+                        previous_overlay_nm=previous_cartesian_assist_overlay,
+                        dt_sec=dt,
+                        maximum_lateral_drift_m=(
+                            args.cartesian_assist_max_lateral_drift_m
+                        ),
+                    )
+                )
+                previous_cartesian_assist_overlay = joint_torque_overlay_nm
+            elif args.mode == "cartesian-hold":
                 if cartesian_spring is None:
                     raise LowGainProbeError(
                         "Cartesian impedance spring was not armed"
@@ -7892,7 +8900,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 measured_qpos_rad=q,
                 measured_qvel_rad_s=qvel,
                 profile=profile,
-                gravity_scale=args.gravity_scale,
+                gravity_scale=gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
                 gravity_joint_offsets_rad=gravity_joint_offsets_rad,
                 gravity_joint_bias_nm=gravity_joint_bias_nm,
@@ -7929,7 +8937,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 measured_qpos_rad=q,
                 measured_qvel_rad_s=qvel,
                 profile=startup_lock_profile,
-                gravity_scale=args.gravity_scale,
+                gravity_scale=gravity_scale,
                 gravity_joint_scales=gravity_joint_scales,
                 gravity_joint_offsets_rad=gravity_joint_offsets_rad,
                 gravity_joint_bias_nm=gravity_joint_bias_nm,
@@ -8020,6 +9028,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "qref_rad": qref,
                     "dispatch_qref_rad": dispatch_reference.qpos_rad,
                     "qvel_ref_rad_s": qvel_ref,
+                    "shared_control": shared_control_audit,
+                    "shared_control_commissioning_state": (
+                        shared_control_commissioning.state.value
+                        if shared_control_commissioning is not None
+                        else None
+                    ),
+                    "cartesian_assist": cartesian_assist_audit,
+                    "cartesian_assist_commissioning_state": (
+                        cartesian_assist_commissioning.state.value
+                        if cartesian_assist_commissioning is not None
+                        else None
+                    ),
                     "startup_state": startup_state_history[-1],
                     "gravity_ramp_fraction": gravity_ramp,
                     "startup_handoff_fraction": handoff_fraction,
@@ -8130,6 +9150,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 and interactive_pose_axis_guide.completed
             ):
                 break
+            if (
+                shared_control_commissioning is not None
+                and shared_control_commissioning.state
+                is B601AssistCommissioningState.COMPLETE
+            ):
+                break
+            if (
+                cartesian_assist_commissioning is not None
+                and cartesian_assist_commissioning.state
+                is B601AssistCommissioningState.COMPLETE
+            ):
+                break
         if stop_reason is None:
             if (
                 interactive_pose_axis_guide is not None
@@ -8141,7 +9173,126 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "[B601] INTERACTIVE CAPTURE COMPLETE: entering protective hold; "
                     "Ctrl-C or SIGUSR1 requests final full disable."
                 )
+            elif (
+                shared_control_commissioning is not None
+                and shared_control_commissioning.state
+                is B601AssistCommissioningState.COMPLETE
+            ):
+                stop["requested"] = True
+                control_completion_reason = "single_joint_assist_complete"
+                assist_commissioning_response = (
+                    evaluate_assist_commissioning_response(
+                        session=shared_control_commissioning,
+                        samples=samples,
+                        active_joint_names=active_joint_names,
+                        minimum_response_rad=args.assist_min_response_rad,
+                        maximum_response_ratio=args.assist_max_response_ratio,
+                        maximum_support_drift_rad=(
+                            args.assist_max_support_drift_rad
+                        ),
+                    )
+                )
+                _operator_notice(
+                    format_assist_response_notice(assist_commissioning_response)
+                )
+                _operator_notice(
+                    "[B601] ASSIST TRIAL COMPLETE: command flow completed; "
+                    f"mechanical acceptance="
+                    f"{assist_commissioning_response['status']}. Entering "
+                    "protective hold with assist zero and no return target. "
+                    "Ctrl-C or SIGUSR1 requests final full disable."
+                )
+            elif (
+                cartesian_assist_commissioning is not None
+                and cartesian_assist_commissioning.state
+                is B601AssistCommissioningState.COMPLETE
+            ):
+                stop["requested"] = True
+                control_completion_reason = "cartesian_assist_complete"
+                cartesian_assist_commissioning_response = (
+                    evaluate_cartesian_assist_commissioning_response(
+                        session=cartesian_assist_commissioning,
+                        samples=samples,
+                        minimum_response_m=args.cartesian_assist_min_response_m,
+                        maximum_response_ratio=(
+                            args.cartesian_assist_max_response_ratio
+                        ),
+                        maximum_lateral_drift_m=(
+                            args.cartesian_assist_max_lateral_drift_m
+                        ),
+                        maximum_rotation_drift_rad=(
+                            args.cartesian_assist_max_rotation_drift_rad
+                        ),
+                    )
+                )
+                _operator_notice(
+                    format_cartesian_assist_response_notice(
+                        cartesian_assist_commissioning_response
+                    )
+                )
+                _operator_notice(
+                    "[B601] CARTESIAN ASSIST TRIAL COMPLETE: command flow "
+                    "completed; mechanical acceptance="
+                    f"{cartesian_assist_commissioning_response['status']}. "
+                    "Entering protective hold with assist zero and no return "
+                    "target. Ctrl-C or SIGUSR1 requests final full disable."
+                )
             else:
+                if shared_control_commissioning is not None:
+                    assist_state = shared_control_commissioning.state
+                    if assist_state in {
+                        B601AssistCommissioningState.WAITING,
+                        B601AssistCommissioningState.COUNTDOWN,
+                        B601AssistCommissioningState.ACTIVE,
+                    }:
+                        assist_event = shared_control_commissioning.cancel(
+                            timestamp_sec=(
+                                previous_feedback_time
+                                if previous_feedback_time is not None
+                                else time.monotonic()
+                            ),
+                            detail=(
+                                "control duration expired before the one-shot "
+                                "assist trial completed"
+                            ),
+                        )
+                        _operator_notice(
+                            f"[B601] [ASSIST INCOMPLETE] {assist_event.detail}; "
+                            "assist is zero and gravity/damping remain active."
+                        )
+                    elif assist_state is B601AssistCommissioningState.CANCELLED:
+                        _operator_notice(
+                            "[B601] [ASSIST INCOMPLETE] trial was cancelled; "
+                            "assist is zero and gravity/damping remain active."
+                        )
+                if cartesian_assist_commissioning is not None:
+                    cartesian_state = cartesian_assist_commissioning.state
+                    if cartesian_state in {
+                        B601AssistCommissioningState.WAITING,
+                        B601AssistCommissioningState.COUNTDOWN,
+                        B601AssistCommissioningState.ACTIVE,
+                    }:
+                        event = cartesian_assist_commissioning.cancel(
+                            timestamp_sec=(
+                                previous_feedback_time
+                                if previous_feedback_time is not None
+                                else time.monotonic()
+                            ),
+                            detail=(
+                                "control duration expired before the one-shot "
+                                "Cartesian assist trial completed"
+                            ),
+                        )
+                        _operator_notice(
+                            "[B601] [CARTESIAN ASSIST INCOMPLETE] "
+                            f"{event.detail}; assist is zero and gravity/damping "
+                            "remain active."
+                        )
+                    elif cartesian_state is B601AssistCommissioningState.CANCELLED:
+                        _operator_notice(
+                            "[B601] [CARTESIAN ASSIST INCOMPLETE] trial was "
+                            "cancelled; assist is zero and gravity/damping remain active."
+                        )
                 control_completion_reason = complete_active_duration(
                     stop=stop,
                     calibration_capture=calibration_capture,
@@ -8378,7 +9529,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
                             max_rebase_rad=args.fault_hold_max_rebase_rad,
                             profile=profile,
-                            gravity_scale=args.gravity_scale,
+                            gravity_scale=gravity_scale,
                             previous_tau=previous_tau,
                             torque_limits_nm=torque_limits,
                             rate_hz=args.rate_hz,
@@ -8408,6 +9559,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             gravity_coulomb_velocity_threshold_rad_s=(
                                 gravity_coulomb_velocity_threshold_rad_s
                             ),
+                            gravity_debug_profile=gravity_debug_profile,
                             feedback_reader=read_admitted_control_feedback,
                         )
                         cleanup_errors.extend(hold_errors)
@@ -8575,12 +9727,44 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             or interactive_pose_axis_guide.completed
         )
     )
+    if assist_commissioning_response is None:
+        assist_commissioning_response = evaluate_assist_commissioning_response(
+            session=shared_control_commissioning,
+            samples=samples,
+            active_joint_names=active_joint_names,
+            minimum_response_rad=args.assist_min_response_rad,
+            maximum_response_ratio=args.assist_max_response_ratio,
+            maximum_support_drift_rad=args.assist_max_support_drift_rad,
+        )
+    shared_control_commissioning_passed = bool(
+        assist_commissioning_response["passed"]
+    )
+    if cartesian_assist_commissioning_response is None:
+        cartesian_assist_commissioning_response = (
+            evaluate_cartesian_assist_commissioning_response(
+                session=cartesian_assist_commissioning,
+                samples=samples,
+                minimum_response_m=args.cartesian_assist_min_response_m,
+                maximum_response_ratio=args.cartesian_assist_max_response_ratio,
+                maximum_lateral_drift_m=(
+                    args.cartesian_assist_max_lateral_drift_m
+                ),
+                maximum_rotation_drift_rad=(
+                    args.cartesian_assist_max_rotation_drift_rad
+                ),
+            )
+        )
+    cartesian_assist_commissioning_passed = bool(
+        cartesian_assist_commissioning_response["passed"]
+    )
     acceptance_passed = (
         control_passed
         and response_passed
         and calibration_passed
         and startup_replay_passed
         and operator_guidance_passed
+        and shared_control_commissioning_passed
+        and cartesian_assist_commissioning_passed
     )
     max_abs_requested = max(
         (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
@@ -8707,6 +9891,24 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "transport": "motorbridge_wired_local",
         "feedback_source": feedback_source,
+        "gravity_debug": {
+            "enabled": gravity_debug_profile is not None,
+            "parameter_source": (
+                "frozen_run_snapshot"
+                if gravity_debug_profile is not None
+                else "normal_controller_arguments"
+            ),
+            "frozen_profile": (
+                gravity_debug_profile.as_dict()
+                if gravity_debug_profile is not None
+                else None
+            ),
+            "protective_hold_semantics": (
+                "live_and_degraded_hold_reuse_the_frozen_snapshot"
+                if gravity_debug_profile is not None
+                else "existing_normal_hold_path_unchanged"
+            ),
+        },
         "feedback_freshness": {
             "control_admitted": active_report_gate is not None,
             "host_receive_sequence_and_age_verified": (
@@ -8915,6 +10117,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "protective_hold": {
             "latched": protective_hold_latched,
+            "gravity_debug_mode": gravity_debug_profile is not None,
+            "gravity_parameter_source": (
+                "frozen_debug_run_snapshot"
+                if gravity_debug_profile is not None
+                else "active_controller_arguments"
+            ),
             "entry_reason": protective_hold_entry_reason,
             "joint_names": _FAULT_HOLD_JOINTS,
             "reference_source": protective_hold_reference_source,
@@ -8948,12 +10156,29 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kp_nm_per_rad": protective_hold_profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": protective_hold_profile.damping_kd_nm_s_per_rad,
             "damping_owner": (
-                "driver_kd_where_nonzero_else_protective_hold_software_kd"
+                "frozen_debug_driver_kd_exact"
+                if gravity_debug_profile is not None
+                else "driver_kd_where_nonzero_else_protective_hold_software_kd"
             ),
-            "default_software_damping_kd_nm_s_per_rad": getattr(
-                args,
-                "protective_hold_kd",
-                _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+            "software_damping_fallback_enabled": bool(
+                protective_hold_profile.metadata.get(
+                    "software_damping_fallback_enabled",
+                    True,
+                )
+            ),
+            "preserve_zero_driver_damping": bool(
+                protective_hold_profile.metadata.get(
+                    "preserve_zero_driver_damping",
+                    False,
+                )
+            ),
+            "default_software_damping_kd_nm_s_per_rad": protective_hold_profile.metadata.get(
+                "default_software_damping_kd_nm_s_per_rad",
+                getattr(
+                    args,
+                    "protective_hold_kd",
+                    _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+                ),
             ),
             "reference_semantics": "current_feedback_pose_each_cycle",
             "position_lock": False,
@@ -9007,7 +10232,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "profile": {
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
-            "gravity_scale": args.gravity_scale,
+            "gravity_scale": gravity_scale,
             "gravity_joint_scales": gravity_joint_scales,
             "gravity_joint_offsets_rad": gravity_joint_offsets_rad,
             "gravity_joint_bias_nm": gravity_joint_bias_nm,
@@ -9019,13 +10244,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 "scale*joint_scale*g(q+offset)+bias+friction*direction(qvel)"
             ),
             "effective_gravity_multipliers": tuple(
-                args.gravity_scale * value for value in gravity_joint_scales
+                gravity_scale * value for value in gravity_joint_scales
             ),
             "gravity_ramp": {
                 "type": "full_vector_immediate_with_total_torque_slew",
                 "duration_sec": args.torque_rise_time_sec,
                 "applies_to": "complete_six_joint_gravity_vector",
-                "scalar_gravity_at_first_active_frame": args.gravity_scale,
+                "scalar_gravity_at_first_active_frame": gravity_scale,
                 "joint_multipliers_at_first_active_frame": gravity_joint_scales,
                 "independent_scalar_ramp": False,
                 "non_gravity_terms_scaled": False,
@@ -9037,7 +10262,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "vendor_kp_nm_per_rad": _ZERO_SIX,
             "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
             "torque_owner": (
-                "software_position_gravity_task_wrench; optional_driver_damping"
+                "software_gravity_policy_assist; optional_driver_damping"
+                if shared_control_runtime is not None
+                else "software_position_gravity_task_wrench; optional_driver_damping"
             ),
             "startup_lock_profile": {
                 "software_kp_nm_per_rad": startup_lock_profile.position_kp_nm_per_rad,
@@ -9054,13 +10281,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "slow_step_response": slow_step_response,
         "joint_impedance": {
-            "enabled": args.mode in (
-                "hold",
-                "gravity-calibration",
-                "startup-replay",
+            "enabled": (
+                shared_control_runtime is None
+                and args.mode
+                in (
+                    "hold",
+                    "gravity-calibration",
+                    "startup-replay",
+                )
             ),
             "reference_source": (
-                "interactive_current_or_R_captured_qpos"
+                "current_measured_q_each_tick"
+                if shared_control_runtime is not None
+                else "interactive_current_or_R_captured_qpos"
                 if args.mode == "gravity-calibration"
                 else (
                     "operator_R_captured_replay_qpos"
@@ -9069,7 +10302,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 )
             ),
             "reference_qpos_rad": (
-                startup_replay_capture.reference_qpos_rad
+                None
+                if shared_control_runtime is not None
+                else startup_replay_capture.reference_qpos_rad
                 if startup_replay_capture is not None
                 else (initial_q if args.mode == "hold" else None)
             ),
@@ -9091,6 +10326,92 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 getattr(args, "apply_driver_torque_limits", False)
             ),
             "absolute_pose_commanded": False,
+        },
+        "shared_control": {
+            "enabled": shared_control_runtime is not None,
+            "injection": (
+                "in_process_runtime_to_existing_single_owner"
+                if shared_control_runtime is not None
+                else None
+            ),
+            "config": (
+                _shared_control_config_payload(shared_control_runtime)
+                if shared_control_runtime is not None
+                else None
+            ),
+            "final_state": (
+                {
+                    "mode": shared_control_runtime.state.mode.value,
+                    "authority": shared_control_runtime.state.authority,
+                    "last_policy_sequence": (
+                        shared_control_runtime.state.last_policy_sequence
+                    ),
+                    "resume_after_sequence": (
+                        shared_control_runtime.state.resume_after_sequence
+                    ),
+                }
+                if shared_control_runtime is not None
+                else None
+            ),
+            "hardware_acceptance": "NOT_CLAIMED",
+            "commissioning": (
+                shared_control_commissioning.audit()
+                if shared_control_commissioning is not None
+                else None
+            ),
+            "commissioning_acceptance": (
+                assist_commissioning_response["status"]
+            ),
+            "commissioning_response": assist_commissioning_response,
+            "guard_rejection": assist_guard_rejection,
+        },
+        "cartesian_assist": {
+            "enabled": cartesian_assist_commissioning is not None,
+            "frame": "base_link world-aligned translation",
+            "mapping": "bounded wrench -> LOCAL_WORLD_ALIGNED J.T -> bounded joint overlay",
+            "commissioning": (
+                cartesian_assist_commissioning.audit()
+                if cartesian_assist_commissioning is not None
+                else None
+            ),
+            "config": (
+                {
+                    "axis": cartesian_assist_commissioning.config.axis,
+                    "offset_m": cartesian_assist_commissioning.config.offset_m,
+                    "stiffness_n_per_m": (
+                        cartesian_assist_commissioning.config.stiffness_n_per_m
+                    ),
+                    "damping_n_s_per_m": (
+                        cartesian_assist_commissioning.config.damping_n_s_per_m
+                    ),
+                    "lateral_stiffness_n_per_m": (
+                        cartesian_assist_commissioning.config.lateral_stiffness_n_per_m
+                    ),
+                    "lateral_damping_n_s_per_m": (
+                        cartesian_assist_commissioning.config.lateral_damping_n_s_per_m
+                    ),
+                    "max_abs_force_n": (
+                        cartesian_assist_commissioning.config.max_abs_force_n
+                    ),
+                    "max_abs_joint_torque_nm": (
+                        cartesian_assist_commissioning.config.max_abs_joint_torque_nm
+                    ),
+                    "max_joint_torque_rate_nm_s": (
+                        cartesian_assist_commissioning.config.max_joint_torque_rate_nm_s
+                    ),
+                    "maximum_rotation_drift_rad": (
+                        args.cartesian_assist_max_rotation_drift_rad
+                    ),
+                }
+                if cartesian_assist_commissioning is not None
+                else None
+            ),
+            "commissioning_acceptance": (
+                cartesian_assist_commissioning_response["status"]
+            ),
+            "commissioning_response": cartesian_assist_commissioning_response,
+            "guard_rejection": cartesian_assist_guard_rejection,
+            "hardware_acceptance": "NOT_CLAIMED",
         },
         "cartesian_impedance": {
             "enabled": args.mode == "cartesian-hold",
@@ -9387,12 +10708,194 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional software damping gain override for --joint only",
     )
     parser.add_argument(
+        "--single-joint-assist",
+        action="store_true",
+        help=(
+            "opt in to one operator-armed relative joint policy-assist trial "
+            "inside the existing gravity/damping owner"
+        ),
+    )
+    parser.add_argument(
+        "--assist-joint",
+        choices=_ALL_JOINTS,
+        default="joint6",
+    )
+    parser.add_argument(
+        "--assist-offset-rad",
+        type=float,
+        default=0.10,
+        help="signed relative target offset captured from fresh measured state",
+    )
+    parser.add_argument("--assist-kp-nm-per-rad", type=float, default=1.0)
+    parser.add_argument("--assist-kd-nm-s-per-rad", type=float, default=0.0)
+    parser.add_argument(
+        "--assist-max-target-error-rad",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument("--assist-max-torque-nm", type=float, default=0.05)
+    parser.add_argument(
+        "--assist-torque-slew-nm-s",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--assist-authority-rise-per-sec",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--assist-command-stale-timeout-sec",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument("--assist-countdown-sec", type=float, default=3.0)
+    parser.add_argument("--assist-duration-sec", type=float, default=4.0)
+    parser.add_argument(
+        "--assist-stationarity-limit-rad-s",
+        type=float,
+        default=0.02,
+    )
+    parser.add_argument(
+        "--assist-min-response-rad",
+        type=float,
+        default=_DEFAULT_ASSIST_MIN_RESPONSE_RAD,
+        help=(
+            "minimum settled correct-direction joint response required for "
+            "real commissioning acceptance"
+        ),
+    )
+    parser.add_argument(
+        "--assist-max-response-ratio",
+        type=float,
+        default=_DEFAULT_ASSIST_MAX_RESPONSE_RATIO,
+        help="maximum measured response relative to the requested offset",
+    )
+    parser.add_argument(
+        "--assist-max-support-drift-rad",
+        type=float,
+        default=_DEFAULT_ASSIST_MAX_SUPPORT_DRIFT_RAD,
+        help="maximum observed drift of any non-target arm joint",
+    )
+    parser.add_argument(
+        "--assist-confirmation",
+        default="",
+        help=(
+            "second exact acknowledgement required by --single-joint-assist"
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist",
+        action="store_true",
+        help=(
+            "opt in to one operator-armed world-aligned translational assist "
+            "trial inside the existing gravity/damping owner"
+        ),
+    )
+    parser.add_argument(
+        "--cartesian-assist-axis",
+        choices=("x", "y", "z"),
+        default="x",
+    )
+    parser.add_argument("--cartesian-assist-offset-m", type=float, default=0.01)
+    parser.add_argument(
+        "--cartesian-assist-stiffness-n-per-m",
+        type=float,
+        default=50.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-damping-n-s-per-m",
+        type=float,
+        default=3.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-lateral-stiffness-n-per-m",
+        type=float,
+        default=30.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-lateral-damping-n-s-per-m",
+        type=float,
+        default=2.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-force-n",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-joint-torque-nm",
+        type=float,
+        default=0.15,
+    )
+    parser.add_argument(
+        "--cartesian-assist-joint-torque-slew-nm-s",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--cartesian-assist-authority-rise-per-sec",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--cartesian-assist-countdown-sec",
+        type=float,
+        default=3.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-duration-sec",
+        type=float,
+        default=6.0,
+    )
+    parser.add_argument(
+        "--cartesian-assist-stationarity-limit-rad-s",
+        type=float,
+        default=0.02,
+    )
+    parser.add_argument(
+        "--cartesian-assist-min-response-m",
+        type=float,
+        default=_DEFAULT_CARTESIAN_ASSIST_MIN_RESPONSE_M,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-response-ratio",
+        type=float,
+        default=_DEFAULT_CARTESIAN_ASSIST_MAX_RESPONSE_RATIO,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-lateral-drift-m",
+        type=float,
+        default=_DEFAULT_CARTESIAN_ASSIST_MAX_LATERAL_DRIFT_M,
+    )
+    parser.add_argument(
+        "--cartesian-assist-max-rotation-drift-rad",
+        type=float,
+        default=_DEFAULT_CARTESIAN_ASSIST_MAX_ROTATION_DRIFT_RAD,
+    )
+    parser.add_argument(
+        "--cartesian-assist-confirmation",
+        default="",
+        help=(
+            "second exact acknowledgement required by --cartesian-assist"
+        ),
+    )
+    parser.add_argument(
         "--protective-hold-kd",
         type=float,
         default=_DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
         help=(
             "software damping used by the draggable Ctrl-C protective hold "
             "while feedback remains valid and no non-zero --driver-kd is selected"
+        ),
+    )
+    parser.add_argument(
+        "--gravity-debug-mode",
+        action="store_true",
+        help=(
+            "explicit gravity-compensation tuning mode: freeze the supplied "
+            "gravity and driver-Kd parameters for ACTIVE, protective, and "
+            "degraded hold; safety limits and full-disable rules are unchanged"
         ),
     )
     parser.add_argument("--gravity-scale", type=float, default=_DEFAULT_GRAVITY_SCALE)
@@ -9667,7 +11170,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
         try:
-            payload = run_probe(args)
+            commissioning_pair = _build_single_joint_assist(args)
+            if commissioning_pair is None:
+                shared_runtime = None
+                commissioning_session = None
+            else:
+                shared_runtime, commissioning_session = commissioning_pair
+            cartesian_commissioning_session = _build_cartesian_assist(args)
+            payload = run_probe(
+                args,
+                shared_control_runtime=shared_runtime,
+                shared_control_commissioning=commissioning_session,
+                cartesian_assist_commissioning=(
+                    cartesian_commissioning_session
+                ),
+            )
         except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
             payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
             exit_code = 2

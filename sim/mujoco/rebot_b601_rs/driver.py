@@ -219,6 +219,7 @@ class B601PositionDriver:
         velocity_profile: JointVelocityLimitProfile | None = None,
         target_velocity_limit_rad_s: float | None = None,
         state_limit_tolerance_rad: float = 1e-4,
+        hold_gripper_open: bool = True,
     ) -> None:
         if not isinstance(scene, MujocoScene):
             raise TypeError("scene must be a MujocoScene")
@@ -268,11 +269,14 @@ class B601PositionDriver:
             raise ValueError(
                 "state_limit_tolerance_rad must be finite and non-negative"
             )
+        if not isinstance(hold_gripper_open, bool):
+            raise TypeError("hold_gripper_open must be bool")
 
         self.scene = scene
         self.timing = resolved_timing
         self.velocity_profile = resolved_velocity_profile
         self.state_limit_tolerance_rad = tolerance
+        self.hold_gripper_open = hold_gripper_open
         self._qpos_addresses = np.asarray(
             [scene.joint_qpos_addr(name) for name in B601_RS_ARM_JOINT_NAMES],
             dtype=np.int32,
@@ -329,7 +333,11 @@ class B601PositionDriver:
             ),
             "gravity_compensation": "not_implemented_m2",
             "collision": "disabled_in_m2",
-            "gripper": "fixed_open_geometry_only",
+            "gripper": (
+                "fixed_open_geometry_only"
+                if self.hold_gripper_open
+                else "external_opt_in_kinematic_mapping"
+            ),
             "target_slew_limit": "per_joint_velocity_limit_at_command_rate",
             "target_slew_profile": {
                 "name": self.velocity_profile.name,
@@ -578,6 +586,8 @@ class B601PositionDriver:
         return finite
 
     def _hold_gripper_open(self) -> None:
+        if not self.hold_gripper_open:
+            return
         for name, value in B601_RS_GRIPPER_OPEN_QPOS.items():
             self.scene.data.qpos[self.scene.joint_qpos_addr(name)] = float(value)
             self.scene.data.qvel[self.scene.joint_dof_addr(name)] = 0.0

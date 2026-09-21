@@ -12,10 +12,135 @@ import numpy as np
 import pytest
 
 from hardware.rebot_b601_rs import B601HardwareState, B601JointState
-from robot_motion.rebot_b601_rs import B601_RS_ARM_JOINT_NAMES
+from robot_motion.rebot_b601_rs import (
+    B601_RS_ARM_JOINT_NAMES,
+    B601PolicyAssistCommand,
+    B601SharedControlConfig,
+    B601SharedControlRuntime,
+)
 from scripts.hardware import rebot_b601_rs_low_gain_probe as probe
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def _shared_runtime() -> B601SharedControlRuntime:
+    return B601SharedControlRuntime(
+        B601SharedControlConfig(
+            position_kp_nm_per_rad=(2.0,) * 6,
+            velocity_kd_nm_s_per_rad=(0.0,) * 6,
+            max_target_error_rad=(0.04,) * 6,
+            max_abs_assist_torque_nm=(0.10,) * 6,
+            max_assist_torque_rate_nm_s=(0.50,) * 6,
+            authority_rise_per_sec=5.0,
+            policy_stale_timeout_sec=0.08,
+        )
+    )
+
+
+def test_injected_shared_control_uses_current_state_and_bounded_overlay() -> None:
+    runtime = _shared_runtime()
+    qpos = (0.0, 1.0, 1.0, 0.0, 0.0, 0.0)
+    target = (*qpos[:5], 0.04)
+    receipt = runtime.publish_policy(
+        B601PolicyAssistCommand(
+            sequence=1,
+            source_timestamp_sec=1.0,
+            receive_timestamp_sec=1.0,
+            qpos_target_rad=target,
+        )
+    )
+    assert receipt.accepted
+
+    reference, audit = probe._step_shared_control_runtime(
+        runtime,
+        control_sequence=7,
+        control_timestamp_sec=1.0,
+        measured_qpos_rad=qpos,
+        measured_qvel_rad_s=(0.0,) * 6,
+        dt_sec=0.01,
+    )
+
+    assert reference.qpos_rad == qpos
+    assert reference.qvel_rad_s == (0.0,) * 6
+    assert reference.joint_torque_overlay_nm == pytest.approx(
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.004)
+    )
+    assert audit["mode"] == "policy_assist"
+    assert audit["authority"] == pytest.approx(0.05)
+    assert audit["last_policy_sequence"] == 1
+
+
+def test_injected_shared_control_rejects_stacked_position_controller() -> None:
+    args = probe.build_parser().parse_args(
+        [
+            "--mode",
+            "hold",
+            "--config",
+            "unused.yaml",
+            "--rebot-source-root",
+            "unused",
+            "--kp",
+            "1.0",
+        ]
+    )
+
+    with pytest.raises(probe.LowGainProbeError, match="zero software"):
+        probe._validate_shared_control_integration(args, _shared_runtime())
+
+
+def test_injected_shared_control_must_fit_inside_final_torque_envelope() -> None:
+    runtime = _shared_runtime()
+
+    assert probe._shared_control_overlay_limits(
+        runtime,
+        total_torque_limits_nm=(1.0,) * 6,
+    ) == (0.1,) * 6
+    with pytest.raises(probe.LowGainProbeError, match="final software torque"):
+        probe._shared_control_overlay_limits(
+            runtime,
+            total_torque_limits_nm=(0.05,) * 6,
+        )
+
+
+def test_injected_shared_control_leaves_existing_hold_contract_unchanged() -> None:
+    args = probe.build_parser().parse_args(
+        [
+            "--mode",
+            "hold",
+            "--config",
+            "unused.yaml",
+            "--rebot-source-root",
+            "unused",
+        ]
+    )
+
+    probe._validate_shared_control_integration(args, None)
+
+
+def test_gravity_debug_profile_copies_tuning_parameters_as_immutable_snapshot() -> None:
+    scales = [0.91, 0.92, 0.93, 0.94, 0.95, 0.96]
+    offsets = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06]
+    profile = probe.B601GravityCompensationDebugProfile.capture(
+        gravity_scale=0.87,
+        gravity_joint_scales=scales,
+        gravity_joint_offsets_rad=offsets,
+        gravity_joint_bias_nm=(0.0, -0.02, -0.03, -0.04, 0.0, 0.01),
+        gravity_coulomb_friction_nm=(0.01,) * 6,
+        gravity_coulomb_velocity_threshold_rad_s=0.02,
+        driver_kd_nm_s_per_rad=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+    )
+    scales[0] = 99.0
+    offsets[0] = 99.0
+
+    assert profile.gravity_scale == pytest.approx(0.87)
+    assert profile.gravity_joint_scales == pytest.approx(
+        (0.91, 0.92, 0.93, 0.94, 0.95, 0.96)
+    )
+    assert profile.gravity_joint_offsets_rad == pytest.approx(
+        (0.01, 0.02, 0.03, 0.04, 0.05, 0.06)
+    )
+    with pytest.raises(AttributeError):
+        profile.gravity_scale = 1.0  # type: ignore[misc]
 
 
 def test_condition_torque_applies_absolute_then_slew_limits() -> None:
@@ -1492,6 +1617,30 @@ def test_protective_hold_default_damping_can_be_selected_for_drag_test() -> None
     assert hold.position_kp_nm_per_rad == (0.0,) * 6
     assert hold.damping_kd_nm_s_per_rad == (1.4,) * 6
     assert hold.metadata["default_software_damping_kd_nm_s_per_rad"] == 1.4
+
+
+def test_gravity_debug_protective_hold_preserves_zero_driver_damping() -> None:
+    startup = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0,) * 6,
+        mit_kd_nm_s_per_rad=(3.0,) * 6,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=1.0,
+    )
+
+    hold = probe.build_protective_hold_profile(
+        startup,
+        driver_kd_nm_s_per_rad=(0.0, 0.0, 0.2, 0.15, 0.1, 0.05),
+        # The debug run must not acquire a new host damping term on J1/J2.
+        default_damping_kd_nm_s_per_rad=1.0,
+        preserve_zero_driver_damping=True,
+    )
+
+    assert hold.damping_kd_nm_s_per_rad == (0.0,) * 6
+    assert hold.metadata["gain_source"] == "gravity_debug_frozen_driver_kd"
+    assert hold.metadata["software_damping_fallback_enabled"] is False
+    assert hold.metadata["preserve_zero_driver_damping"] is True
+    assert hold.metadata["default_software_damping_kd_nm_s_per_rad"] == 0.0
 
 
 def test_startup_lock_blend_preserves_full_gravity_and_handoffs_final_terms() -> None:
@@ -3406,6 +3555,80 @@ def test_latched_fault_hold_uses_explicit_protective_hold_profile(
     assert errors == []
 
 
+def test_gravity_debug_hold_uses_frozen_profile_over_mutable_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    frozen = probe.B601GravityCompensationDebugProfile.capture(
+        gravity_scale=0.83,
+        gravity_joint_scales=(0.8, 0.81, 0.82, 0.83, 0.84, 0.85),
+        gravity_joint_offsets_rad=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        gravity_joint_bias_nm=(0.01, -0.02, -0.03, -0.04, 0.05, 0.06),
+        gravity_coulomb_friction_nm=(0.01, 0.02, 0.03, 0.04, 0.05, 0.06),
+        gravity_coulomb_velocity_threshold_rad_s=0.07,
+        driver_kd_nm_s_per_rad=(0.11, 0.12, 0.13, 0.14, 0.15, 0.16),
+    )
+    observed: dict[str, object] = {}
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        **kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...], tuple[float, ...]]:
+        observed.update(kwargs)
+        return _fault_hold_command_receipt(accepted=True), (0.0,) * 6, (0.0,) * 6
+
+    class FakeBackend:
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            raise AssertionError(f"unexpected safe_stop for {joint_names}")
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=object(),
+        # Deliberately conflicting mutable/legacy arguments.  The explicit
+        # debug snapshot is the only source allowed to win in this mode.
+        gravity_scale=1.0,
+        gravity_joint_scales=(1.0,) * 6,
+        gravity_joint_offsets_rad=(0.0,) * 6,
+        gravity_joint_bias_nm=(0.0,) * 6,
+        gravity_coulomb_friction_nm=(0.0,) * 6,
+        gravity_coulomb_velocity_threshold_rad_s=0.0,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+        gravity_debug_profile=frozen,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=1,
+        operator_interrupt=True,
+    )
+
+    assert result[0] == 1
+    assert result[-1] == []
+    assert observed["gravity_scale"] == pytest.approx(0.83)
+    assert observed["gravity_joint_scales"] == frozen.gravity_joint_scales
+    assert observed["gravity_joint_offsets_rad"] == frozen.gravity_joint_offsets_rad
+    assert observed["gravity_joint_bias_nm"] == frozen.gravity_joint_bias_nm
+    assert observed["gravity_coulomb_friction_nm"] == (
+        frozen.gravity_coulomb_friction_nm
+    )
+    assert observed["gravity_coulomb_velocity_threshold_rad_s"] == pytest.approx(
+        0.07
+    )
+    assert observed["driver_kd_nm_s_per_rad"] == frozen.driver_kd_nm_s_per_rad
+
+
 def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4306,6 +4529,41 @@ def test_slow_step_response_rejects_support_joint_drift() -> None:
 
     assert result["status"] == "SUPPORT_DRIFT_EXCEEDED"
     assert result["support_peak_drift_rad"]["joint1"] == pytest.approx(0.01)
+
+
+def test_assist_commissioning_response_does_not_accept_state_machine_only() -> None:
+    config = probe.B601SingleJointAssistConfig(
+        joint_name="joint6",
+        offset_rad=0.1,
+        max_abs_assist_torque_nm=0.05,
+        countdown_sec=1.0,
+        assist_duration_sec=2.0,
+    )
+    runtime = probe.B601SharedControlRuntime(config.shared_control_config())
+    session = probe.B601SingleJointAssistSession(config, runtime)
+    session.anchor_qpos_rad = (0.0,) * 6
+    session.state = probe.B601AssistCommissioningState.COMPLETE
+    samples = tuple(
+        {
+            "qpos_rad": (0.0, 0.0, 0.0, 0.0, 0.0, 0.00038),
+            "shared_control_commissioning_state": "active",
+            "shared_control": {
+                "assist_torque_nm": (0.0, 0.0, 0.0, 0.0, 0.0, 0.05)
+            },
+        }
+        for _ in range(6)
+    )
+
+    result = probe.evaluate_assist_commissioning_response(
+        session=session,
+        samples=samples,
+        active_joint_names=probe.resolve_active_joint_names(),
+        minimum_response_rad=0.001,
+    )
+
+    assert result["status"] == "INSUFFICIENT_RESPONSE"
+    assert result["passed"] is False
+    assert "0.022deg" in probe.format_assist_response_notice(result)
 
 
 def test_effort_limits_are_read_from_urdf_and_scaled(tmp_path) -> None:

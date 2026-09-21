@@ -129,6 +129,7 @@ class MujocoPositionExecutionConfig:
     # into ``upstream_admitted``; the physical adapter still performs active
     # contact checks and post-step hard-contact latching in that mode.
     collision_projection_mode: str = COLLISION_PROJECTION_MODE_EXECUTOR
+    allow_gripper_self_contact: bool = False
     realtime_worker: bool = True
     worker_join_timeout_sec: float = 2.0
 
@@ -173,6 +174,8 @@ class MujocoPositionExecutionConfig:
             raise ValueError("follow_qpos_alpha must be in (0, 1].")
         object.__setattr__(self, "degraded_speed_scale", degraded)
         object.__setattr__(self, "follow_qpos_alpha", follow)
+        if not isinstance(self.allow_gripper_self_contact, bool):
+            raise TypeError("allow_gripper_self_contact must be a bool.")
         planner = normalize_position_command_planner(self.position_command_planner)
         if planner not in {
             POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
@@ -411,6 +414,7 @@ class MujocoPositionExecutionRig(Rig):
                 config.actuation_profile,
                 active_sides=config.active_sides,
                 collision_projection_mode=config.collision_projection_mode,
+                allow_gripper_self_contact=config.allow_gripper_self_contact,
             )
             self._direct = None
         self._gripper_execution = (

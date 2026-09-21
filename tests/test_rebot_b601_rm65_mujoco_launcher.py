@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,10 @@ def test_launcher_defaults_are_workspace_local_and_auto_activate() -> None:
     assert paths.mapping_profile.name == "b601_rm65_mapping_150_v2.json"
     assert paths.task_config.name == "rm65_right_cube_lift_rl_normal_v1.json"
     assert paths.config.name == "rebotarm_rs.yaml"
+    assert paths.rebot_source_root == launcher.REPO_ROOT / "hardware" / "reBotArm_control_py"
+    assert owner._parser().parse_args([]).rebot_source_root == (
+        owner.REPO_ROOT / "hardware" / "reBotArm_control_py"
+    )
 
 
 def test_launcher_builds_canonical_read_only_command_without_shell(tmp_path: Path) -> None:
@@ -140,6 +145,7 @@ def test_owner_launcher_requires_explicit_motion_acknowledgement() -> None:
     assert args.mode == "hold"
     assert args.feedback_source == "active-report"
     assert args.driver_kd == owner.DEFAULT_DRIVER_KD
+    assert args.gravity_debug_mode is False
 
 
 def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path) -> None:
@@ -153,6 +159,7 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
     assert "--allow-active-report" in command
     assert "--auto-disable-active-report" in command
     assert "--apply-driver-torque-limits" in command
+    assert "--gravity-debug-mode" not in command
     assert (
         command[command.index("--confirmation") + 1]
         == low_gain_probe.CONFIRMATION
@@ -166,6 +173,102 @@ def test_owner_launcher_reuses_guarded_probe_and_standard_limits(tmp_path: Path)
     low_gain_probe._validate_cli(parsed_probe_args)
 
 
+def test_owner_launcher_forwards_explicit_gravity_debug_mode(tmp_path: Path) -> None:
+    args = owner._parser().parse_args(
+        ["--allow-motion", "--gravity-debug-mode"]
+    )
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+
+    assert "--gravity-debug-mode" in command
+    parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    assert parsed_probe_args.gravity_debug_mode is True
+    low_gain_probe._validate_cli(parsed_probe_args)
+
+
+def test_owner_launcher_builds_one_shot_assist_inside_existing_owner(
+    tmp_path: Path,
+) -> None:
+    args = owner._parser().parse_args(
+        [
+            "--allow-motion",
+            "--single-joint-assist",
+            "--assist-joint",
+            "joint6",
+            "--assist-offset-rad",
+            "0.1",
+            "--assist-min-response-rad",
+            "0.002",
+            "--assist-confirmation",
+            owner.DEFAULT_ASSIST_CONFIRMATION,
+        ]
+    )
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+
+    assert "--single-joint-assist" in command
+    assert command[command.index("--assist-joint") + 1] == "joint6"
+    assert command[command.index("--assist-offset-rad") + 1] == "0.1"
+    assert command[command.index("--assist-min-response-rad") + 1] == "0.002"
+    assert (
+        command[command.index("--assist-confirmation") + 1]
+        == low_gain_probe.SINGLE_JOINT_ASSIST_CONFIRMATION
+    )
+    parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    low_gain_probe._validate_cli(parsed_probe_args)
+    runtime, session = low_gain_probe._build_single_joint_assist(parsed_probe_args)
+    assert session.runtime is runtime
+    low_gain_probe._validate_shared_control_integration(parsed_probe_args, runtime)
+
+
+def test_owner_launcher_rejects_assist_without_second_confirmation() -> None:
+    with pytest.raises(SystemExit) as error:
+        owner.main(["--allow-motion", "--single-joint-assist"])
+    assert error.value.code == 2
+
+
+def test_owner_launcher_builds_cartesian_assist_inside_existing_owner(
+    tmp_path: Path,
+) -> None:
+    args = owner._parser().parse_args(
+        [
+            "--allow-motion",
+            "--cartesian-assist",
+            "--cartesian-assist-axis",
+            "z",
+            "--cartesian-assist-offset-m",
+            "0.008",
+            "--cartesian-assist-max-rotation-drift-rad",
+            "0.06",
+            "--cartesian-assist-confirmation",
+            owner.DEFAULT_CARTESIAN_ASSIST_CONFIRMATION,
+        ]
+    )
+    command = owner.build_probe_command(args, run_dir=tmp_path)
+
+    assert "--cartesian-assist" in command
+    assert command[command.index("--cartesian-assist-axis") + 1] == "z"
+    assert command[command.index("--cartesian-assist-offset-m") + 1] == "0.008"
+    assert (
+        command[command.index("--cartesian-assist-max-rotation-drift-rad") + 1]
+        == "0.06"
+    )
+    assert (
+        command[command.index("--cartesian-assist-confirmation") + 1]
+        == low_gain_probe.CARTESIAN_ASSIST_CONFIRMATION
+    )
+    parsed_probe_args = low_gain_probe.build_parser().parse_args(command[2:])
+    low_gain_probe._validate_cli(parsed_probe_args)
+    session = low_gain_probe._build_cartesian_assist(parsed_probe_args)
+    assert session is not None
+    assert session.config.axis == "z"
+    assert session.config.offset_m == pytest.approx(0.008)
+
+
+def test_owner_launcher_rejects_cartesian_assist_without_confirmation() -> None:
+    with pytest.raises(SystemExit) as error:
+        owner.main(["--allow-motion", "--cartesian-assist"])
+    assert error.value.code == 2
+
+
 def test_owner_launcher_rejects_missing_motion_ack_before_resource_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -174,3 +277,53 @@ def test_owner_launcher_rejects_missing_motion_ack_before_resource_access(
     with pytest.raises(SystemExit) as error:
         owner.main([])
     assert error.value.code == 2
+
+
+def test_foreground_launcher_does_not_duplicate_sigint_or_close_output_early(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_handler: object | None = None
+    old_handler = object()
+
+    def fake_signal(_signum: int, handler: object) -> object:
+        nonlocal installed_handler
+        previous = old_handler if installed_handler is None else installed_handler
+        installed_handler = handler
+        return previous
+
+    class InterruptingOutput:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed = False
+
+        def readline(self) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                assert callable(installed_handler)
+                installed_handler(launcher.signal.SIGINT, None)
+                return "child result after Ctrl-C\n"
+            return ""
+
+        def close(self) -> None:
+            self.closed = True
+
+    output = InterruptingOutput()
+    process = SimpleNamespace(stdout=output, wait=lambda: 1)
+    monkeypatch.setattr(launcher.signal, "getsignal", lambda _signum: old_handler)
+    monkeypatch.setattr(launcher.signal, "signal", fake_signal)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    status = launcher._run_foreground(
+        ["fake-child"],
+        cwd=tmp_path,
+        terminal_log=tmp_path / "terminal.log",
+    )
+
+    assert status == 1
+    assert output.closed is True
+    assert installed_handler is old_handler
+    log = (tmp_path / "terminal.log").read_text(encoding="utf-8")
+    assert "child result after Ctrl-C" in log
+    assert "child owned the signal lifecycle" in log
+    assert "forwarding SIGINT" not in log

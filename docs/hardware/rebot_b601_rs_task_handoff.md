@@ -131,6 +131,18 @@ ACTIVE、protective hold 和缓存 gravity-only degraded hold，并记录到结�
 驱动完整摩擦力矩反复换向。所有项贯穿启动、ACTIVE、protective hold 和缓存补偿，并记录
 在结果 profile；它们组成默认 runtime profile，但不修改 URDF、不隐式改写模型文件。
 
+重力调参现场若需要保持参数可比性，可显式使用 `--gravity-debug-mode`。该模式在
+使能前冻结本次 run 的 gravity scale、六轴 scale/offset/bias/friction、Coulomb
+阈值和 driver Kd；ACTIVE、protective hold、恢复后的 live hold 及 degraded cache
+均复用该不可变快照。它只固定参数来源，不改变任何反馈新鲜度、运动/力矩/加速度
+门禁、发送重试、二次 Ctrl-C/SIGUSR1 全失能或物理急停规则。普通模式不构造该快照，
+因此既有严格故障语义保持不变。结果 JSON 的 `gravity_debug` 和
+`protective_hold.gravity_parameter_source` 是验收时的证据字段。
+
+在该显式调试模式中，保护保持也不会为冻结快照中 `driver Kd=0` 的关节补入默认
+`protective_hold_kd`；`protective_hold.software_kd_nm_s_per_rad` 应与本次调试的
+单一阻尼 owner 一致。普通模式的默认阻尼 fallback 保持不变。
+
 重要 owner 规则：
 
 - 最终 active、protective hold 和 degraded hold 的 vendor MIT `kp` 始终为零。只有边界明确的

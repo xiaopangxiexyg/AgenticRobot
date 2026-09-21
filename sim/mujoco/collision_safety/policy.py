@@ -17,6 +17,11 @@ class CollisionSafetyPolicy:
     hard_penetration_m: float = 0.001
     sweep_max_joint_step_rad: float = 0.01
     projection_iterations: int = 8
+    # Some gripper CAD meshes overlap at their normalized closed endpoint.
+    # This opt-in exception is limited to finger-vs-finger self contact; it
+    # never permits gripper/environment, robot/environment, or robot/gripper
+    # self contact. The strict default preserves existing task safety.
+    allow_gripper_self_contact: bool = False
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.minimum_clearance_m)) or self.minimum_clearance_m < 0.0:
@@ -27,11 +32,15 @@ class CollisionSafetyPolicy:
             raise ValueError("sweep_max_joint_step_rad must be positive.")
         if self.projection_iterations <= 0:
             raise ValueError("projection_iterations must be positive.")
+        if not isinstance(self.allow_gripper_self_contact, bool):
+            raise TypeError("allow_gripper_self_contact must be a bool.")
 
     def pair_is_forbidden(self, first_group: int, second_group: int) -> bool:
         pair = frozenset((int(first_group), int(second_group)))
         # CollisionFilter group bits: environment=1, robot=2, gripper=4,
         # object=8. Equal-group pairs collapse to a one-element frozenset.
+        if pair == frozenset((4,)) and self.allow_gripper_self_contact:
+            return False
         return pair in {
             frozenset((1, 2)),
             frozenset((1, 4)),

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_REBOT_SOURCE_ROOT = REPO_ROOT.parent / "reBotArm_control_py"
+DEFAULT_REBOT_SOURCE_ROOT = REPO_ROOT / "hardware" / "reBotArm_control_py"
 DEFAULT_CONFIG = DEFAULT_REBOT_SOURCE_ROOT / "config" / "rebotarm_rs.yaml"
 DEFAULT_TASK_CONFIG = (
     REPO_ROOT / "sim" / "configs" / "tasks" / "rm65_right_cube_lift_rl_normal_v1.json"
@@ -74,13 +74,13 @@ def _parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=_env_path("REBOT_RS_CONFIG", DEFAULT_CONFIG),
-        help="B601 RS YAML (default: REBOT_RS_CONFIG or the sibling reBotArm checkout)",
+        help="B601 RS YAML (default: REBOT_RS_CONFIG or the pinned project submodule)",
     )
     parser.add_argument(
         "--rebot-source-root",
         type=Path,
         default=_env_path("REBOT_SOURCE_ROOT", DEFAULT_REBOT_SOURCE_ROOT),
-        help="reBotArm_control_py root (default: sibling checkout)",
+        help="reBotArm_control_py root (default: pinned hardware/reBotArm_control_py submodule)",
     )
     parser.add_argument(
         "--task-config",
@@ -295,21 +295,42 @@ def _run_foreground(
             return 127
 
         assert process.stdout is not None
+        old_sigint_handler = signal.getsignal(signal.SIGINT)
+        parent_sigint_seen = False
+
+        def observe_parent_sigint(_signum: int, _frame: object) -> None:
+            nonlocal parent_sigint_seen
+            # The child shares the foreground process group and receives the
+            # same terminal SIGINT directly.  The launcher must neither raise
+            # KeyboardInterrupt nor forward a duplicate signal: doing either
+            # can collapse a child's intentional two-stage stop into one event.
+            parent_sigint_seen = True
+
+        signal.signal(signal.SIGINT, observe_parent_sigint)
         try:
-            for line in process.stdout:
+            while True:
+                try:
+                    line = process.stdout.readline()
+                except KeyboardInterrupt:
+                    # Defensive race fallback before the parent handler became
+                    # active.  The child already received the group signal.
+                    parent_sigint_seen = True
+                    continue
+                if not line:
+                    break
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 _write_log(log, line)
-        except KeyboardInterrupt:
-            _write_log(log, "launcher: operator interrupt; forwarding SIGINT")
-            if process.poll() is None:
-                try:
-                    process.send_signal(signal.SIGINT)
-                except ProcessLookupError:
-                    pass
+            status = process.wait()
         finally:
+            signal.signal(signal.SIGINT, old_sigint_handler)
             process.stdout.close()
-        return process.wait()
+        if parent_sigint_seen:
+            _write_log(
+                log,
+                "launcher: terminal SIGINT observed; child owned the signal lifecycle",
+            )
+        return status
 
 
 def main(argv: list[str] | None = None) -> int:

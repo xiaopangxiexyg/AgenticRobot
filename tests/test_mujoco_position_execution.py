@@ -121,6 +121,21 @@ def test_mujoco_position_rig_runs_atomic_60_to_120_to_1000_pipeline() -> None:
     assert rig._direct.ticks == ()
 
 
+def test_execution_metadata_records_gripper_self_contact_policy() -> None:
+    scene = _FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            allow_gripper_self_contact=True,
+        ),
+    )
+    assert rig.config.allow_gripper_self_contact is True
+
+
 def test_mujoco_position_rig_mailbox_keeps_only_latest_qref() -> None:
     scene = _FakeScene()
     rig = MujocoPositionExecutionRig(

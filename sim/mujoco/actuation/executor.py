@@ -93,6 +93,7 @@ class MujocoActuatedPositionExecutor:
         *,
         active_sides: Sequence[str] | None = None,
         collision_projection_mode: str = COLLISION_PROJECTION_MODE_EXECUTOR,
+        allow_gripper_self_contact: bool = False,
     ) -> None:
         if not isinstance(timing, TimingSpec):
             raise TypeError("timing must be a TimingSpec.")
@@ -102,6 +103,9 @@ class MujocoActuatedPositionExecutor:
         self.collision_projection_mode = normalize_collision_projection_mode(
             collision_projection_mode
         )
+        if not isinstance(allow_gripper_self_contact, bool):
+            raise TypeError("allow_gripper_self_contact must be a bool.")
+        self.allow_gripper_self_contact = allow_gripper_self_contact
         model_option = getattr(getattr(scene, "model", None), "opt", None)
         if model_option is not None and not math.isclose(
             float(model_option.timestep),
@@ -176,6 +180,7 @@ class MujocoActuatedPositionExecutor:
             "transport_acceptance": "immediate_on_120hz_sender_call",
             "target_dynamics_owner": "sim.rm65.actuation.Rm65PositionActuator",
             "collision_projection_mode": self.collision_projection_mode,
+            "allow_gripper_self_contact": self.allow_gripper_self_contact,
             "collision_safety": (
                 (
                     "upstream_admitted_full_scene_post_step_hard_contact"
@@ -233,6 +238,7 @@ class MujocoActuatedPositionExecutor:
             "command_hz",
             "physics_hz",
             "collision_projection_mode",
+            "allow_gripper_self_contact",
         }
         if isinstance(initial_state, Mapping) and (
             wrapper_identity_fields.intersection(initial_state)
@@ -251,6 +257,7 @@ class MujocoActuatedPositionExecutor:
             expected_identity = {
                 "execution_mode": self.execution_mode,
                 "collision_projection_mode": self.collision_projection_mode,
+                "allow_gripper_self_contact": self.allow_gripper_self_contact,
             }
             for name, expected in expected_identity.items():
                 if name in initial_state and initial_state[name] != expected:
@@ -521,7 +528,11 @@ class MujocoActuatedPositionExecutor:
         factory = getattr(self.scene, "collision_projector", None)
         if not callable(factory):
             return None
-        projector = factory()
+        projector = (
+            factory(allow_gripper_self_contact=True)
+            if self.allow_gripper_self_contact
+            else factory()
+        )
         if projector is None:
             return None
         oracle = getattr(projector, "oracle", None)

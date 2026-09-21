@@ -24,6 +24,7 @@ class MujocoPassiveViewerSession:
         scene: MujocoScene,
         *,
         sync_callback: Callable[[object], None] | None = None,
+        key_callback: Callable[[int], None] | None = None,
         show_left_ui: bool = True,
         show_right_ui: bool = True,
         launch_callback: Callable[..., object] | None = None,
@@ -32,10 +33,13 @@ class MujocoPassiveViewerSession:
             raise TypeError("scene must be a MujocoScene.")
         if sync_callback is not None and not callable(sync_callback):
             raise TypeError("sync_callback must be callable or None.")
+        if key_callback is not None and not callable(key_callback):
+            raise TypeError("key_callback must be callable or None.")
         if launch_callback is not None and not callable(launch_callback):
             raise TypeError("launch_callback must be callable or None.")
         self.scene = scene
         self.sync_callback = sync_callback
+        self.key_callback = key_callback
         self.show_left_ui = bool(show_left_ui)
         self.show_right_ui = bool(show_right_ui)
         self._launch_callback = launch_callback
@@ -77,6 +81,7 @@ class MujocoPassiveViewerSession:
                 handle = launch(
                     self.scene.model,
                     self.scene.data,
+                    key_callback=self.key_callback,
                     show_left_ui=self.show_left_ui,
                     show_right_ui=self.show_right_ui,
                 )
