@@ -2402,6 +2402,25 @@ class RuleBasedRealTeleopExtension:
             return False, f"等待端点稳定反馈({count}/{required})"
         return True, ""
 
+    @staticmethod
+    def _manual_gripper_close_needs_catch_mode_reset(
+        state: Mapping[str, Any],
+    ) -> bool:
+        """Return whether a closed endpoint is still latched in catch motion.
+
+        DMTAC status code 4 is a vendor-level "closing/catching" state.  It
+        can remain active after the measured position reaches 1.0 when the
+        continuous catch register is still enabled.  A task-chain close may
+        therefore need one same-position one-shot command even though it has
+        no positional increment left to send.
+        """
+
+        raw_status = state.get("gripper_status_code", state.get("status_code"))
+        try:
+            return int(raw_status) == 4
+        except (TypeError, ValueError):
+            return False
+
     def _manual_gripper_feedback(
         self,
         backend: object,
@@ -2659,6 +2678,33 @@ class RuleBasedRealTeleopExtension:
                     self._manual_gripper_last_progress_at_by_side[side] = float(now)
                 else:
                     waiting.append(f"{side}:{settle_reason}")
+                    # If the task-chain starts while the gripper is already
+                    # at the closed endpoint, the ordinary bounded-position
+                    # path has no remaining delta and would never dispatch
+                    # the one-shot mode transition.  Send the same endpoint
+                    # only for the explicit right-only close and rate-limit
+                    # it with the existing resend interval.  Genuine faults,
+                    # stale feedback, opening motion, and unknown statuses
+                    # remain fail-closed.
+                    if (
+                        intent == "close_right_gripper"
+                        and side == "right"
+                        and self._manual_gripper_close_needs_catch_mode_reset(
+                            feedback_state or {}
+                        )
+                    ):
+                        last_dispatch_at = (
+                            self._manual_gripper_last_dispatch_at_by_side.get(side)
+                        )
+                        if (
+                            last_dispatch_at is None
+                            or float(now) - float(last_dispatch_at)
+                            >= float(self.config.manual_gripper_resend_interval_sec)
+                        ):
+                            qpos = np.zeros(6, dtype=np.float32)
+                            qpos[command_dim] = final_target
+                            hand_qpos[side] = qpos
+                            resend_sides.add(side)
                 continue
             if last_target is not None:
                 command_baseline = self._manual_gripper_command_baseline_by_side.get(side)
@@ -2807,10 +2853,17 @@ class RuleBasedRealTeleopExtension:
                 },
             )
             command = self.adapter.resolver.resolve(action)
-            manual_continuous_grasp = intent in {
-                "close_grippers",
-                "close_right_gripper",
-            }
+            # The task-chain right-only close is a terminal-position
+            # transition, not the generic continuous-grasp maintenance
+            # button.  Some DMTAC firmware keeps reporting status code 4
+            # while continuous catch mode is enabled, even after the
+            # measured position reaches the closed endpoint.  Use the
+            # one-shot position close here so the existing strict endpoint
+            # gate can receive an idle/force-stop feedback state.  The next
+            # canonical trajectory command restores the configured
+            # continuous-grasp mode (the backend must not hide that mode
+            # change behind an unchanged position target).
+            manual_continuous_grasp = intent == "close_grippers"
             for side in hand_qpos:
                 effector = command.commands.get(f"{side}_hand")
                 if effector is None:

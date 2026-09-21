@@ -2197,14 +2197,24 @@ class DMTacGripperBackend(EffectorBackend):
                         measured_disagrees = abs(
                             float(measured_values[command_dim]) - target_scalar
                         ) >= float(self.config.send_threshold)
-                mode_disagrees = bool(
-                    continuous_grasp_override is not None
-                    and (
+                if continuous_grasp_override is None:
+                    # A disconnected/shadow backend may not have an applied
+                    # mode yet; preserve its historical threshold-skip
+                    # behavior.  Once a real mode was applied, however, a
+                    # same-position command must reapply the configured mode
+                    # when it changed (for example after the task-chain's
+                    # one-shot close).
+                    mode_disagrees = bool(
+                        self._applied_continuous_grasp is not None
+                        and bool(self._applied_continuous_grasp)
+                        != bool(self.config.continuous_grasp)
+                    )
+                else:
+                    mode_disagrees = bool(
                         self._applied_continuous_grasp is None
                         or bool(self._applied_continuous_grasp)
                         != bool(continuous_grasp_override)
                     )
-                )
                 if not measured_disagrees and not mode_disagrees:
                     return finish(
                         "skipped_threshold",

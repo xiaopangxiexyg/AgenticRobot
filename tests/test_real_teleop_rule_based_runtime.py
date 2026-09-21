@@ -2487,7 +2487,10 @@ def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
             assert set(close.commands) == {"right_hand"}
             assert close.metadata["rule_based_manual_gripper_sides"] == ["right"]
             command = close.commands["right_hand"]
-            assert command.metadata["dmtac_continuous_grasp_override"] is True
+            # The task-chain close must observe a real idle/force-stop
+            # endpoint.  Continuous catch mode can legitimately keep the
+            # vendor status at "正在闭合/夹取" after position reaches 1.0.
+            assert command.metadata["dmtac_continuous_grasp_override"] is False
             backends["right"].set_measured_scalar(float(command.value[0]))
             assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
         now += 0.05
@@ -2495,6 +2498,77 @@ def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
 
     assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
     assert float(backends["right"].measured_joint_pos[0]) == pytest.approx(1.0)
+    assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+
+
+def test_task_chain_close_right_resets_catch_mode_when_already_at_closed_endpoint() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+
+    class _AlreadyClosedCatchPoller:
+        def __init__(self) -> None:
+            self.status_code = 4
+            self.is_moving = True
+            self.timestamp = 9.0
+
+        def latest_at_or_before(self, _now):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = 1.0
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": self.is_moving,
+                }
+            }
+
+    hand_poller = _AlreadyClosedCatchPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+    command = session.external_commands[-1]
+    assert set(command.commands) == {"right_hand"}
+    assert float(command.commands["right_hand"].value[0]) == pytest.approx(1.0)
+    assert command.commands["right_hand"].metadata[
+        "dmtac_continuous_grasp_override"
+    ] is False
+
+    # Once the one-shot mode transition is accepted, the existing strict
+    # endpoint gate still requires fresh idle feedback; position alone never
+    # completes the action.
+    hand_poller.status_code = 2
+    hand_poller.is_moving = False
+    hand_poller.timestamp = 10.1
+    for now in (10.1, 10.2):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_right_gripper"
+        hand_poller.timestamp += 0.1
+    session.command_override_provider(SimpleNamespace(), 10.3)
+    assert extension._pending_gripper_action is None
     assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
 
 

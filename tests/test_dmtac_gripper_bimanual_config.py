@@ -2604,6 +2604,48 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertFalse(fake.moves[0]["continuous"])
         self.assertEqual(backend._last_send_status, "sent")
 
+    def test_dmtac_backend_same_target_reapplies_configured_catch_mode_after_override(self) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+            def __init__(self) -> None:
+                self.moves: list[dict[str, object]] = []
+
+            def move(self, joint_pos: float, **kwargs: object) -> None:
+                self.moves.append({"joint_pos": float(joint_pos), **dict(kwargs)})
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                continuous_grasp=True,
+            )
+        )
+        backend.device = fake
+        backend._applied_speed = backend.config.speed
+        backend._applied_torque = backend.config.torque
+        backend._applied_continuous_grasp = False
+        backend._last_sent_command = np.asarray(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
+        backend._latest_measured_joint_pos = backend._last_sent_command.copy()
+
+        command = EffectorCommand(
+            effector_name="right_hand",
+            side="right",
+            command_type="joint_vector",
+            value=backend._last_sent_command.copy(),
+        )
+
+        self.assertTrue(backend.send_command(command))
+        self.assertEqual(len(fake.moves), 1)
+        self.assertTrue(fake.moves[0]["continuous"])
+        self.assertEqual(backend._last_send_status, "sent")
+
     def test_deploy_builds_dmtac_gripper_backend_from_assignment(self) -> None:
         parser = argparse.ArgumentParser()
         deploy_run_policy.add_args(parser)
