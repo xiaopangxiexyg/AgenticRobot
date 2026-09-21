@@ -3254,6 +3254,23 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         **common,
     ) == (True, "warmup 输入稳定。")
 
+    # A successful exclusive-source Episode leaves Session RUNNING but clears
+    # its command before the next operator-triggered Episode.  The same narrow
+    # bootstrap admission must work for that second-cycle state.
+    running_step.command = None
+    running_step.command_dispatched = False
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (False, "等待 action command 可用。")
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        allow_pre_episode_armed_warmup=True,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
 
 def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
     backend = legacy_entrypoint.DMTacGripperBackend(

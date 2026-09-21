@@ -94,6 +94,7 @@ class _DatasetStopCompletion:
     recorder: Any | None
     task: Any | None
     formal_stopped: bool
+    formal_discarded: bool
     debug_stopped: bool
     frame_count: int
     debug_error: str | None = None
@@ -183,6 +184,7 @@ def build_episode_recording_runtime(
     episode_last_state_provider: Callable[[], str | None],
     set_episode_last_state: Callable[[str | None], None],
     step_index_provider: Callable[[], int],
+    discard_episode_on_stop: Callable[[str], bool] | None = None,
 ) -> EpisodeRecordingRuntime:
     # Snapshot the canonical bindings for this runtime instance.  Long-lived
     # recording sessions should not change dependency sets after construction.
@@ -1667,6 +1669,14 @@ def build_episode_recording_runtime(
         debug_was_recording = bool(episode_recorder.is_recording)
         if formal_recorder is None and not debug_was_recording:
             return False
+        # Freeze the extension policy on the owner/control thread.  The
+        # detached stop worker must never inspect mutable source state after a
+        # later frame has advanced or reset the rule attempt.
+        discard_formal_episode = bool(
+            formal_recorder is not None
+            and discard_episode_on_stop is not None
+            and discard_episode_on_stop(str(end_reason))
+        )
         frame_count = recording_frame_count()
         audit_close = None
         impedance_finalize_deferred_launch = False
@@ -1688,11 +1698,12 @@ def build_episode_recording_runtime(
 
         def stop_episode_lifecycle() -> _DatasetStopCompletion:
             task = None
+            formal_discarded = False
             debug_stopped = False
             debug_error: str | None = None
             try:
                 if formal_recorder is not None:
-                    task = formal_recorder.stop_episode(
+                    stop_kwargs = dict(
                         reason=end_reason,
                         step_index=captured_step_index,
                         last_state=captured_last_state,
@@ -1706,6 +1717,21 @@ def build_episode_recording_runtime(
                             )
                             else None
                         ),
+                    )
+                    # Preserve compatibility for ordinary recorder adapters;
+                    # the additional keyword belongs only to the exclusive
+                    # source path that explicitly requested whole-attempt
+                    # discard semantics.
+                    if discard_formal_episode:
+                        stop_kwargs["discard"] = True
+                    task = formal_recorder.stop_episode(**stop_kwargs)
+                    if discard_formal_episode and task is not None:
+                        raise RuntimeError(
+                            "dataset recorder returned a finalize task for an "
+                            "Episode that must be discarded"
+                        )
+                    formal_discarded = bool(
+                        discard_formal_episode and task is None
                     )
                     if (
                         audit_close is not None
@@ -1742,6 +1768,7 @@ def build_episode_recording_runtime(
                     recorder=formal_recorder,
                     task=task,
                     formal_stopped=formal_recorder is not None,
+                    formal_discarded=formal_discarded,
                     debug_stopped=debug_stopped,
                     frame_count=int(frame_count),
                     debug_error=debug_error,
@@ -2843,7 +2870,15 @@ def build_episode_recording_runtime(
             if completion.formal_stopped:
                 if task is None:
                     event_status = "discarded"
-                    event_message = "正式数采已停止：当前 episode 没有样本，已丢弃。"
+                    if completion.formal_discarded:
+                        event_message = (
+                            "正式数采已停止：规则执行未完整完成，"
+                            f"当前 episode 的 {stopped_frame_count} 帧已全部丢弃。"
+                        )
+                    else:
+                        event_message = (
+                            "正式数采已停止：当前 episode 没有样本，已丢弃。"
+                        )
                 else:
                     event_status = "finalizing"
                     event_message = (

@@ -757,6 +757,7 @@ def _episode_runtime(
     bind_capture_modality_contract=lambda *_args, **_kwargs: None,
     position_episode_debug_runtime_override: object | None = None,
     update_control_debug_runtime_metadata=lambda **_kwargs: None,
+    discard_episode_on_stop=None,
 ):
     logs: list[tuple[str, str]] = []
     episode_state = [None]
@@ -842,6 +843,7 @@ def _episode_runtime(
             episode_last_state_provider=lambda: episode_state[0],
             set_episode_last_state=lambda value: episode_state.__setitem__(0, value),
             step_index_provider=lambda: 0,
+            discard_episode_on_stop=discard_episode_on_stop,
         )
     return runtime, args, logs
 
@@ -3036,6 +3038,7 @@ def test_cancelled_prepare_never_publishes_candidate(tmp_path: Path) -> None:
 def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
+    stop_calls: list[dict[str, object]] = []
     finalize_results: list[object] = []
     finalize_task = SimpleNamespace(
         episode_index=4,
@@ -3067,7 +3070,8 @@ def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path)
         ),
     )
 
-    def stop_episode(**_kwargs: object):
+    def stop_episode(**kwargs: object):
+        stop_calls.append(dict(kwargs))
         entered.set()
         assert release.wait(timeout=1.0)
         recorder.is_recording = False
@@ -3083,6 +3087,7 @@ def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path)
         dataset_slot=slot,
         clutch=clutch,
         transition_calls=[],
+        discard_episode_on_stop=lambda _reason: False,
     )
 
     started_at = time.perf_counter()
@@ -3093,6 +3098,7 @@ def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path)
     )
     assert time.perf_counter() - started_at < 0.05
     assert entered.wait(timeout=1.0)
+    assert "discard" not in stop_calls[0]
     assert not runtime.recording_active()
     assert clutch.recording_states[-1]["event_status"] == "stopping"
 
@@ -3111,6 +3117,66 @@ def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path)
     assert clutch.finalize_states[-1]["status"] == "saved"
     assert clutch.round_trip_advances == 1
     assert clutch.plus_episode_indices == [4]
+    assert runtime.close()
+
+
+def test_rule_abort_discards_nonempty_episode_at_writer_owner_boundary(
+    tmp_path: Path,
+) -> None:
+    stop_calls: list[dict[str, object]] = []
+    policy_thread_ids: list[int] = []
+    control_thread_id = threading.get_ident()
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("stop test must reuse the published recorder")
+
+    recorder = SimpleNamespace(
+        finalizing=False,
+        is_recording=True,
+        is_paused=False,
+        frame_count=17,
+        active_episode_index=4,
+        dataset_root=tmp_path,
+        collection_frequency_status=lambda: {"sample_hz": 15.0},
+        poll_finalize_tasks=lambda: [],
+    )
+
+    def stop_episode(**kwargs: object) -> None:
+        stop_calls.append(dict(kwargs))
+        recorder.is_recording = False
+
+    recorder.stop_episode = stop_episode
+    recorder.close = lambda: None
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, _args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        discard_episode_on_stop=lambda reason: (
+            policy_thread_ids.append(threading.get_ident())
+            or reason == "rule_based_abort"
+        ),
+    )
+
+    assert runtime.stop_recording(time.time(), end_reason="rule_based_abort")
+    assert policy_thread_ids == [control_thread_id]
+    deadline = time.monotonic() + 1.0
+    while (
+        clutch.recording_states[-1]["event_status"] == "stopping"
+        and time.monotonic() < deadline
+    ):
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert len(stop_calls) == 1
+    assert stop_calls[0]["reason"] == "rule_based_abort"
+    assert stop_calls[0]["discard"] is True
+    assert clutch.recording_states[-1]["event_status"] == "discarded"
+    assert "17 帧已全部丢弃" in clutch.recording_states[-1]["event_message"]
     assert runtime.close()
 
 

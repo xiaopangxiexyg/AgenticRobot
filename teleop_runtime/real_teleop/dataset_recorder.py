@@ -3074,6 +3074,7 @@ class RealTeleopDatasetRecorder:
         step_index: int,
         last_state: str | None,
         summary: Mapping[str, Any] | None = None,
+        discard: bool = False,
         defer_finalize_start: bool = False,
         before_finalize: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> RealDatasetFinalizeTask | None:
@@ -3131,7 +3132,11 @@ class RealTeleopDatasetRecorder:
         self._pause_started_frame_index = None
         self._pause_started_step_index = None
         self._pause_started_last_state = None
-        if frame_count <= 0:
+        # Some capture sources define one Episode as one indivisible attempt.
+        # Their cancellation policy is decided by the source, while this
+        # recorder remains the sole owner of durable cleanup for every related
+        # artifact.  Empty Episodes keep the historical discard behavior.
+        if discard or frame_count <= 0:
             self._writer_lifecycle().flush()
             self.writer.discard_episode(episode_index)
             if trace_sink is not None:

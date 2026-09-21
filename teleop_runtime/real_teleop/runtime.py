@@ -190,6 +190,7 @@ from .runtime_extension import (
     RealTeleopRuntimeExtension,
     runtime_extension_allows_active_episode_bootstrap_without_dispatch,
     runtime_extension_collection_startup_blockers,
+    runtime_extension_discards_episode_on_stop,
     runtime_extension_service_startup_control_plane,
 )
 from .runtime_home import (
@@ -2559,6 +2560,12 @@ def run_real_teleop(
             episode_last_state_provider=current_episode_last_state,
             set_episode_last_state=set_current_episode_last_state,
             step_index_provider=current_step_index,
+            discard_episode_on_stop=lambda reason: (
+                runtime_extension_discards_episode_on_stop(
+                    runtime_extension,
+                    reason=reason,
+                )
+            ),
         )
         bind_reconfigure = getattr(
             clutch_input,

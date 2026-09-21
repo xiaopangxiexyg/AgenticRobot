@@ -75,21 +75,26 @@ def recording_warmup_status(
         return False, f"等待恢复，当前状态会自动停止数采：{stop_reason}。"
     if clutch_input.hold_active():
         return False, "等待 hold 解除并重采 runtime home。"
-    command_inert_armed_bootstrap = bool(
+    # A successful rule Episode leaves the shared Session in RUNNING while the
+    # exclusive source deliberately clears its command.  The next rule Episode
+    # must therefore admit the same command-inert bootstrap from either ARMED
+    # (first run) or RUNNING (subsequent run).  This remains an explicit source
+    # opt-in and does not admit samples or motion by itself.
+    command_inert_source_bootstrap = bool(
         (
             allow_pre_episode_armed_warmup
             or allow_active_episode_armed_bootstrap
         )
-        and step_result.state == TeleopRunState.ARMED
+        and step_result.state in {TeleopRunState.ARMED, TeleopRunState.RUNNING}
     )
     if (
         step_result.state != TeleopRunState.RUNNING
-        and not command_inert_armed_bootstrap
+        and not command_inert_source_bootstrap
     ):
         return False, f"等待遥操进入 RUNNING，当前状态：{step_result.state.value}。"
     if step_result.observation is None:
         return False, "等待 observation 可用。"
-    if not command_inert_armed_bootstrap:
+    if not command_inert_source_bootstrap:
         if step_result.command is None:
             return False, "等待 action command 可用。"
         if not session_step_arm_dispatch_confirmed(step_result):

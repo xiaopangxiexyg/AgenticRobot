@@ -3775,6 +3775,15 @@ def test_successful_attempt_waits_for_finalize_then_releases_rule_fix_without_ho
     assert controller.calls == [(4.1, "rule-based Episode completed", False)]
     assert clutch.reasons == []
 
+    # The shared Session intentionally remains RUNNING between successful
+    # attempts.  A fresh START must still reopen the narrow command-inert
+    # writer bootstrap used before the first rule qref.
+    _ui.request_start()
+    extension.after_control_input_poll(now=4.2)
+    assert extension.status().armed is True
+    assert extension.status().execution_begun is False
+    assert extension.allows_pre_episode_armed_warmup() is True
+
 
 def test_successful_attempt_opens_inter_episode_gripper_maintenance_window() -> None:
     extension = RuleBasedRealTeleopExtension(
