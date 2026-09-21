@@ -2192,30 +2192,29 @@ class RuleBasedRealTeleopExtension:
             )
         )
         command.metadata["rule_based_dispatch_timestamp"] = timestamp
-        detail_stage_id = str(
-            command.metadata.get("collection_detail_stage_id")
-            or emission.action.metadata.get("collection_detail_stage_id")
-            or ""
-        )
-        final_pen_up = bool(
-            detail_stage_id == "right_write.pen_up"
-            and emission.directive.segment_terminal
+        fixed_right_grip = bool(
+            str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+            and "right" in self.config.gripper_sides
         )
         command.timestamp = timestamp
         for effector in command.commands.values():
             if not isinstance(effector.metadata, dict):
                 effector.metadata = dict(effector.metadata or {})
             effector.metadata["_parent_command_timestamp"] = timestamp
-            if final_pen_up and effector.effector_name == "right_hand":
-                # End continuous catch on the final pen-up command while
-                # preserving the same closed position. The explicit task-
-                # chain release remains the only operation that opens the
-                # gripper; this mode-only handoff prevents catch mode from
-                # running indefinitely between Episodes.
+            if fixed_right_grip and effector.effector_name == "right_hand":
+                # The task chain closes and opens the writing gripper exactly
+                # once at its explicit boundaries. Every in-Episode hand
+                # command therefore stays in one-shot mode at the fixed
+                # closed target. This prevents the replay stream from
+                # toggling catch mode or re-driving source hand jitter while
+                # preserving one canonical action/command representation for
+                # the dataset contract.
                 effector.metadata["dmtac_continuous_grasp_override"] = False
+                effector.metadata["dmtac_preserve_existing_grip"] = True
                 command.metadata[
-                    "rule_based_final_pen_up_continuous_grasp_released"
-                ] = True
+                    "rule_based_right_gripper_hold_mode"
+                ] = "task_chain_fixed_closed_one_shot"
             if effector.effector_name.endswith("_arm"):
                 # The strict-timestamp jerk planner must see one source cut
                 # per distinct rule qref, not one cut per retry/repeated
@@ -2617,13 +2616,13 @@ class RuleBasedRealTeleopExtension:
     def _dispatch_pending_gripper_action(self, observation: object, now: float) -> None:
         """Advance one feedback-gated reset increment through the Session Rig.
 
-        The rule UI is intentionally not a second device loop.  A reset click
+        The rule UI is intentionally not a second device loop. A reset click
         is converted to the same canonical ``RobotAction``/``TeleopCommand``
         carrier used by collection and sent through ``TeleopSession``'s
-        existing dispatch seam.  Each command is bounded by ``gripper_max_step``
-        and the next one requires fresh measured progress in the requested
-        direction; only the final open/closed target requires measured arrival.
-        No formal writer call is made and no arm effector is included.
+        existing dispatch seam. Task-chain right-hand actions issue one
+        endpoint command and then only observe fresh feedback; generic
+        maintenance actions retain bounded incremental motion. No formal
+        writer call is made and no arm effector is included.
         """
 
         intent = self._pending_gripper_action
@@ -2676,6 +2675,10 @@ class RuleBasedRealTeleopExtension:
         arrived: list[str] = []
         wrong_direction: list[str] = []
         resend_sides: set[str] = set()
+        task_chain_right_only = intent in {
+            "release_right_gripper",
+            "close_right_gripper",
+        }
         is_release = intent in {"release_grippers", "release_right_gripper"}
         target_scalar = 0.0 if is_release else 1.0
         direction = -1.0 if is_release else 1.0
@@ -2802,6 +2805,22 @@ class RuleBasedRealTeleopExtension:
                     float(self.config.manual_gripper_endpoint_tolerance),
                     1e-4,
                 )
+                if task_chain_right_only:
+                    if progress >= minimum_progress:
+                        # The endpoint command is already owned by firmware.
+                        # Fresh forward progress only refreshes the bounded
+                        # no-progress watchdog; it must not trigger another
+                        # register write.
+                        self._manual_gripper_command_baseline_by_side[side] = (
+                            measured_scalar
+                        )
+                        self._manual_gripper_last_progress_at_by_side[side] = (
+                            float(now)
+                        )
+                    waiting.append(
+                        f"{side}={measured_scalar:.3f}/{last_target:.3f}"
+                    )
+                    continue
                 if progress < minimum_progress:
                     last_dispatch_at = self._manual_gripper_last_dispatch_at_by_side.get(
                         side,
@@ -2832,12 +2851,15 @@ class RuleBasedRealTeleopExtension:
                 # final target is still feedback-gated and every new command
                 # remains bounded from the latest measured position.
             baseline = measured_scalar
-            delta = float(np.clip(
-                final_target - baseline,
-                -float(self.config.gripper_max_step),
-                float(self.config.gripper_max_step),
-            ))
-            next_target = baseline + delta
+            if task_chain_right_only:
+                next_target = final_target
+            else:
+                delta = float(np.clip(
+                    final_target - baseline,
+                    -float(self.config.gripper_max_step),
+                    float(self.config.gripper_max_step),
+                ))
+                next_target = baseline + delta
             qpos = np.zeros(6, dtype=np.float32)
             qpos[command_dim] = float(np.clip(next_target, 0.0, max_action))
             hand_qpos[side] = qpos
@@ -2928,6 +2950,11 @@ class RuleBasedRealTeleopExtension:
                     "rule_based_manual_gripper_max_step": float(
                         self.config.gripper_max_step
                     ),
+                    "rule_based_manual_gripper_dispatch_mode": (
+                        "single_endpoint_feedback_gated"
+                        if task_chain_right_only
+                        else "bounded_incremental_feedback_gated"
+                    ),
                     "rule_based_capture_enabled": False,
                     "external_gripper_motion": True,
                     "external_non_motion": True,
@@ -2941,13 +2968,9 @@ class RuleBasedRealTeleopExtension:
                 },
             )
             command = self.adapter.resolver.resolve(action)
-            # The task-chain right-only close is an admission transition, not
-            # the writing hold itself. Keep it one-shot so completion can be
-            # proven by a real idle/force-stop state; accepting vendor status
-            # 4 here lets a still-running catch motor enter the whole writing
-            # episode and can end in a latched 0x0010 device fault. The first
-            # replay hand command restores the configured continuous-grasp
-            # policy through the ordinary DMTAC backend path.
+            # Task-chain right-hand motion and release are one-shot firmware
+            # operations. The writing replay keeps the same mode and target;
+            # it must not restore continuous catch or re-drive the hand.
             manual_continuous_grasp = intent == "close_grippers"
             for side in hand_qpos:
                 effector = command.commands.get(f"{side}_hand")
@@ -2959,10 +2982,15 @@ class RuleBasedRealTeleopExtension:
                     effector.metadata = dict(effector.metadata or {})
                 # Release and the task-chain right-only close are one-shot
                 # maintenance moves. The generic all-side close retains its
-                # historical continuous-grasp behavior; writing replay owns
-                # the later task-specific continuous hold.
+                # historical continuous-grasp behavior; writing replay keeps
+                # the task-chain right hand fixed in the same one-shot mode.
                 effector.metadata["dmtac_continuous_grasp_override"] = bool(
                     manual_continuous_grasp
+                )
+                effector.metadata["rule_based_manual_gripper_dispatch_mode"] = (
+                    "single_endpoint_feedback_gated"
+                    if task_chain_right_only
+                    else "bounded_incremental_feedback_gated"
                 )
             command.metadata.update(
                 {
@@ -4234,6 +4262,19 @@ class RuleBasedRealTeleopExtension:
                     f"initial alignment requires finite causal {side} gripper state."
                 )
             hand_start[side] = actual.astype(np.float32, copy=True)
+        if (
+            str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+            and "right" in hand_target
+            and not self._writing_right_gripper_hold_admitted(
+                target=hand_target["right"],
+                snapshots=snapshots,
+            )
+        ):
+            raise RuleBasedInitialAlignmentPlanningError(
+                "rule writing requires a feedback-gated right-gripper close "
+                "before initial alignment"
+            )
         self._initial_alignment_template = emission
         self._initial_alignment_hand_start_by_side = hand_start
         self._initial_alignment_hand_target_by_side = hand_target
@@ -5426,6 +5467,95 @@ class RuleBasedRealTeleopExtension:
         self._deferred_progress_arm_fix_established = True
         self._waiting_reason = "progress_entry_arm_fix_established"
 
+    def _writing_right_gripper_force_stop_reached(
+        self,
+        *,
+        side: str,
+        target: np.ndarray,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        """Accept the feedback-gated pen contact stop as a closed target."""
+
+        if (
+            side != "right"
+            or str(self.source_selection.get("collection_mode") or "")
+            != "rule_based_writing"
+            or target.shape != (6,)
+        ):
+            return False
+        dim = int(self._hand_command_dim_by_side.get("right", 0))
+        max_action = float(self._hand_max_action_by_side.get("right", 1.0))
+        if abs(float(target[dim]) - max_action) > float(
+            self.config.manual_gripper_endpoint_tolerance
+        ):
+            return False
+        state = snapshots.get("right", {}).get("hand_state")
+        if not isinstance(state, Mapping):
+            return False
+        raw_status = state.get("gripper_status_code", state.get("status_code"))
+        raw_error = state.get("gripper_error_code", state.get("error_code"))
+        try:
+            status_code = int(raw_status)
+            error_code = 0 if raw_error is None else int(raw_error)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            status_code == 6
+            and error_code == 0
+            and not bool(state.get("gripper_is_moving"))
+        )
+
+    def _writing_right_gripper_hold_admitted(
+        self,
+        *,
+        target: np.ndarray,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        """Require a stable close/contact receipt before any writing arm move."""
+
+        expected = np.asarray(target, dtype=float).reshape(-1)
+        actual = np.asarray(
+            snapshots.get("right", {}).get("actual_hand_qpos"),
+            dtype=float,
+        ).reshape(-1)
+        if (
+            expected.shape != (6,)
+            or actual.shape != (6,)
+            or not np.all(np.isfinite(expected))
+            or not np.all(np.isfinite(actual))
+        ):
+            return False
+        if self._writing_right_gripper_force_stop_reached(
+            side="right",
+            target=expected,
+            snapshots=snapshots,
+        ):
+            return True
+        dim = int(self._hand_command_dim_by_side.get("right", 0))
+        max_action = float(self._hand_max_action_by_side.get("right", 1.0))
+        if (
+            abs(float(expected[dim]) - max_action)
+            > float(self.config.manual_gripper_endpoint_tolerance)
+            or abs(float(actual[dim]) - max_action)
+            > float(self.config.manual_gripper_endpoint_tolerance)
+        ):
+            return False
+        state = snapshots.get("right", {}).get("hand_state")
+        if not isinstance(state, Mapping):
+            return False
+        raw_status = state.get("gripper_status_code", state.get("status_code"))
+        raw_error = state.get("gripper_error_code", state.get("error_code"))
+        try:
+            status_code = None if raw_status is None else int(raw_status)
+            error_code = 0 if raw_error is None else int(raw_error)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            error_code == 0
+            and status_code not in {4, 5}
+            and not bool(state.get("gripper_is_moving"))
+        )
+
     def _target_reached(
         self,
         emission: RuleBasedCollectionEmission,
@@ -5465,6 +5595,10 @@ class RuleBasedRealTeleopExtension:
                     return False
                 if float(np.max(np.abs(actual - target))) > float(
                     self.config.gripper_qpos_tolerance
+                ) and not self._writing_right_gripper_force_stop_reached(
+                    side=side,
+                    target=target,
+                    snapshots=snapshots,
                 ):
                     return False
             return True
@@ -5537,7 +5671,14 @@ class RuleBasedRealTeleopExtension:
                 return False
             if not np.all(np.isfinite(target)) or not np.all(np.isfinite(actual)):
                 return False
-            if float(np.max(np.abs(actual - target))) > hand_tolerance:
+            if (
+                float(np.max(np.abs(actual - target))) > hand_tolerance
+                and not self._writing_right_gripper_force_stop_reached(
+                    side=side,
+                    target=target,
+                    snapshots=snapshots,
+                )
+            ):
                 return False
         return True
 

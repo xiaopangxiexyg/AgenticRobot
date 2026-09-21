@@ -940,6 +940,20 @@ def _replace_group_hand_trajectory(
     )
 
 
+def _fixed_dmtac_trajectory(*, frame_count: int, scalar: float) -> np.ndarray:
+    """Return one finite six-slot DMTAC trajectory with a fixed active slot."""
+
+    count = int(frame_count)
+    value = float(scalar)
+    if count < 1:
+        raise ValueError("fixed DMTAC trajectory requires at least one frame.")
+    if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError("fixed DMTAC target must be inside normalized [0, 1].")
+    target = np.zeros(6, dtype=np.float32)
+    target[0] = value
+    return np.repeat(target[None, :], count, axis=0)
+
+
 def _resample_hand_trajectory(
     values: np.ndarray,
     *,
@@ -2820,6 +2834,7 @@ def build_rule_based_writing(
         }
     source_selection = {
         **source_selection,
+        "collection_mode": RULE_COLLECTION_MODE_WRITING,
         "trajectory_catalog": {
             "mode": (
                 "default_plus_additional"
@@ -2852,7 +2867,9 @@ def build_rule_based_writing(
             "grippers": list(configured_gripper_sides),
         },
         "gripper_trajectory_mode": (
-            "source_phase_relative_continuous_time_normalized_write"
+            "right_task_chain_fixed_closed"
+            if "right" in configured_gripper_sides
+            else "source_phase_relative_continuous_time_normalized_write"
             if configured_gripper_sides
             else "disabled"
         ),
@@ -2952,6 +2969,36 @@ def build_rule_based_writing(
                 pre_pen_down_group,
                 sides=configured_gripper_sides,
             )
+    if "right" in configured_gripper_sides:
+        # The task chain is the sole owner of the writing hand: it closes the
+        # right gripper once before this plan starts and opens it once after
+        # the Episode. Source hand traces remain represented by source
+        # provenance, but must not re-drive the pen grip during approach,
+        # writing or departure. Keeping the canonical action fixed at the
+        # closed endpoint also keeps recorded action semantics aligned with
+        # the physical command without introducing a second gripper loop.
+        phase_groups = {
+            phase: _replace_group_hand_trajectory(
+                group,
+                {
+                    "right": _fixed_dmtac_trajectory(
+                        frame_count=group.frame_count,
+                        scalar=1.0,
+                    )
+                },
+            )
+            for phase, group in phase_groups.items()
+        }
+        if pre_pen_down_group is not None:
+            pre_pen_down_group = _replace_group_hand_trajectory(
+                pre_pen_down_group,
+                {
+                    "right": _fixed_dmtac_trajectory(
+                        frame_count=pre_pen_down_group.frame_count,
+                        scalar=1.0,
+                    )
+                },
+            )
 
     speed = (
         float(args.rule_writing_speed_m_s)
@@ -3024,6 +3071,16 @@ def build_rule_based_writing(
                 phase="pen_down",
                 max_step=gripper_max_step,
             )
+            if side == "right":
+                writing_hand_trajectory[side] = _fixed_dmtac_trajectory(
+                    frame_count=len(preview_targets),
+                    scalar=1.0,
+                )
+                pen_up_rebased[side] = _fixed_dmtac_trajectory(
+                    frame_count=phase_groups["pen_up"].frame_count,
+                    scalar=1.0,
+                )
+                continue
             anchored_write = _rebase_hand_trajectory(
                 source_write_hand[side],
                 anchor=pen_down_hand[side][-1],
@@ -3049,6 +3106,7 @@ def build_rule_based_writing(
                 phase="pen_up",
                 max_step=gripper_max_step,
             )
+        for side in configured_gripper_sides:
             if not np.allclose(
                 pen_down_hand[side][-1],
                 writing_hand_trajectory[side][0],

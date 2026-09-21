@@ -2646,6 +2646,72 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertTrue(fake.moves[0]["continuous"])
         self.assertEqual(backend._last_send_status, "sent")
 
+    def test_dmtac_backend_preserves_feedback_gated_task_chain_grip_without_write(
+        self,
+    ) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+            def __init__(self) -> None:
+                self.moves: list[dict[str, object]] = []
+
+            def move(self, joint_pos: float, **kwargs: object) -> None:
+                self.moves.append({"joint_pos": float(joint_pos), **dict(kwargs)})
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                continuous_grasp=True,
+            )
+        )
+        backend.device = fake
+        backend._applied_speed = backend.config.speed
+        backend._applied_torque = backend.config.torque
+        backend._applied_continuous_grasp = False
+        backend._last_sent_command = np.asarray(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
+        measured = np.zeros(6, dtype=np.float32)
+        measured[0] = 0.53
+        backend._latest_measured_joint_pos = measured
+        command = EffectorCommand(
+            effector_name="right_hand",
+            side="right",
+            command_type="joint_vector",
+            value=measured.copy(),
+            metadata={
+                "dmtac_continuous_grasp_override": False,
+                "dmtac_preserve_existing_grip": True,
+            },
+        )
+
+        self.assertTrue(backend.send_command(command))
+        self.assertEqual(fake.moves, [])
+        self.assertEqual(backend._last_send_status, "preserved_existing_grip")
+        self.assertEqual(
+            backend._last_send_skip_reason,
+            "task_chain_owns_physical_grip",
+        )
+
+        backend._last_sent_command = None
+        self.assertFalse(backend.send_command(command))
+        self.assertEqual(backend._last_send_status, "hold_owner_uninitialized")
+        self.assertEqual(fake.moves, [])
+
+        backend._last_sent_command = np.zeros(6, dtype=np.float32)
+        self.assertFalse(backend.send_command(command))
+        self.assertEqual(backend._last_send_status, "hold_owner_uninitialized")
+        self.assertEqual(
+            backend._last_send_skip_reason,
+            "preserve_existing_grip_without_close_command",
+        )
+        self.assertEqual(fake.moves, [])
+
     def test_deploy_builds_dmtac_gripper_backend_from_assignment(self) -> None:
         parser = argparse.ArgumentParser()
         deploy_run_policy.add_args(parser)

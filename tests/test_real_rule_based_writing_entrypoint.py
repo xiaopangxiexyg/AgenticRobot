@@ -488,7 +488,7 @@ def test_full_replay_mode_rejects_writing_speed_override(tmp_path: Path) -> None
         )
 
 
-def test_writing_mode_keeps_its_phase_hand_continuity_contract(
+def test_writing_mode_replaces_source_right_hand_jumps_with_fixed_pen_grip(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -502,18 +502,27 @@ def test_writing_mode_keeps_its_phase_hand_continuity_contract(
     args.left_hand_backend = "dmtac-gripper"
     args.right_hand_backend = "dmtac-gripper"
 
-    with pytest.raises(
-        ValueError,
-        match=r"pen_down right gripper step .* exceeds the bounded maximum",
-    ):
-        rule_based_plan.build_rule_based_writing(
-            args,
-            deployment=rule_based_plan.RuleBasedRealTeleopDeployment(
-                active_sides=("left", "right"),
-                collection_pose_frame_contract=_contract(),
-                tcp_pose_envelope_profile="fixture-envelope",
-            ),
-        )
+    build = rule_based_plan.build_rule_based_writing(
+        args,
+        deployment=rule_based_plan.RuleBasedRealTeleopDeployment(
+            active_sides=("left", "right"),
+            collection_pose_frame_contract=_contract(),
+            tcp_pose_envelope_profile="fixture-envelope",
+        ),
+    )
+
+    steps = build.extension.plan.steps
+    right_trajectories = (
+        build.extension.trajectory_groups["pen_down"].hand_joint_targets["right"],
+        steps[3].action_source.hand_trajectory_by_side["right"],
+        build.extension.trajectory_groups["pen_up"].hand_joint_targets["right"],
+    )
+    for values in right_trajectories:
+        assert np.allclose(values[:, 0], 1.0)
+        assert np.allclose(values[:, 1:], 0.0)
+    assert build.source_selection["gripper_trajectory_mode"] == (
+        "right_task_chain_fixed_closed"
+    )
 
 
 def test_gui_writer_configuration_is_staged_then_committed_to_live_args(
@@ -756,7 +765,7 @@ def test_populated_dataset_contract_overrides_requested_tactile_mode(
     assert args.ignore_tactile == ["left", "right"]
 
 
-def test_dual_dmtac_plan_replays_continuous_three_phase_gripper_trajectories(
+def test_dual_dmtac_plan_keeps_right_pen_grip_fixed_across_three_phases(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -801,6 +810,9 @@ def test_dual_dmtac_plan_replays_continuous_three_phase_gripper_trajectories(
         assert np.allclose(write_values[-1], up_values[0])
         for values in (down_values, write_values, up_values):
             assert np.max(np.abs(np.diff(values, axis=0))) <= 0.050001
+        if side == "right":
+            for values in (down_values, write_values, up_values):
+                assert np.allclose(values[:, 0], 1.0)
 
     initialize = build.extension.adapter.cursor.next_runtime(None)
     assert set(initialize.hand_qpos_by_side) == {"left", "right"}

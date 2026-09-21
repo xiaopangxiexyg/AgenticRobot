@@ -1906,6 +1906,14 @@ class DMTacGripperBackend(EffectorBackend):
             raise ValueError(
                 "dmtac_continuous_grasp_override must be boolean when provided."
             )
+        preserve_existing_grip = command.metadata.get(
+            "dmtac_preserve_existing_grip",
+            False,
+        )
+        if not isinstance(preserve_existing_grip, (bool, np.bool_)):
+            raise ValueError(
+                "dmtac_preserve_existing_grip must be boolean when provided."
+            )
         sent = self._send_joint_pos(
             command.value,
             bypass_send_commands=False,
@@ -1915,6 +1923,7 @@ class DMTacGripperBackend(EffectorBackend):
                 if continuous_override is None
                 else bool(continuous_override)
             ),
+            preserve_existing_grip=bool(preserve_existing_grip),
         )
         if sent:
             self._last_command = command.copy()
@@ -1938,6 +1947,7 @@ class DMTacGripperBackend(EffectorBackend):
             bypass_send_commands=True,
             force=True,
             continuous_grasp_override=None,
+            preserve_existing_grip=False,
         )
 
     def set_torque(self, torque: float) -> float:
@@ -2144,6 +2154,7 @@ class DMTacGripperBackend(EffectorBackend):
         bypass_send_commands: bool,
         force: bool,
         continuous_grasp_override: bool | None,
+        preserve_existing_grip: bool,
     ) -> bool:
         attempt_started_perf = time.perf_counter()
         attempt_started_wall = time.time()
@@ -2172,6 +2183,63 @@ class DMTacGripperBackend(EffectorBackend):
                 "hardware_fault",
                 sent=False,
                 skip_reason=f"error_code={int(self._latest_gripper_error_code)}",
+            )
+        if preserve_existing_grip:
+            # A rule-writing task chain has already sent and feedback-gated
+            # the one physical close command. Its arm-only Episode still
+            # carries a right-hand action for dataset/action consistency, but
+            # that action must not generate another serial write. Accept the
+            # command-inert hold only when the live backend proves the prior
+            # command and requested one-shot mode were actually established.
+            if self.config.connect_hardware and (
+                self.device is None
+                or getattr(self.device, "gripper", None) is None
+            ):
+                return finish(
+                    "not_connected",
+                    sent=False,
+                    skip_reason="preserve_existing_grip_without_device",
+                )
+            if self._last_sent_command is None:
+                return finish(
+                    "hold_owner_uninitialized",
+                    sent=False,
+                    skip_reason="preserve_existing_grip_without_prior_command",
+                )
+            last_sent = np.asarray(self._last_sent_command, dtype=float).reshape(-1)
+            command_dim = int(self.config.command_dim)
+            if (
+                last_sent.shape != (6,)
+                or not np.all(np.isfinite(last_sent))
+                or abs(
+                    float(last_sent[command_dim])
+                    - float(self.config.max_action)
+                )
+                > max(float(self.config.send_threshold), 1e-6)
+            ):
+                return finish(
+                    "hold_owner_uninitialized",
+                    sent=False,
+                    skip_reason="preserve_existing_grip_without_close_command",
+                )
+            requested_mode = (
+                bool(self.config.continuous_grasp)
+                if continuous_grasp_override is None
+                else bool(continuous_grasp_override)
+            )
+            if (
+                self._applied_continuous_grasp is None
+                or bool(self._applied_continuous_grasp) != requested_mode
+            ):
+                return finish(
+                    "hold_owner_uninitialized",
+                    sent=False,
+                    skip_reason="preserve_existing_grip_mode_not_applied",
+                )
+            return finish(
+                "preserved_existing_grip",
+                sent=True,
+                skip_reason="task_chain_owns_physical_grip",
             )
         if self._last_sent_command is not None and not bool(force):
             max_delta = float(np.max(np.abs(target - self._last_sent_command)))

@@ -2494,9 +2494,12 @@ def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
             assert close.metadata["rule_based_manual_gripper_sides"] == ["right"]
             command = close.commands["right_hand"]
             # Admission closes in one-shot mode so a real idle/force-stop
-            # receipt is required. The first replay hand command restores the
-            # configured writing hold.
+            # receipt is required. Writing retains this same fixed mode.
             assert command.metadata["dmtac_continuous_grasp_override"] is False
+            assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
+                "single_endpoint_feedback_gated"
+            )
+            assert float(command.value[0]) == pytest.approx(1.0)
             backends["right"].set_measured_scalar(float(command.value[0]))
             assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
         now += 0.05
@@ -2504,6 +2507,7 @@ def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
 
     assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
     assert float(backends["right"].measured_joint_pos[0]) == pytest.approx(1.0)
+    assert len(session.external_commands) == 1
     assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
     assert extension.status().gripper_action_intent == "close_right_gripper"
     assert extension.status().gripper_action_result == "succeeded"
@@ -2547,12 +2551,17 @@ def test_task_chain_release_right_gripper_preserves_left_hand() -> None:
             assert set(release.commands) == {"right_hand"}
             command = release.commands["right_hand"]
             assert command.metadata["dmtac_continuous_grasp_override"] is False
+            assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
+                "single_endpoint_feedback_gated"
+            )
+            assert float(command.value[0]) == pytest.approx(0.0)
             right.set_measured_scalar(float(command.value[0]))
         now += 0.05
         assert now < 20.0
 
     assert float(left.measured_joint_pos[0]) == pytest.approx(0.5)
     assert float(right.measured_joint_pos[0]) == pytest.approx(0.0)
+    assert len(session.external_commands) == 1
     status = extension.status()
     assert status.gripper_action_status == "右夹爪实测已松开"
     assert status.gripper_action_intent == "release_right_gripper"
@@ -2636,13 +2645,15 @@ def test_task_chain_close_right_waits_for_idle_after_closed_endpoint() -> None:
     assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
 
 
-def test_final_pen_up_releases_continuous_grasp_without_opening_hand() -> None:
+def test_writing_keeps_right_gripper_in_fixed_one_shot_mode() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
             steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
         ),
         trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
     )
     action = SimpleNamespace(
         timestamp=1.0,
@@ -2674,18 +2685,21 @@ def test_final_pen_up_releases_continuous_grasp_without_opening_hand() -> None:
         np.full(6, 0.8)
     )
     assert hand_command.metadata["dmtac_continuous_grasp_override"] is False
+    assert hand_command.metadata["dmtac_preserve_existing_grip"] is True
     assert command.metadata[
-        "rule_based_final_pen_up_continuous_grasp_released"
-    ] is True
+        "rule_based_right_gripper_hold_mode"
+    ] == "task_chain_fixed_closed_one_shot"
 
 
-def test_nonterminal_pen_up_preserves_configured_grasp_mode() -> None:
+def test_nonterminal_writing_frame_uses_same_fixed_one_shot_grip_mode() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
             steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
         ),
         trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
     )
     command = TeleopCommand(
         commands={
@@ -2708,10 +2722,15 @@ def test_nonterminal_pen_up_preserves_configured_grasp_mode() -> None:
 
     extension._prepare_live_dispatch(emission, 2.0)
 
-    assert "dmtac_continuous_grasp_override" not in command.commands[
-        "right_hand"
-    ].metadata
-    assert "rule_based_final_pen_up_continuous_grasp_released" not in command.metadata
+    assert command.commands["right_hand"].metadata[
+        "dmtac_continuous_grasp_override"
+    ] is False
+    assert command.commands["right_hand"].metadata[
+        "dmtac_preserve_existing_grip"
+    ] is True
+    assert command.metadata["rule_based_right_gripper_hold_mode"] == (
+        "task_chain_fixed_closed_one_shot"
+    )
 
 
 def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
@@ -2727,6 +2746,7 @@ def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
         ),
         trajectory_groups={},
         config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
     )
     recorder = _Recorder(_Poller())
 
@@ -2777,8 +2797,41 @@ def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
 
     status = extension.status()
     assert extension._pending_gripper_action is None
+    assert len(session.external_commands) == 1
     assert status.gripper_action_status == "右夹爪实测已闭紧"
     assert status.gripper_action_result == "succeeded"
+
+    nominal = np.zeros(6, dtype=np.float32)
+    nominal[0] = 1.0
+    assert extension._writing_right_gripper_force_stop_reached(
+        side="right",
+        target=nominal,
+        snapshots={
+            "right": {
+                "hand_state": {
+                    "gripper_status_code": 6,
+                    "gripper_error_code": 0,
+                    "gripper_is_moving": False,
+                },
+            }
+        },
+    )
+    assert extension._writing_right_gripper_hold_admitted(
+        target=nominal,
+        snapshots={
+            "right": {
+                "actual_hand_qpos": np.asarray(
+                    [0.53, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    dtype=np.float32,
+                ),
+                "hand_state": {
+                    "gripper_status_code": 6,
+                    "gripper_error_code": 0,
+                    "gripper_is_moving": False,
+                },
+            }
+        },
+    )
 
 
 def test_manual_gripper_reset_uses_recorder_hand_history_without_backend_read() -> None:
