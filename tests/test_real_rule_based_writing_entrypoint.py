@@ -1197,6 +1197,55 @@ def test_launcher_restores_system_tools_when_conda_path_is_isolated(
     assert "--rule-initial-alignment-speed-scale 0.5" in result.stdout
 
 
+def test_launcher_refuses_missing_runtime_scipy_before_device_startup(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    source.mkdir()
+    detail.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then\n"
+        "  echo 'ModuleNotFoundError: No module named scipy' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    environment = dict(os.environ)
+    environment["PATH"] = f"{fake_bin}:/usr/local/bin:/usr/bin:/bin"
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--no-collect-tactile",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert "runtime dependency preflight failed" in result.stderr
+    assert "scipy.spatial.transform.Rotation" in result.stderr
+    assert "no device startup was attempted" in result.stderr
+    assert "control_station.real_rule_based_writing_entrypoint" not in result.stderr
+
+
 def test_launcher_accepts_greek_trajectory_catalog_id(tmp_path: Path) -> None:
     source = tmp_path / "source"
     detail = tmp_path / "detail"

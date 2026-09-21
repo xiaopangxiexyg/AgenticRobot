@@ -476,13 +476,14 @@ TELEOP_ARGS=(
   "${RULE_ARGS[@]}"
 )
 
+RUNTIME_PYTHON="${PYTHON_BIN:-python}"
 RUN_COMMAND=(
   taskset -c 0-7
-  python -m control_station.real_rule_based_writing_entrypoint
+  "$RUNTIME_PYTHON" -m control_station.real_rule_based_writing_entrypoint
   "${TELEOP_ARGS[@]}"
 )
 
-for required_command in taskset python; do
+for required_command in taskset "$RUNTIME_PYTHON"; do
   command -v "$required_command" >/dev/null 2>&1 || \
     die "required command is unavailable after PATH normalization: $required_command"
 done
@@ -490,6 +491,39 @@ done
 if [[ "$DRY_RUN" -eq 1 ]]; then
   print_command "${RUN_COMMAND[@]}"
   exit 0
+fi
+
+# Import this dependency with the exact interpreter that will own the real
+# process.  The source tree declares SciPy in both pyproject.toml and
+# environment.yml, but a stale or partially-created remote conda environment
+# must be rejected before any camera, arm, or gripper component is assembled.
+runtime_dependency_preflight() {
+  local import_output runtime_python_path
+  if import_output="$("$RUNTIME_PYTHON" -c \
+      'import scipy; from scipy.spatial.transform import Rotation; print(scipy.__version__)' \
+      2>&1)"; then
+    printf '[RuleBased] runtime dependency preflight: scipy=%s python=%s\n' \
+      "$import_output" "$RUNTIME_PYTHON"
+    return 0
+  fi
+
+  runtime_python_path="$("$RUNTIME_PYTHON" -c 'import sys; print(sys.executable)' 2>/dev/null || printf '%s' "$RUNTIME_PYTHON")"
+  printf '%s\n' \
+    '[RuleBased] runtime dependency preflight failed; no device startup was attempted.' \
+    "[RuleBased] python=$runtime_python_path" \
+    '[RuleBased] required import: scipy.spatial.transform.Rotation' \
+    '[RuleBased] expected environment declaration: scipy==1.13.1 in environment.yml/pyproject.toml' \
+    '[RuleBased] repair example: conda install -p /home/user/miniconda3/envs/dexteleop310 -c conda-forge scipy=1.13.1' \
+    '[RuleBased] import diagnostic:' \
+    "$import_output" >&2
+  return 1
+}
+
+if ! runtime_dependency_preflight; then
+  # This is a fail-closed startup refusal, intentionally distinct from the
+  # launcher's CLI validation path; do not turn an environment fault into a
+  # Python traceback or the legacy exit-2 validation path.
+  exit 1
 fi
 
 printf '%s\n' \
