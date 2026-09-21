@@ -363,6 +363,7 @@ class RealTeleopControlInput:
         self._camera_depth_monitor = WristDepthFreshnessMonitor()
         self._episode_start_requested = False
         self._episode_stop_requested = False
+        self._episode_stop_reason = ""
         self._dataset_reconfigure_callback: Callable[..., object] | None = None
         self._dataset_reconfigure_transactional = False
         self._dataset_selection_pending = False
@@ -1668,7 +1669,18 @@ class RealTeleopControlInput:
                     self._persist_gripper_force_from_gui(event.split(":", 1)[1])
                 elif event.startswith("init_arm_qpos_speed_set:"):
                     self._set_init_arm_qpos_speed_from_gui(event.split(":", 1)[1])
-                elif event == "episode_stop":
+                elif event == "episode_stop" or event.startswith("episode_stop:"):
+                    # Preserve the first stop owner's reason until the control
+                    # loop consumes it.  Rule completion/failure uses this
+                    # suffix to select finalize-vs-discard semantics; treating
+                    # only the unsuffixed GUI event as valid strands a fully
+                    # completed Episode after its motion source goes idle.
+                    if not self._episode_stop_requested:
+                        self._episode_stop_reason = (
+                            event.split(":", 1)[1].strip()
+                            if ":" in event
+                            else "manual_key_stop"
+                        ) or "manual_key_stop"
                     self._episode_stop_requested = True
                 elif event.startswith("episode_delete:"):
                     try:
@@ -4582,9 +4594,22 @@ class RealTeleopControlInput:
         return True
 
     def consume_episode_stop_request(self) -> bool:
+        requested, _reason = self.consume_episode_stop_request_with_reason()
+        return requested
+
+    def consume_episode_stop_request_with_reason(self) -> tuple[bool, str]:
+        """Consume one stop request without dropping its lifecycle reason."""
+
         requested = bool(self._episode_stop_requested)
+        reason = str(self._episode_stop_reason or "")
         self._episode_stop_requested = False
-        return bool(self.terminal.consume_episode_stop_request() or requested)
+        self._episode_stop_reason = ""
+        terminal_requested = bool(self.terminal.consume_episode_stop_request())
+        if not requested and not terminal_requested:
+            return False, ""
+        if not reason:
+            reason = "manual_key_stop"
+        return True, reason
 
     def bind_dataset_reconfigure_callback(
         self,

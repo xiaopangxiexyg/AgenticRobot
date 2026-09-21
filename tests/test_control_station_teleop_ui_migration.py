@@ -208,6 +208,12 @@ def test_rule_home_retry_is_not_silently_dropped_with_same_cycle_hold() -> None:
             ("episode_stop", "h"),
             "hold",
         ),
+        (
+            ["episode_stop:rule_based_complete", "h", "w"],
+            False,
+            ("episode_stop:rule_based_complete", "h"),
+            "hold",
+        ),
         (["episode_start", "w"], True, (), "terminal_quit"),
     ),
 )

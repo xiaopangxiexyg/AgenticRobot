@@ -2965,6 +2965,27 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(control.consume_tactile_visualization_toggle_request())
         self.assertTrue(control.consume_tactile_solving_enable_request())
 
+    def test_rule_completion_stop_preserves_finalize_reason(self) -> None:
+        ui = _FakeUi(["episode_stop:rule_based_complete"])
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=ui,
+            args=_args(),
+            components=_components(),
+        )
+        control._teleop_started = True
+
+        control.poll()
+
+        self.assertEqual(
+            control.consume_episode_stop_request_with_reason(),
+            (True, "rule_based_complete"),
+        )
+        self.assertEqual(
+            control.consume_episode_stop_request_with_reason(),
+            (False, ""),
+        )
+
     def test_rule_runtime_home_retry_event_uses_robot_state_only_bridge(self) -> None:
         ui = _FakeUi(["runtime_home_retry"])
         control = real_teleop.RealTeleopControlInput(

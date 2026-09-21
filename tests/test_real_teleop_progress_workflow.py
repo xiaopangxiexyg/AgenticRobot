@@ -272,6 +272,41 @@ def test_manual_episode_stop_is_consumed_while_progress_receipt_is_pending() -> 
     ]
 
 
+def test_rule_completion_stop_reason_reaches_episode_finalize_owner() -> None:
+    class _Input:
+        def __init__(self) -> None:
+            self.pending = True
+
+        def consume_episode_stop_request_with_reason(self) -> tuple[bool, str]:
+            result = self.pending
+            self.pending = False
+            return result, "rule_based_complete" if result else ""
+
+    calls: list[tuple[object, ...]] = []
+    consumed = _consume_manual_episode_stop_request(
+        clutch_input=_Input(),
+        recording_active=lambda: True,
+        stop_recording=lambda now, **kwargs: calls.append(
+            (now, kwargs["end_reason"], kwargs["summary"])
+        ),
+        cancel_recording_countdown=lambda *_args, **_kwargs: calls.append(
+            ("cancel",)
+        ),
+        now=17.0,
+        step_index=57,
+        episode_last_state="RUNNING",
+    )
+
+    assert consumed
+    assert calls == [
+        (
+            17.0,
+            "rule_based_complete",
+            {"last_step_index": 57, "last_state": "RUNNING"},
+        )
+    ]
+
+
 def test_manual_episode_stop_precedes_replayed_hold_in_control_loop() -> None:
     source = inspect.getsource(run_real_teleop_control_loop)
     stop_index = source.index("if _consume_manual_episode_stop_request(")
