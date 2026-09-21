@@ -59,6 +59,9 @@ def _task_chain_ready_status(**updates: object) -> dict[str, object]:
         "configuration_available": True,
         "gripper_control_available": True,
         "gripper_sides": ["right"],
+        "gripper_action_id": None,
+        "gripper_action_intent": "",
+        "gripper_action_result": "idle",
         "height_calibration_available": True,
         **updates,
     }
@@ -676,6 +679,8 @@ def test_rule_ui_asset_contains_no_teleop_episode_progress_or_pedal_controls() -
     assert 'postJson("/task-chain"' in script
     assert 'pendingRequests.has("task-chain")' in script
     assert "event.altKey" in script
+    assert "let tactileCaptureLocked = false" in script
+    assert 'input.id === "collect-tactile" && tactileCaptureLocked' in script
     assert '"/task-chain"' in transport
     for forbidden in ("开始遥操", "Episode", "长程进度", "踏板", "夹爪控制"):
         assert forbidden not in asset
@@ -1378,18 +1383,24 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert application.snapshot()["task_chain_can_advance"] is True
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_rule_intents() == ("release_grippers",)
+    assert application.consume_rule_intents() == ("release_right_gripper",)
     assert application.snapshot()["task_chain_phase"] == "initial_release_pending"
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=True,
-            gripper_action_status="已排队：松开夹爪",
+            gripper_action_id=11,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="pending",
+            gripper_action_status="已排队：松开右夹爪",
         )
     )
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
-            gripper_action_status="夹爪实测已松开",
+            gripper_action_id=11,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已松开",
         )
     )
     assert application.snapshot()["task_chain_phase"] == "ready_close"
@@ -1399,20 +1410,29 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
-            gripper_action_status="夹爪实测已松开",
+            gripper_action_id=11,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已松开",
         )
     )
     assert application.snapshot()["task_chain_phase"] == "close_pending"
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=True,
-            gripper_action_status="已排队：闭紧夹爪",
+            gripper_action_id=12,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="pending",
+            gripper_action_status="已排队：闭紧右夹爪",
         )
     )
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
-            gripper_action_status="夹爪实测已闭紧",
+            gripper_action_id=12,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
         )
     )
     assert application.snapshot()["task_chain_phase"] == "ready_height"
@@ -1468,11 +1488,29 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert application.snapshot()["task_chain_phase"] == "ready_final_release"
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_rule_intents() == ("release_grippers",)
+    assert application.consume_rule_intents() == ("release_right_gripper",)
+    # A delayed success receipt from the initial release has the same intent,
+    # but its old action id must not complete the final release.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=False,
+            gripper_action_id=11,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已松开",
+            batch_count=1,
+            batch_completed_count=1,
+            batch_cycle_complete=True,
+        )
+    )
+    assert application.snapshot()["task_chain_phase"] == "final_release_pending"
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=True,
-            gripper_action_status="已排队：松开夹爪",
+            gripper_action_id=13,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="pending",
+            gripper_action_status="已排队：松开右夹爪",
             batch_count=1,
             batch_completed_count=1,
             batch_cycle_complete=True,
@@ -1481,7 +1519,10 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
-            gripper_action_status="夹爪实测已松开",
+            gripper_action_id=13,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已松开",
             batch_count=1,
             batch_completed_count=1,
             batch_cycle_complete=True,
@@ -1589,6 +1630,9 @@ def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() 
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
+            gripper_action_id=21,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="failed",
             gripper_action_status="夹爪控制超时",
         )
     )
@@ -1596,6 +1640,43 @@ def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() 
     assert state["task_chain_phase"] == "idle"
     assert "夹爪控制超时" in state["task_chain_detail"]
     assert state["task_chain_cycle_count"] == 0
+
+
+def test_task_chain_stop_enters_hold_then_releases_sequence_ownership() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("release_right_gripper",)
+    assert application.snapshot()["can_stop"] is True
+
+    assert application.submit_intent(RuleBasedWritingIntent.STOP) is True
+    assert application.consume_rule_intents() == ("rule_stop",)
+    assert application.consume_runtime_events() == [
+        "episode_stop:rule_based_hold_cancel",
+        "h",
+    ]
+    assert application.submit_intent(RuleBasedWritingIntent.STOP) is False
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            held=True,
+            session_state="DEBUG_ONLY",
+            rule_start_available=False,
+            configuration_available=False,
+            height_calibration_available=False,
+            readiness_blockers={
+                "rig.session": "runtime Home required after operator Hold"
+            },
+        )
+    )
+    state = application.snapshot()
+    assert state["task_chain_active"] is False
+    assert state["task_chain_phase"] == "idle"
+    assert state["task_chain_selected_configuration"] == {}
 
 
 def test_task_chain_waits_for_writer_commit_and_stops_on_rule_hold() -> None:

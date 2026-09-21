@@ -366,6 +366,9 @@ class RuleBasedRealTeleopStatus:
     control_topology: str = "双臂（无夹爪）"
     gripper_control_available: bool = False
     gripper_action_pending: bool = False
+    gripper_action_id: int | None = None
+    gripper_action_intent: str = ""
+    gripper_action_result: str = "idle"
     rule_start_available: bool = False
     gripper_action_status: str = ""
     rule_configuration: Mapping[str, Any] = field(default_factory=dict)
@@ -584,6 +587,10 @@ class RuleBasedRealTeleopExtension:
         self._stage_frame_total: int | None = None
         self._collection_position: str | None = None
         self._gripper_action_status = ""
+        self._gripper_action_sequence = 0
+        self._gripper_action_id: int | None = None
+        self._gripper_action_intent = ""
+        self._gripper_action_result = "idle"
         self._pending_gripper_action: str | None = None
         self._manual_gripper_started_at: float | None = None
         self._manual_gripper_last_command_by_side: dict[str, float] = {}
@@ -1389,11 +1396,18 @@ class RuleBasedRealTeleopExtension:
                 self._armed = False
                 self._waiting_reason = "runtime_home_required_after_hold"
                 self._clear_current()
-                self._clear_manual_gripper_action()
+                if self._pending_gripper_action is not None:
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message="夹爪动作已由任务链取消并进入 Hold。",
+                    )
+                else:
+                    self._clear_manual_gripper_action()
                 self._cancel_initial_alignment_planning()
                 self._establish_hold("rule-based operator stop")
             elif intent in {
                 "release_grippers",
+                "release_right_gripper",
                 "close_grippers",
                 "close_right_gripper",
             }:
@@ -1404,34 +1418,51 @@ class RuleBasedRealTeleopExtension:
                     None,
                 )
                 state_value = str(getattr(state, "value", state) or "").upper()
-                if self._height_calibration_future is not None:
-                    self._gripper_action_status = "高度标定读取期间夹爪保持不动。"
-                elif not self.config.gripper_sides:
-                    self._gripper_action_status = "当前拓扑没有已启用的 DMTAC 夹爪。"
-                elif self._pending_gripper_action is not None:
+                if self._pending_gripper_action is not None:
                     self._gripper_action_status = "已有夹爪动作正在执行；新动作已拒绝。"
+                    continue
+                self._begin_manual_gripper_action(str(intent))
+                if self._height_calibration_future is not None:
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message="高度标定读取期间夹爪保持不动。",
+                    )
+                elif not self.config.gripper_sides:
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message="当前拓扑没有已启用的 DMTAC 夹爪。",
+                    )
                 elif not self._manual_gripper_lifecycle_available(
                     session_state_value=state_value,
                 ):
-                    self._gripper_action_status = (
-                        "夹爪独立控制仅在没有活动 Episode 的采集前或轮次间可用。"
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message=(
+                            "夹爪独立控制仅在没有活动 Episode 的采集前或轮次间可用。"
+                        ),
                     )
                 elif (
-                    intent == "close_right_gripper"
+                    intent in {"release_right_gripper", "close_right_gripper"}
                     and "right" not in self.config.gripper_sides
                 ):
-                    self._gripper_action_status = "当前拓扑没有已启用的右夹爪。"
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message="当前拓扑没有已启用的右夹爪。",
+                    )
                 else:
-                    self._pending_gripper_action = str(intent)
                     self._manual_gripper_started_at = None
                     self._manual_gripper_last_command_by_side.clear()
                     self._gripper_action_status = (
                         "已排队：松开夹爪"
                         if intent == "release_grippers"
                         else (
-                            "已排队：闭紧右夹爪"
-                            if intent == "close_right_gripper"
-                            else "已排队：闭紧夹爪"
+                            "已排队：松开右夹爪"
+                            if intent == "release_right_gripper"
+                            else (
+                                "已排队：闭紧右夹爪"
+                                if intent == "close_right_gripper"
+                                else "已排队：闭紧夹爪"
+                            )
                         )
                     )
         if self._abort_pre_dispatch_readiness_loss():
@@ -1822,10 +1853,21 @@ class RuleBasedRealTeleopExtension:
         self._waiting_reason = "configuration_rebuild"
         self._clear_manual_gripper_action()
         self._gripper_action_status = "规则组合验证期间夹爪保持不动。"
-        self._configuration_future = self._configuration_executor.submit(
-            self._rebuild_configuration_batch,
-            request,
-        )
+        try:
+            self._configuration_future = self._configuration_executor.submit(
+                self._rebuild_configuration_batch,
+                request,
+            )
+        except RuntimeError as exc:
+            # Session teardown may race a final browser request.  Treat a
+            # closed executor as a rejected command-inert rebuild, never as an
+            # owner-loop exception that can strand the GUI.
+            self._configuration_request = None
+            self._configuration_error = f"{type(exc).__name__}: {exc}"
+            self._waiting_reason = "configuration_rejected"
+            self._gripper_action_status = ""
+            if callable(publish_result):
+                publish_result(selected=None, error=self._configuration_error)
         return True
 
     def _rebuild_configuration_batch(
@@ -2161,6 +2203,18 @@ class RuleBasedRealTeleopExtension:
                     source_cut_timestamp
                 )
 
+    def _begin_manual_gripper_action(self, intent: str) -> None:
+        self._gripper_action_sequence += 1
+        self._gripper_action_id = int(self._gripper_action_sequence)
+        self._gripper_action_intent = str(intent)
+        self._gripper_action_result = "pending"
+        self._pending_gripper_action = str(intent)
+
+    def _finish_manual_gripper_action(self, *, succeeded: bool, message: str) -> None:
+        self._gripper_action_status = str(message)
+        self._gripper_action_result = "succeeded" if succeeded else "failed"
+        self._clear_manual_gripper_action()
+
     def _clear_manual_gripper_action(self) -> None:
         self._pending_gripper_action = None
         self._manual_gripper_started_at = None
@@ -2339,8 +2393,9 @@ class RuleBasedRealTeleopExtension:
         side: str,
         now: float,
         final_target: float,
+        accept_continuous_close_hold: bool = False,
     ) -> tuple[bool, str]:
-        """Require post-command, distinct feedback frames at an endpoint.
+        """Require post-command, distinct stable endpoint/contact feedback.
 
         DMTAC position writes are asynchronous.  Endpoint position alone is
         therefore insufficient: the cached value can be the last register
@@ -2369,17 +2424,23 @@ class RuleBasedRealTeleopExtension:
             status_code = None if status_code is None else int(status_code)
         except (TypeError, ValueError):
             return False, "夹爪状态码无效"
-        if status_code in {4, 5}:
+        continuous_close_hold = bool(
+            accept_continuous_close_hold
+            and status_code == 4
+            and final_target > 0.0
+        )
+        if status_code in {4, 5} and not continuous_close_hold:
             direction = "张开" if status_code == 5 else "闭合"
             return False, f"夹爪仍在{direction}运动"
-        if bool(state.get("gripper_is_moving")):
+        if bool(state.get("gripper_is_moving")) and not continuous_close_hold:
             return False, "夹爪反馈仍显示运动中"
 
         feedback_timestamp = self._manual_gripper_feedback_timestamp(state)
         last_dispatch = self._manual_gripper_last_dispatch_at_by_side.get(side)
+        if last_dispatch is None:
+            return False, "等待本次夹爪命令后的反馈"
         if (
             feedback_timestamp is not None
-            and last_dispatch is not None
             and feedback_timestamp <= float(last_dispatch)
         ):
             return False, "等待夹爪命令后的新鲜反馈"
@@ -2401,25 +2462,6 @@ class RuleBasedRealTeleopExtension:
         if count < required:
             return False, f"等待端点稳定反馈({count}/{required})"
         return True, ""
-
-    @staticmethod
-    def _manual_gripper_close_needs_catch_mode_reset(
-        state: Mapping[str, Any],
-    ) -> bool:
-        """Return whether a closed endpoint is still latched in catch motion.
-
-        DMTAC status code 4 is a vendor-level "closing/catching" state.  It
-        can remain active after the measured position reaches 1.0 when the
-        continuous catch register is still enabled.  A task-chain close may
-        therefore need one same-position one-shot command even though it has
-        no positional increment left to send.
-        """
-
-        raw_status = state.get("gripper_status_code", state.get("status_code"))
-        try:
-            return int(raw_status) == 4
-        except (TypeError, ValueError):
-            return False
 
     def _manual_gripper_feedback(
         self,
@@ -2553,7 +2595,7 @@ class RuleBasedRealTeleopExtension:
         right hand owns the pen; the left hand must not receive a close command.
         """
 
-        if intent == "close_right_gripper":
+        if intent in {"release_right_gripper", "close_right_gripper"}:
             return ("right",) if "right" in self.config.gripper_sides else ()
         return tuple(self.config.gripper_sides)
 
@@ -2574,13 +2616,17 @@ class RuleBasedRealTeleopExtension:
             return
         action_sides = self._manual_gripper_action_sides(intent)
         if not action_sides:
-            self._gripper_action_status = "当前拓扑没有可用的目标夹爪。"
-            self._clear_manual_gripper_action()
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message="当前拓扑没有可用的目标夹爪。",
+            )
             return
         session = getattr(self._components, "session", None)
         if session is None:
-            self._gripper_action_status = "夹爪控制失败：Session 不可用。"
-            self._clear_manual_gripper_action()
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message="夹爪控制失败：Session 不可用。",
+            )
             return
         state = getattr(getattr(session, "state_machine", None), "state", None)
         state_value = str(getattr(state, "value", state) or "").upper()
@@ -2592,11 +2638,13 @@ class RuleBasedRealTeleopExtension:
         if not self._manual_gripper_lifecycle_available(
             session_state_value=state_value,
         ):
-            self._gripper_action_status = (
-                "夹爪控制已拒绝：当前不处于无活动 Episode 的安全维护窗口"
-                f"（Session={state_value or 'UNKNOWN'}）。"
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制已拒绝：当前不处于无活动 Episode 的安全维护窗口"
+                    f"（Session={state_value or 'UNKNOWN'}）。"
+                ),
             )
-            self._clear_manual_gripper_action()
             return
 
         if self._manual_gripper_started_at is None:
@@ -2613,8 +2661,9 @@ class RuleBasedRealTeleopExtension:
         arrived: list[str] = []
         wrong_direction: list[str] = []
         resend_sides: set[str] = set()
-        target_scalar = 0.0 if intent == "release_grippers" else 1.0
-        direction = -1.0 if intent == "release_grippers" else 1.0
+        is_release = intent in {"release_grippers", "release_right_gripper"}
+        target_scalar = 0.0 if is_release else 1.0
+        direction = -1.0 if is_release else 1.0
         for side in action_sides:
             backend = getattr(self._components, f"{side}_hand_backend", None)
             if backend is None:
@@ -2664,34 +2713,48 @@ class RuleBasedRealTeleopExtension:
             measured_scalar_by_side[side] = measured_scalar
             final_target = float(np.clip(target_scalar, 0.0, max_action))
             last_target = self._manual_gripper_last_command_by_side.get(side)
-            if abs(measured_scalar - final_target) <= float(
+            at_endpoint = abs(measured_scalar - final_target) <= float(
                 self.config.manual_gripper_endpoint_tolerance
-            ):
+            )
+            raw_status_code = (feedback_state or {}).get(
+                "gripper_status_code",
+                (feedback_state or {}).get("status_code"),
+            )
+            try:
+                status_code = (
+                    None if raw_status_code is None else int(raw_status_code)
+                )
+            except (TypeError, ValueError):
+                status_code = None
+            force_stopped_grasp = bool(
+                intent == "close_right_gripper"
+                and side == "right"
+                and status_code == 6
+                and side in self._manual_gripper_last_dispatch_at_by_side
+            )
+            if at_endpoint or force_stopped_grasp:
                 settled, settle_reason = self._manual_gripper_endpoint_settled(
                     feedback_state or {},
                     side=side,
                     now=float(now),
                     final_target=final_target,
+                    accept_continuous_close_hold=(
+                        intent == "close_right_gripper" and at_endpoint
+                    ),
                 )
                 if settled:
                     arrived.append(side)
                     self._manual_gripper_last_progress_at_by_side[side] = float(now)
                 else:
                     waiting.append(f"{side}:{settle_reason}")
-                    # If the task-chain starts while the gripper is already
-                    # at the closed endpoint, the ordinary bounded-position
-                    # path has no remaining delta and would never dispatch
-                    # the one-shot mode transition.  Send the same endpoint
-                    # only for the explicit right-only close and rate-limit
-                    # it with the existing resend interval.  Genuine faults,
-                    # stale feedback, opening motion, and unknown statuses
-                    # remain fail-closed.
+                    # An explicit maintenance action must have a causal device
+                    # command even when the actuator starts at its endpoint.
+                    # Reapply the same target once so release disables catch
+                    # mode and task-chain close establishes continuous hold.
                     if (
-                        intent == "close_right_gripper"
-                        and side == "right"
-                        and self._manual_gripper_close_needs_catch_mode_reset(
-                            feedback_state or {}
-                        )
+                        at_endpoint
+                        and side
+                        not in self._manual_gripper_last_dispatch_at_by_side
                     ):
                         last_dispatch_at = (
                             self._manual_gripper_last_dispatch_at_by_side.get(side)
@@ -2765,12 +2828,14 @@ class RuleBasedRealTeleopExtension:
             qpos[command_dim] = float(np.clip(next_target, 0.0, max_action))
             hand_qpos[side] = qpos
         if wrong_direction:
-            self._gripper_action_status = (
-                "夹爪控制停止：检测到与请求方向相反的实测运动（"
-                + ",".join(wrong_direction)
-                + "）。"
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制停止：检测到与请求方向相反的实测运动（"
+                    + ",".join(wrong_direction)
+                    + "）。"
+                ),
             )
-            self._clear_manual_gripper_action()
             return
         timed_out = [
             side
@@ -2783,49 +2848,58 @@ class RuleBasedRealTeleopExtension:
             )
         ]
         if timed_out:
-            self._gripper_action_status = (
-                "夹爪控制超时：以下侧在限时内没有新的实测进展："
-                + ",".join(sorted(timed_out))
-                + "。"
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制超时：以下侧在限时内没有新的实测进展："
+                    + ",".join(sorted(timed_out))
+                    + "。"
+                ),
             )
-            self._clear_manual_gripper_action()
             return
         if unavailable:
-            self._gripper_action_status = (
-                "夹爪控制已拒绝：未就绪侧 " + ",".join(sorted(unavailable)) + "。"
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制已拒绝：未就绪侧 "
+                    + ",".join(sorted(unavailable))
+                    + "。"
+                ),
             )
-            self._clear_manual_gripper_action()
             return
         if not hand_qpos:
             if len(arrived) == len(action_sides):
-                self._gripper_action_status = (
-                    "夹爪实测已松开"
-                    if intent == "release_grippers"
-                    else (
-                        "右夹爪实测已闭紧"
-                        if intent == "close_right_gripper"
-                        else "夹爪实测已闭紧"
-                    )
+                if intent == "release_right_gripper":
+                    message = "右夹爪实测已松开"
+                elif is_release:
+                    message = "夹爪实测已松开"
+                elif intent == "close_right_gripper":
+                    message = "右夹爪实测已闭紧"
+                else:
+                    message = "夹爪实测已闭紧"
+                self._finish_manual_gripper_action(
+                    succeeded=True,
+                    message=message,
                 )
-                self._clear_manual_gripper_action()
             elif waiting:
-                action_label = (
-                    "松开"
-                    if intent == "release_grippers"
-                    else (
-                        "闭紧右夹爪"
-                        if intent == "close_right_gripper"
-                        else "闭紧"
-                    )
-                )
+                if intent == "release_right_gripper":
+                    action_label = "松开右夹爪"
+                elif is_release:
+                    action_label = "松开"
+                elif intent == "close_right_gripper":
+                    action_label = "闭紧右夹爪"
+                else:
+                    action_label = "闭紧"
                 self._gripper_action_status = (
                     f"正在{action_label}夹爪：等待逐段实测到位（"
                     + ",".join(waiting)
                     + "）。"
                 )
             else:
-                self._gripper_action_status = "夹爪控制已拒绝：没有可用夹爪。"
-                self._clear_manual_gripper_action()
+                self._finish_manual_gripper_action(
+                    succeeded=False,
+                    message="夹爪控制已拒绝：没有可用夹爪。",
+                )
             return
 
         try:
@@ -2853,17 +2927,12 @@ class RuleBasedRealTeleopExtension:
                 },
             )
             command = self.adapter.resolver.resolve(action)
-            # The task-chain right-only close is a terminal-position
-            # transition, not the generic continuous-grasp maintenance
-            # button.  Some DMTAC firmware keeps reporting status code 4
-            # while continuous catch mode is enabled, even after the
-            # measured position reaches the closed endpoint.  Use the
-            # one-shot position close here so the existing strict endpoint
-            # gate can receive an idle/force-stop feedback state.  The next
-            # canonical trajectory command restores the configured
-            # continuous-grasp mode (the backend must not hide that mode
-            # change behind an unchanged position target).
-            manual_continuous_grasp = intent == "close_grippers"
+            # Closing for the task chain acquires the pen and must keep the
+            # configured continuous-grasp policy active through the following
+            # manual height-calibration window.  Completion is established by
+            # causal stable hold/contact feedback below; it must not depend on
+            # a later trajectory command to restore grasp mode.
+            manual_continuous_grasp = not is_release
             for side in hand_qpos:
                 effector = command.commands.get(f"{side}_hand")
                 if effector is None:
@@ -2909,25 +2978,29 @@ class RuleBasedRealTeleopExtension:
                 )
                 if fault is not None:
                     reason = str(getattr(fault, "message", fault) or fault)
-                    self._gripper_action_status = (
-                        f"夹爪控制已被安全门禁拒绝：{reason}"
-                    )
+                    message = f"夹爪控制已被安全门禁拒绝：{reason}"
                 else:
                     reason = str(
                         getattr(result, "rejection_reason", "dispatch_rejected")
                         or "dispatch_rejected"
                     )
-                    self._gripper_action_status = f"夹爪控制已拒绝：{reason}。"
-                self._clear_manual_gripper_action()
+                    message = f"夹爪控制已拒绝：{reason}。"
+                self._finish_manual_gripper_action(
+                    succeeded=False,
+                    message=message,
+                )
                 return
         except Exception as exc:  # noqa: BLE001 - reset must fail closed.
-            self._gripper_action_status = (
+            message = (
                 "夹爪控制发送失败：" f"{type(exc).__name__}: {exc}"
             )
             append_message = getattr(self._control_ui, "append_message", None)
             if callable(append_message):
-                append_message("DMTAC", self._gripper_action_status)
-            self._clear_manual_gripper_action()
+                append_message("DMTAC", message)
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=message,
+            )
             return
         receipts = dict(getattr(result, "dispatch_receipts", {}) or {})
         accepted: list[str] = []
@@ -2976,28 +3049,30 @@ class RuleBasedRealTeleopExtension:
                 retrying.append(detail)
             else:
                 failed.append(detail)
-        action_label = (
-            "松开"
-            if intent == "release_grippers"
-            else (
-                "闭紧右夹爪"
-                if intent == "close_right_gripper"
-                else "闭紧"
-            )
-        )
+        if intent == "release_right_gripper":
+            action_label = "松开右夹爪"
+        elif is_release:
+            action_label = "松开"
+        elif intent == "close_right_gripper":
+            action_label = "闭紧右夹爪"
+        else:
+            action_label = "闭紧"
         if failed:
             partial = (
                 "；部分侧已发送 " + ",".join(sorted(accepted))
                 if accepted
                 else ""
             )
-            self._gripper_action_status = (
+            message = (
                 f"夹爪控制停止：{'，'.join(failed)}{partial}。"
             )
             append_message = getattr(self._control_ui, "append_message", None)
             if callable(append_message):
-                append_message("DMTAC", self._gripper_action_status)
-            self._clear_manual_gripper_action()
+                append_message("DMTAC", message)
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=message,
+            )
         elif accepted:
             positions = ", ".join(
                 f"{side}={self._manual_gripper_last_command_by_side[side]:.2f}"
@@ -5886,6 +5961,12 @@ class RuleBasedRealTeleopExtension:
         terminal_error: BaseException | None,
     ) -> None:
         del terminal_error
+        if self._closed:
+            return
+        # Stop every admission predicate before waiting on lower resources.
+        # A concurrent late GUI poll then rejects work instead of submitting
+        # into an executor while shutdown is in progress.
+        self._closed = True
         if components is self._components and self._started:
             self._establish_hold("rule-based runtime closing")
         self._cancel_initial_alignment_planning()
@@ -5894,7 +5975,6 @@ class RuleBasedRealTeleopExtension:
         # rather than racing hardware/session cleanup against its worker.
         self._initial_alignment_executor.shutdown(wait=True, cancel_futures=True)
         self._configuration_executor.shutdown(wait=True, cancel_futures=True)
-        self._closed = True
 
     def _publish_status(
         self,
@@ -5939,6 +6019,9 @@ class RuleBasedRealTeleopExtension:
             self._stage_index,
             self._stage_frame_total,
             self._pending_gripper_action,
+            self._gripper_action_id,
+            self._gripper_action_intent,
+            self._gripper_action_result,
             self._gripper_action_status,
             self._configuration_future is not None,
             self._configuration_error,
@@ -6289,6 +6372,9 @@ class RuleBasedRealTeleopExtension:
             control_topology=topology,
             gripper_control_available=gripper_control_available,
             gripper_action_pending=gripper_action_pending,
+            gripper_action_id=self._gripper_action_id,
+            gripper_action_intent=str(self._gripper_action_intent),
+            gripper_action_result=str(self._gripper_action_result),
             rule_start_available=rule_start_available,
             gripper_action_status=str(self._gripper_action_status),
             rule_configuration=copy.deepcopy(self._selected_configuration),

@@ -25,6 +25,7 @@ class RuleBasedWritingIntent(str, Enum):
     DEVICE_RETRY = "device_retry"
     RUNTIME_HOME_RETRY = "runtime_home_retry"
     RELEASE_GRIPPERS = "release_grippers"
+    RELEASE_RIGHT_GRIPPER = "release_right_gripper"
     CLOSE_GRIPPERS = "close_grippers"
     CLOSE_RIGHT_GRIPPER = "close_right_gripper"
     DEBUG_TOGGLE = "debug_toggle"
@@ -69,6 +70,9 @@ class RuleBasedWritingUiState:
     control_topology: str = "双臂（无夹爪）"
     gripper_control_available: bool = False
     gripper_action_pending: bool = False
+    gripper_action_id: int | None = None
+    gripper_action_intent: str = ""
+    gripper_action_result: str = "idle"
     rule_start_available: bool = False
     session_state: str = ""
     readiness_reason: str = ""
@@ -152,6 +156,8 @@ class RuleBasedWritingApplication:
         self._configuration_requests: queue.Queue[dict[str, object]] = queue.Queue()
         self._height_calibration_requests: queue.Queue[dict[str, object]] = queue.Queue()
         self._task_chain = RuleWritingTaskChain()
+        self._task_chain_cancel_pending = False
+        self._last_gripper_action_id: int | None = None
         self._task_chain_configuration_pool: list[dict[str, object]] = []
         self._task_chain_choice_index = task_chain_choice_index or secrets.randbelow
         self._configuration_options: dict[str, object] = {}
@@ -468,9 +474,26 @@ class RuleBasedWritingApplication:
         if not isinstance(intent, RuleBasedWritingIntent):
             raise TypeError("intent must be RuleBasedWritingIntent.")
         with self._lock:
+            if intent is RuleBasedWritingIntent.STOP and self._task_chain.active:
+                if self._task_chain_cancel_pending:
+                    return False
+                self._task_chain_cancel_pending = True
+                self._pre_episode_start_admission_open = False
+                self._rule_intents.put(intent)
+                self._runtime_events.put("episode_stop:rule_based_hold_cancel")
+                self._runtime_events.put("h")
+                self._state.phase = "stopping"
+                self._state.title = "正在取消任务链并进入 Hold"
+                self._state.detail = (
+                    "已停止接纳任务链动作；等待底层 Hold 回执后释放任务链控件。"
+                )
+                self._rebuild_controls()
+                self._touch()
+                return True
             if self._task_chain.active and intent in {
                 RuleBasedWritingIntent.START,
                 RuleBasedWritingIntent.RELEASE_GRIPPERS,
+                RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER,
                 RuleBasedWritingIntent.CLOSE_GRIPPERS,
                 RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER,
             }:
@@ -545,12 +568,17 @@ class RuleBasedWritingApplication:
             )
         elif intent in {
             RuleBasedWritingIntent.RELEASE_GRIPPERS,
+            RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER,
             RuleBasedWritingIntent.CLOSE_GRIPPERS,
             RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER,
         }:
             control = (
                 "release_grippers"
-                if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
+                if intent
+                in {
+                    RuleBasedWritingIntent.RELEASE_GRIPPERS,
+                    RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER,
+                }
                 else (
                     "close_right_gripper"
                     if intent is RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
@@ -561,13 +589,20 @@ class RuleBasedWritingApplication:
                 return False
             self._rule_intents.put(intent)
             self._state.gripper_action_pending = True
+            self._state.gripper_action_id = None
+            self._state.gripper_action_intent = intent.value
+            self._state.gripper_action_result = "requested"
             self._state.gripper_action_status = (
                 "正在松开夹爪…"
                 if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
                 else (
-                    "正在闭紧右夹爪…"
-                    if intent is RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
-                    else "正在闭紧夹爪…"
+                    "正在松开右夹爪…"
+                    if intent is RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER
+                    else (
+                        "正在闭紧右夹爪…"
+                        if intent is RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
+                        else "正在闭紧夹爪…"
+                    )
                 )
             )
             self._state.detail = self._state.gripper_action_status
@@ -801,21 +836,23 @@ class RuleBasedWritingApplication:
             }:
                 if not self._task_chain_initially_available_locked(available):
                     return False
-                status_baseline = self._state.gripper_action_status
+                action_id_baseline = self._last_gripper_action_id
                 if not self._submit_intent_locked(
-                    RuleBasedWritingIntent.RELEASE_GRIPPERS
+                    RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER
                 ):
                     return False
                 self._task_chain.begin_initial_release(
-                    status_baseline=status_baseline
+                    action_id_baseline=action_id_baseline
                 )
             elif phase is RuleWritingTaskChainPhase.READY_CLOSE:
-                status_baseline = self._state.gripper_action_status
+                action_id_baseline = self._last_gripper_action_id
                 if not self._submit_intent_locked(
                     RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
                 ):
                     return False
-                self._task_chain.begin_close(status_baseline=status_baseline)
+                self._task_chain.begin_close(
+                    action_id_baseline=action_id_baseline
+                )
             elif phase is RuleWritingTaskChainPhase.READY_HEIGHT:
                 request = self._height_calibration_request_locked(
                     {
@@ -850,13 +887,13 @@ class RuleBasedWritingApplication:
                         return False
                     self._task_chain.begin_configuration(index=index, selected=selected)
             elif phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE:
-                status_baseline = self._state.gripper_action_status
+                action_id_baseline = self._last_gripper_action_id
                 if not self._submit_intent_locked(
-                    RuleBasedWritingIntent.RELEASE_GRIPPERS
+                    RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER
                 ):
                     return False
                 self._task_chain.begin_final_release(
-                    status_baseline=status_baseline
+                    action_id_baseline=action_id_baseline
                 )
             else:
                 return False
@@ -1150,6 +1187,24 @@ class RuleBasedWritingApplication:
                     self._state.gripper_action_pending,
                 )
             )
+            if "gripper_action_id" in status:
+                action_id = self._optional_int(
+                    status.get("gripper_action_id")
+                )
+                self._state.gripper_action_id = action_id
+                if action_id is not None:
+                    self._last_gripper_action_id = max(
+                        action_id,
+                        self._last_gripper_action_id or action_id,
+                    )
+            if "gripper_action_intent" in status:
+                self._state.gripper_action_intent = str(
+                    status.get("gripper_action_intent") or ""
+                )
+            if "gripper_action_result" in status:
+                self._state.gripper_action_result = str(
+                    status.get("gripper_action_result") or "idle"
+                )
             self._state.rule_start_available = bool(
                 status.get("rule_start_available", False)
             )
@@ -1385,6 +1440,14 @@ class RuleBasedWritingApplication:
         aborted: bool,
         held: bool,
     ) -> None:
+        if self._task_chain_cancel_pending:
+            if held or aborted:
+                self._task_chain.cancel(
+                    "任务链已取消并进入 Hold；重新完成安全初始化后可开始新一轮。"
+                )
+                self._task_chain_cancel_pending = False
+            return
+
         phase = self._task_chain.phase
         if (
             phase
@@ -1394,29 +1457,26 @@ class RuleBasedWritingApplication:
                 RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING,
             }
         ):
-            if self._state.gripper_action_pending:
-                self._task_chain.observe_gripper_pending()
-                return
-            status_changed = bool(
-                self._state.gripper_action_status
-                and self._state.gripper_action_status
-                != self._task_chain.gripper_status_baseline
-                and not self._state.gripper_action_status.startswith("正在")
-            )
-            if not self._task_chain.gripper_pending_seen and not status_changed:
-                return
-            expected = (
-                "夹爪实测已闭紧"
+            expected_intent = (
+                RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER.value
                 if phase is RuleWritingTaskChainPhase.CLOSE_PENDING
-                else "夹爪实测已松开"
+                else RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER.value
             )
+            action_id = self._state.gripper_action_id
+            if (
+                action_id is None
+                or self._state.gripper_action_intent != expected_intent
+                or not self._task_chain.bind_gripper_action(action_id)
+            ):
+                return
+            result = self._state.gripper_action_result
+            if result in {"requested", "pending"}:
+                return
+            if result not in {"succeeded", "failed"}:
+                return
             error = (
                 None
-                if self._state.gripper_action_status == expected
-                or (
-                    phase is RuleWritingTaskChainPhase.CLOSE_PENDING
-                    and self._state.gripper_action_status == "右夹爪实测已闭紧"
-                )
+                if result == "succeeded"
                 else self._state.gripper_action_status or "夹爪动作未返回成功回执。"
             )
             if phase is RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING:
@@ -1571,7 +1631,14 @@ class RuleBasedWritingApplication:
         self._state.can_start = bool(
             available["start"] and not chain_owns_manual_step
         )
-        self._state.can_stop = available["stop"]
+        self._state.can_stop = bool(
+            available["stop"]
+            or (
+                self._task_chain.active
+                and not self._task_chain_cancel_pending
+                and not self._state.shutdown
+            )
+        )
         self._state.can_retry_devices = available["retry_devices"]
         self._state.can_runtime_home = available["runtime_home"]
         self._state.can_release_grippers = bool(

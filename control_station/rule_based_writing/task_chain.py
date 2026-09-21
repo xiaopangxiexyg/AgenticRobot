@@ -35,8 +35,8 @@ _PHASE_PRESENTATION: dict[RuleWritingTaskChainPhase, tuple[str, str, str]] = {
     ),
     RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING: (
         "1 / 5",
-        "正在松开夹爪",
-        "等待现有夹爪反馈链确认实测松开。",
+        "正在松开右夹爪",
+        "等待现有夹爪反馈链确认右夹爪实测松开；左侧保持当前状态。",
     ),
     RuleWritingTaskChainPhase.READY_CLOSE: (
         "2 / 5",
@@ -75,13 +75,13 @@ _PHASE_PRESENTATION: dict[RuleWritingTaskChainPhase, tuple[str, str, str]] = {
     ),
     RuleWritingTaskChainPhase.READY_FINAL_RELEASE: (
         "5 / 5",
-        "等待最终松开夹爪",
-        "正式 Episode 已完整提交；确认安全后继续完成闭环。",
+        "等待最终松开右夹爪",
+        "正式 Episode 已完整提交；确认安全后仅松开右夹爪完成闭环。",
     ),
     RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING: (
         "5 / 5",
-        "正在最终松开夹爪",
-        "等待现有夹爪反馈链确认实测松开。",
+        "正在最终松开右夹爪",
+        "等待现有夹爪反馈链确认右夹爪实测松开；左侧保持当前状态。",
     ),
     RuleWritingTaskChainPhase.COMPLETE: (
         "5 / 5",
@@ -101,8 +101,8 @@ class RuleWritingTaskChain:
     selected_configuration_index: int | None = None
     last_error: str = ""
     rule_execution_seen: bool = False
-    gripper_pending_seen: bool = False
-    gripper_status_baseline: str = ""
+    gripper_action_baseline_id: int | None = None
+    gripper_action_id: int | None = None
     rule_start_waiting: bool = False
 
     @property
@@ -112,7 +112,7 @@ class RuleWritingTaskChain:
             RuleWritingTaskChainPhase.COMPLETE,
         }
 
-    def begin_initial_release(self, *, status_baseline: str) -> None:
+    def begin_initial_release(self, *, action_id_baseline: int | None) -> None:
         self._require(
             RuleWritingTaskChainPhase.IDLE,
             RuleWritingTaskChainPhase.COMPLETE,
@@ -121,8 +121,8 @@ class RuleWritingTaskChain:
         self.selected_configuration = {}
         self.selected_configuration_index = None
         self.rule_execution_seen = False
-        self.gripper_pending_seen = False
-        self.gripper_status_baseline = str(status_baseline)
+        self.gripper_action_baseline_id = action_id_baseline
+        self.gripper_action_id = None
         self.last_error = ""
         self.rule_start_waiting = False
 
@@ -135,11 +135,11 @@ class RuleWritingTaskChain:
         )
         self.last_error = str(error or "")
 
-    def begin_close(self, *, status_baseline: str) -> None:
+    def begin_close(self, *, action_id_baseline: int | None) -> None:
         self._require(RuleWritingTaskChainPhase.READY_CLOSE)
         self.phase = RuleWritingTaskChainPhase.CLOSE_PENDING
-        self.gripper_pending_seen = False
-        self.gripper_status_baseline = str(status_baseline)
+        self.gripper_action_baseline_id = action_id_baseline
+        self.gripper_action_id = None
         self.last_error = ""
         self.rule_start_waiting = False
 
@@ -217,13 +217,25 @@ class RuleWritingTaskChain:
         self._require(RuleWritingTaskChainPhase.RULE_PENDING)
         self.rule_execution_seen = True
 
-    def observe_gripper_pending(self) -> None:
+    def bind_gripper_action(self, action_id: int) -> bool:
+        """Bind one runtime-owned action receipt to the current gripper phase."""
+
         self._require(
             RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING,
             RuleWritingTaskChainPhase.CLOSE_PENDING,
             RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING,
         )
-        self.gripper_pending_seen = True
+        normalized = int(action_id)
+        if normalized < 1:
+            return False
+        if (
+            self.gripper_action_baseline_id is not None
+            and normalized <= self.gripper_action_baseline_id
+        ):
+            return False
+        if self.gripper_action_id is None:
+            self.gripper_action_id = normalized
+        return self.gripper_action_id == normalized
 
     def finish_rule(self) -> None:
         self._require(RuleWritingTaskChainPhase.RULE_PENDING)
@@ -237,13 +249,27 @@ class RuleWritingTaskChain:
         self.last_error = str(error)
         self.rule_start_waiting = False
 
-    def begin_final_release(self, *, status_baseline: str) -> None:
+    def begin_final_release(self, *, action_id_baseline: int | None) -> None:
         self._require(RuleWritingTaskChainPhase.READY_FINAL_RELEASE)
         self.phase = RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING
-        self.gripper_pending_seen = False
-        self.gripper_status_baseline = str(status_baseline)
+        self.gripper_action_baseline_id = action_id_baseline
+        self.gripper_action_id = None
         self.last_error = ""
         self.rule_start_waiting = False
+
+    def cancel(self, reason: str) -> None:
+        """Return operator sequencing to idle after lower-owned Hold confirms."""
+
+        if not self.active:
+            return
+        self.phase = RuleWritingTaskChainPhase.IDLE
+        self.selected_configuration = {}
+        self.selected_configuration_index = None
+        self.rule_execution_seen = False
+        self.gripper_action_baseline_id = None
+        self.gripper_action_id = None
+        self.rule_start_waiting = False
+        self.last_error = str(reason)
 
     def finish_final_release(self, *, error: str | None = None) -> None:
         self._require(RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING)

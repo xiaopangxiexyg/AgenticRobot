@@ -2487,10 +2487,9 @@ def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
             assert set(close.commands) == {"right_hand"}
             assert close.metadata["rule_based_manual_gripper_sides"] == ["right"]
             command = close.commands["right_hand"]
-            # The task-chain close must observe a real idle/force-stop
-            # endpoint.  Continuous catch mode can legitimately keep the
-            # vendor status at "正在闭合/夹取" after position reaches 1.0.
-            assert command.metadata["dmtac_continuous_grasp_override"] is False
+            # The pen grasp must remain active through height calibration and
+            # the subsequent trajectory.  Completion is feedback-gated below.
+            assert command.metadata["dmtac_continuous_grasp_override"] is True
             backends["right"].set_measured_scalar(float(command.value[0]))
             assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
         now += 0.05
@@ -2499,9 +2498,61 @@ def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
     assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
     assert float(backends["right"].measured_joint_pos[0]) == pytest.approx(1.0)
     assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+    assert extension.status().gripper_action_intent == "close_right_gripper"
+    assert extension.status().gripper_action_result == "succeeded"
+    assert extension.status().gripper_action_id == 1
 
 
-def test_task_chain_close_right_resets_catch_mode_when_already_at_closed_endpoint() -> None:
+def test_task_chain_release_right_gripper_preserves_left_hand() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("left", "right")),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("left", "right"),
+    )
+    left = extension._components.left_hand_backend
+    right = extension._components.right_hand_backend
+    left.set_measured_scalar(0.5)
+    right.set_measured_scalar(0.5)
+
+    ui.intents.append("release_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    now = 10.0
+    while extension._pending_gripper_action is not None:
+        command_count = len(session.external_commands)
+        session.command_override_provider(SimpleNamespace(), now)
+        if len(session.external_commands) > command_count:
+            release = session.external_commands[-1]
+            assert set(release.commands) == {"right_hand"}
+            command = release.commands["right_hand"]
+            assert command.metadata["dmtac_continuous_grasp_override"] is False
+            right.set_measured_scalar(float(command.value[0]))
+        now += 0.05
+        assert now < 20.0
+
+    assert float(left.measured_joint_pos[0]) == pytest.approx(0.5)
+    assert float(right.measured_joint_pos[0]) == pytest.approx(0.0)
+    status = extension.status()
+    assert status.gripper_action_status == "右夹爪实测已松开"
+    assert status.gripper_action_intent == "release_right_gripper"
+    assert status.gripper_action_result == "succeeded"
+
+
+def test_task_chain_close_right_confirms_continuous_hold_at_closed_endpoint() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -2555,13 +2606,11 @@ def test_task_chain_close_right_resets_catch_mode_when_already_at_closed_endpoin
     assert float(command.commands["right_hand"].value[0]) == pytest.approx(1.0)
     assert command.commands["right_hand"].metadata[
         "dmtac_continuous_grasp_override"
-    ] is False
+    ] is True
 
-    # Once the one-shot mode transition is accepted, the existing strict
-    # endpoint gate still requires fresh idle feedback; position alone never
-    # completes the action.
-    hand_poller.status_code = 2
-    hand_poller.is_moving = False
+    # DMTAC continuous grasp may remain in vendor status 4 at the endpoint.
+    # Three distinct post-command frames establish a causal stable hold; the
+    # first cached frame still cannot complete the action.
     hand_poller.timestamp = 10.1
     for now in (10.1, 10.2):
         session.command_override_provider(SimpleNamespace(), now)
@@ -2570,6 +2619,73 @@ def test_task_chain_close_right_resets_catch_mode_when_already_at_closed_endpoin
     session.command_override_provider(SimpleNamespace(), 10.3)
     assert extension._pending_gripper_action is None
     assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+
+
+def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+
+    class _ForceStoppedPoller:
+        def __init__(self) -> None:
+            self.value = 0.5
+            self.timestamp = 9.0
+            self.status_code = 2
+
+        def latest_at_or_before(self, _now):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = self.value
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": False,
+                }
+            }
+
+    hand_poller = _ForceStoppedPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+
+    # Contact/force stop can occur before normalized position reaches 1.0.
+    # It is accepted only after a causal command and distinct stable frames.
+    hand_poller.value = 0.53
+    hand_poller.status_code = 6
+    for timestamp, now in ((10.1, 10.1), (10.2, 10.2)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_right_gripper"
+    hand_poller.timestamp = 10.3
+    session.command_override_provider(SimpleNamespace(), 10.3)
+
+    status = extension.status()
+    assert extension._pending_gripper_action is None
+    assert status.gripper_action_status == "右夹爪实测已闭紧"
+    assert status.gripper_action_result == "succeeded"
 
 
 def test_manual_gripper_reset_uses_recorder_hand_history_without_backend_read() -> None:
@@ -3222,6 +3338,42 @@ def test_prestart_configuration_rebuild_updates_numeric_alignment_speed_off_loop
     assert extension._height_calibration is calibration
     assert ui.configuration_results[-1] == {"selected": request, "error": None}
     assert commits == [(request, replacement)]
+
+
+def test_prestart_configuration_rejects_closed_executor_without_loop_crash() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={},
+    )
+    extension.configure_prestart_rebuild(
+        options={"fixture": True},
+        selected={"fixture": "old"},
+        rebuilder=lambda _request: extension,
+    )
+    recorder = _Recorder(_Poller())
+    _session, _clutch, ui = _bind(extension, recorder, arm=False)
+    extension._configuration_executor.shutdown(wait=True, cancel_futures=True)
+    ui.configuration_requests.append({"fixture": "new"})
+
+    extension.after_control_input_poll(now=1.0)
+
+    status = extension.status()
+    assert status.configuration_pending is False
+    assert status.waiting_reason == "configuration_rejected"
+    assert "cannot schedule new futures after shutdown" in status.configuration_error
+    assert ui.configuration_results[-1] == {
+        "selected": None,
+        "error": status.configuration_error,
+    }
 
 
 def test_prestart_configuration_completes_while_rig_fault_blocks_runtime_home() -> None:

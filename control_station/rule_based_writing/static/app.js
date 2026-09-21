@@ -56,6 +56,7 @@ let latestState = null;
 let configurationDirty = false;
 let configurationBatch = [];
 let collectionMode = "rule_based_writing";
+let tactileCaptureLocked = false;
 
 const configurationInputs = () => [
   "full-replay-source", "pre-pen-down-source", "pre-pen-down-normal-episodes", "pen-down-source", "write-source", "pen-up-source", "trajectory",
@@ -167,8 +168,9 @@ async function loadOptions() {
   const info = options.runtime_info || {};
   const free = info.tactile_bundle_free_gb;
   const collectTactile = document.getElementById("collect-tactile");
-  collectTactile.disabled = Boolean(info.tactile_capture_locked);
-  collectTactile.title = info.tactile_capture_locked
+  tactileCaptureLocked = Boolean(info.tactile_capture_locked);
+  collectTactile.disabled = tactileCaptureLocked;
+  collectTactile.title = tactileCaptureLocked
     ? `当前数据集已锁定触觉模式：${info.tactile_capture_mode || "existing"}`
     : "空数据集可选择是否采集触觉";
   text("sample-hz", info.sample_hz == null ? null : `${Number(info.sample_hz).toFixed(1)} Hz`);
@@ -349,7 +351,10 @@ async function refresh() {
     && !state.configuration_pending
     && !state.gripper_action_pending
     && !pendingRequests.has("configuration");
-  configurationInputs().forEach((input) => { input.disabled = !configurationEnabled; });
+  configurationInputs().forEach((input) => {
+    input.disabled = !configurationEnabled
+      || (input.id === "collect-tactile" && tactileCaptureLocked);
+  });
   document.getElementById("apply-configuration").disabled = !configurationEnabled;
   document.getElementById("add-to-batch").disabled = !configurationEnabled;
   document.getElementById("clear-batch").disabled = !configurationEnabled;
