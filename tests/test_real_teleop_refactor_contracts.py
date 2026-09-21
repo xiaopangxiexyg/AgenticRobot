@@ -1851,6 +1851,69 @@ def test_device_retry_runtime_immediately_refreshes_camera_projection() -> None:
     assert published[-1]["hardware_status"]["camera.front"]["status_level"] == "ok"
 
 
+def test_device_retry_reports_failed_attempt_to_application() -> None:
+    errors = {"camera.front": "initial startup failure"}
+    retry_results: list[str | None] = []
+
+    class Camera:
+        def close(self) -> None:
+            return None
+
+        def start(self) -> None:
+            raise RuntimeError("camera remains offline")
+
+    clutch = SimpleNamespace(
+        _current_active_controls=lambda: ("device_retry",),
+        device_retry_admission=lambda: (True, ""),
+        _episode_busy=lambda: False,
+        _teleop_started=False,
+        hold_active=lambda: True,
+    )
+    components = SimpleNamespace(
+        gripper_input_source="",
+        left_state_backend=None,
+        right_state_backend=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    runtime = device_retry_runtime.build_device_retry_runtime(
+        args=SimpleNamespace(foot_pad_requested=False, ignore_camera=()),
+        components=components,
+        control_ui=SimpleNamespace(
+            publish=lambda **_kwargs: None,
+            append_message=lambda *_args: None,
+            publish_device_retry_result=lambda *, error: retry_results.append(error),
+        ),
+        clutch_input=clutch,
+        camera_sources={"front": Camera()},
+        vive_source=None,
+        startup_device_errors=errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: None,
+        set_dataset_recorder=lambda _value: None,
+        foot_pad_input_provider=lambda: None,
+        set_foot_pad_input=lambda _value: None,
+        dataset_recorder_type=object,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=object,
+        foot_pad_control_mode="foot-pad",
+        has_dmtac_gripper_backend=lambda _components: False,
+        promote_angle_trigger_gripper_input_to_q6=lambda *_args, **_kwargs: (
+            False,
+            "",
+        ),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    runtime.retry_failed_devices()
+
+    assert "camera.front" in errors
+    assert retry_results
+    assert retry_results[-1] is not None
+    assert "camera.front" in str(retry_results[-1])
+    assert "camera remains offline" in str(retry_results[-1])
+
+
 def test_generic_device_retry_never_starts_or_reuses_dataset_writer() -> None:
     errors = {"dataset.writer": "initial writer startup failure"}
     published: list[dict[str, object]] = []

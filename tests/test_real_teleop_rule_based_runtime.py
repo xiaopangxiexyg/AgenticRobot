@@ -2493,9 +2493,10 @@ def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
             assert set(close.commands) == {"right_hand"}
             assert close.metadata["rule_based_manual_gripper_sides"] == ["right"]
             command = close.commands["right_hand"]
-            # The pen grasp must remain active through height calibration and
-            # the subsequent trajectory.  Completion is feedback-gated below.
-            assert command.metadata["dmtac_continuous_grasp_override"] is True
+            # Admission closes in one-shot mode so a real idle/force-stop
+            # receipt is required. The first replay hand command restores the
+            # configured writing hold.
+            assert command.metadata["dmtac_continuous_grasp_override"] is False
             backends["right"].set_measured_scalar(float(command.value[0]))
             assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
         now += 0.05
@@ -2558,7 +2559,7 @@ def test_task_chain_release_right_gripper_preserves_left_hand() -> None:
     assert status.gripper_action_result == "succeeded"
 
 
-def test_task_chain_close_right_confirms_continuous_hold_at_closed_endpoint() -> None:
+def test_task_chain_close_right_waits_for_idle_after_closed_endpoint() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -2612,19 +2613,105 @@ def test_task_chain_close_right_confirms_continuous_hold_at_closed_endpoint() ->
     assert float(command.commands["right_hand"].value[0]) == pytest.approx(1.0)
     assert command.commands["right_hand"].metadata[
         "dmtac_continuous_grasp_override"
-    ] is True
+    ] is False
 
-    # DMTAC continuous grasp may remain in vendor status 4 at the endpoint.
-    # Three distinct post-command frames establish a causal stable hold; the
-    # first cached frame still cannot complete the action.
+    # Position=1 is not a completion receipt while firmware still reports
+    # closing/catching. The one-shot transition must reach a stable idle
+    # status before the task chain can enter height calibration.
     hand_poller.timestamp = 10.1
     for now in (10.1, 10.2):
         session.command_override_provider(SimpleNamespace(), now)
         assert extension._pending_gripper_action == "close_right_gripper"
         hand_poller.timestamp += 0.1
-    session.command_override_provider(SimpleNamespace(), 10.3)
+    assert "闭合运动" in extension.status().gripper_action_status
+
+    hand_poller.status_code = 2
+    hand_poller.is_moving = False
+    for now in (10.3, 10.4):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_right_gripper"
+        hand_poller.timestamp += 0.1
+    session.command_override_provider(SimpleNamespace(), 10.5)
     assert extension._pending_gripper_action is None
     assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+
+
+def test_final_pen_up_releases_continuous_grasp_without_opening_hand() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    action = SimpleNamespace(
+        timestamp=1.0,
+        metadata={"collection_detail_stage_id": "right_write.pen_up"},
+    )
+    command = TeleopCommand(
+        commands={
+            "right_hand": EffectorCommand(
+                effector_name="right_hand",
+                side="right",
+                command_type="joint_vector",
+                value=np.full(6, 0.8),
+                metadata={},
+            )
+        },
+        timestamp=1.0,
+        metadata={},
+    )
+    emission = SimpleNamespace(
+        action=action,
+        command=command,
+        directive=SimpleNamespace(segment_terminal=True),
+    )
+
+    extension._prepare_live_dispatch(emission, 2.0)
+
+    hand_command = command.commands["right_hand"]
+    assert np.asarray(hand_command.value, dtype=float) == pytest.approx(
+        np.full(6, 0.8)
+    )
+    assert hand_command.metadata["dmtac_continuous_grasp_override"] is False
+    assert command.metadata[
+        "rule_based_final_pen_up_continuous_grasp_released"
+    ] is True
+
+
+def test_nonterminal_pen_up_preserves_configured_grasp_mode() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    command = TeleopCommand(
+        commands={
+            "right_hand": EffectorCommand(
+                effector_name="right_hand",
+                side="right",
+                command_type="joint_vector",
+                value=np.full(6, 0.8),
+                metadata={},
+            )
+        },
+        timestamp=1.0,
+        metadata={"collection_detail_stage_id": "right_write.pen_up"},
+    )
+    emission = SimpleNamespace(
+        action=SimpleNamespace(timestamp=1.0, metadata={}),
+        command=command,
+        directive=SimpleNamespace(segment_terminal=False),
+    )
+
+    extension._prepare_live_dispatch(emission, 2.0)
+
+    assert "dmtac_continuous_grasp_override" not in command.commands[
+        "right_hand"
+    ].metadata
+    assert "rule_based_final_pen_up_continuous_grasp_released" not in command.metadata
 
 
 def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:

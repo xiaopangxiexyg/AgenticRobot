@@ -2190,11 +2190,30 @@ class RuleBasedRealTeleopExtension:
             )
         )
         command.metadata["rule_based_dispatch_timestamp"] = timestamp
+        detail_stage_id = str(
+            command.metadata.get("collection_detail_stage_id")
+            or emission.action.metadata.get("collection_detail_stage_id")
+            or ""
+        )
+        final_pen_up = bool(
+            detail_stage_id == "right_write.pen_up"
+            and emission.directive.segment_terminal
+        )
         command.timestamp = timestamp
         for effector in command.commands.values():
             if not isinstance(effector.metadata, dict):
                 effector.metadata = dict(effector.metadata or {})
             effector.metadata["_parent_command_timestamp"] = timestamp
+            if final_pen_up and effector.effector_name == "right_hand":
+                # End continuous catch on the final pen-up command while
+                # preserving the same closed position. The explicit task-
+                # chain release remains the only operation that opens the
+                # gripper; this mode-only handoff prevents catch mode from
+                # running indefinitely between Episodes.
+                effector.metadata["dmtac_continuous_grasp_override"] = False
+                command.metadata[
+                    "rule_based_final_pen_up_continuous_grasp_released"
+                ] = True
             if effector.effector_name.endswith("_arm"):
                 # The strict-timestamp jerk planner must see one source cut
                 # per distinct rule qref, not one cut per retry/repeated
@@ -2393,7 +2412,6 @@ class RuleBasedRealTeleopExtension:
         side: str,
         now: float,
         final_target: float,
-        accept_continuous_close_hold: bool = False,
     ) -> tuple[bool, str]:
         """Require post-command, distinct stable endpoint/contact feedback.
 
@@ -2424,15 +2442,10 @@ class RuleBasedRealTeleopExtension:
             status_code = None if status_code is None else int(status_code)
         except (TypeError, ValueError):
             return False, "夹爪状态码无效"
-        continuous_close_hold = bool(
-            accept_continuous_close_hold
-            and status_code == 4
-            and final_target > 0.0
-        )
-        if status_code in {4, 5} and not continuous_close_hold:
+        if status_code in {4, 5}:
             direction = "张开" if status_code == 5 else "闭合"
             return False, f"夹爪仍在{direction}运动"
-        if bool(state.get("gripper_is_moving")) and not continuous_close_hold:
+        if bool(state.get("gripper_is_moving")):
             return False, "夹爪反馈仍显示运动中"
 
         feedback_timestamp = self._manual_gripper_feedback_timestamp(state)
@@ -2738,9 +2751,6 @@ class RuleBasedRealTeleopExtension:
                     side=side,
                     now=float(now),
                     final_target=final_target,
-                    accept_continuous_close_hold=(
-                        intent == "close_right_gripper" and at_endpoint
-                    ),
                 )
                 if settled:
                     arrived.append(side)
@@ -2750,7 +2760,9 @@ class RuleBasedRealTeleopExtension:
                     # An explicit maintenance action must have a causal device
                     # command even when the actuator starts at its endpoint.
                     # Reapply the same target once so release disables catch
-                    # mode and task-chain close establishes continuous hold.
+                    # mode and task-chain close establishes a one-shot closed
+                    # state before the writing replay enables its configured
+                    # continuous hold.
                     if (
                         at_endpoint
                         and side
@@ -2927,12 +2939,14 @@ class RuleBasedRealTeleopExtension:
                 },
             )
             command = self.adapter.resolver.resolve(action)
-            # Closing for the task chain acquires the pen and must keep the
-            # configured continuous-grasp policy active through the following
-            # manual height-calibration window.  Completion is established by
-            # causal stable hold/contact feedback below; it must not depend on
-            # a later trajectory command to restore grasp mode.
-            manual_continuous_grasp = not is_release
+            # The task-chain right-only close is an admission transition, not
+            # the writing hold itself. Keep it one-shot so completion can be
+            # proven by a real idle/force-stop state; accepting vendor status
+            # 4 here lets a still-running catch motor enter the whole writing
+            # episode and can end in a latched 0x0010 device fault. The first
+            # replay hand command restores the configured continuous-grasp
+            # policy through the ordinary DMTAC backend path.
+            manual_continuous_grasp = intent == "close_grippers"
             for side in hand_qpos:
                 effector = command.commands.get(f"{side}_hand")
                 if effector is None:
@@ -2941,9 +2955,10 @@ class RuleBasedRealTeleopExtension:
                     )
                 if not isinstance(effector.metadata, dict):
                     effector.metadata = dict(effector.metadata or {})
-                # Release is a free-motion reset and must disable the device's
-                # catch/continuous-grasp mode.  Closing explicitly restores it
-                # so the final grasp keeps the selected task force policy.
+                # Release and the task-chain right-only close are one-shot
+                # maintenance moves. The generic all-side close retains its
+                # historical continuous-grasp behavior; writing replay owns
+                # the later task-specific continuous hold.
                 effector.metadata["dmtac_continuous_grasp_override"] = bool(
                     manual_continuous_grasp
                 )
