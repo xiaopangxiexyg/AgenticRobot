@@ -1723,3 +1723,14 @@ def test_task_chain_waits_for_writer_commit_and_stops_on_rule_hold() -> None:
     assert state["task_chain_phase"] == "ready_rule"
     assert state["task_chain_can_advance"] is False
     assert "中止" in state["task_chain_detail"]
+
+
+def test_gripper_status_distinguishes_topology_from_lifecycle_availability() -> None:
+    script = (
+        Path(__file__).parents[1]
+        / "control_station/rule_based_writing/static/app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "夹爪已配置" in script
+    assert "当前安全/Session 阶段不允许独立控制" in script
+    assert "夹爪独立控制：当前拓扑未启用" in script

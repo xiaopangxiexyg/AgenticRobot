@@ -5939,6 +5939,12 @@ class RuleBasedRealTeleopExtension:
         self._reset_pose_action_motion_intent("runtime_hold")
         if self._held or self._components is None:
             return
+        append_message = getattr(self._control_ui, "append_message", None)
+        if callable(append_message):
+            append_message(
+                "RuleBased",
+                "规则运行时因以下原因请求 Hold：" + str(reason),
+            )
         request_hold = getattr(self._clutch_input, "request_hold", None)
         if callable(request_hold):
             request_hold(reason="rule_based_runtime_hold")
@@ -5946,7 +5952,6 @@ class RuleBasedRealTeleopExtension:
         try:
             self._components.session.hold_hardware(str(reason))
         except Exception as exc:  # noqa: BLE001 - queued owner-loop Hold remains authoritative.
-            append_message = getattr(self._control_ui, "append_message", None)
             if callable(append_message):
                 append_message(
                     "RuleBased",

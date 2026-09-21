@@ -931,6 +931,12 @@ def test_pre_dispatch_hand_fault_cancels_armed_attempt_instead_of_stranding_coun
     assert clutch.reasons == ["rule_based_runtime_hold"]
     assert ui.failure_stop_requests == 1
     assert any("Write timeout" in message for _tag, message in ui.messages)
+    assert any(
+        tag == "RuleBased"
+        and "规则运行时因以下原因请求 Hold" in message
+        and "Write timeout" in message
+        for tag, message in ui.messages
+    )
 
 
 def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> None:

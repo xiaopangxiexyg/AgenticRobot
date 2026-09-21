@@ -1385,6 +1385,27 @@ def _reconcile_idle_progress_entry_arm_control(
     return plan, None, False
 
 
+def _idle_progress_entry_arm_control_allowed(
+    *,
+    active_progress_episode: object | None,
+    pending_transition: PendingProgressArmTransition | None,
+    hold_active: bool,
+) -> bool:
+    """Return whether the idle entry restriction may mutate arm authority.
+
+    An authoritative Hold is not an idle profile window.  A rule extension
+    may revoke its deferred initial-alignment Fix contract in the same frame
+    that it requests Hold; reconciliation must wait for a new runtime Home
+    instead of reclassifying that revocation as a missing arm snapshot.
+    """
+
+    return bool(
+        active_progress_episode is None
+        and pending_transition is None
+        and not hold_active
+    )
+
+
 def _reconcile_active_progress_entry_arm_control(
     plan: ProgressArmTransitionPlan,
     *,
@@ -2609,9 +2630,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     "active_progress_episode",
                     None,
                 )
-                if (
-                    active_progress_episode is None
-                    and pending_progress_arm_transition is None
+                hold_active = bool(clutch_input.hold_active())
+                if _idle_progress_entry_arm_control_allowed(
+                    active_progress_episode=active_progress_episode,
+                    pending_transition=pending_progress_arm_transition,
+                    hold_active=hold_active,
                 ):
                     fix_controller = getattr(
                         components,
@@ -2731,6 +2754,16 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                                 control_ui.append_message("Progress", message)
                     elif idle_entry_ready:
                         progress_arm_entry_snapshot_wait_step_id = ""
+                elif hold_active:
+                    # Hold owns every motion and authority transition.  In
+                    # particular, a rule runtime may have just revoked its
+                    # deferred initial-alignment Fix contract while the
+                    # authoritative Hold request is still being drained.  Do
+                    # not reinterpret that revocation as a missing pre-Episode
+                    # arm snapshot or cancel the writer a second time with a
+                    # misleading progress_entry_arm_snapshot_pending reason.
+                    progress_arm_entry_snapshot_wait_step_id = ""
+                    progress_arm_entry_deferred_step_id = ""
                 active_identity_hash = str(
                     getattr(
                         None
@@ -2742,6 +2775,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 )
                 if (
                     active_progress_episode is not None
+                    and not hold_active
                     and active_progress_episode.state.phase == "ACTIVE_ATTEMPT"
                     and active_identity_hash
                     and active_identity_hash != progress_arm_entry_episode_hash

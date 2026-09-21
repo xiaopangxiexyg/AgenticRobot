@@ -371,10 +371,13 @@ async function refresh() {
         ),
   );
   renderBatch();
+  const gripperSides = state.gripper_sides || [];
   const gripperStatus = state.gripper_action_status || (
     state.gripper_control_available
-      ? `夹爪独立控制可用：${(state.gripper_sides || []).join("、")}`
-      : "夹爪独立控制：当前拓扑未启用。"
+      ? `夹爪独立控制可用：${gripperSides.join("、")}`
+      : gripperSides.length
+        ? `夹爪已配置：${gripperSides.join("、")}；当前安全/Session 阶段不允许独立控制。`
+        : "夹爪独立控制：当前拓扑未启用。"
   );
   text("gripper-status", gripperStatus);
   text("task-chain-step", state.task_chain_step);
