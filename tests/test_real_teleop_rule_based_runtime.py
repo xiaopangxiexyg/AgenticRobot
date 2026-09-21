@@ -179,6 +179,102 @@ def _deployment() -> RuleBasedRealTeleopDeployment:
     )
 
 
+def test_writing_stage_coverage_requires_each_persisted_detail_stage() -> None:
+    group = _group()
+    capture = RuleBasedCaptureSelection(enabled=True)
+    steps = tuple(
+        RuleBasedReplay(
+            step_id=f"right_write.{phase}",
+            group_key=phase,
+            start_index=0,
+            end_index=2,
+            active_sides=("right",),
+            capture=capture,
+        )
+        for phase in ("pen_down", "write", "pen_up")
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(steps=steps),
+        trajectory_groups={phase: replace(group, key=phase) for phase in (
+            "pen_down",
+            "write",
+            "pen_up",
+        )},
+        config=RuleBasedRealTeleopConfig(
+            minimum_stage_sample_coverage=0.8,
+            minimum_stage_sample_count=2,
+        ),
+    )
+
+    assert set(extension._incomplete_detail_stages()) == {
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
+    }
+    extension._accepted_samples_by_detail_stage.update(
+        {
+            "right_write.pen_down": 2,
+            "right_write.write": 1,
+            "right_write.pen_up": 2,
+        }
+    )
+    assert set(extension._incomplete_detail_stages()) == {"right_write.write"}
+    extension._accepted_samples_by_detail_stage["right_write.write"] = 2
+    assert extension._incomplete_detail_stages() == {}
+
+
+def test_successful_random_source_attempt_advances_selection_ordinal() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6),
+                    right_arm=np.zeros(6),
+                ),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={},
+        source_selection={"selection_ordinal": 0},
+    )
+    rebuilt_ordinals: list[int] = []
+
+    def rebuild(configuration):
+        ordinal = int(configuration["_selection_ordinal"])
+        rebuilt_ordinals.append(ordinal)
+        return RuleBasedRealTeleopExtension(
+            deployment=_deployment(),
+            plan=plan,
+            trajectory_groups={},
+            source_selection={"selection_ordinal": ordinal},
+        )
+
+    extension._configuration_rebuilder = rebuild
+    extension._selected_configuration = {
+        "pen_down_candidate_id": "__rule_source_pool_random__",
+    }
+    extension._configuration_options = {"runtime_info": {}}
+    extension._make_initial_alignment_planner = lambda: None
+    extension._recording_active = lambda: False
+    extension._dataset_recorder_provider = lambda: None
+    extension._control_ui = SimpleNamespace(
+        update_rule_runtime_info=lambda _values: None
+    )
+    extension._completed = True
+
+    extension._prepare_next_attempt_after_success(now=1.0)
+
+    assert rebuilt_ordinals == [1]
+    assert extension._selection_ordinal == 1
+    assert extension.source_selection["selection_ordinal"] == 1
+
+
+
 class _Poller:
     def __init__(self) -> None:
         self.qpos = {"left": np.zeros(6), "right": np.zeros(6)}

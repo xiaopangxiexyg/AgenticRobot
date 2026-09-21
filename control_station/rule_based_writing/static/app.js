@@ -57,6 +57,10 @@ let configurationDirty = false;
 let configurationBatch = [];
 let collectionMode = "rule_based_writing";
 let tactileCaptureLocked = false;
+let writingSpeedEdited = false;
+let refreshInFlight = false;
+let optionsRefreshInFlight = false;
+let lastOptionsRefreshAt = 0;
 
 const configurationInputs = () => [
   "full-replay-source", "pre-pen-down-source", "pre-pen-down-normal-episodes", "pen-down-source", "write-source", "pen-up-source", "trajectory",
@@ -94,18 +98,34 @@ const addOptions = (select, values) => {
 };
 
 async function loadOptions() {
+  if (optionsRefreshInFlight) return;
+  optionsRefreshInFlight = true;
+  try {
   let response;
   try {
     response = await fetch("/options.json", {cache: "no-store"});
   } catch (_error) {
+    optionsRefreshInFlight = false;
     return;
   }
-  if (!response.ok) return;
-  const options = await response.json();
+  if (!response.ok) {
+    optionsRefreshInFlight = false;
+    return;
+  }
+  let options;
+  try {
+    options = await response.json();
+  } catch (_error) {
+    optionsRefreshInFlight = false;
+    return;
+  }
   collectionMode = options.collection_mode || "rule_based_writing";
   const sources = options.source_candidates_by_phase || {};
   if (fullReplayMode()) {
-    if (!(options.full_replay_candidates || []).length) return;
+    if (!(options.full_replay_candidates || []).length) {
+      optionsRefreshInFlight = false;
+      return;
+    }
     addOptions(
       document.getElementById("full-replay-source"),
       options.full_replay_candidates,
@@ -113,7 +133,10 @@ async function loadOptions() {
   } else {
     if (!(sources.pen_down || []).length || !(sources.write || []).length ||
         !(sources.pen_up || []).length || !(options.trajectory_ids || []).length ||
-        !(options.directions || []).length) return;
+        !(options.directions || []).length) {
+      optionsRefreshInFlight = false;
+      return;
+    }
     addOptions(
       document.getElementById("pre-pen-down-source"),
       options.pre_pen_down_replay_candidates || [],
@@ -186,6 +209,10 @@ async function loadOptions() {
   );
   optionsLoaded = true;
   if (latestState) syncConfiguration(latestState);
+  optionsRefreshInFlight = false;
+  } finally {
+    optionsRefreshInFlight = false;
+  }
 }
 
 function syncConfiguration(state) {
@@ -256,6 +283,9 @@ function currentConfiguration() {
     direction: document.getElementById("direction").value,
     writing_size_m: Number(document.getElementById("writing-size").value),
     writing_speed_m_s: Number(document.getElementById("writing-speed").value),
+    writing_speed_from_source: !writingSpeedEdited
+      && Boolean(latestState && latestState.rule_configuration
+        && latestState.rule_configuration.writing_speed_from_source),
     ...shared,
   };
 }
@@ -300,19 +330,32 @@ async function applyConfiguration() {
     : current;
   if (await postJson("/configuration", payload, "configuration")) {
     configurationDirty = false;
+    writingSpeedEdited = false;
     await refresh();
   }
 }
 
 async function refresh() {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  try {
   let response;
   try {
     response = await fetch("/state.json", {cache: "no-store"});
   } catch (_error) {
     return;
   }
-  if (!response.ok) return;
-  const state = await response.json();
+  if (!response.ok) {
+    refreshInFlight = false;
+    return;
+  }
+  let state;
+  try {
+    state = await response.json();
+  } catch (_error) {
+    refreshInFlight = false;
+    return;
+  }
   latestState = state;
   collectionMode = state.collection_mode || collectionMode;
   applyModeUi();
@@ -467,6 +510,10 @@ async function refresh() {
     item.append(tag, document.createTextNode(` ${message.message}`));
     return item;
   }));
+  refreshInFlight = false;
+  } finally {
+    refreshInFlight = false;
+  }
 }
 
 document.querySelectorAll("button[data-event]").forEach((button) => {
@@ -495,7 +542,19 @@ configurationInputs().forEach((input) => {
   input.addEventListener("input", () => { configurationDirty = true; });
   input.addEventListener("change", () => { configurationDirty = true; });
 });
+document.getElementById("writing-speed").addEventListener("input", () => {
+  writingSpeedEdited = true;
+});
 setInterval(refresh, 250);
-setInterval(() => { if (!optionsLoaded) loadOptions(); }, 1000);
+setInterval(() => {
+  const now = Date.now();
+  const editing = document.activeElement
+    && configurationInputs().includes(document.activeElement);
+  if ((!optionsLoaded || now - lastOptionsRefreshAt >= 2000)
+      && !configurationDirty && !editing) {
+    lastOptionsRefreshAt = now;
+    loadOptions();
+  }
+}, 500);
 loadOptions();
 refresh();

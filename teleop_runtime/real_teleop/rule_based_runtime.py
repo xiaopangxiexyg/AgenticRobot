@@ -85,6 +85,7 @@ RULE_BASED_REAL_TELEOP_SCHEMA_V1 = "dexteleop.rule_based_real_teleop.v1"
 _RULE_POSE_RIGID_PROJECTION_LIMIT = 1e-5
 _RULE_UI_STATUS_HZ = 15.0
 _WRITING_HEIGHT_DESCENT_STEP_ID = "right_write.pen_down.height_descent"
+_RANDOM_SOURCE_SELECTION_ID = "__rule_source_pool_random__"
 
 
 def _mutable_metadata_copy(value: Any) -> Any:
@@ -195,6 +196,8 @@ class RuleBasedRealTeleopConfig:
     # Keep this additive field after the established positional fields so
     # compatibility fixtures and external callers retain their bindings.
     manual_gripper_settle_samples: int = 3
+    minimum_stage_sample_coverage: float = 0.8
+    minimum_stage_sample_count: int = 2
 
     def __post_init__(self) -> None:
         if self.action_hz is not None and (
@@ -216,12 +219,27 @@ class RuleBasedRealTeleopConfig:
             "manual_gripper_resend_interval_sec",
             "manual_gripper_timeout_sec",
             "hand_state_max_age_sec",
+            "minimum_stage_sample_coverage",
         ):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
         if float(self.initial_alignment_speed_scale) > 1.0:
             raise ValueError("initial_alignment_speed_scale must be in (0, 1].")
+        if float(self.minimum_stage_sample_coverage) > 1.0:
+            raise ValueError("minimum_stage_sample_coverage must be in (0, 1].")
+        minimum_stage_sample_count = self.minimum_stage_sample_count
+        if (
+            isinstance(minimum_stage_sample_count, bool)
+            or not isinstance(minimum_stage_sample_count, (int, np.integer))
+            or int(minimum_stage_sample_count) <= 0
+        ):
+            raise ValueError("minimum_stage_sample_count must be a positive integer.")
+        object.__setattr__(
+            self,
+            "minimum_stage_sample_count",
+            int(minimum_stage_sample_count),
+        )
         normal_episodes = self.pre_pen_down_replay_normal_episodes
         if (
             isinstance(normal_episodes, bool)
@@ -460,6 +478,9 @@ class RuleBasedRealTeleopExtension:
         self.trajectory_groups = dict(trajectory_groups)
         self.config = config or RuleBasedRealTeleopConfig()
         self.source_selection = copy.deepcopy(dict(source_selection or {}))
+        self._selection_ordinal = int(
+            self.source_selection.get("selection_ordinal", 0) or 0
+        )
         self._normal_plan = plan
         self._pre_pen_down_replay_plan = pre_pen_down_replay_plan
         self._pre_pen_down_normal_completed_count = 0
@@ -604,6 +625,7 @@ class RuleBasedRealTeleopExtension:
             str, tuple[str, float]
         ] = {}
         self._admitted_capture_sequences: set[int] = set()
+        self._accepted_samples_by_detail_stage: dict[str, int] = {}
         self._height_calibration: RuleBasedWritingHeightCalibration | None = None
         self._height_calibration_error = ""
         self._height_calibration_pending = False
@@ -613,6 +635,7 @@ class RuleBasedRealTeleopExtension:
         self._height_upper_tolerance_m = 0.001
         self._writing_height_target_z_m: float | None = None
         self._height_descent_planned_count_added = False
+        self._height_descent_planned_sample_count = 0
         self._configuration_options: dict[str, Any] = {}
         self._selected_configuration: dict[str, Any] = {}
         self._configuration_batch: list[
@@ -715,6 +738,76 @@ class RuleBasedRealTeleopExtension:
             else:
                 totals[step.step_id] = int(getattr(step, "repeats", 1))
         return totals
+
+    def _expected_samples_by_detail_stage(self) -> dict[str, int]:
+        """Return writer-rate expectations for each persisted detail stage."""
+
+        expected: dict[str, int] = {}
+        collection_mode = str(
+            self.source_selection.get("collection_mode") or "rule_based_writing"
+        )
+        for step in self.plan.steps:
+            if not bool(step.capture.enabled):
+                continue
+            metadata = self._phase_metadata_for_step(
+                step.step_id,
+                "replay" if isinstance(step, RuleBasedReplay) else "custom_action",
+                collection_mode,
+            )
+            stage_id = metadata.get("collection_detail_stage_id")
+            if stage_id not in {
+                "right_write.pen_down",
+                "right_write.write",
+                "right_write.pen_up",
+                "execute_task.full_replay",
+            }:
+                continue
+            if isinstance(step, RuleBasedReplay):
+                count = max(0, int(step.end_index) - int(step.start_index))
+            elif isinstance(step, RuleBasedActionSegment):
+                count = int(
+                    step.stop_condition.max_steps
+                    if step.planned_steps_hint is None
+                    else step.planned_steps_hint
+                )
+            else:
+                count = max(1, int(getattr(step, "repeats", 1)))
+            expected[str(stage_id)] = expected.get(str(stage_id), 0) + count
+        if self._height_descent_planned_sample_count > 0:
+            stage_id = "right_write.pen_down"
+            expected[stage_id] = (
+                expected.get(stage_id, 0)
+                + int(self._height_descent_planned_sample_count)
+            )
+        return expected
+
+    def _stage_sample_coverage(self) -> dict[str, dict[str, int | float | bool]]:
+        expected = self._expected_samples_by_detail_stage()
+        result: dict[str, dict[str, int | float | bool]] = {}
+        for stage_id, planned in expected.items():
+            required = min(
+                planned,
+                max(
+                    1,
+                    int(self.config.minimum_stage_sample_count),
+                    int(math.ceil(planned * self.config.minimum_stage_sample_coverage)),
+                ),
+            )
+            accepted = int(self._accepted_samples_by_detail_stage.get(stage_id, 0))
+            result[stage_id] = {
+                "planned": int(planned),
+                "required": int(required),
+                "accepted": accepted,
+                "complete": accepted >= required,
+            }
+        return result
+
+    def _incomplete_detail_stages(self) -> dict[str, dict[str, int | float | bool]]:
+        return {
+            stage_id: summary
+            for stage_id, summary in self._stage_sample_coverage().items()
+            if not bool(summary["complete"])
+        }
 
     def _validate_plan(self, plan: RuleBasedCollectionPlan | None = None) -> None:
         steps = tuple((self.plan if plan is None else plan).steps)
@@ -3337,6 +3430,16 @@ class RuleBasedRealTeleopExtension:
                     context=runtime_context,
                 )
             except StopIteration:
+                incomplete = self._incomplete_detail_stages()
+                if incomplete:
+                    detail = ", ".join(
+                        f"{stage}={values['accepted']}/{values['required']}"
+                        for stage, values in sorted(incomplete.items())
+                    )
+                    self._abort_session_step(
+                        "formal dataset stage coverage is incomplete: " + detail
+                    )
+                    return
                 self._completed = True
                 self._armed = False
                 self._waiting_reason = "completed"
@@ -4792,6 +4895,7 @@ class RuleBasedRealTeleopExtension:
                     int(math.ceil(descent_duration_sec * self.action_hz)),
                 )
                 self._planned_sample_count += descent_planned_samples
+                self._height_descent_planned_sample_count = descent_planned_samples
                 self._stage_total_by_step[_WRITING_HEIGHT_DESCENT_STEP_ID] = descent_total
                 self._height_descent_planned_count_added = True
         self._update_stage_display(emission)
@@ -6045,9 +6149,11 @@ class RuleBasedRealTeleopExtension:
         self._reset_pose_action_motion_intent(reason)
         self._last_live_dispatch_timestamp = None
         self._admitted_capture_sequences.clear()
+        self._accepted_samples_by_detail_stage.clear()
         self._planned_sample_count = self._count_planned_samples()
         self._stage_total_by_step = self._stage_totals_by_step()
         self._height_descent_planned_count_added = False
+        self._height_descent_planned_sample_count = 0
         self._writing_height_target_z_m = None
         self._stage_label = None
         self._stage_index = None
@@ -6122,6 +6228,7 @@ class RuleBasedRealTeleopExtension:
                 return
         self._advance_pre_pen_down_replay_cadence()
         try:
+            next_selection_ordinal = self._selection_ordinal + 1
             if self._configuration_batch:
                 count = len(self._configuration_batch)
                 completed_index = int(self._configuration_batch_index)
@@ -6136,6 +6243,11 @@ class RuleBasedRealTeleopExtension:
                     next_index = 0
                     self._configuration_batch_cycle_complete = True
                 configuration, replacement = self._configuration_batch[next_index]
+                if self._configuration_uses_random_sources(configuration):
+                    replacement = self._rebuild_for_selection_ordinal(
+                        configuration,
+                        selection_ordinal=next_selection_ordinal,
+                    )
                 self._adopt_prestart_extension(replacement)
                 if self._configuration_on_commit is not None:
                     self._configuration_on_commit(configuration, replacement)
@@ -6144,7 +6256,21 @@ class RuleBasedRealTeleopExtension:
             else:
                 self._configuration_batch_completed_count = 1
                 self._configuration_batch_cycle_complete = True
-                self.plan = self._plan_for_next_attempt()
+                if self._configuration_uses_random_sources(
+                    self._selected_configuration
+                ):
+                    replacement = self._rebuild_for_selection_ordinal(
+                        self._selected_configuration,
+                        selection_ordinal=next_selection_ordinal,
+                    )
+                    self._adopt_prestart_extension(replacement)
+                    if self._configuration_on_commit is not None:
+                        self._configuration_on_commit(
+                            self._selected_configuration,
+                            replacement,
+                        )
+                else:
+                    self.plan = self._plan_for_next_attempt()
         except Exception as exc:  # noqa: BLE001 - batch activation fails closed.
             self._completed = False
             self._aborted = True
@@ -6161,6 +6287,27 @@ class RuleBasedRealTeleopExtension:
                     "机械臂已进入 Hold，请重新验证批次。",
                 )
             return
+        self._selection_ordinal = next_selection_ordinal
+        runtime_info = self._configuration_options.get("runtime_info")
+        if isinstance(runtime_info, dict) and self._selected_configuration:
+            collect_tactile = bool(
+                self._selected_configuration.get("collect_tactile", False)
+            )
+            updates = {
+                "tactile_capture_locked": True,
+                "tactile_capture_source": "existing_dataset_contract",
+                "tactile_capture_mode": (
+                    "enabled" if collect_tactile else "disabled"
+                ),
+            }
+            runtime_info.update(updates)
+            update_runtime_info = getattr(
+                self._control_ui,
+                "update_rule_runtime_info",
+                None,
+            )
+            if callable(update_runtime_info):
+                update_runtime_info(updates)
         self._reset_attempt_state(reason="successful_episode_reset")
         self._held = False
         self._armed = bool(self._legacy_generic_ui)
@@ -6170,6 +6317,32 @@ class RuleBasedRealTeleopExtension:
             else "waiting_for_rule_start"
         )
         self._invalidate_readiness_diagnosis_cache()
+
+    @staticmethod
+    def _configuration_uses_random_sources(
+        configuration: Mapping[str, Any],
+    ) -> bool:
+        return any(
+            str(value) == _RANDOM_SOURCE_SELECTION_ID
+            for key, value in configuration.items()
+            if str(key).endswith("_candidate_id")
+        )
+
+    def _rebuild_for_selection_ordinal(
+        self,
+        configuration: Mapping[str, Any],
+        *,
+        selection_ordinal: int,
+    ) -> "RuleBasedRealTeleopExtension":
+        rebuilder = self._configuration_rebuilder
+        if rebuilder is None:
+            raise RuntimeError("random source selection rebuilder is unavailable")
+        request = copy.deepcopy(dict(configuration))
+        request["_selection_ordinal"] = int(selection_ordinal)
+        replacement = rebuilder(request)
+        if not isinstance(replacement, RuleBasedRealTeleopExtension):
+            raise TypeError("rule configuration rebuilder returned the wrong type.")
+        return replacement
 
     def discards_episode_on_stop(self, *, reason: str) -> bool:
         if str(reason) == "rule_based_complete" or self._completed:
@@ -6296,6 +6469,12 @@ class RuleBasedRealTeleopExtension:
                 **phase_metadata,
                 "rule_based_stage_frame_index": self._stage_frame_index,
                 "rule_based_stage_frame_total": self._stage_frame_total,
+                "rule_based_stage_sample_coverage_policy": {
+                    "minimum_fraction": float(
+                        self.config.minimum_stage_sample_coverage
+                    ),
+                    "minimum_count": int(self.config.minimum_stage_sample_count),
+                },
             },
         )
 
@@ -6344,6 +6523,12 @@ class RuleBasedRealTeleopExtension:
                 self._publish_status()
             return
         self._admitted_capture_sequences.add(sequence_index)
+        stage_id = metadata.get("collection_detail_stage_id")
+        if stage_id:
+            stage_key = str(stage_id)
+            self._accepted_samples_by_detail_stage[stage_key] = (
+                self._accepted_samples_by_detail_stage.get(stage_key, 0) + 1
+            )
         # This timer describes writer health, not ownership of whichever
         # 60 Hz reference is active when the detached ACK is drained.  Any
         # successful terminal ACK proves that the writer made fresh progress

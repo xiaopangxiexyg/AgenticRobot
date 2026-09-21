@@ -668,4 +668,16 @@ def test_gui_random_source_sentinel_selects_from_the_pool(
         for phase, spec in selected_again.items()
     }
     assert metadata["selection_seed"] == 7
+    assert metadata["selection_ordinal"] == 0
     assert metadata == metadata_again
+
+    args._rule_source_selection_ordinal = 1
+    selected_next, metadata_next = writing_plan._resolve_source_specs(args)
+    assert metadata_next["selection_seed"] == 7
+    assert metadata_next["selection_ordinal"] == 1
+    assert {
+        phase: spec.candidate.candidate_id
+        for phase, spec in selected_next.items()
+    } != {
+        phase: spec.candidate.candidate_id for phase, spec in selected.items()
+    }

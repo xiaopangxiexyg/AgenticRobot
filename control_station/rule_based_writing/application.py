@@ -706,6 +706,18 @@ class RuleBasedWritingApplication:
             self._rebuild_controls()
             self._touch()
 
+    def update_rule_runtime_info(self, values: Mapping[str, object]) -> None:
+        """Refresh mutable dataset facts without replacing operator choices."""
+
+        normalized = dict(values)
+        with self._lock:
+            options = dict(self._configuration_options)
+            runtime_info = dict(options.get("runtime_info", {}) or {})
+            runtime_info.update(normalized)
+            options["runtime_info"] = runtime_info
+            self._configuration_options = options
+            self._touch()
+
     def submit_configuration(self, payload: Mapping[str, object]) -> bool:
         """Queue one validated configuration batch while collection is idle."""
 

@@ -153,6 +153,7 @@ _RULE_GUI_SHARED_RUNTIME_CONFIGURATION_FIELDS = (
 )
 _RULE_GUI_RUNTIME_CONFIGURATION_FIELDS = (
     "writing_speed_m_s",
+    "writing_speed_from_source",
     *_RULE_GUI_SHARED_RUNTIME_CONFIGURATION_FIELDS,
 )
 
@@ -279,9 +280,8 @@ def _resolve_rule_tactile_capture(
 
     A blank target follows the explicit rule toggle, existing ``--ignore-tactile``
     values, or (for backwards compatibility) whether a tactile bundle root was
-    supplied.  A populated target always follows its persisted contract; legacy
-    populated targets without that declaration retain the historical complete
-    tactile contract.
+    supplied. A populated target always follows its persisted contract;
+    ambiguous legacy populated targets fail closed instead of guessing.
     """
 
     dataset_text = str(getattr(args, "dataset_root", "") or "").strip()
@@ -293,14 +293,12 @@ def _resolve_rule_tactile_capture(
     blank = dataset_is_blank(dataset_root)
     if not blank:
         if existing is None:
-            contract = CaptureModalityContract(
-                ignored_camera_keys=current_camera_keys,
-                ignored_tactile_keys=(),
+            raise CaptureModalityBindingError(
+                "target dataset contains data but has no capture modality contract; "
+                "migrate meta/modality_validity.json explicitly before rule collection"
             )
-            source = "legacy_populated_dataset"
-        else:
-            contract = existing
-            source = "existing_dataset_contract"
+        contract = existing
+        source = "existing_dataset_contract"
         mode = (
             "enabled"
             if not contract.ignored_tactile_keys
@@ -1471,9 +1469,10 @@ def _stable_candidate_index(
     seed: int,
     phase: str,
     candidate_count: int,
+    selection_ordinal: int = 0,
 ) -> int:
     digest = hashlib.sha256(
-        f"{pool_hash}\0{int(seed)}\0{phase}".encode("utf-8")
+        f"{pool_hash}\0{int(seed)}\0{phase}\0{int(selection_ordinal)}".encode("utf-8")
     ).digest()
     return int.from_bytes(digest[:8], "big") % int(candidate_count)
 
@@ -1528,6 +1527,9 @@ def _resolve_source_specs(
         )
 
     loaded_pool = _load_rule_source_pool_cached(args, manifest)
+    selection_ordinal = int(getattr(args, "_rule_source_selection_ordinal", 0))
+    if selection_ordinal < 0:
+        raise ValueError("rule source selection ordinal must be non-negative.")
     start, end = _parse_pool_range(
         getattr(args, "rule_source_pool_range", None),
         candidate_count=len(loaded_pool.candidates),
@@ -1587,6 +1589,7 @@ def _resolve_source_specs(
                 seed=int(getattr(args, "rule_source_selection_seed", 0)),
                 phase=phase,
                 candidate_count=len(choices),
+                selection_ordinal=selection_ordinal,
             )
             selected[phase] = choices[index]
             used.add(choices[index].candidate.candidate_id)
@@ -1605,6 +1608,7 @@ def _resolve_source_specs(
                 "pool_manifest_hash": loaded_pool.contract.semantic_content_hash,
                 "pool_range": {"start": start, "end": end},
                 "selection_seed": selection_seed,
+                "selection_ordinal": selection_ordinal,
             },
         )
     selected: dict[str, ResolvedRuleBasedWritingSourceCandidate] = {}
@@ -1622,6 +1626,7 @@ def _resolve_source_specs(
             seed=int(getattr(args, "rule_source_selection_seed", 0)),
             phase=phase,
             candidate_count=len(choices),
+            selection_ordinal=selection_ordinal,
         )
         selected[phase] = choices[index]
         used.add(choices[index].candidate.candidate_id)
@@ -1635,6 +1640,7 @@ def _resolve_source_specs(
             "pool_manifest_hash": loaded_pool.contract.semantic_content_hash,
             "pool_range": {"start": start, "end": end},
             "selection_seed": int(getattr(args, "rule_source_selection_seed", 0)),
+            "selection_ordinal": selection_ordinal,
         },
     )
 
@@ -2027,7 +2033,12 @@ def _rule_configuration_options(
         "select_fields": {
             "tactile_compression": ["none", "lz4", "zstd"],
         },
-        "boolean_fields": ["collect_tactile", "write_parquet", "write_video"],
+        "boolean_fields": [
+            "writing_speed_from_source",
+            "collect_tactile",
+            "write_parquet",
+            "write_video",
+        ],
         "text_fields": ["tactile_bundle_root"],
         "numeric_bounds": {
             "writing_size_m": [
@@ -2114,6 +2125,9 @@ def _rule_configuration_options(
             "direction": str(args.rule_writing_direction),
             "writing_size_m": float(args.rule_writing_size_m),
             "writing_speed_m_s": float(resolved_writing_speed_m_s),
+            "writing_speed_from_source": bool(
+                getattr(args, "rule_writing_speed_m_s", None) is None
+            ),
             "initial_alignment_speed_scale": float(
                 getattr(args, "rule_initial_alignment_speed_scale", 1.0)
             ),
@@ -2269,7 +2283,11 @@ def _apply_rule_gui_runtime_configuration(
         "write_video": bool(configuration["write_video"]),
     }
     if "writing_speed_m_s" in configuration:
-        patch["rule_writing_speed_m_s"] = float(configuration["writing_speed_m_s"])
+        patch["rule_writing_speed_m_s"] = (
+            None
+            if bool(configuration.get("writing_speed_from_source", False))
+            else float(configuration["writing_speed_m_s"])
+        )
     if not tactile_resolution.collect_tactile:
         patch["dmtac_tactile"] = False
         patch["tactile_bundle_root"] = ""
@@ -2635,6 +2653,9 @@ def _build_full_trajectory_replay(
             configuration: Mapping[str, Any],
         ) -> RuleBasedRealTeleopExtension:
             rebuilt_args = copy.copy(base_args)
+            rebuilt_args._rule_source_selection_ordinal = int(
+                configuration.get("_selection_ordinal", 0)
+            )
             rebuilt_args._rule_full_replay_candidate_id = str(
                 configuration["full_replay_candidate_id"]
             )
@@ -3276,6 +3297,9 @@ def build_rule_based_writing(
             configuration: Mapping[str, Any],
         ) -> RuleBasedRealTeleopExtension:
             rebuilt_args = copy.copy(base_args)
+            rebuilt_args._rule_source_selection_ordinal = int(
+                configuration.get("_selection_ordinal", 0)
+            )
             rebuilt_args._rule_source_candidate_ids_by_phase = {
                 phase: str(configuration[f"{phase}_candidate_id"])
                 for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1

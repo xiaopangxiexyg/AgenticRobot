@@ -68,7 +68,7 @@ EOF
 
 die() {
   printf '[RuleBased] %s\n' "$*" >&2
-  exit 2
+  exit 1
 }
 
 is_positive_decimal() {
@@ -493,14 +493,13 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-# Import this dependency with the exact interpreter that will own the real
-# process.  The source tree declares SciPy in both pyproject.toml and
-# environment.yml, but a stale or partially-created remote conda environment
-# must be rejected before any camera, arm, or gripper component is assembled.
+# Import the complete entrypoint with the exact interpreter that will own the
+# real process. This exercises transitive runtime dependencies and local module
+# resolution without constructing a camera, arm, or gripper component.
 runtime_dependency_preflight() {
   local import_output runtime_python_path
   if import_output="$("$RUNTIME_PYTHON" -c \
-      'import scipy; from scipy.spatial.transform import Rotation; print(scipy.__version__)' \
+      'import scipy; from scipy.spatial.transform import Rotation; import control_station.real_rule_based_writing_entrypoint; print(scipy.__version__)' \
       2>&1)"; then
     printf '[RuleBased] runtime dependency preflight: scipy=%s python=%s\n' \
       "$import_output" "$RUNTIME_PYTHON"
@@ -511,7 +510,7 @@ runtime_dependency_preflight() {
   printf '%s\n' \
     '[RuleBased] runtime dependency preflight failed; no device startup was attempted.' \
     "[RuleBased] python=$runtime_python_path" \
-    '[RuleBased] required import: scipy.spatial.transform.Rotation' \
+    '[RuleBased] required import: control_station.real_rule_based_writing_entrypoint (including scipy.spatial.transform.Rotation)' \
     '[RuleBased] expected environment declaration: scipy==1.13.1 in environment.yml/pyproject.toml' \
     '[RuleBased] repair example: conda install -p /home/user/miniconda3/envs/dexteleop310 -c conda-forge scipy=1.13.1' \
     '[RuleBased] import diagnostic:' \

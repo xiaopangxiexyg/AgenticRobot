@@ -568,6 +568,7 @@ def test_gui_writer_configuration_is_staged_then_committed_to_live_args(
         **selected,
         "collect_tactile": True,
         "writing_speed_m_s": 0.05,
+        "writing_speed_from_source": False,
         "tactile_bundle_root": str(tactile_root),
         "tactile_bundle_min_free_gb": 0.0,
         "tactile_compression": "lz4",
@@ -1070,7 +1071,7 @@ def test_launcher_value_options_preserve_missing_value_errors(
         text=True,
     )
 
-    assert result.returncode == 2
+    assert result.returncode == 1
     assert result.stderr == f"[RuleBased] {option} requires {value_hint}.\n"
 
 
@@ -1243,7 +1244,7 @@ def test_launcher_refuses_missing_runtime_scipy_before_device_startup(
     assert "runtime dependency preflight failed" in result.stderr
     assert "scipy.spatial.transform.Rotation" in result.stderr
     assert "no device startup was attempted" in result.stderr
-    assert "control_station.real_rule_based_writing_entrypoint" not in result.stderr
+    assert "control_station.real_rule_based_writing_entrypoint" in result.stderr
 
 
 def test_launcher_accepts_greek_trajectory_catalog_id(tmp_path: Path) -> None:
@@ -1549,7 +1550,7 @@ def test_launcher_full_replay_rejects_writing_speed_override(tmp_path: Path) -> 
         text=True,
     )
 
-    assert result.returncode == 2
+    assert result.returncode == 1
     assert "source Episode timestamps are preserved" in result.stderr
 
 
@@ -1722,7 +1723,7 @@ def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
         capture_output=True,
         text=True,
     )
-    assert full_replay.returncode == 2
+    assert full_replay.returncode == 1
     assert "not valid in full-replay mode" in full_replay.stderr
 
     full_replay_interval = subprocess.run(
@@ -1739,7 +1740,7 @@ def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
         capture_output=True,
         text=True,
     )
-    assert full_replay_interval.returncode == 2
+    assert full_replay_interval.returncode == 1
     assert "not valid in full-replay mode" in full_replay_interval.stderr
 
     source = tmp_path / "source"
@@ -1768,7 +1769,7 @@ def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
         capture_output=True,
         text=True,
     )
-    assert legacy.returncode == 2
+    assert legacy.returncode == 1
     assert "requires --source-pool-manifest" in legacy.stderr
 
 
