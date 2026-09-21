@@ -1,12 +1,19 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
+
+# Conda activation on collection hosts can leave a PATH containing only the
+# environment's bin directory.  Preserve that interpreter precedence while
+# restoring the standard system command locations required by the launcher.
+# The script must not depend on the caller having started bash or zsh as a
+# login shell.
+SYSTEM_COMMAND_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="${PATH:+$PATH:}$SYSTEM_COMMAND_PATH"
 
 usage() {
   cat <<'EOF'
 Usage:
   bash scripts/run_rule_based_writing_collection.sh \
-    --source-pool-manifest /absolute/source-pool.json \
-    --tactile-bundle-root /absolute/tactile/root [options]
+    --source-pool-manifest /absolute/source-pool.json [options]
 
 Required:
   --source-pool-manifest P    Cross-dataset source candidate pool; or
@@ -14,7 +21,8 @@ Required:
   --source-episode N          source episode index.
   --detail-annotation-dir P   Exact immutable annotation-set directory; required
                               only in rule-based-writing legacy mode.
-  --tactile-bundle-root PATH  Existing external tactile output root.
+  --tactile-bundle-root PATH  Existing external tactile output root; required
+                              only when effective tactile capture is enabled.
 
 Options:
   --mode NAME                 rule-based-writing (default) or full-replay.
@@ -30,6 +38,11 @@ Options:
   --speed-m-s MPS             Writing mode only; override source average speed.
   --initial-alignment-speed-scale S
                               Initial dual-arm alignment speed multiplier in (0, 1].
+  --collect-tactile            Request tactile capture for a new/blank dataset.
+  --no-collect-tactile         Request no tactile capture for a new/blank dataset.
+                              A populated target always follows its existing
+                              dataset modality contract. Without a tactile root,
+                              the launcher defaults to this mode.
   --source-pool-range A:B     Half-open candidate range (default: whole pool).
   --selection-seed N          Deterministic source selection seed (default: 0).
   --pre-pen-down-replay-candidate-id ID
@@ -39,12 +52,12 @@ Options:
                               Successful normal Episodes before one configured
                               pre-pen-down replay (default: 0, replay every Episode).
   --task-name NAME            Output collection task name.
-  --tactile-min-free-gb N     Required tactile free space (default: 200).
+  --tactile-min-free-gb N     Required tactile free space (default: 10).
   --camera-frame-max-age-sec S
                               Maximum admitted RGB frame age (default: 0.25).
   --with-left-gripper         Also connect/capture the saved left DMTAC stack.
-  --left-gripper-port PATH    Explicit left DMTAC serial port (optional).
-  --right-gripper-port PATH   Explicit right DMTAC serial port (optional).
+  --left-gripper-port PATH    Override left DMTAC serial port (optional).
+  --right-gripper-port PATH   Override right DMTAC serial port (optional).
   --dry-run                   Print the command; do not start any device.
   -h, --help                  Show this help.
 
@@ -58,13 +71,30 @@ die() {
   exit 2
 }
 
+is_positive_decimal() {
+  local value="$1"
+  [[ "$value" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || return 1
+  [[ ! "$value" =~ ^0*([.]0*)?$ ]]
+}
+
+is_unit_interval_decimal() {
+  local value="$1"
+  is_positive_decimal "$value" || return 1
+  [[ "$value" =~ ^0*1([.]0*)?$ || "$value" =~ ^0*[.][0-9]*[1-9][0-9]*$ ]]
+}
+
 print_command() {
   printf '[dry-run]'
   printf ' %q' "$@"
   printf '\n'
 }
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+SCRIPT_PARENT="${SCRIPT_SOURCE%/*}"
+if [[ "$SCRIPT_PARENT" == "$SCRIPT_SOURCE" ]]; then
+  SCRIPT_PARENT="."
+fi
+SCRIPT_DIR="$(cd -- "$SCRIPT_PARENT" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 TCP_POSE_ENVELOPE_PROFILE="teleop_runtime/configs/real_teleop/rule_based_writing_bimanual_workspace_v1.json"
 SOURCE_DATASET=""
@@ -87,7 +117,9 @@ INITIAL_ALIGNMENT_SPEED_SCALE="1.0"
 LEFT_GRIPPER_PORT=""
 RIGHT_GRIPPER_PORT=""
 TASK_NAME="rule_based_writing"
-TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-200}"
+TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-10}"
+TACTILE_MIN_FREE_EXPLICIT=0
+COLLECT_TACTILE=""
 CAMERA_FRAME_MAX_AGE_SEC="0.25"
 WITH_LEFT_GRIPPER=0
 DRY_RUN=0
@@ -148,11 +180,26 @@ while [[ $# -gt 0 ]]; do
   option="$1"
   if [[ -n "${VALUE_OPTION_TARGET[$option]+present}" ]]; then
     [[ $# -ge 2 ]] || die "$option requires ${VALUE_OPTION_HINT[$option]}."
+    if [[ "$option" == "--tactile-min-free-gb" ]]; then
+      TACTILE_MIN_FREE_EXPLICIT=1
+    fi
     printf -v "${VALUE_OPTION_TARGET[$option]}" '%s' "$2"
     shift 2
     continue
   fi
   case "$1" in
+    --collect-tactile)
+      [[ -z "$COLLECT_TACTILE" ]] || die \
+        "--collect-tactile and --no-collect-tactile are mutually exclusive."
+      COLLECT_TACTILE=1
+      shift
+      ;;
+    --no-collect-tactile)
+      [[ -z "$COLLECT_TACTILE" ]] || die \
+        "--collect-tactile and --no-collect-tactile are mutually exclusive."
+      COLLECT_TACTILE=0
+      shift
+      ;;
     --with-left-gripper)
       WITH_LEFT_GRIPPER=1
       shift
@@ -193,23 +240,32 @@ if [[ "$COLLECTION_MODE" == "full-replay" && "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISOD
   die "--pre-pen-down-replay-normal-episodes is not valid in full-replay mode."
 fi
 
-[[ -n "$TACTILE_ROOT" ]] || die "--tactile-bundle-root is required."
-[[ "$TACTILE_ROOT" == /* ]] || die "tactile root must be absolute."
-[[ -d "$TACTILE_ROOT" ]] || die "tactile root does not exist: $TACTILE_ROOT"
-[[ ! -L "$TACTILE_ROOT" ]] || die "tactile root must not be a symlink."
+if [[ -n "$TACTILE_ROOT" ]]; then
+  [[ "$TACTILE_ROOT" == /* ]] || die "tactile root must be absolute."
+  [[ -d "$TACTILE_ROOT" ]] || die "tactile root does not exist: $TACTILE_ROOT"
+  [[ ! -L "$TACTILE_ROOT" ]] || die "tactile root must not be a symlink."
+fi
+if [[ "$COLLECT_TACTILE" == "1" && -z "$TACTILE_ROOT" ]]; then
+  die "--collect-tactile requires --tactile-bundle-root."
+fi
+if [[ -z "$TACTILE_ROOT" && "$TACTILE_MIN_FREE_EXPLICIT" -eq 1 && "$TACTILE_MIN_FREE_GB" != "0" ]]; then
+  if [[ "$COLLECT_TACTILE" == "0" ]]; then
+    printf '[RuleBased] --tactile-min-free-gb is ignored because --no-collect-tactile is active.\n' >&2
+    TACTILE_MIN_FREE_GB="0"
+  else
+    die "--tactile-min-free-gb requires --tactile-bundle-root."
+  fi
+fi
+if [[ -z "$TACTILE_ROOT" && "$TACTILE_MIN_FREE_EXPLICIT" -eq 0 ]]; then
+  TACTILE_MIN_FREE_GB="0"
+fi
 [[ "$SELECTION_SEED" =~ ^-?[0-9]+$ ]] || die "selection seed must be an integer."
 [[ "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" =~ ^[0-9]+$ ]] || \
   die "pre-pen-down replay normal Episodes must be a non-negative integer."
-if ! [[ "$INITIAL_ALIGNMENT_SPEED_SCALE" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-  die "initial alignment speed scale must be a positive decimal in (0, 1]."
-fi
-if ! awk "BEGIN { exit !($INITIAL_ALIGNMENT_SPEED_SCALE > 0 && $INITIAL_ALIGNMENT_SPEED_SCALE <= 1) }"; then
+if ! is_unit_interval_decimal "$INITIAL_ALIGNMENT_SPEED_SCALE"; then
   die "initial alignment speed scale must be in (0, 1]."
 fi
-if ! [[ "$CAMERA_FRAME_MAX_AGE_SEC" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-  die "camera frame max age must be a positive decimal."
-fi
-if ! awk "BEGIN { exit !($CAMERA_FRAME_MAX_AGE_SEC > 0) }"; then
+if ! is_positive_decimal "$CAMERA_FRAME_MAX_AGE_SEC"; then
   die "camera frame max age must be greater than zero."
 fi
 if [[ -n "$LEFT_GRIPPER_PORT" && "$WITH_LEFT_GRIPPER" -ne 1 ]]; then
@@ -281,6 +337,12 @@ RULE_ARGS=(
   --rule-collection-mode "$RULE_COLLECTION_MODE"
   --rule-initial-alignment-speed-scale "$INITIAL_ALIGNMENT_SPEED_SCALE"
 )
+if [[ "$COLLECT_TACTILE" == "1" ]]; then
+  RULE_ARGS+=(--rule-collect-tactile --dmtac-with-tactile)
+elif [[ "$COLLECT_TACTILE" == "0" || -z "$TACTILE_ROOT" ]]; then
+  RULE_ARGS+=(--no-rule-collect-tactile --dmtac-no-tactile)
+  RULE_ARGS+=(--ignore-tactile left --ignore-tactile right)
+fi
 if [[ "$COLLECTION_MODE" == "rule-based-writing" ]]; then
   RULE_ARGS+=(
     --rule-writing-trajectory "$TRAJECTORY"
@@ -318,6 +380,15 @@ else
 fi
 if [[ -n "$SPEED_M_S" && "$COLLECTION_MODE" == "rule-based-writing" ]]; then
   RULE_ARGS+=(--rule-writing-speed-m-s "$SPEED_M_S")
+fi
+
+TACTILE_RUNTIME_ARGS=()
+if [[ -n "$TACTILE_ROOT" && "$COLLECT_TACTILE" != "0" ]]; then
+  TACTILE_RUNTIME_ARGS=(
+    "${DMTAC_CAPTURE_COMMON_ARGS[@]}"
+    "${DMTAC_A_ARGS[@]}"
+    "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}"
+  )
 fi
 
 LEFT_HAND_BACKEND=none
@@ -363,9 +434,7 @@ fi
 
 TELEOP_ARGS=(
   "${RULE_COMMON_REAL_TELEOP_ARGS[@]}"
-  "${DMTAC_CAPTURE_COMMON_ARGS[@]}"
-  "${DMTAC_A_ARGS[@]}"
-  "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}"
+  "${TACTILE_RUNTIME_ARGS[@]}"
   "${DATASET_COMMON_ARGS[@]}"
   # Rule replay already publishes one safe 60 Hz reference stream and the
   # established acceleration planner updates it without blocking the 120 Hz
@@ -407,15 +476,54 @@ TELEOP_ARGS=(
   "${RULE_ARGS[@]}"
 )
 
+RUNTIME_PYTHON="${PYTHON_BIN:-python}"
 RUN_COMMAND=(
   taskset -c 0-7
-  python -m control_station.real_rule_based_writing_entrypoint
+  "$RUNTIME_PYTHON" -m control_station.real_rule_based_writing_entrypoint
   "${TELEOP_ARGS[@]}"
 )
+
+for required_command in taskset "$RUNTIME_PYTHON"; do
+  command -v "$required_command" >/dev/null 2>&1 || \
+    die "required command is unavailable after PATH normalization: $required_command"
+done
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   print_command "${RUN_COMMAND[@]}"
   exit 0
+fi
+
+# Import this dependency with the exact interpreter that will own the real
+# process.  The source tree declares SciPy in both pyproject.toml and
+# environment.yml, but a stale or partially-created remote conda environment
+# must be rejected before any camera, arm, or gripper component is assembled.
+runtime_dependency_preflight() {
+  local import_output runtime_python_path
+  if import_output="$("$RUNTIME_PYTHON" -c \
+      'import scipy; from scipy.spatial.transform import Rotation; print(scipy.__version__)' \
+      2>&1)"; then
+    printf '[RuleBased] runtime dependency preflight: scipy=%s python=%s\n' \
+      "$import_output" "$RUNTIME_PYTHON"
+    return 0
+  fi
+
+  runtime_python_path="$("$RUNTIME_PYTHON" -c 'import sys; print(sys.executable)' 2>/dev/null || printf '%s' "$RUNTIME_PYTHON")"
+  printf '%s\n' \
+    '[RuleBased] runtime dependency preflight failed; no device startup was attempted.' \
+    "[RuleBased] python=$runtime_python_path" \
+    '[RuleBased] required import: scipy.spatial.transform.Rotation' \
+    '[RuleBased] expected environment declaration: scipy==1.13.1 in environment.yml/pyproject.toml' \
+    '[RuleBased] repair example: conda install -p /home/user/miniconda3/envs/dexteleop310 -c conda-forge scipy=1.13.1' \
+    '[RuleBased] import diagnostic:' \
+    "$import_output" >&2
+  return 1
+}
+
+if ! runtime_dependency_preflight; then
+  # This is a fail-closed startup refusal, intentionally distinct from the
+  # launcher's CLI validation path; do not turn an environment fault into a
+  # Python traceback or the legacy exit-2 validation path.
+  exit 1
 fi
 
 printf '%s\n' \
@@ -425,6 +533,7 @@ printf '%s\n' \
   "[RuleBased] pre_pen_down_replay=${PRE_PEN_DOWN_REPLAY_CANDIDATE_ID:-disabled} normal_episodes_between_replays=$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" \
   "[RuleBased] source_dataset=${SOURCE_DATASET:-pool_selected} episode=${SOURCE_EPISODE:-pool_selected}" \
   "[RuleBased] detail_annotation_dir=${DETAIL_ANNOTATION_DIR:-pool_selected}" \
+  "[RuleBased] gripper_port_override left=${LEFT_GRIPPER_PORT:-assignment} right=${RIGHT_GRIPPER_PORT:-assignment}" \
   "[RuleBased] trajectory=$TRAJECTORY catalog=${TRAJECTORY_CATALOG:-builtin} size_m=$SIZE_M direction=$DIRECTION speed_m_s=${SPEED_M_S:-source_average}" \
-  "[RuleBased] output_dataset_root=$DATASET_BASE tactile_root=$TACTILE_BUNDLE_ROOT"
+  "[RuleBased] output_dataset_root=$DATASET_BASE tactile_request=${COLLECT_TACTILE:-dataset_contract_or_default} tactile_root=$TACTILE_BUNDLE_ROOT min_free_gb=$TACTILE_MIN_FREE_GB"
 exec "${RUN_COMMAND[@]}"

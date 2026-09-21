@@ -2,15 +2,36 @@ const text = (id, value) => {
   document.getElementById(id).textContent = value == null || value === "" ? "—" : String(value);
 };
 
-async function sendEvent(event) {
-  const response = await fetch("/event", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({event}),
-  });
-  if (!response.ok) {
+const pendingRequests = new Set();
+
+async function postJson(path, payload, key) {
+  if (pendingRequests.has(key)) return false;
+  pendingRequests.add(key);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!response.ok) await refresh();
+    return response.ok;
+  } catch (_error) {
+    // A disconnected browser must not create an unhandled rejection or leave
+    // a button looking busy forever.  The backend remains authoritative.
+    await refresh();
+    return false;
+  } finally {
+    window.clearTimeout(timeout);
+    pendingRequests.delete(key);
     await refresh();
   }
+}
+
+async function sendEvent(event) {
+  await postJson("/event", {event}, `event:${event}`);
 }
 
 async function sendHeightCalibration(operation) {
@@ -19,25 +40,15 @@ async function sendHeightCalibration(operation) {
     payload.lower_tolerance_mm = Number(document.getElementById("height-lower-tolerance").value);
     payload.upper_tolerance_mm = Number(document.getElementById("height-upper-tolerance").value);
   }
-  const response = await fetch("/height-calibration", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) await refresh();
+  await postJson("/height-calibration", payload, `height-calibration:${operation}`);
 }
 
 async function advanceTaskChain() {
-  const response = await fetch("/task-chain", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
+  await postJson("/task-chain", {
       event: "advance",
       lower_tolerance_mm: Number(document.getElementById("height-lower-tolerance").value),
       upper_tolerance_mm: Number(document.getElementById("height-upper-tolerance").value),
-    }),
-  });
-  if (!response.ok) await refresh();
+    }, "task-chain");
 }
 
 let optionsLoaded = false;
@@ -45,11 +56,12 @@ let latestState = null;
 let configurationDirty = false;
 let configurationBatch = [];
 let collectionMode = "rule_based_writing";
+let tactileCaptureLocked = false;
 
 const configurationInputs = () => [
   "full-replay-source", "pre-pen-down-source", "pre-pen-down-normal-episodes", "pen-down-source", "write-source", "pen-up-source", "trajectory",
   "direction", "writing-size", "writing-speed", "alignment-speed-input",
-  "tactile-bundle-root", "tactile-min-free", "tactile-compression",
+  "collect-tactile", "tactile-bundle-root", "tactile-min-free", "tactile-compression",
   "writer-workers", "writer-queue-size", "process-queue-size",
   "storage-queue-size", "storage-queue-enqueue-timeout", "camera-frame-max-age", "collection-warning-hz", "write-parquet", "write-video",
   "collection-flush-timeout", "sample-drain-timeout", "terminal-event-timeout",
@@ -82,7 +94,12 @@ const addOptions = (select, values) => {
 };
 
 async function loadOptions() {
-  const response = await fetch("/options.json", {cache: "no-store"});
+  let response;
+  try {
+    response = await fetch("/options.json", {cache: "no-store"});
+  } catch (_error) {
+    return;
+  }
   if (!response.ok) return;
   const options = await response.json();
   collectionMode = options.collection_mode || "rule_based_writing";
@@ -150,6 +167,12 @@ async function loadOptions() {
   });
   const info = options.runtime_info || {};
   const free = info.tactile_bundle_free_gb;
+  const collectTactile = document.getElementById("collect-tactile");
+  tactileCaptureLocked = Boolean(info.tactile_capture_locked);
+  collectTactile.disabled = tactileCaptureLocked;
+  collectTactile.title = tactileCaptureLocked
+    ? `当前数据集已锁定触觉模式：${info.tactile_capture_mode || "existing"}`
+    : "空数据集可选择是否采集触觉";
   text("sample-hz", info.sample_hz == null ? null : `${Number(info.sample_hz).toFixed(1)} Hz`);
   text(
     "position-reference-hz",
@@ -158,7 +181,8 @@ async function loadOptions() {
   text("arm-control-hz", info.arm_control_hz == null ? null : `${Number(info.arm_control_hz).toFixed(1)} Hz`);
   text(
     "storage-status",
-    `正式数据集：${info.dataset_root || "—"}；触觉盘当前可用：${free == null ? "未知" : `${Number(free).toFixed(1)} GiB`}`,
+    `正式数据集：${info.dataset_root || "—"}；触觉模式：${info.tactile_capture_mode || "—"}`
+      + `；触觉盘当前可用：${free == null ? "未知" : `${Number(free).toFixed(1)} GiB`}`,
   );
   optionsLoaded = true;
   if (latestState) syncConfiguration(latestState);
@@ -178,6 +202,7 @@ function syncConfiguration(state) {
   if (selected.writing_size_m != null) document.getElementById("writing-size").value = selected.writing_size_m;
   if (selected.writing_speed_m_s != null) document.getElementById("writing-speed").value = selected.writing_speed_m_s;
   if (selected.initial_alignment_speed_scale != null) document.getElementById("alignment-speed-input").value = selected.initial_alignment_speed_scale;
+  document.getElementById("collect-tactile").checked = Boolean(selected.collect_tactile);
   document.getElementById("tactile-bundle-root").value = selected.tactile_bundle_root || "";
   if (selected.tactile_bundle_min_free_gb != null) document.getElementById("tactile-min-free").value = selected.tactile_bundle_min_free_gb;
   if (selected.tactile_compression != null) document.getElementById("tactile-compression").value = selected.tactile_compression;
@@ -198,6 +223,7 @@ function syncConfiguration(state) {
 function currentConfiguration() {
   const shared = {
     initial_alignment_speed_scale: Number(document.getElementById("alignment-speed-input").value),
+    collect_tactile: document.getElementById("collect-tactile").checked,
     tactile_bundle_root: document.getElementById("tactile-bundle-root").value.trim(),
     tactile_bundle_min_free_gb: Number(document.getElementById("tactile-min-free").value),
     tactile_compression: document.getElementById("tactile-compression").value,
@@ -234,10 +260,13 @@ function currentConfiguration() {
   };
 }
 
+const sourceLabel = (value) =>
+  value === "__rule_source_pool_random__" ? "随机" : (value || "—");
+
 const batchLabel = (entry, index) =>
   fullReplayMode()
     ? `${index + 1}. 完整 Episode · ${entry.full_replay_candidate_id}`
-    : `${index + 1}. ${entry.trajectory_id} · 前置:${entry.pre_pen_down_replay_candidate_id || "关闭"} · 间隔:${entry.pre_pen_down_replay_normal_episodes || 0} · ${entry.pen_down_candidate_id} / ${entry.write_candidate_id} / ${entry.pen_up_candidate_id}`;
+    : `${index + 1}. ${entry.trajectory_id} · 前置:${entry.pre_pen_down_replay_candidate_id || "关闭"} · 间隔:${entry.pre_pen_down_replay_normal_episodes || 0} · ${sourceLabel(entry.pen_down_candidate_id)} / ${sourceLabel(entry.write_candidate_id)} / ${sourceLabel(entry.pen_up_candidate_id)}`;
 
 function renderBatch() {
   const validated = latestState && Array.isArray(latestState.rule_configuration_batch)
@@ -269,17 +298,19 @@ async function applyConfiguration() {
   const payload = configurationBatch.length
     ? {batch: configurationBatch}
     : current;
-  const response = await fetch("/configuration", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(payload),
-  });
-  if (response.ok) configurationDirty = false;
-  else await refresh();
+  if (await postJson("/configuration", payload, "configuration")) {
+    configurationDirty = false;
+    await refresh();
+  }
 }
 
 async function refresh() {
-  const response = await fetch("/state.json", {cache: "no-store"});
+  let response;
+  try {
+    response = await fetch("/state.json", {cache: "no-store"});
+  } catch (_error) {
+    return;
+  }
   if (!response.ok) return;
   const state = await response.json();
   latestState = state;
@@ -321,8 +352,12 @@ async function refresh() {
   const configurationEnabled = optionsLoaded
     && state.can_configure
     && !state.configuration_pending
-    && !state.gripper_action_pending;
-  configurationInputs().forEach((input) => { input.disabled = !configurationEnabled; });
+    && !state.gripper_action_pending
+    && !pendingRequests.has("configuration");
+  configurationInputs().forEach((input) => {
+    input.disabled = !configurationEnabled
+      || (input.id === "collect-tactile" && tactileCaptureLocked);
+  });
   document.getElementById("apply-configuration").disabled = !configurationEnabled;
   document.getElementById("add-to-batch").disabled = !configurationEnabled;
   document.getElementById("clear-batch").disabled = !configurationEnabled;
@@ -339,10 +374,13 @@ async function refresh() {
         ),
   );
   renderBatch();
+  const gripperSides = state.gripper_sides || [];
   const gripperStatus = state.gripper_action_status || (
     state.gripper_control_available
-      ? `夹爪独立控制可用：${(state.gripper_sides || []).join("、")}`
-      : "夹爪独立控制：当前拓扑未启用。"
+      ? `夹爪独立控制可用：${gripperSides.join("、")}`
+      : gripperSides.length
+        ? `夹爪已配置：${gripperSides.join("、")}；当前安全/Session 阶段不允许独立控制。`
+        : "夹爪独立控制：当前拓扑未启用。"
   );
   text("gripper-status", gripperStatus);
   text("task-chain-step", state.task_chain_step);
@@ -357,7 +395,9 @@ async function refresh() {
       : "尚未选择本轮轨迹。",
   );
   const chainButton = document.getElementById("task-chain-advance");
-  chainButton.disabled = !state.task_chain_can_advance || configurationDirty;
+  chainButton.disabled = !state.task_chain_can_advance
+    || configurationDirty
+    || pendingRequests.has("task-chain");
   const chainButtonLabels = {
     idle: "开始任务链（Alt+N）",
     ready_close: "下一步：闭紧夹爪（Alt+N）",
@@ -366,10 +406,12 @@ async function refresh() {
     ready_final_release: "下一步：松开夹爪完成（Alt+N）",
     complete: "开始下一轮（Alt+N）",
   };
-  chainButton.textContent = chainButtonLabels[state.task_chain_phase]
-    || "当前步骤执行中…";
+  chainButton.textContent = state.task_chain_owner_recovery_required
+    ? "下一步：恢复右夹爪闭合（Alt+N）"
+    : chainButtonLabels[state.task_chain_phase] || "当前步骤执行中…";
   document.body.dataset.phase = state.phase;
-  document.getElementById("start").disabled = !state.can_start || configurationDirty;
+  document.getElementById("start").disabled = !state.can_start
+    || configurationDirty || pendingRequests.has("event:rule_start");
   document.getElementById("start").textContent = state.writer_blocked
     ? "按当前配置重试 Writer"
     : state.batch_cycle_complete
@@ -377,15 +419,15 @@ async function refresh() {
       : batchCount > 1 && batchCompleted > 0
         ? `开始下一条（${batchIndex + 1}/${batchCount}）`
         : `${fullReplayMode() ? "开始完整 Replay 采集" : "开始规则采集"}（${batchIndex + 1}/${batchCount}）`;
-  document.getElementById("stop").disabled = !state.can_stop;
-  document.getElementById("retry").disabled = !state.can_retry_devices;
-  document.getElementById("runtime-home-retry").disabled = !state.can_runtime_home;
-  document.getElementById("release").disabled = !state.can_release_grippers;
-  document.getElementById("close-grippers").disabled = !state.can_close_grippers;
-  lowerHeightInput.disabled = !state.can_capture_height;
-  upperHeightInput.disabled = !state.can_capture_height;
-  document.getElementById("capture-height").disabled = !state.can_capture_height;
-  document.getElementById("clear-height").disabled = !state.can_clear_height;
+  document.getElementById("stop").disabled = !state.can_stop || pendingRequests.has("event:rule_stop");
+  document.getElementById("retry").disabled = !state.can_retry_devices || pendingRequests.has("event:device_retry");
+  document.getElementById("runtime-home-retry").disabled = !state.can_runtime_home || pendingRequests.has("event:runtime_home_retry");
+  document.getElementById("release").disabled = !state.can_release_grippers || pendingRequests.has("event:release_grippers");
+  document.getElementById("close-grippers").disabled = !state.can_close_grippers || pendingRequests.has("event:close_grippers");
+  lowerHeightInput.disabled = !state.can_capture_height || pendingRequests.has("height-calibration:capture");
+  upperHeightInput.disabled = !state.can_capture_height || pendingRequests.has("height-calibration:capture");
+  document.getElementById("capture-height").disabled = !state.can_capture_height || pendingRequests.has("height-calibration:capture");
+  document.getElementById("clear-height").disabled = !state.can_clear_height || pendingRequests.has("height-calibration:clear");
   const calibratedZ = state.height_calibrated_z_m;
   const lowerBound = state.height_lower_bound_z_m;
   const upperBound = state.height_upper_bound_z_m;
@@ -400,7 +442,7 @@ async function refresh() {
           : "高度标定：未启用；沿用来源 replay 的原始高度。",
   );
   const debugButton = document.getElementById("debug-mode");
-  debugButton.disabled = !state.can_toggle_debug;
+  debugButton.disabled = !state.can_toggle_debug || pendingRequests.has("event:debug_toggle");
   debugButton.textContent = state.debug_mode_pending
     ? "正在切换 Debug…"
     : state.debug_mode_enabled

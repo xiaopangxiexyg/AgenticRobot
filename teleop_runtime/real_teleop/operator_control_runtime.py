@@ -275,6 +275,10 @@ class RealTeleopControlInput:
         self._init_qpos_emergency_stop_requested = False
         self._calibration_requested = False
         self._calibration_request_from_hold = False
+        # Dedicated rule-collection Home requests use live RM65 state only;
+        # the control loop consumes this marker to select its existing
+        # robot-state snapshot path instead of the VIVE-gated path.
+        self._rule_runtime_home_retry_requested = False
         self._last_calibration_started_from_hold = False
         self._tracker_side_check: dict[str, object] = {
             "status": "unavailable",
@@ -359,6 +363,7 @@ class RealTeleopControlInput:
         self._camera_depth_monitor = WristDepthFreshnessMonitor()
         self._episode_start_requested = False
         self._episode_stop_requested = False
+        self._episode_stop_reason = ""
         self._dataset_reconfigure_callback: Callable[..., object] | None = None
         self._dataset_reconfigure_transactional = False
         self._dataset_selection_pending = False
@@ -973,6 +978,52 @@ class RealTeleopControlInput:
 
         return bool(getattr(self, "_dataset_selection_pending", False))
 
+    def _pre_episode_armed_warmup_allowed(self) -> bool:
+        """Read an optional application-owned pre-Episode admission window.
+
+        Ordinary RealTeleop must still prove an actual arm dispatch before
+        opening an Episode.  A dedicated rule UI can expose a bounded,
+        command-inert writer-open window while Session is ARMED; the UI owns
+        the lifecycle fact so this lower runtime does not infer rule state or
+        broaden the generic admission contract.
+        """
+
+        hook = getattr(self.ui, "allows_pre_episode_armed_warmup", None)
+        if not callable(hook):
+            return False
+        try:
+            return bool(hook())
+        except Exception as exc:  # noqa: BLE001 - admission must fail closed.
+            _log(
+                "Dataset",
+                "optional pre-Episode warmup admission failed closed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+
+    def allows_pre_episode_armed_warmup(self) -> bool:
+        """Expose the rule-owned pre-Episode writer-open capability."""
+
+        return self._pre_episode_armed_warmup_allowed()
+
+    def _pre_episode_armed_warmup_failure_reason(self) -> str | None:
+        """Read an optional rule-UI explanation for a closed warmup window."""
+
+        hook = getattr(self.ui, "pre_episode_start_admission_reason", None)
+        if not callable(hook):
+            return None
+        try:
+            reason = hook()
+        except Exception as exc:  # noqa: BLE001 - admission remains fail-closed.
+            _log(
+                "Dataset",
+                "optional pre-Episode warmup diagnostic failed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        normalized = str(reason or "").strip()
+        return normalized or None
+
     def _progress_configuration_selection_enabled(self) -> bool:
         """Keep progress configuration on the same idle transaction boundary."""
 
@@ -993,8 +1044,14 @@ class RealTeleopControlInput:
             return False, "数据集任务/profile 正在后台准备，完成后才能开始数采。"
         if not bool(getattr(self, "_teleop_started", False)):
             return False, "遥操尚未进入 RUNNING，不能开始数采。"
-        if not self._teleop_arm_dispatch_confirmed():
-            return False, "机械臂命令尚未实际派发，不能开始数采。"
+        if (
+            not self._teleop_arm_dispatch_confirmed()
+            and not self.allows_pre_episode_armed_warmup()
+        ):
+            return False, (
+                self._pre_episode_armed_warmup_failure_reason()
+                or "机械臂命令尚未实际派发，不能开始数采。"
+            )
         if bool(getattr(self, "_hold_active", False)):
             return False, "常规 Hold 期间不能开始数采；请先重采 runtime Home。"
         init_controller = getattr(self.components, "init_arm_controller", None)
@@ -1462,6 +1519,10 @@ class RealTeleopControlInput:
                     self._cancel_tracker_side_warning()
                 elif event == "p":
                     self._request_calibration_with_tracker_side_guard(source="gui")
+                elif event == "runtime_home_retry":
+                    # Rule collection does not consume VIVE poses.  Keep this
+                    # path distinct from the normal tracker-gated Home flow.
+                    self._request_rule_runtime_home_retry()
                 elif event == "two_pedal_b":
                     self._handle_two_pedal_b_event(now=current_time)
                 elif event == "two_pedal_c":
@@ -1608,7 +1669,18 @@ class RealTeleopControlInput:
                     self._persist_gripper_force_from_gui(event.split(":", 1)[1])
                 elif event.startswith("init_arm_qpos_speed_set:"):
                     self._set_init_arm_qpos_speed_from_gui(event.split(":", 1)[1])
-                elif event == "episode_stop":
+                elif event == "episode_stop" or event.startswith("episode_stop:"):
+                    # Preserve the first stop owner's reason until the control
+                    # loop consumes it.  Rule completion/failure uses this
+                    # suffix to select finalize-vs-discard semantics; treating
+                    # only the unsuffixed GUI event as valid strands a fully
+                    # completed Episode after its motion source goes idle.
+                    if not self._episode_stop_requested:
+                        self._episode_stop_reason = (
+                            event.split(":", 1)[1].strip()
+                            if ":" in event
+                            else "manual_key_stop"
+                        ) or "manual_key_stop"
                     self._episode_stop_requested = True
                 elif event.startswith("episode_delete:"):
                     try:
@@ -3256,6 +3328,135 @@ class RealTeleopControlInput:
             request_kind=request_kind,
         )
 
+    def _request_rule_runtime_home_retry(self) -> None:
+        """Queue a guarded robot-state-only Home for the rule-writing GUI.
+
+        This is only an input bridge.  The existing control loop still owns
+        Hold admission, Home capture, Session validation, and dispatch.  The
+        dedicated marker merely tells that loop not to wait for VIVE.
+        """
+
+        if self._calibration_requested or self._rule_runtime_home_retry_requested:
+            return
+
+        def reject(message: str, *, tag: str = "Calibration") -> None:
+            self._append_ui_message_observation(
+                tag,
+                message,
+                context="rule robot-state-only Home admission",
+            )
+            self._publish_ui_observation(
+                context="rule robot-state-only Home admission",
+                active_controls=self._current_active_controls(),
+                control_hint=message,
+                teleop_running=False,
+                gripper_control_enabled=False,
+                capture_stage="runtime_home",
+                capture_phase="failed",
+                home_ready=False,
+                capturing=False,
+                capture_waiting_for_samples=False,
+            )
+
+        if self._episode_busy():
+            reject("规则 runtime Home 未执行：数采、倒计时或后台保存仍在进行。")
+            return
+
+        init_controller = getattr(self.components, "init_arm_controller", None)
+        if bool(getattr(init_controller, "qpos_active", False)):
+            reject(
+                "规则 runtime Home 未执行：精确 Init qpos 正在规划、执行或保持；"
+                "请等待归位结束后重试。"
+            )
+            return
+
+        session = getattr(self.components, "session", None)
+        state = getattr(getattr(session, "state_machine", None), "state", None)
+        state_value = str(getattr(state, "value", state) or "").upper()
+        if state_value in {"FAULT", "ESTOP"}:
+            reject(
+                "规则 runtime Home 未执行：Session 当前处于 "
+                f"{state_value or 'UNKNOWN'}；请先处理故障并重新启动。"
+            )
+            return
+
+        # A running session needs a positive lower Hold receipt.  At startup,
+        # do not consume an unconfirmed Hold request or an unconfirmed latch.
+        if self._teleop_started and not self.hardware_hold_confirmed():
+            reject(
+                "运行中规则重采前请先点击 Hold / 冻结，并等待底层停机确认。",
+                tag="Hold",
+            )
+            return
+        if not self._teleop_started and self._hold_requested:
+            reject(
+                "规则 runtime Home 未执行：正在等待已有 Hold 请求完成；"
+                "请等待底层停机确认后重试。",
+                tag="Hold",
+            )
+            return
+        if (
+            not self._teleop_started
+            and self._hold_active
+            and not self.hardware_hold_confirmed()
+        ):
+            reject(
+                "规则 runtime Home 未执行：应用 Hold 尚未获得底层停机回执；"
+                "请等待停机确认后重试。",
+                tag="Hold",
+            )
+            return
+
+        gate = self._tracker_side_gate_state()
+        # The rule collector uses the current dual-arm qpos snapshot.  It does
+        # not weaken the robot/session safety gates, but VIVE side validation
+        # is not a prerequisite for this dedicated path.
+        gate.initial_check_completed = True
+        gate.pending_request = None
+        gate.pending_confirmation = None
+        gate.final_recheck_required = False
+        gate.confirmation_result = "not_required_rule_based"
+        gate.confirmation_message = ""
+        self._tracker_side_check.update(
+            {
+                "status": "not_required",
+                "warning_required": False,
+                "home_request_pending": False,
+                "confirmation_required": False,
+                "confirmation_result": "not_required_rule_based",
+                "session_check_completed": True,
+                "monitoring_active": False,
+                "message": "规则采集使用双臂实时 qpos；VIVE Tracker 左右检查不适用。",
+            }
+        )
+        self._rule_runtime_home_retry_requested = True
+        self._queue_runtime_home_request(
+            from_hold=bool(self._hold_active),
+            request_kind="rule",
+        )
+        self._gripper_control_enabled = False
+        message = (
+            "已确认规则采集 robot-state-only runtime Home；"
+            "VIVE Tracker 不参与本次安全初始化。"
+        )
+        self._publish_ui_observation(
+            context="rule robot-state-only Home requested",
+            tracker_side_check=self._tracker_side_check_payload(),
+            stage="准备重新确认安全初始化",
+            active_controls=["q"],
+            control_hint=message,
+            teleop_running=False,
+            home_ready=False,
+            capture_stage="runtime_home",
+            capture_phase="preparing",
+            gripper_control_enabled=False,
+        )
+        self._append_ui_message_observation(
+            "Calibration",
+            message,
+            context="rule robot-state-only Home requested",
+        )
+
     def _confirm_tracker_side_warning(self) -> None:
         gate = self._tracker_side_gate_state()
         request = gate.pending_confirmation
@@ -3549,6 +3750,13 @@ class RealTeleopControlInput:
                     home_ready=False,
                     gripper_control_enabled=False,
                 )
+        return requested
+
+    def consume_rule_runtime_home_retry_request(self) -> bool:
+        """Consume the rule-specific robot-state-only Home marker."""
+
+        requested = bool(self._rule_runtime_home_retry_requested)
+        self._rule_runtime_home_retry_requested = False
         return requested
 
     def consume_hitl_source_requests(self) -> tuple[str, ...]:
@@ -4386,9 +4594,22 @@ class RealTeleopControlInput:
         return True
 
     def consume_episode_stop_request(self) -> bool:
+        requested, _reason = self.consume_episode_stop_request_with_reason()
+        return requested
+
+    def consume_episode_stop_request_with_reason(self) -> tuple[bool, str]:
+        """Consume one stop request without dropping its lifecycle reason."""
+
         requested = bool(self._episode_stop_requested)
+        reason = str(self._episode_stop_reason or "")
         self._episode_stop_requested = False
-        return bool(self.terminal.consume_episode_stop_request() or requested)
+        self._episode_stop_reason = ""
+        terminal_requested = bool(self.terminal.consume_episode_stop_request())
+        if not requested and not terminal_requested:
+            return False, ""
+        if not reason:
+            reason = "manual_key_stop"
+        return True, reason
 
     def bind_dataset_reconfigure_callback(
         self,
@@ -5461,6 +5682,7 @@ class RealTeleopControlInput:
         )
         self._calibration_requested = False
         self._calibration_request_from_hold = False
+        self._rule_runtime_home_retry_requested = False
         self._last_calibration_started_from_hold = False
         gate = self._tracker_side_gate_state()
         gate.pending_confirmation = None
@@ -5495,6 +5717,7 @@ class RealTeleopControlInput:
             ),
             capture_stage="runtime_home",
             capture_phase="ready",
+            runtime_home_failure=bool(message),
             teleop_running=False,
             home_ready=False,
             capturing=False,

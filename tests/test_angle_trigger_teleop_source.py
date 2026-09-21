@@ -526,6 +526,36 @@ def test_gui_q6_preflight_failure_isolated_for_runtime_retry() -> None:
     assert "Q6 count is insufficient" in args.q6_startup_error
 
 
+def test_gui_dmtac_preflight_failure_does_not_exit_capability_startup() -> None:
+    args = SimpleNamespace(
+        gui_requested=True,
+        hardware_admission_mode="capability",
+        device_preflight=True,
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="none",
+        visualize_tactile=False,
+        dmtac_tactile=False,
+        no_camera=True,
+    )
+    parser = SimpleNamespace(error=lambda message: pytest.fail(message))
+    with patch.object(
+        cli_runtime_config,
+        "prepare_devices_for_teleop",
+        side_effect=real_teleop.DevicePreflightError(
+            "DMTAC right gripper override '/dev/ttyUSB0' did not produce a successful read-only probe"
+        ),
+    ):
+        real_teleop._run_gui_device_preflight(
+            args,
+            active_sides=("left", "right"),
+            parser=parser,
+        )
+
+    assert "DMTAC right gripper override" in args.device_preflight_startup_error
+
+
 def test_gui_required_q6_assignment_failure_isolated_for_runtime_retry() -> None:
     args = SimpleNamespace(
         active_sides=("left", "right"),

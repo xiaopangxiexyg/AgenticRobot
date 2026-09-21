@@ -58,6 +58,8 @@ GRIPPER_ACTION_MAX = 1.0
 # Keep a short write-to-read guard, but do not hide the physical response for
 # multiple collection frames after every accepted command.
 DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S = 0.02
+DMTAC_GRIPPER_TELEMETRY_READ_ATTEMPTS = 2
+DMTAC_GRIPPER_TELEMETRY_RETRY_INTERVAL_S = 0.02
 DMTAC_TELEMETRY_STOP_TIMEOUT_S = 2.0
 DMTAC_TACTILE_CLOSE_GRACE_S = 3.0
 DMTAC_TACTILE_GLOBAL_READ_GATE = threading.Semaphore(1)
@@ -454,6 +456,10 @@ class DMTacGripperBackendConfig:
     enable_telemetry: bool = True
     telemetry_hz: float = DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ
     gripper_telemetry_command_grace_s: float = DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S
+    gripper_telemetry_read_attempts: int = DMTAC_GRIPPER_TELEMETRY_READ_ATTEMPTS
+    gripper_telemetry_retry_interval_s: float = (
+        DMTAC_GRIPPER_TELEMETRY_RETRY_INTERVAL_S
+    )
     connect_tactile: bool = True
     tactile_ids: tuple[str | int, ...] = ()
     tactile_backend: str = "cpu"
@@ -520,6 +526,12 @@ class DMTacGripperBackendConfig:
             raise ValueError("telemetry_hz must be positive.")
         if float(self.gripper_telemetry_command_grace_s) < 0.0:
             raise ValueError("gripper_telemetry_command_grace_s must be non-negative.")
+        if int(self.gripper_telemetry_read_attempts) <= 0:
+            raise ValueError("gripper_telemetry_read_attempts must be positive.")
+        if float(self.gripper_telemetry_retry_interval_s) < 0.0:
+            raise ValueError(
+                "gripper_telemetry_retry_interval_s must be non-negative."
+            )
         if float(self.reconnect_cooldown_sec) < 0.0:
             raise ValueError("reconnect_cooldown_sec must be non-negative.")
         if int(self.startup_fault_check_attempts) <= 0:
@@ -1726,6 +1738,7 @@ class DMTacGripperBackend(EffectorBackend):
                 and self.device is not None
                 and getattr(self.device, "gripper", None) is not None
                 and self._latest_gripper_error_code in (None, 0)
+                and not self._hardware_telemetry_error_active()
             )
         if self.config.connect_tactile:
             return (
@@ -1733,6 +1746,92 @@ class DMTacGripperBackend(EffectorBackend):
                 and getattr(self.device, "tactile", None) is not None
             )
         return True
+
+    def fixed_closed_one_shot_ready(self) -> bool:
+        """Report whether the rule-writing hold owner is already established.
+
+        Rule-writing frames intentionally preserve the physical right-gripper
+        command instead of issuing a serial write on every arm frame.  That
+        optimization is safe only after this backend has successfully sent a
+        closed command with ``continuous=False`` and received causal, settled
+        feedback.  A grasped object can stop the fingers before the requested
+        endpoint; DMTAC status 6 is the authoritative force-stop/contact
+        receipt for that case.  Keep this a local, command-inert check: it
+        never reads or writes the device.
+        """
+
+        if not self.is_ready():
+            return False
+        last_sent = self._last_sent_command
+        if last_sent is None:
+            return False
+        values = np.asarray(last_sent, dtype=float).reshape(-1)
+        command_dim = int(self.config.command_dim)
+        if (
+            values.shape != (6,)
+            or not np.all(np.isfinite(values))
+            or command_dim < 0
+            or command_dim >= values.size
+            or abs(
+                float(values[command_dim]) - float(self.config.max_action)
+            )
+            > max(float(self.config.send_threshold), 1e-6)
+        ):
+            return False
+        with self._state_lock:
+            measured = (
+                None
+                if self._latest_measured_joint_pos is None
+                else self._latest_measured_joint_pos.copy()
+            )
+            feedback_timestamp = self._latest_joint_timestamp
+            status_code = self._latest_gripper_status_code
+            is_moving = self._latest_gripper_is_moving
+        if is_moving is True:
+            return False
+        if status_code in {4, 5}:
+            return False
+        if (
+            self._applied_continuous_grasp is None
+            or bool(self._applied_continuous_grasp)
+        ):
+            return False
+
+        if measured is None:
+            return not self.config.connect_hardware
+        measured_values = np.asarray(measured, dtype=float).reshape(-1)
+        if measured_values.shape != (6,) or not np.all(np.isfinite(measured_values)):
+            return False
+
+        command_completed_timestamp = self._last_sent_command_completed_timestamp
+        if self.config.connect_hardware:
+            if feedback_timestamp is None or command_completed_timestamp is None:
+                return False
+            if float(feedback_timestamp) <= float(command_completed_timestamp):
+                return False
+
+        endpoint_reached = abs(
+            float(measured_values[command_dim]) - float(self.config.max_action)
+        ) <= max(float(self.config.send_threshold), 1e-6)
+        if endpoint_reached:
+            return True
+        return status_code == 6
+
+    def _hardware_telemetry_error_active(self) -> bool:
+        """Return whether the latest error invalidates hardware admission.
+
+        Tactile-worker failures are reported through the same state payload but
+        are governed by the tactile modality gate.  Serial/command telemetry
+        failures, however, mean the gripper transport is not trustworthy even
+        when the device object and the last vendor error code still look
+        healthy.  Keep that distinction local to the DMTAC backend so all
+        callers share the same fail-closed readiness predicate.
+        """
+
+        if not self.config.connect_hardware:
+            return False
+        error = str(self._telemetry_error or "").strip().lower()
+        return bool(error and not error.startswith("tactile_"))
 
     def readiness_report(self) -> dict[str, object]:
         """Return the current gripper admission state without changing it.
@@ -1889,6 +1988,14 @@ class DMTacGripperBackend(EffectorBackend):
             raise ValueError(
                 "dmtac_continuous_grasp_override must be boolean when provided."
             )
+        preserve_existing_grip = command.metadata.get(
+            "dmtac_preserve_existing_grip",
+            False,
+        )
+        if not isinstance(preserve_existing_grip, (bool, np.bool_)):
+            raise ValueError(
+                "dmtac_preserve_existing_grip must be boolean when provided."
+            )
         sent = self._send_joint_pos(
             command.value,
             bypass_send_commands=False,
@@ -1898,6 +2005,7 @@ class DMTacGripperBackend(EffectorBackend):
                 if continuous_override is None
                 else bool(continuous_override)
             ),
+            preserve_existing_grip=bool(preserve_existing_grip),
         )
         if sent:
             self._last_command = command.copy()
@@ -1921,6 +2029,7 @@ class DMTacGripperBackend(EffectorBackend):
             bypass_send_commands=True,
             force=True,
             continuous_grasp_override=None,
+            preserve_existing_grip=False,
         )
 
     def set_torque(self, torque: float) -> float:
@@ -2127,6 +2236,7 @@ class DMTacGripperBackend(EffectorBackend):
         bypass_send_commands: bool,
         force: bool,
         continuous_grasp_override: bool | None,
+        preserve_existing_grip: bool,
     ) -> bool:
         attempt_started_perf = time.perf_counter()
         attempt_started_wall = time.time()
@@ -2156,6 +2266,71 @@ class DMTacGripperBackend(EffectorBackend):
                 sent=False,
                 skip_reason=f"error_code={int(self._latest_gripper_error_code)}",
             )
+        if preserve_existing_grip:
+            # A rule-writing task chain has already sent and feedback-gated
+            # the one physical close command. Its arm-only Episode still
+            # carries a right-hand action for dataset/action consistency, but
+            # that action must not generate another serial write. Accept the
+            # command-inert hold only when the live backend proves the prior
+            # command and requested one-shot mode were actually established.
+            if self.config.connect_hardware and (
+                self.device is None
+                or getattr(self.device, "gripper", None) is None
+            ):
+                return finish(
+                    "not_connected",
+                    sent=False,
+                    skip_reason="preserve_existing_grip_without_device",
+                )
+            if self._last_sent_command is None:
+                return finish(
+                    "hold_owner_uninitialized",
+                    sent=False,
+                    skip_reason="preserve_existing_grip_without_prior_command",
+                )
+            last_sent = np.asarray(self._last_sent_command, dtype=float).reshape(-1)
+            command_dim = int(self.config.command_dim)
+            if (
+                last_sent.shape != (6,)
+                or not np.all(np.isfinite(last_sent))
+                or abs(
+                    float(last_sent[command_dim])
+                    - float(self.config.max_action)
+                )
+                > max(float(self.config.send_threshold), 1e-6)
+            ):
+                return finish(
+                    "hold_owner_uninitialized",
+                    sent=False,
+                    skip_reason="preserve_existing_grip_without_close_command",
+                )
+            requested_mode = (
+                bool(self.config.continuous_grasp)
+                if continuous_grasp_override is None
+                else bool(continuous_grasp_override)
+            )
+            if (
+                self._applied_continuous_grasp is None
+                or bool(self._applied_continuous_grasp) != requested_mode
+            ):
+                return finish(
+                    "hold_owner_uninitialized",
+                    sent=False,
+                    skip_reason="preserve_existing_grip_mode_not_applied",
+                )
+            if not self.fixed_closed_one_shot_ready():
+                return finish(
+                    "hold_owner_uninitialized",
+                    sent=False,
+                    skip_reason=(
+                        "preserve_existing_grip_without_settled_closed_feedback"
+                    ),
+                )
+            return finish(
+                "preserved_existing_grip",
+                sent=True,
+                skip_reason="task_chain_owns_physical_grip",
+            )
         if self._last_sent_command is not None and not bool(force):
             max_delta = float(np.max(np.abs(target - self._last_sent_command)))
             if max_delta < float(self.config.send_threshold):
@@ -2180,14 +2355,24 @@ class DMTacGripperBackend(EffectorBackend):
                         measured_disagrees = abs(
                             float(measured_values[command_dim]) - target_scalar
                         ) >= float(self.config.send_threshold)
-                mode_disagrees = bool(
-                    continuous_grasp_override is not None
-                    and (
+                if continuous_grasp_override is None:
+                    # A disconnected/shadow backend may not have an applied
+                    # mode yet; preserve its historical threshold-skip
+                    # behavior.  Once a real mode was applied, however, a
+                    # same-position command must reapply the configured mode
+                    # when it changed (for example after the task-chain's
+                    # one-shot close).
+                    mode_disagrees = bool(
+                        self._applied_continuous_grasp is not None
+                        and bool(self._applied_continuous_grasp)
+                        != bool(self.config.continuous_grasp)
+                    )
+                else:
+                    mode_disagrees = bool(
                         self._applied_continuous_grasp is None
                         or bool(self._applied_continuous_grasp)
                         != bool(continuous_grasp_override)
                     )
-                )
                 if not measured_disagrees and not mode_disagrees:
                     return finish(
                         "skipped_threshold",
@@ -2310,6 +2495,31 @@ class DMTacGripperBackend(EffectorBackend):
         age_s = float(now) - float(measured_at)
         max_deferral_s = self._gripper_telemetry_max_deferral_s()
         return bool(age_s >= max_deferral_s or age_s < -max_deferral_s)
+
+    def _read_gripper_state_with_transient_retry_locked(self, device: object) -> object:
+        """Retry one isolated serial read before rebuilding the session.
+
+        DMTAC can occasionally time out the request write while an asynchronous
+        one-shot close is settling.  Reconnecting on that first miss destroys
+        the causal close receipt even when the next transaction is healthy.
+        Keep the retry bounded and inside the existing I/O lock.  Exhaustion
+        still enters the unchanged fail-closed reconnect path.
+        """
+
+        attempts = max(1, int(self.config.gripper_telemetry_read_attempts))
+        interval = max(0.0, float(self.config.gripper_telemetry_retry_interval_s))
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return device.read_gripper_state()
+            except Exception as exc:  # noqa: BLE001 - exhausted error is re-raised.
+                last_error = exc
+                if attempt + 1 >= attempts:
+                    raise
+                if interval > 0.0:
+                    time.sleep(interval)
+        assert last_error is not None
+        raise last_error
 
     def _apply_tactile_worker_payload(self, payload: dict[str, Any]) -> bool:
         payload_type = str(payload.get("type") or "")
@@ -2558,7 +2768,11 @@ class DMTacGripperBackend(EffectorBackend):
                             return
                         gripper_read_started_at = time.perf_counter()
                         try:
-                            gripper_state = device.read_gripper_state()
+                            gripper_state = (
+                                self._read_gripper_state_with_transient_retry_locked(
+                                    device
+                                )
+                            )
                             state_error = self._gripper_state_error_code(gripper_state)
                             if (
                                 state_error == 16

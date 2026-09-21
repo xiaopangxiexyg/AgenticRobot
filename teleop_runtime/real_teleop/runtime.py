@@ -30,6 +30,7 @@ from robot_motion.position_control import (
     DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
     PositionAuditFanout,
 )
+from robot_motion.runtime import run_best_effort_cleanup
 from teleop_runtime.backends.grippers import GRIPPER_ACTION_MAX, DMTacGripperBackend
 from teleop_runtime.cli_value_parsers import _active_sides_from_args
 from teleop_runtime.collection.camera_preview import (
@@ -71,6 +72,7 @@ from .arm_tool_config import (
 from .artifact_context import materialize_real_teleop_artifact_context
 from .camera_runtime import (
     _build_camera_sources,
+    _close_camera_sources,
     _select_preview_camera_sources,
     _start_camera_sources,
     _start_camera_sources_best_effort,
@@ -172,6 +174,8 @@ from .hand_runtime import (
 from .impedance_force_runtime import (
     _emergency_stop_real_arms,
     _guard_impedance_force_control,
+    _position_force_guard_collision_summary,
+    _terminal_force_collision_summary,
 )
 from .main_loop_watchdog import MainLoopStallWatchdog
 from .operator_control_runtime import RealTeleopControlInput
@@ -196,6 +200,9 @@ from .recording_admission import (
 )
 from .runtime_extension import (
     RealTeleopRuntimeExtension,
+    runtime_extension_allows_active_episode_bootstrap_without_dispatch,
+    runtime_extension_collection_startup_blockers,
+    runtime_extension_discards_episode_on_stop,
     runtime_extension_service_startup_control_plane,
 )
 from .runtime_home import (
@@ -1164,6 +1171,10 @@ def run_real_teleop(
             _log("TactileStorage", tactile_capacity_summary)
         if getattr(args, "dmtac_startup_error", ""):
             startup_device_errors["dmtac.assignment"] = str(args.dmtac_startup_error)
+        if getattr(args, "device_preflight_startup_error", ""):
+            startup_device_errors["device.preflight"] = str(
+                args.device_preflight_startup_error
+            )
         if getattr(args, "angle_trigger_startup_error", ""):
             startup_device_errors["angle_trigger"] = str(args.angle_trigger_startup_error)
         if getattr(args, "q6_startup_error", ""):
@@ -1306,9 +1317,30 @@ def run_real_teleop(
         )
         hardware_requirement = device_retry_runtime.hardware_requirement
         hardware_status_item = device_retry_runtime.hardware_status_item
-        collection_startup_blockers = (
+        base_collection_startup_blockers = (
             device_retry_runtime.collection_startup_blockers
         )
+
+        def collection_startup_blockers() -> dict[str, str]:
+            """Merge generic and exclusive-source readiness before writer open."""
+
+            blockers = dict(base_collection_startup_blockers())
+            if runtime_extension is None:
+                return blockers
+            try:
+                extension_blockers = runtime_extension_collection_startup_blockers(
+                    runtime_extension
+                )
+            except Exception as exc:  # noqa: BLE001 - admission fails closed.
+                blockers.setdefault(
+                    "runtime.extension",
+                    "exclusive runtime readiness check failed: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                blockers.update(extension_blockers)
+            return blockers
+
         publish_runtime_hardware_status = (
             device_retry_runtime.publish_runtime_hardware_status
         )
@@ -2208,7 +2240,8 @@ def run_real_teleop(
         _release_runtime_state_readers(components)
         _log(
             "ArmMode",
-            "runtime arm state source=last_commanded_action; startup hardware-state readers are now idle after calibration.",
+            "runtime arm state source=last_commanded_action; startup hardware-state reads are now idle after calibration; "
+            "the shared state-read executor remains available for recovery and maintenance reads until normal shutdown.",
         )
         if startup_home_captured:
             _emit_home_alignment_logs(components)
@@ -2459,6 +2492,7 @@ def run_real_teleop(
             now: float,
             *,
             step_result: SessionStepResult | None,
+            allow_pre_episode_armed_warmup: bool = False,
         ) -> tuple[bool, str]:
             return _recording_warmup_status(
                 now,
@@ -2473,6 +2507,12 @@ def run_real_teleop(
                 recording_auto_stop_reason_fn=recording_auto_stop_reason,
                 gripper_warmup_probe_status=gripper_warmup_probe_status,
                 camera_status_blocking_message=_camera_status_blocking_message,
+                allow_pre_episode_armed_warmup=allow_pre_episode_armed_warmup,
+                allow_active_episode_armed_bootstrap=(
+                    runtime_extension_allows_active_episode_bootstrap_without_dispatch(
+                        runtime_extension
+                    )
+                ),
             )
 
         position_episode_debug_runtime = build_position_episode_debug_runtime(
@@ -2511,6 +2551,12 @@ def run_real_teleop(
             episode_last_state_provider=current_episode_last_state,
             set_episode_last_state=set_current_episode_last_state,
             step_index_provider=current_step_index,
+            discard_episode_on_stop=lambda reason: (
+                runtime_extension_discards_episode_on_stop(
+                    runtime_extension,
+                    reason=reason,
+                )
+            ),
         )
         bind_reconfigure = getattr(
             clutch_input,

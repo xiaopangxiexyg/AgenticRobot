@@ -263,6 +263,27 @@ def test_stop_episode_carries_terminal_collision_summary_to_formal_finalize(
     }
 
 
+def test_stop_episode_discards_nonempty_indivisible_attempt(tmp_path: Path) -> None:
+    events: list[str] = []
+    recorder = _new_recorder(tmp_path, events)
+    recorder.writer_observer.release_flush.set()
+
+    task = recorder.stop_episode(
+        reason="rule_based_abort",
+        step_index=43,
+        last_state="RUNNING",
+        discard=True,
+        defer_finalize_start=True,
+    )
+
+    assert task is None
+    assert recorder.writer.discarded == [12]
+    assert recorder.writer.finalized == []
+    assert recorder.finalize_tasks == []
+    assert recorder.discarded_episodes == 1
+    assert events == ["writer_flush", "writer_discard_episode"]
+
+
 def test_finalize_summary_persists_collection_integrity_failure(tmp_path: Path) -> None:
     recorder = _new_recorder(tmp_path, [])
     recorder._mark_collection_integrity_issue("collection_snapshot_thread_busy")

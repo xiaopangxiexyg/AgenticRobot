@@ -149,6 +149,35 @@ def runtime_extension_refresh_status(
         hook()
 
 
+def runtime_extension_collection_startup_blockers(
+    extension: object | None,
+) -> dict[str, str]:
+    """Read optional extension-owned blockers before opening a formal writer.
+
+    This is an observational seam only.  It lets an exclusive runtime source
+    expose the same readiness facts it uses for command admission without
+    moving writer ownership or weakening the generic device gate.
+    """
+
+    if extension is None:
+        return {}
+    hook = getattr(extension, "collection_startup_blockers", None)
+    if not callable(hook):
+        return {}
+    result = hook()
+    if result is None:
+        return {}
+    if not isinstance(result, Mapping):
+        raise TypeError(
+            "runtime extension collection_startup_blockers() must return a mapping."
+        )
+    return {
+        str(key): str(value)
+        for key, value in result.items()
+        if str(value).strip()
+    }
+
+
 def runtime_extension_service_startup_control_plane(
     extension: object | None,
     *,
@@ -240,8 +269,9 @@ def runtime_extension_allows_pre_episode_armed_warmup(
 ) -> bool:
     """Admit an extension-owned ARMED start without weakening sample gates.
 
-    This opt-in is consulted only by the Episode-start countdown. Resume and
-    per-sample health checks still require a dispatched arm command in RUNNING.
+    This opt-in is consulted only by the Episode-start countdown.  Once an
+    Episode is active, the separate active-bootstrap hook owns any bounded
+    ARMED transition; sample admission remains independently strict.
     """
 
     if extension is None:
@@ -345,6 +375,10 @@ class RealTeleopRuntimeExtension(Protocol):
     # authority or dispatch callback.
     def refresh_status(self, *, force: bool = False) -> None: ...
 
+    # Optional observational hook consulted before a formal writer is opened.
+    # It must not move hardware or mutate lifecycle state.
+    def collection_startup_blockers(self) -> Mapping[str, str]: ...
+
     # Optional command-inert hook used only while startup admission is waiting.
     # It must not consume motion, gripper, Episode, or Hold intents.
     def service_startup_control_plane(self, *, now: float) -> bool: ...
@@ -400,6 +434,7 @@ __all__ = [
     "runtime_extension_after_session_error",
     "runtime_extension_after_runtime_hold",
     "runtime_extension_after_runtime_home",
+    "runtime_extension_collection_startup_blockers",
     "runtime_extension_discards_episode_on_stop",
     "runtime_extension_refresh_status",
     "runtime_extension_service_startup_control_plane",

@@ -172,6 +172,16 @@ class RuleBasedWritingWebUi:
     def bind_rule_runtime(self) -> None:
         self._application.bind_rule_runtime()
 
+    def allows_pre_episode_armed_warmup(self) -> bool:
+        """Expose the narrow rule-owned writer-open admission capability."""
+
+        return self._application.allows_pre_episode_armed_warmup()
+
+    def pre_episode_start_admission_reason(self) -> str | None:
+        """Expose the rule-owned admission diagnostic without owning the gate."""
+
+        return self._application.pre_episode_start_admission_reason()
+
     def consume_rule_intents(self) -> tuple[str, ...]:
         return self._application.consume_rule_intents()
 

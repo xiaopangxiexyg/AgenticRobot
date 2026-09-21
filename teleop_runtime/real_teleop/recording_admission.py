@@ -12,7 +12,11 @@ from ..diagnostics import TeleopRunState
 from ..session import SessionStepResult
 from .components import RealTeleopComponents
 from .hand_config import HAND_BACKEND_NONE, hand_backend_mode_for_side
-from .hand_runtime import _gripper_backend_for_side, _hand_backend_for_side
+from .hand_runtime import (
+    _gripper_backend_for_side,
+    _gripper_input_channel_name,
+    _hand_backend_for_side,
+)
 
 
 def session_step_arm_dispatch_confirmed(step_result: object) -> bool:
@@ -55,6 +59,8 @@ def recording_warmup_status(
     recording_auto_stop_reason_fn: Callable[[TeleopRunState | str], str | None],
     gripper_warmup_probe_status: Callable[..., tuple[bool, str]],
     camera_status_blocking_message: Callable[[Mapping[str, object]], str | None],
+    allow_pre_episode_armed_warmup: bool = False,
+    allow_active_episode_armed_bootstrap: bool = False,
 ) -> tuple[bool, str]:
     """Return the historical fail-closed recording admission result."""
 
@@ -69,14 +75,30 @@ def recording_warmup_status(
         return False, f"等待恢复，当前状态会自动停止数采：{stop_reason}。"
     if clutch_input.hold_active():
         return False, "等待 hold 解除并重采 runtime home。"
-    if step_result.state != TeleopRunState.RUNNING:
+    # A successful rule Episode leaves the shared Session in RUNNING while the
+    # exclusive source deliberately clears its command.  The next rule Episode
+    # must therefore admit the same command-inert bootstrap from either ARMED
+    # (first run) or RUNNING (subsequent run).  This remains an explicit source
+    # opt-in and does not admit samples or motion by itself.
+    command_inert_source_bootstrap = bool(
+        (
+            allow_pre_episode_armed_warmup
+            or allow_active_episode_armed_bootstrap
+        )
+        and step_result.state in {TeleopRunState.ARMED, TeleopRunState.RUNNING}
+    )
+    if (
+        step_result.state != TeleopRunState.RUNNING
+        and not command_inert_source_bootstrap
+    ):
         return False, f"等待遥操进入 RUNNING，当前状态：{step_result.state.value}。"
     if step_result.observation is None:
         return False, "等待 observation 可用。"
-    if step_result.command is None:
-        return False, "等待 action command 可用。"
-    if not session_step_arm_dispatch_confirmed(step_result):
-        return False, "等待机械臂命令通过最终 admission 并实际派发。"
+    if not command_inert_source_bootstrap:
+        if step_result.command is None:
+            return False, "等待 action command 可用。"
+        if not session_step_arm_dispatch_confirmed(step_result):
+            return False, "等待机械臂命令通过最终 admission 并实际派发。"
     if dataset_recorder is not None:
         actual_ready, actual_message = dataset_recorder.actual_feedback_warmup_status(now)
         if not actual_ready:
@@ -137,21 +159,38 @@ def recording_warmup_status(
         )
         if camera_blocking_message:
             return False, camera_blocking_message
-    if any(
+    gripper_input_source = str(
+        getattr(components, "gripper_input_source", "q6") or "q6"
+    ).strip().lower()
+    if gripper_input_source not in {"none", "q6", "angle_trigger"}:
+        return False, f"等待夹爪输入配置恢复：不支持 {gripper_input_source!r}。"
+    # The physical hand backend is an output/feedback device.  It must not
+    # imply an operator-input dependency: rule control deliberately uses
+    # gripper_input_source=none while still commanding and monitoring DMTAC.
+    if gripper_input_source != "none" and any(
         _hand_backend_mode_for_side(args, side) != HAND_BACKEND_NONE
         for side in components.active_sides
     ):
         for side in components.active_sides:
             if _hand_backend_mode_for_side(args, side) == HAND_BACKEND_NONE:
                 continue
-            channel = step_result.channels.get(f"{side}_hand_q6")
+            channel_name = _gripper_input_channel_name(components, side)
+            if channel_name is None:
+                continue
+            channel = step_result.channels.get(channel_name)
+            input_label = (
+                "hand_q6" if gripper_input_source == "q6" else "angle_trigger"
+            )
             if channel is None or not bool(getattr(channel, "valid", False)):
-                return False, f"等待 {side} hand_q6 输入有效。"
+                return False, f"等待 {side} {input_label} 输入有效。"
             hand_age = float(now) - float(getattr(channel, "timestamp", now))
             if hand_age < -0.05:
-                return False, f"等待 {side} hand_q6 时间戳稳定。"
+                return False, f"等待 {side} {input_label} 时间戳稳定。"
             if hand_age > 0.5:
-                return False, f"等待 {side} hand_q6 最新输入，当前 age={hand_age:.2f}s。"
+                return False, (
+                    f"等待 {side} {input_label} 最新输入，"
+                    f"当前 age={hand_age:.2f}s。"
+                )
     for side in components.active_sides:
         backend = _gripper_backend_for_side(components, side)
         if backend is None:
@@ -177,6 +216,13 @@ def recording_warmup_status(
             return False, (
                 f"等待 {side} 夹爪故障恢复：error_code={error_code}{status_suffix}。"
             )
+        telemetry_error = str(state.get("telemetry_error") or "").strip()
+        # DMTAC shares one telemetry field for gripper transport and tactile
+        # worker diagnostics.  The latter is handled by the modality-specific
+        # gate below; a serial/command telemetry error must block the episode
+        # even when the cached vendor error_code is still zero.
+        if telemetry_error and not telemetry_error.lower().startswith("tactile_"):
+            return False, f"等待 {side} 夹爪传输故障恢复：{telemetry_error}。"
     for side in components.active_sides:
         if (
             side

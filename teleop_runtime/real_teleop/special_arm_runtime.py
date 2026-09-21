@@ -8,6 +8,7 @@ only act when called by the owning coordinator.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -82,14 +83,27 @@ def _fresh_gui_init_qpos_by_side(
         raise RuntimeError("GUI Init qpos requires both real-arm state backends.")
 
     states: dict[str, Mapping[str, object]] = {}
-    executor = components.arm_state_read_executor
-    if executor is not None:
-        futures = {
-            side: executor.submit(backends[side].refresh_state_from_hardware)
-            for side in ("left", "right")
-        }
-        for side, future in futures.items():
-            states[side] = future.result()
+    configured_executor = components.arm_state_read_executor
+    parallel_reads_enabled = bool(
+        configured_executor is not None
+        and int(getattr(configured_executor, "_max_workers", 1)) > 1
+    )
+    if parallel_reads_enabled:
+        # The component builder's executor is used during startup readiness and
+        # is deliberately released after the first Home.  GUI Init/remeasure
+        # remains a valid later control boundary, so it must not submit to that
+        # shutdown executor.  Keep the same parallelism contract with a
+        # short-lived reader owned by this snapshot.
+        with ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="rm65_gui_init_snapshot",
+        ) as executor:
+            futures = {
+                side: executor.submit(backends[side].refresh_state_from_hardware)
+                for side in ("left", "right")
+            }
+            for side, future in futures.items():
+                states[side] = future.result()
     else:
         for side in ("left", "right"):
             states[side] = backends[side].refresh_state_from_hardware()

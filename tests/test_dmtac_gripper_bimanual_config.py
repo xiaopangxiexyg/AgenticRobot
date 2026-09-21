@@ -116,6 +116,22 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(report["details"]["gripper_port"], "/dev/ttyUSB1")
         self.assertEqual(report["details"]["gripper_id"], 7)
 
+    def test_dmtac_transport_telemetry_error_closes_readiness_even_with_zero_code(self) -> None:
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+            )
+        )
+        backend.device = SimpleNamespace(gripper=object())
+        backend._telemetry_error = "telemetry_failed: Write timeout"
+
+        self.assertFalse(backend.is_ready())
+        report = backend.readiness_report()
+        self.assertFalse(report["ready"])
+        self.assertIn("Write timeout", report["reason"])
+
     def test_stabilized_startup_fault_ack_waits_for_fresh_zero_state(self) -> None:
         class _Device:
             gripper = object()
@@ -1315,6 +1331,16 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
 
         self.assertEqual(configs["right"].gripper_port, "/dev/ttyUSB3")
 
+        overlay_args = SimpleNamespace(**vars(args))
+        overlay_args.right_gripper_port = "/dev/ttyUSB2"
+        real_teleop._clear_gripper_policy_cache(overlay_args)
+        overlay_configs = real_teleop._dmtac_backend_configs(
+            overlay_args,
+            ("right",),
+        )
+
+        self.assertEqual(overlay_configs["right"].gripper_port, "/dev/ttyUSB2")
+
     def test_real_teleop_keeps_gripper_gui_visible_without_backend(self) -> None:
         components = SimpleNamespace(
             hand_backend_mode=real_teleop.HAND_BACKEND_DMTAC_GRIPPER,
@@ -1810,6 +1836,54 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertTrue(after_reconnect["gripper_read_skipped"])
         self.assertEqual(after_reconnect["gripper_read_skip_reason"], "read_failed")
         self.assertAlmostEqual(after_reconnect["gripper_measured_scalar"], 0.42)
+
+    def test_transient_telemetry_timeout_preserves_one_shot_owner(self) -> None:
+        class _FakeGripperState:
+            joint_pos = 1.0
+            timestamp = time.time()
+            error_code = 0
+            status_code = 2
+            is_moving = False
+
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def read_gripper_state(self):  # noqa: ANN201
+                self.reads += 1
+                if self.reads == 1:
+                    raise TimeoutError("Write timeout")
+                return _FakeGripperState()
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                continuous_grasp=True,
+                gripper_telemetry_read_attempts=2,
+                gripper_telemetry_retry_interval_s=0.0,
+            )
+        )
+        backend.device = fake
+        backend._last_sent_command = np.asarray(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32
+        )
+        backend._last_sent_command_timestamp = time.time() - 0.2
+        backend._last_sent_command_completed_timestamp = time.time() - 0.1
+        backend._applied_continuous_grasp = False
+
+        backend._read_telemetry_once()
+
+        state = backend.get_state(include_tactile_arrays=False)
+        self.assertEqual(fake.reads, 2)
+        self.assertEqual(state["reconnect_count"], 0)
+        self.assertIsNone(state["telemetry_error"])
+        self.assertTrue(backend.fixed_closed_one_shot_ready())
 
     def test_dmtac_send_failure_reconnect_reasserts_pre_fault_target(self) -> None:
         created_grippers = []
@@ -2577,6 +2651,186 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertEqual(len(fake.moves), 1)
         self.assertFalse(fake.moves[0]["continuous"])
         self.assertEqual(backend._last_send_status, "sent")
+
+    def test_dmtac_backend_same_target_reapplies_configured_catch_mode_after_override(self) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+            def __init__(self) -> None:
+                self.moves: list[dict[str, object]] = []
+
+            def move(self, joint_pos: float, **kwargs: object) -> None:
+                self.moves.append({"joint_pos": float(joint_pos), **dict(kwargs)})
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                continuous_grasp=True,
+            )
+        )
+        backend.device = fake
+        backend._applied_speed = backend.config.speed
+        backend._applied_torque = backend.config.torque
+        backend._applied_continuous_grasp = False
+        backend._last_sent_command = np.asarray(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
+        backend._latest_measured_joint_pos = backend._last_sent_command.copy()
+
+        command = EffectorCommand(
+            effector_name="right_hand",
+            side="right",
+            command_type="joint_vector",
+            value=backend._last_sent_command.copy(),
+        )
+
+        self.assertTrue(backend.send_command(command))
+        self.assertEqual(len(fake.moves), 1)
+        self.assertTrue(fake.moves[0]["continuous"])
+        self.assertEqual(backend._last_send_status, "sent")
+
+    def test_dmtac_backend_preserves_feedback_gated_task_chain_grip_without_write(
+        self,
+    ) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+            def __init__(self) -> None:
+                self.moves: list[dict[str, object]] = []
+
+            def move(self, joint_pos: float, **kwargs: object) -> None:
+                self.moves.append({"joint_pos": float(joint_pos), **dict(kwargs)})
+
+        fake = _FakeDevice()
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                continuous_grasp=True,
+            )
+        )
+        backend.device = fake
+        backend._applied_speed = backend.config.speed
+        backend._applied_torque = backend.config.torque
+        backend._applied_continuous_grasp = False
+        backend._last_sent_command = np.asarray(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
+        measured = np.zeros(6, dtype=np.float32)
+        measured[0] = 0.53
+        backend._latest_measured_joint_pos = measured
+        backend._latest_gripper_status_code = 2
+        backend._latest_gripper_is_moving = False
+        backend._last_sent_command_timestamp = 9.9
+        backend._last_sent_command_completed_timestamp = 10.0
+        backend._latest_joint_timestamp = 10.1
+        command = EffectorCommand(
+            effector_name="right_hand",
+            side="right",
+            command_type="joint_vector",
+            value=measured.copy(),
+            metadata={
+                "dmtac_continuous_grasp_override": False,
+                "dmtac_preserve_existing_grip": True,
+            },
+        )
+
+        self.assertFalse(backend.send_command(command))
+        self.assertEqual(backend._last_send_status, "hold_owner_uninitialized")
+        self.assertEqual(
+            backend._last_send_skip_reason,
+            "preserve_existing_grip_without_settled_closed_feedback",
+        )
+        self.assertEqual(fake.moves, [])
+
+        backend._latest_gripper_status_code = 6
+        self.assertTrue(backend.send_command(command))
+        self.assertEqual(fake.moves, [])
+        self.assertEqual(backend._last_send_status, "preserved_existing_grip")
+        self.assertEqual(
+            backend._last_send_skip_reason,
+            "task_chain_owns_physical_grip",
+        )
+
+        backend._last_sent_command = None
+        self.assertFalse(backend.send_command(command))
+        self.assertEqual(backend._last_send_status, "hold_owner_uninitialized")
+        self.assertEqual(fake.moves, [])
+
+        backend._last_sent_command = np.zeros(6, dtype=np.float32)
+        self.assertFalse(backend.send_command(command))
+        self.assertEqual(backend._last_send_status, "hold_owner_uninitialized")
+        self.assertEqual(
+            backend._last_send_skip_reason,
+            "preserve_existing_grip_without_close_command",
+        )
+        self.assertEqual(fake.moves, [])
+
+    def test_fixed_closed_one_shot_ready_requires_sent_closed_mode_receipt(self) -> None:
+        class _FakeDevice:
+            gripper = object()
+            tactile = None
+
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=True,
+                connect_tactile=False,
+                continuous_grasp=True,
+            )
+        )
+        backend.device = _FakeDevice()
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._last_sent_command = np.asarray(
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
+        backend._last_sent_command_timestamp = 9.9
+        backend._last_sent_command_completed_timestamp = 10.0
+        backend._latest_joint_timestamp = 10.1
+        endpoint = np.zeros(6, dtype=np.float32)
+        endpoint[0] = 1.0
+        backend._latest_measured_joint_pos = endpoint
+        backend._latest_gripper_status_code = 2
+        backend._latest_gripper_is_moving = False
+        backend._applied_continuous_grasp = True
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._applied_continuous_grasp = False
+        self.assertTrue(backend.fixed_closed_one_shot_ready())
+
+        # A pen or other object may stop the fingers before the numeric close
+        # endpoint.  Accept only the vendor's explicit, causal force-stop
+        # receipt; an ordinary idle sample short of target remains ambiguous.
+        contact = endpoint.copy()
+        contact[0] = 0.53
+        backend._latest_measured_joint_pos = contact
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_gripper_status_code = 6
+        self.assertTrue(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_joint_timestamp = 9.95
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_joint_timestamp = 10.1
+        backend._latest_gripper_is_moving = True
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_gripper_is_moving = False
+        self.assertTrue(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_gripper_error_code = 16
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
 
     def test_deploy_builds_dmtac_gripper_backend_from_assignment(self) -> None:
         parser = argparse.ArgumentParser()

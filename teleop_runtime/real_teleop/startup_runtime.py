@@ -271,8 +271,15 @@ def _run_camera_startup_self_check(
 
 
 def _release_runtime_state_readers(components: RealTeleopComponents) -> None:
-    if components.arm_state_read_executor is not None:
-        components.arm_state_read_executor.shutdown(wait=True)
+    """Finish startup reads without closing the shared executor.
+
+    Runtime Home recovery and rule-writing height calibration reuse this
+    executor.  Its lifecycle belongs to the normal runtime shutdown owner;
+    closing it here makes later maintenance reads fail with
+    ``cannot schedule new futures after shutdown``.
+    """
+
+    del components
 
 
 def _log_dual_arm_readiness(

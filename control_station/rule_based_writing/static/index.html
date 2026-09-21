@@ -69,6 +69,7 @@
       <h3>正式 Writer 与存储</h3>
       <div class="configuration-grid">
         <label class="wide">触觉 Bundle 根目录<input id="tactile-bundle-root" type="text" spellcheck="false"></label>
+        <label class="toggle"><input id="collect-tactile" type="checkbox">采集触觉</label>
         <label>最低剩余空间（GiB）<input id="tactile-min-free" type="number" step="1"></label>
         <label>触觉压缩<select id="tactile-compression"></select></label>
         <label>Writer 线程数<input id="writer-workers" type="number" step="1"></label>
@@ -97,7 +98,7 @@
       <div>
         <p id="task-chain-step" class="task-chain-step">0 / 5</p>
         <h2 id="task-chain-title">任务链未启动</h2>
-        <p id="task-chain-detail">按“继续任务链”后先松开夹爪。</p>
+        <p id="task-chain-detail">等待右夹爪、安全门禁和轨迹配置就绪。</p>
         <p id="task-chain-selection" class="storage-status">尚未选择本轮轨迹。</p>
       </div>
       <button id="task-chain-advance" type="button" disabled>继续任务链（Alt+N）</button>

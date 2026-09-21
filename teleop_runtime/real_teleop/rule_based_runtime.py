@@ -192,6 +192,9 @@ class RuleBasedRealTeleopConfig:
     manual_gripper_resend_interval_sec: float = 0.25
     manual_gripper_timeout_sec: float = 20.0
     hand_state_max_age_sec: float = 0.5
+    # Keep this additive field after the established positional fields so
+    # compatibility fixtures and external callers retain their bindings.
+    manual_gripper_settle_samples: int = 3
 
     def __post_init__(self) -> None:
         if self.action_hz is not None and (
@@ -246,6 +249,14 @@ class RuleBasedRealTeleopConfig:
                 "manual_gripper_endpoint_tolerance must not exceed "
                 "manual_gripper_tolerance."
             )
+        settle_samples = self.manual_gripper_settle_samples
+        if (
+            isinstance(settle_samples, bool)
+            or not isinstance(settle_samples, (int, np.integer))
+            or int(settle_samples) <= 0
+        ):
+            raise ValueError("manual_gripper_settle_samples must be a positive integer.")
+        object.__setattr__(self, "manual_gripper_settle_samples", int(settle_samples))
         if float(self.initial_alignment_hand_start_drift_tolerance) > float(
             self.gripper_max_step
         ):
@@ -355,6 +366,9 @@ class RuleBasedRealTeleopStatus:
     control_topology: str = "双臂（无夹爪）"
     gripper_control_available: bool = False
     gripper_action_pending: bool = False
+    gripper_action_id: int | None = None
+    gripper_action_intent: str = ""
+    gripper_action_result: str = "idle"
     rule_start_available: bool = False
     gripper_action_status: str = ""
     rule_configuration: Mapping[str, Any] = field(default_factory=dict)
@@ -393,7 +407,7 @@ class _DeferredProgressArmControlContract:
 
 @dataclass(frozen=True)
 class _ReplayReferenceCarrier:
-    """Lightweight immutable carrier materialized only at its dispatch cut."""
+    """Lightweight immutable pose reference materialized at its dispatch cut."""
 
     resampler: MotionTargetResampler
     reference_sequence: int
@@ -402,10 +416,12 @@ class _ReplayReferenceCarrier:
     projected_parent: RobotAction
     directive: RuleBasedCollectionDirective
     next_offset_sec: float
-    right_parent_frame_index: int
+    left_parent_source_index: int
+    right_parent_source_index: int
     captures_source_frame: bool
     keyframe_hz: float
     reference_hz: float
+    source_kind: str
 
 
 class RuleBasedRealTeleopExtension:
@@ -573,12 +589,20 @@ class RuleBasedRealTeleopExtension:
         self._stage_frame_total: int | None = None
         self._collection_position: str | None = None
         self._gripper_action_status = ""
+        self._gripper_action_sequence = 0
+        self._gripper_action_id: int | None = None
+        self._gripper_action_intent = ""
+        self._gripper_action_result = "idle"
         self._pending_gripper_action: str | None = None
         self._manual_gripper_started_at: float | None = None
         self._manual_gripper_last_command_by_side: dict[str, float] = {}
         self._manual_gripper_command_baseline_by_side: dict[str, float] = {}
         self._manual_gripper_last_dispatch_at_by_side: dict[str, float] = {}
         self._manual_gripper_last_progress_at_by_side: dict[str, float] = {}
+        self._manual_gripper_settle_samples_by_side: dict[str, int] = {}
+        self._manual_gripper_last_settle_feedback_token_by_side: dict[
+            str, tuple[str, float]
+        ] = {}
         self._admitted_capture_sequences: set[int] = set()
         self._height_calibration: RuleBasedWritingHeightCalibration | None = None
         self._height_calibration_error = ""
@@ -1131,7 +1155,83 @@ class RuleBasedRealTeleopExtension:
             and not self._completed
             and not self._aborted
             and not self._held
+            and self._right_gripper_hold_owner_ready()[0]
         )
+
+    def _right_gripper_hold_owner_ready(self) -> tuple[bool, str]:
+        """Return the command-inert receipt required by writing hand holds.
+
+        A writing frame carries a right-hand action for the dataset contract,
+        but its physical hand command is deliberately preserved.  The DMTAC
+        backend must therefore have already accepted the task-chain close in
+        one-shot mode.  This check is deliberately local and has no serial
+        side effects.  A backend that cannot provide this receipt is rejected
+        for writing rather than being allowed to guess that its physical grip
+        is owned.
+        """
+
+        if (
+            str(self.source_selection.get("collection_mode") or "")
+            != "rule_based_writing"
+            or "right" not in self.config.gripper_sides
+        ):
+            return True, ""
+        backend = getattr(self._components, "right_hand_backend", None)
+        if backend is None:
+            return False, "右夹爪 backend 不可用。"
+        is_ready = getattr(backend, "is_ready", None)
+        if callable(is_ready):
+            try:
+                if not bool(is_ready()):
+                    # The normal readiness diagnosis owns transport/fault
+                    # errors.  Do not replace those precise blockers with a
+                    # secondary hold-owner message.
+                    return True, ""
+            except Exception:
+                return True, ""
+        receipt = getattr(backend, "fixed_closed_one_shot_ready", None)
+        if not callable(receipt):
+            return False, "右夹爪 backend 未提供固定闭合 owner receipt。"
+        try:
+            ready = bool(receipt())
+        except Exception as exc:  # noqa: BLE001 - admission fails closed.
+            return False, f"右夹爪固定闭合 owner 检查失败：{type(exc).__name__}: {exc}。"
+        if ready:
+            return True, ""
+        return (
+            False,
+            "右夹爪尚未建立书写用的一次性闭合 owner；"
+            "请先完成“闭紧右夹爪”并等待“实测已闭紧”。",
+        )
+
+    def _rule_frame_requires_right_gripper_hold_owner(
+        self,
+        emission: RuleBasedCollectionEmission,
+    ) -> bool:
+        """Return whether this frame would use the command-inert grip hold."""
+
+        return bool(
+            str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+            and "right" in self.config.gripper_sides
+            and "right_hand" in emission.command.commands
+        )
+
+    def collection_startup_blockers(self) -> dict[str, str]:
+        """Expose rule-owned readiness before the formal writer is opened.
+
+        The generic device retry runtime cannot infer an exclusive rule plan's
+        required hand effectors.  Reuse the existing diagnostic path here so
+        a configured right DMTAC fault is rejected before writer preparation,
+        while Q6/input remains unrelated when the rule source disabled it.
+        """
+
+        status = self.status()
+        return {
+            str(key): str(value)
+            for key, value in status.readiness_blockers.items()
+            if str(value).strip()
+        }
 
     def allows_active_episode_bootstrap_without_dispatch(self) -> bool:
         """Identify the bounded pre-first-dispatch phase of an active Episode.
@@ -1233,6 +1333,58 @@ class RuleBasedRealTeleopExtension:
             )
         return True
 
+    def _abort_pre_dispatch_readiness_loss(self) -> bool:
+        """Fail closed when a started rule attempt loses hardware admission.
+
+        The dedicated rule UI intentionally permits a short ARMED window so
+        the formal writer can open before the first rule arm command. That
+        exception must not leave an attempt armed after a hand/Rig fault: the
+        next countdown tick would otherwise report only the generic missing
+        dispatch receipt and strand the task chain. Once any command has been
+        dispatched, the normal Session/Rule failure path owns the fault.
+        """
+
+        if (
+            not self._armed
+            or self._execution_begun
+            or self._completed
+            or self._aborted
+            or self._held
+        ):
+            return False
+        session = getattr(self._components, "session", None)
+        session_state = getattr(getattr(session, "state_machine", None), "state", None)
+        session_state_value = str(
+            getattr(session_state, "value", session_state) or ""
+        ).upper()
+        blockers, readiness_reason = self._session_readiness_diagnosis(
+            session_state_value=session_state_value,
+        )
+        if not blockers:
+            return False
+        detail = "; ".join(
+            f"{key}: {value}" for key, value in sorted(blockers.items())
+        )
+        if not detail:
+            detail = readiness_reason or "Rig is not ready"
+        message = (
+            "规则采集在首条机械臂命令派发前被安全取消："
+            + detail
+            + "。请先恢复设备并重新完成 runtime Home。"
+        )
+        self._aborted = True
+        self._armed = False
+        self._waiting_reason = "session_readiness_failure"
+        self._clear_current()
+        self._clear_replay_reference_schedule()
+        self._cancel_initial_alignment_planning()
+        self._establish_hold(message)
+        self._request_failure_stop()
+        append_message = getattr(self._control_ui, "append_message", None)
+        if callable(append_message):
+            append_message("RuleBased", message)
+        return True
+
     def after_control_input_poll(self, *, now: float) -> None:
         self._frame_emission = None
         self._paused_hold_emission = None
@@ -1306,10 +1458,21 @@ class RuleBasedRealTeleopExtension:
                 self._armed = False
                 self._waiting_reason = "runtime_home_required_after_hold"
                 self._clear_current()
-                self._clear_manual_gripper_action()
+                if self._pending_gripper_action is not None:
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message="夹爪动作已由任务链取消并进入 Hold。",
+                    )
+                else:
+                    self._clear_manual_gripper_action()
                 self._cancel_initial_alignment_planning()
                 self._establish_hold("rule-based operator stop")
-            elif intent in {"release_grippers", "close_grippers"}:
+            elif intent in {
+                "release_grippers",
+                "release_right_gripper",
+                "close_grippers",
+                "close_right_gripper",
+            }:
                 session = getattr(self._components, "session", None)
                 state = getattr(
                     getattr(session, "state_machine", None),
@@ -1317,25 +1480,56 @@ class RuleBasedRealTeleopExtension:
                     None,
                 )
                 state_value = str(getattr(state, "value", state) or "").upper()
-                if self._height_calibration_future is not None:
-                    self._gripper_action_status = "高度标定读取期间夹爪保持不动。"
-                elif not self.config.gripper_sides:
-                    self._gripper_action_status = "当前拓扑没有已启用的 DMTAC 夹爪。"
-                elif self._pending_gripper_action is not None:
+                if self._pending_gripper_action is not None:
                     self._gripper_action_status = "已有夹爪动作正在执行；新动作已拒绝。"
+                    continue
+                self._begin_manual_gripper_action(str(intent))
+                if self._height_calibration_future is not None:
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message="高度标定读取期间夹爪保持不动。",
+                    )
+                elif not self.config.gripper_sides:
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message="当前拓扑没有已启用的 DMTAC 夹爪。",
+                    )
                 elif not self._manual_gripper_lifecycle_available(
                     session_state_value=state_value,
                 ):
-                    self._gripper_action_status = (
-                        "夹爪独立控制仅在没有活动 Episode 的采集前或轮次间可用。"
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message=(
+                            "夹爪独立控制仅在没有活动 Episode 的采集前或轮次间可用。"
+                        ),
+                    )
+                elif (
+                    intent in {"release_right_gripper", "close_right_gripper"}
+                    and "right" not in self.config.gripper_sides
+                ):
+                    self._finish_manual_gripper_action(
+                        succeeded=False,
+                        message="当前拓扑没有已启用的右夹爪。",
                     )
                 else:
-                    self._pending_gripper_action = str(intent)
                     self._manual_gripper_started_at = None
                     self._manual_gripper_last_command_by_side.clear()
                     self._gripper_action_status = (
-                        "已排队：松开夹爪" if intent == "release_grippers" else "已排队：闭紧夹爪"
+                        "已排队：松开夹爪"
+                        if intent == "release_grippers"
+                        else (
+                            "已排队：松开右夹爪"
+                            if intent == "release_right_gripper"
+                            else (
+                                "已排队：闭紧右夹爪"
+                                if intent == "close_right_gripper"
+                                else "已排队：闭紧夹爪"
+                            )
+                        )
                     )
+        if self._abort_pre_dispatch_readiness_loss():
+            self._publish_status(force=True)
+            return
         self._publish_status()
 
     def _height_calibration_mutation_idle(self) -> bool:
@@ -1721,10 +1915,21 @@ class RuleBasedRealTeleopExtension:
         self._waiting_reason = "configuration_rebuild"
         self._clear_manual_gripper_action()
         self._gripper_action_status = "规则组合验证期间夹爪保持不动。"
-        self._configuration_future = self._configuration_executor.submit(
-            self._rebuild_configuration_batch,
-            request,
-        )
+        try:
+            self._configuration_future = self._configuration_executor.submit(
+                self._rebuild_configuration_batch,
+                request,
+            )
+        except RuntimeError as exc:
+            # Session teardown may race a final browser request.  Treat a
+            # closed executor as a rejected command-inert rebuild, never as an
+            # owner-loop exception that can strand the GUI.
+            self._configuration_request = None
+            self._configuration_error = f"{type(exc).__name__}: {exc}"
+            self._waiting_reason = "configuration_rejected"
+            self._gripper_action_status = ""
+            if callable(publish_result):
+                publish_result(selected=None, error=self._configuration_error)
         return True
 
     def _rebuild_configuration_batch(
@@ -2013,6 +2218,21 @@ class RuleBasedRealTeleopExtension:
             # control loop, force guard, and causal state poller keep running.
             self._publish_status(recording_ready=ready)
             return TeleopCommandOverride(None)
+        if self._rule_frame_requires_right_gripper_hold_owner(self._current):
+            owner_ready, owner_detail = self._right_gripper_hold_owner_ready()
+            if not owner_ready:
+                self._waiting_reason = "right_gripper_hold_owner_pending"
+                if self._execution_begun:
+                    raise RuntimeError(
+                        "rule-based writing lost its right-gripper hold owner: "
+                        + (owner_detail or "owner receipt is no longer valid")
+                    )
+                # Do not let an arm qref reach Session while the matching
+                # command-inert hand hold would be rejected by DMTAC.  Keep
+                # the immutable current emission for the next control tick;
+                # a successful task-chain close will make it dispatchable.
+                self._publish_status(recording_ready=False)
+                return TeleopCommandOverride(None)
         self._prepare_live_dispatch(self._current, float(now))
         self._frame_emission = self._current
         self._publish_status(recording_ready=True)
@@ -2047,11 +2267,29 @@ class RuleBasedRealTeleopExtension:
             )
         )
         command.metadata["rule_based_dispatch_timestamp"] = timestamp
+        fixed_right_grip = bool(
+            str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+            and "right" in self.config.gripper_sides
+        )
         command.timestamp = timestamp
         for effector in command.commands.values():
             if not isinstance(effector.metadata, dict):
                 effector.metadata = dict(effector.metadata or {})
             effector.metadata["_parent_command_timestamp"] = timestamp
+            if fixed_right_grip and effector.effector_name == "right_hand":
+                # The task chain closes and opens the writing gripper exactly
+                # once at its explicit boundaries. Every in-Episode hand
+                # command therefore stays in one-shot mode at the fixed
+                # closed target. This prevents the replay stream from
+                # toggling catch mode or re-driving source hand jitter while
+                # preserving one canonical action/command representation for
+                # the dataset contract.
+                effector.metadata["dmtac_continuous_grasp_override"] = False
+                effector.metadata["dmtac_preserve_existing_grip"] = True
+                command.metadata[
+                    "rule_based_right_gripper_hold_mode"
+                ] = "task_chain_fixed_closed_one_shot"
             if effector.effector_name.endswith("_arm"):
                 # The strict-timestamp jerk planner must see one source cut
                 # per distinct rule qref, not one cut per retry/repeated
@@ -2060,6 +2298,18 @@ class RuleBasedRealTeleopExtension:
                     source_cut_timestamp
                 )
 
+    def _begin_manual_gripper_action(self, intent: str) -> None:
+        self._gripper_action_sequence += 1
+        self._gripper_action_id = int(self._gripper_action_sequence)
+        self._gripper_action_intent = str(intent)
+        self._gripper_action_result = "pending"
+        self._pending_gripper_action = str(intent)
+
+    def _finish_manual_gripper_action(self, *, succeeded: bool, message: str) -> None:
+        self._gripper_action_status = str(message)
+        self._gripper_action_result = "succeeded" if succeeded else "failed"
+        self._clear_manual_gripper_action()
+
     def _clear_manual_gripper_action(self) -> None:
         self._pending_gripper_action = None
         self._manual_gripper_started_at = None
@@ -2067,6 +2317,8 @@ class RuleBasedRealTeleopExtension:
         self._manual_gripper_command_baseline_by_side.clear()
         self._manual_gripper_last_dispatch_at_by_side.clear()
         self._manual_gripper_last_progress_at_by_side.clear()
+        self._manual_gripper_settle_samples_by_side.clear()
+        self._manual_gripper_last_settle_feedback_token_by_side.clear()
 
     def _manual_gripper_state(
         self,
@@ -2181,6 +2433,124 @@ class RuleBasedRealTeleopExtension:
         if not 0.0 <= scalar <= max_action:
             return None, "实测夹爪位置越界"
         return measured.astype(np.float32, copy=True), ""
+
+    @staticmethod
+    def _manual_gripper_feedback_timestamp(
+        state: Mapping[str, Any],
+    ) -> float | None:
+        """Return the hardware-side timestamp carried by one hand snapshot."""
+
+        for key in (
+            "joint_timestamp",
+            "gripper_measurement_timestamp",
+            "telemetry_snapshot_source_timestamp",
+        ):
+            try:
+                value = float(state.get(key))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                return value
+        return None
+
+    @staticmethod
+    def _manual_gripper_feedback_token(
+        state: Mapping[str, Any],
+        *,
+        now: float,
+    ) -> tuple[str, float]:
+        """Identify one distinct cached feedback frame.
+
+        Production hand snapshots carry ``joint_timestamp`` or a telemetry
+        sequence.  The control-time fallback keeps compatibility fixtures
+        deterministic without pretending that a cached frame is fresh across
+        repeated calls with the same timestamp.
+        """
+
+        timestamp = RuleBasedRealTeleopExtension._manual_gripper_feedback_timestamp(
+            state
+        )
+        if timestamp is not None:
+            return ("hardware_timestamp", timestamp)
+        for key in ("telemetry_snapshot_sequence", "sequence"):
+            try:
+                sequence = float(state.get(key))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(sequence):
+                return (key, sequence)
+        return ("control_timestamp", float(now))
+
+    def _manual_gripper_endpoint_settled(
+        self,
+        state: Mapping[str, Any],
+        *,
+        side: str,
+        now: float,
+        final_target: float,
+    ) -> tuple[bool, str]:
+        """Require post-command, distinct stable endpoint/contact feedback.
+
+        DMTAC position writes are asynchronous.  Endpoint position alone is
+        therefore insufficient: the cached value can be the last register
+        read from before the close command, while status code 4 still means
+        that the gripper is physically closing/holding.  A short fresh-frame
+        barrier preserves the existing command-inert handoff without adding a
+        second device loop.
+        """
+
+        recovery_phase = str(state.get("gripper_recovery_phase") or "").strip()
+        if recovery_phase in {"recovering", "failed"}:
+            return False, f"等待夹爪恢复({recovery_phase})"
+        raw_error_code = state.get("gripper_error_code", state.get("error_code"))
+        try:
+            error_code = None if raw_error_code is None else int(raw_error_code)
+        except (TypeError, ValueError):
+            return False, "夹爪反馈错误码无效"
+        if error_code not in (None, 0):
+            return False, f"等待夹爪故障清除(error_code={error_code})"
+        telemetry_error = str(state.get("telemetry_error") or "").strip()
+        if telemetry_error and not telemetry_error.lower().startswith("tactile_"):
+            return False, f"等待夹爪传输恢复({telemetry_error})"
+
+        status_code = state.get("gripper_status_code", state.get("status_code"))
+        try:
+            status_code = None if status_code is None else int(status_code)
+        except (TypeError, ValueError):
+            return False, "夹爪状态码无效"
+        if status_code in {4, 5}:
+            direction = "张开" if status_code == 5 else "闭合"
+            return False, f"夹爪仍在{direction}运动"
+        if bool(state.get("gripper_is_moving")):
+            return False, "夹爪反馈仍显示运动中"
+
+        feedback_timestamp = self._manual_gripper_feedback_timestamp(state)
+        last_dispatch = self._manual_gripper_last_dispatch_at_by_side.get(side)
+        if last_dispatch is None:
+            return False, "等待本次夹爪命令后的反馈"
+        if (
+            feedback_timestamp is not None
+            and feedback_timestamp <= float(last_dispatch)
+        ):
+            return False, "等待夹爪命令后的新鲜反馈"
+
+        token = self._manual_gripper_feedback_token(state, now=float(now))
+        previous_token = self._manual_gripper_last_settle_feedback_token_by_side.get(
+            side
+        )
+        if previous_token == token:
+            count = self._manual_gripper_settle_samples_by_side.get(side, 0)
+            return False, (
+                "等待下一帧不同的实测反馈"
+                f"({count}/{self.config.manual_gripper_settle_samples})"
+            )
+        self._manual_gripper_last_settle_feedback_token_by_side[side] = token
+        count = self._manual_gripper_settle_samples_by_side.get(side, 0) + 1
+        self._manual_gripper_settle_samples_by_side[side] = count
+        required = int(self.config.manual_gripper_settle_samples)
+        if count < required:
+            return False, f"等待端点稳定反馈({count}/{required})"
+        return True, ""
 
     def _manual_gripper_feedback(
         self,
@@ -2306,25 +2676,46 @@ class RuleBasedRealTeleopExtension:
         suffix = f"/{skip_reason}" if skip_reason else ""
         return "failed", f"{side}:{label}{suffix}"
 
+    def _manual_gripper_action_sides(self, intent: str) -> tuple[str, ...]:
+        """Return the hand scope for one maintenance intent.
+
+        Generic GUI gripper actions retain their configured all-side behavior.
+        The task chain uses the explicit right-only intent because only the
+        right hand owns the pen; the left hand must not receive a close command.
+        """
+
+        if intent in {"release_right_gripper", "close_right_gripper"}:
+            return ("right",) if "right" in self.config.gripper_sides else ()
+        return tuple(self.config.gripper_sides)
+
     def _dispatch_pending_gripper_action(self, observation: object, now: float) -> None:
         """Advance one feedback-gated reset increment through the Session Rig.
 
-        The rule UI is intentionally not a second device loop.  A reset click
+        The rule UI is intentionally not a second device loop. A reset click
         is converted to the same canonical ``RobotAction``/``TeleopCommand``
         carrier used by collection and sent through ``TeleopSession``'s
-        existing dispatch seam.  Each command is bounded by ``gripper_max_step``
-        and the next one requires fresh measured progress in the requested
-        direction; only the final open/closed target requires measured arrival.
-        No formal writer call is made and no arm effector is included.
+        existing dispatch seam. Task-chain right-hand actions issue one
+        endpoint command and then only observe fresh feedback; generic
+        maintenance actions retain bounded incremental motion. No formal
+        writer call is made and no arm effector is included.
         """
 
         intent = self._pending_gripper_action
         if intent is None:
             return
+        action_sides = self._manual_gripper_action_sides(intent)
+        if not action_sides:
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message="当前拓扑没有可用的目标夹爪。",
+            )
+            return
         session = getattr(self._components, "session", None)
         if session is None:
-            self._gripper_action_status = "夹爪控制失败：Session 不可用。"
-            self._clear_manual_gripper_action()
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message="夹爪控制失败：Session 不可用。",
+            )
             return
         state = getattr(getattr(session, "state_machine", None), "state", None)
         state_value = str(getattr(state, "value", state) or "").upper()
@@ -2336,17 +2727,19 @@ class RuleBasedRealTeleopExtension:
         if not self._manual_gripper_lifecycle_available(
             session_state_value=state_value,
         ):
-            self._gripper_action_status = (
-                "夹爪控制已拒绝：当前不处于无活动 Episode 的安全维护窗口"
-                f"（Session={state_value or 'UNKNOWN'}）。"
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制已拒绝：当前不处于无活动 Episode 的安全维护窗口"
+                    f"（Session={state_value or 'UNKNOWN'}）。"
+                ),
             )
-            self._clear_manual_gripper_action()
             return
 
         if self._manual_gripper_started_at is None:
             self._manual_gripper_started_at = float(now)
             self._manual_gripper_last_progress_at_by_side = {
-                side: float(now) for side in self.config.gripper_sides
+                side: float(now) for side in action_sides
             }
 
         hand_qpos: dict[str, np.ndarray] = {}
@@ -2357,9 +2750,14 @@ class RuleBasedRealTeleopExtension:
         arrived: list[str] = []
         wrong_direction: list[str] = []
         resend_sides: set[str] = set()
-        target_scalar = 0.0 if intent == "release_grippers" else 1.0
-        direction = -1.0 if intent == "release_grippers" else 1.0
-        for side in self.config.gripper_sides:
+        task_chain_right_only = intent in {
+            "release_right_gripper",
+            "close_right_gripper",
+        }
+        is_release = intent in {"release_grippers", "release_right_gripper"}
+        target_scalar = 0.0 if is_release else 1.0
+        direction = -1.0 if is_release else 1.0
+        for side in action_sides:
             backend = getattr(self._components, f"{side}_hand_backend", None)
             if backend is None:
                 unavailable.append(side)
@@ -2408,11 +2806,60 @@ class RuleBasedRealTeleopExtension:
             measured_scalar_by_side[side] = measured_scalar
             final_target = float(np.clip(target_scalar, 0.0, max_action))
             last_target = self._manual_gripper_last_command_by_side.get(side)
-            if abs(measured_scalar - final_target) <= float(
+            at_endpoint = abs(measured_scalar - final_target) <= float(
                 self.config.manual_gripper_endpoint_tolerance
-            ):
-                arrived.append(side)
-                self._manual_gripper_last_progress_at_by_side[side] = float(now)
+            )
+            raw_status_code = (feedback_state or {}).get(
+                "gripper_status_code",
+                (feedback_state or {}).get("status_code"),
+            )
+            try:
+                status_code = (
+                    None if raw_status_code is None else int(raw_status_code)
+                )
+            except (TypeError, ValueError):
+                status_code = None
+            force_stopped_grasp = bool(
+                intent == "close_right_gripper"
+                and side == "right"
+                and status_code == 6
+                and side in self._manual_gripper_last_dispatch_at_by_side
+            )
+            if at_endpoint or force_stopped_grasp:
+                settled, settle_reason = self._manual_gripper_endpoint_settled(
+                    feedback_state or {},
+                    side=side,
+                    now=float(now),
+                    final_target=final_target,
+                )
+                if settled:
+                    arrived.append(side)
+                    self._manual_gripper_last_progress_at_by_side[side] = float(now)
+                else:
+                    waiting.append(f"{side}:{settle_reason}")
+                    # An explicit maintenance action must have a causal device
+                    # command even when the actuator starts at its endpoint.
+                    # Reapply the same target once so release disables catch
+                    # mode and task-chain close establishes a one-shot closed
+                    # state before the writing replay preserves that physical
+                    # grip without another serial write.
+                    if (
+                        at_endpoint
+                        and side
+                        not in self._manual_gripper_last_dispatch_at_by_side
+                    ):
+                        last_dispatch_at = (
+                            self._manual_gripper_last_dispatch_at_by_side.get(side)
+                        )
+                        if (
+                            last_dispatch_at is None
+                            or float(now) - float(last_dispatch_at)
+                            >= float(self.config.manual_gripper_resend_interval_sec)
+                        ):
+                            qpos = np.zeros(6, dtype=np.float32)
+                            qpos[command_dim] = final_target
+                            hand_qpos[side] = qpos
+                            resend_sides.add(side)
                 continue
             if last_target is not None:
                 command_baseline = self._manual_gripper_command_baseline_by_side.get(side)
@@ -2433,6 +2880,22 @@ class RuleBasedRealTeleopExtension:
                     float(self.config.manual_gripper_endpoint_tolerance),
                     1e-4,
                 )
+                if task_chain_right_only:
+                    if progress >= minimum_progress:
+                        # The endpoint command is already owned by firmware.
+                        # Fresh forward progress only refreshes the bounded
+                        # no-progress watchdog; it must not trigger another
+                        # register write.
+                        self._manual_gripper_command_baseline_by_side[side] = (
+                            measured_scalar
+                        )
+                        self._manual_gripper_last_progress_at_by_side[side] = (
+                            float(now)
+                        )
+                    waiting.append(
+                        f"{side}={measured_scalar:.3f}/{last_target:.3f}"
+                    )
+                    continue
                 if progress < minimum_progress:
                     last_dispatch_at = self._manual_gripper_last_dispatch_at_by_side.get(
                         side,
@@ -2463,26 +2926,31 @@ class RuleBasedRealTeleopExtension:
                 # final target is still feedback-gated and every new command
                 # remains bounded from the latest measured position.
             baseline = measured_scalar
-            delta = float(np.clip(
-                final_target - baseline,
-                -float(self.config.gripper_max_step),
-                float(self.config.gripper_max_step),
-            ))
-            next_target = baseline + delta
+            if task_chain_right_only:
+                next_target = final_target
+            else:
+                delta = float(np.clip(
+                    final_target - baseline,
+                    -float(self.config.gripper_max_step),
+                    float(self.config.gripper_max_step),
+                ))
+                next_target = baseline + delta
             qpos = np.zeros(6, dtype=np.float32)
             qpos[command_dim] = float(np.clip(next_target, 0.0, max_action))
             hand_qpos[side] = qpos
         if wrong_direction:
-            self._gripper_action_status = (
-                "夹爪控制停止：检测到与请求方向相反的实测运动（"
-                + ",".join(wrong_direction)
-                + "）。"
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制停止：检测到与请求方向相反的实测运动（"
+                    + ",".join(wrong_direction)
+                    + "）。"
+                ),
             )
-            self._clear_manual_gripper_action()
             return
         timed_out = [
             side
-            for side in self.config.gripper_sides
+            for side in action_sides
             if side not in arrived
             and (
                 float(now)
@@ -2491,35 +2959,58 @@ class RuleBasedRealTeleopExtension:
             )
         ]
         if timed_out:
-            self._gripper_action_status = (
-                "夹爪控制超时：以下侧在限时内没有新的实测进展："
-                + ",".join(sorted(timed_out))
-                + "。"
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制超时：以下侧在限时内没有新的实测进展："
+                    + ",".join(sorted(timed_out))
+                    + "。"
+                ),
             )
-            self._clear_manual_gripper_action()
             return
         if unavailable:
-            self._gripper_action_status = (
-                "夹爪控制已拒绝：未就绪侧 " + ",".join(sorted(unavailable)) + "。"
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=(
+                    "夹爪控制已拒绝：未就绪侧 "
+                    + ",".join(sorted(unavailable))
+                    + "。"
+                ),
             )
-            self._clear_manual_gripper_action()
             return
         if not hand_qpos:
-            if len(arrived) == len(self.config.gripper_sides):
-                self._gripper_action_status = (
-                    "夹爪实测已松开" if intent == "release_grippers" else "夹爪实测已闭紧"
+            if len(arrived) == len(action_sides):
+                if intent == "release_right_gripper":
+                    message = "右夹爪实测已松开"
+                elif is_release:
+                    message = "夹爪实测已松开"
+                elif intent == "close_right_gripper":
+                    message = "右夹爪实测已闭紧"
+                else:
+                    message = "夹爪实测已闭紧"
+                self._finish_manual_gripper_action(
+                    succeeded=True,
+                    message=message,
                 )
-                self._clear_manual_gripper_action()
             elif waiting:
-                action_label = "松开" if intent == "release_grippers" else "闭紧"
+                if intent == "release_right_gripper":
+                    action_label = "松开右夹爪"
+                elif is_release:
+                    action_label = "松开"
+                elif intent == "close_right_gripper":
+                    action_label = "闭紧右夹爪"
+                else:
+                    action_label = "闭紧"
                 self._gripper_action_status = (
                     f"正在{action_label}夹爪：等待逐段实测到位（"
                     + ",".join(waiting)
                     + "）。"
                 )
             else:
-                self._gripper_action_status = "夹爪控制已拒绝：没有可用夹爪。"
-                self._clear_manual_gripper_action()
+                self._finish_manual_gripper_action(
+                    succeeded=False,
+                    message="夹爪控制已拒绝：没有可用夹爪。",
+                )
             return
 
         try:
@@ -2530,8 +3021,14 @@ class RuleBasedRealTeleopExtension:
                 source="rule_based_manual_gripper",
                 metadata={
                     "rule_based_manual_gripper_action": intent,
+                    "rule_based_manual_gripper_sides": list(action_sides),
                     "rule_based_manual_gripper_max_step": float(
                         self.config.gripper_max_step
+                    ),
+                    "rule_based_manual_gripper_dispatch_mode": (
+                        "single_endpoint_feedback_gated"
+                        if task_chain_right_only
+                        else "bounded_incremental_feedback_gated"
                     ),
                     "rule_based_capture_enabled": False,
                     "external_gripper_motion": True,
@@ -2546,7 +3043,19 @@ class RuleBasedRealTeleopExtension:
                 },
             )
             command = self.adapter.resolver.resolve(action)
+            # Task-chain right-hand motion and release are one-shot firmware
+            # operations. The writing replay keeps the same mode and target;
+            # it must not restore continuous catch or re-drive the hand.
             manual_continuous_grasp = intent == "close_grippers"
+            manual_motion_mode = (
+                "one_shot_open"
+                if is_release
+                else (
+                    "one_shot_close"
+                    if task_chain_right_only
+                    else "continuous_close"
+                )
+            )
             for side in hand_qpos:
                 effector = command.commands.get(f"{side}_hand")
                 if effector is None:
@@ -2555,15 +3064,31 @@ class RuleBasedRealTeleopExtension:
                     )
                 if not isinstance(effector.metadata, dict):
                     effector.metadata = dict(effector.metadata or {})
-                # Release is a free-motion reset and must disable the device's
-                # catch/continuous-grasp mode.  Closing explicitly restores it
-                # so the final grasp keeps the selected task force policy.
+                # Release and the task-chain right-only close are one-shot
+                # maintenance moves. The generic all-side close retains its
+                # historical continuous-grasp behavior; writing replay keeps
+                # the task-chain right hand fixed in the same one-shot mode.
                 effector.metadata["dmtac_continuous_grasp_override"] = bool(
                     manual_continuous_grasp
+                )
+                # Never inherit the writing replay's command-inert hold for a
+                # manual release.  The open command must reach DMTAC so the
+                # backend can switch back to its explicit one-shot mode even
+                # when the target value is already cached at the endpoint.
+                effector.metadata["dmtac_preserve_existing_grip"] = False
+                effector.metadata["rule_based_manual_gripper_dispatch_mode"] = (
+                    "single_endpoint_feedback_gated"
+                    if task_chain_right_only
+                    else "bounded_incremental_feedback_gated"
+                )
+                effector.metadata["rule_based_manual_gripper_motion_mode"] = (
+                    manual_motion_mode
                 )
             command.metadata.update(
                 {
                     "rule_based_manual_gripper_action": intent,
+                    "rule_based_manual_gripper_sides": list(action_sides),
+                    "rule_based_manual_gripper_motion_mode": manual_motion_mode,
                     "rule_based_capture_enabled": False,
                     "rule_based_arm_motion": False,
                     "external_gripper_motion": True,
@@ -2591,25 +3116,29 @@ class RuleBasedRealTeleopExtension:
                 )
                 if fault is not None:
                     reason = str(getattr(fault, "message", fault) or fault)
-                    self._gripper_action_status = (
-                        f"夹爪控制已被安全门禁拒绝：{reason}"
-                    )
+                    message = f"夹爪控制已被安全门禁拒绝：{reason}"
                 else:
                     reason = str(
                         getattr(result, "rejection_reason", "dispatch_rejected")
                         or "dispatch_rejected"
                     )
-                    self._gripper_action_status = f"夹爪控制已拒绝：{reason}。"
-                self._clear_manual_gripper_action()
+                    message = f"夹爪控制已拒绝：{reason}。"
+                self._finish_manual_gripper_action(
+                    succeeded=False,
+                    message=message,
+                )
                 return
         except Exception as exc:  # noqa: BLE001 - reset must fail closed.
-            self._gripper_action_status = (
+            message = (
                 "夹爪控制发送失败：" f"{type(exc).__name__}: {exc}"
             )
             append_message = getattr(self._control_ui, "append_message", None)
             if callable(append_message):
-                append_message("DMTAC", self._gripper_action_status)
-            self._clear_manual_gripper_action()
+                append_message("DMTAC", message)
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=message,
+            )
             return
         receipts = dict(getattr(result, "dispatch_receipts", {}) or {})
         accepted: list[str] = []
@@ -2638,6 +3167,16 @@ class RuleBasedRealTeleopExtension:
                     qpos[command_dim]
                 )
                 self._manual_gripper_last_dispatch_at_by_side[side] = float(now)
+                # A newly accepted asynchronous command invalidates all
+                # endpoint samples collected before it.  The next completion
+                # decision must be based on distinct feedback after this
+                # command, including when the backend accepts a threshold
+                # no-op as already at target.
+                self._manual_gripper_settle_samples_by_side[side] = 0
+                self._manual_gripper_last_settle_feedback_token_by_side.pop(
+                    side,
+                    None,
+                )
                 if side not in resend_sides:
                     self._manual_gripper_command_baseline_by_side[side] = float(
                         measured_scalar_by_side[side]
@@ -2648,20 +3187,30 @@ class RuleBasedRealTeleopExtension:
                 retrying.append(detail)
             else:
                 failed.append(detail)
-        action_label = "松开" if intent == "release_grippers" else "闭紧"
+        if intent == "release_right_gripper":
+            action_label = "松开右夹爪"
+        elif is_release:
+            action_label = "松开"
+        elif intent == "close_right_gripper":
+            action_label = "闭紧右夹爪"
+        else:
+            action_label = "闭紧"
         if failed:
             partial = (
                 "；部分侧已发送 " + ",".join(sorted(accepted))
                 if accepted
                 else ""
             )
-            self._gripper_action_status = (
+            message = (
                 f"夹爪控制停止：{'，'.join(failed)}{partial}。"
             )
             append_message = getattr(self._control_ui, "append_message", None)
             if callable(append_message):
-                append_message("DMTAC", self._gripper_action_status)
-            self._clear_manual_gripper_action()
+                append_message("DMTAC", message)
+            self._finish_manual_gripper_action(
+                succeeded=False,
+                message=message,
+            )
         elif accepted:
             positions = ", ".join(
                 f"{side}={self._manual_gripper_last_command_by_side[side]:.2f}"
@@ -2815,6 +3364,30 @@ class RuleBasedRealTeleopExtension:
             except Exception as exc:  # noqa: BLE001 - replay planning fails closed.
                 self._abort_coupled_pose(
                     "60 Hz replay reference planning failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        elif (
+            emission.directive.kind == "custom_action"
+            and emission.action.arm_pose_by_side
+            and bool(
+                emission.action.metadata.get(
+                    "rule_based_position_reference_resample",
+                    False,
+                )
+            )
+            and "rule_based_reference_sequence" not in emission.action.metadata
+        ):
+            try:
+                self._prepare_custom_action_reference_queue(
+                    emission,
+                    observation=observation,
+                    runtime_context=runtime_context,
+                    now=float(now),
+                )
+                emission = self._pop_due_replay_reference(float(now))
+            except Exception as exc:  # noqa: BLE001 - planning fails closed.
+                self._abort_coupled_pose(
+                    "60 Hz custom-action reference planning failed: "
                     f"{type(exc).__name__}: {exc}"
                 )
         if emission.directive.kind == "replay":
@@ -3008,34 +3581,174 @@ class RuleBasedRealTeleopExtension:
                 )
             source_emissions.append(following)
 
+        first_source_time = float(group.relative_time_sec(first_frame_index))
+        source_emissions = [
+            self._project_writing_replay_height(source_emission)
+            for source_emission in source_emissions
+        ]
+        source_indices = [
+            int(source_emission.directive.replay_frame_index or 0)
+            for source_emission in source_emissions
+        ]
+        source_times = [
+            float(group.relative_time_sec(source_index)) - first_source_time
+            for source_index in source_indices
+        ]
+        self._install_pose_reference_queue(
+            source_emissions,
+            source_times=source_times,
+            source_indices=source_indices,
+            keyframe_hz=keyframe_hz,
+            reference_hz=reference_hz,
+            source_kind="replay",
+            now=float(now),
+        )
+
+    def _prepare_custom_action_reference_queue(
+        self,
+        first: RuleBasedCollectionEmission,
+        *,
+        observation: object,
+        runtime_context: Mapping[str, Any],
+        now: float,
+    ) -> None:
+        """Expand one opted-in finite action segment onto the reference clock."""
+
+        directive = first.directive
+        try:
+            plan_step_index = int(directive.metadata["rule_based_step_index"])
+            step = self.plan.steps[plan_step_index]
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "custom-action directive lacks a valid plan-step identity"
+            ) from exc
+        if not isinstance(step, RuleBasedActionSegment):
+            raise TypeError(
+                "resampled custom-action directive does not resolve to an action segment"
+            )
+        keyframe_hz = float(
+            first.action.metadata.get("rule_based_position_keyframe_hz", math.nan)
+        )
+        reference_hz = float(self.config.position_reference_hz)
+        if not np.isfinite(keyframe_hz) or keyframe_hz <= 0.0:
+            raise ValueError(
+                "resampled custom action requires a finite positive keyframe rate"
+            )
+        if reference_hz + 1e-9 < keyframe_hz:
+            raise ValueError(
+                "position reference_hz must be >= custom-action keyframe rate; "
+                f"got reference_hz={reference_hz:g}, keyframe_hz={keyframe_hz:g}"
+            )
+
+        source_emissions = [first]
+        while not source_emissions[-1].directive.segment_terminal:
+            following = self.adapter.next_runtime(
+                observation,
+                context=runtime_context,
+            )
+            following_directive = following.directive
+            following_keyframe_hz = float(
+                following.action.metadata.get(
+                    "rule_based_position_keyframe_hz",
+                    math.nan,
+                )
+            )
+            if (
+                following_directive.kind != "custom_action"
+                or following_directive.step_id != directive.step_id
+                or not bool(
+                    following.action.metadata.get(
+                        "rule_based_position_reference_resample",
+                        False,
+                    )
+                )
+                or not math.isclose(
+                    following_keyframe_hz,
+                    keyframe_hz,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise RuntimeError(
+                    "rule cursor changed stages or reference contract during "
+                    "finite custom-action expansion"
+                )
+            source_emissions.append(following)
+
+        first_source_time = float(source_emissions[0].action.timestamp)
+        source_times = [
+            float(source_emission.action.timestamp) - first_source_time
+            for source_emission in source_emissions
+        ]
+        source_indices = list(range(len(source_emissions)))
+        self._install_pose_reference_queue(
+            source_emissions,
+            source_times=source_times,
+            source_indices=source_indices,
+            keyframe_hz=keyframe_hz,
+            reference_hz=reference_hz,
+            source_kind="custom_action",
+            now=float(now),
+        )
+
+    def _install_pose_reference_queue(
+        self,
+        source_emissions: list[RuleBasedCollectionEmission],
+        *,
+        source_times: list[float],
+        source_indices: list[int],
+        keyframe_hz: float,
+        reference_hz: float,
+        source_kind: str,
+        now: float,
+    ) -> None:
+        """Build the shared reference queue without duplicating cursor ownership."""
+
+        if source_kind not in {"replay", "custom_action"}:
+            raise ValueError(
+                f"unsupported pose reference source kind: {source_kind!r}"
+            )
+        if (
+            not source_emissions
+            or len(source_times) != len(source_emissions)
+            or len(source_indices) != len(source_emissions)
+        ):
+            raise ValueError(
+                "pose reference source arrays must be non-empty and aligned"
+            )
+        source_time_array = np.asarray(source_times, dtype=float)
+        if (
+            not np.all(np.isfinite(source_time_array))
+            or not math.isclose(float(source_time_array[0]), 0.0, abs_tol=1e-9)
+            or (
+                len(source_time_array) > 1
+                and np.any(np.diff(source_time_array) <= 0.0)
+            )
+        ):
+            raise ValueError(
+                "pose reference source timestamps must start at zero and increase"
+            )
+
         resolver = self.adapter.resolver
         if not isinstance(resolver, RealTeleopPoseFrameActionResolver):
             raise RuntimeError("rule pose-frame resolver was replaced")
-        first_source_time = float(group.relative_time_sec(first_frame_index))
         projected_actions: list[RobotAction] = []
         targets: list[TimestampedMotionTarget] = []
         for local_index, source_emission in enumerate(source_emissions):
-            source_emission = self._project_writing_replay_height(source_emission)
-            source_directive = source_emission.directive
-            source_frame_index = int(source_directive.replay_frame_index or 0)
             projected = resolver.project_action(source_emission.action)
             projected_actions.append(projected)
             targets.append(
                 TimestampedMotionTarget(
-                    timestamp=(
-                        float(group.relative_time_sec(source_frame_index))
-                        - first_source_time
-                    ),
-                    available_timestamp=(
-                        float(group.relative_time_sec(source_frame_index))
-                        - first_source_time
-                    ),
+                    timestamp=float(source_time_array[local_index]),
+                    available_timestamp=float(source_time_array[local_index]),
                     source_index=local_index,
                     pose_by_side=projected.arm_pose_by_side,
                     metadata={
-                        "rule_based_source_frame_index": source_frame_index,
+                        "rule_based_source_frame_index": int(
+                            source_indices[local_index]
+                        ),
                         "rule_based_source_sequence_index": int(
-                            source_directive.sequence_index
+                            source_emission.directive.sequence_index
                         ),
                     },
                 )
@@ -3083,11 +3796,12 @@ class RuleBasedRealTeleopExtension:
             captures_source_frame = source_local_index not in captured_source_indices
             if captures_source_frame:
                 captured_source_indices.add(source_local_index)
-            # Every 60 Hz reference in a recordable source interval remains
-            # eligible for the independent 15 Hz sampler.  The former code
-            # exposed only the exact source keyframe and then held motion until
-            # its asynchronous writer ACK arrived.  That made camera/writer
-            # latency an accidental motion clock and produced 20 Hz bursts.
+            # Every dense reference in a recordable source interval remains
+            # eligible for the independent source-cadence sampler.  The
+            # former code exposed only the exact source keyframe and then
+            # held motion until its asynchronous writer ACK arrived.  That
+            # made camera/writer latency an accidental motion clock and
+            # produced 20 Hz bursts.
             # Directive sequence de-duplication still commits at most one
             # formal sample per source interval.
             reference_directive = (
@@ -3105,8 +3819,6 @@ class RuleBasedRealTeleopExtension:
                 if reference_index + 1 < len(reference_timestamps)
                 else float(reference_timestamp) + 1.0 / reference_hz
             )
-            right_parent = source_emissions[right_source_local_index]
-            right_frame_index = int(right_parent.directive.replay_frame_index or 0)
             queue.append(
                 _ReplayReferenceCarrier(
                     resampler=resampler,
@@ -3116,17 +3828,23 @@ class RuleBasedRealTeleopExtension:
                     projected_parent=projected_parent,
                     directive=reference_directive,
                     next_offset_sec=next_offset,
-                    right_parent_frame_index=right_frame_index,
+                    left_parent_source_index=int(
+                        source_indices[source_local_index]
+                    ),
+                    right_parent_source_index=int(
+                        source_indices[right_source_local_index]
+                    ),
                     captures_source_frame=captures_source_frame,
                     keyframe_hz=keyframe_hz,
                     reference_hz=reference_hz,
+                    source_kind=str(source_kind),
                 )
             )
 
         if captured_source_indices != set(range(len(source_emissions))):
             missing = sorted(set(range(len(source_emissions))) - captured_source_indices)
             raise RuntimeError(
-                "60 Hz replay clock skipped source frames; increase reference_hz: "
+                "pose reference clock skipped source frames; increase reference_hz: "
                 f"missing_local_indices={missing}"
             )
         self._replay_reference_queue = deque(queue)
@@ -3199,7 +3917,7 @@ class RuleBasedRealTeleopExtension:
         )
         parent = carrier.parent
         projected_parent = carrier.projected_parent
-        parent_frame_index = int(parent.directive.replay_frame_index or 0)
+        parent_source_index = int(carrier.left_parent_source_index)
         pose_vectors: dict[str, np.ndarray] = {}
         for side, pose in reference.pose_by_side.items():
             xyzquat = pose_matrix_to_xyzquat(pose)
@@ -3219,9 +3937,10 @@ class RuleBasedRealTeleopExtension:
             "rule_based_reference_captures_source_frame": bool(
                 carrier.captures_source_frame
             ),
-            "rule_based_reference_left_source_frame_index": parent_frame_index,
+            "rule_based_reference_source_kind": carrier.source_kind,
+            "rule_based_reference_left_source_frame_index": parent_source_index,
             "rule_based_reference_right_source_frame_index": (
-                carrier.right_parent_frame_index
+                carrier.right_parent_source_index
             ),
             "rule_based_parent_source_action_timestamp": parent.action.timestamp,
             "position_pipeline": (
@@ -3231,8 +3950,8 @@ class RuleBasedRealTeleopExtension:
             "position_keyframe_hz": carrier.keyframe_hz,
             "position_reference_hz": carrier.reference_hz,
             "position_reference_sequence": int(reference.sequence),
-            "left_source_index": parent_frame_index,
-            "right_source_index": carrier.right_parent_frame_index,
+            "left_source_index": parent_source_index,
+            "right_source_index": carrier.right_parent_source_index,
             "left_source_timestamp": float(reference.left_source_timestamp),
             "right_source_timestamp": float(reference.right_source_timestamp),
             "interpolation_alpha": float(reference.interpolation_alpha),
@@ -3252,7 +3971,11 @@ class RuleBasedRealTeleopExtension:
                 projected_parent.end_effector_targets_by_side
             ),
             active_effectors=projected_parent.active_effectors,
-            source="rule_based_replay_position_reference",
+            source=(
+                "rule_based_replay_position_reference"
+                if carrier.source_kind == "replay"
+                else "rule_based_custom_action_position_reference"
+            ),
             metadata=reference_metadata,
         )
         return RuleBasedCollectionEmission(
@@ -3580,6 +4303,16 @@ class RuleBasedRealTeleopExtension:
         planner = self._initial_alignment_planner
         if planner is None:
             raise RuntimeError("initial-alignment planner is not attached.")
+        if self._closed:
+            # ``close_before_session`` owns executor shutdown.  A late owner
+            # loop callback must not turn that normal lifecycle edge into
+            # ``cannot schedule new futures after shutdown`` and crash the
+            # GUI; it is a terminal, fail-closed runtime state instead.
+            self._aborted = True
+            self._armed = False
+            self._waiting_reason = "runtime_closed"
+            self._clear_current()
+            return
         if self._initial_alignment_future is not None:
             raise RuntimeError("initial-alignment planning is already active.")
         if self._initial_alignment_template is not None:
@@ -3622,16 +4355,47 @@ class RuleBasedRealTeleopExtension:
                     f"initial alignment requires finite causal {side} gripper state."
                 )
             hand_start[side] = actual.astype(np.float32, copy=True)
+        if (
+            str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+            and "right" in hand_target
+            and not self._writing_right_gripper_hold_admitted(
+                target=hand_target["right"],
+                snapshots=snapshots,
+            )
+        ):
+            raise RuleBasedInitialAlignmentPlanningError(
+                "rule writing requires a feedback-gated right-gripper close "
+                "before initial alignment"
+            )
         self._initial_alignment_template = emission
         self._initial_alignment_hand_start_by_side = hand_start
         self._initial_alignment_hand_target_by_side = hand_target
         self._initial_alignment_planning_started_at = float(now)
         self._waiting_reason = "initial_alignment_planning"
-        self._initial_alignment_future = self._initial_alignment_executor.submit(
-            planner.plan,
-            start_qpos_by_side=start,
-            target_qpos_by_side=target,
-        )
+        try:
+            self._initial_alignment_future = self._initial_alignment_executor.submit(
+                planner.plan,
+                start_qpos_by_side=start,
+                target_qpos_by_side=target,
+            )
+        except RuntimeError as exc:
+            # Shutdown can race one final callback during Session teardown.
+            # Preserve Hold/fail-closed semantics while keeping the GUI owner
+            # loop alive long enough to publish the actionable terminal state.
+            self._cancel_initial_alignment_planning()
+            self._aborted = True
+            self._armed = False
+            self._waiting_reason = "initial_alignment_executor_unavailable"
+            message = (
+                "规则初始化规划器已关闭，未派发机械臂命令；"
+                f"{type(exc).__name__}: {exc}"
+            )
+            self._establish_hold(message)
+            self._request_failure_stop()
+            append_message = getattr(self._control_ui, "append_message", None)
+            if callable(append_message):
+                append_message("RuleBased", message)
 
     def _prepare_initial_alignment_waypoint(
         self,
@@ -4796,6 +5560,95 @@ class RuleBasedRealTeleopExtension:
         self._deferred_progress_arm_fix_established = True
         self._waiting_reason = "progress_entry_arm_fix_established"
 
+    def _writing_right_gripper_force_stop_reached(
+        self,
+        *,
+        side: str,
+        target: np.ndarray,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        """Accept the feedback-gated pen contact stop as a closed target."""
+
+        if (
+            side != "right"
+            or str(self.source_selection.get("collection_mode") or "")
+            != "rule_based_writing"
+            or target.shape != (6,)
+        ):
+            return False
+        dim = int(self._hand_command_dim_by_side.get("right", 0))
+        max_action = float(self._hand_max_action_by_side.get("right", 1.0))
+        if abs(float(target[dim]) - max_action) > float(
+            self.config.manual_gripper_endpoint_tolerance
+        ):
+            return False
+        state = snapshots.get("right", {}).get("hand_state")
+        if not isinstance(state, Mapping):
+            return False
+        raw_status = state.get("gripper_status_code", state.get("status_code"))
+        raw_error = state.get("gripper_error_code", state.get("error_code"))
+        try:
+            status_code = int(raw_status)
+            error_code = 0 if raw_error is None else int(raw_error)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            status_code == 6
+            and error_code == 0
+            and not bool(state.get("gripper_is_moving"))
+        )
+
+    def _writing_right_gripper_hold_admitted(
+        self,
+        *,
+        target: np.ndarray,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        """Require a stable close/contact receipt before any writing arm move."""
+
+        expected = np.asarray(target, dtype=float).reshape(-1)
+        actual = np.asarray(
+            snapshots.get("right", {}).get("actual_hand_qpos"),
+            dtype=float,
+        ).reshape(-1)
+        if (
+            expected.shape != (6,)
+            or actual.shape != (6,)
+            or not np.all(np.isfinite(expected))
+            or not np.all(np.isfinite(actual))
+        ):
+            return False
+        if self._writing_right_gripper_force_stop_reached(
+            side="right",
+            target=expected,
+            snapshots=snapshots,
+        ):
+            return True
+        dim = int(self._hand_command_dim_by_side.get("right", 0))
+        max_action = float(self._hand_max_action_by_side.get("right", 1.0))
+        if (
+            abs(float(expected[dim]) - max_action)
+            > float(self.config.manual_gripper_endpoint_tolerance)
+            or abs(float(actual[dim]) - max_action)
+            > float(self.config.manual_gripper_endpoint_tolerance)
+        ):
+            return False
+        state = snapshots.get("right", {}).get("hand_state")
+        if not isinstance(state, Mapping):
+            return False
+        raw_status = state.get("gripper_status_code", state.get("status_code"))
+        raw_error = state.get("gripper_error_code", state.get("error_code"))
+        try:
+            status_code = None if raw_status is None else int(raw_status)
+            error_code = 0 if raw_error is None else int(raw_error)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            error_code == 0
+            and status_code not in {4, 5}
+            and not bool(state.get("gripper_is_moving"))
+        )
+
     def _target_reached(
         self,
         emission: RuleBasedCollectionEmission,
@@ -4835,6 +5688,10 @@ class RuleBasedRealTeleopExtension:
                     return False
                 if float(np.max(np.abs(actual - target))) > float(
                     self.config.gripper_qpos_tolerance
+                ) and not self._writing_right_gripper_force_stop_reached(
+                    side=side,
+                    target=target,
+                    snapshots=snapshots,
                 ):
                     return False
             return True
@@ -4907,7 +5764,14 @@ class RuleBasedRealTeleopExtension:
                 return False
             if not np.all(np.isfinite(target)) or not np.all(np.isfinite(actual)):
                 return False
-            if float(np.max(np.abs(actual - target))) > hand_tolerance:
+            if (
+                float(np.max(np.abs(actual - target))) > hand_tolerance
+                and not self._writing_right_gripper_force_stop_reached(
+                    side=side,
+                    target=target,
+                    snapshots=snapshots,
+                )
+            ):
                 return False
         return True
 
@@ -5500,6 +6364,12 @@ class RuleBasedRealTeleopExtension:
         self._reset_pose_action_motion_intent("runtime_hold")
         if self._held or self._components is None:
             return
+        append_message = getattr(self._control_ui, "append_message", None)
+        if callable(append_message):
+            append_message(
+                "RuleBased",
+                "规则运行时因以下原因请求 Hold：" + str(reason),
+            )
         request_hold = getattr(self._clutch_input, "request_hold", None)
         if callable(request_hold):
             request_hold(reason="rule_based_runtime_hold")
@@ -5507,7 +6377,6 @@ class RuleBasedRealTeleopExtension:
         try:
             self._components.session.hold_hardware(str(reason))
         except Exception as exc:  # noqa: BLE001 - queued owner-loop Hold remains authoritative.
-            append_message = getattr(self._control_ui, "append_message", None)
             if callable(append_message):
                 append_message(
                     "RuleBased",
@@ -5522,6 +6391,12 @@ class RuleBasedRealTeleopExtension:
         terminal_error: BaseException | None,
     ) -> None:
         del terminal_error
+        if self._closed:
+            return
+        # Stop every admission predicate before waiting on lower resources.
+        # A concurrent late GUI poll then rejects work instead of submitting
+        # into an executor while shutdown is in progress.
+        self._closed = True
         if components is self._components and self._started:
             self._establish_hold("rule-based runtime closing")
         self._cancel_initial_alignment_planning()
@@ -5530,7 +6405,6 @@ class RuleBasedRealTeleopExtension:
         # rather than racing hardware/session cleanup against its worker.
         self._initial_alignment_executor.shutdown(wait=True, cancel_futures=True)
         self._configuration_executor.shutdown(wait=True, cancel_futures=True)
-        self._closed = True
 
     def _publish_status(
         self,
@@ -5575,6 +6449,9 @@ class RuleBasedRealTeleopExtension:
             self._stage_index,
             self._stage_frame_total,
             self._pending_gripper_action,
+            self._gripper_action_id,
+            self._gripper_action_intent,
+            self._gripper_action_result,
             self._gripper_action_status,
             self._configuration_future is not None,
             self._configuration_error,
@@ -5602,6 +6479,45 @@ class RuleBasedRealTeleopExtension:
         publish(status)
         self._last_status_publish_at = now
         self._last_status_publish_urgent_signature = urgent_signature
+
+    def _rule_pre_dispatch_session_blocker_is_expected(
+        self,
+        *,
+        session_state_value: str,
+        key: str,
+        detail: str,
+    ) -> bool:
+        """Classify the one expected pre-first-command Session diagnostic.
+
+        A dedicated rule start intentionally opens the formal writer before
+        the first arm command: the first command is produced by the rule
+        initial-alignment plan.  The generic Rig report may still describe
+        that ARMED/no-dispatch interval as missing arm admission.  Only this
+        exact, command-inert interval is filtered; hand/backend faults and
+        every non-ARMED Session state remain blocking.
+        """
+
+        if (
+            str(key) != "rig.session"
+            or str(session_state_value).upper() not in {"ARMED", "RUNNING"}
+            or not self._armed
+            or self._execution_begun
+            or self._completed
+            or self._aborted
+            or self._held
+        ):
+            return False
+        normalized = " ".join(str(detail or "").lower().split())
+        return bool(
+            "runtime home" in normalized
+            and "hardware arm admission" in normalized
+            and (
+                "no command" in normalized
+                or "not dispatched" in normalized
+                or "dispatch" in normalized
+                or "before rule collection" in normalized
+            )
+        )
 
     def _session_readiness_diagnosis(
         self,
@@ -5658,6 +6574,13 @@ class RuleBasedRealTeleopExtension:
                 report = candidate
 
         blockers = readiness_report_blockers(report or {})
+        for key, detail in tuple(blockers.items()):
+            if self._rule_pre_dispatch_session_blocker_is_expected(
+                session_state_value=session_state_value,
+                key=key,
+                detail=detail,
+            ):
+                blockers.pop(key, None)
         reported_blockers = set(blockers)
 
         # The rule plan's replay may contain a configured hand effector even
@@ -5774,6 +6697,19 @@ class RuleBasedRealTeleopExtension:
                 for part in (readiness_reason, self._progress_scope_admission_error)
                 if part
             )
+        hold_owner_ready, hold_owner_detail = self._right_gripper_hold_owner_ready()
+        if not hold_owner_ready:
+            readiness_blockers = dict(readiness_blockers)
+            readiness_blockers.setdefault(
+                "rule.right_hand_hold_owner",
+                hold_owner_detail
+                or "右夹爪尚未建立书写用的一次性闭合 owner。",
+            )
+            readiness_reason = "; ".join(
+                part
+                for part in (readiness_reason, hold_owner_detail)
+                if part
+            )
         gripper_backends_ready = True
         for side in self.config.gripper_sides:
             backend = getattr(self._components, f"{side}_hand_backend", None)
@@ -5787,9 +6723,14 @@ class RuleBasedRealTeleopExtension:
         # gate.  RUNNING is valid only in the inter-Episode state produced by
         # the successful reset above; an active/finalizing writer remains a
         # hard blocker.
+        hardware_readiness_blockers = {
+            key: value
+            for key, value in readiness_blockers.items()
+            if key != "rule.right_hand_hold_owner"
+        }
         gripper_control_available = bool(
             gripper_backends_ready
-            and not readiness_blockers
+            and not hardware_readiness_blockers
             and self._manual_gripper_lifecycle_available(
                 session_state_value=session_state_value,
             )
@@ -5818,12 +6759,17 @@ class RuleBasedRealTeleopExtension:
             and not gripper_action_pending
             and not fixed_sides
             and not readiness_blockers
+            and hold_owner_ready
         )
         height_mutation_idle = self._height_calibration_mutation_idle()
         height_calibration_available = bool(
             height_mutation_idle
             and session_state_value in {"ARMED", "RUNNING"}
-            and not readiness_blockers
+            # The rule-start-only hold-owner receipt must not disable the
+            # command-inert height step before the task chain has performed
+            # its explicit right-gripper close.  Transport/session faults do
+            # remain hard blockers through this filtered view.
+            and not hardware_readiness_blockers
         )
         calibration = self._height_calibration
         waiting_reason = self._waiting_reason
@@ -5835,7 +6781,10 @@ class RuleBasedRealTeleopExtension:
             and not self._completed
             and not self._aborted
         ):
-            waiting_reason = "session_readiness_failure"
+            if set(readiness_blockers) == {"rule.right_hand_hold_owner"}:
+                waiting_reason = "right_gripper_hold_owner_pending"
+            else:
+                waiting_reason = "session_readiness_failure"
         side_labels = {"left": "左夹爪", "right": "右夹爪"}
         topology = (
             "双臂（无夹爪）"
@@ -5879,6 +6828,9 @@ class RuleBasedRealTeleopExtension:
             control_topology=topology,
             gripper_control_available=gripper_control_available,
             gripper_action_pending=gripper_action_pending,
+            gripper_action_id=self._gripper_action_id,
+            gripper_action_intent=str(self._gripper_action_intent),
+            gripper_action_result=str(self._gripper_action_result),
             rule_start_available=rule_start_available,
             gripper_action_status=str(self._gripper_action_status),
             rule_configuration=copy.deepcopy(self._selected_configuration),

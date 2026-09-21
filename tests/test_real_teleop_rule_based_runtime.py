@@ -249,6 +249,7 @@ class _HandBackend:
         self.config = SimpleNamespace(command_dim=0, max_action=1.0)
         self.measured_joint_pos = np.zeros(6, dtype=np.float32)
         self.joint_age_sec = 0.0
+        self.fixed_closed_one_shot_owner = True
 
     @staticmethod
     def send_command(_values) -> None:
@@ -268,6 +269,9 @@ class _HandBackend:
     @staticmethod
     def is_ready() -> bool:
         return True
+
+    def fixed_closed_one_shot_ready(self) -> bool:
+        return bool(self.fixed_closed_one_shot_owner)
 
 
 class _HandPoller:
@@ -834,6 +838,140 @@ def test_rule_start_allows_only_pre_episode_armed_warmup_without_motion() -> Non
 
     extension._held = True
     assert not runtime_extension_allows_pre_episode_armed_warmup(extension)
+
+
+def test_rule_start_waits_for_right_one_shot_grip_owner_without_disabling_release() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedInitialize(step_id="init", group_key="source"),
+            )
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, _ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+    extension._components.right_hand_backend.fixed_closed_one_shot_ready = (
+        lambda: False
+    )
+
+    status = extension.status()
+    assert status.rule_start_available is False
+    assert status.gripper_control_available is True
+    assert status.readiness_blockers["rule.right_hand_hold_owner"]
+    assert extension.allows_pre_episode_armed_warmup() is False
+    assert session.external_commands == []
+
+
+def test_rule_runtime_exposes_configured_hand_fault_before_writer_open() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6),
+                        right_arm=np.zeros(6),
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, _ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    class _UnreadyHandBackend(_HandBackend):
+        @staticmethod
+        def is_ready() -> bool:
+            return False
+
+        @staticmethod
+        def readiness_report() -> dict[str, object]:
+            return {"ready": False, "reason": "DMTAC fault"}
+
+    extension._components.right_hand_backend = _UnreadyHandBackend()
+    blockers = extension.collection_startup_blockers()
+
+    assert blockers == {"right_hand": "right_hand DMTAC fault"}
+    assert session.state_machine.state.value == "ARMED"
+
+
+def test_pre_dispatch_hand_fault_cancels_armed_attempt_instead_of_stranding_countdown() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6),
+                        right_arm=np.zeros(6),
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+    session, clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=True,
+        hand_sides=("right",),
+    )
+    session.rig = SimpleNamespace(
+        readiness_report=lambda: {
+            "ready": False,
+            "reason": "unready backends: right_hand",
+            "backends": {
+                "right_hand": {
+                    "ready": False,
+                    "reason": "telemetry_failed: Write timeout",
+                }
+            },
+        }
+    )
+    right_backend = extension._components.right_hand_backend
+    right_backend.is_ready = lambda: False
+    right_backend.readiness_report = lambda: {
+        "ready": False,
+        "reason": "telemetry_failed: Write timeout",
+    }
+
+    extension.after_control_input_poll(now=1.0)
+
+    status = extension.status()
+    assert status.armed is False
+    assert status.aborted is True
+    assert status.held is True
+    assert status.waiting_reason == "session_readiness_failure"
+    assert session.hold_reasons
+    assert clutch.reasons == ["rule_based_runtime_hold"]
+    assert ui.failure_stop_requests == 1
+    assert any("Write timeout" in message for _tag, message in ui.messages)
+    assert any(
+        tag == "RuleBased"
+        and "规则运行时因以下原因请求 Hold" in message
+        and "Write timeout" in message
+        for tag, message in ui.messages
+    )
 
 
 def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> None:
@@ -2351,6 +2489,405 @@ def test_manual_dual_gripper_buttons_use_typed_non_recorded_dispatch_and_lock_af
     assert "没有活动 Episode" in extension.status().gripper_action_status
 
 
+def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("left", "right")),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("left", "right"),
+    )
+    backends = {
+        side: getattr(extension._components, f"{side}_hand_backend")
+        for side in ("left", "right")
+    }
+    for backend in backends.values():
+        backend.set_measured_scalar(0.5)
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    now = 10.0
+    while extension._pending_gripper_action is not None:
+        command_count = len(session.external_commands)
+        session.command_override_provider(SimpleNamespace(), now)
+        if len(session.external_commands) > command_count:
+            close = session.external_commands[-1]
+            assert set(close.commands) == {"right_hand"}
+            assert close.metadata["rule_based_manual_gripper_sides"] == ["right"]
+            command = close.commands["right_hand"]
+            # Admission closes in one-shot mode so a real idle/force-stop
+            # receipt is required. Writing retains this same fixed mode.
+            assert command.metadata["dmtac_continuous_grasp_override"] is False
+            assert command.metadata["dmtac_preserve_existing_grip"] is False
+            assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
+                "single_endpoint_feedback_gated"
+            )
+            assert command.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_close"
+            )
+            assert float(command.value[0]) == pytest.approx(1.0)
+            backends["right"].set_measured_scalar(float(command.value[0]))
+            assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
+        now += 0.05
+        assert now < 20.0
+
+    assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
+    assert float(backends["right"].measured_joint_pos[0]) == pytest.approx(1.0)
+    assert len(session.external_commands) == 1
+    assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+    assert extension.status().gripper_action_intent == "close_right_gripper"
+    assert extension.status().gripper_action_result == "succeeded"
+    assert extension.status().gripper_action_id == 1
+
+
+def test_task_chain_release_right_gripper_preserves_left_hand() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("left", "right")),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("left", "right"),
+    )
+    left = extension._components.left_hand_backend
+    right = extension._components.right_hand_backend
+    left.set_measured_scalar(0.5)
+    right.set_measured_scalar(0.5)
+
+    ui.intents.append("release_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    now = 10.0
+    while extension._pending_gripper_action is not None:
+        command_count = len(session.external_commands)
+        session.command_override_provider(SimpleNamespace(), now)
+        if len(session.external_commands) > command_count:
+            release = session.external_commands[-1]
+            assert set(release.commands) == {"right_hand"}
+            command = release.commands["right_hand"]
+            assert command.metadata["dmtac_continuous_grasp_override"] is False
+            assert command.metadata["dmtac_preserve_existing_grip"] is False
+            assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
+                "single_endpoint_feedback_gated"
+            )
+            assert command.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_open"
+            )
+            assert release.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_open"
+            )
+            assert float(command.value[0]) == pytest.approx(0.0)
+            right.set_measured_scalar(float(command.value[0]))
+        now += 0.05
+        assert now < 20.0
+
+    assert float(left.measured_joint_pos[0]) == pytest.approx(0.5)
+    assert float(right.measured_joint_pos[0]) == pytest.approx(0.0)
+    assert len(session.external_commands) == 1
+    status = extension.status()
+    assert status.gripper_action_status == "右夹爪实测已松开"
+    assert status.gripper_action_intent == "release_right_gripper"
+    assert status.gripper_action_result == "succeeded"
+
+
+def test_task_chain_close_right_waits_for_idle_after_closed_endpoint() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+
+    class _AlreadyClosedCatchPoller:
+        def __init__(self) -> None:
+            self.status_code = 4
+            self.is_moving = True
+            self.timestamp = 9.0
+
+        def latest_at_or_before(self, _now):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = 1.0
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": self.is_moving,
+                }
+            }
+
+    hand_poller = _AlreadyClosedCatchPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+    command = session.external_commands[-1]
+    assert set(command.commands) == {"right_hand"}
+    assert float(command.commands["right_hand"].value[0]) == pytest.approx(1.0)
+    assert command.commands["right_hand"].metadata[
+        "dmtac_continuous_grasp_override"
+    ] is False
+
+    # Position=1 is not a completion receipt while firmware still reports
+    # closing/catching. The one-shot transition must reach a stable idle
+    # status before the task chain can enter height calibration.
+    hand_poller.timestamp = 10.1
+    for now in (10.1, 10.2):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_right_gripper"
+        hand_poller.timestamp += 0.1
+    assert "闭合运动" in extension.status().gripper_action_status
+
+    hand_poller.status_code = 2
+    hand_poller.is_moving = False
+    for now in (10.3, 10.4):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_right_gripper"
+        hand_poller.timestamp += 0.1
+    session.command_override_provider(SimpleNamespace(), 10.5)
+    assert extension._pending_gripper_action is None
+    assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+
+
+def test_writing_keeps_right_gripper_in_fixed_one_shot_mode() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    action = SimpleNamespace(
+        timestamp=1.0,
+        metadata={"collection_detail_stage_id": "right_write.pen_up"},
+    )
+    command = TeleopCommand(
+        commands={
+            "right_hand": EffectorCommand(
+                effector_name="right_hand",
+                side="right",
+                command_type="joint_vector",
+                value=np.full(6, 0.8),
+                metadata={},
+            )
+        },
+        timestamp=1.0,
+        metadata={},
+    )
+    emission = SimpleNamespace(
+        action=action,
+        command=command,
+        directive=SimpleNamespace(segment_terminal=True),
+    )
+
+    extension._prepare_live_dispatch(emission, 2.0)
+
+    hand_command = command.commands["right_hand"]
+    assert np.asarray(hand_command.value, dtype=float) == pytest.approx(
+        np.full(6, 0.8)
+    )
+    assert hand_command.metadata["dmtac_continuous_grasp_override"] is False
+    assert hand_command.metadata["dmtac_preserve_existing_grip"] is True
+    assert command.metadata[
+        "rule_based_right_gripper_hold_mode"
+    ] == "task_chain_fixed_closed_one_shot"
+
+
+def test_nonterminal_writing_frame_uses_same_fixed_one_shot_grip_mode() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    command = TeleopCommand(
+        commands={
+            "right_hand": EffectorCommand(
+                effector_name="right_hand",
+                side="right",
+                command_type="joint_vector",
+                value=np.full(6, 0.8),
+                metadata={},
+            )
+        },
+        timestamp=1.0,
+        metadata={"collection_detail_stage_id": "right_write.pen_up"},
+    )
+    emission = SimpleNamespace(
+        action=SimpleNamespace(timestamp=1.0, metadata={}),
+        command=command,
+        directive=SimpleNamespace(segment_terminal=False),
+    )
+
+    extension._prepare_live_dispatch(emission, 2.0)
+
+    assert command.commands["right_hand"].metadata[
+        "dmtac_continuous_grasp_override"
+    ] is False
+    assert command.commands["right_hand"].metadata[
+        "dmtac_preserve_existing_grip"
+    ] is True
+    assert command.metadata["rule_based_right_gripper_hold_mode"] == (
+        "task_chain_fixed_closed_one_shot"
+    )
+
+
+def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    recorder = _Recorder(_Poller())
+
+    class _ForceStoppedPoller:
+        def __init__(self) -> None:
+            self.value = 0.5
+            self.timestamp = 9.0
+            self.status_code = 2
+
+        def latest_at_or_before(self, _now):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = self.value
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": False,
+                }
+            }
+
+    hand_poller = _ForceStoppedPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+
+    # Contact/force stop can occur before normalized position reaches 1.0.
+    # It is accepted only after a causal command and distinct stable frames.
+    hand_poller.value = 0.53
+    # Closed-side idle without endpoint/contact evidence is ambiguous: it can
+    # be a stall and must not be promoted to a successful grasp.
+    hand_poller.status_code = 2
+    hand_poller.timestamp = 10.1
+    session.command_override_provider(SimpleNamespace(), 10.1)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+
+    hand_poller.status_code = 6
+    for timestamp, now in ((10.1, 10.1), (10.2, 10.2)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_right_gripper"
+    hand_poller.timestamp = 10.3
+    session.command_override_provider(SimpleNamespace(), 10.3)
+
+    status = extension.status()
+    assert extension._pending_gripper_action is None
+    assert len(session.external_commands) == 1
+    assert status.gripper_action_status == "右夹爪实测已闭紧"
+    assert status.gripper_action_result == "succeeded"
+
+    nominal = np.zeros(6, dtype=np.float32)
+    nominal[0] = 1.0
+    assert extension._writing_right_gripper_force_stop_reached(
+        side="right",
+        target=nominal,
+        snapshots={
+            "right": {
+                "hand_state": {
+                    "gripper_status_code": 6,
+                    "gripper_error_code": 0,
+                    "gripper_is_moving": False,
+                },
+            }
+        },
+    )
+    assert extension._writing_right_gripper_hold_admitted(
+        target=nominal,
+        snapshots={
+            "right": {
+                "actual_hand_qpos": np.asarray(
+                    [0.53, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    dtype=np.float32,
+                ),
+                "hand_state": {
+                    "gripper_status_code": 6,
+                    "gripper_error_code": 0,
+                    "gripper_is_moving": False,
+                },
+            }
+        },
+    )
+
+
 def test_manual_gripper_reset_uses_recorder_hand_history_without_backend_read() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -2656,7 +3193,88 @@ def test_manual_gripper_close_requires_strict_endpoint_and_sends_final_target() 
     assert command.metadata["dmtac_continuous_grasp_override"] is True
 
     backend.set_measured_scalar(1.0)
+    for now in (10.1, 10.2):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    session.command_override_provider(SimpleNamespace(), 10.3)
+    assert extension._pending_gripper_action is None
+    assert extension.status().gripper_action_status == "夹爪实测已闭紧"
+
+
+def test_manual_gripper_endpoint_waits_for_post_command_fresh_frames() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+
+    class TimestampedHandPoller:
+        def __init__(self) -> None:
+            self.value = 0.981
+            self.timestamp = 9.0
+            self.status_code = 2
+            self.is_moving = False
+
+        def latest_at_or_before(self, _now, **_kwargs):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = self.value
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": self.is_moving,
+                }
+            }
+
+    hand_poller = TimestampedHandPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_grippers")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+
+    hand_poller.value = 1.0
+    hand_poller.timestamp = 10.0  # The pre-dispatch cached frame is rejected.
     session.command_override_provider(SimpleNamespace(), 10.1)
+    assert extension._pending_gripper_action == "close_grippers"
+    assert "新鲜反馈" in extension.status().gripper_action_status
+
+    hand_poller.status_code = 4
+    hand_poller.is_moving = True
+    for timestamp, now in ((10.1, 10.2), (10.2, 10.3)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    assert "闭合运动" in extension.status().gripper_action_status
+
+    # Position=1 with status 4 is still the user's observed failure mode:
+    # the gripper is closing, not settled.  Only an idle closed status may
+    # contribute endpoint samples.
+    hand_poller.status_code = 2
+    hand_poller.is_moving = False
+    for timestamp, now in ((10.3, 10.4), (10.4, 10.5)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    hand_poller.timestamp = 10.5
+    session.command_override_provider(SimpleNamespace(), 10.6)
     assert extension._pending_gripper_action is None
     assert extension.status().gripper_action_status == "夹爪实测已闭紧"
 
@@ -2773,6 +3391,10 @@ def test_manual_gripper_close_then_release_recovers_from_real_backend_rate_limit
 
     def run_until_complete(*, deadline: float) -> None:
         while extension._pending_gripper_action is not None:
+            # With telemetry disabled this fixture has to advance the same
+            # hardware timestamp that production HandStateHistoryPoller
+            # advances after each fresh register read.
+            backend._latest_joint_timestamp = clock.now
             session.command_override_provider(SimpleNamespace(), clock.now)
             clock.now += 0.01
             assert clock.now < deadline
@@ -2916,6 +3538,42 @@ def test_prestart_configuration_rebuild_updates_numeric_alignment_speed_off_loop
     assert extension._height_calibration is calibration
     assert ui.configuration_results[-1] == {"selected": request, "error": None}
     assert commits == [(request, replacement)]
+
+
+def test_prestart_configuration_rejects_closed_executor_without_loop_crash() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={},
+    )
+    extension.configure_prestart_rebuild(
+        options={"fixture": True},
+        selected={"fixture": "old"},
+        rebuilder=lambda _request: extension,
+    )
+    recorder = _Recorder(_Poller())
+    _session, _clutch, ui = _bind(extension, recorder, arm=False)
+    extension._configuration_executor.shutdown(wait=True, cancel_futures=True)
+    ui.configuration_requests.append({"fixture": "new"})
+
+    extension.after_control_input_poll(now=1.0)
+
+    status = extension.status()
+    assert status.configuration_pending is False
+    assert status.waiting_reason == "configuration_rejected"
+    assert "cannot schedule new futures after shutdown" in status.configuration_error
+    assert ui.configuration_results[-1] == {
+        "selected": None,
+        "error": status.configuration_error,
+    }
 
 
 def test_prestart_configuration_completes_while_rig_fault_blocks_runtime_home() -> None:
@@ -3310,6 +3968,15 @@ def test_successful_attempt_waits_for_finalize_then_releases_rule_fix_without_ho
     assert controller.fixed_sides == ()
     assert controller.calls == [(4.1, "rule-based Episode completed", False)]
     assert clutch.reasons == []
+
+    # The shared Session intentionally remains RUNNING between successful
+    # attempts.  A fresh START must still reopen the narrow command-inert
+    # writer bootstrap used before the first rule qref.
+    _ui.request_start()
+    extension.after_control_input_poll(now=4.2)
+    assert extension.status().armed is True
+    assert extension.status().execution_begun is False
+    assert extension.allows_pre_episode_armed_warmup() is True
 
 
 def test_successful_attempt_opens_inter_episode_gripper_maintenance_window() -> None:
@@ -4636,6 +5303,148 @@ def test_replay_uses_source_duration_with_dense_60hz_coupled_references() -> Non
         item.metadata["rule_based_sequence_index"]
         for item in references
     } == {0, 1}
+
+
+def test_opted_in_custom_segment_uses_dense_reference_clock_and_source_capture_ids() -> None:
+    source_actions = iter(
+        (
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                timestamp=0.0,
+                arm_pose_by_side={
+                    "left": _pose(0.0),
+                    "right": _pose(0.0),
+                },
+                frame_by_effector={
+                    "left_arm": "canonical_desk",
+                    "right_arm": "canonical_desk",
+                },
+                controlled_frame_by_effector={
+                    "left_arm": "tool_tcp",
+                    "right_arm": "tool_tcp",
+                },
+                source="writing_keyframe",
+                metadata={
+                    "rule_based_position_reference_resample": True,
+                    "rule_based_position_keyframe_hz": 15.0,
+                },
+            ),
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                timestamp=1.0 / 15.0,
+                arm_pose_by_side={
+                    "left": _pose(0.0),
+                    "right": _pose(0.02),
+                },
+                frame_by_effector={
+                    "left_arm": "canonical_desk",
+                    "right_arm": "canonical_desk",
+                },
+                controlled_frame_by_effector={
+                    "left_arm": "tool_tcp",
+                    "right_arm": "tool_tcp",
+                },
+                source="writing_keyframe",
+                metadata={
+                    "rule_based_position_reference_resample": True,
+                    "rule_based_position_keyframe_hz": 15.0,
+                },
+            ),
+        )
+    )
+    source_calls = 0
+
+    def produce(_observation):
+        nonlocal source_calls
+        source_calls += 1
+        return next(source_actions)
+
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedActionSegment(
+                    step_id="right_write.write",
+                    action_source=CallableActionSource(produce),
+                    stop_condition=RuleBasedSegmentStopCondition(max_steps=2),
+                    capture=RuleBasedCaptureSelection(enabled=True),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            action_hz=15.0,
+            position_reference_hz=60.0,
+        ),
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    references = []
+    admitted_sequences = []
+    for index in range(5):
+        now = 3200.0 + index / 60.0 + 1e-6
+        command = session.command_override_provider(SimpleNamespace(), now).command
+        assert command is not None
+        references.append(command)
+        extension.after_session_step(
+            step_result=SimpleNamespace(command_dispatched=True),
+            now=now,
+        )
+        admission = extension.dataset_sample_admission(
+            step_result=SimpleNamespace(command_dispatched=True),
+            now=now,
+        )
+        if admission.allowed:
+            admitted_sequences.append(
+                int(admission.metadata["rule_based_sequence_index"])
+            )
+            extension.after_dataset_sample_attempt(
+                admission=admission,
+                accepted=True,
+                now=now,
+            )
+
+    assert source_calls == 2
+    assert [
+        item.metadata["rule_based_reference_sequence"] for item in references
+    ] == list(range(5))
+    assert references[0].metadata["rule_based_reference_timestamp_sec"] == pytest.approx(
+        0.0
+    )
+    assert references[-1].metadata[
+        "rule_based_reference_timestamp_sec"
+    ] == pytest.approx(1.0 / 15.0)
+    assert all(
+        item.metadata["rule_based_reference_source_kind"] == "custom_action"
+        for item in references
+    )
+    assert all(
+        item.metadata["rule_based_phase"] == "write_rule_base"
+        for item in references
+    )
+    assert all(
+        item.metadata["rule_based_coupled_pose_safety"] for item in references
+    )
+    right_positions = np.stack(
+        [
+            item.metadata["rule_based_target_pose_base_by_side"]["right"][:3, 3]
+            for item in references
+        ]
+    )
+    left_positions = np.stack(
+        [
+            item.metadata["rule_based_target_pose_base_by_side"]["left"][:3, 3]
+            for item in references
+        ]
+    )
+    assert np.max(np.linalg.norm(np.diff(right_positions, axis=0), axis=1)) <= 0.005001
+    assert np.allclose(np.diff(left_positions, axis=0), 0.0)
+    assert {
+        item.metadata["rule_based_sequence_index"] for item in references
+    } == {0, 1}
+    assert admitted_sequences == [0, 1]
 
 
 def test_replay_queue_resolves_only_source_keyframes_and_live_references() -> None:

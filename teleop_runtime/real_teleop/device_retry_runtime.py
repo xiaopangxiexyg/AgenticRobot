@@ -294,6 +294,8 @@ def build_device_retry_runtime(
             return "required_for_collection"
         if key.startswith("dataset."):
             return "required_for_collection"
+        if key == "device.preflight":
+            return "required_for_collection"
         if key == "angle_trigger":
             return (
                 "required_for_collection"
@@ -676,6 +678,7 @@ def build_device_retry_runtime(
                 control_ui.append_message("Device", "当前没有启动失败的可重连设备。")
             _publish_retry_outcome()
             return
+        retry_failures: list[str] = []
         retry_backends = {
             "arm.left.qpos": components.left_state_backend,
             "arm.right.qpos": components.right_state_backend,
@@ -935,6 +938,7 @@ def build_device_retry_runtime(
                     continue
                 elif key in {
                     "dmtac.assignment",
+                    "device.preflight",
                     "camera.config",
                     "angle_trigger",
                 }:
@@ -950,6 +954,7 @@ def build_device_retry_runtime(
             except Exception as exc:  # noqa: BLE001 - keep the failed status visible.
                 detail = f"{type(exc).__name__}: {exc}"
                 startup_device_errors[key] = detail
+                retry_failures.append(f"{key}: {detail}")
                 if key == "dataset.writer":
                     args.dataset_startup_error = detail
                 continue
@@ -978,7 +983,9 @@ def build_device_retry_runtime(
                 if control_ui is not None:
                     control_ui.append_message("Camera", message)
         _invalidate_readiness_cache()
-        _publish_retry_outcome()
+        _publish_retry_outcome(
+            error="；".join(retry_failures) if retry_failures else None,
+        )
 
     return DeviceRetryRuntime(
         hardware_requirement=hardware_requirement,

@@ -266,7 +266,9 @@ class RealTeleopProgressWorkflowPort(Protocol):
 
     def consume_sample_acceptance(
         self,
-        **kwargs: Any,
+        *,
+        available_at: float,
+        receipts: tuple[Any, ...] | None = None,
     ) -> ProgressWorkflowResultView: ...
 
 
