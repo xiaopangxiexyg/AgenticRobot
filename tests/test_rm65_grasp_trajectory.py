@@ -1878,6 +1878,88 @@ def test_straight_ingress_collision_defers_to_global_grasp_target_search(monkeyp
     np.testing.assert_allclose(trajectory.qpos_by_side["right"][-1][0], .1)
 
 
+def test_local_pregrasp_failure_falls_back_to_global_grasp_target_search(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
+    planner.profile.position_profile.ik_execution.joint_velocity_limit_profile = (
+        "test-velocity"
+    )
+    current = {side: np.zeros(6) for side in ("left", "right")}
+
+    class Builder:
+        def solver_world_targets_for_qpos_pair(self, **_kwargs):
+            return {side: np.eye(4) for side in ("left", "right")}
+
+        def solver_world_target_from_tool_tcp_world_target(
+            self, *, tool_tcp_world_target, **_kwargs
+        ):
+            return np.asarray(tool_tcp_world_target, dtype=float)
+
+        def tool_tcp_world_targets_for_qpos_pair(self, *, left_qpos, right_qpos):
+            poses = {side: np.eye(4) for side in ("left", "right")}
+            poses["right"][0, 3] = float(np.asarray(right_qpos)[0])
+            return poses
+
+    planner.target_builder = Builder()
+    planner._require_unmodified_target_envelope = lambda *_args, **_kwargs: None
+    planner._preflight_start_envelope = lambda **_kwargs: None
+    planner._pregrasp_distance_candidates = lambda: (0.02,)
+    planner._revalidate = lambda *_args, **_kwargs: {"sample_count": 2}
+
+    target = np.eye(4)
+    target[0, 3] = .1
+    endpoint_qpos = {side: value.copy() for side, value in current.items()}
+    endpoint_qpos["right"][0] = .1
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=endpoint_qpos,
+        seed_index=0,
+        solve_cycles=1,
+        position_residual_m=0.0,
+        orientation_residual_deg=0.0,
+    )
+    leg = grasp_trajectory_module._PlannedPathLeg(
+        endpoint=endpoint,
+        path=SimpleNamespace(
+            waypoints=(current, endpoint_qpos),
+            metadata={"planning_phase": "grasp_target"},
+            semantic_content_hash="path:test",
+        ),
+        dense_revalidation={},
+        search_attempts=(),
+    )
+    calls = []
+
+    def local_rejection(**_kwargs):
+        raise RM65GraspTrajectoryPlanningError(
+            "ik_search_exhausted",
+            details={"planning_phase": "local_pregrasp_ik"},
+        )
+
+    def global_target_search(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["planning_phase"] == "grasp_target"
+        return leg
+
+    planner._plan_chain_for_pregrasp = local_rejection
+    planner._plan_path_leg = global_target_search
+    monkeypatch.setattr(
+        grasp_trajectory_module,
+        "load_joint_velocity_limit_profiles",
+        lambda: {"test-velocity": SimpleNamespace(max_velocity_deg_s=(30.0,) * 6)},
+    )
+
+    trajectory = planner(
+        qpos_by_side=current,
+        side="right",
+        target_tool_tcp_world=target,
+        speed_scale=.2,
+        monotonic=lambda: 0.0,
+    )
+
+    assert len(calls) == 1
+    np.testing.assert_allclose(trajectory.qpos_by_side["right"][-1][0], .1)
+
+
 def test_pregrasp_branch_selection_validates_local_stage_before_exact_global_connection():
     planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
     current = {side: np.zeros(6) for side in ("left", "right")}

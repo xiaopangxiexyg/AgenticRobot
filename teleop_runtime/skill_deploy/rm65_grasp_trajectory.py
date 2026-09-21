@@ -81,6 +81,26 @@ RM65_GRASP_ENDPOINT_ORDER_MODES = (
     RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
     RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME,
 )
+# A failed fixed-orientation pregrasp is a local-route rejection, not proof
+# that the terminal grasp target is unreachable.  These failures may fall
+# back to the existing global target search; unavailable checks, a blocked
+# measured start, and exhausted global time must remain terminal.
+_RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS = frozenset(
+    {
+        "ik_search_exhausted",
+        "approach_ik_search_exhausted",
+        "approach_branch_discontinuous",
+        "endpoint_collision_blocked",
+        "endpoint_safety_envelope_blocked",
+        "approach_endpoint_collision_blocked",
+        "approach_endpoint_safety_envelope_blocked",
+        "path_search_exhausted",
+        "path_target_collision_blocked",
+        "path_collision_blocked",
+        "path_target_safety_envelope_blocked",
+        "target_safety_envelope_blocked",
+    }
+)
 
 
 class RM65GraspTrajectoryPlanningError(RuntimeError):
@@ -3271,6 +3291,37 @@ class RM65GraspJointTrajectoryPlanner:
             },
         ) from route_error
 
+    @staticmethod
+    def _may_fallback_to_global_grasp_target_search(
+        error: RM65GraspTrajectoryPlanningError,
+    ) -> bool:
+        """Return whether a local grasp-chain rejection may try the terminal target.
+
+        The fallback is deliberately limited to failures produced while
+        searching an artificial pregrasp/approach route.  The final target
+        envelope is checked before entering this loop, and the global target
+        search performs its own endpoint IK, sparse-proxy path checks, and
+        dense revalidation.  This therefore removes a false veto from the
+        fixed local approach without weakening the safety gates.
+        """
+
+        if error.reason_code not in _RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS:
+            return False
+        if error.reason_code != "target_safety_envelope_blocked":
+            return True
+        # A target-safety error from the final target is already raised before
+        # the pregrasp loop.  Only an artificial local target may be bypassed.
+        phase = str(error.details.get("planning_phase", ""))
+        return phase in {
+            "local_pregrasp_ik",
+            "local_approach_validation",
+            "pregrasp_target",
+            "constrained_approach",
+            "constrained_approach_ik",
+            "envelope_ingress",
+            "dense_revalidation",
+        }
+
     def __call__(
         self,
         *,
@@ -3495,14 +3546,68 @@ class RM65GraspJointTrajectoryPlanner:
             if selected_legs is None:
                 if route_error is None:
                     route_error = RM65GraspTrajectoryPlanningError("path_planner_error")
-                raise RM65GraspTrajectoryPlanningError(
-                    route_error.reason_code,
-                    details={
-                        **route_error.details,
-                        "pregrasp_route_attempts": pregrasp_route_attempts,
-                        "direct_grasp_target_fallback": direct_fallback_attempt,
-                    },
-                ) from route_error
+                local_route_error = route_error
+                if (
+                    not direct_fallback_tried
+                    and self._may_fallback_to_global_grasp_target_search(
+                        local_route_error
+                    )
+                ):
+                    direct_fallback_tried = True
+                    direct_fallback_attempt = {
+                        "planning_phase": "global_grasp_target_fallback",
+                        "trigger_reason_code": local_route_error.reason_code,
+                        "trigger_details": dict(local_route_error.details),
+                        "trigger_scope": "local_pregrasp_chain",
+                    }
+                    try:
+                        direct_leg = self._plan_path_leg(
+                            qpos_by_side=current,
+                            side=selected_side,
+                            target_tool_tcp_world=target_pose,
+                            planning_phase="grasp_target",
+                            visible_scene=visible_scene,
+                            prefer_closest_tolerance=False,
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        )
+                    except RM65GraspTrajectoryPlanningError as error:
+                        direct_fallback_attempt.update(
+                            {
+                                "status": "rejected",
+                                "reason_code": error.reason_code,
+                                "details": dict(error.details),
+                            }
+                        )
+                        route_error = RM65GraspTrajectoryPlanningError(
+                            error.reason_code,
+                            details={
+                                **error.details,
+                                "local_pregrasp_failure": {
+                                    "reason_code": local_route_error.reason_code,
+                                    "details": dict(local_route_error.details),
+                                },
+                                "direct_grasp_target_fallback": (
+                                    direct_fallback_attempt
+                                ),
+                            },
+                        )
+                    else:
+                        direct_fallback_attempt["status"] = "path_found"
+                        selected_legs = (direct_leg,)
+                        ingress_route = None
+                        ingress_route_attempts = []
+                        pregrasp_pose = target_pose.copy()
+                        route_mode = "global_grasp_target_fallback"
+                if selected_legs is None:
+                    raise RM65GraspTrajectoryPlanningError(
+                        route_error.reason_code,
+                        details={
+                            **route_error.details,
+                            "pregrasp_route_attempts": pregrasp_route_attempts,
+                            "direct_grasp_target_fallback": direct_fallback_attempt,
+                        },
+                    ) from route_error
 
         assert selected_legs is not None
         path_search_finished_at = time.perf_counter()
