@@ -12,7 +12,11 @@ from ..diagnostics import TeleopRunState
 from ..session import SessionStepResult
 from .components import RealTeleopComponents
 from .hand_config import HAND_BACKEND_NONE, hand_backend_mode_for_side
-from .hand_runtime import _gripper_backend_for_side, _hand_backend_for_side
+from .hand_runtime import (
+    _gripper_backend_for_side,
+    _gripper_input_channel_name,
+    _hand_backend_for_side,
+)
 
 
 def session_step_arm_dispatch_confirmed(step_result: object) -> bool:
@@ -143,21 +147,38 @@ def recording_warmup_status(
         )
         if camera_blocking_message:
             return False, camera_blocking_message
-    if any(
+    gripper_input_source = str(
+        getattr(components, "gripper_input_source", "q6") or "q6"
+    ).strip().lower()
+    if gripper_input_source not in {"none", "q6", "angle_trigger"}:
+        return False, f"等待夹爪输入配置恢复：不支持 {gripper_input_source!r}。"
+    # The physical hand backend is an output/feedback device.  It must not
+    # imply an operator-input dependency: rule control deliberately uses
+    # gripper_input_source=none while still commanding and monitoring DMTAC.
+    if gripper_input_source != "none" and any(
         _hand_backend_mode_for_side(args, side) != HAND_BACKEND_NONE
         for side in components.active_sides
     ):
         for side in components.active_sides:
             if _hand_backend_mode_for_side(args, side) == HAND_BACKEND_NONE:
                 continue
-            channel = step_result.channels.get(f"{side}_hand_q6")
+            channel_name = _gripper_input_channel_name(components, side)
+            if channel_name is None:
+                continue
+            channel = step_result.channels.get(channel_name)
+            input_label = (
+                "hand_q6" if gripper_input_source == "q6" else "angle_trigger"
+            )
             if channel is None or not bool(getattr(channel, "valid", False)):
-                return False, f"等待 {side} hand_q6 输入有效。"
+                return False, f"等待 {side} {input_label} 输入有效。"
             hand_age = float(now) - float(getattr(channel, "timestamp", now))
             if hand_age < -0.05:
-                return False, f"等待 {side} hand_q6 时间戳稳定。"
+                return False, f"等待 {side} {input_label} 时间戳稳定。"
             if hand_age > 0.5:
-                return False, f"等待 {side} hand_q6 最新输入，当前 age={hand_age:.2f}s。"
+                return False, (
+                    f"等待 {side} {input_label} 最新输入，"
+                    f"当前 age={hand_age:.2f}s。"
+                )
     for side in components.active_sides:
         backend = _gripper_backend_for_side(components, side)
         if backend is None:

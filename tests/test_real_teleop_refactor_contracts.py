@@ -3306,6 +3306,146 @@ def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
     assert message == "等待 right 夹爪故障恢复：error_code=16，status=5:正在张开。"
 
 
+def test_recording_admission_rule_input_none_does_not_require_q6() -> None:
+    backend = legacy_entrypoint.DMTacGripperBackend(
+        legacy_entrypoint.DMTacGripperBackendConfig(
+            side="right",
+            connect_hardware=False,
+            connect_tactile=False,
+        )
+    )
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="dmtac-gripper",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        gripper_input_source="none",
+        left_hand_backend=None,
+        right_hand_backend=backend,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
+        channels={},
+    )
+
+    ready, message = recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        args=args,
+        components=components_snapshot,
+        clutch_input=SimpleNamespace(hold_active=lambda: False),
+        dataset_recorder=None,
+        camera_sources={},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=recording_admission.recording_auto_stop_reason,
+        gripper_warmup_probe_status=lambda now, *, reason: (True, "ready"),
+        camera_status_blocking_message=lambda status: None,
+    )
+
+    assert ready is True
+    assert message == "warmup 输入稳定。"
+
+
+def test_recording_admission_checks_only_configured_gripper_input_channel() -> None:
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="dmtac-gripper",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        gripper_input_source="angle_trigger",
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
+        channels={
+            "right_hand_q6": SimpleNamespace(valid=False, timestamp=10.0),
+            "right_angle_trigger": SimpleNamespace(valid=True, timestamp=10.0),
+        },
+    )
+
+    ready, message = recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        args=args,
+        components=components_snapshot,
+        clutch_input=SimpleNamespace(hold_active=lambda: False),
+        dataset_recorder=None,
+        camera_sources={},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=recording_admission.recording_auto_stop_reason,
+        gripper_warmup_probe_status=lambda now, *, reason: (True, "ready"),
+        camera_status_blocking_message=lambda status: None,
+    )
+
+    assert ready is True
+    assert message == "warmup 输入稳定。"
+
+
+def test_recording_admission_keeps_q6_gate_for_q6_teleop() -> None:
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="dmtac-gripper",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        gripper_input_source="q6",
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
+        channels={},
+    )
+    common = {
+        "args": args,
+        "components": components_snapshot,
+        "clutch_input": SimpleNamespace(hold_active=lambda: False),
+        "dataset_recorder": None,
+        "camera_sources": {},
+        "preview_camera_sources": {},
+        "camera_previewer": None,
+        "recording_auto_stop_reason_fn": recording_admission.recording_auto_stop_reason,
+        "gripper_warmup_probe_status": lambda now, *, reason: (True, "ready"),
+        "camera_status_blocking_message": lambda status: None,
+    }
+
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (False, "等待 right hand_q6 输入有效。")
+
+    running_step.channels["right_hand_q6"] = SimpleNamespace(
+        valid=True,
+        timestamp=10.0,
+    )
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
+
 def test_recording_admission_blocks_dmtac_transport_error_with_zero_vendor_code() -> None:
     backend = legacy_entrypoint.DMTacGripperBackend(
         legacy_entrypoint.DMTacGripperBackendConfig(
