@@ -2833,6 +2833,14 @@ def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
     # Contact/force stop can occur before normalized position reaches 1.0.
     # It is accepted only after a causal command and distinct stable frames.
     hand_poller.value = 0.53
+    # Closed-side idle without endpoint/contact evidence is ambiguous: it can
+    # be a stall and must not be promoted to a successful grasp.
+    hand_poller.status_code = 2
+    hand_poller.timestamp = 10.1
+    session.command_override_provider(SimpleNamespace(), 10.1)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+
     hand_poller.status_code = 6
     for timestamp, now in ((10.1, 10.1), (10.2, 10.2)):
         hand_poller.timestamp = timestamp

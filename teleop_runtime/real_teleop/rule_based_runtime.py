@@ -2841,8 +2841,8 @@ class RuleBasedRealTeleopExtension:
                     # command even when the actuator starts at its endpoint.
                     # Reapply the same target once so release disables catch
                     # mode and task-chain close establishes a one-shot closed
-                    # state before the writing replay enables its configured
-                    # continuous hold.
+                    # state before the writing replay preserves that physical
+                    # grip without another serial write.
                     if (
                         at_endpoint
                         and side

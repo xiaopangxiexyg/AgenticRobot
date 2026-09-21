@@ -1741,8 +1741,11 @@ class DMTacGripperBackend(EffectorBackend):
         Rule-writing frames intentionally preserve the physical right-gripper
         command instead of issuing a serial write on every arm frame.  That
         optimization is safe only after this backend has successfully sent a
-        closed command with ``continuous=False``.  Keep this a local,
-        command-inert receipt: it never reads or writes the device.
+        closed command with ``continuous=False`` and received causal, settled
+        feedback.  A grasped object can stop the fingers before the requested
+        endpoint; DMTAC status 6 is the authoritative force-stop/contact
+        receipt for that case.  Keep this a local, command-inert check: it
+        never reads or writes the device.
         """
 
         if not self.is_ready():
@@ -1763,27 +1766,44 @@ class DMTacGripperBackend(EffectorBackend):
             > max(float(self.config.send_threshold), 1e-6)
         ):
             return False
-        measured = self._latest_measured_joint_pos
-        if measured is not None:
-            measured_values = np.asarray(measured, dtype=float).reshape(-1)
-            if (
-                measured_values.shape == (6,)
-                and np.all(np.isfinite(measured_values))
-                and abs(
-                    float(measured_values[command_dim])
-                    - float(self.config.max_action)
-                )
-                > max(float(self.config.send_threshold), 1e-6)
-            ):
+        with self._state_lock:
+            measured = (
+                None
+                if self._latest_measured_joint_pos is None
+                else self._latest_measured_joint_pos.copy()
+            )
+            feedback_timestamp = self._latest_joint_timestamp
+            status_code = self._latest_gripper_status_code
+            is_moving = self._latest_gripper_is_moving
+        if is_moving is True:
+            return False
+        if status_code in {4, 5}:
+            return False
+        if (
+            self._applied_continuous_grasp is None
+            or bool(self._applied_continuous_grasp)
+        ):
+            return False
+
+        if measured is None:
+            return not self.config.connect_hardware
+        measured_values = np.asarray(measured, dtype=float).reshape(-1)
+        if measured_values.shape != (6,) or not np.all(np.isfinite(measured_values)):
+            return False
+
+        command_completed_timestamp = self._last_sent_command_completed_timestamp
+        if self.config.connect_hardware:
+            if feedback_timestamp is None or command_completed_timestamp is None:
                 return False
-        if self._latest_gripper_is_moving is True:
-            return False
-        if self._latest_gripper_status_code in {4, 5}:
-            return False
-        return bool(
-            self._applied_continuous_grasp is not None
-            and not bool(self._applied_continuous_grasp)
-        )
+            if float(feedback_timestamp) <= float(command_completed_timestamp):
+                return False
+
+        endpoint_reached = abs(
+            float(measured_values[command_dim]) - float(self.config.max_action)
+        ) <= max(float(self.config.send_threshold), 1e-6)
+        if endpoint_reached:
+            return True
+        return status_code == 6
 
     def _hardware_telemetry_error_active(self) -> bool:
         """Return whether the latest error invalidates hardware admission.
@@ -2285,6 +2305,14 @@ class DMTacGripperBackend(EffectorBackend):
                     "hold_owner_uninitialized",
                     sent=False,
                     skip_reason="preserve_existing_grip_mode_not_applied",
+                )
+            if not self.fixed_closed_one_shot_ready():
+                return finish(
+                    "hold_owner_uninitialized",
+                    sent=False,
+                    skip_reason=(
+                        "preserve_existing_grip_without_settled_closed_feedback"
+                    ),
                 )
             return finish(
                 "preserved_existing_grip",

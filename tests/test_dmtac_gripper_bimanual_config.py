@@ -2679,6 +2679,11 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         measured = np.zeros(6, dtype=np.float32)
         measured[0] = 0.53
         backend._latest_measured_joint_pos = measured
+        backend._latest_gripper_status_code = 2
+        backend._latest_gripper_is_moving = False
+        backend._last_sent_command_timestamp = 9.9
+        backend._last_sent_command_completed_timestamp = 10.0
+        backend._latest_joint_timestamp = 10.1
         command = EffectorCommand(
             effector_name="right_hand",
             side="right",
@@ -2690,6 +2695,15 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             },
         )
 
+        self.assertFalse(backend.send_command(command))
+        self.assertEqual(backend._last_send_status, "hold_owner_uninitialized")
+        self.assertEqual(
+            backend._last_send_skip_reason,
+            "preserve_existing_grip_without_settled_closed_feedback",
+        )
+        self.assertEqual(fake.moves, [])
+
+        backend._latest_gripper_status_code = 6
         self.assertTrue(backend.send_command(command))
         self.assertEqual(fake.moves, [])
         self.assertEqual(backend._last_send_status, "preserved_existing_grip")
@@ -2732,10 +2746,39 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             dtype=np.float32,
         )
+        backend._last_sent_command_timestamp = 9.9
+        backend._last_sent_command_completed_timestamp = 10.0
+        backend._latest_joint_timestamp = 10.1
+        endpoint = np.zeros(6, dtype=np.float32)
+        endpoint[0] = 1.0
+        backend._latest_measured_joint_pos = endpoint
+        backend._latest_gripper_status_code = 2
+        backend._latest_gripper_is_moving = False
         backend._applied_continuous_grasp = True
         self.assertFalse(backend.fixed_closed_one_shot_ready())
 
         backend._applied_continuous_grasp = False
+        self.assertTrue(backend.fixed_closed_one_shot_ready())
+
+        # A pen or other object may stop the fingers before the numeric close
+        # endpoint.  Accept only the vendor's explicit, causal force-stop
+        # receipt; an ordinary idle sample short of target remains ambiguous.
+        contact = endpoint.copy()
+        contact[0] = 0.53
+        backend._latest_measured_joint_pos = contact
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_gripper_status_code = 6
+        self.assertTrue(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_joint_timestamp = 9.95
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_joint_timestamp = 10.1
+        backend._latest_gripper_is_moving = True
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_gripper_is_moving = False
         self.assertTrue(backend.fixed_closed_one_shot_ready())
 
         backend._latest_gripper_error_code = 16
