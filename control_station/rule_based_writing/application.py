@@ -108,6 +108,7 @@ class RuleBasedWritingUiState:
     task_chain_title: str = "任务链未启动"
     task_chain_detail: str = "等待右夹爪、安全门禁和轨迹配置就绪。"
     task_chain_can_advance: bool = False
+    task_chain_owner_recovery_required: bool = False
     task_chain_cycle_count: int = 0
     task_chain_selected_configuration: dict[str, object] = field(default_factory=dict)
     task_chain_selected_configuration_index: int | None = None
@@ -925,7 +926,16 @@ class RuleBasedWritingApplication:
                     return False
                 self._task_chain.begin_height()
             elif phase is RuleWritingTaskChainPhase.READY_RULE:
-                if self._task_chain.rule_start_waiting:
+                if self._rule_owner_recovery_window_locked():
+                    # A serial reconnect correctly invalidates the previous
+                    # close receipt.  Re-establish that receipt through the
+                    # same right-only, one-shot task-chain command instead of
+                    # exposing the generic continuous-close maintenance path.
+                    if not self._submit_intent_locked(
+                        RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
+                    ):
+                        return False
+                elif self._task_chain.rule_start_waiting:
                     if not self._submit_intent_locked(RuleBasedWritingIntent.START):
                         return False
                     self._task_chain.begin_rule_after_wait()
@@ -1695,6 +1705,8 @@ class RuleBasedWritingApplication:
         self._state.task_chain_can_advance = self._task_chain_can_advance_locked(
             available
         )
+        owner_recovery_required = self._rule_owner_recovery_window_locked()
+        self._state.task_chain_owner_recovery_required = owner_recovery_required
         task_chain_detail = str(chain["detail"])
         if (
             self._task_chain.phase
@@ -1714,6 +1726,22 @@ class RuleBasedWritingApplication:
             )
         ):
             task_chain_detail = self._task_chain_blocked_detail_locked(available)
+        elif owner_recovery_required:
+            task_chain_detail = (
+                "右夹爪串口会话已变化，先前闭爪 owner 已安全失效。"
+                "点击下一步只会重新发送右夹爪一次性闭合命令；"
+                "收到新的实测闭紧反馈后，任务链才会恢复规则采集。"
+            )
+            if self._state.gripper_action_pending:
+                task_chain_detail = (
+                    "正在恢复右夹爪一次性闭合 owner；等待新串口会话中的"
+                    "实测闭紧反馈。"
+                )
+            elif self._state.gripper_action_result == "failed":
+                task_chain_detail += "\n" + (
+                    self._state.gripper_action_status
+                    or "右夹爪 owner 恢复未完成，请确认安全后重试。"
+                )
         elif (
             self._task_chain.phase is RuleWritingTaskChainPhase.RULE_PENDING
             and self._state.phase == "armed"
@@ -1741,18 +1769,10 @@ class RuleBasedWritingApplication:
         self._state.can_retry_devices = available["retry_devices"]
         self._state.can_runtime_home = available["runtime_home"]
         self._state.can_release_grippers = bool(
-            available["release_grippers"]
-            and (
-                not chain_owns_manual_step
-                or self._rule_owner_recovery_window_locked()
-            )
+            available["release_grippers"] and not chain_owns_manual_step
         )
         self._state.can_close_grippers = bool(
-            available["close_grippers"]
-            and (
-                not chain_owns_manual_step
-                or self._rule_owner_recovery_window_locked()
-            )
+            available["close_grippers"] and not chain_owns_manual_step
         )
         self._state.can_toggle_debug = available["toggle_debug"]
         self._state.can_capture_height = bool(
@@ -1964,6 +1984,8 @@ class RuleBasedWritingApplication:
         if phase is RuleWritingTaskChainPhase.READY_HEIGHT:
             return bool(available["capture_height"])
         if phase is RuleWritingTaskChainPhase.READY_RULE:
+            if self._rule_owner_recovery_window_locked():
+                return bool(available["close_right_gripper"])
             if (
                 self._effective_startup_blockers_locked()
                 or self._state.runtime_home_pending

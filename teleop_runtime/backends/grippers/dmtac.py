@@ -58,6 +58,8 @@ GRIPPER_ACTION_MAX = 1.0
 # Keep a short write-to-read guard, but do not hide the physical response for
 # multiple collection frames after every accepted command.
 DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S = 0.02
+DMTAC_GRIPPER_TELEMETRY_READ_ATTEMPTS = 2
+DMTAC_GRIPPER_TELEMETRY_RETRY_INTERVAL_S = 0.02
 DMTAC_TELEMETRY_STOP_TIMEOUT_S = 2.0
 DMTAC_TACTILE_CLOSE_GRACE_S = 3.0
 DMTAC_TACTILE_GLOBAL_READ_GATE = threading.Semaphore(1)
@@ -454,6 +456,10 @@ class DMTacGripperBackendConfig:
     enable_telemetry: bool = True
     telemetry_hz: float = DEFAULT_DMTAC_GRIPPER_TELEMETRY_HZ
     gripper_telemetry_command_grace_s: float = DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S
+    gripper_telemetry_read_attempts: int = DMTAC_GRIPPER_TELEMETRY_READ_ATTEMPTS
+    gripper_telemetry_retry_interval_s: float = (
+        DMTAC_GRIPPER_TELEMETRY_RETRY_INTERVAL_S
+    )
     connect_tactile: bool = True
     tactile_ids: tuple[str | int, ...] = ()
     tactile_backend: str = "cpu"
@@ -520,6 +526,12 @@ class DMTacGripperBackendConfig:
             raise ValueError("telemetry_hz must be positive.")
         if float(self.gripper_telemetry_command_grace_s) < 0.0:
             raise ValueError("gripper_telemetry_command_grace_s must be non-negative.")
+        if int(self.gripper_telemetry_read_attempts) <= 0:
+            raise ValueError("gripper_telemetry_read_attempts must be positive.")
+        if float(self.gripper_telemetry_retry_interval_s) < 0.0:
+            raise ValueError(
+                "gripper_telemetry_retry_interval_s must be non-negative."
+            )
         if float(self.reconnect_cooldown_sec) < 0.0:
             raise ValueError("reconnect_cooldown_sec must be non-negative.")
         if int(self.startup_fault_check_attempts) <= 0:
@@ -2484,6 +2496,31 @@ class DMTacGripperBackend(EffectorBackend):
         max_deferral_s = self._gripper_telemetry_max_deferral_s()
         return bool(age_s >= max_deferral_s or age_s < -max_deferral_s)
 
+    def _read_gripper_state_with_transient_retry_locked(self, device: object) -> object:
+        """Retry one isolated serial read before rebuilding the session.
+
+        DMTAC can occasionally time out the request write while an asynchronous
+        one-shot close is settling.  Reconnecting on that first miss destroys
+        the causal close receipt even when the next transaction is healthy.
+        Keep the retry bounded and inside the existing I/O lock.  Exhaustion
+        still enters the unchanged fail-closed reconnect path.
+        """
+
+        attempts = max(1, int(self.config.gripper_telemetry_read_attempts))
+        interval = max(0.0, float(self.config.gripper_telemetry_retry_interval_s))
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return device.read_gripper_state()
+            except Exception as exc:  # noqa: BLE001 - exhausted error is re-raised.
+                last_error = exc
+                if attempt + 1 >= attempts:
+                    raise
+                if interval > 0.0:
+                    time.sleep(interval)
+        assert last_error is not None
+        raise last_error
+
     def _apply_tactile_worker_payload(self, payload: dict[str, Any]) -> bool:
         payload_type = str(payload.get("type") or "")
         if payload_type == "ready":
@@ -2731,7 +2768,11 @@ class DMTacGripperBackend(EffectorBackend):
                             return
                         gripper_read_started_at = time.perf_counter()
                         try:
-                            gripper_state = device.read_gripper_state()
+                            gripper_state = (
+                                self._read_gripper_state_with_transient_retry_locked(
+                                    device
+                                )
+                            )
                             state_error = self._gripper_state_error_code(gripper_state)
                             if (
                                 state_error == 16

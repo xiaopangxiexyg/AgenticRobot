@@ -406,8 +406,9 @@ async function refresh() {
     ready_final_release: "下一步：松开夹爪完成（Alt+N）",
     complete: "开始下一轮（Alt+N）",
   };
-  chainButton.textContent = chainButtonLabels[state.task_chain_phase]
-    || "当前步骤执行中…";
+  chainButton.textContent = state.task_chain_owner_recovery_required
+    ? "下一步：恢复右夹爪闭合（Alt+N）"
+    : chainButtonLabels[state.task_chain_phase] || "当前步骤执行中…";
   document.body.dataset.phase = state.phase;
   document.getElementById("start").disabled = !state.can_start
     || configurationDirty || pendingRequests.has("event:rule_start");

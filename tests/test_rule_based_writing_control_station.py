@@ -728,6 +728,7 @@ def test_rule_ui_asset_contains_no_teleop_episode_progress_or_pedal_controls() -
     assert "Alt+N" in asset
     assert 'postJson("/task-chain"' in script
     assert 'pendingRequests.has("task-chain")' in script
+    assert "下一步：恢复右夹爪闭合（Alt+N）" in script
     assert "event.altKey" in script
     assert "let tactileCaptureLocked = false" in script
     assert 'input.id === "collect-tactile" && tactileCaptureLocked' in script
@@ -1630,6 +1631,56 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert state["task_chain_can_advance"] is True
 
 
+def test_task_chain_recovers_lost_gripper_owner_through_right_one_shot_close() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    # This test enters the post-height phase directly; the ordinary full-chain
+    # transition coverage above owns the earlier release/close/height stages.
+    application._task_chain.phase = RuleWritingTaskChainPhase.READY_RULE
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "right owner was invalidated"
+            },
+        )
+    )
+
+    blocked = application.snapshot()
+    assert blocked["task_chain_owner_recovery_required"] is True
+    assert blocked["task_chain_can_advance"] is True
+    assert blocked["can_release_grippers"] is False
+    assert blocked["can_close_grippers"] is False
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+    pending = application.snapshot()
+    assert pending["task_chain_phase"] == "ready_rule"
+    assert pending["gripper_action_pending"] is True
+    assert pending["task_chain_can_advance"] is False
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=False,
+            gripper_action_id=21,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
+            readiness_blockers={},
+        )
+    )
+    recovered = application.snapshot()
+    assert recovered["task_chain_owner_recovery_required"] is False
+    assert recovered["task_chain_can_advance"] is True
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_configuration_requests() == (first,)
+
+
 def test_task_chain_can_reach_gripper_close_when_rule_owner_is_not_initialized() -> None:
     application = RuleBasedWritingApplication()
     options, first, _second = _task_chain_configuration()
@@ -1672,8 +1723,11 @@ def test_ready_rule_owner_blocker_exposes_gripper_recovery_without_starting_rule
     state = application.snapshot()
     assert state["phase"] == "ready"
     assert state["can_start"] is False
-    assert state["can_close_grippers"] is True
-    assert state["can_release_grippers"] is True
+    assert state["can_close_grippers"] is False
+    assert state["can_release_grippers"] is False
+    assert state["task_chain_owner_recovery_required"] is True
+    assert state["task_chain_can_advance"] is True
+    assert "下一步" in state["task_chain_detail"]
 
 
 def test_task_chain_starts_after_stale_start_gate_recovers() -> None:
