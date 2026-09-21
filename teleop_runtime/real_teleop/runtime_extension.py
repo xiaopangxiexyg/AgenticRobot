@@ -269,8 +269,9 @@ def runtime_extension_allows_pre_episode_armed_warmup(
 ) -> bool:
     """Admit an extension-owned ARMED start without weakening sample gates.
 
-    This opt-in is consulted only by the Episode-start countdown. Resume and
-    per-sample health checks still require a dispatched arm command in RUNNING.
+    This opt-in is consulted only by the Episode-start countdown.  Once an
+    Episode is active, the separate active-bootstrap hook owns any bounded
+    ARMED transition; sample admission remains independently strict.
     """
 
     if extension is None:

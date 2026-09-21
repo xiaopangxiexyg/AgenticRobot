@@ -60,6 +60,7 @@ def recording_warmup_status(
     gripper_warmup_probe_status: Callable[..., tuple[bool, str]],
     camera_status_blocking_message: Callable[[Mapping[str, object]], str | None],
     allow_pre_episode_armed_warmup: bool = False,
+    allow_active_episode_armed_bootstrap: bool = False,
 ) -> tuple[bool, str]:
     """Return the historical fail-closed recording admission result."""
 
@@ -74,15 +75,21 @@ def recording_warmup_status(
         return False, f"等待恢复，当前状态会自动停止数采：{stop_reason}。"
     if clutch_input.hold_active():
         return False, "等待 hold 解除并重采 runtime home。"
-    pre_episode_armed_warmup = bool(
-        allow_pre_episode_armed_warmup
+    command_inert_armed_bootstrap = bool(
+        (
+            allow_pre_episode_armed_warmup
+            or allow_active_episode_armed_bootstrap
+        )
         and step_result.state == TeleopRunState.ARMED
     )
-    if step_result.state != TeleopRunState.RUNNING and not pre_episode_armed_warmup:
+    if (
+        step_result.state != TeleopRunState.RUNNING
+        and not command_inert_armed_bootstrap
+    ):
         return False, f"等待遥操进入 RUNNING，当前状态：{step_result.state.value}。"
     if step_result.observation is None:
         return False, "等待 observation 可用。"
-    if not pre_episode_armed_warmup:
+    if not command_inert_armed_bootstrap:
         if step_result.command is None:
             return False, "等待 action command 可用。"
         if not session_step_arm_dispatch_confirmed(step_result):

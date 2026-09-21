@@ -3247,6 +3247,13 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         **common,
     ) == (True, "warmup 输入稳定。")
 
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=armed_step,
+        allow_active_episode_armed_bootstrap=True,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
 
 def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
     backend = legacy_entrypoint.DMTacGripperBackend(

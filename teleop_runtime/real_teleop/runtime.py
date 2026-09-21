@@ -188,6 +188,7 @@ from .recording_admission import (
 )
 from .runtime_extension import (
     RealTeleopRuntimeExtension,
+    runtime_extension_allows_active_episode_bootstrap_without_dispatch,
     runtime_extension_collection_startup_blockers,
     runtime_extension_service_startup_control_plane,
 )
@@ -2515,6 +2516,11 @@ def run_real_teleop(
                 gripper_warmup_probe_status=gripper_warmup_probe_status,
                 camera_status_blocking_message=_camera_status_blocking_message,
                 allow_pre_episode_armed_warmup=allow_pre_episode_armed_warmup,
+                allow_active_episode_armed_bootstrap=(
+                    runtime_extension_allows_active_episode_bootstrap_without_dispatch(
+                        runtime_extension
+                    )
+                ),
             )
 
         position_episode_debug_runtime = build_position_episode_debug_runtime(
