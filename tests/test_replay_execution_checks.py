@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -38,7 +38,11 @@ from teleop_runtime.replay.checks import (
     ReplayPreflightReport,
     run_replay_preflight,
 )
-from teleop_runtime.replay.executor import ReplayExecutionController, ReplayExecutionSettings
+from teleop_runtime.replay.executor import (
+    ReplayExecutionController,
+    ReplayExecutionSettings,
+    _replay_dispatch_not_before,
+)
 from teleop_runtime.replay.hardware import ReplayHardwareConfig, ReplayHardwareRig
 from teleop_runtime.replay.session import ReplayGuiSession
 from teleop_runtime.replay.trajectory import (
@@ -451,6 +455,18 @@ class _BlockingDispatchReplayRig(_FakeReplayWorkerRig):
         super().send_joint_targets(qpos_by_side, source=source, metadata=metadata)
 
 
+class _SlowFirstDispatchReplayRig(_FakeReplayWorkerRig):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dispatch_started_at: list[float] = []
+
+    def send_joint_targets(self, qpos_by_side, *, source: str, metadata=None) -> None:
+        self.dispatch_started_at.append(time.monotonic())
+        if len(self.dispatch_started_at) == 1:
+            time.sleep(0.15)
+        super().send_joint_targets(qpos_by_side, source=source, metadata=metadata)
+
+
 class _CaptureBackend:
     def __init__(self) -> None:
         self.commands = []
@@ -523,6 +539,75 @@ class _FakeQposInitRig(_FakeReplayWorkerRig):
 
 
 class ReplayExecutionChecksTest(unittest.TestCase):
+    def test_replay_dispatch_floor_preserves_grid_when_on_time(self) -> None:
+        self.assertEqual(
+            _replay_dispatch_not_before(
+                scheduled_at=10.0,
+                previous_dispatch_started_at=8.0,
+                period_sec=1.0,
+            ),
+            10.0,
+        )
+
+    def test_replay_dispatch_floor_stretches_late_work_without_catchup(self) -> None:
+        self.assertEqual(
+            _replay_dispatch_not_before(
+                scheduled_at=10.0,
+                previous_dispatch_started_at=10.5,
+                period_sec=1.0,
+            ),
+            11.5,
+        )
+
+    def test_replay_dispatch_floor_rejects_invalid_timing(self) -> None:
+        with self.assertRaisesRegex(ValueError, "period_sec"):
+            _replay_dispatch_not_before(
+                scheduled_at=10.0,
+                previous_dispatch_started_at=None,
+                period_sec=0.0,
+            )
+
+    def test_impedance_qpos_replay_does_not_catch_up_after_slow_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = _write_profile(
+                Path(tmpdir) / "right.json",
+                side="right",
+                tcp=[0.01, 0, 0, 0, 0, 0],
+            )
+            base = _group(profile)
+            group = replace(
+                base,
+                end_index=3,
+                frame_count=3,
+                actions=np.concatenate((base.actions, base.actions[-1:]), axis=0),
+                arm_joint_targets={
+                    "right": np.zeros((3, 6), dtype=np.float32),
+                },
+                arm_observation_current_qpos={
+                    "right": np.zeros((3, 6), dtype=np.float32),
+                },
+            )
+            controller = ReplayExecutionController(
+                hardware_config=ReplayHardwareConfig(
+                    active_sides=("right",),
+                    arm_control_mode="impedance",
+                    connect_hardware=False,
+                ),
+                settings=ReplayExecutionSettings(
+                    send_actions_enabled=True,
+                    trajectory_source=REPLAY_TRAJECTORY_QPOS_TARGET,
+                ),
+            )
+            rig = _SlowFirstDispatchReplayRig()
+
+            controller._replay_worker(rig, group)  # type: ignore[arg-type]
+
+            self.assertEqual(controller.status()["state"], "finished")
+            self.assertEqual(len(rig.dispatch_started_at), 3)
+            gaps = np.diff(np.asarray(rig.dispatch_started_at, dtype=float))
+            self.assertGreaterEqual(gaps[0], 0.14)
+            self.assertGreaterEqual(gaps[1], 0.09)
+
     def test_deploy_dataset_replay_uses_explicit_hand_target_for_invalid_action_slots(self) -> None:
         actions = np.zeros((2, ACTION_DIM), dtype=np.float32)
         actions[1, ACTION_HAND_SLICES["right"]] = np.nan
@@ -2146,6 +2231,16 @@ class ReplayExecutionChecksTest(unittest.TestCase):
             )
             self.assertEqual(metadata["position_command_hz"], 20.0)
             self.assertFalse(metadata["position_background_streaming_active"])
+            self.assertEqual(
+                metadata["position_replay_timing"]["policy"],
+                "stretch_no_catchup_v1",
+            )
+            self.assertGreaterEqual(
+                metadata["position_replay_timing"][
+                    "previous_dispatch_start_gap_sec"
+                ],
+                1.0 / 20.0 - 1e-3,
+            )
 
     def test_replay_worker_dispatches_end_effector_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
