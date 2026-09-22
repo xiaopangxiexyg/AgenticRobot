@@ -197,6 +197,18 @@ class RuleBasedWritingWebUi:
             {"event": "advance", "source": "foot_pad"}
         )
 
+    def task_chain_foot_pad_action_label(self) -> str:
+        """Describe the phase actually entered by the latest pedal advance."""
+
+        state = self._application.snapshot()
+        if bool(state.get("task_chain_owner_recovery_required")):
+            return (
+                "正在恢复右夹爪一次性闭合 owner"
+                if bool(state.get("gripper_action_pending"))
+                else "等待恢复右夹爪一次性闭合 owner"
+            )
+        return str(state.get("task_chain_title") or "任务链下一步")
+
     def submit_emergency_stop_from_foot_pad(self) -> bool:
         """Queue the existing rule stop-and-Hold path for pedal 2."""
 

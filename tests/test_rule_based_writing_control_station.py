@@ -1806,6 +1806,17 @@ def test_task_chain_recovers_lost_gripper_owner_through_right_one_shot_close() -
     assert blocked["can_close_grippers"] is False
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_configuration_requests() == (first,)
+    assert application.snapshot()["task_chain_phase"] == "configuration_pending"
+    application.complete_configuration(selected=first, error=None)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "right owner was invalidated"
+            },
+        )
+    )
     assert application.consume_rule_intents() == ("close_right_gripper",)
     pending = application.snapshot()
     assert pending["task_chain_phase"] == "ready_rule"
@@ -1824,10 +1835,74 @@ def test_task_chain_recovers_lost_gripper_owner_through_right_one_shot_close() -
     )
     recovered = application.snapshot()
     assert recovered["task_chain_owner_recovery_required"] is False
-    assert recovered["task_chain_can_advance"] is True
+    assert recovered["task_chain_phase"] == "rule_pending"
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+
+
+def test_task_chain_owner_recovery_retries_once_after_serial_session_loss() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.READY_RULE
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+        )
+    )
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
     assert application.consume_configuration_requests() == (first,)
+    application.complete_configuration(selected=first, error=None)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+        )
+    )
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+
+    # The serial session changes while the first owner receipt settles.  The
+    # accepted compound rule step may repeat that exact close once.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            gripper_action_pending=False,
+            gripper_action_id=31,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="failed",
+            gripper_action_status="串口会话已变化",
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+        )
+    )
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+
+    # A persistent failure does not create an unbounded write loop.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            gripper_action_pending=False,
+            gripper_action_id=32,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="failed",
+            gripper_action_status="串口会话仍未稳定",
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+        )
+    )
+    assert application.consume_rule_intents() == ()
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "ready_rule"
+    assert state["task_chain_can_advance"] is True
 
 
 def test_task_chain_can_reach_gripper_close_when_rule_owner_is_not_initialized() -> None:

@@ -176,6 +176,12 @@ class RuleBasedWritingApplication:
         self._device_recovery_task_chain_step: str | None = None
         self._device_recovery_home_requested = False
         self._device_recovery_owner_close_requested = False
+        # A READY_RULE advance owns the complete command-inert
+        # configuration -> owner recovery -> START transaction.  Keep a
+        # small bounded counter so one transient serial-session invalidation
+        # can be repaired without another operator press, while a persistent
+        # hand fault still stops automatic writes.
+        self._task_chain_owner_recovery_attempts = 0
         self._rule_runtime_bound = False
         # A dedicated rule start owns a short pre-Episode writer-open window.
         # The lower RealTeleop admission may consult this capability while the
@@ -446,6 +452,7 @@ class RuleBasedWritingApplication:
             elif self._state.phase == "preparing" and self._rule_runtime_bound:
                 self._project_prestart_readiness_locked()
             self._maybe_continue_device_recovery_locked()
+            self._try_recover_waiting_task_chain_owner_locked()
             self._try_start_waiting_task_chain_locked()
             self._rebuild_controls()
             self._touch()
@@ -825,6 +832,7 @@ class RuleBasedWritingApplication:
                     )
                 elif self._submit_intent_locked(RuleBasedWritingIntent.START):
                     self._task_chain.begin_rule()
+                    self._task_chain_owner_recovery_attempts = 0
                 else:
                     # Configuration completion and the lower Session/Rig
                     # admission receipt are asynchronous.  Keep the validated
@@ -832,6 +840,7 @@ class RuleBasedWritingApplication:
                     # of treating a stale start receipt as a config failure or
                     # bypassing the safety gate.
                     self._task_chain.wait_for_rule_start()
+                    self._try_recover_waiting_task_chain_owner_locked()
                 self._rebuild_controls()
             self._touch()
 
@@ -914,6 +923,8 @@ class RuleBasedWritingApplication:
                 return False
             phase = self._task_chain.phase
             available = self._base_control_availability_locked()
+            if not self._task_chain_can_advance_locked(available):
+                return False
             if phase in {
                 RuleWritingTaskChainPhase.IDLE,
                 RuleWritingTaskChainPhase.COMPLETE,
@@ -928,6 +939,7 @@ class RuleBasedWritingApplication:
                 self._task_chain.begin_initial_release(
                     action_id_baseline=action_id_baseline
                 )
+                self._task_chain_owner_recovery_attempts = 0
             elif phase is RuleWritingTaskChainPhase.READY_CLOSE:
                 action_id_baseline = self._last_gripper_action_id
                 if not self._submit_intent_locked(
@@ -949,36 +961,32 @@ class RuleBasedWritingApplication:
                     return False
                 self._task_chain.begin_height()
             elif phase is RuleWritingTaskChainPhase.READY_RULE:
-                if self._rule_owner_recovery_window_locked():
-                    # A serial reconnect correctly invalidates the previous
-                    # close receipt.  Re-establish that receipt through the
-                    # same right-only, one-shot task-chain command instead of
-                    # exposing the generic continuous-close maintenance path.
-                    if not self._submit_intent_locked(
-                        RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
+                if self._task_chain.rule_start_waiting:
+                    if self._rule_owner_recovery_window_locked():
+                        # This is an explicit retry of the already validated
+                        # rule step.  Reset only the bounded owner-recovery
+                        # allowance; the selected trajectory remains fixed.
+                        self._task_chain_owner_recovery_attempts = 0
+                        if not self._request_task_chain_owner_recovery_locked(
+                            automatic=False
+                        ):
+                            return False
+                    elif not self._submit_intent_locked(
+                        RuleBasedWritingIntent.START
                     ):
                         return False
-                elif self._task_chain.rule_start_waiting:
-                    if not self._submit_intent_locked(RuleBasedWritingIntent.START):
-                        return False
-                    self._task_chain.begin_rule_after_wait()
+                    else:
+                        self._task_chain.begin_rule_after_wait()
+                        self._task_chain_owner_recovery_attempts = 0
                 else:
-                    if not available["configure"] or not self._task_chain_configuration_pool:
+                    # The operator authorizes the complete rule phase here,
+                    # not a standalone gripper repair.  Lock the random
+                    # configuration first.  If the serial session invalidated
+                    # the close owner during height calibration, the
+                    # configuration callback will recover that owner and then
+                    # start this same validated selection automatically.
+                    if not self._begin_task_chain_configuration_locked():
                         return False
-                    count = len(self._task_chain_configuration_pool)
-                    index = int(self._task_chain_choice_index(count))
-                    if not 0 <= index < count:
-                        raise ValueError("task_chain_choice_index returned an invalid index.")
-                    selected = dict(self._task_chain_configuration_pool[index])
-                    # Revalidate at the same trust boundary used by manual GUI
-                    # configuration; the chain never promotes cached UI state.
-                    selected = self._validate_configuration_request(
-                        selected,
-                        options=self._configuration_options,
-                    )
-                    if not self._submit_configuration_locked(selected):
-                        return False
-                    self._task_chain.begin_configuration(index=index, selected=selected)
             elif phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE:
                 action_id_baseline = self._last_gripper_action_id
                 if not self._submit_intent_locked(
@@ -993,6 +1001,27 @@ class RuleBasedWritingApplication:
             self._rebuild_controls()
             self._touch()
             return True
+
+    def _begin_task_chain_configuration_locked(self) -> bool:
+        """Lock one validated random choice for the complete rule phase."""
+
+        available = self._base_control_availability_locked()
+        if not available["configure"] or not self._task_chain_configuration_pool:
+            return False
+        count = len(self._task_chain_configuration_pool)
+        index = int(self._task_chain_choice_index(count))
+        if not 0 <= index < count:
+            raise ValueError("task_chain_choice_index returned an invalid index.")
+        selected = dict(self._task_chain_configuration_pool[index])
+        selected = self._validate_configuration_request(
+            selected,
+            options=self._configuration_options,
+        )
+        if not self._submit_configuration_locked(selected):
+            return False
+        self._task_chain.begin_configuration(index=index, selected=selected)
+        self._task_chain_owner_recovery_attempts = 0
+        return True
 
     @staticmethod
     def _option_values(options: Mapping[str, object], key: str) -> set[str]:
@@ -1503,6 +1532,7 @@ class RuleBasedWritingApplication:
                 elif self._state.gripper_action_status:
                     self._state.detail = self._state.gripper_action_status
             self._maybe_continue_device_recovery_locked()
+            self._try_recover_waiting_task_chain_owner_locked()
             self._try_start_waiting_task_chain_locked()
             self._observe_task_chain_status_locked(
                 begun=begun,
@@ -1545,7 +1575,52 @@ class RuleBasedWritingApplication:
         if not self._submit_intent_locked(RuleBasedWritingIntent.START):
             return False
         self._task_chain.begin_rule_after_wait()
+        self._task_chain_owner_recovery_attempts = 0
         return True
+
+    def _request_task_chain_owner_recovery_locked(
+        self,
+        *,
+        automatic: bool,
+    ) -> bool:
+        """Re-establish the validated rule step's one-shot hand owner.
+
+        The operator's READY_RULE advance already authorized this exact
+        right-hand close as part of the compound rule phase. At most two
+        automatic sends are admitted: the first establishes the owner, and a
+        second may repair a serial session that changed while the first
+        receipt was settling. Persistent faults remain visible and require an
+        explicit operator retry.
+        """
+
+        if (
+            self._task_chain.phase is not RuleWritingTaskChainPhase.READY_RULE
+            or not self._task_chain.rule_start_waiting
+            or not self._rule_owner_recovery_window_locked()
+            or self._state.gripper_action_pending
+        ):
+            return False
+        if automatic and self._task_chain_owner_recovery_attempts >= 2:
+            return False
+        if not self._base_control_availability_locked()["close_right_gripper"]:
+            return False
+        if not self._submit_intent_locked(
+            RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
+        ):
+            return False
+        self._task_chain_owner_recovery_attempts += 1
+        qualifier = "自动" if automatic else "按操作员请求"
+        self._append_message_locked(
+            "Progress",
+            f"{qualifier}重新建立右夹爪一次性闭合 owner；"
+            "实测闭紧并通过当前串口会话校验后，将继续同一条已验证规则采集。",
+        )
+        return True
+
+    def _try_recover_waiting_task_chain_owner_locked(self) -> bool:
+        """Continue a compound READY_RULE transaction after owner loss."""
+
+        return self._request_task_chain_owner_recovery_locked(automatic=True)
 
     def _clear_device_recovery_locked(self) -> None:
         self._device_recovery_task_chain_step = None
@@ -2144,15 +2219,22 @@ class RuleBasedWritingApplication:
         if phase is RuleWritingTaskChainPhase.READY_HEIGHT:
             return bool(available["capture_height"])
         if phase is RuleWritingTaskChainPhase.READY_RULE:
-            if self._rule_owner_recovery_window_locked():
-                return bool(available["close_right_gripper"])
-            if (
-                self._effective_startup_blockers_locked()
-                or self._state.runtime_home_pending
-            ):
-                return False
             if self._task_chain.rule_start_waiting:
+                if self._rule_owner_recovery_window_locked():
+                    return bool(available["close_right_gripper"])
+                if (
+                    self._effective_startup_blockers_locked()
+                    or self._state.runtime_home_pending
+                ):
+                    return False
                 return bool(available["start"])
+            non_owner_blockers = {
+                key: detail
+                for key, detail in self._effective_startup_blockers_locked().items()
+                if key != "rule.right_hand_hold_owner"
+            }
+            if non_owner_blockers or self._state.runtime_home_pending:
+                return False
             return bool(available["configure"] and self._task_chain_configuration_pool)
         if phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE:
             return bool(available["release_grippers"])
