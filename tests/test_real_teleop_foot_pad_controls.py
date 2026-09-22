@@ -1412,6 +1412,7 @@ class FootPadControlModeTests(unittest.TestCase):
             submit_task_chain_advance_from_foot_pad=lambda: (
                 calls.append("advance") or True
             ),
+            task_chain_foot_pad_action_label=lambda: "正在激活随机配置",
             submit_emergency_stop_from_foot_pad=lambda: (
                 calls.append("stop") or True
             ),
@@ -1425,7 +1426,7 @@ class FootPadControlModeTests(unittest.TestCase):
 
         self.assertEqual(calls, ["advance", "stop"])
         self.assertEqual([tag for tag, _message in messages], ["FootPad", "FootPad"])
-        self.assertIn("任务链下一步", messages[0][1])
+        self.assertIn("正在激活随机配置", messages[0][1])
         self.assertIn("停止并 Hold", messages[1][1])
 
     def test_two_pedal_alerts_replace_each_other_and_red_expires(self) -> None:

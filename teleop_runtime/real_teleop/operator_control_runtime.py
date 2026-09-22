@@ -2061,6 +2061,16 @@ class RealTeleopControlInput:
         else:
             return False
         accepted = bool(callback())
+        if accepted and normalized_event == "fix_arm_left":
+            label_callback = getattr(
+                self.ui,
+                "task_chain_foot_pad_action_label",
+                None,
+            )
+            if callable(label_callback):
+                resolved_label = str(label_callback() or "").strip()
+                if resolved_label:
+                    operation_label = resolved_label
         message = (
             f"{pedal_label}已提交：{operation_label}。"
             if accepted
