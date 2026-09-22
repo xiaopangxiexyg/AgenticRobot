@@ -631,6 +631,11 @@ class RuleBasedRealTeleopExtension:
         ] = {}
         self._admitted_capture_sequences: set[int] = set()
         self._accepted_samples_by_detail_stage: dict[str, int] = {}
+        # Resampled pose stages execute on the 60 Hz reference clock while
+        # formal samples remain owned by the lower-rate dataset clock.  Keep
+        # the resulting writer-rate plan per step so stage coverage never
+        # compares writer ACKs with the raw keyframe count.
+        self._writer_rate_expected_samples_by_step: dict[str, int] = {}
         self._height_calibration: RuleBasedWritingHeightCalibration | None = None
         self._height_calibration_error = ""
         self._height_calibration_pending = False
@@ -789,13 +794,11 @@ class RuleBasedRealTeleopExtension:
                 )
             else:
                 count = max(1, int(getattr(step, "repeats", 1)))
-            expected[str(stage_id)] = expected.get(str(stage_id), 0) + count
-        if self._height_descent_planned_sample_count > 0:
-            stage_id = "right_write.pen_down"
-            expected[stage_id] = (
-                expected.get(stage_id, 0)
-                + int(self._height_descent_planned_sample_count)
+            count = self._writer_rate_expected_samples_by_step.get(
+                step.step_id,
+                count,
             )
+            expected[str(stage_id)] = expected.get(str(stage_id), 0) + count
         return expected
 
     def _stage_sample_coverage(self) -> dict[str, dict[str, int | float | bool]]:
@@ -4020,6 +4023,41 @@ class RuleBasedRealTeleopExtension:
                 "pose reference clock cannot represent source frames: "
                 f"unrepresented_local_indices={missing}"
             )
+        step_ids = {carrier.directive.step_id for carrier in queue}
+        if len(step_ids) != 1:
+            raise RuntimeError(
+                "pose reference queue crosses rule steps: "
+                f"step_ids={sorted(step_ids)!r}"
+            )
+        capture_sequences = {
+            int(carrier.directive.sequence_index)
+            for carrier in queue
+            if carrier.captures_source_frame and carrier.directive.capture.enabled
+        }
+        if capture_sequences:
+            # The terminal keyframe owns one final keyframe interval.  At the
+            # formal writer rate this is the number of samples the stage can
+            # intentionally produce before runtime catch-up or a real writer
+            # rejection.  Cap by distinct capturable source intervals so a
+            # jittered frame represented only as the interpolation right
+            # bracket is not counted as an impossible writer sample.
+            writer_window_sec = float(reference_timestamps[-1]) + (
+                1.0 / float(keyframe_hz)
+            )
+            writer_rate_count = max(
+                1,
+                math.ceil(writer_window_sec * float(self.action_hz) - 1e-9),
+            )
+            expected_count = min(len(capture_sequences), writer_rate_count)
+            step_id = next(iter(step_ids))
+            previous = self._writer_rate_expected_samples_by_step.get(step_id)
+            if previous is not None and previous != expected_count:
+                raise RuntimeError(
+                    "pose reference writer-rate expectation changed within one "
+                    f"attempt: step={step_id!r} previous={previous} "
+                    f"current={expected_count}"
+                )
+            self._writer_rate_expected_samples_by_step[step_id] = expected_count
         self._replay_reference_queue = deque(queue)
         self._replay_reference_stage_started_at = float(now)
         self._replay_reference_pause_started_at = None
@@ -6425,6 +6463,7 @@ class RuleBasedRealTeleopExtension:
         self._last_live_dispatch_timestamp = None
         self._admitted_capture_sequences.clear()
         self._accepted_samples_by_detail_stage.clear()
+        self._writer_rate_expected_samples_by_step.clear()
         self._planned_sample_count = self._count_planned_samples()
         self._stage_total_by_step = self._stage_totals_by_step()
         self._height_descent_planned_count_added = False

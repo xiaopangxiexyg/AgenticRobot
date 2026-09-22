@@ -6027,6 +6027,78 @@ def test_custom_action_reference_accepts_source_frame_used_as_right_bracket() ->
     # Source frame 1 is not the left parent of any reference in this jittered
     # timeline, but it is retained as the right interpolation bracket.
     assert second.metadata["rule_based_reference_source_kind"] == "custom_action"
+    coverage = extension._stage_sample_coverage()["right_write.write"]
+    assert coverage == {
+        "planned": 3,
+        "required": 3,
+        "accepted": 0,
+        "complete": False,
+    }
+
+
+def test_stage_coverage_uses_writer_rate_for_dense_reference_plan() -> None:
+    source_actions = iter(
+        RobotAction(
+            action_space=BIMANUAL_EE_POSE_V1,
+            timestamp=index / 60.0,
+            arm_pose_by_side={
+                "left": _pose(0.0),
+                "right": _pose(index * 0.001),
+            },
+            frame_by_effector={
+                "left_arm": "canonical_desk",
+                "right_arm": "canonical_desk",
+            },
+            controlled_frame_by_effector={
+                "left_arm": "tool_tcp",
+                "right_arm": "tool_tcp",
+            },
+            source="writing_keyframe",
+            metadata={
+                "rule_based_position_reference_resample": True,
+                "rule_based_position_keyframe_hz": 60.0,
+            },
+        )
+        for index in range(12)
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedActionSegment(
+                    step_id="right_write.write",
+                    action_source=CallableActionSource(
+                        lambda _observation: next(source_actions)
+                    ),
+                    stop_condition=RuleBasedSegmentStopCondition(
+                        max_steps=12,
+                        min_steps=12,
+                        name="dense_source_complete",
+                    ),
+                    capture=RuleBasedCaptureSelection(enabled=True),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            action_hz=15.0,
+            position_reference_hz=60.0,
+        ),
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    first = session.command_override_provider(SimpleNamespace(), 3400.0).command
+
+    assert first is not None
+    assert extension._writer_rate_expected_samples_by_step == {
+        "right_write.write": 3
+    }
+    extension._accepted_samples_by_detail_stage["right_write.write"] = 2
+    assert set(extension._incomplete_detail_stages()) == {"right_write.write"}
+    extension._accepted_samples_by_detail_stage["right_write.write"] = 3
+    assert extension._incomplete_detail_stages() == {}
 
 
 def test_replay_queue_resolves_only_source_keyframes_and_live_references() -> None:
