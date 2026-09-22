@@ -5543,6 +5543,78 @@ def test_opted_in_custom_segment_uses_dense_reference_clock_and_source_capture_i
     assert admitted_sequences == [0, 1]
 
 
+def test_custom_action_reference_accepts_source_frame_used_as_right_bracket() -> None:
+    """Jittered source times must not fail when interpolation still represents a frame."""
+
+    timestamps = (0.0, 0.018, 0.019, 0.04)
+    source_actions = iter(
+        RobotAction(
+            action_space=BIMANUAL_EE_POSE_V1,
+            timestamp=timestamp,
+            arm_pose_by_side={
+                "left": _pose(0.0),
+                "right": _pose(index * 0.01),
+            },
+            frame_by_effector={
+                "left_arm": "canonical_desk",
+                "right_arm": "canonical_desk",
+            },
+            controlled_frame_by_effector={
+                "left_arm": "tool_tcp",
+                "right_arm": "tool_tcp",
+            },
+            source="writing_keyframe",
+            metadata={
+                "rule_based_position_reference_resample": True,
+                "rule_based_position_keyframe_hz": 30.0,
+            },
+        )
+        for index, timestamp in enumerate(timestamps)
+    )
+
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedActionSegment(
+                    step_id="right_write.write",
+                    action_source=CallableActionSource(
+                        lambda _observation: next(source_actions)
+                    ),
+                    stop_condition=RuleBasedSegmentStopCondition(
+                        max_steps=len(timestamps),
+                        min_steps=len(timestamps),
+                        name="jittered_source_complete",
+                    ),
+                    capture=RuleBasedCaptureSelection(enabled=True),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            action_hz=30.0,
+            position_reference_hz=60.0,
+        ),
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    first = session.command_override_provider(SimpleNamespace(), 3300.0).command
+    assert first is not None
+    assert any(
+        carrier.right_parent_source_index == 1
+        for carrier in extension._replay_reference_queue
+    )
+    second = session.command_override_provider(
+        SimpleNamespace(), 3300.0 + (1.0 / 60.0) + 1e-6
+    ).command
+    assert second is not None
+    # Source frame 1 is not the left parent of any reference in this jittered
+    # timeline, but it is retained as the right interpolation bracket.
+    assert second.metadata["rule_based_reference_source_kind"] == "custom_action"
+
+
 def test_replay_queue_resolves_only_source_keyframes_and_live_references() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),

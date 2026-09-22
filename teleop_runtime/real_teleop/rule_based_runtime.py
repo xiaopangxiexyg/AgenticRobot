@@ -3869,6 +3869,7 @@ class RuleBasedRealTeleopExtension:
 
         queue: list[_ReplayReferenceCarrier] = []
         captured_source_indices: set[int] = set()
+        represented_source_indices: set[int] = set()
         for reference_index, reference_timestamp in enumerate(reference_timestamps):
             right_position = bisect_right(
                 resampler.source_timestamps,
@@ -3896,6 +3897,13 @@ class RuleBasedRealTeleopExtension:
                 raise RuntimeError("replay resampler returned an invalid source index")
             parent = source_emissions[source_local_index]
             projected_parent = projected_actions[source_local_index]
+            # A source frame is represented by either side of the interpolation
+            # bracket.  Requiring every frame to become the left/active parent
+            # is too strict for jittered or non-integer source timestamps: a
+            # frame can be used as the right bracket and still contribute to
+            # the emitted pose through MotionTargetResampler.
+            represented_source_indices.add(source_local_index)
+            represented_source_indices.add(right_source_local_index)
             captures_source_frame = source_local_index not in captured_source_indices
             if captures_source_frame:
                 captured_source_indices.add(source_local_index)
@@ -3944,11 +3952,13 @@ class RuleBasedRealTeleopExtension:
                 )
             )
 
-        if captured_source_indices != set(range(len(source_emissions))):
-            missing = sorted(set(range(len(source_emissions))) - captured_source_indices)
+        missing = sorted(
+            set(range(len(source_emissions))) - represented_source_indices
+        )
+        if missing:
             raise RuntimeError(
-                "pose reference clock skipped source frames; increase reference_hz: "
-                f"missing_local_indices={missing}"
+                "pose reference clock cannot represent source frames: "
+                f"unrepresented_local_indices={missing}"
             )
         self._replay_reference_queue = deque(queue)
         self._replay_reference_stage_started_at = float(now)
