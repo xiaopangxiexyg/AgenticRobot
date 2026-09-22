@@ -878,6 +878,126 @@ def test_writing_height_capture_uses_fresh_async_right_arm_read_and_is_recoverab
     assert extension.status().height_calibration_enabled is False
 
 
+def test_height_calibration_rebases_command_transport_from_alignment_snapshot() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    components = _components(_Session())
+    extension.attach_components(components)
+
+    class CommandBackend:
+        def __init__(self) -> None:
+            self.resets: list[np.ndarray] = []
+            self.stopped = False
+
+        def is_emergency_stopped(self) -> bool:
+            return self.stopped
+
+        def reset_motion_state(self, qpos) -> None:
+            self.resets.append(np.asarray(qpos, dtype=float).copy())
+
+    class PreviewBackend:
+        def __init__(self) -> None:
+            self.qpos = np.zeros(6, dtype=float)
+
+        def set_local_qpos(self, qpos) -> None:
+            self.qpos = np.asarray(qpos, dtype=float).copy()
+
+        def get_state(self):
+            return {"current_qpos": self.qpos.copy()}
+
+    command_backends = {
+        side: CommandBackend() for side in ("left", "right")
+    }
+    preview_backends = {
+        side: PreviewBackend() for side in ("left", "right")
+    }
+    for side in ("left", "right"):
+        setattr(components, f"{side}_command_backend", command_backends[side])
+        setattr(components, f"{side}_preview_backend", preview_backends[side])
+    components.position_execution_qvel_feedback_enabled = False
+
+    canonical = _pose(0.2, -0.1, 0.321)
+    raw = extension.runtime_pose_frame_contract.canonical_desk_pose_vector_to_storage(
+        canonical,
+        side="right",
+    )
+    extension._commit_writing_height(
+        {
+            "current_tcp_pose": _matrix(raw),
+            "measured_timestamp": 10.0,
+        },
+        now=10.0,
+        requested_at=9.9,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+    )
+    start = {
+        "left": np.linspace(-0.4, 0.1, 6),
+        "right": np.linspace(0.2, -0.3, 6),
+    }
+
+    extension._rebase_motion_transport_after_manual_adjustment(start)
+
+    assert extension._manual_adjustment_motion_rebase_pending is False
+    for side in ("left", "right"):
+        assert len(command_backends[side].resets) == 1
+        np.testing.assert_allclose(command_backends[side].resets[0], start[side])
+        np.testing.assert_allclose(preview_backends[side].qpos, start[side])
+        np.testing.assert_allclose(
+            components.dual_arm_retargeter.current_qpos[side],
+            start[side],
+        )
+
+    # The edge is one-shot; repeated planner polls cannot reset transport
+    # history underneath an already-running transition.
+    extension._rebase_motion_transport_after_manual_adjustment(start)
+    assert all(len(backend.resets) == 1 for backend in command_backends.values())
+
+
+def test_height_calibration_rebase_never_rearms_stopped_arm() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    components = _components(_Session())
+    extension.attach_components(components)
+
+    class StoppedBackend:
+        @staticmethod
+        def is_emergency_stopped() -> bool:
+            return True
+
+        @staticmethod
+        def reset_motion_state(_qpos) -> None:
+            raise AssertionError("stopped backend must not be reset")
+
+    class PreviewBackend:
+        @staticmethod
+        def set_local_qpos(_qpos) -> None:
+            raise AssertionError("preview must not change after failed preflight")
+
+    for side in ("left", "right"):
+        setattr(components, f"{side}_command_backend", StoppedBackend())
+        setattr(components, f"{side}_preview_backend", PreviewBackend())
+    extension._manual_adjustment_motion_rebase_pending = True
+
+    with pytest.raises(RuntimeError, match="runtime Home is required"):
+        extension._rebase_motion_transport_after_manual_adjustment(
+            {"left": np.zeros(6), "right": np.zeros(6)}
+        )
+
+    assert extension._manual_adjustment_motion_rebase_pending is True
+
+
 def test_writing_replay_height_projection_is_lower_floor_only_and_opt_in() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),

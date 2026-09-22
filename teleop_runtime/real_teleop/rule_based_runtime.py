@@ -61,6 +61,7 @@ from ..backends.grippers import DMTAC_GRIPPER_RECOVERABLE_SEND_STATUSES
 from ..collection.action_record import validate_collection_command_action
 from ..command_override import TeleopCommandOverride
 from ..diagnostics import FaultEvent, FaultSeverity
+from .arm_runtime import _sync_dual_arm_retargeter_for_real_control
 from .pose_frame_runtime import (
     RealTeleopPoseFrameActionResolver,
     resolve_runtime_pose_frame_contract,
@@ -637,6 +638,13 @@ class RuleBasedRealTeleopExtension:
         self._height_lower_tolerance_m = 0.001
         self._height_upper_tolerance_m = 0.001
         self._writing_height_target_z_m: float | None = None
+        # Height calibration is deliberately performed after the operator may
+        # have moved either arm by hand.  The next initial-alignment planner
+        # therefore has to rebase the position transport from the same fresh
+        # dual-arm feedback cut it uses as waypoint zero.  This is a one-shot
+        # pre-dispatch operation; runtime Home remains the only path allowed to
+        # clear an emergency-stop latch.
+        self._manual_adjustment_motion_rebase_pending = False
         self._height_descent_planned_count_added = False
         self._height_descent_planned_sample_count = 0
         self._configuration_options: dict[str, Any] = {}
@@ -1872,6 +1880,7 @@ class RuleBasedRealTeleopExtension:
         self._height_upper_tolerance_m = float(captured.upper_tolerance_m)
         self._height_calibration_error = ""
         self._writing_height_target_z_m = None
+        self._manual_adjustment_motion_rebase_pending = True
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
             append_message(
@@ -4449,6 +4458,7 @@ class RuleBasedRealTeleopExtension:
         # during planning; collision, TCP-envelope, and command guards remain
         # authoritative for every emitted waypoint.
         start = self._initial_alignment_start_qpos_pair(snapshots)
+        self._rebase_motion_transport_after_manual_adjustment(start)
         target = {
             side: np.asarray(
                 emission.directive.qpos_by_side.get(side, start[side]),
@@ -4812,6 +4822,74 @@ class RuleBasedRealTeleopExtension:
         """
 
         return self._snapshot_qpos_pair(snapshots)
+
+    def _rebase_motion_transport_after_manual_adjustment(
+        self,
+        start_qpos_by_side: Mapping[str, np.ndarray],
+    ) -> None:
+        """Align command-planner state with post-calibration arm feedback.
+
+        Manual adjustment changes the physical qpos without passing through
+        the command backend.  RM65 position planners otherwise retain their
+        last accepted pre-adjustment qcmd and turn the command-inert first
+        alignment waypoint into a visible corrective kick.  Rebase all three
+        consumers from one causal snapshot before any rule command is built.
+
+        This helper never rearms a stopped backend.  A stopped or incomplete
+        transport remains a hard failure that must go through runtime Home.
+        """
+
+        if not self._manual_adjustment_motion_rebase_pending:
+            return
+        components = self._components
+        if components is None:
+            raise RuntimeError(
+                "post-calibration motion rebase requires attached real-arm components."
+            )
+
+        prepared: dict[str, tuple[object, object, np.ndarray]] = {}
+        for side in ("left", "right"):
+            try:
+                qpos = np.asarray(start_qpos_by_side[side], dtype=float).reshape(6)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"post-calibration motion rebase requires finite {side} actual_qpos."
+                ) from exc
+            if not np.all(np.isfinite(qpos)):
+                raise RuntimeError(
+                    f"post-calibration motion rebase requires finite {side} actual_qpos."
+                )
+            command_backend = getattr(components, f"{side}_command_backend", None)
+            preview_backend = getattr(components, f"{side}_preview_backend", None)
+            if not callable(getattr(command_backend, "reset_motion_state", None)):
+                raise RuntimeError(
+                    f"post-calibration motion rebase requires {side} command backend."
+                )
+            if not callable(getattr(preview_backend, "set_local_qpos", None)):
+                raise RuntimeError(
+                    f"post-calibration motion rebase requires {side} preview backend."
+                )
+            is_stopped = getattr(command_backend, "is_emergency_stopped", None)
+            if callable(is_stopped) and bool(is_stopped()):
+                raise RuntimeError(
+                    f"{side} command backend is stopped; runtime Home is required "
+                    "before rule initialization."
+                )
+            prepared[side] = (command_backend, preview_backend, qpos.copy())
+
+        for command_backend, preview_backend, qpos in prepared.values():
+            preview_backend.set_local_qpos(qpos)
+            command_backend.reset_motion_state(qpos)
+        _sync_dual_arm_retargeter_for_real_control(components)
+        self._manual_adjustment_motion_rebase_pending = False
+
+        append_message = getattr(self._control_ui, "append_message", None)
+        if callable(append_message):
+            append_message(
+                "Calibration",
+                "已用标定后的双臂新鲜实测姿态重置位控规划锚点；"
+                "初始化首帧不会沿用标定前命令状态。",
+            )
 
     def _hand_qpos_from_state(
         self,
@@ -6589,6 +6667,10 @@ class RuleBasedRealTeleopExtension:
         if self._recording_active is not None and self._recording_active():
             raise RuntimeError("cancelled rule Episode is still active")
         self._held = False
+        # Explicit runtime Home already resets preview, command transport and
+        # coupled IK from one live snapshot, so no additional rule-owned
+        # pre-dispatch rebase is needed.
+        self._manual_adjustment_motion_rebase_pending = False
         self._armed = bool(self._legacy_generic_ui)
         self._waiting_reason = (
             "waiting_for_formal_episode"

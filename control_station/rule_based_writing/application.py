@@ -173,6 +173,9 @@ class RuleBasedWritingApplication:
         self._runtime_home_retry_available = False
         self._runtime_home_retry_reason = ""
         self._device_retry_waiting_for_hold = False
+        self._device_recovery_task_chain_step: str | None = None
+        self._device_recovery_home_requested = False
+        self._device_recovery_owner_close_requested = False
         self._rule_runtime_bound = False
         # A dedicated rule start owns a short pre-Episode writer-open window.
         # The lower RealTeleop admission may consult this capability while the
@@ -442,6 +445,7 @@ class RuleBasedWritingApplication:
                 self._set_readiness_blocked_locked()
             elif self._state.phase == "preparing" and self._rule_runtime_bound:
                 self._project_prestart_readiness_locked()
+            self._maybe_continue_device_recovery_locked()
             self._try_start_waiting_task_chain_locked()
             self._rebuild_controls()
             self._touch()
@@ -531,6 +535,7 @@ class RuleBasedWritingApplication:
                 if self._task_chain_cancel_pending:
                     return False
                 self._task_chain_cancel_pending = True
+                self._clear_device_recovery_locked()
                 self._pre_episode_start_admission_open = False
                 self._rule_intents.put(intent)
                 self._runtime_events.put("episode_stop:rule_based_hold_cancel")
@@ -600,6 +605,12 @@ class RuleBasedWritingApplication:
         elif intent is RuleBasedWritingIntent.DEVICE_RETRY:
             if not available["retry_devices"]:
                 return False
+            if self._device_recovery_task_chain_step is None:
+                self._device_recovery_task_chain_step = (
+                    self._task_chain.prepare_device_recovery()
+                )
+                self._device_recovery_home_requested = False
+                self._device_recovery_owner_close_requested = False
             self._state.device_retry_pending = True
             self._state.phase = "preparing"
             if self._device_retry_directly_admitted_locked():
@@ -1175,10 +1186,18 @@ class RuleBasedWritingApplication:
                 self._state.phase = "blocked"
                 self._state.title = "设备重连未执行"
                 self._state.detail = str(error)
-            elif self._state.startup_blockers:
-                self._set_readiness_blocked_locked()
             else:
-                self._project_prestart_readiness_locked()
+                if self._device_recovery_task_chain_step is None:
+                    self._device_recovery_task_chain_step = (
+                        self._task_chain.prepare_device_recovery()
+                    )
+                self._maybe_continue_device_recovery_locked()
+                if self._state.runtime_home_pending:
+                    self._set_runtime_home_pending_locked()
+                elif self._state.startup_blockers:
+                    self._set_readiness_blocked_locked()
+                elif self._device_recovery_task_chain_step is None:
+                    self._project_prestart_readiness_locked()
             self._rebuild_controls()
             self._touch()
 
@@ -1202,6 +1221,12 @@ class RuleBasedWritingApplication:
                     and not self._state.runtime_home_pending
                 ):
                     self._state.runtime_home_pending = False
+                    # Generic ``home_ready`` is authoritative, but the rule
+                    # heartbeat may lag it by one publication.  Keep the
+                    # one-shot request latch until this fresh Session receipt
+                    # arrives so the stale DEBUG_ONLY label cannot enqueue a
+                    # duplicate runtime Home.
+                    self._device_recovery_home_requested = False
             if "readiness_reason" in status:
                 self._state.readiness_reason = str(
                     status.get("readiness_reason") or ""
@@ -1477,6 +1502,7 @@ class RuleBasedWritingApplication:
                     self._state.detail = self._state.configuration_error
                 elif self._state.gripper_action_status:
                     self._state.detail = self._state.gripper_action_status
+            self._maybe_continue_device_recovery_locked()
             self._try_start_waiting_task_chain_locked()
             self._observe_task_chain_status_locked(
                 begun=begun,
@@ -1519,6 +1545,128 @@ class RuleBasedWritingApplication:
         if not self._submit_intent_locked(RuleBasedWritingIntent.START):
             return False
         self._task_chain.begin_rule_after_wait()
+        return True
+
+    def _clear_device_recovery_locked(self) -> None:
+        self._device_recovery_task_chain_step = None
+        self._device_recovery_home_requested = False
+        self._device_recovery_owner_close_requested = False
+
+    def _maybe_continue_device_recovery_locked(self) -> bool:
+        """Continue one interrupted task-chain step through canonical gates.
+
+        Reconnection alone is never motion admission.  The existing
+        robot-state-only runtime Home must succeed first, then the exact step
+        accepted before the device fault is resubmitted once.  Repeated status
+        publications are intentionally idempotent.
+        """
+
+        step = self._device_recovery_task_chain_step
+        if (
+            step is None
+            or self._state.device_retry_pending
+            or self._device_retry_waiting_for_hold
+            or self._state.configuration_pending
+            or self._state.writer_retry_pending
+            or self._state.height_calibration_pending
+            or self._state.shutdown
+        ):
+            return False
+
+        blockers = self._effective_startup_blockers_locked()
+        non_home_blockers = {
+            key: detail
+            for key, detail in blockers.items()
+            if not self._is_runtime_home_requirement(key, detail)
+            and key != "rule.right_hand_hold_owner"
+        }
+        if non_home_blockers:
+            return False
+
+        if self._state.runtime_home_pending:
+            return False
+        if self._session_requires_runtime_home_locked():
+            if self._device_recovery_home_requested:
+                return False
+            if not self._submit_intent_locked(
+                RuleBasedWritingIntent.RUNTIME_HOME_RETRY
+            ):
+                return False
+            self._device_recovery_home_requested = True
+            self._append_message_locked(
+                "Progress",
+                "失败设备已恢复；正在通过现有 runtime Home 门禁重建任务链安全状态。",
+            )
+            return True
+
+        if blockers and set(blockers) != {"rule.right_hand_hold_owner"}:
+            return False
+        if self._state.gripper_action_pending:
+            return False
+
+        if step == "rule":
+            phase = self._task_chain.phase
+            if phase is RuleWritingTaskChainPhase.CONFIGURATION_PENDING:
+                return False
+            if phase is RuleWritingTaskChainPhase.RULE_PENDING:
+                self._clear_device_recovery_locked()
+                return True
+            if phase is not RuleWritingTaskChainPhase.READY_RULE:
+                return False
+            if self._rule_owner_recovery_window_locked():
+                if self._device_recovery_owner_close_requested:
+                    return False
+                if not self._submit_intent_locked(
+                    RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
+                ):
+                    return False
+                self._device_recovery_owner_close_requested = True
+                self._append_message_locked(
+                    "Progress",
+                    "设备会话恢复后正在重新建立右夹爪一次性闭合 owner；"
+                    "实测闭紧前不会恢复规则运动。",
+                )
+                return True
+            if not self._task_chain.selected_configuration:
+                return False
+            if not self._task_chain.rule_start_waiting:
+                self._task_chain.wait_for_recovered_rule_start()
+            if not self._try_start_waiting_task_chain_locked():
+                return False
+            self._clear_device_recovery_locked()
+            return True
+
+        action_id_baseline = self._last_gripper_action_id
+        if step == "initial_release":
+            if self._task_chain.phase is not RuleWritingTaskChainPhase.IDLE:
+                return False
+            intent = RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER
+        elif step == "close":
+            if self._task_chain.phase is not RuleWritingTaskChainPhase.READY_CLOSE:
+                return False
+            intent = RuleBasedWritingIntent.CLOSE_RIGHT_GRIPPER
+        elif step == "final_release":
+            if (
+                self._task_chain.phase
+                is not RuleWritingTaskChainPhase.READY_FINAL_RELEASE
+            ):
+                return False
+            intent = RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER
+        else:
+            raise RuntimeError(f"unknown device recovery task-chain step: {step}")
+        if not self._submit_intent_locked(intent):
+            return False
+        if step == "initial_release":
+            self._task_chain.begin_initial_release(
+                action_id_baseline=action_id_baseline
+            )
+        elif step == "close":
+            self._task_chain.begin_close(action_id_baseline=action_id_baseline)
+        else:
+            self._task_chain.begin_final_release(
+                action_id_baseline=action_id_baseline
+            )
+        self._clear_device_recovery_locked()
         return True
 
     def _observe_task_chain_status_locked(
@@ -2108,6 +2256,7 @@ class RuleBasedWritingApplication:
     def _has_retryable_device_blockers_locked(self) -> bool:
         return any(
             not self._is_runtime_home_requirement(key, detail)
+            and str(key) != "rule.right_hand_hold_owner"
             for key, detail in self._state.startup_blockers.items()
         )
 
@@ -2159,7 +2308,11 @@ class RuleBasedWritingApplication:
         self._set_device_retry_running_locked()
 
     def _session_requires_runtime_home_locked(self) -> bool:
-        blockers = self._effective_startup_blockers_locked()
+        blockers = {
+            key: detail
+            for key, detail in self._effective_startup_blockers_locked().items()
+            if key != "rule.right_hand_hold_owner"
+        }
         if self._runtime_home_retry_available:
             return True
         state = str(self._state.session_state or "").upper()

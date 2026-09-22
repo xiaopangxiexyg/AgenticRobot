@@ -207,6 +207,73 @@ class RuleWritingTaskChain:
         self.last_error = ""
         self.rule_start_waiting = True
 
+    def wait_for_recovered_rule_start(self) -> None:
+        """Resume the same validated rule after device/Home recovery.
+
+        Unlike configuration completion, recovery already owns a validated
+        selection.  It may only reopen the existing START gate; it never
+        chooses or rebuilds a different trajectory.
+        """
+
+        self._require(RuleWritingTaskChainPhase.READY_RULE)
+        if not self.selected_configuration:
+            raise RuntimeError(
+                "recovered rule start requires the previously selected configuration."
+            )
+        self.last_error = ""
+        self.rule_start_waiting = True
+
+    def prepare_device_recovery(self) -> str | None:
+        """Freeze an interrupted step at its nearest retryable boundary.
+
+        The returned token describes only a step that had already been
+        accepted before the device fault.  Merely waiting at a manual gate
+        does not grant automatic continuation.
+        """
+
+        phase = self.phase
+        operation: str | None = None
+        if phase is RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING:
+            self.phase = RuleWritingTaskChainPhase.IDLE
+            operation = "initial_release"
+        elif phase is RuleWritingTaskChainPhase.CLOSE_PENDING:
+            self.phase = RuleWritingTaskChainPhase.READY_CLOSE
+            operation = "close"
+        elif phase is RuleWritingTaskChainPhase.CONFIGURATION_PENDING:
+            # The command-inert configuration worker keeps its ownership.  Its
+            # normal callback will move the chain to READY_RULE.
+            operation = "rule"
+        elif phase is RuleWritingTaskChainPhase.RULE_PENDING:
+            self.phase = RuleWritingTaskChainPhase.READY_RULE
+            operation = "rule"
+        elif phase is RuleWritingTaskChainPhase.FINAL_RELEASE_PENDING:
+            self.phase = RuleWritingTaskChainPhase.READY_FINAL_RELEASE
+            operation = "final_release"
+        elif phase is RuleWritingTaskChainPhase.IDLE and self.last_error:
+            operation = "initial_release"
+        elif phase is RuleWritingTaskChainPhase.READY_CLOSE and self.last_error:
+            operation = "close"
+        elif (
+            phase is RuleWritingTaskChainPhase.READY_RULE
+            and self.selected_configuration
+            and (self.last_error or self.rule_start_waiting)
+        ):
+            operation = "rule"
+        elif (
+            phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE
+            and self.last_error
+        ):
+            operation = "final_release"
+
+        if operation is None:
+            return None
+        self.gripper_action_baseline_id = None
+        self.gripper_action_id = None
+        self.rule_execution_seen = False
+        self.rule_start_waiting = False
+        self.last_error = ""
+        return operation
+
     def fail_rule_preparation(self, error: str) -> None:
         self._require(RuleWritingTaskChainPhase.CONFIGURATION_PENDING)
         self.phase = RuleWritingTaskChainPhase.READY_RULE

@@ -895,6 +895,155 @@ def test_rule_device_retry_holds_running_control_before_automatic_retry() -> Non
     assert completed["can_retry_devices"] is True
 
 
+def test_task_chain_device_recovery_runs_home_restores_owner_and_resumes_rule() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, selected, _other = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, selected)
+    application.observe_rule_status(_task_chain_ready_status())
+    application._task_chain.phase = RuleWritingTaskChainPhase.RULE_PENDING
+    application._task_chain.selected_configuration = dict(selected)
+    application._task_chain.selected_configuration_index = 0
+
+    # The device fault aborts the active rule and the ordinary chain observer
+    # moves it to its retry boundary while preserving the selected trajectory.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            session_state="FAULT",
+            # The runtime Hold owner resets the failed attempt before
+            # publishing its recoverable held state.
+            aborted=False,
+            held=True,
+            rule_start_available=False,
+            readiness_blockers={
+                "hand.right": "DMTAC disconnected",
+                "rig.session": "Session state=FAULT; runtime Home required",
+            },
+        )
+    )
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["device_retry", "q"],
+            "startup_blockers": {
+                "hand.right": "DMTAC disconnected",
+                "rig.session": "Session state=FAULT; runtime Home required",
+            },
+        }
+    )
+    assert application.submit_intent(RuleBasedWritingIntent.DEVICE_RETRY) is True
+    assert application.consume_runtime_events() == ["device_retry"]
+
+    application.complete_device_retry(error=None)
+    assert application.consume_runtime_events() == []
+
+    # Fresh lower readiness removes the hardware fault.  Recovery must reuse
+    # the canonical robot-state-only Home path exactly once.
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["runtime_home_retry", "q"],
+            "startup_blockers": {
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect",
+            },
+        }
+    )
+    assert application.consume_runtime_events() == []
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            session_state="DEBUG_ONLY",
+            held=True,
+            rule_start_available=False,
+            readiness_blockers={
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect",
+            },
+        )
+    )
+    assert application.consume_runtime_events() == ["runtime_home_retry"]
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["runtime_home_retry", "q"],
+            "startup_blockers": {
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect",
+            },
+        }
+    )
+    assert application.consume_runtime_events() == []
+
+    application.observe_runtime_publication(
+        {
+            "home_ready": True,
+            "active_controls": ["q"],
+            "startup_blockers": {
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect",
+            },
+        }
+    )
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+            rule_start_available=False,
+        )
+    )
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+
+    # The new serial session's measured-close receipt restores the owner, then
+    # the same validated rule is started without another operator click.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            readiness_blockers={},
+            gripper_action_pending=False,
+            gripper_action_id=51,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
+        )
+    )
+    application.observe_runtime_publication(
+        {"active_controls": ["q"], "startup_blockers": {}}
+    )
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "rule_pending"
+
+    application.observe_rule_status(_task_chain_ready_status(armed=True))
+    assert application.consume_rule_intents() == ()
+    assert application.consume_runtime_events() == []
+
+
+def test_task_chain_device_recovery_does_not_advance_while_fault_remains() -> None:
+    application = RuleBasedWritingApplication()
+    options, selected, _other = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, selected)
+    application.observe_rule_status(_task_chain_ready_status())
+    application._task_chain.phase = RuleWritingTaskChainPhase.CLOSE_PENDING
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["device_retry", "q"],
+            "startup_blockers": {"hand.right": "DMTAC disconnected"},
+        }
+    )
+
+    assert application.submit_intent(RuleBasedWritingIntent.DEVICE_RETRY) is True
+    assert application.consume_runtime_events() == ["device_retry"]
+    application.complete_device_retry(error=None)
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["device_retry", "q"],
+            "startup_blockers": {"hand.right": "DMTAC still disconnected"},
+        }
+    )
+
+    assert application.consume_runtime_events() == []
+    assert application.consume_rule_intents() == ()
+    assert application.snapshot()["task_chain_phase"] == "ready_close"
+
+
 def test_rule_device_retry_is_unavailable_without_lower_retry_or_hold_control() -> None:
     application = RuleBasedWritingApplication()
     application.bind_rule_runtime()
