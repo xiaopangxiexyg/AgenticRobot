@@ -1156,6 +1156,7 @@ def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     assert "--collection-progress-entry-step right_write" in output
     assert "--collection-progress-entry-stage right_write.pen_down" in output
     assert "--camera-frame-max-age-sec 0.25" in output
+    assert "--actual-wrist-camera-pose-hz 15.0" in output
 
 
 def test_launcher_restores_system_tools_when_conda_path_is_isolated(
