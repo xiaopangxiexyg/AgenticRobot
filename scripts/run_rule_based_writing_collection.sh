@@ -463,6 +463,10 @@ TELEOP_ARGS=(
   --camera-config teleop_runtime/configs/devices/realsense.json
   --camera-color-format bgr8
   --camera-frame-max-age-sec "$CAMERA_FRAME_MAX_AGE_SEC"
+  # RM65 force and actual-qpos feedback share one serialized state SDK
+  # connection. Keep the best-effort annotation below the 20 Hz force guard
+  # cadence so it cannot create a 30 Hz + 20 Hz burst at collection start.
+  --actual-wrist-camera-pose-hz 15.0
   --write-parquet
   --write-video
   --gui-resizable-sidebars

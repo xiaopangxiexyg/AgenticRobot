@@ -855,12 +855,21 @@ class RealTeleopDatasetRecorder:
         }
         if not active_backends:
             return None
+        force_guard_active = bool(
+            getattr(self.args, "position_force_guard", False)
+        )
         return ArmHardwareStatePoller(
             backends_by_side=active_backends,
             config=ArmHardwareStatePollerConfig(
                 poll_hz=float(getattr(self.args, "actual_wrist_camera_pose_hz", 30.0)),
                 stale_after_sec=float(
                     getattr(self.args, "actual_wrist_camera_pose_max_age_sec", 0.2)
+                ),
+                hardware_read_priority=(
+                    "background" if force_guard_active else "normal"
+                ),
+                hardware_read_lock_timeout_sec=(
+                    0.02 if force_guard_active else None
                 ),
             ),
         )

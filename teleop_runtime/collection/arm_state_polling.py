@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
@@ -83,6 +84,11 @@ class ArmHardwareStatePollerConfig:
     stale_after_sec: float = 0.2
     hardware_read_retries: int = 0
     hardware_read_retry_delay_sec: float = 0.0
+    # Rule/position collection can opt this annotation-only reader into the
+    # bounded background lane.  Keep ordinary collection's historical
+    # synchronous read behavior unless its caller explicitly opts in.
+    hardware_read_priority: str = "normal"
+    hardware_read_lock_timeout_sec: float | None = None
     source_label: str = "rm65_hardware_state_poller"
     wrist_camera_pose_source: str = "rm65_feedback_qpos_fk"
     history_size: int = 256
@@ -98,6 +104,18 @@ class ArmHardwareStatePollerConfig:
             raise ValueError("hardware_read_retries must be non-negative.")
         if float(self.hardware_read_retry_delay_sec) < 0.0:
             raise ValueError("hardware_read_retry_delay_sec must be non-negative.")
+        priority = str(self.hardware_read_priority or "normal").strip().lower()
+        if priority not in {"normal", "background"}:
+            raise ValueError(
+                "hardware_read_priority must be 'normal' or 'background'."
+            )
+        object.__setattr__(self, "hardware_read_priority", priority)
+        if self.hardware_read_lock_timeout_sec is not None:
+            lock_timeout = float(self.hardware_read_lock_timeout_sec)
+            if not math.isfinite(lock_timeout) or lock_timeout < 0.0:
+                raise ValueError(
+                    "hardware_read_lock_timeout_sec must be non-negative and finite."
+                )
 
 
 class ArmHardwareStatePoller:
@@ -348,10 +366,19 @@ class ArmHardwareStatePoller:
             kwargs["hardware_read_retry_delay_sec"] = float(
                 self.config.hardware_read_retry_delay_sec
             )
-        # This poller runs at 30 Hz per arm and consumes measured qpos/pose
-        # fields only.  RM65's complete diagnostic snapshot performs FK and
-        # exact percentile sorting; requesting it here periodically competes
-        # for the GIL with the real-time command loop.
+        if "hardware_read_priority" in arg_names:
+            kwargs["hardware_read_priority"] = self.config.hardware_read_priority
+        if (
+            "hardware_read_lock_timeout_sec" in arg_names
+            and self.config.hardware_read_lock_timeout_sec is not None
+        ):
+            kwargs["hardware_read_lock_timeout_sec"] = float(
+                self.config.hardware_read_lock_timeout_sec
+            )
+        # This poller consumes measured qpos/pose fields only.  RM65's complete
+        # diagnostic snapshot performs FK and exact percentile sorting;
+        # requesting it here periodically competes for the GIL with the
+        # real-time command loop.
         if "include_derived_pose" in arg_names:
             kwargs["include_derived_pose"] = False
         if "include_timing_percentiles" in arg_names:

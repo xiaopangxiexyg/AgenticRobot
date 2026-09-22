@@ -109,6 +109,27 @@ class _FakeRefreshArmBackend:
         return self.tcp_pose.copy()
 
 
+class _PriorityRefreshArmBackend:
+    def __init__(self) -> None:
+        self.received: dict[str, object] = {}
+
+    def refresh_state_from_hardware(
+        self,
+        *,
+        hardware_read_priority: str = "normal",
+        hardware_read_lock_timeout_sec: float | None = None,
+        include_derived_pose: bool = True,
+        include_timing_percentiles: bool = True,
+    ) -> dict[str, object]:
+        self.received = {
+            "hardware_read_priority": hardware_read_priority,
+            "hardware_read_lock_timeout_sec": hardware_read_lock_timeout_sec,
+            "include_derived_pose": include_derived_pose,
+            "include_timing_percentiles": include_timing_percentiles,
+        }
+        return {}
+
+
 class TeleopCollectionActionRecordTest(unittest.TestCase):
     def test_collection_action_record_metadata_uses_canonical_pose_action(self) -> None:
         pose = np.array([0.11, 0.12, 0.13, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
@@ -909,6 +930,33 @@ class TeleopCollectionActionRecordTest(unittest.TestCase):
         )
         self.assertEqual(latest["actual_hardware_result_code"], 0)
         self.assertAlmostEqual(latest["wrist_camera_pose_sample_time_offset_sec"], 0.02)
+
+    def test_actual_wrist_camera_poller_uses_bounded_background_admission(self) -> None:
+        self.assertEqual(
+            ArmHardwareStatePollerConfig().hardware_read_priority,
+            "normal",
+        )
+        self.assertIsNone(
+            ArmHardwareStatePollerConfig().hardware_read_lock_timeout_sec
+        )
+        backend = _PriorityRefreshArmBackend()
+        poller = ArmHardwareStatePoller(
+            backends_by_side={"left": backend},
+            config=ArmHardwareStatePollerConfig(
+                hardware_read_priority="background",
+                hardware_read_lock_timeout_sec=0.017,
+            ),
+        )
+
+        poller._refresh_state_from_hardware(backend)
+
+        self.assertEqual(backend.received["hardware_read_priority"], "background")
+        self.assertAlmostEqual(
+            float(backend.received["hardware_read_lock_timeout_sec"]),
+            0.017,
+        )
+        self.assertFalse(backend.received["include_derived_pose"])
+        self.assertFalse(backend.received["include_timing_percentiles"])
 
     def test_actual_state_poller_selects_latest_snapshot_at_or_before_sample(self) -> None:
         pose = xyzquat_to_matrix(
