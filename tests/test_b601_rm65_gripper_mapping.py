@@ -169,7 +169,9 @@ def test_normalized_sample_rejects_invalid_order_and_timestamps() -> None:
         _sample(1.1, 1)
 
 
-def test_b601_j7_reader_is_parameter_only_and_never_commands_motor() -> None:
+def test_b601_j7_reader_is_parameter_only_and_never_commands_motor(
+    tmp_path: Path,
+) -> None:
     calls: list[tuple[str, tuple[object, ...]]] = []
 
     class Motor:
@@ -188,9 +190,26 @@ def test_b601_j7_reader_is_parameter_only_and_never_commands_motor() -> None:
         def close(self):
             calls.append(("close", ()))
 
-    config = B601RSGripperReaderConfig.from_rs_yaml(
-        REBOT_SOURCE_ROOT / "config/rebotarm_rs.yaml"
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text(
+        """\
+channel: can0
+groups:
+  gripper:
+    joints: [gripper]
+joints:
+  - name: gripper
+    motor_id: 7
+    feedback_id: 253
+    model: rs-00
+    vendor: robstride
+    MIT:
+      kp: 50.0
+      kd: 4.0
+""",
+        encoding="utf-8",
     )
+    config = B601RSGripperReaderConfig.from_rs_yaml(config_path)
     reader = B601RSGripperReader(config, controller_factory=Controller)
     reader.connect()
     observation = reader.read_position()
