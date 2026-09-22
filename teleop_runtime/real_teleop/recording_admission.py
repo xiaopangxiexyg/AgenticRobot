@@ -109,6 +109,16 @@ def recording_warmup_status(
         if not worker_ready:
             return False, worker_message
     if not bool(getattr(args, "no_camera", False)):
+        configured_camera_max_age = getattr(
+            args,
+            "camera_frame_max_age_sec",
+            DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+        )
+        camera_frame_max_age_sec = float(
+            DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
+            if configured_camera_max_age is None
+            else configured_camera_max_age
+        )
         pending_contract = CaptureModalityContract(
             ignored_camera_keys=tuple(
                 getattr(args, "ignore_camera", ()) or ()
@@ -121,9 +131,30 @@ def recording_warmup_status(
         for camera_key, source in camera_sources.items():
             if camera_key in ignored_camera_keys:
                 continue
-            frame = source.frame_buffer().get_latest()
+            frame_buffer = source.frame_buffer()
+            # Use the same causal lookup as CollectorSampleBuilder.  The
+            # camera thread can publish a newer frame after this control
+            # frame's T0; treating that frame as the candidate makes a
+            # healthy stream look as though its clock jumped into the future.
+            frame = frame_buffer.get_latest_before_or_at(float(now))
             if frame is None:
-                return False, f"等待相机 {camera_key} 首帧。"
+                latest = frame_buffer.get_latest()
+                if latest is None:
+                    return False, f"等待相机 {camera_key} 首帧。"
+                latest_source_timestamp = float(latest.source_timestamp)
+                latest_available_timestamp = float(
+                    getattr(
+                        latest,
+                        "available_timestamp",
+                        latest_source_timestamp,
+                    )
+                )
+                if (
+                    latest_source_timestamp > float(now) + 0.05
+                    or latest_available_timestamp > float(now) + 0.05
+                ):
+                    return False, f"等待相机 {camera_key} 时间戳稳定。"
+                return False, f"等待相机 {camera_key} 因果对齐帧。"
             source_timestamp = float(frame.source_timestamp)
             # CollectorSampleBuilder applies the stricter of the source and
             # availability timestamps.  Use the same effective age here so
@@ -141,7 +172,7 @@ def recording_warmup_status(
                 source_age,
                 available_age,
             )
-            if camera_age > DEFAULT_CAMERA_FRAME_MAX_AGE_SEC:
+            if camera_age > camera_frame_max_age_sec:
                 return False, f"等待相机 {camera_key} 最新帧，当前 age={camera_age:.2f}s。"
         camera_status = clutch_input.publish_camera_status(
             camera_sources=camera_sources,
