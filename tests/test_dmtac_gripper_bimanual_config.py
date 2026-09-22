@@ -2743,11 +2743,13 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             },
         )
 
-        self.assertFalse(backend.send_command(command))
-        self.assertEqual(backend._last_send_status, "hold_owner_uninitialized")
+        # Closed-side idle plus causal measured progress is a valid
+        # object-limited grasp even when the normalized endpoint is not 1.0.
+        self.assertTrue(backend.send_command(command))
+        self.assertEqual(backend._last_send_status, "preserved_existing_grip")
         self.assertEqual(
             backend._last_send_skip_reason,
-            "preserve_existing_grip_without_settled_closed_feedback",
+            "task_chain_owns_physical_grip",
         )
         self.assertEqual(fake.moves, [])
 
@@ -2809,15 +2811,24 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         self.assertTrue(backend.fixed_closed_one_shot_ready())
 
         # A pen or other object may stop the fingers before the numeric close
-        # endpoint.  Accept only the vendor's explicit, causal force-stop
-        # receipt; an ordinary idle sample short of target remains ambiguous.
+        # endpoint.  A closed-side idle sample is valid only after the causal
+        # one-shot close has moved the measured hand away from the open
+        # endpoint; status=2 by itself remains ambiguous.
         contact = endpoint.copy()
         contact[0] = 0.53
         backend._latest_measured_joint_pos = contact
-        self.assertFalse(backend.fixed_closed_one_shot_ready())
+        self.assertTrue(backend.fixed_closed_one_shot_ready())
 
         backend._latest_gripper_status_code = 6
         self.assertTrue(backend.fixed_closed_one_shot_ready())
+
+        stalled_open = endpoint.copy()
+        stalled_open[0] = 0.0
+        backend._latest_measured_joint_pos = stalled_open
+        backend._latest_gripper_status_code = 2
+        self.assertFalse(backend.fixed_closed_one_shot_ready())
+
+        backend._latest_measured_joint_pos = contact
 
         backend._latest_joint_timestamp = 9.95
         self.assertFalse(backend.fixed_closed_one_shot_ready())

@@ -3165,10 +3165,7 @@ def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
     assert extension._pending_gripper_action == "close_right_gripper"
     assert len(session.external_commands) == 1
 
-    # Contact/force stop can occur before normalized position reaches 1.0.
-    # It is accepted only after a causal command and distinct stable frames.
-    hand_poller.value = 0.53
-    # Closed-side idle without endpoint/contact evidence is ambiguous: it can
+    # A closed-side idle sample without measured progress is ambiguous: it can
     # be a stall and must not be promoted to a successful grasp.
     hand_poller.status_code = 2
     hand_poller.timestamp = 10.1
@@ -3176,13 +3173,15 @@ def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
     assert extension._pending_gripper_action == "close_right_gripper"
     assert len(session.external_commands) == 1
 
-    hand_poller.status_code = 6
-    for timestamp, now in ((10.1, 10.1), (10.2, 10.2)):
+    # A pen/object can stop the hand below the numeric endpoint.  Once the
+    # causal close has produced forward measured progress, the same stable
+    # endpoint gate accepts status=2 as a valid closed-side idle receipt.
+    hand_poller.value = 0.53
+    for timestamp, now in ((10.2, 10.2), (10.3, 10.3), (10.4, 10.4)):
         hand_poller.timestamp = timestamp
         session.command_override_provider(SimpleNamespace(), now)
-        assert extension._pending_gripper_action == "close_right_gripper"
-    hand_poller.timestamp = 10.3
-    session.command_override_provider(SimpleNamespace(), 10.3)
+        if now < 10.4:
+            assert extension._pending_gripper_action == "close_right_gripper"
 
     status = extension.status()
     assert extension._pending_gripper_action is None
@@ -3202,6 +3201,37 @@ def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
                     "gripper_error_code": 0,
                     "gripper_is_moving": False,
                 },
+            }
+        },
+    )
+    partial_idle_state = {
+        "gripper_status_code": 2,
+        "gripper_error_code": 0,
+        "gripper_is_moving": False,
+        "gripper_commanded_scalar": 1.0,
+    }
+    assert extension._writing_right_gripper_force_stop_reached(
+        side="right",
+        target=nominal,
+        snapshots={
+            "right": {
+                "actual_hand_qpos": np.asarray(
+                    [0.53, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    dtype=np.float32,
+                ),
+                "hand_state": partial_idle_state,
+            }
+        },
+    )
+    assert extension._writing_right_gripper_hold_admitted(
+        target=nominal,
+        snapshots={
+            "right": {
+                "actual_hand_qpos": np.asarray(
+                    [0.53, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    dtype=np.float32,
+                ),
+                "hand_state": partial_idle_state,
             }
         },
     )

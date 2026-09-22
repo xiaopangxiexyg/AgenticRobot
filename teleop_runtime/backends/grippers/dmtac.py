@@ -1755,9 +1755,9 @@ class DMTacGripperBackend(EffectorBackend):
         optimization is safe only after this backend has successfully sent a
         closed command with ``continuous=False`` and received causal, settled
         feedback.  A grasped object can stop the fingers before the requested
-        endpoint; DMTAC status 6 is the authoritative force-stop/contact
-        receipt for that case.  Keep this a local, command-inert check: it
-        never reads or writes the device.
+        endpoint; DMTAC status 6 is the explicit force-stop/contact receipt,
+        while status 2 is accepted only with non-open measured progress.  Keep
+        this a local, command-inert check: it never reads or writes the device.
         """
 
         if not self.is_ready():
@@ -1815,7 +1815,20 @@ class DMTacGripperBackend(EffectorBackend):
         ) <= max(float(self.config.send_threshold), 1e-6)
         if endpoint_reached:
             return True
-        return status_code == 6
+        if status_code == 6:
+            return True
+        if status_code != 2:
+            return False
+        # A pen/object can stop the fingers before the normalized endpoint
+        # while the vendor reports the settled closed-side idle state.  Do not
+        # accept status=2 by itself: the measured position must have left the
+        # open endpoint after the causal close command.  The runtime layer
+        # separately verifies the same post-command progress and stable-frame
+        # evidence before it establishes the owner.
+        return (
+            float(measured_values[command_dim])
+            > max(float(self.config.send_threshold), 1e-4)
+        )
 
     def _hardware_telemetry_error_active(self) -> bool:
         """Return whether the latest error invalidates hardware admission.

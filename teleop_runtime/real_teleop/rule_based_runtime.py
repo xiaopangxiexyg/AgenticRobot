@@ -2652,6 +2652,50 @@ class RuleBasedRealTeleopExtension:
             return False, f"等待端点稳定反馈({count}/{required})"
         return True, ""
 
+    def _manual_gripper_closed_idle_progress(
+        self,
+        *,
+        intent: str,
+        side: str,
+        status_code: int | None,
+        measured_scalar: float,
+        last_target: float | None,
+        final_target: float,
+    ) -> bool:
+        """Recognize an object-limited closed-side idle receipt.
+
+        DMTAC may report ``status=2`` (closed-side idle/stop) when the fingers
+        contact the pen before reaching the normalized command endpoint.  The
+        status alone is ambiguous: an already stalled or disconnected hand
+        can produce the same value.  Require a close intent, a command from
+        this action, and fresh measured progress from that command's baseline.
+        The endpoint settle gate still validates the error, freshness, and
+        stable-frame requirements after this evidence is present.
+        """
+
+        if (
+            intent not in {"close_grippers", "close_right_gripper"}
+            or status_code != 2
+            or last_target is None
+            or side not in self._manual_gripper_last_dispatch_at_by_side
+            or abs(float(last_target) - float(final_target))
+            > float(self.config.manual_gripper_endpoint_tolerance)
+        ):
+            return False
+        baseline = self._manual_gripper_command_baseline_by_side.get(side)
+        if baseline is None:
+            return False
+        backend = getattr(self._components, f"{side}_hand_backend", None)
+        send_threshold = float(
+            getattr(getattr(backend, "config", None), "send_threshold", 0.0)
+        )
+        minimum_progress = max(
+            send_threshold,
+            float(self.config.manual_gripper_endpoint_tolerance),
+            1e-4,
+        )
+        return float(measured_scalar) - float(baseline) >= minimum_progress
+
     def _manual_gripper_feedback(
         self,
         backend: object,
@@ -2925,7 +2969,15 @@ class RuleBasedRealTeleopExtension:
                 and status_code == 6
                 and side in self._manual_gripper_last_dispatch_at_by_side
             )
-            if at_endpoint or force_stopped_grasp:
+            closed_idle_progress = self._manual_gripper_closed_idle_progress(
+                intent=intent,
+                side=side,
+                status_code=status_code,
+                measured_scalar=measured_scalar,
+                last_target=last_target,
+                final_target=final_target,
+            )
+            if at_endpoint or force_stopped_grasp or closed_idle_progress:
                 settled, settle_reason = self._manual_gripper_endpoint_settled(
                     feedback_state or {},
                     side=side,
@@ -5853,7 +5905,15 @@ class RuleBasedRealTeleopExtension:
         target: np.ndarray,
         snapshots: Mapping[str, Mapping[str, Any]],
     ) -> bool:
-        """Accept the feedback-gated pen contact stop as a closed target."""
+        """Accept a feedback-gated closed/contact stop as a closed target.
+
+        Status 6 is the explicit force-stop receipt.  Status 2 is also valid
+        for a pen-limited close, but only when the hand state proves that the
+        causal command was the closed endpoint and the measured hand position
+        is no longer at the open endpoint.  This keeps a stalled open hand
+        from becoming a write owner merely because it reports closed-side
+        idle.
+        """
 
         if (
             side != "right"
@@ -5871,6 +5931,10 @@ class RuleBasedRealTeleopExtension:
         state = snapshots.get("right", {}).get("hand_state")
         if not isinstance(state, Mapping):
             return False
+        actual_hand_qpos = np.asarray(
+            snapshots.get("right", {}).get("actual_hand_qpos"),
+            dtype=float,
+        ).reshape(-1)
         raw_status = state.get("gripper_status_code", state.get("status_code"))
         raw_error = state.get("gripper_error_code", state.get("error_code"))
         try:
@@ -5878,10 +5942,34 @@ class RuleBasedRealTeleopExtension:
             error_code = 0 if raw_error is None else int(raw_error)
         except (TypeError, ValueError):
             return False
-        return bool(
-            status_code == 6
-            and error_code == 0
-            and not bool(state.get("gripper_is_moving"))
+        if error_code != 0 or bool(state.get("gripper_is_moving")):
+            return False
+        telemetry_error = str(state.get("telemetry_error") or "").strip()
+        if telemetry_error and not telemetry_error.lower().startswith("tactile_"):
+            return False
+        if status_code == 6:
+            return True
+        if status_code != 2:
+            return False
+        command_value = state.get(
+            "gripper_commanded_scalar",
+            state.get("gripper_last_send_target_scalar"),
+        )
+        try:
+            command_value = float(command_value)
+            actual_value = float(actual_hand_qpos[dim])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if (
+            not np.isfinite(command_value)
+            or not np.isfinite(actual_value)
+            or abs(command_value - max_action)
+            > float(self.config.manual_gripper_endpoint_tolerance)
+        ):
+            return False
+        return actual_value > max(
+            float(self.config.manual_gripper_endpoint_tolerance),
+            1e-4,
         )
 
     def _writing_right_gripper_hold_admitted(
