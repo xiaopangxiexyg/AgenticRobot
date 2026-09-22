@@ -274,7 +274,7 @@ def test_successful_random_source_attempt_advances_selection_ordinal() -> None:
     assert extension.source_selection["selection_ordinal"] == 1
 
 
-def test_successful_episode_reset_uses_current_qpos_not_startup_home() -> None:
+def test_successful_episode_reset_uses_current_qpos() -> None:
     plan = RuleBasedCollectionPlan(
         steps=(
             RuleBasedCustomAction(
@@ -297,16 +297,10 @@ def test_successful_episode_reset_uses_current_qpos_not_startup_home() -> None:
     extension._control_ui = SimpleNamespace(
         update_rule_runtime_info=lambda _values: None
     )
-    startup_home = {
-        "left": np.full(6, 0.4, dtype=float),
-        "right": np.full(6, -0.4, dtype=float),
-    }
-    extension.bind_runtime_home_snapshot(qpos_by_side=startup_home)
     extension._completed = True
 
     extension._prepare_next_attempt_after_success(now=1.0)
 
-    assert extension._runtime_home_qpos_snapshot is None
     current_after_episode = {
         side: {"actual_qpos": np.full(6, 0.1, dtype=float)}
         for side in ("left", "right")
@@ -1942,7 +1936,7 @@ def test_rule_start_is_unavailable_with_preexisting_fix_authority() -> None:
     assert session.command_override_provider(SimpleNamespace(), 1.2).command is None
 
 
-def test_first_initial_alignment_uses_bound_atomic_runtime_home_as_plan_start() -> None:
+def test_first_initial_alignment_uses_fresh_causal_state_after_runtime_home() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -1950,20 +1944,19 @@ def test_first_initial_alignment_uses_bound_atomic_runtime_home_as_plan_start() 
         ),
         trajectory_groups={"source": _group()},
     )
-    home = {
-        "left": np.full(6, 0.1, dtype=float),
-        "right": np.full(6, -0.1, dtype=float),
-    }
     later_causal = {
         side: {"actual_qpos": np.zeros(6, dtype=float)}
         for side in ("left", "right")
     }
-    extension.bind_runtime_home_snapshot(qpos_by_side=home)
 
     selected = extension._initial_alignment_start_qpos_pair(later_causal)
 
-    np.testing.assert_array_equal(selected["left"], home["left"])
-    np.testing.assert_array_equal(selected["right"], home["right"])
+    np.testing.assert_array_equal(
+        selected["left"], later_causal["left"]["actual_qpos"]
+    )
+    np.testing.assert_array_equal(
+        selected["right"], later_causal["right"]["actual_qpos"]
+    )
 
     extension._execution_begun = True
     current_after_dispatch = extension._initial_alignment_start_qpos_pair(
@@ -1972,6 +1965,53 @@ def test_first_initial_alignment_uses_bound_atomic_runtime_home_as_plan_start() 
     np.testing.assert_array_equal(
         current_after_dispatch["left"], later_causal["left"]["actual_qpos"]
     )
+
+
+def test_initial_alignment_rejects_actual_arm_drift_during_background_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    planner = extension._initial_alignment_planner
+    assert planner is not None
+    original_plan = planner.plan
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_plan(**kwargs):
+        entered.set()
+        if not release.wait(timeout=2.0):
+            raise AssertionError("test did not release the planning worker")
+        return original_plan(**kwargs)
+
+    monkeypatch.setattr(planner, "plan", blocked_plan)
+    assert session.command_override_provider(SimpleNamespace(), 2.0).command is None
+    assert entered.wait(timeout=2.0)
+    recorder.arm_state_poller.qpos["right"][2] = np.deg2rad(0.5)
+    release.set()
+    for _ in range(200):
+        if extension._initial_alignment_future.done():
+            break
+        time.sleep(0.001)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "actual arm state drifted while the transition was being planned: "
+            "side=right joint=3"
+        ),
+    ):
+        session.command_override_provider(SimpleNamespace(), 2.1)
+    assert extension.status().aborted is True
+    assert extension.status().held is True
 
 
 def test_non_dispatched_rule_frame_holds_and_automatically_reclaims_episode() -> None:

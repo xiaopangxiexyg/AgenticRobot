@@ -597,7 +597,6 @@ class RuleBasedRealTeleopExtension:
         self._started = False
         self._armed = False
         self._execution_begun = False
-        self._runtime_home_qpos_snapshot: dict[str, np.ndarray] | None = None
         self._completed = False
         self._completion_stop_requested = False
         self._aborted = False
@@ -1251,36 +1250,6 @@ class RuleBasedRealTeleopExtension:
             and not self._held
             and self._right_gripper_hold_owner_ready()[0]
         )
-
-    def bind_runtime_home_snapshot(
-        self,
-        *,
-        qpos_by_side: Mapping[str, Any] | None,
-    ) -> None:
-        """Store the accepted atomic Home used by rule initial alignment.
-
-        The rule planner owns its own first-command admission; it must not
-        share the generic VIVE StartupHomeContinuity gate.  It does, however,
-        use the exact same runtime-Home snapshot as its command-inert first
-        waypoint.  This method is a copy-only lifecycle handoff and never
-        dispatches motion.
-        """
-
-        if qpos_by_side is None:
-            self._runtime_home_qpos_snapshot = None
-            return
-        home: dict[str, np.ndarray] = {}
-        for side in self.deployment.active_sides:
-            try:
-                qpos = np.asarray(qpos_by_side[side], dtype=float).reshape(6)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"runtime Home qpos is missing a valid {side} six-vector."
-                ) from exc
-            if not np.all(np.isfinite(qpos)):
-                raise ValueError(f"runtime Home qpos is non-finite for {side}.")
-            home[side] = qpos.copy()
-        self._runtime_home_qpos_snapshot = home
 
     def _right_gripper_hold_owner_ready(self) -> tuple[bool, str]:
         """Return the command-inert receipt required by writing hand holds.
@@ -4473,11 +4442,13 @@ class RuleBasedRealTeleopExtension:
         self._initial_alignment_cumulative_schedule_shift_sec = 0.0
         self._initial_alignment_skipped_clock_ticks = 0
         # RuleBasedInitialAlignmentPlanner owns this pre-dispatch transition.
-        # Before the first dispatch, use the exact atomic Home snapshot handed
-        # over by startup; after execution has begun, each later transition
-        # starts from its current causal qpos.  The planner's existing
-        # start-drift, collision, TCP-envelope, and command-guard checks remain
-        # authoritative for this source.
+        # The formal Episode can start many seconds after runtime Home while
+        # writer warmup and operator/task-chain steps run.  Its command-inert
+        # first waypoint must therefore use the fresh causal hardware qpos
+        # from this execution cut, not the older Home admission snapshot.
+        # The post-plan start-drift check below still rejects real movement
+        # during planning; collision, TCP-envelope, and command guards remain
+        # authoritative for every emitted waypoint.
         start = self._initial_alignment_start_qpos_pair(snapshots)
         target = {
             side: np.asarray(
@@ -4579,20 +4550,25 @@ class RuleBasedRealTeleopExtension:
             raise AssertionError("unreachable") from exc
         if self._initial_alignment_plan is None:
             actual = self._snapshot_qpos_pair(snapshots)
-            drift = max(
-                float(
-                    np.max(
-                        np.abs(
-                            actual[side]
-                            - np.asarray(plan.start_qpos_by_side[side], dtype=float)
-                        )
-                    )
+            drift_by_side = {
+                side: np.abs(
+                    actual[side]
+                    - np.asarray(plan.start_qpos_by_side[side], dtype=float)
                 )
                 for side in ("left", "right")
+            }
+            drift_side, drift_joint_index = max(
+                (
+                    (side, int(np.argmax(values)))
+                    for side, values in drift_by_side.items()
+                ),
+                key=lambda item: float(drift_by_side[item[0]][item[1]]),
             )
+            drift = float(drift_by_side[drift_side][drift_joint_index])
             if drift > float(planner.start_drift_tolerance_rad):
                 self._abort_initial_alignment(
                     "actual arm state drifted while the transition was being planned: "
+                    f"side={drift_side} joint={drift_joint_index + 1} "
                     f"max_drift_deg={float(np.rad2deg(drift)):.6f}"
                 )
             hand_drift = 0.0
@@ -4825,17 +4801,17 @@ class RuleBasedRealTeleopExtension:
         self,
         snapshots: Mapping[str, Mapping[str, Any]],
     ) -> dict[str, np.ndarray]:
-        """Select the rule-owned Home/current start for one transition."""
+        """Select the fresh causal start for one certified transition.
 
-        current = self._snapshot_qpos_pair(snapshots)
-        if self._execution_begun:
-            return current
-        if self._runtime_home_qpos_snapshot is None:
-            return current
-        return {
-            side: qpos.copy()
-            for side, qpos in self._runtime_home_qpos_snapshot.items()
-        }
+        Runtime Home is the Session-admission anchor, not a motion reference
+        that remains current across writer warmup or task-chain interaction.
+        Rule motion has no generic StartupHomeContinuity gate and owns a
+        bounded post-plan start-drift check, so the safest zero-motion first
+        qref is the hardware feedback from the same execution cut that starts
+        planning.
+        """
+
+        return self._snapshot_qpos_pair(snapshots)
 
     def _hand_qpos_from_state(
         self,
@@ -6290,14 +6266,6 @@ class RuleBasedRealTeleopExtension:
                     "机械臂已进入 Hold，请重新验证批次。",
                 )
             return
-        # The atomic runtime Home is a one-shot anchor for the first
-        # pre-dispatch transition after Home admission.  A successful Episode
-        # ends at its own measured terminal pose; retaining the startup Home
-        # while resetting ``_execution_begun`` would make the next Episode
-        # plan from a stale pose and cause the start-drift gate to reject it.
-        # The next attempt therefore starts from its fresh causal qpos.  A
-        # later explicit runtime Home binds a new anchor again.
-        self._runtime_home_qpos_snapshot = None
         self._selection_ordinal = next_selection_ordinal
         runtime_info = self._configuration_options.get("runtime_info")
         if isinstance(runtime_info, dict) and self._selected_configuration:
@@ -6384,7 +6352,6 @@ class RuleBasedRealTeleopExtension:
         reason: str,
         hardware_hold_confirmed: bool,
     ) -> None:
-        self._runtime_home_qpos_snapshot = None
         if not self.restarts_after_hold(reason=reason):
             return
         self._reset_attempt_for_runtime_home()
