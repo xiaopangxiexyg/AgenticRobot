@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from dataset_contracts.pose_frames import PoseFrameContract
-from robot_motion.relative_action import pose_matrix_to_xyzquat
+from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose_matrix
 from robot_motion.action import HandActionSpec, RobotAction
 from robot_motion.position_control import (
     DEFAULT_POSITION_REFERENCE_HZ,
@@ -30,7 +30,11 @@ from robot_motion.position_control import (
     build_uniform_time_grid,
     resolve_periodic_tick,
 )
-from robot_motion.rm65 import BimanualPoseTarget, BimanualPoseTargetSource
+from robot_motion.rm65 import (
+    BimanualPoseTarget,
+    BimanualPoseTargetSource,
+    DualArmCollisionAwareRetargeter,
+)
 from robot_motion.transforms import project_near_rigid_pose
 from robot_motion.runtime import (
     EffectorCommand,
@@ -391,6 +395,9 @@ class RuleBasedRealTeleopStatus:
     gripper_action_intent: str = ""
     gripper_action_result: str = "idle"
     rule_start_available: bool = False
+    writing_reachability_status: str = "disabled"
+    writing_reachability_detail: str = ""
+    writing_reachability_skipped_count: int = 0
     gripper_action_status: str = ""
     rule_configuration: Mapping[str, Any] = field(default_factory=dict)
     source_selection: Mapping[str, Any] = field(default_factory=dict)
@@ -683,6 +690,15 @@ class RuleBasedRealTeleopExtension:
             "RuleBasedRealTeleopExtension"
         ] | None = None
         self._next_attempt_rebuild_context: dict[str, Any] | None = None
+        self._writing_reachability_future: Future[Mapping[str, Any]] | None = None
+        self._writing_reachability_rebuild_future: Future[
+            "RuleBasedRealTeleopExtension"
+        ] | None = None
+        self._writing_reachability_rebuild_ordinal: int | None = None
+        self._writing_reachability_fingerprint: tuple[object, ...] | None = None
+        self._writing_reachability_status = "disabled"
+        self._writing_reachability_detail = ""
+        self._writing_reachability_skipped_count = 0
         self._configuration_error = ""
         self._arm_feedback_pause_started_at: float | None = None
         # Readiness reports may perform a bounded serial telemetry read (the
@@ -1523,6 +1539,7 @@ class RuleBasedRealTeleopExtension:
             self._publish_status()
             return
         self._process_height_calibration_requests(float(now))
+        self._service_writing_reachability_preflight()
         consume_rule_intents = getattr(self._control_ui, "consume_rule_intents", None)
         if not callable(consume_rule_intents):
             raise RuntimeError("dedicated rule-based UI lost its intent boundary.")
@@ -1535,6 +1552,10 @@ class RuleBasedRealTeleopExtension:
                     or self._aborted
                     or self._height_calibration_future is not None
                     or self._height_calibration_pending
+                    or (
+                        self._writing_reachability_enabled()
+                        and not self._writing_reachability_passed_for_current_selection()
+                    )
                 ):
                     continue
                 fix_controller = getattr(self._components, "fix_arm_controller", None)
@@ -6376,6 +6397,8 @@ class RuleBasedRealTeleopExtension:
             or self._configuration_rebuilder is None
             or self._configuration_future is not None
             or self._next_attempt_rebuild_future is not None
+            or self._writing_reachability_future is not None
+            or self._writing_reachability_rebuild_future is not None
             or self._height_calibration_future is not None
             or self._height_calibration_pending
             or self._pending_gripper_action is not None
@@ -6590,7 +6613,7 @@ class RuleBasedRealTeleopExtension:
                 "next_completed_count": int(next_completed_count),
                 "next_cycle_complete": bool(next_cycle_complete),
             }
-            if self._configuration_uses_random_sources(configuration):
+            if self._configuration_requires_ordinal_rebuild(configuration):
                 self._next_attempt_rebuild_context = context
                 self._next_attempt_rebuild_future = (
                     self._configuration_executor.submit(
@@ -6715,6 +6738,19 @@ class RuleBasedRealTeleopExtension:
             if str(key).endswith("_candidate_id")
         )
 
+    def _configuration_requires_ordinal_rebuild(
+        self,
+        configuration: Mapping[str, Any],
+    ) -> bool:
+        variant = self.source_selection.get("writing_variant_selection", {})
+        return bool(
+            self._configuration_uses_random_sources(configuration)
+            or (
+                isinstance(variant, Mapping)
+                and bool(variant.get("enabled", False))
+            )
+        )
+
     def _rebuild_for_selection_ordinal(
         self,
         configuration: Mapping[str, Any],
@@ -6730,6 +6766,394 @@ class RuleBasedRealTeleopExtension:
         if not isinstance(replacement, RuleBasedRealTeleopExtension):
             raise TypeError("rule configuration rebuilder returned the wrong type.")
         return replacement
+
+    def _writing_reachability_metadata(self) -> Mapping[str, Any]:
+        metadata = self.source_selection.get("writing_reachability", {})
+        return metadata if isinstance(metadata, Mapping) else {}
+
+    def _writing_reachability_enabled(self) -> bool:
+        return bool(self._writing_reachability_metadata().get("enabled", False))
+
+    def _writing_reachability_current_fingerprint(
+        self,
+    ) -> tuple[object, ...] | None:
+        calibration = self._height_calibration
+        if calibration is None or not calibration.enabled:
+            return None
+        variant = self.source_selection.get("writing_variant_selection", {})
+        variant = variant if isinstance(variant, Mapping) else {}
+        return (
+            int(
+                self.source_selection.get(
+                    "selection_ordinal",
+                    self._selection_ordinal,
+                )
+                or 0
+            ),
+            str(variant.get("selected_trajectory_id") or ""),
+            str(variant.get("selected_direction") or ""),
+            float(variant.get("selected_size_m") or 0.0),
+            float(calibration.upper_bound_z_m),
+        )
+
+    def _writing_reachability_passed_for_current_selection(self) -> bool:
+        return bool(
+            not self._writing_reachability_enabled()
+            or (
+                self._writing_reachability_status == "passed"
+                and self._writing_reachability_fingerprint
+                == self._writing_reachability_current_fingerprint()
+            )
+        )
+
+    def _writing_reachability_request(self) -> dict[str, Any]:
+        metadata = self._writing_reachability_metadata()
+        probes = metadata.get("probes")
+        if not isinstance(probes, (list, tuple)) or len(probes) != 4:
+            raise RuntimeError("writing reachability requires exactly four probes")
+        calibration = self._height_calibration
+        if calibration is None or not calibration.enabled:
+            raise RuntimeError("writing reachability requires calibrated writing height")
+        components = self._components
+        retargeter = getattr(components, "dual_arm_retargeter", None)
+        retargeter_config = getattr(retargeter, "config", None)
+        if retargeter is None or retargeter_config is None:
+            raise RuntimeError("writing reachability requires the production IK config")
+        runtime_calibration = getattr(
+            getattr(components, "session", None),
+            "calibration",
+            None,
+        )
+        if runtime_calibration is None:
+            raise RuntimeError("writing reachability requires runtime calibration")
+        pen_down_group = self.trajectory_groups.get("pen_down")
+        source_qpos = getattr(
+            pen_down_group,
+            "arm_observation_actual_qpos",
+            None,
+        )
+        if not isinstance(source_qpos, Mapping):
+            raise RuntimeError("writing reachability lacks pen-down source qpos")
+        # The live plan moves both arms to frame zero, then holds the left arm
+        # while replaying the right-arm pen-down stage.  Mirror that exact
+        # boundary here instead of importing incidental left-arm drift from
+        # later source observations.
+        seed_qpos = {
+            "left": np.asarray(source_qpos["left"][0], dtype=float)
+            .reshape(6)
+            .copy(),
+            "right": np.asarray(source_qpos["right"][-1], dtype=float)
+            .reshape(6)
+            .copy(),
+        }
+        left_pose = xyzquat_to_pose_matrix(
+            np.asarray(
+                metadata.get("left_hold_pose_canonical_desk"),
+                dtype=float,
+            ).reshape(7)
+        )
+        target_filter = getattr(retargeter, "pre_ik_target_safety_filter", None)
+        if not callable(target_filter):
+            raise RuntimeError("writing reachability requires the Active TCP envelope")
+        world_to_base_by_side: dict[str, np.ndarray] = {}
+        for side in ("left", "right"):
+            arm_calibration = runtime_calibration.get_arm_for_side(side)
+            transform = getattr(arm_calibration, "T_D_B", None)
+            if transform is None:
+                raise RuntimeError(f"{side} calibration lacks T_D_B")
+            world_to_base_by_side[side] = np.linalg.inv(
+                np.asarray(transform, dtype=float).reshape(4, 4)
+            )
+
+        prepared_probes: list[dict[str, Any]] = []
+        for raw_probe in probes:
+            if not isinstance(raw_probe, Mapping):
+                raise RuntimeError("writing reachability probe must be a mapping")
+            right_pose = xyzquat_to_pose_matrix(
+                np.asarray(
+                    raw_probe.get("right_pose_canonical_desk"),
+                    dtype=float,
+                ).reshape(7)
+            )
+            right_pose = np.asarray(right_pose, dtype=float).copy()
+            right_pose[2, 3] = float(calibration.upper_bound_z_m)
+            solver_targets = {
+                "left": retargeter.solver_world_target_from_tool_tcp_world_target(
+                    side="left",
+                    tool_tcp_world_target=left_pose,
+                ),
+                "right": retargeter.solver_world_target_from_tool_tcp_world_target(
+                    side="right",
+                    tool_tcp_world_target=right_pose,
+                ),
+            }
+            effective_targets = target_filter(solver_targets)
+            if effective_targets is None:
+                raise RuntimeError("Active TCP envelope returned no target")
+            modified_sides = tuple(
+                side
+                for side in ("left", "right")
+                if not np.allclose(
+                    np.asarray(effective_targets[side], dtype=float),
+                    np.asarray(solver_targets[side], dtype=float),
+                    rtol=0.0,
+                    atol=1e-10,
+                )
+            )
+            prepared_probes.append(
+                {
+                    "name": str(raw_probe.get("name") or "unknown"),
+                    "target_pose_by_side": {
+                        side: np.asarray(solver_targets[side], dtype=float).copy()
+                        for side in ("left", "right")
+                    },
+                    "envelope_modified_sides": modified_sides,
+                }
+            )
+
+        oracle_config = replace(
+            retargeter_config,
+            left_initial_qpos=seed_qpos["left"],
+            right_initial_qpos=seed_qpos["right"],
+            enforce_realistic_joint_step=False,
+            solve_time_budget_ms=None,
+            solve_max_iterations=max(
+                32,
+                int(getattr(retargeter_config, "solve_max_iterations", 1)),
+            ),
+            solve_min_iterations=1,
+            solve_adaptive_iterations_enabled=False,
+            output_qpos_smoothing_alpha=1.0,
+            output_qpos_smoothing_adaptive_enabled=False,
+            target_pose_smoother=None,
+            debug_viz=False,
+            debug_profile=False,
+        )
+        return {
+            "oracle_config": oracle_config,
+            "seed_qpos": seed_qpos,
+            "probes": tuple(prepared_probes),
+            "world_to_base_by_side": world_to_base_by_side,
+            "translation_tolerance_m": 0.005,
+            "rotation_tolerance_deg": 3.0,
+        }
+
+    @staticmethod
+    def _run_writing_reachability_preflight(
+        request: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Certify four endpoints with no backend, Session, or dispatch access."""
+
+        oracle = DualArmCollisionAwareRetargeter(request["oracle_config"])
+        seed_qpos = request["seed_qpos"]
+        translation_tolerance = float(request["translation_tolerance_m"])
+        rotation_tolerance = float(request["rotation_tolerance_deg"])
+        results: list[dict[str, Any]] = []
+        for probe in request["probes"]:
+            modified_sides = tuple(probe["envelope_modified_sides"])
+            if modified_sides:
+                results.append(
+                    {
+                        "name": str(probe["name"]),
+                        "reachable": False,
+                        "reason": "tcp_envelope_projection_required",
+                        "modified_sides": list(modified_sides),
+                    }
+                )
+                continue
+            oracle.set_current_qpos_pair(
+                left_qpos=seed_qpos["left"],
+                right_qpos=seed_qpos["right"],
+                reset_tracking=True,
+            )
+            final_result = None
+            final_error: Mapping[str, Any] = {}
+            for _iteration in range(64):
+                final_result = oracle.solve_target_pair(
+                    BimanualPoseTarget(
+                        timestamp=None,
+                        target_pose_by_side=probe["target_pose_by_side"],
+                        active_sides=("right",),
+                        hard_hold_inactive_sides=True,
+                        world_to_base_by_side=request["world_to_base_by_side"],
+                    )
+                )
+                pose_error = final_result.metadata.get("ik_solve_pose_error", {})
+                final_error = (
+                    pose_error.get("right", {})
+                    if isinstance(pose_error, Mapping)
+                    else {}
+                )
+                translation_error = float(
+                    final_error.get("translation_m", float("inf"))
+                )
+                rotation_error = float(
+                    final_error.get("rotation_deg", float("inf"))
+                )
+                if (
+                    final_result.status in {"tracking", "boundary_active"}
+                    and translation_error <= translation_tolerance
+                    and rotation_error <= rotation_tolerance
+                ):
+                    break
+                if final_result.status in {
+                    "hold_last_safe",
+                    "unsafe_candidate",
+                    "jump_gate_hold",
+                }:
+                    break
+            assert final_result is not None
+            translation_error = float(
+                final_error.get("translation_m", float("inf"))
+            )
+            rotation_error = float(
+                final_error.get("rotation_deg", float("inf"))
+            )
+            reachable = bool(
+                final_result.status in {"tracking", "boundary_active"}
+                and translation_error <= translation_tolerance
+                and rotation_error <= rotation_tolerance
+            )
+            results.append(
+                {
+                    "name": str(probe["name"]),
+                    "reachable": reachable,
+                    "reason": (
+                        "certified" if reachable else "ik_or_collision_unreachable"
+                    ),
+                    "solver_status": str(final_result.status),
+                    "fallback_reason": final_result.fallback_reason,
+                    "translation_error_m": translation_error,
+                    "rotation_error_deg": rotation_error,
+                }
+            )
+        return {
+            "reachable": all(bool(item["reachable"]) for item in results),
+            "probes": results,
+        }
+
+    def _service_writing_reachability_preflight(self) -> None:
+        if not self._writing_reachability_enabled():
+            self._writing_reachability_status = "disabled"
+            self._writing_reachability_detail = ""
+            return
+        if (
+            self._closed
+            or self._armed
+            or self._execution_begun
+            or self._completed
+            or self._aborted
+            or self._held
+            or self._height_calibration is None
+            or not self._height_calibration.enabled
+        ):
+            return
+
+        rebuild = self._writing_reachability_rebuild_future
+        if rebuild is not None:
+            if not rebuild.done():
+                self._writing_reachability_status = "skipping_unreachable"
+                self._writing_reachability_detail = "正在跳过不可达候选并准备下一条。"
+                return
+            ordinal = self._writing_reachability_rebuild_ordinal
+            self._writing_reachability_rebuild_future = None
+            self._writing_reachability_rebuild_ordinal = None
+            try:
+                replacement = rebuild.result()
+                self._adopt_prestart_extension(replacement)
+                if ordinal is None:
+                    raise RuntimeError("reachability rebuild lost its selection ordinal")
+                self._selection_ordinal = int(ordinal)
+                self._reset_attempt_state(reason="unreachable_candidate_skip")
+                self._writing_reachability_fingerprint = None
+                self._writing_reachability_status = "pending"
+                self._writing_reachability_detail = "下一候选已准备，正在重新检查。"
+                self._waiting_reason = "writing_reachability_preflight"
+            except Exception as exc:  # noqa: BLE001 - command-inert preparation.
+                self._writing_reachability_status = "error"
+                self._writing_reachability_detail = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._waiting_reason = "writing_reachability_error"
+            return
+
+        fingerprint = self._writing_reachability_current_fingerprint()
+        if fingerprint is None:
+            return
+        if (
+            self._writing_reachability_status == "passed"
+            and self._writing_reachability_fingerprint == fingerprint
+        ):
+            return
+
+        pending = self._writing_reachability_future
+        if pending is None:
+            try:
+                request = self._writing_reachability_request()
+                self._writing_reachability_future = self._configuration_executor.submit(
+                    self._run_writing_reachability_preflight,
+                    request,
+                )
+                self._writing_reachability_fingerprint = fingerprint
+                self._writing_reachability_status = "pending"
+                self._writing_reachability_detail = "正在后台检查书写四边界接触点。"
+                self._waiting_reason = "writing_reachability_preflight"
+            except Exception as exc:  # noqa: BLE001 - no motion was authorized.
+                self._writing_reachability_status = "error"
+                self._writing_reachability_detail = f"{type(exc).__name__}: {exc}"
+                self._waiting_reason = "writing_reachability_error"
+            return
+        if not pending.done():
+            return
+        self._writing_reachability_future = None
+        try:
+            result = pending.result()
+        except Exception as exc:  # noqa: BLE001 - preflight remains command-inert.
+            self._writing_reachability_status = "error"
+            self._writing_reachability_detail = f"{type(exc).__name__}: {exc}"
+            self._waiting_reason = "writing_reachability_error"
+            return
+        if bool(result.get("reachable", False)):
+            self._writing_reachability_status = "passed"
+            self._writing_reachability_detail = "书写四边界接触点 IK/碰撞检查通过。"
+            self._waiting_reason = "waiting_for_rule_start"
+            return
+
+        failed = [
+            str(item.get("name") or "unknown")
+            for item in result.get("probes", ())
+            if isinstance(item, Mapping) and not bool(item.get("reachable", False))
+        ]
+        self._writing_reachability_skipped_count += 1
+        self._writing_reachability_status = "unreachable"
+        self._writing_reachability_detail = (
+            "不可达边界点：" + ", ".join(failed or ("unknown",))
+        )
+        append_message = getattr(self._control_ui, "append_message", None)
+        if callable(append_message):
+            append_message(
+                "RuleBasedReachability",
+                self._writing_reachability_detail + "；当前候选不启动 Episode。",
+            )
+        configuration = copy.deepcopy(self._selected_configuration)
+        if (
+            self._writing_reachability_skipped_count >= 32
+            or not configuration
+            or not self._configuration_requires_ordinal_rebuild(configuration)
+            or self._configuration_rebuilder is None
+        ):
+            self._waiting_reason = "writing_reachability_unreachable"
+            return
+        next_ordinal = self._selection_ordinal + 1
+        self._writing_reachability_rebuild_ordinal = next_ordinal
+        self._writing_reachability_rebuild_future = self._configuration_executor.submit(
+            self._rebuild_for_selection_ordinal,
+            configuration,
+            selection_ordinal=next_ordinal,
+        )
+        self._writing_reachability_status = "skipping_unreachable"
+        self._writing_reachability_detail += "；正在跳过并准备下一候选。"
+        self._waiting_reason = "writing_reachability_skip"
 
     def discards_episode_on_stop(self, *, reason: str) -> bool:
         if str(reason) == "rule_based_complete" or self._completed:
@@ -6986,6 +7410,16 @@ class RuleBasedRealTeleopExtension:
         self._next_attempt_rebuild_context = None
         if pending is not None and pending.done() and not pending.cancelled():
             self._dispose_rebuilt_extension_future(pending)
+        reachability_rebuild = self._writing_reachability_rebuild_future
+        self._writing_reachability_rebuild_future = None
+        self._writing_reachability_rebuild_ordinal = None
+        if (
+            reachability_rebuild is not None
+            and reachability_rebuild.done()
+            and not reachability_rebuild.cancelled()
+        ):
+            self._dispose_rebuilt_extension_future(reachability_rebuild)
+        self._writing_reachability_future = None
 
     def _publish_status(
         self,
@@ -7037,6 +7471,9 @@ class RuleBasedRealTeleopExtension:
             self._configuration_future is not None,
             self._next_attempt_rebuild_future is not None,
             self._configuration_error,
+            self._writing_reachability_status,
+            self._writing_reachability_detail,
+            self._writing_reachability_skipped_count,
             self._configuration_batch_index,
             self._configuration_batch_completed_count,
             self._configuration_batch_cycle_complete,
@@ -7319,6 +7756,24 @@ class RuleBasedRealTeleopExtension:
             and self._pending_gripper_action is None
         )
         gripper_action_pending = self._pending_gripper_action is not None
+        if (
+            self._writing_reachability_enabled()
+            and self._height_calibration is not None
+            and self._height_calibration.enabled
+            and not self._writing_reachability_passed_for_current_selection()
+        ):
+            readiness_blockers = dict(readiness_blockers)
+            reachability_detail = (
+                self._writing_reachability_detail
+                or "书写四边界接触点尚未完成可达性检查。"
+            )
+            readiness_blockers.setdefault(
+                "rule.writing_reachability",
+                reachability_detail,
+            )
+            readiness_reason = "; ".join(
+                part for part in (readiness_reason, reachability_detail) if part
+            )
         fix_controller = getattr(self._components, "fix_arm_controller", None)
         fixed_sides = tuple(getattr(fix_controller, "fixed_sides", ()) or ())
         rule_start_available = bool(
@@ -7366,6 +7821,10 @@ class RuleBasedRealTeleopExtension:
         ):
             if set(readiness_blockers) == {"rule.right_hand_hold_owner"}:
                 waiting_reason = "right_gripper_hold_owner_pending"
+            elif set(readiness_blockers) == {"rule.writing_reachability"}:
+                waiting_reason = str(
+                    self._waiting_reason or "writing_reachability_preflight"
+                )
             else:
                 waiting_reason = "session_readiness_failure"
         side_labels = {"left": "左夹爪", "right": "右夹爪"}
@@ -7415,6 +7874,11 @@ class RuleBasedRealTeleopExtension:
             gripper_action_intent=str(self._gripper_action_intent),
             gripper_action_result=str(self._gripper_action_result),
             rule_start_available=rule_start_available,
+            writing_reachability_status=str(self._writing_reachability_status),
+            writing_reachability_detail=str(self._writing_reachability_detail),
+            writing_reachability_skipped_count=int(
+                self._writing_reachability_skipped_count
+            ),
             gripper_action_status=str(self._gripper_action_status),
             rule_configuration=copy.deepcopy(self._selected_configuration),
             source_selection=copy.deepcopy(self.source_selection),
@@ -7430,6 +7894,8 @@ class RuleBasedRealTeleopExtension:
             configuration_pending=bool(
                 self._configuration_future is not None
                 or self._next_attempt_rebuild_future is not None
+                or self._writing_reachability_future is not None
+                or self._writing_reachability_rebuild_future is not None
             ),
             configuration_error=str(self._configuration_error),
             session_state=session_state_value,

@@ -290,6 +290,128 @@ def test_successful_random_source_attempt_advances_selection_ordinal() -> None:
     assert extension.source_selection["selection_ordinal"] == 1
 
 
+def test_writing_reachability_blocks_start_until_background_check_passes() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={
+            "collection_mode": "rule_based_writing",
+            "selection_ordinal": 0,
+            "writing_reachability": {"enabled": True},
+            "writing_variant_selection": {
+                "enabled": True,
+                "selected_trajectory_id": "latin_a_v1",
+                "selected_direction": "up",
+                "selected_size_m": 0.06,
+            },
+        },
+    )
+    recorder = _Recorder(_Poller())
+    _session, _clutch, _ui = _bind(extension, recorder, arm=False)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._writing_reachability_request = lambda: {}
+    extension._run_writing_reachability_preflight = lambda _request: {
+        "reachable": True,
+        "probes": (),
+    }
+
+    extension.after_control_input_poll(now=1.0)
+    assert extension.status().rule_start_available is False
+    deadline = time.monotonic() + 2.0
+    while extension.status().writing_reachability_status != "passed":
+        extension.after_control_input_poll(now=1.1)
+        if time.monotonic() >= deadline:
+            raise AssertionError("writing reachability preflight did not settle")
+        time.sleep(0.001)
+
+    status = extension.status()
+    assert status.writing_reachability_status == "passed"
+    assert status.rule_start_available is True
+
+
+def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+    )
+
+    def selection(ordinal: int) -> dict[str, object]:
+        return {
+            "collection_mode": "rule_based_writing",
+            "selection_ordinal": ordinal,
+            "writing_reachability": {"enabled": True},
+            "writing_variant_selection": {
+                "enabled": True,
+                "selected_trajectory_id": "latin_a_v1",
+                "selected_direction": "up",
+                "selected_size_m": 0.06,
+            },
+        }
+
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={"source": _group()},
+        source_selection=selection(0),
+    )
+    recorder = _Recorder(_Poller())
+    _session, _clutch, _ui = _bind(extension, recorder, arm=False)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._selected_configuration = {
+        "pen_down_candidate_id": "__rule_source_pool_random__",
+    }
+    extension._configuration_options = {"runtime_info": {}}
+    extension._configuration_rebuilder = lambda request: RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={"source": _group()},
+        source_selection=selection(int(request["_selection_ordinal"])),
+    )
+    extension._writing_reachability_request = lambda: {}
+    check_count = 0
+
+    def check(_request):
+        nonlocal check_count
+        check_count += 1
+        if check_count == 1:
+            return {
+                "reachable": False,
+                "probes": ({"name": "right", "reachable": False},),
+            }
+        return {"reachable": True, "probes": ()}
+
+    extension._run_writing_reachability_preflight = check
+
+    deadline = time.monotonic() + 2.0
+    while extension.status().writing_reachability_status != "passed":
+        extension.after_control_input_poll(now=1.0)
+        if time.monotonic() >= deadline:
+            raise AssertionError("unreachable candidate skip did not settle")
+        time.sleep(0.001)
+
+    assert extension._selection_ordinal == 1
+    assert extension.status().writing_reachability_skipped_count == 1
+    assert extension.status().held is False
+    assert extension.status().aborted is False
+    assert recorder.is_recording is False
+
+
 def test_successful_next_attempt_rebuild_keeps_certified_arm_hold_stream() -> None:
     plan = RuleBasedCollectionPlan(
         steps=(

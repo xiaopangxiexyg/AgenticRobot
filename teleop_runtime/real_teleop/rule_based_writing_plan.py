@@ -534,6 +534,46 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         help="Direction of glyph-local +Y in canonical desk coordinates.",
     )
     group.add_argument(
+        "--rule-writing-random-trajectory-ids",
+        default="",
+        metavar="IDS",
+        help=(
+            "Optional comma-separated one-stroke trajectory ids. One id is "
+            "selected deterministically for each Episode from the source-selection "
+            "seed and ordinal; empty preserves the fixed --rule-writing-trajectory."
+        ),
+    )
+    group.add_argument(
+        "--rule-writing-random-directions",
+        default="",
+        metavar="NAMES",
+        help=(
+            "Optional comma-separated subset of up,right,down,left selected "
+            "deterministically per Episode; empty preserves the fixed direction."
+        ),
+    )
+    group.add_argument(
+        "--rule-writing-random-size-min-m",
+        type=float,
+        default=None,
+        help="Optional lower bound for deterministic per-Episode writing size.",
+    )
+    group.add_argument(
+        "--rule-writing-random-size-max-m",
+        type=float,
+        default=None,
+        help="Optional upper bound for deterministic per-Episode writing size.",
+    )
+    group.add_argument(
+        "--rule-writing-reachability-check",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Before each Episode, certify the four centerline/bounding-box contact "
+            "points with a command-inert copy of the production IK/collision solver."
+        ),
+    )
+    group.add_argument(
         "--rule-writing-speed-m-s",
         type=float,
         default=None,
@@ -1228,6 +1268,9 @@ class FixedWritingActionSource:
             source="rule_based_fixed_writing",
             metadata={
                 **dict(target.metadata),
+                "rule_based_writing_trajectory_id": self.trajectory_id,
+                "rule_based_writing_direction": self.direction,
+                "rule_based_writing_size_m": self.scale_m,
                 # Motion and dataset clocks are intentionally independent.
                 # The runtime expands these source-cadence keyframes onto the
                 # shared position-reference clock while retaining this
@@ -1511,6 +1554,181 @@ def _stable_candidate_index(
         f"{pool_hash}\0{int(seed)}\0{phase}\0{int(selection_ordinal)}".encode("utf-8")
     ).digest()
     return int.from_bytes(digest[:8], "big") % int(candidate_count)
+
+
+def _comma_separated_unique(value: object, *, name: str) -> tuple[str, ...]:
+    items = tuple(part.strip() for part in str(value or "").split(",") if part.strip())
+    if len(items) != len(set(items)):
+        raise ValueError(f"{name} must not contain duplicate values.")
+    return items
+
+
+def _stable_unit_interval(
+    *,
+    catalog_hash: str,
+    seed: int,
+    phase: str,
+    selection_ordinal: int,
+) -> float:
+    digest = hashlib.sha256(
+        f"{catalog_hash}\0{int(seed)}\0{phase}\0{int(selection_ordinal)}".encode(
+            "utf-8"
+        )
+    ).digest()
+    return int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
+
+
+def _resolve_writing_variant(
+    args: argparse.Namespace,
+    *,
+    additional_catalog_path: Path | None,
+) -> tuple[str, str, float, dict[str, Any]]:
+    """Resolve one deterministic writing variant without process RNG state."""
+
+    catalog_hash = fixed_trajectory_catalog_hash(
+        additional_catalog_path=additional_catalog_path,
+    )
+    selection_ordinal = int(getattr(args, "_rule_source_selection_ordinal", 0))
+    if selection_ordinal < 0:
+        raise ValueError("rule source selection ordinal must be non-negative.")
+    seed = int(getattr(args, "rule_source_selection_seed", 0))
+
+    trajectory_ids = _comma_separated_unique(
+        getattr(args, "rule_writing_random_trajectory_ids", ""),
+        name="rule writing random trajectory ids",
+    )
+    available_ids = set(
+        available_fixed_trajectory_ids(
+            additional_catalog_path=additional_catalog_path,
+        )
+    )
+    unknown_ids = tuple(value for value in trajectory_ids if value not in available_ids)
+    if unknown_ids:
+        raise ValueError(
+            "rule writing random trajectory ids are absent from the composed "
+            f"one-stroke catalog: {', '.join(unknown_ids)}"
+        )
+    trajectory_id = str(args.rule_writing_trajectory)
+    if trajectory_ids:
+        trajectory_id = trajectory_ids[
+            _stable_candidate_index(
+                pool_hash=catalog_hash,
+                seed=seed,
+                phase="writing_trajectory",
+                candidate_count=len(trajectory_ids),
+                selection_ordinal=selection_ordinal,
+            )
+        ]
+
+    directions = _comma_separated_unique(
+        getattr(args, "rule_writing_random_directions", ""),
+        name="rule writing random directions",
+    )
+    invalid_directions = tuple(
+        value for value in directions if value not in FIXED_TRAJECTORY_DIRECTIONS
+    )
+    if invalid_directions:
+        raise ValueError(
+            "rule writing random directions must be selected from "
+            f"{','.join(FIXED_TRAJECTORY_DIRECTIONS)}: {','.join(invalid_directions)}"
+        )
+    direction = str(args.rule_writing_direction)
+    if directions:
+        direction = directions[
+            _stable_candidate_index(
+                pool_hash=catalog_hash,
+                seed=seed,
+                phase="writing_direction",
+                candidate_count=len(directions),
+                selection_ordinal=selection_ordinal,
+            )
+        ]
+
+    minimum = getattr(args, "rule_writing_random_size_min_m", None)
+    maximum = getattr(args, "rule_writing_random_size_max_m", None)
+    if (minimum is None) != (maximum is None):
+        raise ValueError(
+            "rule writing random size requires both minimum and maximum bounds."
+        )
+    size_m = float(args.rule_writing_size_m)
+    size_range: list[float] | None = None
+    if minimum is not None and maximum is not None:
+        lower = float(minimum)
+        upper = float(maximum)
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower <= 0.0:
+            raise ValueError("rule writing random size bounds must be finite and positive.")
+        if upper < lower:
+            raise ValueError("rule writing random size maximum must be >= minimum.")
+        fraction = _stable_unit_interval(
+            catalog_hash=catalog_hash,
+            seed=seed,
+            phase="writing_size",
+            selection_ordinal=selection_ordinal,
+        )
+        size_m = lower + (upper - lower) * fraction
+        size_range = [lower, upper]
+
+    enabled = bool(trajectory_ids or directions or size_range is not None)
+    return trajectory_id, direction, size_m, {
+        "schema": "dexteleop.rule_based_writing_variant_selection.v1",
+        "enabled": enabled,
+        "selection_seed": seed if enabled else None,
+        "selection_ordinal": selection_ordinal,
+        "trajectory_candidates": list(trajectory_ids),
+        "direction_candidates": list(directions),
+        "size_range_m": size_range,
+        "selected_trajectory_id": trajectory_id,
+        "selected_direction": direction,
+        "selected_size_m": size_m,
+    }
+
+
+def _writing_reachability_contact_probes(
+    targets: Sequence[TimestampedMotionTarget],
+) -> list[dict[str, Any]]:
+    """Return the four centerline contacts of a shrinking axis-aligned box."""
+
+    right_poses = [
+        np.asarray(target.pose_by_side["right"], dtype=float).reshape(4, 4)
+        for target in targets
+    ]
+    positions = np.stack([pose[:3, 3] for pose in right_poses], axis=0)
+    center_xy = 0.5 * (
+        np.min(positions[:, :2], axis=0) + np.max(positions[:, :2], axis=0)
+    )
+    edge_specs = (
+        ("left", 0, np.argmin, 1),
+        ("right", 0, np.argmax, 1),
+        ("bottom", 1, np.argmin, 0),
+        ("top", 1, np.argmax, 0),
+    )
+    probes: list[dict[str, Any]] = []
+    for name, axis, reducer, orthogonal_axis in edge_specs:
+        extreme_index = int(reducer(positions[:, axis]))
+        coordinate = float(positions[extreme_index, axis])
+        edge_indices = np.flatnonzero(
+            np.isclose(positions[:, axis], coordinate, rtol=0.0, atol=1e-12)
+        )
+        index = int(
+            edge_indices[
+                np.argmin(
+                    np.abs(
+                        positions[edge_indices, orthogonal_axis]
+                        - center_xy[orthogonal_axis]
+                    )
+                )
+            ]
+        )
+        probes.append(
+            {
+                "name": name,
+                "target_index": index,
+                "right_pose_canonical_desk": pose_matrix_to_xyzquat(
+                    right_poses[index]
+                ).tolist(),
+            }
+        )
+    return probes
 
 
 def _resolve_source_specs(
@@ -2785,6 +3003,15 @@ def build_rule_based_writing(
     if collection_mode != RULE_COLLECTION_MODE_WRITING:
         raise ValueError(f"unsupported rule collection mode: {collection_mode!r}.")
     additional_catalog_path = _additional_fixed_trajectory_catalog_path(args)
+    (
+        resolved_trajectory_id,
+        resolved_direction,
+        resolved_size_m,
+        writing_variant_selection,
+    ) = _resolve_writing_variant(
+        args,
+        additional_catalog_path=additional_catalog_path,
+    )
     source_specs, source_selection = _resolve_source_specs(args)
     pre_pen_down_spec = _resolve_pre_pen_down_replay_source_spec(args)
     requested_by_candidate: dict[str, list[str]] = {}
@@ -2935,6 +3162,7 @@ def build_rule_based_writing(
         ),
         "gripper_max_step": gripper_max_step,
         "initial_alignment_speed_scale": alignment_speed_scale,
+        "writing_variant_selection": writing_variant_selection,
     }
 
     phase_groups = {
@@ -3071,7 +3299,7 @@ def build_rule_based_writing(
     )
     if not np.isfinite(speed) or speed <= 0.0:
         raise ValueError("rule writing speed must be finite and positive.")
-    size_m = float(args.rule_writing_size_m)
+    size_m = float(resolved_size_m)
     if not np.isfinite(size_m) or size_m <= 0.0:
         raise ValueError("rule writing size must be finite and positive.")
 
@@ -3083,11 +3311,11 @@ def build_rule_based_writing(
                 ACTION_ARM_POSE_SLICES["right"],
             ],
         },
-        args.rule_writing_trajectory,
+        resolved_trajectory_id,
         scale_m=size_m,
         linear_speed_m_s=speed,
         side="right",
-        direction=args.rule_writing_direction,
+        direction=resolved_direction,
         additional_catalog_path=additional_catalog_path,
     )
     preview_targets = resample_motion_targets(
@@ -3099,6 +3327,37 @@ def build_rule_based_writing(
     if duration <= 0.0 or len(preview_targets) < 2:
         raise ValueError("fixed writing trajectory has no positive-duration path.")
     writing_action_hz = float((len(preview_targets) - 1) / duration)
+    source_selection = {
+        **source_selection,
+        "writing_reachability": {
+            "schema": "dexteleop.rule_based_writing_reachability.v1",
+            "enabled": bool(
+                getattr(args, "rule_writing_reachability_check", False)
+            ),
+            "probe_definition": "centerline_axis_aligned_bbox_edge_contacts",
+            "probe_count": 4,
+            "left_hold_pose_canonical_desk": left_hold_pose.astype(float).tolist(),
+            "probes": _writing_reachability_contact_probes(preview_keyframes),
+        },
+    }
+    phase_groups = {
+        phase: replace(
+            group,
+            metadata={
+                **dict(group.metadata),
+                "rule_based_source_selection": source_selection,
+            },
+        )
+        for phase, group in phase_groups.items()
+    }
+    if pre_pen_down_group is not None:
+        pre_pen_down_group = replace(
+            pre_pen_down_group,
+            metadata={
+                **dict(pre_pen_down_group.metadata),
+                "rule_based_source_selection": source_selection,
+            },
+        )
     writing_hand_trajectory: dict[str, np.ndarray] = {}
     if configured_gripper_sides:
         pen_down_hand = {
@@ -3190,10 +3449,10 @@ def build_rule_based_writing(
     if pre_pen_down_group is not None:
         groups[pre_pen_down_group.key] = pre_pen_down_group
     writing_source = FixedWritingActionSource(
-        trajectory_id=args.rule_writing_trajectory,
+        trajectory_id=resolved_trajectory_id,
         scale_m=size_m,
         speed_m_s=speed,
-        direction=args.rule_writing_direction,
+        direction=resolved_direction,
         left_hold_pose=left_hold_pose,
         additional_catalog_path=additional_catalog_path,
         hand_trajectory_by_side=writing_hand_trajectory,

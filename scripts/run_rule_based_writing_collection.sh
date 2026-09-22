@@ -35,6 +35,16 @@ Options:
                               (default: 0.08).
   --direction NAME            Writing mode only; up, right, down, or left
                               (default: up).
+  --random-trajectory-ids IDS Writing mode only; comma-separated one-stroke ids
+                              selected deterministically per Episode.
+  --random-directions NAMES   Writing mode only; comma-separated subset of
+                              up,right,down,left selected per Episode.
+  --random-size-range MIN:MAX Writing mode only; deterministic per-Episode size
+                              range in metres.
+  --writing-reachability-check
+                              Command-inert four-boundary-point IK/collision
+                              certification before each Episode; unreachable
+                              random candidates are skipped without opening data.
   --speed-m-s MPS             Writing mode only; override source average speed.
   --initial-alignment-speed-scale S
                               Initial dual-arm alignment speed multiplier in (0, 1].
@@ -122,6 +132,10 @@ TRAJECTORY="digit_1_v1"
 TRAJECTORY_CATALOG=""
 SIZE_M="0.08"
 DIRECTION="up"
+RANDOM_TRAJECTORY_IDS=""
+RANDOM_DIRECTIONS=""
+RANDOM_SIZE_RANGE=""
+WRITING_REACHABILITY_CHECK=0
 SPEED_M_S=""
 INITIAL_ALIGNMENT_SPEED_SCALE="1.0"
 LEFT_GRIPPER_PORT=""
@@ -155,6 +169,9 @@ declare -A VALUE_OPTION_TARGET=(
   [--trajectory-catalog]=TRAJECTORY_CATALOG
   [--size-m]=SIZE_M
   [--direction]=DIRECTION
+  [--random-trajectory-ids]=RANDOM_TRAJECTORY_IDS
+  [--random-directions]=RANDOM_DIRECTIONS
+  [--random-size-range]=RANDOM_SIZE_RANGE
   [--speed-m-s]=SPEED_M_S
   [--initial-alignment-speed-scale]=INITIAL_ALIGNMENT_SPEED_SCALE
   [--left-gripper-port]=LEFT_GRIPPER_PORT
@@ -180,6 +197,9 @@ declare -A VALUE_OPTION_HINT=(
   [--trajectory-catalog]=PATH
   [--size-m]=M
   [--direction]=NAME
+  [--random-trajectory-ids]=IDS
+  [--random-directions]=NAMES
+  [--random-size-range]=MIN:MAX
   [--speed-m-s]=MPS
   [--initial-alignment-speed-scale]=S
   [--left-gripper-port]=PATH
@@ -218,6 +238,10 @@ while [[ $# -gt 0 ]]; do
       TASK_CHAIN_FOOT_PAD=1
       shift
       ;;
+    --writing-reachability-check)
+      WRITING_REACHABILITY_CHECK=1
+      shift
+      ;;
     --with-left-gripper)
       WITH_LEFT_GRIPPER=1
       shift
@@ -253,6 +277,9 @@ if [[ "$COLLECTION_MODE" == "full-replay" && -n "$TRAJECTORY_CATALOG" ]]; then
 fi
 if [[ "$COLLECTION_MODE" == "full-replay" && -n "$PRE_PEN_DOWN_REPLAY_CANDIDATE_ID" ]]; then
   die "--pre-pen-down-replay-candidate-id is not valid in full-replay mode."
+fi
+if [[ "$COLLECTION_MODE" == "full-replay" && ( -n "$RANDOM_TRAJECTORY_IDS" || -n "$RANDOM_DIRECTIONS" || -n "$RANDOM_SIZE_RANGE" || "$WRITING_REACHABILITY_CHECK" -eq 1 ) ]]; then
+  die "writing randomization and reachability options are not valid in full-replay mode."
 fi
 if [[ "$COLLECTION_MODE" == "full-replay" && "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" != "0" ]]; then
   die "--pre-pen-down-replay-normal-episodes is not valid in full-replay mode."
@@ -326,6 +353,27 @@ case "$DIRECTION" in
   up|right|down|left) ;;
   *) die "direction must be up, right, down, or left." ;;
 esac
+if [[ -n "$RANDOM_DIRECTIONS" ]]; then
+  IFS=',' read -r -a random_direction_values <<< "$RANDOM_DIRECTIONS"
+  for random_direction in "${random_direction_values[@]}"; do
+    case "$random_direction" in
+      up|right|down|left) ;;
+      *) die "random directions must be a comma-separated subset of up,right,down,left." ;;
+    esac
+  done
+fi
+RANDOM_SIZE_MIN_M=""
+RANDOM_SIZE_MAX_M=""
+if [[ -n "$RANDOM_SIZE_RANGE" ]]; then
+  [[ "$RANDOM_SIZE_RANGE" == *:* && "$RANDOM_SIZE_RANGE" != *:*:* ]] || \
+    die "random size range must use MIN:MAX."
+  RANDOM_SIZE_MIN_M="${RANDOM_SIZE_RANGE%%:*}"
+  RANDOM_SIZE_MAX_M="${RANDOM_SIZE_RANGE#*:}"
+  is_positive_decimal "$RANDOM_SIZE_MIN_M" || \
+    die "random size minimum must be greater than zero."
+  is_positive_decimal "$RANDOM_SIZE_MAX_M" || \
+    die "random size maximum must be greater than zero."
+fi
 if [[ -n "$TRAJECTORY_CATALOG" ]]; then
   [[ "$TRAJECTORY_CATALOG" == /* ]] || die "trajectory catalog must be absolute."
   [[ -f "$TRAJECTORY_CATALOG" ]] || die \
@@ -380,6 +428,21 @@ if [[ "$COLLECTION_MODE" == "rule-based-writing" ]]; then
   )
   if [[ -n "$TRAJECTORY_CATALOG" ]]; then
     RULE_ARGS+=(--rule-writing-trajectory-catalog "$TRAJECTORY_CATALOG")
+  fi
+  if [[ -n "$RANDOM_TRAJECTORY_IDS" ]]; then
+    RULE_ARGS+=(--rule-writing-random-trajectory-ids "$RANDOM_TRAJECTORY_IDS")
+  fi
+  if [[ -n "$RANDOM_DIRECTIONS" ]]; then
+    RULE_ARGS+=(--rule-writing-random-directions "$RANDOM_DIRECTIONS")
+  fi
+  if [[ -n "$RANDOM_SIZE_RANGE" ]]; then
+    RULE_ARGS+=(
+      --rule-writing-random-size-min-m "$RANDOM_SIZE_MIN_M"
+      --rule-writing-random-size-max-m "$RANDOM_SIZE_MAX_M"
+    )
+  fi
+  if [[ "$WRITING_REACHABILITY_CHECK" -eq 1 ]]; then
+    RULE_ARGS+=(--rule-writing-reachability-check)
   fi
 fi
 if [[ -n "$SOURCE_POOL_MANIFEST" ]]; then
@@ -570,5 +633,6 @@ printf '%s\n' \
   "[RuleBased] detail_annotation_dir=${DETAIL_ANNOTATION_DIR:-pool_selected}" \
   "[RuleBased] gripper_port_override left=${LEFT_GRIPPER_PORT:-assignment} right=${RIGHT_GRIPPER_PORT:-assignment}" \
   "[RuleBased] trajectory=$TRAJECTORY catalog=${TRAJECTORY_CATALOG:-builtin} size_m=$SIZE_M direction=$DIRECTION speed_m_s=${SPEED_M_S:-source_average}" \
+  "[RuleBased] random_trajectories=${RANDOM_TRAJECTORY_IDS:-disabled} random_directions=${RANDOM_DIRECTIONS:-disabled} random_size_range=${RANDOM_SIZE_RANGE:-disabled} reachability_check=$WRITING_REACHABILITY_CHECK" \
   "[RuleBased] output_dataset_root=$DATASET_BASE tactile_request=${COLLECT_TACTILE:-dataset_contract_or_default} tactile_root=$TACTILE_BUNDLE_ROOT min_free_gb=$TACTILE_MIN_FREE_GB"
 exec "${RUN_COMMAND[@]}"

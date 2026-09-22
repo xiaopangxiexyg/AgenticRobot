@@ -1747,6 +1747,42 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
     assert "--rule-detail-annotation-dir" not in output
 
 
+def test_launcher_forwards_random_writing_and_reachability_options(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "source-pool.json"
+    manifest.write_text("{}", encoding="utf-8")
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(LAUNCHER),
+            "--source-pool-manifest",
+            str(manifest),
+            "--random-trajectory-ids",
+            "latin_a_v1,latin_b_v1",
+            "--random-directions",
+            "up,left",
+            "--random-size-range",
+            "0.04:0.08",
+            "--writing-reachability-check",
+            "--no-collect-tactile",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout
+    assert "--rule-writing-random-trajectory-ids latin_a_v1\\,latin_b_v1" in output
+    assert "--rule-writing-random-directions up\\,left" in output
+    assert "--rule-writing-random-size-min-m 0.04" in output
+    assert "--rule-writing-random-size-max-m 0.08" in output
+    assert "--rule-writing-reachability-check" in output
+
+
 def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
     tmp_path: Path,
 ) -> None:
@@ -1848,6 +1884,76 @@ def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
         "value": "latin_z_v1",
         "label": "英文字母 Z",
     }
+
+
+def test_rule_arguments_resolve_reproducible_random_writing_variant() -> None:
+    parser = argparse.ArgumentParser()
+    rule_based_plan.add_rule_based_writing_arguments(parser)
+    args = parser.parse_args(
+        [
+            "--rule-writing-random-trajectory-ids",
+            "latin_a_v1,latin_b_v1,latin_c_v1",
+            "--rule-writing-random-directions",
+            "up,right,down,left",
+            "--rule-writing-random-size-min-m",
+            "0.04",
+            "--rule-writing-random-size-max-m",
+            "0.08",
+            "--rule-writing-reachability-check",
+            "--rule-source-selection-seed",
+            "42",
+        ]
+    )
+    args._rule_source_selection_ordinal = 7
+
+    first = rule_based_plan._resolve_writing_variant(
+        args,
+        additional_catalog_path=None,
+    )
+    second = rule_based_plan._resolve_writing_variant(
+        args,
+        additional_catalog_path=None,
+    )
+
+    assert first == second
+    trajectory_id, direction, size_m, metadata = first
+    assert trajectory_id in {"latin_a_v1", "latin_b_v1", "latin_c_v1"}
+    assert direction in {"up", "right", "down", "left"}
+    assert 0.04 <= size_m <= 0.08
+    assert metadata["enabled"] is True
+    assert metadata["selection_seed"] == 42
+    assert metadata["selection_ordinal"] == 7
+
+
+def test_writing_reachability_probes_are_centerline_bbox_contacts() -> None:
+    boundary = {
+        "left": xyzquat_to_pose_matrix(_pose(0.0, 0.0, 0.4)),
+        "right": xyzquat_to_pose_matrix(_pose(0.2, -0.1, 0.3)),
+    }
+    targets = rule_based_plan.build_fixed_trajectory_targets(
+        boundary,
+        "latin_s_v1",
+        scale_m=0.08,
+        linear_speed_m_s=0.02,
+        direction="right",
+    )
+    probes = rule_based_plan._writing_reachability_contact_probes(targets)
+    positions = np.stack(
+        [target.pose_by_side["right"][:3, 3] for target in targets],
+        axis=0,
+    )
+    probe_positions = {
+        probe["name"]: np.asarray(
+            probe["right_pose_canonical_desk"], dtype=float
+        )[:3]
+        for probe in probes
+    }
+
+    assert tuple(probe_positions) == ("left", "right", "bottom", "top")
+    assert probe_positions["left"][0] == pytest.approx(positions[:, 0].min())
+    assert probe_positions["right"][0] == pytest.approx(positions[:, 0].max())
+    assert probe_positions["bottom"][1] == pytest.approx(positions[:, 1].min())
+    assert probe_positions["top"][1] == pytest.approx(positions[:, 1].max())
 
 
 def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:
