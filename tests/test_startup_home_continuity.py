@@ -65,6 +65,25 @@ def test_outside_home_qref_is_withheld_without_modifying_candidate() -> None:
     assert candidate.metadata["dataset_recording_eligible"] is False
 
 
+def test_home_qpos_snapshot_is_defensive_and_matches_gate_anchor() -> None:
+    gate = _gate()
+    home = {"left": np.zeros(6), "right": np.full(6, 0.1)}
+
+    assert gate.home_qpos_snapshot() is None
+    gate.arm_from_home(home)
+
+    snapshot = gate.home_qpos_snapshot()
+    assert snapshot is not None
+    np.testing.assert_array_equal(snapshot["left"], home["left"])
+    np.testing.assert_array_equal(snapshot["right"], home["right"])
+
+    snapshot["right"][0] = 99.0
+    np.testing.assert_array_equal(
+        gate.home_qpos_snapshot()["right"],
+        home["right"],
+    )
+
+
 def test_inside_home_qref_releases_only_after_consecutive_dwell() -> None:
     gate = _gate(required_frames=3)
     gate.arm_from_home({"left": np.zeros(6), "right": np.zeros(6)})

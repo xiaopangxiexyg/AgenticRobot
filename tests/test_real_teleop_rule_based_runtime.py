@@ -1976,6 +1976,44 @@ def test_first_rule_qref_retries_only_startup_home_continuity_dwell() -> None:
     )
 
 
+def test_first_initial_alignment_uses_atomic_runtime_home_as_plan_start() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    home = {
+        "left": np.full(6, 0.1, dtype=float),
+        "right": np.full(6, -0.1, dtype=float),
+    }
+    later_causal = {
+        side: {"actual_qpos": np.zeros(6, dtype=float)}
+        for side in ("left", "right")
+    }
+    extension._components = SimpleNamespace(
+        startup_home_continuity_gate=SimpleNamespace(
+            home_qpos_snapshot=lambda: {
+                side: values.copy() for side, values in home.items()
+            }
+        )
+    )
+
+    selected = extension._initial_alignment_start_qpos_pair(later_causal)
+
+    np.testing.assert_array_equal(selected["left"], home["left"])
+    np.testing.assert_array_equal(selected["right"], home["right"])
+
+    extension._execution_begun = True
+    current_after_dispatch = extension._initial_alignment_start_qpos_pair(
+        later_causal
+    )
+    np.testing.assert_array_equal(
+        current_after_dispatch["left"], later_causal["left"]["actual_qpos"]
+    )
+
+
 def test_first_rule_qref_rejection_holds_and_automatically_reclaims_episode() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),

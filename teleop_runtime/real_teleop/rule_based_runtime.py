@@ -4442,7 +4442,17 @@ class RuleBasedRealTeleopExtension:
         self._initial_alignment_last_schedule_lag_sec = 0.0
         self._initial_alignment_cumulative_schedule_shift_sec = 0.0
         self._initial_alignment_skipped_clock_ticks = 0
-        start = self._snapshot_qpos_pair(snapshots)
+        # The first initialization must be anchored to the same atomic qpos
+        # snapshot that armed StartupHomeContinuity.  Using a later causal
+        # poller sample here creates two different notions of Home: the gate
+        # evaluates the emitted first qref against the runtime-Home snapshot,
+        # while the planner starts from whatever sample happened to arrive
+        # after writer warmup/countdown.  A small amount of feedback drift is
+        # then enough to reject the very first qref before any real command is
+        # dispatched.  Later initialization segments intentionally start from
+        # their current causal state because the one-shot startup gate has
+        # already been released and the robot is executing normally.
+        start = self._initial_alignment_start_qpos_pair(snapshots)
         target = {
             side: np.asarray(
                 emission.directive.qpos_by_side.get(side, start[side]),
@@ -4784,6 +4794,57 @@ class RuleBasedRealTeleopExtension:
                 )
             result[side] = qpos.copy()
         return result
+
+    def _initial_alignment_start_qpos_pair(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, np.ndarray]:
+        """Select one authoritative start snapshot for an initialization plan.
+
+        Before the first dispatch, StartupHomeContinuity is the owner of the
+        runtime-Home anchor.  Reuse that exact snapshot instead of silently
+        switching to a later poller sample.  If the current causal state has
+        genuinely drifted, the existing bounded start-drift check in
+        ``_prepare_initial_alignment_waypoint`` still fails closed and asks
+        for a fresh runtime Home; this method never widens a safety envelope
+        or rebases the gate implicitly.
+        """
+
+        current = self._snapshot_qpos_pair(snapshots)
+        if self._execution_begun:
+            return current
+
+        components = self._components
+        gate = (
+            None
+            if components is None
+            else getattr(components, "startup_home_continuity_gate", None)
+        )
+        snapshot_fn = getattr(gate, "home_qpos_snapshot", None)
+        home_snapshot = snapshot_fn() if callable(snapshot_fn) else None
+        if home_snapshot is None:
+            return current
+        if not isinstance(home_snapshot, Mapping):
+            raise RuntimeError(
+                "StartupHomeContinuity returned an invalid runtime Home qpos snapshot."
+            )
+
+        home_qpos: dict[str, np.ndarray] = {}
+        for side in ("left", "right"):
+            try:
+                qpos = np.asarray(home_snapshot[side], dtype=float).reshape(6)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "StartupHomeContinuity runtime Home qpos snapshot is missing "
+                    f"a valid {side} six-vector."
+                ) from exc
+            if not np.all(np.isfinite(qpos)):
+                raise RuntimeError(
+                    "StartupHomeContinuity runtime Home qpos snapshot contains "
+                    f"non-finite values for {side}."
+                )
+            home_qpos[side] = qpos.copy()
+        return home_qpos
 
     def _hand_qpos_from_state(
         self,
