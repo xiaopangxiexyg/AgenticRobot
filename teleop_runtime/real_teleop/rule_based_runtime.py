@@ -193,6 +193,7 @@ class RuleBasedRealTeleopConfig:
     manual_gripper_resend_interval_sec: float = 0.25
     manual_gripper_timeout_sec: float = 20.0
     hand_state_max_age_sec: float = 0.5
+    arm_feedback_recovery_timeout_sec: float = 0.5
     # Keep this additive field after the established positional fields so
     # compatibility fixtures and external callers retain their bindings.
     manual_gripper_settle_samples: int = 3
@@ -219,6 +220,7 @@ class RuleBasedRealTeleopConfig:
             "manual_gripper_resend_interval_sec",
             "manual_gripper_timeout_sec",
             "hand_state_max_age_sec",
+            "arm_feedback_recovery_timeout_sec",
             "minimum_stage_sample_coverage",
         ):
             value = float(getattr(self, name))
@@ -541,6 +543,7 @@ class RuleBasedRealTeleopExtension:
         self._initial_alignment_last_schedule_lag_sec = 0.0
         self._initial_alignment_cumulative_schedule_shift_sec = 0.0
         self._initial_alignment_skipped_clock_ticks = 0
+        self._initial_alignment_reacquire_samples = 0
         self._initial_alignment_hand_start_by_side: dict[str, np.ndarray] = {}
         self._initial_alignment_hand_target_by_side: dict[str, np.ndarray] = {}
         self._coupled_pose_solver_seeded = False
@@ -662,7 +665,12 @@ class RuleBasedRealTeleopExtension:
             tuple[tuple[dict[str, Any], "RuleBasedRealTeleopExtension"], ...]
         ] | None = None
         self._configuration_request: dict[str, Any] | None = None
+        self._next_attempt_rebuild_future: Future[
+            "RuleBasedRealTeleopExtension"
+        ] | None = None
+        self._next_attempt_rebuild_context: dict[str, Any] | None = None
         self._configuration_error = ""
+        self._arm_feedback_pause_started_at: float | None = None
         # Readiness reports may perform a bounded serial telemetry read (the
         # DMTAC backend does so to include its vendor error/status fields).
         # ``status()`` is published from the realtime loop, so do not repeat
@@ -2184,6 +2192,19 @@ class RuleBasedRealTeleopExtension:
             raise RuntimeError("rule-based runtime is closed.")
         if not self._started:
             return TeleopCommandOverride(None)
+        if (
+            self._completed
+            and not self._held
+            and self._last_dispatched_emission is not None
+        ):
+            return self._paused_arm_hold_override(
+                reason=(
+                    "successful_next_attempt_rebuild"
+                    if self._next_attempt_rebuild_future is not None
+                    else "successful_episode_finalizing"
+                ),
+                now=float(now),
+            )
         if self._configuration_future is not None:
             return TeleopCommandOverride(None)
         if not self._armed and not self._execution_begun and not self._completed and not self._aborted:
@@ -2200,46 +2221,24 @@ class RuleBasedRealTeleopExtension:
                     reason.startswith("causal_hand_backend_recovery:")
                     and reason.endswith(":recovering")
                 )
+                or self._recoverable_arm_feedback_pause(
+                    reason=reason,
+                    now=float(now),
+                )
             )
             if self._execution_begun and recoverable_pause:
                 if self._replay_reference_pause_started_at is None:
                     self._replay_reference_pause_started_at = float(now)
-                # A transient camera/tactile health pause is a reversible
-                # collection gate, not a Session fault.  Keep dispatching the
-                # last certified qref so the position stream and resume
-                # warmup retain an arm receipt, but do not expose it as the
-                # active frame: cursor/arrival/sample state must not advance
-                # while the writer is paused.
-                held = self._last_dispatched_emission
-                if held is None:
-                    raise RuntimeError(
-                        "rule-based execution has no certified command to hold "
-                        "during a recoverable pause"
-                    )
-                arm_hold = command_effector_kind_subset(held.command, kind="arm")
-                if arm_hold is None:
-                    raise RuntimeError(
-                        "rule-based execution has no certified arm command to hold "
-                        "during a recoverable pause"
-                    )
-                arm_hold.metadata.update(
-                    {
-                        "rule_based_pause_hold": True,
-                        "rule_based_pause_reason": reason,
-                        "rule_based_capture_enabled": False,
-                        "dataset_recording_eligible": False,
-                    }
+                return self._paused_arm_hold_override(
+                    reason=reason,
+                    now=float(now),
                 )
-                paused_hold = replace(held, command=arm_hold)
-                self._prepare_live_dispatch(paused_hold, float(now))
-                self._paused_hold_emission = paused_hold
-                self._publish_status(recording_ready=False)
-                return TeleopCommandOverride(paused_hold.command)
             if self._execution_begun:
                 raise RuntimeError(
                     "rule-based execution lost formal collection readiness: " + reason
                 )
             return TeleopCommandOverride(None)
+        self._arm_feedback_pause_started_at = None
         if self._replay_reference_pause_started_at is not None:
             paused_sec = max(
                 0.0,
@@ -4593,6 +4592,7 @@ class RuleBasedRealTeleopExtension:
                 )
             self._initial_alignment_plan = plan
             self._initial_alignment_waypoint_index = 0
+            self._initial_alignment_reacquire_samples = 0
             self._initial_alignment_started_at = float(now)
             self._initial_alignment_last_schedule_lag_sec = 0.0
             self._initial_alignment_cumulative_schedule_shift_sec = 0.0
@@ -5287,6 +5287,65 @@ class RuleBasedRealTeleopExtension:
         if self._current.directive.kind == "initialize":
             if self._is_final_initial_alignment_waypoint(self._current):
                 return False
+            waypoint_index = int(
+                self._current.command.metadata.get(
+                    "rule_based_initial_alignment_waypoint_index",
+                    0,
+                )
+            )
+            if waypoint_index == 0:
+                # The first certified waypoint is the same causal qpos cut
+                # used to plan this transition.  Repeat that zero-motion qref
+                # for a bounded dwell before advancing, so a backend that
+                # entered idle quick-stop between Episodes can reacquire the
+                # existing position stream without a jump to waypoint 1.
+                planner = self._initial_alignment_planner
+                if planner is None:
+                    self._abort_session_step(
+                        "initial-alignment reacquisition lost its certified planner"
+                    )
+                    return False
+                within_start = True
+                for side, target in self._current.directive.qpos_by_side.items():
+                    actual = np.asarray(
+                        snapshots.get(side, {}).get("actual_qpos"),
+                        dtype=float,
+                    ).reshape(-1)
+                    target_qpos = np.asarray(target, dtype=float).reshape(-1)
+                    if (
+                        actual.shape != (6,)
+                        or target_qpos.shape != (6,)
+                        or not np.all(np.isfinite(actual))
+                        or not np.all(np.isfinite(target_qpos))
+                    ):
+                        self._abort_session_step(
+                            "initial-alignment zero-motion reacquisition lost "
+                            f"finite {side} qpos feedback"
+                        )
+                        return False
+                    within_start = within_start and bool(
+                        np.max(np.abs(actual - target_qpos))
+                        <= float(planner.start_drift_tolerance_rad)
+                    )
+                self._initial_alignment_reacquire_samples = (
+                    self._initial_alignment_reacquire_samples + 1
+                    if self._current_dispatched and within_start
+                    else 0
+                )
+                if self._initial_alignment_reacquire_samples < int(
+                    self.config.settle_consecutive_samples
+                ):
+                    self._waiting_reason = "initial_alignment_reacquire_dwell"
+                    if (
+                        self._target_wait_started_at is not None
+                        and float(now) - float(self._target_wait_started_at)
+                        > float(self.config.target_timeout_sec)
+                    ):
+                        self._abort_session_step(
+                            "initial-alignment zero-motion qref reacquisition "
+                            f"exceeded {self.config.target_timeout_sec:.3f}s"
+                        )
+                    return False
             should_advance = bool(
                 self._current_dispatched
                 and self._next_due_at is not None
@@ -5325,6 +5384,66 @@ class RuleBasedRealTeleopExtension:
         if arm_command is None:
             raise RuntimeError("accepted rule emission has no arm command to hold")
         return replace(emission, command=arm_command)
+
+    def _paused_arm_hold_override(
+        self,
+        *,
+        reason: str,
+        now: float,
+    ) -> TeleopCommandOverride:
+        """Keep the last accepted arm qref alive without advancing the rule.
+
+        This is a dispatch-preserving pause, not a second motion controller.
+        The canonical Session/Rig path still validates and sends the exact
+        accepted arm target, while capture and cursor advancement remain off.
+        """
+
+        held = self._last_dispatched_emission
+        if held is None:
+            raise RuntimeError(
+                "rule-based execution has no certified command to hold during "
+                "a recoverable pause"
+            )
+        paused_hold = self._certified_arm_hold_emission(held)
+        paused_hold.command.metadata.update(
+            {
+                "rule_based_pause_hold": True,
+                "rule_based_pause_reason": str(reason),
+                "rule_based_capture_enabled": False,
+                "dataset_recording_eligible": False,
+            }
+        )
+        self._prepare_live_dispatch(paused_hold, float(now))
+        self._paused_hold_emission = paused_hold
+        self._waiting_reason = str(reason)
+        self._publish_status(recording_ready=False)
+        return TeleopCommandOverride(paused_hold.command)
+
+    @staticmethod
+    def _is_transient_arm_read_failure(reason: str) -> bool:
+        prefix = "causal_arm_feedback_not_ready:"
+        if not str(reason).startswith(prefix):
+            return False
+        details = str(reason)[len(prefix) :].split(",")
+        return bool(details) and all(
+            detail.partition("=")[0] in {"left", "right"}
+            and detail.partition("=")[1] == "="
+            and detail.partition("=")[2] == "hardware_read_failed"
+            for detail in details
+        )
+
+    def _recoverable_arm_feedback_pause(self, *, reason: str, now: float) -> bool:
+        """Bound one isolated hardware-state read failure without hiding faults."""
+
+        if not self._is_transient_arm_read_failure(reason):
+            self._arm_feedback_pause_started_at = None
+            return False
+        if self._arm_feedback_pause_started_at is None:
+            self._arm_feedback_pause_started_at = float(now)
+        return (
+            float(now) - float(self._arm_feedback_pause_started_at)
+            <= float(self.config.arm_feedback_recovery_timeout_sec)
+        )
 
     def after_session_step(self, *, step_result: object, now: float) -> None:
         emission = self._frame_emission
@@ -5532,7 +5651,13 @@ class RuleBasedRealTeleopExtension:
     ) -> None:
         ready, reason, snapshots = self._runtime_ready(now)
         if not ready:
+            if self._recoverable_arm_feedback_pause(reason=reason, now=float(now)):
+                self._waiting_reason = reason
+                if self._replay_reference_pause_started_at is None:
+                    self._replay_reference_pause_started_at = float(now)
+                return
             raise RuntimeError("target arrival feedback unavailable: " + reason)
+        self._arm_feedback_pause_started_at = None
         reached = self._target_reached(emission, snapshots)
         self._settled_samples = self._settled_samples + 1 if reached else 0
         if self._settled_samples >= int(self.config.settle_consecutive_samples):
@@ -5944,6 +6069,7 @@ class RuleBasedRealTeleopExtension:
         self._initial_alignment_last_schedule_lag_sec = 0.0
         self._initial_alignment_cumulative_schedule_shift_sec = 0.0
         self._initial_alignment_skipped_clock_ticks = 0
+        self._initial_alignment_reacquire_samples = 0
         self._initial_alignment_hand_start_by_side = {}
         self._initial_alignment_hand_target_by_side = {}
 
@@ -6004,6 +6130,7 @@ class RuleBasedRealTeleopExtension:
             or self._initial_alignment_future is not None
             or self._initial_alignment_cancel_pending
             or self._configuration_future is not None
+            or self._next_attempt_rebuild_future is not None
             or self._height_calibration_future is not None
             or self._height_calibration_pending
         ):
@@ -6043,6 +6170,7 @@ class RuleBasedRealTeleopExtension:
             or self._closed
             or self._configuration_rebuilder is None
             or self._configuration_future is not None
+            or self._next_attempt_rebuild_future is not None
             or self._height_calibration_future is not None
             or self._height_calibration_pending
             or self._pending_gripper_action is not None
@@ -6097,6 +6225,7 @@ class RuleBasedRealTeleopExtension:
     def _reset_attempt_state(self, *, reason: str) -> None:
         """Rebuild one indivisible rule cursor without changing Session authority."""
 
+        self._abandon_next_attempt_rebuild()
         self._cancel_initial_alignment_planning()
         self._boundaries.clear()
         for step in self.plan.steps:
@@ -6145,6 +6274,8 @@ class RuleBasedRealTeleopExtension:
         self._completed = False
         self._completion_stop_requested = False
         self._aborted = False
+        self._arm_feedback_pause_started_at = None
+        self._initial_alignment_reacquire_samples = 0
         self._clear_manual_gripper_action()
 
     def _reset_attempt_for_runtime_home(self) -> None:
@@ -6180,6 +6311,23 @@ class RuleBasedRealTeleopExtension:
                 return
         except Exception:
             return
+        pending = self._next_attempt_rebuild_future
+        if pending is not None:
+            if not pending.done():
+                self._waiting_reason = "successful_next_attempt_rebuild"
+                return
+            context = dict(self._next_attempt_rebuild_context or {})
+            self._next_attempt_rebuild_future = None
+            self._next_attempt_rebuild_context = None
+            try:
+                replacement = pending.result()
+                self._activate_successful_next_attempt(
+                    replacement=replacement,
+                    **context,
+                )
+            except Exception as exc:  # noqa: BLE001 - activation fails closed.
+                self._fail_successful_next_attempt_activation(exc)
+            return
         if self._deferred_progress_arm_fix_established:
             controller = getattr(self._components, "fix_arm_controller", None)
             cancel_active = getattr(controller, "cancel_active", None)
@@ -6205,67 +6353,78 @@ class RuleBasedRealTeleopExtension:
                     + str(getattr(transition, "message", "unknown failure"))
                 )
                 return
+            self._deferred_progress_arm_fix_established = False
         self._advance_pre_pen_down_replay_cadence()
         try:
             next_selection_ordinal = self._selection_ordinal + 1
             if self._configuration_batch:
                 count = len(self._configuration_batch)
                 completed_index = int(self._configuration_batch_index)
-                self._configuration_batch_completed_count = min(
+                next_completed_count = min(
                     count,
                     self._configuration_batch_completed_count + 1,
                 )
                 if completed_index + 1 < count:
                     next_index = completed_index + 1
-                    self._configuration_batch_cycle_complete = False
+                    next_cycle_complete = False
                 else:
                     next_index = 0
-                    self._configuration_batch_cycle_complete = True
+                    next_cycle_complete = True
                 configuration, replacement = self._configuration_batch[next_index]
-                if self._configuration_uses_random_sources(configuration):
-                    replacement = self._rebuild_for_selection_ordinal(
+            else:
+                next_index = 0
+                next_completed_count = 1
+                next_cycle_complete = True
+                configuration = copy.deepcopy(self._selected_configuration)
+                replacement = None
+            context = {
+                "configuration": copy.deepcopy(dict(configuration)),
+                "next_selection_ordinal": int(next_selection_ordinal),
+                "next_index": int(next_index),
+                "next_completed_count": int(next_completed_count),
+                "next_cycle_complete": bool(next_cycle_complete),
+            }
+            if self._configuration_uses_random_sources(configuration):
+                self._next_attempt_rebuild_context = context
+                self._next_attempt_rebuild_future = (
+                    self._configuration_executor.submit(
+                        self._rebuild_for_selection_ordinal,
                         configuration,
                         selection_ordinal=next_selection_ordinal,
                     )
-                self._adopt_prestart_extension(replacement)
-                if self._configuration_on_commit is not None:
-                    self._configuration_on_commit(configuration, replacement)
-                self._configuration_batch_index = next_index
-                self._selected_configuration = copy.deepcopy(configuration)
-            else:
-                self._configuration_batch_completed_count = 1
-                self._configuration_batch_cycle_complete = True
-                if self._configuration_uses_random_sources(
-                    self._selected_configuration
-                ):
-                    replacement = self._rebuild_for_selection_ordinal(
-                        self._selected_configuration,
-                        selection_ordinal=next_selection_ordinal,
-                    )
-                    self._adopt_prestart_extension(replacement)
-                    if self._configuration_on_commit is not None:
-                        self._configuration_on_commit(
-                            self._selected_configuration,
-                            replacement,
-                        )
-                else:
-                    self.plan = self._plan_for_next_attempt()
-        except Exception as exc:  # noqa: BLE001 - batch activation fails closed.
-            self._completed = False
-            self._aborted = True
-            self._waiting_reason = "successful_batch_advance_failed"
-            self._establish_hold(
-                "completed rule attempt could not activate the next validated "
-                f"batch item: {type(exc).__name__}: {exc}"
-            )
-            append_message = getattr(self._control_ui, "append_message", None)
-            if callable(append_message):
-                append_message(
-                    "RuleBased",
-                    "当前 Episode 已提交，但下一条预验证组合激活失败；"
-                    "机械臂已进入 Hold，请重新验证批次。",
                 )
+                self._waiting_reason = "successful_next_attempt_rebuild"
+                return
+            self._activate_successful_next_attempt(
+                replacement=replacement,
+                **context,
+            )
+        except Exception as exc:  # noqa: BLE001 - batch activation fails closed.
+            self._next_attempt_rebuild_context = None
+            self._fail_successful_next_attempt_activation(exc)
             return
+
+    def _activate_successful_next_attempt(
+        self,
+        *,
+        configuration: Mapping[str, Any],
+        replacement: "RuleBasedRealTeleopExtension" | None,
+        next_selection_ordinal: int,
+        next_index: int,
+        next_completed_count: int,
+        next_cycle_complete: bool,
+    ) -> None:
+        if replacement is not None:
+            self._adopt_prestart_extension(replacement)
+            if self._configuration_on_commit is not None:
+                self._configuration_on_commit(configuration, replacement)
+        else:
+            self.plan = self._plan_for_next_attempt()
+        if self._configuration_batch:
+            self._configuration_batch_index = int(next_index)
+            self._selected_configuration = copy.deepcopy(dict(configuration))
+        self._configuration_batch_completed_count = int(next_completed_count)
+        self._configuration_batch_cycle_complete = bool(next_cycle_complete)
         self._selection_ordinal = next_selection_ordinal
         runtime_info = self._configuration_options.get("runtime_info")
         if isinstance(runtime_info, dict) and self._selected_configuration:
@@ -6296,6 +6455,49 @@ class RuleBasedRealTeleopExtension:
             else "waiting_for_rule_start"
         )
         self._invalidate_readiness_diagnosis_cache()
+
+    def _fail_successful_next_attempt_activation(self, exc: BaseException) -> None:
+        self._completed = False
+        self._aborted = True
+        self._waiting_reason = "successful_batch_advance_failed"
+        self._establish_hold(
+            "completed rule attempt could not activate the next validated "
+            f"batch item: {type(exc).__name__}: {exc}"
+        )
+        append_message = getattr(self._control_ui, "append_message", None)
+        if callable(append_message):
+            append_message(
+                "RuleBased",
+                "当前 Episode 已提交，但下一条预验证组合激活失败；"
+                "机械臂已进入 Hold，请重新验证批次。",
+            )
+
+    @staticmethod
+    def _dispose_rebuilt_extension_future(
+        future: Future["RuleBasedRealTeleopExtension"],
+    ) -> None:
+        try:
+            replacement = future.result()
+        except Exception:
+            return
+        replacement._initial_alignment_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+        replacement._configuration_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+
+    def _abandon_next_attempt_rebuild(self) -> None:
+        pending = self._next_attempt_rebuild_future
+        self._next_attempt_rebuild_future = None
+        self._next_attempt_rebuild_context = None
+        if pending is None:
+            return
+        if pending.cancel():
+            return
+        pending.add_done_callback(self._dispose_rebuilt_extension_future)
 
     @staticmethod
     def _configuration_uses_random_sources(
@@ -6569,6 +6771,11 @@ class RuleBasedRealTeleopExtension:
         # rather than racing hardware/session cleanup against its worker.
         self._initial_alignment_executor.shutdown(wait=True, cancel_futures=True)
         self._configuration_executor.shutdown(wait=True, cancel_futures=True)
+        pending = self._next_attempt_rebuild_future
+        self._next_attempt_rebuild_future = None
+        self._next_attempt_rebuild_context = None
+        if pending is not None and pending.done() and not pending.cancelled():
+            self._dispose_rebuilt_extension_future(pending)
 
     def _publish_status(
         self,
@@ -6618,6 +6825,7 @@ class RuleBasedRealTeleopExtension:
             self._gripper_action_result,
             self._gripper_action_status,
             self._configuration_future is not None,
+            self._next_attempt_rebuild_future is not None,
             self._configuration_error,
             self._configuration_batch_index,
             self._configuration_batch_completed_count,
@@ -6918,6 +7126,7 @@ class RuleBasedRealTeleopExtension:
             and not self._armed
             and not self._execution_begun
             and self._configuration_future is None
+            and self._next_attempt_rebuild_future is None
             and self._height_calibration_future is None
             and not self._height_calibration_pending
             and not gripper_action_pending
@@ -7007,7 +7216,10 @@ class RuleBasedRealTeleopExtension:
             batch_completed_count=int(self._configuration_batch_completed_count),
             batch_cycle_complete=bool(self._configuration_batch_cycle_complete),
             configuration_available=self._configuration_lifecycle_available(),
-            configuration_pending=self._configuration_future is not None,
+            configuration_pending=bool(
+                self._configuration_future is not None
+                or self._next_attempt_rebuild_future is not None
+            ),
             configuration_error=str(self._configuration_error),
             session_state=session_state_value,
             readiness_reason=readiness_reason,
