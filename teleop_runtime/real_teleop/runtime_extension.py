@@ -271,10 +271,10 @@ def runtime_extension_bind_runtime_home_snapshot(
 ) -> None:
     """Pass the accepted atomic Home snapshot to an interested extension.
 
-    This is a lifecycle handoff only.  It does not arm hardware or authorize
-    dispatch; it gives an exclusive source the same Home epoch used by the
-    canonical runtime so it can build its own command-inert first waypoint.
-    Extensions that do not own a source-specific Home anchor are unchanged.
+    This is a lifecycle handoff only.  It does not arm hardware, authorize
+    dispatch, or require later motion to start from a snapshot that may have
+    become stale.  Extensions without an epoch-specific Home consumer are
+    unchanged.
     """
 
     if extension is None:
