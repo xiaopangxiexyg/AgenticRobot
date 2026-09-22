@@ -1037,16 +1037,28 @@ def build_episode_recording_runtime(
         nonlocal episode_start_countdown_deadline, episode_start_countdown_reason
         nonlocal episode_start_warmup_ready_since, episode_start_warmup_last_message
         clutch_input._restore_gripper_task_policy_for_collection()
-        countdown_sec = float(DEFAULT_EPISODE_START_COUNTDOWN_SEC)
+        countdown_sec = max(
+            0.0,
+            float(
+                getattr(
+                    args,
+                    "episode_start_countdown_sec",
+                    DEFAULT_EPISODE_START_COUNTDOWN_SEC,
+                )
+            ),
+        )
         episode_start_countdown_deadline = float(now) + countdown_sec
         episode_start_countdown_reason = str(start_reason)
         episode_start_warmup_ready_since = None
         episode_start_warmup_last_message = None
         reset_gripper_warmup_probe(f"countdown:{start_reason}")
-        message = (
-            f"准备开始数采：warmup 与 {countdown_sec:.1f} 秒倒计时同时进行；"
-            "两者都完成后开始写入。"
-        )
+        if countdown_sec > 0.0:
+            message = (
+                f"准备开始数采：warmup 与 {countdown_sec:.1f} 秒倒计时同时进行；"
+                "两者都完成后开始写入。"
+            )
+        else:
+            message = "准备开始数采：warmup 完成后立即开始写入（已关闭额外倒计时）。"
         clutch_input.set_episode_start_countdown_state(
             remaining_sec=countdown_sec,
             message=message,

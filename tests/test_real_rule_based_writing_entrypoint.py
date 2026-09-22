@@ -1159,6 +1159,43 @@ def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     assert "--actual-wrist-camera-pose-hz 15.0" in output
 
 
+def test_launcher_dry_run_enables_dedicated_two_pedal_task_chain_mode(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+    result = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--task-chain-foot-pad",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout
+    assert "--special-arm-control-mode foot-pad" in output
+    assert "--rule-task-chain-foot-pad" in output
+    assert "--special-arm-control-mode manual" not in output
+
+
 def test_launcher_restores_system_tools_when_conda_path_is_isolated(
     tmp_path: Path,
 ) -> None:
@@ -1801,6 +1838,8 @@ def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
     assert args.rule_writing_direction == "down"
     assert args.rule_writing_trajectory_catalog == "/custom-trajectories.json"
     assert args.rule_writing_trajectory == "custom_spiral_v1"
+    assert args.episode_start_countdown_sec == pytest.approx(0.0)
+    assert args.rule_task_chain_foot_pad is False
     assert rule_based_plan._fixed_trajectory_option("latin_z_v1") == {
         "value": "latin_z_v1",
         "label": "英文字母 Z",

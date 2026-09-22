@@ -404,7 +404,13 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
     # human Q6/angle-trigger input stream.  Mark this specialized entrypoint
     # so CLI resolution can default to the explicit no-input topology without
     # changing the ordinary teleop default (automatic Q6 discovery).
-    parser.set_defaults(_rule_based_writing_entrypoint=True)
+    parser.set_defaults(
+        _rule_based_writing_entrypoint=True,
+        # Rule-based collection keeps the writer/camera/feedback warmup, but
+        # has no operator-facing preparation countdown between readiness and
+        # the first admitted sample.
+        episode_start_countdown_sec=0.0,
+    )
     group = parser.add_argument_group("rule-based writing collection")
     group.add_argument(
         "--rule-collection-mode",
@@ -541,6 +547,16 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
             "Whether this rule-based run records DMTAC tactile data. On a "
             "populated dataset, the existing dataset modality contract takes "
             "precedence and prevents mixed tactile/non-tactile Episodes."
+        ),
+    )
+    group.add_argument(
+        "--rule-task-chain-foot-pad",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the dedicated two-pedal task-chain mapping: pedal 1 advances "
+            "the next task-chain step and pedal 2 requests the existing rule "
+            "stop-and-Hold path. This does not change ordinary teleop mappings."
         ),
     )
 

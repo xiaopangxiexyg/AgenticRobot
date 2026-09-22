@@ -185,6 +185,23 @@ class RuleBasedWritingWebUi:
     def consume_rule_intents(self) -> tuple[str, ...]:
         return self._application.consume_rule_intents()
 
+    def submit_task_chain_advance_from_foot_pad(self) -> bool:
+        """Submit one task-chain advance through the existing app boundary.
+
+        The physical input adapter only calls this capability on the
+        dedicated rule UI. It must not synthesize a GUI event or own any task
+        state, so the application remains the single task-chain authority.
+        """
+
+        return self._application.submit_task_chain_advance(
+            {"event": "advance", "source": "foot_pad"}
+        )
+
+    def submit_emergency_stop_from_foot_pad(self) -> bool:
+        """Queue the existing rule stop-and-Hold path for pedal 2."""
+
+        return self._application.submit_intent(RuleBasedWritingIntent.STOP)
+
     def configure_rule_options(
         self,
         options: Mapping[str, object],

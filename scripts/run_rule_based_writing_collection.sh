@@ -55,6 +55,10 @@ Options:
   --tactile-min-free-gb N     Required tactile free space (default: 10).
   --camera-frame-max-age-sec S
                               Maximum admitted RGB frame age (default: 0.25).
+  --task-chain-foot-pad       Enable the 2-pedal rule task-chain mapping:
+                              pedal 1 = next step; pedal 2 = stop and Hold.
+                              Start the independent service with
+                              python -m hardware.foot_pad --count 2.
   --with-left-gripper         Also connect/capture the saved left DMTAC stack.
   --left-gripper-port PATH    Override left DMTAC serial port (optional).
   --right-gripper-port PATH   Override right DMTAC serial port (optional).
@@ -121,6 +125,7 @@ TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-10}"
 TACTILE_MIN_FREE_EXPLICIT=0
 COLLECT_TACTILE=""
 CAMERA_FRAME_MAX_AGE_SEC="0.25"
+TASK_CHAIN_FOOT_PAD=0
 WITH_LEFT_GRIPPER=0
 DRY_RUN=0
 
@@ -200,6 +205,10 @@ while [[ $# -gt 0 ]]; do
       COLLECT_TACTILE=0
       shift
       ;;
+    --task-chain-foot-pad)
+      TASK_CHAIN_FOOT_PAD=1
+      shift
+      ;;
     --with-left-gripper)
       WITH_LEFT_GRIPPER=1
       shift
@@ -238,6 +247,9 @@ if [[ "$COLLECTION_MODE" == "full-replay" && -n "$PRE_PEN_DOWN_REPLAY_CANDIDATE_
 fi
 if [[ "$COLLECTION_MODE" == "full-replay" && "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" != "0" ]]; then
   die "--pre-pen-down-replay-normal-episodes is not valid in full-replay mode."
+fi
+if [[ "$TASK_CHAIN_FOOT_PAD" -eq 1 && "$COLLECTION_MODE" != "rule-based-writing" ]]; then
+  die "--task-chain-foot-pad is only valid in rule-based-writing mode."
 fi
 
 if [[ -n "$TACTILE_ROOT" ]]; then
@@ -337,6 +349,9 @@ RULE_ARGS=(
   --rule-collection-mode "$RULE_COLLECTION_MODE"
   --rule-initial-alignment-speed-scale "$INITIAL_ALIGNMENT_SPEED_SCALE"
 )
+if [[ "$TASK_CHAIN_FOOT_PAD" -eq 1 ]]; then
+  RULE_ARGS+=(--rule-task-chain-foot-pad)
+fi
 if [[ "$COLLECT_TACTILE" == "1" ]]; then
   RULE_ARGS+=(--rule-collect-tactile --dmtac-with-tactile)
 elif [[ "$COLLECT_TACTILE" == "0" || -z "$TACTILE_ROOT" ]]; then
@@ -395,12 +410,16 @@ LEFT_HAND_BACKEND=none
 if [[ "$WITH_LEFT_GRIPPER" -eq 1 ]]; then
   LEFT_HAND_BACKEND=dmtac-gripper
 fi
+SPECIAL_ARM_CONTROL_MODE=manual
+if [[ "$TASK_CHAIN_FOOT_PAD" -eq 1 ]]; then
+  SPECIAL_ARM_CONTROL_MODE=foot-pad
+fi
 HAND_TOPOLOGY_ARGS=(
   --left-hand-backend "$LEFT_HAND_BACKEND"
   --right-hand-backend dmtac-gripper
   --gripper-input-source none
   --no-q6-default-config
-  --special-arm-control-mode manual
+  --special-arm-control-mode "$SPECIAL_ARM_CONTROL_MODE"
 )
 
 if [[ -n "${LEFT_GRIPPER_PORT:-}" ]]; then
