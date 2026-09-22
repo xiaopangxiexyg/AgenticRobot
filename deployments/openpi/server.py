@@ -11,25 +11,34 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
+from pathlib import Path
 
 from dataset_contracts.normalization import (
     NormalizationContract,
     NormalizationContractError,
 )
-from deployments.policy_artifact import load_policy_artifact
 from deployments.openpi.camera_semantics import (
     validate_declared_camera_semantics,
     validate_legacy_swapped_wrist_artifact,
 )
+from deployments.openpi.image_wire import OpenPIImageWireServerConfig
 from deployments.openpi.prepared_deployment import (
     prepare_checkpoint_deployment_artifact,
     validate_prepared_deployment_artifact,
 )
-from deployments.openpi.image_wire import OpenPIImageWireServerConfig
+from deployments.policy_artifact import load_policy_artifact
+
+_NATIVE_THREAD_ENVIRONMENT_VARIABLES = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
 
 
 def _non_negative_cpu_id(text: str) -> int:
@@ -40,6 +49,28 @@ def _non_negative_cpu_id(text: str) -> int:
     if value < 0:
         raise argparse.ArgumentTypeError("CPU id must be non-negative")
     return value
+
+
+def _positive_thread_count(text: str) -> int:
+    try:
+        value = int(text)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("thread count must be an integer") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("thread count must be positive")
+    return value
+
+
+def _native_thread_environment(thread_count: int | None) -> dict[str, str]:
+    if thread_count is None:
+        return {}
+    count = int(thread_count)
+    if isinstance(thread_count, bool) or count != thread_count or count <= 0:
+        raise ValueError("native thread count must be a positive integer")
+    return {
+        variable: str(count)
+        for variable in _NATIVE_THREAD_ENVIRONMENT_VARIABLES
+    }
 
 
 def _exclude_server_cpus_before_exec(
@@ -316,6 +347,16 @@ def main(argv: list[str] | None = None) -> int:
             "reduced mask; omitting all occurrences is the rollback."
         ),
     )
+    parser.add_argument(
+        "--native-thread-count",
+        type=_positive_thread_count,
+        default=None,
+        help=(
+            "Default-off native math thread cap inherited by the exec'd "
+            "OpenPI server. Sets OMP, MKL, OpenBLAS, NumExpr, BLIS, and "
+            "Accelerate thread environments to the same positive value."
+        ),
+    )
     parser.add_argument("--record", action="store_true")
     parser.add_argument(
         "--enable-rtc-continuation",
@@ -538,6 +579,9 @@ def main(argv: list[str] | None = None) -> int:
         project_root,
         os.environ.get("PYTHONPATH"),
     )
+    native_thread_environment = _native_thread_environment(
+        args.native_thread_count
+    )
     if args.dry_run:
         print(
             json.dumps(
@@ -546,7 +590,10 @@ def main(argv: list[str] | None = None) -> int:
                     "openpi_root": str(openpi_root),
                     "openpi_root_source": openpi_root_source,
                     "command": command,
-                    "environment": {"PYTHONPATH": runtime_pythonpath},
+                    "environment": {
+                        "PYTHONPATH": runtime_pythonpath,
+                        **native_thread_environment,
+                    },
                     "excluded_cpu_ids": sorted(
                         set(int(cpu) for cpu in args.exclude_cpu)
                     ),
@@ -598,6 +645,13 @@ def main(argv: list[str] | None = None) -> int:
             "[OpenPICPU] READY: server process excludes control CPUs "
             f"{list(excluded_cpu_ids)}; migrated_native_threads="
             f"{reservation['native_threads_migrated']} inherited_after_exec=true.",
+            flush=True,
+        )
+    if native_thread_environment:
+        os.environ.update(native_thread_environment)
+        print(
+            "[OpenPICPU] READY: native math thread pools capped at "
+            f"{args.native_thread_count}; inherited_after_exec=true.",
             flush=True,
         )
     os.environ["PYTHONPATH"] = runtime_pythonpath

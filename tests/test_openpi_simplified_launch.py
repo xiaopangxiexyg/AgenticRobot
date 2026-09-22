@@ -15,7 +15,6 @@ from dataset_contracts.v22 import PolicyIOLayout
 from deployments.openpi import server as openpi_server
 from deployments.openpi.client import real as openpi_real
 
-
 pytestmark = pytest.mark.integration
 
 
@@ -129,6 +128,8 @@ def test_server_dry_run_builds_registry_from_artifact(
             "14",
             "--exclude-cpu",
             "15",
+            "--native-thread-count",
+            "3",
             "--dry-run",
         ]
     ) == 0
@@ -141,6 +142,8 @@ def test_server_dry_run_builds_registry_from_artifact(
         Path(openpi_server.__file__).resolve().parents[2]
     )
     assert report["excluded_cpu_ids"] == [14, 15]
+    for variable in openpi_server._NATIVE_THREAD_ENVIRONMENT_VARIABLES:
+        assert report["environment"][variable] == "3"
     registry_path = Path(report["command"][report["command"].index("--registry") + 1])
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     entry = registry["models"][artifact.model_id]
@@ -245,6 +248,8 @@ def test_server_applies_process_cpu_exclusion_immediately_before_exec(
     )
     monkeypatch.setattr(openpi_server.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(openpi_server.os, "chdir", lambda _path: None)
+    inherited_environment: dict[str, str] = {}
+    monkeypatch.setattr(openpi_server.os, "environ", inherited_environment)
     calls: list[tuple[int, ...]] = []
 
     def fake_exclude(cpu_ids):
@@ -271,7 +276,41 @@ def test_server_applies_process_cpu_exclusion_immediately_before_exec(
             "15",
             "--exclude-cpu",
             "14",
+            "--native-thread-count",
+            "2",
         ]
     ) == 0
 
     assert calls == [(14, 15)]
+    assert inherited_environment["PYTHONPATH"].split(":")[0] == str(
+        Path(openpi_server.__file__).resolve().parents[2]
+    )
+    for variable in openpi_server._NATIVE_THREAD_ENVIRONMENT_VARIABLES:
+        assert inherited_environment[variable] == "2"
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "not-an-int"))
+def test_server_rejects_invalid_native_thread_count(
+    tmp_path: Path,
+    capsys,
+    value: str,
+) -> None:
+    openpi_root = tmp_path / "openpi"
+    checkpoint, _artifact = _write_checkpoint(openpi_root)
+    _write_openpi_runtime_checkout(openpi_root)
+
+    with pytest.raises(SystemExit) as exc_info:
+        openpi_server.main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--openpi-root",
+                str(openpi_root),
+                "--native-thread-count",
+                value,
+                "--dry-run",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "thread count" in capsys.readouterr().err

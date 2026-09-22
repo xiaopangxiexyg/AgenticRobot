@@ -22,6 +22,25 @@ submodule；当前 DexTeleop server/client 路径不依赖这两个示例仓库�
 checkout 时才使用固定 submodule。prepared training profile 仍严格绑定其中记录的
 `openpi_checkout`，不会被 submodule fallback 静默替换。
 
+同机运行遥操与 OpenPI 推理时，server launcher 可以同时收缩 CPU mask 和原生数学
+线程池。例如为控制链保留 0～7，并让 server 在其余 CPU 上最多使用 4 个 native
+计算线程：
+
+```bash
+python -m deployments.openpi.server \
+  --checkpoint-dir "$CHECKPOINT_DIR" \
+  --exclude-cpu 0 --exclude-cpu 1 --exclude-cpu 2 --exclude-cpu 3 \
+  --exclude-cpu 4 --exclude-cpu 5 --exclude-cpu 6 --exclude-cpu 7 \
+  --native-thread-count 4 \
+  --dry-run
+```
+
+先用 `--dry-run` 核对 `excluded_cpu_ids` 和 `environment`，再去掉 dry-run 启动。
+`--native-thread-count` 会在 `exec` 前统一设置 OMP、MKL、OpenBLAS、NumExpr、BLIS
+和 Accelerate 的线程环境；不传时完全保留既有环境。它只约束 server 进程，不能替代
+系统级 cpuset，也不会自动判断 SMT sibling；控制核及其 sibling 仍应由部署环境成组
+预留。
+
 当前经过闭环 server/client 握手验证的模型是：
 
 | 项目 | 值 |
