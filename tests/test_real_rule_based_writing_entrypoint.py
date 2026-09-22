@@ -1181,6 +1181,8 @@ def test_launcher_dry_run_enables_dedicated_two_pedal_task_chain_mode(
             "--tactile-bundle-root",
             str(tactile),
             "--task-chain-foot-pad",
+            "--grasp-adjustment-interval",
+            "7",
             "--dry-run",
         ],
         cwd=ROOT,
@@ -1193,6 +1195,7 @@ def test_launcher_dry_run_enables_dedicated_two_pedal_task_chain_mode(
     output = result.stdout
     assert "--special-arm-control-mode foot-pad" in output
     assert "--rule-task-chain-foot-pad" in output
+    assert "--rule-task-chain-grasp-adjustment-interval 7" in output
     assert "--special-arm-control-mode manual" not in output
 
 
@@ -1840,6 +1843,7 @@ def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
     assert args.rule_writing_trajectory == "custom_spiral_v1"
     assert args.episode_start_countdown_sec == pytest.approx(0.0)
     assert args.rule_task_chain_foot_pad is False
+    assert args.rule_task_chain_grasp_adjustment_interval == 10
     assert rule_based_plan._fixed_trajectory_option("latin_z_v1") == {
         "value": "latin_z_v1",
         "label": "英文字母 Z",

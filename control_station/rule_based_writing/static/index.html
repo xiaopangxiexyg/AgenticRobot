@@ -40,11 +40,11 @@
       </div>
       <div class="configuration-grid">
         <label id="full-replay-source-field" class="wide" hidden>完整数据集轨迹来源<select id="full-replay-source"></select></label>
-        <label class="writing-option wide">落笔前固定轨迹（可选）<select id="pre-pen-down-source"></select></label>
-        <label class="writing-option wide">普通成功采集次数 / 每次前置轨迹<input id="pre-pen-down-normal-episodes" type="number" min="0" step="1"></label>
-        <label class="writing-option">靠近纸面来源<select id="pen-down-source"></select></label>
+        <label class="writing-option wide">落笔前额外完整轨迹（可选，默认关闭；不属于靠近纸面 replay）<select id="pre-pen-down-source"></select></label>
+        <label class="writing-option wide">普通成功采集次数 / 每次额外完整轨迹<input id="pre-pen-down-normal-episodes" type="number" min="0" step="1"></label>
+        <label class="writing-option">靠近纸面 replay 来源（pen_down）<select id="pen-down-source"></select></label>
         <label class="writing-option">书写动态来源<select id="write-source"></select></label>
-        <label class="writing-option">离开纸面来源<select id="pen-up-source"></select></label>
+        <label class="writing-option">离开纸面相对 replay 来源（pen_up）<select id="pen-up-source"></select></label>
         <label class="writing-option">书写数字<select id="trajectory"></select></label>
         <label class="writing-option">书写方向<select id="direction"></select></label>
         <label class="writing-option">字形高度（米）<input id="writing-size" type="number" step="0.005"></label>

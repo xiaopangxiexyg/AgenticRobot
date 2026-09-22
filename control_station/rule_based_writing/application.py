@@ -52,6 +52,7 @@ class RuleBasedWritingUiState:
     collection_position: str | None = None
     initial_alignment_speed_scale: float | None = None
     rule_configuration: dict[str, object] = field(default_factory=dict)
+    rule_source_selection: dict[str, object] = field(default_factory=dict)
     collection_mode: str = "rule_based_writing"
     rule_configuration_batch: list[dict[str, object]] = field(default_factory=list)
     batch_index: int = 0
@@ -110,6 +111,9 @@ class RuleBasedWritingUiState:
     task_chain_can_advance: bool = False
     task_chain_owner_recovery_required: bool = False
     task_chain_cycle_count: int = 0
+    task_chain_grasp_adjustment_interval: int = 10
+    task_chain_episodes_since_grasp_adjustment: int = 0
+    task_chain_grasp_adjustment_due: bool = True
     task_chain_selected_configuration: dict[str, object] = field(default_factory=dict)
     task_chain_selected_configuration_index: int | None = None
     held: bool = False
@@ -712,7 +716,16 @@ class RuleBasedWritingApplication:
             selected,
             options=normalized_options,
         )
+        runtime_info = normalized_options.get("runtime_info", {})
+        if not isinstance(runtime_info, Mapping):
+            raise ValueError("规则运行信息尚未就绪。")
+        grasp_adjustment_interval = int(
+            runtime_info.get("task_chain_grasp_adjustment_interval", 10)
+        )
         with self._lock:
+            self._task_chain.configure_grasp_adjustment_interval(
+                grasp_adjustment_interval
+            )
             self._configuration_options = normalized_options
             self._state.collection_mode = str(
                 normalized_options.get("collection_mode")
@@ -720,6 +733,10 @@ class RuleBasedWritingApplication:
             )
             self._state.rule_configuration = normalized_selected
             self._task_chain_configuration_pool = [dict(normalized_selected)]
+            self._task_chain.set_prepared_configuration(
+                index=0,
+                selected=normalized_selected,
+            )
             self._state.configuration_error = ""
             self._rebuild_controls()
             self._touch()
@@ -803,6 +820,15 @@ class RuleBasedWritingApplication:
                             dict(item)
                             for item in self._state.rule_configuration_batch
                         ]
+                        if self._task_chain.phase in {
+                            RuleWritingTaskChainPhase.IDLE,
+                            RuleWritingTaskChainPhase.COMPLETE,
+                            RuleWritingTaskChainPhase.READY_RULE,
+                        }:
+                            self._task_chain.set_prepared_configuration(
+                                index=self._state.batch_index,
+                                selected=self._state.rule_configuration,
+                            )
                 self._state.configuration_error = ""
                 if self._state.startup_blockers:
                     self._set_readiness_blocked_locked()
@@ -931,6 +957,16 @@ class RuleBasedWritingApplication:
             }:
                 if not self._task_chain_initially_available_locked(available):
                     return False
+                if (
+                    phase is RuleWritingTaskChainPhase.COMPLETE
+                    and not self._task_chain.grasp_adjustment_due
+                ):
+                    if not self._start_prepared_task_chain_rule_locked():
+                        return False
+                    self._task_chain_owner_recovery_attempts = 0
+                    self._rebuild_controls()
+                    self._touch()
+                    return True
                 action_id_baseline = self._last_gripper_action_id
                 if not self._submit_intent_locked(
                     RuleBasedWritingIntent.RELEASE_RIGHT_GRIPPER
@@ -978,6 +1014,17 @@ class RuleBasedWritingApplication:
                     else:
                         self._task_chain.begin_rule_after_wait()
                         self._task_chain_owner_recovery_attempts = 0
+                elif self._task_chain.configuration_prepared:
+                    if self._rule_owner_recovery_window_locked():
+                        self._task_chain.wait_for_recovered_rule_start()
+                        if not self._request_task_chain_owner_recovery_locked(
+                            automatic=False
+                        ):
+                            return False
+                    else:
+                        if not self._start_prepared_task_chain_rule_locked():
+                            return False
+                        self._task_chain_owner_recovery_attempts = 0
                 else:
                     # The operator authorizes the complete rule phase here,
                     # not a standalone gripper repair.  Lock the random
@@ -1001,6 +1048,26 @@ class RuleBasedWritingApplication:
             self._rebuild_controls()
             self._touch()
             return True
+
+    def _start_prepared_task_chain_rule_locked(self) -> bool:
+        """Start the runtime-owned next attempt without resetting randomness."""
+
+        if not self._task_chain.configuration_prepared:
+            return False
+        if not self._submit_intent_locked(RuleBasedWritingIntent.START):
+            return False
+        selected = (
+            dict(self._state.rule_configuration)
+            if self._state.rule_configuration
+            else dict(self._task_chain.selected_configuration)
+        )
+        index = int(
+            self._state.batch_index
+            if self._state.rule_configuration
+            else self._task_chain.selected_configuration_index or 0
+        )
+        self._task_chain.begin_prepared_rule(index=index, selected=selected)
+        return True
 
     def _begin_task_chain_configuration_locked(self) -> bool:
         """Lock one validated random choice for the complete rule phase."""
@@ -1363,6 +1430,9 @@ class RuleBasedWritingApplication:
             raw_configuration = status.get("rule_configuration")
             if isinstance(raw_configuration, Mapping):
                 self._state.rule_configuration = dict(raw_configuration)
+            raw_source_selection = status.get("source_selection")
+            if isinstance(raw_source_selection, Mapping):
+                self._state.rule_source_selection = dict(raw_source_selection)
             self._state.collection_mode = str(
                 status.get("collection_mode", self._state.collection_mode)
                 or "rule_based_writing"
@@ -1927,6 +1997,15 @@ class RuleBasedWritingApplication:
         self._state.task_chain_step = str(chain["step"])
         self._state.task_chain_title = str(chain["title"])
         self._state.task_chain_cycle_count = int(chain["cycle_count"])
+        self._state.task_chain_grasp_adjustment_interval = int(
+            chain["grasp_adjustment_interval"]
+        )
+        self._state.task_chain_episodes_since_grasp_adjustment = int(
+            chain["episodes_since_grasp_adjustment"]
+        )
+        self._state.task_chain_grasp_adjustment_due = bool(
+            chain["grasp_adjustment_due"]
+        )
         selected_configuration = chain["selected_configuration"]
         self._state.task_chain_selected_configuration = (
             dict(selected_configuration)
@@ -2137,13 +2216,25 @@ class RuleBasedWritingApplication:
         self,
         available: Mapping[str, bool],
     ) -> bool:
+        if self._state.collection_mode != "rule_based_writing":
+            return False
+        if not self._task_chain_configuration_pool:
+            return False
+        if (
+            self._task_chain.phase is RuleWritingTaskChainPhase.COMPLETE
+            and not self._task_chain.grasp_adjustment_due
+        ):
+            return bool(
+                self._task_chain.configuration_prepared and available["start"]
+            )
         return bool(
-            self._state.collection_mode == "rule_based_writing"
-            and self._task_chain_configuration_pool
-            and available["configure"]
-            and available["release_grippers"]
+            available["release_grippers"]
             and available["close_right_gripper"]
             and available["capture_height"]
+            and (
+                self._task_chain.configuration_prepared
+                or available["configure"]
+            )
         )
 
     def _task_chain_blocked_detail_locked(
@@ -2199,7 +2290,8 @@ class RuleBasedWritingApplication:
         if not self._task_chain_configuration_pool:
             return "等待可用轨迹组合完成预验证；就绪前不能开始任务链。"
         if not available["configure"]:
-            return "等待轨迹配置事务可用；完成前不会输出规则运动命令。"
+            if not self._task_chain.configuration_prepared:
+                return "等待轨迹配置事务可用；完成前不会输出规则运动命令。"
         if not available["start"]:
             return "等待现有安全门禁放行；安全就绪后才能开始任务链。"
         return "任务链尚未满足全部前置条件；请查看上方设备与安全消息。"
@@ -2235,6 +2327,10 @@ class RuleBasedWritingApplication:
             }
             if non_owner_blockers or self._state.runtime_home_pending:
                 return False
+            if self._rule_owner_recovery_window_locked():
+                return bool(available["close_right_gripper"])
+            if self._task_chain.configuration_prepared:
+                return bool(available["start"])
             return bool(available["configure"] and self._task_chain_configuration_pool)
         if phase is RuleWritingTaskChainPhase.READY_FINAL_RELEASE:
             return bool(available["release_grippers"])

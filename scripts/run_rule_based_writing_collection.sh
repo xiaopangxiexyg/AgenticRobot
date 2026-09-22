@@ -46,8 +46,10 @@ Options:
   --source-pool-range A:B     Half-open candidate range (default: whole pool).
   --selection-seed N          Deterministic source selection seed (default: 0).
   --pre-pen-down-replay-candidate-id ID
-                              Writing mode only; optional complete source Episode
-                              replayed without capture before pen-down.
+                              Writing mode only; optional extra complete source
+                              Episode replayed without capture before ordinary
+                              pen-down. It is disabled by default and is not the
+                              pen-down/approach source.
   --pre-pen-down-replay-normal-episodes N
                               Successful normal Episodes before one configured
                               pre-pen-down replay (default: 0, replay every Episode).
@@ -59,6 +61,10 @@ Options:
                               pedal 1 = next step; pedal 2 = stop and Hold.
                               Start the independent service with
                               python -m hardware.foot_pad --count 2.
+  --grasp-adjustment-interval N
+                              Successful Episodes per release -> close -> height
+                              recalibration cycle (default: 10). Episodes inside
+                              the cycle reuse the current pen grasp and height.
   --with-left-gripper         Also connect/capture the saved left DMTAC stack.
   --left-gripper-port PATH    Override left DMTAC serial port (optional).
   --right-gripper-port PATH   Override right DMTAC serial port (optional).
@@ -126,6 +132,7 @@ TACTILE_MIN_FREE_EXPLICIT=0
 COLLECT_TACTILE=""
 CAMERA_FRAME_MAX_AGE_SEC="0.25"
 TASK_CHAIN_FOOT_PAD=0
+GRASP_ADJUSTMENT_INTERVAL="10"
 WITH_LEFT_GRIPPER=0
 DRY_RUN=0
 
@@ -155,6 +162,7 @@ declare -A VALUE_OPTION_TARGET=(
   [--task-name]=TASK_NAME
   [--tactile-min-free-gb]=TACTILE_MIN_FREE_GB
   [--camera-frame-max-age-sec]=CAMERA_FRAME_MAX_AGE_SEC
+  [--grasp-adjustment-interval]=GRASP_ADJUSTMENT_INTERVAL
 )
 declare -A VALUE_OPTION_HINT=(
   [--mode]=NAME
@@ -179,6 +187,7 @@ declare -A VALUE_OPTION_HINT=(
   [--task-name]=NAME
   [--tactile-min-free-gb]=N
   [--camera-frame-max-age-sec]=S
+  [--grasp-adjustment-interval]=N
 )
 
 while [[ $# -gt 0 ]]; do
@@ -274,6 +283,8 @@ fi
 [[ "$SELECTION_SEED" =~ ^-?[0-9]+$ ]] || die "selection seed must be an integer."
 [[ "$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" =~ ^[0-9]+$ ]] || \
   die "pre-pen-down replay normal Episodes must be a non-negative integer."
+[[ "$GRASP_ADJUSTMENT_INTERVAL" =~ ^[1-9][0-9]*$ ]] || \
+  die "grasp adjustment interval must be a positive integer."
 if ! is_unit_interval_decimal "$INITIAL_ALIGNMENT_SPEED_SCALE"; then
   die "initial alignment speed scale must be in (0, 1]."
 fi
@@ -348,6 +359,7 @@ done
 RULE_ARGS=(
   --rule-collection-mode "$RULE_COLLECTION_MODE"
   --rule-initial-alignment-speed-scale "$INITIAL_ALIGNMENT_SPEED_SCALE"
+  --rule-task-chain-grasp-adjustment-interval "$GRASP_ADJUSTMENT_INTERVAL"
 )
 if [[ "$TASK_CHAIN_FOOT_PAD" -eq 1 ]]; then
   RULE_ARGS+=(--rule-task-chain-foot-pad)
@@ -552,7 +564,8 @@ printf '%s\n' \
   "[RuleBased] starting collection mode=$COLLECTION_MODE on the established real-teleop UI." \
   '[RuleBased] clear the workspace; start one formal Episode only after the existing GUI reports ready.' \
   "[RuleBased] source_pool=${SOURCE_POOL_MANIFEST:-legacy_single_source} range=${SOURCE_POOL_RANGE:-all} seed=$SELECTION_SEED" \
-  "[RuleBased] pre_pen_down_replay=${PRE_PEN_DOWN_REPLAY_CANDIDATE_ID:-disabled} normal_episodes_between_replays=$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" \
+  "[RuleBased] extra_pre_pen_down_full_replay=${PRE_PEN_DOWN_REPLAY_CANDIDATE_ID:-disabled} normal_episodes_between_extra_replays=$PRE_PEN_DOWN_REPLAY_NORMAL_EPISODES" \
+  "[RuleBased] grasp_adjustment_interval=$GRASP_ADJUSTMENT_INTERVAL successful_episodes" \
   "[RuleBased] source_dataset=${SOURCE_DATASET:-pool_selected} episode=${SOURCE_EPISODE:-pool_selected}" \
   "[RuleBased] detail_annotation_dir=${DETAIL_ANNOTATION_DIR:-pool_selected}" \
   "[RuleBased] gripper_port_override left=${LEFT_GRIPPER_PORT:-assignment} right=${RIGHT_GRIPPER_PORT:-assignment}" \

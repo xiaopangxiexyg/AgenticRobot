@@ -151,6 +151,15 @@ _RULE_GUI_SHARED_RUNTIME_CONFIGURATION_FIELDS = (
     "write_parquet",
     "write_video",
 )
+
+
+def _positive_int(value: str) -> int:
+    normalized = int(value)
+    if normalized < 1:
+        raise argparse.ArgumentTypeError("value must be an integer >= 1")
+    return normalized
+
+
 _RULE_GUI_RUNTIME_CONFIGURATION_FIELDS = (
     "writing_speed_m_s",
     "writing_speed_from_source",
@@ -557,6 +566,17 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
             "Enable the dedicated two-pedal task-chain mapping: pedal 1 advances "
             "the next task-chain step and pedal 2 requests the existing rule "
             "stop-and-Hold path. This does not change ordinary teleop mappings."
+        ),
+    )
+    group.add_argument(
+        "--rule-task-chain-grasp-adjustment-interval",
+        type=_positive_int,
+        default=10,
+        help=(
+            "Successful rule Episodes per right-gripper adjustment. The first "
+            "Episode always runs release, close, and height calibration; "
+            "subsequent Episodes reuse that grasp until this positive interval "
+            "is reached (default: 10)."
         ),
     )
 
@@ -2119,6 +2139,9 @@ def _rule_configuration_options(
             "position_reference_hz": effective_position_reference_hz(args),
             "outer_control_hz": effective_outer_control_hz(args),
             "arm_control_hz": effective_arm_control_hz(args),
+            "task_chain_grasp_adjustment_interval": int(
+                getattr(args, "rule_task_chain_grasp_adjustment_interval", 10)
+            ),
         },
     }
     selected = {

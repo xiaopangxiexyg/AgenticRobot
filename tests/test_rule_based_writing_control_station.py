@@ -8,6 +8,7 @@ from control_station.rule_based_writing import (
     RuleBasedWritingApplication,
     RuleBasedWritingIntent,
     RuleBasedWritingWebUi,
+    RuleWritingTaskChain,
     RuleWritingTaskChainPhase,
 )
 from teleop_runtime.real_teleop.rule_based_writing_plan import (
@@ -1614,7 +1615,7 @@ def test_manual_gripper_pending_blocks_start_and_reverse_action() -> None:
     assert application.submit_intent(RuleBasedWritingIntent.START) is False
 
 
-def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> None:
+def test_task_chain_configures_once_then_reuses_runtime_prepared_attempt() -> None:
     application = RuleBasedWritingApplication(task_chain_choice_index=lambda count: count - 1)
     options, first, second = _task_chain_configuration()
     application.bind_rule_runtime()
@@ -1701,15 +1702,13 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert application.snapshot()["task_chain_phase"] == "ready_rule"
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_configuration_requests() == (second,)
-    assert application.snapshot()["task_chain_phase"] == "configuration_pending"
-    application.complete_configuration(selected=second, error=None)
+    assert application.consume_configuration_requests() == ()
     assert application.consume_rule_intents() == ("rule_start",)
     assert application.consume_runtime_events() == ["episode_start"]
     state = application.snapshot()
     assert state["task_chain_phase"] == "rule_pending"
-    assert state["task_chain_selected_configuration"] == second
-    assert state["task_chain_selected_configuration_index"] == 1
+    assert state["task_chain_selected_configuration"] == first
+    assert state["task_chain_selected_configuration_index"] == 0
 
     application.observe_rule_status(
         _task_chain_ready_status(
@@ -1731,53 +1730,75 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
             batch_cycle_complete=True,
         )
     )
-    assert application.snapshot()["task_chain_phase"] == "ready_final_release"
-
-    assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_rule_intents() == ("release_right_gripper",)
-    # A delayed success receipt from the initial release has the same intent,
-    # but its old action id must not complete the final release.
-    application.observe_rule_status(
-        _task_chain_ready_status(
-            gripper_action_pending=False,
-            gripper_action_id=11,
-            gripper_action_intent="release_right_gripper",
-            gripper_action_result="succeeded",
-            gripper_action_status="右夹爪实测已松开",
-            batch_count=1,
-            batch_completed_count=1,
-            batch_cycle_complete=True,
-        )
-    )
-    assert application.snapshot()["task_chain_phase"] == "final_release_pending"
-    application.observe_rule_status(
-        _task_chain_ready_status(
-            gripper_action_pending=True,
-            gripper_action_id=13,
-            gripper_action_intent="release_right_gripper",
-            gripper_action_result="pending",
-            gripper_action_status="已排队：松开右夹爪",
-            batch_count=1,
-            batch_completed_count=1,
-            batch_cycle_complete=True,
-        )
-    )
-    application.observe_rule_status(
-        _task_chain_ready_status(
-            gripper_action_pending=False,
-            gripper_action_id=13,
-            gripper_action_intent="release_right_gripper",
-            gripper_action_result="succeeded",
-            gripper_action_status="右夹爪实测已松开",
-            batch_count=1,
-            batch_completed_count=1,
-            batch_cycle_complete=True,
-        )
-    )
     state = application.snapshot()
     assert state["task_chain_phase"] == "complete"
     assert state["task_chain_cycle_count"] == 1
+    assert state["task_chain_episodes_since_grasp_adjustment"] == 1
+    assert state["task_chain_grasp_adjustment_due"] is False
     assert state["task_chain_can_advance"] is True
+
+    # The runtime prepares the next random attempt after success.  Continuing
+    # must only submit START; re-submitting the GUI configuration would reset
+    # the source-selection ordinal and repeatedly choose the same sources.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_configuration=second,
+            source_selection={
+                "selection_ordinal": 1,
+                "phases": {
+                    "pen_down": {"candidate_id": "approach-b"},
+                    "write": {"candidate_id": "write-b"},
+                    "pen_up": {"candidate_id": "depart-b"},
+                },
+            },
+        )
+    )
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_configuration_requests() == ()
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "rule_pending"
+    assert state["task_chain_selected_configuration"] == second
+    assert state["rule_source_selection"]["selection_ordinal"] == 1
+
+
+def test_task_chain_grasp_adjustment_interval_counts_only_successes() -> None:
+    chain = RuleWritingTaskChain()
+    chain.configure_grasp_adjustment_interval(2)
+    selected = {"trajectory_id": "digit_1_v1"}
+
+    assert chain.grasp_adjustment_due is True
+    chain.set_prepared_configuration(index=0, selected=selected)
+    chain.begin_initial_release(action_id_baseline=None)
+    chain.bind_gripper_action(1)
+    chain.finish_initial_release(error=None)
+    chain.begin_close(action_id_baseline=1)
+    chain.bind_gripper_action(2)
+    chain.finish_close(error=None)
+    chain.begin_height()
+    chain.finish_height(error=None)
+    assert chain.grasp_adjustment_due is False
+
+    chain.begin_prepared_rule(index=0, selected=selected)
+    chain.observe_rule_execution()
+    chain.finish_rule()
+    assert chain.cycle_count == 1
+    assert chain.episodes_since_grasp_adjustment == 1
+    assert chain.grasp_adjustment_due is False
+
+    chain.begin_prepared_rule(index=0, selected=selected)
+    chain.observe_rule_execution()
+    chain.fail_rule("cancelled")
+    assert chain.cycle_count == 1
+    assert chain.episodes_since_grasp_adjustment == 1
+
+    chain.begin_prepared_rule(index=0, selected=selected)
+    chain.observe_rule_execution()
+    chain.finish_rule()
+    assert chain.cycle_count == 2
+    assert chain.episodes_since_grasp_adjustment == 2
+    assert chain.grasp_adjustment_due is True
 
 
 def test_task_chain_recovers_lost_gripper_owner_through_right_one_shot_close() -> None:
@@ -1806,17 +1827,7 @@ def test_task_chain_recovers_lost_gripper_owner_through_right_one_shot_close() -
     assert blocked["can_close_grippers"] is False
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_configuration_requests() == (first,)
-    assert application.snapshot()["task_chain_phase"] == "configuration_pending"
-    application.complete_configuration(selected=first, error=None)
-    application.observe_rule_status(
-        _task_chain_ready_status(
-            rule_start_available=False,
-            readiness_blockers={
-                "rule.right_hand_hold_owner": "right owner was invalidated"
-            },
-        )
-    )
+    assert application.consume_configuration_requests() == ()
     assert application.consume_rule_intents() == ("close_right_gripper",)
     pending = application.snapshot()
     assert pending["task_chain_phase"] == "ready_rule"
@@ -1856,16 +1867,7 @@ def test_task_chain_owner_recovery_retries_once_after_serial_session_loss() -> N
     )
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_configuration_requests() == (first,)
-    application.complete_configuration(selected=first, error=None)
-    application.observe_rule_status(
-        _task_chain_ready_status(
-            rule_start_available=False,
-            readiness_blockers={
-                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
-            },
-        )
-    )
+    assert application.consume_configuration_requests() == ()
     assert application.consume_rule_intents() == ("close_right_gripper",)
 
     # The serial session changes while the first owner receipt settles.  The

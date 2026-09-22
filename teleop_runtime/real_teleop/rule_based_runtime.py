@@ -393,6 +393,7 @@ class RuleBasedRealTeleopStatus:
     rule_start_available: bool = False
     gripper_action_status: str = ""
     rule_configuration: Mapping[str, Any] = field(default_factory=dict)
+    source_selection: Mapping[str, Any] = field(default_factory=dict)
     rule_configuration_batch: tuple[Mapping[str, Any], ...] = field(
         default_factory=tuple
     )
@@ -7377,6 +7378,7 @@ class RuleBasedRealTeleopExtension:
             rule_start_available=rule_start_available,
             gripper_action_status=str(self._gripper_action_status),
             rule_configuration=copy.deepcopy(self._selected_configuration),
+            source_selection=copy.deepcopy(self.source_selection),
             rule_configuration_batch=tuple(
                 copy.deepcopy(configuration)
                 for configuration, _replacement in self._configuration_batch

@@ -1328,6 +1328,14 @@ def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> N
             )
         ),
         trajectory_groups={},
+        source_selection={
+            "selection_ordinal": 3,
+            "phases": {
+                "pen_down": {"candidate_id": "approach-3"},
+                "write": {"candidate_id": "write-3"},
+                "pen_up": {"candidate_id": "depart-3"},
+            },
+        },
     )
     recorder = _Recorder(_Poller())
     session, _clutch, ui = _bind(extension, recorder, arm=False)
@@ -1347,6 +1355,10 @@ def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> N
     extension._publish_status()
     assert len(ui.statuses) == publish_count + 1
     assert ui.statuses[-1]["rule_start_available"] is not True
+    assert ui.statuses[-1]["source_selection"]["selection_ordinal"] == 3
+    assert ui.statuses[-1]["source_selection"]["phases"]["pen_down"] == {
+        "candidate_id": "approach-3"
+    }
     extension._publish_status()
     assert len(ui.statuses) == publish_count + 1
 

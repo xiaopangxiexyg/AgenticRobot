@@ -85,8 +85,8 @@ _PHASE_PRESENTATION: dict[RuleWritingTaskChainPhase, tuple[str, str, str]] = {
     ),
     RuleWritingTaskChainPhase.COMPLETE: (
         "5 / 5",
-        "任务链已完成",
-        "本轮闭环完成；再次继续将开始下一轮。",
+        "本条规则采集已完成",
+        "再次继续将按调整抓笔周期决定直接采集下一条，或先重新抓笔并标定高度。",
     ),
 }
 
@@ -97,8 +97,12 @@ class RuleWritingTaskChain:
 
     phase: RuleWritingTaskChainPhase = RuleWritingTaskChainPhase.IDLE
     cycle_count: int = 0
+    grasp_adjustment_interval: int = 10
+    episodes_since_grasp_adjustment: int = 0
+    grasp_adjustment_initialized: bool = False
     selected_configuration: dict[str, object] = field(default_factory=dict)
     selected_configuration_index: int | None = None
+    configuration_prepared: bool = False
     last_error: str = ""
     rule_execution_seen: bool = False
     gripper_action_baseline_id: int | None = None
@@ -112,14 +116,27 @@ class RuleWritingTaskChain:
             RuleWritingTaskChainPhase.COMPLETE,
         }
 
+    @property
+    def grasp_adjustment_due(self) -> bool:
+        return bool(
+            not self.grasp_adjustment_initialized
+            or self.episodes_since_grasp_adjustment
+            >= self.grasp_adjustment_interval
+        )
+
+    def configure_grasp_adjustment_interval(self, value: int) -> None:
+        normalized = int(value)
+        if normalized < 1:
+            raise ValueError("grasp adjustment interval must be at least 1.")
+        self.grasp_adjustment_interval = normalized
+
     def begin_initial_release(self, *, action_id_baseline: int | None) -> None:
         self._require(
             RuleWritingTaskChainPhase.IDLE,
             RuleWritingTaskChainPhase.COMPLETE,
         )
         self.phase = RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING
-        self.selected_configuration = {}
-        self.selected_configuration_index = None
+        self.grasp_adjustment_initialized = False
         self.rule_execution_seen = False
         self.gripper_action_baseline_id = action_id_baseline
         self.gripper_action_id = None
@@ -166,6 +183,9 @@ class RuleWritingTaskChain:
             else RuleWritingTaskChainPhase.READY_HEIGHT
         )
         self.last_error = str(error or "")
+        if not error:
+            self.grasp_adjustment_initialized = True
+            self.episodes_since_grasp_adjustment = 0
 
     def begin_configuration(
         self,
@@ -177,6 +197,7 @@ class RuleWritingTaskChain:
         self.phase = RuleWritingTaskChainPhase.CONFIGURATION_PENDING
         self.selected_configuration_index = int(index)
         self.selected_configuration = dict(selected)
+        self.configuration_prepared = False
         self.rule_execution_seen = False
         self.last_error = ""
         self.rule_start_waiting = False
@@ -184,6 +205,7 @@ class RuleWritingTaskChain:
     def begin_rule(self) -> None:
         self._require(RuleWritingTaskChainPhase.CONFIGURATION_PENDING)
         self.phase = RuleWritingTaskChainPhase.RULE_PENDING
+        self.configuration_prepared = True
         self.rule_execution_seen = False
         self.last_error = ""
         self.rule_start_waiting = False
@@ -195,6 +217,49 @@ class RuleWritingTaskChain:
         if not self.rule_start_waiting:
             raise RuntimeError("rule start is not waiting for a gate retry.")
         self.phase = RuleWritingTaskChainPhase.RULE_PENDING
+        self.configuration_prepared = True
+        self.rule_execution_seen = False
+        self.last_error = ""
+        self.rule_start_waiting = False
+
+    def set_prepared_configuration(
+        self,
+        *,
+        index: int,
+        selected: Mapping[str, object],
+    ) -> None:
+        """Mirror a command-inert configuration already activated by runtime."""
+
+        self._require(
+            RuleWritingTaskChainPhase.IDLE,
+            RuleWritingTaskChainPhase.COMPLETE,
+            RuleWritingTaskChainPhase.READY_RULE,
+        )
+        self.selected_configuration_index = int(index)
+        self.selected_configuration = dict(selected)
+        self.configuration_prepared = True
+
+    def begin_prepared_rule(
+        self,
+        *,
+        index: int,
+        selected: Mapping[str, object],
+    ) -> None:
+        """Start the runtime-prepared next attempt without rebuilding it.
+
+        A successful rule attempt already advances random source selection and
+        prepares the next immutable plan.  Re-submitting the same GUI
+        configuration here would reset that selection ordinal to zero.
+        """
+
+        self._require(
+            RuleWritingTaskChainPhase.COMPLETE,
+            RuleWritingTaskChainPhase.READY_RULE,
+        )
+        self.phase = RuleWritingTaskChainPhase.RULE_PENDING
+        self.selected_configuration_index = int(index)
+        self.selected_configuration = dict(selected)
+        self.configuration_prepared = True
         self.rule_execution_seen = False
         self.last_error = ""
         self.rule_start_waiting = False
@@ -204,6 +269,7 @@ class RuleWritingTaskChain:
 
         self._require(RuleWritingTaskChainPhase.CONFIGURATION_PENDING)
         self.phase = RuleWritingTaskChainPhase.READY_RULE
+        self.configuration_prepared = True
         self.last_error = ""
         self.rule_start_waiting = True
 
@@ -277,6 +343,7 @@ class RuleWritingTaskChain:
     def fail_rule_preparation(self, error: str) -> None:
         self._require(RuleWritingTaskChainPhase.CONFIGURATION_PENDING)
         self.phase = RuleWritingTaskChainPhase.READY_RULE
+        self.configuration_prepared = False
         self.last_error = str(error)
         self.rule_start_waiting = False
 
@@ -306,7 +373,9 @@ class RuleWritingTaskChain:
 
     def finish_rule(self) -> None:
         self._require(RuleWritingTaskChainPhase.RULE_PENDING)
-        self.phase = RuleWritingTaskChainPhase.READY_FINAL_RELEASE
+        self.phase = RuleWritingTaskChainPhase.COMPLETE
+        self.cycle_count += 1
+        self.episodes_since_grasp_adjustment += 1
         self.last_error = ""
         self.rule_start_waiting = False
 
@@ -332,10 +401,12 @@ class RuleWritingTaskChain:
         self.phase = RuleWritingTaskChainPhase.IDLE
         self.selected_configuration = {}
         self.selected_configuration_index = None
+        self.configuration_prepared = False
         self.rule_execution_seen = False
         self.gripper_action_baseline_id = None
         self.gripper_action_id = None
         self.rule_start_waiting = False
+        self.grasp_adjustment_initialized = False
         self.last_error = str(reason)
 
     def finish_final_release(self, *, error: str | None = None) -> None:
@@ -345,7 +416,6 @@ class RuleWritingTaskChain:
             self.last_error = str(error)
             return
         self.phase = RuleWritingTaskChainPhase.COMPLETE
-        self.cycle_count += 1
         self.last_error = ""
         self.rule_start_waiting = False
 
@@ -358,6 +428,20 @@ class RuleWritingTaskChain:
                 "配置已验证，等待现有安全门禁放行；门禁就绪后将自动开始规则采集，"
                 "不会自动绕过安全检查。"
             )
+        elif self.phase is RuleWritingTaskChainPhase.COMPLETE:
+            if self.grasp_adjustment_due:
+                title = "本条已完成，下一条前调整抓笔"
+                detail = (
+                    f"已连续完成 {self.episodes_since_grasp_adjustment} 条；"
+                    "下一步将依次松开右夹爪、闭紧右夹爪并重新标定高度。"
+                )
+            else:
+                title = "本条已完成，可直接继续"
+                detail = (
+                    "本周期继续复用当前抓笔和高度；"
+                    f"已完成 {self.episodes_since_grasp_adjustment} / "
+                    f"{self.grasp_adjustment_interval} 条。"
+                )
         return {
             "active": self.active,
             "phase": self.phase.value,
@@ -365,6 +449,12 @@ class RuleWritingTaskChain:
             "title": title,
             "detail": detail,
             "cycle_count": int(self.cycle_count),
+            "grasp_adjustment_interval": int(self.grasp_adjustment_interval),
+            "episodes_since_grasp_adjustment": int(
+                self.episodes_since_grasp_adjustment
+            ),
+            "grasp_adjustment_due": bool(self.grasp_adjustment_due),
+            "configuration_prepared": bool(self.configuration_prepared),
             "selected_configuration": dict(self.selected_configuration),
             "selected_configuration_index": self.selected_configuration_index,
         }

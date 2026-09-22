@@ -296,7 +296,7 @@ const sourceLabel = (value) =>
 const batchLabel = (entry, index) =>
   fullReplayMode()
     ? `${index + 1}. 完整 Episode · ${entry.full_replay_candidate_id}`
-    : `${index + 1}. ${entry.trajectory_id} · 前置:${entry.pre_pen_down_replay_candidate_id || "关闭"} · 间隔:${entry.pre_pen_down_replay_normal_episodes || 0} · ${sourceLabel(entry.pen_down_candidate_id)} / ${sourceLabel(entry.write_candidate_id)} / ${sourceLabel(entry.pen_up_candidate_id)}`;
+    : `${index + 1}. ${entry.trajectory_id} · 额外完整轨迹:${entry.pre_pen_down_replay_candidate_id || "关闭"} · 间隔:${entry.pre_pen_down_replay_normal_episodes || 0} · 靠近:${sourceLabel(entry.pen_down_candidate_id)} / 书写:${sourceLabel(entry.write_candidate_id)} / 离开:${sourceLabel(entry.pen_up_candidate_id)}`;
 
 function renderBatch() {
   const validated = latestState && Array.isArray(latestState.rule_configuration_batch)
@@ -431,11 +431,23 @@ async function refresh() {
   text("task-chain-detail", state.task_chain_detail);
   const chainSelection = state.task_chain_selected_configuration || {};
   const chainIndex = state.task_chain_selected_configuration_index;
+  const resolvedSelection = state.rule_source_selection || {};
+  const resolvedPhases = resolvedSelection.phases || {};
+  const resolvedCandidate = (phase) => {
+    const value = resolvedPhases[phase];
+    return value && typeof value === "object"
+      ? value.candidate_id || "未知"
+      : value || "未知";
+  };
+  const resolvedSources = Object.keys(resolvedPhases).length
+    ? ` · 实际来源 靠近:${resolvedCandidate("pen_down")} / 书写:${resolvedCandidate("write")} / 离开:${resolvedCandidate("pen_up")}`
+    : "";
+  const cadence = ` · 抓笔周期 ${Number(state.task_chain_episodes_since_grasp_adjustment || 0)}/${Number(state.task_chain_grasp_adjustment_interval || 10)}`;
   text(
     "task-chain-selection",
     Object.keys(chainSelection).length
-      ? `本轮随机选择：池中第 ${Number(chainIndex) + 1} 条 · ${chainSelection.trajectory_id || chainSelection.full_replay_candidate_id || "已验证组合"}`
-      : "尚未选择本轮轨迹。",
+      ? `本轮组合：池中第 ${Number(chainIndex) + 1} 条 · ${chainSelection.trajectory_id || chainSelection.full_replay_candidate_id || "已验证组合"}${resolvedSources}${cadence}`
+      : `尚未选择本轮轨迹${cadence}。`,
   );
   const chainButton = document.getElementById("task-chain-advance");
   chainButton.disabled = !state.task_chain_can_advance
@@ -447,7 +459,9 @@ async function refresh() {
     ready_height: "下一步：标定高度（Alt+N）",
     ready_rule: "下一步：随机执行规则采集（Alt+N）",
     ready_final_release: "下一步：松开夹爪完成（Alt+N）",
-    complete: "开始下一轮（Alt+N）",
+    complete: state.task_chain_grasp_adjustment_due
+      ? "下一条：调整抓笔（Alt+N）"
+      : "下一条：直接规则采集（Alt+N）",
   };
   chainButton.textContent = state.task_chain_owner_recovery_required
     ? "下一步：恢复右夹爪闭合（Alt+N）"
