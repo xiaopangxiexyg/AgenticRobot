@@ -597,6 +597,7 @@ class RuleBasedRealTeleopExtension:
         self._started = False
         self._armed = False
         self._execution_begun = False
+        self._runtime_home_qpos_snapshot: dict[str, np.ndarray] | None = None
         self._completed = False
         self._completion_stop_requested = False
         self._aborted = False
@@ -1251,6 +1252,36 @@ class RuleBasedRealTeleopExtension:
             and self._right_gripper_hold_owner_ready()[0]
         )
 
+    def bind_runtime_home_snapshot(
+        self,
+        *,
+        qpos_by_side: Mapping[str, Any] | None,
+    ) -> None:
+        """Store the accepted atomic Home used by rule initial alignment.
+
+        The rule planner owns its own first-command admission; it must not
+        share the generic VIVE StartupHomeContinuity gate.  It does, however,
+        use the exact same runtime-Home snapshot as its command-inert first
+        waypoint.  This method is a copy-only lifecycle handoff and never
+        dispatches motion.
+        """
+
+        if qpos_by_side is None:
+            self._runtime_home_qpos_snapshot = None
+            return
+        home: dict[str, np.ndarray] = {}
+        for side in self.deployment.active_sides:
+            try:
+                qpos = np.asarray(qpos_by_side[side], dtype=float).reshape(6)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"runtime Home qpos is missing a valid {side} six-vector."
+                ) from exc
+            if not np.all(np.isfinite(qpos)):
+                raise ValueError(f"runtime Home qpos is non-finite for {side}.")
+            home[side] = qpos.copy()
+        self._runtime_home_qpos_snapshot = home
+
     def _right_gripper_hold_owner_ready(self) -> tuple[bool, str]:
         """Return the command-inert receipt required by writing hand holds.
 
@@ -1330,11 +1361,10 @@ class RuleBasedRealTeleopExtension:
         """Identify the bounded pre-first-dispatch phase of an active Episode.
 
         The production writing plan starts with an asynchronous, command-inert
-        initial-alignment certification.  Its first qref may then spend several
-        frames in the one-shot runtime-Home continuity dwell.  Neither state is
-        a missing-control fault, and neither is allowed to admit a dataset
-        sample.  Once any arm command is actually dispatched this exception is
-        permanently disabled.
+        initial-alignment certification.  Its first qref is the exact
+        command-inert runtime-Home waypoint, and neither planning nor that
+        waypoint is allowed to admit a dataset sample.  Once any arm command
+        is actually dispatched this exception is permanently disabled.
         """
 
         provider = self._dataset_recorder_provider
@@ -4442,16 +4472,12 @@ class RuleBasedRealTeleopExtension:
         self._initial_alignment_last_schedule_lag_sec = 0.0
         self._initial_alignment_cumulative_schedule_shift_sec = 0.0
         self._initial_alignment_skipped_clock_ticks = 0
-        # The first initialization must be anchored to the same atomic qpos
-        # snapshot that armed StartupHomeContinuity.  Using a later causal
-        # poller sample here creates two different notions of Home: the gate
-        # evaluates the emitted first qref against the runtime-Home snapshot,
-        # while the planner starts from whatever sample happened to arrive
-        # after writer warmup/countdown.  A small amount of feedback drift is
-        # then enough to reject the very first qref before any real command is
-        # dispatched.  Later initialization segments intentionally start from
-        # their current causal state because the one-shot startup gate has
-        # already been released and the robot is executing normally.
+        # RuleBasedInitialAlignmentPlanner owns this pre-dispatch transition.
+        # Before the first dispatch, use the exact atomic Home snapshot handed
+        # over by startup; after execution has begun, each later transition
+        # starts from its current causal qpos.  The planner's existing
+        # start-drift, collision, TCP-envelope, and command-guard checks remain
+        # authoritative for this source.
         start = self._initial_alignment_start_qpos_pair(snapshots)
         target = {
             side: np.asarray(
@@ -4600,7 +4626,7 @@ class RuleBasedRealTeleopExtension:
             if self._initial_alignment_hand_target_by_side:
                 # Count commands, not increments: command zero must reproduce
                 # the measured hand state while the arm's zero-motion qref is
-                # held by StartupHomeContinuity.  The remaining commands keep
+                # held by the runtime-Home waypoint.  The remaining commands keep
                 # the original gripper_max_step bound and end exactly at the
                 # replay target.
                 hand_count = 1 + max(
@@ -4799,52 +4825,17 @@ class RuleBasedRealTeleopExtension:
         self,
         snapshots: Mapping[str, Mapping[str, Any]],
     ) -> dict[str, np.ndarray]:
-        """Select one authoritative start snapshot for an initialization plan.
-
-        Before the first dispatch, StartupHomeContinuity is the owner of the
-        runtime-Home anchor.  Reuse that exact snapshot instead of silently
-        switching to a later poller sample.  If the current causal state has
-        genuinely drifted, the existing bounded start-drift check in
-        ``_prepare_initial_alignment_waypoint`` still fails closed and asks
-        for a fresh runtime Home; this method never widens a safety envelope
-        or rebases the gate implicitly.
-        """
+        """Select the rule-owned Home/current start for one transition."""
 
         current = self._snapshot_qpos_pair(snapshots)
         if self._execution_begun:
             return current
-
-        components = self._components
-        gate = (
-            None
-            if components is None
-            else getattr(components, "startup_home_continuity_gate", None)
-        )
-        snapshot_fn = getattr(gate, "home_qpos_snapshot", None)
-        home_snapshot = snapshot_fn() if callable(snapshot_fn) else None
-        if home_snapshot is None:
+        if self._runtime_home_qpos_snapshot is None:
             return current
-        if not isinstance(home_snapshot, Mapping):
-            raise RuntimeError(
-                "StartupHomeContinuity returned an invalid runtime Home qpos snapshot."
-            )
-
-        home_qpos: dict[str, np.ndarray] = {}
-        for side in ("left", "right"):
-            try:
-                qpos = np.asarray(home_snapshot[side], dtype=float).reshape(6)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    "StartupHomeContinuity runtime Home qpos snapshot is missing "
-                    f"a valid {side} six-vector."
-                ) from exc
-            if not np.all(np.isfinite(qpos)):
-                raise RuntimeError(
-                    "StartupHomeContinuity runtime Home qpos snapshot contains "
-                    f"non-finite values for {side}."
-                )
-            home_qpos[side] = qpos.copy()
-        return home_qpos
+        return {
+            side: qpos.copy()
+            for side, qpos in self._runtime_home_qpos_snapshot.items()
+        }
 
     def _hand_qpos_from_state(
         self,
@@ -5374,16 +5365,12 @@ class RuleBasedRealTeleopExtension:
         elif attempted_emission is not None and not bool(
             getattr(step_result, "command_dispatched", False)
         ):
-            continuity = (
-                self._pending_startup_home_continuity(step_result)
-                if emission is not None
-                else None
-            )
-            if continuity is not None:
-                self._current_dispatched = False
-                self._waiting_reason = "startup_home_continuity_dwell"
-            else:
-                self._abort_session_step("session did not dispatch the active rule frame")
+            # The generic StartupHomeContinuity gate is intentionally not
+            # installed for rule-owned motion.  A rule frame that reaches this
+            # branch therefore failed a real Session/guard/dispatch boundary;
+            # silently replaying it would create an unbounded duplicate-qref
+            # loop and could hide a hardware or command-owner fault.
+            self._abort_session_step("session did not dispatch the active rule frame")
         elif paused_hold is not None:
             # This dispatch exists only to preserve the certified position
             # stream and supply an arm receipt to collection resume warmup.
@@ -5463,61 +5450,6 @@ class RuleBasedRealTeleopExtension:
                 request_stop()
                 self._completion_stop_requested = True
         self._publish_status()
-
-    def _pending_startup_home_continuity(
-        self,
-        step_result: object,
-    ) -> Mapping[str, Any] | None:
-        """Return only the gate's deliberate multi-frame dwell, never a rejection."""
-
-        command = getattr(step_result, "command", None)
-        metadata = getattr(command, "metadata", None)
-        continuity = (
-            metadata.get("startup_home_continuity")
-            if isinstance(metadata, Mapping)
-            else None
-        )
-        if not isinstance(continuity, Mapping):
-            return None
-        gate = getattr(
-            self._components,
-            "startup_home_continuity_gate",
-            None,
-        )
-        snapshot_fn = getattr(gate, "snapshot", None)
-        authoritative = snapshot_fn() if callable(snapshot_fn) else None
-        if not isinstance(authoritative, Mapping):
-            return None
-        state = str(
-            getattr(
-                getattr(step_result, "state", None),
-                "value",
-                getattr(step_result, "state", ""),
-            )
-            or ""
-        ).upper()
-        if (
-            str(continuity.get("schema", ""))
-            != "teleop_runtime.startup_home_continuity/v1"
-            or str(continuity.get("status", "")) != "continuity_dwell"
-            or bool(continuity.get("dispatch_allowed", False))
-            or state != "ARMED"
-            or not bool(authoritative.get("armed", False))
-            or bool(authoritative.get("released", False))
-            or any(
-                authoritative.get(key) != continuity.get(key)
-                for key in (
-                    "schema",
-                    "epoch",
-                    "status",
-                    "dispatch_allowed",
-                    "stable_frames",
-                    "required_consecutive_frames",
-                )
-            )
-        ):
-            return None
-        return continuity
 
     def after_session_error(self, *, error: BaseException, now: float) -> None:
         del now
@@ -6444,6 +6376,7 @@ class RuleBasedRealTeleopExtension:
         reason: str,
         hardware_hold_confirmed: bool,
     ) -> None:
+        self._runtime_home_qpos_snapshot = None
         if not self.restarts_after_hold(reason=reason):
             return
         self._reset_attempt_for_runtime_home()

@@ -1898,85 +1898,7 @@ def test_rule_start_is_unavailable_with_preexisting_fix_authority() -> None:
     assert session.command_override_provider(SimpleNamespace(), 1.2).command is None
 
 
-def test_first_rule_qref_retries_only_startup_home_continuity_dwell() -> None:
-    extension = RuleBasedRealTeleopExtension(
-        deployment=_deployment(),
-        plan=RuleBasedCollectionPlan(
-            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
-        ),
-        trajectory_groups={"source": _group()},
-        config=RuleBasedRealTeleopConfig(settle_consecutive_samples=1),
-    )
-    recorder = _Recorder(_Poller())
-    recorder.is_recording = True
-    session, _clutch, _ui = _bind(extension, recorder)
-
-    first = _wait_for_command(session, now=2.0)
-    command = first.command
-    command.metadata["startup_home_continuity"] = {
-        "schema": "teleop_runtime.startup_home_continuity/v1",
-        "epoch": 1,
-        "status": "continuity_dwell",
-        "armed": True,
-        "released": False,
-        "dispatch_allowed": False,
-        "stable_frames": 1,
-        "required_consecutive_frames": 3,
-    }
-    extension._components.startup_home_continuity_gate = SimpleNamespace(
-        snapshot=lambda: dict(command.metadata["startup_home_continuity"])
-    )
-    extension.after_session_step(
-        step_result=SimpleNamespace(
-            command=command,
-            command_dispatched=False,
-            state=SimpleNamespace(value="ARMED"),
-            faults=(),
-        ),
-        now=2.0,
-    )
-
-    assert extension.status().aborted is False
-    assert extension.status().execution_begun is False
-    assert extension.status().waiting_reason == "startup_home_continuity_dwell"
-    assert runtime_extension_allows_active_episode_bootstrap_without_dispatch(
-        extension
-    )
-    assert extension.dataset_sample_admission(
-        step_result=SimpleNamespace(command_dispatched=False),
-        now=2.0,
-    ).allowed is False
-
-    retry = session.command_override_provider(SimpleNamespace(), 2.01)
-    assert retry.command is command
-    for side in ("left", "right"):
-        recorder.arm_state_poller.qpos[side] = np.asarray(
-            command.commands[f"{side}_arm"].value,
-            dtype=float,
-        )
-    command.metadata["startup_home_continuity"] = {
-        **command.metadata["startup_home_continuity"],
-        "status": "released",
-        "dispatch_allowed": True,
-        "stable_frames": 3,
-    }
-    extension.after_session_step(
-        step_result=SimpleNamespace(
-            command=command,
-            command_dispatched=True,
-            state=SimpleNamespace(value="RUNNING"),
-            faults=(),
-        ),
-        now=2.01,
-    )
-
-    assert extension.status().execution_begun is True
-    assert not runtime_extension_allows_active_episode_bootstrap_without_dispatch(
-        extension
-    )
-
-
-def test_first_initial_alignment_uses_atomic_runtime_home_as_plan_start() -> None:
+def test_first_initial_alignment_uses_bound_atomic_runtime_home_as_plan_start() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -1992,13 +1914,7 @@ def test_first_initial_alignment_uses_atomic_runtime_home_as_plan_start() -> Non
         side: {"actual_qpos": np.zeros(6, dtype=float)}
         for side in ("left", "right")
     }
-    extension._components = SimpleNamespace(
-        startup_home_continuity_gate=SimpleNamespace(
-            home_qpos_snapshot=lambda: {
-                side: values.copy() for side, values in home.items()
-            }
-        )
-    )
+    extension.bind_runtime_home_snapshot(qpos_by_side=home)
 
     selected = extension._initial_alignment_start_qpos_pair(later_causal)
 
@@ -2014,7 +1930,7 @@ def test_first_initial_alignment_uses_atomic_runtime_home_as_plan_start() -> Non
     )
 
 
-def test_first_rule_qref_rejection_holds_and_automatically_reclaims_episode() -> None:
+def test_non_dispatched_rule_frame_holds_and_automatically_reclaims_episode() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -2026,12 +1942,6 @@ def test_first_rule_qref_rejection_holds_and_automatically_reclaims_episode() ->
     recorder.is_recording = True
     session, clutch, ui = _bind(extension, recorder)
     first = _wait_for_command(session, now=3.0)
-    first.command.metadata["startup_home_continuity"] = {
-        "schema": "teleop_runtime.startup_home_continuity/v1",
-        "status": "outside_home_envelope",
-        "dispatch_allowed": False,
-    }
-
     extension.after_session_step(
         step_result=SimpleNamespace(
             command=first.command,

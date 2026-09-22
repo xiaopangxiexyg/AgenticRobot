@@ -329,22 +329,6 @@ class StartupHomeContinuityGate:
     def snapshot(self) -> dict[str, Any]:
         return dict(self._last_evaluation)
 
-    def home_qpos_snapshot(self) -> dict[str, np.ndarray] | None:
-        """Return the atomic runtime-Home qpos used by this gate.
-
-        The initial-alignment planner must use the same qpos snapshot as the
-        continuity gate.  Returning defensive copies keeps the gate as the
-        owner of that safety anchor while allowing another component to build
-        a plan from it without sharing mutable arrays.
-        """
-
-        if not self._armed or not self._home_qpos_by_side:
-            return None
-        return {
-            side: qpos.copy()
-            for side, qpos in self._home_qpos_by_side.items()
-        }
-
 
 __all__ = [
     "DEFAULT_STARTUP_HOME_MAX_JOINT_DELTA_DEG",

@@ -264,6 +264,26 @@ def runtime_extension_after_runtime_home(
         hook(now=float(now))
 
 
+def runtime_extension_bind_runtime_home_snapshot(
+    extension: object | None,
+    *,
+    qpos_by_side: Mapping[str, Any] | None,
+) -> None:
+    """Pass the accepted atomic Home snapshot to an interested extension.
+
+    This is a lifecycle handoff only.  It does not arm hardware or authorize
+    dispatch; it gives an exclusive source the same Home epoch used by the
+    canonical runtime so it can build its own command-inert first waypoint.
+    Extensions that do not own a source-specific Home anchor are unchanged.
+    """
+
+    if extension is None:
+        return
+    hook = getattr(extension, "bind_runtime_home_snapshot", None)
+    if callable(hook):
+        hook(qpos_by_side=qpos_by_side)
+
+
 def runtime_extension_allows_pre_episode_armed_warmup(
     extension: object | None,
 ) -> bool:
@@ -286,10 +306,9 @@ def runtime_extension_allows_active_episode_bootstrap_without_dispatch(
     """Identify a command-inert active-Episode bootstrap owned by an extension.
 
     This hook does not authorize motion or sample admission.  It only tells the
-    owner loop that an ARMED extension is still preparing its first arm command,
-    or that the one-shot Home-continuity gate is deliberately dwelling on that
-    first command.  All observation, modality, force, collision, TCP-envelope,
-    Session, backend-receipt, and writer sample gates remain authoritative.
+    owner loop that an ARMED extension is still preparing its first arm command.
+    All observation, modality, force, collision, TCP-envelope, Session,
+    backend-receipt, and writer sample gates remain authoritative.
     """
 
     if extension is None:
@@ -396,6 +415,14 @@ class RealTeleopRuntimeExtension(Protocol):
 
     def after_runtime_home(self, *, now: float) -> None: ...
 
+    # Optional lifecycle handoff.  The hook must only copy/validate the
+    # accepted Home snapshot; it must not move hardware or dispatch commands.
+    def bind_runtime_home_snapshot(
+        self,
+        *,
+        qpos_by_side: Mapping[str, Any] | None,
+    ) -> None: ...
+
     def allows_pre_episode_armed_warmup(self) -> bool: ...
 
     def allows_active_episode_bootstrap_without_dispatch(self) -> bool: ...
@@ -434,6 +461,7 @@ __all__ = [
     "runtime_extension_after_session_error",
     "runtime_extension_after_runtime_hold",
     "runtime_extension_after_runtime_home",
+    "runtime_extension_bind_runtime_home_snapshot",
     "runtime_extension_collection_startup_blockers",
     "runtime_extension_discards_episode_on_stop",
     "runtime_extension_refresh_status",
