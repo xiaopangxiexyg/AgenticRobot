@@ -6329,11 +6329,12 @@ def test_full_replay_large_hand_source_delta_is_bounded_only_at_live_dispatch() 
     now = 7000.100001
     measured = 0.0
     dispatched: list[tuple[float, float]] = []
+    saw_large_source_target = False
     while extension._current is not None or not dispatched:
         command = session.command_override_provider(SimpleNamespace(), now).command
         assert command is not None
         if not dispatched:
-            assert command.metadata["rule_based_reference_sequence"] == 6
+            assert command.metadata["rule_based_reference_sequence"] == 1
             assert command.metadata["right_source_index"] == 1
         target = float(command.commands["right_hand"].value[0])
         dispatched.append((measured, target))
@@ -6341,9 +6342,12 @@ def test_full_replay_large_hand_source_delta_is_bounded_only_at_live_dispatch() 
         assert command.metadata["rule_based_hand_dispatch_baseline"] == (
             "causal_measured_state"
         )
-        assert command.metadata["rule_based_source_hand_qpos_by_side"]["right"][
-            0
-        ] == pytest.approx(0.70)
+        source_target = float(
+            command.metadata["rule_based_source_hand_qpos_by_side"]["right"][0]
+        )
+        if source_target > 0.6:
+            saw_large_source_target = True
+            assert source_target == pytest.approx(0.70)
         extension.after_session_step(
             step_result=SimpleNamespace(command_dispatched=True),
             now=now,
@@ -6364,6 +6368,7 @@ def test_full_replay_large_hand_source_delta_is_bounded_only_at_live_dispatch() 
         assert len(dispatched) < 30
 
     assert measured == pytest.approx(0.70)
+    assert saw_large_source_target is True
     assert len(dispatched) > 2
     assert extension.status().completed is False
     completed = session.command_override_provider(SimpleNamespace(), now)
@@ -6371,7 +6376,7 @@ def test_full_replay_large_hand_source_delta_is_bounded_only_at_live_dispatch() 
     assert extension.status().completed is True
 
 
-def test_replay_catches_up_to_wall_clock_without_bursting_stale_references() -> None:
+def test_replay_rebases_late_clock_without_skipping_or_bursting_references() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -6400,17 +6405,55 @@ def test_replay_catches_up_to_wall_clock_without_bursting_stale_references() -> 
         step_result=SimpleNamespace(command_dispatched=True), now=5000.0
     )
 
-    # A 55 ms owner-loop delay must select the 50 ms reference directly.  It
-    # must not emit 16.7/33.3 ms backlog targets in successive fast bursts.
+    # A 55 ms owner-loop delay must keep the next 16.7 ms reference instead of
+    # jumping directly to 50 ms.  The remaining clock slips by the measured
+    # lag, so neither a multi-grid target jump nor a fast stale backlog burst
+    # can reach the physical command path.
     current = session.command_override_provider(SimpleNamespace(), 5000.055).command
-    assert current.metadata["rule_based_reference_sequence"] == 3
-    assert current.metadata["rule_based_reference_skipped_count"] == 2
+    assert current.metadata["rule_based_reference_sequence"] == 1
+    assert current.metadata["rule_based_reference_schedule_policy"] == (
+        "ordered_rebase_no_skip"
+    )
+    assert current.metadata["rule_based_reference_schedule_shift_sec"] == pytest.approx(
+        0.055 - (1.0 / 60.0)
+    )
+    assert current.metadata["rule_based_reference_rebased_tick_count"] == 1
     assert current.metadata["rule_based_scheduled_source_cut_timestamp"] == pytest.approx(
-        5000.05
+        5000.0 + (1.0 / 60.0)
     )
     assert current.metadata["rule_based_source_cut_timestamp"] == pytest.approx(
-        5000.05
+        5000.0 + (1.0 / 60.0)
     )
+    extension.after_session_step(
+        step_result=SimpleNamespace(command_dispatched=True), now=5000.055
+    )
+
+    # The rebased next deadline is 16.7 ms after this delayed dispatch.  An
+    # immediate owner-loop iteration therefore holds sequence 1; once due,
+    # sequence 2 is emitted exactly once.
+    held = session.command_override_provider(SimpleNamespace(), 5000.060).command
+    assert held.metadata["rule_based_reference_sequence"] == 1
+    # Continue at a sustained 40 Hz owner cadence.  Every reference remains
+    # ordered even though each tick is later than the 60 Hz nominal clock;
+    # the scheduler must not skip a point or emit two points on one tick.
+    observed_sequences: list[int] = []
+    observed_rebase_counts: list[int] = []
+    for tick in (5000.080, 5000.105, 5000.130):
+        next_reference = session.command_override_provider(
+            SimpleNamespace(), tick
+        ).command
+        observed_sequences.append(
+            int(next_reference.metadata["rule_based_reference_sequence"])
+        )
+        observed_rebase_counts.append(
+            int(next_reference.metadata["rule_based_reference_rebased_tick_count"])
+        )
+        extension.after_session_step(
+            step_result=SimpleNamespace(command_dispatched=True), now=tick
+        )
+
+    assert observed_sequences == [2, 3, 4]
+    assert observed_rebase_counts == [2, 3, 4]
 
 
 def test_accepted_rule_hold_snapshot_supports_immutable_motion_metadata() -> None:

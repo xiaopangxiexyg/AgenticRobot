@@ -589,6 +589,9 @@ class RuleBasedRealTeleopExtension:
         self._replay_reference_queue: deque[_ReplayReferenceCarrier] = deque()
         self._replay_reference_stage_started_at: float | None = None
         self._replay_reference_pause_started_at: float | None = None
+        self._replay_reference_last_schedule_lag_sec = 0.0
+        self._replay_reference_cumulative_schedule_shift_sec = 0.0
+        self._replay_reference_rebased_tick_count = 0
         self._frame_emission: RuleBasedCollectionEmission | None = None
         # A writer-pause frame still dispatches a certified arm hold, but it
         # must remain invisible to cursor/arrival/sample advancement.  Keep a
@@ -4082,49 +4085,52 @@ class RuleBasedRealTeleopExtension:
         self._replay_reference_queue = deque(queue)
         self._replay_reference_stage_started_at = float(now)
         self._replay_reference_pause_started_at = None
+        self._replay_reference_last_schedule_lag_sec = 0.0
+        self._replay_reference_cumulative_schedule_shift_sec = 0.0
+        self._replay_reference_rebased_tick_count = 0
 
     def _pop_due_replay_reference(self, now: float) -> RuleBasedCollectionEmission:
-        """Select the latest due reference instead of replaying stale backlog."""
+        """Dispatch one ordered reference and slip a late owner-loop clock.
+
+        The real owner loop may run below the nominal 60 Hz reference rate.
+        Skipping every overdue grid point preserves wall-clock duration, but
+        turns a smooth resampled path into irregular multi-grid target jumps.
+        Keep every certified reference ordered and dispatch it exactly once;
+        when this call is late, move the remaining schedule by the observed
+        lag so no stale backlog is emitted in a burst.
+        """
 
         if not self._replay_reference_queue:
             raise RuntimeError("replay reference queue is empty")
         stage_started_at = self._replay_reference_stage_started_at
         if stage_started_at is None:
             raise RuntimeError("replay reference stage lacks a monotonic start cut")
-        elapsed_sec = max(0.0, float(now) - float(stage_started_at))
         carrier = self._replay_reference_queue.popleft()
-        skipped = 0
-        while (
-            self._replay_reference_queue
-            and float(
-                self._replay_reference_queue[0].reference_timestamp_sec
-            )
-            <= elapsed_sec + 1e-12
-        ):
-            carrier = self._replay_reference_queue.popleft()
-            skipped += 1
-        emission = self._materialize_replay_reference(carrier)
         scheduled_cut = (
             float(stage_started_at) + float(carrier.reference_timestamp_sec)
         )
+        schedule_lag_sec = max(0.0, float(now) - scheduled_cut)
+        self._replay_reference_last_schedule_lag_sec = schedule_lag_sec
+        if schedule_lag_sec > 0.0:
+            self._replay_reference_stage_started_at = (
+                float(stage_started_at) + schedule_lag_sec
+            )
+            self._replay_reference_cumulative_schedule_shift_sec += schedule_lag_sec
+            self._replay_reference_rebased_tick_count += 1
+
+        emission = self._materialize_replay_reference(carrier)
         schedule_metadata: dict[str, Any] = {
             "rule_based_scheduled_source_cut_timestamp": scheduled_cut,
-            "rule_based_reference_dispatch_lag_sec": max(
-                0.0,
-                float(now) - scheduled_cut,
+            "rule_based_reference_dispatch_lag_sec": schedule_lag_sec,
+            "rule_based_reference_schedule_policy": "ordered_rebase_no_skip",
+            "rule_based_reference_schedule_shift_sec": schedule_lag_sec,
+            "rule_based_reference_cumulative_schedule_shift_sec": float(
+                self._replay_reference_cumulative_schedule_shift_sec
+            ),
+            "rule_based_reference_rebased_tick_count": int(
+                self._replay_reference_rebased_tick_count
             ),
         }
-        if skipped:
-            schedule_metadata.update(
-                {
-                    "rule_based_reference_catchup": True,
-                    "rule_based_reference_skipped_count": int(skipped),
-                    "rule_based_reference_schedule_lag_sec": max(
-                        0.0,
-                        elapsed_sec - float(carrier.reference_timestamp_sec),
-                    ),
-                }
-            )
         emission.command.metadata.update(schedule_metadata)
         return replace(
             emission,
@@ -6278,6 +6284,9 @@ class RuleBasedRealTeleopExtension:
         self._replay_reference_queue.clear()
         self._replay_reference_stage_started_at = None
         self._replay_reference_pause_started_at = None
+        self._replay_reference_last_schedule_lag_sec = 0.0
+        self._replay_reference_cumulative_schedule_shift_sec = 0.0
+        self._replay_reference_rebased_tick_count = 0
 
     def _cancel_initial_alignment_planning(self) -> None:
         future = self._initial_alignment_future
