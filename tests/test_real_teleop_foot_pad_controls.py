@@ -203,6 +203,28 @@ class FootPadControlModeTests(unittest.TestCase):
             SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
         )
 
+    def test_rule_task_chain_mode_admits_only_two_pedals_without_fix_init_gate(
+        self,
+    ) -> None:
+        self.assertEqual(
+            resolve_special_arm_control_mode(
+                SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+                fix_arm_enabled=False,
+                init_arm_enabled=False,
+                foot_pad_count=2,
+                rule_task_chain_foot_pad_enabled=True,
+            ),
+            SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        )
+        with self.assertRaisesRegex(ValueError, "exactly 2 pedals"):
+            resolve_special_arm_control_mode(
+                SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+                fix_arm_enabled=False,
+                init_arm_enabled=False,
+                foot_pad_count=4,
+                rule_task_chain_foot_pad_enabled=True,
+            )
+
     def test_five_pedal_topology_is_admitted_before_progress_profile_selection(self) -> None:
         self.assertEqual(
             resolve_special_arm_control_mode(
@@ -1380,6 +1402,31 @@ class FootPadControlModeTests(unittest.TestCase):
                 ("left", 11.0, "pedal_2"),
             ],
         )
+
+    def test_rule_task_chain_two_pedals_use_dedicated_application_ports(self) -> None:
+        calls: list[str] = []
+        messages: list[tuple[str, str]] = []
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(rule_task_chain_foot_pad=True)
+        control.ui = SimpleNamespace(
+            submit_task_chain_advance_from_foot_pad=lambda: (
+                calls.append("advance") or True
+            ),
+            submit_emergency_stop_from_foot_pad=lambda: (
+                calls.append("stop") or True
+            ),
+            append_message=lambda tag, message: messages.append((tag, message)),
+        )
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 2
+
+        control._handle_foot_pad_special_arm_event("fix_arm_left", now=10.0)
+        control._handle_foot_pad_special_arm_event("fix_arm_right", now=11.0)
+
+        self.assertEqual(calls, ["advance", "stop"])
+        self.assertEqual([tag for tag, _message in messages], ["FootPad", "FootPad"])
+        self.assertIn("任务链下一步", messages[0][1])
+        self.assertIn("停止并 Hold", messages[1][1])
 
     def test_two_pedal_alerts_replace_each_other_and_red_expires(self) -> None:
         published = []

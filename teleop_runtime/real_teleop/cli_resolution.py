@@ -775,6 +775,9 @@ def _parse_real_teleop_args(
                 getattr(args, "collection_progress_profile", None) is not None
                 or getattr(args, "collection_progress_gui", False)
             ),
+            rule_task_chain_foot_pad_enabled=bool(
+                getattr(args, "rule_task_chain_foot_pad", False)
+            ),
         )
     except ValueError as exc:
         parser.error(str(exc))

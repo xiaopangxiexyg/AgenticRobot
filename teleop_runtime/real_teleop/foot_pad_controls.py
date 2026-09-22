@@ -115,19 +115,22 @@ def resolve_special_arm_control_mode(
     init_arm_enabled: bool,
     foot_pad_count: int | None = None,
     progress_enabled: bool = False,
+    rule_task_chain_foot_pad_enabled: bool = False,
 ) -> str:
     """Resolve the mode for a configured 2-, 4-, or 5-pedal topology.
 
     Four pedals retain the original fix-left/fix-right/init-left/init-right
-    mapping.  With exactly two configured pedals, the pedals emit only
+    mapping. With exactly two configured pedals, the pedals emit only
     fix-left/fix-right. Five pedals use the same two-pedal side-switch contract
     for F13/F14 and add F15--F17 progress events. Their progress events are
     admitted or rejected later by the progress state machine; the pedal
     topology itself must not depend on whether an operator has selected a
-    profile yet. This function selects the input
-    adapter; it does not enable or disable the Fix/Init controllers or their
-    GUI and keyboard controls. Any other known count selects manual mode so
-    the caller can continue without foot-pad hardware.
+    profile yet. The rule task-chain mode is an explicit narrow exception:
+    it only admits a live two-pedal topology and leaves the actual task-chain
+    routing to the dedicated rule UI. This function selects the input adapter;
+    it does not enable or disable the Fix/Init controllers or their GUI and
+    keyboard controls. Any other known count selects manual mode so the caller
+    can continue without foot-pad hardware.
     """
 
     requested = str(requested_mode or "").strip()
@@ -143,6 +146,8 @@ def resolve_special_arm_control_mode(
     del progress_enabled
     if requested:
         mode = requested
+    elif rule_task_chain_foot_pad_enabled:
+        mode = SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
     elif count in FOOT_PAD_TWO_PEDAL_STYLE_COUNTS:
         mode = (
             SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
@@ -156,7 +161,12 @@ def resolve_special_arm_control_mode(
             else SPECIAL_ARM_CONTROL_MODE_MANUAL
         )
     if mode == SPECIAL_ARM_CONTROL_MODE_FOOT_PAD:
-        if count in FOOT_PAD_TWO_PEDAL_STYLE_COUNTS:
+        if rule_task_chain_foot_pad_enabled:
+            if count not in (None, 2):
+                raise ValueError(
+                    "rule task-chain foot-pad mode requires exactly 2 pedals."
+                )
+        elif count in FOOT_PAD_TWO_PEDAL_STYLE_COUNTS:
             if not fix_arm_enabled:
                 count_label = "two" if count == 2 else "five"
                 raise ValueError(
@@ -207,6 +217,9 @@ def apply_live_foot_pad_topology(args: Any, foot_pad_count: int) -> str:
         progress_enabled=bool(
             getattr(args, "collection_progress_profile", None) is not None
             or getattr(args, "collection_progress_gui", False)
+        ),
+        rule_task_chain_foot_pad_enabled=bool(
+            getattr(args, "rule_task_chain_foot_pad", False)
         ),
     )
     args.foot_pad_config_count = count

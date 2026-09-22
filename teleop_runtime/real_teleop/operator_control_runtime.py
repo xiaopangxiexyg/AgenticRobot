@@ -429,10 +429,16 @@ class RealTeleopControlInput:
             else "脚踏测试不可用：当前未启用 foot-pad 输入。"
         )
         if foot_pad_input is not None and self._foot_pad_count() == 2:
-            self._foot_pad_test_status = (
-                "已连接 2 个踏板：踏板 1 进入仅左臂遥操，"
-                "踏板 2 进入仅右臂遥操；双踏板不执行 Init。"
-            )
+            if self._rule_task_chain_foot_pad_enabled():
+                self._foot_pad_test_status = (
+                    "已连接 2 个踏板：踏板 1 推进任务链下一步，"
+                    "踏板 2 触发规则采集停止并 Hold。"
+                )
+            else:
+                self._foot_pad_test_status = (
+                    "已连接 2 个踏板：踏板 1 进入仅左臂遥操，"
+                    "踏板 2 进入仅右臂遥操；双踏板不执行 Init。"
+                )
         elif foot_pad_input is not None and self._foot_pad_count() == 5:
             self._foot_pad_test_status = (
                 "已连接 5 个踏板：踏板 1/2 与双踏板一致，分别进入仅左/右臂遥操；"
@@ -2005,10 +2011,75 @@ class RealTeleopControlInput:
         self._publish_progress_pedal_message(message, now=now)
         return True
 
+    def _rule_task_chain_foot_pad_enabled(self) -> bool:
+        """Return whether this input is bound to the dedicated rule UI.
+
+        The capability check deliberately uses the two application-port
+        methods instead of the UI class name. This keeps the operator input
+        layer independent from the control-station package while ensuring the
+        legacy Fix/Init mapping remains untouched for every other UI.
+        """
+
+        ui = getattr(self, "ui", None)
+        return bool(
+            self._foot_pad_mode_enabled()
+            and self._foot_pad_count() == 2
+            and callable(
+                getattr(ui, "submit_task_chain_advance_from_foot_pad", None)
+            )
+            and callable(
+                getattr(ui, "submit_emergency_stop_from_foot_pad", None)
+            )
+            and bool(
+                getattr(
+                    getattr(self, "args", None),
+                    "rule_task_chain_foot_pad",
+                    False,
+                )
+            )
+        )
+
+    def _handle_rule_task_chain_foot_pad_event(
+        self,
+        event: str,
+        *,
+        now: float,
+    ) -> bool:
+        """Route the two dedicated rule pedals through the rule app port."""
+
+        if not self._rule_task_chain_foot_pad_enabled():
+            return False
+        normalized_event = str(event)
+        if normalized_event == "fix_arm_left":
+            callback = getattr(self.ui, "submit_task_chain_advance_from_foot_pad")
+            pedal_label = "踏板 1"
+            operation_label = "任务链下一步"
+        elif normalized_event == "fix_arm_right":
+            callback = getattr(self.ui, "submit_emergency_stop_from_foot_pad")
+            pedal_label = "踏板 2"
+            operation_label = "规则采集停止并 Hold"
+        else:
+            return False
+        accepted = bool(callback())
+        message = (
+            f"{pedal_label}已提交：{operation_label}。"
+            if accepted
+            else f"{pedal_label}未接纳：当前状态不允许{operation_label}。"
+        )
+        append_message = getattr(self.ui, "append_message", None)
+        if callable(append_message):
+            append_message("FootPad", message)
+        logger = globals().get("_log")
+        if callable(logger):
+            logger("FootPad", message, now=now)
+        return True
+
     def _handle_foot_pad_special_arm_event(self, event: str, *, now: float) -> None:
-        """Route one physical pedal to the existing GUI special-arm transition."""
+        """Route one physical pedal to its admitted application boundary."""
 
         if not self._foot_pad_mode_enabled():
+            return
+        if self._handle_rule_task_chain_foot_pad_event(event, now=now):
             return
         if (
             self._foot_pad_count() == 5
