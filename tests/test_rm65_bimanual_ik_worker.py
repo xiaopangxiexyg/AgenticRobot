@@ -184,6 +184,8 @@ def test_latest_pending_request_replaces_backlog_and_preserves_input_copy() -> N
             required_worker_generation=generation,
             required_control_epoch=7,
             required_anchor_generation=12,
+            current_reference_qpos_by_side=_qpos(0.3),
+            max_reference_drift_rad=0.0,
             minimum_request_sequence=latest_request.request_sequence,
         )
         assert assessment.eligible_for_admission
@@ -270,15 +272,36 @@ def test_transport_assessment_rejects_expired_or_wrong_anchor_result() -> None:
             required_worker_generation=generation,
             required_control_epoch=4,
             required_anchor_generation=10,
+            current_reference_qpos_by_side=_qpos(0.4),
+            max_reference_drift_rad=0.0,
         )
         assert not wrong_anchor.eligible_for_admission
         assert wrong_anchor.reasons == ("anchor_generation_mismatch",)
+        drifted = assess_bimanual_ik_proposal(
+            completion,
+            now=completion.completed_at,
+            required_worker_generation=generation,
+            required_control_epoch=4,
+            required_anchor_generation=9,
+            current_reference_qpos_by_side=_qpos(0.41),
+            max_reference_drift_rad=0.005,
+        )
+        assert not drifted.eligible_for_admission
+        assert drifted.reasons == (
+            "reference_qpos_drift_exceeded:left",
+            "reference_qpos_drift_exceeded:right",
+        )
+        assert drifted.reference_qpos_max_abs_drift_rad_by_side[
+            "left"
+        ] == pytest.approx(0.01)
         expired = assess_bimanual_ik_proposal(
             completion,
             now=request.valid_until + 0.001,
             required_worker_generation=generation,
             required_control_epoch=4,
             required_anchor_generation=9,
+            current_reference_qpos_by_side=_qpos(0.4),
+            max_reference_drift_rad=0.0,
         )
         assert not expired.eligible_for_admission
         assert expired.reasons == ("result_expired",)
@@ -309,6 +332,8 @@ def test_solver_error_is_returned_as_non_admissible_completion() -> None:
             required_worker_generation=generation,
             required_control_epoch=5,
             required_anchor_generation=2,
+            current_reference_qpos_by_side=_qpos(0.5),
+            max_reference_drift_rad=0.0,
         )
         assert not assessment.eligible_for_admission
         assert assessment.reasons == ("solver_error", "result_missing")

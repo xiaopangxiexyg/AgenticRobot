@@ -19,6 +19,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Protocol
 
 import numpy as np
@@ -225,6 +226,7 @@ class BimanualIKProposalAssessment:
     eligible_for_admission: bool
     reasons: tuple[str, ...]
     result: BimanualIKResult | None
+    reference_qpos_max_abs_drift_rad_by_side: Mapping[str, float]
 
 
 def assess_bimanual_ik_proposal(
@@ -234,6 +236,8 @@ def assess_bimanual_ik_proposal(
     required_worker_generation: int,
     required_control_epoch: int,
     required_anchor_generation: int,
+    current_reference_qpos_by_side: Mapping[str, Any],
+    max_reference_drift_rad: float,
     minimum_request_sequence: int | None = None,
 ) -> BimanualIKProposalAssessment:
     """Reject stale transport work before canonical result admission."""
@@ -253,6 +257,16 @@ def assess_bimanual_ik_proposal(
         required_anchor_generation,
         name="required_anchor_generation",
     )
+    current_reference = _qpos_pair(
+        current_reference_qpos_by_side,
+        name="current_reference_qpos_by_side",
+    )
+    drift_limit = _finite_time(
+        max_reference_drift_rad,
+        name="max_reference_drift_rad",
+    )
+    if drift_limit < 0.0:
+        raise ValueError("max_reference_drift_rad must be non-negative.")
     minimum_sequence = (
         None
         if minimum_request_sequence is None
@@ -263,6 +277,17 @@ def assess_bimanual_ik_proposal(
     )
     request = completion.request
     reasons: list[str] = []
+    drift_by_side = {
+        side: float(
+            np.max(
+                np.abs(
+                    current_reference[side]
+                    - request.reference_qpos_by_side[side]
+                )
+            )
+        )
+        for side in ("left", "right")
+    }
     if request.worker_generation != worker_generation:
         reasons.append("worker_generation_mismatch")
     if request.control_epoch != control_epoch:
@@ -271,6 +296,9 @@ def assess_bimanual_ik_proposal(
         reasons.append("anchor_generation_mismatch")
     if minimum_sequence is not None and request.request_sequence < minimum_sequence:
         reasons.append("request_sequence_too_old")
+    for side in ("left", "right"):
+        if drift_by_side[side] > drift_limit + 1e-12:
+            reasons.append(f"reference_qpos_drift_exceeded:{side}")
     if completion.error is not None:
         reasons.append("solver_error")
     if completion.deadline_missed:
@@ -283,6 +311,9 @@ def assess_bimanual_ik_proposal(
         eligible_for_admission=not reasons,
         reasons=tuple(reasons),
         result=completion.result if not reasons else None,
+        reference_qpos_max_abs_drift_rad_by_side=MappingProxyType(
+            drift_by_side
+        ),
     )
 
 
