@@ -187,6 +187,34 @@ def _rate_label(value: float) -> str:
     return f"{float(value):g}"
 
 
+def _replay_dispatch_not_before(
+    *,
+    scheduled_at: float,
+    previous_dispatch_started_at: float | None,
+    period_sec: float,
+) -> float:
+    """Return a replay dispatch floor that cannot create a catch-up burst.
+
+    Replay references are stateful, so dropping an intermediate
+    collision-limited endpoint would change the planner path. When work
+    overruns, stretch the remaining replay instead: preserve every reference
+    while keeping consecutive dispatch starts at least one period apart.
+    """
+
+    scheduled = float(scheduled_at)
+    period = float(period_sec)
+    if not np.isfinite(scheduled):
+        raise ValueError("scheduled_at must be finite.")
+    if not np.isfinite(period) or period <= 0.0:
+        raise ValueError("period_sec must be finite and positive.")
+    if previous_dispatch_started_at is None:
+        return scheduled
+    previous = float(previous_dispatch_started_at)
+    if not np.isfinite(previous):
+        raise ValueError("previous_dispatch_started_at must be finite.")
+    return max(scheduled, previous + period)
+
+
 def _print_worker_fault(stage: str, exc: BaseException) -> None:
     print(f"[ReplayHardware][ERROR] {stage} failed: {exc}", file=sys.stderr, flush=True)
 
@@ -2097,7 +2125,8 @@ class ReplayExecutionController:
             group, self._hardware_config.active_sides
         )
         period = 1.0 / max(1e-6, float(group.action_hz))
-        next_time = time.monotonic()
+        schedule_started_at = time.monotonic()
+        previous_dispatch_started_at: float | None = None
         trajectory_source = normalize_replay_trajectory_source(self._settings.trajectory_source)
         current_index: int | None = None
         try:
@@ -2107,6 +2136,18 @@ class ReplayExecutionController:
             rig.begin_replay_speed()
             for index in range(int(group.frame_count)):
                 current_index = int(index)
+                scheduled_at = schedule_started_at + float(index) * period
+                dispatch_not_before = _replay_dispatch_not_before(
+                    scheduled_at=scheduled_at,
+                    previous_dispatch_started_at=previous_dispatch_started_at,
+                    period_sec=period,
+                )
+                wait_sec = dispatch_not_before - time.monotonic()
+                if wait_sec > 0.0 and self._stop_event.wait(wait_sec):
+                    with self._lock:
+                        self._state = "aborted"
+                        self._finished_at = time.time()
+                    return
                 if self._stop_event.is_set():
                     with self._lock:
                         self._state = "aborted"
@@ -2114,6 +2155,7 @@ class ReplayExecutionController:
                     return
                 if trajectory_source == REPLAY_TRAJECTORY_QPOS_TARGET:
                     qpos_targets = self._qpos_targets_at_index(group, index)
+                    previous_dispatch_started_at = time.monotonic()
                     dispatched = self._dispatch_unless_stopped(
                         lambda: rig.send_joint_targets(
                             qpos_targets,
@@ -2125,9 +2167,9 @@ class ReplayExecutionController:
                         group,
                         index=index,
                         observed_at=time.monotonic(),
-                        schedule_start_at=next_time,
-                        target_effective_at=next_time,
-                        effective_until_at=next_time + period,
+                        schedule_start_at=schedule_started_at,
+                        target_effective_at=scheduled_at,
+                        effective_until_at=scheduled_at + period,
                     )
                     replay_command = replay_teleop_command_at_index(
                         hardware_group,
@@ -2138,6 +2180,7 @@ class ReplayExecutionController:
                         source="replay_action_pose",
                         resolver=rig.action_resolver,
                     )
+                    previous_dispatch_started_at = time.monotonic()
                     dispatched = self._dispatch_unless_stopped(
                         lambda: rig.send_commands(
                             replay_command,
@@ -2150,13 +2193,6 @@ class ReplayExecutionController:
                     return
                 with self._lock:
                     self._frame_index = int(index)
-                next_time += period
-                sleep_s = next_time - time.monotonic()
-                if sleep_s > 0.0 and self._stop_event.wait(sleep_s):
-                    with self._lock:
-                        self._state = "aborted"
-                        self._finished_at = time.time()
-                    return
             with self._lock:
                 self._state = "finished"
                 self._frame_index = max(0, int(group.frame_count) - 1)
@@ -2269,6 +2305,54 @@ class ReplayExecutionController:
             )
             first_timestamp = float(references[0].timestamp)
             started_monotonic = time.monotonic()
+            previous_dispatch_started_at: float | None = None
+
+            def dispatch_reference_without_catchup(
+                callback: Callable[[], None],
+                *,
+                scheduled_at: float,
+                metadata: dict[str, Any],
+            ) -> bool:
+                nonlocal previous_dispatch_started_at
+                dispatch_not_before = _replay_dispatch_not_before(
+                    scheduled_at=scheduled_at,
+                    previous_dispatch_started_at=previous_dispatch_started_at,
+                    period_sec=reference_period,
+                )
+                wait_for_spacing_sec = max(
+                    0.0,
+                    dispatch_not_before - time.monotonic(),
+                )
+                if wait_for_spacing_sec > 0.0 and self._stop_event.wait(
+                    wait_for_spacing_sec
+                ):
+                    return False
+                if self._stop_event.is_set():
+                    return False
+                dispatch_started_at = time.monotonic()
+                previous_gap_sec = (
+                    None
+                    if previous_dispatch_started_at is None
+                    else max(
+                        0.0,
+                        dispatch_started_at - previous_dispatch_started_at,
+                    )
+                )
+                metadata["position_replay_timing"] = {
+                    "policy": "stretch_no_catchup_v1",
+                    "scheduled_at": float(scheduled_at),
+                    "dispatch_not_before": float(dispatch_not_before),
+                    "dispatch_started_at": float(dispatch_started_at),
+                    "schedule_lag_sec": max(
+                        0.0,
+                        dispatch_started_at - float(scheduled_at),
+                    ),
+                    "spacing_wait_sec": float(wait_for_spacing_sec),
+                    "previous_dispatch_start_gap_sec": previous_gap_sec,
+                }
+                previous_dispatch_started_at = dispatch_started_at
+                return self._dispatch_unless_stopped(callback)
+
             next_end_effector_index = 0
             last_observed_source_index = -1
             for reference in references:
@@ -2397,7 +2481,7 @@ class ReplayExecutionController:
                         ).reshape(ARM_JOINT_DOF)
                         for side in self._hardware_config.active_sides
                     }
-                    dispatched = self._dispatch_unless_stopped(
+                    dispatched = dispatch_reference_without_catchup(
                         lambda: _send_joint_reference(
                             rig,
                             qpos_reference,
@@ -2405,7 +2489,9 @@ class ReplayExecutionController:
                                 f"replay_qpos_reference_{_rate_label(reference_hz)}hz"
                             ),
                             metadata=reference_metadata,
-                        )
+                        ),
+                        scheduled_at=deadline,
+                        metadata=reference_metadata,
                     )
                 elif collision_required:
                     assert collision_planner is not None
@@ -2496,17 +2582,21 @@ class ReplayExecutionController:
                             stage="after_arm_reference_before_hand",
                         )
 
-                    dispatched = self._dispatch_unless_stopped(
-                        dispatch_collision_joint_reference
+                    dispatched = dispatch_reference_without_catchup(
+                        dispatch_collision_joint_reference,
+                        scheduled_at=deadline,
+                        metadata=reference_metadata,
                     )
                 elif trajectory_source == REPLAY_TRAJECTORY_QPOS_TARGET:
-                    dispatched = self._dispatch_unless_stopped(
+                    dispatched = dispatch_reference_without_catchup(
                         lambda: _send_joint_reference(
                             rig,
                             reference.qpos_by_side,
                             source=f"replay_qpos_reference_{_rate_label(reference_hz)}hz",
                             metadata=reference_metadata,
-                        )
+                        ),
+                        scheduled_at=deadline,
+                        metadata=reference_metadata,
                     )
                 else:
                     xyzquat_by_side: dict[str, np.ndarray] = {}
@@ -2517,13 +2607,15 @@ class ReplayExecutionController:
                                 f"{side} interpolated replay reference is not a valid pose matrix."
                             )
                         xyzquat_by_side[str(side)] = np.asarray(xyzquat, dtype=np.float32).reshape(7)
-                    dispatched = self._dispatch_unless_stopped(
+                    dispatched = dispatch_reference_without_catchup(
                         lambda: _send_pose_reference(
                             rig,
                             xyzquat_by_side,
                             source=f"replay_action_pose_reference_{_rate_label(reference_hz)}hz",
                             metadata=reference_metadata,
-                        )
+                        ),
+                        scheduled_at=deadline,
+                        metadata=reference_metadata,
                     )
                 if not dispatched:
                     with self._lock:
