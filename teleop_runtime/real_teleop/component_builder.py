@@ -164,6 +164,32 @@ def _hand_control_via_session_rig(
     if inspire_retargeter is not None:
         return True
     return bool(rule_command_source and backend_mode == HAND_BACKEND_DMTAC_GRIPPER)
+
+
+def _requires_startup_home_continuity_gate(
+    *,
+    rule_command_source: bool,
+    arm_control_mode: str,
+    position_command_planner: str,
+) -> bool:
+    """Keep the generic VIVE first-qref gate out of rule-owned motion.
+
+    Rule-based motion has its own certified initial-alignment planner and
+    bounded start-drift check.  Installing the generic gate as a second
+    admission owner makes it compare a later rule-plan qref with a separate
+    Home epoch and can reject an otherwise valid rule frame.  Ordinary
+    position/VIVE control retains the existing gate unchanged.
+    """
+
+    return bool(
+        not rule_command_source
+        and arm_control_mode == "position"
+        and position_command_planner
+        in {
+            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
+            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
+        }
+    )
 from .startup_home_continuity import (
     StartupHomeContinuityConfig,
     StartupHomeContinuityGate,
@@ -2207,13 +2233,10 @@ def build_real_teleop_components(
         )
     )
     startup_home_continuity_gate = None
-    if (
-        arm_control_mode == "position"
-        and position_command_planner
-        in {
-            POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
-            POSITION_COMMAND_PLANNER_SAMPLE_ALIGNED_JERK_LIMITED,
-        }
+    if _requires_startup_home_continuity_gate(
+        rule_command_source=rule_command_source,
+        arm_control_mode=arm_control_mode,
+        position_command_planner=position_command_planner,
     ):
         startup_command_backends = {
             "left": left_command_backend,

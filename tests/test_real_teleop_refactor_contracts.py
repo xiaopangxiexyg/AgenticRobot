@@ -124,6 +124,24 @@ def test_rule_command_source_does_not_open_vive_source() -> None:
     assert calls == []
 
 
+def test_rule_command_source_does_not_install_generic_home_gate() -> None:
+    assert component_builder._requires_startup_home_continuity_gate(
+        rule_command_source=True,
+        arm_control_mode="position",
+        position_command_planner="acceleration_limited",
+    ) is False
+    assert component_builder._requires_startup_home_continuity_gate(
+        rule_command_source=False,
+        arm_control_mode="position",
+        position_command_planner="acceleration_limited",
+    ) is True
+    assert component_builder._requires_startup_home_continuity_gate(
+        rule_command_source=True,
+        arm_control_mode="impedance",
+        position_command_planner="acceleration_limited",
+    ) is False
+
+
 def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
     assert control_loop._fresh_control_step_timestamp(
         10.0,
@@ -2496,6 +2514,15 @@ def test_startup_home_continuity_gate_arms_before_real_hardware(
         publish_calibration_waiting=lambda message: events.append("waiting"),
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
+    runtime_extension = SimpleNamespace(
+        bind_runtime_home_snapshot=lambda *, qpos_by_side: (
+            events.append(
+                "extension_home_bound"
+                if qpos_by_side is home_qpos
+                else "extension_home_wrong_snapshot"
+            )
+        )
+    )
 
     admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
@@ -2503,8 +2530,10 @@ def test_startup_home_continuity_gate_arms_before_real_hardware(
         clutch,
         home_captured=True,
         runtime_home_qpos_snapshot=home_qpos,
+        runtime_extension=runtime_extension,
     )
 
+    assert events.index("extension_home_bound") < events.index("continuity_armed")
     assert events.index("continuity_armed") < events.index("arm_hardware")
     assert "hold_hardware" not in events
     assert admitted is True

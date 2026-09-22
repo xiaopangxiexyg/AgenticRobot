@@ -44,7 +44,10 @@ from .impedance_force_runtime import (
     _warm_start_impedance_force_control_before_home,
 )
 from .runtime_home import DEFAULT_RUNTIME_HOME_START_DELAY_SEC
-from .runtime_extension import runtime_extension_refresh_status
+from .runtime_extension import (
+    runtime_extension_bind_runtime_home_snapshot,
+    runtime_extension_refresh_status,
+)
 from .special_arm_runtime import (
     _cancel_special_arm_modes_for_hold,
     _release_gui_qpos_init_transit,
@@ -978,6 +981,17 @@ def _arm_after_start_calibration(
             )
         reset_elapsed_ms = (time.perf_counter() - reset_start) * 1000.0
         _log("Calibration", f"runtime restart motion state reset from live real qpos synced={synced}")
+        try:
+            runtime_extension_bind_runtime_home_snapshot(
+                runtime_extension,
+                qpos_by_side=runtime_home_qpos_snapshot,
+            )
+        except Exception as exc:  # noqa: BLE001 - source anchor admission is fail closed.
+            return reject_arm_admission(
+                "RuntimeExtension",
+                "runtime Home 快照交给专用运行时失败，保持停臂："
+                f"{type(exc).__name__}: {exc}",
+            )
         startup_continuity_gate = getattr(
             components,
             "startup_home_continuity_gate",
