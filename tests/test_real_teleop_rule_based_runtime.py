@@ -274,6 +274,50 @@ def test_successful_random_source_attempt_advances_selection_ordinal() -> None:
     assert extension.source_selection["selection_ordinal"] == 1
 
 
+def test_successful_episode_reset_uses_current_qpos_not_startup_home() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6),
+                    right_arm=np.zeros(6),
+                ),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={},
+    )
+    extension._make_initial_alignment_planner = lambda: None
+    extension._recording_active = lambda: False
+    extension._dataset_recorder_provider = lambda: None
+    extension._control_ui = SimpleNamespace(
+        update_rule_runtime_info=lambda _values: None
+    )
+    startup_home = {
+        "left": np.full(6, 0.4, dtype=float),
+        "right": np.full(6, -0.4, dtype=float),
+    }
+    extension.bind_runtime_home_snapshot(qpos_by_side=startup_home)
+    extension._completed = True
+
+    extension._prepare_next_attempt_after_success(now=1.0)
+
+    assert extension._runtime_home_qpos_snapshot is None
+    current_after_episode = {
+        side: {"actual_qpos": np.full(6, 0.1, dtype=float)}
+        for side in ("left", "right")
+    }
+    selected = extension._initial_alignment_start_qpos_pair(current_after_episode)
+    for side in ("left", "right"):
+        np.testing.assert_array_equal(
+            selected[side], current_after_episode[side]["actual_qpos"]
+        )
+
+
 
 class _Poller:
     def __init__(self) -> None:

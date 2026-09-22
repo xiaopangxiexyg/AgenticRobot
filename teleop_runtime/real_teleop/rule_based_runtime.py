@@ -6290,6 +6290,14 @@ class RuleBasedRealTeleopExtension:
                     "机械臂已进入 Hold，请重新验证批次。",
                 )
             return
+        # The atomic runtime Home is a one-shot anchor for the first
+        # pre-dispatch transition after Home admission.  A successful Episode
+        # ends at its own measured terminal pose; retaining the startup Home
+        # while resetting ``_execution_begun`` would make the next Episode
+        # plan from a stale pose and cause the start-drift gate to reject it.
+        # The next attempt therefore starts from its fresh causal qpos.  A
+        # later explicit runtime Home binds a new anchor again.
+        self._runtime_home_qpos_snapshot = None
         self._selection_ordinal = next_selection_ordinal
         runtime_info = self._configuration_options.get("runtime_info")
         if isinstance(runtime_info, dict) and self._selected_configuration:
