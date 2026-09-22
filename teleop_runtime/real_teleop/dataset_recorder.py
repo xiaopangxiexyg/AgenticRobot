@@ -586,6 +586,16 @@ class RealTeleopDatasetRecorder:
             initial_episode_index = int(initial_writer.next_episode_index)
             initial_sample_index = int(initial_writer.next_sample_index)
             self.writer = initial_writer
+        configured_camera_max_age = getattr(
+            args,
+            "camera_frame_max_age_sec",
+            DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+        )
+        camera_frame_max_age_sec = float(
+            DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
+            if configured_camera_max_age is None
+            else configured_camera_max_age
+        )
         sample_builder_config = CollectorSampleBuilderConfig(
             active_sides=components.active_sides,
             camera_buffers={
@@ -593,7 +603,7 @@ class RealTeleopDatasetRecorder:
                 for camera_key, source in self.camera_sources.items()
             },
             require_camera_frames=bool(args.write_video and not args.no_camera),
-            camera_frame_max_age_sec=DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+            camera_frame_max_age_sec=camera_frame_max_age_sec,
             episode_index=initial_episode_index,
             sample_index_start=initial_sample_index,
             tactile_array_snapshot_policy=(
@@ -2240,7 +2250,11 @@ class RealTeleopDatasetRecorder:
             "pause_reason": self.pause_reason,
             "paused_duration_sec": self._total_paused_sec(current_time=current_time),
             "frame_count": frame_count,
-            "camera_frame_max_age_sec": DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+            "camera_frame_max_age_sec": getattr(
+                getattr(self.sample_builder, "config", None),
+                "camera_frame_max_age_sec",
+                DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+            ),
             "camera_frame_rejection": self.sample_builder.last_camera_rejection,
             "camera_frame_age_sec_by_key": dict(
                 self.sample_builder.last_camera_frame_age_sec_by_key
