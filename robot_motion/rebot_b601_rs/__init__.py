@@ -25,6 +25,11 @@ from .gripper_mapping import (
     NormalizedGripperSample,
     load_b601_rm65_gripper_mapping_profile,
 )
+from .gripper_observation import (
+    B601_RS_GRIPPER_CLOCK_DOMAIN,
+    B601_RS_GRIPPER_SOURCE_ID,
+    B601RSGripperPositionObservation,
+)
 from .haptics import (
     B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME,
     B601_RS_WRENCH_ORDER,
@@ -103,6 +108,8 @@ __all__ = [
     "B601_RS_BASE_FRAME",
     "B601_RS_END_EFFECTOR_FRAME",
     "B601_RS_GRIPPER_SOURCE_V1",
+    "B601_RS_GRIPPER_CLOCK_DOMAIN",
+    "B601_RS_GRIPPER_SOURCE_ID",
     "B601_RS_JACOBIAN_REFERENCE",
     "B601_RS_JOINT_MIT_FRAME",
     "B601_RS_TWIST_ORDER",
@@ -141,6 +148,7 @@ __all__ = [
     "B601PoseVirtualSpring",
     "B601PoseVirtualSpringResult",
     "B601RM65GripperMappingProfile",
+    "B601RSGripperPositionObservation",
     "B601SharedControlConfig",
     "B601SharedControlFrame",
     "B601SharedControlMode",

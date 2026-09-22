@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from hardware.rebot_b601_rs.gripper import (
+from robot_motion.rebot_b601_rs.gripper_observation import (
     B601_RS_GRIPPER_SOURCE_ID,
     B601RSGripperPositionObservation,
 )

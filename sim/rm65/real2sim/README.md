@@ -93,14 +93,20 @@ fixed historical values rather than silently reinterpreting the fit against
 the current files.
 
 The current runtime-source binding is
-`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260829_v4.json`.
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260922_v5.json`.
 It content-addresses the current arm profile, backend-independent actuator core,
 MuJoCo executor, simulation contract, camera registry, frozen v4 fit, and the
-preceding 20260822.v3 runtime binding. The execution-continuity changes are
-therefore recoverable without rewriting the old fit evidence. This binding
-explicitly records no arm-profile refit, no behavior change caused by the
-evidence-only binding itself, and carries forward the `provisional` claim and
-held-out `not_run` status.
+preceding 20260829.v4 runtime binding. It records the executor change that
+excludes the expected B601 gripper self-contact pair from collision admission,
+without rewriting the old fit evidence. This binding explicitly records no
+arm-profile refit and carries forward the `provisional` claim and held-out
+`not_run` status; the collision exclusion is a simulation runtime behavior
+change, not new physical-response evidence.
+
+The 20260829.v4 binding remains immutable at
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260829_v4.json`.
+It records the exact execution-continuity and lifecycle sources before the
+B601 self-contact exclusion and retains the preceding 20260822.v3 binding.
 
 The 20260822.v3 binding remains immutable at
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260822_v3.json`.

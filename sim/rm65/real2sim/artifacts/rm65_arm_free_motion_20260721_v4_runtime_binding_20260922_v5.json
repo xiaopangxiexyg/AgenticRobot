@@ -1,0 +1,133 @@
+{
+  "schema_version": "dexteleop.sim.real2sim_artifact.v1",
+  "name": "rm65_arm_free_motion_20260721_v4_runtime_binding_20260922_v5",
+  "simulation_contract": {
+    "artifact_id": "rm65-bimanual-physics-runtime-20260922-v5",
+    "artifact_kind": "simulation_contract",
+    "sha256": "dbf0cd77b5e8ffbd0f7951f9a4ae10c6c25757e6f32657e16f1fe14cf100938d",
+    "locator": "sim/configs/rm65_bimanual_physics_v1.json"
+  },
+  "resolved_timing": {
+    "sample_hz": 15.0,
+    "policy_hz": 15.0,
+    "reference_hz": 60.0,
+    "ik_hz": 60.0,
+    "command_hz": 120.0,
+    "physics_hz": 1000.0,
+    "camera_hz": 30.0,
+    "interpolation": "timestamp_linear",
+    "command_hold": "zero_order_hold_between_command_ticks",
+    "parameter_source": "project_default_pending_real_system_id"
+  },
+  "dependency_artifacts": [
+    {
+      "artifact_id": "rm65-arm-free-motion-fit-20260721-v4",
+      "artifact_kind": "real2sim_fit_artifact",
+      "sha256": "89d72aed454bdc309959f7489486eb5ef3eae13d688be444efd849b637d6bd53",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json"
+    },
+    {
+      "artifact_id": "rm65-arm-profile-runtime-20260922-v5",
+      "artifact_kind": "actuation_profile",
+      "sha256": "551b8a832f97d6e4fdfaef96b0cd3ff8b7dee46f4610ac948e23ff13602c48de",
+      "locator": "sim/rm65/actuation/profile.py"
+    },
+    {
+      "artifact_id": "rm65-arm-actuator-core-runtime-20260922-v5",
+      "artifact_kind": "sim_actuator_core_source",
+      "sha256": "4a68394fd359b6481e28594bf933c56ffe270ddcd7806c44675cd3e964e697c6",
+      "locator": "sim/rm65/actuation/core.py"
+    },
+    {
+      "artifact_id": "rm65-arm-mujoco-executor-runtime-20260922-v5",
+      "artifact_kind": "sim_backend_adapter_source",
+      "sha256": "083be187b1322cfb448d7c639bbc398705e00c0414f429ddd1c848c1a8fa3831",
+      "locator": "sim/mujoco/actuation/executor.py"
+    },
+    {
+      "artifact_id": "rm65-camera-registry-runtime-20260922-v5",
+      "artifact_kind": "camera_registry",
+      "sha256": "7a0c1e612508c15dc5e0d8445e362498d92b28606e6f7157f47b88fda965e9ba",
+      "locator": "robot_motion/configs/rm65_camera_registry.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20260829-v4",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "0a520a25a7bb279967c47ef5d27e1b22944a741196080f95ca0e7982f35adb14",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260829_v4.json"
+    }
+  ],
+  "fidelity_claims": [
+    {
+      "component": "arm.position_response.free_motion.runtime_source_binding",
+      "status": "provisional",
+      "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-arm-profile-runtime-20260922-v5",
+        "rm65-arm-actuator-core-runtime-20260922-v5",
+        "rm65-arm-mujoco-executor-runtime-20260922-v5",
+        "rm65-camera-registry-runtime-20260922-v5",
+        "rm65-arm-runtime-binding-20260829-v4"
+      ],
+      "limitations": [
+        "This binding reuses the frozen 20260721.v4 arm fit; no arm parameters were refit or revalidated.",
+        "The frozen fit manifest continues to identify its historical core and MuJoCo adapter by their original hashes; the current sources are bound separately here.",
+        "The MuJoCo executor now excludes the expected B601 gripper self-contact pair from collision admission; this is a simulation runtime behavior change, not new physical-response evidence.",
+        "The original v4 held-out status remains not_run, so this binding does not promote the arm fidelity claim.",
+        "Collision avoidance correctness and MuJoCo contact behavior do not establish real-robot collision or grasp fidelity."
+      ],
+      "notes": "The v5 runtime-source binding records the B601 gripper self-contact exclusion while preserving the frozen fit and all earlier runtime bindings unchanged."
+    }
+  ],
+  "validation_evidence": [
+    {
+      "validation_id": "runtime-source-content-binding-integrity-v5",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "bound_runtime_source_file_count": 3.0,
+        "changed_runtime_source_file_count_from_previous_binding": 1.0,
+        "unchanged_arm_profile_source_file_count": 1.0,
+        "arm_profile_refit_count": 0.0,
+        "mutated_historical_artifact_count": 0.0
+      },
+      "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-arm-profile-runtime-20260922-v5",
+        "rm65-arm-actuator-core-runtime-20260922-v5",
+        "rm65-arm-mujoco-executor-runtime-20260922-v5",
+        "rm65-arm-runtime-binding-20260829-v4"
+      ],
+      "notes": "Content-hash checks bind the exact current runtime sources and separately retain the immutable v4 runtime binding and frozen fit."
+    },
+    {
+      "validation_id": "new-untouched-clean-held-out-v5-runtime-source-binding",
+      "split": "held_out",
+      "status": "not_run",
+      "metrics": {},
+      "evidence_artifact_ids": [],
+      "notes": "Lifecycle and identity hardening plus source rebinding are not new arm-response evidence. A later clean capture must remain untouched before the reused v4 fit can pass held-out validation."
+    }
+  ],
+  "code_revision": "2282b1a3d309f1abb5f800daac116b0fc75679db",
+  "environment_fingerprint": {
+    "python": "3.10.20",
+    "mujoco": "3.10.0",
+    "source_commit": "2282b1a3d309f1abb5f800daac116b0fc75679db"
+  },
+  "metadata": {
+    "owner": "sim.rm65",
+    "binding_kind": "runtime_source_rebind",
+    "fit_profile_name": "rm65_bimanual_udp_feedback_20260721.v4",
+    "fit_artifact_sha256": "501702e3b741096fc3038b082405073bad51f63626b7296b75d2847e85df778d",
+    "fit_simulation_contract_sha256": "baa5efcd490f27b0d2e261ac2e5c91181a0618de75596017a05714a02333a0df",
+    "previous_runtime_binding_artifact_sha256": "1933f1a764b95ee7eb06a6feca16ed198a72529ce788d98235da8aecd2f71346",
+    "previous_runtime_binding_file_sha256": "0a520a25a7bb279967c47ef5d27e1b22944a741196080f95ca0e7982f35adb14",
+    "arm_profile_refit": false,
+    "runtime_behavior_change": true,
+    "runtime_behavior_change_scope": "b601_gripper_self_contact_collision_exclusion",
+    "runtime_source_commit": "2282b1a3d309f1abb5f800daac116b0fc75679db",
+    "migration": "b601_gripper_self_contact_runtime_source_binding"
+  },
+  "artifact_sha256": "9b5bc0cd6e45b8f907a921f3fee811b062efc71db93a4cec5a7ed2bd61724f76"
+}
