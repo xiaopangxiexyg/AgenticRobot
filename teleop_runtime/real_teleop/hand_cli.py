@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ..dmtac_tactile_fields import DMTAC_TACTILE_FIELDS
+from ..dmtac_tactile_cli import add_dmtac_tactile_arguments
 from ..cli_value_parsers import (
     _alpha_float,
     _non_negative_int,
@@ -179,193 +179,26 @@ def add_hand_backend_arguments(parser: argparse.ArgumentParser) -> None:
 
 def add_dmtac_arguments(parser: argparse.ArgumentParser) -> None:
     add_dmtac_assignment_arguments(parser, assignment_includes_tactile=True)
-    parser.add_argument(
-        "--dmtac-tactile-backend",
-        type=str,
-        default="cpu",
-        help="DM-Tac tactile backend passed to portable_dmtac_gripper.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-timeout-ms",
-        type=_positive_int,
-        default=None,
-        help="Per-sensor DM-Tac read timeout. Runtime telemetry does not wait for new frames by default.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-max-fps",
-        type=_positive_int,
-        default=None,
-        help="DM-Tac camera max_fps. Lower values reduce USB/CPU pressure; default follows backend config.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-warmup-frames",
-        type=_non_negative_int,
-        default=None,
-        help="DM-Tac tactile filter warmup frames. Runtime default is 0 like the assignment GUI.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-wait-for-new",
-        action="store_true",
-        default=None,
-        help="Wait for a new DM-Tac frame on each telemetry read. Higher latency; off by default.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-read-hz",
-        type=_non_negative_float,
-        default=None,
-        help=(
+    add_dmtac_tactile_arguments(
+        parser,
+        positive_int=_positive_int,
+        non_negative_int=_non_negative_int,
+        non_negative_float=_non_negative_float,
+        worker_cpu_affinity=_dmtac_worker_cpu_affinity,
+        worker_nice=_dmtac_worker_nice,
+        parse_tactile_fields=_parse_dmtac_tactile_fields,
+        read_hz_help=(
             "Max DM-Tac tactile read rate per gripper backend. Formal collection defaults "
             "to --hz (capped by max_fps); non-collection tools retain the 1 Hz backend "
             "default. Use 0 to read every gripper telemetry cycle."
         ),
-    )
-    parser.add_argument(
-        "--dmtac-tactile-process-read",
-        dest="dmtac_tactile_process_read",
-        action="store_true",
-        default=None,
-        help="Read DM-Tac tactile frames in a separate low-priority process. Runtime default is on.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-in-process-read",
-        dest="dmtac_tactile_process_read",
-        action="store_false",
-        help="Read DM-Tac tactile frames in the main teleop process.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-worker-cpus",
-        type=_dmtac_worker_cpu_affinity,
-        default=None,
-        help=(
-            "Comma/space-separated CPU cores for low-priority DM-Tac tactile worker processes, "
-            "for example '6,7'. Unset lets the OS schedule normally."
-        ),
-    )
-    parser.add_argument(
-        "--dmtac-tactile-worker-nice",
-        type=_dmtac_worker_nice,
-        default=None,
-        help="Lower scheduling priority for DM-Tac tactile worker processes; 0 is normal, 19 is lowest.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-worker-queue-size",
-        type=_positive_int,
-        default=None,
-        help="Latest-frame queue size between each DM-Tac tactile worker process and the main process.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-parallel-read",
-        dest="dmtac_tactile_parallel_read",
-        action="store_true",
-        default=None,
-        help="Read sensors in each DM-Tac gripper backend concurrently. Higher USB/CPU pressure.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-sequential-read",
-        dest="dmtac_tactile_parallel_read",
-        action="store_false",
-        help="Read sensors in each DM-Tac gripper backend sequentially. This is the runtime default.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-global-read-lock",
-        dest="dmtac_tactile_global_read_lock",
-        action="store_true",
-        default=None,
-        help="Serialize DMTAC tactile reads across left/right gripper backends. Runtime default is on.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-no-global-read-lock",
-        dest="dmtac_tactile_global_read_lock",
-        action="store_false",
-        help="Allow left/right DMTAC tactile reads to overlap.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-fields",
-        type=_parse_dmtac_tactile_fields,
-        default=None,
-        metavar="FIELDS",
-        help=(
-            "DM-Tac fields to read/store. Default is raw-image-only collection; pass "
-            "'distributed_force' for real-time force output. Valid fields: "
-            + ", ".join(DMTAC_TACTILE_FIELDS)
-        ),
-    )
-    parser.add_argument(
-        "--dmtac-tactile-compute-profile",
-        choices=("dist-only", "legacy", "requested", "shear-depth"),
-        default=None,
-        help=(
-            "SDK compute channels for DMTAC telemetry. Default follows backend config; "
-            "use dist-only with distributed_force for the real-time force path."
-        ),
-    )
-    parser.add_argument(
-        "--dmtac-tactile-calibrate",
-        dest="dmtac_tactile_calibrate",
-        action="store_true",
-        default=None,
-        help=(
-            "Explicitly capture a DM-Tac no-contact base frame before reads. "
-            "Disabled by default for raw images and solved tactile fields."
-        ),
-    )
-    parser.add_argument(
-        "--dmtac-tactile-no-calibrate",
-        dest="dmtac_tactile_calibrate",
-        action="store_false",
-        help="Do not capture a DM-Tac base frame at startup (the default).",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-calibration-policy",
-        choices=("auto", "required", "off"),
-        default=None,
-        help=(
-            "Fixed per-sensor base-frame policy. GUI distributed-force solving uses "
-            "'required' so an uncalibrated sensor cannot be presented as calibrated."
-        ),
-    )
-    parser.add_argument(
-        "--dmtac-tactile-calibration-dir",
-        default="",
-        help="Optional directory containing fixed per-sensor DM-Tac base-frame calibrations.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-denoise",
-        dest="dmtac_tactile_denoise",
-        action="store_true",
-        default=None,
-        help="Enable runtime distributed_force denoise. This is heavier than the assignment GUI default.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-no-denoise",
-        dest="dmtac_tactile_denoise",
-        action="store_false",
-        help="Disable runtime distributed_force denoise.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-flat-vector",
-        dest="dmtac_tactile_flat_vector",
-        action="store_true",
-        default=None,
-        help="Keep building the legacy flattened tactile vector in telemetry.",
-    )
-    parser.add_argument(
-        "--dmtac-tactile-no-flat-vector",
-        dest="dmtac_tactile_flat_vector",
-        action="store_false",
-        help="Do not build the legacy flattened tactile vector in telemetry.",
-    )
-    parser.add_argument(
-        "--dmtac-with-tactile",
-        dest="dmtac_tactile",
-        action="store_true",
-        default=None,
-        help=(
+        in_process_help="Read DM-Tac tactile frames in the main teleop process.",
+        enable_help=(
             "Opt in to DM-Tac tactile sensors during real teleop. Off by default so gripper/Q6 "
             "control does not depend on the DM-Tac SDK camera threads."
         ),
+        fixed_calibration=True,
     )
-    parser.add_argument("--dmtac-no-tactile", dest="dmtac_tactile", action="store_false")
     parser.add_argument(
         "--no-device-preflight",
         dest="device_preflight",
