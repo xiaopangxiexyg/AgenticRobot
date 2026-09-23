@@ -109,7 +109,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "latency_sec": latency,
                 "action_shape": list(actions.shape),
             }), flush=True)
-            next_request_at += 1.0 / args.target_hz
+            # A slow inference must not create a burst of overdue requests.
+            next_request_at = max(next_request_at + 1.0 / args.target_hz, ended)
             time.sleep(max(0.0, min(next_request_at - time.monotonic(), deadline - time.monotonic())))
         elapsed = time.monotonic() - start
         return {
