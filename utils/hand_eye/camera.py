@@ -7,6 +7,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from utils.calibration_common.camera import (
+    VideoStreamProfileInfo as _CommonVideoStreamProfileInfo,
     aruco_dictionary as _aruco_dictionary,
     detector_parameters as _detector_parameters,
     make_aruco_detector as _make_aruco_detector,
@@ -16,6 +17,7 @@ from utils.calibration_common.camera import (
     require_cv2 as _require_cv2,
     require_pyrealsense2 as _require_pyrealsense2,
     safe_device_info as _safe_device_info,
+    video_profile_score as _video_profile_score,
 )
 from hardware.realsense.color import (
     color_format_value as _color_format_value,
@@ -46,15 +48,8 @@ class RealSenseDevice:
 
 
 @dataclass(frozen=True)
-class VideoStreamProfileInfo:
-    stream: str
-    format_name: str
-    width: int
-    height: int
-    fps: int
-
-    def describe(self) -> str:
-        return f"{self.stream} {self.width}x{self.height}@{self.fps} {self.format_name}"
+class VideoStreamProfileInfo(_CommonVideoStreamProfileInfo):
+    """Preserve the wrist camera's historical profile type path."""
 
 
 @dataclass
@@ -1194,28 +1189,19 @@ def _select_video_profile(
     if not candidates:
         return None
 
-    requested_area = int(requested_width) * int(requested_height)
-
     format_rank = {
         _format_name(rs, value): index for index, value in enumerate(preferred_formats)
     }
-
-    def score(item: VideoStreamProfileInfo) -> tuple[int, int, int, int, int, int]:
-        exact_resolution = 0 if (item.width, item.height) == (requested_width, requested_height) else 1
-        fps_penalty = abs(item.fps - int(requested_fps))
-        area_penalty = abs(item.width * item.height - requested_area)
-        width_penalty = abs(item.width - int(requested_width))
-        height_penalty = abs(item.height - int(requested_height))
-        return (
-            exact_resolution,
-            fps_penalty,
-            area_penalty,
-            width_penalty,
-            height_penalty,
-            format_rank.get(item.format_name, len(format_rank)),
-        )
-
-    return min(candidates, key=score)
+    return min(
+        candidates,
+        key=lambda item: _video_profile_score(
+            item,
+            requested_width=requested_width,
+            requested_height=requested_height,
+            requested_fps=requested_fps,
+            format_rank=format_rank,
+        ),
+    )
 
 
 def _video_profile_info(rs: Any, profile: Any) -> VideoStreamProfileInfo | None:

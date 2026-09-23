@@ -2,9 +2,46 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class VideoStreamProfileInfo:
+    """A video profile advertised by a calibration camera."""
+
+    stream: str
+    format_name: str
+    width: int
+    height: int
+    fps: int
+
+    def describe(self) -> str:
+        return f"{self.stream} {self.width}x{self.height}@{self.fps} {self.format_name}"
+
+
+def video_profile_score(
+    profile: VideoStreamProfileInfo,
+    *,
+    requested_width: int,
+    requested_height: int,
+    requested_fps: int,
+    format_rank: Mapping[str, int],
+) -> tuple[int, int, int, int, int, int]:
+    """Rank exact resolution, then rate, area, dimensions, and format."""
+
+    width = int(requested_width)
+    height = int(requested_height)
+    return (
+        0 if (profile.width, profile.height) == (width, height) else 1,
+        abs(profile.fps - int(requested_fps)),
+        abs(profile.width * profile.height - width * height),
+        abs(profile.width - width),
+        abs(profile.height - height),
+        format_rank.get(profile.format_name, len(format_rank)),
+    )
 
 
 def require_pyrealsense2():
@@ -106,6 +143,7 @@ def put_status(cv2: Any, image: np.ndarray, text: str, *, ok: bool) -> None:
 
 
 __all__ = [
+    "VideoStreamProfileInfo",
     "aruco_dictionary",
     "detector_parameters",
     "make_aruco_detector",
@@ -115,4 +153,5 @@ __all__ = [
     "require_cv2",
     "require_pyrealsense2",
     "safe_device_info",
+    "video_profile_score",
 ]
