@@ -27,6 +27,7 @@ include = [
     "control_station/__init__.py",
     "control_station/__main__.py",
     "control_station/refinement_annotation/__init__.py",
+    "control_station/refinement_annotation/abnormal_projection.py",
     "control_station/refinement_annotation/application.py",
     "control_station/refinement_annotation/cli.py",
     "control_station/refinement_annotation/detail_annotation.py",
