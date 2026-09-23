@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -111,6 +112,10 @@ class RealSenseRGBCameraConfig:
     startup_software_retry_sleep_sec: float = 0.5
     startup_hardware_reset: bool = False
     startup_hardware_reset_on_failure: bool = True
+    # Opt in per camera: a missing first frame can require device re-enumeration
+    # even after a clean pipeline stop/reopen. Other startup errors keep their
+    # existing reset policy.
+    startup_hardware_reset_on_warmup_failure: bool = False
     startup_hardware_reset_retry_attempts: int = 1
     startup_hardware_reset_sleep_sec: float = 2.0
     startup_hardware_reset_reconnect_timeout_sec: float = 6.0
@@ -239,6 +244,7 @@ class RealSenseRGBCameraConfig:
                 ),
                 "startup_hardware_reset": bool(self.startup_hardware_reset),
                 "startup_hardware_reset_on_failure": bool(self.startup_hardware_reset_on_failure),
+                "startup_hardware_reset_on_warmup_failure": bool(self.startup_hardware_reset_on_warmup_failure),
                 "startup_hardware_reset_retry_attempts": int(self.startup_hardware_reset_retry_attempts),
                 "startup_hardware_reset_sleep_sec": float(self.startup_hardware_reset_sleep_sec),
                 "startup_hardware_reset_reconnect_timeout_sec": float(
@@ -513,6 +519,8 @@ class RealSenseRGBSource(ObservationSource):
         *,
         software_retry_attempts: int | None = None,
     ) -> tuple[Any, Any]:
+        recovery_started = time.perf_counter()
+        reset_attempt_count = 0
         self._hardware_reset_device_if_requested(rs, reason="configured_startup_reset")
         if software_retry_attempts is None:
             software_retries_remaining = int(
@@ -524,7 +532,10 @@ class RealSenseRGBSource(ObservationSource):
                 raise ValueError("software_retry_attempts must be >= 0.")
         hardware_reset_retries_remaining = (
             int(self.config.startup_hardware_reset_retry_attempts)
-            if bool(self.config.startup_hardware_reset_on_failure)
+            if (
+                bool(self.config.startup_hardware_reset_on_failure)
+                or bool(self.config.startup_hardware_reset_on_warmup_failure)
+            )
             else 0
         )
         attempt_index = 0
@@ -533,7 +544,16 @@ class RealSenseRGBSource(ObservationSource):
                 raise RuntimeError("startup_cancelled:shutdown_requested")
             attempt_index += 1
             try:
-                return self._start_pipeline_once(rs)
+                pipeline, profile = self._start_pipeline_once(rs)
+                if reset_attempt_count:
+                    with self._lock:
+                        self._startup_timing["hardware_reset_retries"] = float(
+                            reset_attempt_count
+                        )
+                        self._startup_timing["total_with_recovery_sec"] = float(
+                            time.perf_counter() - recovery_started
+                        )
+                return pipeline, profile
             except RuntimeError as exc:
                 message = str(exc)
                 if (
@@ -562,16 +582,25 @@ class RealSenseRGBSource(ObservationSource):
                 ):
                     raise
                 hardware_reset_retries_remaining -= 1
+                reset_attempt_count += 1
                 with self._lock:
                     self._last_runtime_error = (
                         "startup_connection_error_reset_retry:"
                         f"attempt={attempt_index}:{exc}"
                     )
-                self._hardware_reset_device(
+                reset_succeeded = self._hardware_reset_device(
                     rs,
                     reason="startup_connection_error",
                     force=True,
                 )
+                if not reset_succeeded:
+                    with self._lock:
+                        reset_error = self._last_runtime_error
+                    raise RuntimeError(
+                        "startup_hardware_reset_failed:"
+                        f"camera_key={self.config.camera_key}:"
+                        f"serial={self.config.serial}:detail={reset_error}"
+                    ) from exc
 
     def _start_pipeline_once(self, rs: Any) -> tuple[Any, Any]:
         startup_started = time.perf_counter()
@@ -599,32 +628,47 @@ class RealSenseRGBSource(ObservationSource):
             reset_sleep_sec = float(self.config.startup_reset_sleep_sec)
             if reset_sleep_sec > 0.0:
                 time.sleep(reset_sleep_sec)
+        pipeline_start_started = time.perf_counter()
         try:
-            pipeline_start_started = time.perf_counter()
             profile = pipeline.start(stream_config)
             pipeline_start_elapsed = time.perf_counter() - pipeline_start_started
         except RuntimeError as exc:
-            self._stop_pipeline_quietly(pipeline)
+            diagnostic = self._failed_startup_diagnostic(
+                pipeline,
+                stage="pipeline_start",
+                startup_started=startup_started,
+                stage_started=pipeline_start_started,
+            )
             request = self._requested_stream_profile_text()
             raise RuntimeError(
                 f"RealSense pipeline start failed for camera_key={self.config.camera_key!r} "
                 f"serial={self.config.serial!r} request={request}: {exc}. "
                 "The configured profile was preserved. Verify the device's enumerated native "
                 "profiles, USB link, firmware, and exclusive access; do not silently lower "
-                "collection resolution to bypass a device/profile failure."
+                f"collection resolution to bypass a device/profile failure. {diagnostic}"
             ) from exc
         self._active_color_format = self.config.color_format
+        stage = "sensor_configure"
+        stage_started = time.perf_counter()
+        configure_elapsed: float | None = None
         try:
-            configure_started = time.perf_counter()
             self._configure_sensor_options(profile)
             self._configure_depth_state(rs, profile)
-            configure_elapsed = time.perf_counter() - configure_started
-            warmup_started = time.perf_counter()
+            configure_elapsed = time.perf_counter() - stage_started
+            stage = "first_frame_warmup"
+            stage_started = time.perf_counter()
             self._warmup_pipeline(pipeline)
-            warmup_elapsed = time.perf_counter() - warmup_started
-        except RuntimeError:
-            self._stop_pipeline_quietly(pipeline)
-            raise
+            warmup_elapsed = time.perf_counter() - stage_started
+        except RuntimeError as exc:
+            diagnostic = self._failed_startup_diagnostic(
+                pipeline,
+                stage=stage,
+                startup_started=startup_started,
+                stage_started=stage_started,
+                pipeline_start_sec=pipeline_start_elapsed,
+                sensor_configure_sec=configure_elapsed,
+            )
+            raise RuntimeError(f"{exc}; {diagnostic}") from exc
         with self._lock:
             self._startup_timing = {
                 "pipeline_start_sec": float(pipeline_start_elapsed),
@@ -634,6 +678,38 @@ class RealSenseRGBSource(ObservationSource):
                 "warmup_frames": float(self.config.startup_warmup_frames),
             }
         return pipeline, profile
+
+    def _failed_startup_diagnostic(
+        self,
+        pipeline: Any,
+        *,
+        stage: str,
+        startup_started: float,
+        stage_started: float,
+        pipeline_start_sec: float | None = None,
+        sensor_configure_sec: float | None = None,
+    ) -> str:
+        failure_time = time.perf_counter()
+        stop_started = failure_time
+        stop_error: str | None = None
+        try:
+            pipeline.stop()
+        except Exception as exc:  # noqa: BLE001 - retain the original startup failure.
+            stop_error = f"{type(exc).__name__}: {exc}"
+        diagnostic = {
+            "camera_key": self.config.camera_key,
+            "serial": self.config.serial,
+            "requested_streams": self._requested_stream_profile_text(),
+            "warmup_policy": self.config.startup_warmup_policy,
+            "failed_stage": stage,
+            "stage_elapsed_sec": round(failure_time - stage_started, 3),
+            "startup_elapsed_sec": round(failure_time - startup_started, 3),
+            "pipeline_start_sec": pipeline_start_sec,
+            "sensor_configure_sec": sensor_configure_sec,
+            "pipeline_stop_sec": round(time.perf_counter() - stop_started, 3),
+            "pipeline_stop_error": stop_error,
+        }
+        return "startup_diagnostic=" + json.dumps(diagnostic, sort_keys=True)
 
     def _requested_stream_profile_text(self) -> str:
         color = (
@@ -917,7 +993,31 @@ class RealSenseRGBSource(ObservationSource):
                         f"{reason}_hardware_reset_device_not_found:{self.config.serial}"
                     )
                 return False
-            target_device.hardware_reset()
+            try:
+                target_device.hardware_reset()
+            except RuntimeError as exc:
+                # Some SDK builds report a vanished /dev/video node while the
+                # requested reset is already in progress. Only trust that
+                # outcome after observing this serial disappear and return.
+                if not self._wait_for_device_reconnect(rs, require_disconnect=True):
+                    raise RuntimeError(
+                        "hardware_reset reported an error without confirmed "
+                        f"device re-enumeration: {exc}"
+                    ) from exc
+                with self._lock:
+                    self._last_runtime_error = (
+                        f"{reason}_hardware_reset_call_failed_but_reenumerated:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                logging.getLogger(__name__).warning(
+                    "RealSense %s (%s) re-enumerated after hardware_reset "
+                    "reported %s: %s",
+                    self.config.camera_key,
+                    self.config.serial,
+                    type(exc).__name__,
+                    exc,
+                )
+                return True
             reset_sleep_sec = float(self.config.startup_hardware_reset_sleep_sec)
             if reset_sleep_sec > 0.0 and self._shutdown_event.wait(reset_sleep_sec):
                 return False
@@ -947,11 +1047,23 @@ class RealSenseRGBSource(ObservationSource):
                 return device
         return None
 
-    def _wait_for_device_reconnect(self, rs: Any) -> bool:
+    def _wait_for_device_reconnect(
+        self,
+        rs: Any,
+        *,
+        require_disconnect: bool = False,
+    ) -> bool:
         timeout_sec = float(self.config.startup_hardware_reset_reconnect_timeout_sec)
         deadline = time.time() + timeout_sec
+        disconnected = not require_disconnect
         while True:
-            if self._find_device_by_serial(rs) is not None:
+            try:
+                visible = self._find_device_by_serial(rs) is not None
+            except RuntimeError:
+                visible = False
+            if not visible:
+                disconnected = True
+            elif disconnected:
                 return True
             if time.time() >= deadline or self._shutdown_event.is_set():
                 return False
@@ -985,17 +1097,19 @@ class RealSenseRGBSource(ObservationSource):
         )
 
     def _should_hardware_reset_retry_startup_error(self, message: str) -> bool:
-        # A missing first frame is deliberately fail-fast in the bounded
-        # bounded policy. Hardware reset adds reset/re-enumeration latency and
-        # has historically destabilized sibling cameras. Explicit device,
-        # USB, UVC, or exclusive-access failures still use the legacy retry.
+        # A missing first frame permits a device reset only for a camera whose
+        # profile explicitly opts in. Resetting another camera can disturb
+        # its siblings during a multi-camera startup.
         if (
             self.config.startup_warmup_policy
             == REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
             and "startup_warmup_failed" in str(message).lower()
         ):
-            return False
-        return self._is_startup_connection_error(message)
+            return bool(self.config.startup_hardware_reset_on_warmup_failure)
+        return bool(
+            self.config.startup_hardware_reset_on_failure
+            and self._is_startup_connection_error(message)
+        )
 
     def _configure_depth_state(self, rs: Any, profile: Any) -> None:
         if not bool(self.config.enable_depth):
