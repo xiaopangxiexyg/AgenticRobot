@@ -1912,8 +1912,8 @@ def test_device_retry_reports_failed_attempt_to_application() -> None:
         def close(self) -> None:
             return None
 
-    def start(self) -> None:
-        raise RuntimeError("camera remains offline")
+        def start(self) -> None:
+            raise RuntimeError("camera remains offline")
     clutch = SimpleNamespace(
         _current_active_controls=lambda: ("device_retry",),
         device_retry_admission=lambda: (True, ""),
