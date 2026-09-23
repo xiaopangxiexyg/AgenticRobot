@@ -44,6 +44,12 @@ class RealDmtacGripperControlPort:
         self.clock = clock
         self._sequence = 0
         config = getattr(backend, "config", None)
+        side = str(getattr(config, "side", "right"))
+        if side != "right":
+            raise ValueError(
+                "real gripper Skill is bound to right_gripper; "
+                f"backend side must be 'right', got {side!r}."
+            )
         if bool(getattr(config, "observation_only", False)):
             raise ValueError(
                 "real gripper Skill cannot use an observation-only backend."
@@ -57,7 +63,7 @@ class RealDmtacGripperControlPort:
         identity = {
             "adapter": "real_dmtac_gripper_control.v1",
             "component_id": self.component_id,
-            "side": str(getattr(config, "side", "right")),
+            "side": side,
             "gripper_port": str(getattr(config, "gripper_port", "bound")),
             "gripper_id": int(getattr(config, "gripper_id", 1)),
         }
