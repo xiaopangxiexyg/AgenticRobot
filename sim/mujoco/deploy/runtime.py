@@ -2918,16 +2918,6 @@ class MujocoDeployRuntime:
             raise RuntimeError(
                 "Accepted policy emission did not produce a component action."
             )
-        coverage = component_action.component_coverage
-        selection_groups = tuple(
-            group
-            for group in self.catalog.selection_group_ids
-            if any(
-                component.component_id in coverage
-                for component in self.catalog.components_for_group(group)
-            )
-        )
-
         sequence = self._next_proposal_sequence
         audit_metadata = {
             "policy_action_emission_id": emission.emission_id,
