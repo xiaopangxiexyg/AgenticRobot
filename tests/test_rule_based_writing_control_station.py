@@ -8,7 +8,11 @@ from control_station.rule_based_writing import (
     RuleBasedWritingApplication,
     RuleBasedWritingIntent,
     RuleBasedWritingWebUi,
+    RuleWritingTaskChain,
     RuleWritingTaskChainPhase,
+)
+from teleop_runtime.real_teleop.rule_based_writing_plan import (
+    RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
 )
 
 
@@ -59,6 +63,9 @@ def _task_chain_ready_status(**updates: object) -> dict[str, object]:
         "configuration_available": True,
         "gripper_control_available": True,
         "gripper_sides": ["right"],
+        "gripper_action_id": None,
+        "gripper_action_intent": "",
+        "gripper_action_result": "idle",
         "height_calibration_available": True,
         **updates,
     }
@@ -89,6 +96,230 @@ def test_rule_application_exposes_one_start_and_translates_to_writer_intent() ->
     assert application.consume_rule_intents() == ("rule_start",)
 
 
+def test_rule_ui_opens_only_its_armed_pre_episode_writer_window() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication(
+        {"active_controls": ["episode_start"]}
+    )
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+
+    assert application.allows_pre_episode_armed_warmup() is False
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+    assert application.allows_pre_episode_armed_warmup() is True
+
+    # Writer preparation and rule status publication are asynchronous.  The
+    # accepted dedicated START latch must remain authoritative even if a
+    # transient callback projects ``preparing`` instead of ``armed``.
+    application._state.phase = "preparing"
+    assert application.allows_pre_episode_armed_warmup() is True
+
+    application.observe_runtime_publication(
+        {
+            "startup_blockers": {
+                "rig.session": (
+                    "Session state=ARMED; runtime Home and hardware arm admission "
+                    "are required before rule collection."
+                )
+            }
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is True
+    assert application.pre_episode_start_admission_reason() is None
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": True,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "readiness_blockers": {
+                "dataset.lifecycle": (
+                    "cancelled rule Episode lifecycle is still settling"
+                )
+            },
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is True
+    assert application.pre_episode_start_admission_reason() is None
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": False,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is True
+
+    application.observe_runtime_publication(
+        {"startup_blockers": {"right_hand": "DMTAC fault"}}
+    )
+    assert application.allows_pre_episode_armed_warmup() is False
+
+
+def test_rule_ui_does_not_ignore_discard_lifecycle_or_device_faults() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication({"active_controls": ["episode_start"]})
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": True,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "readiness_blockers": {
+                "dataset.lifecycle": (
+                    "cancelled rule Episode is still active and awaiting discard"
+                )
+            },
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is False
+
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication({"active_controls": ["episode_start"]})
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": True,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "readiness_blockers": {
+                "hand.right": "right_hand telemetry_failed: Write timeout",
+                "dataset.lifecycle": (
+                    "cancelled rule Episode lifecycle is still settling"
+                ),
+            },
+        }
+    )
+    assert application.allows_pre_episode_armed_warmup() is False
+    reason = application.pre_episode_start_admission_reason()
+    assert reason is not None
+    assert "hand.right" in reason
+
+
+def test_rule_ui_preserves_dynamic_blocker_for_pre_episode_admission_diagnostic() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication({"active_controls": ["episode_start"]})
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+
+    application.observe_runtime_publication(
+        {"startup_blockers": {"hand.right": "right_hand telemetry_failed: Write timeout"}}
+    )
+
+    reason = application.pre_episode_start_admission_reason()
+    assert reason is not None
+    assert "hand.right" in reason
+    assert "Write timeout" in reason
+
+
+def test_rule_ui_keeps_accepted_start_window_across_stale_status_heartbeat() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication(
+        {"active_controls": ["episode_start"]}
+    )
+    application.bind_rule_runtime()
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": False,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "rule_start_available": True,
+            "configuration_available": True,
+        }
+    )
+
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": False,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "rule_start_available": True,
+            "configuration_available": True,
+        }
+    )
+
+    state = application.snapshot()
+    assert state["phase"] == "armed"
+    assert application.allows_pre_episode_armed_warmup() is True
+
+
+def test_rule_ui_projects_writer_owned_pre_motion_wait_detail() -> None:
+    application = RuleBasedWritingApplication()
+    application.observe_runtime_publication(
+        {"active_controls": ["episode_start", "episode_stop", "h"]}
+    )
+    application.bind_rule_runtime()
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": False,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "rule_start_available": True,
+        }
+    )
+    assert application.submit_intent(RuleBasedWritingIntent.START) is True
+
+    writer_detail = "数采 warmup 等待中：等待相机 front 新鲜帧；倒计时已完成。"
+    application.observe_runtime_publication(
+        {
+            "episode_event_status": "preparing",
+            "episode_event_message": writer_detail,
+        }
+    )
+    application.observe_rule_status(
+        {
+            "started": True,
+            "armed": True,
+            "execution_begun": False,
+            "completed": False,
+            "aborted": False,
+            "held": False,
+            "session_state": "ARMED",
+            "waiting_reason": "formal_episode_not_active",
+        }
+    )
+
+    state = application.snapshot()
+    assert state["phase"] == "armed"
+    assert state["detail"] == writer_detail
+    assert state["episode_event_status"] == "preparing"
+    assert state["episode_event_message"] == writer_detail
+
+
 def test_rule_runtime_bind_waits_for_first_readiness_status() -> None:
     """Binding the extension alone must not advertise a usable start gate."""
 
@@ -105,6 +336,72 @@ def test_rule_runtime_bind_waits_for_first_readiness_status() -> None:
     ready = application.snapshot()
     assert ready["phase"] == "ready"
     assert ready["can_start"] is True
+
+
+def test_task_chain_explains_missing_right_gripper_instead_of_inviting_click() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application.observe_rule_status(
+        {
+            "collection_mode": "rule_based_writing",
+            "rule_start_available": True,
+            "configuration_available": True,
+            "gripper_control_available": False,
+            "gripper_sides": [],
+            "height_calibration_available": True,
+        }
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_can_advance"] is False
+    assert "等待夹爪控制拓扑就绪" in state["task_chain_detail"]
+    assert "按“继续任务链”" not in state["task_chain_detail"]
+
+
+def test_failed_runtime_home_returns_to_a_retryable_blocked_state() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application.observe_rule_status(
+        {
+            "started": True,
+            "session_state": "DEBUG_ONLY",
+            "rule_start_available": False,
+            "readiness_blockers": {
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required"
+            },
+        }
+    )
+
+    assert application.snapshot()["can_runtime_home"] is True
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is True
+    assert application.snapshot()["runtime_home_pending"] is True
+    application.observe_rule_status({"session_state": "ARMED"})
+    assert application.snapshot()["runtime_home_pending"] is True
+    application.observe_runtime_publication(
+        {
+            "capture_stage": "runtime_home",
+            "capture_phase": "ready",
+            "control_hint": "已禁止新的机械臂/夹爪命令，正在等待底层停机确认。",
+        }
+    )
+    assert application.snapshot()["runtime_home_pending"] is True
+
+    application.observe_runtime_publication(
+        {
+            "capture_stage": "runtime_home",
+            "capture_phase": "failed",
+            "home_ready": False,
+            "control_hint": "实时 qpos 快照失败；机械臂保持 Hold。",
+        }
+    )
+    failed = application.snapshot()
+    assert failed["runtime_home_pending"] is False
+    assert failed["can_runtime_home"] is True
+    assert failed["phase"] == "blocked"
+    assert "实时 qpos 快照失败" in failed["detail"]
+
+    # A second click is a genuine retry, not a permanently consumed request.
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is True
 
 
 def test_rule_start_does_not_depend_on_generic_episode_control_projection() -> None:
@@ -247,8 +544,8 @@ def test_rule_stop_atomically_blocks_rule_and_requests_writer_stop_and_hold() ->
     assert application.consume_rule_intents() == ("rule_stop",)
     assert application.consume_runtime_events() == [
         "episode_stop:rule_based_hold_cancel",
-        "h",
     ]
+    assert "停止并 Hold" in application.snapshot()["messages"][-1]["message"]
     assert application.snapshot()["can_stop"] is False
 
     application.observe_runtime_publication(
@@ -430,8 +727,12 @@ def test_rule_ui_asset_contains_no_teleop_episode_progress_or_pedal_controls() -
     assert 'data-event="runtime_home_retry"' in asset
     assert 'id="task-chain-advance"' in asset
     assert "Alt+N" in asset
-    assert 'fetch("/task-chain"' in script
+    assert 'postJson("/task-chain"' in script
+    assert 'pendingRequests.has("task-chain")' in script
+    assert "下一步：恢复右夹爪闭合（Alt+N）" in script
     assert "event.altKey" in script
+    assert "let tactileCaptureLocked = false" in script
+    assert 'input.id === "collect-tactile" && tactileCaptureLocked' in script
     assert '"/task-chain"' in transport
     for forbidden in ("开始遥操", "Episode", "长程进度", "踏板", "夹爪控制"):
         assert forbidden not in asset
@@ -593,6 +894,155 @@ def test_rule_device_retry_holds_running_control_before_automatic_retry() -> Non
     completed = application.snapshot()
     assert completed["device_retry_pending"] is False
     assert completed["can_retry_devices"] is True
+
+
+def test_task_chain_device_recovery_runs_home_restores_owner_and_resumes_rule() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, selected, _other = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, selected)
+    application.observe_rule_status(_task_chain_ready_status())
+    application._task_chain.phase = RuleWritingTaskChainPhase.RULE_PENDING
+    application._task_chain.selected_configuration = dict(selected)
+    application._task_chain.selected_configuration_index = 0
+
+    # The device fault aborts the active rule and the ordinary chain observer
+    # moves it to its retry boundary while preserving the selected trajectory.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            session_state="FAULT",
+            # The runtime Hold owner resets the failed attempt before
+            # publishing its recoverable held state.
+            aborted=False,
+            held=True,
+            rule_start_available=False,
+            readiness_blockers={
+                "hand.right": "DMTAC disconnected",
+                "rig.session": "Session state=FAULT; runtime Home required",
+            },
+        )
+    )
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["device_retry", "q"],
+            "startup_blockers": {
+                "hand.right": "DMTAC disconnected",
+                "rig.session": "Session state=FAULT; runtime Home required",
+            },
+        }
+    )
+    assert application.submit_intent(RuleBasedWritingIntent.DEVICE_RETRY) is True
+    assert application.consume_runtime_events() == ["device_retry"]
+
+    application.complete_device_retry(error=None)
+    assert application.consume_runtime_events() == []
+
+    # Fresh lower readiness removes the hardware fault.  Recovery must reuse
+    # the canonical robot-state-only Home path exactly once.
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["runtime_home_retry", "q"],
+            "startup_blockers": {
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect",
+            },
+        }
+    )
+    assert application.consume_runtime_events() == []
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            session_state="DEBUG_ONLY",
+            held=True,
+            rule_start_available=False,
+            readiness_blockers={
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect",
+            },
+        )
+    )
+    assert application.consume_runtime_events() == ["runtime_home_retry"]
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["runtime_home_retry", "q"],
+            "startup_blockers": {
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect",
+            },
+        }
+    )
+    assert application.consume_runtime_events() == []
+
+    application.observe_runtime_publication(
+        {
+            "home_ready": True,
+            "active_controls": ["q"],
+            "startup_blockers": {
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect",
+            },
+        }
+    )
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+            rule_start_available=False,
+        )
+    )
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+
+    # The new serial session's measured-close receipt restores the owner, then
+    # the same validated rule is started without another operator click.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            readiness_blockers={},
+            gripper_action_pending=False,
+            gripper_action_id=51,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
+        )
+    )
+    application.observe_runtime_publication(
+        {"active_controls": ["q"], "startup_blockers": {}}
+    )
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "rule_pending"
+
+    application.observe_rule_status(_task_chain_ready_status(armed=True))
+    assert application.consume_rule_intents() == ()
+    assert application.consume_runtime_events() == []
+
+
+def test_task_chain_device_recovery_does_not_advance_while_fault_remains() -> None:
+    application = RuleBasedWritingApplication()
+    options, selected, _other = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, selected)
+    application.observe_rule_status(_task_chain_ready_status())
+    application._task_chain.phase = RuleWritingTaskChainPhase.CLOSE_PENDING
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["device_retry", "q"],
+            "startup_blockers": {"hand.right": "DMTAC disconnected"},
+        }
+    )
+
+    assert application.submit_intent(RuleBasedWritingIntent.DEVICE_RETRY) is True
+    assert application.consume_runtime_events() == ["device_retry"]
+    application.complete_device_retry(error=None)
+    application.observe_runtime_publication(
+        {
+            "active_controls": ["device_retry", "q"],
+            "startup_blockers": {"hand.right": "DMTAC still disconnected"},
+        }
+    )
+
+    assert application.consume_runtime_events() == []
+    assert application.consume_rule_intents() == ()
+    assert application.snapshot()["task_chain_phase"] == "ready_close"
 
 
 def test_rule_device_retry_is_unavailable_without_lower_retry_or_hold_control() -> None:
@@ -798,6 +1248,52 @@ def test_rule_configuration_validates_all_independent_combinations_and_numeric_s
         {**changed, "pre_pen_down_replay_normal_episodes": 1.5}
     ) is False
     assert "必须是整数" in application.snapshot()["configuration_error"]
+
+
+def test_rule_configuration_accepts_random_source_pool_default() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application.observe_rule_status({"rule_start_available": True})
+    options = {
+        "configuration_core_fields": [
+            "pen_down_candidate_id",
+            "write_candidate_id",
+            "pen_up_candidate_id",
+            "trajectory_id",
+            "direction",
+            "writing_size_m",
+            "initial_alignment_speed_scale",
+        ],
+        "source_candidates_by_phase": {
+            phase: [
+                {
+                    "value": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+                    "label": "随机选择（默认）",
+                },
+                {"value": "a", "label": "A"},
+            ]
+            for phase in ("pen_down", "write", "pen_up")
+        },
+        "trajectory_ids": ["digit_1_v1"],
+        "directions": ["up"],
+        "numeric_bounds": {
+            "writing_size_m": [0.005, 0.2],
+            "initial_alignment_speed_scale": [0.05, 1.0],
+        },
+    }
+    selected = {
+        "pen_down_candidate_id": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+        "write_candidate_id": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+        "pen_up_candidate_id": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+        "trajectory_id": "digit_1_v1",
+        "direction": "up",
+        "writing_size_m": 0.08,
+        "initial_alignment_speed_scale": 1.0,
+    }
+
+    application.configure_rule_options(options, selected)
+
+    assert application.snapshot()["rule_configuration"] == selected
 
 
 def test_rule_configuration_rejects_out_of_range_speed_without_queueing() -> None:
@@ -1119,7 +1615,7 @@ def test_manual_gripper_pending_blocks_start_and_reverse_action() -> None:
     assert application.submit_intent(RuleBasedWritingIntent.START) is False
 
 
-def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> None:
+def test_task_chain_configures_once_then_reuses_runtime_prepared_attempt() -> None:
     application = RuleBasedWritingApplication(task_chain_choice_index=lambda count: count - 1)
     options, first, second = _task_chain_configuration()
     application.bind_rule_runtime()
@@ -1134,41 +1630,56 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert application.snapshot()["task_chain_can_advance"] is True
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_rule_intents() == ("release_grippers",)
+    assert application.consume_rule_intents() == ("release_right_gripper",)
     assert application.snapshot()["task_chain_phase"] == "initial_release_pending"
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=True,
-            gripper_action_status="已排队：松开夹爪",
+            gripper_action_id=11,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="pending",
+            gripper_action_status="已排队：松开右夹爪",
         )
     )
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
-            gripper_action_status="夹爪实测已松开",
+            gripper_action_id=11,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已松开",
         )
     )
     assert application.snapshot()["task_chain_phase"] == "ready_close"
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_rule_intents() == ("close_grippers",)
+    assert application.consume_rule_intents() == ("close_right_gripper",)
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
-            gripper_action_status="夹爪实测已松开",
+            gripper_action_id=11,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已松开",
         )
     )
     assert application.snapshot()["task_chain_phase"] == "close_pending"
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=True,
-            gripper_action_status="已排队：闭紧夹爪",
+            gripper_action_id=12,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="pending",
+            gripper_action_status="已排队：闭紧右夹爪",
         )
     )
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
-            gripper_action_status="夹爪实测已闭紧",
+            gripper_action_id=12,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
         )
     )
     assert application.snapshot()["task_chain_phase"] == "ready_height"
@@ -1191,15 +1702,13 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
     assert application.snapshot()["task_chain_phase"] == "ready_rule"
 
     assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_configuration_requests() == (second,)
-    assert application.snapshot()["task_chain_phase"] == "configuration_pending"
-    application.complete_configuration(selected=second, error=None)
+    assert application.consume_configuration_requests() == ()
     assert application.consume_rule_intents() == ("rule_start",)
     assert application.consume_runtime_events() == ["episode_start"]
     state = application.snapshot()
     assert state["task_chain_phase"] == "rule_pending"
-    assert state["task_chain_selected_configuration"] == second
-    assert state["task_chain_selected_configuration_index"] == 1
+    assert state["task_chain_selected_configuration"] == first
+    assert state["task_chain_selected_configuration_index"] == 0
 
     application.observe_rule_status(
         _task_chain_ready_status(
@@ -1221,32 +1730,309 @@ def test_task_chain_advances_one_gate_at_a_time_and_reuses_existing_queues() -> 
             batch_cycle_complete=True,
         )
     )
-    assert application.snapshot()["task_chain_phase"] == "ready_final_release"
-
-    assert application.submit_task_chain_advance({"event": "advance"}) is True
-    assert application.consume_rule_intents() == ("release_grippers",)
-    application.observe_rule_status(
-        _task_chain_ready_status(
-            gripper_action_pending=True,
-            gripper_action_status="已排队：松开夹爪",
-            batch_count=1,
-            batch_completed_count=1,
-            batch_cycle_complete=True,
-        )
-    )
-    application.observe_rule_status(
-        _task_chain_ready_status(
-            gripper_action_pending=False,
-            gripper_action_status="夹爪实测已松开",
-            batch_count=1,
-            batch_completed_count=1,
-            batch_cycle_complete=True,
-        )
-    )
     state = application.snapshot()
     assert state["task_chain_phase"] == "complete"
     assert state["task_chain_cycle_count"] == 1
+    assert state["task_chain_episodes_since_grasp_adjustment"] == 1
+    assert state["task_chain_grasp_adjustment_due"] is False
     assert state["task_chain_can_advance"] is True
+
+    # The runtime prepares the next random attempt after success.  Continuing
+    # must only submit START; re-submitting the GUI configuration would reset
+    # the source-selection ordinal and repeatedly choose the same sources.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_configuration=second,
+            source_selection={
+                "selection_ordinal": 1,
+                "phases": {
+                    "pen_down": {"candidate_id": "approach-b"},
+                    "write": {"candidate_id": "write-b"},
+                    "pen_up": {"candidate_id": "depart-b"},
+                },
+            },
+        )
+    )
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_configuration_requests() == ()
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "rule_pending"
+    assert state["task_chain_selected_configuration"] == second
+    assert state["rule_source_selection"]["selection_ordinal"] == 1
+
+
+def test_task_chain_grasp_adjustment_interval_counts_only_successes() -> None:
+    chain = RuleWritingTaskChain()
+    chain.configure_grasp_adjustment_interval(2)
+    selected = {"trajectory_id": "digit_1_v1"}
+
+    assert chain.grasp_adjustment_due is True
+    chain.set_prepared_configuration(index=0, selected=selected)
+    chain.begin_initial_release(action_id_baseline=None)
+    chain.bind_gripper_action(1)
+    chain.finish_initial_release(error=None)
+    chain.begin_close(action_id_baseline=1)
+    chain.bind_gripper_action(2)
+    chain.finish_close(error=None)
+    chain.begin_height()
+    chain.finish_height(error=None)
+    assert chain.grasp_adjustment_due is False
+
+    chain.begin_prepared_rule(index=0, selected=selected)
+    chain.observe_rule_execution()
+    chain.finish_rule()
+    assert chain.cycle_count == 1
+    assert chain.episodes_since_grasp_adjustment == 1
+    assert chain.grasp_adjustment_due is False
+
+    chain.begin_prepared_rule(index=0, selected=selected)
+    chain.observe_rule_execution()
+    chain.fail_rule("cancelled")
+    assert chain.cycle_count == 1
+    assert chain.episodes_since_grasp_adjustment == 1
+
+    chain.begin_prepared_rule(index=0, selected=selected)
+    chain.observe_rule_execution()
+    chain.finish_rule()
+    assert chain.cycle_count == 2
+    assert chain.episodes_since_grasp_adjustment == 2
+    assert chain.grasp_adjustment_due is True
+
+
+def test_task_chain_recovers_lost_gripper_owner_through_right_one_shot_close() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    # This test enters the post-height phase directly; the ordinary full-chain
+    # transition coverage above owns the earlier release/close/height stages.
+    application._task_chain.phase = RuleWritingTaskChainPhase.READY_RULE
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "right owner was invalidated"
+            },
+        )
+    )
+
+    blocked = application.snapshot()
+    assert blocked["task_chain_owner_recovery_required"] is True
+    assert blocked["task_chain_can_advance"] is True
+    assert blocked["can_release_grippers"] is False
+    assert blocked["can_close_grippers"] is False
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_configuration_requests() == ()
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+    pending = application.snapshot()
+    assert pending["task_chain_phase"] == "ready_rule"
+    assert pending["gripper_action_pending"] is True
+    assert pending["task_chain_can_advance"] is False
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            gripper_action_pending=False,
+            gripper_action_id=21,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
+            readiness_blockers={},
+        )
+    )
+    recovered = application.snapshot()
+    assert recovered["task_chain_owner_recovery_required"] is False
+    assert recovered["task_chain_phase"] == "rule_pending"
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+
+
+def test_task_chain_owner_recovery_retries_once_after_serial_session_loss() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.READY_RULE
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+        )
+    )
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_configuration_requests() == ()
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+
+    # The serial session changes while the first owner receipt settles.  The
+    # accepted compound rule step may repeat that exact close once.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            gripper_action_pending=False,
+            gripper_action_id=31,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="failed",
+            gripper_action_status="串口会话已变化",
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+        )
+    )
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+
+    # A persistent failure does not create an unbounded write loop.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            gripper_action_pending=False,
+            gripper_action_id=32,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="failed",
+            gripper_action_status="串口会话仍未稳定",
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated by reconnect"
+            },
+        )
+    )
+    assert application.consume_rule_intents() == ()
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "ready_rule"
+    assert state["task_chain_can_advance"] is True
+
+
+def test_task_chain_can_reach_gripper_close_when_rule_owner_is_not_initialized() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": (
+                    "右夹爪尚未建立书写用的一次性闭合 owner。"
+                )
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_can_advance"] is True
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("release_right_gripper",)
+
+
+def test_ready_rule_owner_blocker_exposes_gripper_recovery_without_starting_rule() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.READY_RULE
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": (
+                    "右夹爪尚未建立书写用的一次性闭合 owner。"
+                )
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["phase"] == "ready"
+    assert state["can_start"] is False
+    assert state["can_close_grippers"] is False
+    assert state["can_release_grippers"] is False
+    assert state["task_chain_owner_recovery_required"] is True
+    assert state["task_chain_can_advance"] is True
+    assert "下一步" in state["task_chain_detail"]
+
+
+def test_task_chain_starts_after_stale_start_gate_recovers() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            configuration_available=True,
+        )
+    )
+
+    # Model the asynchronous configuration callback: the previous status
+    # receipt still says that START is unavailable, even though validation has
+    # succeeded.  This must not become a configuration failure or reconfigure
+    # the same choice on the next click.
+    application._task_chain.phase = RuleWritingTaskChainPhase.CONFIGURATION_PENDING
+    application.complete_configuration(selected=first, error=None)
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "ready_rule"
+    assert state["task_chain_can_advance"] is False
+    assert "配置已验证" in state["task_chain_detail"]
+    assert application.consume_rule_intents() == ()
+    assert application.consume_configuration_requests() == ()
+
+    # The generic runtime can still publish its ARMED/no-command diagnostic
+    # while this validated chain waits for the dedicated START receipt.  That
+    # projection is expected here and must not strand the chain in READY_RULE.
+    application.observe_runtime_publication(
+        {
+            "startup_blockers": {
+                "rig.session": (
+                    "Session state=ARMED; runtime Home and hardware arm admission "
+                    "are required before rule collection."
+                )
+            }
+        }
+    )
+
+    application.observe_rule_status(_task_chain_ready_status())
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    assert application.snapshot()["task_chain_phase"] == "rule_pending"
+
+    # Later status heartbeats must not submit a second START for the same
+    # validated chain selection.
+    application.observe_rule_status(_task_chain_ready_status())
+    assert application.consume_rule_intents() == ()
+    assert application.consume_runtime_events() == []
+
+
+def test_task_chain_does_not_offer_rule_retry_while_device_is_blocked() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    assert application.submit_configuration({"batch": [first]}) is True
+    assert application.consume_configuration_requests() == ({"batch": [first]},)
+    application._task_chain.phase = RuleWritingTaskChainPhase.CONFIGURATION_PENDING
+    application.complete_configuration(selected={"batch": [first]}, error=None)
+    assert application.snapshot()["task_chain_phase"] == "rule_pending"
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            aborted=True,
+            held=True,
+            session_state="DEBUG_ONLY",
+            rule_start_available=False,
+            readiness_blockers={"right_hand": "DMTAC fault"},
+        )
+    )
+    state = application.snapshot()
+    assert state["task_chain_phase"] == "ready_rule"
+    assert state["task_chain_can_advance"] is False
+    assert "DMTAC fault" in state["task_chain_detail"]
 
 
 def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() -> None:
@@ -1266,6 +2052,9 @@ def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() 
     application.observe_rule_status(
         _task_chain_ready_status(
             gripper_action_pending=False,
+            gripper_action_id=21,
+            gripper_action_intent="release_right_gripper",
+            gripper_action_result="failed",
             gripper_action_status="夹爪控制超时",
         )
     )
@@ -1273,6 +2062,43 @@ def test_task_chain_rejects_manual_step_replacement_and_does_not_skip_failure() 
     assert state["task_chain_phase"] == "idle"
     assert "夹爪控制超时" in state["task_chain_detail"]
     assert state["task_chain_cycle_count"] == 0
+
+
+def test_task_chain_stop_enters_hold_then_releases_sequence_ownership() -> None:
+    application = RuleBasedWritingApplication()
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application.observe_rule_status(_task_chain_ready_status())
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("release_right_gripper",)
+    assert application.snapshot()["can_stop"] is True
+
+    assert application.submit_intent(RuleBasedWritingIntent.STOP) is True
+    assert application.consume_rule_intents() == ("rule_stop",)
+    assert application.consume_runtime_events() == [
+        "episode_stop:rule_based_hold_cancel",
+    ]
+    assert "停止并 Hold" in application.snapshot()["messages"][-1]["message"]
+    assert application.submit_intent(RuleBasedWritingIntent.STOP) is False
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            held=True,
+            session_state="DEBUG_ONLY",
+            rule_start_available=False,
+            configuration_available=False,
+            height_calibration_available=False,
+            readiness_blockers={
+                "rig.session": "runtime Home required after operator Hold"
+            },
+        )
+    )
+    state = application.snapshot()
+    assert state["task_chain_active"] is False
+    assert state["task_chain_phase"] == "idle"
+    assert state["task_chain_selected_configuration"] == {}
 
 
 def test_task_chain_waits_for_writer_commit_and_stops_on_rule_hold() -> None:
@@ -1319,3 +2145,14 @@ def test_task_chain_waits_for_writer_commit_and_stops_on_rule_hold() -> None:
     assert state["task_chain_phase"] == "ready_rule"
     assert state["task_chain_can_advance"] is False
     assert "中止" in state["task_chain_detail"]
+
+
+def test_gripper_status_distinguishes_topology_from_lifecycle_availability() -> None:
+    script = (
+        Path(__file__).parents[1]
+        / "control_station/rule_based_writing/static/app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "夹爪已配置" in script
+    assert "当前安全/Session 阶段不允许独立控制" in script
+    assert "夹爪独立控制：当前拓扑未启用" in script

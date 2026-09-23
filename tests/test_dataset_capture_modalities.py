@@ -56,12 +56,13 @@ def test_populated_dataset_requires_exact_capture_contract(tmp_path) -> None:
 
 
 @pytest.mark.integration
-def test_populated_legacy_dataset_means_no_modalities_ignored(tmp_path) -> None:
+def test_populated_legacy_dataset_requires_explicit_migration(tmp_path) -> None:
     root = tmp_path / "dataset"
     _populate(root)
 
-    bind_capture_modality_contract(root, CaptureModalityContract())
-    with pytest.raises(CaptureModalityBindingError):
+    with pytest.raises(CaptureModalityBindingError, match="migrate"):
+        bind_capture_modality_contract(root, CaptureModalityContract())
+    with pytest.raises(CaptureModalityBindingError, match="cannot be mixed"):
         bind_capture_modality_contract(
             root,
             CaptureModalityContract(ignored_camera_keys=("left_wrist",)),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 import inspect
 import threading
@@ -121,6 +122,24 @@ def test_rule_command_source_does_not_open_vive_source() -> None:
 
     assert sources == [keyboard, hand]
     assert calls == []
+
+
+def test_rule_command_source_does_not_install_generic_home_gate() -> None:
+    assert component_builder._requires_startup_home_continuity_gate(
+        rule_command_source=True,
+        arm_control_mode="position",
+        position_command_planner="acceleration_limited",
+    ) is False
+    assert component_builder._requires_startup_home_continuity_gate(
+        rule_command_source=False,
+        arm_control_mode="position",
+        position_command_planner="acceleration_limited",
+    ) is True
+    assert component_builder._requires_startup_home_continuity_gate(
+        rule_command_source=True,
+        arm_control_mode="impedance",
+        position_command_planner="acceleration_limited",
+    ) is False
 
 
 def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
@@ -881,8 +900,8 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 451
-    assert sum(len(action.option_strings) for action in parser._actions) == 512
+    assert len(parser._actions) == 452
+    assert sum(len(action.option_strings) for action in parser._actions) == 513
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
     assert parser.parse_args([]).artifact_layout == "legacy"
@@ -1431,6 +1450,16 @@ def test_control_station_passes_explicit_runtime_ui_factories(
     assert not hasattr(args, "_real_teleop_control_ui_type")
 
 
+def test_real_teleop_runtime_exposes_shutdown_support() -> None:
+    for name in (
+        "_close_camera_sources",
+        "_position_force_guard_collision_summary",
+        "_terminal_force_collision_summary",
+        "run_best_effort_cleanup",
+    ):
+        assert callable(getattr(runtime, name))
+
+
 def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1875,6 +1904,69 @@ def test_device_retry_runtime_immediately_refreshes_camera_projection() -> None:
     assert published[-1]["hardware_status"]["camera.front"]["status_level"] == "ok"
 
 
+def test_device_retry_reports_failed_attempt_to_application() -> None:
+    errors = {"camera.front": "initial startup failure"}
+    retry_results: list[str | None] = []
+
+    class Camera:
+        def close(self) -> None:
+            return None
+
+        def start(self) -> None:
+            raise RuntimeError("camera remains offline")
+
+    clutch = SimpleNamespace(
+        _current_active_controls=lambda: ("device_retry",),
+        device_retry_admission=lambda: (True, ""),
+        _episode_busy=lambda: False,
+        _teleop_started=False,
+        hold_active=lambda: True,
+    )
+    components = SimpleNamespace(
+        gripper_input_source="",
+        left_state_backend=None,
+        right_state_backend=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    runtime = device_retry_runtime.build_device_retry_runtime(
+        args=SimpleNamespace(foot_pad_requested=False, ignore_camera=()),
+        components=components,
+        control_ui=SimpleNamespace(
+            publish=lambda **_kwargs: None,
+            append_message=lambda *_args: None,
+            publish_device_retry_result=lambda *, error: retry_results.append(error),
+        ),
+        clutch_input=clutch,
+        camera_sources={"front": Camera()},
+        vive_source=None,
+        startup_device_errors=errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: None,
+        set_dataset_recorder=lambda _value: None,
+        foot_pad_input_provider=lambda: None,
+        set_foot_pad_input=lambda _value: None,
+        dataset_recorder_type=object,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=object,
+        foot_pad_control_mode="foot-pad",
+        has_dmtac_gripper_backend=lambda _components: False,
+        promote_angle_trigger_gripper_input_to_q6=lambda *_args, **_kwargs: (
+            False,
+            "",
+        ),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    runtime.retry_failed_devices()
+
+    assert "camera.front" in errors
+    assert retry_results
+    assert retry_results[-1] is not None
+    assert "camera.front" in str(retry_results[-1])
+    assert "camera remains offline" in str(retry_results[-1])
+
+
 def test_generic_device_retry_never_starts_or_reuses_dataset_writer() -> None:
     errors = {"dataset.writer": "initial writer startup failure"}
     published: list[dict[str, object]] = []
@@ -2282,6 +2374,16 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
     assert "from ..debug" not in source
 
 
+def test_startup_state_reader_executor_remains_available_for_later_maintenance() -> None:
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        components = SimpleNamespace(arm_state_read_executor=executor)
+        startup_runtime._release_runtime_state_readers(components)
+        assert executor.submit(lambda: "height-read").result(timeout=1) == "height-read"
+    finally:
+        executor.shutdown(wait=True)
+
+
 def test_startup_qpos_hold_failure_is_contained_after_ownership_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2412,6 +2514,15 @@ def test_startup_home_continuity_gate_arms_before_real_hardware(
         publish_calibration_waiting=lambda message: events.append("waiting"),
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
+    runtime_extension = SimpleNamespace(
+        bind_runtime_home_snapshot=lambda *, qpos_by_side: (
+            events.append(
+                "extension_home_bound"
+                if qpos_by_side is home_qpos
+                else "extension_home_wrong_snapshot"
+            )
+        )
+    )
 
     admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
@@ -2419,8 +2530,10 @@ def test_startup_home_continuity_gate_arms_before_real_hardware(
         clutch,
         home_captured=True,
         runtime_home_qpos_snapshot=home_qpos,
+        runtime_extension=runtime_extension,
     )
 
+    assert events.index("extension_home_bound") < events.index("continuity_armed")
     assert events.index("continuity_armed") < events.index("arm_hardware")
     assert "hold_hardware" not in events
     assert admitted is True
@@ -3255,6 +3368,44 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         **common,
     ) == (False, "等待机械臂命令通过最终 admission 并实际派发。")
 
+    armed_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.ARMED,
+        observation=object(),
+        command=None,
+        command_dispatched=False,
+        channels={},
+    )
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=armed_step,
+        allow_pre_episode_armed_warmup=True,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=armed_step,
+        allow_active_episode_armed_bootstrap=True,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
+    # A successful exclusive-source Episode leaves Session RUNNING but clears
+    # its command before the next operator-triggered Episode.  The same narrow
+    # bootstrap admission must work for that second-cycle state.
+    running_step.command = None
+    running_step.command_dispatched = False
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (False, "等待 action command 可用。")
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        allow_pre_episode_armed_warmup=True,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
 
 def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
     backend = legacy_entrypoint.DMTacGripperBackend(
@@ -3312,6 +3463,194 @@ def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
 
     assert not ready
     assert message == "等待 right 夹爪故障恢复：error_code=16，status=5:正在张开。"
+
+
+def test_recording_admission_rule_input_none_does_not_require_q6() -> None:
+    backend = legacy_entrypoint.DMTacGripperBackend(
+        legacy_entrypoint.DMTacGripperBackendConfig(
+            side="right",
+            connect_hardware=False,
+            connect_tactile=False,
+        )
+    )
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="dmtac-gripper",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        gripper_input_source="none",
+        left_hand_backend=None,
+        right_hand_backend=backend,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
+        channels={},
+    )
+
+    ready, message = recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        args=args,
+        components=components_snapshot,
+        clutch_input=SimpleNamespace(hold_active=lambda: False),
+        dataset_recorder=None,
+        camera_sources={},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=recording_admission.recording_auto_stop_reason,
+        gripper_warmup_probe_status=lambda now, *, reason: (True, "ready"),
+        camera_status_blocking_message=lambda status: None,
+    )
+
+    assert ready is True
+    assert message == "warmup 输入稳定。"
+
+
+def test_recording_admission_checks_only_configured_gripper_input_channel() -> None:
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="dmtac-gripper",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        gripper_input_source="angle_trigger",
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
+        channels={
+            "right_hand_q6": SimpleNamespace(valid=False, timestamp=10.0),
+            "right_angle_trigger": SimpleNamespace(valid=True, timestamp=10.0),
+        },
+    )
+
+    ready, message = recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        args=args,
+        components=components_snapshot,
+        clutch_input=SimpleNamespace(hold_active=lambda: False),
+        dataset_recorder=None,
+        camera_sources={},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=recording_admission.recording_auto_stop_reason,
+        gripper_warmup_probe_status=lambda now, *, reason: (True, "ready"),
+        camera_status_blocking_message=lambda status: None,
+    )
+
+    assert ready is True
+    assert message == "warmup 输入稳定。"
+
+
+def test_recording_admission_keeps_q6_gate_for_q6_teleop() -> None:
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="dmtac-gripper",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        gripper_input_source="q6",
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
+        channels={},
+    )
+    common = {
+        "args": args,
+        "components": components_snapshot,
+        "clutch_input": SimpleNamespace(hold_active=lambda: False),
+        "dataset_recorder": None,
+        "camera_sources": {},
+        "preview_camera_sources": {},
+        "camera_previewer": None,
+        "recording_auto_stop_reason_fn": recording_admission.recording_auto_stop_reason,
+        "gripper_warmup_probe_status": lambda now, *, reason: (True, "ready"),
+        "camera_status_blocking_message": lambda status: None,
+    }
+
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (False, "等待 right hand_q6 输入有效。")
+
+    running_step.channels["right_hand_q6"] = SimpleNamespace(
+        valid=True,
+        timestamp=10.0,
+    )
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (True, "warmup 输入稳定。")
+
+
+def test_recording_admission_blocks_dmtac_transport_error_with_zero_vendor_code() -> None:
+    backend = legacy_entrypoint.DMTacGripperBackend(
+        legacy_entrypoint.DMTacGripperBackendConfig(
+            side="right",
+            connect_hardware=True,
+            connect_tactile=False,
+        )
+    )
+    backend.device = SimpleNamespace(gripper=object())
+    backend._telemetry_error = "telemetry_failed: Write timeout"
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="none",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        left_hand_backend=None,
+        right_hand_backend=backend,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
+        channels={},
+    )
+
+    ready, message = recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        args=args,
+        components=components_snapshot,
+        clutch_input=SimpleNamespace(hold_active=lambda: False),
+        dataset_recorder=None,
+        camera_sources={},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=recording_admission.recording_auto_stop_reason,
+        gripper_warmup_probe_status=lambda now, *, reason: (True, "ready"),
+        camera_status_blocking_message=lambda status: None,
+    )
+
+    assert ready is False
+    assert message == "等待 right 夹爪传输故障恢复：telemetry_failed: Write timeout。"
 
 
 def test_position_episode_debug_detaches_before_deferred_close(
@@ -3653,6 +3992,59 @@ def test_teleop_running_projection_requires_an_actual_arm_dispatch(
     )
     assert control._teleop_dispatch_confirmed is False
     assert control.gripper_control_enabled() is False
+
+
+def test_rule_ui_can_open_writer_before_first_arm_dispatch() -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.components = SimpleNamespace(
+        session=SimpleNamespace(
+            state_machine=SimpleNamespace(
+                state=SimpleNamespace(value="ARMED"),
+            ),
+        ),
+    )
+    control.ui = SimpleNamespace(
+        allows_pre_episode_armed_warmup=lambda: True,
+    )
+    control._dataset_selection_pending = False
+    control._teleop_started = True
+    control._teleop_dispatch_confirmed = False
+    control._hold_active = False
+    control._fix_hold_active = False
+
+    assert control.episode_start_admission() == (True, "")
+
+
+def test_rule_ui_reports_its_blocker_when_pre_episode_dispatch_is_not_confirmed() -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.components = SimpleNamespace(
+        session=SimpleNamespace(
+            state_machine=SimpleNamespace(
+                state=SimpleNamespace(value="ARMED"),
+            ),
+        ),
+    )
+    control.ui = SimpleNamespace(
+        allows_pre_episode_armed_warmup=lambda: False,
+        pre_episode_start_admission_reason=lambda: (
+            "规则采集启动门禁已关闭；hand.right: telemetry_failed: Write timeout"
+        ),
+    )
+    control._dataset_selection_pending = False
+    control._teleop_started = True
+    control._teleop_dispatch_confirmed = False
+    control._hold_active = False
+    control._fix_hold_active = False
+
+    admitted, message = control.episode_start_admission()
+
+    assert admitted is False
+    assert "hand.right" in message
+    assert "Write timeout" in message
 
 
 def test_two_pedal_transition_cannot_bypass_missing_dispatch_receipt() -> None:

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -486,7 +488,7 @@ def test_full_replay_mode_rejects_writing_speed_override(tmp_path: Path) -> None
         )
 
 
-def test_writing_mode_keeps_its_phase_hand_continuity_contract(
+def test_writing_mode_replaces_source_right_hand_jumps_with_fixed_pen_grip(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -500,18 +502,27 @@ def test_writing_mode_keeps_its_phase_hand_continuity_contract(
     args.left_hand_backend = "dmtac-gripper"
     args.right_hand_backend = "dmtac-gripper"
 
-    with pytest.raises(
-        ValueError,
-        match=r"pen_down right gripper step .* exceeds the bounded maximum",
-    ):
-        rule_based_plan.build_rule_based_writing(
-            args,
-            deployment=rule_based_plan.RuleBasedRealTeleopDeployment(
-                active_sides=("left", "right"),
-                collection_pose_frame_contract=_contract(),
-                tcp_pose_envelope_profile="fixture-envelope",
-            ),
-        )
+    build = rule_based_plan.build_rule_based_writing(
+        args,
+        deployment=rule_based_plan.RuleBasedRealTeleopDeployment(
+            active_sides=("left", "right"),
+            collection_pose_frame_contract=_contract(),
+            tcp_pose_envelope_profile="fixture-envelope",
+        ),
+    )
+
+    steps = build.extension.plan.steps
+    right_trajectories = (
+        build.extension.trajectory_groups["pen_down"].hand_joint_targets["right"],
+        steps[3].action_source.hand_trajectory_by_side["right"],
+        build.extension.trajectory_groups["pen_up"].hand_joint_targets["right"],
+    )
+    for values in right_trajectories:
+        assert np.allclose(values[:, 0], 1.0)
+        assert np.allclose(values[:, 1:], 0.0)
+    assert build.source_selection["gripper_trajectory_mode"] == (
+        "right_task_chain_fixed_closed"
+    )
 
 
 def test_gui_writer_configuration_is_staged_then_committed_to_live_args(
@@ -555,7 +566,9 @@ def test_gui_writer_configuration_is_staged_then_committed_to_live_args(
     assert options["runtime_info"]["arm_control_hz"] == pytest.approx(120.0)
     configured = {
         **selected,
+        "collect_tactile": True,
         "writing_speed_m_s": 0.05,
+        "writing_speed_from_source": False,
         "tactile_bundle_root": str(tactile_root),
         "tactile_bundle_min_free_gb": 0.0,
         "tactile_compression": "lz4",
@@ -609,6 +622,7 @@ def test_gui_tactile_threshold_validation_rejects_currently_unavailable_reserve(
         lambda _path: SimpleNamespace(free=10 * 1024**3),
     )
     configuration = {
+        "collect_tactile": True,
         "writing_speed_m_s": 0.05,
         "tactile_bundle_root": str(tactile_root),
         "tactile_bundle_min_free_gb": 20.0,
@@ -630,7 +644,129 @@ def test_gui_tactile_threshold_validation_rejects_currently_unavailable_reserve(
     assert not hasattr(target, "rule_writing_speed_m_s")
 
 
-def test_dual_dmtac_plan_replays_continuous_three_phase_gripper_trajectories(
+def test_rule_tactile_toggle_is_explicit_for_blank_dataset(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "formal"
+    tactile_root = tmp_path / "tactile"
+    dataset_root.mkdir()
+    tactile_root.mkdir()
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=False,
+        tactile_bundle_root=str(tactile_root),
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=True,
+    )
+
+    resolution = rule_based_plan._resolve_rule_tactile_capture(args)
+    assert resolution.mode == "disabled"
+    rule_based_plan._apply_rule_tactile_capture_resolution(args, resolution)
+
+    assert args.ignore_tactile == ["left", "right"]
+    assert args.dmtac_tactile is False
+    assert args.tactile_bundle_root == ""
+    assert args.tactile_bundle_min_free_gb == 0.0
+
+
+def test_rule_tactile_toggle_defaults_to_ten_gib_when_root_is_present(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "formal"
+    tactile_root = tmp_path / "tactile"
+    dataset_root.mkdir()
+    tactile_root.mkdir()
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=None,
+        tactile_bundle_root=str(tactile_root),
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=False,
+    )
+
+    resolution = rule_based_plan._resolve_rule_tactile_capture(args)
+    rule_based_plan._apply_rule_tactile_capture_resolution(args, resolution)
+
+    assert resolution.mode == "enabled"
+    assert args.dmtac_tactile is True
+    assert args.tactile_bundle_min_free_gb == pytest.approx(10.0)
+
+
+def test_rule_tactile_cli_disable_wins_over_legacy_root_default(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "formal"
+    tactile_root = tmp_path / "tactile"
+    dataset_root.mkdir()
+    tactile_root.mkdir()
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=None,
+        dmtac_tactile=False,
+        tactile_bundle_root=str(tactile_root),
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=True,
+    )
+
+    resolution = rule_based_plan._resolve_rule_tactile_capture(args)
+
+    assert resolution.mode == "disabled"
+    assert resolution.source == "cli_dmtac_tactile"
+    rule_based_plan._apply_rule_tactile_capture_resolution(args, resolution)
+    assert args.dmtac_tactile is False
+    assert args.tactile_bundle_root == ""
+
+
+def test_populated_dataset_contract_overrides_requested_tactile_mode(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "formal"
+    dataset_root.mkdir()
+    (dataset_root / "meta").mkdir()
+    from dataset_interface.capture_modalities import bind_capture_modality_contract
+    from dataset_contracts.capture_modalities import CaptureModalityContract
+
+    bind_capture_modality_contract(
+        dataset_root,
+        CaptureModalityContract(
+            ignored_camera_keys=("front",),
+            ignored_tactile_keys=("left", "right"),
+        ),
+    )
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps({"episode_count": 1}),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        dataset_root=str(dataset_root),
+        ignore_camera=[],
+        ignore_tactile=[],
+        rule_collect_tactile=True,
+        tactile_bundle_root="",
+        tactile_bundle_min_free_gb=0.0,
+        tactile_bundle_min_free_source="default",
+        tactile_artifact_integrity=True,
+    )
+
+    resolution = rule_based_plan._resolve_rule_tactile_capture(args)
+
+    assert resolution.locked is True
+    assert resolution.source == "existing_dataset_contract"
+    assert resolution.mode == "disabled"
+    rule_based_plan._apply_rule_tactile_capture_resolution(args, resolution)
+    assert args.ignore_camera == ["front"]
+    assert args.rule_collect_tactile is False
+    assert args.ignore_tactile == ["left", "right"]
+
+
+def test_dual_dmtac_plan_keeps_right_pen_grip_fixed_across_three_phases(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -675,6 +811,9 @@ def test_dual_dmtac_plan_replays_continuous_three_phase_gripper_trajectories(
         assert np.allclose(write_values[-1], up_values[0])
         for values in (down_values, write_values, up_values):
             assert np.max(np.abs(np.diff(values, axis=0))) <= 0.050001
+        if side == "right":
+            for values in (down_values, write_values, up_values):
+                assert np.allclose(values[:, 0], 1.0)
 
     initialize = build.extension.adapter.cursor.next_runtime(None)
     assert set(initialize.hand_qpos_by_side) == {"left", "right"}
@@ -802,6 +941,10 @@ def test_fixed_writing_anchors_in_canonical_desk_and_resamples_source_rate() -> 
     assert interval_velocity["by_side"]["left"][
         "linear_speed_p90_m_s"
     ] == pytest.approx(0.0)
+    assert actions[0].metadata["rule_based_position_reference_resample"] is True
+    assert actions[0].metadata["rule_based_position_keyframe_hz"] == pytest.approx(
+        10.0
+    )
 
 
 def test_calibrated_height_descent_is_optional_pure_z_and_c2_bounded() -> None:
@@ -928,8 +1071,16 @@ def test_launcher_value_options_preserve_missing_value_errors(
         text=True,
     )
 
-    assert result.returncode == 2
+    assert result.returncode == 1
     assert result.stderr == f"[RuleBased] {option} requires {value_hint}.\n"
+
+
+def test_real_teleop_parser_accepts_camera_frame_max_age_option() -> None:
+    args = real_teleop_entrypoint.build_real_teleop_argument_parser().parse_args(
+        ["--camera-frame-max-age-sec", "0.25"]
+    )
+
+    assert args.camera_frame_max_age_sec == pytest.approx(0.25)
 
 
 def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
@@ -1005,6 +1156,136 @@ def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     assert "--collection-progress-entry-step right_write" in output
     assert "--collection-progress-entry-stage right_write.pen_down" in output
     assert "--camera-frame-max-age-sec 0.25" in output
+    assert "--actual-wrist-camera-pose-hz 15.0" in output
+
+
+def test_launcher_dry_run_enables_dedicated_two_pedal_task_chain_mode(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+    result = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--task-chain-foot-pad",
+            "--grasp-adjustment-interval",
+            "7",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout
+    assert "--special-arm-control-mode foot-pad" in output
+    assert "--rule-task-chain-foot-pad" in output
+    assert "--rule-task-chain-grasp-adjustment-interval 7" in output
+    assert "--special-arm-control-mode manual" not in output
+
+
+def test_launcher_restores_system_tools_when_conda_path_is_isolated(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    source.mkdir()
+    detail.mkdir()
+    environment = dict(os.environ)
+    environment["PATH"] = str(Path(sys.executable).resolve().parent)
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--initial-alignment-speed-scale",
+            "0.5",
+            "--camera-frame-max-age-sec",
+            "0.25",
+            "--no-collect-tactile",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dirname: command not found" not in result.stderr
+    assert "awk: command not found" not in result.stderr
+    assert "--rule-initial-alignment-speed-scale 0.5" in result.stdout
+
+
+def test_launcher_refuses_missing_runtime_scipy_before_device_startup(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    source.mkdir()
+    detail.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then\n"
+        "  echo 'ModuleNotFoundError: No module named scipy' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    environment = dict(os.environ)
+    environment["PATH"] = f"{fake_bin}:/usr/local/bin:/usr/bin:/bin"
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--no-collect-tactile",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert "runtime dependency preflight failed" in result.stderr
+    assert "scipy.spatial.transform.Rotation" in result.stderr
+    assert "no device startup was attempted" in result.stderr
+    assert "control_station.real_rule_based_writing_entrypoint" in result.stderr
 
 
 def test_launcher_accepts_greek_trajectory_catalog_id(tmp_path: Path) -> None:
@@ -1078,6 +1359,88 @@ def test_launcher_accepts_latin_and_additional_trajectory_catalog(
     assert result.returncode == 0, result.stderr
     assert f"--rule-writing-trajectory-catalog {catalog}" in result.stdout
     assert "--rule-writing-trajectory custom_zigzag_v1" in result.stdout
+
+
+def test_launcher_supports_explicit_tactile_modes_and_ten_gib_default(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+
+    enabled = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    disabled = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--no-collect-tactile",
+            "--tactile-min-free-gb",
+            "10",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    default_no_root = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, TACTILE_BUNDLE_ROOT="", TACTILE_BUNDLE_MIN_FREE_GB=""),
+    )
+
+    assert enabled.returncode == 0, enabled.stderr
+    assert "--tactile-bundle-min-free-gb 10" in enabled.stdout
+    assert "--rule-collect-tactile" not in enabled.stdout
+    assert disabled.returncode == 0, disabled.stderr
+    assert "--tactile-min-free-gb is ignored" in disabled.stderr
+    assert "--no-rule-collect-tactile" in disabled.stdout
+    assert "--dmtac-no-tactile" in disabled.stdout
+    assert "--ignore-tactile left" in disabled.stdout
+    assert "--tactile-bundle-min-free-gb 0" in disabled.stdout
+    assert default_no_root.returncode == 0, default_no_root.stderr
+    assert "--dmtac-with-tactile" not in default_no_root.stdout
+    assert "--tactile-bundle-min-free-gb 0" in default_no_root.stdout
 
 
 def test_build_appends_custom_catalog_and_records_provenance(
@@ -1228,7 +1591,7 @@ def test_launcher_full_replay_rejects_writing_speed_override(tmp_path: Path) -> 
         text=True,
     )
 
-    assert result.returncode == 2
+    assert result.returncode == 1
     assert "source Episode timestamps are preserved" in result.stderr
 
 
@@ -1301,6 +1664,46 @@ def test_launcher_can_enable_left_dmtac_later_without_enabling_q6(
     ) in output
 
 
+def test_launcher_forwards_assignment_preserving_gripper_port_overrides(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    tactile = tmp_path / "tactile"
+    source.mkdir()
+    detail.mkdir()
+    tactile.mkdir()
+    result = subprocess.run(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "3",
+            "--detail-annotation-dir",
+            str(detail),
+            "--tactile-bundle-root",
+            str(tactile),
+            "--with-left-gripper",
+            "--left-gripper-port",
+            "/dev/ttyUSB1",
+            "--right-gripper-port",
+            "/dev/ttyUSB2",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout
+    assert "--left-gripper-port /dev/ttyUSB1" in output
+    assert "--right-gripper-port /dev/ttyUSB2" in output
+
+
 def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> None:
     manifest = tmp_path / "source-pool.json"
     tactile = tmp_path / "tactile"
@@ -1344,6 +1747,42 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
     assert "--rule-detail-annotation-dir" not in output
 
 
+def test_launcher_forwards_random_writing_and_reachability_options(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "source-pool.json"
+    manifest.write_text("{}", encoding="utf-8")
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(LAUNCHER),
+            "--source-pool-manifest",
+            str(manifest),
+            "--random-trajectory-ids",
+            "latin_a_v1,latin_b_v1",
+            "--random-directions",
+            "up,left",
+            "--random-size-range",
+            "0.04:0.08",
+            "--writing-reachability-check",
+            "--no-collect-tactile",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout
+    assert "--rule-writing-random-trajectory-ids latin_a_v1\\,latin_b_v1" in output
+    assert "--rule-writing-random-directions up\\,left" in output
+    assert "--rule-writing-random-size-min-m 0.04" in output
+    assert "--rule-writing-random-size-max-m 0.08" in output
+    assert "--rule-writing-reachability-check" in output
+
+
 def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
     tmp_path: Path,
 ) -> None:
@@ -1361,7 +1800,7 @@ def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
         capture_output=True,
         text=True,
     )
-    assert full_replay.returncode == 2
+    assert full_replay.returncode == 1
     assert "not valid in full-replay mode" in full_replay.stderr
 
     full_replay_interval = subprocess.run(
@@ -1378,7 +1817,7 @@ def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
         capture_output=True,
         text=True,
     )
-    assert full_replay_interval.returncode == 2
+    assert full_replay_interval.returncode == 1
     assert "not valid in full-replay mode" in full_replay_interval.stderr
 
     source = tmp_path / "source"
@@ -1407,7 +1846,7 @@ def test_launcher_rejects_pre_pen_down_replay_outside_writing_pool_mode(
         capture_output=True,
         text=True,
     )
-    assert legacy.returncode == 2
+    assert legacy.returncode == 1
     assert "requires --source-pool-manifest" in legacy.stderr
 
 
@@ -1438,10 +1877,83 @@ def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
     assert args.rule_writing_direction == "down"
     assert args.rule_writing_trajectory_catalog == "/custom-trajectories.json"
     assert args.rule_writing_trajectory == "custom_spiral_v1"
+    assert args.episode_start_countdown_sec == pytest.approx(0.0)
+    assert args.rule_task_chain_foot_pad is False
+    assert args.rule_task_chain_grasp_adjustment_interval == 10
     assert rule_based_plan._fixed_trajectory_option("latin_z_v1") == {
         "value": "latin_z_v1",
         "label": "英文字母 Z",
     }
+
+
+def test_rule_arguments_resolve_reproducible_random_writing_variant() -> None:
+    parser = argparse.ArgumentParser()
+    rule_based_plan.add_rule_based_writing_arguments(parser)
+    args = parser.parse_args(
+        [
+            "--rule-writing-random-trajectory-ids",
+            "latin_a_v1,latin_b_v1,latin_c_v1",
+            "--rule-writing-random-directions",
+            "up,right,down,left",
+            "--rule-writing-random-size-min-m",
+            "0.04",
+            "--rule-writing-random-size-max-m",
+            "0.08",
+            "--rule-writing-reachability-check",
+            "--rule-source-selection-seed",
+            "42",
+        ]
+    )
+    args._rule_source_selection_ordinal = 7
+
+    first = rule_based_plan._resolve_writing_variant(
+        args,
+        additional_catalog_path=None,
+    )
+    second = rule_based_plan._resolve_writing_variant(
+        args,
+        additional_catalog_path=None,
+    )
+
+    assert first == second
+    trajectory_id, direction, size_m, metadata = first
+    assert trajectory_id in {"latin_a_v1", "latin_b_v1", "latin_c_v1"}
+    assert direction in {"up", "right", "down", "left"}
+    assert 0.04 <= size_m <= 0.08
+    assert metadata["enabled"] is True
+    assert metadata["selection_seed"] == 42
+    assert metadata["selection_ordinal"] == 7
+
+
+def test_writing_reachability_probes_are_centerline_bbox_contacts() -> None:
+    boundary = {
+        "left": xyzquat_to_pose_matrix(_pose(0.0, 0.0, 0.4)),
+        "right": xyzquat_to_pose_matrix(_pose(0.2, -0.1, 0.3)),
+    }
+    targets = rule_based_plan.build_fixed_trajectory_targets(
+        boundary,
+        "latin_s_v1",
+        scale_m=0.08,
+        linear_speed_m_s=0.02,
+        direction="right",
+    )
+    probes = rule_based_plan._writing_reachability_contact_probes(targets)
+    positions = np.stack(
+        [target.pose_by_side["right"][:3, 3] for target in targets],
+        axis=0,
+    )
+    probe_positions = {
+        probe["name"]: np.asarray(
+            probe["right_pose_canonical_desk"], dtype=float
+        )[:3]
+        for probe in probes
+    }
+
+    assert tuple(probe_positions) == ("left", "right", "bottom", "top")
+    assert probe_positions["left"][0] == pytest.approx(positions[:, 0].min())
+    assert probe_positions["right"][0] == pytest.approx(positions[:, 0].max())
+    assert probe_positions["bottom"][1] == pytest.approx(positions[:, 1].min())
+    assert probe_positions["top"][1] == pytest.approx(positions[:, 1].max())
 
 
 def test_rule_arguments_accept_pool_without_legacy_source_arguments() -> None:

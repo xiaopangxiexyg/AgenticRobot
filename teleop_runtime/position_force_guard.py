@@ -641,7 +641,7 @@ class PositionForceGuardMonitor:
                     inflight_since = self._reader_inflight_since_by_side.get(side)
                     last_reading = self._last_reading_by_side.get(side)
                 inflight_text = (
-                    f"; force read call in flight for "
+                    f"; force reader total time in flight for "
                     f"{max(0.0, now - inflight_since):.3f}s"
                     if inflight_since is not None
                     else ""

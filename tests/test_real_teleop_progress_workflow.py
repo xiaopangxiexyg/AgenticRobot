@@ -188,7 +188,13 @@ def test_failure_pause_resume_retry_uses_first_accepted_sample(tmp_path: Path) -
             AcceptedSampleReceipt(4, 10, 10, 14.1),
         )
     )
-    retried = workflow.consume_sample_acceptance(available_at=14.2)
+    # The control loop drains terminal events before handing accepted receipts
+    # to the workflow.  The workflow must not try to drain the recorder again.
+    terminal_receipts = tuple(recorder.drain_accepted_sample_receipts())
+    retried = workflow.consume_sample_acceptance(
+        available_at=14.2,
+        receipts=terminal_receipts,
+    )
     assert retried.handled
     assert retried.phase == "ACTIVE_ATTEMPT"
     assert episode.state.current_progress_step_id == "pick"
@@ -262,6 +268,41 @@ def test_manual_episode_stop_is_consumed_while_progress_receipt_is_pending() -> 
             16.0,
             "manual_key_stop",
             {"last_step_index": 23, "last_state": "RUNNING"},
+        )
+    ]
+
+
+def test_rule_completion_stop_reason_reaches_episode_finalize_owner() -> None:
+    class _Input:
+        def __init__(self) -> None:
+            self.pending = True
+
+        def consume_episode_stop_request_with_reason(self) -> tuple[bool, str]:
+            result = self.pending
+            self.pending = False
+            return result, "rule_based_complete" if result else ""
+
+    calls: list[tuple[object, ...]] = []
+    consumed = _consume_manual_episode_stop_request(
+        clutch_input=_Input(),
+        recording_active=lambda: True,
+        stop_recording=lambda now, **kwargs: calls.append(
+            (now, kwargs["end_reason"], kwargs["summary"])
+        ),
+        cancel_recording_countdown=lambda *_args, **_kwargs: calls.append(
+            ("cancel",)
+        ),
+        now=17.0,
+        step_index=57,
+        episode_last_state="RUNNING",
+    )
+
+    assert consumed
+    assert calls == [
+        (
+            17.0,
+            "rule_based_complete",
+            {"last_step_index": 57, "last_state": "RUNNING"},
         )
     ]
 

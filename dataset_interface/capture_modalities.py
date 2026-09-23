@@ -88,9 +88,9 @@ def bind_capture_modality_contract(
 ) -> Path:
     """Persist *contract*, rejecting policy changes on a populated dataset.
 
-    Legacy populated datasets without a declaration are interpreted as using
-    the complete (empty-ignore) contract.  This permits explicit backfilling
-    of that declaration but never permits adding an ignore rule retroactively.
+    A populated dataset must already carry an explicit declaration. Payload
+    presence alone cannot distinguish a legacy tactile dataset from a legacy
+    no-tactile dataset, so guessing here could silently create a mixed dataset.
     """
 
     root = Path(dataset_root).expanduser()
@@ -107,9 +107,13 @@ def bind_capture_modality_contract(
             payload = _read_object(path)
             existing = read_capture_modality_contract(root)
             blank = dataset_is_blank(root)
+            if existing is None and not blank:
+                raise CaptureModalityBindingError(
+                    "target dataset already contains data but has no capture modality "
+                    "contract; migrate meta/modality_validity.json explicitly before "
+                    "appending so tactile and non-tactile episodes cannot be mixed"
+                )
             effective_existing = existing
-            if effective_existing is None and not blank:
-                effective_existing = CaptureModalityContract()
             if not blank and effective_existing != contract:
                 raise CaptureModalityBindingError(
                     "target dataset already contains data with a different modality ignore "

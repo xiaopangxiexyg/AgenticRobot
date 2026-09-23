@@ -87,7 +87,10 @@ from collection_runtime.progress.profiles import (
 )
 from collection_runtime.sample_acceptance import (
     AcceptedSampleReceipt,
+    DEFAULT_SAMPLE_TERMINAL_EVENT_CAPACITY,
     SampleAcceptanceReceiptBuffer,
+    SampleTerminalEvent,
+    SampleTerminalEventBuffer,
 )
 from ..collection.v25p_capture_profiles import (
     V25P_REAL_TELEOP_SOURCE,
@@ -435,6 +438,13 @@ class RealTeleopDatasetRecorder:
                 else 0
             )
         )
+        # Runtime extensions advance only after the authoritative writer has
+        # accepted or rejected a sample.  Keep this channel independent from
+        # the optional progress-receipt buffer: rule-based collection needs
+        # terminal outcomes even when no progress UI/profile is configured.
+        self._sample_terminal_event_buffer = SampleTerminalEventBuffer(
+            capacity=DEFAULT_SAMPLE_TERMINAL_EVENT_CAPACITY
+        )
         self.v25p_native_shadow: V25pDualWriteShadow | None = None
         self._v25p_native_shadow_active = False
         self._v25p_native_shadow_error = ""
@@ -576,6 +586,16 @@ class RealTeleopDatasetRecorder:
             initial_episode_index = int(initial_writer.next_episode_index)
             initial_sample_index = int(initial_writer.next_sample_index)
             self.writer = initial_writer
+        configured_camera_max_age = getattr(
+            args,
+            "camera_frame_max_age_sec",
+            DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+        )
+        camera_frame_max_age_sec = float(
+            DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
+            if configured_camera_max_age is None
+            else configured_camera_max_age
+        )
         sample_builder_config = CollectorSampleBuilderConfig(
             active_sides=components.active_sides,
             camera_buffers={
@@ -583,7 +603,7 @@ class RealTeleopDatasetRecorder:
                 for camera_key, source in self.camera_sources.items()
             },
             require_camera_frames=bool(args.write_video and not args.no_camera),
-            camera_frame_max_age_sec=DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+            camera_frame_max_age_sec=camera_frame_max_age_sec,
             episode_index=initial_episode_index,
             sample_index_start=initial_sample_index,
             tactile_array_snapshot_policy=(
@@ -845,12 +865,21 @@ class RealTeleopDatasetRecorder:
         }
         if not active_backends:
             return None
+        force_guard_active = bool(
+            getattr(self.args, "position_force_guard", False)
+        )
         return ArmHardwareStatePoller(
             backends_by_side=active_backends,
             config=ArmHardwareStatePollerConfig(
                 poll_hz=float(getattr(self.args, "actual_wrist_camera_pose_hz", 30.0)),
                 stale_after_sec=float(
                     getattr(self.args, "actual_wrist_camera_pose_max_age_sec", 0.2)
+                ),
+                hardware_read_priority=(
+                    "background" if force_guard_active else "normal"
+                ),
+                hardware_read_lock_timeout_sec=(
+                    0.02 if force_guard_active else None
                 ),
             ),
         )
@@ -1799,21 +1828,65 @@ class RealTeleopDatasetRecorder:
                 drain_process()
             except RuntimeError:
                 pass
+        drain_terminal = getattr(
+            process_worker,
+            "drain_sample_terminal_events",
+            None,
+        )
+        if callable(drain_terminal):
+            # Draining acceptance receipts above also drains worker ACKs and
+            # can populate terminal events.  Clear both views at the same
+            # Episode boundary so an old terminal outcome cannot advance a
+            # new runtime sequence.
+            try:
+                drain_terminal()
+            except RuntimeError:
+                pass
         buffer = getattr(self, "_sample_acceptance_receipt_buffer", None)
         if buffer is not None:
             buffer.reset()
+        terminal_buffer = getattr(self, "_sample_terminal_event_buffer", None)
+        if terminal_buffer is not None:
+            terminal_buffer.reset()
 
-    def _record_thread_sample_acceptance(self, sample: Any) -> None:
-        buffer = getattr(self, "_sample_acceptance_receipt_buffer", None)
-        if buffer is None or buffer.capacity <= 0:
+    def _record_thread_sample_acceptance(
+        self,
+        sample: Any,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        acceptance_buffer = getattr(
+            self,
+            "_sample_acceptance_receipt_buffer",
+            None,
+        )
+        terminal_buffer = getattr(self, "_sample_terminal_event_buffer", None)
+        acceptance_enabled = (
+            acceptance_buffer is not None and acceptance_buffer.capacity > 0
+        )
+        terminal_enabled = (
+            terminal_buffer is not None and terminal_buffer.capacity > 0
+        )
+        if not acceptance_enabled and not terminal_enabled:
             return
+        terminal_metadata = dict(metadata or {})
         receipt = AcceptedSampleReceipt(
             episode_index=int(sample.episode_index),
             sample_index=int(sample.index),
             episode_frame_index=int(sample.frame_index),
             sample_timestamp=float(sample.timestamp),
+            metadata=terminal_metadata,
         )
-        buffer.append(receipt)
+        if acceptance_enabled:
+            acceptance_buffer.append(receipt)
+        if terminal_enabled:
+            terminal_buffer.append(
+                SampleTerminalEvent(
+                    accepted=True,
+                    receipt=receipt,
+                    metadata=terminal_metadata,
+                )
+            )
 
     def drain_accepted_sample_receipts(
         self,
@@ -1829,6 +1902,24 @@ class RealTeleopDatasetRecorder:
             )
             return () if not callable(drain) else tuple(drain())
         buffer = getattr(self, "_sample_acceptance_receipt_buffer", None)
+        return () if buffer is None else buffer.drain()
+
+    def drain_sample_terminal_events(
+        self,
+    ) -> tuple[SampleTerminalEvent, ...]:
+        """Return authoritative per-sample outcomes exactly once.
+
+        Process mode forwards the existing child-writer event stream.  Thread
+        mode uses the local buffer populated only after ``handle_step`` has
+        returned an accepted sample.  Queue submission is deliberately not a
+        terminal boundary.
+        """
+
+        if getattr(self, "collection_worker_mode", "thread") == "process":
+            process_worker = getattr(self, "process_worker", None)
+            drain = getattr(process_worker, "drain_sample_terminal_events", None)
+            return () if not callable(drain) else tuple(drain())
+        buffer = getattr(self, "_sample_terminal_event_buffer", None)
         return () if buffer is None else buffer.drain()
 
     def actual_feedback_warmup_status(self, now: float) -> tuple[bool, str]:
@@ -2159,7 +2250,11 @@ class RealTeleopDatasetRecorder:
             "pause_reason": self.pause_reason,
             "paused_duration_sec": self._total_paused_sec(current_time=current_time),
             "frame_count": frame_count,
-            "camera_frame_max_age_sec": DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+            "camera_frame_max_age_sec": getattr(
+                getattr(self.sample_builder, "config", None),
+                "camera_frame_max_age_sec",
+                DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+            ),
             "camera_frame_rejection": self.sample_builder.last_camera_rejection,
             "camera_frame_age_sec_by_key": dict(
                 self.sample_builder.last_camera_frame_age_sec_by_key
@@ -2315,9 +2410,26 @@ class RealTeleopDatasetRecorder:
                     )
                     self._sample_overload_reason = sample_rejection
                     self._mark_collection_integrity_issue(sample_rejection)
+                    terminal_buffer = getattr(
+                        self,
+                        "_sample_terminal_event_buffer",
+                        None,
+                    )
+                    if terminal_buffer is not None:
+                        terminal_buffer.append(
+                            SampleTerminalEvent(
+                                accepted=False,
+                                metadata=dict(metadata_extra or {}),
+                                reason=sample_rejection,
+                                terminal_kind="rejected",
+                            )
+                        )
                     result = None
                 if result is not None:
-                    self._record_thread_sample_acceptance(result)
+                    self._record_thread_sample_acceptance(
+                        result,
+                        metadata=metadata_extra,
+                    )
         finally:
             self.sample_builder.include_debug_metadata = previous_include_debug_metadata
             self.sample_builder.include_action_debug_metadata = previous_include_action_debug_metadata
@@ -2985,6 +3097,7 @@ class RealTeleopDatasetRecorder:
         step_index: int,
         last_state: str | None,
         summary: Mapping[str, Any] | None = None,
+        discard: bool = False,
         defer_finalize_start: bool = False,
         before_finalize: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> RealDatasetFinalizeTask | None:
@@ -3042,7 +3155,11 @@ class RealTeleopDatasetRecorder:
         self._pause_started_frame_index = None
         self._pause_started_step_index = None
         self._pause_started_last_state = None
-        if frame_count <= 0:
+        # Some capture sources define one Episode as one indivisible attempt.
+        # Their cancellation policy is decided by the source, while this
+        # recorder remains the sole owner of durable cleanup for every related
+        # artifact.  Empty Episodes keep the historical discard behavior.
+        if discard or frame_count <= 0:
             self._writer_lifecycle().flush()
             self.writer.discard_episode(episode_index)
             if trace_sink is not None:

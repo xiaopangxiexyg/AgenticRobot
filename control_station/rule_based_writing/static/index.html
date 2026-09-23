@@ -40,11 +40,11 @@
       </div>
       <div class="configuration-grid">
         <label id="full-replay-source-field" class="wide" hidden>完整数据集轨迹来源<select id="full-replay-source"></select></label>
-        <label class="writing-option wide">落笔前固定轨迹（可选）<select id="pre-pen-down-source"></select></label>
-        <label class="writing-option wide">普通成功采集次数 / 每次前置轨迹<input id="pre-pen-down-normal-episodes" type="number" min="0" step="1"></label>
-        <label class="writing-option">靠近纸面来源<select id="pen-down-source"></select></label>
+        <label class="writing-option wide">落笔前额外完整轨迹（可选，默认关闭；不属于靠近纸面 replay）<select id="pre-pen-down-source"></select></label>
+        <label class="writing-option wide">普通成功采集次数 / 每次额外完整轨迹<input id="pre-pen-down-normal-episodes" type="number" min="0" step="1"></label>
+        <label class="writing-option">靠近纸面 replay 来源（pen_down）<select id="pen-down-source"></select></label>
         <label class="writing-option">书写动态来源<select id="write-source"></select></label>
-        <label class="writing-option">离开纸面来源<select id="pen-up-source"></select></label>
+        <label class="writing-option">离开纸面相对 replay 来源（pen_up）<select id="pen-up-source"></select></label>
         <label class="writing-option">书写数字<select id="trajectory"></select></label>
         <label class="writing-option">书写方向<select id="direction"></select></label>
         <label class="writing-option">字形高度（米）<input id="writing-size" type="number" step="0.005"></label>
@@ -69,6 +69,7 @@
       <h3>正式 Writer 与存储</h3>
       <div class="configuration-grid">
         <label class="wide">触觉 Bundle 根目录<input id="tactile-bundle-root" type="text" spellcheck="false"></label>
+        <label class="toggle"><input id="collect-tactile" type="checkbox">采集触觉</label>
         <label>最低剩余空间（GiB）<input id="tactile-min-free" type="number" step="1"></label>
         <label>触觉压缩<select id="tactile-compression"></select></label>
         <label>Writer 线程数<input id="writer-workers" type="number" step="1"></label>
@@ -97,7 +98,7 @@
       <div>
         <p id="task-chain-step" class="task-chain-step">0 / 5</p>
         <h2 id="task-chain-title">任务链未启动</h2>
-        <p id="task-chain-detail">按“继续任务链”后先松开夹爪。</p>
+        <p id="task-chain-detail">等待右夹爪、安全门禁和轨迹配置就绪。</p>
         <p id="task-chain-selection" class="storage-status">尚未选择本轮轨迹。</p>
       </div>
       <button id="task-chain-advance" type="button" disabled>继续任务链（Alt+N）</button>

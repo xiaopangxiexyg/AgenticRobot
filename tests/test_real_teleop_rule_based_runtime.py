@@ -34,6 +34,7 @@ from robot_motion.replay import (
     RuleBasedReplay,
     RuleBasedSegmentStopCondition,
 )
+from robot_motion.rm65 import DualArmCollisionAwareRetargeterConfig
 from teleop_runtime.command_override import TeleopCommandOverride
 from teleop_runtime.backends.grippers.dmtac import (
     DMTacGripperBackend,
@@ -179,6 +180,410 @@ def _deployment() -> RuleBasedRealTeleopDeployment:
     )
 
 
+def test_writing_stage_coverage_requires_each_persisted_detail_stage() -> None:
+    group = _group()
+    capture = RuleBasedCaptureSelection(enabled=True)
+    steps = tuple(
+        RuleBasedReplay(
+            step_id=f"right_write.{phase}",
+            group_key=phase,
+            start_index=0,
+            end_index=2,
+            active_sides=("right",),
+            capture=capture,
+        )
+        for phase in ("pen_down", "write", "pen_up")
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(steps=steps),
+        trajectory_groups={phase: replace(group, key=phase) for phase in (
+            "pen_down",
+            "write",
+            "pen_up",
+        )},
+        config=RuleBasedRealTeleopConfig(
+            minimum_stage_sample_coverage=0.8,
+            minimum_stage_sample_count=2,
+        ),
+    )
+
+    assert set(extension._incomplete_detail_stages()) == {
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
+    }
+    extension._accepted_samples_by_detail_stage.update(
+        {
+            "right_write.pen_down": 2,
+            "right_write.write": 1,
+            "right_write.pen_up": 2,
+        }
+    )
+    assert set(extension._incomplete_detail_stages()) == {"right_write.write"}
+    extension._accepted_samples_by_detail_stage["right_write.write"] = 2
+    assert extension._incomplete_detail_stages() == {}
+
+
+def test_successful_random_source_attempt_advances_selection_ordinal() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6),
+                    right_arm=np.zeros(6),
+                ),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={},
+        source_selection={"selection_ordinal": 0},
+    )
+    rebuilt_ordinals: list[int] = []
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
+
+    def rebuild(configuration):
+        ordinal = int(configuration["_selection_ordinal"])
+        rebuilt_ordinals.append(ordinal)
+        rebuild_started.set()
+        assert release_rebuild.wait(timeout=2.0)
+        return RuleBasedRealTeleopExtension(
+            deployment=_deployment(),
+            plan=plan,
+            trajectory_groups={},
+            source_selection={"selection_ordinal": ordinal},
+        )
+
+    extension._configuration_rebuilder = rebuild
+    extension._selected_configuration = {
+        "pen_down_candidate_id": "__rule_source_pool_random__",
+    }
+    extension._configuration_options = {"runtime_info": {}}
+    extension._make_initial_alignment_planner = lambda: None
+    extension._recording_active = lambda: False
+    extension._dataset_recorder_provider = lambda: None
+    extension._control_ui = SimpleNamespace(
+        update_rule_runtime_info=lambda _values: None
+    )
+    extension._completed = True
+
+    extension._prepare_next_attempt_after_success(now=1.0)
+
+    assert rebuild_started.wait(timeout=1.0)
+    assert rebuilt_ordinals == [1]
+    assert extension._selection_ordinal == 0
+    assert extension._next_attempt_rebuild_future is not None
+
+    release_rebuild.set()
+    deadline = time.monotonic() + 2.0
+    while extension._next_attempt_rebuild_future is not None:
+        extension._prepare_next_attempt_after_success(now=1.1)
+        if time.monotonic() >= deadline:
+            raise AssertionError("next-attempt rebuild did not settle")
+        time.sleep(0.001)
+
+    assert extension._selection_ordinal == 1
+    assert extension.source_selection["selection_ordinal"] == 1
+
+
+def test_writing_reachability_blocks_start_until_background_check_passes() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={
+            "collection_mode": "rule_based_writing",
+            "selection_ordinal": 0,
+            "writing_reachability": {"enabled": True},
+            "writing_variant_selection": {
+                "enabled": True,
+                "selected_trajectory_id": "latin_a_v1",
+                "selected_direction": "up",
+                "selected_size_m": 0.06,
+            },
+        },
+    )
+    recorder = _Recorder(_Poller())
+    _session, _clutch, _ui = _bind(extension, recorder, arm=False)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._writing_reachability_request = lambda: {}
+    extension._run_writing_reachability_preflight = lambda _request: {
+        "reachable": True,
+        "probes": (),
+    }
+
+    extension.after_control_input_poll(now=1.0)
+    assert extension.status().rule_start_available is False
+    deadline = time.monotonic() + 2.0
+    while extension.status().writing_reachability_status != "passed":
+        extension.after_control_input_poll(now=1.1)
+        if time.monotonic() >= deadline:
+            raise AssertionError("writing reachability preflight did not settle")
+        time.sleep(0.001)
+
+    status = extension.status()
+    assert status.writing_reachability_status == "passed"
+    assert status.rule_start_available is True
+
+
+def test_writing_reachability_oracle_accepts_production_fast_path_config() -> None:
+    source = _group()
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="pen_down"),)
+        ),
+        trajectory_groups={
+            "pen_down": replace(
+                source,
+                arm_observation_actual_qpos={
+                    side: np.zeros((2, 6)) for side in ("left", "right")
+                },
+            )
+        },
+        source_selection={
+            "writing_reachability": {
+                "enabled": True,
+                "left_hold_pose_canonical_desk": _pose().tolist(),
+                "probes": [
+                    {"name": name, "right_pose_canonical_desk": _pose().tolist()}
+                    for name in ("left", "right", "top", "bottom")
+                ],
+            }
+        },
+    )
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    production_config = DualArmCollisionAwareRetargeterConfig(
+        output_qpos_smoothing_alpha=0.14,
+        output_qpos_admittance_fast_path_alpha=0.85,
+        output_qpos_smoothing_singularity_alpha=0.45,
+    )
+    retargeter = _Retargeter()
+    retargeter.config = production_config
+    extension._components = SimpleNamespace(
+        dual_arm_retargeter=retargeter,
+        session=_Session(),
+    )
+
+    request = extension._writing_reachability_request()
+
+    assert len(request["probes"]) == 4
+    assert request["oracle_config"].output_qpos_smoothing_alpha == 1.0
+    assert request["oracle_config"].output_qpos_admittance_fast_path_alpha == 1.0
+    assert request["oracle_config"].output_qpos_smoothing_singularity_alpha == 1.0
+    assert production_config.output_qpos_admittance_fast_path_alpha == 0.85
+
+
+def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+    )
+
+    def selection(ordinal: int) -> dict[str, object]:
+        return {
+            "collection_mode": "rule_based_writing",
+            "selection_ordinal": ordinal,
+            "writing_reachability": {"enabled": True},
+            "writing_variant_selection": {
+                "enabled": True,
+                "selected_trajectory_id": "latin_a_v1",
+                "selected_direction": "up",
+                "selected_size_m": 0.06,
+            },
+        }
+
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={"source": _group()},
+        source_selection=selection(0),
+    )
+    recorder = _Recorder(_Poller())
+    _session, _clutch, _ui = _bind(extension, recorder, arm=False)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._selected_configuration = {
+        "pen_down_candidate_id": "__rule_source_pool_random__",
+    }
+    extension._configuration_options = {"runtime_info": {}}
+    extension._configuration_rebuilder = lambda request: RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={"source": _group()},
+        source_selection=selection(int(request["_selection_ordinal"])),
+    )
+    extension._writing_reachability_request = lambda: {}
+    check_count = 0
+
+    def check(_request):
+        nonlocal check_count
+        check_count += 1
+        if check_count == 1:
+            return {
+                "reachable": False,
+                "probes": ({"name": "right", "reachable": False},),
+            }
+        return {"reachable": True, "probes": ()}
+
+    extension._run_writing_reachability_preflight = check
+
+    deadline = time.monotonic() + 2.0
+    while extension.status().writing_reachability_status != "passed":
+        extension.after_control_input_poll(now=1.0)
+        if time.monotonic() >= deadline:
+            raise AssertionError("unreachable candidate skip did not settle")
+        time.sleep(0.001)
+
+    assert extension._selection_ordinal == 1
+    assert extension.status().writing_reachability_skipped_count == 1
+    assert extension.status().held is False
+    assert extension.status().aborted is False
+    assert recorder.is_recording is False
+
+
+def test_successful_next_attempt_rebuild_keeps_certified_arm_hold_stream() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6),
+                    right_arm=np.zeros(6),
+                ),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={},
+        source_selection={"selection_ordinal": 0},
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=2.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=2.0,
+    )
+
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
+
+    def rebuild(configuration):
+        rebuild_started.set()
+        assert release_rebuild.wait(timeout=2.0)
+        return RuleBasedRealTeleopExtension(
+            deployment=_deployment(),
+            plan=plan,
+            trajectory_groups={},
+            source_selection={
+                "selection_ordinal": int(configuration["_selection_ordinal"])
+            },
+        )
+
+    extension._configuration_rebuilder = rebuild
+    extension._selected_configuration = {
+        "pen_down_candidate_id": "__rule_source_pool_random__",
+    }
+    extension._configuration_options = {"runtime_info": {}}
+    extension._completed = True
+    extension._armed = False
+    recorder.is_recording = False
+
+    extension._prepare_next_attempt_after_success(now=2.1)
+    assert rebuild_started.wait(timeout=1.0)
+    held = session.command_override_provider(SimpleNamespace(), 2.11)
+
+    assert set(held.command.commands) == {"left_arm", "right_arm"}
+    assert held.command.metadata["rule_based_pause_hold"] is True
+    assert (
+        held.command.metadata["rule_based_pause_reason"]
+        == "successful_next_attempt_rebuild"
+    )
+    assert held.command.metadata["dataset_recording_eligible"] is False
+
+    release_rebuild.set()
+    deadline = time.monotonic() + 2.0
+    while extension._next_attempt_rebuild_future is not None:
+        extension._prepare_next_attempt_after_success(now=2.2)
+        if time.monotonic() >= deadline:
+            raise AssertionError("next-attempt rebuild did not settle")
+        time.sleep(0.001)
+
+
+def test_successful_episode_reset_uses_current_qpos() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6),
+                    right_arm=np.zeros(6),
+                ),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={},
+    )
+    extension._make_initial_alignment_planner = lambda: None
+    extension._recording_active = lambda: False
+    extension._dataset_recorder_provider = lambda: None
+    extension._control_ui = SimpleNamespace(
+        update_rule_runtime_info=lambda _values: None
+    )
+    extension._completed = True
+
+    extension._prepare_next_attempt_after_success(now=1.0)
+
+    current_after_episode = {
+        side: {"actual_qpos": np.full(6, 0.1, dtype=float)}
+        for side in ("left", "right")
+    }
+    selected = extension._initial_alignment_start_qpos_pair(current_after_episode)
+    for side in ("left", "right"):
+        np.testing.assert_array_equal(
+            selected[side], current_after_episode[side]["actual_qpos"]
+        )
+
+
+
 class _Poller:
     def __init__(self) -> None:
         self.qpos = {"left": np.zeros(6), "right": np.zeros(6)}
@@ -249,6 +654,7 @@ class _HandBackend:
         self.config = SimpleNamespace(command_dim=0, max_action=1.0)
         self.measured_joint_pos = np.zeros(6, dtype=np.float32)
         self.joint_age_sec = 0.0
+        self.fixed_closed_one_shot_owner = True
 
     @staticmethod
     def send_command(_values) -> None:
@@ -268,6 +674,9 @@ class _HandBackend:
     @staticmethod
     def is_ready() -> bool:
         return True
+
+    def fixed_closed_one_shot_ready(self) -> bool:
+        return bool(self.fixed_closed_one_shot_owner)
 
 
 class _HandPoller:
@@ -647,6 +1056,126 @@ def test_writing_height_capture_uses_fresh_async_right_arm_read_and_is_recoverab
     assert extension.status().height_calibration_enabled is False
 
 
+def test_height_calibration_rebases_command_transport_from_alignment_snapshot() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    components = _components(_Session())
+    extension.attach_components(components)
+
+    class CommandBackend:
+        def __init__(self) -> None:
+            self.resets: list[np.ndarray] = []
+            self.stopped = False
+
+        def is_emergency_stopped(self) -> bool:
+            return self.stopped
+
+        def reset_motion_state(self, qpos) -> None:
+            self.resets.append(np.asarray(qpos, dtype=float).copy())
+
+    class PreviewBackend:
+        def __init__(self) -> None:
+            self.qpos = np.zeros(6, dtype=float)
+
+        def set_local_qpos(self, qpos) -> None:
+            self.qpos = np.asarray(qpos, dtype=float).copy()
+
+        def get_state(self):
+            return {"current_qpos": self.qpos.copy()}
+
+    command_backends = {
+        side: CommandBackend() for side in ("left", "right")
+    }
+    preview_backends = {
+        side: PreviewBackend() for side in ("left", "right")
+    }
+    for side in ("left", "right"):
+        setattr(components, f"{side}_command_backend", command_backends[side])
+        setattr(components, f"{side}_preview_backend", preview_backends[side])
+    components.position_execution_qvel_feedback_enabled = False
+
+    canonical = _pose(0.2, -0.1, 0.321)
+    raw = extension.runtime_pose_frame_contract.canonical_desk_pose_vector_to_storage(
+        canonical,
+        side="right",
+    )
+    extension._commit_writing_height(
+        {
+            "current_tcp_pose": _matrix(raw),
+            "measured_timestamp": 10.0,
+        },
+        now=10.0,
+        requested_at=9.9,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+    )
+    start = {
+        "left": np.linspace(-0.4, 0.1, 6),
+        "right": np.linspace(0.2, -0.3, 6),
+    }
+
+    extension._rebase_motion_transport_after_manual_adjustment(start)
+
+    assert extension._manual_adjustment_motion_rebase_pending is False
+    for side in ("left", "right"):
+        assert len(command_backends[side].resets) == 1
+        np.testing.assert_allclose(command_backends[side].resets[0], start[side])
+        np.testing.assert_allclose(preview_backends[side].qpos, start[side])
+        np.testing.assert_allclose(
+            components.dual_arm_retargeter.current_qpos[side],
+            start[side],
+        )
+
+    # The edge is one-shot; repeated planner polls cannot reset transport
+    # history underneath an already-running transition.
+    extension._rebase_motion_transport_after_manual_adjustment(start)
+    assert all(len(backend.resets) == 1 for backend in command_backends.values())
+
+
+def test_height_calibration_rebase_never_rearms_stopped_arm() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    components = _components(_Session())
+    extension.attach_components(components)
+
+    class StoppedBackend:
+        @staticmethod
+        def is_emergency_stopped() -> bool:
+            return True
+
+        @staticmethod
+        def reset_motion_state(_qpos) -> None:
+            raise AssertionError("stopped backend must not be reset")
+
+    class PreviewBackend:
+        @staticmethod
+        def set_local_qpos(_qpos) -> None:
+            raise AssertionError("preview must not change after failed preflight")
+
+    for side in ("left", "right"):
+        setattr(components, f"{side}_command_backend", StoppedBackend())
+        setattr(components, f"{side}_preview_backend", PreviewBackend())
+    extension._manual_adjustment_motion_rebase_pending = True
+
+    with pytest.raises(RuntimeError, match="runtime Home is required"):
+        extension._rebase_motion_transport_after_manual_adjustment(
+            {"left": np.zeros(6), "right": np.zeros(6)}
+        )
+
+    assert extension._manual_adjustment_motion_rebase_pending is True
+
+
 def test_writing_replay_height_projection_is_lower_floor_only_and_opt_in() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -810,17 +1339,9 @@ def test_rule_start_allows_only_pre_episode_armed_warmup_without_motion() -> Non
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
-            steps=(
-                RuleBasedCustomAction(
-                    step_id="collect",
-                    action=RobotAction.bimanual_qpos(
-                        left_arm=np.zeros(6),
-                        right_arm=np.zeros(6),
-                    ),
-                ),
-            )
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
         ),
-        trajectory_groups={},
+        trajectory_groups={"source": _group()},
     )
     recorder = _Recorder(_Poller())
     session, _clutch, _ui = _bind(extension, recorder)
@@ -834,6 +1355,140 @@ def test_rule_start_allows_only_pre_episode_armed_warmup_without_motion() -> Non
 
     extension._held = True
     assert not runtime_extension_allows_pre_episode_armed_warmup(extension)
+
+
+def test_rule_start_waits_for_right_one_shot_grip_owner_without_disabling_release() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedInitialize(step_id="init", group_key="source"),
+            )
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, _ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+    extension._components.right_hand_backend.fixed_closed_one_shot_ready = (
+        lambda: False
+    )
+
+    status = extension.status()
+    assert status.rule_start_available is False
+    assert status.gripper_control_available is True
+    assert status.readiness_blockers["rule.right_hand_hold_owner"]
+    assert extension.allows_pre_episode_armed_warmup() is False
+    assert session.external_commands == []
+
+
+def test_rule_runtime_exposes_configured_hand_fault_before_writer_open() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6),
+                        right_arm=np.zeros(6),
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, _ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    class _UnreadyHandBackend(_HandBackend):
+        @staticmethod
+        def is_ready() -> bool:
+            return False
+
+        @staticmethod
+        def readiness_report() -> dict[str, object]:
+            return {"ready": False, "reason": "DMTAC fault"}
+
+    extension._components.right_hand_backend = _UnreadyHandBackend()
+    blockers = extension.collection_startup_blockers()
+
+    assert blockers == {"right_hand": "right_hand DMTAC fault"}
+    assert session.state_machine.state.value == "ARMED"
+
+
+def test_pre_dispatch_hand_fault_cancels_armed_attempt_instead_of_stranding_countdown() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6),
+                        right_arm=np.zeros(6),
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+    session, clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=True,
+        hand_sides=("right",),
+    )
+    session.rig = SimpleNamespace(
+        readiness_report=lambda: {
+            "ready": False,
+            "reason": "unready backends: right_hand",
+            "backends": {
+                "right_hand": {
+                    "ready": False,
+                    "reason": "telemetry_failed: Write timeout",
+                }
+            },
+        }
+    )
+    right_backend = extension._components.right_hand_backend
+    right_backend.is_ready = lambda: False
+    right_backend.readiness_report = lambda: {
+        "ready": False,
+        "reason": "telemetry_failed: Write timeout",
+    }
+
+    extension.after_control_input_poll(now=1.0)
+
+    status = extension.status()
+    assert status.armed is False
+    assert status.aborted is True
+    assert status.held is True
+    assert status.waiting_reason == "session_readiness_failure"
+    assert session.hold_reasons
+    assert clutch.reasons == ["rule_based_runtime_hold"]
+    assert ui.failure_stop_requests == 1
+    assert any("Write timeout" in message for _tag, message in ui.messages)
+    assert any(
+        tag == "RuleBased"
+        and "规则运行时因以下原因请求 Hold" in message
+        and "Write timeout" in message
+        for tag, message in ui.messages
+    )
 
 
 def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> None:
@@ -851,6 +1506,14 @@ def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> N
             )
         ),
         trajectory_groups={},
+        source_selection={
+            "selection_ordinal": 3,
+            "phases": {
+                "pen_down": {"candidate_id": "approach-3"},
+                "write": {"candidate_id": "write-3"},
+                "pen_up": {"candidate_id": "depart-3"},
+            },
+        },
     )
     recorder = _Recorder(_Poller())
     session, _clutch, ui = _bind(extension, recorder, arm=False)
@@ -870,6 +1533,10 @@ def test_rule_status_never_claims_start_ready_while_session_is_debug_only() -> N
     extension._publish_status()
     assert len(ui.statuses) == publish_count + 1
     assert ui.statuses[-1]["rule_start_available"] is not True
+    assert ui.statuses[-1]["source_selection"]["selection_ordinal"] == 3
+    assert ui.statuses[-1]["source_selection"]["phases"]["pen_down"] == {
+        "candidate_id": "approach-3"
+    }
     extension._publish_status()
     assert len(ui.statuses) == publish_count + 1
 
@@ -1264,6 +1931,8 @@ def test_progress_fix_is_deferred_until_final_dual_arm_alignment_arrives() -> No
         config=RuleBasedRealTeleopConfig(settle_consecutive_samples=1),
     )
     poller = _Poller()
+    for side in ("left", "right"):
+        poller.qpos[side] = np.full(6, -0.02)
     poller.qpos = {
         "left": np.full(6, -0.02),
         "right": np.full(6, -0.02),
@@ -1664,85 +2333,85 @@ def test_rule_start_is_unavailable_with_preexisting_fix_authority() -> None:
     assert session.command_override_provider(SimpleNamespace(), 1.2).command is None
 
 
-def test_first_rule_qref_retries_only_startup_home_continuity_dwell() -> None:
+def test_first_initial_alignment_uses_fresh_causal_state_after_runtime_home() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
             steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
         ),
         trajectory_groups={"source": _group()},
-        config=RuleBasedRealTeleopConfig(settle_consecutive_samples=1),
+    )
+    later_causal = {
+        side: {"actual_qpos": np.zeros(6, dtype=float)}
+        for side in ("left", "right")
+    }
+
+    selected = extension._initial_alignment_start_qpos_pair(later_causal)
+
+    np.testing.assert_array_equal(
+        selected["left"], later_causal["left"]["actual_qpos"]
+    )
+    np.testing.assert_array_equal(
+        selected["right"], later_causal["right"]["actual_qpos"]
+    )
+
+    extension._execution_begun = True
+    current_after_dispatch = extension._initial_alignment_start_qpos_pair(
+        later_causal
+    )
+    np.testing.assert_array_equal(
+        current_after_dispatch["left"], later_causal["left"]["actual_qpos"]
+    )
+
+
+def test_initial_alignment_rejects_actual_arm_drift_during_background_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
     )
     recorder = _Recorder(_Poller())
     recorder.is_recording = True
     session, _clutch, _ui = _bind(extension, recorder)
+    planner = extension._initial_alignment_planner
+    assert planner is not None
+    original_plan = planner.plan
+    entered = threading.Event()
+    release = threading.Event()
 
-    first = _wait_for_command(session, now=2.0)
-    command = first.command
-    command.metadata["startup_home_continuity"] = {
-        "schema": "teleop_runtime.startup_home_continuity/v1",
-        "epoch": 1,
-        "status": "continuity_dwell",
-        "armed": True,
-        "released": False,
-        "dispatch_allowed": False,
-        "stable_frames": 1,
-        "required_consecutive_frames": 3,
-    }
-    extension._components.startup_home_continuity_gate = SimpleNamespace(
-        snapshot=lambda: dict(command.metadata["startup_home_continuity"])
-    )
-    extension.after_session_step(
-        step_result=SimpleNamespace(
-            command=command,
-            command_dispatched=False,
-            state=SimpleNamespace(value="ARMED"),
-            faults=(),
+    def blocked_plan(**kwargs):
+        entered.set()
+        if not release.wait(timeout=2.0):
+            raise AssertionError("test did not release the planning worker")
+        return original_plan(**kwargs)
+
+    monkeypatch.setattr(planner, "plan", blocked_plan)
+    assert session.command_override_provider(SimpleNamespace(), 2.0).command is None
+    assert entered.wait(timeout=2.0)
+    recorder.arm_state_poller.qpos["right"][2] = np.deg2rad(0.5)
+    release.set()
+    for _ in range(200):
+        if extension._initial_alignment_future.done():
+            break
+        time.sleep(0.001)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "actual arm state drifted while the transition was being planned: "
+            "side=right joint=3"
         ),
-        now=2.0,
-    )
-
-    assert extension.status().aborted is False
-    assert extension.status().execution_begun is False
-    assert extension.status().waiting_reason == "startup_home_continuity_dwell"
-    assert runtime_extension_allows_active_episode_bootstrap_without_dispatch(
-        extension
-    )
-    assert extension.dataset_sample_admission(
-        step_result=SimpleNamespace(command_dispatched=False),
-        now=2.0,
-    ).allowed is False
-
-    retry = session.command_override_provider(SimpleNamespace(), 2.01)
-    assert retry.command is command
-    for side in ("left", "right"):
-        recorder.arm_state_poller.qpos[side] = np.asarray(
-            command.commands[f"{side}_arm"].value,
-            dtype=float,
-        )
-    command.metadata["startup_home_continuity"] = {
-        **command.metadata["startup_home_continuity"],
-        "status": "released",
-        "dispatch_allowed": True,
-        "stable_frames": 3,
-    }
-    extension.after_session_step(
-        step_result=SimpleNamespace(
-            command=command,
-            command_dispatched=True,
-            state=SimpleNamespace(value="RUNNING"),
-            faults=(),
-        ),
-        now=2.01,
-    )
-
-    assert extension.status().execution_begun is True
-    assert not runtime_extension_allows_active_episode_bootstrap_without_dispatch(
-        extension
-    )
+    ):
+        session.command_override_provider(SimpleNamespace(), 2.1)
+    assert extension.status().aborted is True
+    assert extension.status().held is True
 
 
-def test_first_rule_qref_rejection_holds_and_automatically_reclaims_episode() -> None:
+def test_non_dispatched_rule_frame_holds_and_automatically_reclaims_episode() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -1754,12 +2423,6 @@ def test_first_rule_qref_rejection_holds_and_automatically_reclaims_episode() ->
     recorder.is_recording = True
     session, clutch, ui = _bind(extension, recorder)
     first = _wait_for_command(session, now=3.0)
-    first.command.metadata["startup_home_continuity"] = {
-        "schema": "teleop_runtime.startup_home_continuity/v1",
-        "status": "outside_home_envelope",
-        "dispatch_allowed": False,
-    }
-
     extension.after_session_step(
         step_result=SimpleNamespace(
             command=first.command,
@@ -2351,6 +3014,435 @@ def test_manual_dual_gripper_buttons_use_typed_non_recorded_dispatch_and_lock_af
     assert "没有活动 Episode" in extension.status().gripper_action_status
 
 
+def test_task_chain_close_right_gripper_only_dispatches_right_hand() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("left", "right")),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("left", "right"),
+    )
+    backends = {
+        side: getattr(extension._components, f"{side}_hand_backend")
+        for side in ("left", "right")
+    }
+    for backend in backends.values():
+        backend.set_measured_scalar(0.5)
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    now = 10.0
+    while extension._pending_gripper_action is not None:
+        command_count = len(session.external_commands)
+        session.command_override_provider(SimpleNamespace(), now)
+        if len(session.external_commands) > command_count:
+            close = session.external_commands[-1]
+            assert set(close.commands) == {"right_hand"}
+            assert close.metadata["rule_based_manual_gripper_sides"] == ["right"]
+            command = close.commands["right_hand"]
+            # Admission closes in one-shot mode so a real idle/force-stop
+            # receipt is required. Writing retains this same fixed mode.
+            assert command.metadata["dmtac_continuous_grasp_override"] is False
+            assert command.metadata["dmtac_preserve_existing_grip"] is False
+            assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
+                "single_endpoint_feedback_gated"
+            )
+            assert command.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_close"
+            )
+            assert float(command.value[0]) == pytest.approx(1.0)
+            backends["right"].set_measured_scalar(float(command.value[0]))
+            assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
+        now += 0.05
+        assert now < 20.0
+
+    assert float(backends["left"].measured_joint_pos[0]) == pytest.approx(0.5)
+    assert float(backends["right"].measured_joint_pos[0]) == pytest.approx(1.0)
+    assert len(session.external_commands) == 1
+    assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+    assert extension.status().gripper_action_intent == "close_right_gripper"
+    assert extension.status().gripper_action_result == "succeeded"
+    assert extension.status().gripper_action_id == 1
+
+
+def test_task_chain_release_right_gripper_preserves_left_hand() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("left", "right")),
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("left", "right"),
+    )
+    left = extension._components.left_hand_backend
+    right = extension._components.right_hand_backend
+    left.set_measured_scalar(0.5)
+    right.set_measured_scalar(0.5)
+
+    ui.intents.append("release_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    now = 10.0
+    while extension._pending_gripper_action is not None:
+        command_count = len(session.external_commands)
+        session.command_override_provider(SimpleNamespace(), now)
+        if len(session.external_commands) > command_count:
+            release = session.external_commands[-1]
+            assert set(release.commands) == {"right_hand"}
+            command = release.commands["right_hand"]
+            assert command.metadata["dmtac_continuous_grasp_override"] is False
+            assert command.metadata["dmtac_preserve_existing_grip"] is False
+            assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
+                "single_endpoint_feedback_gated"
+            )
+            assert command.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_open"
+            )
+            assert release.metadata["rule_based_manual_gripper_motion_mode"] == (
+                "one_shot_open"
+            )
+            assert float(command.value[0]) == pytest.approx(0.0)
+            right.set_measured_scalar(float(command.value[0]))
+        now += 0.05
+        assert now < 20.0
+
+    assert float(left.measured_joint_pos[0]) == pytest.approx(0.5)
+    assert float(right.measured_joint_pos[0]) == pytest.approx(0.0)
+    assert len(session.external_commands) == 1
+    status = extension.status()
+    assert status.gripper_action_status == "右夹爪实测已松开"
+    assert status.gripper_action_intent == "release_right_gripper"
+    assert status.gripper_action_result == "succeeded"
+
+
+def test_task_chain_close_right_waits_for_idle_after_closed_endpoint() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+
+    class _AlreadyClosedCatchPoller:
+        def __init__(self) -> None:
+            self.status_code = 4
+            self.is_moving = True
+            self.timestamp = 9.0
+
+        def latest_at_or_before(self, _now):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = 1.0
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": self.is_moving,
+                }
+            }
+
+    hand_poller = _AlreadyClosedCatchPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+    command = session.external_commands[-1]
+    assert set(command.commands) == {"right_hand"}
+    assert float(command.commands["right_hand"].value[0]) == pytest.approx(1.0)
+    assert command.commands["right_hand"].metadata[
+        "dmtac_continuous_grasp_override"
+    ] is False
+
+    # Position=1 is not a completion receipt while firmware still reports
+    # closing/catching. The one-shot transition must reach a stable idle
+    # status before the task chain can enter height calibration.
+    hand_poller.timestamp = 10.1
+    for now in (10.1, 10.2):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_right_gripper"
+        hand_poller.timestamp += 0.1
+    assert "闭合运动" in extension.status().gripper_action_status
+
+    hand_poller.status_code = 2
+    hand_poller.is_moving = False
+    for now in (10.3, 10.4):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_right_gripper"
+        hand_poller.timestamp += 0.1
+    session.command_override_provider(SimpleNamespace(), 10.5)
+    assert extension._pending_gripper_action is None
+    assert extension.status().gripper_action_status == "右夹爪实测已闭紧"
+
+
+def test_writing_keeps_right_gripper_in_fixed_one_shot_mode() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    action = SimpleNamespace(
+        timestamp=1.0,
+        metadata={"collection_detail_stage_id": "right_write.pen_up"},
+    )
+    command = TeleopCommand(
+        commands={
+            "right_hand": EffectorCommand(
+                effector_name="right_hand",
+                side="right",
+                command_type="joint_vector",
+                value=np.full(6, 0.8),
+                metadata={},
+            )
+        },
+        timestamp=1.0,
+        metadata={},
+    )
+    emission = SimpleNamespace(
+        action=action,
+        command=command,
+        directive=SimpleNamespace(segment_terminal=True),
+    )
+
+    extension._prepare_live_dispatch(emission, 2.0)
+
+    hand_command = command.commands["right_hand"]
+    assert np.asarray(hand_command.value, dtype=float) == pytest.approx(
+        np.full(6, 0.8)
+    )
+    assert hand_command.metadata["dmtac_continuous_grasp_override"] is False
+    assert hand_command.metadata["dmtac_preserve_existing_grip"] is True
+    assert command.metadata[
+        "rule_based_right_gripper_hold_mode"
+    ] == "task_chain_fixed_closed_one_shot"
+
+
+def test_nonterminal_writing_frame_uses_same_fixed_one_shot_grip_mode() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    command = TeleopCommand(
+        commands={
+            "right_hand": EffectorCommand(
+                effector_name="right_hand",
+                side="right",
+                command_type="joint_vector",
+                value=np.full(6, 0.8),
+                metadata={},
+            )
+        },
+        timestamp=1.0,
+        metadata={"collection_detail_stage_id": "right_write.pen_up"},
+    )
+    emission = SimpleNamespace(
+        action=SimpleNamespace(timestamp=1.0, metadata={}),
+        command=command,
+        directive=SimpleNamespace(segment_terminal=False),
+    )
+
+    extension._prepare_live_dispatch(emission, 2.0)
+
+    assert command.commands["right_hand"].metadata[
+        "dmtac_continuous_grasp_override"
+    ] is False
+    assert command.commands["right_hand"].metadata[
+        "dmtac_preserve_existing_grip"
+    ] is True
+    assert command.metadata["rule_based_right_gripper_hold_mode"] == (
+        "task_chain_fixed_closed_one_shot"
+    )
+
+
+def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    recorder = _Recorder(_Poller())
+
+    class _ForceStoppedPoller:
+        def __init__(self) -> None:
+            self.value = 0.5
+            self.timestamp = 9.0
+            self.status_code = 2
+
+        def latest_at_or_before(self, _now):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = self.value
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": False,
+                }
+            }
+
+    hand_poller = _ForceStoppedPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_right_gripper")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+
+    # A closed-side idle sample without measured progress is ambiguous: it can
+    # be a stall and must not be promoted to a successful grasp.
+    hand_poller.status_code = 2
+    hand_poller.timestamp = 10.1
+    session.command_override_provider(SimpleNamespace(), 10.1)
+    assert extension._pending_gripper_action == "close_right_gripper"
+    assert len(session.external_commands) == 1
+
+    # A pen/object can stop the hand below the numeric endpoint.  Once the
+    # causal close has produced forward measured progress, the same stable
+    # endpoint gate accepts status=2 as a valid closed-side idle receipt.
+    hand_poller.value = 0.53
+    for timestamp, now in ((10.2, 10.2), (10.3, 10.3), (10.4, 10.4)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        if now < 10.4:
+            assert extension._pending_gripper_action == "close_right_gripper"
+
+    status = extension.status()
+    assert extension._pending_gripper_action is None
+    assert len(session.external_commands) == 1
+    assert status.gripper_action_status == "右夹爪实测已闭紧"
+    assert status.gripper_action_result == "succeeded"
+
+    nominal = np.zeros(6, dtype=np.float32)
+    nominal[0] = 1.0
+    assert extension._writing_right_gripper_force_stop_reached(
+        side="right",
+        target=nominal,
+        snapshots={
+            "right": {
+                "hand_state": {
+                    "gripper_status_code": 6,
+                    "gripper_error_code": 0,
+                    "gripper_is_moving": False,
+                },
+            }
+        },
+    )
+    partial_idle_state = {
+        "gripper_status_code": 2,
+        "gripper_error_code": 0,
+        "gripper_is_moving": False,
+        "gripper_commanded_scalar": 1.0,
+    }
+    assert extension._writing_right_gripper_force_stop_reached(
+        side="right",
+        target=nominal,
+        snapshots={
+            "right": {
+                "actual_hand_qpos": np.asarray(
+                    [0.53, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    dtype=np.float32,
+                ),
+                "hand_state": partial_idle_state,
+            }
+        },
+    )
+    assert extension._writing_right_gripper_hold_admitted(
+        target=nominal,
+        snapshots={
+            "right": {
+                "actual_hand_qpos": np.asarray(
+                    [0.53, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    dtype=np.float32,
+                ),
+                "hand_state": partial_idle_state,
+            }
+        },
+    )
+    assert extension._writing_right_gripper_hold_admitted(
+        target=nominal,
+        snapshots={
+            "right": {
+                "actual_hand_qpos": np.asarray(
+                    [0.53, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    dtype=np.float32,
+                ),
+                "hand_state": {
+                    "gripper_status_code": 6,
+                    "gripper_error_code": 0,
+                    "gripper_is_moving": False,
+                },
+            }
+        },
+    )
+
+
 def test_manual_gripper_reset_uses_recorder_hand_history_without_backend_read() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -2656,7 +3748,88 @@ def test_manual_gripper_close_requires_strict_endpoint_and_sends_final_target() 
     assert command.metadata["dmtac_continuous_grasp_override"] is True
 
     backend.set_measured_scalar(1.0)
+    for now in (10.1, 10.2):
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    session.command_override_provider(SimpleNamespace(), 10.3)
+    assert extension._pending_gripper_action is None
+    assert extension.status().gripper_action_status == "夹爪实测已闭紧"
+
+
+def test_manual_gripper_endpoint_waits_for_post_command_fresh_frames() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+    )
+    recorder = _Recorder(_Poller())
+
+    class TimestampedHandPoller:
+        def __init__(self) -> None:
+            self.value = 0.981
+            self.timestamp = 9.0
+            self.status_code = 2
+            self.is_moving = False
+
+        def latest_at_or_before(self, _now, **_kwargs):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = self.value
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": self.is_moving,
+                }
+            }
+
+    hand_poller = TimestampedHandPoller()
+    recorder.hand_state_poller = hand_poller
+    session, _clutch, ui = _bind(
+        extension,
+        recorder,
+        arm=False,
+        hand_sides=("right",),
+    )
+
+    ui.intents.append("close_grippers")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+
+    hand_poller.value = 1.0
+    hand_poller.timestamp = 10.0  # The pre-dispatch cached frame is rejected.
     session.command_override_provider(SimpleNamespace(), 10.1)
+    assert extension._pending_gripper_action == "close_grippers"
+    assert "新鲜反馈" in extension.status().gripper_action_status
+
+    hand_poller.status_code = 4
+    hand_poller.is_moving = True
+    for timestamp, now in ((10.1, 10.2), (10.2, 10.3)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    assert "闭合运动" in extension.status().gripper_action_status
+
+    # Position=1 with status 4 is still the user's observed failure mode:
+    # the gripper is closing, not settled.  Only an idle closed status may
+    # contribute endpoint samples.
+    hand_poller.status_code = 2
+    hand_poller.is_moving = False
+    for timestamp, now in ((10.3, 10.4), (10.4, 10.5)):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+    hand_poller.timestamp = 10.5
+    session.command_override_provider(SimpleNamespace(), 10.6)
     assert extension._pending_gripper_action is None
     assert extension.status().gripper_action_status == "夹爪实测已闭紧"
 
@@ -2773,6 +3946,10 @@ def test_manual_gripper_close_then_release_recovers_from_real_backend_rate_limit
 
     def run_until_complete(*, deadline: float) -> None:
         while extension._pending_gripper_action is not None:
+            # With telemetry disabled this fixture has to advance the same
+            # hardware timestamp that production HandStateHistoryPoller
+            # advances after each fresh register read.
+            backend._latest_joint_timestamp = clock.now
             session.command_override_provider(SimpleNamespace(), clock.now)
             clock.now += 0.01
             assert clock.now < deadline
@@ -2916,6 +4093,42 @@ def test_prestart_configuration_rebuild_updates_numeric_alignment_speed_off_loop
     assert extension._height_calibration is calibration
     assert ui.configuration_results[-1] == {"selected": request, "error": None}
     assert commits == [(request, replacement)]
+
+
+def test_prestart_configuration_rejects_closed_executor_without_loop_crash() -> None:
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+            ),
+        )
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=plan,
+        trajectory_groups={},
+    )
+    extension.configure_prestart_rebuild(
+        options={"fixture": True},
+        selected={"fixture": "old"},
+        rebuilder=lambda _request: extension,
+    )
+    recorder = _Recorder(_Poller())
+    _session, _clutch, ui = _bind(extension, recorder, arm=False)
+    extension._configuration_executor.shutdown(wait=True, cancel_futures=True)
+    ui.configuration_requests.append({"fixture": "new"})
+
+    extension.after_control_input_poll(now=1.0)
+
+    status = extension.status()
+    assert status.configuration_pending is False
+    assert status.waiting_reason == "configuration_rejected"
+    assert "cannot schedule new futures after shutdown" in status.configuration_error
+    assert ui.configuration_results[-1] == {
+        "selected": None,
+        "error": status.configuration_error,
+    }
 
 
 def test_prestart_configuration_completes_while_rig_fault_blocks_runtime_home() -> None:
@@ -3310,6 +4523,15 @@ def test_successful_attempt_waits_for_finalize_then_releases_rule_fix_without_ho
     assert controller.fixed_sides == ()
     assert controller.calls == [(4.1, "rule-based Episode completed", False)]
     assert clutch.reasons == []
+
+    # The shared Session intentionally remains RUNNING between successful
+    # attempts.  A fresh START must still reopen the narrow command-inert
+    # writer bootstrap used before the first rule qref.
+    _ui.request_start()
+    extension.after_control_input_poll(now=4.2)
+    assert extension.status().armed is True
+    assert extension.status().execution_begun is False
+    assert extension.allows_pre_episode_armed_warmup() is True
 
 
 def test_successful_attempt_opens_inter_episode_gripper_maintenance_window() -> None:
@@ -3861,6 +5083,98 @@ def test_writer_pause_hold_keeps_initial_alignment_rewrite_guard_active() -> Non
     assert fault.code == "rule_based_initial_alignment_command_rewritten"
 
 
+def test_transient_arm_read_failure_holds_then_resumes_without_cursor_advance() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(
+            settle_consecutive_samples=1,
+            arm_feedback_recovery_timeout_sec=0.5,
+        ),
+    )
+    poller = _Poller()
+    for side in ("left", "right"):
+        poller.qpos[side] = np.full(6, -0.02)
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=32.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=32.0,
+    )
+    current = extension._current
+
+    poller.blocked["right"] = "hardware_read_failed"
+    paused = session.command_override_provider(SimpleNamespace(), 32.1)
+    assert paused.command.metadata["rule_based_pause_hold"] is True
+    assert extension._current is current
+    assert extension.status().aborted is False
+
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=paused.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=32.1,
+    )
+    poller.blocked.clear()
+    resumed = session.command_override_provider(SimpleNamespace(), 32.2)
+    assert resumed.command is not None
+    assert resumed.command.metadata.get("rule_based_pause_hold") is not True
+    assert extension.status().aborted is False
+
+
+def test_sustained_arm_read_failure_remains_fail_closed_after_grace() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6),
+                        right_arm=np.zeros(6),
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            settle_consecutive_samples=1,
+            arm_feedback_recovery_timeout_sec=0.25,
+        ),
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=34.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=34.0,
+    )
+    poller.blocked["left"] = "hardware_read_failed"
+    assert session.command_override_provider(SimpleNamespace(), 34.1).command is not None
+    with pytest.raises(RuntimeError, match="lost formal collection readiness"):
+        session.command_override_provider(SimpleNamespace(), 34.36)
+
+
 def test_writer_pause_shifts_initial_alignment_clock_without_resume_catchup() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -4064,6 +5378,47 @@ def test_initial_alignment_streams_qrefs_and_bounds_measured_tracking_lag() -> N
         raise AssertionError("initial alignment did not enforce tracking lag bound")
     assert extension.status().waiting_reason == "initial_alignment_tracking_lag"
     assert extension.status().aborted is False
+
+
+def test_initial_alignment_reacquires_zero_motion_qref_before_second_waypoint() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(settle_consecutive_samples=3),
+    )
+    poller = _Poller()
+    for side in ("left", "right"):
+        poller.qpos[side] = np.full(6, -0.12)
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    now = 60.0
+    first = _wait_for_command(session, now=now)
+    assert first.command.metadata["rule_based_initial_alignment_waypoint_index"] == 0
+    for sample_index in range(2):
+        extension.after_session_step(
+            step_result=SimpleNamespace(command_dispatched=True),
+            now=now,
+        )
+        now += 0.02
+        repeated = session.command_override_provider(SimpleNamespace(), now)
+        assert (
+            repeated.command.metadata[
+                "rule_based_initial_alignment_waypoint_index"
+            ]
+            == 0
+        )
+
+    extension.after_session_step(
+        step_result=SimpleNamespace(command_dispatched=True),
+        now=now,
+    )
+    advanced = session.command_override_provider(SimpleNamespace(), now + 0.02)
+    assert advanced.command.metadata["rule_based_initial_alignment_waypoint_index"] == 1
 
 
 def test_initial_alignment_slips_late_clock_without_catchup_burst() -> None:
@@ -4638,6 +5993,292 @@ def test_replay_uses_source_duration_with_dense_60hz_coupled_references() -> Non
     } == {0, 1}
 
 
+def test_opted_in_custom_segment_uses_dense_reference_clock_and_source_capture_ids() -> None:
+    source_actions = iter(
+        (
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                timestamp=0.0,
+                arm_pose_by_side={
+                    "left": _pose(0.0),
+                    "right": _pose(0.0),
+                },
+                frame_by_effector={
+                    "left_arm": "canonical_desk",
+                    "right_arm": "canonical_desk",
+                },
+                controlled_frame_by_effector={
+                    "left_arm": "tool_tcp",
+                    "right_arm": "tool_tcp",
+                },
+                source="writing_keyframe",
+                metadata={
+                    "rule_based_position_reference_resample": True,
+                    "rule_based_position_keyframe_hz": 15.0,
+                },
+            ),
+            RobotAction(
+                action_space=BIMANUAL_EE_POSE_V1,
+                timestamp=1.0 / 15.0,
+                arm_pose_by_side={
+                    "left": _pose(0.0),
+                    "right": _pose(0.02),
+                },
+                frame_by_effector={
+                    "left_arm": "canonical_desk",
+                    "right_arm": "canonical_desk",
+                },
+                controlled_frame_by_effector={
+                    "left_arm": "tool_tcp",
+                    "right_arm": "tool_tcp",
+                },
+                source="writing_keyframe",
+                metadata={
+                    "rule_based_position_reference_resample": True,
+                    "rule_based_position_keyframe_hz": 15.0,
+                },
+            ),
+        )
+    )
+    source_calls = 0
+
+    def produce(_observation):
+        nonlocal source_calls
+        source_calls += 1
+        return next(source_actions)
+
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedActionSegment(
+                    step_id="right_write.write",
+                    action_source=CallableActionSource(produce),
+                    stop_condition=RuleBasedSegmentStopCondition(max_steps=2),
+                    capture=RuleBasedCaptureSelection(enabled=True),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            action_hz=15.0,
+            position_reference_hz=60.0,
+        ),
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    references = []
+    admitted_sequences = []
+    for index in range(5):
+        now = 3200.0 + index / 60.0 + 1e-6
+        command = session.command_override_provider(SimpleNamespace(), now).command
+        assert command is not None
+        references.append(command)
+        extension.after_session_step(
+            step_result=SimpleNamespace(command_dispatched=True),
+            now=now,
+        )
+        admission = extension.dataset_sample_admission(
+            step_result=SimpleNamespace(command_dispatched=True),
+            now=now,
+        )
+        if admission.allowed:
+            admitted_sequences.append(
+                int(admission.metadata["rule_based_sequence_index"])
+            )
+            extension.after_dataset_sample_attempt(
+                admission=admission,
+                accepted=True,
+                now=now,
+            )
+
+    assert source_calls == 2
+    assert [
+        item.metadata["rule_based_reference_sequence"] for item in references
+    ] == list(range(5))
+    assert references[0].metadata["rule_based_reference_timestamp_sec"] == pytest.approx(
+        0.0
+    )
+    assert references[-1].metadata[
+        "rule_based_reference_timestamp_sec"
+    ] == pytest.approx(1.0 / 15.0)
+    assert all(
+        item.metadata["rule_based_reference_source_kind"] == "custom_action"
+        for item in references
+    )
+    assert all(
+        item.metadata["rule_based_phase"] == "write_rule_base"
+        for item in references
+    )
+    assert all(
+        item.metadata["rule_based_coupled_pose_safety"] for item in references
+    )
+    right_positions = np.stack(
+        [
+            item.metadata["rule_based_target_pose_base_by_side"]["right"][:3, 3]
+            for item in references
+        ]
+    )
+    left_positions = np.stack(
+        [
+            item.metadata["rule_based_target_pose_base_by_side"]["left"][:3, 3]
+            for item in references
+        ]
+    )
+    assert np.max(np.linalg.norm(np.diff(right_positions, axis=0), axis=1)) <= 0.005001
+    assert np.allclose(np.diff(left_positions, axis=0), 0.0)
+    assert {
+        item.metadata["rule_based_sequence_index"] for item in references
+    } == {0, 1}
+    assert admitted_sequences == [0, 1]
+
+
+def test_custom_action_reference_accepts_source_frame_used_as_right_bracket() -> None:
+    """Jittered source times must not fail when interpolation still represents a frame."""
+
+    timestamps = (0.0, 0.018, 0.019, 0.04)
+    source_actions = iter(
+        RobotAction(
+            action_space=BIMANUAL_EE_POSE_V1,
+            timestamp=timestamp,
+            arm_pose_by_side={
+                "left": _pose(0.0),
+                "right": _pose(index * 0.01),
+            },
+            frame_by_effector={
+                "left_arm": "canonical_desk",
+                "right_arm": "canonical_desk",
+            },
+            controlled_frame_by_effector={
+                "left_arm": "tool_tcp",
+                "right_arm": "tool_tcp",
+            },
+            source="writing_keyframe",
+            metadata={
+                "rule_based_position_reference_resample": True,
+                "rule_based_position_keyframe_hz": 30.0,
+            },
+        )
+        for index, timestamp in enumerate(timestamps)
+    )
+
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedActionSegment(
+                    step_id="right_write.write",
+                    action_source=CallableActionSource(
+                        lambda _observation: next(source_actions)
+                    ),
+                    stop_condition=RuleBasedSegmentStopCondition(
+                        max_steps=len(timestamps),
+                        min_steps=len(timestamps),
+                        name="jittered_source_complete",
+                    ),
+                    capture=RuleBasedCaptureSelection(enabled=True),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            action_hz=30.0,
+            position_reference_hz=60.0,
+        ),
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    first = session.command_override_provider(SimpleNamespace(), 3300.0).command
+    assert first is not None
+    assert any(
+        carrier.right_parent_source_index == 1
+        for carrier in extension._replay_reference_queue
+    )
+    second = session.command_override_provider(
+        SimpleNamespace(), 3300.0 + (1.0 / 60.0) + 1e-6
+    ).command
+    assert second is not None
+    # Source frame 1 is not the left parent of any reference in this jittered
+    # timeline, but it is retained as the right interpolation bracket.
+    assert second.metadata["rule_based_reference_source_kind"] == "custom_action"
+    coverage = extension._stage_sample_coverage()["right_write.write"]
+    assert coverage == {
+        "planned": 3,
+        "required": 3,
+        "accepted": 0,
+        "complete": False,
+    }
+
+
+def test_stage_coverage_uses_writer_rate_for_dense_reference_plan() -> None:
+    source_actions = iter(
+        RobotAction(
+            action_space=BIMANUAL_EE_POSE_V1,
+            timestamp=index / 60.0,
+            arm_pose_by_side={
+                "left": _pose(0.0),
+                "right": _pose(index * 0.001),
+            },
+            frame_by_effector={
+                "left_arm": "canonical_desk",
+                "right_arm": "canonical_desk",
+            },
+            controlled_frame_by_effector={
+                "left_arm": "tool_tcp",
+                "right_arm": "tool_tcp",
+            },
+            source="writing_keyframe",
+            metadata={
+                "rule_based_position_reference_resample": True,
+                "rule_based_position_keyframe_hz": 60.0,
+            },
+        )
+        for index in range(12)
+    )
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedActionSegment(
+                    step_id="right_write.write",
+                    action_source=CallableActionSource(
+                        lambda _observation: next(source_actions)
+                    ),
+                    stop_condition=RuleBasedSegmentStopCondition(
+                        max_steps=12,
+                        min_steps=12,
+                        name="dense_source_complete",
+                    ),
+                    capture=RuleBasedCaptureSelection(enabled=True),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(
+            action_hz=15.0,
+            position_reference_hz=60.0,
+        ),
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+
+    first = session.command_override_provider(SimpleNamespace(), 3400.0).command
+
+    assert first is not None
+    assert extension._writer_rate_expected_samples_by_step == {
+        "right_write.write": 3
+    }
+    extension._accepted_samples_by_detail_stage["right_write.write"] = 2
+    assert set(extension._incomplete_detail_stages()) == {"right_write.write"}
+    extension._accepted_samples_by_detail_stage["right_write.write"] = 3
+    assert extension._incomplete_detail_stages() == {}
+
+
 def test_replay_queue_resolves_only_source_keyframes_and_live_references() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -4744,11 +6385,12 @@ def test_full_replay_large_hand_source_delta_is_bounded_only_at_live_dispatch() 
     now = 7000.100001
     measured = 0.0
     dispatched: list[tuple[float, float]] = []
+    saw_large_source_target = False
     while extension._current is not None or not dispatched:
         command = session.command_override_provider(SimpleNamespace(), now).command
         assert command is not None
         if not dispatched:
-            assert command.metadata["rule_based_reference_sequence"] == 6
+            assert command.metadata["rule_based_reference_sequence"] == 1
             assert command.metadata["right_source_index"] == 1
         target = float(command.commands["right_hand"].value[0])
         dispatched.append((measured, target))
@@ -4756,9 +6398,12 @@ def test_full_replay_large_hand_source_delta_is_bounded_only_at_live_dispatch() 
         assert command.metadata["rule_based_hand_dispatch_baseline"] == (
             "causal_measured_state"
         )
-        assert command.metadata["rule_based_source_hand_qpos_by_side"]["right"][
-            0
-        ] == pytest.approx(0.70)
+        source_target = float(
+            command.metadata["rule_based_source_hand_qpos_by_side"]["right"][0]
+        )
+        if source_target > 0.6:
+            saw_large_source_target = True
+            assert source_target == pytest.approx(0.70)
         extension.after_session_step(
             step_result=SimpleNamespace(command_dispatched=True),
             now=now,
@@ -4779,6 +6424,7 @@ def test_full_replay_large_hand_source_delta_is_bounded_only_at_live_dispatch() 
         assert len(dispatched) < 30
 
     assert measured == pytest.approx(0.70)
+    assert saw_large_source_target is True
     assert len(dispatched) > 2
     assert extension.status().completed is False
     completed = session.command_override_provider(SimpleNamespace(), now)
@@ -4786,7 +6432,7 @@ def test_full_replay_large_hand_source_delta_is_bounded_only_at_live_dispatch() 
     assert extension.status().completed is True
 
 
-def test_replay_catches_up_to_wall_clock_without_bursting_stale_references() -> None:
+def test_replay_rebases_late_clock_without_skipping_or_bursting_references() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -4815,17 +6461,55 @@ def test_replay_catches_up_to_wall_clock_without_bursting_stale_references() -> 
         step_result=SimpleNamespace(command_dispatched=True), now=5000.0
     )
 
-    # A 55 ms owner-loop delay must select the 50 ms reference directly.  It
-    # must not emit 16.7/33.3 ms backlog targets in successive fast bursts.
+    # A 55 ms owner-loop delay must keep the next 16.7 ms reference instead of
+    # jumping directly to 50 ms.  The remaining clock slips by the measured
+    # lag, so neither a multi-grid target jump nor a fast stale backlog burst
+    # can reach the physical command path.
     current = session.command_override_provider(SimpleNamespace(), 5000.055).command
-    assert current.metadata["rule_based_reference_sequence"] == 3
-    assert current.metadata["rule_based_reference_skipped_count"] == 2
+    assert current.metadata["rule_based_reference_sequence"] == 1
+    assert current.metadata["rule_based_reference_schedule_policy"] == (
+        "ordered_rebase_no_skip"
+    )
+    assert current.metadata["rule_based_reference_schedule_shift_sec"] == pytest.approx(
+        0.055 - (1.0 / 60.0)
+    )
+    assert current.metadata["rule_based_reference_rebased_tick_count"] == 1
     assert current.metadata["rule_based_scheduled_source_cut_timestamp"] == pytest.approx(
-        5000.05
+        5000.0 + (1.0 / 60.0)
     )
     assert current.metadata["rule_based_source_cut_timestamp"] == pytest.approx(
-        5000.05
+        5000.0 + (1.0 / 60.0)
     )
+    extension.after_session_step(
+        step_result=SimpleNamespace(command_dispatched=True), now=5000.055
+    )
+
+    # The rebased next deadline is 16.7 ms after this delayed dispatch.  An
+    # immediate owner-loop iteration therefore holds sequence 1; once due,
+    # sequence 2 is emitted exactly once.
+    held = session.command_override_provider(SimpleNamespace(), 5000.060).command
+    assert held.metadata["rule_based_reference_sequence"] == 1
+    # Continue at a sustained 40 Hz owner cadence.  Every reference remains
+    # ordered even though each tick is later than the 60 Hz nominal clock;
+    # the scheduler must not skip a point or emit two points on one tick.
+    observed_sequences: list[int] = []
+    observed_rebase_counts: list[int] = []
+    for tick in (5000.080, 5000.105, 5000.130):
+        next_reference = session.command_override_provider(
+            SimpleNamespace(), tick
+        ).command
+        observed_sequences.append(
+            int(next_reference.metadata["rule_based_reference_sequence"])
+        )
+        observed_rebase_counts.append(
+            int(next_reference.metadata["rule_based_reference_rebased_tick_count"])
+        )
+        extension.after_session_step(
+            step_result=SimpleNamespace(command_dispatched=True), now=tick
+        )
+
+    assert observed_sequences == [2, 3, 4]
+    assert observed_rebase_counts == [2, 3, 4]
 
 
 def test_accepted_rule_hold_snapshot_supports_immutable_motion_metadata() -> None:

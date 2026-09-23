@@ -42,11 +42,18 @@ def test_accepted_sample_receipt_validates_exact_coordinate() -> None:
         )
 
 
-def _thread_recorder(*, capacity: int) -> RealTeleopDatasetRecorder:
+def _thread_recorder(
+    *,
+    capacity: int,
+    terminal_capacity: int = 0,
+) -> RealTeleopDatasetRecorder:
     recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
     recorder.collection_worker_mode = "thread"
     recorder._sample_acceptance_receipt_buffer = SampleAcceptanceReceiptBuffer(
         capacity=capacity
+    )
+    recorder._sample_terminal_event_buffer = SampleTerminalEventBuffer(
+        capacity=terminal_capacity
     )
     return recorder
 
@@ -100,6 +107,70 @@ def test_disabled_thread_receipts_do_not_inspect_sample() -> None:
 
     recorder._record_thread_sample_acceptance(_MustNotBeRead())
     assert recorder.drain_accepted_sample_receipts() == ()
+
+
+def test_thread_writer_terminal_event_preserves_rule_sequence_metadata() -> None:
+    recorder = _thread_recorder(capacity=0, terminal_capacity=4)
+    sample = SimpleNamespace(
+        episode_index=7,
+        index=101,
+        frame_index=11,
+        timestamp=42.25,
+    )
+
+    recorder._record_thread_sample_acceptance(
+        sample,
+        metadata={
+            "rule_based_sequence_index": 42,
+            "rule_based_segment_terminal": True,
+        },
+    )
+
+    assert recorder.drain_sample_terminal_events() == (
+        SampleTerminalEvent(
+            accepted=True,
+            receipt=AcceptedSampleReceipt(
+                episode_index=7,
+                sample_index=101,
+                episode_frame_index=11,
+                sample_timestamp=42.25,
+                metadata={
+                    "rule_based_sequence_index": 42,
+                    "rule_based_segment_terminal": True,
+                },
+            ),
+            metadata={
+                "rule_based_sequence_index": 42,
+                "rule_based_segment_terminal": True,
+            },
+        ),
+    )
+    assert recorder.drain_sample_terminal_events() == ()
+
+
+def test_process_recorder_forwards_authoritative_terminal_events() -> None:
+    event = SampleTerminalEvent(
+        accepted=False,
+        metadata={"rule_based_sequence_index": 42},
+        reason="writer rejected terminal sample",
+        terminal_kind="rejected",
+    )
+
+    class _ProcessWorker:
+        def __init__(self) -> None:
+            self.events = (event,)
+
+        def drain_sample_terminal_events(self):
+            events = self.events
+            self.events = ()
+            return events
+
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    recorder.collection_worker_mode = "process"
+    recorder.process_worker = _ProcessWorker()
+
+    assert recorder.drain_sample_terminal_events() == (event,)
+    assert recorder.drain_sample_terminal_events() == ()
 
 
 def test_terminal_event_buffer_retains_rejections_and_fails_closed_on_overflow() -> None:

@@ -42,6 +42,7 @@ from robot_motion.rm65 import (
 from ..action.human_shadow_frontend import add_human_shadow_arguments
 from ..arm_frames import TOOL_TCP_FRAME
 from ..backends.hands import DEFAULT_INSPIRE_HAND_MAX_FORCE
+from ..collection.sample_assembler import DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
 from ..cli_value_parsers import (
     _alpha_float,
     _non_negative_int,
@@ -350,6 +351,15 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
             "then the unchanged global multi-frame camera self-check runs. "
             "Pipeline negotiation remains serial and no USB reset is implied. "
             "Default: bounded_first_frame; select legacy for atomic rollback."
+        ),
+    )
+    parser.add_argument(
+        "--camera-frame-max-age-sec",
+        type=_positive_float,
+        default=DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+        help=(
+            "Maximum admitted age of a causal RealSense frame for collection "
+            "and camera-history alignment."
         ),
     )
     parser.add_argument(

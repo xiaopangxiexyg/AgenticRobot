@@ -149,6 +149,35 @@ def runtime_extension_refresh_status(
         hook()
 
 
+def runtime_extension_collection_startup_blockers(
+    extension: object | None,
+) -> dict[str, str]:
+    """Read optional extension-owned blockers before opening a formal writer.
+
+    This is an observational seam only.  It lets an exclusive runtime source
+    expose the same readiness facts it uses for command admission without
+    moving writer ownership or weakening the generic device gate.
+    """
+
+    if extension is None:
+        return {}
+    hook = getattr(extension, "collection_startup_blockers", None)
+    if not callable(hook):
+        return {}
+    result = hook()
+    if result is None:
+        return {}
+    if not isinstance(result, Mapping):
+        raise TypeError(
+            "runtime extension collection_startup_blockers() must return a mapping."
+        )
+    return {
+        str(key): str(value)
+        for key, value in result.items()
+        if str(value).strip()
+    }
+
+
 def runtime_extension_service_startup_control_plane(
     extension: object | None,
     *,
@@ -235,13 +264,34 @@ def runtime_extension_after_runtime_home(
         hook(now=float(now))
 
 
+def runtime_extension_bind_runtime_home_snapshot(
+    extension: object | None,
+    *,
+    qpos_by_side: Mapping[str, Any] | None,
+) -> None:
+    """Pass the accepted atomic Home snapshot to an interested extension.
+
+    This is a lifecycle handoff only.  It does not arm hardware, authorize
+    dispatch, or require later motion to start from a snapshot that may have
+    become stale.  Extensions without an epoch-specific Home consumer are
+    unchanged.
+    """
+
+    if extension is None:
+        return
+    hook = getattr(extension, "bind_runtime_home_snapshot", None)
+    if callable(hook):
+        hook(qpos_by_side=qpos_by_side)
+
+
 def runtime_extension_allows_pre_episode_armed_warmup(
     extension: object | None,
 ) -> bool:
     """Admit an extension-owned ARMED start without weakening sample gates.
 
-    This opt-in is consulted only by the Episode-start countdown. Resume and
-    per-sample health checks still require a dispatched arm command in RUNNING.
+    This opt-in is consulted only by the Episode-start countdown.  Once an
+    Episode is active, the separate active-bootstrap hook owns any bounded
+    ARMED transition; sample admission remains independently strict.
     """
 
     if extension is None:
@@ -256,10 +306,9 @@ def runtime_extension_allows_active_episode_bootstrap_without_dispatch(
     """Identify a command-inert active-Episode bootstrap owned by an extension.
 
     This hook does not authorize motion or sample admission.  It only tells the
-    owner loop that an ARMED extension is still preparing its first arm command,
-    or that the one-shot Home-continuity gate is deliberately dwelling on that
-    first command.  All observation, modality, force, collision, TCP-envelope,
-    Session, backend-receipt, and writer sample gates remain authoritative.
+    owner loop that an ARMED extension is still preparing its first arm command.
+    All observation, modality, force, collision, TCP-envelope, Session,
+    backend-receipt, and writer sample gates remain authoritative.
     """
 
     if extension is None:
@@ -345,6 +394,10 @@ class RealTeleopRuntimeExtension(Protocol):
     # authority or dispatch callback.
     def refresh_status(self, *, force: bool = False) -> None: ...
 
+    # Optional observational hook consulted before a formal writer is opened.
+    # It must not move hardware or mutate lifecycle state.
+    def collection_startup_blockers(self) -> Mapping[str, str]: ...
+
     # Optional command-inert hook used only while startup admission is waiting.
     # It must not consume motion, gripper, Episode, or Hold intents.
     def service_startup_control_plane(self, *, now: float) -> bool: ...
@@ -361,6 +414,14 @@ class RealTeleopRuntimeExtension(Protocol):
     ) -> None: ...
 
     def after_runtime_home(self, *, now: float) -> None: ...
+
+    # Optional lifecycle handoff.  The hook must only copy/validate the
+    # accepted Home snapshot; it must not move hardware or dispatch commands.
+    def bind_runtime_home_snapshot(
+        self,
+        *,
+        qpos_by_side: Mapping[str, Any] | None,
+    ) -> None: ...
 
     def allows_pre_episode_armed_warmup(self) -> bool: ...
 
@@ -400,6 +461,8 @@ __all__ = [
     "runtime_extension_after_session_error",
     "runtime_extension_after_runtime_hold",
     "runtime_extension_after_runtime_home",
+    "runtime_extension_bind_runtime_home_snapshot",
+    "runtime_extension_collection_startup_blockers",
     "runtime_extension_discards_episode_on_stop",
     "runtime_extension_refresh_status",
     "runtime_extension_service_startup_control_plane",
