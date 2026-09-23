@@ -13,6 +13,12 @@ from project_paths import calibration_profiles_dir, default_dataset_root
 
 from ..backends.grippers import normalize_dmtac_tactile_fields
 from ..backends.hands import DEFAULT_INSPIRE_HAND_MAX_FORCE
+from ..cli_value_parsers import (
+    _alpha_float,
+    _non_negative_float,
+    _non_negative_int,
+    _parse_joint_order,
+)
 from ..configs.camera_paths import (
     DEFAULT_REALSENSE_CAMERA_REGISTRY_PATH,
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
@@ -23,7 +29,11 @@ from ..defaults import (
     DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
     DEFAULT_TELEOP_SAMPLE_HZ,
 )
-from ..dmtac_tactile_cli import add_dmtac_tactile_arguments
+from ..dmtac_tactile_cli import (
+    _dmtac_worker_cpu_affinity,
+    _dmtac_worker_nice,
+    add_dmtac_tactile_arguments,
+)
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER
 from ..hand_tcp_alignment import add_vive_tracker_height_correction_args
 from ..sources.pose import DEFAULT_VIVE_CLOCK_SYNC_PORT
@@ -50,56 +60,10 @@ def _positive_float(text: str) -> float:
     return value
 
 
-def _non_negative_int(text: str) -> int:
-    value = int(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError("value must be >= 0")
-    return value
-
-
 def _positive_int(text: str) -> int:
     value = int(text)
     if value <= 0:
         raise argparse.ArgumentTypeError("value must be > 0")
-    return value
-
-
-def _alpha_float(text: str) -> float:
-    value = float(text)
-    if not 0.0 < value <= 1.0:
-        raise argparse.ArgumentTypeError("alpha must be in (0, 1]")
-    return value
-
-
-def _non_negative_float(text: str) -> float:
-    value = float(text)
-    if value < 0.0:
-        raise argparse.ArgumentTypeError("value must be >= 0")
-    return value
-
-
-def _dmtac_worker_cpu_affinity(text: str) -> tuple[int, ...]:
-    parts = [part.strip() for part in re.split(r"[,\s]+", str(text)) if part.strip()]
-    if not parts:
-        return ()
-    cpus: list[int] = []
-    for part in parts:
-        try:
-            cpu = int(part)
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(
-                "CPU affinity must be a comma-separated integer list"
-            ) from exc
-        if cpu < 0:
-            raise argparse.ArgumentTypeError("CPU affinity indices must be >= 0")
-        cpus.append(cpu)
-    return tuple(dict.fromkeys(cpus))
-
-
-def _dmtac_worker_nice(text: str) -> int:
-    value = int(text)
-    if not 0 <= value <= 19:
-        raise argparse.ArgumentTypeError("worker nice must be in [0, 19]")
     return value
 
 
@@ -108,23 +72,6 @@ def _parse_dmtac_tactile_fields(text: str) -> tuple[str, ...]:
         return normalize_dmtac_tactile_fields(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
-
-
-def _parse_joint_order(text: str) -> tuple[int, ...]:
-    parts = [part.strip() for part in str(text).split(",") if part.strip()]
-    if len(parts) != 6:
-        raise argparse.ArgumentTypeError(
-            "joint order must contain 6 comma-separated indices"
-        )
-    try:
-        order = tuple(int(part) for part in parts)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid joint order: {text}") from exc
-    if sorted(order) != [0, 1, 2, 3, 4, 5]:
-        raise argparse.ArgumentTypeError(
-            "joint order must be a permutation of 0,1,2,3,4,5"
-        )
-    return order
 
 
 def _parse_arm_max_angvel(text: str) -> tuple[float, ...]:

@@ -3,9 +3,33 @@
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Callable
 
 from .dmtac_tactile_fields import DMTAC_TACTILE_FIELDS
+
+
+def _dmtac_worker_cpu_affinity(text: str) -> tuple[int, ...]:
+    parts = [part.strip() for part in re.split(r"[,\s]+", str(text)) if part.strip()]
+    if not parts:
+        return ()
+    cpus: list[int] = []
+    for part in parts:
+        try:
+            cpu = int(part)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("CPU affinity must be a comma-separated integer list") from exc
+        if cpu < 0:
+            raise argparse.ArgumentTypeError("CPU affinity indices must be >= 0")
+        cpus.append(cpu)
+    return tuple(dict.fromkeys(cpus))
+
+
+def _dmtac_worker_nice(text: str) -> int:
+    value = int(text)
+    if not 0 <= value <= 19:
+        raise argparse.ArgumentTypeError("worker nice must be in [0, 19]")
+    return value
 
 
 def add_dmtac_tactile_arguments(
