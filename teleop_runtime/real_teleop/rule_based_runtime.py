@@ -236,6 +236,7 @@ class RuleBasedRealTeleopConfig:
     manual_gripper_settle_samples: int = 3
     minimum_stage_sample_coverage: float = 0.8
     minimum_stage_sample_count: int = 2
+    pause_hold_max_joint_delta_rad: float = math.radians(0.75)
 
     def __post_init__(self) -> None:
         if self.action_hz is not None and (
@@ -258,6 +259,7 @@ class RuleBasedRealTeleopConfig:
             "manual_gripper_timeout_sec",
             "hand_state_max_age_sec",
             "arm_feedback_recovery_timeout_sec",
+            "pause_hold_max_joint_delta_rad",
             "minimum_stage_sample_coverage",
         ):
             value = float(getattr(self, name))
@@ -692,7 +694,6 @@ class RuleBasedRealTeleopExtension:
         # dual-arm feedback cut it uses as waypoint zero.  This is a one-shot
         # pre-dispatch operation; runtime Home remains the only path allowed to
         # clear an emergency-stop latch.
-        self._manual_adjustment_motion_rebase_pending = False
         self._height_descent_planned_count_added = False
         self._height_descent_planned_sample_count = 0
         self._configuration_options: dict[str, Any] = {}
@@ -1954,7 +1955,6 @@ class RuleBasedRealTeleopExtension:
         self._height_upper_tolerance_m = float(captured.upper_tolerance_m)
         self._height_calibration_error = ""
         self._writing_height_target_z_m = None
-        self._manual_adjustment_motion_rebase_pending = True
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
             append_message(
@@ -2324,8 +2324,15 @@ class RuleBasedRealTeleopExtension:
                     "rule-based execution lost formal collection readiness: " + reason
                 )
             return TeleopCommandOverride(None)
-        self._arm_feedback_pause_started_at = None
         if self._replay_reference_pause_started_at is not None:
+            displacement = self._paused_hold_displacement(snapshots)
+            if displacement is not None:
+                self._abort_session_step(
+                    "measured arm position changed during rule pause; "
+                    "the old trajectory cannot resume safely: " + displacement
+                )
+                self._publish_status(recording_ready=False)
+                return TeleopCommandOverride(None)
             paused_sec = max(
                 0.0,
                 float(now) - float(self._replay_reference_pause_started_at),
@@ -2350,6 +2357,7 @@ class RuleBasedRealTeleopExtension:
                 if started_at is not None:
                     setattr(self, attribute, float(started_at) + paused_sec)
             self._replay_reference_pause_started_at = None
+        self._arm_feedback_pause_started_at = None
         self._waiting_reason = ""
         if self._current is not None and self._advance_due(
             float(now),
@@ -3480,22 +3488,11 @@ class RuleBasedRealTeleopExtension:
             return False, "formal_writer_not_recording", {}
         if not bool(getattr(recorder, "can_record_samples", False)):
             return False, "formal_writer_paused", {}
-        poller = getattr(recorder, "arm_state_poller", None)
-        if poller is None:
-            return False, "causal_arm_feedback_poller_unavailable", {}
-        readiness = poller.readiness_by_side(
-            required_sides=self.deployment.active_sides,
-            sample_timestamp=now,
+        arm_ready, arm_reason, snapshots = self._fresh_arm_snapshots(
+            float(now), recorder=recorder
         )
-        blocked = {side: value for side, value in readiness.items() if value}
-        if blocked:
-            details = ",".join(f"{side}={value}" for side, value in sorted(blocked.items()))
-            return False, "causal_arm_feedback_not_ready:" + details, {}
-        snapshots = poller.latest_at_or_before(now)
-        missing = sorted(set(self.deployment.active_sides) - set(snapshots))
-        if missing:
-            return False, "causal_arm_feedback_missing:" + ",".join(missing), {}
-        snapshots = {side: dict(value) for side, value in snapshots.items()}
+        if not arm_ready:
+            return False, arm_reason, {}
         if self.config.gripper_sides:
             hand_poller = getattr(recorder, "hand_state_poller", None)
             if hand_poller is None or not callable(
@@ -3537,6 +3534,39 @@ class RuleBasedRealTeleopExtension:
                     ), {}
                 snapshots.setdefault(side, {})["actual_hand_qpos"] = hand_qpos
                 snapshots[side]["hand_state"] = dict(state)
+        return True, "", snapshots
+
+    def _fresh_arm_snapshots(
+        self,
+        now: float,
+        *,
+        recorder: object | None = None,
+    ) -> tuple[bool, str, dict[str, dict[str, Any]]]:
+        """Read measured arm feedback even when the writer cannot accept samples."""
+
+        if recorder is None:
+            provider = self._dataset_recorder_provider
+            recorder = None if provider is None else provider()
+        poller = getattr(recorder, "arm_state_poller", None)
+        if poller is None:
+            return False, "causal_arm_feedback_poller_unavailable", {}
+        readiness = poller.readiness_by_side(
+            required_sides=self.deployment.active_sides,
+            sample_timestamp=now,
+        )
+        blocked = {side: value for side, value in readiness.items() if value}
+        if blocked:
+            details = ",".join(f"{side}={value}" for side, value in sorted(blocked.items()))
+            return False, "causal_arm_feedback_not_ready:" + details, {}
+        snapshots = poller.latest_at_or_before(now)
+        missing = sorted(set(self.deployment.active_sides) - set(snapshots))
+        if missing:
+            return False, "causal_arm_feedback_missing:" + ",".join(missing), {}
+        snapshots = {side: dict(value) for side, value in snapshots.items()}
+        for side in self.deployment.active_sides:
+            state = snapshots[side]
+            if state.get("actual_state_valid") is False or state.get("actual_state_stale") is True:
+                return False, f"causal_arm_feedback_not_ready:{side}=feedback_stale", {}
         return True, "", snapshots
 
     def _load_next(
@@ -4571,6 +4601,7 @@ class RuleBasedRealTeleopExtension:
         for classifier in self._pose_action_motion_intent.values():
             classifier.reset(str(reason))
         self._pose_action_motion_intent_step_id = None
+        self._coupled_pose_solver_seeded = False
 
     def _ensure_pose_action_motion_intent_step(self, step_id: str) -> None:
         normalized = str(step_id)
@@ -4579,6 +4610,10 @@ class RuleBasedRealTeleopExtension:
         for classifier in self._pose_action_motion_intent.values():
             classifier.reset(f"rule_step_changed:{normalized}")
         self._pose_action_motion_intent_step_id = normalized
+        # A new pen_down/write/pen_up or relative replay step must start from
+        # this step's causal measured configuration, not the prior step's IK
+        # continuation state. Do not reset on each dense reference frame.
+        self._coupled_pose_solver_seeded = False
 
     def _start_initial_alignment_planning(
         self,
@@ -4625,7 +4660,7 @@ class RuleBasedRealTeleopExtension:
         # during planning; collision, TCP-envelope, and command guards remain
         # authoritative for every emitted waypoint.
         start = self._initial_alignment_start_qpos_pair(snapshots)
-        self._rebase_motion_transport_after_manual_adjustment(start)
+        self._rebase_motion_transport_from_measured_start(start)
         target = {
             side: np.asarray(
                 emission.directive.qpos_by_side.get(side, start[side]),
@@ -4990,28 +5025,26 @@ class RuleBasedRealTeleopExtension:
 
         return self._snapshot_qpos_pair(snapshots)
 
-    def _rebase_motion_transport_after_manual_adjustment(
+    def _rebase_motion_transport_from_measured_start(
         self,
         start_qpos_by_side: Mapping[str, np.ndarray],
     ) -> None:
-        """Align command-planner state with post-calibration arm feedback.
+        """Align every new transition's transport with fresh arm feedback.
 
-        Manual adjustment changes the physical qpos without passing through
-        the command backend.  RM65 position planners otherwise retain their
-        last accepted pre-adjustment qcmd and turn the command-inert first
-        alignment waypoint into a visible corrective kick.  Rebase all three
-        consumers from one causal snapshot before any rule command is built.
+        Manual motion and the idle target-stale quick-stop between Episodes do
+        not update the command backend's accepted qcmd. Rebase the preview,
+        command transport and coupled solver from the same causal hardware
+        snapshot before planning *each* transition, not only after a height
+        calibration. The first certified waypoint is then command-inert.
 
         This helper never rearms a stopped backend.  A stopped or incomplete
         transport remains a hard failure that must go through runtime Home.
         """
 
-        if not self._manual_adjustment_motion_rebase_pending:
-            return
         components = self._components
         if components is None:
             raise RuntimeError(
-                "post-calibration motion rebase requires attached real-arm components."
+                "measured-start motion rebase requires attached real-arm components."
             )
 
         prepared: dict[str, tuple[object, object, np.ndarray]] = {}
@@ -5020,21 +5053,21 @@ class RuleBasedRealTeleopExtension:
                 qpos = np.asarray(start_qpos_by_side[side], dtype=float).reshape(6)
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError(
-                    f"post-calibration motion rebase requires finite {side} actual_qpos."
+                    f"measured-start motion rebase requires finite {side} actual_qpos."
                 ) from exc
             if not np.all(np.isfinite(qpos)):
                 raise RuntimeError(
-                    f"post-calibration motion rebase requires finite {side} actual_qpos."
+                    f"measured-start motion rebase requires finite {side} actual_qpos."
                 )
             command_backend = getattr(components, f"{side}_command_backend", None)
             preview_backend = getattr(components, f"{side}_preview_backend", None)
             if not callable(getattr(command_backend, "reset_motion_state", None)):
                 raise RuntimeError(
-                    f"post-calibration motion rebase requires {side} command backend."
+                    f"measured-start motion rebase requires {side} command backend."
                 )
             if not callable(getattr(preview_backend, "set_local_qpos", None)):
                 raise RuntimeError(
-                    f"post-calibration motion rebase requires {side} preview backend."
+                    f"measured-start motion rebase requires {side} preview backend."
                 )
             is_stopped = getattr(command_backend, "is_emergency_stopped", None)
             if callable(is_stopped) and bool(is_stopped()):
@@ -5048,14 +5081,14 @@ class RuleBasedRealTeleopExtension:
             preview_backend.set_local_qpos(qpos)
             command_backend.reset_motion_state(qpos)
         _sync_dual_arm_retargeter_for_real_control(components)
-        self._manual_adjustment_motion_rebase_pending = False
+        self._coupled_pose_solver_seeded = False
 
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
             append_message(
-                "Calibration",
-                "已用标定后的双臂新鲜实测姿态重置位控规划锚点；"
-                "初始化首帧不会沿用标定前命令状态。",
+                "RuleBased",
+                "已用本次过渡前的双臂新鲜实测姿态重置位控规划锚点；"
+                "初始化首帧不会沿用上次采集或暂停前命令状态。",
             )
 
     def _hand_qpos_from_state(
@@ -5636,7 +5669,7 @@ class RuleBasedRealTeleopExtension:
         reason: str,
         now: float,
     ) -> TeleopCommandOverride:
-        """Keep the last accepted arm qref alive without advancing the rule.
+        """Keep a near-measured accepted qref alive without advancing the rule.
 
         This is a dispatch-preserving pause, not a second motion controller.
         The canonical Session/Rig path still validates and sends the exact
@@ -5649,6 +5682,29 @@ class RuleBasedRealTeleopExtension:
                 "rule-based execution has no certified command to hold during "
                 "a recoverable pause"
             )
+        feedback_ready, feedback_reason, snapshots = self._fresh_arm_snapshots(float(now))
+        if not feedback_ready:
+            if self._recoverable_arm_feedback_pause(
+                reason=feedback_reason, now=float(now)
+            ):
+                self._waiting_reason = feedback_reason
+                self._publish_status(recording_ready=False)
+                return TeleopCommandOverride(None)
+            self._abort_session_step(
+                "cannot safely keep the paused arm target without fresh measured "
+                "feedback: " + feedback_reason
+            )
+            self._publish_status(recording_ready=False)
+            return TeleopCommandOverride(None)
+        self._arm_feedback_pause_started_at = None
+        displacement = self._paused_hold_displacement(snapshots)
+        if displacement is not None:
+            self._abort_session_step(
+                "measured arm position changed during rule pause; "
+                "the previous arm target is no longer safe: " + displacement
+            )
+            self._publish_status(recording_ready=False)
+            return TeleopCommandOverride(None)
         paused_hold = self._certified_arm_hold_emission(held)
         paused_hold.command.metadata.update(
             {
@@ -5663,6 +5719,45 @@ class RuleBasedRealTeleopExtension:
         self._waiting_reason = str(reason)
         self._publish_status(recording_ready=False)
         return TeleopCommandOverride(paused_hold.command)
+
+    def _paused_hold_displacement(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> str | None:
+        """Reject a cached hold/resume target that no longer matches the robot.
+
+        The accepted qref is retained only for a bounded, already-nearby
+        position hold. An operator-moved arm needs a new runtime Home and a
+        measured-start transition; a pause is not a path replanner.
+        """
+
+        held = self._last_dispatched_emission
+        if held is None:
+            return "no previously accepted arm target"
+        try:
+            actual = self._snapshot_qpos_pair(snapshots)
+        except RuntimeError as exc:
+            return str(exc)
+        limit = float(self.config.pause_hold_max_joint_delta_rad)
+        for side in self.deployment.active_sides:
+            command = held.command.commands.get(f"{side}_arm")
+            if command is None:
+                return f"{side} accepted arm target is missing"
+            try:
+                target = np.asarray(command.value, dtype=float).reshape(6)
+            except (TypeError, ValueError):
+                return f"{side} accepted arm target is invalid"
+            if not np.all(np.isfinite(target)):
+                return f"{side} accepted arm target is non-finite"
+            delta = np.abs(actual[side] - target)
+            joint = int(np.argmax(delta))
+            if float(delta[joint]) > limit:
+                return (
+                    f"{side} joint {joint + 1} measured-to-accepted delta="
+                    f"{math.degrees(float(delta[joint])):.3f}deg > "
+                    f"{math.degrees(limit):.3f}deg"
+                )
+        return None
 
     @staticmethod
     def _is_transient_arm_read_failure(reason: str) -> bool:
@@ -7672,10 +7767,6 @@ class RuleBasedRealTeleopExtension:
             raise RuntimeError("cancelled rule Episode is still active")
         self._invalidate_writing_reachability_preflight()
         self._held = False
-        # Explicit runtime Home already resets preview, command transport and
-        # coupled IK from one live snapshot, so no additional rule-owned
-        # pre-dispatch rebase is needed.
-        self._manual_adjustment_motion_rebase_pending = False
         self._armed = bool(self._legacy_generic_ui)
         self._waiting_reason = (
             "waiting_for_formal_episode"

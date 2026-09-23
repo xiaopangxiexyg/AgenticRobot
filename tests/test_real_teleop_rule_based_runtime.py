@@ -1608,6 +1608,27 @@ class _Retargeter:
 
 
 def _components(session: _Session, *, hand_sides: tuple[str, ...] = ()):
+    class CommandBackend:
+        def __init__(self) -> None:
+            self.resets: list[np.ndarray] = []
+
+        @staticmethod
+        def is_emergency_stopped() -> bool:
+            return False
+
+        def reset_motion_state(self, qpos) -> None:
+            self.resets.append(np.asarray(qpos, dtype=float).copy())
+
+    class PreviewBackend:
+        def __init__(self) -> None:
+            self.qpos = np.zeros(6, dtype=float)
+
+        def set_local_qpos(self, qpos) -> None:
+            self.qpos = np.asarray(qpos, dtype=float).copy()
+
+        def get_state(self):
+            return {"current_qpos": self.qpos.copy()}
+
     components = SimpleNamespace(
         session=session,
         active_sides=("left", "right"),
@@ -1615,6 +1636,8 @@ def _components(session: _Session, *, hand_sides: tuple[str, ...] = ()):
         dual_arm_retargeter=_Retargeter(),
     )
     for side in ("left", "right"):
+        setattr(components, f"{side}_command_backend", CommandBackend())
+        setattr(components, f"{side}_preview_backend", PreviewBackend())
         setattr(
             components,
             f"{side}_hand_backend",
@@ -1795,7 +1818,7 @@ def test_writing_height_capture_uses_fresh_async_right_arm_read_and_is_recoverab
     assert extension.status().height_calibration_enabled is False
 
 
-def test_height_calibration_rebases_command_transport_from_alignment_snapshot() -> None:
+def test_each_alignment_rebases_command_transport_from_measured_snapshot() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -1859,9 +1882,8 @@ def test_height_calibration_rebases_command_transport_from_alignment_snapshot() 
         "right": np.linspace(0.2, -0.3, 6),
     }
 
-    extension._rebase_motion_transport_after_manual_adjustment(start)
+    extension._rebase_motion_transport_from_measured_start(start)
 
-    assert extension._manual_adjustment_motion_rebase_pending is False
     for side in ("left", "right"):
         assert len(command_backends[side].resets) == 1
         np.testing.assert_allclose(command_backends[side].resets[0], start[side])
@@ -1871,10 +1893,31 @@ def test_height_calibration_rebases_command_transport_from_alignment_snapshot() 
             start[side],
         )
 
-    # The edge is one-shot; repeated planner polls cannot reset transport
-    # history underneath an already-running transition.
-    extension._rebase_motion_transport_after_manual_adjustment(start)
-    assert all(len(backend.resets) == 1 for backend in command_backends.values())
+    # A later Episode without a new height calibration must rebase again;
+    # the call site is one per planned transition, never each planner poll.
+    next_start = {side: value + 0.05 for side, value in start.items()}
+    extension._rebase_motion_transport_from_measured_start(next_start)
+    for side in ("left", "right"):
+        assert len(command_backends[side].resets) == 2
+        np.testing.assert_allclose(command_backends[side].resets[1], next_start[side])
+        np.testing.assert_allclose(preview_backends[side].qpos, next_start[side])
+
+
+def test_coupled_pose_solver_reseeds_only_at_new_rule_step() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    extension._ensure_pose_action_motion_intent_step("right_write.pen_down")
+    extension._coupled_pose_solver_seeded = True
+    extension._ensure_pose_action_motion_intent_step("right_write.pen_down")
+    assert extension._coupled_pose_solver_seeded is True
+
+    extension._ensure_pose_action_motion_intent_step("right_write.write")
+    assert extension._coupled_pose_solver_seeded is False
 
 
 def test_height_calibration_rebase_never_rearms_stopped_arm() -> None:
@@ -1905,14 +1948,10 @@ def test_height_calibration_rebase_never_rearms_stopped_arm() -> None:
     for side in ("left", "right"):
         setattr(components, f"{side}_command_backend", StoppedBackend())
         setattr(components, f"{side}_preview_backend", PreviewBackend())
-    extension._manual_adjustment_motion_rebase_pending = True
-
     with pytest.raises(RuntimeError, match="runtime Home is required"):
-        extension._rebase_motion_transport_after_manual_adjustment(
+        extension._rebase_motion_transport_from_measured_start(
             {"left": np.zeros(6), "right": np.zeros(6)}
         )
-
-    assert extension._manual_adjustment_motion_rebase_pending is True
 
 
 def test_writing_replay_height_projection_is_lower_floor_only_and_opt_in() -> None:
@@ -5854,19 +5893,10 @@ def test_transient_arm_read_failure_holds_then_resumes_without_cursor_advance() 
 
     poller.blocked["right"] = "hardware_read_failed"
     paused = session.command_override_provider(SimpleNamespace(), 32.1)
-    assert paused.command.metadata["rule_based_pause_hold"] is True
+    assert paused.command is None
     assert extension._current is current
     assert extension.status().aborted is False
 
-    extension.after_session_step(
-        step_result=SimpleNamespace(
-            command=paused.command,
-            command_dispatched=True,
-            state=SimpleNamespace(value="RUNNING"),
-            faults=(),
-        ),
-        now=32.1,
-    )
     poller.blocked.clear()
     resumed = session.command_override_provider(SimpleNamespace(), 32.2)
     assert resumed.command is not None
@@ -5909,7 +5939,7 @@ def test_sustained_arm_read_failure_remains_fail_closed_after_grace() -> None:
         now=34.0,
     )
     poller.blocked["left"] = "hardware_read_failed"
-    assert session.command_override_provider(SimpleNamespace(), 34.1).command is not None
+    assert session.command_override_provider(SimpleNamespace(), 34.1).command is None
     with pytest.raises(RuntimeError, match="lost formal collection readiness"):
         session.command_override_provider(SimpleNamespace(), 34.36)
 
@@ -5932,6 +5962,10 @@ def test_writer_pause_shifts_initial_alignment_clock_without_resume_catchup() ->
 
     first_time = 35.0
     active = _wait_for_command(session, now=first_time)
+    for side in ("left", "right"):
+        backend = getattr(extension._components, f"{side}_command_backend")
+        assert len(backend.resets) == 1
+        np.testing.assert_allclose(backend.resets[0], poller.qpos[side])
     active_index = int(
         active.command.metadata["rule_based_initial_alignment_waypoint_index"]
     )
@@ -5980,6 +6014,84 @@ def test_writer_pause_shifts_initial_alignment_clock_without_resume_catchup() ->
         "rule_based_scheduled_source_cut_timestamp"
     ] == pytest.approx(advanced_at)
     assert float(extension._next_due_at) - advanced_at >= 1.0 / 60.0 - 1e-9
+
+
+def test_writer_pause_rejects_operator_moved_arm_before_old_qref_dispatch() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6), right_arm=np.zeros(6)
+                ),
+            ),)
+        ),
+        trajectory_groups={},
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=40.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=40.0,
+    )
+    recorder.is_paused = True
+    poller.qpos["right"][2] = 0.1
+
+    paused = session.command_override_provider(SimpleNamespace(), 40.01)
+
+    assert paused.command is None
+    assert extension.status().aborted is True
+    assert session.hold_reasons
+    assert "right joint 3" in session.hold_reasons[-1]
+
+
+def test_writer_resume_rechecks_measured_arm_after_safe_pause_hold() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6), right_arm=np.zeros(6)
+                ),
+            ),)
+        ),
+        trajectory_groups={},
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=41.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=41.0,
+    )
+    recorder.is_paused = True
+    safe_hold = session.command_override_provider(SimpleNamespace(), 41.01)
+    assert safe_hold.command is not None
+    recorder.is_paused = False
+    poller.qpos["left"][0] = 0.1
+
+    resumed = session.command_override_provider(SimpleNamespace(), 41.02)
+
+    assert resumed.command is None
+    assert extension.status().aborted is True
+    assert session.hold_reasons
 
 
 def test_writer_pause_hold_backend_rejection_fails_closed() -> None:
