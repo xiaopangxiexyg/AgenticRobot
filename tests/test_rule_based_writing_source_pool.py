@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +22,56 @@ from robot_motion.pose_frame_profiles import (
 from robot_motion.replay import RuleBasedCollectionCursor
 from teleop_runtime.real_teleop import rule_based_writing_plan as writing_plan
 from teleop_runtime.replay.dataset import EpisodeSummary, LoadedReplayEpisode
+
+
+def test_random_main_direction_has_stable_bounded_deviation() -> None:
+    args = argparse.Namespace(
+        rule_source_selection_seed=42,
+        _rule_source_selection_ordinal=3,
+        rule_writing_random_trajectory_ids="",
+        rule_writing_trajectory="digit_1_v1",
+        rule_writing_random_directions="up,left",
+        rule_writing_direction="right",
+        rule_writing_random_direction_deviation_deg=45.0,
+        rule_writing_random_size_min_m=None,
+        rule_writing_random_size_max_m=None,
+        rule_writing_size_m=0.08,
+    )
+    first = writing_plan._resolve_writing_variant(args, additional_catalog_path=None)
+    second = writing_plan._resolve_writing_variant(args, additional_catalog_path=None)
+    assert first == second
+    assert first[1] in {"up", "left"}
+    selection = first[3]
+    assert -45.0 <= selection["selected_direction_deviation_deg"] <= 45.0
+    assert selection["selected_yaw_rad"] == pytest.approx(
+        writing_plan.fixed_trajectory_direction_yaw_rad(first[1])
+        + np.deg2rad(selection["selected_direction_deviation_deg"])
+    )
+    args.rule_writing_random_directions = ""
+    assert writing_plan._resolve_writing_variant(
+        args, additional_catalog_path=None
+    )[3]["selected_direction_deviation_deg"] == 0.0
+
+
+def test_relative_pen_up_probes_use_temporal_midpoint_and_last(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def rebase(group, sides, *, index, boundary, **kwargs):
+        calls.append((index, tuple(sides), boundary.tcp_pose_by_side["right"].copy()))
+        return SimpleNamespace(arm_pose_by_side={"right": np.asarray([index, 0, 0, 0, 0, 0, 1])})
+
+    monkeypatch.setattr(writing_plan, "rebase_replay_action_at_boundary", rebase)
+    group = writing_plan.ReplayTrajectoryGroup(
+        key="pen_up", label="pen_up", source_path="fixture", source_episode_index=0,
+        start_index=0, end_index=4, frame_count=4, action_hz=10,
+        actions=np.zeros((4, ACTION_DIM), dtype=np.float32),
+        frame_times_sec=(0.0, 0.2, 0.7, 1.0),
+    )
+    end = SimpleNamespace(pose_by_side={"right": np.eye(4)})
+    probes = writing_plan._relative_pen_up_reachability_probes(group, writing_end=end)
+    assert [probe["name"] for probe in probes] == ["pen_up_mid", "pen_up_end"]
+    assert [probe["target_index"] for probe in probes] == [2, 3]
+    assert [call[0] for call in calls] == [2, 3]
 
 
 def _manifest_payload(candidates: list[dict[str, object]]) -> dict[str, object]:
@@ -321,7 +372,15 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
     monkeypatch.setattr(
         writing_plan,
         "load_contract_replay_actions_from_parquet",
-        lambda path, **_kwargs: (actions_by_path[Path(path).resolve()].copy(), {}, contract, True),
+        lambda path, **_kwargs: (
+            actions_by_path[Path(path).resolve()].copy(),
+            {
+                "pose_action_absolute_frame": "canonical_desk",
+                "pose_frame_contract": contract.to_dict(),
+            },
+            contract,
+            True,
+        ),
     )
     monkeypatch.setattr(
         writing_plan,
@@ -350,6 +409,7 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         rule_writing_size_m=0.08,
         rule_writing_direction="up",
         rule_writing_speed_m_s=None,
+        rule_writing_reachability_check=True,
         rule_initial_alignment_speed_scale=1.0,
         rule_pre_pen_down_replay_normal_episodes=0,
         left_hand_backend="none",
@@ -362,6 +422,9 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
     )
 
     build = writing_plan.build_rule_based_writing(args, deployment=deployment)
+    assert [
+        probe["name"] for probe in build.source_selection["writing_reachability"]["probes"]
+    ][-2:] == ["pen_up_mid", "pen_up_end"]
 
     assert build.extension.trajectory_groups["pen_down"].source_episode_index == 1
     assert build.extension.trajectory_groups["pen_up"].source_episode_index == 3

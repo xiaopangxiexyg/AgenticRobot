@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
+from dataset_interface.episode_exclusion import set_episode_excluded
 
 from dataset_contracts.stats import (
     FORCE_COLLISION_LABEL_DETECTED,
@@ -4139,6 +4140,36 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 )
                 pending_progress_arm_transition = None
             continue
+        exclude_episode_index = getattr(
+            clutch_input, "consume_episode_exclude_last_request", lambda: None
+        )()
+        if exclude_episode_index is not None:
+            if dataset_recorder is None:
+                message = "舍弃失败：未启用正式 dataset writer。"
+            elif (
+                recording_active()
+                or context.episode_start_countdown_deadline() is not None
+                or dataset_recorder.finalizing
+            ):
+                message = "舍弃失败：当前 Episode 或后台保存尚未结束。"
+            else:
+                last_index = int(dataset_recorder.writer.next_episode_index) - 1
+                if int(exclude_episode_index) != last_index:
+                    message = "舍弃失败：目标已不是最新完成的 episode；未更改任何数据。"
+                else:
+                    try:
+                        set_episode_excluded(
+                            dataset_recorder.dataset_root, last_index, excluded=True
+                        )
+                    except (ValueError, OSError) as exc:
+                        message = f"舍弃失败：{type(exc).__name__}: {exc}"
+                    else:
+                        message = f"已可恢复地排除 episode {last_index}；原始轨迹保留，训练读取会跳过。"
+            _log("Dataset", message, now=loop_start)
+            clutch_input.set_episode_finalize_state(
+                status="excluded" if message.startswith("已可恢复") else "error",
+                message=message,
+            )
         episode_delete_index = clutch_input.consume_episode_delete_request()
         if episode_delete_index is not None:
             plus_binding_blocker = (

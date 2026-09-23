@@ -38,12 +38,17 @@ Options:
   --random-trajectory-ids IDS Writing mode only; comma-separated one-stroke ids
                               selected deterministically per Episode.
   --random-directions NAMES   Writing mode only; comma-separated subset of
-                              up,right,down,left selected per Episode.
+                              up,right,down,left selected per Episode, with
+                              deterministic angular deviation of +/-45 degrees.
+  --random-direction-deviation-deg DEG
+                              Maximum deviation around the selected main
+                              direction (default: 45; zero preserves cardinal axes).
   --random-size-range MIN:MAX Writing mode only; deterministic per-Episode size
                               range in metres.
   --writing-reachability-check
-                              Command-inert four-boundary-point IK/collision
-                              certification before each Episode; unreachable
+                              Command-inert four writing boundary points plus
+                              relative pen-up midpoint/end IK/collision checks
+                              before each Episode; unreachable
                               random candidates are skipped without opening data.
   --speed-m-s MPS             Writing mode only; override source average speed.
   --initial-alignment-speed-scale S
@@ -134,6 +139,7 @@ SIZE_M="0.08"
 DIRECTION="up"
 RANDOM_TRAJECTORY_IDS=""
 RANDOM_DIRECTIONS=""
+RANDOM_DIRECTION_DEVIATION_DEG="45"
 RANDOM_SIZE_RANGE=""
 WRITING_REACHABILITY_CHECK=0
 SPEED_M_S=""
@@ -171,6 +177,7 @@ declare -A VALUE_OPTION_TARGET=(
   [--direction]=DIRECTION
   [--random-trajectory-ids]=RANDOM_TRAJECTORY_IDS
   [--random-directions]=RANDOM_DIRECTIONS
+  [--random-direction-deviation-deg]=RANDOM_DIRECTION_DEVIATION_DEG
   [--random-size-range]=RANDOM_SIZE_RANGE
   [--speed-m-s]=SPEED_M_S
   [--initial-alignment-speed-scale]=INITIAL_ALIGNMENT_SPEED_SCALE
@@ -199,6 +206,7 @@ declare -A VALUE_OPTION_HINT=(
   [--direction]=NAME
   [--random-trajectory-ids]=IDS
   [--random-directions]=NAMES
+  [--random-direction-deviation-deg]=DEG
   [--random-size-range]=MIN:MAX
   [--speed-m-s]=MPS
   [--initial-alignment-speed-scale]=S
@@ -362,6 +370,10 @@ if [[ -n "$RANDOM_DIRECTIONS" ]]; then
     esac
   done
 fi
+[[ "$RANDOM_DIRECTION_DEVIATION_DEG" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || \
+  die "random direction deviation must be a number in [0, 45]."
+awk -v value="$RANDOM_DIRECTION_DEVIATION_DEG" 'BEGIN { exit !(value >= 0 && value <= 45) }' || \
+  die "random direction deviation must be in [0, 45] degrees."
 RANDOM_SIZE_MIN_M=""
 RANDOM_SIZE_MAX_M=""
 if [[ -n "$RANDOM_SIZE_RANGE" ]]; then
@@ -435,6 +447,7 @@ if [[ "$COLLECTION_MODE" == "rule-based-writing" ]]; then
   if [[ -n "$RANDOM_DIRECTIONS" ]]; then
     RULE_ARGS+=(--rule-writing-random-directions "$RANDOM_DIRECTIONS")
   fi
+  RULE_ARGS+=(--rule-writing-random-direction-deviation-deg "$RANDOM_DIRECTION_DEVIATION_DEG")
   if [[ -n "$RANDOM_SIZE_RANGE" ]]; then
     RULE_ARGS+=(
       --rule-writing-random-size-min-m "$RANDOM_SIZE_MIN_M"

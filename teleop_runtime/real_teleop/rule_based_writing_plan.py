@@ -56,6 +56,7 @@ from robot_motion.replay import (
     CANONICAL_DESK_ACTION_FRAME,
     FIXED_TRAJECTORY_DIRECTIONS,
     ReplayTrajectoryGroup,
+    RuleBasedBoundaryState,
     RuleBasedActionSegment,
     RuleBasedCaptureSelection,
     RuleBasedCollectionPlan,
@@ -64,7 +65,9 @@ from robot_motion.replay import (
     RuleBasedSegmentStopCondition,
     available_fixed_trajectory_ids,
     build_fixed_trajectory_targets,
+    fixed_trajectory_direction_yaw_rad,
     fixed_trajectory_catalog_hash,
+    rebase_replay_action_at_boundary,
     get_fixed_trajectory,
     replay_action_metadata,
     replay_end_effector_targets_at_index,
@@ -557,6 +560,12 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         help="Optional lower bound for deterministic per-Episode writing size.",
+    )
+    group.add_argument(
+        "--rule-writing-random-direction-deviation-deg",
+        type=float,
+        default=45.0,
+        help="Maximum deterministic deviation around each selected cardinal direction (0..45 degrees).",
     )
     group.add_argument(
         "--rule-writing-random-size-max-m",
@@ -1127,6 +1136,7 @@ class FixedWritingActionSource:
         scale_m: float,
         speed_m_s: float,
         direction: str,
+        yaw_rad: float | None = None,
         left_hold_pose: np.ndarray,
         reference_hz: float,
         additional_catalog_path: Path | None = None,
@@ -1137,6 +1147,7 @@ class FixedWritingActionSource:
         self.scale_m = float(scale_m)
         self.speed_m_s = float(speed_m_s)
         self.direction = str(direction)
+        self.yaw_rad = None if yaw_rad is None else float(yaw_rad)
         self.additional_catalog_path = additional_catalog_path
         self.left_hold_pose = np.asarray(left_hold_pose, dtype=float).reshape(7).copy()
         self.hand_trajectory_by_side = {
@@ -1226,7 +1237,8 @@ class FixedWritingActionSource:
                 scale_m=self.scale_m,
                 linear_speed_m_s=self.speed_m_s,
                 side="right",
-                direction=self.direction,
+                direction="up" if self.yaw_rad is not None else self.direction,
+                yaw_rad=self.yaw_rad,
                 additional_catalog_path=self.additional_catalog_path,
             )
             self._targets = resample_motion_targets(
@@ -1668,6 +1680,21 @@ def _resolve_writing_variant(
         size_m = lower + (upper - lower) * fraction
         size_range = [lower, upper]
 
+    max_deviation_deg = float(
+        getattr(args, "rule_writing_random_direction_deviation_deg", 45.0)
+    )
+    if not np.isfinite(max_deviation_deg) or not 0.0 <= max_deviation_deg <= 45.0:
+        raise ValueError("random writing direction deviation must be in [0, 45] degrees.")
+    deviation_deg = (
+        (2.0 * _stable_unit_interval(
+            catalog_hash=catalog_hash,
+            seed=seed,
+            phase="writing_direction_deviation",
+            selection_ordinal=selection_ordinal,
+        ) - 1.0) * max_deviation_deg
+        if directions else 0.0
+    )
+    yaw_rad = fixed_trajectory_direction_yaw_rad(direction) + math.radians(deviation_deg)
     enabled = bool(trajectory_ids or directions or size_range is not None)
     return trajectory_id, direction, size_m, {
         "schema": "dexteleop.rule_based_writing_variant_selection.v1",
@@ -1679,6 +1706,8 @@ def _resolve_writing_variant(
         "size_range_m": size_range,
         "selected_trajectory_id": trajectory_id,
         "selected_direction": direction,
+        "selected_direction_deviation_deg": deviation_deg,
+        "selected_yaw_rad": yaw_rad,
         "selected_size_m": size_m,
     }
 
@@ -1728,6 +1757,44 @@ def _writing_reachability_contact_probes(
                 ).tolist(),
             }
         )
+    return probes
+
+
+def _relative_pen_up_reachability_probes(
+    group: ReplayTrajectoryGroup,
+    *,
+    writing_end: TimestampedMotionTarget,
+) -> list[dict[str, Any]]:
+    """Sample the actual relative replay formula at its temporal midpoint and end.
+
+    The writing endpoint is a planned boundary. Live replay still rebases on
+    measured TCP and passes the normal runtime safety/IK gates.
+    """
+
+    times = np.asarray(
+        [group.relative_time_sec(index) for index in range(group.frame_count)],
+        dtype=float,
+    )
+    middle_time = 0.5 * (float(times[0]) + float(times[-1]))
+    middle_index = int(np.argmin(np.abs(times - middle_time)))
+    boundary = RuleBasedBoundaryState(
+        tcp_pose_by_side={"right": writing_end.pose_by_side["right"]},
+        pose_frame_by_side={"right": CANONICAL_DESK_ACTION_FRAME},
+        source="planned_writing_endpoint_preflight",
+    )
+    probes = []
+    for name, index in (("pen_up_mid", middle_index), ("pen_up_end", group.frame_count - 1)):
+        action = rebase_replay_action_at_boundary(
+            group, ("right",), index=index, boundary=boundary,
+            source_start_index=0,
+        )
+        probes.append({
+            "name": name,
+            "target_index": index,
+            "right_pose_canonical_desk": np.asarray(
+                action.arm_pose_by_side["right"], dtype=float
+            ).reshape(7).tolist(),
+        })
     return probes
 
 
@@ -3012,6 +3079,11 @@ def build_rule_based_writing(
         args,
         additional_catalog_path=additional_catalog_path,
     )
+    direction_yaw_override = (
+        float(writing_variant_selection["selected_yaw_rad"])
+        if float(writing_variant_selection["selected_direction_deviation_deg"]) != 0.0
+        else None
+    )
     source_specs, source_selection = _resolve_source_specs(args)
     pre_pen_down_spec = _resolve_pre_pen_down_replay_source_spec(args)
     requested_by_candidate: dict[str, list[str]] = {}
@@ -3315,7 +3387,8 @@ def build_rule_based_writing(
         scale_m=size_m,
         linear_speed_m_s=speed,
         side="right",
-        direction=resolved_direction,
+        direction="up" if direction_yaw_override is not None else resolved_direction,
+        yaw_rad=direction_yaw_override,
         additional_catalog_path=additional_catalog_path,
     )
     preview_targets = resample_motion_targets(
@@ -3327,17 +3400,29 @@ def build_rule_based_writing(
     if duration <= 0.0 or len(preview_targets) < 2:
         raise ValueError("fixed writing trajectory has no positive-duration path.")
     writing_action_hz = float((len(preview_targets) - 1) / duration)
+    writing_reachability_enabled = bool(
+        getattr(args, "rule_writing_reachability_check", False)
+    )
+    reachability_probes = _writing_reachability_contact_probes(preview_keyframes)
+    if writing_reachability_enabled:
+        reachability_probes.extend(
+            _relative_pen_up_reachability_probes(
+                phase_groups["pen_up"], writing_end=preview_targets[-1],
+            )
+        )
     source_selection = {
         **source_selection,
         "writing_reachability": {
             "schema": "dexteleop.rule_based_writing_reachability.v1",
-            "enabled": bool(
-                getattr(args, "rule_writing_reachability_check", False)
+            "enabled": writing_reachability_enabled,
+            "probe_definition": (
+                "four_writing_bbox_contacts_and_two_relative_pen_up_samples"
+                if writing_reachability_enabled
+                else "centerline_axis_aligned_bbox_edge_contacts"
             ),
-            "probe_definition": "centerline_axis_aligned_bbox_edge_contacts",
-            "probe_count": 4,
+            "probe_count": len(reachability_probes),
             "left_hold_pose_canonical_desk": left_hold_pose.astype(float).tolist(),
-            "probes": _writing_reachability_contact_probes(preview_keyframes),
+            "probes": reachability_probes,
         },
     }
     phase_groups = {
@@ -3453,6 +3538,7 @@ def build_rule_based_writing(
         scale_m=size_m,
         speed_m_s=speed,
         direction=resolved_direction,
+        yaw_rad=direction_yaw_override,
         left_hold_pose=left_hold_pose,
         additional_catalog_path=additional_catalog_path,
         hand_trajectory_by_side=writing_hand_trajectory,

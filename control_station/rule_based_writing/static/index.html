@@ -106,6 +106,7 @@
     <section class="controls" aria-label="轨迹采集控制">
       <button id="start" data-event="rule_start" disabled>开始规则采集</button>
       <button id="stop" class="danger" data-event="rule_stop" disabled>停止并 Hold</button>
+      <button id="exclude-last" class="secondary" data-event="exclude_last_episode" disabled>舍弃上一条轨迹（可恢复）</button>
       <button id="retry" class="secondary" data-event="device_retry" disabled>重连失败设备</button>
       <button id="runtime-home-retry" class="secondary" data-event="runtime_home_retry" disabled>重新安全初始化</button>
       <button id="release" class="secondary" data-event="release_grippers" disabled>松开夹爪</button>
@@ -113,6 +114,7 @@
       <button id="debug-mode" class="secondary" data-event="debug_toggle" disabled>开启 Debug 诊断</button>
       <button id="quit" class="secondary" data-event="q">退出程序</button>
     </section>
+    <p id="curation-status" class="storage-status" aria-live="polite"></p>
     <p id="gripper-status" class="gripper-status" aria-live="polite">夹爪独立控制：等待设备状态。</p>
     <p id="debug-status" class="gripper-status" aria-live="polite">Debug 诊断：关闭。</p>
     <section class="diagnostics" aria-labelledby="diagnostics-title">

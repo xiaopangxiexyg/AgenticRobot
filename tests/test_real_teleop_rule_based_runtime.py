@@ -632,7 +632,9 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
                 "left_hold_pose_canonical_desk": _pose().tolist(),
                 "probes": [
                     {"name": name, "right_pose_canonical_desk": _pose().tolist()}
-                    for name in ("left", "right", "top", "bottom")
+                    for name in (
+                        "left", "right", "top", "bottom", "pen_up_mid", "pen_up_end"
+                    )
                 ],
             }
         },
@@ -669,8 +671,10 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
     request = extension._writing_reachability_request()
 
     assert pickle.loads(pickle.dumps(request))["oracle_config"] is not None
-    assert len(request["probes"]) == 4
+    assert len(request["probes"]) == 6
     assert request["probes"][0]["envelope_modified_sides"] == ("left",)
+    assert request["probes"][4]["active_sides"] == ("right",)
+    assert request["probes"][5]["active_sides"] == ("right",)
     assert np.isclose(request["probes"][0]["target_pose_by_side"]["left"][0, 3], 0.01)
     assert request["oracle_config"].output_qpos_smoothing_alpha == 1.0
     assert request["oracle_config"].output_qpos_admittance_fast_path_alpha == 1.0
@@ -977,6 +981,57 @@ def test_writing_reachability_budget_exhaustion_is_not_unreachable(
 
     assert result["reachable"] is False
     assert result["probes"][0]["reason"] == "solver_budget_exhausted"
+
+
+def test_writing_reachability_cannot_pass_without_all_replay_probes(monkeypatch) -> None:
+    clock = [0.0]
+
+    class Oracle:
+        def __init__(self, _config):
+            pass
+
+        def set_current_qpos_pair(self, **_kwargs):
+            pass
+
+        def solve_target_pair(self, target):
+            return SimpleNamespace(
+                status="tracking",
+                fallback_reason=None,
+                side_results={
+                    "right": SimpleNamespace(
+                        solver_pose_world=target.target_pose_by_side["right"],
+                        qpos=np.zeros(6),
+                    )
+                },
+            )
+
+        def check_qpos_pair_collision(self, **_kwargs):
+            clock[0] = 5.0
+            return SimpleNamespace(safe=True, reason="")
+
+    monkeypatch.setattr(rule_runtime_module, "DualArmCollisionAwareRetargeter", Oracle)
+    monkeypatch.setattr(rule_runtime_module.time, "monotonic", lambda: clock[0])
+    request = {
+        "oracle_config": object(),
+        "seed_qpos": {"left": np.zeros(6), "right": np.zeros(6)},
+        "probes": tuple(
+            {
+                "name": name,
+                "target_pose_by_side": {"left": np.eye(4), "right": np.eye(4)},
+                "envelope_modified_sides": (),
+            }
+            for name in ("write_left", "pen_up_mid", "pen_up_end")
+        ),
+        "world_to_base_by_side": {"left": np.eye(4), "right": np.eye(4)},
+        "translation_tolerance_m": 0.005,
+        "rotation_tolerance_deg": 3.0,
+    }
+
+    result = RuleBasedRealTeleopExtension._run_writing_reachability_preflight(request)
+    assert result["reachable"] is False
+    assert [probe["reason"] for probe in result["probes"]] == [
+        "certified", "solver_budget_exhausted", "solver_budget_exhausted"
+    ]
 
 
 @pytest.mark.parametrize(

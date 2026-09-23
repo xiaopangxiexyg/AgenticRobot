@@ -6848,6 +6848,8 @@ class RuleBasedRealTeleopExtension:
         phases = phases if isinstance(phases, Mapping) else {}
         pen_down = phases.get("pen_down", {})
         pen_down = pen_down if isinstance(pen_down, Mapping) else {}
+        pen_up = phases.get("pen_up", {})
+        pen_up = pen_up if isinstance(pen_up, Mapping) else {}
         catalog = self.source_selection.get("trajectory_catalog", {})
         catalog = catalog if isinstance(catalog, Mapping) else {}
         return (
@@ -6860,9 +6862,12 @@ class RuleBasedRealTeleopExtension:
             ),
             str(variant.get("selected_trajectory_id") or ""),
             str(variant.get("selected_direction") or ""),
+            float(variant.get("selected_yaw_rad") or 0.0),
             float(variant.get("selected_size_m") or 0.0),
             str(pen_down.get("candidate_id") or ""),
             str(pen_down.get("source_contract_hash") or ""),
+            str(pen_up.get("candidate_id") or ""),
+            str(pen_up.get("source_contract_hash") or ""),
             str(catalog.get("combined_sha256") or ""),
             float(calibration.upper_bound_z_m),
         )
@@ -6956,8 +6961,8 @@ class RuleBasedRealTeleopExtension:
     def _writing_reachability_request(self) -> dict[str, Any]:
         metadata = self._writing_reachability_metadata()
         probes = metadata.get("probes")
-        if not isinstance(probes, (list, tuple)) or len(probes) != 4:
-            raise RuntimeError("writing reachability requires exactly four probes")
+        if not isinstance(probes, (list, tuple)) or len(probes) not in {4, 6}:
+            raise RuntimeError("writing reachability requires four writing probes and optional pen-up probes")
         calibration = self._height_calibration
         if calibration is None or not calibration.enabled:
             raise RuntimeError("writing reachability requires calibrated writing height")
@@ -7031,7 +7036,8 @@ class RuleBasedRealTeleopExtension:
                 ).reshape(7)
             )
             right_pose = np.asarray(right_pose, dtype=float).copy()
-            right_pose[2, 3] = float(calibration.upper_bound_z_m)
+            if not str(raw_probe.get("name") or "").startswith("pen_up_"):
+                right_pose[2, 3] = float(calibration.upper_bound_z_m)
             # Mirror the formal execution path in _coupled_pose_emission:
             # canonical desk -> runtime arm base -> calibrated solver world ->
             # solver endpoint.  Feeding canonical desk directly to the solver
@@ -7069,6 +7075,11 @@ class RuleBasedRealTeleopExtension:
             prepared_probes.append(
                 {
                     "name": str(raw_probe.get("name") or "unknown"),
+                    "active_sides": (
+                        ("right",)
+                        if str(raw_probe.get("name") or "").startswith("pen_up_")
+                        else ("left", "right")
+                    ),
                     "target_pose_by_side": {
                         side: np.asarray(effective_targets[side], dtype=float).copy()
                         for side in ("left", "right")
@@ -7122,7 +7133,7 @@ class RuleBasedRealTeleopExtension:
     def _run_writing_reachability_preflight(
         request: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        """Check four endpoints without backend, Session, or dispatch access."""
+        """Check writing bounds and sampled relative replay without dispatch."""
 
         started_at = time.monotonic()
         deadline = started_at + _WRITING_REACHABILITY_MAX_CHECK_SEC
@@ -7183,7 +7194,9 @@ class RuleBasedRealTeleopExtension:
                         # Fixed writing sends both poses to the live coupled
                         # solver. The downstream FixArm owner holds the left
                         # qpos, checked explicitly below after this solve.
-                        active_sides=("left", "right"),
+                        active_sides=tuple(
+                            probe.get("active_sides", ("left", "right"))
+                        ),
                         hard_hold_inactive_sides=True,
                         world_to_base_by_side=request["world_to_base_by_side"],
                     )
@@ -7247,8 +7260,20 @@ class RuleBasedRealTeleopExtension:
                 ))
             if reason == "solver_budget_exhausted":
                 break
+        if len(results) < len(probes):
+            results.extend(
+                {
+                    "name": str(probe["name"]),
+                    "reachable": False,
+                    "reason": "solver_budget_exhausted",
+                    "solver_status": "not_run",
+                    "solve_frames": 0,
+                }
+                for probe in probes[len(results):]
+            )
         return {
-            "reachable": all(bool(item["reachable"]) for item in results),
+            "reachable": len(results) == len(probes)
+            and all(bool(item["reachable"]) for item in results),
             "probes": results,
             "pose_projection": dict(request.get("pose_projection") or {}),
             "elapsed_ms": (time.monotonic() - started_at) * 1000.0,
@@ -7445,8 +7470,11 @@ class RuleBasedRealTeleopExtension:
                 request["progress_callback"] = progress.put
                 self._writing_reachability_progress = progress
                 self._writing_reachability_started_at = time.monotonic()
+                probe_count = len(request.get("probes") or ())
                 self._writing_reachability_progress_detail = (
-                    "独立计算进程正在检查四个边界点"
+                    f"独立计算进程正在检查 {probe_count} 个抽样点"
+                    if probe_count
+                    else "独立计算进程正在检查抽样点"
                 )
                 self._writing_reachability_future = (
                     self._submit_writing_reachability_preflight(request)
@@ -7455,7 +7483,7 @@ class RuleBasedRealTeleopExtension:
                 self._writing_reachability_detail = (
                     f"{self._writing_reachability_candidate_label}；"
                     f"前台准备 {self._writing_reachability_preparation_ms:.0f}ms；"
-                    "正在独立计算进程检查书写四边界接触点；尚未启动 Episode。"
+                    "正在独立计算进程检查书写边界与相对提笔；尚未启动 Episode。"
                 )
                 self._waiting_reason = "writing_reachability_preflight"
             except Exception as exc:  # noqa: BLE001 - no motion was authorized.
@@ -7515,7 +7543,7 @@ class RuleBasedRealTeleopExtension:
                 f"{self._writing_reachability_candidate_label}；"
                 + elapsed_detail
                 + (f"各点 {probe_timings}；" if probe_timings else "")
-                + "书写四边界接触点 IK/碰撞检查通过。"
+                + "书写边界与相对提笔抽样 IK/碰撞检查通过。"
             )
             self._waiting_reason = "waiting_for_rule_start"
             append_message = getattr(self._control_ui, "append_message", None)

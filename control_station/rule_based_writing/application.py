@@ -29,6 +29,7 @@ class RuleBasedWritingIntent(str, Enum):
     CLOSE_GRIPPERS = "close_grippers"
     CLOSE_RIGHT_GRIPPER = "close_right_gripper"
     DEBUG_TOGGLE = "debug_toggle"
+    EXCLUDE_LAST_EPISODE = "exclude_last_episode"
     QUIT = "q"
 
 
@@ -69,6 +70,8 @@ class RuleBasedWritingUiState:
     writer_retry_pending: bool = False
     episode_event_status: str = ""
     episode_event_message: str = ""
+    can_exclude_last_episode: bool = False
+    last_completed_episode_index: int | None = None
     gripper_sides: list[str] = field(default_factory=list)
     control_topology: str = "双臂（无夹爪）"
     gripper_control_available: bool = False
@@ -167,6 +170,7 @@ class RuleBasedWritingApplication:
         self._task_chain = RuleWritingTaskChain()
         self._task_chain_cancel_pending = False
         self._last_gripper_action_id: int | None = None
+        self._episode_exclusion_pending = False
         self._task_chain_configuration_pool: list[dict[str, object]] = []
         self._task_chain_choice_index = task_chain_choice_index or secrets.randbelow
         self._configuration_options: dict[str, object] = {}
@@ -431,10 +435,24 @@ class RuleBasedWritingApplication:
                 self._state.episode_event_status = str(
                     updates.get("episode_event_status", "") or ""
                 )
+            if "episode_last_episode_index" in updates:
+                self._state.last_completed_episode_index = self._optional_int(
+                    updates.get("episode_last_episode_index")
+                )
             if "episode_event_message" in updates:
                 self._state.episode_event_message = str(
                     updates.get("episode_event_message", "") or ""
                 )
+            if self._episode_exclusion_pending and "episode_event_message" in updates and (
+                self._state.episode_event_status == "excluded"
+                or (
+                    self._state.episode_event_status == "error"
+                    and self._state.episode_event_message.startswith("舍弃失败：")
+                )
+            ):
+                self._episode_exclusion_pending = False
+                if self._state.episode_event_status == "error":
+                    self._state.can_exclude_last_episode = True
             if (
                 self._state.device_retry_pending
                 and self._device_retry_waiting_for_hold
@@ -565,6 +583,20 @@ class RuleBasedWritingApplication:
         if not isinstance(intent, RuleBasedWritingIntent):
             raise TypeError("intent must be RuleBasedWritingIntent.")
         with self._lock:
+            if intent is RuleBasedWritingIntent.EXCLUDE_LAST_EPISODE:
+                if (
+                    not self._state.can_exclude_last_episode
+                    or self._state.last_completed_episode_index is None
+                ):
+                    return False
+                self._state.can_exclude_last_episode = False
+                self._episode_exclusion_pending = True
+                self._runtime_events.put(
+                    f"episode_exclude:{self._state.last_completed_episode_index}"
+                )
+                self._append_message_locked("Dataset", "正在可恢复地排除上一条已保存轨迹。")
+                self._touch()
+                return True
             if intent is RuleBasedWritingIntent.STOP and self._task_chain.active:
                 if self._task_chain_cancel_pending:
                     return False
@@ -605,6 +637,7 @@ class RuleBasedWritingApplication:
                 return False
             retry_writer_only = bool(self._state.writer_blocked)
             if not retry_writer_only:
+                self._state.can_exclude_last_episode = False
                 self._completion_stop_queued = False
                 self._rule_intents.put(intent)
                 self._pre_episode_start_admission_open = True
@@ -1931,6 +1964,9 @@ class RuleBasedWritingApplication:
             # The lower runtime increments this count only after the writer has
             # fully closed the singleton chain Episode and reset to pre-start.
             self._task_chain.finish_rule()
+            self._state.can_exclude_last_episode = (
+                self._state.last_completed_episode_index is not None
+            )
 
     @staticmethod
     def _waiting_detail(waiting: str) -> str:

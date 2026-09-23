@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
@@ -14,6 +15,54 @@ from control_station.rule_based_writing import (
 from teleop_runtime.real_teleop.rule_based_writing_plan import (
     RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
 )
+from dataset_interface.episode_exclusion import (
+    DECISIONS_RELATIVE_PATH,
+    read_episode_exclusions,
+    set_episode_excluded,
+)
+from dataset_interface.metadata import DexTeleopDatasetIndex
+
+
+def test_rule_gui_exclusion_requires_completed_episode_intent() -> None:
+    application = RuleBasedWritingApplication()
+    assert not application.submit_intent(RuleBasedWritingIntent.EXCLUDE_LAST_EPISODE)
+    application._state.can_exclude_last_episode = True
+    application._state.last_completed_episode_index = 7
+    assert application.submit_intent(RuleBasedWritingIntent.EXCLUDE_LAST_EPISODE)
+    assert application.consume_runtime_events() == ["episode_exclude:7"]
+    assert not application.submit_intent(RuleBasedWritingIntent.EXCLUDE_LAST_EPISODE)
+    application.observe_runtime_publication(
+        {"episode_event_status": "error", "episode_event_message": "writer 其他错误"}
+    )
+    assert not application.snapshot()["can_exclude_last_episode"]
+    application.observe_runtime_publication(
+        {"episode_event_status": "error", "episode_event_message": "舍弃失败：后台保存尚未结束。"}
+    )
+    assert application.snapshot()["can_exclude_last_episode"]
+
+
+def test_reversible_episode_exclusion_preserves_raw_catalog_and_training_filter(tmp_path: Path) -> None:
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    (meta / "info.json").write_text("{}", encoding="utf-8")
+    episode_path = meta / "episodes.jsonl"
+    original = json.dumps({"episode_index": 0, "frame_count": 3}) + "\n"
+    episode_path.write_text(original, encoding="utf-8")
+    assert DexTeleopDatasetIndex(tmp_path).training_eligibility(0).eligible
+    set_episode_excluded(tmp_path, 0, excluded=True)
+    assert read_episode_exclusions(tmp_path) == {0: True}
+    assert not DexTeleopDatasetIndex(tmp_path).training_eligibility(0).eligible
+    assert episode_path.read_text(encoding="utf-8") == original
+    set_episode_excluded(tmp_path, 0, excluded=False)
+    assert read_episode_exclusions(tmp_path) == {0: False}
+    assert DexTeleopDatasetIndex(tmp_path).training_eligibility(0).eligible
+    assert (tmp_path / DECISIONS_RELATIVE_PATH).is_file()
+    episode_path.write_text(
+        json.dumps({"episode_index": 0, "frame_count": 99}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="stale episode decision"):
+        read_episode_exclusions(tmp_path)
 
 
 def _task_chain_configuration() -> tuple[

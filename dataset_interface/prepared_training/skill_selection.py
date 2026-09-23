@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from ..episode_exclusion import read_episode_exclusions
 
 from ..progress_annotation_jobs import list_progress_annotation_work_items
 from ..progress_skill_projection import SkillProjectionCatalog
@@ -214,6 +215,7 @@ def select_strict_successful_skill_episodes(
     seen: set[str] = set()
     used_selector_keys: set[str] = set()
     for source in sorted(sources, key=lambda value: value.source_dataset_id):
+        operator_exclusions = read_episode_exclusions(source.dataset_root)
         for item in list_progress_annotation_work_items(source.dataset_root):
             identity = item.episode_identity_hash
             if identity in seen:
@@ -231,18 +233,22 @@ def select_strict_successful_skill_episodes(
             )
             if selector_key is not None:
                 used_selector_keys.add(selector_key)
-            annotation = _select_annotation(
-                dataset_root=source.dataset_root,
-                episode_uuid=item.episode_uuid,
-                episode_identity_hash=identity,
-                selector=(
-                    None if selector_key is None else selectors[selector_key]
-                ),
+            reason: str | None = (
+                "OPERATOR_EXCLUDED"
+                if operator_exclusions.get(item.episode_index, False)
+                else None
             )
-            reason: str | None = None
-            if annotation is None:
+            annotation = None
+            if reason is None:
+                annotation = _select_annotation(
+                    dataset_root=source.dataset_root,
+                    episode_uuid=item.episode_uuid,
+                    episode_identity_hash=identity,
+                    selector=(None if selector_key is None else selectors[selector_key]),
+                )
+            if reason is None and annotation is None:
                 reason = "NO_SEALED_STAGE_ANNOTATION"
-            else:
+            elif reason is None:
                 matches = tuple(
                     projection
                     for projection in skill_projection_catalog.projections_for_skill(
