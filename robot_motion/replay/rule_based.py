@@ -651,8 +651,13 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
         source_name = str(getattr(step.action_source, "name", "")).strip()
         if not source_name:
             source_name = step.action_source.__class__.__name__
+        # Dataset admission de-duplicates on this cursor-wide identity.  A
+        # runtime segment may emit many actions, so its plan-step index cannot
+        # be reused as the directive sequence without dropping the segment.
+        sequence_index = self._directive_index
+        self._directive_index += 1
         return RuleBasedCollectionDirective(
-            sequence_index=step_index,
+            sequence_index=sequence_index,
             step_id=step.step_id,
             kind="custom_action",
             capture=step.capture,

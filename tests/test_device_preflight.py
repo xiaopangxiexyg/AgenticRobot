@@ -748,6 +748,61 @@ class DevicePreflightTests(unittest.TestCase):
 
         self.assertEqual(save_mock.call_count, 0)
 
+    def test_dmtac_preflight_explains_stable_endpoint_for_stale_tty_override(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        original_scan = _dmtac_scan()
+        assignment = usb_assignment.build_assignment_from_tokens(
+            original_scan,
+            left_gripper="0",
+            right_gripper="1",
+        )
+        stale_override = dict(original_scan["grippers"][0])
+        stale_override.update(
+            {
+                "port": "/dev/ttyUSB0",
+                "device": "/dev/ttyUSB0",
+                "preferred_port": "/dev/ttyUSB0",
+                "port_aliases": ["/dev/ttyUSB0"],
+                "probe": {"reachable": False},
+            }
+        )
+        reachable_right = dict(original_scan["grippers"][1])
+        reachable_right.update(
+            {
+                "port": "/dev/ttyUSB2",
+                "device": "/dev/ttyUSB2",
+                "preferred_port": "/dev/serial/by-path/right-gripper",
+                "port_aliases": [
+                    "/dev/ttyUSB2",
+                    "/dev/serial/by-path/right-gripper",
+                ],
+                "probe": {"reachable": True},
+            }
+        )
+        current_scan = {"grippers": [stale_override, reachable_right], "tactile": []}
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("right",),
+            require_dmtac_tactile=False,
+            dmtac_gripper_overrides={
+                "right": {
+                    "port": "/dev/ttyUSB0",
+                    "gripper_id": 1,
+                    "baudrate": 115200,
+                }
+            },
+        )
+
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", return_value=current_scan),
+            patch.object(usb_assignment, "load_assignment", return_value=assignment),
+        ):
+            with self.assertRaisesRegex(
+                device_preflight.DevicePreflightError,
+                "reachable at '/dev/serial/by-path/right-gripper'.*omit the manual override",
+            ):
+                device_preflight.prepare_dmtac(options, result)
+
     def test_dmtac_preflight_accepts_override_matching_requested_identity(self) -> None:
         usb_assignment, *_ = device_preflight._load_dmtac_modules()
         scan = _dmtac_scan()

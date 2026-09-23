@@ -180,6 +180,18 @@ def test_real_teleop_input_batch_preserves_order_and_duplicates_without_barrier(
     assert result.suppress_foot_pad_events is False
 
 
+def test_rule_home_retry_is_not_silently_dropped_with_same_cycle_hold() -> None:
+    result = prioritize_input_batch(
+        ["h", "runtime_home_retry"],
+        terminal_quit_requested=False,
+        teleop_started=True,
+        two_pedal_mode_active=False,
+    )
+
+    assert result.events == ("h", "runtime_home_retry")
+    assert result.barrier == "hold"
+
+
 @pytest.mark.parametrize(
     ("events", "terminal_quit", "expected_events", "expected_barrier"),
     (
@@ -194,6 +206,12 @@ def test_real_teleop_input_batch_preserves_order_and_duplicates_without_barrier(
             ["episode_stop", "h", "w"],
             False,
             ("episode_stop", "h"),
+            "hold",
+        ),
+        (
+            ["episode_stop:rule_based_complete", "h", "w"],
+            False,
+            ("episode_stop:rule_based_complete", "h"),
             "hold",
         ),
         (["episode_start", "w"], True, (), "terminal_quit"),

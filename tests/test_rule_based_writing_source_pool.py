@@ -339,6 +339,7 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         lambda path, **_kwargs: tcp_by_path[Path(path).resolve()],
     )
     args = argparse.Namespace(
+        dataset_root=str(tmp_path / "collection"),
         rule_source_pool_manifest=str(manifest),
         rule_source_pool_range=None,
         rule_source_selection_seed=5,
@@ -387,6 +388,15 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
         ]
         == 0
     )
+    assert build.extension._selected_configuration[
+        "pen_down_candidate_id"
+    ] == writing_plan.RULE_BASED_RANDOM_SOURCE_SELECTION_ID
+    assert build.extension._selected_configuration[
+        "write_candidate_id"
+    ] == writing_plan.RULE_BASED_RANDOM_SOURCE_SELECTION_ID
+    assert build.extension._selected_configuration[
+        "pen_up_candidate_id"
+    ] == writing_plan.RULE_BASED_RANDOM_SOURCE_SELECTION_ID
     assert [step.step_id for step in build.extension.plan.steps] == [
         "initial_alignment",
         "right_write.pen_down",
@@ -414,7 +424,7 @@ def test_build_uses_three_datasets_and_records_exact_phase_provenance(
     assert [
         item["value"]
         for item in options["source_candidates_by_phase"]["pen_down"]
-    ] == ["down"]
+    ] == [writing_plan.RULE_BASED_RANDOM_SOURCE_SELECTION_ID, "down"]
     assert [item["value"] for item in options["trajectory_ids"]] == list(
         writing_plan.available_fixed_trajectory_ids()
     )
@@ -574,3 +584,100 @@ def test_gui_phase_candidate_overrides_cover_independent_source_combinations(
         phase: spec.candidate.candidate_id for phase, spec in selected.items()
     } == {"pen_down": "c", "write": "a", "pen_up": "b"}
     assert metadata["mode"] == "source_pool_gui_selection"
+
+
+def test_gui_phase_candidate_overrides_can_mix_fixed_and_seeded_random_sources(
+    tmp_path: Path,
+) -> None:
+    ids = ("a", "b", "c")
+    _make_dirs(tmp_path, ids)
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            {
+                "candidate_id": candidate_id,
+                "dataset_root": f"datasets/{candidate_id}",
+                "episode_index": index,
+                "detail_annotation_dir": f"details/{candidate_id}",
+                "phases": ["pen_down", "write", "pen_up"],
+                "tags": [],
+            }
+            for index, candidate_id in enumerate(ids)
+        ],
+    )
+    args = argparse.Namespace(
+        rule_source_pool_manifest=str(manifest),
+        rule_source_pool_range=None,
+        rule_source_selection_seed=23,
+        rule_source_dataset=None,
+        rule_source_episode=None,
+        rule_detail_annotation_dir=None,
+        _rule_source_candidate_ids_by_phase={"write": "b"},
+    )
+
+    selected, metadata = writing_plan._resolve_source_specs(args)
+
+    selected_ids = {
+        phase: spec.candidate.candidate_id for phase, spec in selected.items()
+    }
+    assert selected_ids["write"] == "b"
+    assert selected_ids["pen_down"] != "b"
+    assert selected_ids["pen_up"] != "b"
+    assert metadata["mode"] == "source_pool_gui_selection"
+    assert metadata["selection_seed"] == 23
+
+
+def test_gui_random_source_sentinel_selects_from_the_pool(
+    tmp_path: Path,
+) -> None:
+    _make_dirs(tmp_path, ("a", "b", "c"))
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            {
+                "candidate_id": candidate_id,
+                "dataset_root": f"datasets/{candidate_id}",
+                "episode_index": index,
+                "detail_annotation_dir": f"details/{candidate_id}",
+                "phases": ["pen_down", "write", "pen_up"],
+                "tags": [],
+            }
+            for index, candidate_id in enumerate(("a", "b", "c"))
+        ],
+    )
+    args = argparse.Namespace(
+        rule_source_pool_manifest=str(manifest),
+        rule_source_pool_range=None,
+        rule_source_selection_seed=7,
+        rule_source_dataset=None,
+        rule_source_episode=None,
+        rule_detail_annotation_dir=None,
+        _rule_source_candidate_ids_by_phase={
+            phase: writing_plan.RULE_BASED_RANDOM_SOURCE_SELECTION_ID
+            for phase in writing_plan.RULE_BASED_WRITING_SOURCE_PHASES_V1
+        },
+    )
+
+    selected, metadata = writing_plan._resolve_source_specs(args)
+    selected_again, metadata_again = writing_plan._resolve_source_specs(args)
+
+    assert {
+        phase: spec.candidate.candidate_id for phase, spec in selected.items()
+    } == {
+        phase: spec.candidate.candidate_id
+        for phase, spec in selected_again.items()
+    }
+    assert metadata["selection_seed"] == 7
+    assert metadata["selection_ordinal"] == 0
+    assert metadata == metadata_again
+
+    args._rule_source_selection_ordinal = 1
+    selected_next, metadata_next = writing_plan._resolve_source_specs(args)
+    assert metadata_next["selection_seed"] == 7
+    assert metadata_next["selection_ordinal"] == 1
+    assert {
+        phase: spec.candidate.candidate_id
+        for phase, spec in selected_next.items()
+    } != {
+        phase: spec.candidate.candidate_id for phase, spec in selected.items()
+    }

@@ -630,6 +630,58 @@ def test_rm65_backend_serializes_concurrent_force_reads():
     assert arm.call_times[1] - arm.call_times[0] >= 0.045
 
 
+def test_rm65_background_state_read_yields_to_inflight_force_reader():
+    force_started = threading.Event()
+    release_force = threading.Event()
+
+    class FakeArm:
+        state_calls = 0
+
+        def Get_Current_Arm_State(self):
+            self.state_calls += 1
+            values = [0.0] * 6
+            return 0, values, values, 0, 0
+
+        def Get_Force_Data(self):
+            force_started.set()
+            assert release_force.wait(1.0)
+            values = [0.0] * 6
+            return 0, values, values, values, values
+
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="127.0.0.1",
+            side="right",
+            connect_hardware=False,
+        )
+    )
+    arm = FakeArm()
+    backend.arm = arm
+    force_thread = threading.Thread(target=backend.read_force_data)
+    force_thread.start()
+    try:
+        assert force_started.wait(0.5)
+        started = time.perf_counter()
+        state = backend.refresh_state_from_hardware(
+            hardware_read_retries=0,
+            hardware_read_priority="background",
+            hardware_read_lock_timeout_sec=0.02,
+            include_derived_pose=False,
+            include_timing_percentiles=False,
+        )
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.1
+        assert state["hardware_read_success"] is False
+        assert "background hardware state read admission timed out" in str(
+            state["hardware_result_text"]
+        )
+        assert arm.state_calls == 0
+    finally:
+        release_force.set()
+        force_thread.join(timeout=0.5)
+        assert not force_thread.is_alive()
+
+
 def test_bimanual_emergency_stop_requests_both_arms_in_parallel():
     barrier = threading.Barrier(2)
 

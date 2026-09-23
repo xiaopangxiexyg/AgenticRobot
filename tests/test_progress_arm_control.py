@@ -22,6 +22,7 @@ from teleop_runtime.real_teleop.progress_arm_control import (
 )
 from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
 from teleop_runtime.real_teleop.control_loop import (
+    _idle_progress_entry_arm_control_allowed,
     _reconcile_active_progress_entry_arm_control,
     _reconcile_active_progress_intent_arm_control,
     _reconcile_idle_progress_entry_arm_control,
@@ -230,6 +231,24 @@ def test_pre_episode_fixed_side_waits_for_first_command_without_home() -> None:
     assert not plan.requires_home
     assert pending is None
     assert not ready
+
+
+def test_idle_entry_reconciliation_never_runs_under_authoritative_hold() -> None:
+    assert _idle_progress_entry_arm_control_allowed(
+        active_progress_episode=None,
+        pending_transition=None,
+        hold_active=False,
+    )
+    assert not _idle_progress_entry_arm_control_allowed(
+        active_progress_episode=None,
+        pending_transition=None,
+        hold_active=True,
+    )
+    assert not _idle_progress_entry_arm_control_allowed(
+        active_progress_episode=object(),
+        pending_transition=None,
+        hold_active=False,
+    )
 
 
 def test_active_episode_additive_fix_wait_never_creates_empty_home_transition() -> None:

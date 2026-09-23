@@ -172,8 +172,47 @@ class RuleBasedWritingWebUi:
     def bind_rule_runtime(self) -> None:
         self._application.bind_rule_runtime()
 
+    def allows_pre_episode_armed_warmup(self) -> bool:
+        """Expose the narrow rule-owned writer-open admission capability."""
+
+        return self._application.allows_pre_episode_armed_warmup()
+
+    def pre_episode_start_admission_reason(self) -> str | None:
+        """Expose the rule-owned admission diagnostic without owning the gate."""
+
+        return self._application.pre_episode_start_admission_reason()
+
     def consume_rule_intents(self) -> tuple[str, ...]:
         return self._application.consume_rule_intents()
+
+    def submit_task_chain_advance_from_foot_pad(self) -> bool:
+        """Submit one task-chain advance through the existing app boundary.
+
+        The physical input adapter only calls this capability on the
+        dedicated rule UI. It must not synthesize a GUI event or own any task
+        state, so the application remains the single task-chain authority.
+        """
+
+        return self._application.submit_task_chain_advance(
+            {"event": "advance", "source": "foot_pad"}
+        )
+
+    def task_chain_foot_pad_action_label(self) -> str:
+        """Describe the phase actually entered by the latest pedal advance."""
+
+        state = self._application.snapshot()
+        if bool(state.get("task_chain_owner_recovery_required")):
+            return (
+                "正在恢复右夹爪一次性闭合 owner"
+                if bool(state.get("gripper_action_pending"))
+                else "等待恢复右夹爪一次性闭合 owner"
+            )
+        return str(state.get("task_chain_title") or "任务链下一步")
+
+    def submit_emergency_stop_from_foot_pad(self) -> bool:
+        """Queue the existing rule stop-and-Hold path for pedal 2."""
+
+        return self._application.submit_intent(RuleBasedWritingIntent.STOP)
 
     def configure_rule_options(
         self,

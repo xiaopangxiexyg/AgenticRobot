@@ -136,7 +136,7 @@ def test_recording_resume_gate_uses_camera_availability_age() -> None:
         preview_camera_sources={},
         camera_previewer=None,
         recording_auto_stop_reason_fn=lambda _state: None,
-        gripper_warmup_probe_status=lambda **_kwargs: (True, "ready"),
+        gripper_warmup_probe_status=lambda *_args, **_kwargs: (True, "ready"),
         camera_status_blocking_message=lambda _status: None,
     )
 
@@ -166,12 +166,79 @@ def test_recording_resume_gate_rejects_future_availability_timestamp() -> None:
         preview_camera_sources={},
         camera_previewer=None,
         recording_auto_stop_reason_fn=lambda _state: None,
-        gripper_warmup_probe_status=lambda **_kwargs: (True, "ready"),
+        gripper_warmup_probe_status=lambda *_args, **_kwargs: (True, "ready"),
         camera_status_blocking_message=lambda _status: None,
     )
 
     assert ready is False
     assert message == "等待相机 front 时间戳稳定。"
+
+
+def test_recording_resume_gate_uses_latest_causal_frame_not_newer_buffer_head() -> None:
+    buffer = NearestFrameBuffer(keep_last=3)
+    buffer.push(_frame(9.95, frame_index=1, available_timestamp=9.96))
+    buffer.push(_frame(10.01, frame_index=2, available_timestamp=10.02))
+    source = SimpleNamespace(frame_buffer=lambda: buffer)
+    args = SimpleNamespace(
+        no_camera=False,
+        ignore_camera=(),
+        ignore_tactile=(),
+        camera_frame_max_age_sec=0.1,
+    )
+
+    ready, message = recording_warmup_status(
+        10.0,
+        step_result=_dispatched_arm_step(10.0),
+        args=args,
+        components=SimpleNamespace(active_sides=()),
+        clutch_input=SimpleNamespace(
+            hold_active=lambda: False,
+            publish_camera_status=lambda **_kwargs: {},
+        ),
+        dataset_recorder=None,
+        camera_sources={"front": source},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=lambda _state: None,
+        gripper_warmup_probe_status=lambda *_args, **_kwargs: (True, "ready"),
+        camera_status_blocking_message=lambda _status: None,
+    )
+
+    assert ready is True
+    assert message == "warmup 输入稳定。"
+
+
+def test_recording_resume_gate_honors_configured_camera_max_age() -> None:
+    buffer = NearestFrameBuffer(keep_last=2)
+    buffer.push(_frame(9.80, frame_index=1, available_timestamp=9.80))
+    source = SimpleNamespace(frame_buffer=lambda: buffer)
+    args = SimpleNamespace(
+        no_camera=False,
+        ignore_camera=(),
+        ignore_tactile=(),
+        camera_frame_max_age_sec=0.25,
+    )
+
+    ready, message = recording_warmup_status(
+        10.0,
+        step_result=_dispatched_arm_step(10.0),
+        args=args,
+        components=SimpleNamespace(active_sides=()),
+        clutch_input=SimpleNamespace(
+            hold_active=lambda: False,
+            publish_camera_status=lambda **_kwargs: {},
+        ),
+        dataset_recorder=None,
+        camera_sources={"front": source},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=lambda _state: None,
+        gripper_warmup_probe_status=lambda *_args, **_kwargs: (True, "ready"),
+        camera_status_blocking_message=lambda _status: None,
+    )
+
+    assert ready is True
+    assert message == "warmup 输入稳定。"
 
 
 def test_collection_camera_lookup_requires_source_and_availability_before_t0() -> None:

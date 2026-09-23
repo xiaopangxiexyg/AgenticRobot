@@ -415,22 +415,19 @@ class RuleBasedInitialAlignmentPlanner:
             _qpos_pair(step.qpos_by_side, name="planned_waypoint")
             for step in raw_plan.steps
         )
-        # The startup-Home continuity gate deliberately evaluates the first
-        # command against the atomic runtime-Home snapshot before permitting
-        # any real dispatch.  A bounded planner step may be larger than that
-        # one-shot envelope, so begin every certified plan with an exact,
-        # command-inert copy of the causal start state.  The gate can complete
-        # its multi-frame dwell on this qref; the original coupled transition
-        # and all of its velocity/collision bounds then follow unchanged.
+        # Begin every certified plan with an exact, command-inert copy of the
+        # accepted runtime-Home/start state.  This keeps the first rule frame
+        # inside the planner's own pre-dispatch boundary; the original coupled
+        # transition and all of its velocity/collision bounds then follow
+        # unchanged.
         certified_waypoints = (
             _qpos_pair(start, name="startup_home_continuity_waypoint"),
             *transition_waypoints,
         )
         if len(certified_waypoints) == 1:
-            # Preserve the StartupHomeContinuity dwell even when the measured
-            # arms already equal the selected first frame.  The shared C2
-            # builder requires a real interval and the duplicate is
-            # deliberately command-inert.
+            # The shared C2 builder requires a real interval even when the
+            # measured arms already equal the selected first frame.  The
+            # duplicate is deliberately command-inert.
             certified_waypoints = (
                 certified_waypoints[0],
                 _qpos_pair(start, name="already_aligned_terminal_waypoint"),

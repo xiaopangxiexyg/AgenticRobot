@@ -22,6 +22,11 @@ from typing import Any
 
 import numpy as np
 
+from dataset_contracts.capture_modalities import CaptureModalityContract
+from dataset_interface.capture_modalities import (
+    dataset_is_blank,
+    read_capture_modality_contract,
+)
 from dataset_contracts.rule_based_writing_sources import (
     RULE_BASED_WRITING_SOURCE_PHASES_V1,
     RuleBasedWritingSourceCandidateV1,
@@ -107,6 +112,7 @@ DEFAULT_COLLECTION_FLUSH_TIMEOUT_SEC = 30.0
 DEFAULT_COLLECTION_SAMPLE_DRAIN_TIMEOUT_SEC = 30.0
 DEFAULT_COLLECTION_TERMINAL_EVENT_PUT_TIMEOUT_SEC = 0.5
 DEFAULT_COLLECTION_STORAGE_QUEUE_ENQUEUE_TIMEOUT_SEC = 1.0
+DEFAULT_RULE_TACTILE_MIN_FREE_GB = 10.0
 
 RULE_COLLECTION_MODE_WRITING = "rule_based_writing"
 RULE_COLLECTION_MODE_FULL_REPLAY = "full_trajectory_replay"
@@ -114,6 +120,11 @@ RULE_COLLECTION_MODES = (
     RULE_COLLECTION_MODE_WRITING,
     RULE_COLLECTION_MODE_FULL_REPLAY,
 )
+# This is a UI-only value.  It is never used as a dataset candidate ID; the
+# source resolver turns it into a seeded source-pool choice before loading any
+# replay data.  Keeping the sentinel explicit lets the GUI distinguish the
+# default random policy from an operator-selected fixed candidate.
+RULE_BASED_RANDOM_SOURCE_SELECTION_ID = "__rule_source_pool_random__"
 FULL_REPLAY_INITIALIZE_STEP_ID = "execute_task.replay_initial_alignment"
 FULL_REPLAY_STEP_ID = "execute_task.manipulate"
 PRE_PEN_DOWN_ALIGNMENT_STEP_ID = "right_write.pre_pen_down.alignment"
@@ -123,6 +134,7 @@ PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID = (
 )
 
 _RULE_GUI_SHARED_RUNTIME_CONFIGURATION_FIELDS = (
+    "collect_tactile",
     "tactile_bundle_root",
     "tactile_bundle_min_free_gb",
     "tactile_compression",
@@ -139,8 +151,18 @@ _RULE_GUI_SHARED_RUNTIME_CONFIGURATION_FIELDS = (
     "write_parquet",
     "write_video",
 )
+
+
+def _positive_int(value: str) -> int:
+    normalized = int(value)
+    if normalized < 1:
+        raise argparse.ArgumentTypeError("value must be an integer >= 1")
+    return normalized
+
+
 _RULE_GUI_RUNTIME_CONFIGURATION_FIELDS = (
     "writing_speed_m_s",
+    "writing_speed_from_source",
     *_RULE_GUI_SHARED_RUNTIME_CONFIGURATION_FIELDS,
 )
 
@@ -238,12 +260,166 @@ class _LoadedWritingSource:
     metadata: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class RuleTactileCaptureResolution:
+    """Effective tactile policy for one rule-based dataset target.
+
+    The dataset-level capture contract is authoritative once a target contains
+    data.  This keeps a later run from appending tactile and non-tactile
+    episodes to the same dataset even when the operator changes the CLI/GUI
+    toggle.
+    """
+
+    contract: CaptureModalityContract
+    mode: str
+    source: str
+    locked: bool
+
+    @property
+    def collect_tactile(self) -> bool:
+        return set(self.contract.ignored_tactile_keys) != {"left", "right"}
+
+
+def _resolve_rule_tactile_capture(
+    args: argparse.Namespace,
+    *,
+    requested: bool | None = None,
+) -> RuleTactileCaptureResolution:
+    """Resolve rule tactile capture without mixing a populated dataset.
+
+    A blank target follows the explicit rule toggle, existing ``--ignore-tactile``
+    values, or (for backwards compatibility) whether a tactile bundle root was
+    supplied. A populated target always follows its persisted contract;
+    ambiguous legacy populated targets fail closed instead of guessing.
+    """
+
+    dataset_text = str(getattr(args, "dataset_root", "") or "").strip()
+    if not dataset_text:
+        raise ValueError("rule-based tactile resolution requires --dataset-root.")
+    dataset_root = Path(dataset_text).expanduser()
+    current_camera_keys = tuple(getattr(args, "ignore_camera", ()) or ())
+    existing = read_capture_modality_contract(dataset_root)
+    blank = dataset_is_blank(dataset_root)
+    if not blank:
+        if existing is None:
+            raise CaptureModalityBindingError(
+                "target dataset contains data but has no capture modality contract; "
+                "migrate meta/modality_validity.json explicitly before rule collection"
+            )
+        contract = existing
+        source = "existing_dataset_contract"
+        mode = (
+            "enabled"
+            if not contract.ignored_tactile_keys
+            else "disabled"
+            if set(contract.ignored_tactile_keys) == {"left", "right"}
+            else "existing_partial"
+        )
+        return RuleTactileCaptureResolution(
+            contract=contract,
+            mode=mode,
+            source=source,
+            locked=True,
+        )
+
+    if requested is None:
+        requested = getattr(args, "rule_collect_tactile", None)
+    if requested is not None:
+        ignored_tactile_keys = () if bool(requested) else ("left", "right")
+        source = "rule_option"
+    else:
+        current_tactile_keys = tuple(getattr(args, "ignore_tactile", ()) or ())
+        if current_tactile_keys:
+            ignored_tactile_keys = current_tactile_keys
+            source = "cli_ignore_tactile"
+        else:
+            explicit_dmtac_tactile = getattr(args, "dmtac_tactile", None)
+            if explicit_dmtac_tactile is not None:
+                ignored_tactile_keys = (
+                    () if bool(explicit_dmtac_tactile) else ("left", "right")
+                )
+                source = "cli_dmtac_tactile"
+            else:
+                # The previous rule launcher always required a tactile root.
+                # Keep that behavior when a root is present, while making a
+                # root-less invocation a valid explicit no-tactile collection.
+                has_tactile_root = bool(
+                    str(getattr(args, "tactile_bundle_root", "") or "").strip()
+                )
+                ignored_tactile_keys = () if has_tactile_root else ("left", "right")
+                source = "default_with_root" if has_tactile_root else "default_without_root"
+    contract = CaptureModalityContract(
+        ignored_camera_keys=current_camera_keys,
+        ignored_tactile_keys=ignored_tactile_keys,
+    )
+    mode = (
+        "enabled"
+        if not contract.ignored_tactile_keys
+        else "disabled"
+        if set(contract.ignored_tactile_keys) == {"left", "right"}
+        else "partial"
+    )
+    return RuleTactileCaptureResolution(
+        contract=contract,
+        mode=mode,
+        source=source,
+        locked=False,
+    )
+
+
+def _apply_rule_tactile_capture_resolution(
+    args: argparse.Namespace,
+    resolution: RuleTactileCaptureResolution,
+) -> RuleTactileCaptureResolution:
+    """Apply one resolved policy to the existing runtime argument namespace."""
+
+    # The persisted contract covers camera omissions as well.  Restore the
+    # complete contract before the recorder binds it again, otherwise an old
+    # dataset with a camera ignore rule could fail append admission even when
+    # only the tactile setting was changed in the UI.
+    args.ignore_camera = list(resolution.contract.ignored_camera_keys)
+    args.ignore_tactile = list(resolution.contract.ignored_tactile_keys)
+    args.rule_collect_tactile = bool(resolution.collect_tactile)
+    args.rule_tactile_capture_mode = resolution.mode
+    args.rule_tactile_capture_source = resolution.source
+    if not resolution.collect_tactile:
+        args.dmtac_tactile = False
+        args.tactile_bundle_root = ""
+        args.tactile_bundle_min_free_gb = 0.0
+        args.tactile_artifact_integrity = False
+        args.idle_tactile_compression = False
+        return resolution
+
+    tactile_root = str(getattr(args, "tactile_bundle_root", "") or "").strip()
+    if not tactile_root:
+        raise ValueError(
+            "当前规则数据集要求采集触觉，但未配置 --tactile-bundle-root；"
+            "请提供已有触觉 Bundle 根目录，不能与无触觉数据混采。"
+        )
+    args.dmtac_tactile = True
+    minimum_source = str(
+        getattr(args, "tactile_bundle_min_free_source", "default") or "default"
+    )
+    minimum_free_gb = float(
+        getattr(args, "tactile_bundle_min_free_gb", 0.0) or 0.0
+    )
+    if minimum_source == "default" and minimum_free_gb <= 0.0:
+        args.tactile_bundle_min_free_gb = DEFAULT_RULE_TACTILE_MIN_FREE_GB
+    return resolution
+
+
 def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
     # Rule-based collection replays measured DMTAC state and never consumes a
     # human Q6/angle-trigger input stream.  Mark this specialized entrypoint
     # so CLI resolution can default to the explicit no-input topology without
     # changing the ordinary teleop default (automatic Q6 discovery).
-    parser.set_defaults(_rule_based_writing_entrypoint=True)
+    parser.set_defaults(
+        _rule_based_writing_entrypoint=True,
+        # Rule-based collection keeps the writer/camera/feedback warmup, but
+        # has no operator-facing preparation countdown between readiness and
+        # the first admitted sample.
+        episode_start_countdown_sec=0.0,
+    )
     group = parser.add_argument_group("rule-based writing collection")
     group.add_argument(
         "--rule-collection-mode",
@@ -358,6 +534,46 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         help="Direction of glyph-local +Y in canonical desk coordinates.",
     )
     group.add_argument(
+        "--rule-writing-random-trajectory-ids",
+        default="",
+        metavar="IDS",
+        help=(
+            "Optional comma-separated one-stroke trajectory ids. One id is "
+            "selected deterministically for each Episode from the source-selection "
+            "seed and ordinal; empty preserves the fixed --rule-writing-trajectory."
+        ),
+    )
+    group.add_argument(
+        "--rule-writing-random-directions",
+        default="",
+        metavar="NAMES",
+        help=(
+            "Optional comma-separated subset of up,right,down,left selected "
+            "deterministically per Episode; empty preserves the fixed direction."
+        ),
+    )
+    group.add_argument(
+        "--rule-writing-random-size-min-m",
+        type=float,
+        default=None,
+        help="Optional lower bound for deterministic per-Episode writing size.",
+    )
+    group.add_argument(
+        "--rule-writing-random-size-max-m",
+        type=float,
+        default=None,
+        help="Optional upper bound for deterministic per-Episode writing size.",
+    )
+    group.add_argument(
+        "--rule-writing-reachability-check",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Before each Episode, certify the four centerline/bounding-box contact "
+            "points with a command-inert copy of the production IK/collision solver."
+        ),
+    )
+    group.add_argument(
         "--rule-writing-speed-m-s",
         type=float,
         default=None,
@@ -370,6 +586,37 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Initial dual-arm-to-source-start speed multiplier in (0, 1]. "
             "The certified RM65 joint/position limits remain the upper bound."
+        ),
+    )
+    group.add_argument(
+        "--rule-collect-tactile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether this rule-based run records DMTAC tactile data. On a "
+            "populated dataset, the existing dataset modality contract takes "
+            "precedence and prevents mixed tactile/non-tactile Episodes."
+        ),
+    )
+    group.add_argument(
+        "--rule-task-chain-foot-pad",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the dedicated two-pedal task-chain mapping: pedal 1 advances "
+            "the next task-chain step and pedal 2 requests the existing rule "
+            "stop-and-Hold path. This does not change ordinary teleop mappings."
+        ),
+    )
+    group.add_argument(
+        "--rule-task-chain-grasp-adjustment-interval",
+        type=_positive_int,
+        default=10,
+        help=(
+            "Successful rule Episodes per right-gripper adjustment. The first "
+            "Episode always runs release, close, and height calibration; "
+            "subsequent Episodes reuse that grasp until this positive interval "
+            "is reached (default: 10)."
         ),
     )
 
@@ -767,6 +1014,20 @@ def _replace_group_hand_trajectory(
     )
 
 
+def _fixed_dmtac_trajectory(*, frame_count: int, scalar: float) -> np.ndarray:
+    """Return one finite six-slot DMTAC trajectory with a fixed active slot."""
+
+    count = int(frame_count)
+    value = float(scalar)
+    if count < 1:
+        raise ValueError("fixed DMTAC trajectory requires at least one frame.")
+    if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError("fixed DMTAC target must be inside normalized [0, 1].")
+    target = np.zeros(6, dtype=np.float32)
+    target[0] = value
+    return np.repeat(target[None, :], count, axis=0)
+
+
 def _resample_hand_trajectory(
     values: np.ndarray,
     *,
@@ -1007,6 +1268,15 @@ class FixedWritingActionSource:
             source="rule_based_fixed_writing",
             metadata={
                 **dict(target.metadata),
+                "rule_based_writing_trajectory_id": self.trajectory_id,
+                "rule_based_writing_direction": self.direction,
+                "rule_based_writing_size_m": self.scale_m,
+                # Motion and dataset clocks are intentionally independent.
+                # The runtime expands these source-cadence keyframes onto the
+                # shared position-reference clock while retaining this
+                # segment's cursor sequence as the dataset capture identity.
+                "rule_based_position_reference_resample": True,
+                "rule_based_position_keyframe_hz": self.reference_hz,
                 "hand_action_specs_by_side": {
                     side: spec.to_metadata()
                     for side, spec in self.hand_action_specs_by_side.items()
@@ -1278,11 +1548,187 @@ def _stable_candidate_index(
     seed: int,
     phase: str,
     candidate_count: int,
+    selection_ordinal: int = 0,
 ) -> int:
     digest = hashlib.sha256(
-        f"{pool_hash}\0{int(seed)}\0{phase}".encode("utf-8")
+        f"{pool_hash}\0{int(seed)}\0{phase}\0{int(selection_ordinal)}".encode("utf-8")
     ).digest()
     return int.from_bytes(digest[:8], "big") % int(candidate_count)
+
+
+def _comma_separated_unique(value: object, *, name: str) -> tuple[str, ...]:
+    items = tuple(part.strip() for part in str(value or "").split(",") if part.strip())
+    if len(items) != len(set(items)):
+        raise ValueError(f"{name} must not contain duplicate values.")
+    return items
+
+
+def _stable_unit_interval(
+    *,
+    catalog_hash: str,
+    seed: int,
+    phase: str,
+    selection_ordinal: int,
+) -> float:
+    digest = hashlib.sha256(
+        f"{catalog_hash}\0{int(seed)}\0{phase}\0{int(selection_ordinal)}".encode(
+            "utf-8"
+        )
+    ).digest()
+    return int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
+
+
+def _resolve_writing_variant(
+    args: argparse.Namespace,
+    *,
+    additional_catalog_path: Path | None,
+) -> tuple[str, str, float, dict[str, Any]]:
+    """Resolve one deterministic writing variant without process RNG state."""
+
+    catalog_hash = fixed_trajectory_catalog_hash(
+        additional_catalog_path=additional_catalog_path,
+    )
+    selection_ordinal = int(getattr(args, "_rule_source_selection_ordinal", 0))
+    if selection_ordinal < 0:
+        raise ValueError("rule source selection ordinal must be non-negative.")
+    seed = int(getattr(args, "rule_source_selection_seed", 0))
+
+    trajectory_ids = _comma_separated_unique(
+        getattr(args, "rule_writing_random_trajectory_ids", ""),
+        name="rule writing random trajectory ids",
+    )
+    available_ids = set(
+        available_fixed_trajectory_ids(
+            additional_catalog_path=additional_catalog_path,
+        )
+    )
+    unknown_ids = tuple(value for value in trajectory_ids if value not in available_ids)
+    if unknown_ids:
+        raise ValueError(
+            "rule writing random trajectory ids are absent from the composed "
+            f"one-stroke catalog: {', '.join(unknown_ids)}"
+        )
+    trajectory_id = str(args.rule_writing_trajectory)
+    if trajectory_ids:
+        trajectory_id = trajectory_ids[
+            _stable_candidate_index(
+                pool_hash=catalog_hash,
+                seed=seed,
+                phase="writing_trajectory",
+                candidate_count=len(trajectory_ids),
+                selection_ordinal=selection_ordinal,
+            )
+        ]
+
+    directions = _comma_separated_unique(
+        getattr(args, "rule_writing_random_directions", ""),
+        name="rule writing random directions",
+    )
+    invalid_directions = tuple(
+        value for value in directions if value not in FIXED_TRAJECTORY_DIRECTIONS
+    )
+    if invalid_directions:
+        raise ValueError(
+            "rule writing random directions must be selected from "
+            f"{','.join(FIXED_TRAJECTORY_DIRECTIONS)}: {','.join(invalid_directions)}"
+        )
+    direction = str(args.rule_writing_direction)
+    if directions:
+        direction = directions[
+            _stable_candidate_index(
+                pool_hash=catalog_hash,
+                seed=seed,
+                phase="writing_direction",
+                candidate_count=len(directions),
+                selection_ordinal=selection_ordinal,
+            )
+        ]
+
+    minimum = getattr(args, "rule_writing_random_size_min_m", None)
+    maximum = getattr(args, "rule_writing_random_size_max_m", None)
+    if (minimum is None) != (maximum is None):
+        raise ValueError(
+            "rule writing random size requires both minimum and maximum bounds."
+        )
+    size_m = float(args.rule_writing_size_m)
+    size_range: list[float] | None = None
+    if minimum is not None and maximum is not None:
+        lower = float(minimum)
+        upper = float(maximum)
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower <= 0.0:
+            raise ValueError("rule writing random size bounds must be finite and positive.")
+        if upper < lower:
+            raise ValueError("rule writing random size maximum must be >= minimum.")
+        fraction = _stable_unit_interval(
+            catalog_hash=catalog_hash,
+            seed=seed,
+            phase="writing_size",
+            selection_ordinal=selection_ordinal,
+        )
+        size_m = lower + (upper - lower) * fraction
+        size_range = [lower, upper]
+
+    enabled = bool(trajectory_ids or directions or size_range is not None)
+    return trajectory_id, direction, size_m, {
+        "schema": "dexteleop.rule_based_writing_variant_selection.v1",
+        "enabled": enabled,
+        "selection_seed": seed if enabled else None,
+        "selection_ordinal": selection_ordinal,
+        "trajectory_candidates": list(trajectory_ids),
+        "direction_candidates": list(directions),
+        "size_range_m": size_range,
+        "selected_trajectory_id": trajectory_id,
+        "selected_direction": direction,
+        "selected_size_m": size_m,
+    }
+
+
+def _writing_reachability_contact_probes(
+    targets: Sequence[TimestampedMotionTarget],
+) -> list[dict[str, Any]]:
+    """Return the four centerline contacts of a shrinking axis-aligned box."""
+
+    right_poses = [
+        np.asarray(target.pose_by_side["right"], dtype=float).reshape(4, 4)
+        for target in targets
+    ]
+    positions = np.stack([pose[:3, 3] for pose in right_poses], axis=0)
+    center_xy = 0.5 * (
+        np.min(positions[:, :2], axis=0) + np.max(positions[:, :2], axis=0)
+    )
+    edge_specs = (
+        ("left", 0, np.argmin, 1),
+        ("right", 0, np.argmax, 1),
+        ("bottom", 1, np.argmin, 0),
+        ("top", 1, np.argmax, 0),
+    )
+    probes: list[dict[str, Any]] = []
+    for name, axis, reducer, orthogonal_axis in edge_specs:
+        extreme_index = int(reducer(positions[:, axis]))
+        coordinate = float(positions[extreme_index, axis])
+        edge_indices = np.flatnonzero(
+            np.isclose(positions[:, axis], coordinate, rtol=0.0, atol=1e-12)
+        )
+        index = int(
+            edge_indices[
+                np.argmin(
+                    np.abs(
+                        positions[edge_indices, orthogonal_axis]
+                        - center_xy[orthogonal_axis]
+                    )
+                )
+            ]
+        )
+        probes.append(
+            {
+                "name": name,
+                "target_index": index,
+                "right_pose_canonical_desk": pose_matrix_to_xyzquat(
+                    right_poses[index]
+                ).tolist(),
+            }
+        )
+    return probes
 
 
 def _resolve_source_specs(
@@ -1335,6 +1781,9 @@ def _resolve_source_specs(
         )
 
     loaded_pool = _load_rule_source_pool_cached(args, manifest)
+    selection_ordinal = int(getattr(args, "_rule_source_selection_ordinal", 0))
+    if selection_ordinal < 0:
+        raise ValueError("rule source selection ordinal must be non-negative.")
     start, end = _parse_pool_range(
         getattr(args, "rule_source_pool_range", None),
         candidate_count=len(loaded_pool.candidates),
@@ -1344,12 +1793,31 @@ def _resolve_source_specs(
     if requested_ids is not None:
         if not isinstance(requested_ids, Mapping):
             raise ValueError("rule source candidate overrides must be a mapping.")
-        if set(requested_ids) != set(RULE_BASED_WRITING_SOURCE_PHASES_V1):
-            raise ValueError("rule source candidate overrides must cover all phases.")
+        normalized_requested_ids = {
+            str(phase): value for phase, value in requested_ids.items()
+        }
+        unknown_phases = set(normalized_requested_ids) - set(
+            RULE_BASED_WRITING_SOURCE_PHASES_V1
+        )
+        if unknown_phases:
+            raise ValueError(
+                "rule source candidate overrides contain unknown phases: "
+                f"{sorted(unknown_phases)!r}."
+            )
         by_id = {value.candidate.candidate_id: value for value in ranged}
         selected: dict[str, ResolvedRuleBasedWritingSourceCandidate] = {}
+        used: set[str] = set()
+        random_phases: list[str] = []
         for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1:
-            candidate_id = str(requested_ids[phase])
+            raw_candidate_id = normalized_requested_ids.get(phase)
+            candidate_id = (
+                ""
+                if raw_candidate_id is None
+                else str(raw_candidate_id).strip()
+            )
+            if not candidate_id or candidate_id == RULE_BASED_RANDOM_SOURCE_SELECTION_ID:
+                random_phases.append(phase)
+                continue
             spec = by_id.get(candidate_id)
             if spec is None or phase not in spec.candidate.phases:
                 raise ValueError(
@@ -1357,6 +1825,33 @@ def _resolve_source_specs(
                     "inside the selected source-pool range."
                 )
             selected[phase] = spec
+            used.add(candidate_id)
+        for phase in random_phases:
+            eligible = [value for value in ranged if phase in value.candidate.phases]
+            if not eligible:
+                raise ValueError(
+                    f"selected source-pool range has no candidate for phase {phase!r}."
+                )
+            unused = [
+                value
+                for value in eligible
+                if value.candidate.candidate_id not in used
+            ]
+            choices = unused or eligible
+            index = _stable_candidate_index(
+                pool_hash=loaded_pool.contract.semantic_content_hash,
+                seed=int(getattr(args, "rule_source_selection_seed", 0)),
+                phase=phase,
+                candidate_count=len(choices),
+                selection_ordinal=selection_ordinal,
+            )
+            selected[phase] = choices[index]
+            used.add(choices[index].candidate.candidate_id)
+        selection_seed = (
+            None
+            if not random_phases
+            else int(getattr(args, "rule_source_selection_seed", 0))
+        )
         return (
             selected,
             {
@@ -1366,7 +1861,8 @@ def _resolve_source_specs(
                 "pool_manifest_path": str(loaded_pool.manifest_path),
                 "pool_manifest_hash": loaded_pool.contract.semantic_content_hash,
                 "pool_range": {"start": start, "end": end},
-                "selection_seed": None,
+                "selection_seed": selection_seed,
+                "selection_ordinal": selection_ordinal,
             },
         )
     selected: dict[str, ResolvedRuleBasedWritingSourceCandidate] = {}
@@ -1384,6 +1880,7 @@ def _resolve_source_specs(
             seed=int(getattr(args, "rule_source_selection_seed", 0)),
             phase=phase,
             candidate_count=len(choices),
+            selection_ordinal=selection_ordinal,
         )
         selected[phase] = choices[index]
         used.add(choices[index].candidate.candidate_id)
@@ -1397,6 +1894,7 @@ def _resolve_source_specs(
             "pool_manifest_hash": loaded_pool.contract.semantic_content_hash,
             "pool_range": {"start": start, "end": end},
             "selection_seed": int(getattr(args, "rule_source_selection_seed", 0)),
+            "selection_ordinal": selection_ordinal,
         },
     )
 
@@ -1640,6 +2138,7 @@ def _rule_configuration_options(
     source_specs: Mapping[str, ResolvedRuleBasedWritingSourceCandidate],
     resolved_writing_speed_m_s: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    tactile_resolution = _resolve_rule_tactile_capture(args)
     additional_catalog_path = _additional_fixed_trajectory_catalog_path(args)
     manifest = getattr(args, "rule_source_pool_manifest", None)
     if manifest is None:
@@ -1652,16 +2151,30 @@ def _rule_configuration_options(
         )
         candidates = loaded_pool.candidates[start:end]
     source_options = {
-        phase: [
-            _configuration_option_entry(spec)
-            for spec in candidates
-            if phase in spec.candidate.phases
-        ]
+        phase: (
+            (
+                [
+                    {
+                        "value": RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+                        "label": "随机选择（默认）",
+                    }
+                ]
+                if manifest is not None
+                else []
+            )
+            + [
+                _configuration_option_entry(spec)
+                for spec in candidates
+                if phase in spec.candidate.phases
+            ]
+        )
         for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1
     }
-    tactile_bundle_root = str(
-        getattr(args, "tactile_bundle_root", "") or ""
-    ).strip()
+    tactile_bundle_root = (
+        str(getattr(args, "tactile_bundle_root", "") or "").strip()
+        if tactile_resolution.collect_tactile
+        else ""
+    )
     tactile_bundle_free_gb: float | None = None
     if tactile_bundle_root:
         try:
@@ -1774,7 +2287,12 @@ def _rule_configuration_options(
         "select_fields": {
             "tactile_compression": ["none", "lz4", "zstd"],
         },
-        "boolean_fields": ["write_parquet", "write_video"],
+        "boolean_fields": [
+            "writing_speed_from_source",
+            "collect_tactile",
+            "write_parquet",
+            "write_video",
+        ],
         "text_fields": ["tactile_bundle_root"],
         "numeric_bounds": {
             "writing_size_m": [
@@ -1832,14 +2350,24 @@ def _rule_configuration_options(
         "runtime_info": {
             "dataset_root": str(getattr(args, "dataset_root", "") or ""),
             "tactile_bundle_free_gb": tactile_bundle_free_gb,
+            "tactile_capture_mode": tactile_resolution.mode,
+            "tactile_capture_source": tactile_resolution.source,
+            "tactile_capture_locked": bool(tactile_resolution.locked),
             "sample_hz": float(getattr(args, "hz", 15.0)),
             "position_reference_hz": effective_position_reference_hz(args),
             "outer_control_hz": effective_outer_control_hz(args),
             "arm_control_hz": effective_arm_control_hz(args),
+            "task_chain_grasp_adjustment_interval": int(
+                getattr(args, "rule_task_chain_grasp_adjustment_interval", 10)
+            ),
         },
     }
     selected = {
-        f"{phase}_candidate_id": source_specs[phase].candidate.candidate_id
+        f"{phase}_candidate_id": (
+            RULE_BASED_RANDOM_SOURCE_SELECTION_ID
+            if manifest is not None
+            else source_specs[phase].candidate.candidate_id
+        )
         for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1
     }
     selected.update(
@@ -1854,9 +2382,13 @@ def _rule_configuration_options(
             "direction": str(args.rule_writing_direction),
             "writing_size_m": float(args.rule_writing_size_m),
             "writing_speed_m_s": float(resolved_writing_speed_m_s),
+            "writing_speed_from_source": bool(
+                getattr(args, "rule_writing_speed_m_s", None) is None
+            ),
             "initial_alignment_speed_scale": float(
                 getattr(args, "rule_initial_alignment_speed_scale", 1.0)
             ),
+            "collect_tactile": bool(tactile_resolution.collect_tactile),
             "tactile_bundle_root": tactile_bundle_root,
             "tactile_bundle_min_free_gb": current_min_free_gb,
             "tactile_compression": str(
@@ -1942,9 +2474,29 @@ def _apply_rule_gui_runtime_configuration(
         value = configuration.get(name, getattr(target, name, default))
         return float(value)
 
+    requested_tactile = configuration.get(
+        "collect_tactile",
+        getattr(target, "rule_collect_tactile", None),
+    )
+    tactile_resolution = _resolve_rule_tactile_capture(
+        target,
+        requested=(None if requested_tactile is None else bool(requested_tactile)),
+    )
     patch: dict[str, object] = {
+        "collect_tactile": bool(tactile_resolution.collect_tactile),
+        "ignore_tactile": list(tactile_resolution.contract.ignored_tactile_keys),
+        "rule_collect_tactile": bool(tactile_resolution.collect_tactile),
+        "rule_tactile_capture_mode": tactile_resolution.mode,
+        "rule_tactile_capture_source": tactile_resolution.source,
         "tactile_bundle_min_free_gb": float(
-            configuration["tactile_bundle_min_free_gb"]
+            configuration.get(
+                "tactile_bundle_min_free_gb",
+                getattr(
+                    target,
+                    "tactile_bundle_min_free_gb",
+                    DEFAULT_RULE_TACTILE_MIN_FREE_GB,
+                ),
+            )
         ),
         "tactile_compression": str(configuration["tactile_compression"]),
         "writer_workers": int(configuration["writer_workers"]),
@@ -1988,8 +2540,23 @@ def _apply_rule_gui_runtime_configuration(
         "write_video": bool(configuration["write_video"]),
     }
     if "writing_speed_m_s" in configuration:
-        patch["rule_writing_speed_m_s"] = float(configuration["writing_speed_m_s"])
-    configured_root = str(configuration["tactile_bundle_root"] or "").strip()
+        patch["rule_writing_speed_m_s"] = (
+            None
+            if bool(configuration.get("writing_speed_from_source", False))
+            else float(configuration["writing_speed_m_s"])
+        )
+    if not tactile_resolution.collect_tactile:
+        patch["dmtac_tactile"] = False
+        patch["tactile_bundle_root"] = ""
+        patch["tactile_bundle_min_free_gb"] = 0.0
+        patch["tactile_artifact_integrity"] = False
+        patch["idle_tactile_compression"] = False
+        for key, value in patch.items():
+            setattr(target, key, value)
+        return patch
+
+    patch["dmtac_tactile"] = True
+    configured_root = str(configuration.get("tactile_bundle_root", "") or "").strip()
     minimum_free_gb = float(patch["tactile_bundle_min_free_gb"])
     if not configured_root:
         if minimum_free_gb > 0.0:
@@ -2343,6 +2910,9 @@ def _build_full_trajectory_replay(
             configuration: Mapping[str, Any],
         ) -> RuleBasedRealTeleopExtension:
             rebuilt_args = copy.copy(base_args)
+            rebuilt_args._rule_source_selection_ordinal = int(
+                configuration.get("_selection_ordinal", 0)
+            )
             rebuilt_args._rule_full_replay_candidate_id = str(
                 configuration["full_replay_candidate_id"]
             )
@@ -2402,6 +2972,15 @@ def build_rule_based_writing(
     deployment: RuleBasedRealTeleopDeployment | None = None,
     enable_prestart_configuration: bool = True,
 ) -> RuleBasedWritingBuild:
+    tactile_resolution = _resolve_rule_tactile_capture(args)
+    _apply_rule_tactile_capture_resolution(args, tactile_resolution)
+    print(
+        "[RuleBased] tactile_capture="
+        f"{tactile_resolution.mode} "
+        f"source={tactile_resolution.source} "
+        f"locked={str(tactile_resolution.locked).lower()} "
+        f"ignored_sides={list(tactile_resolution.contract.ignored_tactile_keys)}"
+    )
     deployment = deployment or preflight_rule_based_real_teleop_deployment(args)
     collection_mode = str(
         getattr(args, "rule_collection_mode", RULE_COLLECTION_MODE_WRITING)
@@ -2424,6 +3003,15 @@ def build_rule_based_writing(
     if collection_mode != RULE_COLLECTION_MODE_WRITING:
         raise ValueError(f"unsupported rule collection mode: {collection_mode!r}.")
     additional_catalog_path = _additional_fixed_trajectory_catalog_path(args)
+    (
+        resolved_trajectory_id,
+        resolved_direction,
+        resolved_size_m,
+        writing_variant_selection,
+    ) = _resolve_writing_variant(
+        args,
+        additional_catalog_path=additional_catalog_path,
+    )
     source_specs, source_selection = _resolve_source_specs(args)
     pre_pen_down_spec = _resolve_pre_pen_down_replay_source_spec(args)
     requested_by_candidate: dict[str, list[str]] = {}
@@ -2533,6 +3121,7 @@ def build_rule_based_writing(
         }
     source_selection = {
         **source_selection,
+        "collection_mode": RULE_COLLECTION_MODE_WRITING,
         "trajectory_catalog": {
             "mode": (
                 "default_plus_additional"
@@ -2565,12 +3154,15 @@ def build_rule_based_writing(
             "grippers": list(configured_gripper_sides),
         },
         "gripper_trajectory_mode": (
-            "source_phase_relative_continuous_time_normalized_write"
+            "right_task_chain_fixed_closed"
+            if "right" in configured_gripper_sides
+            else "source_phase_relative_continuous_time_normalized_write"
             if configured_gripper_sides
             else "disabled"
         ),
         "gripper_max_step": gripper_max_step,
         "initial_alignment_speed_scale": alignment_speed_scale,
+        "writing_variant_selection": writing_variant_selection,
     }
 
     phase_groups = {
@@ -2665,6 +3257,36 @@ def build_rule_based_writing(
                 pre_pen_down_group,
                 sides=configured_gripper_sides,
             )
+    if "right" in configured_gripper_sides:
+        # The task chain is the sole owner of the writing hand: it closes the
+        # right gripper once before this plan starts and opens it once after
+        # the Episode. Source hand traces remain represented by source
+        # provenance, but must not re-drive the pen grip during approach,
+        # writing or departure. Keeping the canonical action fixed at the
+        # closed endpoint also keeps recorded action semantics aligned with
+        # the physical command without introducing a second gripper loop.
+        phase_groups = {
+            phase: _replace_group_hand_trajectory(
+                group,
+                {
+                    "right": _fixed_dmtac_trajectory(
+                        frame_count=group.frame_count,
+                        scalar=1.0,
+                    )
+                },
+            )
+            for phase, group in phase_groups.items()
+        }
+        if pre_pen_down_group is not None:
+            pre_pen_down_group = _replace_group_hand_trajectory(
+                pre_pen_down_group,
+                {
+                    "right": _fixed_dmtac_trajectory(
+                        frame_count=pre_pen_down_group.frame_count,
+                        scalar=1.0,
+                    )
+                },
+            )
 
     speed = (
         float(args.rule_writing_speed_m_s)
@@ -2677,7 +3299,7 @@ def build_rule_based_writing(
     )
     if not np.isfinite(speed) or speed <= 0.0:
         raise ValueError("rule writing speed must be finite and positive.")
-    size_m = float(args.rule_writing_size_m)
+    size_m = float(resolved_size_m)
     if not np.isfinite(size_m) or size_m <= 0.0:
         raise ValueError("rule writing size must be finite and positive.")
 
@@ -2689,11 +3311,11 @@ def build_rule_based_writing(
                 ACTION_ARM_POSE_SLICES["right"],
             ],
         },
-        args.rule_writing_trajectory,
+        resolved_trajectory_id,
         scale_m=size_m,
         linear_speed_m_s=speed,
         side="right",
-        direction=args.rule_writing_direction,
+        direction=resolved_direction,
         additional_catalog_path=additional_catalog_path,
     )
     preview_targets = resample_motion_targets(
@@ -2705,6 +3327,37 @@ def build_rule_based_writing(
     if duration <= 0.0 or len(preview_targets) < 2:
         raise ValueError("fixed writing trajectory has no positive-duration path.")
     writing_action_hz = float((len(preview_targets) - 1) / duration)
+    source_selection = {
+        **source_selection,
+        "writing_reachability": {
+            "schema": "dexteleop.rule_based_writing_reachability.v1",
+            "enabled": bool(
+                getattr(args, "rule_writing_reachability_check", False)
+            ),
+            "probe_definition": "centerline_axis_aligned_bbox_edge_contacts",
+            "probe_count": 4,
+            "left_hold_pose_canonical_desk": left_hold_pose.astype(float).tolist(),
+            "probes": _writing_reachability_contact_probes(preview_keyframes),
+        },
+    }
+    phase_groups = {
+        phase: replace(
+            group,
+            metadata={
+                **dict(group.metadata),
+                "rule_based_source_selection": source_selection,
+            },
+        )
+        for phase, group in phase_groups.items()
+    }
+    if pre_pen_down_group is not None:
+        pre_pen_down_group = replace(
+            pre_pen_down_group,
+            metadata={
+                **dict(pre_pen_down_group.metadata),
+                "rule_based_source_selection": source_selection,
+            },
+        )
     writing_hand_trajectory: dict[str, np.ndarray] = {}
     if configured_gripper_sides:
         pen_down_hand = {
@@ -2737,6 +3390,16 @@ def build_rule_based_writing(
                 phase="pen_down",
                 max_step=gripper_max_step,
             )
+            if side == "right":
+                writing_hand_trajectory[side] = _fixed_dmtac_trajectory(
+                    frame_count=len(preview_targets),
+                    scalar=1.0,
+                )
+                pen_up_rebased[side] = _fixed_dmtac_trajectory(
+                    frame_count=phase_groups["pen_up"].frame_count,
+                    scalar=1.0,
+                )
+                continue
             anchored_write = _rebase_hand_trajectory(
                 source_write_hand[side],
                 anchor=pen_down_hand[side][-1],
@@ -2762,6 +3425,7 @@ def build_rule_based_writing(
                 phase="pen_up",
                 max_step=gripper_max_step,
             )
+        for side in configured_gripper_sides:
             if not np.allclose(
                 pen_down_hand[side][-1],
                 writing_hand_trajectory[side][0],
@@ -2785,10 +3449,10 @@ def build_rule_based_writing(
     if pre_pen_down_group is not None:
         groups[pre_pen_down_group.key] = pre_pen_down_group
     writing_source = FixedWritingActionSource(
-        trajectory_id=args.rule_writing_trajectory,
+        trajectory_id=resolved_trajectory_id,
         scale_m=size_m,
         speed_m_s=speed,
-        direction=args.rule_writing_direction,
+        direction=resolved_direction,
         left_hold_pose=left_hold_pose,
         additional_catalog_path=additional_catalog_path,
         hand_trajectory_by_side=writing_hand_trajectory,
@@ -2931,6 +3595,9 @@ def build_rule_based_writing(
             configuration: Mapping[str, Any],
         ) -> RuleBasedRealTeleopExtension:
             rebuilt_args = copy.copy(base_args)
+            rebuilt_args._rule_source_selection_ordinal = int(
+                configuration.get("_selection_ordinal", 0)
+            )
             rebuilt_args._rule_source_candidate_ids_by_phase = {
                 phase: str(configuration[f"{phase}_candidate_id"])
                 for phase in RULE_BASED_WRITING_SOURCE_PHASES_V1
@@ -3045,12 +3712,14 @@ __all__ = [
     "PRE_PEN_DOWN_ALIGNMENT_STEP_ID",
     "PRE_PEN_DOWN_REPLAY_STEP_ID",
     "PRE_PEN_DOWN_TO_PEN_DOWN_ALIGNMENT_STEP_ID",
+    "RULE_BASED_RANDOM_SOURCE_SELECTION_ID",
     "RULE_COLLECTION_MODE_FULL_REPLAY",
     "RULE_COLLECTION_MODE_WRITING",
     "DetailWritingSelection",
     "FixedWritingActionSource",
     "HEIGHT_DESCENT_STEP_ID",
     "RuleBasedWritingBuild",
+    "RuleTactileCaptureResolution",
     "StageSpan",
     "add_rule_based_writing_arguments",
     "build_rule_based_writing",

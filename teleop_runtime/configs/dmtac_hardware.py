@@ -411,13 +411,25 @@ def manual_dmtac_backend_config_for_side(
     args: argparse.Namespace,
     side: str,
     policy: Mapping[str, Any],
+    *,
+    base_config: DMTacGripperBackendConfig | None = None,
 ) -> DMTacGripperBackendConfig | None:
-    """Build one gripper-only backend config from an explicit port override."""
+    """Apply an explicit port override to one side's backend config.
+
+    When ``base_config`` comes from the saved assignment or GUI preflight,
+    preserve its tactile binding and transport settings and replace only the
+    serial endpoint.  Without a base config, retain the legacy gripper-only
+    manual-port fallback.
+    """
 
     side_name = str(side)
     port = str(getattr(args, f"{side_name}_gripper_port", "") or "").strip()
     if not port:
         return None
+    if base_config is not None:
+        base_config.gripper_port = port
+        base_config.connect_hardware = True
+        return base_config
     return DMTacGripperBackendConfig(
         side=side_name,
         effector_name=f"{side_name}_hand",
@@ -441,6 +453,31 @@ def manual_dmtac_backend_config_for_side(
         connect_tactile=False,
         tactile_ids=(),
     )
+
+
+def apply_dmtac_gripper_port_overrides(
+    configs: Mapping[str, DMTacGripperBackendConfig],
+    args: argparse.Namespace,
+    *,
+    active_sides: Sequence[str],
+) -> dict[str, DMTacGripperBackendConfig]:
+    """Apply explicit ports without replacing assignment metadata.
+
+    A manual port override is intentionally a gripper-only fallback and does
+    not attach tactile devices.  When an assignment already resolves a side,
+    this override keeps its tactile ids and transport settings while changing
+    only the runtime serial endpoint.
+    """
+
+    resolved = dict(configs)
+    for side in active_sides:
+        side_name = str(side)
+        port = str(getattr(args, f"{side_name}_gripper_port", "") or "").strip()
+        if not port or side_name not in resolved:
+            continue
+        resolved[side_name].gripper_port = port
+        resolved[side_name].connect_hardware = True
+    return resolved
 
 
 def load_latest_dmtac_backend_configs(

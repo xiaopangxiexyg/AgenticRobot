@@ -122,6 +122,7 @@ RM65_BACKGROUND_TARGET_ADMISSION_CHOICES = (
     RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
     RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
 )
+RM65_BACKGROUND_HARDWARE_READ_LOCK_TIMEOUT_SEC = 0.02
 
 # Shared lower execution defaults for position reference sources.  Deployment
 # frontends may keep compatibility aliases, but a non-policy Skill process must
@@ -1171,6 +1172,13 @@ class RM65ArmBackend(EffectorBackend):
         # synchronous force guard disabled because a force read can occupy
         # this lock for roughly one 50 ms SDK transaction.
         self._hardware_read_lock = threading.RLock()
+        # Force feedback and actual-qpos annotation share the state SDK handle.
+        # A background annotation read must not queue ahead of a force sample:
+        # the force guard has a bounded freshness deadline, while annotation
+        # can safely skip one sample and use the last causal snapshot.
+        self._force_read_waiting = threading.Event()
+        self._force_read_waiters_lock = threading.Lock()
+        self._force_read_waiters = 0
         self._last_force_query_monotonic: float | None = None
         self._singularity_analysis_lock = threading.RLock()
         self._emergency_stopped = False
@@ -6890,11 +6898,71 @@ class RM65ArmBackend(EffectorBackend):
         )
         return adapter.invoke(context=context, backend_call=backend_call)
 
+    def _mark_force_read_waiting(self) -> None:
+        with self._force_read_waiters_lock:
+            self._force_read_waiters += 1
+            self._force_read_waiting.set()
+
+    def _mark_force_read_acquired(self) -> None:
+        with self._force_read_waiters_lock:
+            self._force_read_waiters = max(0, self._force_read_waiters - 1)
+            if self._force_read_waiters == 0:
+                self._force_read_waiting.clear()
+
+    def _acquire_background_hardware_read_lock(
+        self,
+        *,
+        timeout_sec: float | None,
+    ) -> bool:
+        """Acquire the serialized SDK lock without delaying force feedback.
+
+        Actual-qpos annotation is observational.  If a force request is
+        waiting, or if another SDK transaction does not finish within the
+        bounded admission window, the annotation read is skipped.  The caller
+        records an invalid observation and falls back to its cached state;
+        control and force-safety paths never wait on this best-effort reader.
+        """
+
+        timeout = None if timeout_sec is None else float(timeout_sec)
+        if timeout is not None and (not math.isfinite(timeout) or timeout < 0.0):
+            raise ValueError("hardware_read_lock_timeout_sec must be non-negative")
+        deadline = None if timeout is None else time.perf_counter() + timeout
+        while True:
+            if self._force_read_waiting.is_set():
+                if deadline is not None:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0.0:
+                        return False
+                    time.sleep(min(0.001, remaining))
+                else:
+                    time.sleep(0.001)
+                continue
+            if deadline is None:
+                acquired = self._hardware_read_lock.acquire()
+            else:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    return False
+                acquired = self._hardware_read_lock.acquire(timeout=remaining)
+            if not acquired:
+                return False
+            # A force request may have arrived while this background reader
+            # waited for the SDK lock.  Yield the lock and let the force reader
+            # win before retrying within the same bounded window.
+            if self._force_read_waiting.is_set():
+                self._hardware_read_lock.release()
+                if deadline is not None and deadline - time.perf_counter() <= 0.0:
+                    return False
+                continue
+            return True
+
     def refresh_state_from_hardware(
         self,
         *,
         hardware_read_retries: int | None = None,
         hardware_read_retry_delay_sec: float | None = None,
+        hardware_read_priority: str = "normal",
+        hardware_read_lock_timeout_sec: float | None = None,
         include_derived_pose: bool = True,
         include_timing_percentiles: bool = True,
         include_pose_source_attestation: bool | None = None,
@@ -6907,6 +6975,24 @@ class RM65ArmBackend(EffectorBackend):
                     include_pose_source_attestation
                 ),
             )
+        priority = str(hardware_read_priority or "normal").strip().lower()
+        if priority not in {"normal", "background"}:
+            raise ValueError(
+                "hardware_read_priority must be 'normal' or 'background'"
+            )
+        if hardware_read_lock_timeout_sec is not None:
+            lock_timeout = float(hardware_read_lock_timeout_sec)
+            if not math.isfinite(lock_timeout) or lock_timeout < 0.0:
+                raise ValueError(
+                    "hardware_read_lock_timeout_sec must be non-negative"
+                )
+        elif priority == "background":
+            # Background observations are never allowed to inherit an
+            # unbounded SDK-lock wait from a caller that omitted the optional
+            # timeout.
+            lock_timeout = RM65_BACKGROUND_HARDWARE_READ_LOCK_TIMEOUT_SEC
+        else:
+            lock_timeout = None
         refresh_wall_started = time.perf_counter()
         refresh_cpu_started = time.thread_time()
         lock_wait_wall_sec = 0.0
@@ -6941,35 +7027,60 @@ class RM65ArmBackend(EffectorBackend):
         for attempt in range(retry_count):
             lock_wait_started = time.perf_counter()
             lock_wait_cpu_started = time.thread_time()
+            lock_acquired_for_read = False
             try:
-                with self._hardware_read_lock:
-                    lock_acquired = time.perf_counter()
-                    lock_wait_wall_sec += max(0.0, lock_acquired - lock_wait_started)
-                    lock_wait_cpu_sec += max(
-                        0.0,
-                        time.thread_time() - lock_wait_cpu_started,
+                if priority == "background":
+                    lock_acquired_for_read = (
+                        self._acquire_background_hardware_read_lock(
+                            timeout_sec=lock_timeout,
+                        )
                     )
-                    sdk_call_started = time.perf_counter()
-                    sdk_call_cpu_started = time.thread_time()
-                    try:
-                        raw_result, joint_now, pose_now, arm_err, sys_err = (
-                            self.arm.Get_Current_Arm_State()
+                    if not lock_acquired_for_read:
+                        raise TimeoutError(
+                            "background hardware state read admission timed out"
                         )
-                    finally:
-                        sdk_call_wall_sec += max(
-                            0.0,
-                            time.perf_counter() - sdk_call_started,
+                else:
+                    if lock_timeout is None:
+                        self._hardware_read_lock.acquire()
+                        lock_acquired_for_read = True
+                    else:
+                        lock_acquired_for_read = self._hardware_read_lock.acquire(
+                            timeout=lock_timeout
                         )
-                        sdk_call_cpu_sec += max(
-                            0.0,
-                            time.thread_time() - sdk_call_cpu_started,
-                        )
+                        if not lock_acquired_for_read:
+                            raise TimeoutError(
+                                "hardware state read lock acquisition timed out"
+                            )
+                lock_acquired = time.perf_counter()
+                lock_wait_wall_sec += max(0.0, lock_acquired - lock_wait_started)
+                lock_wait_cpu_sec += max(
+                    0.0,
+                    time.thread_time() - lock_wait_cpu_started,
+                )
+                sdk_call_started = time.perf_counter()
+                sdk_call_cpu_started = time.thread_time()
+                try:
+                    raw_result, joint_now, pose_now, arm_err, sys_err = (
+                        self.arm.Get_Current_Arm_State()
+                    )
+                finally:
+                    sdk_call_wall_sec += max(
+                        0.0,
+                        time.perf_counter() - sdk_call_started,
+                    )
+                    sdk_call_cpu_sec += max(
+                        0.0,
+                        time.thread_time() - sdk_call_cpu_started,
+                    )
             except Exception as exc:
                 raw_result = f"EXCEPTION: {exc}"
                 joint_now = None
                 pose_now = None
                 arm_err = None
                 sys_err = None
+            finally:
+                if lock_acquired_for_read:
+                    self._hardware_read_lock.release()
             parse_validation_started = time.perf_counter()
             parse_validation_cpu_started = time.thread_time()
             parsed_code, parsed_text = _parse_rm65_result(raw_result)
@@ -7076,7 +7187,11 @@ class RM65ArmBackend(EffectorBackend):
         while True:
             lock_wait_started = time.perf_counter()
             lock_wait_cpu_started = time.thread_time()
-            with self._hardware_read_lock:
+            self._mark_force_read_waiting()
+            lock_acquired_for_force = False
+            try:
+                self._hardware_read_lock.acquire()
+                lock_acquired_for_force = True
                 lock_acquired = time.perf_counter()
                 lock_wait_wall_sec += max(0.0, lock_acquired - lock_wait_started)
                 lock_wait_cpu_sec += max(
@@ -7106,6 +7221,10 @@ class RM65ArmBackend(EffectorBackend):
                             time.thread_time() - sdk_call_cpu_started,
                         )
                     break
+            finally:
+                if lock_acquired_for_force:
+                    self._hardware_read_lock.release()
+                self._mark_force_read_acquired()
             pacing_wait_requested_sec += max(0.0, wait_sec)
             pacing_wait_started = time.perf_counter()
             pacing_wait_cpu_started = time.thread_time()

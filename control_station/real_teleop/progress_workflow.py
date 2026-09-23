@@ -429,11 +429,21 @@ class RealTeleopProgressWorkflow:
         self,
         *,
         available_at: float,
+        receipts: tuple[Any, ...] | None = None,
     ) -> ProgressWorkflowResult:
         episode = self._episode()
         if episode is None:
             return ProgressWorkflowResult(False, "ABSENT")
-        receipts = tuple(self.recorder.drain_accepted_sample_receipts())
+        # The real-time control loop may already have drained the writer's
+        # terminal events so it can deliver them to every runtime extension.
+        # In that path the accepted receipts must be passed through instead of
+        # draining the recorder a second time.  Keep the old no-argument path
+        # for callers that do not own the terminal-event drain.
+        accepted_receipts = (
+            tuple(self.recorder.drain_accepted_sample_receipts())
+            if receipts is None
+            else tuple(receipts)
+        )
         if episode.state.phase != "RESUME_RECEIVED":
             return ProgressWorkflowResult(False, episode.state.phase)
         resume_fact_id = episode.state.resume_receipt_fact_id
@@ -445,7 +455,7 @@ class RealTeleopProgressWorkflow:
         # Retry may begin only after both lower-owned Resume effects. The
         # envelope effective time is their validated maximum.
         resume_at = None if resume_fact is None else resume_fact.effective_at
-        for receipt in receipts:
+        for receipt in accepted_receipts:
             if resume_at is not None and receipt.sample_timestamp < resume_at:
                 continue
             result = episode.retry_on_accepted_sample(
