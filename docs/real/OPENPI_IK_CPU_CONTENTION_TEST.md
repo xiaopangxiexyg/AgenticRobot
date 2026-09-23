@@ -4,7 +4,7 @@
 
 ## 已核对的远端资源
 
-- 主机：`user@192.168.70.116`；遥操工作树：`/home/user/zc/AgenticRobot-ik-realtime-isolation-20260922`。
+- 主机：`user@192.168.70.116`；实验脚本与 OpenPI 客户端工作树：`/home/user/zc/AgenticRobot-ik-realtime-isolation-20260922`；真机遥操运行源码：`/home/user/zc/AgenticRobot-deployment-20260830`，HEAD 固定为 `0b06b74707b709937b9c1a09f35d6bfe048ead7c`。
 - 推理替代检查点：`/home/user/zc/checkpoints/openpi/writing-stage1-all-by-date-front-right-wrist-h32-absolute-standard-200k-v1-prepared/writing-stage1-all-by-date-front-right-wrist-h32-absolute-standard-200k-v1-b1-nw4/10000`。
 - 匹配的训练 profile：`/home/user/zc/AgenticRobot-deployment-20260919-writing-stage1-bydate-h32-200k/deployments/openpi/configs/training/writing_stage1_all_by_date_front_right_wrist_h32_absolute_standard_200k_v1.json`；AgenticRobot 服务代码：`/home/user/zc/AgenticRobot-deployment-20260919-writing-stage1-bydate-h32-200k`；OpenPI 代码：`/home/user/zc/openpi_stage4_model_rtc_runs/20260913_by_date_v1/code/openpi-359f1ced`。不要用当前遥操工作树的服务入口装载该历史检查点。
 - 2026-09-23 离线验证：匹配的历史服务 `--dry-run` 通过，真实 GPU 服务成功加载，合成客户端返回 `[32,16]` 动作并丢弃。首次请求约 9.0 秒（含 JAX 编译）；随后一次 10 秒窗口 23 请求，吞吐约 2.29 Hz，延迟 p50 0.436 秒、p95 0.442 秒。**这是无真机、无遥操的推理通路验证，不是控制实时性验收。**
@@ -26,18 +26,34 @@
 
 ## 运行骨架（由现场人员执行）
 
-终端 1，在远端遥操工作树运行纯遥操 GUI。下面使用同一低开销预分配 trace 档位做所有组；不加入 `DATASET_COMMON_ARGS`、相机或触觉参数。真机运动须遵守现场安全流程，操作者负责检查启动前置条件、状态与急停。
+终端 1，使用正式部署工作树的真机遥操实现运行纯遥操 GUI。旧实验命令虽然使用相同的 JERK_V2 profile，却来自较早的真机控制代码，没有正式部署版的低控制频率闭锁和 CANFD 低频故障处理；事故后不要再用旧命令运行真机。下面的包装脚本固定正式源码 HEAD、核验正式 profile 的六个现有低频/反馈开关，用同一低开销预分配 trace 档位运行；不启动数采、相机、触觉、Q6 或夹爪。它不把 OpenPI 动作接到机械臂，也不引入新的关节角度、速度或安全阈值。正式数采的严格阶段手臂控制权依赖数采进度流程，本次无数采纯遥操不会伪装成该流程；操作者须按现场实际任务明确哪侧手臂可以运动。
+
+先核实双臂上实际安装的工具与 DMTAC_M TCP/负载标定一致，确认控制器上次报警原因及现场安全状态。若仍有未解释的超限报警，**先不要运行真机命令**；仅执行 `--dry-run` 并提供控制器报警码、终端记录和工具安装信息。
+
+只读预检（不会打开设备）：
 
 ```bash
 cd /home/user/zc/AgenticRobot-ik-realtime-isolation-20260922
-source /home/user/zc/openpi/.venv/bin/activate
-source docs/real/teleop_args.sh
-python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
-  "${NO_GRIPPER_COMMON_ARGS[@]}" \
-  "${POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ARGS[@]}" \
-  "${POSITION_COLLECTION_PRODUCTION_ARGS[@]}" \
-  --no-arm-ip-save-latest
+bash scripts/probes/run_formal_no_capture_teleop.sh \
+  --formal-root /home/user/zc/AgenticRobot-deployment-20260830 \
+  --expected-head 0b06b74707b709937b9c1a09f35d6bfe048ead7c \
+  --python /home/user/miniconda3/envs/dexteleop310/bin/python \
+  --log-dir /home/user/zc/teleop_cpu_contention \
+  --dry-run
 ```
+
+只有在上述报警核查和现场安全确认完成、预检打印的命令正确后，现场操作者再运行真机命令；保持此终端打开以保存完整异常栈和退出码：
+
+```bash
+cd /home/user/zc/AgenticRobot-ik-realtime-isolation-20260922
+bash scripts/probes/run_formal_no_capture_teleop.sh \
+  --formal-root /home/user/zc/AgenticRobot-deployment-20260830 \
+  --expected-head 0b06b74707b709937b9c1a09f35d6bfe048ead7c \
+  --python /home/user/miniconda3/envs/dexteleop310/bin/python \
+  --log-dir /home/user/zc/teleop_cpu_contention
+```
+
+`[teleop preflight] terminal_log=` 给出本次完整控制台日志路径；异常退出也保留日志。机械臂控制器/HMI 的报警码和实际关节反馈不在预分配 actuator trace 内，仍需现场另行保存。`--expected-head` 是源码身份检查；正式部署代码升级后应先重新核对差异并更新该 SHA，而不是跳过检查。
 
 终端 2，启动**已实际加载和推理验证**的替代模型。服务只绑定 `127.0.0.1`；它不连接遥操，推理结果不会下发给机器人。先确认端口 8078 未被其他服务占用、GPU 有足够余量，再启动；保持这个终端打开。
 
@@ -95,7 +111,7 @@ scripts/probes/capture_cpu_contention.sh --phase C1_inference --duration-sec 120
 
 基线 A 仅传 `--pid "$TELEOP_PID"`。B 的模型服务保持空闲。将 120 秒的采集窗口与负载窗口对齐；采集进程不能自动判断 GUI 动作是否一致。`capture_cpu_contention.sh` 会输出采集目录，其中含 procfs 每秒线程运行/等待、CPU pressure、GPU、亲和性和进程快照。
 
-遥操正常退出后，`actuator-trace` 才落盘为 `command_trace.npz`。记录启动日志给出的 trace 目录及上述 `capture_dir`，对每组分别运行：
+遥操退出后，`actuator-trace` 才落盘为 `command_trace.npz`。新遥操进程的 trace 写在**正式部署工作树**的 `teleop_records/actuator_identification` 下；同时保留包装脚本的 `terminal_log` 和上述 `capture_dir`。对每组分别运行：
 
 ```bash
 cd /home/user/zc/AgenticRobot-ik-realtime-isolation-20260922
