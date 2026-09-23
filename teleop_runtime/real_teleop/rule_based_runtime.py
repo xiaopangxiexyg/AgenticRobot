@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import copy
 import math
+import multiprocessing
+import os
 import time
 from bisect import bisect_right
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from queue import Empty, SimpleQueue
@@ -95,6 +97,32 @@ _WRITING_REACHABILITY_MAX_CHECK_SEC = 4.0
 _WRITING_REACHABILITY_MAX_AUTO_SKIPS = 32
 _WRITING_HEIGHT_DESCENT_STEP_ID = "right_write.pen_down.height_descent"
 _RANDOM_SOURCE_SELECTION_ID = "__rule_source_pool_random__"
+
+
+def _initialize_writing_reachability_process() -> None:
+    """Keep command-inert certification below the control process priority."""
+
+    try:
+        os.nice(5)
+    except OSError:
+        # Some deployment policies prohibit changing niceness. Process
+        # isolation still removes GIL and descriptor sharing in that case.
+        pass
+
+
+def _run_writing_reachability_preflight_process(
+    request: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Run command-inert IK certification outside the realtime process.
+
+    A spawned worker deliberately owns a fresh numerical IK instance. This
+    prevents URDF/model construction and repeated QP solves from holding the
+    realtime process GIL or inheriting open hardware descriptors.
+    """
+
+    return RuleBasedRealTeleopExtension._run_writing_reachability_preflight(
+        request
+    )
 
 
 def _mutable_metadata_copy(value: Any) -> Any:
@@ -689,6 +717,10 @@ class RuleBasedRealTeleopExtension:
             max_workers=1,
             thread_name_prefix="rule-plan-configuration",
         )
+        # Created lazily only when the optional certification is used. Most
+        # rebuilt candidates never own runtime resources and therefore must
+        # not allocate multiprocessing queues or child processes.
+        self._reachability_executor: ProcessPoolExecutor | None = None
         self._configuration_future: Future[
             tuple[tuple[dict[str, Any], "RuleBasedRealTeleopExtension"], ...]
         ] | None = None
@@ -713,6 +745,7 @@ class RuleBasedRealTeleopExtension:
         self._writing_reachability_started_at: float | None = None
         self._writing_reachability_candidate_label = ""
         self._writing_reachability_preparation_ms: float | None = None
+        self._writing_reachability_skip_summary = ""
         self._configuration_error = ""
         self._arm_feedback_pause_started_at: float | None = None
         # Readiness reports may perform a bounded serial telemetry read (the
@@ -2118,6 +2151,7 @@ class RuleBasedRealTeleopExtension:
                     wait=False,
                     cancel_futures=True,
                 )
+                replacement._shutdown_writing_reachability_executor(wait=False)
                 prepared.append((configuration, replacement))
         except Exception:
             for _configuration, replacement in prepared:
@@ -2129,6 +2163,7 @@ class RuleBasedRealTeleopExtension:
                     wait=False,
                     cancel_futures=True,
                 )
+                replacement._shutdown_writing_reachability_executor(wait=False)
             raise
         return tuple(prepared)
 
@@ -2150,6 +2185,7 @@ class RuleBasedRealTeleopExtension:
             wait=False,
             cancel_futures=True,
         )
+        replacement._shutdown_writing_reachability_executor(wait=False)
         prior_interval = int(self.config.pre_pen_down_replay_normal_episodes)
         prior_has_prelude = self._pre_pen_down_replay_plan is not None
         prior_normal_completed = self._pre_pen_down_normal_completed_count
@@ -6742,6 +6778,7 @@ class RuleBasedRealTeleopExtension:
             wait=False,
             cancel_futures=True,
         )
+        replacement._shutdown_writing_reachability_executor(wait=False)
 
     def _abandon_next_attempt_rebuild(self) -> None:
         pending = self._next_attempt_rebuild_future
@@ -6860,6 +6897,7 @@ class RuleBasedRealTeleopExtension:
         self._writing_reachability_started_at = None
         self._writing_reachability_candidate_label = ""
         self._writing_reachability_preparation_ms = None
+        self._writing_reachability_skip_summary = ""
 
     def _writing_reachability_candidate_description(self) -> str:
         variant = self.source_selection.get("writing_variant_selection", {})
@@ -6869,7 +6907,7 @@ class RuleBasedRealTeleopExtension:
         approach = phases.get("pen_down", {})
         approach = approach if isinstance(approach, Mapping) else {}
         return (
-            f"候选 {self._selection_ordinal + 1} · "
+            f"待检候选 {self._selection_ordinal + 1} · "
             f"{variant.get('selected_trajectory_id') or '未指定轨迹'} / "
             f"{variant.get('selected_direction') or '未指定方向'} / "
             f"{float(variant.get('selected_size_m') or 0.0):.3f}m · "
@@ -7089,7 +7127,7 @@ class RuleBasedRealTeleopExtension:
         started_at = time.monotonic()
         deadline = started_at + _WRITING_REACHABILITY_MAX_CHECK_SEC
         report_progress = request.get("progress_callback")
-        oracle = DualArmCollisionAwareRetargeter(request["oracle_config"])
+        oracle: DualArmCollisionAwareRetargeter | None = None
         seed_qpos = request["seed_qpos"]
         translation_tolerance = float(request["translation_tolerance_m"])
         rotation_tolerance = float(request["rotation_tolerance_deg"])
@@ -7120,6 +7158,8 @@ class RuleBasedRealTeleopExtension:
                         results[-1]["elapsed_ms"],
                     ))
                 continue
+            if oracle is None:
+                oracle = DualArmCollisionAwareRetargeter(request["oracle_config"])
             oracle.set_current_qpos_pair(
                 left_qpos=seed_qpos["left"],
                 right_qpos=seed_qpos["right"],
@@ -7214,6 +7254,114 @@ class RuleBasedRealTeleopExtension:
             "elapsed_ms": (time.monotonic() - started_at) * 1000.0,
         }
 
+    def _submit_writing_reachability_preflight(
+        self,
+        request: Mapping[str, Any],
+    ) -> Future[Mapping[str, Any]]:
+        """Submit numerical certification without sharing runtime resources.
+
+        The progress callback is a process-local queue and is intentionally
+        not serialized. The owner loop still reports spawn/wait duration and
+        receives per-probe timings in the final result.
+        """
+
+        process_request = dict(request)
+        process_request.pop("progress_callback", None)
+        executor = self._reachability_executor
+        if executor is None:
+            executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_writing_reachability_process,
+            )
+            self._reachability_executor = executor
+        try:
+            return executor.submit(
+                _run_writing_reachability_preflight_process,
+                process_request,
+            )
+        except RuntimeError:
+            # A crashed spawn worker poisons its ProcessPoolExecutor. Drop the
+            # pool so a later explicit retry can create a fresh isolated worker.
+            self._shutdown_writing_reachability_executor(wait=False)
+            raise
+
+    def _shutdown_writing_reachability_executor(self, *, wait: bool) -> None:
+        executor = self._reachability_executor
+        self._reachability_executor = None
+        if executor is not None:
+            executor.shutdown(wait=wait, cancel_futures=True)
+
+    def _skip_uncertified_writing_candidate(
+        self,
+        *,
+        status: str,
+        summary: str,
+        elapsed_detail: str,
+        details: str,
+    ) -> None:
+        """Reject one candidate without converting it into a device fault."""
+
+        self._writing_reachability_skipped_count += 1
+        self._writing_reachability_status = status
+        self._writing_reachability_skip_summary = summary
+        self._writing_reachability_detail = (
+            f"{self._writing_reachability_candidate_label}；{elapsed_detail}"
+            f"{summary}：{details}"
+        )
+        append_message = getattr(self._control_ui, "append_message", None)
+        if callable(append_message):
+            append_message(
+                "RuleBasedReachability",
+                self._writing_reachability_detail
+                + "；当前候选不会启动 Episode，也不会触发设备重连或 Hold。",
+            )
+
+        configuration = copy.deepcopy(self._selected_configuration)
+        can_rebuild = bool(
+            configuration
+            and self._configuration_requires_ordinal_rebuild(configuration)
+            and self._configuration_rebuilder is not None
+        )
+        if self._writing_reachability_skipped_count >= (
+            _WRITING_REACHABILITY_MAX_AUTO_SKIPS
+        ):
+            self._writing_reachability_detail += (
+                f"；连续 {_WRITING_REACHABILITY_MAX_AUTO_SKIPS} 条候选未通过认证，"
+                "已停止自动选择。请调整配置后重新开始。"
+            )
+            self._waiting_reason = "writing_reachability_exhausted"
+            return
+        if not can_rebuild:
+            self._writing_reachability_detail += (
+                "；当前配置没有可自动选择的下一候选。"
+                "请调整书写大小、方向或来源后重试。"
+            )
+            self._waiting_reason = "writing_reachability_candidate_rejected"
+            return
+
+        next_ordinal = self._selection_ordinal + 1
+        try:
+            self._writing_reachability_rebuild_ordinal = next_ordinal
+            self._writing_reachability_rebuild_future = (
+                self._configuration_executor.submit(
+                    self._rebuild_for_selection_ordinal,
+                    configuration,
+                    selection_ordinal=next_ordinal,
+                )
+            )
+        except RuntimeError as exc:
+            self._writing_reachability_rebuild_ordinal = None
+            self._writing_reachability_status = "error"
+            self._writing_reachability_detail += (
+                f"；下一候选准备失败：{type(exc).__name__}: {exc}"
+            )
+            self._waiting_reason = "writing_reachability_error"
+            return
+        self._writing_reachability_status = "skipping_candidate"
+        self._writing_reachability_detail += "；正在后台准备并检查下一候选。"
+        self._waiting_reason = "writing_reachability_skip"
+
     def _service_writing_reachability_preflight(self) -> None:
         if not self._writing_reachability_enabled():
             self._writing_reachability_status = "disabled"
@@ -7234,9 +7382,10 @@ class RuleBasedRealTeleopExtension:
         rebuild = self._writing_reachability_rebuild_future
         if rebuild is not None:
             if not rebuild.done():
-                self._writing_reachability_status = "skipping_unreachable"
+                self._writing_reachability_status = "skipping_candidate"
                 self._writing_reachability_detail = (
-                    f"{self._writing_reachability_candidate_label} 已被安全边界拒绝；"
+                    f"{self._writing_reachability_candidate_label}"
+                    f"未通过认证（{self._writing_reachability_skip_summary or '原因见日志'}）；"
                     f"累计跳过 {self._writing_reachability_skipped_count} 条，"
                     "正在后台准备下一候选；尚未启动 Episode。"
                 )
@@ -7250,10 +7399,11 @@ class RuleBasedRealTeleopExtension:
                 if ordinal is None:
                     raise RuntimeError("reachability rebuild lost its selection ordinal")
                 self._selection_ordinal = int(ordinal)
-                self._reset_attempt_state(reason="unreachable_candidate_skip")
+                self._reset_attempt_state(reason="uncertified_candidate_skip")
                 self._writing_reachability_fingerprint = None
                 self._writing_reachability_status = "pending"
                 self._writing_reachability_detail = "下一候选已准备，正在重新检查。"
+                self._writing_reachability_skip_summary = ""
                 self._waiting_reason = "writing_reachability_preflight"
             except Exception as exc:  # noqa: BLE001 - command-inert preparation.
                 self._writing_reachability_fingerprint = (
@@ -7272,7 +7422,7 @@ class RuleBasedRealTeleopExtension:
         if (
             self._writing_reachability_fingerprint == fingerprint
             and self._writing_reachability_status
-            in {"passed", "unreachable", "error"}
+            in {"passed", "unreachable", "uncertified", "error"}
         ):
             # A terminal result belongs to this exact candidate and height.
             # Re-submitting it every foreground frame previously spun the IK
@@ -7295,16 +7445,17 @@ class RuleBasedRealTeleopExtension:
                 request["progress_callback"] = progress.put
                 self._writing_reachability_progress = progress
                 self._writing_reachability_started_at = time.monotonic()
-                self._writing_reachability_progress_detail = ""
-                self._writing_reachability_future = self._configuration_executor.submit(
-                    self._run_writing_reachability_preflight,
-                    request,
+                self._writing_reachability_progress_detail = (
+                    "独立计算进程正在检查四个边界点"
+                )
+                self._writing_reachability_future = (
+                    self._submit_writing_reachability_preflight(request)
                 )
                 self._writing_reachability_status = "pending"
                 self._writing_reachability_detail = (
                     f"{self._writing_reachability_candidate_label}；"
                     f"前台准备 {self._writing_reachability_preparation_ms:.0f}ms；"
-                    "正在后台检查书写四边界接触点；尚未启动 Episode。"
+                    "正在独立计算进程检查书写四边界接触点；尚未启动 Episode。"
                 )
                 self._waiting_reason = "writing_reachability_preflight"
             except Exception as exc:  # noqa: BLE001 - no motion was authorized.
@@ -7323,6 +7474,7 @@ class RuleBasedRealTeleopExtension:
         try:
             result = pending.result()
         except Exception as exc:  # noqa: BLE001 - preflight remains command-inert.
+            self._shutdown_writing_reachability_executor(wait=False)
             self._writing_reachability_status = "error"
             self._writing_reachability_detail = (
                 f"{self._writing_reachability_candidate_label}；"
@@ -7331,9 +7483,22 @@ class RuleBasedRealTeleopExtension:
             self._waiting_reason = "writing_reachability_error"
             return
         elapsed_value = result.get("elapsed_ms")
+        wall_elapsed_ms = (
+            None
+            if self._writing_reachability_started_at is None
+            else max(
+                0.0,
+                (time.monotonic() - self._writing_reachability_started_at) * 1000.0,
+            )
+        )
         elapsed_detail = (
             f"前台准备 {float(self._writing_reachability_preparation_ms or 0.0):.0f}ms；"
-            f"预检耗时 {float(elapsed_value):.0f}ms；"
+            + (
+                f"隔离进程总等待 {wall_elapsed_ms:.0f}ms；"
+                if wall_elapsed_ms is not None
+                else ""
+            )
+            + f"预检耗时 {float(elapsed_value):.0f}ms；"
             if elapsed_value is not None
             else f"前台准备 {float(self._writing_reachability_preparation_ms or 0.0):.0f}ms；"
         )
@@ -7378,57 +7543,41 @@ class RuleBasedRealTeleopExtension:
             "held_left_collision",
             "collision_guard_rejected",
         }
-        if not failed or any(
-            str(item.get("reason")) not in definitive_reasons for item in failed
+        numerical_reasons = {
+            "solver_not_converged",
+            "solver_guard_hold",
+            "solver_budget_exhausted",
+        }
+        failure_reasons = {str(item.get("reason") or "") for item in failed}
+        if not failed or not failure_reasons.issubset(
+            definitive_reasons | numerical_reasons
         ):
             self._writing_reachability_status = "error"
             self._writing_reachability_detail = (
                 f"{self._writing_reachability_candidate_label}；{elapsed_detail}"
-                "书写可达性数值检查未能确认，未判为几何不可达；"
+                "书写可达性预检返回了未知结果；"
                 + (details or "缺少失败点结果")
-                + "。请调整书写大小/方向或检查标定后重试。"
+                + "。当前候选不会启动 Episode，请检查预检实现。"
             )
-            self._waiting_reason = "writing_reachability_unresolved"
+            self._waiting_reason = "writing_reachability_error"
             append_message = getattr(self._control_ui, "append_message", None)
             if callable(append_message):
                 append_message("RuleBasedReachability", self._writing_reachability_detail)
             return
-        self._writing_reachability_skipped_count += 1
-        self._writing_reachability_status = "unreachable"
-        self._writing_reachability_detail = (
-            f"{self._writing_reachability_candidate_label}；{elapsed_detail}"
-            "安全边界拒绝：" + details
-        )
-        append_message = getattr(self._control_ui, "append_message", None)
-        if callable(append_message):
-            append_message(
-                "RuleBasedReachability",
-                self._writing_reachability_detail + "；当前候选不启动 Episode。",
+        if failure_reasons & numerical_reasons:
+            self._skip_uncertified_writing_candidate(
+                status="uncertified",
+                summary="数值 IK 未能认证该候选",
+                elapsed_detail=elapsed_detail,
+                details=details,
             )
-        configuration = copy.deepcopy(self._selected_configuration)
-        if (
-            self._writing_reachability_skipped_count
-            >= _WRITING_REACHABILITY_MAX_AUTO_SKIPS
-            or not configuration
-            or not self._configuration_requires_ordinal_rebuild(configuration)
-            or self._configuration_rebuilder is None
-        ):
-            self._writing_reachability_detail += (
-                f"；连续 {_WRITING_REACHABILITY_MAX_AUTO_SKIPS} 条候选未通过，"
-                "已停止自动重试。请调整配置后重新开始。"
-            )
-            self._waiting_reason = "writing_reachability_unreachable"
             return
-        next_ordinal = self._selection_ordinal + 1
-        self._writing_reachability_rebuild_ordinal = next_ordinal
-        self._writing_reachability_rebuild_future = self._configuration_executor.submit(
-            self._rebuild_for_selection_ordinal,
-            configuration,
-            selection_ordinal=next_ordinal,
+        self._skip_uncertified_writing_candidate(
+            status="unreachable",
+            summary="安全边界拒绝该候选",
+            elapsed_detail=elapsed_detail,
+            details=details,
         )
-        self._writing_reachability_status = "skipping_unreachable"
-        self._writing_reachability_detail += "；正在跳过并准备下一候选。"
-        self._waiting_reason = "writing_reachability_skip"
 
     def discards_episode_on_stop(self, *, reason: str) -> bool:
         if str(reason) == "rule_based_complete" or self._completed:
@@ -7680,6 +7829,7 @@ class RuleBasedRealTeleopExtension:
         # Wait for an in-flight read-only certification to leave that resource
         # rather than racing hardware/session cleanup against its worker.
         self._initial_alignment_executor.shutdown(wait=True, cancel_futures=True)
+        self._shutdown_writing_reachability_executor(wait=True)
         self._configuration_executor.shutdown(wait=True, cancel_futures=True)
         pending = self._next_attempt_rebuild_future
         self._next_attempt_rebuild_future = None

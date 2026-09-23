@@ -2264,6 +2264,12 @@ class RuleBasedWritingApplication:
                 f"{key}: {value}"
                 for key, value in sorted(effective_blockers.items())
             )
+            if self._only_rule_planning_blockers_locked(effective_blockers):
+                return (
+                    "书写候选正在进行可达性预检或自动跳过；"
+                    "当前候选不会启动 Episode，无需重连设备或重新安全初始化。\n"
+                    + detail_lines
+                )
             if self._has_retryable_device_blockers_locked():
                 if self._device_retry_request_available_locked():
                     action = "请先重连失败设备，并重新完成 runtime Home。"
@@ -2431,10 +2437,24 @@ class RuleBasedWritingApplication:
             )
         )
 
+    @staticmethod
+    def _is_rule_planning_blocker(key: str) -> bool:
+        return str(key) == "rule.writing_reachability"
+
+    @classmethod
+    def _only_rule_planning_blockers_locked(
+        cls,
+        blockers: Mapping[str, str],
+    ) -> bool:
+        return bool(blockers) and all(
+            cls._is_rule_planning_blocker(key) for key in blockers
+        )
+
     def _has_retryable_device_blockers_locked(self) -> bool:
         return any(
             not self._is_runtime_home_requirement(key, detail)
             and str(key) != "rule.right_hand_hold_owner"
+            and not self._is_rule_planning_blocker(key)
             for key, detail in self._state.startup_blockers.items()
         )
 
@@ -2531,7 +2551,17 @@ class RuleBasedWritingApplication:
             return
         details = self._state.startup_blockers
         reason = self._state.readiness_reason
-        if details and self._has_retryable_device_blockers_locked():
+        if self._only_rule_planning_blockers_locked(details):
+            detail_lines = "; ".join(
+                f"{key}: {value}" for key, value in sorted(details.items())
+            )
+            self._state.title = "正在验证下一条书写候选"
+            self._state.detail = (
+                "候选可达性预检尚未通过；系统会在安全边界内自动跳过"
+                "未认证候选。无需重连设备或重新安全初始化，且不会提前启动 Episode。\n"
+                + detail_lines
+            )
+        elif details and self._has_retryable_device_blockers_locked():
             detail_lines = "; ".join(
                 f"{key}: {value}" for key, value in sorted(details.items())
             )
