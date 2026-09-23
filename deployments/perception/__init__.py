@@ -21,8 +21,11 @@ from .sam2_graspnet_point_grasp import (
 )
 from .sam2_grounding_dino import (
     GroundedObjectDetection,
+    GroundedObjectSegment,
+    GroundedObjectSegmentArtifacts,
     Sam2GroundingDinoLocalizer,
     Sam2GroundingDinoModelSpec,
+    encode_grounded_object_segment_artifacts,
 )
 from .sam2_vgn_point_grasp import (
     DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
@@ -41,11 +44,14 @@ __all__ = [
     "GraspGenXRuntimeReceipt",
     "GraspNetPointGraspModelSpec",
     "GroundedObjectDetection",
+    "GroundedObjectSegment",
+    "GroundedObjectSegmentArtifacts",
     "Sam2GraspGenXPointGraspPlanner",
     "Sam2GraspNetPointGraspPlanner",
     "Sam2GroundingDinoLocalizer",
     "Sam2GroundingDinoModelSpec",
     "Sam2VgnPointGraspPlanner",
     "VgnPointGraspModelSpec",
+    "encode_grounded_object_segment_artifacts",
     "verify_graspgenx_inprocess_runtime",
 ]

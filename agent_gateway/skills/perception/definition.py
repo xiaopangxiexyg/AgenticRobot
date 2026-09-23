@@ -9,6 +9,7 @@ CAPTURE_RGB_SKILL_ID_V1 = "perception.capture_rgb"
 LOCALIZE_OBJECTS_SKILL_ID_V1 = "perception.localize_objects"
 PLAN_POINT_GRASP_SKILL_ID_V1 = "perception.plan_point_grasp"
 RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1 = "perception.render_point_grasp_candidate"
+SEGMENT_SKILL_ID_V1 = "perception.segment"
 
 
 def capture_depth_skill_definition_v1() -> SkillDefinition:
@@ -136,6 +137,36 @@ def localize_objects_skill_definition_v1() -> SkillDefinition:
     )
 
 
+def segment_skill_definition_v1() -> SkillDefinition:
+    """Describe passive text- or point-prompted image segmentation."""
+
+    return SkillDefinition(
+        skill_id=SEGMENT_SKILL_ID_V1,
+        skill_version="1",
+        skill_kind="inspection",
+        summary=(
+            "Segment one object in a live deployment-registered camera image "
+            "from exactly one language or pixel prompt, without changing "
+            "downstream control state."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "registered_rgb_role.exclusive_text_or_pixel_prompt.v1"
+        ),
+        execution_result_semantics_id=(
+            "pixel_mask_metadata_and_mask_overlay_artifacts.v1"
+        ),
+        task_outcome_semantics_id="passive_object_segmentation.v1",
+        entry_predicate_ids=(
+            "registered_visual_role_available.v1",
+            "segmentation_model_available.v1",
+        ),
+        task_outcome_predicate_ids=("object_mask_segmented.v1",),
+    )
+
+
 def plan_point_grasp_skill_definition_v1() -> SkillDefinition:
     """Describe passive point-conditioned RGB-D grasp pose planning."""
 
@@ -258,6 +289,7 @@ __all__ = [
     "LOCALIZE_OBJECTS_SKILL_ID_V1",
     "PLAN_POINT_GRASP_SKILL_ID_V1",
     "RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1",
+    "SEGMENT_SKILL_ID_V1",
     "capture_depth_skill_definition_v1",
     "capture_depth_skill_definition_v2",
     "capture_rgb_skill_definition_v1",
@@ -267,4 +299,5 @@ __all__ = [
     "plan_point_grasp_skill_definition_v2",
     "plan_point_grasp_skill_definition_v3",
     "render_point_grasp_candidate_skill_definition_v1",
+    "segment_skill_definition_v1",
 ]

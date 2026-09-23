@@ -8,6 +8,10 @@ import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 
+from agent_gateway.profiles.segmentation import (
+    LiveSegmentationProvider,
+    build_segmentation_executor,
+)
 from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
     AgentSkillOperation,
@@ -74,8 +78,8 @@ from teleop_runtime.skill_deploy.motion_port import (
 from .grasp_approach_plan import (
     BoundedRealGraspApproachPlanStore,
     RealGraspApproachPlanProvider,
-    build_real_grasp_approach_plan_executor,
     build_grasp_visible_scene_reader,
+    build_real_grasp_approach_plan_executor,
 )
 from .localization_gateway import (
     ObjectLocalizationProvider,
@@ -96,6 +100,7 @@ from .point_grasp_render_gateway import (
     build_station_bound_point_grasp_render_executor,
 )
 from .realsense_perception import RealSenseAgentPerceptionProvider
+from .segmentation import RealSenseSegmentationCapturePort
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -606,6 +611,8 @@ class RealAgentPrimitiveGatewaySession:
     depth_executor: PassiveReadSkillExecutor | None
     localization_provider: ObjectLocalizationProvider | None
     localization_executor: PassiveReadSkillExecutor | None
+    segmentation_provider: LiveSegmentationProvider | None
+    segmentation_executor: PassiveReadSkillExecutor | None
     station_point_grasp_provider: StationBoundPointGraspProvider | None
     station_point_grasp_executor: PassiveReadSkillExecutor | None
     station_point_grasp_render_provider: StationBoundPointGraspRenderProvider | None
@@ -657,6 +664,16 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError(
                 "Real point-grasp registration and runtime resources disagree."
             )
+        segmentation_enabled = (
+            self.contract_bundle.segmentation_registration is not None
+        )
+        if segmentation_enabled != all(
+            item is not None
+            for item in (self.segmentation_provider, self.segmentation_executor)
+        ):
+            raise ValueError(
+                "Real segmentation registration and runtime resources disagree."
+            )
         grasp_plan_enabled = (
             self.contract_bundle.grasp_approach_plan_registration is not None
         )
@@ -689,6 +706,7 @@ class RealAgentPrimitiveGatewaySession:
             "perception.capture_rgb": self.rgb_executor,
             "perception.capture_depth": self.depth_executor,
             "perception.localize_objects": self.localization_executor,
+            "perception.segment": self.segmentation_executor,
             "perception.plan_point_grasp": self.station_point_grasp_executor,
             "perception.render_point_grasp_candidate": (
                 self.station_point_grasp_render_executor
@@ -798,7 +816,11 @@ class RealAgentPrimitiveGatewaySession:
                     self.grasp_approach_plan_executor,
                 )
             )
-            if not passive_reads_settled:
+            segmentation_settled = (
+                self.segmentation_executor is None
+                or self.segmentation_executor.wait_all(timeout_sec=65.0)
+            )
+            if not passive_reads_settled or not segmentation_settled:
                 raise RuntimeError(
                     "Passive real reads did not quiesce before Gateway close."
                 )
@@ -926,6 +948,7 @@ def _real_hardware_view_provider(
     port: RealAgentMotionPort,
     perception_provider: RealSenseAgentPerceptionProvider | None,
     localization_provider: ObjectLocalizationProvider | None,
+    segmentation_provider: LiveSegmentationProvider | None,
     operation_store: BoundedInMemoryAgentSkillOperationStore,
     clock: Callable[[], float],
 ) -> HardwareViewProvider:
@@ -977,12 +1000,17 @@ def _real_hardware_view_provider(
                 ),
             )
         )
-    if localization_provider is not None:
+    model_provider = segmentation_provider or localization_provider
+    if model_provider is not None:
         model_route_hashes = tuple(
             entry.route.semantic_content_hash
             for entry in contract_bundle.route_manifest.skill_routes
             if entry.route.skill_id
-            in {"perception.localize_objects", "perception.plan_point_grasp"}
+            in {
+                "perception.localize_objects",
+                "perception.plan_point_grasp",
+                "perception.segment",
+            }
         )
         if not model_route_hashes:
             raise ValueError("Real localization provider has no model Routes.")
@@ -992,7 +1020,7 @@ def _real_hardware_view_provider(
                 resource_kind="local_model",
                 route_hashes=model_route_hashes,
                 health_provider=lambda: (
-                    "ready" if localization_provider.started else "unavailable"
+                    "ready" if model_provider.started else "unavailable"
                 ),
                 control_claimed_provider=lambda: False,
             )
@@ -1013,6 +1041,7 @@ def assemble_real_agent_primitive_gateway_session(
     max_retained_operations: int = 16,
     perception_provider: RealSenseAgentPerceptionProvider | None = None,
     localization_provider: ObjectLocalizationProvider | None = None,
+    segmentation_localizer: object | None = None,
     station_point_grasp_planner: object | None = None,
     station_point_grasp_reachability_evaluator: Callable[..., object] | None = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
@@ -1070,6 +1099,17 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError("Localization registration requires its exact provider.")
     if grasp_enabled != (station_point_grasp_planner is not None):
         raise ValueError("Point-grasp registration requires its exact planner.")
+    segmentation_enabled = contract_bundle.segmentation_registration is not None
+    if segmentation_enabled != (segmentation_localizer is not None):
+        raise ValueError("Segmentation registration requires its exact localizer.")
+    if (
+        segmentation_enabled
+        and localization_provider is not None
+        and segmentation_localizer is not localization_provider.localizer
+    ):
+        raise ValueError(
+            "Segmentation must reuse the lifecycle-owned localization model."
+        )
     point_grasp_registration = contract_bundle.station_point_grasp_registration
     reachability_registered = bool(
         point_grasp_registration is not None
@@ -1094,9 +1134,8 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError(
             "Grasp-approach planning requires the exact URDF/FCL trajectory planner."
         )
-    if (
-        captured_robot_observation_filter is not None
-        and not callable(captured_robot_observation_filter)
+    if captured_robot_observation_filter is not None and not callable(
+        captured_robot_observation_filter
     ):
         raise TypeError("captured_robot_observation_filter must be callable or None")
     if max_session_admissions_per_route is not None and (
@@ -1251,6 +1290,8 @@ def assemble_real_agent_primitive_gateway_session(
     rgb_executor = None
     depth_executor = None
     localization_executor = None
+    segmentation_provider = None
+    segmentation_executor = None
     station_point_grasp_provider = None
     station_point_grasp_executor = None
     station_point_grasp_render_provider = None
@@ -1275,6 +1316,28 @@ def assemble_real_agent_primitive_gateway_session(
                 registration.depth.routes[0].semantic_content_hash: depth_executor,
             }
         )
+        segmentation_registration = contract_bundle.segmentation_registration
+        if segmentation_registration is not None:
+            assert segmentation_localizer is not None
+            segmentation_provider = LiveSegmentationProvider(
+                localizer=segmentation_localizer,
+                capture_port=RealSenseSegmentationCapturePort(
+                    perception_provider=perception_provider,
+                ),
+                registration=segmentation_registration,
+            )
+            segmentation_executor = build_segmentation_executor(
+                registration=segmentation_registration,
+                provider=segmentation_provider,
+                artifact_store=artifact_store,
+                runtime_session_id=(contract_bundle.attachment.runtime_session_id),
+                current_station_revision=(lambda: producer.current_station_revision),
+                max_retained_operations=max_retained_operations,
+                clock=clock,
+            )
+            execution_port_by_route_hash[
+                segmentation_registration.skill.routes[0].semantic_content_hash
+            ] = segmentation_executor
         if contract_bundle.localization_registration is not None:
             assert localization_provider is not None
             assert station_point_grasp_planner is not None
@@ -1321,7 +1384,9 @@ def assemble_real_agent_primitive_gateway_session(
                 point_grasp_executor=station_point_grasp_executor,
                 perception_provider=perception_provider,
                 frame_binding=frame_binding,
-                solid_geometry=getattr(station_point_grasp_planner, "solid_geometry", None),
+                solid_geometry=getattr(
+                    station_point_grasp_planner, "solid_geometry", None
+                ),
                 runtime_session_id=contract_bundle.attachment.runtime_session_id,
                 current_station_revision=lambda: producer.current_station_revision,
             )
@@ -1502,6 +1567,7 @@ def assemble_real_agent_primitive_gateway_session(
         port=port,
         perception_provider=perception_provider,
         localization_provider=localization_provider,
+        segmentation_provider=segmentation_provider,
         operation_store=service.operation_store,
         clock=clock,
     )
@@ -1517,6 +1583,8 @@ def assemble_real_agent_primitive_gateway_session(
         depth_executor=depth_executor,
         localization_provider=localization_provider,
         localization_executor=localization_executor,
+        segmentation_provider=segmentation_provider,
+        segmentation_executor=segmentation_executor,
         station_point_grasp_provider=station_point_grasp_provider,
         station_point_grasp_executor=station_point_grasp_executor,
         station_point_grasp_render_provider=station_point_grasp_render_provider,

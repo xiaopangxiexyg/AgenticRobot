@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +19,30 @@ from agent_gateway.profiles.mujoco.gateway_cli import (
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def test_cli_import_does_not_load_optional_perception_models() -> None:
+    script = r"""
+import importlib.abc
+import sys
+
+class BlockPerceptionModels(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "deployments.perception" or fullname.startswith(
+            "deployments.perception."
+        ):
+            raise AssertionError(f"optional perception model imported: {fullname}")
+        return None
+
+sys.meta_path.insert(0, BlockPerceptionModels())
+import agent_gateway.profiles.mujoco.gateway_cli
+assert "deployments.perception" not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        cwd=os.getcwd(),
+    )
 
 
 def _server(*, receipt=None):

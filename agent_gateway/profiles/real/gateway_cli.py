@@ -398,6 +398,9 @@ def _ready_payload(
                 "point_grasp_enabled": (
                     composition.station_point_grasp_registration is not None
                 ),
+                "segmentation_enabled": (
+                    composition.segmentation_registration is not None
+                ),
                 "point_grasp_render_view_roles": (
                     []
                     if composition.station_point_grasp_render_registration is None

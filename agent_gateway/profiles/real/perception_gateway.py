@@ -7,6 +7,11 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
+from agent_gateway.profiles.segmentation import (
+    LiveSegmentationProvider,
+    SegmentationRegistration,
+    build_segmentation_executor,
+)
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.protocol.contracts import AgentObservationSnapshot
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
@@ -82,6 +87,7 @@ from .realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
 )
+from .segmentation import RealSenseSegmentationCapturePort
 from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
 )
@@ -104,6 +110,7 @@ class RealPerceptionContractBundle:
 
     registration: RealPerceptionCaptureRegistration
     localization_registration: RealObjectLocalizationRegistration | None
+    segmentation_registration: SegmentationRegistration | None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -121,6 +128,10 @@ class RealPerceptionContractBundle:
     def __post_init__(self) -> None:
         if not isinstance(self.registration, RealPerceptionCaptureRegistration):
             raise TypeError("registration must be typed.")
+        if self.segmentation_registration is not None and not isinstance(
+            self.segmentation_registration, SegmentationRegistration
+        ):
+            raise TypeError("segmentation_registration must be typed or None.")
         if self.station_point_grasp_registration is not None and not isinstance(
             self.station_point_grasp_registration,
             StationBoundPointGraspRegistration,
@@ -151,6 +162,7 @@ class RealPerceptionContractBundle:
         expected_routes = (
             2
             + int(self.localization_registration is not None)
+            + int(self.segmentation_registration is not None)
             + int(self.station_point_grasp_registration is not None)
             + int(self.station_point_grasp_render_registration is not None)
         )
@@ -204,6 +216,7 @@ def build_real_perception_contract_bundle(
     tool_config_hash: str,
     calibration_hash: str,
     localization_registration: RealObjectLocalizationRegistration | None = None,
+    segmentation_registration: SegmentationRegistration | None = None,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -218,6 +231,10 @@ def build_real_perception_contract_bundle(
         RealObjectLocalizationRegistration,
     ):
         raise TypeError("localization_registration must be typed or None.")
+    if segmentation_registration is not None and not isinstance(
+        segmentation_registration, SegmentationRegistration
+    ):
+        raise TypeError("segmentation_registration must be typed or None.")
     if station_point_grasp_registration is not None and not isinstance(
         station_point_grasp_registration,
         StationBoundPointGraspRegistration,
@@ -258,6 +275,14 @@ def build_real_perception_contract_bundle(
                 localization_registration.skill,
                 localization_registration.binding,
                 localization_registration.availability_hash,
+            )
+        )
+    if segmentation_registration is not None:
+        raw_pairs.append(
+            (
+                segmentation_registration.skill,
+                segmentation_registration.binding,
+                segmentation_registration.availability_hash,
             )
         )
     if station_point_grasp_registration is not None:
@@ -354,6 +379,8 @@ def build_real_perception_contract_bundle(
     optional_validators = []
     if localization_registration is not None:
         optional_validators.append(localization_registration.payload_validator)
+    if segmentation_registration is not None:
+        optional_validators.append(segmentation_registration.payload_validator)
     if station_point_grasp_registration is not None:
         optional_validators.append(station_point_grasp_registration.payload_validator)
     if station_point_grasp_render_registration is not None:
@@ -368,6 +395,7 @@ def build_real_perception_contract_bundle(
     return RealPerceptionContractBundle(
         registration=registration,
         localization_registration=localization_registration,
+        segmentation_registration=segmentation_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration
@@ -755,6 +783,8 @@ class RealPerceptionGatewaySession:
     rgb_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor
     localization_executor: PassiveReadSkillExecutor | None
+    segmentation_provider: LiveSegmentationProvider | None
+    segmentation_executor: PassiveReadSkillExecutor | None
     station_point_grasp_provider: StationBoundPointGraspProvider | None
     station_point_grasp_executor: PassiveReadSkillExecutor | None
     station_point_grasp_render_provider: StationBoundPointGraspRenderProvider | None
@@ -829,6 +859,11 @@ class RealPerceptionGatewaySession:
                 "Passive object localization did not quiesce during close."
             )
         if (
+            self.segmentation_executor is not None
+            and not self.segmentation_executor.wait_all(timeout_sec=65.0)
+        ):
+            raise RuntimeError("Passive segmentation did not quiesce during close.")
+        if (
             self.station_point_grasp_executor is not None
             and not self.station_point_grasp_executor.wait_all(timeout_sec=125.0)
         ):
@@ -852,6 +887,7 @@ def assemble_real_perception_gateway_session(
     artifact_store: RecoverableAgentArtifactStore,
     allowed_client_ids: tuple[str, ...],
     localization_provider: ObjectLocalizationProvider | None = None,
+    segmentation_localizer: object | None = None,
     station_point_grasp_planner: object | None = None,
     max_retained_operations: int = 16,
     clock: Callable[[], float] = time.time,
@@ -909,6 +945,42 @@ def assemble_real_perception_gateway_session(
         ] = localization_executor
     elif localization_provider is not None:
         raise ValueError("Localization provider cannot exist without its registration.")
+    segmentation_provider = None
+    segmentation_executor = None
+    if bundle.segmentation_registration is not None:
+        if segmentation_localizer is None:
+            raise ValueError("Segmentation registration requires its localizer.")
+        if (
+            localization_provider is None
+            or segmentation_localizer is not localization_provider.localizer
+        ):
+            raise ValueError(
+                "Segmentation must reuse the lifecycle-owned localization model."
+            )
+        segmentation_provider = LiveSegmentationProvider(
+            localizer=segmentation_localizer,
+            capture_port=RealSenseSegmentationCapturePort(
+                perception_provider=provider,
+                max_rgb_bytes=bundle.registration.profile.max_artifact_bytes,
+            ),
+            registration=bundle.segmentation_registration,
+        )
+        segmentation_executor = build_segmentation_executor(
+            registration=bundle.segmentation_registration,
+            provider=segmentation_provider,
+            artifact_store=artifact_store,
+            runtime_session_id=bundle.route_manifest.runtime_session_id,
+            current_station_revision=lambda: producer.current_station_revision,
+            max_retained_operations=max_retained_operations,
+            clock=clock,
+        )
+        ports[
+            bundle.segmentation_registration.skill.routes[0].semantic_content_hash
+        ] = segmentation_executor
+    elif segmentation_localizer is not None:
+        raise ValueError(
+            "Segmentation localizer cannot exist without its registration."
+        )
     station_point_grasp_provider = None
     station_point_grasp_executor = None
     station_point_grasp_render_provider = None
@@ -1015,6 +1087,10 @@ def assemble_real_perception_gateway_session(
         bundle.registration.rgb.routes[0].semantic_content_hash,
         bundle.registration.depth.routes[0].semantic_content_hash,
     ]
+    if bundle.segmentation_registration is not None:
+        camera_route_hashes.append(
+            bundle.segmentation_registration.skill.routes[0].semantic_content_hash
+        )
     if bundle.station_point_grasp_registration is not None:
         camera_route_hashes.append(
             bundle.station_point_grasp_registration.skill.routes[
@@ -1040,6 +1116,10 @@ def assemble_real_perception_gateway_session(
         localization_route_hashes = [
             bundle.localization_registration.skill.routes[0].semantic_content_hash
         ]
+        if bundle.segmentation_registration is not None:
+            localization_route_hashes.append(
+                bundle.segmentation_registration.skill.routes[0].semantic_content_hash
+            )
         if bundle.station_point_grasp_registration is not None:
             localization_route_hashes.append(
                 bundle.station_point_grasp_registration.skill.routes[
@@ -1091,6 +1171,8 @@ def assemble_real_perception_gateway_session(
         rgb_executor=rgb_executor,
         depth_executor=depth_executor,
         localization_executor=localization_executor,
+        segmentation_provider=segmentation_provider,
+        segmentation_executor=segmentation_executor,
         station_point_grasp_provider=station_point_grasp_provider,
         station_point_grasp_executor=station_point_grasp_executor,
         station_point_grasp_render_provider=station_point_grasp_render_provider,

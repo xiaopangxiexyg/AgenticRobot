@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+from agent_gateway.profiles.segmentation import SegmentationRegistration
 from agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
     SkillDefinitionCatalog,
@@ -577,6 +578,7 @@ class RealAgentPrimitiveContractBundle:
     tcp_pose_observe: RealTcpPoseObserveContractBundle
     perception_capture: RealPerceptionCaptureRegistration | None = None
     localization_registration: RealObjectLocalizationRegistration | None = None
+    segmentation_registration: SegmentationRegistration | None = None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -712,6 +714,11 @@ class RealAgentPrimitiveContractBundle:
             and self.perception_capture is None
         ):
             raise ValueError("Real point-grasp Routes require perception capture.")
+        if (
+            self.segmentation_registration is not None
+            and self.perception_capture is None
+        ):
+            raise ValueError("Real segmentation Route requires perception capture.")
         if grasp_approach_plan_enabled and not all(
             item is not None for item in optional_grasp
         ):
@@ -720,6 +727,7 @@ class RealAgentPrimitiveContractBundle:
             (11 + int(pose_target_enabled) + int(grasp_approach_enabled))
             + (2 if self.perception_capture is not None else 0)
             + (3 if self.localization_registration is not None else 0)
+            + int(self.segmentation_registration is not None)
             + (2 if grasp_approach_plan_enabled else 0)
         )
         if len(self.route_manifest.skill_routes) != expected_route_count:
@@ -937,6 +945,7 @@ def build_real_agent_primitive_contract_bundle(
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
+    segmentation_registration: SegmentationRegistration | None = None,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -1479,6 +1488,8 @@ def build_real_agent_primitive_contract_bundle(
         )
     if localization_registration is not None and perception_capture is None:
         raise ValueError("Real point-grasp Routes require perception capture.")
+    if segmentation_registration is not None and perception_capture is None:
+        raise ValueError("Real segmentation Route requires perception capture.")
     perception_registrations = list(
         ()
         if perception_capture is None
@@ -1494,6 +1505,8 @@ def build_real_agent_primitive_contract_bundle(
                 station_point_grasp_render_registration.skill,
             )
         )
+    if segmentation_registration is not None:
+        perception_registrations.append(segmentation_registration.skill)
     if grasp_approach_plan_registration is not None:
         perception_registrations.append(grasp_approach_plan_registration.skill)
     perception_registrations = tuple(perception_registrations)
@@ -1605,6 +1618,15 @@ def build_real_agent_primitive_contract_bundle(
                     availability_hash=availability_hash,
                 )
             )
+    if segmentation_registration is not None:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=segmentation_registration.skill.routes[0],
+                deployment_binding=segmentation_registration.binding.to_ref(),
+                evaluation_plan_hash=None,
+                availability_hash=segmentation_registration.availability_hash,
+            )
+        )
     if grasp_approach_plan_registration is not None:
         route_items.append(
             SkillRouteManifestEntry(
@@ -1758,6 +1780,11 @@ def build_real_agent_primitive_contract_bundle(
             ),
             *(
                 ()
+                if segmentation_registration is None
+                else (segmentation_registration.payload_validator,)
+            ),
+            *(
+                ()
                 if grasp_approach_plan_registration is None
                 else (grasp_approach_plan_registration.payload_validator,)
             ),
@@ -1779,6 +1806,7 @@ def build_real_agent_primitive_contract_bundle(
         tcp_pose_observe=tcp_pose_observe,
         perception_capture=perception_capture,
         localization_registration=localization_registration,
+        segmentation_registration=segmentation_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration

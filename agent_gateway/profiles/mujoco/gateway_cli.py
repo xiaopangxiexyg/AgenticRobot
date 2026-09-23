@@ -109,6 +109,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--segmentation-asset-bundle",
+        type=Path,
+        help=(
+            "optional absolute assets/perception/sam2_grounding_dino directory; "
+            "enables the live MuJoCo perception.segment Route and requires "
+            "--artifact-root"
+        ),
+    )
+    parser.add_argument(
+        "--segmentation-device",
+        default="cuda",
+        help="Torch device used by the optional SAM2/Grounding DINO segmenter",
+    )
+    parser.add_argument(
         "--history-root",
         type=Path,
         help=(
@@ -317,6 +331,9 @@ def _prepare_gateway_before_ready(*, session: Any, viewer: Any | None) -> None:
     it creates no Artifact, Agent observation, or operation.
     """
 
+    start_perception_resources = getattr(session, "start_perception_resources", None)
+    if callable(start_perception_resources):
+        start_perception_resources()
     if viewer is not None:
         viewer.start()
     application = session.application
@@ -405,6 +422,30 @@ def main(argv: list[str] | None = None) -> int:
             flag="--artifact-root",
         )
         artifact_storage = MujocoAgentArtifactStorageConfig(root=artifact_root)
+    segmentation_localizer = None
+    if args.segmentation_asset_bundle is not None:
+        from deployments.perception.sam2_grounding_dino import (
+            Sam2GroundingDinoLocalizer,
+            Sam2GroundingDinoModelSpec,
+        )
+
+        if artifact_storage is None:
+            parser.error("--segmentation-asset-bundle requires --artifact-root")
+        segmentation_bundle = _absolute_managed_directory(
+            parser,
+            args.segmentation_asset_bundle,
+            flag="--segmentation-asset-bundle",
+        )
+        try:
+            segmentation_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(
+                segmentation_bundle
+            )
+            segmentation_localizer = Sam2GroundingDinoLocalizer(
+                model_spec=segmentation_spec,
+                device=args.segmentation_device,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            parser.error(f"invalid segmentation model bundle: {error}")
 
     # Task configs may contain repository-relative calibration/profile paths.
     # This dedicated process owns its working directory, so normalize it once
@@ -426,11 +467,10 @@ def main(argv: list[str] | None = None) -> int:
         target_config=target_config,
         allowed_client_ids=client_bindings.allowed_client_ids,
         max_retained_operations=args.max_retained_operations,
-        max_session_admissions_per_route=(
-            args.max_session_admissions_per_route
-        ),
+        max_session_admissions_per_route=(args.max_session_admissions_per_route),
         history_storage=history_storage,
         artifact_storage=artifact_storage,
+        segmentation_localizer=segmentation_localizer,
     )
     viewer = None
     if args.viewer:
@@ -468,8 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         stop_requested.set()
 
     previous_handlers = {
-        signum: signal.getsignal(signum)
-        for signum in (signal.SIGINT, signal.SIGTERM)
+        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
     }
     for signum in previous_handlers:
         signal.signal(signum, request_stop)

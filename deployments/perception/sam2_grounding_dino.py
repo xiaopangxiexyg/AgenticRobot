@@ -7,6 +7,7 @@ manifest pins their Git revisions and the exact checkpoint byte identities.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import subprocess
@@ -274,6 +275,133 @@ class GroundedObjectDetection:
             _required(self.label, field_name="label")
 
 
+@dataclass(frozen=True)
+class GroundedObjectSegment:
+    """One bounded immutable SAM2 mask and its prompt confidence."""
+
+    mask: np.ndarray
+    score: float
+    label: str | None
+    box_xyxy: tuple[int, int, int, int]
+
+    def __post_init__(self) -> None:
+        mask = self.mask
+        if (
+            not isinstance(mask, np.ndarray)
+            or mask.dtype != np.bool_
+            or mask.ndim != 2
+            or not mask.size
+            or not bool(mask.any())
+        ):
+            raise ValueError(
+                "mask must be one non-empty two-dimensional boolean array."
+            )
+        copied = np.array(mask, dtype=bool, copy=True, order="C")
+        copied.setflags(write=False)
+        object.__setattr__(self, "mask", copied)
+        GroundedObjectDetection(
+            box_xyxy=self.box_xyxy,
+            score=self.score,
+            label=self.label,
+        )
+        expected = _mask_box(copied)
+        if expected != self.box_xyxy:
+            raise ValueError("box_xyxy must be the exact half-open mask bounds.")
+
+
+@dataclass(frozen=True)
+class GroundedObjectSegmentArtifacts:
+    """Numerical mask evidence encoded for the target-neutral Gateway layer."""
+
+    score: float
+    label: str | None
+    box_xyxy: tuple[int, int, int, int]
+    mask_pixel_count: int
+    mask_npy: bytes
+    overlay_jpeg: bytes
+
+
+def encode_grounded_object_segment_artifacts(
+    image: Image.Image,
+    segment: object,
+) -> GroundedObjectSegmentArtifacts:
+    """Validate raw model output and encode its mask evidence once."""
+
+    if not isinstance(image, Image.Image):
+        raise TypeError("image must be a PIL Image.")
+    raw_mask = getattr(segment, "mask", None)
+    if not isinstance(raw_mask, np.ndarray) or raw_mask.dtype != np.bool_:
+        raise RuntimeError("Segmentation model returned a non-boolean mask.")
+    mask = raw_mask
+    if (
+        mask.ndim != 2
+        or mask.shape != (image.height, image.width)
+        or not bool(mask.any())
+    ):
+        raise RuntimeError("Segmentation model returned an invalid mask.")
+    ys, xs = np.nonzero(mask)
+    exact_bounds = (
+        int(xs.min()),
+        int(ys.min()),
+        int(xs.max()) + 1,
+        int(ys.max()) + 1,
+    )
+    raw_bounds = getattr(segment, "box_xyxy", None)
+    if (
+        not isinstance(raw_bounds, (list, tuple))
+        or len(raw_bounds) != 4
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in raw_bounds
+        )
+        or tuple(raw_bounds) != exact_bounds
+    ):
+        raise RuntimeError("Segmentation model bounds differ from its mask.")
+    raw_score = getattr(segment, "score", None)
+    if (
+        isinstance(raw_score, bool)
+        or not isinstance(raw_score, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(raw_score))
+        or not 0.0 <= float(raw_score) <= 1.0
+    ):
+        raise RuntimeError("Segmentation model returned an invalid score.")
+    label = getattr(segment, "label", None)
+    if label is not None and (
+        not isinstance(label, str)
+        or not label
+        or label != label.strip()
+        or len(label) > 256
+    ):
+        raise RuntimeError("Segmentation model returned an invalid label.")
+
+    mask_output = io.BytesIO()
+    np.save(
+        mask_output,
+        np.ascontiguousarray(mask, dtype=bool),
+        allow_pickle=False,
+    )
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+    pixels[mask] = np.rint(
+        pixels[mask].astype(np.float32) * 0.45
+        + np.asarray([255.0, 32.0, 32.0], dtype=np.float32) * 0.55
+    ).astype(np.uint8)
+    overlay_output = io.BytesIO()
+    Image.fromarray(pixels, mode="RGB").save(
+        overlay_output,
+        format="JPEG",
+        quality=90,
+        optimize=True,
+    )
+    return GroundedObjectSegmentArtifacts(
+        score=float(raw_score),
+        label=label,
+        box_xyxy=exact_bounds,
+        mask_pixel_count=int(mask.sum()),
+        mask_npy=mask_output.getvalue(),
+        overlay_jpeg=overlay_output.getvalue(),
+    )
+
+
 def _box_iou(
     first: tuple[int, int, int, int], second: tuple[int, int, int, int]
 ) -> float:
@@ -366,9 +494,19 @@ class Sam2GroundingDinoLocalizer:
                 "text_threshold": self.text_threshold,
                 "automatic_score_threshold": self.automatic_score_threshold,
                 "nms_iou_threshold": self.nms_iou_threshold,
+                "point_segmentation_policy": "highest_sam_score.v1",
+                "text_segmentation_policy": (
+                    "grounding_dino_boxes_then_sam2_min_joint_score.v1"
+                ),
+                "segmentation_artifact_policy": "npy_bool_and_jpeg_overlay.v1",
             },
             domain="dexteleop.perception.sam2_grounding_dino_localizer.v1",
         )
+
+    @property
+    def started(self) -> bool:
+        with self._lock:
+            return self._started and not self._closed
 
     def start(self) -> None:
         with self._lock:
@@ -467,7 +605,7 @@ class Sam2GroundingDinoLocalizer:
         ):
             raise ValueError("max_detections must be positive.")
         rgb = image.convert("RGB")
-        array = np.asarray(rgb, dtype=np.uint8)
+        array = np.array(rgb, dtype=np.uint8, copy=True, order="C")
         with self._lock:
             if not self._started or self._closed:
                 raise RuntimeError("Object-localization model is not running.")
@@ -486,25 +624,74 @@ class Sam2GroundingDinoLocalizer:
     ) -> np.ndarray:
         """Return the highest-confidence SAM2 mask prompted by one image pixel."""
 
+        segment = self.segment(
+            image,
+            language_prompt=None,
+            pixel_uv=pixel_uv,
+            min_score=0.0,
+        )
+        if segment is None:  # pragma: no cover - min_score=0 admits valid SAM output
+            raise RuntimeError("SAM2 did not return a point-prompted mask.")
+        return segment.mask
+
+    @staticmethod
+    def encode_segment_artifacts(
+        image: Image.Image,
+        segment: object,
+    ) -> GroundedObjectSegmentArtifacts:
+        return encode_grounded_object_segment_artifacts(image, segment)
+
+    def segment(
+        self,
+        image: Image.Image,
+        *,
+        language_prompt: str | None,
+        pixel_uv: tuple[int, int] | None,
+        min_score: float,
+    ) -> GroundedObjectSegment | None:
+        """Return one text- or point-prompted mask using the shared SAM2 model."""
+
         if not isinstance(image, Image.Image):
             raise TypeError("image must be a PIL Image.")
+        if (language_prompt is None) == (pixel_uv is None):
+            raise ValueError("Exactly one language_prompt or pixel_uv is required.")
         if (
-            not isinstance(pixel_uv, tuple)
-            or len(pixel_uv) != 2
-            or any(
-                isinstance(value, bool) or not isinstance(value, int)
-                for value in pixel_uv
-            )
+            isinstance(min_score, bool)
+            or not isinstance(min_score, (int, float))
+            or not math.isfinite(float(min_score))
+            or not 0.0 <= float(min_score) <= 1.0
         ):
-            raise TypeError("pixel_uv must contain two integers.")
-        u, v = pixel_uv
+            raise ValueError("min_score must be finite and in [0, 1].")
         rgb = image.convert("RGB")
-        if not (0 <= u < rgb.width and 0 <= v < rgb.height):
-            raise ValueError("pixel_uv is outside the image.")
-        array = np.asarray(rgb, dtype=np.uint8)
+        array = np.array(rgb, dtype=np.uint8, copy=True, order="C")
         with self._lock:
             if not self._started or self._closed:
                 raise RuntimeError("Object-localization model is not running.")
+            if language_prompt is not None:
+                prompt = _required(language_prompt, field_name="language_prompt")
+                candidates = self._grounded_segments(rgb, array, prompt)
+                admitted = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.score >= float(min_score)
+                ]
+                return (
+                    max(admitted, key=lambda item: (item.score, item.box_xyxy))
+                    if admitted
+                    else None
+                )
+            if (
+                not isinstance(pixel_uv, tuple)
+                or len(pixel_uv) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in pixel_uv
+                )
+            ):
+                raise TypeError("pixel_uv must contain two integers.")
+            u, v = pixel_uv
+            if not (0 <= u < rgb.width and 0 <= v < rgb.height):
+                raise ValueError("pixel_uv is outside the image.")
             self._predictor.set_image(array)
             masks, scores, _logits = self._predictor.predict(
                 point_coords=np.asarray([[u, v]], dtype=np.float32),
@@ -513,11 +700,27 @@ class Sam2GroundingDinoLocalizer:
             )
         if not len(masks):
             raise RuntimeError("SAM2 did not return a point-prompted mask.")
-        best = int(np.argmax(np.asarray(scores, dtype=np.float32)))
-        mask = np.asarray(masks[best], dtype=bool)
+        score_values = np.asarray(scores, dtype=np.float32)
+        if len(score_values) != len(masks) or not bool(np.isfinite(score_values).all()):
+            raise RuntimeError("SAM2 returned non-finite point-mask scores.")
+        best = int(np.argmax(score_values))
+        mask = masks[best]
+        if not isinstance(mask, np.ndarray) or mask.dtype != np.bool_:
+            raise RuntimeError("SAM2 returned a non-boolean point mask.")
         if mask.shape != (rgb.height, rgb.width) or not bool(mask[v, u]):
             raise RuntimeError("SAM2 point mask does not contain the requested pixel.")
-        return mask
+        score = min(1.0, max(0.0, float(score_values[best])))
+        bounds = _mask_box(mask)
+        if bounds is None:
+            raise RuntimeError("SAM2 returned an empty point-prompted mask.")
+        if score < float(min_score):
+            return None
+        return GroundedObjectSegment(
+            mask=mask,
+            score=score,
+            label=None,
+            box_xyxy=bounds,
+        )
 
     def _automatic(self, image: np.ndarray) -> list[GroundedObjectDetection]:
         result = []
@@ -562,6 +765,9 @@ class Sam2GroundingDinoLocalizer:
         self._predictor.set_image(array)
         result = []
         for box, logit, phrase in zip(boxes, logits, phrases, strict=True):
+            grounding_score = float(logit)
+            if not math.isfinite(grounding_score):
+                raise RuntimeError("Grounding DINO returned a non-finite score.")
             cx, cy, box_width, box_height = (float(value) for value in box.tolist())
             input_box = np.asarray(
                 [
@@ -592,10 +798,72 @@ class Sam2GroundingDinoLocalizer:
                 result.append(
                     GroundedObjectDetection(
                         box_xyxy=refined,
-                        score=min(1.0, max(0.0, float(logit))),
+                        score=min(1.0, max(0.0, grounding_score)),
                         label=_required(str(phrase), field_name="grounding phrase"),
                     )
                 )
+        return result
+
+    def _grounded_segments(
+        self,
+        image: Image.Image,
+        array: np.ndarray,
+        language_prompt: str,
+    ) -> list[GroundedObjectSegment]:
+        transformed, _target = self._grounding_transform(image, None)
+        boxes, logits, phrases = self._grounding_predict(
+            model=self._grounding_model,
+            image=transformed,
+            caption=language_prompt,
+            box_threshold=self.box_threshold,
+            text_threshold=self.text_threshold,
+            device=self.device,
+        )
+        width, height = image.size
+        self._predictor.set_image(array)
+        result = []
+        for box, logit, phrase in zip(boxes, logits, phrases, strict=True):
+            grounding_score = float(logit)
+            if not math.isfinite(grounding_score):
+                raise RuntimeError("Grounding DINO returned a non-finite score.")
+            cx, cy, box_width, box_height = (float(value) for value in box.tolist())
+            input_box = np.asarray(
+                [
+                    (cx - box_width / 2.0) * width,
+                    (cy - box_height / 2.0) * height,
+                    (cx + box_width / 2.0) * width,
+                    (cy + box_height / 2.0) * height,
+                ],
+                dtype=np.float32,
+            )
+            masks, mask_scores, _logits = self._predictor.predict(
+                box=input_box,
+                multimask_output=True,
+            )
+            if not len(masks):
+                continue
+            score_values = np.asarray(mask_scores, dtype=np.float32)
+            if len(score_values) != len(masks) or not bool(
+                np.isfinite(score_values).all()
+            ):
+                raise RuntimeError("SAM2 returned non-finite box-mask scores.")
+            best = int(np.argmax(score_values))
+            mask = masks[best]
+            if not isinstance(mask, np.ndarray) or mask.dtype != np.bool_:
+                raise RuntimeError("SAM2 returned a non-boolean box mask.")
+            bounds = _mask_box(mask)
+            if mask.shape != (height, width) or bounds is None:
+                continue
+            grounding_score = min(1.0, max(0.0, grounding_score))
+            sam_score = min(1.0, max(0.0, float(score_values[best])))
+            result.append(
+                GroundedObjectSegment(
+                    mask=mask,
+                    score=min(grounding_score, sam_score),
+                    label=_required(str(phrase), field_name="grounding phrase"),
+                    box_xyxy=bounds,
+                )
+            )
         return result
 
 
@@ -606,6 +874,9 @@ __all__ = [
     "SAM2_GIT_URL",
     "SAM2_REVIEWED_REVISION",
     "GroundedObjectDetection",
+    "GroundedObjectSegment",
+    "GroundedObjectSegmentArtifacts",
     "Sam2GroundingDinoLocalizer",
     "Sam2GroundingDinoModelSpec",
+    "encode_grounded_object_segment_artifacts",
 ]
