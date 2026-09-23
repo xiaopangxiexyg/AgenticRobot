@@ -358,6 +358,18 @@ def _interpolate_targets(
     right: TimestampedMotionTarget,
     alpha: float,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    if left is right and alpha == 0.0:
+        # Exact/held targets were validated when frozen. The reference
+        # constructor still validates and copies them; avoid interpolating a
+        # pose with itself on every online reference tick. Keep the qpos
+        # arithmetic so signed-zero output matches the general path.
+        return (
+            dict(left.pose_by_side),
+            {
+                side: np.asarray(qpos + (qpos - qpos) * alpha, dtype=float)
+                for side, qpos in left.qpos_by_side.items()
+            },
+        )
     pose_by_side = {
         side: interpolate_pose_shortest_path(
             left.pose_by_side[side],
