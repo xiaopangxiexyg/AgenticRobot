@@ -15,6 +15,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
+from queue import Empty, SimpleQueue
 from typing import Any
 
 import numpy as np
@@ -705,6 +706,13 @@ class RuleBasedRealTeleopExtension:
         self._writing_reachability_status = "disabled"
         self._writing_reachability_detail = ""
         self._writing_reachability_skipped_count = 0
+        self._writing_reachability_progress: (
+            SimpleQueue[tuple[str, str, int, int, float]] | None
+        ) = None
+        self._writing_reachability_progress_detail = ""
+        self._writing_reachability_started_at: float | None = None
+        self._writing_reachability_candidate_label = ""
+        self._writing_reachability_preparation_ms: float | None = None
         self._configuration_error = ""
         self._arm_feedback_pause_started_at: float | None = None
         # Readiness reports may perform a bounded serial telemetry read (the
@@ -6847,6 +6855,65 @@ class RuleBasedRealTeleopExtension:
             "pending" if self._writing_reachability_enabled() else "disabled"
         )
         self._writing_reachability_detail = ""
+        self._writing_reachability_progress = None
+        self._writing_reachability_progress_detail = ""
+        self._writing_reachability_started_at = None
+        self._writing_reachability_candidate_label = ""
+        self._writing_reachability_preparation_ms = None
+
+    def _writing_reachability_candidate_description(self) -> str:
+        variant = self.source_selection.get("writing_variant_selection", {})
+        variant = variant if isinstance(variant, Mapping) else {}
+        phases = self.source_selection.get("phases", {})
+        phases = phases if isinstance(phases, Mapping) else {}
+        approach = phases.get("pen_down", {})
+        approach = approach if isinstance(approach, Mapping) else {}
+        return (
+            f"候选 {self._selection_ordinal + 1} · "
+            f"{variant.get('selected_trajectory_id') or '未指定轨迹'} / "
+            f"{variant.get('selected_direction') or '未指定方向'} / "
+            f"{float(variant.get('selected_size_m') or 0.0):.3f}m · "
+            f"靠近来源 {approach.get('candidate_id') or '未指定'}"
+        )
+
+    def _observe_writing_reachability_progress(self) -> None:
+        progress = self._writing_reachability_progress
+        if progress is None:
+            return
+        for _ in range(8):
+            try:
+                event, name, index, count, elapsed_ms = progress.get_nowait()
+            except Empty:
+                break
+            if event == "start":
+                self._writing_reachability_progress_detail = (
+                    f"第 {index}/{count} 点 {name} 求解中"
+                )
+            else:
+                self._writing_reachability_progress_detail = (
+                    f"第 {index}/{count} 点 {name} 已检查 "
+                    f"({elapsed_ms:.0f}ms)"
+                )
+        if self._writing_reachability_started_at is not None:
+            elapsed = max(0.0, time.monotonic() - self._writing_reachability_started_at)
+            pending = self._writing_reachability_future
+            if pending is not None and not pending.running():
+                phase = "等待后台计算资源"
+            else:
+                phase = self._writing_reachability_progress_detail or "等待第一点检查启动"
+            deadline_detail = (
+                "；超过预检目标时限，正在等待后台数值调用返回"
+                if elapsed > _WRITING_REACHABILITY_MAX_CHECK_SEC
+                and pending is not None
+                and pending.running()
+                else ""
+            )
+            self._writing_reachability_detail = (
+                f"{self._writing_reachability_candidate_label}；"
+                f"前台准备 {float(self._writing_reachability_preparation_ms or 0.0):.0f}ms；"
+                f"{phase}；已等待 {int(elapsed)}s{deadline_detail}；"
+                "尚未启动 Episode。"
+            )
 
     def _writing_reachability_request(self) -> dict[str, Any]:
         metadata = self._writing_reachability_metadata()
@@ -6991,13 +7058,20 @@ class RuleBasedRealTeleopExtension:
     ) -> Mapping[str, Any]:
         """Check four endpoints without backend, Session, or dispatch access."""
 
-        deadline = time.monotonic() + _WRITING_REACHABILITY_MAX_CHECK_SEC
+        started_at = time.monotonic()
+        deadline = started_at + _WRITING_REACHABILITY_MAX_CHECK_SEC
+        report_progress = request.get("progress_callback")
         oracle = DualArmCollisionAwareRetargeter(request["oracle_config"])
         seed_qpos = request["seed_qpos"]
         translation_tolerance = float(request["translation_tolerance_m"])
         rotation_tolerance = float(request["rotation_tolerance_deg"])
         results: list[dict[str, Any]] = []
-        for probe in request["probes"]:
+        probes = request["probes"]
+        for index, probe in enumerate(probes, start=1):
+            name = str(probe["name"])
+            probe_started_at = time.monotonic()
+            if callable(report_progress):
+                report_progress(("start", name, index, len(probes), 0.0))
             modified_sides = tuple(probe["envelope_modified_sides"])
             # A projected right target would change the written glyph. The
             # left target is only a solver input; its actual qpos remains
@@ -7009,8 +7083,14 @@ class RuleBasedRealTeleopExtension:
                         "reachable": False,
                         "reason": "tcp_envelope_projection_required",
                         "modified_sides": list(modified_sides),
+                        "elapsed_ms": (time.monotonic() - probe_started_at) * 1000.0,
                     }
                 )
+                if callable(report_progress):
+                    report_progress((
+                        "finish", name, index, len(probes),
+                        results[-1]["elapsed_ms"],
+                    ))
                 continue
             oracle.set_current_qpos_pair(
                 left_qpos=seed_qpos["left"],
@@ -7089,13 +7169,20 @@ class RuleBasedRealTeleopExtension:
                     "solve_frames": solve_frames,
                     "translation_error_m": translation_error,
                     "rotation_error_deg": rotation_error,
+                    "elapsed_ms": (time.monotonic() - probe_started_at) * 1000.0,
                 }
             )
+            if callable(report_progress):
+                report_progress((
+                    "finish", name, index, len(probes),
+                    results[-1]["elapsed_ms"],
+                ))
             if reason == "solver_budget_exhausted":
                 break
         return {
             "reachable": all(bool(item["reachable"]) for item in results),
             "probes": results,
+            "elapsed_ms": (time.monotonic() - started_at) * 1000.0,
         }
 
     def _service_writing_reachability_preflight(self) -> None:
@@ -7119,7 +7206,11 @@ class RuleBasedRealTeleopExtension:
         if rebuild is not None:
             if not rebuild.done():
                 self._writing_reachability_status = "skipping_unreachable"
-                self._writing_reachability_detail = "正在跳过不可达候选并准备下一条。"
+                self._writing_reachability_detail = (
+                    f"{self._writing_reachability_candidate_label} 已被安全边界拒绝；"
+                    f"累计跳过 {self._writing_reachability_skipped_count} 条，"
+                    "正在后台准备下一候选；尚未启动 Episode。"
+                )
                 return
             ordinal = self._writing_reachability_rebuild_ordinal
             self._writing_reachability_rebuild_future = None
@@ -7163,33 +7254,79 @@ class RuleBasedRealTeleopExtension:
         if pending is None:
             self._writing_reachability_fingerprint = fingerprint
             try:
+                self._writing_reachability_candidate_label = (
+                    self._writing_reachability_candidate_description()
+                )
+                preparation_started_at = time.monotonic()
                 request = self._writing_reachability_request()
+                self._writing_reachability_preparation_ms = (
+                    time.monotonic() - preparation_started_at
+                ) * 1000.0
+                progress: SimpleQueue[tuple[str, str, int, int, float]] = SimpleQueue()
+                request["progress_callback"] = progress.put
+                self._writing_reachability_progress = progress
+                self._writing_reachability_started_at = time.monotonic()
+                self._writing_reachability_progress_detail = ""
                 self._writing_reachability_future = self._configuration_executor.submit(
                     self._run_writing_reachability_preflight,
                     request,
                 )
                 self._writing_reachability_status = "pending"
-                self._writing_reachability_detail = "正在后台检查书写四边界接触点。"
+                self._writing_reachability_detail = (
+                    f"{self._writing_reachability_candidate_label}；"
+                    f"前台准备 {self._writing_reachability_preparation_ms:.0f}ms；"
+                    "正在后台检查书写四边界接触点；尚未启动 Episode。"
+                )
                 self._waiting_reason = "writing_reachability_preflight"
             except Exception as exc:  # noqa: BLE001 - no motion was authorized.
                 self._writing_reachability_status = "error"
-                self._writing_reachability_detail = f"{type(exc).__name__}: {exc}"
+                self._writing_reachability_detail = (
+                    f"{self._writing_reachability_candidate_label}；"
+                    f"前台准备失败：{type(exc).__name__}: {exc}"
+                )
                 self._waiting_reason = "writing_reachability_error"
             return
+        self._observe_writing_reachability_progress()
         if not pending.done():
             return
         self._writing_reachability_future = None
+        self._writing_reachability_progress = None
         try:
             result = pending.result()
         except Exception as exc:  # noqa: BLE001 - preflight remains command-inert.
             self._writing_reachability_status = "error"
-            self._writing_reachability_detail = f"{type(exc).__name__}: {exc}"
+            self._writing_reachability_detail = (
+                f"{self._writing_reachability_candidate_label}；"
+                f"后台预检失败：{type(exc).__name__}: {exc}"
+            )
             self._waiting_reason = "writing_reachability_error"
             return
+        elapsed_value = result.get("elapsed_ms")
+        elapsed_detail = (
+            f"前台准备 {float(self._writing_reachability_preparation_ms or 0.0):.0f}ms；"
+            f"预检耗时 {float(elapsed_value):.0f}ms；"
+            if elapsed_value is not None
+            else f"前台准备 {float(self._writing_reachability_preparation_ms or 0.0):.0f}ms；"
+        )
         if bool(result.get("reachable", False)):
             self._writing_reachability_status = "passed"
-            self._writing_reachability_detail = "书写四边界接触点 IK/碰撞检查通过。"
+            probe_timings = ", ".join(
+                f"{probe.get('name', 'unknown')} "
+                f"{float(probe['elapsed_ms']):.0f}ms/"
+                f"{probe.get('solve_frames', 0)}帧"
+                for probe in result.get("probes", ())
+                if isinstance(probe, Mapping) and probe.get("elapsed_ms") is not None
+            )
+            self._writing_reachability_detail = (
+                f"{self._writing_reachability_candidate_label}；"
+                + elapsed_detail
+                + (f"各点 {probe_timings}；" if probe_timings else "")
+                + "书写四边界接触点 IK/碰撞检查通过。"
+            )
             self._waiting_reason = "waiting_for_rule_start"
+            append_message = getattr(self._control_ui, "append_message", None)
+            if callable(append_message):
+                append_message("RuleBasedReachability", self._writing_reachability_detail)
             return
 
         failed = [
@@ -7204,6 +7341,7 @@ class RuleBasedRealTeleopExtension:
             f"/{item.get('solve_frames', 'n/a')} frames"
             f"/{item.get('translation_error_m', 'n/a')}m"
             f"/{item.get('rotation_error_deg', 'n/a')}deg"
+            f"/{item.get('elapsed_ms', 'n/a')}ms"
             for item in failed
         )
         definitive_reasons = {
@@ -7216,15 +7354,22 @@ class RuleBasedRealTeleopExtension:
         ):
             self._writing_reachability_status = "error"
             self._writing_reachability_detail = (
+                f"{self._writing_reachability_candidate_label}；{elapsed_detail}"
                 "书写可达性数值检查未能确认，未判为几何不可达；"
                 + (details or "缺少失败点结果")
                 + "。请调整书写大小/方向或检查标定后重试。"
             )
             self._waiting_reason = "writing_reachability_unresolved"
+            append_message = getattr(self._control_ui, "append_message", None)
+            if callable(append_message):
+                append_message("RuleBasedReachability", self._writing_reachability_detail)
             return
         self._writing_reachability_skipped_count += 1
         self._writing_reachability_status = "unreachable"
-        self._writing_reachability_detail = "安全边界拒绝：" + details
+        self._writing_reachability_detail = (
+            f"{self._writing_reachability_candidate_label}；{elapsed_detail}"
+            "安全边界拒绝：" + details
+        )
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
             append_message(

@@ -340,6 +340,89 @@ def test_writing_reachability_blocks_start_until_background_check_passes() -> No
     assert status.rule_start_available is True
 
 
+def test_writing_reachability_shows_candidate_probe_and_slow_solve() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={
+            "selection_ordinal": 2,
+            "writing_reachability": {"enabled": True},
+            "writing_variant_selection": {
+                "selected_trajectory_id": "latin_a_v1",
+                "selected_direction": "right",
+                "selected_size_m": 0.07,
+            },
+            "phases": {"pen_down": {"candidate_id": "approach-17"}},
+        },
+    )
+    recorder = _Recorder(_Poller())
+    _session, _clutch, ui = _bind(extension, recorder, arm=False)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._writing_reachability_request = lambda: {}
+    worker_busy = threading.Event()
+    free_worker = threading.Event()
+    extension._configuration_executor.submit(
+        lambda: (worker_busy.set(), free_worker.wait(timeout=2.0))
+    )
+    assert worker_busy.wait(timeout=1.0)
+    started = threading.Event()
+    release = threading.Event()
+
+    def check(request):
+        request["progress_callback"](("start", "top", 1, 4, 0.0))
+        started.set()
+        assert release.wait(timeout=2.0)
+        request["progress_callback"](("finish", "top", 1, 4, 1200.0))
+        return {"reachable": True, "probes": (), "elapsed_ms": 1200.0}
+
+    extension._run_writing_reachability_preflight = check
+    try:
+        extension.after_control_input_poll(now=1.0)
+        extension.after_control_input_poll(now=1.05)
+        assert "等待后台计算资源" in extension.status().writing_reachability_detail
+        assert "前台准备" in extension.status().writing_reachability_detail
+        free_worker.set()
+        assert started.wait(timeout=1.0)
+        extension._writing_reachability_started_at -= 5.0
+        extension.after_control_input_poll(now=1.1)
+        status = extension.status()
+        assert "候选 3" in status.writing_reachability_detail
+        assert "latin_a_v1 / right / 0.070m" in status.writing_reachability_detail
+        assert "靠近来源 approach-17" in status.writing_reachability_detail
+        assert "第 1/4 点 top 求解中" in status.writing_reachability_detail
+        assert "超过预检目标时限" in status.writing_reachability_detail
+        assert status.readiness_blockers["rule.writing_reachability"] == (
+            status.writing_reachability_detail
+        )
+        assert recorder.is_recording is False
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while extension.status().writing_reachability_status != "passed":
+            extension.after_control_input_poll(now=1.2)
+            if time.monotonic() >= deadline:
+                raise AssertionError("writing reachability preflight did not settle")
+            time.sleep(0.001)
+        assert "预检耗时 1200ms" in extension.status().writing_reachability_detail
+        assert ui.statuses
+        assert any(
+            tag == "RuleBasedReachability" and "预检耗时 1200ms" in message
+            for tag, message in ui.messages
+        )
+    finally:
+        free_worker.set()
+        release.set()
+
+
 def test_writing_reachability_receipt_is_bound_to_pen_down_source() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -528,12 +611,21 @@ def test_writing_reachability_matches_live_coupled_solver_and_fixed_left_collisi
         "translation_tolerance_m": 0.005,
         "rotation_tolerance_deg": 3.0,
     }
+    progress = []
+    request["progress_callback"] = progress.append
 
     result = RuleBasedRealTeleopExtension._run_writing_reachability_preflight(
         request
     )
 
     assert result["reachable"] is held_pair_safe
+    assert result["elapsed_ms"] >= 0.0
+    assert [event[:4] for event in progress] == [
+        (phase, name, index, 4)
+        for index, name in enumerate(("left", "right", "bottom", "top"), start=1)
+        for phase in ("start", "finish")
+    ]
+    assert all(event[4] >= 0.0 for event in progress)
     if not held_pair_safe:
         assert {probe["reason"] for probe in result["probes"]} == {
             "held_left_collision"
@@ -649,7 +741,7 @@ def test_terminal_writing_reachability_result_is_not_resubmitted(
             },
         },
     )
-    _bind(extension, _Recorder(_Poller()), arm=False)
+    _session, _clutch, ui = _bind(extension, _Recorder(_Poller()), arm=False)
     extension._height_calibration = RuleBasedWritingHeightCalibration(
         calibrated_z_m=0.3,
         lower_tolerance_m=0.001,
@@ -680,7 +772,14 @@ def test_terminal_writing_reachability_result_is_not_resubmitted(
     for _ in range(20):
         extension.after_control_input_poll(now=1.1)
     assert checks == [1]
-    assert extension.status().rule_start_available is False
+    status = extension.status()
+    assert status.rule_start_available is False
+    assert "候选 1" in status.writing_reachability_detail
+    assert reason in status.writing_reachability_detail
+    assert any(
+        tag == "RuleBasedReachability" and reason in message
+        for tag, message in ui.messages
+    )
 
 
 def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> None:
@@ -708,7 +807,7 @@ def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> N
         source_selection=selection(0),
     )
     recorder = _Recorder(_Poller())
-    _session, _clutch, _ui = _bind(extension, recorder, arm=False)
+    _session, _clutch, ui = _bind(extension, recorder, arm=False)
     extension._height_calibration = RuleBasedWritingHeightCalibration(
         calibrated_z_m=0.3,
         lower_tolerance_m=0.001,
@@ -760,6 +859,10 @@ def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> N
     assert extension.status().held is False
     assert extension.status().aborted is False
     assert recorder.is_recording is False
+    assert any(
+        tag == "RuleBasedReachability" and "安全边界拒绝" in message
+        for tag, message in ui.messages
+    )
 
 
 def test_successful_next_attempt_rebuild_keeps_certified_arm_hold_stream() -> None:
