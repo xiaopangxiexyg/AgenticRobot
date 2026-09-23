@@ -35,8 +35,15 @@ def build_observation(artifact: dict, *, prompt: str) -> dict[str, object]:
     image_inputs = camera["inputs"]
     if not image_inputs or len(image_inputs) > 8:
         raise ValueError("Expected one to eight camera inputs")
+    state_dim = int(state["dim"])
+    synthetic_state = np.zeros((state_dim,), dtype=np.float32)
+    if artifact.get("state_input_mode") == "masked_normalized_concat_v1":
+        if state_dim % 2:
+            raise ValueError("Masked state contract requires even state dimension")
+        # The second half is the availability mask, not a state value.
+        synthetic_state[state_dim // 2 :] = 1.0
     observation: dict[str, object] = {
-        "observation.state": np.zeros((int(state["dim"]),), dtype=np.float32),
+        "observation.state": synthetic_state,
         "prompt": prompt,
     }
     for item in image_inputs:

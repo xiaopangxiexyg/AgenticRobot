@@ -41,6 +41,14 @@ def test_synthetic_observation_matches_checkpoint_inputs() -> None:
         assert observation[key].dtype == np.uint8
 
 
+def test_masked_state_declares_all_components_available() -> None:
+    artifact = _artifact()
+    artifact["state_input_mode"] = "masked_normalized_concat_v1"
+    state = _MODULE.build_observation(artifact, prompt="stage one")["observation.state"]
+    np.testing.assert_array_equal(state[:16], np.zeros((16,), dtype=np.float32))
+    np.testing.assert_array_equal(state[16:], np.ones((16,), dtype=np.float32))
+
+
 @pytest.mark.parametrize(
     "key,value",
     [
