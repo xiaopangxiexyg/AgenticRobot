@@ -115,11 +115,22 @@
     </section>
     <p id="gripper-status" class="gripper-status" aria-live="polite">夹爪独立控制：等待设备状态。</p>
     <p id="debug-status" class="gripper-status" aria-live="polite">Debug 诊断：关闭。</p>
+    <section class="diagnostics" aria-labelledby="diagnostics-title">
+      <div class="section-heading">
+        <h2 id="diagnostics-title">当前阻塞与故障</h2>
+        <span id="diagnostics-summary" aria-live="polite">正在检查当前状态…</span>
+      </div>
+      <div id="active-diagnostics" class="diagnostic-grid" aria-live="polite"></div>
+      <p id="diagnostics-empty" class="diagnostics-empty" hidden>
+        当前没有活动故障；下方事件历史仅用于追溯，不代表问题仍然存在。
+      </p>
+    </section>
     <section class="messages">
-      <h2>设备与安全消息</h2>
+      <h2>事件历史（最近 12 条）</h2>
       <ol id="messages"></ol>
     </section>
   </main>
+  <script src="/diagnostics.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

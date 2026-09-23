@@ -12,7 +12,7 @@ h1, h2, p { margin-top: 0; }
 h1 { font-size: clamp(2rem, 5vw, 3.5rem); margin-bottom: 0; }
 .eyebrow { color: #79d5c5; letter-spacing: .16em; font-size: .75rem; position: absolute; top: 20px; }
 .phase { margin-left: auto; padding: 7px 12px; border-radius: 999px; background: #1d3446; color: #9bded2; }
-.status-card, .configuration, .task-chain, .messages { background: rgba(17, 29, 40, .92); border: 1px solid #294154; border-radius: 18px; padding: 24px; box-shadow: 0 20px 50px rgba(0,0,0,.25); }
+.status-card, .configuration, .task-chain, .diagnostics, .messages { background: rgba(17, 29, 40, .92); border: 1px solid #294154; border-radius: 18px; padding: 24px; box-shadow: 0 20px 50px rgba(0,0,0,.25); }
 .status-card > p { color: #aebfcd; }
 dl { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 24px 0 0; }
 dl div { background: #0c1822; padding: 14px; border-radius: 12px; min-width: 0; }
@@ -51,8 +51,40 @@ button.danger { background: #ff7d79; color: #2c0808; }
 button.secondary { margin-left: auto; background: #263b4c; color: #dae6ef; }
 button:disabled { opacity: .35; cursor: not-allowed; }
 .gripper-status { color: #9fb5c4; margin: 8px 0 18px; }
-.messages ol { margin-bottom: 0; padding-left: 22px; color: #b7c8d5; }
+.diagnostics { margin-top: 18px; }
+.diagnostics h2, .messages h2 { margin-bottom: 0; }
+.diagnostic-grid { display: grid; gap: 12px; margin-top: 16px; }
+.diagnostic-card { border: 1px solid #486174; border-left-width: 5px; border-radius: 12px; padding: 16px; background: #0c1822; }
+.diagnostic-card.severity-critical { border-left-color: #ff6666; background: #251317; }
+.diagnostic-card.severity-error { border-left-color: #ff9d70; background: #211815; }
+.diagnostic-card.severity-warning { border-left-color: #e9c46a; }
+.diagnostic-card.severity-info { border-left-color: #67d2be; }
+.diagnostic-badges { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 10px; }
+.diagnostic-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; font-size: .72rem; font-weight: 700; background: #203445; color: #c8d7e2; }
+.diagnostic-badge-severity-critical { background: #7a2328; color: #ffe2e2; }
+.diagnostic-badge-severity-error { background: #683522; color: #ffe7da; }
+.diagnostic-badge-severity-warning { background: #5a4920; color: #fff2c0; }
+.diagnostic-badge-severity-info { background: #17463e; color: #c8fff5; }
+.diagnostic-badge-component { background: #243748; color: #d9e8f2; }
+.diagnostic-card h3 { margin: 0 0 8px; font-size: 1rem; }
+.diagnostic-summary { color: #d6e1e9; margin-bottom: 10px; overflow-wrap: anywhere; }
+.diagnostic-action { color: #a9bdca; margin-bottom: 10px; }
+.diagnostic-action strong { color: #e8f0f7; }
+.diagnostic-card details { color: #8fa6b7; font-size: .82rem; }
+.diagnostic-card details summary { cursor: pointer; }
+.diagnostic-card pre { margin: 9px 0 0; padding: 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 8px; background: #071019; color: #b7c8d5; }
+.diagnostics-empty { margin: 16px 0 0; padding: 14px; border-radius: 10px; background: #102b27; color: #a9e8dc; }
+.messages { margin-top: 18px; }
+.messages ol { margin: 16px 0 0; padding: 0; color: #b7c8d5; list-style: none; }
+.messages li { padding: 12px; border-left: 3px solid #486174; border-radius: 8px; background: #0c1822; }
+.messages li.severity-critical { border-left-color: #ff6666; }
+.messages li.severity-error { border-left-color: #ff9d70; }
+.messages li.severity-warning { border-left-color: #e9c46a; }
+.messages li.severity-info { border-left-color: #67d2be; }
 .messages li + li { margin-top: 8px; }
+.message-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.message-heading strong { margin-left: 2px; color: #e8f0f7; }
+.message-entry p { margin: 8px 0 0; overflow-wrap: anywhere; }
 body[data-phase="running"] .phase { background: #16483f; color: #a9f5e7; }
 body[data-phase="aborted"] .phase, body[data-phase="stopping"] .phase { background: #572929; color: #ffd0cd; }
 @media (max-width: 680px) {
