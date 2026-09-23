@@ -29,7 +29,25 @@ Install the runtime dependency in the environment that runs the module:
 python -m pip install -r hardware/foot_pad/requirements.txt
 ```
 
-Start with four pads (the recommended/default layout).  If no valid mapping
+## One-click startup
+
+From an activated DexTeleop environment, run:
+
+```bash
+bash scripts/start_foot_pad.sh
+```
+
+Enter the pedal count when prompted. The launcher requests sudo authorization
+for the complete device permission repair, recalibrates every pedal in order,
+then saves the new mapping and leaves the forwarding service running in the
+foreground. Each launch replaces the stored mapping after calibration
+completes. Press Ctrl-C to stop the service. The permission repair updates
+currently connected device nodes and installs the persistent rule for the
+virtual foot-pad keyboard; details are below.
+
+## Direct service usage
+
+Start with four pads (the recommended/default layout). If no valid mapping
 exists, this enters terminal calibration and asks for foot pads 1 through N in
 sequence:
 
@@ -89,16 +107,20 @@ The account must be able to read the physical `/dev/input/event*` nodes, create
 `/dev/uinput`, and read the virtual `DexTeleop foot pads` event node. The
 virtual node is normally created as `root:input 0660`; without a persistent
 rule the forwarding service can report success while the GUI cannot open it.
-Install the packaged device-specific udev rule and repair current nodes once:
+`--fix-permissions` repairs the currently enumerated USB serial, video/media,
+USB bus, input-event, and uinput nodes to mode `0666`, then installs the
+packaged device-specific udev rule. The rule itself only makes the named
+`DexTeleop foot pads` virtual keyboard world-readable; it does not relax every
+input device. The one-click launcher runs this complete permission repair
+before each calibration:
 
 ```bash
 sudo -E "$CONDA_PREFIX/bin/python" -m teleop_runtime.configure_devices --fix-permissions
 ```
 
-`--fix-permissions` installs
-`/etc/udev/rules.d/99-dexteleop-foot-pad.rules`. It only makes the named
-DexTeleop virtual keyboard world-readable; it does not relax every input
-device. Startup probes once. If the virtual keyboard is absent or later
+The command installs
+`/etc/udev/rules.d/99-dexteleop-foot-pad.rules`. Startup probes once. If the
+virtual keyboard is absent or later
 disconnects, the running GUI does not scan automatically; press
 “重连失败设备” to request one explicit scan after the node becomes readable.
 The retry control is available before runtime Home or in regular Hold, and is

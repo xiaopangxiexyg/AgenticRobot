@@ -116,10 +116,10 @@ q5 release-band 的“保持上一侧”条件，并启用 `[1,2,4]` 半径的�
 ### 踏板:
 
 ```bash
-sudo -E "$(command -v python)" -m teleop_runtime.configure_devices --fix-permissions
-
-python -m hardware.foot_pad --count 2
+bash scripts/start_foot_pad.sh
 ```
+
+按提示输入踏板数量 `N`，再在 sudo 提示中输入密码，并按服务提示依次踩下踏板完成重新标定。转发服务会保持前台运行，按 `Ctrl-C` 停止。
 
 ### 1.3 正式 position 数采（M）
 
