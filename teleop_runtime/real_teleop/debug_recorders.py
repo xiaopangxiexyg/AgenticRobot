@@ -611,6 +611,7 @@ class IkDebugLogRecorder:
         payload: Mapping[str, object] | None = None,
         *,
         now: float | None = None,
+        nonblocking: bool = False,
     ) -> None:
         if self._queue is None:
             return
@@ -621,7 +622,10 @@ class IkDebugLogRecorder:
             "payload": dict(payload or {}),
         }
         try:
-            self._queue.put(row, timeout=0.02)
+            if nonblocking:
+                self._queue.put_nowait(row)
+            else:
+                self._queue.put(row, timeout=0.02)
         except queue.Full:
             self.dropped_frame_count += 1
 

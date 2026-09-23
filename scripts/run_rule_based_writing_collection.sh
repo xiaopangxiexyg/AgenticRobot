@@ -574,6 +574,13 @@ TELEOP_ARGS=(
   "${RULE_ARGS[@]}"
 )
 
+if [[ "$COLLECTION_MODE" == "rule-based-writing" ]]; then
+  # This workflow tolerates one bounded force-reader stall while retaining
+  # the force/torque limits and the latched stale-read emergency stop.
+  # Keep the shared formal profile's 0.4 s default for other workflows.
+  TELEOP_ARGS+=(--position-force-guard-stale-sec 0.75)
+fi
+
 RUNTIME_PYTHON="${PYTHON_BIN:-python}"
 RUN_COMMAND=(
   taskset -c 0-7

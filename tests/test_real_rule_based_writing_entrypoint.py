@@ -1157,6 +1157,7 @@ def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     assert "--collection-progress-entry-stage right_write.pen_down" in output
     assert "--camera-frame-max-age-sec 0.25" in output
     assert "--actual-wrist-camera-pose-hz 15.0" in output
+    assert output.rstrip().endswith("--position-force-guard-stale-sec 0.75")
 
 
 def test_launcher_dry_run_enables_dedicated_two_pedal_task_chain_mode(
@@ -1543,6 +1544,7 @@ def test_launcher_full_replay_mode_uses_complete_episode_progress_without_detail
         "catalog:dmtac_rm65_full_trajectory_replay_v1_progress"
     ) in output
     assert "--collection-progress-entry-step execute_task" in output
+    assert "--position-force-guard-stale-sec 0.75" not in output
     assert "--collection-progress-entry-stage execute_task.full_replay" in output
     assert "--collection-task-id dmtac_rm65_full_trajectory_replay_v1" in output
     progress = load_real_teleop_progress_profile(

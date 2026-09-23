@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -173,6 +174,8 @@ class PositionForceGuardMonitor:
         readers_by_side: Mapping[str, Callable[[], Mapping[str, Any]]],
         emergency_stop: Callable[[PositionForceGuardFault], None],
         config: PositionForceGuardConfig | None = None,
+        diagnostic_enabled: Callable[[], bool] | None = None,
+        diagnostic_sink: Callable[[str, Mapping[str, object]], None] | None = None,
     ):
         self.config = config if config is not None else PositionForceGuardConfig()
         self._readers = {
@@ -184,7 +187,11 @@ class PositionForceGuardMonitor:
             raise ValueError("position force guard requires at least one force reader")
         if not callable(emergency_stop):
             raise TypeError("emergency_stop must be callable")
+        if (diagnostic_enabled is None) != (diagnostic_sink is None):
+            raise ValueError("force diagnostics require both an enable check and a sink")
         self._emergency_stop = emergency_stop
+        self._diagnostic_enabled = diagnostic_enabled
+        self._diagnostic_sink = diagnostic_sink
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._stale_watchdog_armed = threading.Event()
@@ -203,6 +210,84 @@ class PositionForceGuardMonitor:
         self._last_error_by_side: dict[str, str] = {}
         self._fault: PositionForceGuardFault | None = None
         self._emergency_stop_error: str | None = None
+
+    def _diagnostics_active(self) -> bool:
+        if self._diagnostic_enabled is None or self._diagnostic_sink is None:
+            return False
+        try:
+            return bool(self._diagnostic_enabled())
+        except Exception:
+            return False  # Diagnostics cannot affect the safety monitor.
+
+    def _emit_diagnostic(self, event: str, payload: Mapping[str, object]) -> None:
+        if not self._diagnostics_active():
+            return
+        try:
+            sink = self._diagnostic_sink
+            if sink is not None:
+                sink(event, payload)
+        except Exception:
+            pass  # A full or failed debug sink must not delay force protection.
+
+    def _reader_stack(self, side: str) -> list[dict[str, object]]:
+        thread = next(
+            (
+                item
+                for item in self._threads
+                if item.name == f"rm65_position_force_guard_{side}"
+            ),
+            None,
+        )
+        frame = (
+            None
+            if thread is None or thread.ident is None
+            else sys._current_frames().get(thread.ident)
+        )
+        stack: list[dict[str, object]] = []
+        while frame is not None and len(stack) < 12:
+            stack.append(
+                {
+                    "file": frame.f_code.co_filename,
+                    "function": frame.f_code.co_name,
+                    "line": frame.f_lineno,
+                }
+            )
+            frame = frame.f_back
+        return stack
+
+    def _stale_diagnostic(
+        self,
+        *,
+        side: str,
+        now: float,
+        age_sec: float,
+        inflight_since: float | None,
+        last_reading: PositionForceReading | None,
+    ) -> dict[str, object] | None:
+        if not self._diagnostics_active():
+            return None
+        try:
+            return {
+                "side": side,
+                "last_success_age_sec": age_sec,
+                "inflight_age_sec": (
+                    None if inflight_since is None else max(0.0, now - inflight_since)
+                ),
+                "gap_before_inflight_sec": (
+                    None
+                    if inflight_since is None or last_reading is None
+                    else max(0.0, inflight_since - last_reading.monotonic_time_sec)
+                ),
+                "last_success_read_elapsed_sec": (
+                    None if last_reading is None else last_reading.read_elapsed_sec
+                ),
+                "last_success_phase_timing": (
+                    {} if last_reading is None else dict(last_reading.read_phase_timing)
+                ),
+                "reader_stack": self._reader_stack(side),
+            }
+        except Exception as exc:
+            return {"side": side, "diagnostic_error": f"{type(exc).__name__}: {exc}"}
 
     @property
     def fault(self) -> PositionForceGuardFault | None:
@@ -573,6 +658,7 @@ class PositionForceGuardMonitor:
                     or reading.torque_norm_nm > float(self.config.max_torque_nm)
                 )
                 with self._lock:
+                    previous_success = self._last_success_monotonic_by_side.get(side)
                     self._last_reading_by_side[side] = reading
                     self._last_success_monotonic_by_side[side] = (
                         reading.monotonic_time_sec
@@ -612,6 +698,24 @@ class PositionForceGuardMonitor:
                     # trips the guard.  Otherwise start() can race the polling
                     # thread and briefly admit an already-over-limit arm.
                     self._ready_by_side[side].set()
+                    gap_sec = (
+                        None
+                        if previous_success is None
+                        else max(0.0, iteration_start - previous_success)
+                    )
+                    if self.fault is None and (
+                        (reading.read_elapsed_sec or 0.0) >= period_sec
+                        or (gap_sec or 0.0) >= 2.0 * period_sec
+                    ):
+                        self._emit_diagnostic(
+                            "force_read_slow",
+                            {
+                                "side": side,
+                                "read_elapsed_sec": reading.read_elapsed_sec,
+                                "gap_before_read_sec": gap_sec,
+                                "read_phase_timing": dict(reading.read_phase_timing),
+                            },
+                        )
             finally:
                 with self._lock:
                     self._reader_inflight_since_by_side.pop(side, None)
@@ -653,6 +757,13 @@ class PositionForceGuardMonitor:
                     and last_reading.read_elapsed_sec is not None
                     else ""
                 )
+                diagnostic = self._stale_diagnostic(
+                    side=side,
+                    now=now,
+                    age_sec=age_sec,
+                    inflight_since=inflight_since,
+                    last_reading=last_reading,
+                )
                 tripped = self._trip(
                     PositionForceGuardFault(
                         reason="force_read_stale",
@@ -669,6 +780,8 @@ class PositionForceGuardMonitor:
                     stale_watchdog_generation=watchdog_generation,
                 )
                 if tripped:
+                    if diagnostic is not None:
+                        self._emit_diagnostic("force_read_stale", diagnostic)
                     return
 
     def _trip(

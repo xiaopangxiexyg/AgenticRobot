@@ -774,6 +774,7 @@ def run_real_teleop(
         )
     startup_device_errors: dict[str, str] = {}
     position_force_guard_monitor: PositionForceGuardMonitor | None = None
+    ik_debug_log_recorder: IkDebugLogRecorder | None = None
     position_admittance_shadow = None
     startup_device_runtime = StartupDeviceRuntime(
         capability_admission=capability_admission,
@@ -964,6 +965,17 @@ def run_real_teleop(
                     readers_by_side=readers_by_side,
                     emergency_stop=position_force_guard_stop,
                     config=_position_force_guard_config(args),
+                    diagnostic_enabled=lambda: bool(
+                        ik_debug_log_recorder is not None
+                        and ik_debug_log_recorder.active
+                    ),
+                    diagnostic_sink=lambda event, payload: (
+                        ik_debug_log_recorder.write_event(
+                            event, payload, nonblocking=True
+                        )
+                        if ik_debug_log_recorder is not None
+                        else None
+                    ),
                 )
                 force_guard_snapshot = position_force_guard_monitor.start(
                     arm_stale_watchdog=False

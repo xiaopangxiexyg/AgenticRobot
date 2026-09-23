@@ -130,6 +130,39 @@ def test_position_force_guard_preserves_backend_read_phase_timing():
         monitor.close()
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_force_read_slow_diagnostic_requires_debug_mode(enabled: bool):
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def reader():
+        payload = _payload()
+        payload["read_elapsed_sec"] = 0.08
+        payload["read_phase_timing"] = {"hardware_read_lock_wait_wall_ms": 70.0}
+        return payload
+
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={"left": reader},
+        emergency_stop=lambda _fault: None,
+        diagnostic_enabled=lambda: enabled,
+        diagnostic_sink=lambda event, payload: events.append((event, dict(payload))),
+        config=PositionForceGuardConfig(stale_timeout_sec=0.2),
+    )
+    try:
+        monitor.start()
+        deadline = time.monotonic() + 0.3
+        while enabled and not events and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert bool(events) is enabled
+        if enabled:
+            event, payload = events[0]
+            assert event == "force_read_slow"
+            assert payload["read_phase_timing"] == {
+                "hardware_read_lock_wait_wall_ms": 70.0
+            }
+    finally:
+        monitor.close()
+
+
 def test_position_force_guard_over_limit_latches_one_bimanual_stop():
     stops = []
     monitor = PositionForceGuardMonitor(
@@ -269,6 +302,7 @@ def test_position_force_guard_latches_fault_when_stop_callback_fails():
 
 def test_position_force_guard_watchdog_stops_on_blocked_reader():
     stops = []
+    events: list[tuple[str, dict[str, object]]] = []
     first = True
     block = threading.Event()
 
@@ -283,6 +317,8 @@ def test_position_force_guard_watchdog_stops_on_blocked_reader():
     monitor = PositionForceGuardMonitor(
         readers_by_side={"left": reader},
         emergency_stop=stops.append,
+        diagnostic_enabled=lambda: True,
+        diagnostic_sink=lambda event, payload: events.append((event, dict(payload))),
         config=PositionForceGuardConfig(
             poll_hz=20.0,
             stale_timeout_sec=0.08,
@@ -292,11 +328,53 @@ def test_position_force_guard_watchdog_stops_on_blocked_reader():
     try:
         monitor.start()
         deadline = time.monotonic() + 0.5
-        while monitor.fault is None and time.monotonic() < deadline:
+        while (monitor.fault is None or not events) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert monitor.fault is not None
         assert monitor.fault.reason == "force_read_stale"
         assert len(stops) == 1
+        assert events and events[-1][0] == "force_read_stale"
+        diagnostic = events[-1][1]
+        assert diagnostic["last_success_age_sec"] >= 0.08
+        assert diagnostic["inflight_age_sec"] is not None
+        assert any(
+            frame["function"] == "reader" for frame in diagnostic["reader_stack"]
+        )
+    finally:
+        block.set()
+        monitor.close()
+
+
+def test_force_debug_sink_failure_does_not_block_stale_emergency_stop():
+    stops = []
+    block = threading.Event()
+    first = True
+
+    def reader():
+        nonlocal first
+        if first:
+            first = False
+            return _payload()
+        block.wait(1.0)
+        return _payload()
+
+    def broken_sink(_event, _payload):
+        raise RuntimeError("diagnostic sink unavailable")
+
+    monitor = PositionForceGuardMonitor(
+        readers_by_side={"left": reader},
+        emergency_stop=stops.append,
+        diagnostic_enabled=lambda: True,
+        diagnostic_sink=broken_sink,
+        config=PositionForceGuardConfig(stale_timeout_sec=0.08),
+    )
+    try:
+        monitor.start()
+        deadline = time.monotonic() + 0.5
+        while not stops and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(stops) == 1
+        assert stops[0].reason == "force_read_stale"
     finally:
         block.set()
         monitor.close()

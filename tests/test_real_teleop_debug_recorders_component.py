@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 from types import SimpleNamespace
 
 import numpy as np
@@ -94,6 +95,32 @@ def test_extracted_debug_recorders_write_and_stop_cleanly(
     assert [row["event"] for row in rows] == ["start", "frame", "stop"]
     assert rows[1]["payload"]["numpy"] == [1.0, 2.0]
     assert rows[-1]["payload"]["reason"] == "test"
+
+
+def test_ik_debug_event_can_drop_without_blocking_when_queue_is_full() -> None:
+    recorder = IkDebugLogRecorder()
+    recorder._queue = queue.Queue(maxsize=1)
+    recorder._queue.put_nowait({"event": "occupied"})
+
+    recorder.write_event("force_read_stale", {"side": "left"}, nonblocking=True)
+
+    assert recorder._queue.qsize() == 1
+    assert recorder.dropped_frame_count == 1
+
+
+def test_ik_debug_event_records_force_diagnostic_without_waiting(tmp_path) -> None:
+    recorder = IkDebugLogRecorder(root_dir=tmp_path)
+    path = recorder.start(now=1_700_000_000.0)
+    recorder.write_event(
+        "force_read_slow",
+        {"side": "left", "read_phase_timing": {"sdk_call_wall_ms": 81.0}},
+        nonblocking=True,
+    )
+    recorder.stop(reason="test")
+
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert rows[1]["event"] == "force_read_slow"
+    assert rows[1]["payload"]["read_phase_timing"]["sdk_call_wall_ms"] == 81.0
 
 
 def test_extracted_timing_recorder_selects_state_change_and_heartbeat(tmp_path) -> None:
