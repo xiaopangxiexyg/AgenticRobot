@@ -56,6 +56,7 @@ from teleop_runtime.sources.camera.realsense_rgb import (
     RealSenseRGBSource,
     load_realsense_camera_config_map,
 )
+from teleop_runtime.sources.camera.startup import start_real_sense_source_with_containment
 from teleop_runtime.tools.field_validation.camera_tactile_health_probe import (
     _fresh_camera,
     _fresh_tactile,
@@ -98,6 +99,7 @@ def _camera_sources(
         config.startup_reset = False
         config.startup_hardware_reset = False
         config.startup_hardware_reset_on_failure = False
+        config.startup_hardware_reset_on_warmup_failure = False
         config.startup_hardware_reset_retry_attempts = 0
         config.startup_warmup_frames = 10
         # A slow first frame is not a reason to reset USB hardware.  Keep the
@@ -142,6 +144,7 @@ def _start_camera_no_reset(
     *,
     attempts: int,
     retry_delay_sec: float,
+    startup_timeout_sec: float,
 ) -> None:
     last_error: Exception | None = None
     for attempt in range(1, int(attempts) + 1):
@@ -151,8 +154,16 @@ def _start_camera_no_reset(
             flush=True,
         )
         try:
-            source.start()
+            start_real_sense_source_with_containment(
+                source,
+                timeout_sec=startup_timeout_sec,
+                software_retry_attempts=0,
+            )
             return
+        except TimeoutError:
+            # The native worker may still own the SDK lifecycle lock.
+            # Do not close or retry this source in the same process.
+            raise
         except Exception as exc:
             last_error = exc
             source.close()
@@ -280,18 +291,24 @@ def main() -> int:
         raise RuntimeError(f"expected two tactile sides, found {sorted(tactile)}")
 
     writer: LeRobotV21Writer | None = None
+    timed_out_camera: str | None = None
     started_at = time.time()
     try:
         # Preserve the proven serial RealSense startup contract.  The probe
         # changes no startup concurrency or USB recovery behavior.
         camera_items = list(cameras.items())
         for camera_index, (camera_key, source) in enumerate(camera_items):
-            _start_camera_no_reset(
-                camera_key,
-                source,
-                attempts=int(args.camera_start_attempts),
-                retry_delay_sec=float(args.camera_start_retry_delay_sec),
-            )
+            try:
+                _start_camera_no_reset(
+                    camera_key,
+                    source,
+                    attempts=int(args.camera_start_attempts),
+                    retry_delay_sec=float(args.camera_start_retry_delay_sec),
+                    startup_timeout_sec=float(args.camera_startup_grace_sec) + 5.0,
+                )
+            except TimeoutError:
+                timed_out_camera = camera_key
+                raise
             if camera_index + 1 < len(camera_items):
                 stagger_sec = float(args.camera_start_stagger_sec)
                 if stagger_sec > 0.0:
@@ -427,8 +444,9 @@ def main() -> int:
     finally:
         for backend in tactile.values():
             backend.close()
-        for source in cameras.values():
-            source.close()
+        for camera_key, source in cameras.items():
+            if camera_key != timed_out_camera:
+                source.close()
 
 
 if __name__ == "__main__":

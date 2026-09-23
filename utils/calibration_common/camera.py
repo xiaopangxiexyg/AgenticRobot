@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import threading
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 import numpy as np
 
@@ -105,6 +107,46 @@ def video_profile_score(
         abs(profile.height - height),
         format_rank.get(profile.format_name, len(format_rank)),
     )
+CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC = 30.0
+
+
+def start_camera_bounded(
+    start: Callable[[], Any],
+    *,
+    timeout_sec: float,
+    on_timeout: Callable[[], None] | None = None,
+) -> Any:
+    """Bound CLI camera admission without retrying a stuck native SDK call.
+
+    On timeout the owning command must exit. The daemon worker is not joined or
+    stopped because librealsense may still be in an uninterruptible USB wait.
+    """
+
+    duration = float(timeout_sec)
+    if not math.isfinite(duration) or duration <= 0.0:
+        raise ValueError("timeout_sec must be finite and positive")
+    result: list[Any] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            result.append(start())
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run, name="calibration_camera_start", daemon=True)
+    worker.start()
+    worker.join(timeout=duration)
+    if worker.is_alive():
+        if on_timeout is not None:
+            on_timeout()
+        raise TimeoutError(
+            f"Calibration camera startup exceeded {duration:.3f}s; "
+            "native SDK worker may still be blocked; exit this process without retry"
+        )
+    if errors:
+        raise errors[0]
+    return result[0]
 
 
 def require_pyrealsense2():
@@ -158,6 +200,17 @@ def safe_device_info(rs: Any, device: Any, field: Any) -> str:
     return ""
 
 
+def stop_pipeline_quietly(pipeline: Any | None) -> None:
+    """Release a failed SDK pipeline without masking its original error."""
+
+    if pipeline is None:
+        return
+    try:
+        pipeline.stop()
+    except Exception:
+        pass
+
+
 def aruco_dictionary(aruco: Any, dictionary: str):
     name = str(dictionary)
     if hasattr(aruco, name):
@@ -206,6 +259,7 @@ def put_status(cv2: Any, image: np.ndarray, text: str, *, ok: bool) -> None:
 
 
 __all__ = [
+    "CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC",
     "VideoStreamProfileInfo",
     "aruco_dictionary",
     "detector_parameters",
@@ -216,5 +270,7 @@ __all__ = [
     "require_cv2",
     "require_pyrealsense2",
     "safe_device_info",
+    "start_camera_bounded",
+    "stop_pipeline_quietly",
     "video_profile_score",
 ]

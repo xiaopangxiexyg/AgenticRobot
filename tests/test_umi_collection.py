@@ -140,6 +140,91 @@ def test_umi_component_bundle_exposes_backend_neutral_ports():
     assert components.command_input_name == "command_input"
 
 
+def test_umi_camera_start_action_is_used_without_replacing_frame_source():
+    events: list[str] = []
+
+    class Camera:
+        def start(self) -> None:
+            events.append("direct-start")
+
+        def close(self) -> None:
+            events.append("close")
+
+    camera = Camera()
+    resource = UmiStartupResource(
+        key="camera.left_wrist",
+        component=camera,
+        label="camera",
+        requirement="collection",
+        strict_start_message="starting camera",
+        start_action=lambda: events.append("bounded-start"),
+    )
+    components = UmiComponents(
+        vive=object(),
+        cameras={"left_wrist": camera},
+        angle_trigger=object(),
+        grippers={},
+        rig=object(),
+        retargeters={},
+        hand_state_poller=object(),
+        startup_resources=(resource,),
+    )
+
+    components.start()
+    assert events == ["bounded-start"]
+    assert components.camera_sources["left_wrist"] is camera
+    components.close()
+    assert events == ["bounded-start", "close"]
+
+
+def test_umi_optional_camera_native_start_timeout_aborts_next_resource():
+    events: list[str] = []
+
+    class Resource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def start(self) -> None:
+            events.append(self.name)
+
+        def close(self) -> None:
+            events.append(f"close:{self.name}")
+
+    camera = Resource("camera")
+    next_resource = Resource("next")
+    components = UmiComponents(
+        vive=object(),
+        cameras={"left_wrist": camera},
+        angle_trigger=object(),
+        grippers={},
+        rig=object(),
+        retargeters={},
+        hand_state_poller=object(),
+        startup_resources=(
+            UmiStartupResource(
+                key="camera.left_wrist",
+                component=camera,
+                label="camera",
+                requirement="collection",
+                strict_start_message="starting camera",
+                start_action=lambda: (_ for _ in ()).throw(TimeoutError("native start")),
+            ),
+            UmiStartupResource(
+                key="next",
+                component=next_resource,
+                label="next",
+                requirement="collection_core",
+                strict_start_message="starting next",
+            ),
+        ),
+    )
+
+    with pytest.raises(TimeoutError, match="native start"):
+        components.start()
+    assert events == []
+    assert "native start" in components.startup_errors["camera.left_wrist"]
+
+
 def test_umi_component_bundle_uses_injected_diagnostics_without_backend_config():
     backend = object()
     components = UmiComponents(

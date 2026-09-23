@@ -1912,9 +1912,8 @@ def test_device_retry_reports_failed_attempt_to_application() -> None:
         def close(self) -> None:
             return None
 
-        def start(self) -> None:
-            raise RuntimeError("camera remains offline")
-
+    def start(self) -> None:
+        raise RuntimeError("camera remains offline")
     clutch = SimpleNamespace(
         _current_active_controls=lambda: ("device_retry",),
         device_retry_admission=lambda: (True, ""),
@@ -1965,6 +1964,77 @@ def test_device_retry_reports_failed_attempt_to_application() -> None:
     assert retry_results[-1] is not None
     assert "camera.front" in str(retry_results[-1])
     assert "camera remains offline" in str(retry_results[-1])
+
+
+def test_device_retry_camera_native_timeout_does_not_start_next_camera(monkeypatch) -> None:
+    errors = {
+        "camera.front": "initial startup failure",
+        "camera.right_wrist": "initial startup failure",
+    }
+    calls: list[str] = []
+
+    class Camera:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            calls.append(f"close:{self.name}")
+
+        def start(self) -> None:
+            calls.append(f"start:{self.name}")
+
+    def timed_out_start(camera, **_kwargs) -> None:
+        calls.append(f"bounded_start:{camera.name}")
+        raise TimeoutError("native worker still blocked")
+
+    monkeypatch.setattr(device_retry_runtime, "RealSenseRGBSource", Camera)
+    monkeypatch.setattr(
+        device_retry_runtime,
+        "start_real_sense_source_with_containment",
+        timed_out_start,
+    )
+    ui = SimpleNamespace(publish=lambda **_kwargs: None, append_message=lambda *_args: None)
+    clutch = SimpleNamespace(
+        _current_active_controls=lambda: ("device_retry",),
+        device_retry_admission=lambda: (True, ""),
+        _episode_busy=lambda: False,
+        _teleop_started=False,
+        hold_active=lambda: True,
+    )
+    components = SimpleNamespace(
+        gripper_input_source="",
+        left_state_backend=None,
+        right_state_backend=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    runtime = device_retry_runtime.build_device_retry_runtime(
+        args=SimpleNamespace(foot_pad_requested=False, ignore_camera=()),
+        components=components,
+        control_ui=ui,
+        clutch_input=clutch,
+        camera_sources={"front": Camera("front"), "right_wrist": Camera("right_wrist")},
+        vive_source=None,
+        startup_device_errors=errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: None,
+        set_dataset_recorder=lambda _value: None,
+        foot_pad_input_provider=lambda: None,
+        set_foot_pad_input=lambda _value: None,
+        dataset_recorder_type=object,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=object,
+        foot_pad_control_mode="foot-pad",
+        has_dmtac_gripper_backend=lambda _components: False,
+        promote_angle_trigger_gripper_input_to_q6=lambda *_args, **_kwargs: (False, ""),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    runtime.retry_failed_devices()
+
+    assert calls == ["close:front", "bounded_start:front"]
+    assert "TimeoutError" in errors["camera.front"]
+    assert errors["camera.right_wrist"] == "initial startup failure"
 
 
 def test_generic_device_retry_never_starts_or_reuses_dataset_writer() -> None:

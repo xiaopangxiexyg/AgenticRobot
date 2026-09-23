@@ -148,6 +148,12 @@ def _selected_configs(args: argparse.Namespace) -> dict[str, Any]:
         config.align_depth_to_color = True
         config.wait_timeout_ms = int(args.wait_timeout_ms)
         config.stale_after_sec = float(args.stale_after_sec)
+        # This diagnostic is a read-only capture. Shared station profiles may
+        # allow front-camera recovery, but this CLI never re-enumerates USB.
+        config.startup_hardware_reset = False
+        config.startup_hardware_reset_on_failure = False
+        config.startup_hardware_reset_on_warmup_failure = False
+        config.startup_hardware_reset_retry_attempts = 0
         selected[key] = config
     return selected
 
@@ -387,6 +393,9 @@ def main() -> int:
     camera_configs = _selected_configs(args)
     _prepare_output_files(output_root, tuple(camera_configs), save_raw=bool(args.save_raw))
     RealSenseRGBSource, _config_loader = _runtime_camera_api()
+    from teleop_runtime.sources.camera.startup import (  # noqa: PLC0415
+        start_real_sense_source_with_containment,
+    )
     sources = {key: RealSenseRGBSource(cfg) for key, cfg in camera_configs.items()}
     states = {key: CameraSmokeState(camera_key=key) for key in sources}
     print(
@@ -414,9 +423,15 @@ def main() -> int:
     warmup_wait_sec = 0.0
     next_save_at = process_started_at
     period_sec = 1.0 / float(args.fps)
+    started_sources: list[Any] = []
     try:
         for source in sources.values():
-            source.start()
+            start_real_sense_source_with_containment(
+                source,
+                timeout_sec=20.0,
+                software_retry_attempts=None,
+            )
+            started_sources.append(source)
         warmup_ready, warmup_wait_sec = _wait_for_initial_depth_frames(
             sources,
             timeout_sec=float(args.warmup_timeout_sec),
@@ -455,7 +470,8 @@ def main() -> int:
                 )
         capture_finished_at = time.time()
     finally:
-        for source in sources.values():
+        # A timed-out source may still be blocked inside librealsense.
+        for source in reversed(started_sources):
             try:
                 source.close()
             except Exception:

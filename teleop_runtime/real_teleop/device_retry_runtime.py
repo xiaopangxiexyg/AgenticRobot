@@ -11,6 +11,10 @@ from robot_motion.runtime.readiness import (
     format_readiness_report,
     readiness_report_blockers,
 )
+from teleop_runtime.sources.camera import (
+    RealSenseRGBSource,
+    start_real_sense_source_with_containment,
+)
 
 from .foot_pad_controls import (
     apply_live_foot_pad_topology,
@@ -750,7 +754,14 @@ def build_device_retry_runtime(
                     camera_retry_attempted = True
                     camera = camera_sources[key.split(".", 1)[1]]
                     camera.close()
-                    camera.start()
+                    if isinstance(camera, RealSenseRGBSource):
+                        start_real_sense_source_with_containment(
+                            camera,
+                            timeout_sec=15.0,
+                            software_retry_attempts=None,
+                        )
+                    else:
+                        camera.start()
                 elif key == "dataset.writer":
                     # A formal writer is a collection capability, not a
                     # hardware connection.  Constructing it here would run its
@@ -957,6 +968,10 @@ def build_device_retry_runtime(
                 retry_failures.append(f"{key}: {detail}")
                 if key == "dataset.writer":
                     args.dataset_startup_error = detail
+                if key.startswith("camera.") and isinstance(exc, TimeoutError):
+                    # The native worker may still own the process-wide SDK
+                    # lock; do not attempt another device in this retry pass.
+                    break
                 continue
             startup_device_errors.pop(key, None)
             dynamic_readiness_keys.discard(key)

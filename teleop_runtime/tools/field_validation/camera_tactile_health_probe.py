@@ -337,6 +337,9 @@ def _run_probe() -> int:
         config.startup_hardware_reset_on_failure = bool(
             args.allow_camera_hardware_reset
         )
+        config.startup_hardware_reset_on_warmup_failure = bool(
+            args.allow_camera_hardware_reset
+        )
         config.startup_hardware_reset_retry_attempts = (
             1 if args.allow_camera_hardware_reset else 0
         )

@@ -10,7 +10,9 @@ import numpy as np
 import pytest
 
 from teleop_runtime.real_teleop import camera_runtime
+from teleop_runtime.cameras import capture_realsense_intrinsics
 from teleop_runtime.sources.camera import realsense_rgb
+from teleop_runtime.sources.camera import startup as camera_startup
 from teleop_runtime.sources.camera.realsense_rgb import (
     REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
     REALSENSE_STARTUP_WARMUP_LEGACY,
@@ -18,6 +20,8 @@ from teleop_runtime.sources.camera.realsense_rgb import (
     RealSenseRGBSource,
     load_realsense_camera_config_map,
 )
+from utils.head_eye import camera as head_eye_camera
+from utils.calibration_common.camera import start_camera_bounded
 
 
 class _FakeStreamConfig:
@@ -492,6 +496,301 @@ def test_gateway_profile_limits_warmup_recovery_to_front_camera() -> None:
     assert configs["front"].startup_hardware_reset_retry_attempts == 1
     assert configs["left_wrist"].startup_hardware_reset_on_warmup_failure is False
     assert configs["right_wrist"].startup_hardware_reset_on_warmup_failure is False
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_keys"),
+    [
+        ("realsense.json", {"front", "left_wrist", "right_wrist"}),
+        ("realsense_front.json", {"front"}),
+    ],
+)
+def test_shared_station_profiles_limit_hardware_recovery_to_front_warmup(
+    profile: str,
+    expected_keys: set[str],
+) -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "teleop_runtime/configs/devices"
+        / profile
+    )
+    configs = load_realsense_camera_config_map(config_path)
+    camera_runtime.apply_real_teleop_camera_startup_defaults(configs)
+
+    assert set(configs) == expected_keys
+    assert configs["front"].startup_hardware_reset_on_warmup_failure is True
+    assert configs["front"].startup_hardware_reset_on_failure is False
+    assert configs["front"].startup_hardware_reset_retry_attempts == 1
+    assert configs["front"].startup_software_retry_attempts == 2
+    for key in expected_keys - {"front"}:
+        assert configs[key].startup_hardware_reset_on_warmup_failure is False
+        assert configs[key].startup_hardware_reset_on_failure is False
+        assert configs[key].startup_software_retry_attempts == 1
+
+
+def test_legacy_collection_adapter_does_not_close_timed_out_native_start() -> None:
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="FRONT123"))
+    adapter = camera_startup.BoundedRealSenseSessionSource(source)
+
+    with (
+        patch.object(
+            camera_startup,
+            "start_real_sense_source_with_containment",
+            side_effect=TimeoutError("native start blocked"),
+        ),
+        patch.object(source, "close") as close,
+    ):
+        with pytest.raises(TimeoutError, match="native start blocked"):
+            adapter.start()
+        adapter.close()
+        with pytest.raises(RuntimeError, match="reconstruct"):
+            adapter.start()
+        close.assert_not_called()
+
+
+def test_legacy_collection_adapter_delegates_successful_source_lifecycle() -> None:
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="FRONT123"))
+    adapter = camera_startup.BoundedRealSenseSessionSource(source)
+
+    with (
+        patch.object(
+            camera_startup,
+            "start_real_sense_source_with_containment"
+        ) as start,
+        patch.object(source, "close") as close,
+    ):
+        adapter.start()
+        adapter.close()
+
+    start.assert_called_once_with(
+        source, timeout_sec=30.0, software_retry_attempts=None
+    )
+    close.assert_called_once_with()
+
+
+def test_head_eye_camera_releases_pipeline_if_first_frame_never_arrives() -> None:
+    class FakePipeline:
+        stop_count = 0
+
+        def start(self, _config):
+            return object()
+
+        def wait_for_frames(self, _timeout_ms):
+            raise RuntimeError("Frame didn't arrive")
+
+        def stop(self):
+            self.stop_count += 1
+
+    class FakeConfig:
+        def enable_device(self, _serial):
+            pass
+
+        def enable_stream(self, *_args):
+            pass
+
+    pipeline = FakePipeline()
+    fake_rs = SimpleNamespace(
+        pipeline=lambda: pipeline,
+        config=FakeConfig,
+        stream=SimpleNamespace(color="color"),
+        format=SimpleNamespace(bgr8="bgr8"),
+    )
+    config = head_eye_camera.RealSenseConfig(
+        serial="FRONT123",
+        enable_depth=False,
+        color_format="bgr8",
+        startup_frame_grace_sec=0.01,
+    )
+
+    with patch.object(head_eye_camera, "_require_pyrealsense2", return_value=fake_rs):
+        camera = head_eye_camera.RealSenseCamera(config)
+        with pytest.raises(RuntimeError, match="first-frame warmup failed"):
+            camera.start()
+
+    assert pipeline.stop_count == 1
+    assert camera._pipeline is None
+
+
+def test_calibration_camera_native_start_timeout_is_terminal() -> None:
+    release = threading.Event()
+    cancelled = threading.Event()
+
+    with pytest.raises(TimeoutError, match="exit this process without retry"):
+        start_camera_bounded(
+            lambda: release.wait(1.0),
+            timeout_sec=0.01,
+            on_timeout=cancelled.set,
+        )
+
+    assert cancelled.is_set()
+    release.set()
+
+
+def test_head_eye_camera_fallback_uses_fresh_pipeline() -> None:
+    class FakePipeline:
+        def __init__(self, *, fails: bool) -> None:
+            self.fails = fails
+            self.stop_count = 0
+
+        def start(self, _config):
+            if self.fails:
+                raise RuntimeError("unsupported profile")
+            return object()
+
+        def wait_for_frames(self, _timeout_ms):
+            return SimpleNamespace(get_color_frame=lambda: object())
+
+        def stop(self):
+            self.stop_count += 1
+
+    class FakeConfig:
+        def enable_device(self, _serial):
+            pass
+
+        def enable_stream(self, *_args):
+            pass
+
+    first_pipeline = FakePipeline(fails=True)
+    second_pipeline = FakePipeline(fails=False)
+    pipelines = [first_pipeline, second_pipeline]
+    fake_rs = SimpleNamespace(
+        pipeline=lambda: pipelines.pop(0),
+        config=FakeConfig,
+        stream=SimpleNamespace(color="color"),
+        format=SimpleNamespace(bgr8="bgr8"),
+    )
+    config = head_eye_camera.RealSenseConfig(
+        serial="FRONT123", enable_depth=False, color_format="bgr8"
+    )
+
+    with patch.object(head_eye_camera, "_require_pyrealsense2", return_value=fake_rs):
+        camera = head_eye_camera.RealSenseCamera(config)
+    fallback_config = FakeConfig()
+    with patch.object(
+        camera,
+        "_fallback_stream_config",
+        return_value=(fallback_config, {"fallback_used": True}, "bgr8"),
+    ):
+        camera.start()
+
+    assert camera.settings_report["fallback_used"] is True
+    assert first_pipeline.stop_count == 1
+    camera.stop()
+    assert second_pipeline.stop_count == 1
+
+
+def test_intrinsics_capture_does_not_close_a_timed_out_native_source() -> None:
+    events: list[str] = []
+
+    class FakeSource:
+        def __init__(self, key: str) -> None:
+            self.key = key
+
+        def close(self) -> None:
+            events.append(f"close:{self.key}")
+
+    sources = [FakeSource("front"), FakeSource("wrist")]
+
+    def start(source: FakeSource, **_kwargs) -> None:
+        events.append(f"start:{source.key}")
+        if source.key == "wrist":
+            raise TimeoutError("native startup timeout")
+
+    with (
+        patch.object(
+            capture_realsense_intrinsics,
+            "load_realsense_camera_config_map",
+            return_value={"front": "front", "wrist": "wrist"},
+        ),
+        patch.object(
+            capture_realsense_intrinsics,
+            "RealSenseRGBSource",
+            side_effect=sources,
+        ),
+        patch.object(
+            capture_realsense_intrinsics,
+            "start_real_sense_source_with_containment",
+            side_effect=start,
+        ),
+        pytest.raises(TimeoutError, match="native startup timeout"),
+    ):
+        capture_realsense_intrinsics.main(
+            ["--camera-config", "unused.json", "--warmup-sec", "0"]
+        )
+
+    assert events == ["start:front", "start:wrist", "close:front"]
+
+
+def test_no_motion_bundle_probe_disables_inherited_front_reset() -> None:
+    from teleop_runtime.tools.field_validation import (  # noqa: PLC0415
+        camera_tactile_bundle_capture_probe as probe,
+    )
+
+    config = RealSenseRGBCameraConfig(
+        serial="FRONT123",
+        startup_hardware_reset_on_warmup_failure=True,
+    )
+    with (
+        patch.object(probe, "load_realsense_camera_config_map", return_value={"front": config}),
+        patch.object(probe, "RealSenseRGBSource", side_effect=lambda item: item),
+    ):
+        sources = probe._camera_sources(Path("unused.json"), startup_grace_sec=15.0)
+
+    assert sources["front"] is config
+    assert config.startup_hardware_reset_on_warmup_failure is False
+    assert config.startup_hardware_reset_on_failure is False
+    assert config.startup_hardware_reset_retry_attempts == 0
+
+
+def test_no_motion_bundle_probe_does_not_retry_native_start_timeout() -> None:
+    from teleop_runtime.tools.field_validation import (  # noqa: PLC0415
+        camera_tactile_bundle_capture_probe as probe,
+    )
+
+    source = SimpleNamespace(close=lambda: pytest.fail("timed-out source was closed"))
+    with patch.object(
+        probe,
+        "start_real_sense_source_with_containment",
+        side_effect=TimeoutError("native call blocked"),
+    ) as start:
+        with pytest.raises(TimeoutError, match="native call blocked"):
+            probe._start_camera_no_reset(
+                "front",
+                source,
+                attempts=3,
+                retry_delay_sec=0.0,
+                startup_timeout_sec=20.0,
+            )
+    start.assert_called_once()
+
+
+def test_wrist_depth_smoke_clears_inherited_hardware_reset() -> None:
+    from utils.dataset_postprocess.wrist_cam_adjust import (  # noqa: PLC0415
+        smoke_wrist_depth_capture as smoke,
+    )
+
+    config = RealSenseRGBCameraConfig(
+        serial="FRONT123",
+        startup_hardware_reset_on_warmup_failure=True,
+    )
+    args = SimpleNamespace(
+        camera_config="unused.json",
+        camera=["front"],
+        depth_stream_fps=15,
+        wait_timeout_ms=1000,
+        stale_after_sec=2.0,
+    )
+    with patch.object(
+        smoke,
+        "_runtime_camera_api",
+        return_value=(RealSenseRGBSource, lambda _: {"front": config}),
+    ):
+        selected = smoke._selected_configs(args)
+
+    assert selected["front"] is config
+    assert config.startup_hardware_reset_on_warmup_failure is False
+    assert config.startup_hardware_reset_on_failure is False
+    assert config.startup_hardware_reset_retry_attempts == 0
 
 
 def test_realsense_bounded_warmup_uses_full_grace_not_legacy_frame_count() -> None:

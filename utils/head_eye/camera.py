@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
 
 from utils.calibration_common.camera import (
+    CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC,
     VideoStreamProfileInfo as _CommonVideoStreamProfileInfo,
     available_video_profiles as _collect_video_profiles,
     aruco_dictionary as _aruco_dictionary,
@@ -19,6 +21,8 @@ from utils.calibration_common.camera import (
     require_cv2 as _require_cv2,
     require_pyrealsense2 as _require_pyrealsense2,
     safe_device_info as _safe_device_info,
+    start_camera_bounded,
+    stop_pipeline_quietly as _stop_pipeline_quietly,
     video_profile_score as _video_profile_score,
 )
 from hardware.realsense.color import (
@@ -76,9 +80,15 @@ class RealSenseConfig:
     enable_depth: bool = True
     # Only used after the explicitly requested profile fails to start.
     auto_select_supported_profile: bool = True
+    startup_wait_timeout_ms: int = 1000
+    startup_frame_grace_sec: float = 5.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "color_format", _normalize_color_format(self.color_format))
+        if int(self.startup_wait_timeout_ms) <= 0:
+            raise ValueError("startup_wait_timeout_ms must be positive")
+        if float(self.startup_frame_grace_sec) <= 0.0:
+            raise ValueError("startup_frame_grace_sec must be positive")
 
 
 class RealSenseCamera:
@@ -89,6 +99,7 @@ class RealSenseCamera:
         self._align = None
         self._profile = None
         self._active_color_format = self.config.color_format
+        self._startup_timeout_event = threading.Event()
         self.serial: str | None = None
         self.depth_scale_m: float | None = None
         # Saved by the command-line tool with new calibration samples/results.
@@ -112,6 +123,8 @@ class RealSenseCamera:
         return devices
 
     def start(self) -> "RealSenseCamera":
+        if self._startup_timeout_event.is_set():
+            raise RuntimeError("Calibration camera startup timed out; reconstruct the camera")
         if self._pipeline is not None:
             return self
         serial = self.config.serial
@@ -142,18 +155,35 @@ class RealSenseCamera:
                 "fallback_used": False,
             }
         except Exception as exc:
+            _stop_pipeline_quietly(pipeline)
             if not self.config.auto_select_supported_profile:
                 raise RuntimeError(self._profile_error_message(exc, serial)) from exc
             fallback_config, selected_profiles, active_color_format = self._fallback_stream_config(
                 serial
             )
+            pipeline = rs.pipeline()
             try:
                 profile = pipeline.start(fallback_config)
             except Exception as fallback_exc:
+                _stop_pipeline_quietly(pipeline)
                 raise RuntimeError(self._profile_error_message(fallback_exc, serial)) from fallback_exc
+        try:
+            if self._startup_timeout_event.is_set():
+                raise RuntimeError("Calibration camera startup timed out")
+            self._wait_for_first_frameset(pipeline)
+            if self._startup_timeout_event.is_set():
+                raise RuntimeError("Calibration camera startup timed out")
+        except Exception:
+            _stop_pipeline_quietly(pipeline)
+            raise
+        try:
+            align = rs.align(rs.stream.color) if self.config.enable_depth else None
+        except Exception:
+            _stop_pipeline_quietly(pipeline)
+            raise
         self._pipeline = pipeline
         self._profile = profile
-        self._align = rs.align(rs.stream.color) if self.config.enable_depth else None
+        self._align = align
         self._active_color_format = (
             self.config.color_format
             if not selected_profiles.get("fallback_used")
@@ -172,7 +202,37 @@ class RealSenseCamera:
                 self.depth_scale_m = float(profile.get_device().first_depth_sensor().get_depth_scale())
             except Exception:
                 self.depth_scale_m = None
+        if self._startup_timeout_event.is_set():
+            self.stop()
+            raise RuntimeError("Calibration camera startup timed out")
         return self
+
+    def _wait_for_first_frameset(self, pipeline: Any) -> None:
+        deadline = time.monotonic() + float(self.config.startup_frame_grace_sec)
+        attempts = 0
+        last_error = "no frameset"
+        while True:
+            remaining_sec = deadline - time.monotonic()
+            if remaining_sec <= 0.0:
+                break
+            timeout_ms = max(
+                1,
+                min(int(self.config.startup_wait_timeout_ms), int(remaining_sec * 1000)),
+            )
+            attempts += 1
+            try:
+                frames = pipeline.wait_for_frames(timeout_ms)
+                if frames.get_color_frame() and (
+                    not self.config.enable_depth or frames.get_depth_frame()
+                ):
+                    return
+                last_error = "incomplete color/depth frameset"
+            except RuntimeError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+        raise RuntimeError(
+            "RealSense calibration camera first-frame warmup failed: "
+            f"serial={self.serial!r} attempts={attempts} last_error={last_error}"
+        )
 
     def _fallback_stream_config(
         self,
@@ -325,15 +385,22 @@ class RealSenseCamera:
         )
 
     def stop(self) -> None:
-        if self._pipeline is not None:
-            self._pipeline.stop()
-        self._pipeline = None
-        self._align = None
-        self._profile = None
-        self._active_color_format = self.config.color_format
+        pipeline = self._pipeline
+        try:
+            if pipeline is not None:
+                pipeline.stop()
+        finally:
+            self._pipeline = None
+            self._align = None
+            self._profile = None
+            self._active_color_format = self.config.color_format
 
     def __enter__(self) -> "RealSenseCamera":
-        return self.start()
+        return start_camera_bounded(
+            self.start,
+            timeout_sec=CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC,
+            on_timeout=self._startup_timeout_event.set,
+        )
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.stop()

@@ -12,7 +12,11 @@ from ..configs.camera_paths import (
     DEFAULT_REALSENSE_DEVICE_CONFIG_PATH,
 )
 
-from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_map
+from ..sources.camera import (
+    RealSenseRGBSource,
+    load_realsense_camera_config_map,
+    start_real_sense_source_with_containment,
+)
 from .registry import build_camera_registry_snapshot, load_camera_registry
 
 
@@ -61,9 +65,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         camera_key: RealSenseRGBSource(config)
         for camera_key, config in camera_configs.items()
     }
+    started_sources: list[RealSenseRGBSource] = []
     try:
         for source in sources.values():
-            source.start()
+            start_real_sense_source_with_containment(
+                source,
+                timeout_sec=30.0,
+                software_retry_attempts=None,
+            )
+            started_sources.append(source)
         warmup_sec = max(0.0, float(args.warmup_sec))
         if warmup_sec > 0.0:
             time.sleep(warmup_sec)
@@ -77,7 +87,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             device_info_by_key=device_info_by_key,
         )
     finally:
-        for source in sources.values():
+        # A timed-out native SDK worker may still hold its lifecycle lock.
+        # Only close sources whose startup completed.
+        for source in reversed(started_sources):
             source.close()
 
     text = json.dumps(snapshot, indent=2, sort_keys=True)

@@ -102,7 +102,11 @@ from ..session import (
     TeleopSession,
     TeleopSessionConfig,
 )
-from ..sources.camera import RealSenseRGBSource, load_realsense_camera_config_map
+from ..sources.camera import (
+    BoundedRealSenseSessionSource,
+    RealSenseRGBSource,
+    load_realsense_camera_config_map,
+)
 from ..sources.hand import HandQ6Source
 from ..sources.misc import KeyboardButtonSource
 from ..sources.pose import VivePoseSource, ViveTrackerConfig
@@ -3560,7 +3564,9 @@ def build_collect_app(args: argparse.Namespace) -> CollectApp:
     hand_source = _build_hand_source(args, active_sides)
     if hand_source is not None:
         session_sources.append(hand_source)
-    session_sources.extend(camera_sources.values())
+    session_sources.extend(
+        BoundedRealSenseSessionSource(source) for source in camera_sources.values()
+    )
 
     (
         arm_retargeters,
