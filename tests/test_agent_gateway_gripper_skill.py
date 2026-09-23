@@ -4,6 +4,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+import pytest
+
 from agent_gateway.profiles.mujoco.gripper_skill import MujocoGripperControlPort
 from agent_gateway.profiles.real.gripper_skill import (
     RealDmtacGripperControlPort,
@@ -326,6 +328,17 @@ def test_real_adapter_dispatches_normalized_close_and_measures_feedback() -> Non
     assert sample.moving is True
     assert hold.succeeded is True
     assert backend.holds == ["test terminal hold"]
+
+
+def test_real_adapter_rejects_backend_side_that_does_not_match_component() -> None:
+    backend = _FakeDmtacBackend()
+    backend.config.side = "left"
+
+    with pytest.raises(ValueError, match="bound to right_gripper"):
+        RealDmtacGripperControlPort(backend=backend)
+
+    assert backend.commands == []
+    assert backend.holds == []
 
 
 def test_mujoco_adapter_observation_is_passive_and_command_is_gripper_only() -> None:
