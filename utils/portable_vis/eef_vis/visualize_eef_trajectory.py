@@ -6,6 +6,7 @@ import argparse
 import html
 import json
 import math
+import sys
 import tempfile
 import warnings
 import webbrowser
@@ -15,6 +16,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
+
+# Keep the documented direct-script invocation usable outside an installed package.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from utils.portable_vis.shared_episode_pose import _quat_xyzw_to_matrix
 
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -202,28 +209,6 @@ def _as_int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _quat_xyzw_to_matrix(quat: Sequence[float]) -> np.ndarray | None:
-    q = np.asarray(quat, dtype=float).reshape(-1)
-    if q.shape != (4,) or not np.all(np.isfinite(q)):
-        return None
-    norm = float(np.linalg.norm(q))
-    if norm <= 1e-12:
-        return None
-    x, y, z, w = (q / norm).tolist()
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-    wx, wy, wz = w * x, w * y, w * z
-    return np.asarray(
-        [
-            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
-            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
-            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
-        ],
-        dtype=float,
-    )
-
 
 def _pose_sample_from_value(
     value: Any,
