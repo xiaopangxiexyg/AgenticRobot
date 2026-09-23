@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 
 from dataset_contracts.pose_frames import PoseFrameContract
+from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose_matrix
 from robot_motion.action import HandActionSpec, RobotAction
 from robot_motion.position_control import (
@@ -89,6 +90,8 @@ RULE_BASED_REAL_TELEOP_SCHEMA_V1 = "dexteleop.rule_based_real_teleop.v1"
 # matrices must still fail closed before coupled IK.
 _RULE_POSE_RIGID_PROJECTION_LIMIT = 1e-5
 _RULE_UI_STATUS_HZ = 15.0
+_WRITING_REACHABILITY_MAX_CHECK_SEC = 4.0
+_WRITING_REACHABILITY_MAX_AUTO_SKIPS = 32
 _WRITING_HEIGHT_DESCENT_STEP_ID = "right_write.pen_down.height_descent"
 _RANDOM_SOURCE_SELECTION_ID = "__rule_source_pool_random__"
 
@@ -1729,6 +1732,7 @@ class RuleBasedRealTeleopExtension:
                     if not self._height_calibration_mutation_idle():
                         raise RuntimeError("高度标定只能在数采和规则运动完整停止时清除。")
                     self._height_calibration = None
+                    self._invalidate_writing_reachability_preflight()
                     self._writing_height_target_z_m = None
                     self._height_calibration_error = ""
                     append_message = getattr(self._control_ui, "append_message", None)
@@ -1904,6 +1908,7 @@ class RuleBasedRealTeleopExtension:
             pose_frame_contract_hash=self.runtime_pose_frame_contract.contract_hash,
         )
         self._height_calibration = captured
+        self._invalidate_writing_reachability_preflight()
         self._height_lower_tolerance_m = float(captured.lower_tolerance_m)
         self._height_upper_tolerance_m = float(captured.upper_tolerance_m)
         self._height_calibration_error = ""
@@ -6520,6 +6525,8 @@ class RuleBasedRealTeleopExtension:
         """Rebuild one indivisible rule attempt after authoritative Hold."""
 
         self._reset_attempt_state(reason="runtime_home_reset")
+        self._invalidate_writing_reachability_preflight()
+        self._writing_reachability_skipped_count = 0
 
     def _prepare_next_attempt_after_success(self, now: float) -> None:
         """Return a committed successful run to command-inert next-ready state.
@@ -6685,6 +6692,7 @@ class RuleBasedRealTeleopExtension:
             if callable(update_runtime_info):
                 update_runtime_info(updates)
         self._reset_attempt_state(reason="successful_episode_reset")
+        self._writing_reachability_skipped_count = 0
         self._held = False
         self._armed = bool(self._legacy_generic_ui)
         self._waiting_reason = (
@@ -6791,6 +6799,12 @@ class RuleBasedRealTeleopExtension:
             return None
         variant = self.source_selection.get("writing_variant_selection", {})
         variant = variant if isinstance(variant, Mapping) else {}
+        phases = self.source_selection.get("phases", {})
+        phases = phases if isinstance(phases, Mapping) else {}
+        pen_down = phases.get("pen_down", {})
+        pen_down = pen_down if isinstance(pen_down, Mapping) else {}
+        catalog = self.source_selection.get("trajectory_catalog", {})
+        catalog = catalog if isinstance(catalog, Mapping) else {}
         return (
             int(
                 self.source_selection.get(
@@ -6802,6 +6816,9 @@ class RuleBasedRealTeleopExtension:
             str(variant.get("selected_trajectory_id") or ""),
             str(variant.get("selected_direction") or ""),
             float(variant.get("selected_size_m") or 0.0),
+            str(pen_down.get("candidate_id") or ""),
+            str(pen_down.get("source_contract_hash") or ""),
+            str(catalog.get("combined_sha256") or ""),
             float(calibration.upper_bound_z_m),
         )
 
@@ -6814,6 +6831,22 @@ class RuleBasedRealTeleopExtension:
                 == self._writing_reachability_current_fingerprint()
             )
         )
+
+    def _invalidate_writing_reachability_preflight(self) -> None:
+        pending = self._writing_reachability_future
+        self._writing_reachability_future = None
+        if pending is not None:
+            pending.cancel()
+        rebuild = self._writing_reachability_rebuild_future
+        self._writing_reachability_rebuild_future = None
+        self._writing_reachability_rebuild_ordinal = None
+        if rebuild is not None and not rebuild.cancel():
+            rebuild.add_done_callback(self._dispose_rebuilt_extension_future)
+        self._writing_reachability_fingerprint = None
+        self._writing_reachability_status = (
+            "pending" if self._writing_reachability_enabled() else "disabled"
+        )
+        self._writing_reachability_detail = ""
 
     def _writing_reachability_request(self) -> dict[str, Any]:
         metadata = self._writing_reachability_metadata()
@@ -6913,7 +6946,7 @@ class RuleBasedRealTeleopExtension:
                 {
                     "name": str(raw_probe.get("name") or "unknown"),
                     "target_pose_by_side": {
-                        side: np.asarray(solver_targets[side], dtype=float).copy()
+                        side: np.asarray(effective_targets[side], dtype=float).copy()
                         for side in ("left", "right")
                     },
                     "envelope_modified_sides": modified_sides,
@@ -6956,8 +6989,9 @@ class RuleBasedRealTeleopExtension:
     def _run_writing_reachability_preflight(
         request: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        """Certify four endpoints with no backend, Session, or dispatch access."""
+        """Check four endpoints without backend, Session, or dispatch access."""
 
+        deadline = time.monotonic() + _WRITING_REACHABILITY_MAX_CHECK_SEC
         oracle = DualArmCollisionAwareRetargeter(request["oracle_config"])
         seed_qpos = request["seed_qpos"]
         translation_tolerance = float(request["translation_tolerance_m"])
@@ -6965,7 +6999,10 @@ class RuleBasedRealTeleopExtension:
         results: list[dict[str, Any]] = []
         for probe in request["probes"]:
             modified_sides = tuple(probe["envelope_modified_sides"])
-            if modified_sides:
+            # A projected right target would change the written glyph. The
+            # left target is only a solver input; its actual qpos remains
+            # fixed by FixArm and is collision-checked with the right result.
+            if "right" in modified_sides:
                 results.append(
                     {
                         "name": str(probe["name"]),
@@ -6981,66 +7018,81 @@ class RuleBasedRealTeleopExtension:
                 reset_tracking=True,
             )
             final_result = None
-            final_error: Mapping[str, Any] = {}
+            translation_error = float("inf")
+            rotation_error = float("inf")
+            reachable = False
+            reason = "solver_not_converged"
+            collision_reason = None
+            solve_frames = 0
             for _iteration in range(64):
+                if time.monotonic() >= deadline:
+                    reason = "solver_budget_exhausted"
+                    break
                 final_result = oracle.solve_target_pair(
                     BimanualPoseTarget(
                         timestamp=None,
                         target_pose_by_side=probe["target_pose_by_side"],
-                        active_sides=("right",),
+                        # Fixed writing sends both poses to the live coupled
+                        # solver. The downstream FixArm owner holds the left
+                        # qpos, checked explicitly below after this solve.
+                        active_sides=("left", "right"),
                         hard_hold_inactive_sides=True,
                         world_to_base_by_side=request["world_to_base_by_side"],
                     )
                 )
-                pose_error = final_result.metadata.get("ik_solve_pose_error", {})
-                final_error = (
-                    pose_error.get("right", {})
-                    if isinstance(pose_error, Mapping)
-                    else {}
-                )
-                translation_error = float(
-                    final_error.get("translation_m", float("inf"))
-                )
-                rotation_error = float(
-                    final_error.get("rotation_deg", float("inf"))
+                solve_frames += 1
+                right_result = final_result.side_results["right"]
+                translation_error, rotation_error = pose_delta_metrics(
+                    right_result.solver_pose_world,
+                    probe["target_pose_by_side"]["right"],
                 )
                 if (
                     final_result.status in {"tracking", "boundary_active"}
                     and translation_error <= translation_tolerance
                     and rotation_error <= rotation_tolerance
                 ):
+                    held_pair = oracle.check_qpos_pair_collision(
+                        left_qpos=seed_qpos["left"],
+                        right_qpos=right_result.qpos,
+                    )
+                    reachable = bool(held_pair.safe)
+                    reason = (
+                        "certified" if reachable else "held_left_collision"
+                    )
+                    collision_reason = (
+                        None if reachable else str(held_pair.reason)
+                    )
                     break
-                if final_result.status in {
-                    "hold_last_safe",
-                    "unsafe_candidate",
-                    "jump_gate_hold",
-                }:
+                if final_result.status in {"hold_last_safe", "unsafe_candidate"}:
+                    reason = (
+                        "collision_guard_rejected"
+                        if final_result.fallback_reason
+                        in {"collision_margin_low", "freeze_on_contact"}
+                        else "solver_guard_hold"
+                    )
                     break
-            assert final_result is not None
-            translation_error = float(
-                final_error.get("translation_m", float("inf"))
-            )
-            rotation_error = float(
-                final_error.get("rotation_deg", float("inf"))
-            )
-            reachable = bool(
-                final_result.status in {"tracking", "boundary_active"}
-                and translation_error <= translation_tolerance
-                and rotation_error <= rotation_tolerance
-            )
+                # The oracle is a background worker, but yielding between
+                # numerical solves keeps the foreground control loop responsive.
+                time.sleep(0.001)
+            fallback_reason = collision_reason
+            if fallback_reason is None and final_result is not None:
+                fallback_reason = final_result.fallback_reason
             results.append(
                 {
                     "name": str(probe["name"]),
                     "reachable": reachable,
-                    "reason": (
-                        "certified" if reachable else "ik_or_collision_unreachable"
+                    "reason": reason,
+                    "solver_status": (
+                        "not_run" if final_result is None else str(final_result.status)
                     ),
-                    "solver_status": str(final_result.status),
-                    "fallback_reason": final_result.fallback_reason,
+                    "fallback_reason": fallback_reason,
+                    "solve_frames": solve_frames,
                     "translation_error_m": translation_error,
                     "rotation_error_deg": rotation_error,
                 }
             )
+            if reason == "solver_budget_exhausted":
+                break
         return {
             "reachable": all(bool(item["reachable"]) for item in results),
             "probes": results,
@@ -7084,6 +7136,9 @@ class RuleBasedRealTeleopExtension:
                 self._writing_reachability_detail = "下一候选已准备，正在重新检查。"
                 self._waiting_reason = "writing_reachability_preflight"
             except Exception as exc:  # noqa: BLE001 - command-inert preparation.
+                self._writing_reachability_fingerprint = (
+                    self._writing_reachability_current_fingerprint()
+                )
                 self._writing_reachability_status = "error"
                 self._writing_reachability_detail = (
                     f"{type(exc).__name__}: {exc}"
@@ -7095,20 +7150,24 @@ class RuleBasedRealTeleopExtension:
         if fingerprint is None:
             return
         if (
-            self._writing_reachability_status == "passed"
-            and self._writing_reachability_fingerprint == fingerprint
+            self._writing_reachability_fingerprint == fingerprint
+            and self._writing_reachability_status
+            in {"passed", "unreachable", "error"}
         ):
+            # A terminal result belongs to this exact candidate and height.
+            # Re-submitting it every foreground frame previously spun the IK
+            # worker indefinitely after search exhaustion or an exception.
             return
 
         pending = self._writing_reachability_future
         if pending is None:
+            self._writing_reachability_fingerprint = fingerprint
             try:
                 request = self._writing_reachability_request()
                 self._writing_reachability_future = self._configuration_executor.submit(
                     self._run_writing_reachability_preflight,
                     request,
                 )
-                self._writing_reachability_fingerprint = fingerprint
                 self._writing_reachability_status = "pending"
                 self._writing_reachability_detail = "正在后台检查书写四边界接触点。"
                 self._waiting_reason = "writing_reachability_preflight"
@@ -7134,15 +7193,38 @@ class RuleBasedRealTeleopExtension:
             return
 
         failed = [
-            str(item.get("name") or "unknown")
+            item
             for item in result.get("probes", ())
             if isinstance(item, Mapping) and not bool(item.get("reachable", False))
         ]
+        details = ", ".join(
+            f"{item.get('name') or 'unknown'}:{item.get('reason') or 'unknown'}"
+            f"/{item.get('solver_status') or 'unknown'}"
+            f"/{item.get('fallback_reason') or 'no_fallback'}"
+            f"/{item.get('solve_frames', 'n/a')} frames"
+            f"/{item.get('translation_error_m', 'n/a')}m"
+            f"/{item.get('rotation_error_deg', 'n/a')}deg"
+            for item in failed
+        )
+        definitive_reasons = {
+            "tcp_envelope_projection_required",
+            "held_left_collision",
+            "collision_guard_rejected",
+        }
+        if not failed or any(
+            str(item.get("reason")) not in definitive_reasons for item in failed
+        ):
+            self._writing_reachability_status = "error"
+            self._writing_reachability_detail = (
+                "书写可达性数值检查未能确认，未判为几何不可达；"
+                + (details or "缺少失败点结果")
+                + "。请调整书写大小/方向或检查标定后重试。"
+            )
+            self._waiting_reason = "writing_reachability_unresolved"
+            return
         self._writing_reachability_skipped_count += 1
         self._writing_reachability_status = "unreachable"
-        self._writing_reachability_detail = (
-            "不可达边界点：" + ", ".join(failed or ("unknown",))
-        )
+        self._writing_reachability_detail = "安全边界拒绝：" + details
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
             append_message(
@@ -7151,11 +7233,16 @@ class RuleBasedRealTeleopExtension:
             )
         configuration = copy.deepcopy(self._selected_configuration)
         if (
-            self._writing_reachability_skipped_count >= 32
+            self._writing_reachability_skipped_count
+            >= _WRITING_REACHABILITY_MAX_AUTO_SKIPS
             or not configuration
             or not self._configuration_requires_ordinal_rebuild(configuration)
             or self._configuration_rebuilder is None
         ):
+            self._writing_reachability_detail += (
+                f"；连续 {_WRITING_REACHABILITY_MAX_AUTO_SKIPS} 条候选未通过，"
+                "已停止自动重试。请调整配置后重新开始。"
+            )
             self._waiting_reason = "writing_reachability_unreachable"
             return
         next_ordinal = self._selection_ordinal + 1
@@ -7232,6 +7319,7 @@ class RuleBasedRealTeleopExtension:
             raise RuntimeError("cancelled rule Episode lifecycle is still settling")
         if self._recording_active is not None and self._recording_active():
             raise RuntimeError("cancelled rule Episode is still active")
+        self._invalidate_writing_reachability_preflight()
         self._held = False
         # Explicit runtime Home already resets preview, command transport and
         # coupled IK from one live snapshot, so no additional rule-owned
