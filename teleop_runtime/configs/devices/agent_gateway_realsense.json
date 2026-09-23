@@ -17,6 +17,9 @@
     "startup_software_retry_sleep_sec": 0.5,
     "startup_hardware_reset": false,
     "startup_hardware_reset_on_failure": false,
+    "startup_hardware_reset_on_warmup_failure": true,
+    "startup_hardware_reset_sleep_sec": 1.0,
+    "startup_hardware_reset_reconnect_timeout_sec": 4.0,
     "metadata": {
       "mount": "single_front",
       "startup_priority": 0,
