@@ -1959,6 +1959,131 @@ def test_task_chain_recovers_lost_gripper_owner_through_right_one_shot_close() -
     assert application.consume_runtime_events() == ["episode_start"]
 
 
+def test_complete_cadence_episode_recovers_lost_owner_before_next_rule() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.COMPLETE
+    application._task_chain.grasp_adjustment_initialized = True
+    application._task_chain.episodes_since_grasp_adjustment = 3
+    application._task_chain.configure_grasp_adjustment_interval(10)
+    application._task_chain.set_prepared_configuration(index=0, selected=first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated after serial recovery"
+            },
+        )
+    )
+
+    blocked = application.snapshot()
+    assert blocked["task_chain_phase"] == "complete"
+    assert blocked["task_chain_grasp_adjustment_due"] is False
+    assert blocked["task_chain_owner_recovery_required"] is True
+    assert blocked["task_chain_can_advance"] is True
+    assert "闭合 owner 已失效" in blocked["task_chain_detail"]
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+    assert application.consume_runtime_events() == []
+    pending = application.snapshot()
+    assert pending["task_chain_phase"] == "ready_rule"
+    assert pending["task_chain_episodes_since_grasp_adjustment"] == 3
+    assert pending["gripper_action_pending"] is True
+
+    # A physical position alone is not an owner receipt.  The runtime must
+    # remove the owner blocker after the new one-shot close settles.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            gripper_action_pending=False,
+            gripper_action_id=41,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner still unconfirmed"
+            },
+        )
+    )
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+    assert application.consume_runtime_events() == []
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=True,
+            gripper_action_pending=False,
+            gripper_action_id=42,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
+            readiness_blockers={},
+        )
+    )
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    resumed = application.snapshot()
+    assert resumed["task_chain_phase"] == "rule_pending"
+    assert resumed["task_chain_episodes_since_grasp_adjustment"] == 3
+
+
+def test_complete_cadence_owner_recovery_keeps_other_faults_closed() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.COMPLETE
+    application._task_chain.grasp_adjustment_initialized = True
+    application._task_chain.episodes_since_grasp_adjustment = 3
+    application._task_chain.configure_grasp_adjustment_interval(10)
+    application._task_chain.set_prepared_configuration(index=0, selected=first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated",
+                "hand.right": "DMTAC transport unavailable",
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_owner_recovery_required"] is False
+    assert state["task_chain_can_advance"] is False
+    assert application.submit_task_chain_advance({"event": "advance"}) is False
+    assert application.consume_rule_intents() == ()
+
+
+def test_complete_cadence_owner_loss_does_not_skip_due_grasp_adjustment() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.COMPLETE
+    application._task_chain.grasp_adjustment_initialized = True
+    application._task_chain.episodes_since_grasp_adjustment = 10
+    application._task_chain.configure_grasp_adjustment_interval(10)
+    application._task_chain.set_prepared_configuration(index=0, selected=first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated after serial recovery"
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_grasp_adjustment_due"] is True
+    assert state["task_chain_owner_recovery_required"] is False
+    assert state["task_chain_can_advance"] is True
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("release_right_gripper",)
+    assert application.snapshot()["task_chain_phase"] == "initial_release_pending"
+
+
 def test_task_chain_owner_recovery_retries_once_after_serial_session_loss() -> None:
     application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
     options, first, _second = _task_chain_configuration()

@@ -289,6 +289,18 @@ class RuleWritingTaskChain:
         self.last_error = ""
         self.rule_start_waiting = True
 
+    def wait_for_next_rule_owner_recovery(self) -> None:
+        """Preserve the cadence and prepared next rule while its grip is repaired."""
+
+        self._require(RuleWritingTaskChainPhase.COMPLETE)
+        if not self.configuration_prepared or not self.selected_configuration:
+            raise RuntimeError("next rule owner recovery requires a prepared configuration.")
+        if self.grasp_adjustment_due:
+            raise RuntimeError("grasp adjustment is due before the next rule.")
+        self.phase = RuleWritingTaskChainPhase.READY_RULE
+        self.last_error = ""
+        self.rule_start_waiting = True
+
     def prepare_device_recovery(self) -> str | None:
         """Freeze an interrupted step at its nearest retryable boundary.
 

@@ -366,6 +366,27 @@ class RuleBasedWritingApplication:
             and not self._state.shutdown
         )
 
+    def _next_rule_owner_recovery_window_locked(self) -> bool:
+        """Allow a closed-grip receipt to be renewed between cadence episodes.
+
+        COMPLETE suppresses only the owner's rule-start blocker so the task
+        chain can finish.  A lost serial session must not force a new release
+        or height calibration before the configured grasp interval, but it
+        also cannot authorize the next rule until a fresh close receipt exists.
+        """
+
+        return bool(
+            self._task_chain.phase is RuleWritingTaskChainPhase.COMPLETE
+            and not self._task_chain.grasp_adjustment_due
+            and self._task_chain.configuration_prepared
+            and bool(self._task_chain.selected_configuration)
+            and set(self._state.startup_blockers) == {"rule.right_hand_hold_owner"}
+            and not self._state.held
+            and not self._state.completed
+            and not self._state.aborted
+            and not self._state.shutdown
+        )
+
     def observe_runtime_publication(self, updates: Mapping[str, object]) -> None:
         """Consume the generic projection without exposing its controls or progress."""
 
@@ -963,6 +984,21 @@ class RuleBasedWritingApplication:
                     phase is RuleWritingTaskChainPhase.COMPLETE
                     and not self._task_chain.grasp_adjustment_due
                 ):
+                    if self._next_rule_owner_recovery_window_locked():
+                        # This click authorizes only a right-hand one-shot close.
+                        # Existing READY_RULE recovery owns the fresh-feedback
+                        # gate and the subsequent start of this prepared rule.
+                        self._task_chain.wait_for_next_rule_owner_recovery()
+                        self._task_chain_owner_recovery_attempts = 0
+                        if not self._request_task_chain_owner_recovery_locked(
+                            automatic=False
+                        ):
+                            self._rebuild_controls()
+                            self._touch()
+                            return False
+                        self._rebuild_controls()
+                        self._touch()
+                        return True
                     if not self._start_prepared_task_chain_rule_locked():
                         return False
                     self._task_chain_owner_recovery_attempts = 0
@@ -2026,7 +2062,10 @@ class RuleBasedWritingApplication:
         self._state.task_chain_can_advance = self._task_chain_can_advance_locked(
             available
         )
-        owner_recovery_required = self._rule_owner_recovery_window_locked()
+        owner_recovery_required = (
+            self._rule_owner_recovery_window_locked()
+            or self._next_rule_owner_recovery_window_locked()
+        )
         self._state.task_chain_owner_recovery_required = owner_recovery_required
         task_chain_detail = str(chain["detail"])
         if (
@@ -2049,9 +2088,9 @@ class RuleBasedWritingApplication:
             task_chain_detail = self._task_chain_blocked_detail_locked(available)
         elif owner_recovery_required:
             task_chain_detail = (
-                "右夹爪串口会话已变化，先前闭爪 owner 已安全失效。"
-                "点击下一步只会重新发送右夹爪一次性闭合命令；"
-                "收到新的实测闭紧反馈后，任务链才会恢复规则采集。"
+                "右夹爪先前的闭合 owner 已失效；实测位置闭紧不能替代"
+                "当前串口会话的一次性闭合回执。点击下一步只会重建右夹爪"
+                "闭合 owner；新鲜实测反馈确认后才继续已准备的规则采集。"
             )
             if self._state.gripper_action_pending:
                 task_chain_detail = (
@@ -2232,7 +2271,15 @@ class RuleBasedWritingApplication:
             and not self._task_chain.grasp_adjustment_due
         ):
             return bool(
-                self._task_chain.configuration_prepared and available["start"]
+                self._task_chain.configuration_prepared
+                and self._task_chain.selected_configuration
+                and (
+                    available["start"]
+                    or (
+                        self._next_rule_owner_recovery_window_locked()
+                        and available["close_right_gripper"]
+                    )
+                )
             )
         return bool(
             available["release_grippers"]
