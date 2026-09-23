@@ -84,6 +84,74 @@ def test_progress_controls_require_active_attempt() -> None:
     ) == ("progress_failure",)
 
 
+@pytest.mark.parametrize(
+    ("availability", "allowed_kinds"),
+    (
+        (ProgressControlAvailability(), ()),
+        (
+            ProgressControlAvailability(
+                enabled=True,
+                recording_active=True,
+                phase="PAUSED_NO_ACTIVE_ATTEMPT",
+                allowed_next_step_ids=("place",),
+                can_undo_last_advance=True,
+            ),
+            (),
+        ),
+        (
+            ProgressControlAvailability(
+                enabled=True,
+                recording_active=True,
+                phase="ACTIVE_ATTEMPT",
+                allowed_next_step_ids=("place",),
+                can_undo_last_advance=True,
+            ),
+            ("REPORT_FAILURE", "ADVANCE_PROGRESS", "UNDO_LAST_ADVANCE"),
+        ),
+        (
+            ProgressControlAvailability(
+                enabled=True,
+                recording_active=True,
+                phase="ACTIVE_ATTEMPT",
+            ),
+            ("REPORT_FAILURE",),
+        ),
+        (
+            ProgressControlAvailability(
+                enabled=True,
+                recording_active=True,
+                phase="ACTIVE_ATTEMPT",
+                allowed_next_step_ids=("place",),
+                can_undo_last_advance=True,
+                application_held=True,
+            ),
+            (),
+        ),
+        (
+            ProgressControlAvailability(
+                enabled=True,
+                recording_active=True,
+                phase="ACTIVE_ATTEMPT",
+                allowed_next_step_ids=("place",),
+                can_undo_last_advance=True,
+                application_held=True,
+                failure_promotes_existing_hold=True,
+            ),
+            ("REPORT_FAILURE",),
+        ),
+    ),
+)
+def test_progress_mutation_admission_matches_episode_and_hold(
+    availability: ProgressControlAvailability,
+    allowed_kinds: tuple[str, ...],
+) -> None:
+    kinds = ("REPORT_FAILURE", "ADVANCE_PROGRESS", "UNDO_LAST_ADVANCE")
+    assert tuple(kind for kind in kinds if availability.allows_mutation(kind)) == (
+        allowed_kinds
+    )
+    assert not availability.allows_mutation("UNKNOWN")
+
+
 def test_progress_event_mapping_emits_canonical_commands() -> None:
     application = build_real_teleop_progress_application(SimpleNamespace())
 
@@ -666,12 +734,16 @@ def test_strict_profile_blocks_manual_fix_and_single_arm_pedal_routes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+    control.args = SimpleNamespace(
+        collection_progress_profile=object(),
+        collection_progress_arm_control_mode="strict_profile",
+    )
     control._progress_application = build_real_teleop_progress_application(
-        SimpleNamespace()
+        control.args
     )
     control._progress_ui_payload = {
         "configured": True,
-        "arm_control_mode": "strict_profile",
+        "arm_control_mode": "profile",
     }
     messages: list[str] = []
     control._foot_pad_mode_enabled = lambda: True
@@ -723,6 +795,7 @@ def test_strict_profile_blocks_manual_fix_and_single_arm_pedal_routes(
 
     control._progress_ui_payload = {
         "configured": True,
-        "arm_control_mode": "profile",
+        "arm_control_mode": "strict_profile",
     }
+    control.args.collection_progress_arm_control_mode = "profile"
     assert control._manual_fix_arm_controls_enabled()

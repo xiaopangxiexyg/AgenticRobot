@@ -1,8 +1,8 @@
-"""Pure Control Station policy for RealTeleop progress presentation.
+"""Pure Control Station policy for RealTeleop progress operator admission.
 
-This module owns UI-facing event vocabulary and availability only.  It does
-not import collection runtime objects, mutate a progress reducer, pause a
-writer, or request robot Hold.
+This module owns UI-facing event vocabulary and read-only availability. It
+does not import collection runtime objects, mutate a progress reducer, pause
+a writer, or request robot Hold.
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ class ProgressProfileOption:
 
 @dataclass(frozen=True)
 class ProgressControlAvailability:
-    """Rebuildable UI-facing availability derived from canonical state."""
+    """Rebuildable application availability derived from canonical state."""
 
     enabled: bool = False
     recording_active: bool = False
@@ -93,6 +93,21 @@ class ProgressControlAvailability:
             and self.recording_active
             and self.phase == "ACTIVE_ATTEMPT"
         )
+
+    def allows_mutation(self, kind: str) -> bool:
+        """Admit a mutation before any profile arm-control side effect."""
+
+        if not self.active_attempt:
+            return False
+        if kind == "REPORT_FAILURE":
+            return not self.application_held or self.failure_promotes_existing_hold
+        if self.application_held:
+            return False
+        if kind == "ADVANCE_PROGRESS":
+            return bool(self.allowed_next_step_ids)
+        if kind == "UNDO_LAST_ADVANCE":
+            return self.can_undo_last_advance
+        return False
 
 
 class ProgressUiStateView(Protocol):
@@ -115,18 +130,12 @@ def available_progress_controls(
 ) -> tuple[str, ...]:
     """Return canonical event names; rendering remains a separate concern."""
 
-    if not state.active_attempt:
-        return ()
-    if state.application_held:
-        return (
-            (PROGRESS_FAILURE_EVENT,)
-            if state.failure_promotes_existing_hold
-            else ()
-        )
-    controls = [PROGRESS_FAILURE_EVENT]
-    if state.allowed_next_step_ids:
+    controls = []
+    if state.allows_mutation("REPORT_FAILURE"):
+        controls.append(PROGRESS_FAILURE_EVENT)
+    if state.allows_mutation("ADVANCE_PROGRESS"):
         controls.append(PROGRESS_ADVANCE_EVENT)
-    if state.can_undo_last_advance:
+    if state.allows_mutation("UNDO_LAST_ADVANCE"):
         controls.append(PROGRESS_UNDO_EVENT)
     return tuple(controls)
 

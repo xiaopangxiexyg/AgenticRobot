@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -30,6 +32,7 @@ from control_station.real_teleop.control_availability import (
     GuiControlState,
     current_active_controls,
 )
+from control_station.real_teleop.input_mapping import prioritize_input_batch
 from control_station.real_teleop_application import (
     build_real_teleop_progress_application,
 )
@@ -41,6 +44,25 @@ class FootPadControlModeTests(unittest.TestCase):
         control._progress_application = build_real_teleop_progress_application(
             control.args
         )
+
+    @staticmethod
+    def _projection_control(
+        project: Callable[..., object],
+    ) -> RealTeleopControlInput:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(
+            collection_progress_profile=object(),
+            collection_progress_arm_control_mode="strict_profile",
+        )
+        control._hold_active = False
+        control._progress_application = SimpleNamespace(
+            project_progress_application_state=project,
+        )
+        control._progress_configuration_selection_enabled = lambda: False
+        control._progress_runtime_controls = ("progress_advance",)
+        control._progress_ui_controls = ("progress_advance",)
+        control._progress_ui_payload = {"enabled": True}
+        return control
 
     @staticmethod
     def _five_pedal_assignment() -> dict[str, object]:
@@ -1198,6 +1220,173 @@ class FootPadControlModeTests(unittest.TestCase):
         intents = control.consume_progress_operator_intents()
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0].kind, "ADVANCE_PROGRESS")
+
+    def test_hold_revokes_progress_pedal_and_gui_admission_immediately(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(
+            collection_progress_profile=object(),
+            collection_progress_arm_control_mode="strict_profile",
+        )
+        control.ui = None
+        control._teleop_started = True
+        control._cancel_init_arm_qpos_sequence = lambda *, reason: None
+        control._q6_hold_recalibration_gesture = SimpleNamespace(
+            reset_for_hold=lambda: None
+        )
+        control._progress_runtime_controls = ("progress_advance",)
+        control._progress_runtime_state = {
+            "configured": True,
+            "phase": "ACTIVE_ATTEMPT",
+            "application_held": False,
+        }
+        control._progress_ui_controls = ("progress_advance",)
+        control._progress_ui_payload = {"enabled": True}
+
+        control.request_hold(reason="q6_gesture")
+
+        self.assertTrue(control.hold_active())
+        self.assertEqual(control.hold_request_reason(), "q6_gesture")
+        self.assertEqual(control._progress_runtime_controls, ())
+        self.assertEqual(control._progress_ui_controls, ())
+        self.assertTrue(control._progress_runtime_state["application_held"])
+        self.assertEqual(control._progress_ui_payload, {})
+        self.assertFalse(control._manual_single_arm_switch_enabled())
+
+    def test_progress_pedal_sampled_before_q6_hold_stays_queued_for_loop_gate(self) -> None:
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(collection_progress_profile=object())
+        self._attach_progress_application(control)
+        control.ui = None
+        control.terminal = SimpleNamespace(
+            poll=lambda: None,
+            should_quit=False,
+            consume_calibration_request=lambda: False,
+        )
+        control.foot_pad_input = SimpleNamespace(
+            consume_events=lambda: ["init_arm_left"],
+        )
+        control._input_batch_prioritizer = prioritize_input_batch
+        control._poll_two_pedal_alert_timeout = lambda *, now: None
+        control._poll_tracker_side_request_timeout = lambda *, now: None
+        control._foot_pad_online = lambda: True
+        control._foot_pad_mode_enabled = lambda: True
+        control._foot_pad_count = lambda: 4
+        control._handle_rule_task_chain_foot_pad_event = (
+            lambda _event, *, now: False
+        )
+        control._publish_progress_pedal_message = lambda _message, *, now: None
+        control._cancel_init_arm_qpos_sequence = lambda *, reason: None
+        control._q6_hold_recalibration_gesture = SimpleNamespace(
+            reset_for_hold=lambda: None
+        )
+        control._poll_q6_hold_recalibration_gesture = (
+            lambda *, now: control.request_hold(reason="q6_gesture")
+        )
+        control.publish_raw_tracker_pose_state = lambda *, now: None
+        control._teleop_started = True
+        control._hold_active = False
+        control.should_quit = False
+        control._progress_operator_intents = deque()
+        control._progress_operator_intent_sequence = 0
+        control._progress_ui_payload = {"enabled": False}
+        control._progress_ui_controls = ()
+        control._progress_ui_transport_revision = 0
+        control.publish_progress_control_availability(
+            configured=True,
+            active_controls=("progress_advance",),
+            recording_active=True,
+            phase="ACTIVE_ATTEMPT",
+            application_held=False,
+            allowed_next_step_ids=("next",),
+        )
+
+        control.poll()
+
+        self.assertTrue(control.hold_active())
+        self.assertEqual(control.hold_request_reason(), "q6_gesture")
+        self.assertEqual(control._progress_runtime_controls, ())
+        intents = control.consume_progress_operator_intents()
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0].kind, "ADVANCE_PROGRESS")
+
+    def test_failed_progress_projection_revokes_previous_pedal_grant(self) -> None:
+        def broken_projection(**_kwargs: object) -> None:
+            raise RuntimeError("projection failed")
+
+        control = self._projection_control(broken_projection)
+
+        with self.assertRaisesRegex(RuntimeError, "projection failed"):
+            control.publish_progress_application_state(
+                dataset_recorder=None,
+                progress_workflow=None,
+                promotable_hold_pause=None,
+                arm_transition_pending=False,
+            )
+
+        self.assertEqual(control._progress_runtime_controls, ())
+        self.assertEqual(control._progress_ui_controls, ())
+        self.assertEqual(
+            control._progress_runtime_state["blocked_reason"],
+            "projection_failed",
+        )
+        self.assertFalse(control._manual_single_arm_switch_enabled())
+
+    def test_invalid_progress_runtime_projection_also_revokes_pedal_grant(self) -> None:
+        control = self._projection_control(
+            lambda **_kwargs: SimpleNamespace(
+                configured=True,
+                active_controls="progress_advance",
+                recording_active=True,
+                phase="ACTIVE_ATTEMPT",
+                application_held=False,
+                allowed_next_step_ids=("next",),
+                blocked_reason="",
+            ),
+        )
+
+        with self.assertRaisesRegex(TypeError, "active_controls"):
+            control.publish_progress_application_state(
+                dataset_recorder=None,
+                progress_workflow=None,
+                promotable_hold_pause=None,
+                arm_transition_pending=False,
+            )
+
+        self.assertEqual(control._progress_runtime_controls, ())
+        self.assertEqual(control._progress_ui_controls, ())
+        self.assertEqual(
+            control._progress_runtime_state["blocked_reason"],
+            "projection_failed",
+        )
+
+    def test_gui_transport_failure_keeps_fresh_pedal_admission(self) -> None:
+        def broken_ui(_payload: object) -> None:
+            raise RuntimeError("browser unavailable")
+
+        control = self._projection_control(
+            lambda **_kwargs: SimpleNamespace(
+                configured=True,
+                active_controls=("progress_advance",),
+                recording_active=True,
+                phase="ACTIVE_ATTEMPT",
+                application_held=False,
+                allowed_next_step_ids=("next",),
+                blocked_reason="",
+                ui_payload={"enabled": True},
+            ),
+        )
+        control.publish_progress_ui_state = broken_ui
+
+        with self.assertRaisesRegex(RuntimeError, "browser unavailable"):
+            control.publish_progress_application_state(
+                dataset_recorder=None,
+                progress_workflow=None,
+                promotable_hold_pause=None,
+                arm_transition_pending=False,
+            )
+
+        self.assertEqual(control._progress_runtime_controls, ("progress_advance",))
+        self.assertEqual(control._progress_runtime_state["phase"], "ACTIVE_ATTEMPT")
 
     def test_progress_pedal_rejection_reports_idle_episode_reason(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)

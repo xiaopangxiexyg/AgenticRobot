@@ -2089,7 +2089,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
         return candidate
 
     def publish_progress_ui_state(*, now: float) -> None:
-        """Publish display-only progress state without affecting control."""
+        """Publish progress projection; failed admission refresh closes pedals."""
 
         if context.collection_transition_active():
             return
@@ -2109,10 +2109,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     pending_progress_arm_transition is not None
                 ),
             )
-        except Exception as exc:  # noqa: BLE001 - UI is observational only.
+        except Exception as exc:  # noqa: BLE001 - facts stay authoritative.
             _log(
                 "Progress",
-                "长程进度 GUI 状态发布失败；控制与数采语义不受影响："
+                "长程进度状态发布失败；Progress 快捷输入可能暂不可用，"
+                "权威进度事实与数采边界未改变："
                 f"{type(exc).__name__}: {exc}",
                 now=now,
             )
@@ -2870,6 +2871,19 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                             if control_ui is not None:
                                 control_ui.append_message("Progress", message)
                 for progress_intent in progress_intents:
+                    availability = progress_workflow.availability(
+                        application_held=clutch_input.hold_active(),
+                        promotable_hold_pause=current_promotable_hold_pause(),
+                    )
+                    if not availability.allows_mutation(progress_intent.kind):
+                        message = (
+                            "progress 请求已忽略：当前 Episode/Hold 状态不允许 "
+                            f"{progress_intent.kind}；该请求未变更固定臂或进度。"
+                        )
+                        _log("Progress", message, now=loop_start)
+                        if control_ui is not None:
+                            control_ui.append_message("Progress", message)
+                        continue
                     if pending_progress_arm_transition is not None:
                         raise RuntimeError(
                             "A profile arm transition is already waiting for "
