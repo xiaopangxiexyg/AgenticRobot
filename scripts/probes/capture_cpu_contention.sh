@@ -152,6 +152,13 @@ start_sampler() {
   sampler_pids+=("$!")
 }
 
+# Procfs provides per-thread CPU ticks and scheduler wait without sysstat.
+probe_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+start_sampler python3 "$probe_dir/sample_procfs_cpu.py" \
+  --duration-sec "$duration_sec" \
+  "${root_pids[@]/#/--pid=}" \
+  >"$run_dir/procfs_cpu.jsonl" 2>"$run_dir/procfs_cpu.stderr"
+
 if command -v mpstat >/dev/null 2>&1; then
   start_sampler mpstat -P ALL 1 "$duration_sec" \
     >"$run_dir/mpstat.txt" 2>&1
