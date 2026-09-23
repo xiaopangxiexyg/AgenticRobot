@@ -1167,10 +1167,11 @@ class RM65ArmBackend(EffectorBackend):
         self._solver_lock = threading.RLock()
         # One RM65 SDK handle serves state, force, and command calls.  The
         # vendor request/response API is not safe for concurrent calls, so all
-        # SDK operations are serialized at this boundary.  Deployment's
-        # default live 60 Hz reference / 120 Hz command path leaves the
-        # synchronous force guard disabled because a force read can occupy
-        # this lock for roughly one 50 ms SDK transaction.
+        # SDK operations are serialized at this boundary.  A waiting force
+        # read has freshness priority over later command and
+        # observational transactions.  One already-running SDK call may
+        # finish, but the high-rate position stream must not repeatedly win
+        # the lock and starve the safety reader.
         self._hardware_read_lock = threading.RLock()
         # Force feedback and actual-qpos annotation share the state SDK handle.
         # A background annotation read must not queue ahead of a force sample:
@@ -6858,10 +6859,11 @@ class RM65ArmBackend(EffectorBackend):
             # State, force, and command operations share one vendor SDK
             # handle.  Serialize the actual request/response call so an
             # explicitly enabled low-rate force monitor cannot race a command
-            # or corrupt the SDK transport.  Live 60/120 deployment leaves
-            # that monitor disabled by default and validates the combination
-            # at the CLI boundary.
-            with self._hardware_read_lock:
+            # or corrupt the SDK transport.  If a force read is already
+            # waiting, yield before starting this command so a 120 Hz command
+            # stream cannot starve the force-safety deadline.
+            self._acquire_command_hardware_lock()
+            try:
                 if self.config.force_position_control:
                     return self.arm.Force_Position_Move_Joint(
                         joint_deg,
@@ -6877,6 +6879,8 @@ class RM65ArmBackend(EffectorBackend):
                     trajectory_mode=int(self.config.canfd_trajectory_mode),
                     radio=int(self.config.canfd_radio),
                 )
+            finally:
+                self._hardware_read_lock.release()
 
         adapter = self._pre_sdk_dispatch_adapter
         if adapter is None:
@@ -6908,6 +6912,25 @@ class RM65ArmBackend(EffectorBackend):
             self._force_read_waiters = max(0, self._force_read_waiters - 1)
             if self._force_read_waiters == 0:
                 self._force_read_waiting.clear()
+
+    def _acquire_command_hardware_lock(self) -> None:
+        """Acquire the serialized SDK lock without starving force safety.
+
+        A force request keeps ``_force_read_waiting`` set from before it joins
+        the lock queue until its SDK transaction completes.  Command traffic
+        therefore checks both before and after lock acquisition.  The second
+        check closes the race where a force request arrives while a command is
+        waiting for an earlier SDK call to finish.
+        """
+
+        while True:
+            if self._force_read_waiting.is_set():
+                time.sleep(0.001)
+                continue
+            self._hardware_read_lock.acquire()
+            if not self._force_read_waiting.is_set():
+                return
+            self._hardware_read_lock.release()
 
     def _acquire_background_hardware_read_lock(
         self,

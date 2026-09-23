@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -706,6 +707,42 @@ def test_rm65_backend_serializes_concurrent_force_reads():
         assert not thread.is_alive()
     assert arm.max_active_calls == 1
     assert arm.call_times[1] - arm.call_times[0] >= 0.045
+
+
+def test_rm65_command_stream_yields_to_waiting_force_reader():
+    command_started = threading.Event()
+    command_dispatched = threading.Event()
+
+    class FakeArm:
+        def Movej_CANFD(self, *_args, **_kwargs):
+            command_dispatched.set()
+            return 0
+
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="127.0.0.1",
+            side="right",
+            connect_hardware=False,
+        )
+    )
+    backend.arm = FakeArm()
+    backend._mark_force_read_waiting()
+
+    def send_command() -> None:
+        command_started.set()
+        backend._send_joint_target(np.zeros(6))
+
+    command_thread = threading.Thread(target=send_command)
+    command_thread.start()
+    try:
+        assert command_started.wait(0.5)
+        assert not command_dispatched.wait(0.05)
+    finally:
+        backend._mark_force_read_acquired()
+        command_thread.join(timeout=0.5)
+
+    assert not command_thread.is_alive()
+    assert command_dispatched.is_set()
 
 
 def test_rm65_background_state_read_yields_to_inflight_force_reader():
