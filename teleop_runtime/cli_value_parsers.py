@@ -19,6 +19,13 @@ def _non_negative_int(text: str) -> int:
     return value
 
 
+def _non_negative_float(text: str) -> float:
+    value = float(text)
+    if value < 0.0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return value
+
+
 def _positive_int(text: str) -> int:
     value = int(text)
     if value <= 0:
@@ -99,6 +106,7 @@ def _active_sides_from_args(args: argparse.Namespace) -> tuple[str, ...]:
 __all__ = [
     "_active_sides_from_args",
     "_alpha_float",
+    "_non_negative_float",
     "_non_negative_int",
     "_normalize_active_sides",
     "_parse_active_sides",
