@@ -559,6 +559,151 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
     assert production_config.output_qpos_admittance_fast_path_alpha == 0.85
 
 
+def test_writing_reachability_uses_live_frame_projection_and_held_qpos_fk() -> None:
+    source = _group()
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="pen_down"),)
+        ),
+        trajectory_groups={
+            "pen_down": replace(
+                source,
+                arm_observation_actual_qpos={
+                    "left": np.stack((np.full(6, 0.2), np.full(6, 0.3))),
+                    "right": np.stack((np.full(6, 0.4), np.full(6, 0.5))),
+                },
+            )
+        },
+        source_selection={
+            "writing_reachability": {
+                "enabled": True,
+                # Deliberately unrelated to held-qpos FK.  The preflight must
+                # not use this recorded action pose as the fixed-arm target.
+                "left_hold_pose_canonical_desk": _pose(9.0, 8.0, 7.0).tolist(),
+                "probes": [
+                    {
+                        "name": name,
+                        "right_pose_canonical_desk": _pose(
+                            0.10 + index * 0.01,
+                            -0.20,
+                            0.50,
+                        ).tolist(),
+                    }
+                    for index, name in enumerate(("left", "right", "top", "bottom"))
+                ],
+            }
+        },
+    )
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+
+    transforms = {
+        "left": np.asarray(
+            [
+                [0.0, -1.0, 0.0, 0.15],
+                [1.0, 0.0, 0.0, -0.05],
+                [0.0, 0.0, 1.0, 0.02],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+        "right": np.asarray(
+            [
+                [0.0, 1.0, 0.0, -0.12],
+                [-1.0, 0.0, 0.0, 0.08],
+                [0.0, 0.0, 1.0, 0.03],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+    }
+
+    class Calibration:
+        def get_arm_for_side(self, side):
+            return SimpleNamespace(T_D_B=transforms[side])
+
+        def base_to_desk(self, pose, side):
+            return transforms[side] @ np.asarray(pose, dtype=float)
+
+    held_left_solver_target = np.eye(4)
+    held_left_solver_target[:3, 3] = [0.7, -0.4, 0.25]
+
+    class RecordingRetargeter(_Retargeter):
+        def __init__(self):
+            super().__init__()
+            self.config = DualArmCollisionAwareRetargeterConfig()
+            self.seed_fk_calls = []
+            self.right_tool_targets = []
+
+        def solver_world_targets_for_qpos_pair(self, *, left_qpos, right_qpos):
+            self.seed_fk_calls.append(
+                {
+                    "left": np.asarray(left_qpos, dtype=float).copy(),
+                    "right": np.asarray(right_qpos, dtype=float).copy(),
+                }
+            )
+            return {"left": held_left_solver_target, "right": np.eye(4)}
+
+        def solver_world_target_from_tool_tcp_world_target(
+            self, *, side, tool_tcp_world_target
+        ):
+            assert side == "right"
+            value = np.asarray(tool_tcp_world_target, dtype=float).copy()
+            self.right_tool_targets.append(value)
+            return value
+
+    retargeter = RecordingRetargeter()
+    extension._components = SimpleNamespace(
+        dual_arm_retargeter=retargeter,
+        session=SimpleNamespace(calibration=Calibration()),
+    )
+
+    request = extension._writing_reachability_request()
+
+    assert len(retargeter.seed_fk_calls) == 1
+    assert np.array_equal(
+        retargeter.seed_fk_calls[0]["left"], np.full(6, 0.2)
+    )
+    assert np.array_equal(
+        retargeter.seed_fk_calls[0]["right"], np.full(6, 0.5)
+    )
+    assert request["pose_projection"]["left_hold"] == "seed_qpos_solver_fk"
+    assert request["pose_projection"]["runtime_pose_frame_contract_hash"] == (
+        extension.runtime_pose_frame_contract.contract_hash
+    )
+    for index, probe in enumerate(request["probes"]):
+        canonical_pose = _matrix(_pose(0.10 + index * 0.01, -0.20, 0.301))
+        expected_base = (
+            extension.runtime_pose_frame_contract.canonical_desk_pose_to_storage(
+                canonical_pose,
+                side="right",
+            )
+        )
+        expected_world = transforms["right"] @ expected_base
+        assert np.allclose(
+            probe["target_pose_by_side"]["right"],
+            expected_world,
+        )
+        assert not np.allclose(
+            probe["target_pose_by_side"]["right"],
+            canonical_pose,
+        )
+        assert np.array_equal(
+            probe["target_pose_by_side"]["left"],
+            held_left_solver_target,
+        )
+    assert len(retargeter.right_tool_targets) == 4
+    assert np.allclose(
+        request["world_to_base_by_side"]["right"],
+        np.linalg.inv(transforms["right"]),
+    )
+
+
 @pytest.mark.parametrize("held_pair_safe", [True, False])
 @pytest.mark.parametrize("left_projected", [True, False])
 def test_writing_reachability_matches_live_coupled_solver_and_fixed_left_collision(

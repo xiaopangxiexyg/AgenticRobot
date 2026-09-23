@@ -6935,6 +6935,9 @@ class RuleBasedRealTeleopExtension:
         )
         if runtime_calibration is None:
             raise RuntimeError("writing reachability requires runtime calibration")
+        resolver = self.adapter.resolver
+        if not isinstance(resolver, RealTeleopPoseFrameActionResolver):
+            raise RuntimeError("rule pose-frame resolver was replaced")
         pen_down_group = self.trajectory_groups.get("pen_down")
         source_qpos = getattr(
             pen_down_group,
@@ -6955,12 +6958,17 @@ class RuleBasedRealTeleopExtension:
             .reshape(6)
             .copy(),
         }
-        left_pose = xyzquat_to_pose_matrix(
-            np.asarray(
-                metadata.get("left_hold_pose_canonical_desk"),
-                dtype=float,
-            ).reshape(7)
+        # The left arm is held at the source qpos throughout writing.  Its
+        # solver target must therefore be FK of that exact held state, rather
+        # than a recorded action pose that may use a different timestamp or
+        # frame.  This is read-only FK and does not change the live IK state.
+        seed_solver_targets = retargeter.solver_world_targets_for_qpos_pair(
+            left_qpos=seed_qpos["left"],
+            right_qpos=seed_qpos["right"],
         )
+        left_solver_target = np.asarray(
+            seed_solver_targets["left"], dtype=float
+        ).reshape(4, 4)
         target_filter = getattr(retargeter, "pre_ik_target_safety_filter", None)
         if not callable(target_filter):
             raise RuntimeError("writing reachability requires the Active TCP envelope")
@@ -6986,14 +6994,25 @@ class RuleBasedRealTeleopExtension:
             )
             right_pose = np.asarray(right_pose, dtype=float).copy()
             right_pose[2, 3] = float(calibration.upper_bound_z_m)
+            # Mirror the formal execution path in _coupled_pose_emission:
+            # canonical desk -> runtime arm base -> calibrated solver world ->
+            # solver endpoint.  Feeding canonical desk directly to the solver
+            # can introduce a large translation and a 180-degree rotation.
+            right_base_pose = (
+                resolver.runtime_contract.canonical_desk_pose_to_storage(
+                    right_pose,
+                    side="right",
+                )
+            )
+            right_tool_tcp_world = runtime_calibration.base_to_desk(
+                right_base_pose,
+                "right",
+            )
             solver_targets = {
-                "left": retargeter.solver_world_target_from_tool_tcp_world_target(
-                    side="left",
-                    tool_tcp_world_target=left_pose,
-                ),
+                "left": left_solver_target.copy(),
                 "right": retargeter.solver_world_target_from_tool_tcp_world_target(
                     side="right",
-                    tool_tcp_world_target=right_pose,
+                    tool_tcp_world_target=right_tool_tcp_world,
                 ),
             }
             effective_targets = target_filter(solver_targets)
@@ -7048,6 +7067,15 @@ class RuleBasedRealTeleopExtension:
             "seed_qpos": seed_qpos,
             "probes": tuple(prepared_probes),
             "world_to_base_by_side": world_to_base_by_side,
+            "pose_projection": {
+                "right_probe": (
+                    "canonical_desk_to_runtime_arm_base_to_solver_world"
+                ),
+                "left_hold": "seed_qpos_solver_fk",
+                "runtime_pose_frame_contract_hash": (
+                    resolver.runtime_contract.contract_hash
+                ),
+            },
             "translation_tolerance_m": 0.005,
             "rotation_tolerance_deg": 3.0,
         }
@@ -7182,6 +7210,7 @@ class RuleBasedRealTeleopExtension:
         return {
             "reachable": all(bool(item["reachable"]) for item in results),
             "probes": results,
+            "pose_projection": dict(request.get("pose_projection") or {}),
             "elapsed_ms": (time.monotonic() - started_at) * 1000.0,
         }
 
