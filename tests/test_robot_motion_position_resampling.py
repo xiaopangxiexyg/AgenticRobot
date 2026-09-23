@@ -10,6 +10,8 @@ from robot_motion.position_control import (
     PoseActionMotionIntentStateMachine,
     TimestampedMotionTarget,
     build_uniform_time_grid,
+    interpolate_pose_shortest_path,
+    interpolate_qpos_by_side,
     resample_motion_targets,
 )
 
@@ -253,6 +255,48 @@ def test_causal_resampling_interpolates_only_when_both_brackets_were_available()
 
     with pytest.raises(ValueError, match="cannot be later"):
         resampler.sample_at(2.1, emitted_timestamp=2.0)
+
+
+def test_exact_and_held_targets_match_general_interpolation_bits() -> None:
+    pose = _z_pose(175.0, (0.1, -0.2, 0.3))
+    qpos = np.array([-0.0, 0.0, 1.0, -1.0, 0.25, -0.25])
+    target = TimestampedMotionTarget(
+        timestamp=10.0,
+        source_index=7,
+        pose_by_side={"right": pose},
+        qpos_by_side={"right": qpos},
+    )
+    resampler = CausalMotionResampler()
+    resampler.push(target)
+    expected_pose = interpolate_pose_shortest_path(
+        target.pose_by_side["right"], target.pose_by_side["right"], 0.0
+    )
+    expected_qpos = interpolate_qpos_by_side(
+        target.qpos_by_side, target.qpos_by_side, 0.0
+    )["right"]
+
+    for query, expected_mode in ((10.0, "causal_exact"), (10.5, "causal_hold")):
+        reference = resampler.sample_at(query, emitted_timestamp=query)
+        assert reference.pose_by_side["right"].tobytes() == expected_pose.tobytes()
+        assert reference.qpos_by_side["right"].tobytes() == expected_qpos.tobytes()
+        assert reference.interpolation_alpha == 0.0
+        assert reference.left_source_index == reference.right_source_index == 7
+        assert reference.metadata["resampling_mode"] == expected_mode
+        assert reference.metadata["lookahead_used"] is False
+        assert reference.metadata["lookahead_available_at_emit"] is True
+        assert not np.shares_memory(
+            reference.pose_by_side["right"], target.pose_by_side["right"]
+        )
+        assert not np.shares_memory(
+            reference.qpos_by_side["right"], target.qpos_by_side["right"]
+        )
+        with pytest.raises(ValueError):
+            reference.pose_by_side["right"][0, 3] = 1.0
+
+    offline = MotionTargetResampler([target]).resample_at(10.0, sequence=0)
+    assert offline.pose_by_side["right"].tobytes() == expected_pose.tobytes()
+    assert offline.qpos_by_side["right"].tobytes() == expected_qpos.tobytes()
+    assert offline.metadata["resampling_mode"] == "offline_exact"
 
 
 def test_causal_resampling_uses_future_logical_target_already_available_from_chunk() -> None:
