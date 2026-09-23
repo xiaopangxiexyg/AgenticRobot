@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence, TypeVar
 
 import numpy as np
 
@@ -20,6 +20,69 @@ class VideoStreamProfileInfo:
 
     def describe(self) -> str:
         return f"{self.stream} {self.width}x{self.height}@{self.fps} {self.format_name}"
+
+
+_ProfileInfo = TypeVar("_ProfileInfo", bound=VideoStreamProfileInfo)
+
+
+def device_from_serial(rs: Any, serial: str | None):
+    ctx = rs.context()
+    devices = list(ctx.devices)
+    if not devices:
+        raise RuntimeError("no RealSense devices detected.")
+    if serial:
+        for device in devices:
+            if safe_device_info(rs, device, rs.camera_info.serial_number) == str(serial):
+                return device
+        available = ", ".join(
+            safe_device_info(rs, device, rs.camera_info.serial_number) for device in devices
+        )
+        raise ValueError(f"RealSense serial {serial!r} not found; available: {available}")
+    return devices[0]
+
+
+def enum_name(namespace: Any, value: Any, names: Sequence[str]) -> str:
+    for name in names:
+        if getattr(namespace, name, None) == value:
+            return name
+    return str(value).split(".")[-1]
+
+
+def available_video_profiles(
+    rs: Any,
+    device: Any,
+    *,
+    profile_type: type[_ProfileInfo],
+    stream_names: Sequence[str],
+    format_names: Sequence[str],
+) -> list[_ProfileInfo]:
+    profiles: list[_ProfileInfo] = []
+    try:
+        sensors = list(device.sensors)
+    except Exception:
+        sensors = []
+    for sensor in sensors:
+        try:
+            stream_profiles = sensor.get_stream_profiles()
+        except Exception:
+            continue
+        for profile in stream_profiles:
+            try:
+                video = profile.as_video_stream_profile()
+                info = profile_type(
+                    stream=enum_name(rs.stream, profile.stream_type(), stream_names),
+                    format_name=enum_name(rs.format, profile.format(), format_names),
+                    width=int(video.width()),
+                    height=int(video.height()),
+                    fps=int(profile.fps()),
+                )
+            except Exception:
+                continue
+            profiles.append(info)
+    profiles.sort(
+        key=lambda item: (item.stream, item.width, item.height, item.fps, item.format_name)
+    )
+    return profiles
 
 
 def video_profile_score(
