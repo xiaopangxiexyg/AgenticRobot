@@ -340,6 +340,76 @@ def test_writing_reachability_blocks_start_until_background_check_passes() -> No
     assert status.rule_start_available is True
 
 
+def test_writing_reachability_receipt_is_bound_to_pen_down_source() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={
+            "selection_ordinal": 0,
+            "phases": {
+                "pen_down": {
+                    "candidate_id": "source-a",
+                    "source_contract_hash": "contract-a",
+                }
+            },
+            "trajectory_catalog": {"combined_sha256": "catalog-a"},
+            "writing_variant_selection": {
+                "selected_trajectory_id": "digit_1_v1",
+                "selected_direction": "up",
+                "selected_size_m": 0.06,
+            },
+        },
+    )
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    original = extension._writing_reachability_current_fingerprint()
+
+    extension.source_selection["phases"]["pen_down"]["candidate_id"] = "source-b"
+
+    assert extension._writing_reachability_current_fingerprint() != original
+
+
+def test_runtime_home_invalidates_terminal_writing_reachability_result() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={"writing_reachability": {"enabled": True}},
+    )
+    _bind(extension, _Recorder(_Poller()), arm=False)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._writing_reachability_fingerprint = (
+        extension._writing_reachability_current_fingerprint()
+    )
+    extension._writing_reachability_status = "error"
+    extension._writing_reachability_detail = "old solver error"
+    extension._held = True
+
+    extension.after_runtime_home(now=2.0)
+
+    assert extension._writing_reachability_fingerprint is None
+    assert extension.status().writing_reachability_status == "pending"
+    assert extension.status().writing_reachability_detail == ""
+
+
 def test_writing_reachability_oracle_accepts_production_fast_path_config() -> None:
     source = _group()
     extension = RuleBasedRealTeleopExtension(
@@ -381,6 +451,15 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
     )
     retargeter = _Retargeter()
     retargeter.config = production_config
+    def project_left(targets):
+        effective = {
+            side: np.asarray(pose, dtype=float).copy()
+            for side, pose in targets.items()
+        }
+        effective["left"][0, 3] += 0.01
+        return effective
+
+    retargeter.pre_ik_target_safety_filter = project_left
     extension._components = SimpleNamespace(
         dual_arm_retargeter=retargeter,
         session=_Session(),
@@ -389,10 +468,219 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
     request = extension._writing_reachability_request()
 
     assert len(request["probes"]) == 4
+    assert request["probes"][0]["envelope_modified_sides"] == ("left",)
+    assert np.isclose(request["probes"][0]["target_pose_by_side"]["left"][0, 3], 0.01)
     assert request["oracle_config"].output_qpos_smoothing_alpha == 1.0
     assert request["oracle_config"].output_qpos_admittance_fast_path_alpha == 1.0
     assert request["oracle_config"].output_qpos_smoothing_singularity_alpha == 1.0
     assert production_config.output_qpos_admittance_fast_path_alpha == 0.85
+
+
+@pytest.mark.parametrize("held_pair_safe", [True, False])
+@pytest.mark.parametrize("left_projected", [True, False])
+def test_writing_reachability_matches_live_coupled_solver_and_fixed_left_collision(
+    monkeypatch, held_pair_safe, left_projected,
+) -> None:
+    calls = []
+
+    class Oracle:
+        def __init__(self, _config):
+            pass
+
+        def set_current_qpos_pair(self, **kwargs):
+            calls.append(("seed", kwargs))
+
+        def solve_target_pair(self, target):
+            calls.append(("solve", target.active_sides))
+            return SimpleNamespace(
+                status="tracking",
+                fallback_reason=None,
+                side_results={
+                    "right": SimpleNamespace(
+                        solver_pose_world=target.target_pose_by_side["right"],
+                        qpos=np.ones(6),
+                    )
+                },
+            )
+
+        def check_qpos_pair_collision(self, **kwargs):
+            calls.append(("collision", kwargs))
+            return SimpleNamespace(
+                safe=held_pair_safe,
+                reason="" if held_pair_safe else "collision_margin_low",
+            )
+
+    monkeypatch.setattr(rule_runtime_module, "DualArmCollisionAwareRetargeter", Oracle)
+    target = np.eye(4)
+    target[0, 3] = 0.02
+    request = {
+        "oracle_config": object(),
+        "seed_qpos": {"left": np.zeros(6), "right": np.zeros(6)},
+        "probes": tuple(
+            {
+                "name": name,
+                "target_pose_by_side": {"left": np.eye(4), "right": target},
+                "envelope_modified_sides": ("left",) if left_projected else (),
+            }
+            for name in ("left", "right", "bottom", "top")
+        ),
+        "world_to_base_by_side": {"left": np.eye(4), "right": np.eye(4)},
+        "translation_tolerance_m": 0.005,
+        "rotation_tolerance_deg": 3.0,
+    }
+
+    result = RuleBasedRealTeleopExtension._run_writing_reachability_preflight(
+        request
+    )
+
+    assert result["reachable"] is held_pair_safe
+    if not held_pair_safe:
+        assert {probe["reason"] for probe in result["probes"]} == {
+            "held_left_collision"
+        }
+    assert [value for kind, value in calls if kind == "solve"] == [
+        ("left", "right")
+    ] * 4
+    held_pairs = [value for kind, value in calls if kind == "collision"]
+    assert len(held_pairs) == 4
+    assert all(np.array_equal(pair["left_qpos"], np.zeros(6)) for pair in held_pairs)
+    assert all(np.array_equal(pair["right_qpos"], np.ones(6)) for pair in held_pairs)
+
+
+def test_writing_reachability_rejects_projected_right_glyph_target(
+    monkeypatch,
+) -> None:
+    class Oracle:
+        def __init__(self, _config):
+            pass
+
+        def solve_target_pair(self, _target):
+            raise AssertionError("projected right glyph must not enter IK")
+
+    monkeypatch.setattr(rule_runtime_module, "DualArmCollisionAwareRetargeter", Oracle)
+    result = RuleBasedRealTeleopExtension._run_writing_reachability_preflight(
+        {
+            "oracle_config": object(),
+            "seed_qpos": {"left": np.zeros(6), "right": np.zeros(6)},
+            "probes": (
+                {
+                    "name": "right",
+                    "target_pose_by_side": {
+                        "left": np.eye(4),
+                        "right": np.eye(4),
+                    },
+                    "envelope_modified_sides": ("left", "right"),
+                },
+            ),
+            "world_to_base_by_side": {"left": np.eye(4), "right": np.eye(4)},
+            "translation_tolerance_m": 0.005,
+            "rotation_tolerance_deg": 3.0,
+        }
+    )
+
+    assert result["reachable"] is False
+    assert result["probes"][0]["reason"] == "tcp_envelope_projection_required"
+
+
+def test_writing_reachability_budget_exhaustion_is_not_unreachable(
+    monkeypatch,
+) -> None:
+    class Oracle:
+        def __init__(self, _config):
+            pass
+
+        def set_current_qpos_pair(self, **_kwargs):
+            pass
+
+        def solve_target_pair(self, _target):
+            raise AssertionError("expired preflight must not enter IK")
+
+    monkeypatch.setattr(rule_runtime_module, "DualArmCollisionAwareRetargeter", Oracle)
+    monkeypatch.setattr(
+        rule_runtime_module, "_WRITING_REACHABILITY_MAX_CHECK_SEC", 0.0
+    )
+    result = RuleBasedRealTeleopExtension._run_writing_reachability_preflight(
+        {
+            "oracle_config": object(),
+            "seed_qpos": {"left": np.zeros(6), "right": np.zeros(6)},
+            "probes": (
+                {
+                    "name": "right",
+                    "target_pose_by_side": {
+                        "left": np.eye(4),
+                        "right": np.eye(4),
+                    },
+                    "envelope_modified_sides": (),
+                },
+            ),
+            "world_to_base_by_side": {"left": np.eye(4), "right": np.eye(4)},
+            "translation_tolerance_m": 0.005,
+            "rotation_tolerance_deg": 3.0,
+        }
+    )
+
+    assert result["reachable"] is False
+    assert result["probes"][0]["reason"] == "solver_budget_exhausted"
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_status"),
+    [
+        ("solver_not_converged", "error"),
+        ("tcp_envelope_projection_required", "unreachable"),
+    ],
+)
+def test_terminal_writing_reachability_result_is_not_resubmitted(
+    reason, expected_status,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={
+            "selection_ordinal": 0,
+            "writing_reachability": {"enabled": True},
+            "writing_variant_selection": {
+                "selected_trajectory_id": "latin_a_v1",
+                "selected_direction": "up",
+                "selected_size_m": 0.06,
+            },
+        },
+    )
+    _bind(extension, _Recorder(_Poller()), arm=False)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._writing_reachability_request = lambda: {}
+    extension._writing_reachability_skipped_count = 31
+    checks = []
+
+    def check(_request):
+        checks.append(1)
+        return {
+            "reachable": False,
+            "probes": ({"name": "right", "reachable": False, "reason": reason},),
+        }
+
+    extension._run_writing_reachability_preflight = check
+    deadline = time.monotonic() + 2.0
+    while extension.status().writing_reachability_status != expected_status:
+        extension.after_control_input_poll(now=1.0)
+        if time.monotonic() >= deadline:
+            raise AssertionError("terminal preflight did not settle")
+        time.sleep(0.001)
+
+    for _ in range(20):
+        extension.after_control_input_poll(now=1.1)
+    assert checks == [1]
+    assert extension.status().rule_start_available is False
 
 
 def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> None:
@@ -448,7 +736,13 @@ def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> N
         if check_count == 1:
             return {
                 "reachable": False,
-                "probes": ({"name": "right", "reachable": False},),
+                "probes": (
+                    {
+                        "name": "right",
+                        "reachable": False,
+                        "reason": "tcp_envelope_projection_required",
+                    },
+                ),
             }
         return {"reachable": True, "probes": ()}
 
