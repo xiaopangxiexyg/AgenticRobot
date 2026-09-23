@@ -3071,6 +3071,26 @@ class MujocoDeployRuntime:
             receipts=tuple(receipts),
         )
 
+    def _validate_replay_source(self, source: ReplayProposalSource) -> None:
+        source_config = source.config
+        if source_config.producer_id != self.config.replay_producer_id:
+            raise ValueError(
+                "Replay producer does not match the sim authority profile."
+            )
+        if (
+            source_config.runtime_session_id != self.config.runtime_session_id
+            or source_config.control_domain_id != self.config.control_domain_id
+            or source_config.embodiment_instance_id
+            != self.config.embodiment_instance_id
+        ):
+            raise ValueError("Replay proposal source belongs to another sim target.")
+        if source_config.target_runtime_contract.semantic_content_hash != (
+            self.target_runtime_action_contract.semantic_content_hash
+        ):
+            raise ValueError(
+                "Replay source is not assessed against this exact sim target."
+            )
+
     def submit_replay_action(
         self,
         source: ReplayProposalSource,
@@ -3092,24 +3112,7 @@ class MujocoDeployRuntime:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
         if not self.config.enable_replay_authority:
             raise RuntimeError("Replay authority is not enabled for this sim runtime.")
-        source_config = source.config
-        if source_config.producer_id != self.config.replay_producer_id:
-            raise ValueError(
-                "Replay producer does not match the sim authority profile."
-            )
-        if (
-            source_config.runtime_session_id != self.config.runtime_session_id
-            or source_config.control_domain_id != self.config.control_domain_id
-            or source_config.embodiment_instance_id
-            != self.config.embodiment_instance_id
-        ):
-            raise ValueError("Replay proposal source belongs to another sim target.")
-        if source_config.target_runtime_contract.semantic_content_hash != (
-            self.target_runtime_action_contract.semantic_content_hash
-        ):
-            raise ValueError(
-                "Replay source is not assessed against this exact sim target."
-            )
+        self._validate_replay_source(source)
         produced = float(self.clock() if produced_at is None else produced_at)
         target = float(produced if target_effective_at is None else target_effective_at)
         source_emission = create_replay_source_frame_emission(
@@ -3165,24 +3168,7 @@ class MujocoDeployRuntime:
             raise RuntimeError("Replay authority is not enabled for this sim runtime.")
         if not isinstance(emission, ReplaySourceFrameEmission):
             raise TypeError("emission must be a ReplaySourceFrameEmission.")
-        source_config = source.config
-        if source_config.producer_id != self.config.replay_producer_id:
-            raise ValueError(
-                "Replay producer does not match the sim authority profile."
-            )
-        if (
-            source_config.runtime_session_id != self.config.runtime_session_id
-            or source_config.control_domain_id != self.config.control_domain_id
-            or source_config.embodiment_instance_id
-            != self.config.embodiment_instance_id
-        ):
-            raise ValueError("Replay proposal source belongs to another sim target.")
-        if source_config.target_runtime_contract.semantic_content_hash != (
-            self.target_runtime_action_contract.semantic_content_hash
-        ):
-            raise ValueError(
-                "Replay source is not assessed against this exact sim target."
-            )
+        self._validate_replay_source(source)
         if emission.clock_domain_id != self.config.clock_domain_id:
             raise ValueError(
                 "Replay source-frame and sim runtime require one explicit clock domain."
