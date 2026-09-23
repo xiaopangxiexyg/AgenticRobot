@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from collection_runtime.progress.stage_annotation_store import (
     STAGE_ANNOTATION_RELATIVE_ROOT,
@@ -211,6 +211,31 @@ def _equal_active_time_splits(
 
 class RefinementAnnotationApplicationError(ValueError):
     """Raised when a UI request cannot preserve annotation semantics."""
+
+
+def _stage_occurrences_from_draft(
+    values: Iterable[Mapping[str, Any]],
+    *,
+    clock_domain_id: str,
+) -> tuple[StageOccurrenceAnnotationV1, ...]:
+    """Apply draft defaults; callers retain their own validation and errors."""
+
+    return tuple(
+        StageOccurrenceAnnotationV1(
+            annotation_id=value.get("annotation_id", ""),
+            coarse_attempt_id=value.get("coarse_attempt_id", ""),
+            progress_step_id=value.get("progress_step_id", ""),
+            stage_id=value.get("stage_id", ""),
+            occurrence_index_in_attempt=value.get("occurrence_index_in_attempt", 0),
+            start_at=value.get("start_at"),
+            end_at=value.get("end_at"),
+            clock_domain_id=clock_domain_id,
+            outcome=value.get("outcome", ""),
+            confidence=value.get("confidence", 1.0),
+            source_failure_fact_id=value.get("source_failure_fact_id"),
+        )
+        for value in values
+    )
 
 
 class RefinementAnnotationApplication:
@@ -1250,26 +1275,9 @@ class RefinementAnnotationApplication:
             )
         clock = item.progress.timeline.clock_domain_id
         try:
-            contracts = tuple(
-                StageOccurrenceAnnotationV1(
-                    annotation_id=value.get("annotation_id", ""),
-                    coarse_attempt_id=value.get("coarse_attempt_id", ""),
-                    progress_step_id=value.get("progress_step_id", ""),
-                    stage_id=value.get("stage_id", ""),
-                    occurrence_index_in_attempt=value.get(
-                        "occurrence_index_in_attempt",
-                        0,
-                    ),
-                    start_at=value.get("start_at"),
-                    end_at=value.get("end_at"),
-                    clock_domain_id=clock,
-                    outcome=value.get("outcome", ""),
-                    confidence=value.get("confidence", 1.0),
-                    source_failure_fact_id=value.get(
-                        "source_failure_fact_id"
-                    ),
-                )
-                for value in raw_occurrences
+            contracts = _stage_occurrences_from_draft(
+                raw_occurrences,
+                clock_domain_id=clock,
             )
             bundle = DetailStageAnnotationBundleV1(occurrences=contracts)
         except (TypeError, ValueError) as exc:
@@ -1331,26 +1339,9 @@ class RefinementAnnotationApplication:
         clock = item.progress.timeline.clock_domain_id
         try:
             return DetailStageAnnotationBundleV1(
-                occurrences=tuple(
-                    StageOccurrenceAnnotationV1(
-                        annotation_id=value.get("annotation_id", ""),
-                        coarse_attempt_id=value.get("coarse_attempt_id", ""),
-                        progress_step_id=value.get("progress_step_id", ""),
-                        stage_id=value.get("stage_id", ""),
-                        occurrence_index_in_attempt=value.get(
-                            "occurrence_index_in_attempt",
-                            0,
-                        ),
-                        start_at=value.get("start_at"),
-                        end_at=value.get("end_at"),
-                        clock_domain_id=clock,
-                        outcome=value.get("outcome", ""),
-                        confidence=value.get("confidence", 1.0),
-                        source_failure_fact_id=value.get(
-                            "source_failure_fact_id"
-                        ),
-                    )
-                    for value in draft.get("occurrences", ())
+                occurrences=_stage_occurrences_from_draft(
+                    draft.get("occurrences", ()),
+                    clock_domain_id=clock,
                 )
             )
         except (TypeError, ValueError) as exc:
@@ -4801,26 +4792,9 @@ class RefinementAnnotationApplication:
             sample_axis = self._sample_axis(item)
         clock = item.progress.timeline.clock_domain_id
         try:
-            occurrence_contracts = tuple(
-                StageOccurrenceAnnotationV1(
-                    annotation_id=value.get("annotation_id", ""),
-                    coarse_attempt_id=value.get("coarse_attempt_id", ""),
-                    progress_step_id=value.get("progress_step_id", ""),
-                    stage_id=value.get("stage_id", ""),
-                    occurrence_index_in_attempt=value.get(
-                        "occurrence_index_in_attempt",
-                        0,
-                    ),
-                    start_at=value.get("start_at"),
-                    end_at=value.get("end_at"),
-                    clock_domain_id=clock,
-                    outcome=value.get("outcome", ""),
-                    confidence=value.get("confidence", 1.0),
-                    source_failure_fact_id=value.get(
-                        "source_failure_fact_id"
-                    ),
-                )
-                for value in occurrences
+            occurrence_contracts = _stage_occurrences_from_draft(
+                occurrences,
+                clock_domain_id=clock,
             )
             return normalize_failure_trigger_drafts(
                 timeline=item.progress.timeline,
@@ -4887,26 +4861,9 @@ class RefinementAnnotationApplication:
             sample_axis = self._sample_axis(item)
         clock = item.progress.timeline.clock_domain_id
         try:
-            occurrence_contracts = tuple(
-                StageOccurrenceAnnotationV1(
-                    annotation_id=value.get("annotation_id", ""),
-                    coarse_attempt_id=value.get("coarse_attempt_id", ""),
-                    progress_step_id=value.get("progress_step_id", ""),
-                    stage_id=value.get("stage_id", ""),
-                    occurrence_index_in_attempt=value.get(
-                        "occurrence_index_in_attempt",
-                        0,
-                    ),
-                    start_at=value.get("start_at"),
-                    end_at=value.get("end_at"),
-                    clock_domain_id=clock,
-                    outcome=value.get("outcome", ""),
-                    confidence=value.get("confidence", 1.0),
-                    source_failure_fact_id=value.get(
-                        "source_failure_fact_id"
-                    ),
-                )
-                for value in occurrences
+            occurrence_contracts = _stage_occurrences_from_draft(
+                occurrences,
+                clock_domain_id=clock,
             )
             return normalize_recoverable_failure_drafts(
                 occurrences=occurrence_contracts,
@@ -4972,26 +4929,9 @@ class RefinementAnnotationApplication:
     ) -> StageAnnotationBundleV1:
         clock = item.progress.timeline.clock_domain_id
         return StageAnnotationBundleV1(
-            occurrences=tuple(
-                StageOccurrenceAnnotationV1(
-                    annotation_id=value.get("annotation_id", ""),
-                    coarse_attempt_id=value.get("coarse_attempt_id", ""),
-                    progress_step_id=value.get("progress_step_id", ""),
-                    stage_id=value.get("stage_id", ""),
-                    occurrence_index_in_attempt=value.get(
-                        "occurrence_index_in_attempt",
-                        0,
-                    ),
-                    start_at=value.get("start_at"),
-                    end_at=value.get("end_at"),
-                    clock_domain_id=clock,
-                    outcome=value.get("outcome", ""),
-                    confidence=value.get("confidence", 1.0),
-                    source_failure_fact_id=value.get(
-                        "source_failure_fact_id"
-                    ),
-                )
-                for value in draft.get("occurrences", ())
+            occurrences=_stage_occurrences_from_draft(
+                draft.get("occurrences", ()),
+                clock_domain_id=clock,
             ),
             abnormal_intervals=tuple(
                 AbnormalIntervalAnnotationV1(
