@@ -11,16 +11,19 @@ import numpy as np
 import pytest
 
 import utils.calibration_common.camera as common_camera
+import utils.calibration_common.calibration as common_calibration
 import utils.calibration_common.capture as common_capture
 import utils.calibration_common.interactive as common_interactive
 import utils.calibration_common.robot as common_robot
 import utils.calibration_common.transforms as common_transforms
 import utils.hand_eye.camera as hand_camera
+import utils.hand_eye.calibration as hand_calibration
 import utils.hand_eye.capture as hand_capture
 import utils.hand_eye.robot as hand_robot
 import utils.hand_eye.run_calibrate_handeye as hand_runner
 import utils.hand_eye.transforms as hand_transforms
 import utils.head_eye.camera as head_camera
+import utils.head_eye.calibration as head_calibration
 import utils.head_eye.capture as head_capture
 import utils.head_eye.robot as head_robot
 import utils.head_eye.run_calibrate_handeye as head_runner
@@ -61,6 +64,41 @@ from utils.head_eye.visualize_handeye import build_parser as build_visualizer_pa
 
 
 class CalibrationCommonOwnershipTest(unittest.TestCase):
+    def test_calibration_namespaces_share_data_and_stateless_helpers(self) -> None:
+        payload = {
+            "T_gripper_to_base": np.eye(4).tolist(),
+            "T_target_to_camera": np.eye(4).tolist(),
+            "robot_pose_xyz_rpy": [0, 1, 2, 3, 4, 5],
+            "robot_joint_deg": [6, 7, 8, 9, 10, 11],
+            "target_reprojection_rmse_px": 0.25,
+            "target_corner_count": 12,
+            "timestamp_utc": "2026-09-22T00:00:00Z",
+            "metadata": {"source": "unit"},
+        }
+        for sample_type, module_name in (
+            (hand_calibration.CalibrationSample, "utils.hand_eye.calibration"),
+            (head_calibration.CalibrationSample, "utils.head_eye.calibration"),
+        ):
+            self.assertIs(sample_type.__mro__[1], common_calibration.CalibrationSample)
+            self.assertEqual(sample_type.__module__, module_name)
+            sample = sample_type.from_dict(payload)
+            self.assertIs(type(sample), sample_type)
+            self.assertEqual(sample.to_dict(), payload)
+
+        for compatibility_name, shared_name in (
+            ("_float_or_none", "float_or_none"),
+            ("_jsonable", "jsonable"),
+            ("_list_or_none", "list_or_none"),
+            ("_max_or_zero", "max_or_zero"),
+            ("_now_utc", "now_utc"),
+            ("_pose_span", "pose_span"),
+            ("_rms", "rms"),
+            ("_timestamp_for_filename", "timestamp_for_filename"),
+        ):
+            shared = getattr(common_calibration, shared_name)
+            self.assertIs(getattr(hand_calibration, compatibility_name), shared)
+            self.assertIs(getattr(head_calibration, compatibility_name), shared)
+
     def test_interactive_namespaces_export_one_mechanics_implementation(self) -> None:
         self.assertIs(hand_runner.AutoRecordState, common_interactive.AutoRecordState)
         self.assertIs(head_runner.AutoRecordState, common_interactive.AutoRecordState)
