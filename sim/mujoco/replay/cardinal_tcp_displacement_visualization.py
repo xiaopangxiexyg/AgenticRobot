@@ -17,6 +17,8 @@ from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.primitives import CARDINAL_TCP_SHORT_STEP_PRIMITIVES
 from robot_motion.transforms import as_pose_matrix
 
+from ._viewer_geometry import write_arrow, write_sphere
+
 _SIDES = ("left", "right")
 _DESK_REFERENCE_FRAME_SPEC = CoordinateFrameSpec(
     frame_id="desk",
@@ -195,7 +197,7 @@ class CardinalTcpPrimitiveVisualizer:
                 )
             cursor = self._base_geom_index
             for side in _SIDES:
-                self._write_sphere(
+                write_sphere(
                     scene.geoms[cursor],
                     position=self.anchor_pose_world_by_side[side][:3, 3],
                     radius=self.config.anchor_radius_m,
@@ -210,7 +212,7 @@ class CardinalTcpPrimitiveVisualizer:
                     endpoint = self.primitive_target_by_side_and_direction[
                         (side, direction)
                     ][:3, 3]
-                    self._write_arrow(
+                    write_arrow(
                         scene.geoms[cursor],
                         start=origin,
                         end=endpoint,
@@ -233,7 +235,7 @@ class CardinalTcpPrimitiveVisualizer:
                     )
                     cursor += 1
             for side in _SIDES:
-                self._write_sphere(
+                write_sphere(
                     scene.geoms[cursor],
                     position=self.actual_pose_world_by_side[side][index][:3, 3],
                     radius=self.config.current_tcp_radius_m,
@@ -249,7 +251,7 @@ class CardinalTcpPrimitiveVisualizer:
                 if active_side in _SIDES and direction in _DIRECTION_COLORS
                 else np.array([1.0, 0.86, 0.05, 0.0], dtype=np.float32)
             )
-            self._write_sphere(
+            write_sphere(
                 scene.geoms[cursor],
                 position=self.target_pose_world_by_frame[index][target_side][
                     :3, 3
@@ -267,59 +269,6 @@ class CardinalTcpPrimitiveVisualizer:
             if cursor != stop:
                 raise RuntimeError("Cardinal TCP visualizer geometry count drifted")
         return True
-
-    @staticmethod
-    def _write_sphere(
-        geom: Any,
-        *,
-        position: np.ndarray,
-        radius: float,
-        rgba: np.ndarray,
-        label: str,
-    ) -> None:
-        import mujoco
-
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_SPHERE,
-            np.full(3, float(radius), dtype=float),
-            np.asarray(position, dtype=float),
-            np.eye(3, dtype=float).reshape(-1),
-            np.asarray(rgba, dtype=np.float32),
-        )
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = label
-
-    @staticmethod
-    def _write_arrow(
-        geom: Any,
-        *,
-        start: np.ndarray,
-        end: np.ndarray,
-        width: float,
-        rgba: np.ndarray,
-        label: str,
-    ) -> None:
-        import mujoco
-
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_ARROW,
-            np.zeros(3, dtype=float),
-            np.zeros(3, dtype=float),
-            np.eye(3, dtype=float).reshape(-1),
-            np.asarray(rgba, dtype=np.float32),
-        )
-        mujoco.mjv_connector(
-            geom,
-            mujoco.mjtGeom.mjGEOM_ARROW,
-            float(width),
-            np.asarray(start, dtype=float),
-            np.asarray(end, dtype=float),
-        )
-        geom.rgba = np.asarray(rgba, dtype=np.float32)
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = label
 
     @staticmethod
     def _write_capsule(
