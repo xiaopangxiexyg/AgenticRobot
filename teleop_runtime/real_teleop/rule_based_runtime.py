@@ -6932,8 +6932,13 @@ class RuleBasedRealTeleopExtension:
             ),
             solve_min_iterations=1,
             solve_adaptive_iterations_enabled=False,
+            # The oracle has no output smoothing. Keep its fast endpoints
+            # consistent with the unsmoothed slow endpoint when cloning the
+            # live config; these values do not alter the production solver.
             output_qpos_smoothing_alpha=1.0,
             output_qpos_smoothing_adaptive_enabled=False,
+            output_qpos_admittance_fast_path_alpha=1.0,
+            output_qpos_smoothing_singularity_alpha=1.0,
             target_pose_smoother=None,
             debug_viz=False,
             debug_profile=False,

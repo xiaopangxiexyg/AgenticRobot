@@ -34,6 +34,7 @@ from robot_motion.replay import (
     RuleBasedReplay,
     RuleBasedSegmentStopCondition,
 )
+from robot_motion.rm65 import DualArmCollisionAwareRetargeterConfig
 from teleop_runtime.command_override import TeleopCommandOverride
 from teleop_runtime.backends.grippers.dmtac import (
     DMTacGripperBackend,
@@ -337,6 +338,61 @@ def test_writing_reachability_blocks_start_until_background_check_passes() -> No
     status = extension.status()
     assert status.writing_reachability_status == "passed"
     assert status.rule_start_available is True
+
+
+def test_writing_reachability_oracle_accepts_production_fast_path_config() -> None:
+    source = _group()
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="pen_down"),)
+        ),
+        trajectory_groups={
+            "pen_down": replace(
+                source,
+                arm_observation_actual_qpos={
+                    side: np.zeros((2, 6)) for side in ("left", "right")
+                },
+            )
+        },
+        source_selection={
+            "writing_reachability": {
+                "enabled": True,
+                "left_hold_pose_canonical_desk": _pose().tolist(),
+                "probes": [
+                    {"name": name, "right_pose_canonical_desk": _pose().tolist()}
+                    for name in ("left", "right", "top", "bottom")
+                ],
+            }
+        },
+    )
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    production_config = DualArmCollisionAwareRetargeterConfig(
+        output_qpos_smoothing_alpha=0.14,
+        output_qpos_admittance_fast_path_alpha=0.85,
+        output_qpos_smoothing_singularity_alpha=0.45,
+    )
+    retargeter = _Retargeter()
+    retargeter.config = production_config
+    extension._components = SimpleNamespace(
+        dual_arm_retargeter=retargeter,
+        session=_Session(),
+    )
+
+    request = extension._writing_reachability_request()
+
+    assert len(request["probes"]) == 4
+    assert request["oracle_config"].output_qpos_smoothing_alpha == 1.0
+    assert request["oracle_config"].output_qpos_admittance_fast_path_alpha == 1.0
+    assert request["oracle_config"].output_qpos_smoothing_singularity_alpha == 1.0
+    assert production_config.output_qpos_admittance_fast_path_alpha == 0.85
 
 
 def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> None:
