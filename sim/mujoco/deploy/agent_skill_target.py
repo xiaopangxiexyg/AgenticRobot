@@ -22,7 +22,7 @@ from .target_measurement import (
 
 @dataclass(frozen=True)
 class MujocoAgentSkillMotionTarget:
-    """No-model, arms-only target bound to the shared MuJoCo executor."""
+    """No-model arm-and-gripper target bound to the shared MuJoCo executor."""
 
     task_config: Any
     scene: Any
@@ -42,7 +42,7 @@ def build_mujoco_agent_skill_motion_target(
     trace_sink: Callable[[Any], None] | None = None,
     tcp_pose_envelope_runtime: Any | None = None,
 ) -> MujocoAgentSkillMotionTarget:
-    """Build the first no-model, right-arm Agent Skill execution target.
+    """Build the no-model, right-arm/right-gripper Agent execution target.
 
     The direct source only emits the runtime's exact ``ComponentAction``.
     Canonical safety, coupled IK, reference generation and dispatch remain in
@@ -69,18 +69,21 @@ def build_mujoco_agent_skill_motion_target(
     materializer = getattr(component_execution_binding, "materializer", None)
     profile = getattr(materializer, "profile", None)
     if (
-        tuple(getattr(action_schema, "component_ids", ())) != ("right_arm",)
+        tuple(getattr(action_schema, "component_ids", ()))
+        != ("right_arm", "right_gripper")
         or dict(getattr(profile, "arm_side_by_component", {}))
         != {"right_arm": "right"}
-        or dict(getattr(profile, "gripper_name_by_component", {}))
+        or set(dict(getattr(profile, "gripper_name_by_component", {})))
+        != {"right_gripper"}
     ):
         raise ValueError(
-            "The first Agent motion target requires one right_arm pose "
-            "component and no hand/gripper component."
+            "The Agent target requires one right_arm pose component and one "
+            "right_gripper joint-position component."
         )
 
     from robot_motion.action import (
         CanonicalKeyframeSafetyProfile,
+        HandQposSafetyLimits,
         IMMEDIATE_QREF_SIM_V1,
         apply_canonical_keyframe_safety,
     )
@@ -115,22 +118,40 @@ def build_mujoco_agent_skill_motion_target(
         MujocoDirectComponentProposalSource,
     )
 
+    hand_specs = dict(getattr(materializer, "hand_action_spec_by_component", {}))
+    if set(hand_specs) != {"right_gripper"}:
+        raise ValueError("Agent target requires the exact right-gripper hand spec.")
+    right_hand_spec = hand_specs["right_gripper"]
+    if getattr(right_hand_spec, "side", None) != "right":
+        raise ValueError("Agent target right_gripper must bind the right hand.")
+
     rig = MujocoPositionExecutionRig(
         prepared.scene,
         MujocoPositionExecutionConfig(
             timing=prepared.timing,
             active_sides=("left", "right"),
             actuation_profile=prepared.arm_profile,
-            # The generic profile has no hand action surface.
-            gripper_actuation_profile=None,
+            gripper_actuation_profile=prepared.gripper_profile,
+            # The reviewed EG2-4B2 CAD mesh overlaps slightly at its closed
+            # endpoint.  Permit only gripper-to-gripper (4:4) self-contact;
+            # robot, object, and environment collision guards remain active.
+            allow_gripper_self_contact=prepared.gripper_profile.name.startswith(
+                "dmtac_bimanual_position_eg2_4b2_cad_"
+            ),
             realtime_worker=config.realtime_worker,
             follow_qpos_alpha=1.0,
         ),
     )
     safety_profile = CanonicalKeyframeSafetyProfile(
-        profile_id="control-station-mujoco-agent-skill-arms-safety-v1",
+        profile_id="control-station-mujoco-agent-skill-arm-gripper-safety-v1",
         limits=PositionKeyframeSafetyConfig(workspace_enabled=True),
-        hand_limits_by_side={},
+        hand_limits_by_side={
+            "right": HandQposSafetyLimits.uniform(
+                right_hand_spec,
+                lower=0.0,
+                upper=1.0,
+            )
+        },
     )
 
     def shared_safety(action: Any, input_id: str) -> Any:
@@ -138,7 +159,7 @@ def build_mujoco_agent_skill_motion_target(
             lambda captured_scene: capture_mujoco_sim_hil_safety_anchor(
                 captured_scene,
                 prepared.task_config,
-                {},
+                {"right": right_hand_spec},
                 now=time.monotonic(),
             )
         )

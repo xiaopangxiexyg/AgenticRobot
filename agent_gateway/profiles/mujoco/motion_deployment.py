@@ -40,9 +40,11 @@ from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorSet,
 )
 from agent_gateway.skills.motion.definition import (
+    CLOSE_GRIPPER_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+    OPEN_GRIPPER_SKILL_ID_V1,
     cardinal_tcp_step_skill_definition_v1,
     fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
@@ -82,6 +84,13 @@ from robot_motion.primitives import level_tcp_orientation
 from .depth_deployment import (
     MujocoDepthCaptureRegistration,
     build_mujoco_depth_capture_registration_v2,
+)
+from .gripper_deployment import (
+    MUJOCO_CLOSE_GRIPPER_ROUTE_ID_V1,
+    MUJOCO_OPEN_GRIPPER_ROUTE_ID_V1,
+    MujocoGripperActionRegistration,
+    MujocoGripperStateRegistration,
+    build_mujoco_gripper_registrations,
 )
 from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
@@ -676,6 +685,8 @@ class MujocoAgentTcpPoseContractBundle:
     payload_validators: AgentSkillPayloadValidatorRegistry
     station_manifest: ControlStationRunManifest
     execution_manifest: Any
+    gripper_actions: tuple[MujocoGripperActionRegistration, ...]
+    gripper_state: MujocoGripperStateRegistration
     depth_capture: MujocoDepthCaptureRegistration | None = None
     rgb_capture: MujocoRgbCaptureRegistration | None = None
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None
@@ -724,6 +735,54 @@ class MujocoAgentTcpPoseContractBundle:
                 rgb_capture.deployment_binding.semantic_content_hash
             ):
                 raise ValueError("RGB Route uses another deployment binding.")
+        gripper_actions = tuple(self.gripper_actions)
+        if len(gripper_actions) != 2 or any(
+            not isinstance(item, MujocoGripperActionRegistration)
+            for item in gripper_actions
+        ):
+            raise ValueError("Bundle requires exactly two MuJoCo gripper actions.")
+        if {item.skill.definition.skill_id for item in gripper_actions} != {
+            OPEN_GRIPPER_SKILL_ID_V1,
+            CLOSE_GRIPPER_SKILL_ID_V1,
+        }:
+            raise ValueError("Bundle requires exactly open and close gripper actions.")
+        if not isinstance(self.gripper_state, MujocoGripperStateRegistration):
+            raise TypeError("gripper_state must be a typed registration.")
+        for item in gripper_actions:
+            entry = self.route_manifest.route(
+                item.skill.definition.skill_id,
+                item.skill.definition.skill_version,
+            )
+            if entry.deployment_binding.deployment_binding_hash != (
+                item.binding.semantic_content_hash
+            ):
+                raise ValueError("Gripper Route uses another deployment binding.")
+            if entry.evaluation_plan_hash != (
+                item.evaluation_plan.semantic_content_hash
+            ):
+                raise ValueError("Gripper Route uses another evaluation plan.")
+            if item.binding.route_hash != item.skill.routes[0].semantic_content_hash:
+                raise ValueError("Gripper deployment uses another Route.")
+            if item.binding.profile_hash != item.profile.semantic_content_hash:
+                raise ValueError("Gripper deployment uses another profile.")
+        gripper_state_entry = self.route_manifest.route(
+            self.gripper_state.skill.definition.skill_id,
+            self.gripper_state.skill.definition.skill_version,
+        )
+        if gripper_state_entry.deployment_binding.deployment_binding_hash != (
+            self.gripper_state.binding.semantic_content_hash
+        ):
+            raise ValueError("Gripper-state Route uses another deployment binding.")
+        if gripper_state_entry.evaluation_plan_hash is not None:
+            raise ValueError("Gripper-state Route cannot use an evaluation plan.")
+        if self.gripper_state.binding.route_hash != (
+            self.gripper_state.skill.routes[0].semantic_content_hash
+        ):
+            raise ValueError("Gripper-state deployment uses another Route.")
+        if self.gripper_state.binding.profile_hash != (
+            self.gripper_state.profile.semantic_content_hash
+        ):
+            raise ValueError("Gripper-state deployment uses another profile.")
         if motion_entry.deployment_binding.deployment_binding_hash != (
             self.deployment_binding.semantic_content_hash
         ):
@@ -887,7 +946,8 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
         or config.enable_composer_authority
         or config.enable_replay_authority
         or config.initial_control_mode != "agent_skill"
-        or tuple(runtime.action_schema.component_ids) != ("right_arm",)
+        or tuple(runtime.action_schema.component_ids)
+        != ("right_arm", "right_gripper")
     ):
         raise ValueError("Runtime is not the exact no-model Agent motion profile.")
     target = ExecutionDomainBinding(
@@ -909,7 +969,6 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
         trace_requirement_profile_id=MUJOCO_AGENT_TCP_POSE_TRACE_PROFILE_ID_V1,
         explicit_exclusions=(
             "hardware_device_initialization",
-            "hand_control",
             "model_inference",
             "real_backend",
             "second_dispatch_owner",
@@ -966,7 +1025,6 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
                 ),
                 explicit_exclusions=(
                     "agent_selected_producer_identity",
-                    "hand_component",
                     "policy_lineage",
                     "raw_action_stream",
                     "second_dispatch_owner",
@@ -989,7 +1047,6 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
             "agent_rearm",
             "agent_resume",
             "hardware_device_initialization",
-            "hand_control",
             "model_inference",
             "real_motion",
             "second_dispatch_owner",
@@ -1002,7 +1059,6 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
             evidence_ids=(station.semantic_content_hash,),
         )
         for capability_id in (
-            "hand_control",
             "hardware_device_initialization",
             "human_motion_source",
             "model_inference",
@@ -1470,7 +1526,7 @@ def _state_validators(
     *,
     route: SkillExecutionRoute,
     schema_entry: Any,
-    exact: Mapping[str, str],
+    binding: MujocoPassiveTcpPoseStateDeploymentBinding,
 ) -> AgentSkillPayloadValidatorSet:
     parameter_fields = {
         "component_ids",
@@ -1490,7 +1546,7 @@ def _state_validators(
         )
         if tuple(payload["component_ids"]) != ("right_arm",):
             raise ValueError("TCP pose query must exactly select right_arm.")
-        if payload["reference_frame_id"] != exact["reference_frame_id"]:
+        if payload["reference_frame_id"] != binding.reference_frame_id:
             raise ValueError("TCP pose query reference frame mismatch.")
         age = payload["max_measurement_age_ms"]
         if (
@@ -1518,7 +1574,7 @@ def _state_validators(
         validate_result_for(
             {
                 "component_ids": ["right_arm"],
-                "reference_frame_id": exact["reference_frame_id"],
+                "reference_frame_id": binding.reference_frame_id,
                 "controlled_frame_id": "tool_tcp",
                 "max_measurement_age_ms": (
                     MUJOCO_AGENT_TCP_POSE_MAX_MEASUREMENT_AGE_MS_V1
@@ -1527,18 +1583,18 @@ def _state_validators(
             payload,
         )
         expected = {
-            "reference_frame_spec_hash": exact["reference_frame_spec_hash"],
-            "frame_graph_hash": exact["frame_graph_hash"],
-            "tool_config_hash": exact["tool_config_hash"],
-            "calibration_hash": exact["calibration_hash"],
-            "observation_binding_id": exact["observation_binding_id"],
-            "observation_plan_hash": exact["observation_plan_hash"],
+            "reference_frame_spec_hash": binding.reference_frame_spec_hash,
+            "frame_graph_hash": binding.frame_graph_hash,
+            "tool_config_hash": binding.tool_config_hash,
+            "calibration_hash": binding.calibration_hash,
+            "observation_binding_id": binding.observation_binding_id,
+            "observation_plan_hash": binding.observation_plan_hash,
         }
         for field_name, value in expected.items():
             if payload[field_name] != value:
                 raise ValueError(f"TCP pose result {field_name} mismatch.")
         if payload["pose_schema_hash_by_component"] != {
-            "right_arm": exact["pose_schema_hash"]
+            "right_arm": binding.pose_schema_hash
         }:
             raise ValueError("TCP pose result pose schema mismatch.")
 
@@ -1549,7 +1605,7 @@ def _state_validators(
     return AgentSkillPayloadValidatorSet(
         validator_id=(
             "payload-validator:mujoco-agent-passive-tcp-pose:"
-            + exact["runtime_session_id"]
+            + binding.runtime_session_id
         ),
         skill_id=route.skill_id,
         skill_version=route.skill_version,
@@ -2046,6 +2102,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         orientation_schemas.append(orientation_schema)
         orientation_routes.append(orientation_route)
     safety_runtime = getattr(application, "tcp_pose_envelope_runtime", None)
+
     def safety_envelope_refs_for_route(
         route_id: str,
     ) -> tuple[SkillDeploymentSafetyEnvelopeRef, ...]:
@@ -2067,6 +2124,24 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 "Each Agent motion Route requires exactly one lower safety envelope."
             )
         return refs
+    open_gripper, close_gripper, gripper_state = build_mujoco_gripper_registrations(
+        gripper_name=str(application.task_config.right_gripper_name),
+        clock_domain_id=exact["clock_domain_id"],
+        runtime_session_id=exact["runtime_session_id"],
+        control_domain_id=exact["control_domain_id"],
+        target_binding_id=target_binding.binding_id,
+        station_manifest_hash=station.semantic_content_hash,
+        execution_manifest_hash=execution.semantic_content_hash,
+        safety_envelope_refs_by_route_id={
+            route_id: safety_envelope_refs_for_route(route_id)
+            for route_id in (
+                MUJOCO_OPEN_GRIPPER_ROUTE_ID_V1,
+                MUJOCO_CLOSE_GRIPPER_ROUTE_ID_V1,
+            )
+        },
+        physics_ticks_per_control_cycle=max(1, round(physics_hz / decision_hz)),
+    )
+    gripper_actions = (open_gripper, close_gripper)
     binding = MujocoAgentTcpPoseDeploymentBinding(
         deployment_binding_id=(
             "sim.mujoco.agent_tcp_pose:" + exact["runtime_session_id"]
@@ -2100,7 +2175,6 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         trace_requirement_profile_id=station.trace_requirement_profile_id,
         executor_id=MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1,
         explicit_exclusions=(
-            "hand_control",
             "hardware_backend",
             "model_inference",
             "requested_duration",
@@ -2145,7 +2219,6 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         executor_id=MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
         explicit_exclusions=(
             "agent_authored_distance",
-            "hand_control",
             "hardware_backend",
             "model_inference",
             "second_dispatch_owner",
@@ -2288,7 +2361,6 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             explicit_exclusions=(
                 "agent_authored_direction",
                 "agent_authored_distance",
-                "hand_control",
                 "hardware_backend",
                 "model_inference",
                 "second_dispatch_owner",
@@ -2397,7 +2469,6 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             ),
             explicit_exclusions=(
                 "agent_authored_angle",
-                "hand_control",
                 "hardware_backend",
                 "model_inference",
                 "relative_rotation",
@@ -2704,6 +2775,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if rgb_capture is not None:
         definition_items.append(rgb_capture.registration.definition)
         schema_items.append(rgb_capture.registration.schema_entry)
+    for item in (*gripper_actions, gripper_state):
+        definition_items.append(item.skill.definition)
+        schema_items.append(item.skill.schema_entry)
     definitions = SkillDefinitionCatalog(
         catalog_id="dexteleop.agent_skill_definitions.agent_tcp_pose_session",
         catalog_version="1",
@@ -2866,11 +2940,28 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=rgb_capture.availability_hash,
             )
         )
+    for item in gripper_actions:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=item.skill.routes[0],
+                deployment_binding=item.binding.to_ref(),
+                evaluation_plan_hash=item.evaluation_plan.semantic_content_hash,
+                availability_hash=item.availability_hash,
+            )
+        )
+    route_items.append(
+        SkillRouteManifestEntry(
+            route=gripper_state.skill.routes[0],
+            deployment_binding=gripper_state.binding.to_ref(),
+            evaluation_plan_hash=None,
+            availability_hash=gripper_state.availability_hash,
+        )
+    )
     io_contract_by_skill = {}
     for item in route_items:
         route_item = item.route
         key = (route_item.skill_id, route_item.skill_version)
-        artifact_contracts = tuple(
+        explicit_contracts = tuple(
             registration.registration.io_contract
             for registration in (depth_capture, rgb_capture)
             if registration is not None
@@ -2880,9 +2971,18 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 registration.registration.definition.skill_version,
             )
         )
+        explicit_contracts += tuple(
+            registration.skill.io_contract
+            for registration in (*gripper_actions, gripper_state)
+            if key
+            == (
+                registration.skill.definition.skill_id,
+                registration.skill.definition.skill_version,
+            )
+        )
         contract = (
-            artifact_contracts[0]
-            if artifact_contracts
+            explicit_contracts[0]
+            if explicit_contracts
             else inline_only_skill_io_contract(
                 skill_id=route_item.skill_id,
                 skill_version=route_item.skill_version,
@@ -2920,19 +3020,13 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "own_operation_status_v1",
             "idempotency_v1",
             "authoritative_port_receipt_v1",
-            *(
-                ("safety_profile_selection_v1",)
-                if getattr(application, "tcp_pose_envelope_runtime", None)
-                is not None
-                else ()
-            ),
+            *(("safety_profile_selection_v1",) if safety_runtime is not None else ()),
         ),
         skill_routes=tuple(route_items),
         explicit_exclusions=(
             "agent_estop",
             "agent_rearm",
             "agent_resume",
-            "hand_control",
             "hardware_backend",
             "model_inference",
             "raw_action_submission",
@@ -2952,7 +3046,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         _state_validators(
             route=state_route,
             schema_entry=state_schema,
-            exact=exact,
+            binding=state_binding,
         ),
     ]
     validator_items[2:2] = [
@@ -2997,6 +3091,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(depth_capture.payload_validator)
     if rgb_capture is not None:
         validator_items.append(rgb_capture.payload_validator)
+    validator_items.extend(item.payload_validator for item in gripper_actions)
+    validator_items.append(gripper_state.payload_validator)
     validators = AgentSkillPayloadValidatorRegistry(
         registry_id=(
             "dexteleop.agent_skill_payload_validators.agent_tcp_pose_session:"
@@ -3021,6 +3117,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         payload_validators=validators,
         station_manifest=station,
         execution_manifest=execution,
+        gripper_actions=gripper_actions,
+        gripper_state=gripper_state,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
         history_profile=history_profile,

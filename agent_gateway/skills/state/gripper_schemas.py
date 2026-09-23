@@ -154,7 +154,8 @@ def validate_read_gripper_state_parameters_v1(
         "max_measurement_age_ms",
     }:
         raise ValueError(
-            "Gripper-state parameters require exactly component_ids and max_measurement_age_ms."
+            "Gripper-state parameters require exactly component_ids and "
+            "max_measurement_age_ms."
         )
     requested = payload["component_ids"]
     if (

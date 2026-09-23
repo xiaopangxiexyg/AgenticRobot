@@ -17,8 +17,8 @@ def read_gripper_state_definition_v1(
         skill_version="1",
         skill_kind="inspection",
         summary=(
-            "Read fresh measured gripper close fractions without refreshing "
-            "hardware or changing downstream control state."
+            "Read fresh measured gripper close fractions without commanding "
+            "motion or changing downstream control state."
         ),
         intended_target_kind="target_agnostic",
         cross_target_deployment_policy="not_applicable",

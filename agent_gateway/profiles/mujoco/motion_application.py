@@ -34,7 +34,6 @@ from sim.mujoco.depth_snapshot import (
 )
 from sim.mujoco.rgb_snapshot import EncodedMujocoRgbSnapshot, MujocoRgbSnapshotSource
 
-
 def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string.")
@@ -97,10 +96,11 @@ class MujocoAgentSkillMotionApplication:
             or getattr(runtime.config, "initial_control_mode", None)
             != "agent_skill"
             or tuple(getattr(runtime.action_schema, "component_ids", ()))
-            != ("right_arm",)
+            != ("right_arm", "right_gripper")
         ):
             raise ValueError(
-                "Motion application requires the exact right-arm Agent Skill runtime."
+                "Motion application requires the exact right-arm/right-gripper "
+                "Agent Skill runtime."
             )
         self.target = target
         self.task_config = target.task_config
@@ -125,6 +125,7 @@ class MujocoAgentSkillMotionApplication:
         self._held = False
         self._closed = False
         self._active_operation_id: str | None = None
+        self._active_tcp_safety_operation_id: str | None = None
         self._visual_snapshot_source = MujocoRgbSnapshotSource(
             capture_scene=self._capture_visual_scene,
             clock=self.runtime.clock,
@@ -284,6 +285,9 @@ class MujocoAgentSkillMotionApplication:
                     )
                 raise
             self._active_operation_id = normalized_id
+            self._active_tcp_safety_operation_id = (
+                normalized_id if safety_activation is not None else None
+            )
             self._held = False
             if safety_activation is None:
                 return transition
@@ -343,29 +347,115 @@ class MujocoAgentSkillMotionApplication:
             )
             return MujocoAgentSkillMotionStep(admission, step)
 
+    def _capture_arm_gripper_state_from_scene(
+        self,
+        scene: Any,
+    ) -> Mapping[str, object]:
+        if not bool(scene.state_is_finite()):
+            raise RuntimeError("MuJoCo scene state is non-finite.")
+        poses = capture_mujoco_sim_hil_tool_tcp_pose_by_side(
+            scene,
+            self.task_config,
+        )
+        vector = pose_matrix_to_xyzquat(poses["right"])
+        if vector is None:
+            raise RuntimeError("right_arm TCP pose is not representable.")
+        arm = tuple(float(item) for item in vector)
+        if len(arm) != 7 or not all(math.isfinite(item) for item in arm):
+            raise RuntimeError("right_arm TCP pose is invalid.")
+        name = str(self.task_config.right_gripper_name)
+        qpos = tuple(float(value) for value in scene.get_gripper_qpos(name))
+        close = float(scene.get_gripper_close(name))
+        if not qpos or not all(math.isfinite(value) for value in qpos):
+            raise RuntimeError("right_gripper qpos is invalid.")
+        if not math.isfinite(close) or not 0.0 <= close <= 1.0:
+            raise RuntimeError("right_gripper close fraction is invalid.")
+        return {
+            "right_arm": arm,
+            "right_gripper": {
+                "qpos": qpos,
+                "close_fraction": close,
+                "measured_at": float(self.runtime.clock()),
+                "state_source": "mujoco_measured_joint_state",
+            },
+        }
+
     def capture_tcp_pose_by_component(self) -> Mapping[str, tuple[float, ...]]:
         """Capture measured TCP state under the application/rig lock."""
 
         with self._lock:
             if self._closed:
                 raise RuntimeError("Agent motion application is closed.")
+            captured = self.runtime.rig.capture_scene(
+                self._capture_arm_gripper_state_from_scene
+            )
+            return {"right_arm": tuple(captured["right_arm"])}
 
-            def capture(scene: Any) -> Mapping[str, tuple[float, ...]]:
-                if not bool(scene.state_is_finite()):
-                    raise RuntimeError("MuJoCo scene state is non-finite.")
-                poses = capture_mujoco_sim_hil_tool_tcp_pose_by_side(
-                    scene,
-                    self.task_config,
+    def capture_gripper_state_by_component(self) -> Mapping[str, Mapping[str, object]]:
+        """Capture physical gripper qpos and normalized close under the rig lock."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+            captured = self.runtime.rig.capture_scene(
+                self._capture_arm_gripper_state_from_scene
+            )
+            return {"right_gripper": dict(captured["right_gripper"])}
+
+    def gripper_qpos_for_close(self, close_fraction: float) -> tuple[float, ...]:
+        """Resolve a normalized endpoint through the bound scene geometry."""
+
+        close = float(close_fraction)
+        if not math.isfinite(close) or not 0.0 <= close <= 1.0:
+            raise ValueError("close_fraction must lie in [0, 1].")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+
+            def capture(scene: Any) -> tuple[float, ...]:
+                values = tuple(
+                    float(value)
+                    for value in scene.gripper_qpos_from_close(
+                        str(self.task_config.right_gripper_name),
+                        close,
+                    )
                 )
-                vector = pose_matrix_to_xyzquat(poses["right"])
-                if vector is None:
-                    raise RuntimeError("right_arm TCP pose is not representable.")
-                values = tuple(float(item) for item in vector)
-                if len(values) != 7 or not all(math.isfinite(item) for item in values):
-                    raise RuntimeError("right_arm TCP pose is invalid.")
-                return {"right_arm": values}
+                if not values or not all(math.isfinite(value) for value in values):
+                    raise RuntimeError("Resolved right_gripper qpos is invalid.")
+                return values
 
             return self.runtime.rig.capture_scene(capture)
+
+    def complete_component_action(
+        self,
+        values_by_component: Mapping[str, object],
+    ) -> ComponentAction:
+        """Fill unchanged support components from one application-locked cut."""
+
+        provided = dict(values_by_component)
+        runtime_components = tuple(self.runtime.action_schema.component_ids)
+        unknown = set(provided) - set(runtime_components)
+        if unknown:
+            raise ValueError(f"Unknown Agent component values: {sorted(unknown)}.")
+        if "right_gripper" not in runtime_components:
+            return ComponentAction(
+                action_schema=self.runtime.action_schema,
+                values_by_component=provided,
+            )
+        with self._lock:
+            captured = self.runtime.rig.capture_scene(
+                self._capture_arm_gripper_state_from_scene
+            )
+            gripper = captured["right_gripper"]
+            complete = {
+                "right_arm": captured["right_arm"],
+                "right_gripper": gripper["qpos"],
+                **provided,
+            }
+            return ComponentAction(
+                action_schema=self.runtime.action_schema,
+                values_by_component=complete,
+            )
 
     def transform_tcp_pose_xyzquat(
         self,
@@ -469,7 +559,12 @@ class MujocoAgentSkillMotionApplication:
                 ),
                 force_cancellation=True,
             )
-            if self.tcp_pose_envelope_runtime is not None:
+            if self._active_tcp_safety_operation_id is not None:
+                safety_operation_id = self._active_tcp_safety_operation_id
+                if operation_id is not None and operation_id != safety_operation_id:
+                    raise TCPPoseEnvelopeLifecycleError(
+                        "TCP safety operation identity mismatch during HOLD"
+                    )
                 receiver = self.runtime.authoritative_port.capture_receiver_state()
                 hold_refs = tuple(getattr(transition, "lower_event_ids", ()))
                 if not hold_refs:
@@ -477,10 +572,11 @@ class MujocoAgentSkillMotionApplication:
                         "lower HOLD did not provide envelope deactivation evidence"
                     )
                 self.tcp_pose_envelope_runtime.deactivate_after_hold(
-                    operation_id=operation_id,
+                    operation_id=safety_operation_id,
                     next_execution_epoch=int(receiver.current_execution_epoch),
                     hold_evidence_ids=hold_refs,
                 )
+                self._active_tcp_safety_operation_id = None
             self._held = True
             return transition
 

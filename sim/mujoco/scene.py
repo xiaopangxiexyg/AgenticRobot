@@ -886,6 +886,16 @@ class MujocoScene:
         spec = self.gripper_specs[self._resolve_gripper_name(name)]
         return spec.close_from_qpos(self.get_gripper_qpos(spec.name))
 
+    def gripper_qpos_from_close(
+        self,
+        name: str | None,
+        close: float,
+    ) -> np.ndarray:
+        """Project a normalized close fraction through scene gripper geometry."""
+
+        spec = self.gripper_specs[self._resolve_gripper_name(name)]
+        return np.asarray(spec.qpos_from_close(close), dtype=float)
+
     def set_gripper_close(self, name: str | None, close: float) -> None:
         """Teleport gripper close state for reset/replay; no safety projection."""
         spec = self.gripper_specs[self._resolve_gripper_name(name)]

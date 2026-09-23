@@ -442,11 +442,10 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self.action: ComponentAction | None = (
             None
             if self.target_pose is None
-            else ComponentAction(
-                action_schema=application.runtime.action_schema,
-                values_by_component={
+            else application.complete_component_action(
+                {
                     component_id: np.asarray(self.target_pose, dtype=np.float32),
-                },
+                }
             )
         )
         self.clock = clock
@@ -495,11 +494,10 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 fraction,
             ),
         )
-        return ComponentAction(
-            action_schema=self.application.runtime.action_schema,
-            values_by_component={
+        return self.application.complete_component_action(
+            {
                 self.component_id: np.asarray(reference_pose, dtype=np.float32),
-            },
+            }
         )
 
     def _measured_translation_excursion_exceeded(
@@ -576,14 +574,13 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 source_frame_id=self.motion_profile.execution_reference_frame_id,
                 target_frame_id=self.motion_profile.reference_frame_id,
             )
-            self.action = ComponentAction(
-                action_schema=self.application.runtime.action_schema,
-                values_by_component={
+            self.action = self.application.complete_component_action(
+                {
                     self.component_id: np.asarray(
                         self.target_pose,
                         dtype=np.float32,
                     ),
-                },
+                }
             )
             with self._lock:
                 self._execution_refs.update(resolution.evidence_refs)

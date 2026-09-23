@@ -57,8 +57,10 @@ from agent_gateway.runtime.station_operation_worker import (
     StationOperationWorkerBinding,
 )
 from agent_gateway.skills.motion.definition import (
+    CLOSE_GRIPPER_SKILL_ID_V1,
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
+    OPEN_GRIPPER_SKILL_ID_V1,
 )
 from agent_gateway.skills.perception.definition import (
     CAPTURE_DEPTH_SKILL_ID_V1,
@@ -83,6 +85,7 @@ from collection_runtime.source_observation_history import (
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .depth_deployment import MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1
+from .gripper_skill import build_mujoco_gripper_action_executor
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import MujocoAgentTcpPoseContractBundle
 from .motion_skill import (
@@ -128,7 +131,11 @@ class MujocoAgentTcpPoseGatewaySession:
     fixed_orientation_executors: Mapping[
         str, ReusableStationAgentSkillOperationExecutor
     ]
+    gripper_action_executors: Mapping[
+        str, ReusableStationAgentSkillOperationExecutor
+    ]
     state_executor: PassiveReadSkillExecutor
+    gripper_state_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor | None
     rgb_executor: PassiveReadSkillExecutor | None
     history_provider: MujocoAgentTcpPoseHistoryProvider | None
@@ -173,6 +180,13 @@ class MujocoAgentTcpPoseGatewaySession:
         ):
             raise ValueError(
                 "fixed_orientation_executors must exactly cover three Skills."
+            )
+        if set(self.gripper_action_executors) != {
+            OPEN_GRIPPER_SKILL_ID_V1,
+            CLOSE_GRIPPER_SKILL_ID_V1,
+        }:
+            raise ValueError(
+                "gripper_action_executors must exactly cover open and close."
             )
         if not isinstance(self.owns_source_observation_history_store, bool):
             raise TypeError("owns_source_observation_history_store must be boolean.")
@@ -315,6 +329,13 @@ class MujocoAgentTcpPoseGatewaySession:
                 self.fixed_orientation_executors[skill_id]
                 for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
             ),
+            *tuple(
+                self.gripper_action_executors[skill_id]
+                for skill_id in (
+                    OPEN_GRIPPER_SKILL_ID_V1,
+                    CLOSE_GRIPPER_SKILL_ID_V1,
+                )
+            ),
         )
 
     def close(self) -> AgentGatewayOperationOutcome:
@@ -331,7 +352,11 @@ class MujocoAgentTcpPoseGatewaySession:
                 )
             perception_settled = all(
                 executor is None or executor.wait_all(timeout_sec=5.0)
-                for executor in (self.depth_executor, self.rgb_executor)
+                for executor in (
+                    self.gripper_state_executor,
+                    self.depth_executor,
+                    self.rgb_executor,
+                )
             )
             if not perception_settled:
                 raise RuntimeError(
@@ -540,6 +565,17 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     state_entry = contract_bundle.route_manifest.route(
         "state.read_tcp_pose",
         "1",
+    )
+    gripper_action_entry_by_skill_id = {
+        item.skill.definition.skill_id: contract_bundle.route_manifest.route(
+            item.skill.definition.skill_id,
+            item.skill.definition.skill_version,
+        )
+        for item in contract_bundle.gripper_actions
+    }
+    gripper_state_entry = contract_bundle.route_manifest.route(
+        contract_bundle.gripper_state.skill.definition.skill_id,
+        contract_bundle.gripper_state.skill.definition.skill_version,
     )
     history_entry = (
         contract_bundle.route_manifest.route(
@@ -922,6 +958,79 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         clock=runtime_clock,
         max_retained_operations=retention,
     )
+    gripper_action_executors = {
+        registration.skill.definition.skill_id: (
+            build_mujoco_gripper_action_executor(
+                application=application,
+                registration=registration,
+                current_station_revision=lambda: (
+                    observation_producer.current_station_revision
+                ),
+                clock=runtime_clock,
+            )
+        )
+        for registration in contract_bundle.gripper_actions
+    }
+
+    def read_gripper_state(request, operation) -> PassiveReadResult:
+        requested = tuple(sorted(request.parameters["component_ids"]))
+        captured = application.capture_gripper_state_by_component()
+        available_at = float(runtime_clock())
+        measured_at = {
+            component_id: float(captured[component_id]["measured_at"])
+            for component_id in requested
+        }
+        close_fraction = {
+            component_id: float(captured[component_id]["close_fraction"])
+            for component_id in requested
+        }
+        state_source = {
+            component_id: str(captured[component_id]["state_source"])
+            for component_id in requested
+        }
+        identity = canonical_content_hash(
+            {
+                "operation_id": operation.operation_id,
+                "component_ids": requested,
+                "measured_at_by_component": measured_at,
+                "close_fraction_by_component": close_fraction,
+                "state_source_by_component": state_source,
+                "available_at": available_at,
+            },
+            domain="dexteleop.agent_state.mujoco_gripper_measurement.v1",
+        )
+        profile = contract_bundle.gripper_state.profile
+        result = {
+            "component_ids": list(requested),
+            "station_revision": observation_producer.current_station_revision,
+            "measurement_id": "mujoco-gripper-measurement:" + identity,
+            "measurement_hash": identity,
+            "measured_at_by_component": measured_at,
+            "available_at": available_at,
+            "clock_domain_id": profile.clock_domain_id,
+            "close_fraction_by_component": close_fraction,
+            "state_source_by_component": state_source,
+            "observation_binding_id": profile.observation_binding_id,
+            "observation_binding_hash": profile.observation_binding_hash,
+        }
+        return PassiveReadResult(
+            execution_result=result,
+            evidence_refs=("mujoco-gripper-state-read:" + identity,),
+            reason_code="passive_gripper_state_read_completed",
+        )
+
+    gripper_state_executor = PassiveReadSkillExecutor(
+        port_id=(
+            "agent-gateway:passive-gripper-state:" + binding.runtime_session_id
+        ),
+        executor_id=contract_bundle.gripper_state.binding.executor_id,
+        read=read_gripper_state,
+        current_station_revision=lambda: (
+            observation_producer.current_station_revision
+        ),
+        clock=runtime_clock,
+        max_retained_operations=retention,
+    )
     depth_executor = None
     if depth_entry is not None and artifact_store is not None:
         depth_registration = contract_bundle.depth_capture
@@ -1169,7 +1278,16 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         motion_route.semantic_content_hash: motion_executor,
         cardinal_step_route.semantic_content_hash: cardinal_step_executor,
         state_entry.route.semantic_content_hash: state_executor,
+        gripper_state_entry.route.semantic_content_hash: gripper_state_executor,
     }
+    execution_port_by_route_hash.update(
+        {
+            gripper_action_entry_by_skill_id[
+                skill_id
+            ].route.semantic_content_hash: executor
+            for skill_id, executor in gripper_action_executors.items()
+        }
+    )
     execution_port_by_route_hash.update(
         {
             fixed_cardinal_entry_by_skill_id[
@@ -1312,7 +1430,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         cardinal_step_executor=cardinal_step_executor,
         fixed_cardinal_step_executors=fixed_cardinal_step_executors,
         fixed_orientation_executors=fixed_orientation_executors,
+        gripper_action_executors=gripper_action_executors,
         state_executor=state_executor,
+        gripper_state_executor=gripper_state_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
         history_provider=history_provider,

@@ -86,7 +86,9 @@ from sim.mujoco.deploy import (
     MujocoDirectComponentProposalSource,
     MujocoSimHILTargetConfig,
     build_mujoco_pose_component_target_profile,
+    build_mujoco_pose_qpos_component_target_profile,
 )
+from sim.mujoco.config import GripperSpec
 from sim.mujoco.depth_snapshot import EncodedMujocoDepthFrame
 from sim.mujoco.rgb_snapshot import (
     EncodedMujocoRgbFrame,
@@ -1333,7 +1335,30 @@ def _build_no_model_contract_bundle_fixture(
     *,
     enable_artifact_perception: bool = False,
 ):
-    _profile, action_schema = _profile_and_schema()
+    target_profile = build_mujoco_pose_qpos_component_target_profile(
+        SimpleNamespace(
+            arm_specs={"left": object(), "right": object()},
+            gripper_specs={
+                "right_gripper": GripperSpec(
+                    name="right_gripper",
+                    joint_names=("right_gripper_joint",),
+                    open_qpos=(0.0,),
+                    closed_qpos=(1.0,),
+                    side="right",
+                )
+            },
+        ),
+        profile_id="fixture.agent_tcp_pose.right_arm_gripper.v1",
+        arm_side_by_component={"right_arm": "right"},
+        gripper_name_by_component={"right_gripper": "right_gripper"},
+        arm_reference_frame_by_component={"right_arm": "right_arm_base"},
+        arm_controlled_frame_by_component={"right_arm": "tool_tcp"},
+        selection_group_by_component={
+            "right_arm": "arms",
+            "right_gripper": "right_gripper",
+        },
+    )
+    action_schema = target_profile.action_schema
     observation_plan = SimpleNamespace(
         enabled=True,
         reference_mode="full_frames",
@@ -1391,7 +1416,7 @@ def _build_no_model_contract_bundle_fixture(
         ),
         authoritative_port=SimpleNamespace(
             profile=SimpleNamespace(
-                selection_group_ids=("arms",),
+                selection_group_ids=("arms", "right_gripper"),
                 authority_policy_hash="authority-policy:fixture",
                 decision_schedule_hash="decision-schedule:fixture",
             ),
@@ -1440,7 +1465,10 @@ def _build_no_model_contract_bundle_fixture(
     )
     application = SimpleNamespace(
         runtime=runtime,
-        task_config=SimpleNamespace(physics_hz=1_000.0),
+        task_config=SimpleNamespace(
+            physics_hz=1_000.0,
+            right_gripper_name="right_gripper",
+        ),
         calibration_hash="calibration:agent-motion-bundle-fixture",
         target_frame_profile=SimpleNamespace(
             semantic_content_hash="target-frame-profile:fixture",
@@ -1551,6 +1579,12 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
             bundle.cardinal_step_profile.primitive_catalog_hash
         ),
     }
+    state_parameters = {
+        "component_ids": ["right_arm"],
+        "reference_frame_id": bundle.state_deployment_binding.reference_frame_id,
+        "controlled_frame_id": "tool_tcp",
+        "max_measurement_age_ms": 500,
+    }
 
     assert bundle.route_manifest.current_mode == "sim_active"
     assert motion_entry.route.control_effect_class == "motion"
@@ -1602,6 +1636,20 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         route=cardinal_step_entry.route,
         payload=cardinal_parameters,
     )
+    bundle.payload_validators.validate_parameters(
+        route=state_entry.route,
+        payload=state_parameters,
+    )
+    with pytest.raises(ValueError, match="reference frame mismatch"):
+        bundle.payload_validators.validate_parameters(
+            route=state_entry.route,
+            payload={
+                **state_parameters,
+                "reference_frame_id": (
+                    bundle.motion_profile.execution_reference_frame_id
+                ),
+            },
+        )
     for fixed_contract in bundle.fixed_cardinal_step_contracts:
         fixed_route = bundle.route_manifest.route(
             fixed_contract.skill_id,
@@ -1721,7 +1769,14 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         assert route_to_port[skill_id] is session.fixed_orientation_executors[
             skill_id
         ]
+    for skill_id in ("motion.open_gripper", "motion.close_gripper"):
+        assert route_to_port[skill_id] is session.gripper_action_executors[
+            skill_id
+        ]
     assert route_to_port["state.read_tcp_pose"] is session.state_executor
+    assert route_to_port["state.read_gripper_state"] is (
+        session.gripper_state_executor
+    )
     assert session.service.operation_store.max_retained_operations == 3
     assert session.service.operation_store.max_admissions_by_route_hash == {}
     assert not motion_application.started
@@ -1736,7 +1791,8 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert simulation["resource_kind"] == "simulation_runtime"
     assert simulation["properties"] == {"readable": True, "drivable": True}
     assert {item["skill_id"] for item in simulation["read_skill_refs"]} == {
-        "state.read_tcp_pose"
+        "state.read_gripper_state",
+        "state.read_tcp_pose",
     }
     assert "motion.step_tcp_forward" in {
         item["skill_id"] for item in simulation["drive_skill_refs"]
@@ -1766,6 +1822,38 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "station_hold_not_confirmed_no_active_operation"
     )
     assert motion_application.closed
+
+
+def test_gripper_contract_bundle_closes_action_identity_and_evaluation_plan(
+    monkeypatch,
+) -> None:
+    _application, _runtime, _direct, bundle, _captured_manifest_args = (
+        _build_no_model_contract_bundle_fixture(monkeypatch)
+    )
+    open_action, close_action = bundle.gripper_actions
+
+    with pytest.raises(ValueError, match="exactly open and close"):
+        replace(bundle, gripper_actions=(open_action, open_action))
+
+    changed_plan = replace(
+        open_action.evaluation_plan,
+        evaluation_plan_id="motion.gripper_open_endpoint_rule.mismatch",
+    )
+    with pytest.raises(ValueError, match="another evaluation plan"):
+        replace(
+            bundle,
+            gripper_actions=(
+                replace(open_action, evaluation_plan=changed_plan),
+                close_action,
+            ),
+        )
+
+    open_entry = bundle.route_manifest.route("motion.open_gripper", "1")
+    with pytest.raises(ValueError, match="not allowed"):
+        bundle.payload_validators.validate_parameters(
+            route=open_entry.route,
+            payload={"component_id": "left_gripper"},
+        )
 
 
 def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
@@ -1871,6 +1959,7 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     } == {
         "perception.capture_depth",
         "perception.capture_rgb",
+        "state.read_gripper_state",
         "state.read_tcp_pose",
     }
     capabilities = session.service.protocol_runtime.session_capabilities

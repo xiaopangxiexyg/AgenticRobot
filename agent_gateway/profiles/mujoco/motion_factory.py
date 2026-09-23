@@ -20,6 +20,7 @@ from collection_runtime.source_observation_history import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ExecutionObservationPlan
+from robot_motion.action import HandActionSpec
 from robot_motion.target_safety import (
     TCPPoseEnvelopeCatalogEntry,
     TCPPoseEnvelopeProfile,
@@ -32,13 +33,17 @@ from sim.mujoco.deploy import (
     MujocoSimHILTargetConfig,
     build_mujoco_agent_skill_motion_target,
     build_mujoco_component_execution_binding,
-    build_mujoco_pose_component_target_profile,
+    build_mujoco_pose_qpos_component_target_profile,
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
     prepare_mujoco_sim_hil_target,
 )
 from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
 
 from .motion_application import MujocoAgentSkillMotionApplication
+from .gripper_deployment import (
+    MUJOCO_CLOSE_GRIPPER_ROUTE_ID_V1,
+    MUJOCO_OPEN_GRIPPER_ROUTE_ID_V1,
+)
 from .motion_deployment import (
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
@@ -72,6 +77,9 @@ MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1 = (
 )
 MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1 = (
     "mujoco.agent_tcp_pose.safety.fixed_orientation.v1"
+)
+MUJOCO_AGENT_GRIPPER_ARM_HOLD_ENVELOPE_ID_V1 = (
+    "mujoco.agent_gripper.safety.arm_hold.v1"
 )
 
 
@@ -327,8 +335,45 @@ def _build_standard_tcp_pose_envelope_runtime(
             MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()
         ),
     )
+    gripper_arm_hold_profile = TCPPoseEnvelopeProfile(
+        profile_id="mujoco-agent-gripper-arm-hold-envelope-v1",
+        target_frame_binding_hash=target_binding_hash,
+        tool_frame_binding_hash_by_side={"right": tool_binding_hash},
+        reference_frame_by_side={"right": reference_frame},
+        side_config_by_side={
+            "right": TCPPoseEnvelopeSideConfig(
+                absolute_min_xyz_m=(bounds[0], bounds[2], bounds[4]),
+                absolute_max_xyz_m=(bounds[1], bounds[3], bounds[5]),
+                relative_min_xyz_m=(0.0, 0.0, 0.0),
+                relative_max_xyz_m=(0.0, 0.0, 0.0),
+                relative_axes="canonical_axes",
+                max_rotation_rad=0.0,
+            )
+        },
+    )
+    gripper_constraint_set_hash = canonical_content_hash(
+        {
+            "tcp_pose_envelope_profile_hash": (
+                gripper_arm_hold_profile.semantic_content_hash
+            ),
+            "gripper_only_motion": True,
+            "arm_translation_must_equal_activation_anchor": True,
+            "arm_rotation_must_equal_activation_anchor": True,
+            "canonical_keyframe_safety_retained": True,
+        },
+        domain="dexteleop.mujoco.agent_gripper_arm_hold_constraint_set.v1",
+    )
+    gripper_entry = TCPPoseEnvelopeCatalogEntry(
+        envelope_id=MUJOCO_AGENT_GRIPPER_ARM_HOLD_ENVELOPE_ID_V1,
+        profile=gripper_arm_hold_profile,
+        constraint_set_hash=gripper_constraint_set_hash,
+        allowed_route_ids=(
+            MUJOCO_OPEN_GRIPPER_ROUTE_ID_V1,
+            MUJOCO_CLOSE_GRIPPER_ROUTE_ID_V1,
+        ),
+    )
     return TCPPoseEnvelopeSafetyRuntime(
-        catalog_entries=(standard_entry, orientation_entry),
+        catalog_entries=(standard_entry, orientation_entry, gripper_entry),
         target_frame_binding_hash=target_binding_hash,
         tool_frame_binding_hash_by_side={"right": tool_binding_hash},
         reference_frame_by_side={"right": reference_frame},
@@ -365,13 +410,19 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         )
     validate_mujoco_agent_tcp_pose_target_config(target_config)
     prepared = prepare_mujoco_sim_hil_target(target_config)
-    component_profile = build_mujoco_pose_component_target_profile(
+    component_profile = build_mujoco_pose_qpos_component_target_profile(
         prepared.scene,
         profile_id=MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1,
         arm_side_by_component={"right_arm": "right"},
+        gripper_name_by_component={
+            "right_gripper": str(prepared.task_config.right_gripper_name)
+        },
         arm_reference_frame_by_component={"right_arm": "right_arm_base"},
         arm_controlled_frame_by_component={"right_arm": "tool_tcp"},
-        selection_group_by_component={"right_arm": "arms"},
+        selection_group_by_component={
+            "right_arm": "arms",
+            "right_gripper": "right_gripper",
+        },
     )
     runtime_rig_holder: dict[str, Any] = {}
 
@@ -393,7 +444,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     materializer = MujocoComponentActionRobotActionV1Materializer(
         prepared.scene,
         component_profile,
-        hand_action_spec_by_component={},
+        hand_action_spec_by_component={
+            "right_gripper": HandActionSpec.dmtac_gripper("right")
+        },
         support_arm_pose_provider=capture_support_arm_pose,
         support_arm_sides=("left",),
         support_pose_contract_id=(
@@ -509,6 +562,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
 
 __all__ = [
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1",
+    "MUJOCO_AGENT_GRIPPER_ARM_HOLD_ENVELOPE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_CALIBRATION_HASH_DOMAIN_V1",
     "MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_OBSERVATION_PLAN_ID_V1",
