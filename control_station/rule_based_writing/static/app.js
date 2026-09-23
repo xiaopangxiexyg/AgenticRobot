@@ -2,6 +2,85 @@ const text = (id, value) => {
   document.getElementById(id).textContent = value == null || value === "" ? "—" : String(value);
 };
 
+const diagnosticApi = window.RuleWritingDiagnostics;
+
+function diagnosticBadge(label, kind) {
+  const badge = document.createElement("span");
+  badge.className = `diagnostic-badge diagnostic-badge-${kind}`;
+  badge.textContent = label;
+  return badge;
+}
+
+function renderActiveDiagnostics(state) {
+  const diagnostics = diagnosticApi.buildActiveDiagnostics(state);
+  const container = document.getElementById("active-diagnostics");
+  const empty = document.getElementById("diagnostics-empty");
+  empty.hidden = diagnostics.length !== 0;
+  text(
+    "diagnostics-summary",
+    diagnostics.length
+      ? `${diagnostics.length} 项活动问题 · 优先处理 ${diagnostics[0].severityLabel}`
+      : "0 项活动问题",
+  );
+  container.replaceChildren(...diagnostics.map((diagnostic) => {
+    const card = document.createElement("article");
+    card.className = `diagnostic-card severity-${diagnostic.severity}`;
+
+    const badges = document.createElement("div");
+    badges.className = "diagnostic-badges";
+    badges.append(
+      diagnosticBadge(diagnostic.severityLabel, `severity-${diagnostic.severity}`),
+      diagnosticBadge(diagnostic.domainLabel, "domain"),
+      diagnosticBadge(diagnostic.componentLabel, "component"),
+    );
+
+    const heading = document.createElement("h3");
+    heading.textContent = `${diagnostic.domainLabel} · ${diagnostic.componentLabel}`;
+    const summary = document.createElement("p");
+    summary.className = "diagnostic-summary";
+    summary.textContent = diagnostic.summary;
+    const action = document.createElement("p");
+    action.className = "diagnostic-action";
+    const actionLabel = document.createElement("strong");
+    actionLabel.textContent = `${diagnostic.recovery.label}：`;
+    action.append(actionLabel, document.createTextNode(diagnostic.recovery.instruction));
+    const evidence = document.createElement("details");
+    const evidenceTitle = document.createElement("summary");
+    evidenceTitle.textContent = "查看原始证据";
+    const evidenceBody = document.createElement("pre");
+    evidenceBody.textContent = diagnostic.evidence;
+    evidence.append(evidenceTitle, evidenceBody);
+    card.append(badges, heading, summary, action, evidence);
+    return card;
+  }));
+}
+
+function renderMessageHistory(messages) {
+  const list = document.getElementById("messages");
+  list.replaceChildren(...(messages || []).slice(-12).map((message) => {
+    const diagnostic = diagnosticApi.classifyDiagnostic({
+      tag: message.tag,
+      message: message.message,
+      source: "message",
+    });
+    const item = document.createElement("li");
+    item.className = `message-entry severity-${diagnostic.severity}`;
+    const heading = document.createElement("div");
+    heading.className = "message-heading";
+    heading.append(
+      diagnosticBadge(diagnostic.severityLabel, `severity-${diagnostic.severity}`),
+      diagnosticBadge(diagnostic.componentLabel, "component"),
+    );
+    const tag = document.createElement("strong");
+    tag.textContent = message.tag;
+    heading.append(tag);
+    const body = document.createElement("p");
+    body.textContent = message.message;
+    item.append(heading, body);
+    return item;
+  }));
+}
+
 const pendingRequests = new Set();
 
 async function postJson(path, payload, key) {
@@ -516,14 +595,8 @@ async function refresh() {
           : "Debug 诊断：关闭。",
   );
   document.getElementById("quit").disabled = Boolean(state.shutdown);
-  const list = document.getElementById("messages");
-  list.replaceChildren(...(state.messages || []).slice(-12).map((message) => {
-    const item = document.createElement("li");
-    const tag = document.createElement("strong");
-    tag.textContent = message.tag;
-    item.append(tag, document.createTextNode(` ${message.message}`));
-    return item;
-  }));
+  renderActiveDiagnostics(state);
+  renderMessageHistory(state.messages);
   refreshInFlight = false;
   } finally {
     refreshInFlight = false;
