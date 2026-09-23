@@ -14,6 +14,8 @@ import numpy as np
 
 from robot_motion.transforms import as_pose_matrix
 
+from ._viewer_geometry import write_segment, write_sphere
+
 
 _PATH_NAMES = ("raw", "effective", "actual")
 _PATH_COLORS = {
@@ -194,7 +196,7 @@ class TcpPoseEnvelopeVisualizer:
                 poses = self.trajectory_pose_world_by_kind[kind]
                 color = _PATH_COLORS[kind]
                 for start, end in zip(poses[:-1], poses[1:]):
-                    self._write_segment(
+                    write_segment(
                         scene.geoms[cursor],
                         start=start[:3, 3],
                         end=end[:3, 3],
@@ -204,10 +206,12 @@ class TcpPoseEnvelopeVisualizer:
                     )
                     cursor += 1
             for kind in _PATH_NAMES:
-                self._write_position(
+                write_sphere(
                     scene.geoms[cursor],
-                    pose=self.trajectory_pose_world_by_kind[kind][index],
-                    kind=kind,
+                    position=self.trajectory_pose_world_by_kind[kind][index][:3, 3],
+                    radius=float(self.config.pose_origin_radius_m),
+                    rgba=_PATH_COLORS[kind],
+                    label=f"{kind}_tcp_position",
                 )
                 cursor += self._POSITION_GEOMS
             for kind in _PATH_NAMES:
@@ -261,7 +265,7 @@ class TcpPoseEnvelopeVisualizer:
             (4, 5), (4, 6),
             (5, 7), (6, 7),
         ):
-            self._write_segment(
+            write_segment(
                 scene.geoms[cursor],
                 start=corners[first],
                 end=corners[second],
@@ -299,7 +303,7 @@ class TcpPoseEnvelopeVisualizer:
             )
             label = f"tcp_orientation_{'xyz'[axis_index]}_cone"
             for boundary_index, point in enumerate(circle):
-                self._write_segment(
+                write_segment(
                     scene.geoms[cursor],
                     start=origin,
                     end=point,
@@ -309,7 +313,7 @@ class TcpPoseEnvelopeVisualizer:
                 )
                 cursor += 1
             for point, successor in zip(circle, circle[1:] + circle[:1]):
-                self._write_segment(
+                write_segment(
                     scene.geoms[cursor],
                     start=point,
                     end=successor,
@@ -365,71 +369,6 @@ class TcpPoseEnvelopeVisualizer:
         y = np.cross(z, x)
         return np.column_stack((x, y, z))
 
-    @staticmethod
-    def _write_segment(
-        geom,
-        *,
-        start: np.ndarray,
-        end: np.ndarray,
-        radius: float,
-        rgba: np.ndarray,
-        label: str,
-    ) -> None:
-        import mujoco
-
-        start_point = np.asarray(start, dtype=float)
-        end_point = np.asarray(end, dtype=float)
-        if float(np.linalg.norm(end_point - start_point)) <= 1e-12:
-            mujoco.mjv_initGeom(
-                geom,
-                mujoco.mjtGeom.mjGEOM_SPHERE,
-                np.array([radius, radius, radius], dtype=float),
-                start_point,
-                np.eye(3, dtype=float).reshape(-1),
-                rgba,
-            )
-        else:
-            mujoco.mjv_initGeom(
-                geom,
-                mujoco.mjtGeom.mjGEOM_CAPSULE,
-                np.zeros(3, dtype=float),
-                np.zeros(3, dtype=float),
-                np.eye(3, dtype=float).reshape(-1),
-                rgba,
-            )
-            mujoco.mjv_connector(
-                geom,
-                mujoco.mjtGeom.mjGEOM_CAPSULE,
-                radius,
-                start_point,
-                end_point,
-            )
-            geom.rgba = rgba
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = label
-
-    def _write_position(
-        self,
-        geom,
-        *,
-        pose: np.ndarray,
-        kind: str,
-    ) -> None:
-        import mujoco
-
-        origin = pose[:3, 3]
-        radius = float(self.config.pose_origin_radius_m)
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_SPHERE,
-            np.array([radius, radius, radius], dtype=float),
-            origin,
-            np.eye(3, dtype=float).reshape(-1),
-            _PATH_COLORS[kind],
-        )
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = f"{kind}_tcp_position"
-
     def _write_orientation_directions(
         self,
         scene,
@@ -442,7 +381,7 @@ class TcpPoseEnvelopeVisualizer:
         length = float(self.config.orientation_cone_length_m)
         for axis_index in range(3):
             endpoint = origin + pose[:3, axis_index] * length
-            self._write_segment(
+            write_segment(
                 scene.geoms[cursor],
                 start=origin,
                 end=endpoint,

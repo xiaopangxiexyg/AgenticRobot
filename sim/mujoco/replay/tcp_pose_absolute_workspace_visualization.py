@@ -26,6 +26,8 @@ from robot_motion.target_safety.tcp_pose_envelope import (
 from robot_motion.transforms import as_pose_matrix
 from sim.mujoco.urdf import URDFModel, URDFVisual, parse_urdf
 
+from ._viewer_geometry import write_segment, write_sphere
+
 
 PREVIEW_SCHEMA_VERSION = "sim_real_tests.tcp_pose_absolute_workspace_preview.v1"
 PREVIEW_PROFILE_NAMES = (
@@ -694,7 +696,7 @@ class AbsoluteWorkspaceVisualizer:
                 ),
             ):
                 for start, end in zip(poses[:-1], poses[1:]):
-                    self._write_segment(
+                    write_segment(
                         scene.geoms[cursor],
                         start=start[:3, 3],
                         end=end[:3, 3],
@@ -706,7 +708,7 @@ class AbsoluteWorkspaceVisualizer:
             raw_pose = self.raw_pose_world[index]
             effective_pose = self.effective_pose_world[index]
             actual_pose = self.actual_pose_world[index]
-            self._write_sphere(
+            write_sphere(
                 scene.geoms[cursor],
                 position=raw_pose[:3, 3],
                 radius=float(self.config.point_radius_m),
@@ -714,7 +716,7 @@ class AbsoluteWorkspaceVisualizer:
                 label="absolute_workspace_raw_tcp",
             )
             cursor += 1
-            self._write_sphere(
+            write_sphere(
                 scene.geoms[cursor],
                 position=effective_pose[:3, 3],
                 radius=float(self.config.point_radius_m),
@@ -727,7 +729,7 @@ class AbsoluteWorkspaceVisualizer:
                 label="absolute_workspace_effective_tcp",
             )
             cursor += 1
-            self._write_sphere(
+            write_sphere(
                 scene.geoms[cursor],
                 position=actual_pose[:3, 3],
                 radius=float(self.config.point_radius_m),
@@ -735,7 +737,7 @@ class AbsoluteWorkspaceVisualizer:
                 label="absolute_workspace_actual_tcp",
             )
             cursor += 1
-            self._write_segment(
+            write_segment(
                 scene.geoms[cursor],
                 start=raw_pose[:3, 3],
                 end=effective_pose[:3, 3],
@@ -788,7 +790,7 @@ class AbsoluteWorkspaceVisualizer:
         edge_color = rgba.copy()
         edge_color[3] = max(0.65, float(edge_color[3]))
         for first, second in edge_indices:
-            self._write_segment(
+            write_segment(
                 scene.geoms[cursor],
                 start=corners_world[first],
                 end=corners_world[second],
@@ -806,7 +808,7 @@ class AbsoluteWorkspaceVisualizer:
                 float(self.config.axis_length_m)
                 * self.workspace.desk_pose_world[:3, axis_index]
             )
-            self._write_segment(
+            write_segment(
                 scene.geoms[cursor],
                 start=origin,
                 end=endpoint,
@@ -816,71 +818,6 @@ class AbsoluteWorkspaceVisualizer:
             )
             cursor += 1
         return cursor
-
-    @staticmethod
-    def _write_sphere(
-        geom: Any,
-        *,
-        position: np.ndarray,
-        radius: float,
-        rgba: np.ndarray,
-        label: str,
-    ) -> None:
-        import mujoco
-
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_SPHERE,
-            np.array([radius, radius, radius], dtype=float),
-            np.asarray(position, dtype=float),
-            np.eye(3, dtype=float).reshape(-1),
-            rgba,
-        )
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = label
-
-    @staticmethod
-    def _write_segment(
-        geom: Any,
-        *,
-        start: np.ndarray,
-        end: np.ndarray,
-        radius: float,
-        rgba: np.ndarray,
-        label: str,
-    ) -> None:
-        import mujoco
-
-        start_point = np.asarray(start, dtype=float)
-        end_point = np.asarray(end, dtype=float)
-        if float(np.linalg.norm(end_point - start_point)) <= 1e-12:
-            AbsoluteWorkspaceVisualizer._write_sphere(
-                geom,
-                position=start_point,
-                radius=radius,
-                rgba=rgba,
-                label=label,
-            )
-            return
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.zeros(3, dtype=float),
-            np.zeros(3, dtype=float),
-            np.eye(3, dtype=float).reshape(-1),
-            rgba,
-        )
-        mujoco.mjv_connector(
-            geom,
-            mujoco.mjtGeom.mjGEOM_CAPSULE,
-            radius,
-            start_point,
-            end_point,
-        )
-        geom.rgba = rgba
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = label
-
 
 __all__ = [
     "AbsoluteWorkspacePreviewConfig",
