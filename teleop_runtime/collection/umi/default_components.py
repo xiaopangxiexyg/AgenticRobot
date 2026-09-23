@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 from hardware.angle_trigger.angle_trigger import load_configured_reader
@@ -25,6 +26,7 @@ from ...sources.camera.realsense_rgb import (
     RealSenseRGBCameraConfig,
     RealSenseRGBSource,
 )
+from ...sources.camera.startup import start_real_sense_source_with_containment
 from ...sources.hand.angle_trigger import AngleTriggerSource
 from ...sources.pose.vive import VivePoseSource, ViveTrackerConfig
 from ..hand_state_polling import HandStateHistoryPoller
@@ -162,6 +164,8 @@ def build_default_umi_components(
                 keep_last=8,
                 color_space="rgb",
                 enable_depth=False,
+                startup_software_retry_attempts=1,
+                startup_hardware_reset_on_failure=False,
             )
         )
         for side in SIDES
@@ -264,6 +268,12 @@ def build_default_umi_components(
                 strict_start_message="正在启动视频流",
                 strict_success_message="视频流已启动",
                 cleanup_name=f"camera[{key}]",
+                start_action=partial(
+                    start_real_sense_source_with_containment,
+                    camera,
+                    timeout_sec=15.0,
+                    software_retry_attempts=None,
+                ),
             )
             for key, camera in cameras.items()
         ),

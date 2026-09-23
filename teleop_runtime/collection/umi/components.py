@@ -92,6 +92,7 @@ class UmiStartupResource:
     strict_success_message: str = "连接完成"
     cleanup_name: str = ""
     require_end_effector_readiness: bool = False
+    start_action: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -108,6 +109,8 @@ class UmiStartupResource:
             raise TypeError(f"UMI startup resource {self.key!r} has no start()")
         if not callable(getattr(self.component, "close", None)):
             raise TypeError(f"UMI startup resource {self.key!r} has no close()")
+        if self.start_action is not None and not callable(self.start_action):
+            raise TypeError(f"UMI startup resource {self.key!r} start_action must be callable")
         if not self.cleanup_name:
             object.__setattr__(self, "cleanup_name", self.key)
 
@@ -321,7 +324,7 @@ class UmiComponents:
                         requirement=resource.requirement,
                     )
                 try:
-                    resource.component.start()
+                    (resource.start_action or resource.component.start)()
                     if resource.require_end_effector_readiness:
                         self._require_end_effectors_ready()
                 except Exception as exc:  # noqa: BLE001 - report each independent device.
@@ -329,6 +332,10 @@ class UmiComponents:
                     self.startup_errors[resource.key] = detail
                     if startup_progress is not None:
                         startup_progress.fail(resource.key, detail)
+                    if resource.key.startswith("camera.") and isinstance(exc, TimeoutError):
+                        # A native camera start may still hold the process-wide
+                        # SDK lifecycle lock. Do not open the next device.
+                        raise
                 else:
                     if startup_progress is not None:
                         startup_progress.succeed(
@@ -349,7 +356,7 @@ class UmiComponents:
                         message=resource.strict_start_message,
                         requirement=resource.requirement,
                     )
-                resource.component.start()
+                (resource.start_action or resource.component.start)()
                 started.append(resource)
                 if resource.require_end_effector_readiness:
                     self._require_end_effectors_ready()

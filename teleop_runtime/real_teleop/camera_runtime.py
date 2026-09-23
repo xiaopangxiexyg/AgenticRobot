@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -23,6 +22,7 @@ from ..sources.camera import (
     RealSenseRGBCameraConfig,
     RealSenseRGBSource,
     load_realsense_camera_config_map,
+    start_real_sense_source_with_containment,
 )
 from .wrist_depth_freshness import (
     DEFAULT_WRIST_DEPTH_SAVE_FPS,
@@ -521,54 +521,12 @@ def _start_camera_source_with_containment(
         _record_camera_start_attempt(source)
         source.start()
         return
-    normalized_timeout_sec = float(timeout_sec)
-    if not math.isfinite(normalized_timeout_sec) or normalized_timeout_sec < 0.0:
-        raise ValueError("timeout_sec must be finite and >= 0.")
-    errors: list[BaseException] = []
-    start_method_is_base = (
-        getattr(source.start, "__func__", source.start) is RealSenseRGBSource.start
-    )
-    pipeline_method_is_base = (
-        getattr(source._start_pipeline, "__func__", source._start_pipeline)
-        is RealSenseRGBSource._start_pipeline
-    )
-
-    def start_native() -> None:
-        try:
-            # The formal multi-camera caller owns the configured deferred
-            # retry rounds.
-            # Keep direct RealSenseRGBSource.start() callers compatible with
-            # their configured software retry budget.
-            if (
-                start_method_is_base
-                and pipeline_method_is_base
-                and software_retry_attempts is not None
-            ):
-                source.start(
-                    startup_software_retry_attempts=software_retry_attempts
-                )
-            else:
-                source.start()
-        except BaseException as exc:  # noqa: BLE001 - preserve source failure type.
-            errors.append(exc)
-
-    worker = threading.Thread(
-        target=start_native,
-        name=f"{source.name}_startup",
-        daemon=True,
-    )
     _record_camera_start_attempt(source)
-    worker.start()
-    worker.join(timeout=normalized_timeout_sec)
-    if worker.is_alive():
-        source.mark_startup_timeout(normalized_timeout_sec)
-        raise TimeoutError(
-            f"{source.name} startup exceeded {normalized_timeout_sec:.3f}s; "
-            "native SDK worker remains blocked; no immediate retry/close was "
-            "attempted"
-        )
-    if errors:
-        raise errors[0]
+    start_real_sense_source_with_containment(
+        source,
+        timeout_sec=timeout_sec,
+        software_retry_attempts=software_retry_attempts,
+    )
 
 
 def _start_camera_sources(

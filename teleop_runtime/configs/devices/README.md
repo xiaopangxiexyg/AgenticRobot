@@ -27,10 +27,21 @@ wrist keys from each dataset's recorded RealSense serial.
 `realsense_front.json` is retained as the single-front station variant for
 explicit callers; it is not the multi-camera default.
 
-`agent_gateway_realsense.json` is the opt-in independent Agent Gateway
-inventory. It preserves the reviewed three serial assignments at 640x480/15
-Hz, disables hardware-reset recovery, and enables aligned depth only on
-`front`. All three cameras may serve RGB. Wrist depth is intentionally disabled:
+The shared station profiles use bounded software reopen attempts for transient
+startup failures. Only the reviewed front serial opts into one targeted device
+re-enumeration when a pipeline opens but produces no first frame; wrist cameras
+never request a startup hardware reset. This applies to real teleop, collection,
+and policy deployment that load these profiles. A native SDK call that remains
+blocked is not safe to retry or close immediately; the formal multi-camera
+startup owner reports a terminal timeout instead. Other camera inventories
+must opt in separately after device-specific validation.
+
+`agent_gateway_realsense.json` is the independent Agent Gateway inventory.
+It preserves the reviewed three serial assignments at 640x480/15 Hz and
+enables aligned depth only on `front`. The front camera alone permits one
+targeted reset after a first-frame warmup failure; ordinary connection errors
+and both wrist cameras do not request a reset. All three cameras may serve RGB.
+Wrist depth is intentionally disabled:
 the wrist mounts move with link 6, while the shared registry currently provides
 no numeric activation-time camera pose for those roles. Do not enable it by
 copying the front camera's static arm-base transform; add and review the
