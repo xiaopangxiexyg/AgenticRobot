@@ -10,7 +10,7 @@
 - 对应 model-RTC profile：`/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/AgenticRobot/deployments/openpi/configs/model_rtc/writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json`。
 - 历史文档中的 `/home/user/zc/openpi/checkpoints/...` 在当前主机不存在；不可照抄。当前遥操工作树的服务入口只支持 model-RTC profile v1，不能装载此 v2 检查点；须使用同次训练的 AgenticRobot 历史代码快照启动模型服务和训练。
 
-这些是路径存在性与契约核对，不代表当前工作树的 prepared server 已成功加载该检查点。先在**无遥操**状态完成服务启动和一条合成推理；若失败，停止在此，不进入并行真机测试。
+历史代码快照的 `--dry-run` 已通过检查点/profile/资产哈希绑定，但一次实际 GPU 服务启动在训练配置解析阶段失败：`/home/user/zc/datasets/RealmanDMTAC/DexTeleop/camera_semantic_prepared_views/DexTeleop_0803__2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage.camera_only_v1/meta/info.json` 不存在。服务已退出，**C/D 组当前不可运行**。先由数据资产负责人确认该不可变 prepared view 的真实归档位置、来源和恢复方式；不得通过跳过 profile/哈希/数据校验或把另一数据集冒充该路径来启动。A/B 组也应在服务能够实际加载之后再做正式对比。
 
 ## 测量矩阵
 
@@ -40,7 +40,7 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
   --no-arm-ip-save-latest
 ```
 
-终端 2，先在没有遥操时预检服务。以下路径只针对上面核对的 Stage1 检查点；**模型侧使用历史代码快照**，服务绑定 `127.0.0.1`，模型结果不接入遥操。该组合的 `--dry-run` 绑定预检已通过；实际加载 GPU 权重仍未运行：
+终端 2，**仅在缺失的 prepared view 经验证恢复后运行**。以下路径只针对上面核对的 Stage1 检查点；模型侧使用历史代码快照，服务绑定 `127.0.0.1`，模型结果不接入遥操。该组合的 `--dry-run` 绑定预检已通过，但实际加载此前失败：
 
 ```bash
 cd /home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/AgenticRobot
@@ -56,7 +56,7 @@ python -m deployments.openpi.server --checkpoint-dir "$CKPT" \
   --openpi-root "$OPENPI" --host 127.0.0.1 --port 8078
 ```
 
-终端 3，同一工作树与 Python 环境；先用 1 个请求附近的小窗口预检，确认服务返回有限动作且脚本没有连接机器人/传感器，然后再做 120 秒 C 组。动作仅被校验形状后丢弃。
+终端 3，**仅在终端 2 的服务实际就绪后运行**。使用遥操隔离工作树中的客户端与同一 Python 环境；先用 1 个请求附近的小窗口预检，再做 120 秒 C 组。动作仅被校验形状后丢弃。
 
 ```bash
 cd /home/user/zc/AgenticRobot-ik-realtime-isolation-20260922
@@ -98,7 +98,7 @@ python scripts/probes/summarize_teleop_contention.py \
 
 ## 训练 D 组的停止条件
 
-历史 100000 步训练不能直接重启或 resume。现有 `prepared_skill_launch` 支持 model-RTC profile 上的 `--num-train-steps`、`--save-interval` 和独立 `--exp-name`；可用其创建一次新的短程训练，但即使 20 步，JAX 编译、数据预检及最终 checkpoint 仍可能消耗数分钟和大量磁盘。先确认磁盘余量、GPU 空闲、上述 snapshot/profile 兼容，并在**无真机**状态完成一次短程 smoke；未通过之前不执行 D 组。不得使用 `--resume` 或 `--overwrite` 指向历史训练目录。
+历史 100000 步训练不能直接重启或 resume。现有 `prepared_skill_launch` 支持 model-RTC profile 上的 `--num-train-steps`、`--save-interval` 和独立 `--exp-name`；可用其创建一次新的短程训练，但即使 20 步，JAX 编译、数据预检及最终 checkpoint 仍可能消耗数分钟和大量磁盘。**当前 prepared view 缺失，不能执行本节候选命令。**先确认不可变数据资产恢复、磁盘余量、GPU 空闲、snapshot/profile 兼容，并在无真机状态完成一次短程 smoke；未通过之前不执行 D 组。不得使用 `--resume` 或 `--overwrite` 指向历史训练目录。
 
 候选命令（尚未实机验证，暂不作为直接真机并行命令；模型侧仍使用历史代码快照）：
 
