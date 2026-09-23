@@ -1923,6 +1923,26 @@ class DMTacGripperBackend(EffectorBackend):
             continuous_grasp_override=None,
         )
 
+    def hold_motion(self, reason: str = "manual hold") -> None:
+        """Stop an in-flight actuator move at the lower-owner boundary.
+
+        An active upper-layer fence always issues the vendor stop command, even
+        when the latest telemetry reports idle, because an accepted command may
+        still be queued. This method never opens, replaces, or reconnects
+        hardware.
+        """
+
+        del reason
+        if (
+            self.config.observation_only
+            or self.config.disconnected_state_scalar is not None
+        ):
+            return
+        with self._lock:
+            if self.device is None or getattr(self.device, "gripper", None) is None:
+                raise RuntimeError("DMTAC gripper is not connected for HOLD.")
+            self.device.stop()
+
     def set_torque(self, torque: float) -> float:
         """Set normalized gripper torque and apply it to an active device now.
 

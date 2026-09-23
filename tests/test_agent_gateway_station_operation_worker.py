@@ -62,6 +62,7 @@ class _FakeStationLifecycle:
         activation_error: bool = False,
         run_error: bool = False,
         invalid_result: bool = False,
+        failed_without_terminal_hold: bool = False,
         evaluation: StationLifecycleEvaluationCompletion | None = None,
     ) -> None:
         self.activation_entered = threading.Event()
@@ -75,6 +76,7 @@ class _FakeStationLifecycle:
         self.activation_error = activation_error
         self.run_error = run_error
         self.invalid_result = invalid_result
+        self.failed_without_terminal_hold = failed_without_terminal_hold
         self.evaluation = evaluation
         self.calls: list[str] = []
         self._lock = threading.Lock()
@@ -122,6 +124,13 @@ class _FakeStationLifecycle:
                 reason_code="fake_execution_preempted",
                 execution_receipt_refs=("lower-hold:run-preempted",),
                 terminal_hold_confirmed=True,
+            )
+        if self.failed_without_terminal_hold:
+            return StationLifecycleExecutionCompletion(
+                succeeded=False,
+                reason_code="fake_post_hold_motion_detected",
+                execution_receipt_refs=("lower-hold:unconfirmed",),
+                terminal_hold_confirmed=False,
             )
         result = (
             {"unexpected": "payload"}
@@ -485,6 +494,24 @@ def test_worker_exception_publishes_bounded_phase_diagnostic_after_hold() -> Non
         },
     }
     assert worker.last_error == "RuntimeError:injected execution failure"
+    assert lifecycle.calls == ["activate", "run", "hold", "close"]
+
+
+def test_failed_completion_without_terminal_hold_retries_before_commit() -> None:
+    lifecycle = _FakeStationLifecycle(failed_without_terminal_hold=True)
+    service, worker, admitted = _setup(lifecycle)
+    assert worker.launch(service=service, operation_id=admitted.operation_id).accepted
+    assert worker.wait(timeout_sec=1.0)
+
+    failed = service.get_operation(admitted.operation_id)
+    assert failed.status == "failed"
+    assert failed.reason_code == "fake_post_hold_motion_detected"
+    assert failed.execution_result is None
+    assert "lower-hold:unconfirmed" in failed.execution_receipt_refs
+    assert any(
+        ref.startswith("agent-gateway-authoritative-receipt:")
+        for ref in failed.execution_receipt_refs
+    )
     assert lifecycle.calls == ["activate", "run", "hold", "close"]
 
 

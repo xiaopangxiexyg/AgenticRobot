@@ -835,13 +835,16 @@ action is the distinct `execute_grasp_approach_plan`; authorizing the legacy
 | 渲染候选 | `perception.render_point_grasp_candidate` | 只读；不改变候选、姿态或运动状态 |
 | 可选的显式 reach 规划 | `perception.plan_grasp_approach@1` | 只读；计划绑定会话、场景版本、起始 qpos 和时效 |
 | 到达抓姿 | `motion.execute_grasp_approach_plan@1` / `motion.approach_grasp_pose@1` | 独立运动授权；不自动闭合夹爪 |
-| 夹爪闭合 / 松开 | 尚未在此 worktree 公开 | 必须是独立执行 Skill，不能悄悄并入 reach |
+| 夹爪闭合 / 松开 | `motion.close_gripper@1` / `motion.open_gripper@1` | 独立高风险执行 Skill；需请求绑定授权，不悄悄并入 reach |
 | 空手移动 | `motion.move_tcp_to_pose@1` | 不能作为携物碰撞验证的替代品 |
 
 当前 reach 准入验证真实机械臂连杆网格与部署的代理几何、固定桌面/相机杆和 TCP
 包络。成对规划另验证可见目标/背景与名义张开夹爪的非接触接近，但没有将
 观测障碍纳入整臂检查，也尚未验证随开度变化的真实夹爪实体、闭合过程、
-带物退出、放置或物理夹持成功。因此 `path_found` 的含义是“reach
+带物退出、放置或物理夹持成功。
+当前夹爪 Skill 只允许选择已部署的夹爪 component；开合端点、速度和力度由部署所有，
+`close_gripper` 的完成表示指令已停稳且无故障，不等于已抓住物体。
+因此 `path_found` 的含义是“reach
 阶段在当前模型下通过”，不是“完整抓取链通过”；不能据此自动闭合、试抬
 或搬运。后续这些阶段必须有独立的场景/夹爪状态和接触规则证据后才可开放。
 

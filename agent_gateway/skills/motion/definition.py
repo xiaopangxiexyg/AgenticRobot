@@ -27,6 +27,8 @@ TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1 = "motion.set_tcp_level_forward_left_30"
 TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1 = "motion.set_tcp_level_forward_right_30"
 REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1 = "motion.replay_registered_tcp_pose_trajectory"
 INLINE_TCP_TRAJECTORY_SKILL_ID_V1 = "motion.replay_inline_tcp_pose_trajectory"
+OPEN_GRIPPER_SKILL_ID_V1 = "motion.open_gripper"
+CLOSE_GRIPPER_SKILL_ID_V1 = "motion.close_gripper"
 
 CARDINAL_TCP_STEP_DIRECTIONS_V1 = (
     "forward",
@@ -111,6 +113,62 @@ def _component_ids(values: tuple[str, ...]) -> tuple[str, ...]:
     if len(set(normalized)) != len(normalized):
         raise ValueError("controlled_component_ids must be unique.")
     return tuple(sorted(normalized))
+
+
+def _gripper_endpoint_skill_definition_v1(
+    *,
+    skill_id: str,
+    controlled_component_ids: tuple[str, ...],
+) -> SkillDefinition:
+    components = _component_ids(controlled_component_ids)
+    if skill_id == OPEN_GRIPPER_SKILL_ID_V1:
+        action = "open"
+        outcome = "gripper_open_endpoint_reached.v1"
+    elif skill_id == CLOSE_GRIPPER_SKILL_ID_V1:
+        action = "close"
+        outcome = "gripper_close_command_settled.v1"
+    else:
+        raise ValueError("skill_id is not a fixed gripper endpoint Skill.")
+    return SkillDefinition(
+        skill_id=skill_id,
+        skill_version="1",
+        skill_kind="motion",
+        summary=(
+            f"{action.capitalize()} one selected gripper using the deployment's "
+            "reviewed fixed endpoint, speed, and force settings. The caller "
+            "cannot provide an arbitrary opening, speed, or force."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=components,
+        parameter_semantics_id=f"gripper.{action}.selected_component_only.v1",
+        execution_result_semantics_id="gripper.fixed_endpoint_execution.v1",
+        task_outcome_semantics_id=outcome,
+        entry_predicate_ids=("route_ready.v1", "fresh_gripper_state_valid.v1"),
+        task_outcome_predicate_ids=(outcome,),
+    )
+
+
+def open_gripper_skill_definition_v1(
+    *, controlled_component_ids: tuple[str, ...]
+) -> SkillDefinition:
+    """Return the fixed fully-open gripper action definition."""
+
+    return _gripper_endpoint_skill_definition_v1(
+        skill_id=OPEN_GRIPPER_SKILL_ID_V1,
+        controlled_component_ids=controlled_component_ids,
+    )
+
+
+def close_gripper_skill_definition_v1(
+    *, controlled_component_ids: tuple[str, ...]
+) -> SkillDefinition:
+    """Return the fixed close-until-settled gripper action definition."""
+
+    return _gripper_endpoint_skill_definition_v1(
+        skill_id=CLOSE_GRIPPER_SKILL_ID_V1,
+        controlled_component_ids=controlled_component_ids,
+    )
 
 
 def tcp_pose_target_skill_definition_v1(
@@ -292,6 +350,7 @@ def fixed_level_tcp_orientation_skill_definition_v1(
 
 __all__ = [
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
+    "CLOSE_GRIPPER_SKILL_ID_V1",
     "EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1",
     "FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1",
     "FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1",
@@ -300,6 +359,7 @@ __all__ = [
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1",
     "GRASP_APPROACH_SKILL_ID_V1",
     "INLINE_TCP_TRAJECTORY_SKILL_ID_V1",
+    "OPEN_GRIPPER_SKILL_ID_V1",
     "REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1",
     "TCP_CARDINAL_STEP_SKILL_ID_V1",
     "TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1",
@@ -313,9 +373,11 @@ __all__ = [
     "TCP_STEP_RIGHT_SKILL_ID_V1",
     "TCP_STEP_UP_SKILL_ID_V1",
     "cardinal_tcp_step_skill_definition_v1",
+    "close_gripper_skill_definition_v1",
     "execute_grasp_approach_plan_skill_definition_v1",
     "fixed_cardinal_tcp_step_skill_definition_v1",
     "fixed_level_tcp_orientation_skill_definition_v1",
     "grasp_approach_skill_definition_v1",
+    "open_gripper_skill_definition_v1",
     "tcp_pose_target_skill_definition_v1",
 ]

@@ -19,6 +19,13 @@ from .dmtac_shadow_ports import (
     RM65ToolTcpWorldFk,
     StartedRM65ShadowPorts,
 )
+from .gripper_port import (
+    DMTacGripperActionPort,
+    GripperActionBackend,
+    RealGripperActionDispatchReceipt,
+    RealGripperActionFeedback,
+    RealGripperActionHoldReceipt,
+)
 from .motion_port import (
     REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
     RealAgentJointTrajectory,
@@ -77,6 +84,7 @@ from .rm65_urdf_grasp_planning import RM65UrdfGraspPlanningContext
 __all__ = [
     "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
     "RM65_SKILL_SCENE_WORLD_FRAME_ID_V1",
+    "DMTacGripperActionPort",
     "DMTacRM65RegisteredTrajectoryPorts",
     "DMTacShadowReplayPortProfile",
     "ExclusiveRM65SkillDeployPorts",
@@ -87,6 +95,7 @@ __all__ = [
     "ExclusiveRM65SkillStartupSafetyReceipt",
     "ExclusiveRM65SkillTargetSafetyRuntime",
     "ExclusiveRealSkillControlRuntime",
+    "GripperActionBackend",
     "MeasuredGripperBackend",
     "MeasuredGripperStateCut",
     "RM65SkillBackendFactory",
@@ -107,6 +116,9 @@ __all__ = [
     "RealAgentMotionPortConfig",
     "RealAgentMotionPortSnapshot",
     "RealAgentMotionTargetBuilder",
+    "RealGripperActionDispatchReceipt",
+    "RealGripperActionFeedback",
+    "RealGripperActionHoldReceipt",
     "RealSkillControlLifecycle",
     "RealSkillControlStep",
     "RealSkillControlTraceSample",
