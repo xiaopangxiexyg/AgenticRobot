@@ -8,7 +8,9 @@ import numpy as np
 
 from utils.calibration_common.camera import (
     VideoStreamProfileInfo as _CommonVideoStreamProfileInfo,
+    available_video_profiles as _collect_video_profiles,
     aruco_dictionary as _aruco_dictionary,
+    device_from_serial as _device_from_serial,
     detector_parameters as _detector_parameters,
     make_aruco_detector as _make_aruco_detector,
     put_status as _put_status,
@@ -584,47 +586,13 @@ def available_video_profiles(serial: str | None = None) -> list[VideoStreamProfi
 
 
 def _available_video_profiles(rs: Any, device: Any) -> list[VideoStreamProfileInfo]:
-    profiles: list[VideoStreamProfileInfo] = []
-    try:
-        sensors = list(device.sensors)
-    except Exception:
-        sensors = []
-    for sensor in sensors:
-        try:
-            stream_profiles = sensor.get_stream_profiles()
-        except Exception:
-            continue
-        for profile in stream_profiles:
-            info = _video_profile_info(rs, profile)
-            if info is not None:
-                profiles.append(info)
-    profiles.sort(
-        key=lambda item: (
-            item.stream,
-            item.width,
-            item.height,
-            item.fps,
-            item.format_name,
-        )
+    return _collect_video_profiles(
+        rs,
+        device,
+        profile_type=VideoStreamProfileInfo,
+        stream_names=("color", "depth", "infrared"),
+        format_names=("bgr8", "bgra8", "rgb8", "rgba8", "uyvy", "y8", "yuyv", "z16"),
     )
-    return profiles
-
-
-def _device_from_serial(rs: Any, serial: str | None):
-    ctx = rs.context()
-    devices = list(ctx.devices)
-    if not devices:
-        raise RuntimeError("no RealSense devices detected.")
-    if serial:
-        for device in devices:
-            if _safe_device_info(rs, device, rs.camera_info.serial_number) == str(serial):
-                return device
-        available = ", ".join(
-            _safe_device_info(rs, device, rs.camera_info.serial_number)
-            for device in devices
-        )
-        raise ValueError(f"RealSense serial {serial!r} not found; available: {available}")
-    return devices[0]
 
 
 def _choose_compatible_video_profile_pair(
@@ -702,43 +670,6 @@ def _choose_video_profile(
             format_rank=format_rank,
         ),
     )
-
-
-def _video_profile_info(rs: Any, profile: Any) -> VideoStreamProfileInfo | None:
-    try:
-        video = profile.as_video_stream_profile()
-        return VideoStreamProfileInfo(
-            stream=_stream_name(rs, profile.stream_type()),
-            format_name=_format_name(rs, profile.format()),
-            width=int(video.width()),
-            height=int(video.height()),
-            fps=int(profile.fps()),
-        )
-    except Exception:
-        return None
-
-
-def _stream_name(rs: Any, stream: Any) -> str:
-    for name in ("color", "depth", "infrared"):
-        if getattr(rs.stream, name, None) == stream:
-            return name
-    return str(stream).split(".")[-1]
-
-
-def _format_name(rs: Any, fmt: Any) -> str:
-    for name in (
-        "bgr8",
-        "bgra8",
-        "rgb8",
-        "rgba8",
-        "uyvy",
-        "y8",
-        "yuyv",
-        "z16",
-    ):
-        if getattr(rs.format, name, None) == fmt:
-            return name
-    return str(fmt).split(".")[-1]
 
 
 def _serial_from_index(index: int) -> str:

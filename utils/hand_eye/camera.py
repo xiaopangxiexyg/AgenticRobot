@@ -8,8 +8,11 @@ import numpy as np
 
 from utils.calibration_common.camera import (
     VideoStreamProfileInfo as _CommonVideoStreamProfileInfo,
+    available_video_profiles as _available_video_profiles,
     aruco_dictionary as _aruco_dictionary,
+    device_from_serial as _device_from_serial,
     detector_parameters as _detector_parameters,
+    enum_name as _enum_name,
     make_aruco_detector as _make_aruco_detector,
     put_status as _put_status,
     requested_profile_text as _requested_profile_text,
@@ -36,6 +39,8 @@ DEFAULT_CAMERA_SERIALS = [
     "017322074878",
 ]
 CAMERA_IDS = DEFAULT_CAMERA_SERIALS
+_PROFILE_STREAM_NAMES = ("color", "depth")
+_PROFILE_FORMAT_NAMES = ("bgr8", "rgb8", "z16", "y8", "yuyv", "uyvy", "rgba8", "bgra8")
 
 
 @dataclass(frozen=True)
@@ -1102,38 +1107,13 @@ class TargetDetector:
 def available_video_profiles(serial: str | None = None) -> list[VideoStreamProfileInfo]:
     rs = _require_pyrealsense2()
     device = _device_from_serial(rs, serial)
-    profiles: list[VideoStreamProfileInfo] = []
-    try:
-        sensors = list(device.sensors)
-    except Exception:
-        sensors = []
-    for sensor in sensors:
-        try:
-            stream_profiles = sensor.get_stream_profiles()
-        except Exception:
-            continue
-        for profile in stream_profiles:
-            info = _video_profile_info(rs, profile)
-            if info is not None:
-                profiles.append(info)
-    profiles.sort(key=lambda item: (item.stream, item.width, item.height, item.fps, item.format_name))
-    return profiles
-
-
-def _device_from_serial(rs: Any, serial: str | None):
-    ctx = rs.context()
-    devices = list(ctx.devices)
-    if not devices:
-        raise RuntimeError("no RealSense devices detected.")
-    if serial:
-        for device in devices:
-            if _safe_device_info(rs, device, rs.camera_info.serial_number) == str(serial):
-                return device
-        available = ", ".join(
-            _safe_device_info(rs, device, rs.camera_info.serial_number) for device in devices
-        )
-        raise ValueError(f"RealSense serial {serial!r} not found; available: {available}")
-    return devices[0]
+    return _available_video_profiles(
+        rs,
+        device,
+        profile_type=VideoStreamProfileInfo,
+        stream_names=_PROFILE_STREAM_NAMES,
+        format_names=_PROFILE_FORMAT_NAMES,
+    )
 
 
 def _stop_pipeline_quietly(pipeline: Any | None) -> None:
@@ -1204,34 +1184,12 @@ def _select_video_profile(
     )
 
 
-def _video_profile_info(rs: Any, profile: Any) -> VideoStreamProfileInfo | None:
-    try:
-        video = profile.as_video_stream_profile()
-        stream = _stream_name(rs, profile.stream_type())
-        format_name = _format_name(rs, profile.format())
-        return VideoStreamProfileInfo(
-            stream=stream,
-            format_name=format_name,
-            width=int(video.width()),
-            height=int(video.height()),
-            fps=int(profile.fps()),
-        )
-    except Exception:
-        return None
-
-
 def _stream_name(rs: Any, stream: Any) -> str:
-    for name in ("color", "depth"):
-        if getattr(rs.stream, name, None) == stream:
-            return name
-    return str(stream).split(".")[-1]
+    return _enum_name(rs.stream, stream, _PROFILE_STREAM_NAMES)
 
 
 def _format_name(rs: Any, fmt: Any) -> str:
-    for name in ("bgr8", "rgb8", "z16", "y8", "yuyv", "uyvy", "rgba8", "bgra8"):
-        if getattr(rs.format, name, None) == fmt:
-            return name
-    return str(fmt).split(".")[-1]
+    return _enum_name(rs.format, fmt, _PROFILE_FORMAT_NAMES)
 
 
 def _serial_from_index(index: int) -> str:

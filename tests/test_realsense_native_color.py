@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -17,6 +17,78 @@ from utils.head_eye.camera import RealSenseConfig as HeadEyeRealSenseConfig
 
 
 class RealSenseNativeColorTest(unittest.TestCase):
+    def test_calibration_profile_enumeration_preserves_module_types_and_device_errors(self) -> None:
+        color, depth, infrared = object(), object(), object()
+        yuyv, z16 = object(), object()
+        rs = SimpleNamespace(
+            stream=SimpleNamespace(color=color, depth=depth, infrared=infrared),
+            format=SimpleNamespace(yuyv=yuyv, z16=z16),
+            camera_info=SimpleNamespace(serial_number=object()),
+        )
+
+        def profile(stream: object, fmt: object, width: int):
+            video = SimpleNamespace(width=lambda: width, height=lambda: 480)
+            return SimpleNamespace(
+                as_video_stream_profile=lambda: video,
+                stream_type=lambda: stream,
+                format=lambda: fmt,
+                fps=lambda: 15,
+            )
+
+        invalid = SimpleNamespace(as_video_stream_profile=lambda: None)
+        sensor = SimpleNamespace(
+            get_stream_profiles=lambda: [
+                profile(depth, z16, 1280),
+                invalid,
+                profile(color, yuyv, 640),
+                profile(infrared, z16, 320),
+            ]
+        )
+        failing_sensor = SimpleNamespace(
+            get_stream_profiles=Mock(side_effect=RuntimeError("profile query failed"))
+        )
+        device = SimpleNamespace(
+            sensors=[failing_sensor, sensor],
+            supports=lambda _: True,
+            get_info=lambda _: "selected-serial",
+        )
+        rs.context = lambda: SimpleNamespace(devices=[device])
+
+        for module in (hand_camera, head_camera):
+            with self.subTest(module=module.__name__), patch.object(
+                module, "_require_pyrealsense2", return_value=rs
+            ):
+                profiles = module.available_video_profiles("selected-serial")
+                self.assertEqual(len(profiles), 3)
+                self.assertTrue(all(type(item) is module.VideoStreamProfileInfo for item in profiles))
+                self.assertEqual(
+                    profiles,
+                    sorted(
+                        profiles,
+                        key=lambda item: (
+                            item.stream, item.width, item.height, item.fps, item.format_name
+                        ),
+                    ),
+                )
+                by_width = {item.width: item for item in profiles}
+                self.assertEqual(by_width[640].describe(), "color 640x480@15 yuyv")
+                self.assertEqual(by_width[1280].describe(), "depth 1280x480@15 z16")
+                infrared_profile = by_width[320]
+                if module is head_camera:
+                    self.assertEqual(infrared_profile.stream, "infrared")
+                else:
+                    self.assertNotEqual(infrared_profile.stream, "infrared")
+                with self.assertRaisesRegex(ValueError, "missing-serial.*selected-serial"):
+                    module.available_video_profiles("missing-serial")
+
+        rs.context = lambda: SimpleNamespace(devices=[])
+        for module in (hand_camera, head_camera):
+            with self.subTest(empty_module=module.__name__), patch.object(
+                module, "_require_pyrealsense2", return_value=rs
+            ):
+                with self.assertRaisesRegex(RuntimeError, "no RealSense devices detected"):
+                    module.available_video_profiles()
+
     def test_calibration_profile_selection_preserves_resolution_and_format_priority(self) -> None:
         for profile_type, module_name in (
             (hand_camera.VideoStreamProfileInfo, "utils.hand_eye.camera"),
