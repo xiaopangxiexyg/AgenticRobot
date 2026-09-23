@@ -8,9 +8,7 @@ backends, start workers, or issue commands.
 from __future__ import annotations
 
 import argparse
-import json
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 from robot_motion.deploy.schema import ALL_SIDES
@@ -23,7 +21,12 @@ from ..backends.grippers import (
     DMTacGripperBackendConfig,
     normalize_dmtac_tactile_fields,
 )
-
+from ..gripper_policy_core import (
+    load_gripper_task_profile,
+    normalize_gripper_policy,
+    overlay_gripper_policy,
+    profile_value,
+)
 
 HAND_BACKEND_INSPIRE = "inspire"
 HAND_BACKEND_DMTAC_GRIPPER = "dmtac-gripper"
@@ -82,52 +85,10 @@ def _hands_enabled(args: argparse.Namespace) -> bool:
 
 
 def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
-    path_text = str(getattr(args, "gripper_task_profile", "") or "").strip()
-    if not path_text:
-        return {}
-    path = Path(path_text).expanduser()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        raise TypeError(f"Gripper task profile {path} must contain a JSON object.")
-    base_gripper = payload.get("gripper")
-    if base_gripper is not None and not isinstance(base_gripper, Mapping):
-        raise ValueError(f"Profile {path} field 'gripper' must be an object.")
-    selected: Mapping[str, Any] | None = None
-    tasks = payload.get("tasks")
-    if isinstance(tasks, Mapping):
-        task_keys = (
-            str(getattr(args, "gripper_task", "") or ""),
-            str(getattr(args, "task_id", "") or ""),
-            str(getattr(args, "task_name", "") or ""),
-            str(getattr(args, "task", "") or ""),
-        )
-        for key in task_keys:
-            item = tasks.get(key)
-            if isinstance(item, Mapping):
-                selected = item
-                args._resolved_gripper_task = key
-                break
-    if selected is not None:
-        gripper = selected.get("gripper")
-        if gripper is not None and not isinstance(gripper, Mapping):
-            raise ValueError(
-                f"Profile {path} selected task field 'gripper' must be an object."
-            )
-        merged = dict(base_gripper) if isinstance(base_gripper, Mapping) else {}
-        merged.update(dict(gripper) if isinstance(gripper, Mapping) else dict(selected))
-        return merged
-    if isinstance(base_gripper, Mapping):
-        return dict(base_gripper)
-    if "gripper" in payload:
-        raise ValueError(f"Profile {path} field 'gripper' must be an object.")
-    return dict(payload)
+    return load_gripper_task_profile(args, invalid_root_error=TypeError)
 
 
-def _profile_value(profile: Mapping[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in profile:
-            return profile[key]
-    return None
+_profile_value = profile_value
 
 
 def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
@@ -136,70 +97,8 @@ def _resolved_gripper_policy(args: argparse.Namespace) -> dict[str, Any]:
         return dict(cached)
 
     profile = _load_gripper_task_profile(args)
-    policy: dict[str, Any] = dict(GRIPPER_POLICY_DEFAULTS)
-    profile_keys = {
-        "output_dim": ("output_dim", "gripper_slot"),
-        "speed": ("speed",),
-        "torque": ("torque", "force"),
-        "max_action": ("max_action", "max_close"),
-        "send_threshold": ("send_threshold",),
-        "command_hz": ("command_hz", "max_command_hz"),
-        "continuous_grasp": ("continuous_grasp", "continuous"),
-        "telemetry_hz": ("telemetry_hz",),
-        "telemetry_command_grace_s": ("telemetry_command_grace_s",),
-        "tactile_fields": ("tactile_fields", "dmtac_tactile_fields"),
-        "tactile_compute_profile": (
-            "tactile_compute_profile",
-            "dmtac_tactile_compute_profile",
-        ),
-    }
-    for key, aliases in profile_keys.items():
-        value = _profile_value(profile, *aliases)
-        if value is not None:
-            policy[key] = value
-
-    cli_overrides = {
-        "output_dim": getattr(args, "gripper_output_dim", None),
-        "speed": getattr(args, "gripper_speed", None),
-        "torque": getattr(args, "gripper_torque", None),
-        "max_action": getattr(args, "gripper_max_action", None),
-        "send_threshold": getattr(args, "gripper_send_threshold", None),
-        "command_hz": getattr(args, "gripper_command_hz", None),
-        "continuous_grasp": getattr(args, "gripper_continuous_grasp", None),
-        "telemetry_hz": getattr(args, "gripper_telemetry_hz", None),
-        "telemetry_command_grace_s": getattr(
-            args, "gripper_telemetry_command_grace_s", None
-        ),
-    }
-    for key, value in cli_overrides.items():
-        if value is not None:
-            policy[key] = value
-
-    policy["output_dim"] = int(policy["output_dim"])
-    policy["speed"] = float(policy["speed"])
-    policy["torque"] = float(policy["torque"])
-    policy["max_action"] = float(policy["max_action"])
-    policy["send_threshold"] = float(policy["send_threshold"])
-    policy["command_hz"] = float(policy["command_hz"])
-    policy["continuous_grasp"] = bool(policy["continuous_grasp"])
-    policy["telemetry_hz"] = float(policy["telemetry_hz"])
-    policy["telemetry_command_grace_s"] = float(policy["telemetry_command_grace_s"])
-    if policy.get("tactile_fields") is not None:
-        policy["tactile_fields"] = normalize_dmtac_tactile_fields(
-            policy["tactile_fields"]
-        )
-    if policy.get("tactile_compute_profile") is not None:
-        policy["tactile_compute_profile"] = str(policy["tactile_compute_profile"])
-    if int(policy["output_dim"]) != 0:
-        raise ValueError("dmtac-gripper output_dim/gripper_slot must be 0.")
-    if float(policy["send_threshold"]) < 0.0:
-        raise ValueError("gripper send_threshold must be >= 0.")
-    if float(policy["command_hz"]) <= 0.0:
-        raise ValueError("gripper command_hz must be > 0.")
-    if float(policy["telemetry_hz"]) <= 0.0:
-        raise ValueError("gripper telemetry_hz must be > 0.")
-    if float(policy["telemetry_command_grace_s"]) < 0.0:
-        raise ValueError("gripper telemetry_command_grace_s must be >= 0.")
+    policy = overlay_gripper_policy(args, GRIPPER_POLICY_DEFAULTS, profile)
+    normalize_gripper_policy(policy, canonical_max_action=False)
     args._resolved_gripper_policy = dict(policy)
     return dict(policy)
 

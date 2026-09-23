@@ -99,6 +99,16 @@ def test_task_profile_precedes_cli_defaults_and_clamps_action_space(tmp_path) ->
     assert policy["continuous_grasp"] is True
 
 
+def test_collection_profile_root_must_remain_a_json_object(tmp_path) -> None:
+    profile_path = tmp_path / "gripper_tasks.json"
+    profile_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must contain a JSON object"):
+        gripper_policy_config.load_gripper_task_profile(
+            _args(gripper_task_profile=str(profile_path))
+        )
+
+
 def test_cli_overrides_are_normalized_and_tactile_fields_are_canonical() -> None:
     args = _args(
         gripper_source_dim=3,

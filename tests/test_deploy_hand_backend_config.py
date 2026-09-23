@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import pytest
 
 from teleop_runtime.backends.grippers import DMTacGripperBackendConfig
-from teleop_runtime.deploy import hand_backend_config
-from teleop_runtime.deploy import hand_backend_runtime
-from teleop_runtime.deploy import run_policy
-
+from teleop_runtime.deploy import hand_backend_config, hand_backend_runtime, run_policy
 
 _MIGRATED_NAMES = (
     "_apply_gripper_policy_to_dmtac_config",
@@ -91,6 +89,35 @@ def test_resolved_gripper_policy_preserves_defaults_and_copying_cache() -> None:
     assert second == hand_backend_config.GRIPPER_POLICY_DEFAULTS
     assert second is not args._resolved_gripper_policy
     assert second["speed"] == 0.2
+
+
+def test_deploy_profile_preserves_root_error_and_noncanonical_max_action(
+    tmp_path,
+) -> None:
+    profile_path = tmp_path / "gripper_tasks.json"
+    profile_path.write_text("[]", encoding="utf-8")
+    args = argparse.Namespace(gripper_task_profile=str(profile_path))
+    with pytest.raises(TypeError, match="must contain a JSON object"):
+        hand_backend_config._load_gripper_task_profile(args)
+
+    profile_path.write_text(
+        json.dumps(
+            {
+                "gripper": {"force": 0.2, "max_action": 0.7},
+                "tasks": {"selected": {"gripper": {"force": 0.3, "max_close": 0.6}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        gripper_task_profile=str(profile_path),
+        task_id="selected",
+        gripper_max_action=0.8,
+    )
+    policy = hand_backend_config._resolved_gripper_policy(args)
+    assert args._resolved_gripper_task == "selected"
+    assert policy["torque"] == pytest.approx(0.3)
+    assert policy["max_action"] == pytest.approx(0.8)
 
 
 def test_apply_gripper_policy_preserves_shadow_no_write_flags() -> None:
