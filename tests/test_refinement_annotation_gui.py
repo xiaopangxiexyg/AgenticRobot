@@ -28,12 +28,16 @@ from control_station.refinement_annotation import RefinementAnnotationGui
 from control_station.refinement_annotation.application import (
     RefinementAnnotationApplication,
     RefinementAnnotationApplicationError,
+    _stage_occurrences_from_draft,
 )
 from control_station.refinement_annotation.cli import build_parser
 from dataset_interface.progress_annotation_read_cache import (
     ProgressAnnotationReadCache,
 )
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
+from dataset_contracts.progress_stage_annotations import (
+    ProgressStageAnnotationContractError,
+)
 from dataset_contracts.progress_profile import (
     ProgressStepDefinitionV1,
     TaskProgressProfileV1,
@@ -57,6 +61,51 @@ from teleop_runtime.real_teleop.progress_adapter import (
 
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def test_stage_occurrence_draft_conversion_keeps_defaults_clock_and_error_context() -> None:
+    draft = {
+        "annotation_id": "annotation-1",
+        "coarse_attempt_id": "attempt-1",
+        "progress_step_id": "step-1",
+        "stage_id": "stage-1",
+        "occurrence_index_in_attempt": 1,
+        "start_at": 1.0,
+        "end_at": 2.0,
+        "outcome": "success",
+        "clock_domain_id": "untrusted-clock",
+        "schema": "untrusted-schema",
+        "semantic_content_hash": "untrusted-hash",
+    }
+    (occurrence,) = _stage_occurrences_from_draft(
+        (draft,), clock_domain_id="episode-clock"
+    )
+    assert occurrence.clock_domain_id == "episode-clock"
+    assert occurrence.outcome == "SUCCESS"
+    assert occurrence.confidence == 1.0
+    assert occurrence.source_failure_fact_id is None
+    assert _stage_occurrences_from_draft((), clock_domain_id="episode-clock") == ()
+
+    invalid = {**draft, "end_at": 1.0}
+    with pytest.raises(ProgressStageAnnotationContractError, match="positive duration"):
+        _stage_occurrences_from_draft((invalid,), clock_domain_id="episode-clock")
+
+    application = object.__new__(RefinementAnnotationApplication)
+    item = SimpleNamespace(
+        progress=SimpleNamespace(timeline=SimpleNamespace(clock_domain_id="episode-clock"))
+    )
+    with pytest.raises(RefinementAnnotationApplicationError, match="Invalid detail stage annotation"):
+        application._detail_bundle_from_draft(item, {"occurrences": [invalid]})
+    with pytest.raises(RefinementAnnotationApplicationError, match="Invalid failure_trigger annotation"):
+        application._normalize_failure_triggers(
+            item, [invalid], (), sample_axis=object()
+        )
+    with pytest.raises(RefinementAnnotationApplicationError, match="Invalid recoverable-failure annotation"):
+        application._normalize_recoverable_failures(
+            item, [invalid], (), sample_axis=object()
+        )
+    with pytest.raises(ProgressStageAnnotationContractError, match="positive duration"):
+        application._bundle_from_draft(item, {"occurrences": [invalid]})
 
 
 def _read_json(url: str) -> dict[str, object]:
