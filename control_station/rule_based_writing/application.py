@@ -79,6 +79,8 @@ class RuleBasedWritingUiState:
     rule_start_available: bool = False
     session_state: str = ""
     readiness_reason: str = ""
+    waiting_reason: str = ""
+    writing_reachability_status: str = "disabled"
     startup_blockers: dict[str, str] = field(default_factory=dict)
     can_retry_devices: bool = False
     device_retry_pending: bool = False
@@ -1306,6 +1308,11 @@ class RuleBasedWritingApplication:
             aborted = bool(status.get("aborted", False))
             held = bool(status.get("held", False))
             waiting = str(status.get("waiting_reason", "") or "")
+            self._state.waiting_reason = waiting
+            if "writing_reachability_status" in status:
+                self._state.writing_reachability_status = str(
+                    status.get("writing_reachability_status") or "disabled"
+                )
             if "session_state" in status:
                 self._state.session_state = str(status.get("session_state") or "").upper()
                 # A rule-status heartbeat can lag the generic Home
@@ -2264,6 +2271,27 @@ class RuleBasedWritingApplication:
                 f"{key}: {value}"
                 for key, value in sorted(effective_blockers.items())
             )
+            if self._only_rule_planning_blockers_locked(effective_blockers):
+                planning_projection = self._rule_planning_projection_locked()
+                if planning_projection == "error":
+                    return (
+                        "书写可达性预检异常，系统保持 fail-closed；"
+                        "当前候选不会启动 Episode。请查看原始错误与 Debug 日志，"
+                        "无需重连设备或重新安全初始化。\n"
+                        + detail_lines
+                    )
+                if planning_projection == "candidate_rejected":
+                    return (
+                        "书写候选未通过认证且自动选择已停止；"
+                        "请调整书写大小、方向或来源后重新预验证。"
+                        "无需重连设备或重新安全初始化。\n"
+                        + detail_lines
+                    )
+                return (
+                    "书写候选正在进行可达性预检或自动跳过；"
+                    "当前候选不会启动 Episode，无需重连设备或重新安全初始化。\n"
+                    + detail_lines
+                )
             if self._has_retryable_device_blockers_locked():
                 if self._device_retry_request_available_locked():
                     action = "请先重连失败设备，并重新完成 runtime Home。"
@@ -2431,10 +2459,38 @@ class RuleBasedWritingApplication:
             )
         )
 
+    @staticmethod
+    def _is_rule_planning_blocker(key: str) -> bool:
+        return str(key) == "rule.writing_reachability"
+
+    @classmethod
+    def _only_rule_planning_blockers_locked(
+        cls,
+        blockers: Mapping[str, str],
+    ) -> bool:
+        return bool(blockers) and all(
+            cls._is_rule_planning_blocker(key) for key in blockers
+        )
+
+    def _rule_planning_projection_locked(self) -> str:
+        """Distinguish candidate progress, rejection, and preflight failure."""
+
+        status = str(self._state.writing_reachability_status or "").lower()
+        waiting = str(self._state.waiting_reason or "").lower()
+        if status == "error" or waiting == "writing_reachability_error":
+            return "error"
+        if waiting in {
+            "writing_reachability_exhausted",
+            "writing_reachability_candidate_rejected",
+        }:
+            return "candidate_rejected"
+        return "progress"
+
     def _has_retryable_device_blockers_locked(self) -> bool:
         return any(
             not self._is_runtime_home_requirement(key, detail)
             and str(key) != "rule.right_hand_hold_owner"
+            and not self._is_rule_planning_blocker(key)
             for key, detail in self._state.startup_blockers.items()
         )
 
@@ -2531,7 +2587,36 @@ class RuleBasedWritingApplication:
             return
         details = self._state.startup_blockers
         reason = self._state.readiness_reason
-        if details and self._has_retryable_device_blockers_locked():
+        if self._only_rule_planning_blockers_locked(details):
+            detail_lines = "; ".join(
+                f"{key}: {value}" for key, value in sorted(details.items())
+            )
+            planning_projection = self._rule_planning_projection_locked()
+            if planning_projection == "error":
+                self._state.title = "书写可达性预检异常"
+                self._state.detail = (
+                    "可达性预检返回未知结果或后台执行失败；系统保持 fail-closed，"
+                    "不会启动 Episode，也不会把该错误当作设备断联。"
+                    "请查看原始错误与 Debug 日志并修复预检实现；"
+                    "无需重连设备或重新安全初始化。\n"
+                    + detail_lines
+                )
+            elif planning_projection == "candidate_rejected":
+                self._state.title = "当前书写候选未通过认证"
+                self._state.detail = (
+                    "候选已被安全边界或数值认证拒绝，且自动选择已停止。"
+                    "请调整书写大小、方向或来源后重新预验证；"
+                    "无需重连设备或重新安全初始化，且不会启动 Episode。\n"
+                    + detail_lines
+                )
+            else:
+                self._state.title = "正在验证下一条书写候选"
+                self._state.detail = (
+                    "候选可达性预检尚未通过；系统会在安全边界内自动跳过"
+                    "未认证候选。无需重连设备或重新安全初始化，且不会提前启动 Episode。\n"
+                    + detail_lines
+                )
+        elif details and self._has_retryable_device_blockers_locked():
             detail_lines = "; ".join(
                 f"{key}: {value}" for key, value in sorted(details.items())
             )

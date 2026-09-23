@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pickle
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
 
@@ -325,6 +327,12 @@ def test_writing_reachability_blocks_start_until_background_check_passes() -> No
         "reachable": True,
         "probes": (),
     }
+    extension._submit_writing_reachability_preflight = lambda request: (
+        extension._configuration_executor.submit(
+            extension._run_writing_reachability_preflight,
+            request,
+        )
+    )
 
     extension.after_control_input_poll(now=1.0)
     assert extension.status().rule_start_available is False
@@ -338,6 +346,110 @@ def test_writing_reachability_blocks_start_until_background_check_passes() -> No
     status = extension.status()
     assert status.writing_reachability_status == "passed"
     assert status.rule_start_available is True
+
+
+def test_writing_reachability_submission_uses_process_safe_payload() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    captured: dict[str, object] = {}
+
+    class Executor:
+        def submit(self, fn, request):
+            captured["fn"] = fn
+            captured["request"] = request
+            future = Future()
+            future.set_result({"reachable": True, "probes": ()})
+            return future
+
+    extension._reachability_executor = Executor()
+    callback = lambda _event: None
+    future = extension._submit_writing_reachability_preflight(
+        {"value": 1, "progress_callback": callback}
+    )
+
+    assert future.result()["reachable"] is True
+    assert captured["fn"].__name__ == (
+        "_run_writing_reachability_preflight_process"
+    )
+    assert captured["request"] == {"value": 1}
+
+
+def test_writing_reachability_spawn_worker_round_trip() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    projected_probe = {
+        "name": "right",
+        "target_pose_by_side": {
+            "left": np.eye(4),
+            "right": np.eye(4),
+        },
+        "envelope_modified_sides": ("right",),
+    }
+    try:
+        future = extension._submit_writing_reachability_preflight(
+            {
+                "oracle_config": object(),
+                "seed_qpos": {"left": np.zeros(6), "right": np.zeros(6)},
+                "probes": tuple(projected_probe for _ in range(4)),
+                "world_to_base_by_side": {
+                    "left": np.eye(4),
+                    "right": np.eye(4),
+                },
+                "translation_tolerance_m": 0.005,
+                "rotation_tolerance_deg": 3.0,
+                "progress_callback": lambda _event: None,
+            }
+        )
+        result = future.result(timeout=15.0)
+    finally:
+        extension._shutdown_writing_reachability_executor(wait=True)
+
+    assert result["reachable"] is False
+    assert len(result["probes"]) == 4
+    assert all(
+        probe["reason"] == "tcp_envelope_projection_required"
+        for probe in result["probes"]
+    )
+
+
+def test_writing_reachability_replaces_crashed_process_pool_on_retry() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+
+    class BrokenExecutor:
+        shutdown_called = False
+
+        def submit(self, *_args, **_kwargs):
+            raise RuntimeError("spawn worker crashed")
+
+        def shutdown(self, *, wait, cancel_futures):
+            assert wait is False
+            assert cancel_futures is True
+            self.shutdown_called = True
+
+    broken = BrokenExecutor()
+    extension._reachability_executor = broken
+
+    with pytest.raises(RuntimeError, match="spawn worker crashed"):
+        extension._submit_writing_reachability_preflight({"value": 1})
+
+    assert broken.shutdown_called is True
+    assert extension._reachability_executor is None
 
 
 def test_writing_reachability_shows_candidate_probe_and_slow_solve() -> None:
@@ -386,6 +498,12 @@ def test_writing_reachability_shows_candidate_probe_and_slow_solve() -> None:
         return {"reachable": True, "probes": (), "elapsed_ms": 1200.0}
 
     extension._run_writing_reachability_preflight = check
+    extension._submit_writing_reachability_preflight = lambda request: (
+        extension._configuration_executor.submit(
+            extension._run_writing_reachability_preflight,
+            request,
+        )
+    )
     try:
         extension.after_control_input_poll(now=1.0)
         extension.after_control_input_poll(now=1.05)
@@ -550,6 +668,7 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
 
     request = extension._writing_reachability_request()
 
+    assert pickle.loads(pickle.dumps(request))["oracle_config"] is not None
     assert len(request["probes"]) == 4
     assert request["probes"][0]["envelope_modified_sides"] == ("left",)
     assert np.isclose(request["probes"][0]["target_pose_by_side"]["left"][0, 3], 0.01)
@@ -863,8 +982,9 @@ def test_writing_reachability_budget_exhaustion_is_not_unreachable(
 @pytest.mark.parametrize(
     ("reason", "expected_status"),
     [
-        ("solver_not_converged", "error"),
+        ("solver_not_converged", "uncertified"),
         ("tcp_envelope_projection_required", "unreachable"),
+        ("internal_protocol_error", "error"),
     ],
 )
 def test_terminal_writing_reachability_result_is_not_resubmitted(
@@ -907,6 +1027,12 @@ def test_terminal_writing_reachability_result_is_not_resubmitted(
         }
 
     extension._run_writing_reachability_preflight = check
+    extension._submit_writing_reachability_preflight = lambda request: (
+        extension._configuration_executor.submit(
+            extension._run_writing_reachability_preflight,
+            request,
+        )
+    )
     deadline = time.monotonic() + 2.0
     while extension.status().writing_reachability_status != expected_status:
         extension.after_control_input_poll(now=1.0)
@@ -927,7 +1053,17 @@ def test_terminal_writing_reachability_result_is_not_resubmitted(
     )
 
 
-def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> None:
+@pytest.mark.parametrize(
+    ("first_reason", "expected_summary"),
+    [
+        ("tcp_envelope_projection_required", "安全边界拒绝"),
+        ("solver_guard_hold", "数值 IK 未能认证"),
+    ],
+)
+def test_uncertified_writing_candidate_is_skipped_without_hold_or_episode(
+    first_reason: str,
+    expected_summary: str,
+) -> None:
     plan = RuleBasedCollectionPlan(
         steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
     )
@@ -984,13 +1120,19 @@ def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> N
                     {
                         "name": "right",
                         "reachable": False,
-                        "reason": "tcp_envelope_projection_required",
+                        "reason": first_reason,
                     },
                 ),
             }
         return {"reachable": True, "probes": ()}
 
     extension._run_writing_reachability_preflight = check
+    extension._submit_writing_reachability_preflight = lambda request: (
+        extension._configuration_executor.submit(
+            extension._run_writing_reachability_preflight,
+            request,
+        )
+    )
 
     deadline = time.monotonic() + 2.0
     while extension.status().writing_reachability_status != "passed":
@@ -1005,7 +1147,7 @@ def test_unreachable_writing_candidate_is_skipped_without_hold_or_episode() -> N
     assert extension.status().aborted is False
     assert recorder.is_recording is False
     assert any(
-        tag == "RuleBasedReachability" and "安全边界拒绝" in message
+        tag == "RuleBasedReachability" and expected_summary in message
         for tag, message in ui.messages
     )
 

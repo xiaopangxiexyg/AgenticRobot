@@ -803,6 +803,114 @@ def test_rule_ui_explains_startup_home_continuity_without_claiming_motion() -> N
     assert "不会下发运动或写入样本" in state["detail"]
 
 
+def test_rule_ui_does_not_present_reachability_as_device_or_home_fault() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application.observe_runtime_publication({"active_controls": ["q"]})
+    application.observe_rule_status(
+        {
+            "started": True,
+            "session_state": "RUNNING",
+            "rule_start_available": False,
+            "waiting_reason": "writing_reachability_skip",
+            "writing_reachability_status": "skipping_candidate",
+            "readiness_blockers": {
+                "rule.writing_reachability": (
+                    "待检候选 4 数值 IK 未能认证；正在准备下一候选"
+                )
+            },
+        }
+    )
+
+    state = application.snapshot()
+    assert state["can_retry_devices"] is False
+    assert state["can_runtime_home"] is False
+    assert state["title"] == "正在验证下一条书写候选"
+    assert state["waiting_reason"] == "writing_reachability_skip"
+    assert state["writing_reachability_status"] == "skipping_candidate"
+    assert "无需重连设备或重新安全初始化" in state["detail"]
+    assert "保持 Hold" not in state["detail"]
+
+
+def test_rule_ui_keeps_reachability_preflight_error_fail_closed() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application.observe_runtime_publication({"active_controls": ["q"]})
+    application.observe_rule_status(
+        {
+            "started": True,
+            "session_state": "RUNNING",
+            "rule_start_available": False,
+            "waiting_reason": "writing_reachability_error",
+            "writing_reachability_status": "error",
+            "readiness_blockers": {
+                "rule.writing_reachability": (
+                    "书写可达性预检返回未知结果；请检查预检实现"
+                )
+            },
+        }
+    )
+
+    state = application.snapshot()
+    assert state["can_retry_devices"] is False
+    assert state["can_runtime_home"] is False
+    assert state["title"] == "书写可达性预检异常"
+    assert "系统保持 fail-closed" in state["detail"]
+    assert "修复预检实现" in state["detail"]
+    assert "自动跳过" not in state["detail"]
+    assert "无需重连设备或重新安全初始化" in state["detail"]
+
+
+def test_task_chain_explains_exhausted_reachability_candidates() -> None:
+    application = RuleBasedWritingApplication()
+    options, selected, _other = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, selected)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            session_state="RUNNING",
+            rule_start_available=False,
+            waiting_reason="writing_reachability_exhausted",
+            writing_reachability_status="uncertified",
+            readiness_blockers={
+                "rule.writing_reachability": (
+                    "连续 32 条候选未通过认证，已停止自动选择"
+                )
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_can_advance"] is False
+    assert "自动选择已停止" in state["task_chain_detail"]
+    assert "调整书写大小、方向或来源" in state["task_chain_detail"]
+    assert "正在进行可达性预检或自动跳过" not in state["task_chain_detail"]
+
+
+def test_task_chain_projects_reachability_as_candidate_preparation() -> None:
+    application = RuleBasedWritingApplication()
+    options, selected, _other = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, selected)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            session_state="RUNNING",
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.writing_reachability": (
+                    "待检候选 4 数值 IK 未能认证；正在准备下一候选"
+                )
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert "书写候选正在进行可达性预检或自动跳过" in state[
+        "task_chain_detail"
+    ]
+    assert "无需重连设备或重新安全初始化" in state["task_chain_detail"]
+
+
 def test_rule_ui_exposes_rehome_only_after_devices_recover() -> None:
     application = RuleBasedWritingApplication()
     application.bind_rule_runtime()
