@@ -98,6 +98,14 @@ def _build_active(state: dict[str, object]) -> list[dict[str, object]]:
             "device_retry",
         ),
         (
+            "tactile.right",
+            "Device",
+            "right DMTAC camera tactile Bundle root is unavailable",
+            "tactile",
+            "tactile_capture",
+            "device_retry",
+        ),
+        (
             "safety.force",
             "PositionForceGuard",
             "left RM65 force reading is stale: 0.8s",
@@ -160,6 +168,48 @@ def test_force_trip_is_critical_but_ik_failure_is_not_a_device_retry() -> None:
     assert reachability["domain"] == "arm_ik"
     assert reachability["recovery"]["id"] == "adjust_candidate"
     assert reachability["recovery"]["id"] != "device_retry"
+
+
+def test_active_reachability_diagnostics_follow_runtime_lifecycle() -> None:
+    blocker = {
+        "rule.writing_reachability": "待检候选 4 数值 IK 未能认证；正在后台准备下一候选"
+    }
+    progress = _build_active(
+        {
+            "startup_blockers": blocker,
+            "waiting_reason": "writing_reachability_skip",
+            "writing_reachability_status": "skipping_candidate",
+        }
+    )[0]
+    assert progress["planningMode"] == "progress"
+    assert progress["severity"] == "warning"
+    assert progress["recovery"]["id"] == "wait_candidate_check"
+
+    exhausted = _build_active(
+        {
+            "startup_blockers": {
+                "rule.writing_reachability": "连续 32 条候选未通过认证，已停止自动选择"
+            },
+            "waiting_reason": "writing_reachability_exhausted",
+            "writing_reachability_status": "uncertified",
+        }
+    )[0]
+    assert exhausted["planningMode"] == "candidate_rejected"
+    assert exhausted["recovery"]["id"] == "adjust_candidate"
+
+    failed = _build_active(
+        {
+            "startup_blockers": {
+                "rule.writing_reachability": "书写可达性预检返回未知结果；请检查预检实现"
+            },
+            "waiting_reason": "writing_reachability_error",
+            "writing_reachability_status": "error",
+        }
+    )[0]
+    assert failed["planningMode"] == "error"
+    assert failed["severity"] == "error"
+    assert failed["recovery"]["id"] == "inspect_reachability_preflight"
+    assert failed["recovery"]["id"] != "device_retry"
 
 
 def test_right_hand_owner_requirement_is_not_misreported_as_disconnect() -> None:

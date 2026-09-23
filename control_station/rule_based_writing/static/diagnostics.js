@@ -38,6 +38,31 @@
     return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
   }
 
+  function reachabilityMode({key = "", message = "", waitingReason = "", reachabilityStatus = ""}) {
+    const evidence = `${lower(key)} ${lower(message)}`;
+    if (!containsAny(evidence, ["writing_reachability", "书写可达性", "writing reachability"])) {
+      return null;
+    }
+    const waiting = lower(waitingReason);
+    const status = lower(reachabilityStatus);
+    if (
+      status === "error"
+      || waiting === "writing_reachability_error"
+      || containsAny(evidence, [
+        "未知结果", "后台预检失败", "下一候选准备失败", "检查预检实现",
+        "worker crash", "brokenprocesspool",
+      ])
+    ) return "error";
+    if (
+      status === "pending"
+      || status === "skipping_candidate"
+      || waiting === "writing_reachability_preflight"
+      || waiting === "writing_reachability_skip"
+      || containsAny(evidence, ["正在后台准备", "正在重新检查", "尚未完成可达性检查"])
+    ) return "progress";
+    return "candidate_rejected";
+  }
+
   function component(domain, evidence) {
     const value = lower(evidence);
     if (domain === "camera") {
@@ -101,6 +126,7 @@
       "emergency stop", "hard joint limit", "机械臂急停", "关节硬限位",
       "tcp pose envelope", "tcp姿态包络",
     ])) return "arm_motion";
+    if (containsAny(evidence, ["tactile", "dmtac camera", "触觉", "bundle root"])) return "tactile";
     if (tagText === "camera" || tagText === "cameraselfcheck" || containsAny(evidence, [
       "camera.", "camera/", " camera", "realsense", "left_wrist", "right_wrist",
       "相机", "摄像头",
@@ -112,7 +138,6 @@
       "dataset writer", "writer_blocked", "writer failed", "episode open", "落盘",
       "数据集 writer", "正式数采",
     ])) return "dataset_writer";
-    if (containsAny(evidence, ["tactile", "dmtac camera", "触觉", "bundle root"])) return "tactile";
     if (tagText === "footpad" || containsAny(evidence, ["foot_pad", "foot pad", "踏板", "输入设备"])) return "input";
     if (keyText === "rig.session" || containsAny(evidence, [
       "debug_only", "runtime home", "hardware arm admission", "session state",
@@ -124,8 +149,9 @@
     return "unknown";
   }
 
-  function severityFor(domain, source, tag, message) {
+  function severityFor(domain, source, tag, message, planningMode) {
     const evidence = `${lower(tag)} ${lower(message)}`;
+    if (planningMode === "progress") return "warning";
     if (domain === "arm_force" && containsAny(evidence, ["tripped", "急停", "stale", "超限", "latched stop"])) {
       return "critical";
     }
@@ -143,7 +169,7 @@
     return "info";
   }
 
-  function recoveryFor(domain, key, message) {
+  function recoveryFor(domain, key, message, planningMode) {
     const evidence = `${lower(key)} ${lower(message)}`;
     if (lower(key) === "rule.right_hand_hold_owner") {
       return {
@@ -157,6 +183,20 @@
         id: "force_telemetry_check",
         label: "检查对应机械臂的力数据新鲜度",
         instruction: "保持 Hold，检查所标明侧别的力读取延迟与阻塞；同时排除真实碰撞，确认恢复新鲜数据后重新安全初始化。",
+      };
+    }
+    if (planningMode === "progress") {
+      return {
+        id: "wait_candidate_check",
+        label: "等待自动候选检查",
+        instruction: "系统正在命令惰性地检查或切换候选；不会启动 Episode。无需重连设备、重做 runtime Home 或手动跳过。",
+      };
+    }
+    if (planningMode === "error") {
+      return {
+        id: "inspect_reachability_preflight",
+        label: "检查可达性预检实现",
+        instruction: "系统保持 fail-closed，当前候选不会启动 Episode。查看原始错误与 Debug 日志；不要把预检异常当作设备断联。",
       };
     }
     const recoveries = {
@@ -224,14 +264,27 @@
     return recoveries[domain];
   }
 
-  function classifyDiagnostic({tag = "", key = "", message = "", source = "message"} = {}) {
+  function classifyDiagnostic({
+    tag = "",
+    key = "",
+    message = "",
+    source = "message",
+    waitingReason = "",
+    reachabilityStatus = "",
+  } = {}) {
     const rawMessage = normalize(message);
     const rawKey = normalize(key);
     const rawTag = normalize(tag);
     const evidence = [rawKey, rawTag, rawMessage].filter(Boolean).join(" · ");
     const domain = domainFor(rawTag, rawKey, rawMessage);
+    const planningMode = reachabilityMode({
+      key: rawKey,
+      message: rawMessage,
+      waitingReason,
+      reachabilityStatus,
+    });
     const target = component(domain, evidence);
-    const severity = severityFor(domain, source, rawTag, rawMessage);
+    const severity = severityFor(domain, source, rawTag, rawMessage, planningMode);
     return {
       id: `${source}:${rawKey || rawTag || "unknown"}:${target.id}`,
       source,
@@ -245,7 +298,8 @@
       severityLabel: SEVERITY_LABELS[severity],
       summary: compact(rawMessage || rawKey || rawTag || "未提供错误详情"),
       evidence: rawMessage || rawKey || rawTag || "未提供错误详情",
-      recovery: recoveryFor(domain, rawKey, rawMessage),
+      planningMode,
+      recovery: recoveryFor(domain, rawKey, rawMessage, planningMode),
     };
   }
 
@@ -255,7 +309,13 @@
       ? state.startup_blockers
       : {};
     Object.entries(blockers).forEach(([key, message]) => {
-      diagnostics.push(classifyDiagnostic({key, message, source: "blocker"}));
+      diagnostics.push(classifyDiagnostic({
+        key,
+        message,
+        source: "blocker",
+        waitingReason: state.waiting_reason,
+        reachabilityStatus: state.writing_reachability_status,
+      }));
     });
     if (normalize(state.configuration_error)) {
       diagnostics.push(classifyDiagnostic({
