@@ -4,6 +4,7 @@ import io
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from sim.mujoco.depth_snapshot import MujocoDepthSnapshotSource
 
@@ -40,6 +41,10 @@ class _Renderer:
         if view_id == "front":
             return np.asarray([[1.0, np.nan], [-2.0, 3.0]], dtype=np.float64)
         return np.asarray([[0.5, 1.5, 2.5]], dtype=np.float32)
+
+    def render(self, view_id):
+        self.calls.append(f"rgb:{view_id}")
+        return np.full((self.height, self.width, 3), 64, dtype=np.uint8)
 
     def close(self):
         self.closed = True
@@ -91,6 +96,45 @@ def test_depth_snapshot_is_native_metric_float32_with_zero_invalid() -> None:
     assert again.data == frame.data
     assert len(renderers) == 1
     assert renderers[0].calls == ["front", "front"]
+
+
+def test_rgbd_cut_uses_one_scene_capture_when_scene_changes_between_captures() -> None:
+    scene = _Scene()
+    scene.generation = 0
+    capture_calls = 0
+
+    class _ChangingRenderer(_Renderer):
+        def render(self, view_id):
+            return np.full(
+                (self.height, self.width, 3),
+                scene.generation,
+                dtype=np.uint8,
+            )
+
+        def render_depth(self, view_id):
+            return np.full(
+                (self.height, self.width),
+                scene.generation,
+                dtype=np.float32,
+            )
+
+    def capture_scene(capture):
+        nonlocal capture_calls
+        capture_calls += 1
+        scene.generation = 10 * capture_calls
+        return capture(scene)
+
+    source = MujocoDepthSnapshotSource(
+        capture_scene=capture_scene,
+        clock=lambda: 12.5,
+        renderer_factory=_ChangingRenderer,
+    )
+    rgb, depth = source.capture_jpeg_npy_cut(view_id="front")
+
+    assert capture_calls == 1
+    with Image.open(io.BytesIO(rgb.data)) as image:
+        assert np.asarray(image)[0, 0, 0] == 10
+    assert np.load(io.BytesIO(depth.data), allow_pickle=False)[0, 0] == 10.0
 
 
 def test_depth_snapshot_catalog_bounds_cache_and_close() -> None:

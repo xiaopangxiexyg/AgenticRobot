@@ -32,7 +32,11 @@ from sim.mujoco.depth_snapshot import (
     EncodedMujocoDepthFrame,
     MujocoDepthSnapshotSource,
 )
-from sim.mujoco.rgb_snapshot import EncodedMujocoRgbSnapshot, MujocoRgbSnapshotSource
+from sim.mujoco.rgb_snapshot import (
+    EncodedMujocoRgbFrame,
+    EncodedMujocoRgbSnapshot,
+    MujocoRgbSnapshotSource,
+)
 
 def _required(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -402,6 +406,20 @@ class MujocoAgentSkillMotionApplication:
             )
             return {"right_gripper": dict(captured["right_gripper"])}
 
+    def capture_arm_gripper_state(self) -> Mapping[str, object]:
+        """Capture one atomic measured arm/gripper scene cut."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+            captured = self.runtime.rig.capture_scene(
+                self._capture_arm_gripper_state_from_scene
+            )
+            return {
+                "right_arm": tuple(captured["right_arm"]),
+                "right_gripper": dict(captured["right_gripper"]),
+            }
+
     def gripper_qpos_for_close(self, close_fraction: float) -> tuple[float, ...]:
         """Resolve a normalized endpoint through the bound scene geometry."""
 
@@ -525,6 +543,18 @@ class MujocoAgentSkillMotionApplication:
         """Capture one passive native-resolution metric depth Artifact."""
 
         return self._depth_snapshot_source.capture_npy_frame(view_id=view_id)
+
+    def capture_visual_depth_cut(
+        self,
+        *,
+        view_id: str,
+    ) -> tuple[EncodedMujocoRgbFrame, EncodedMujocoDepthFrame]:
+        """Render RGB and depth from one rig-owned scene cut."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+            return self._depth_snapshot_source.capture_jpeg_npy_cut(view_id=view_id)
 
     def _capture_visual_scene(self, capture: Callable[[Any], Any]) -> Any:
         """Keep renderer access serialized with motion and lifecycle changes."""

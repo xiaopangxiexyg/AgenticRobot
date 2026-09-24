@@ -11,6 +11,10 @@ from agent_gateway.profiles.segmentation import (
     SegmentationRegistration,
     build_segmentation_registration,
 )
+from agent_gateway.profiles.placement import (
+    PlacementRegistration,
+    build_placement_registration,
+)
 from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
@@ -694,6 +698,7 @@ class MujocoAgentTcpPoseContractBundle:
     depth_capture: MujocoDepthCaptureRegistration | None = None
     rgb_capture: MujocoRgbCaptureRegistration | None = None
     segmentation: SegmentationRegistration | None = None
+    placement: PlacementRegistration | None = None
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None
     history_source_binding: SourceObservationHistoryBinding | None = None
     history_deployment_binding: (
@@ -752,6 +757,20 @@ class MujocoAgentTcpPoseContractBundle:
                 segmentation.binding.semantic_content_hash
             ):
                 raise ValueError("Segmentation Route uses another deployment binding.")
+        placement = self.placement
+        if placement is not None:
+            if not isinstance(placement, PlacementRegistration):
+                raise TypeError("placement must be a typed registration.")
+            placement_entry = self.route_manifest.route(
+                placement.skill.definition.skill_id,
+                placement.skill.definition.skill_version,
+            )
+            if placement_entry.deployment_binding.deployment_binding_hash != (
+                placement.binding.semantic_content_hash
+            ):
+                raise ValueError("Placement Route uses another deployment binding.")
+            if segmentation is None or depth_capture is None:
+                raise ValueError("Placement requires segmentation and depth capture.")
         gripper_actions = tuple(self.gripper_actions)
         if len(gripper_actions) != 2 or any(
             not isinstance(item, MujocoGripperActionRegistration)
@@ -1881,6 +1900,23 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         if segmentation_model_profile_id is not None
         else None
     )
+    placement = (
+        build_placement_registration(
+            segmentation=segmentation,
+            back_projection=depth_capture.back_projection,
+            component_id="right_arm",
+            destination_role="main",
+            runtime_session_id=exact["runtime_session_id"],
+            control_domain_id=exact["control_domain_id"],
+            target_binding_id=target_binding.binding_id,
+            station_manifest_hash=station.semantic_content_hash,
+            execution_manifest_hash=execution.semantic_content_hash,
+        )
+        if segmentation is not None
+        and depth_capture is not None
+        and depth_capture.back_projection is not None
+        else None
+    )
     if any(
         item.distance_m > profile.max_translation_delta_m
         for item in cardinal_step_profile.primitives
@@ -2836,6 +2872,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if segmentation is not None:
         definition_items.append(segmentation.skill.definition)
         schema_items.append(segmentation.skill.schema_entry)
+    if placement is not None:
+        definition_items.append(placement.skill.definition)
+        schema_items.append(placement.skill.schema_entry)
     for item in (*gripper_actions, gripper_state):
         definition_items.append(item.skill.definition)
         schema_items.append(item.skill.schema_entry)
@@ -3020,6 +3059,15 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=segmentation.availability_hash,
             )
         )
+    if placement is not None:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=placement.skill.routes[0],
+                deployment_binding=placement.binding.to_ref(),
+                evaluation_plan_hash=None,
+                availability_hash=placement.availability_hash,
+            )
+        )
     for item in gripper_actions:
         route_items.append(
             SkillRouteManifestEntry(
@@ -3075,6 +3123,11 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             segmentation.skill.definition.skill_version,
         ):
             explicit_contracts += (segmentation.skill.io_contract,)
+        if placement is not None and key == (
+            placement.skill.definition.skill_id,
+            placement.skill.definition.skill_version,
+        ):
+            explicit_contracts += (placement.skill.io_contract,)
         contract = (
             explicit_contracts[0]
             if explicit_contracts
@@ -3190,6 +3243,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         validator_items.append(rgb_capture.payload_validator)
     if segmentation is not None:
         validator_items.append(segmentation.payload_validator)
+    if placement is not None:
+        validator_items.append(placement.payload_validator)
     validator_items.extend(item.payload_validator for item in gripper_actions)
     validator_items.append(gripper_state.payload_validator)
     validators = AgentSkillPayloadValidatorRegistry(
@@ -3221,6 +3276,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
         segmentation=segmentation,
+        placement=placement,
         history_profile=history_profile,
         history_source_binding=history_source_binding,
         history_deployment_binding=history_binding,

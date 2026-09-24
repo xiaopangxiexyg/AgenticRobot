@@ -103,7 +103,7 @@ def test_back_project_schema_avoids_provider_one_of_and_validates_exclusive_mode
         )
 
 
-def test_pixel_back_projection_returns_station_geometry_and_provenance() -> None:
+def test_pixel_back_projection_returns_compact_station_geometry() -> None:
     registration = _registration()
     port = _CapturePort(np.full((3, 4), 2.0, dtype=np.float32))
     provider = LiveBackProjectionProvider(
@@ -122,12 +122,7 @@ def test_pixel_back_projection_returns_station_geometry_and_provenance() -> None
 
     assert port.calls == [("main", 7)]
     assert result["coordinate_mode"] == "pixel"
-    assert result["world_center_xyz_m"] == [0.5, -0.25, 3.0]
-    assert result["world_bounds_xyz_m"] == {
-        "low": [0.5, -0.25, 3.0],
-        "high": [0.5, -0.25, 3.0],
-    }
-    assert result["world_extent_xyz_m"] == [0.0, 0.0, 0.0]
+    assert result["world_xyz_m"] == [0.5, -0.25, 3.0]
     assert result["valid_point_count"] == 1
     assert result["reference_frame_id"] == "canonical_station"
     registration.payload_validator.validate_execution_result(result)
@@ -136,7 +131,7 @@ def test_pixel_back_projection_returns_station_geometry_and_provenance() -> None
     )
 
 
-def test_region_back_projection_filters_station_z_and_returns_robust_extent() -> None:
+def test_region_back_projection_filters_station_z() -> None:
     registration = _registration()
     depth = np.asarray(
         [
@@ -163,12 +158,7 @@ def test_region_back_projection_filters_station_z_and_returns_robust_extent() ->
     assert result["coordinate_mode"] == "region"
     assert result["valid_point_count"] == 8
     assert result["depth_m"] == 1.0
-    assert result["world_bounds_xyz_m"]["low"] == pytest.approx(
-        [-0.5, -0.75, 2.0]
-    )
-    assert result["world_bounds_xyz_m"]["high"] == pytest.approx(
-        [1.0, -0.25, 2.0]
-    )
+    assert result["world_xyz_m"] == pytest.approx([0.25, -0.5, 2.0])
     registration.payload_validator.validate_execution_result(result)
 
 

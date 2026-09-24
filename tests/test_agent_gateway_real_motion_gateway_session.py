@@ -29,6 +29,7 @@ from agent_gateway.profiles.real.one_shot_authorization import (
 from agent_gateway.profiles.real.perception_deployment import (
     build_real_perception_capture_registration,
 )
+from agent_gateway.profiles.real.placement import RealPlacementRobotStatePort
 from agent_gateway.profiles.real.realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
@@ -278,6 +279,43 @@ def _runtime_fixture(
         port.confirm_exclusive_attachment()
         port.publish_owner_state(session=_OwnerSession(), captured_at=10.0)
     return bundle, port, target_builder
+
+
+def test_real_placement_state_uses_fresh_station_frame_tcp_measurement() -> None:
+    station_from_execution = np.eye(4, dtype=float)
+    station_from_execution[:3, 3] = (0.2, -0.1, 0.3)
+    bundle, port, _ = _runtime_fixture(
+        station_from_execution=station_from_execution
+    )
+    clock = _Clock()
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:placement",),
+    )
+    state_port = RealPlacementRobotStatePort(
+        port=port,
+        frame_graph=bundle.frame_graph,
+        component_id=COMPONENT_ID,
+        execution_reference_frame_id=(
+            bundle.attachment.execution_reference_frame_id
+        ),
+        reference_frame_id=bundle.cardinal_profile.reference_frame_id,
+        maximum_measurement_age_ms=200,
+        current_station_revision=lambda: 4,
+        clock=clock,
+    )
+
+    captured = state_port.capture_placement_robot_state(
+        expected_station_revision=4
+    )
+
+    assert captured.tool_tcp_reference_xyz_quat_xyzw == pytest.approx(
+        (0.2, -0.1, 0.3, 0.0, 0.0, 0.0, 1.0)
+    )
+    assert captured.gripper_close_fraction is None
+    assert captured.station_revision == 4
 
 
 def _owner_state(bundle, *, captured_at: float) -> RealControlOwnerState:

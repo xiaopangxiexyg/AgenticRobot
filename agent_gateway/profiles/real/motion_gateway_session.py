@@ -16,6 +16,11 @@ from agent_gateway.profiles.back_projection import (
     LiveBackProjectionProvider,
     build_back_projection_executor,
 )
+from agent_gateway.profiles.placement import (
+    PLACEMENT_MAX_OPERATION_DURATION_MS_V1,
+    PlacementProvider,
+    build_placement_executor,
+)
 from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
     AgentSkillOperation,
@@ -86,6 +91,7 @@ from .grasp_approach_plan import (
     build_real_grasp_approach_plan_executor,
 )
 from .back_projection import RealSenseBackProjectionCapturePort
+from .placement import RealPlacementRobotStatePort
 from .localization_gateway import (
     ObjectLocalizationProvider,
     build_real_object_localization_executor,
@@ -620,6 +626,8 @@ class RealAgentPrimitiveGatewaySession:
     localization_executor: PassiveReadSkillExecutor | None
     segmentation_provider: LiveSegmentationProvider | None
     segmentation_executor: PassiveReadSkillExecutor | None
+    placement_provider: PlacementProvider | None
+    placement_executor: PassiveReadSkillExecutor | None
     station_point_grasp_provider: StationBoundPointGraspProvider | None
     station_point_grasp_executor: PassiveReadSkillExecutor | None
     station_point_grasp_render_provider: StationBoundPointGraspRenderProvider | None
@@ -695,6 +703,14 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError(
                 "Real segmentation registration and runtime resources disagree."
             )
+        placement_enabled = self.contract_bundle.placement_registration is not None
+        if placement_enabled != all(
+            item is not None
+            for item in (self.placement_provider, self.placement_executor)
+        ):
+            raise ValueError(
+                "Real placement registration and runtime resources disagree."
+            )
         grasp_plan_enabled = (
             self.contract_bundle.grasp_approach_plan_registration is not None
         )
@@ -729,6 +745,7 @@ class RealAgentPrimitiveGatewaySession:
             "perception.back_project": self.back_projection_executor,
             "perception.localize_objects": self.localization_executor,
             "perception.segment": self.segmentation_executor,
+            "perception.plan_placement": self.placement_executor,
             "perception.plan_point_grasp": self.station_point_grasp_executor,
             "perception.render_point_grasp_candidate": (
                 self.station_point_grasp_render_executor
@@ -827,16 +844,20 @@ class RealAgentPrimitiveGatewaySession:
             if not outcome.accepted:
                 return outcome
             passive_reads_settled = all(
-                executor is None or executor.wait_all(timeout_sec=5.0)
-                for executor in (
-                    self.state_executor,
-                    self.rgb_executor,
-                    self.depth_executor,
-                    self.back_projection_executor,
-                    self.localization_executor,
-                    self.station_point_grasp_executor,
-                    self.station_point_grasp_render_executor,
-                    self.grasp_approach_plan_executor,
+                executor is None or executor.wait_all(timeout_sec=timeout_sec)
+                for executor, timeout_sec in (
+                    (self.state_executor, 5.0),
+                    (self.rgb_executor, 5.0),
+                    (self.depth_executor, 5.0),
+                    (self.back_projection_executor, 5.0),
+                    (
+                        self.placement_executor,
+                        PLACEMENT_MAX_OPERATION_DURATION_MS_V1 / 1_000.0 + 5.0,
+                    ),
+                    (self.localization_executor, 5.0),
+                    (self.station_point_grasp_executor, 5.0),
+                    (self.station_point_grasp_render_executor, 5.0),
+                    (self.grasp_approach_plan_executor, 5.0),
                 )
             )
             segmentation_settled = (
@@ -1314,9 +1335,12 @@ def assemble_real_agent_primitive_gateway_session(
     depth_executor = None
     back_projection_provider = None
     back_projection_executor = None
+    back_projection_capture_port = None
     localization_executor = None
     segmentation_provider = None
     segmentation_executor = None
+    placement_provider = None
+    placement_executor = None
     station_point_grasp_provider = None
     station_point_grasp_executor = None
     station_point_grasp_render_provider = None
@@ -1346,11 +1370,12 @@ def assemble_real_agent_primitive_gateway_session(
             frame_binding = registration.frame_binding
             if frame_binding is None:
                 raise ValueError("Back-projection requires a v2 frame binding.")
+            back_projection_capture_port = RealSenseBackProjectionCapturePort(
+                perception_provider=perception_provider,
+                frame_binding=frame_binding,
+            )
             back_projection_provider = LiveBackProjectionProvider(
-                capture_port=RealSenseBackProjectionCapturePort(
-                    perception_provider=perception_provider,
-                    frame_binding=frame_binding,
-                ),
+                capture_port=back_projection_capture_port,
                 registration=back_projection_registration,
             )
             back_projection_executor = build_back_projection_executor(
@@ -1385,6 +1410,52 @@ def assemble_real_agent_primitive_gateway_session(
             execution_port_by_route_hash[
                 segmentation_registration.skill.routes[0].semantic_content_hash
             ] = segmentation_executor
+        placement_registration = contract_bundle.placement_registration
+        if placement_registration is not None:
+            assert segmentation_registration is not None
+            assert segmentation_executor is not None
+            assert segmentation_provider is not None
+            assert back_projection_registration is not None
+            assert back_projection_capture_port is not None
+            frame_binding = registration.frame_binding
+            if frame_binding is None:
+                raise ValueError("Placement requires a v2 frame binding.")
+            placement_provider = PlacementProvider(
+                registration=placement_registration,
+                segmentation_registration=segmentation_registration,
+                segmentation_executor=segmentation_executor,
+                segmentation_provider=segmentation_provider,
+                back_projection_registration=back_projection_registration,
+                capture_port=back_projection_capture_port,
+                robot_state_port=RealPlacementRobotStatePort(
+                    port=port,
+                    frame_graph=contract_bundle.frame_graph,
+                    component_id=placement_registration.profile.component_id,
+                    execution_reference_frame_id=(
+                        contract_bundle.attachment.execution_reference_frame_id
+                    ),
+                    reference_frame_id=(
+                        placement_registration.profile.reference_frame_id
+                    ),
+                    maximum_measurement_age_ms=(
+                        contract_bundle.convergence_profile.max_measurement_age_ms
+                    ),
+                    current_station_revision=lambda: (
+                        producer.current_station_revision
+                    ),
+                    clock=clock,
+                ),
+            )
+            placement_executor = build_placement_executor(
+                registration=placement_registration,
+                provider=placement_provider,
+                current_station_revision=lambda: producer.current_station_revision,
+                max_retained_operations=max_retained_operations,
+                clock=clock,
+            )
+            execution_port_by_route_hash[
+                placement_registration.skill.routes[0].semantic_content_hash
+            ] = placement_executor
         if contract_bundle.localization_registration is not None:
             assert localization_provider is not None
             assert station_point_grasp_planner is not None
@@ -1634,6 +1705,8 @@ def assemble_real_agent_primitive_gateway_session(
         localization_executor=localization_executor,
         segmentation_provider=segmentation_provider,
         segmentation_executor=segmentation_executor,
+        placement_provider=placement_provider,
+        placement_executor=placement_executor,
         station_point_grasp_provider=station_point_grasp_provider,
         station_point_grasp_executor=station_point_grasp_executor,
         station_point_grasp_render_provider=station_point_grasp_render_provider,

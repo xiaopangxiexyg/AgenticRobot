@@ -24,25 +24,14 @@ _PARAMETER_FIELDS = {
 _RESULT_FIELDS = {
     "source_id",
     "role",
-    "captured_at",
     "station_revision",
     "capture_group_id",
     "depth_content_hash",
-    "image_width",
-    "image_height",
     "reference_frame_id",
     "reference_frame_spec_hash",
     "frame_graph_hash",
-    "camera_pose_reference_xyz_quat_xyzw",
     "coordinate_mode",
-    "target_pixel_uv",
-    "pixel_region_xyxy",
-    "world_z_min_m",
-    "world_z_max_m",
-    "world_center_xyz_m",
-    "world_median_xyz_m",
-    "world_bounds_xyz_m",
-    "world_extent_xyz_m",
+    "world_xyz_m",
     "depth_m",
     "valid_point_count",
 }
@@ -221,35 +210,14 @@ def back_project_schema_entry_v1(
         "properties": {
             "source_id": {"type": "string", "minLength": 1},
             "role": {"type": "string", "enum": list(roles)},
-            "captured_at": {"type": "number"},
             "station_revision": {"type": "integer", "minimum": 0},
             "capture_group_id": {"type": "string", "minLength": 1},
             "depth_content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "image_width": {"type": "integer", "minimum": 1},
-            "image_height": {"type": "integer", "minimum": 1},
             "reference_frame_id": {"const": reference},
             "reference_frame_spec_hash": {"const": reference_hash},
             "frame_graph_hash": {"const": graph_hash},
-            "camera_pose_reference_xyz_quat_xyzw": {
-                "type": "array",
-                "minItems": 7,
-                "maxItems": 7,
-                "items": {"type": "number"},
-            },
             "coordinate_mode": {"type": "string", "enum": ["pixel", "region"]},
-            "target_pixel_uv": nullable_pixel,
-            "pixel_region_xyxy": nullable_region,
-            "world_z_min_m": nullable_number,
-            "world_z_max_m": nullable_number,
-            "world_center_xyz_m": vector3,
-            "world_median_xyz_m": vector3,
-            "world_bounds_xyz_m": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {"low": vector3, "high": vector3},
-                "required": ["low", "high"],
-            },
-            "world_extent_xyz_m": vector3,
+            "world_xyz_m": vector3,
             "depth_m": {"type": "number", "exclusiveMinimum": 0.0},
             "valid_point_count": {"type": "integer", "minimum": 1},
         },
@@ -289,7 +257,6 @@ def validate_back_project_result_v1(
     payload: Mapping[str, Any],
     *,
     source_id_by_role: Mapping[str, str],
-    dimensions_by_role: Mapping[str, tuple[int, int]],
     reference_frame_id: str,
     reference_frame_spec_hash: str,
     frame_graph_hash: str,
@@ -301,70 +268,21 @@ def validate_back_project_result_v1(
     role = _required_text(payload["role"], field_name="role")
     if role not in source_id_by_role or payload["source_id"] != source_id_by_role[role]:
         raise ValueError("Back-project result changed its registered source binding.")
-    width, height = dimensions_by_role[role]
-    if payload["image_width"] != width or payload["image_height"] != height:
-        raise ValueError("Back-project image dimensions changed.")
     if payload["reference_frame_id"] != reference_frame_id:
         raise ValueError("Back-project reference frame changed.")
     if payload["reference_frame_spec_hash"] != reference_frame_spec_hash:
         raise ValueError("Back-project reference-frame specification changed.")
     if payload["frame_graph_hash"] != frame_graph_hash:
         raise ValueError("Back-project frame graph changed.")
-    _finite(payload["captured_at"], field_name="captured_at")
     revision = payload["station_revision"]
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise ValueError("station_revision must be non-negative.")
     _required_text(payload["capture_group_id"], field_name="capture_group_id")
     _digest(payload["depth_content_hash"], field_name="depth_content_hash")
-    pose = _vector(
-        payload["camera_pose_reference_xyz_quat_xyzw"],
-        field_name="camera_pose_reference_xyz_quat_xyzw",
-        length=7,
-    )
-    if not math.isclose(
-        math.sqrt(sum(value * value for value in pose[3:])),
-        1.0,
-        abs_tol=1e-5,
-    ):
-        raise ValueError("Back-project camera quaternion is not normalized.")
-    parameter_projection = {
-        "role": role,
-        "target_pixel_uv": payload["target_pixel_uv"],
-        "pixel_region_xyxy": payload["pixel_region_xyxy"],
-        "world_z_min_m": payload["world_z_min_m"],
-        "world_z_max_m": payload["world_z_max_m"],
-    }
-    pixel, region, _z_min, _z_max = _parameter_values(
-        parameter_projection, allowed_roles=tuple(source_id_by_role)
-    )
     mode = payload["coordinate_mode"]
-    if mode != ("pixel" if pixel is not None else "region"):
-        raise ValueError("Back-project coordinate mode and target disagree.")
-    if pixel is not None and (pixel[0] >= width or pixel[1] >= height):
-        raise ValueError("Back-project pixel is outside the image.")
-    if region is not None and (region[2] > width or region[3] > height):
-        raise ValueError("Back-project region is outside the image.")
-    center = _vector(payload["world_center_xyz_m"], field_name="world_center_xyz_m", length=3)
-    median = _vector(payload["world_median_xyz_m"], field_name="world_median_xyz_m", length=3)
-    bounds = payload["world_bounds_xyz_m"]
-    if not isinstance(bounds, Mapping) or set(bounds) != {"low", "high"}:
-        raise ValueError("world_bounds_xyz_m must contain low and high.")
-    low = _vector(bounds["low"], field_name="world_bounds_xyz_m.low", length=3)
-    high = _vector(bounds["high"], field_name="world_bounds_xyz_m.high", length=3)
-    extent = _vector(payload["world_extent_xyz_m"], field_name="world_extent_xyz_m", length=3)
-    if any(lower > upper for lower, upper in zip(low, high, strict=True)):
-        raise ValueError("Back-project world bounds are inverted.")
-    if any(
-        not math.isclose(value, upper - lower, abs_tol=2e-6)
-        for value, lower, upper in zip(extent, low, high, strict=True)
-    ):
-        raise ValueError("Back-project extent differs from its world bounds.")
-    if any(
-        value < lower - 2e-6 or value > upper + 2e-6
-        for values in (center, median)
-        for value, lower, upper in zip(values, low, high, strict=True)
-    ):
-        raise ValueError("Back-project center or median lies outside its bounds.")
+    if mode not in {"pixel", "region"}:
+        raise ValueError("Back-project coordinate mode is invalid.")
+    _vector(payload["world_xyz_m"], field_name="world_xyz_m", length=3)
     depth = _finite(payload["depth_m"], field_name="depth_m")
     if not 0.0 < depth <= maximum_depth_m:
         raise ValueError("Back-project depth is outside the deployment bound.")
@@ -380,11 +298,9 @@ def validate_back_project_result_v1(
 def validate_back_project_result_for_parameters_v1(
     parameters: Mapping[str, Any], result: Mapping[str, Any]
 ) -> None:
-    for field_name in _PARAMETER_FIELDS:
-        if result[field_name] != parameters[field_name]:
-            raise ValueError(
-                f"Back-project result field {field_name!r} differs from the request."
-            )
+    expected_mode = "pixel" if parameters["target_pixel_uv"] is not None else "region"
+    if result["role"] != parameters["role"] or result["coordinate_mode"] != expected_mode:
+        raise ValueError("Back-project result differs from the requested role or mode.")
 
 
 __all__ = [

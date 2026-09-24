@@ -9,6 +9,7 @@ CAPTURE_RGB_SKILL_ID_V1 = "perception.capture_rgb"
 BACK_PROJECT_SKILL_ID_V1 = "perception.back_project"
 LOCALIZE_OBJECTS_SKILL_ID_V1 = "perception.localize_objects"
 PLAN_POINT_GRASP_SKILL_ID_V1 = "perception.plan_point_grasp"
+PLAN_PLACEMENT_SKILL_ID_V1 = "perception.plan_placement"
 RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1 = "perception.render_point_grasp_candidate"
 SEGMENT_SKILL_ID_V1 = "perception.segment"
 
@@ -40,6 +41,42 @@ def back_project_skill_definition_v1() -> SkillDefinition:
         task_outcome_semantics_id="passive_depth_back_projection.v1",
         entry_predicate_ids=("trusted_live_aligned_depth_binding_available.v1",),
         task_outcome_predicate_ids=("depth_geometry_back_projected.v1",),
+    )
+
+
+def plan_placement_skill_definition_v1() -> SkillDefinition:
+    """Describe passive, offset-aware placement geometry planning."""
+
+    return SkillDefinition(
+        skill_id=PLAN_PLACEMENT_SKILL_ID_V1,
+        skill_version="1",
+        skill_kind="inspection",
+        summary=(
+            "Plan EEF lateral alignment and measured XY containment from two "
+            "completed text-prompt segmentation operations: one for the held "
+            "object and one for the fixed main-camera destination. The Gateway "
+            "uses their text prompts as identity anchors, segments fresh correlated "
+            "RGB-D cuts, back-projects them in the bound Station frame, and reads "
+            "the current EEF state. "
+            "This read-only Skill never moves the robot and does not prove object "
+            "identity, grasp success, collision-free descent, or task success."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "retained_held_and_destination_segment_operations.clearance.v1"
+        ),
+        execution_result_semantics_id=(
+            "station_bound_offset_aware_placement_geometry.v1"
+        ),
+        task_outcome_semantics_id="passive_placement_geometry_plan.v1",
+        entry_predicate_ids=(
+            "retained_text_segment_prompts_available.v1",
+            "live_correlated_rgbd_binding_available.v1",
+            "measured_tool_tcp_pose_available.v1",
+        ),
+        task_outcome_predicate_ids=("placement_geometry_assessed.v1",),
     )
 
 
@@ -320,6 +357,7 @@ __all__ = [
     "CAPTURE_RGB_SKILL_ID_V1",
     "LOCALIZE_OBJECTS_SKILL_ID_V1",
     "PLAN_POINT_GRASP_SKILL_ID_V1",
+    "PLAN_PLACEMENT_SKILL_ID_V1",
     "RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1",
     "SEGMENT_SKILL_ID_V1",
     "back_project_skill_definition_v1",
@@ -331,6 +369,7 @@ __all__ = [
     "plan_point_grasp_skill_definition_v1",
     "plan_point_grasp_skill_definition_v2",
     "plan_point_grasp_skill_definition_v3",
+    "plan_placement_skill_definition_v1",
     "render_point_grasp_candidate_skill_definition_v1",
     "segment_skill_definition_v1",
 ]

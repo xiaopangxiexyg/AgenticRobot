@@ -79,6 +79,7 @@ from agent_gateway.skills.motion.definition import (
 from agent_gateway.skills.perception.definition import (
     CAPTURE_DEPTH_SKILL_ID_V1,
     CAPTURE_RGB_SKILL_ID_V1,
+    PLAN_PLACEMENT_SKILL_ID_V1,
     SEGMENT_SKILL_ID_V1,
 )
 from deployments.perception.sam2_grounding_dino import (
@@ -152,10 +153,13 @@ def test_segmentation_model_startup_failure_closes_partial_resources() -> None:
 
 
 def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
+    wait_timeouts = []
+
     class _Executor:
         settled = False
 
         def wait_all(self, *, timeout_sec):
+            wait_timeouts.append(timeout_sec)
             return self.settled
 
     class _Localizer:
@@ -189,6 +193,7 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
         rgb_executor=None,
         history_executor=None,
         segmentation_executor=None,
+        placement_executor=executor,
         _segmentation_model_started=True,
         segmentation_localizer=localizer,
         _finish_lower_close=lambda value: lower_close_calls.append(value),
@@ -202,6 +207,7 @@ def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
 
     with pytest.raises(RuntimeError, match="state_executor"):
         MujocoAgentTcpPoseGatewaySession.close(session)
+    assert 130.0 in wait_timeouts
     assert localizer.close_calls == 0
     assert lower_close_calls == []
     assert artifact_store.close_calls == 0
@@ -1566,7 +1572,7 @@ def _build_no_model_contract_bundle_fixture(
         ),
     )
     application.depth_source_catalog = lambda: (
-        {"view_id": "front", "native_width": 2, "native_height": 2},
+        {"view_id": "front", "native_width": 640, "native_height": 480},
     )
     application.visual_source_catalog = lambda: (
         {"source_id": "front", "native_width": 640, "native_height": 480},
@@ -1958,11 +1964,9 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
     assert not depth_entry.route.may_open_publication
     assert bundle.depth_capture is not None
     depth_payload = io.BytesIO()
-    np.save(
-        depth_payload,
-        np.asarray([[1.0, 2.0], [3.0, 0.0]], dtype=np.float32),
-        allow_pickle=False,
-    )
+    initial_depth = np.zeros((480, 640), dtype=np.float32)
+    initial_depth[0, 1] = 2.0
+    np.save(depth_payload, initial_depth, allow_pickle=False)
     depth_bytes = depth_payload.getvalue()
 
     motion_application = object.__new__(MujocoAgentSkillMotionApplication)
@@ -1977,8 +1981,8 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
         EncodedMujocoDepthFrame(
             view_id="front",
             captured_at=10.0,
-            width=2,
-            height=2,
+            width=640,
+            height=480,
             media_type="application/x-npy",
             schema_id="dexteleop.perception.depth_image_meters.v1",
             encoding="npy.float32.c_order.v1",
@@ -1986,8 +1990,8 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
             data=depth_bytes,
             camera_pose_world_xyz_quat_xyzw=(0, 0, 1, 0, 0, 0, 1),
             intrinsics={
-                "width": 2,
-                "height": 2,
+                "width": 640,
+                "height": 480,
                 "fx": 1.0,
                 "fy": 1.0,
                 "cx": 1.0,
@@ -2020,6 +2024,14 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
         )
 
     motion_application.capture_visual_jpeg_snapshot = capture_visual_jpeg_snapshot
+    motion_application.capture_visual_depth_cut = lambda *, view_id: (
+        capture_visual_jpeg_snapshot(
+            source_ids=(view_id,),
+            width=640,
+            height=480,
+        ).frames[view_id],
+        motion_application.capture_depth_npy_frame(view_id=view_id),
+    )
 
     class _Segmenter:
         semantic_content_hash = "sam2-localizer:test"
@@ -2032,6 +2044,8 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
             self.started = False
             self.closed = False
             self.fail_close = False
+            self.prompts = []
+            self.advance_inference_clock = None
 
         def start(self):
             self.started = True
@@ -2045,15 +2059,28 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
         def segment(self, image, *, language_prompt, pixel_uv, min_score):
             assert self.started
             assert image.size == (640, 480)
-            assert language_prompt is None
-            assert pixel_uv == (320, 240)
+            self.prompts.append(language_prompt)
+            if self.advance_inference_clock is not None:
+                self.advance_inference_clock()
             mask = np.zeros((480, 640), dtype=bool)
-            mask[235:246, 315:326] = True
+            if language_prompt == "destination surface":
+                assert pixel_uv is None
+                mask[180:301, 240:401] = True
+            else:
+                assert language_prompt in {None, "held object"}
+                assert pixel_uv == ((320, 240) if language_prompt is None else None)
+                mask[235:246, 315:326] = True
+            ys, xs = np.nonzero(mask)
             return GroundedObjectSegment(
                 mask=mask,
                 score=max(0.95, min_score),
-                label=None,
-                box_xyxy=(315, 235, 326, 246),
+                label=language_prompt,
+                box_xyxy=(
+                    int(xs.min()),
+                    int(ys.min()),
+                    int(xs.max()) + 1,
+                    int(ys.max()) + 1,
+                ),
             )
 
         encode_segment_artifacts = staticmethod(
@@ -2071,7 +2098,7 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
         application=motion_application,
         contract_bundle=bundle,
         allowed_client_ids=("rpent:fixture",),
-        max_retained_operations=3,
+        max_retained_operations=8,
         artifact_store=artifact_store,
         owns_artifact_store=True,
         segmentation_localizer=segmenter,
@@ -2085,6 +2112,9 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
     assert route_to_port[CAPTURE_RGB_SKILL_ID_V1] is session.rgb_executor
     assert route_to_port["perception.back_project"] is (
         session.back_projection_executor
+    )
+    assert route_to_port[PLAN_PLACEMENT_SKILL_ID_V1] is (
+        session.placement_executor
     )
     assert session.depth_executor is not session.motion_executor
     assert session.service.domain_control_port is session.motion_executor
@@ -2104,6 +2134,7 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
         "perception.back_project",
         "perception.capture_depth",
         "perception.capture_rgb",
+        "perception.plan_placement",
         "perception.segment",
         "state.read_gripper_state",
         "state.read_tcp_pose",
@@ -2299,33 +2330,56 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
     )
     assert session.motion_executor.workers == ()
 
-    back_projection_entry = bundle.route_manifest.route(
-        "perception.back_project", "1"
-    )
-    back_projection_route = back_projection_entry.route
-    back_projection_request = AgentSkillRequest(
-        client_id="rpent:fixture",
-        request_id="request:back-project:1",
-        idempotency_key="idempotency:back-project:1",
-        client_sequence=3,
-        runtime_session_id=bundle.route_manifest.runtime_session_id,
-        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
-        expected_station_revision=0,
-        skill_id=back_projection_route.skill_id,
-        skill_version=back_projection_route.skill_version,
-        skill_definition_hash=back_projection_route.skill_definition_hash,
-        route_id=back_projection_route.route_id,
-        route_version=back_projection_route.route_version,
-        route_hash=back_projection_route.semantic_content_hash,
-        deployment_binding_hash=(
-            back_projection_entry.deployment_binding.deployment_binding_hash
-        ),
-        parameter_profile_id=(
-            back_projection_route.allowed_parameter_profiles[0].parameter_profile_id
-        ),
-        parameter_profile_hash=(
-            back_projection_route.allowed_parameter_profiles[0].parameter_profile_hash
-        ),
+    def run_passive_skill(
+        skill_id: str,
+        *,
+        sequence: int,
+        parameters: dict[str, object],
+        timeout_ms: int,
+    ) -> AgentSkillOperation:
+        entry = bundle.route_manifest.route(skill_id, "1")
+        route = entry.route
+        profile_ref = route.allowed_parameter_profiles[0]
+        request = AgentSkillRequest(
+            client_id="rpent:fixture",
+            request_id=f"request:{skill_id}:{sequence}",
+            idempotency_key=f"idempotency:{skill_id}:{sequence}",
+            client_sequence=sequence,
+            runtime_session_id=bundle.route_manifest.runtime_session_id,
+            skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+            expected_station_revision=0,
+            skill_id=route.skill_id,
+            skill_version=route.skill_version,
+            skill_definition_hash=route.skill_definition_hash,
+            route_id=route.route_id,
+            route_version=route.route_version,
+            route_hash=route.semantic_content_hash,
+            deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=profile_ref.parameter_profile_id,
+            parameter_profile_hash=profile_ref.parameter_profile_hash,
+            parameters=parameters,
+            observation_snapshot_id=snapshot.snapshot_id,
+            requested_mode="sim_active",
+            requested_timeout_ms=timeout_ms,
+        )
+        admitted = session.service.submit_request(
+            request=request,
+            current_station_revision=0,
+            now=10.0,
+        )
+        assert admitted.accepted and admitted.operation is not None
+        assert session.service.launch_operation(admitted.operation.operation_id).accepted
+        executor = route_to_port[skill_id]
+        assert executor.wait(admitted.operation.operation_id, timeout_sec=1.0)
+        completed = session.service.operation_store.get(
+            admitted.operation.operation_id
+        )
+        assert completed is not None and completed.status == "completed"
+        return completed
+
+    projected = run_passive_skill(
+        "perception.back_project",
+        sequence=3,
         parameters={
             "role": "main",
             "target_pixel_uv": [1, 0],
@@ -2333,91 +2387,26 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
             "world_z_min_m": None,
             "world_z_max_m": None,
         },
-        observation_snapshot_id=snapshot.snapshot_id,
-        requested_mode="sim_active",
-        requested_timeout_ms=1_000,
+        timeout_ms=1_000,
     )
-    back_projection_admitted = session.service.submit_request(
-        request=back_projection_request,
-        current_station_revision=0,
-        now=10.0,
-    )
-    assert (
-        back_projection_admitted.accepted
-        and back_projection_admitted.operation is not None
-    )
-    assert session.service.launch_operation(
-        back_projection_admitted.operation.operation_id
-    ).accepted
-    assert session.back_projection_executor is not None
-    assert session.back_projection_executor.wait(
-        back_projection_admitted.operation.operation_id,
-        timeout_sec=1.0,
-    )
-    projected = session.service.operation_store.get(
-        back_projection_admitted.operation.operation_id
-    )
-    assert projected is not None and projected.status == "completed"
     assert projected.execution_result["coordinate_mode"] == "pixel"
-    assert projected.execution_result["world_center_xyz_m"] == pytest.approx(
+    assert projected.execution_result["world_xyz_m"] == pytest.approx(
         [0.0, -2.0, 3.0]
     )
     assert projected.execution_result["depth_m"] == 2.0
     assert projected.output_artifact_bindings == ()
 
-    segment_entry = bundle.route_manifest.route(SEGMENT_SKILL_ID_V1, "1")
-    segment_route = segment_entry.route
-    segment_request = AgentSkillRequest(
-        client_id="rpent:fixture",
-        request_id="request:segment:1",
-        idempotency_key="idempotency:segment:1",
-        client_sequence=4,
-        runtime_session_id=bundle.route_manifest.runtime_session_id,
-        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
-        expected_station_revision=0,
-        skill_id=segment_route.skill_id,
-        skill_version=segment_route.skill_version,
-        skill_definition_hash=segment_route.skill_definition_hash,
-        route_id=segment_route.route_id,
-        route_version=segment_route.route_version,
-        route_hash=segment_route.semantic_content_hash,
-        deployment_binding_hash=(
-            segment_entry.deployment_binding.deployment_binding_hash
-        ),
-        parameter_profile_id=(
-            segment_route.allowed_parameter_profiles[0].parameter_profile_id
-        ),
-        parameter_profile_hash=(
-            segment_route.allowed_parameter_profiles[0].parameter_profile_hash
-        ),
+    segmented = run_passive_skill(
+        SEGMENT_SKILL_ID_V1,
+        sequence=4,
         parameters={
             "role": "main",
             "language_prompt": None,
             "target_pixel_uv": [320, 240],
             "min_score": 0.5,
         },
-        observation_snapshot_id=snapshot.snapshot_id,
-        requested_mode="sim_active",
-        requested_timeout_ms=60_000,
+        timeout_ms=60_000,
     )
-    segment_admitted = session.service.submit_request(
-        request=segment_request,
-        current_station_revision=0,
-        now=10.0,
-    )
-    assert segment_admitted.accepted and segment_admitted.operation is not None
-    assert session.service.launch_operation(
-        segment_admitted.operation.operation_id
-    ).accepted
-    assert session.segmentation_executor is not None
-    assert session.segmentation_executor.wait(
-        segment_admitted.operation.operation_id,
-        timeout_sec=1.0,
-    )
-    segmented = session.service.operation_store.get(
-        segment_admitted.operation.operation_id
-    )
-    assert segmented is not None and segmented.status == "completed"
     assert segmented.execution_result["mask_pixel_count"] == 121
     assert [binding.slot_id for binding in segmented.output_artifact_bindings] == [
         SEGMENT_MASK_OUTPUT_SLOT_ID_V1,
@@ -2436,6 +2425,88 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
     ) as overlay:
         assert overlay.format == "JPEG"
         assert overlay.size == (640, 480)
+
+    placement_depth = io.BytesIO()
+    np.save(
+        placement_depth,
+        np.full((480, 640), 0.1, dtype=np.float32),
+        allow_pickle=False,
+    )
+    placement_depth_bytes = placement_depth.getvalue()
+    motion_application.capture_depth_npy_frame = lambda **_kwargs: (
+        EncodedMujocoDepthFrame(
+            view_id="front",
+            captured_at=10.0,
+            width=640,
+            height=480,
+            media_type="application/x-npy",
+            schema_id="dexteleop.perception.depth_image_meters.v1",
+            encoding="npy.float32.c_order.v1",
+            compression="none",
+            data=placement_depth_bytes,
+            camera_pose_world_xyz_quat_xyzw=(0, 0, 1, 0, 0, 0, 1),
+            intrinsics={
+                "width": 640,
+                "height": 480,
+                "fx": 600.0,
+                "fy": 600.0,
+                "cx": 320.0,
+                "cy": 240.0,
+                "fovy_deg": 43.6,
+            },
+        )
+    )
+    motion_application.capture_arm_gripper_state = lambda: {
+        "right_arm": (0.0, 0.0, 1.1, 0.0, 0.0, 0.0, 1.0),
+        "right_gripper": {
+            "qpos": (0.5,),
+            "close_fraction": 0.7,
+            "measured_at": 10.0,
+            "state_source": "mujoco_measured_joint_state",
+        },
+    }
+
+    def run_text_segment(prompt: str, sequence: int) -> AgentSkillOperation:
+        return run_passive_skill(
+            SEGMENT_SKILL_ID_V1,
+            sequence=sequence,
+            parameters={
+                "role": "main",
+                "language_prompt": prompt,
+                "target_pixel_uv": None,
+                "min_score": 0.5,
+            },
+            timeout_ms=60_000,
+        )
+
+    held_segment = run_text_segment("held object", 5)
+    destination_segment = run_text_segment("destination surface", 6)
+    placement_clock = {"now": 10.0}
+    assert session.placement_executor is not None
+    session.placement_executor._clock = lambda: placement_clock["now"]
+
+    def advance_inference_clock() -> None:
+        placement_clock["now"] += 30.0
+
+    segmenter.advance_inference_clock = advance_inference_clock
+    placement = run_passive_skill(
+        PLAN_PLACEMENT_SKILL_ID_V1,
+        sequence=7,
+        parameters={
+            "held_segment_operation_id": held_segment.operation_id,
+            "destination_segment_operation_id": destination_segment.operation_id,
+            "clearance_m": 0.005,
+        },
+        timeout_ms=120_000,
+    )
+    assert placement.execution_result["planning_status"] == "planned"
+    assert placement.execution_result["geometry_eligible_for_motion_planning"]
+    assert placement.execution_result["held_gripper_state_checked"]
+    assert placement.execution_result["motion_or_hold_performed"] is False
+    assert segmenter.prompts.count("held object") == 2
+    assert segmenter.prompts.count("destination surface") == 2
+    assert placement_clock["now"] == 70.0
+    assert session.motion_executor.workers == ()
 
     segmenter.fail_close = True
     with pytest.raises(RuntimeError, match="segmentation_model"):

@@ -462,11 +462,8 @@ def test_real_back_projection_uses_the_bound_station_camera_pose() -> None:
         )
     )
 
-    assert result["world_center_xyz_m"] == pytest.approx(
+    assert result["world_xyz_m"] == pytest.approx(
         [0.1, 1.0 / 6.0, 0.5], abs=1e-6
-    )
-    assert result["camera_pose_reference_xyz_quat_xyzw"] == pytest.approx(
-        [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]
     )
     assert result["capture_group_id"].startswith("real-aligned-rgbd:")
 

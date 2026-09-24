@@ -22,6 +22,7 @@ from agent_gateway.runtime.passive_read_executor import (
     PassiveReadSkillExecutor,
 )
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
+from agent_gateway.profiles.segmentation import LiveRgbSegmentationCapture
 from agent_gateway.skills.perception.back_projection_schemas import (
     back_project_schema_entry_v1,
     validate_back_project_parameters_v1,
@@ -33,7 +34,6 @@ from agent_gateway.skills.perception.definition import (
 )
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.relative_action import pose_matrix_to_xyzquat
 
 BACK_PROJECT_MIN_REGION_VALID_POINTS_V1 = 8
 BACK_PROJECT_MAX_REGION_PIXELS_V1 = 1_048_576
@@ -171,6 +171,135 @@ class LiveAlignedDepthCapturePort(Protocol):
     def capture_aligned_depth(
         self, *, role: str, expected_station_revision: int
     ) -> LiveAlignedDepthCapture: ...
+
+
+@dataclass(frozen=True)
+class CorrelatedPlacementCapture:
+    """One RGB image and aligned depth cut captured under one backend owner."""
+
+    rgb: LiveRgbSegmentationCapture
+    depth: LiveAlignedDepthCapture
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rgb, LiveRgbSegmentationCapture) or not isinstance(
+            self.depth, LiveAlignedDepthCapture
+        ):
+            raise TypeError("Placement RGB-D capture members must be typed.")
+        if (
+            self.rgb.source_id != self.depth.source_id
+            or self.rgb.role != self.depth.role
+            or self.rgb.station_revision != self.depth.station_revision
+            or self.rgb.image.size != self.depth.depth_m.shape[::-1]
+        ):
+            raise ValueError("Placement RGB and depth cuts do not share one identity.")
+
+
+class CorrelatedPlacementCapturePort(Protocol):
+    def capture_placement_rgbd(
+        self, *, role: str, expected_station_revision: int
+    ) -> CorrelatedPlacementCapture: ...
+
+
+@dataclass(frozen=True)
+class ProjectedDepthGeometry:
+    world_center_xyz_m: tuple[float, float, float]
+    world_median_xyz_m: tuple[float, float, float]
+    world_bounds_low_xyz_m: tuple[float, float, float]
+    world_bounds_high_xyz_m: tuple[float, float, float]
+    world_extent_xyz_m: tuple[float, float, float]
+    median_depth_m: float
+    valid_point_count: int
+
+
+def project_depth_mask_geometry(
+    capture: LiveAlignedDepthCapture,
+    mask: np.ndarray,
+    *,
+    minimum_valid_points: int,
+    maximum_depth_m: float,
+    robust_lower_quantile: float = 0.05,
+    robust_upper_quantile: float = 0.95,
+    world_z_min_m: float | None = None,
+    world_z_max_m: float | None = None,
+    insufficient_points_error: str = "depth_mask_insufficient_points",
+) -> ProjectedDepthGeometry:
+    """Project exact selected mask pixels into the capture's reference frame."""
+
+    selected = np.asarray(mask, dtype=bool)
+    if selected.shape != capture.depth_m.shape:
+        raise ValueError("Depth mask dimensions differ from the live depth image.")
+    if (
+        isinstance(minimum_valid_points, bool)
+        or not isinstance(minimum_valid_points, int)
+        or minimum_valid_points <= 0
+    ):
+        raise ValueError("minimum_valid_points must be positive.")
+    if not math.isfinite(maximum_depth_m) or maximum_depth_m <= 0.0:
+        raise ValueError("maximum_depth_m must be positive and finite.")
+    if not 0.0 <= robust_lower_quantile < robust_upper_quantile <= 1.0:
+        raise ValueError("Robust quantiles are invalid.")
+    for name, value in (
+        ("world_z_min_m", world_z_min_m),
+        ("world_z_max_m", world_z_max_m),
+    ):
+        if value is not None and not math.isfinite(float(value)):
+            raise ValueError(f"{name} must be finite when provided.")
+    if (
+        world_z_min_m is not None
+        and world_z_max_m is not None
+        and world_z_min_m > world_z_max_m
+    ):
+        raise ValueError("world_z_min_m must not exceed world_z_max_m.")
+    valid = (
+        selected
+        & np.isfinite(capture.depth_m)
+        & (capture.depth_m > 0.0)
+        & (capture.depth_m <= maximum_depth_m)
+    )
+    rows, columns = np.nonzero(valid)
+    depths = capture.depth_m[valid].astype(np.float64, copy=False)
+    points = _project_pixels(
+        u=columns.astype(np.float64),
+        v=rows.astype(np.float64),
+        depth=depths,
+        intrinsics=capture.intrinsics,
+        reference_from_camera=capture.reference_from_camera,
+    )
+    keep = np.ones(points.shape[0], dtype=bool)
+    if world_z_min_m is not None:
+        keep &= points[:, 2] >= float(world_z_min_m)
+    if world_z_max_m is not None:
+        keep &= points[:, 2] <= float(world_z_max_m)
+    points = points[keep]
+    depths = depths[keep]
+    if depths.size < minimum_valid_points:
+        raise RuntimeError(insufficient_points_error)
+    low, high = np.quantile(
+        points,
+        [robust_lower_quantile, robust_upper_quantile],
+        axis=0,
+    )
+    median = np.median(points, axis=0)
+    center = (low + high) / 2.0
+    center[2] = median[2]
+    extent = high - low
+
+    def vector(values: np.ndarray) -> tuple[float, float, float]:
+        return (
+            round(float(values[0]), 6),
+            round(float(values[1]), 6),
+            round(float(values[2]), 6),
+        )
+
+    return ProjectedDepthGeometry(
+        world_center_xyz_m=vector(center),
+        world_median_xyz_m=vector(median),
+        world_bounds_low_xyz_m=vector(low),
+        world_bounds_high_xyz_m=vector(high),
+        world_extent_xyz_m=vector(extent),
+        median_depth_m=round(float(np.median(depths)), 6),
+        valid_point_count=int(depths.size),
+    )
 
 
 @dataclass(frozen=True)
@@ -327,19 +456,53 @@ class BackProjectionRegistration:
     availability_hash: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.profile, BackProjectionProfile):
+            raise TypeError("profile must be a BackProjectionProfile.")
+        if not isinstance(self.skill, SkillRegistrationTemplate):
+            raise TypeError("skill must be a SkillRegistrationTemplate.")
+        if not isinstance(self.binding, BackProjectionDeploymentBinding):
+            raise TypeError("binding must be a BackProjectionDeploymentBinding.")
+        if not isinstance(self.payload_validator, AgentSkillPayloadValidatorSet):
+            raise TypeError("payload_validator must be typed.")
+        if len(self.skill.routes) != 1:
+            raise ValueError("Back-projection registration requires exactly one Route.")
         route = self.skill.routes[0]
         definition = back_project_skill_definition_v1()
         if self.skill.definition != definition or (
+            route.skill_id,
+            route.skill_version,
             route.control_effect_class,
             route.privilege_tier,
             route.may_move_robot,
+            route.may_open_publication,
+            route.requires_operator_confirmation,
+            route.requires_deadman,
+            route.max_operation_duration_ms,
+            route.cancellation_policy,
             route.requires_task_evaluation,
-        ) != ("read_only", "t0_read_only", False, False):
+        ) != (
+            definition.skill_id,
+            definition.skill_version,
+            "read_only",
+            "t0_read_only",
+            False,
+            False,
+            False,
+            False,
+            3_000,
+            "cancel_only",
+            False,
+        ):
             raise ValueError("Back-projection registration uses another contract.")
+        profile_refs = route.allowed_parameter_profiles
+        if len(profile_refs) != 1 or (
+            profile_refs[0].parameter_profile_id != self.profile.profile_id
+            or profile_refs[0].parameter_profile_hash
+            != self.profile.semantic_content_hash
+        ):
+            raise ValueError("Back-projection Route does not bind its exact profile.")
         if (
-            route.skill_id != definition.skill_id
-            or route.skill_version != definition.skill_version
-            or route.target_kind != self.profile.target_kind
+            route.target_kind != self.profile.target_kind
             or route.supported_modes != (self.profile.current_mode,)
             or self.binding.route_hash != route.semantic_content_hash
             or self.binding.profile_hash != self.profile.semantic_content_hash
@@ -347,6 +510,17 @@ class BackProjectionRegistration:
         ):
             raise ValueError("Back-projection deployment contracts disagree.")
         self.payload_validator.validate_route(route)
+        expected_availability_hash = canonical_content_hash(
+            {
+                "status": "configured_requires_live_aligned_depth",
+                "route_hash": route.semantic_content_hash,
+                "deployment_binding_hash": self.binding.semantic_content_hash,
+                "profile_hash": self.profile.semantic_content_hash,
+            },
+            domain="dexteleop.agent_skill.back_projection_availability.v1",
+        )
+        if self.availability_hash != expected_availability_hash:
+            raise ValueError("Back-projection availability changed its contracts.")
 
 
 def build_back_projection_registration(
@@ -445,7 +619,6 @@ def build_back_projection_registration(
         validate_execution_result=lambda payload: validate_back_project_result_v1(
             payload,
             source_id_by_role=profile.source_id_by_role,
-            dimensions_by_role=profile.dimensions_by_role,
             reference_frame_id=profile.reference_frame_id,
             reference_frame_spec_hash=profile.reference_frame_spec_hash,
             frame_graph_hash=profile.frame_graph_hash,
@@ -506,130 +679,56 @@ class LiveBackProjectionProvider:
             raise RuntimeError("Back-projection capture changed its bound identity.")
         pixel = parameters["target_pixel_uv"]
         region = parameters["pixel_region_xyxy"]
+        selected = np.zeros(capture.depth_m.shape, dtype=bool)
         if pixel is not None:
-            points, depths = self._pixel_points(capture, pixel)
+            u, v = (int(pixel[0]), int(pixel[1]))
+            height, width = capture.depth_m.shape
+            if not (0 <= u < width and 0 <= v < height):
+                raise ValueError("target_pixel_uv is outside the live depth image.")
+            selected[v, u] = True
             mode = "pixel"
+            minimum_valid_points = 1
         else:
-            points, depths = self._region_points(
-                capture,
-                region,
-                world_z_min_m=parameters["world_z_min_m"],
-                world_z_max_m=parameters["world_z_max_m"],
-            )
+            x0, y0, x1, y1 = (int(value) for value in region)
+            height, width = capture.depth_m.shape
+            if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+                raise ValueError("pixel_region_xyxy is outside the live depth image.")
+            if (x1 - x0) * (y1 - y0) > profile.maximum_region_pixels:
+                raise ValueError(
+                    "pixel_region_xyxy exceeds the reviewed pixel bound."
+                )
+            selected[y0:y1, x0:x1] = True
             mode = "region"
-        if mode == "pixel":
-            low = high = median = center = points[0]
-        else:
-            low, high = np.quantile(
-                points,
-                [profile.robust_lower_quantile, profile.robust_upper_quantile],
-                axis=0,
-            )
-            median = np.median(points, axis=0)
-            center = (low + high) / 2.0
-        low_values = _rounded_vector(low)
-        high_values = _rounded_vector(high)
-        center_values = _rounded_vector(center)
-        median_values = _rounded_vector(median)
-        extent_values = [
-            round(upper - lower, 6)
-            for lower, upper in zip(low_values, high_values, strict=True)
-        ]
-        pose = pose_matrix_to_xyzquat(
-            capture.reference_from_camera,
-            name="back_projection.reference_from_camera",
+            minimum_valid_points = profile.minimum_region_valid_points
+        geometry = project_depth_mask_geometry(
+            capture,
+            selected,
+            minimum_valid_points=minimum_valid_points,
+            maximum_depth_m=profile.maximum_depth_m,
+            robust_lower_quantile=profile.robust_lower_quantile,
+            robust_upper_quantile=profile.robust_upper_quantile,
+            world_z_min_m=parameters["world_z_min_m"],
+            world_z_max_m=parameters["world_z_max_m"],
+            insufficient_points_error=(
+                "back_projection_pixel_depth_invalid"
+                if mode == "pixel"
+                else "back_projection_region_insufficient_points"
+            ),
         )
         return {
             "source_id": capture.source_id,
             "role": capture.role,
-            "captured_at": float(capture.captured_at),
             "station_revision": capture.station_revision,
             "capture_group_id": capture.capture_group_id,
             "depth_content_hash": capture.depth_content_hash,
-            "image_width": int(capture.depth_m.shape[1]),
-            "image_height": int(capture.depth_m.shape[0]),
             "reference_frame_id": profile.reference_frame_id,
             "reference_frame_spec_hash": profile.reference_frame_spec_hash,
             "frame_graph_hash": profile.frame_graph_hash,
-            "camera_pose_reference_xyz_quat_xyzw": [float(value) for value in pose],
             "coordinate_mode": mode,
-            "target_pixel_uv": parameters["target_pixel_uv"],
-            "pixel_region_xyxy": parameters["pixel_region_xyxy"],
-            "world_z_min_m": parameters["world_z_min_m"],
-            "world_z_max_m": parameters["world_z_max_m"],
-            "world_center_xyz_m": center_values,
-            "world_median_xyz_m": median_values,
-            "world_bounds_xyz_m": {"low": low_values, "high": high_values},
-            "world_extent_xyz_m": extent_values,
-            "depth_m": round(float(np.median(depths)), 6),
-            "valid_point_count": int(points.shape[0]),
+            "world_xyz_m": list(geometry.world_center_xyz_m),
+            "depth_m": geometry.median_depth_m,
+            "valid_point_count": geometry.valid_point_count,
         }
-
-    def _pixel_points(
-        self, capture: LiveAlignedDepthCapture, pixel: list[int]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        u, v = (int(pixel[0]), int(pixel[1]))
-        height, width = capture.depth_m.shape
-        if not (0 <= u < width and 0 <= v < height):
-            raise ValueError("target_pixel_uv is outside the live depth image.")
-        depth = float(capture.depth_m[v, u])
-        if not 0.0 < depth <= self.registration.profile.maximum_depth_m:
-            raise RuntimeError("back_projection_pixel_depth_invalid")
-        return (
-            _project_pixels(
-                u=np.asarray([u], dtype=np.float64),
-                v=np.asarray([v], dtype=np.float64),
-                depth=np.asarray([depth], dtype=np.float64),
-                intrinsics=capture.intrinsics,
-                reference_from_camera=capture.reference_from_camera,
-            ),
-            np.asarray([depth], dtype=np.float64),
-        )
-
-    def _region_points(
-        self,
-        capture: LiveAlignedDepthCapture,
-        region: list[int],
-        *,
-        world_z_min_m: float | None,
-        world_z_max_m: float | None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        x0, y0, x1, y1 = (int(value) for value in region)
-        height, width = capture.depth_m.shape
-        if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
-            raise ValueError("pixel_region_xyxy is outside the live depth image.")
-        area = (x1 - x0) * (y1 - y0)
-        if area > self.registration.profile.maximum_region_pixels:
-            raise ValueError("pixel_region_xyxy exceeds the reviewed pixel bound.")
-        window = capture.depth_m[y0:y1, x0:x1]
-        valid = (
-            (window > 0.0)
-            & (window <= self.registration.profile.maximum_depth_m)
-            & np.isfinite(window)
-        )
-        rows, columns = np.nonzero(valid)
-        depths = window[valid].astype(np.float64, copy=False)
-        points = _project_pixels(
-            u=columns.astype(np.float64) + x0,
-            v=rows.astype(np.float64) + y0,
-            depth=depths,
-            intrinsics=capture.intrinsics,
-            reference_from_camera=capture.reference_from_camera,
-        )
-        keep = np.ones(points.shape[0], dtype=bool)
-        if world_z_min_m is not None:
-            keep &= points[:, 2] >= float(world_z_min_m)
-        if world_z_max_m is not None:
-            keep &= points[:, 2] <= float(world_z_max_m)
-        points = points[keep]
-        depths = depths[keep]
-        if points.shape[0] < self.registration.profile.minimum_region_valid_points:
-            raise RuntimeError("back_projection_region_insufficient_points")
-        return points, depths
-
-
-def _rounded_vector(values: np.ndarray) -> list[float]:
-    return [round(float(value), 6) for value in values]
 
 
 def _project_pixels(
@@ -666,21 +765,16 @@ def build_back_projection_executor(
     if provider.registration is not registration:
         raise ValueError("Back-projection provider and registration differ.")
 
-    def read(request: Any, operation: Any) -> PassiveReadResult:
+    def read(request: Any, _operation: Any) -> PassiveReadResult:
         result = provider.project_request(request)
         if current_station_revision() != request.expected_station_revision:
             raise RuntimeError("Station revision changed during back-projection.")
-        receipt = canonical_content_hash(
-            {
-                "operation_id": operation.operation_id,
-                "request_hash": request.semantic_content_hash,
-                "execution_result": result,
-            },
-            domain="dexteleop.agent_skill.back_projection_receipt.v1",
-        )
         return PassiveReadResult(
             execution_result=result,
-            evidence_refs=("live-depth-back-projection:" + receipt,),
+            evidence_refs=(
+                "live-depth-capture:" + result["capture_group_id"],
+                "live-depth-content:" + result["depth_content_hash"],
+            ),
             reason_code="passive_depth_back_projection_completed",
         )
 
@@ -696,9 +790,13 @@ def build_back_projection_executor(
 
 __all__ = [
     "BackProjectionRegistration",
+    "CorrelatedPlacementCapture",
+    "CorrelatedPlacementCapturePort",
     "LiveAlignedDepthCapture",
     "LiveAlignedDepthCapturePort",
     "LiveBackProjectionProvider",
+    "ProjectedDepthGeometry",
     "build_back_projection_executor",
     "build_back_projection_registration",
+    "project_depth_mask_geometry",
 ]

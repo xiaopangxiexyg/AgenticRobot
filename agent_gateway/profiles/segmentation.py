@@ -14,6 +14,7 @@ from numbers import Real
 from types import MappingProxyType
 from typing import Any, Protocol
 
+import numpy as np
 from PIL import Image
 
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
@@ -530,6 +531,34 @@ def _validate_encoded_mask_npy(
         raise RuntimeError("Segmentation mask NPY bounds differ from metadata.")
 
 
+def decode_segmentation_mask_npy(
+    data: bytes,
+    *,
+    width: int,
+    height: int,
+    expected_count: int,
+    expected_bounds: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Decode one already-bounded mask after rechecking its exact metadata."""
+
+    _validate_encoded_mask_npy(
+        data,
+        width=width,
+        height=height,
+        expected_count=expected_count,
+        expected_bounds=expected_bounds,
+    )
+    try:
+        mask = np.load(io.BytesIO(data), allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise RuntimeError("Segmentation mask Artifact is not valid NPY.") from error
+    if mask.dtype != np.bool_ or mask.shape != (height, width):
+        raise RuntimeError("Segmentation mask decoded identity changed.")
+    result = np.ascontiguousarray(mask)
+    result.setflags(write=False)
+    return result
+
+
 def _validate_overlay_jpeg(data: bytes, *, width: int, height: int) -> None:
     try:
         with Image.open(io.BytesIO(data)) as overlay:
@@ -594,12 +623,26 @@ class LiveSegmentationProvider:
             role=requested_role,
             expected_station_revision=expected_revision,
         )
-        if capture.role != requested_role:
-            raise RuntimeError("Segmentation capture returned another camera role.")
         if capture.station_revision != expected_revision:
             raise RuntimeError(
                 "Segmentation capture returned another Station revision."
             )
+        return self.segment_capture(capture=capture, parameters=parameters)
+
+    def segment_capture(
+        self,
+        *,
+        capture: LiveRgbSegmentationCapture,
+        parameters: Mapping[str, Any],
+    ) -> PreparedSegmentation:
+        """Run the registered localizer on one caller-owned immutable RGB cut."""
+
+        if not isinstance(capture, LiveRgbSegmentationCapture):
+            raise TypeError("capture must be a LiveRgbSegmentationCapture.")
+        self.registration.payload_validator.validate_parameters(parameters)
+        requested_role = parameters["role"]
+        if capture.role != requested_role:
+            raise RuntimeError("Segmentation capture returned another camera role.")
         if (
             self.registration.profile.source_id_by_role.get(requested_role)
             != capture.source_id
@@ -846,4 +889,5 @@ __all__ = [
     "SegmentationRegistration",
     "build_segmentation_executor",
     "build_segmentation_registration",
+    "decode_segmentation_mask_npy",
 ]

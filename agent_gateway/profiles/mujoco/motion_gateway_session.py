@@ -25,6 +25,11 @@ from agent_gateway.profiles.back_projection import (
     LiveBackProjectionProvider,
     build_back_projection_executor,
 )
+from agent_gateway.profiles.placement import (
+    PLACEMENT_MAX_OPERATION_DURATION_MS_V1,
+    PlacementProvider,
+    build_placement_executor,
+)
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
@@ -75,6 +80,7 @@ from agent_gateway.skills.perception.definition import (
     CAPTURE_DEPTH_SKILL_ID_V1,
     CAPTURE_RGB_SKILL_ID_V1,
     SEGMENT_SKILL_ID_V1,
+    PLAN_PLACEMENT_SKILL_ID_V1,
 )
 from agent_gateway.skills.perception.schemas import (
     RGB_FRAME_COMPRESSION_V1,
@@ -109,6 +115,7 @@ from .observation_binding import (
 )
 from .rgb_deployment import MUJOCO_CAPTURE_RGB_OUTPUT_SLOT_ID_V1
 from .segmentation import MujocoSegmentationCapturePort
+from .placement import MujocoPlacementRobotStatePort
 from .tcp_pose_history import MujocoAgentTcpPoseHistoryProvider
 from .visual_observation import MujocoAgentRgbCaptureProvider
 
@@ -153,6 +160,8 @@ class MujocoAgentTcpPoseGatewaySession:
     segmentation_localizer: object | None
     segmentation_provider: LiveSegmentationProvider | None
     segmentation_executor: PassiveReadSkillExecutor | None
+    placement_provider: PlacementProvider | None
+    placement_executor: PassiveReadSkillExecutor | None
     history_provider: MujocoAgentTcpPoseHistoryProvider | None
     history_executor: PassiveReadSkillExecutor | None
     history_recorder: SourceObservationHistoryRecorder | None
@@ -249,6 +258,14 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError("MuJoCo segmentation resources must be all-or-none.")
         if self.segmentation_provider is not None and self.artifact_store is None:
             raise ValueError("MuJoCo segmentation requires the Artifact store.")
+        placement_enabled = self.contract_bundle.placement is not None
+        if placement_enabled != all(
+            item is not None
+            for item in (self.placement_provider, self.placement_executor)
+        ):
+            raise ValueError(
+                "MuJoCo placement registration and runtime resources disagree."
+            )
         if not isinstance(self.hardware_view_provider, HardwareViewProvider):
             raise TypeError("MuJoCo hardware view provider must be typed.")
 
@@ -445,6 +462,11 @@ class MujocoAgentTcpPoseGatewaySession:
                     ),
                     ("history", self.history_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
+                    (
+                        "placement",
+                        getattr(self, "placement_executor", None),
+                        PLACEMENT_MAX_OPERATION_DURATION_MS_V1 / 1_000.0 + 5.0,
+                    ),
                 ):
                     try:
                         if executor is not None and not executor.wait_all(
@@ -782,6 +804,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         if contract_bundle.segmentation is not None
         else None
     )
+    placement_entry = (
+        contract_bundle.route_manifest.route(PLAN_PLACEMENT_SKILL_ID_V1, "1")
+        if contract_bundle.placement is not None
+        else None
+    )
     observation_producer = MujocoAgentObservationProducer(
         application=application,
         contract_bundle=contract_bundle,
@@ -817,27 +844,68 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             max_retained_operations=retention,
             clock=runtime_clock,
         )
+    back_projection_capture_port = None
     back_projection_provider = None
     back_projection_executor = None
     if back_projection_registration is not None:
         depth_binding = depth_registration.deployment_binding
-        back_projection_provider = LiveBackProjectionProvider(
-            capture_port=MujocoBackProjectionCapturePort(
-                application=application,
-                source_id_by_role=dict(
-                    back_projection_registration.profile.source_id_by_role
-                ),
-                source_frame_id=depth_binding.source_frame_id,
-                reference_frame_id=depth_binding.reference_frame_id,
-                current_station_revision=lambda: (
-                    observation_producer.current_station_revision
-                ),
+        back_projection_capture_port = MujocoBackProjectionCapturePort(
+            application=application,
+            source_id_by_role=dict(
+                back_projection_registration.profile.source_id_by_role
             ),
+            source_frame_id=depth_binding.source_frame_id,
+            reference_frame_id=depth_binding.reference_frame_id,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+        )
+        back_projection_provider = LiveBackProjectionProvider(
+            capture_port=back_projection_capture_port,
             registration=back_projection_registration,
         )
         back_projection_executor = build_back_projection_executor(
             registration=back_projection_registration,
             provider=back_projection_provider,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+            max_retained_operations=retention,
+            clock=runtime_clock,
+        )
+    placement_provider = None
+    placement_executor = None
+    if contract_bundle.placement is not None:
+        assert contract_bundle.segmentation is not None
+        assert segmentation_executor is not None
+        assert segmentation_provider is not None
+        assert back_projection_registration is not None
+        assert back_projection_capture_port is not None
+        placement_provider = PlacementProvider(
+            registration=contract_bundle.placement,
+            segmentation_registration=contract_bundle.segmentation,
+            segmentation_executor=segmentation_executor,
+            segmentation_provider=segmentation_provider,
+            back_projection_registration=back_projection_registration,
+            capture_port=back_projection_capture_port,
+            robot_state_port=MujocoPlacementRobotStatePort(
+                application=application,
+                component_id=contract_bundle.placement.profile.component_id,
+                source_frame_id=(
+                    contract_bundle.motion_profile.execution_reference_frame_id
+                    or contract_bundle.motion_profile.reference_frame_id
+                ),
+                reference_frame_id=(
+                    contract_bundle.placement.profile.reference_frame_id
+                ),
+                current_station_revision=lambda: (
+                    observation_producer.current_station_revision
+                ),
+            ),
+        )
+        placement_executor = build_placement_executor(
+            registration=contract_bundle.placement,
+            provider=placement_provider,
             current_station_revision=lambda: (
                 observation_producer.current_station_revision
             ),
@@ -1516,6 +1584,10 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         execution_port_by_route_hash[
             back_projection_entry.route.semantic_content_hash
         ] = back_projection_executor
+    if placement_entry is not None and placement_executor is not None:
+        execution_port_by_route_hash[
+            placement_entry.route.semantic_content_hash
+        ] = placement_executor
     executor_registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -1641,6 +1713,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         segmentation_localizer=segmentation_localizer,
         segmentation_provider=segmentation_provider,
         segmentation_executor=segmentation_executor,
+        placement_provider=placement_provider,
+        placement_executor=placement_executor,
         history_provider=history_provider,
         history_executor=history_executor,
         history_recorder=history_recorder,

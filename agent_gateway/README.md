@@ -306,7 +306,14 @@ disconnect handling, so the safety channel does not weaken HOLD-on-disconnect.
 `--artifact-root` is optional and default-off. Supplying a real,
 non-world-writable directory enables the read-only
 `perception.capture_depth`, `perception.capture_rgb`, and
-`perception.back_project` Skills. Depth returns role-selected native-resolution
+`perception.back_project` Skills. A motion Gateway that also has the optional
+segmentation model exposes `perception.segment` and
+`perception.plan_placement`. The placement planner consumes two retained
+text-prompt segment operation IDs as identity anchors, reruns the registered
+localizer on current correlated RGB-D cuts, and returns compact Station-frame
+placement geometry. It never dispatches motion, and callers must
+use a separate motion Skill after checking
+`geometry_eligible_for_motion_planning`. Depth returns role-selected native-resolution
 float32 metric data; RGB returns one role-selected JPEG per output Artifact
 ordinal. Back-projection takes either one pixel or a half-open pixel region,
 captures aligned live depth internally, and returns bounded geometry in the
