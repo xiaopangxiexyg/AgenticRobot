@@ -53,6 +53,11 @@ lower domains must not import application/profile layers
 换绑为另一组策略。可用性策略直接使用既有纯策略模块，snapshot/event 类型仍由该模块持有，
 不新增策略容器或第二套状态定义。旧 CLI 与控制器导出保留，但不再改变 lower module 的依赖。
 
+数采的 v2.5-p native shadow 由 `teleop_runtime.collection.v25p_dual_write_shadow` 统一处理
+已规划 legacy row 的追加、正式封存后的投影及失败清理；线程、子进程和 UMI 入口只保留各自的
+启用条件、状态发布与生命周期所有权。共享操作不重新规划样本，不调用正式 Writer 的封存，
+影子失败不改写正式保存结果；UMI 仍提交与 Writer 相同的下一帧动作对齐样本。
+
 ## 执行模式边界
 
 执行模式按同时参与控制决策的 source 数量划分，而不是按是否启用 GUI、trace 或被动 shadow 划分：

@@ -8,11 +8,19 @@ writer and contains no v2.4 commit behavior.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+from collection_runtime.component_capture import (
+    ComponentCaptureCommitReport,
+    ComponentCaptureEpisodeStore,
+    ComponentCaptureSealReport,
+    ProducedComponentSample,
+)
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from dataset_contracts.v25p import v25p_base_episode_manifest_hash
@@ -29,13 +37,6 @@ from dataset_interface.v25p_projection_plan import (
 from dataset_interface.v25p_v23_adapter import V25pV23ProjectedRow
 
 from .v25p_capture_profiles import V25pCaptureProfileBundle
-from collection_runtime.component_capture import (
-    ComponentCaptureCommitReport,
-    ComponentCaptureEpisodeStore,
-    ComponentCaptureSealReport,
-    ProducedComponentSample,
-)
-
 
 _LEGACY_ROW_JOB_KIND = "lerobot_v21.row"
 
@@ -104,6 +105,86 @@ def load_finalized_legacy_episode_record(
             f"episode_index={int(episode_index)} matches={len(matches)}."
         )
     return matches[0]
+
+
+def _close_failed_shadow(
+    shadow: V25pDualWriteShadow,
+    identity: EpisodeCaptureIdentity,
+    error: str,
+) -> str:
+    try:
+        shadow.close_unsealed(identity)
+    except BaseException as exc:  # noqa: BLE001 - Preserve the subordinate failure.
+        error += f";close_unsealed:{type(exc).__name__}: {exc}"
+    return error
+
+
+def append_shadow_from_legacy_jobs(
+    shadow: V25pDualWriteShadow,
+    identity: EpisodeCaptureIdentity,
+    *,
+    source_sample: Any,
+    jobs: object,
+) -> str:
+    """Observe already planned jobs without vetoing authoritative capture."""
+
+    try:
+        shadow.append(
+            identity,
+            source_sample=source_sample,
+            legacy_row=legacy_row_from_planned_jobs(jobs),
+        )
+    except BaseException as exc:  # noqa: BLE001 - Legacy capture stays authoritative.
+        return _close_failed_shadow(
+            shadow, identity, f"append:{type(exc).__name__}: {exc}"
+        )
+    return ""
+
+
+def finalize_shadow_after_legacy(
+    shadow: V25pDualWriteShadow,
+    identity: EpisodeCaptureIdentity,
+    *,
+    dataset_root: str | Path,
+    episode_index: int,
+    error_prefix: str = "finalize",
+    incomplete_message: str = "v2.5-p compatibility projection failed",
+    record_finalize_elapsed: Callable[[float], None] | None = None,
+) -> tuple[V25pShadowFinalizeReport | None, str | None]:
+    """Seal the subordinate shadow after its owner finalized the legacy row.
+
+    The caller retains admission and publication ownership. Report projection
+    and cleanup failures separately from the already committed legacy result;
+    never close a different active identity. Timing excludes failure cleanup.
+    A complete receipt returns no error update, preserving prior owner errors.
+    """
+
+    report = None
+    try:
+        started_at = time.perf_counter() if record_finalize_elapsed is not None else 0.0
+        try:
+            candidate_report = shadow.finalize_after_legacy(
+                identity,
+                legacy_episode_record=load_finalized_legacy_episode_record(
+                    dataset_root, episode_index
+                ),
+                completed_at=time.time(),
+                completed_clock_domain_id="local_wall_clock",
+            )
+        finally:
+            if record_finalize_elapsed is not None:
+                record_finalize_elapsed(time.perf_counter() - started_at)
+        report = candidate_report
+        error = (
+            str(report.receipt.message or incomplete_message)
+            if report.receipt.status != "complete"
+            else None
+        )
+    except BaseException as exc:  # noqa: BLE001 - Legacy finalization already succeeded.
+        error = f"{error_prefix}:{type(exc).__name__}: {exc}"
+        if shadow.active_identity == identity:
+            error = _close_failed_shadow(shadow, identity, error)
+    return report, error
 
 
 def _project_produced_sample(
@@ -354,6 +435,8 @@ __all__ = [
     "V25pSampleProducer",
     "V25pShadowAppendReport",
     "V25pShadowFinalizeReport",
+    "append_shadow_from_legacy_jobs",
+    "finalize_shadow_after_legacy",
     "legacy_row_from_planned_jobs",
     "load_finalized_legacy_episode_record",
 ]

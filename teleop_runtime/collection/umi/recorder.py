@@ -37,8 +37,8 @@ from ..schema_v22 import (
 from ..writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 from ..v25p_dual_write_shadow import (
     V25pDualWriteShadow,
-    legacy_row_from_planned_jobs,
-    load_finalized_legacy_episode_record,
+    append_shadow_from_legacy_jobs,
+    finalize_shadow_after_legacy,
 )
 from collection_runtime.compatibility import CompatibilityEpisodeSidecarStore
 from .calibration import UmiCalibrationBinding
@@ -599,20 +599,11 @@ class UmiDatasetRecorder:
             and identity is not None
             and self._v25p_native_shadow_active
         ):
-            try:
-                shadow.append(
-                    identity,
-                    source_sample=aligned,
-                    legacy_row=legacy_row_from_planned_jobs(jobs),
-                )
-            except BaseException as exc:  # legacy capture remains authoritative
-                self._v25p_native_shadow_error = f"append:{type(exc).__name__}: {exc}"
-                try:
-                    shadow.close_unsealed(identity)
-                except BaseException as close_exc:
-                    self._v25p_native_shadow_error += (
-                        f";close_unsealed:{type(close_exc).__name__}: {close_exc}"
-                    )
+            error = append_shadow_from_legacy_jobs(
+                shadow, identity, source_sample=aligned, jobs=jobs
+            )
+            if error:
+                self._v25p_native_shadow_error = error
                 self._v25p_native_shadow_active = False
         for job in jobs:
             self.pool.submit(job)
@@ -728,29 +719,15 @@ class UmiDatasetRecorder:
             and getattr(self, "_v25p_native_shadow_active", False)
         ):
             try:
-                legacy_record = load_finalized_legacy_episode_record(
-                    self.writer.root_dir,
-                    index,
-                )
-                report = native_shadow.finalize_after_legacy(
+                _report, error = finalize_shadow_after_legacy(
+                    native_shadow,
                     identity,
-                    legacy_episode_record=legacy_record,
-                    completed_at=time.time(),
-                    completed_clock_domain_id="local_wall_clock",
+                    dataset_root=self.writer.root_dir,
+                    episode_index=index,
+                    incomplete_message="",
                 )
-                if report.receipt.status != "complete":
-                    self._v25p_native_shadow_error = report.receipt.message
-            except BaseException as shadow_exc:
-                self._v25p_native_shadow_error = (
-                    f"finalize:{type(shadow_exc).__name__}: {shadow_exc}"
-                )
-                if native_shadow.active_identity == identity:
-                    try:
-                        native_shadow.close_unsealed(identity)
-                    except BaseException as close_exc:
-                        self._v25p_native_shadow_error += (
-                            f";close_unsealed:{type(close_exc).__name__}: {close_exc}"
-                        )
+                if error is not None:
+                    self._v25p_native_shadow_error = error
             finally:
                 self._v25p_native_shadow_active = False
         self.episode_index = None

@@ -5,27 +5,33 @@ import os
 import stat
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
+from collection_runtime.v25p_native_store import (
+    V25pComponentInput,
+    V25pNativeEpisodeStore,
+)
+from collection_runtime.v25p_producer import V25pProducedSample
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.v22 import PolicyIOLayout
 from dataset_contracts.v25p_native_storage import V25P_PARQUET_CHUNK_LAYOUT_V1
 from dataset_interface.v25p_native import V25pNativeReadError, load_v25p_native_episode
 from dataset_interface.v25p_v23_adapter import project_native_episode_to_v23_rows
+from teleop_runtime.collection import v25p_dual_write_shadow as shadow_module
 from teleop_runtime.collection.v25p_capture_profiles import (
     V25P_REAL_TELEOP_SOURCE,
     build_policy_io_v25p_capture_profiles,
 )
-from teleop_runtime.collection.v25p_dual_write_shadow import V25pDualWriteShadow
-from collection_runtime.v25p_native_store import (
-    V25pComponentInput,
-    V25pNativeEpisodeStore,
+from teleop_runtime.collection.v25p_dual_write_shadow import (
+    V25pDualWriteShadow,
+    append_shadow_from_legacy_jobs,
+    finalize_shadow_after_legacy,
 )
-from collection_runtime.v25p_producer import V25pProducedSample
-
 
 POSE_HASH = canonical_content_hash(
     {"name": "shadow_test_pose_frames"},
@@ -126,6 +132,153 @@ def _publish_legacy_episode_record(root: Path, row: dict[str, object]) -> None:
     path = root / "meta" / "episodes.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_owner_helpers_preserve_native_capture_and_projection_receipt(
+    tmp_path: Path, drift: bool,
+) -> None:
+    _bundle, shadow, identity = _setup(tmp_path)
+    shadow.prepare_episode(identity)
+    shadow.bind_prepared_episode(identity, bound_at=2.0, bound_clock_domain_id="test_clock")
+    row = _legacy_row(drift=drift)
+    job = SimpleNamespace(kind="lerobot_v21.row", payload={"row": row})
+
+    assert append_shadow_from_legacy_jobs(
+        shadow, identity,
+        source_sample={"frame_index": 0, "timestamp": 3.0}, jobs=(job,),
+    ) == ""
+    _publish_legacy_episode_record(tmp_path, row)
+    report, error = finalize_shadow_after_legacy(
+        shadow, identity, dataset_root=tmp_path, episode_index=0,
+    )
+
+    assert report is not None
+    assert report.receipt.status == ("failed" if drift else "complete")
+    assert error == (report.receipt.message if drift else None)
+    loaded = load_v25p_native_episode(tmp_path, identity.episode_uuid)
+    assert loaded.identity == identity
+    assert loaded.native_capture_manifest.sample_count == 1
+    assert loaded.compatibility_projection_receipts == (report.receipt,)
+    assert json.loads((tmp_path / "meta/episodes.jsonl").read_text()) == row
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError("append failed"), KeyboardInterrupt()])
+@pytest.mark.parametrize("close_failure", [None, OSError("close failed")])
+def test_append_helper_observes_exact_planned_row_and_preserves_failures(
+    failure, close_failure,
+) -> None:
+    identity, sample, row = object(), object(), {"frame_index": 7}
+    shadow = Mock()
+    shadow.append.side_effect = failure
+    shadow.close_unsealed.side_effect = close_failure
+    jobs = (
+        SimpleNamespace(kind="video", payload={}),
+        SimpleNamespace(kind="lerobot_v21.row", payload={"row": row}),
+    )
+
+    error = append_shadow_from_legacy_jobs(
+        shadow, identity, source_sample=sample, jobs=jobs,
+    )
+
+    shadow.append.assert_called_once_with(identity, source_sample=sample, legacy_row=row)
+    assert shadow.append.call_args.kwargs["legacy_row"] is row
+    if failure is None:
+        assert error == ""
+        shadow.close_unsealed.assert_not_called()
+    else:
+        expected = f"append:{type(failure).__name__}: {failure}"
+        if close_failure is not None:
+            expected += f";close_unsealed:OSError: {close_failure}"
+        assert error == expected
+        shadow.close_unsealed.assert_called_once_with(identity)
+
+
+@pytest.mark.parametrize("row_count", [0, 2])
+def test_append_helper_rejects_ambiguous_jobs_without_appending(row_count: int) -> None:
+    shadow, identity = Mock(), object()
+    job = SimpleNamespace(kind="lerobot_v21.row", payload={"row": {}})
+    error = append_shadow_from_legacy_jobs(
+        shadow, identity, source_sample=object(), jobs=(job,) * row_count,
+    )
+    assert error == f"append:ValueError: Expected exactly one legacy row job, found {row_count}."
+    shadow.append.assert_not_called()
+    shadow.close_unsealed.assert_called_once_with(identity)
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "fallback", "expected"),
+    [
+        ("complete", "", "unused", None),
+        ("failed", "projection differs", "unused", "projection differs"),
+        ("failed", "", "v2.5-p compatibility projection failed", "v2.5-p compatibility projection failed"),
+        ("failed", "", "", ""),
+    ],
+)
+def test_finalize_helper_preserves_receipt_and_owner_message_policy(
+    tmp_path: Path, status, message, fallback, expected,
+) -> None:
+    record = {"episode_index": 7, "length": 1}
+    _publish_legacy_episode_record(tmp_path, record)
+    report = SimpleNamespace(receipt=SimpleNamespace(status=status, message=message))
+    shadow, identity = Mock(), object()
+    shadow.finalize_after_legacy.return_value = report
+
+    actual, error = finalize_shadow_after_legacy(
+        shadow, identity, dataset_root=tmp_path, episode_index=7,
+        incomplete_message=fallback,
+    )
+
+    assert actual is report
+    assert error == expected
+    shadow.finalize_after_legacy.assert_called_once()
+    args, kwargs = shadow.finalize_after_legacy.call_args
+    assert args == (identity,)
+    assert kwargs["legacy_episode_record"] == record
+    assert kwargs["completed_clock_domain_id"] == "local_wall_clock"
+    shadow.close_unsealed.assert_not_called()
+
+
+@pytest.mark.parametrize("failure_stage", ["load", "finalize"])
+@pytest.mark.parametrize("same_identity", [False, True])
+@pytest.mark.parametrize("close_failure", [False, True])
+def test_finalize_helper_cleans_only_failed_identity_after_recording_timing(
+    tmp_path: Path, monkeypatch, failure_stage, same_identity, close_failure,
+) -> None:
+    identity = object()
+    shadow = Mock(active_identity=identity if same_identity else object())
+    events = []
+
+    def close(active_identity):
+        assert active_identity is identity
+        events.append("close")
+        if close_failure:
+            raise OSError("cleanup failed")
+
+    shadow.close_unsealed.side_effect = close
+    shadow.finalize_after_legacy.side_effect = RuntimeError("seal failed")
+    loader = Mock(return_value={"episode_index": 7})
+    if failure_stage == "load":
+        loader.side_effect = ValueError("record missing")
+    monkeypatch.setattr(shadow_module, "load_finalized_legacy_episode_record", loader)
+    monkeypatch.setattr(shadow_module.time, "perf_counter", Mock(side_effect=[10.0, 10.25]))
+
+    report, error = finalize_shadow_after_legacy(
+        shadow, identity, dataset_root=tmp_path, episode_index=7,
+        error_prefix="post_finalize",
+        record_finalize_elapsed=lambda elapsed: events.append(("timing", elapsed)),
+    )
+
+    assert report is None
+    expected = "post_finalize:" + (
+        "ValueError: record missing" if failure_stage == "load" else "RuntimeError: seal failed"
+    )
+    if same_identity and close_failure:
+        expected += ";close_unsealed:OSError: cleanup failed"
+    assert error == expected
+    assert events == [("timing", 0.25)] + (["close"] if same_identity else [])
+    assert shadow.finalize_after_legacy.call_count == int(failure_stage == "finalize")
+    assert shadow.close_unsealed.call_count == int(same_identity)
 
 
 def _assert_persisted_projection(loaded, bundle, *, sample_count: int) -> None:

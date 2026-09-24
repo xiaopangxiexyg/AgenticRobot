@@ -98,8 +98,8 @@ from ..collection.v25p_capture_profiles import (
 )
 from ..collection.v25p_dual_write_shadow import (
     V25pDualWriteShadow,
-    legacy_row_from_planned_jobs,
-    load_finalized_legacy_episode_record,
+    append_shadow_from_legacy_jobs,
+    finalize_shadow_after_legacy,
 )
 from collection_runtime.component_capture import ComponentCaptureEpisodeStore
 from ..collection.v25p_real_teleop_producer import RealTeleopV25pProducer
@@ -802,21 +802,11 @@ class RealTeleopDatasetRecorder:
             or not self._v25p_native_shadow_active
         ):
             return jobs
-        try:
-            shadow.append(
-                identity,
-                source_sample=sample,
-                legacy_row=legacy_row_from_planned_jobs(jobs),
-            )
-        except BaseException as exc:  # legacy capture stays authoritative
-            self._v25p_native_shadow_error = f"append:{type(exc).__name__}: {exc}"
-            try:
-                shadow.close_unsealed(identity)
-            except BaseException as close_exc:
-                self._v25p_native_shadow_error += (
-                    ";close_unsealed:"
-                    f"{type(close_exc).__name__}: {close_exc}"
-                )
+        error = append_shadow_from_legacy_jobs(
+            shadow, identity, source_sample=sample, jobs=jobs
+        )
+        if error:
+            self._v25p_native_shadow_error = error
             self._v25p_native_shadow_active = False
         return jobs
 
@@ -2994,37 +2984,18 @@ class RealTeleopDatasetRecorder:
             and task.episode_identity is not None
             and self._v25p_native_shadow_active
         ):
-            try:
-                task.v25p_native_finalize_report = run_stage(
-                    "v25p_native_post_finalize",
-                    lambda: v25p_native_shadow.finalize_after_legacy(
-                        task.episode_identity,
-                        legacy_episode_record=load_finalized_legacy_episode_record(
-                            self.dataset_root,
-                            task.episode_index,
-                        ),
-                        completed_at=time.time(),
-                        completed_clock_domain_id="local_wall_clock",
-                    ),
-                )
-                receipt = task.v25p_native_finalize_report.receipt
-                if receipt.status != "complete":
-                    task.v25p_native_error = str(
-                        receipt.message
-                        or "v2.5-p compatibility projection failed"
-                    )
-            except BaseException as shadow_exc:  # legacy finalize remains successful
-                task.v25p_native_error = (
-                    f"post_finalize:{type(shadow_exc).__name__}: {shadow_exc}"
-                )
-                if v25p_native_shadow.active_identity == task.episode_identity:
-                    try:
-                        v25p_native_shadow.close_unsealed(task.episode_identity)
-                    except BaseException as close_exc:
-                        task.v25p_native_error += (
-                            ";close_unsealed:"
-                            f"{type(close_exc).__name__}: {close_exc}"
-                        )
+            task.v25p_native_finalize_report, error = finalize_shadow_after_legacy(
+                v25p_native_shadow,
+                task.episode_identity,
+                dataset_root=self.dataset_root,
+                episode_index=task.episode_index,
+                error_prefix="post_finalize",
+                record_finalize_elapsed=lambda elapsed: task.record_stage_timing(
+                    "v25p_native_post_finalize", elapsed
+                ),
+            )
+            if error is not None:
+                task.v25p_native_error = error
         elif getattr(self, "_v25p_native_shadow_error", ""):
             task.v25p_native_error = str(self._v25p_native_shadow_error)
         if task.progress_episode is not None and not task.progress_error:

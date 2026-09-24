@@ -914,7 +914,11 @@ def _worker_main(
                 V25P_REAL_TELEOP_SOURCE,
                 build_policy_io_v25p_capture_profiles,
             )
-            from .v25p_dual_write_shadow import V25pDualWriteShadow
+            from .v25p_dual_write_shadow import (
+                V25pDualWriteShadow,
+                append_shadow_from_legacy_jobs,
+                finalize_shadow_after_legacy,
+            )
             from collection_runtime.component_capture import (
                 ComponentCaptureEpisodeStore,
             )
@@ -1095,30 +1099,13 @@ def _worker_main(
                     ):
                         active_stage = "worker.v25p_native_shadow_append"
                         stage_started = time.perf_counter()
-                        try:
-                            from .v25p_dual_write_shadow import (
-                                legacy_row_from_planned_jobs,
-                            )
-
-                            v25p_native_shadow.append(
-                                v25p_native_shadow_identity,
-                                source_sample=sample,
-                                legacy_row=legacy_row_from_planned_jobs(jobs),
-                            )
-                        except BaseException as exc:
-                            # The legacy capture stays authoritative.
-                            v25p_native_shadow_error = (
-                                f"append:{type(exc).__name__}: {exc}"
-                            )
-                            try:
-                                v25p_native_shadow.close_unsealed(
-                                    v25p_native_shadow_identity
-                                )
-                            except BaseException as close_exc:
-                                v25p_native_shadow_error += (
-                                    ";close_unsealed:"
-                                    f"{type(close_exc).__name__}: {close_exc}"
-                                )
+                        v25p_native_shadow_error = append_shadow_from_legacy_jobs(
+                            v25p_native_shadow,
+                            v25p_native_shadow_identity,
+                            source_sample=sample,
+                            jobs=jobs,
+                        )
+                        if v25p_native_shadow_error:
                             v25p_native_shadow_identity = None
                         stage_ms["worker.v25p_native_shadow_append"] = float(
                             (time.perf_counter() - stage_started) * 1000.0
@@ -1486,41 +1473,14 @@ def _worker_main(
                         shadow_error = v25p_native_shadow_error
                         if v25p_native_shadow_identity is not None:
                             try:
-                                from .v25p_dual_write_shadow import (
-                                    load_finalized_legacy_episode_record,
-                                )
-
-                                shadow_report = v25p_native_shadow.finalize_after_legacy(
+                                shadow_report, error = finalize_shadow_after_legacy(
+                                    v25p_native_shadow,
                                     v25p_native_shadow_identity,
-                                    legacy_episode_record=(
-                                        load_finalized_legacy_episode_record(
-                                            writer_config.root_dir,
-                                            requested_episode_index,
-                                        )
-                                    ),
-                                    completed_at=time.time(),
-                                    completed_clock_domain_id="local_wall_clock",
+                                    dataset_root=writer_config.root_dir,
+                                    episode_index=requested_episode_index,
                                 )
-                                if shadow_report.receipt.status != "complete":
-                                    shadow_error = str(
-                                        shadow_report.receipt.message
-                                        or "v2.5-p compatibility projection failed"
-                                    )
-                            except BaseException as exc:  # legacy finalize succeeded
-                                shadow_error = f"finalize:{type(exc).__name__}: {exc}"
-                                if (
-                                    v25p_native_shadow.active_identity
-                                    == v25p_native_shadow_identity
-                                ):
-                                    try:
-                                        v25p_native_shadow.close_unsealed(
-                                            v25p_native_shadow_identity
-                                        )
-                                    except BaseException as close_exc:
-                                        shadow_error += (
-                                            ";close_unsealed:"
-                                            f"{type(close_exc).__name__}: {close_exc}"
-                                        )
+                                if error is not None:
+                                    shadow_error = error
                             finally:
                                 v25p_native_shadow_identity = None
                         result = replace(
