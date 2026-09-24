@@ -167,6 +167,69 @@ def test_default_full_scale_is_twice_the_legacy_rate_and_remains_scalable() -> N
         assert certificate["passed"] is True
 
 
+def test_initial_alignment_certifies_inward_escape_from_joint_hold_margin() -> None:
+    planner = _planner()
+    start = _pair(0.0)
+    target = _pair(0.0)
+    start["right"][0] = 3.095  # Inside the 1-degree hold band below +3.1 rad.
+    target["right"][0] = 3.05
+
+    plan = planner.plan(start_qpos_by_side=start, target_qpos_by_side=target)
+
+    np.testing.assert_array_equal(plan.waypoints[0]["right"], start["right"])
+    np.testing.assert_allclose(
+        plan.waypoints[-1]["right"], target["right"], atol=1e-6
+    )
+    assert all(
+        next_qpos["right"][0] <= prior_qpos["right"][0] + 1e-10
+        for prior_qpos, next_qpos in zip(plan.waypoints, plan.waypoints[1:])
+    )
+    assert plan.metadata["reference_trajectory"]["continuous_hard_limit_certificate"][
+        "passed"
+    ] is True
+
+
+@pytest.mark.parametrize("target_j1", [3.09, 3.099])
+def test_initial_alignment_rejects_target_remaining_in_joint_hold_margin(
+    target_j1: float,
+) -> None:
+    planner = _planner()
+    start = _pair(0.0)
+    target = _pair(0.0)
+    start["right"][0] = 3.095
+    target["right"][0] = target_j1
+
+    with pytest.raises(RuleBasedInitialAlignmentPlanningError) as caught:
+        planner.plan(start_qpos_by_side=start, target_qpos_by_side=target)
+
+    assert caught.value.status == "hold_current"
+    assert caught.value.blocked_reason == "joint_limit_hold_margin"
+    assert "right.j1 distance_to_limit_deg=" in str(caught.value)
+    assert "target_deg=" in str(caught.value)
+
+
+def test_initial_alignment_collision_hold_reports_measured_margin() -> None:
+    class NearCollisionRetargeter(_Retargeter):
+        def _distance(self, left_qpos, right_qpos) -> float:
+            return 0.015
+
+    planner = RuleBasedInitialAlignmentPlanner(
+        dual_arm_retargeter=NearCollisionRetargeter(),
+        target_filter=_Envelope(),
+        config=RuleBasedInitialAlignmentConfig(
+            collision_slow_margin_m=0.02,
+            collision_hold_margin_m=0.01,
+        ),
+    )
+
+    with pytest.raises(RuleBasedInitialAlignmentPlanningError) as caught:
+        planner.plan(start_qpos_by_side=_pair(0.0), target_qpos_by_side=_pair(0.02))
+
+    assert caught.value.status == "hold_current"
+    assert caught.value.blocked_reason == "collision_soft"
+    assert "distance_m=0.015000 hold_threshold_m=0.020000" in str(caught.value)
+
+
 def test_planner_rejects_collision_and_tcp_envelope_projection() -> None:
     with pytest.raises(RuleBasedInitialAlignmentPlanningError, match="target state"):
         _planner(retargeter=_Retargeter(collision_above=0.01)).plan(

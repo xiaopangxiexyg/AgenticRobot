@@ -99,13 +99,14 @@
         <p id="task-chain-step" class="task-chain-step">0 / 5</p>
         <h2 id="task-chain-title">任务链未启动</h2>
         <p id="task-chain-detail">等待右夹爪、安全门禁和轨迹配置就绪。</p>
-        <p id="task-chain-selection" class="storage-status">尚未选择本轮轨迹。</p>
+        <p id="task-chain-selection" class="storage-status" aria-live="polite">尚未选择本轮轨迹。</p>
       </div>
       <button id="task-chain-advance" type="button" disabled>继续任务链（Alt+N）</button>
     </section>
     <section class="controls" aria-label="轨迹采集控制">
       <button id="start" data-event="rule_start" disabled>开始规则采集</button>
       <button id="stop" class="danger" data-event="rule_stop" disabled>停止并 Hold</button>
+      <button id="exclude-last" class="secondary" data-event="exclude_last_episode" disabled>舍弃上一条轨迹（可恢复）</button>
       <button id="retry" class="secondary" data-event="device_retry" disabled>重连失败设备</button>
       <button id="runtime-home-retry" class="secondary" data-event="runtime_home_retry" disabled>重新安全初始化</button>
       <button id="release" class="secondary" data-event="release_grippers" disabled>松开夹爪</button>
@@ -113,6 +114,7 @@
       <button id="debug-mode" class="secondary" data-event="debug_toggle" disabled>开启 Debug 诊断</button>
       <button id="quit" class="secondary" data-event="q">退出程序</button>
     </section>
+    <p id="curation-status" class="storage-status" aria-live="polite"></p>
     <p id="gripper-status" class="gripper-status" aria-live="polite">夹爪独立控制：等待设备状态。</p>
     <p id="debug-status" class="gripper-status" aria-live="polite">Debug 诊断：关闭。</p>
     <section class="diagnostics" aria-labelledby="diagnostics-title">
@@ -131,6 +133,7 @@
     </section>
   </main>
   <script src="/diagnostics.js"></script>
+  <script src="/selection.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

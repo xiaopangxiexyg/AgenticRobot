@@ -826,6 +826,21 @@ clip = pipeline.read_augmented_clip(
 )
 ```
 
+MP4 按 `nominal_fps` 以恒定帧率封装，但每帧只对应一个已接纳的 Parquet 样本。
+当实际采样低于标称频率时，MP4 的播放时长会短于真实采集时长；这不会改变
+`video_frame_index` 与动作行的对应关系，却会使按行号构造的固定频率动作 chunk
+具有错误的时间尺度。时序训练必须使用 Parquet 的 `timestamp` 作为采集时钟，
+不能把 MP4 PTS 或 `frame_index / nominal_fps` 当成实测时间。
+
+`dataset_interface.temporal_sampling.select_fixed_cadence_window_starts` 可在
+不重写视频、不补帧的前提下筛选真实时间间隔合格的连续窗口。当前 OpenPI v2.3
+适配器在 action chunk 索引建立时调用它：相邻样本间隔须在标称周期的 ±25% 内，
+整个 chunk 的实测时长与标称时长偏差须在 ±10% 内，且不能跨越 continuity segment。
+不合格窗口不进入训练；若全数被筛除，训练加载直接报错。需要保留更低频数据时，
+必须另行定义与部署一致的低频模型契约，不能仅改 MP4 帧率。
+已固定窗口计数的 prepared training profile 若因筛选而与实测计数不符，会按原有
+绑定检查拒绝启动；应基于新筛选结果重新生成并审核 profile，不可跳过该检查。
+
 ## PyTorch-style 包装
 
 ```python

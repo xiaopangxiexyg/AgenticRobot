@@ -170,6 +170,15 @@ def test_force_trip_is_critical_but_ik_failure_is_not_a_device_retry() -> None:
     assert reachability["recovery"]["id"] != "device_retry"
 
 
+def test_terminal_session_does_not_advertise_in_process_runtime_home() -> None:
+    diagnostic = _classify(
+        key="rig.session",
+        message="Session state=FAULT; runtime Home and hardware arm admission are required",
+    )
+    assert diagnostic["recovery"]["id"] == "restart_after_terminal_session"
+    assert "重新启动程序" in diagnostic["recovery"]["instruction"]
+
+
 def test_active_reachability_diagnostics_follow_runtime_lifecycle() -> None:
     blocker = {
         "rule.writing_reachability": "待检候选 4 数值 IK 未能认证；正在后台准备下一候选"
@@ -210,6 +219,23 @@ def test_active_reachability_diagnostics_follow_runtime_lifecycle() -> None:
     assert failed["severity"] == "error"
     assert failed["recovery"]["id"] == "inspect_reachability_preflight"
     assert failed["recovery"]["id"] != "device_retry"
+
+
+def test_held_session_recovery_precedes_pending_candidate_advice() -> None:
+    diagnostics = _build_active(
+        {
+            "can_runtime_home": True,
+            "startup_blockers": {
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+                "rule.writing_reachability": "书写四边界接触点尚未完成可达性检查。",
+            },
+            "writing_reachability_status": "pending",
+        }
+    )
+    planning = next(item for item in diagnostics if item["planningMode"] == "progress")
+    assert planning["recovery"]["id"] == "runtime_home_then_wait_candidate_check"
+    assert "重新安全初始化" in planning["recovery"]["instruction"]
+    assert all(item["recovery"]["id"] != "device_retry" for item in diagnostics)
 
 
 def test_right_hand_owner_requirement_is_not_misreported_as_disconnect() -> None:

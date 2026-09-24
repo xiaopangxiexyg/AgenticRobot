@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 from pathlib import Path
+from urllib.request import urlopen
 
 import pytest
 
@@ -11,9 +15,57 @@ from control_station.rule_based_writing import (
     RuleWritingTaskChain,
     RuleWritingTaskChainPhase,
 )
+from dataset_interface.episode_exclusion import (
+    DECISIONS_RELATIVE_PATH,
+    read_episode_exclusions,
+    set_episode_excluded,
+)
+from dataset_interface.metadata import DexTeleopDatasetIndex
 from teleop_runtime.real_teleop.rule_based_writing_plan import (
     RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
 )
+
+
+def test_rule_gui_exclusion_requires_completed_episode_intent() -> None:
+    application = RuleBasedWritingApplication()
+    assert not application.submit_intent(RuleBasedWritingIntent.EXCLUDE_LAST_EPISODE)
+    application._state.can_exclude_last_episode = True
+    application._state.last_completed_episode_index = 7
+    assert application.submit_intent(RuleBasedWritingIntent.EXCLUDE_LAST_EPISODE)
+    assert application.consume_runtime_events() == ["episode_exclude:7"]
+    assert not application.submit_intent(RuleBasedWritingIntent.EXCLUDE_LAST_EPISODE)
+    application.observe_runtime_publication(
+        {"episode_event_status": "error", "episode_event_message": "writer 其他错误"}
+    )
+    assert not application.snapshot()["can_exclude_last_episode"]
+    application.observe_runtime_publication(
+        {"episode_event_status": "error", "episode_event_message": "舍弃失败：后台保存尚未结束。"}
+    )
+    assert application.snapshot()["can_exclude_last_episode"]
+
+
+def test_reversible_episode_exclusion_preserves_raw_catalog_and_training_filter(tmp_path: Path) -> None:
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    (meta / "info.json").write_text("{}", encoding="utf-8")
+    episode_path = meta / "episodes.jsonl"
+    original = json.dumps({"episode_index": 0, "frame_count": 3}) + "\n"
+    episode_path.write_text(original, encoding="utf-8")
+    assert DexTeleopDatasetIndex(tmp_path).training_eligibility(0).eligible
+    set_episode_excluded(tmp_path, 0, excluded=True)
+    assert read_episode_exclusions(tmp_path) == {0: True}
+    assert not DexTeleopDatasetIndex(tmp_path).training_eligibility(0).eligible
+    assert episode_path.read_text(encoding="utf-8") == original
+    set_episode_excluded(tmp_path, 0, excluded=False)
+    assert read_episode_exclusions(tmp_path) == {0: False}
+    assert DexTeleopDatasetIndex(tmp_path).training_eligibility(0).eligible
+    assert (tmp_path / DECISIONS_RELATIVE_PATH).is_file()
+    episode_path.write_text(
+        json.dumps({"episode_index": 0, "frame_count": 99}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="stale episode decision"):
+        read_episode_exclusions(tmp_path)
 
 
 def _task_chain_configuration() -> tuple[
@@ -639,6 +691,131 @@ def test_failed_rule_attempt_exposes_rehome_after_confirmed_hold_reset() -> None
     assert recoverable["can_runtime_home"] is True
     assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is True
     assert application.consume_runtime_events() == ["runtime_home_retry"]
+
+
+def test_operator_hold_rehome_is_not_blocked_by_pending_writing_preflight() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    home_blocker = "Session state=DEBUG_ONLY; runtime Home required"
+    planning_blocker = "书写四边界接触点尚未完成可达性检查。"
+    blockers = {
+        "rig.session": home_blocker,
+        "rule.writing_reachability": planning_blocker,
+    }
+    application.observe_runtime_publication(
+        {
+            "capture_stage": "runtime_home",
+            "capture_phase": "ready",
+            "hardware_hold_confirmed": True,
+            "startup_blockers": blockers,
+        }
+    )
+    application.observe_rule_status(
+        {
+            "started": True,
+            "held": True,
+            "execution_begun": False,
+            "session_state": "DEBUG_ONLY",
+            "rule_start_available": False,
+            "readiness_blockers": blockers,
+        }
+    )
+
+    held = application.snapshot()
+    assert held["phase"] == "blocked"
+    assert held["can_start"] is False
+    assert held["can_runtime_home"] is True
+    assert held["can_retry_devices"] is False
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY)
+    assert application.consume_runtime_events() == ["runtime_home_retry"]
+    assert application.snapshot()["can_runtime_home"] is False
+
+    # Home does not certify the candidate: rule START remains blocked until
+    # its independent reachability check passes.
+    application.observe_runtime_publication(
+        {
+            "home_ready": True,
+            "startup_blockers": {"rule.writing_reachability": planning_blocker},
+        }
+    )
+    application.observe_rule_status(
+        {
+            "started": True,
+            "held": False,
+            "session_state": "ARMED",
+            "rule_start_available": True,
+            "readiness_blockers": {"rule.writing_reachability": planning_blocker},
+        }
+    )
+    assert application.snapshot()["can_start"] is False
+    application.observe_runtime_publication({"startup_blockers": {}})
+    application.observe_rule_status(
+        {
+            "session_state": "ARMED",
+            "readiness_blockers": {},
+            "rule_start_available": True,
+        }
+    )
+    assert application.snapshot()["can_start"] is True
+
+
+@pytest.mark.parametrize("terminal_state", ["FAULT", "ESTOP"])
+def test_terminal_session_fault_does_not_advertise_unavailable_runtime_home(
+    terminal_state: str,
+) -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application._runtime_home_retry_available = True
+    blockers = {
+        "rig.session": f"Session state={terminal_state}; runtime Home required",
+        "rule.writing_reachability": "书写四边界接触点尚未完成可达性检查。",
+    }
+    application.observe_runtime_publication(
+        {
+            "capture_stage": "runtime_home",
+            "capture_phase": "ready",
+            "startup_blockers": blockers,
+        }
+    )
+    application.observe_rule_status(
+        {
+            "started": True,
+            "session_state": terminal_state,
+            "rule_start_available": False,
+            "readiness_blockers": blockers,
+        }
+    )
+
+    state = application.snapshot()
+    assert state["can_runtime_home"] is False
+    assert state["can_start"] is False
+    assert "当前进程不能重新采集 runtime Home" in state["detail"]
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is False
+    assert application.consume_runtime_events() == []
+
+
+def test_writing_preflight_does_not_mask_real_device_fault_before_rehome() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    blockers = {
+        "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+        "rule.writing_reachability": "书写四边界接触点尚未完成可达性检查。",
+        "hand.right": "DMTAC gripper disconnected",
+    }
+    application.observe_runtime_publication({"startup_blockers": blockers})
+    application.observe_rule_status(
+        {
+            "started": True,
+            "held": True,
+            "session_state": "DEBUG_ONLY",
+            "readiness_blockers": blockers,
+        }
+    )
+
+    state = application.snapshot()
+    assert state["can_runtime_home"] is False
+    assert state["can_start"] is False
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is False
 
 
 def test_transient_writer_pause_keeps_running_controls_stable() -> None:
@@ -1959,6 +2136,131 @@ def test_task_chain_recovers_lost_gripper_owner_through_right_one_shot_close() -
     assert application.consume_runtime_events() == ["episode_start"]
 
 
+def test_complete_cadence_episode_recovers_lost_owner_before_next_rule() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.COMPLETE
+    application._task_chain.grasp_adjustment_initialized = True
+    application._task_chain.episodes_since_grasp_adjustment = 3
+    application._task_chain.configure_grasp_adjustment_interval(10)
+    application._task_chain.set_prepared_configuration(index=0, selected=first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated after serial recovery"
+            },
+        )
+    )
+
+    blocked = application.snapshot()
+    assert blocked["task_chain_phase"] == "complete"
+    assert blocked["task_chain_grasp_adjustment_due"] is False
+    assert blocked["task_chain_owner_recovery_required"] is True
+    assert blocked["task_chain_can_advance"] is True
+    assert "闭合 owner 已失效" in blocked["task_chain_detail"]
+
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+    assert application.consume_runtime_events() == []
+    pending = application.snapshot()
+    assert pending["task_chain_phase"] == "ready_rule"
+    assert pending["task_chain_episodes_since_grasp_adjustment"] == 3
+    assert pending["gripper_action_pending"] is True
+
+    # A physical position alone is not an owner receipt.  The runtime must
+    # remove the owner blocker after the new one-shot close settles.
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            gripper_action_pending=False,
+            gripper_action_id=41,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner still unconfirmed"
+            },
+        )
+    )
+    assert application.consume_rule_intents() == ("close_right_gripper",)
+    assert application.consume_runtime_events() == []
+
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=True,
+            gripper_action_pending=False,
+            gripper_action_id=42,
+            gripper_action_intent="close_right_gripper",
+            gripper_action_result="succeeded",
+            gripper_action_status="右夹爪实测已闭紧",
+            readiness_blockers={},
+        )
+    )
+    assert application.consume_rule_intents() == ("rule_start",)
+    assert application.consume_runtime_events() == ["episode_start"]
+    resumed = application.snapshot()
+    assert resumed["task_chain_phase"] == "rule_pending"
+    assert resumed["task_chain_episodes_since_grasp_adjustment"] == 3
+
+
+def test_complete_cadence_owner_recovery_keeps_other_faults_closed() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.COMPLETE
+    application._task_chain.grasp_adjustment_initialized = True
+    application._task_chain.episodes_since_grasp_adjustment = 3
+    application._task_chain.configure_grasp_adjustment_interval(10)
+    application._task_chain.set_prepared_configuration(index=0, selected=first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated",
+                "hand.right": "DMTAC transport unavailable",
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_owner_recovery_required"] is False
+    assert state["task_chain_can_advance"] is False
+    assert application.submit_task_chain_advance({"event": "advance"}) is False
+    assert application.consume_rule_intents() == ()
+
+
+def test_complete_cadence_owner_loss_does_not_skip_due_grasp_adjustment() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    application._task_chain.phase = RuleWritingTaskChainPhase.COMPLETE
+    application._task_chain.grasp_adjustment_initialized = True
+    application._task_chain.episodes_since_grasp_adjustment = 10
+    application._task_chain.configure_grasp_adjustment_interval(10)
+    application._task_chain.set_prepared_configuration(index=0, selected=first)
+    application.observe_rule_status(
+        _task_chain_ready_status(
+            rule_start_available=False,
+            readiness_blockers={
+                "rule.right_hand_hold_owner": "owner invalidated after serial recovery"
+            },
+        )
+    )
+
+    state = application.snapshot()
+    assert state["task_chain_grasp_adjustment_due"] is True
+    assert state["task_chain_owner_recovery_required"] is False
+    assert state["task_chain_can_advance"] is True
+    assert application.submit_task_chain_advance({"event": "advance"}) is True
+    assert application.consume_rule_intents() == ("release_right_gripper",)
+    assert application.snapshot()["task_chain_phase"] == "initial_release_pending"
+
+
 def test_task_chain_owner_recovery_retries_once_after_serial_session_loss() -> None:
     application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
     options, first, _second = _task_chain_configuration()
@@ -2264,3 +2566,64 @@ def test_gripper_status_distinguishes_topology_from_lifecycle_availability() -> 
     assert "夹爪已配置" in script
     assert "当前安全/Session 阶段不允许独立控制" in script
     assert "夹爪独立控制：当前拓扑未启用" in script
+
+
+def test_rule_ui_displays_actual_random_writing_instead_of_configured_default() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the browser selection contract")
+    selection_script = (
+        Path(__file__).parents[1]
+        / "control_station/rule_based_writing/static/selection.js"
+    )
+    choices = [{"value": "digit_2_v1", "label": "数字 2"}]
+    configured = {"trajectory_id": "digit_1_v1"}
+    variants = [
+        {"selected_trajectory_id": "digit_2_v1", "selected_direction": "left",
+         "selected_direction_deviation_deg": 12.4, "selected_size_m": 0.072},
+        {"selected_trajectory_id": "digit_9_v1", "selected_direction": "down",
+         "selected_direction_deviation_deg": -8.1, "selected_size_m": 0.065},
+        {"selected_trajectory_id": "latin_a_v1", "selected_direction": "up",
+         "selected_direction_deviation_deg": 0.0, "selected_size_m": 0.06},
+        {},
+    ]
+    script = (
+        "const selection=require(process.argv[1]);"
+        "const [variants,configured,choices]=JSON.parse(process.argv[2]);"
+        "process.stdout.write(JSON.stringify(variants.map(variant=>"
+        "selection.describeWritingVariant(variant,configured,choices))));"
+    )
+    result = subprocess.run(
+        [node, "-e", script, str(selection_script),
+         json.dumps([variants, configured, choices])],
+        check=True, capture_output=True, text=True,
+    )
+    first, second, letter, unresolved = json.loads(result.stdout)
+    assert "实际书写：数字 2（digit_2_v1）" in first
+    assert "方向 向左（偏角 +12.4°）" in first
+    assert "字高 0.072m" in first
+    assert "实际书写：数字 9（digit_9_v1）" in second
+    assert "方向 向下（偏角 -8.1°）" in second
+    assert "实际书写：字母 A（latin_a_v1）" in letter
+    assert "实际书写待确定（配置默认 digit_1_v1）" == unresolved
+
+
+def test_rule_ui_serves_selected_writing_display_before_app() -> None:
+    ui = RuleBasedWritingWebUi(port=0, open_browser=False)
+    ui.start()
+    try:
+        with urlopen(ui.url, timeout=2.0) as response:
+            html = response.read().decode("utf-8")
+        with urlopen(f"{ui.url}selection.js", timeout=2.0) as response:
+            selection_script = response.read().decode("utf-8")
+    finally:
+        ui.close()
+    assert html.index('<script src="/selection.js"></script>') < html.index(
+        '<script src="/app.js"></script>'
+    )
+    assert "RuleWritingSelection" in selection_script
+    app = (
+        Path(__file__).parents[1]
+        / "control_station/rule_based_writing/static/app.js"
+    ).read_text(encoding="utf-8")
+    assert "selectionApi.describeWritingVariant(variant, chainSelection, trajectoryChoices)" in app

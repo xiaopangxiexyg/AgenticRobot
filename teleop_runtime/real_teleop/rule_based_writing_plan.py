@@ -56,6 +56,7 @@ from robot_motion.replay import (
     CANONICAL_DESK_ACTION_FRAME,
     FIXED_TRAJECTORY_DIRECTIONS,
     ReplayTrajectoryGroup,
+    RuleBasedBoundaryState,
     RuleBasedActionSegment,
     RuleBasedCaptureSelection,
     RuleBasedCollectionPlan,
@@ -64,7 +65,9 @@ from robot_motion.replay import (
     RuleBasedSegmentStopCondition,
     available_fixed_trajectory_ids,
     build_fixed_trajectory_targets,
+    fixed_trajectory_direction_yaw_rad,
     fixed_trajectory_catalog_hash,
+    rebase_replay_action_at_boundary,
     get_fixed_trajectory,
     replay_action_metadata,
     replay_end_effector_targets_at_index,
@@ -94,6 +97,10 @@ from teleop_runtime.real_teleop.rule_based_runtime import (
     RuleBasedRealTeleopDeployment,
     RuleBasedRealTeleopExtension,
     preflight_rule_based_real_teleop_deployment,
+)
+from teleop_runtime.real_teleop.writing_contact_point import (
+    contact_height_from_tool_tcp,
+    tool_tcp_z_for_contact_height,
 )
 from teleop_runtime.replay.dataset import LoadedReplayEpisode, ReplayDatasetIndex
 
@@ -559,6 +566,12 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         help="Optional lower bound for deterministic per-Episode writing size.",
     )
     group.add_argument(
+        "--rule-writing-random-direction-deviation-deg",
+        type=float,
+        default=45.0,
+        help="Maximum deterministic deviation around each selected cardinal direction (0..45 degrees).",
+    )
+    group.add_argument(
         "--rule-writing-random-size-max-m",
         type=float,
         default=None,
@@ -571,6 +584,16 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Before each Episode, certify the four centerline/bounding-box contact "
             "points with a command-inert copy of the production IK/collision solver."
+        ),
+    )
+    group.add_argument(
+        "--correct-tcp", "--rule-writing-correct-tcp",
+        dest="rule_writing_correct_tcp",
+        action="store_true",
+        help=(
+            "Use the measured right fixture tip at flange +Z 0.20 m for writing "
+            "height; commands still target the existing 0.14 m tool_tcp. "
+            "Default is unchanged."
         ),
     )
     group.add_argument(
@@ -1127,6 +1150,7 @@ class FixedWritingActionSource:
         scale_m: float,
         speed_m_s: float,
         direction: str,
+        yaw_rad: float | None = None,
         left_hold_pose: np.ndarray,
         reference_hz: float,
         additional_catalog_path: Path | None = None,
@@ -1137,6 +1161,7 @@ class FixedWritingActionSource:
         self.scale_m = float(scale_m)
         self.speed_m_s = float(speed_m_s)
         self.direction = str(direction)
+        self.yaw_rad = None if yaw_rad is None else float(yaw_rad)
         self.additional_catalog_path = additional_catalog_path
         self.left_hold_pose = np.asarray(left_hold_pose, dtype=float).reshape(7).copy()
         self.hand_trajectory_by_side = {
@@ -1168,6 +1193,7 @@ class FixedWritingActionSource:
         self.reference_hz = float(reference_hz)
         self._targets: list[Any] | None = None
         self._index = 0
+        self._height_calibration_metadata: dict[str, Any] = {}
 
     def start(self) -> None:
         return None
@@ -1180,6 +1206,7 @@ class FixedWritingActionSource:
 
         self._targets = None
         self._index = 0
+        self._height_calibration_metadata = {}
 
     def produce_action(self, observation: Any, *, context: Any = None) -> RobotAction:
         del observation
@@ -1199,14 +1226,23 @@ class FixedWritingActionSource:
                 side="right",
             )
             writing_height = context.get("writing_height_target_z_m")
+            height_calibration = context.get("writing_height_calibration")
+            if isinstance(height_calibration, Mapping):
+                self._height_calibration_metadata = dict(height_calibration)
+            correct_tcp = bool(
+                isinstance(height_calibration, Mapping)
+                and height_calibration.get("contact_offset_tool_tcp_m", 0.0)
+            )
             if writing_height is not None:
                 writing_height = float(writing_height)
                 if not np.isfinite(writing_height):
                     raise RuntimeError("fixed writing received a non-finite height target.")
                 right_desk = np.asarray(right_desk, dtype=float).reshape(7).copy()
-                right_desk[2] = writing_height
+                right_desk[2] = (
+                    tool_tcp_z_for_contact_height(right_desk, writing_height)
+                    if correct_tcp else writing_height
+                )
             else:
-                height_calibration = context.get("writing_height_calibration")
                 if isinstance(height_calibration, Mapping) and bool(
                     height_calibration.get("enabled", False)
                 ):
@@ -1216,7 +1252,13 @@ class FixedWritingActionSource:
                             "fixed writing received a non-finite calibrated lower bound."
                         )
                     right_desk = np.asarray(right_desk, dtype=float).reshape(7).copy()
-                    right_desk[2] = max(float(right_desk[2]), lower_bound)
+                    right_desk[2] += max(
+                        0.0,
+                        lower_bound - (
+                            contact_height_from_tool_tcp(right_desk)
+                            if correct_tcp else float(right_desk[2])
+                        ),
+                    )
             keyframes = build_fixed_trajectory_targets(
                 {
                     "left": self.left_hold_pose,
@@ -1226,7 +1268,8 @@ class FixedWritingActionSource:
                 scale_m=self.scale_m,
                 linear_speed_m_s=self.speed_m_s,
                 side="right",
-                direction=self.direction,
+                direction="up" if self.yaw_rad is not None else self.direction,
+                yaw_rad=self.yaw_rad,
                 additional_catalog_path=self.additional_catalog_path,
             )
             self._targets = resample_motion_targets(
@@ -1268,6 +1311,11 @@ class FixedWritingActionSource:
             source="rule_based_fixed_writing",
             metadata={
                 **dict(target.metadata),
+                **(
+                    {"rule_based_height_calibration": self._height_calibration_metadata}
+                    if self._height_calibration_metadata.get("contact_offset_tool_tcp_m")
+                    else {}
+                ),
                 "rule_based_writing_trajectory_id": self.trajectory_id,
                 "rule_based_writing_direction": self.direction,
                 "rule_based_writing_size_m": self.scale_m,
@@ -1404,7 +1452,11 @@ class CalibratedHeightDescentActionSource:
                 raise RuntimeError(f"height descent received non-finite {side} TCP feedback.")
 
         upper_z = float(calibration["upper_bound_z_m"])
-        start_z = float(poses["right"][2])
+        correct_tcp = bool(calibration.get("contact_offset_tool_tcp_m", 0.0))
+        start_z = (
+            contact_height_from_tool_tcp(poses["right"])
+            if correct_tcp else float(poses["right"][2])
+        )
         if not np.isfinite(upper_z):
             raise RuntimeError("height descent received a non-finite upper bound.")
         distance = start_z - upper_z
@@ -1448,7 +1500,11 @@ class CalibratedHeightDescentActionSource:
             alpha = index / step_count
             blend = 10.0 * alpha**3 - 15.0 * alpha**4 + 6.0 * alpha**5
             right = poses["right"].copy()
-            right[2] = start_z - distance * blend
+            desired_z = start_z - distance * blend
+            right[2] = (
+                tool_tcp_z_for_contact_height(right, desired_z)
+                if correct_tcp else desired_z
+            )
             samples.append(
                 TimestampedMotionTarget(
                     timestamp=index / self.reference_hz,
@@ -1668,6 +1724,21 @@ def _resolve_writing_variant(
         size_m = lower + (upper - lower) * fraction
         size_range = [lower, upper]
 
+    max_deviation_deg = float(
+        getattr(args, "rule_writing_random_direction_deviation_deg", 45.0)
+    )
+    if not np.isfinite(max_deviation_deg) or not 0.0 <= max_deviation_deg <= 45.0:
+        raise ValueError("random writing direction deviation must be in [0, 45] degrees.")
+    deviation_deg = (
+        (2.0 * _stable_unit_interval(
+            catalog_hash=catalog_hash,
+            seed=seed,
+            phase="writing_direction_deviation",
+            selection_ordinal=selection_ordinal,
+        ) - 1.0) * max_deviation_deg
+        if directions else 0.0
+    )
+    yaw_rad = fixed_trajectory_direction_yaw_rad(direction) + math.radians(deviation_deg)
     enabled = bool(trajectory_ids or directions or size_range is not None)
     return trajectory_id, direction, size_m, {
         "schema": "dexteleop.rule_based_writing_variant_selection.v1",
@@ -1679,6 +1750,8 @@ def _resolve_writing_variant(
         "size_range_m": size_range,
         "selected_trajectory_id": trajectory_id,
         "selected_direction": direction,
+        "selected_direction_deviation_deg": deviation_deg,
+        "selected_yaw_rad": yaw_rad,
         "selected_size_m": size_m,
     }
 
@@ -1728,6 +1801,44 @@ def _writing_reachability_contact_probes(
                 ).tolist(),
             }
         )
+    return probes
+
+
+def _relative_pen_up_reachability_probes(
+    group: ReplayTrajectoryGroup,
+    *,
+    writing_end: TimestampedMotionTarget,
+) -> list[dict[str, Any]]:
+    """Sample the actual relative replay formula at its temporal midpoint and end.
+
+    The writing endpoint is a planned boundary. Live replay still rebases on
+    measured TCP and passes the normal runtime safety/IK gates.
+    """
+
+    times = np.asarray(
+        [group.relative_time_sec(index) for index in range(group.frame_count)],
+        dtype=float,
+    )
+    middle_time = 0.5 * (float(times[0]) + float(times[-1]))
+    middle_index = int(np.argmin(np.abs(times - middle_time)))
+    boundary = RuleBasedBoundaryState(
+        tcp_pose_by_side={"right": writing_end.pose_by_side["right"]},
+        pose_frame_by_side={"right": CANONICAL_DESK_ACTION_FRAME},
+        source="planned_writing_endpoint_preflight",
+    )
+    probes = []
+    for name, index in (("pen_up_mid", middle_index), ("pen_up_end", group.frame_count - 1)):
+        action = rebase_replay_action_at_boundary(
+            group, ("right",), index=index, boundary=boundary,
+            source_start_index=0,
+        )
+        probes.append({
+            "name": name,
+            "target_index": index,
+            "right_pose_canonical_desk": np.asarray(
+                action.arm_pose_by_side["right"], dtype=float
+            ).reshape(7).tolist(),
+        })
     return probes
 
 
@@ -2987,6 +3098,8 @@ def build_rule_based_writing(
         or RULE_COLLECTION_MODE_WRITING
     )
     if collection_mode == RULE_COLLECTION_MODE_FULL_REPLAY:
+        if getattr(args, "rule_writing_correct_tcp", False):
+            raise ValueError("--correct-tcp is only valid for rule-based writing")
         if getattr(args, "rule_writing_trajectory_catalog", None):
             raise ValueError(
                 "rule writing trajectory catalog is not valid in full replay mode."
@@ -3011,6 +3124,11 @@ def build_rule_based_writing(
     ) = _resolve_writing_variant(
         args,
         additional_catalog_path=additional_catalog_path,
+    )
+    direction_yaw_override = (
+        float(writing_variant_selection["selected_yaw_rad"])
+        if float(writing_variant_selection["selected_direction_deviation_deg"]) != 0.0
+        else None
     )
     source_specs, source_selection = _resolve_source_specs(args)
     pre_pen_down_spec = _resolve_pre_pen_down_replay_source_spec(args)
@@ -3315,7 +3433,8 @@ def build_rule_based_writing(
         scale_m=size_m,
         linear_speed_m_s=speed,
         side="right",
-        direction=resolved_direction,
+        direction="up" if direction_yaw_override is not None else resolved_direction,
+        yaw_rad=direction_yaw_override,
         additional_catalog_path=additional_catalog_path,
     )
     preview_targets = resample_motion_targets(
@@ -3327,17 +3446,29 @@ def build_rule_based_writing(
     if duration <= 0.0 or len(preview_targets) < 2:
         raise ValueError("fixed writing trajectory has no positive-duration path.")
     writing_action_hz = float((len(preview_targets) - 1) / duration)
+    writing_reachability_enabled = bool(
+        getattr(args, "rule_writing_reachability_check", False)
+    )
+    reachability_probes = _writing_reachability_contact_probes(preview_keyframes)
+    if writing_reachability_enabled:
+        reachability_probes.extend(
+            _relative_pen_up_reachability_probes(
+                phase_groups["pen_up"], writing_end=preview_targets[-1],
+            )
+        )
     source_selection = {
         **source_selection,
         "writing_reachability": {
             "schema": "dexteleop.rule_based_writing_reachability.v1",
-            "enabled": bool(
-                getattr(args, "rule_writing_reachability_check", False)
+            "enabled": writing_reachability_enabled,
+            "probe_definition": (
+                "four_writing_bbox_contacts_and_two_relative_pen_up_samples"
+                if writing_reachability_enabled
+                else "centerline_axis_aligned_bbox_edge_contacts"
             ),
-            "probe_definition": "centerline_axis_aligned_bbox_edge_contacts",
-            "probe_count": 4,
+            "probe_count": len(reachability_probes),
             "left_hold_pose_canonical_desk": left_hold_pose.astype(float).tolist(),
-            "probes": _writing_reachability_contact_probes(preview_keyframes),
+            "probes": reachability_probes,
         },
     }
     phase_groups = {
@@ -3453,6 +3584,7 @@ def build_rule_based_writing(
         scale_m=size_m,
         speed_m_s=speed,
         direction=resolved_direction,
+        yaw_rad=direction_yaw_override,
         left_hold_pose=left_hold_pose,
         additional_catalog_path=additional_catalog_path,
         hand_trajectory_by_side=writing_hand_trajectory,
@@ -3579,6 +3711,7 @@ def build_rule_based_writing(
             pre_pen_down_replay_normal_episodes=pre_pen_down_normal_episodes,
             gripper_sides=configured_gripper_sides,
             gripper_max_step=gripper_max_step,
+            correct_tcp=bool(getattr(args, "rule_writing_correct_tcp", False)),
         ),
         source_selection=source_selection,
         pre_pen_down_replay_plan=pre_pen_down_plan,
@@ -3699,6 +3832,8 @@ def build_rule_based_writing_extension(
         f"action_hz={build.writing_action_hz:.3f} "
         f"pose_contract={build.source_contract_hash} "
         f"selected_sources={selected_summary}"
+        + (" correct_tcp=right_flange_plus_z_0p20m"
+           if getattr(args, "rule_writing_correct_tcp", False) else "")
     )
     return build.extension
 

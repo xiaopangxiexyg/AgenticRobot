@@ -83,6 +83,13 @@ from .rule_based_initial_alignment import (
     rule_based_initial_alignment_command_fault,
 )
 from .runtime_extension import RealTeleopDatasetSampleAdmission
+from .writing_contact_point import (
+    RIGHT_CONTACT_FRAME,
+    RIGHT_CONTACT_OFFSET_TOOL_TCP_M,
+    contact_height_from_tool_tcp,
+    require_right_tool_tcp_profile,
+    tool_tcp_z_for_contact_height,
+)
 
 RULE_BASED_REAL_TELEOP_SCHEMA_V1 = "dexteleop.rule_based_real_teleop.v1"
 
@@ -236,6 +243,8 @@ class RuleBasedRealTeleopConfig:
     manual_gripper_settle_samples: int = 3
     minimum_stage_sample_coverage: float = 0.8
     minimum_stage_sample_count: int = 2
+    pause_hold_max_joint_delta_rad: float = math.radians(0.75)
+    correct_tcp: bool = False
 
     def __post_init__(self) -> None:
         if self.action_hz is not None and (
@@ -258,6 +267,7 @@ class RuleBasedRealTeleopConfig:
             "manual_gripper_timeout_sec",
             "hand_state_max_age_sec",
             "arm_feedback_recovery_timeout_sec",
+            "pause_hold_max_joint_delta_rad",
             "minimum_stage_sample_coverage",
         ):
             value = float(getattr(self, name))
@@ -333,7 +343,10 @@ class RuleBasedRealTeleopConfig:
 
 @dataclass(frozen=True)
 class RuleBasedWritingHeightCalibration:
-    """One operator-captured right tool-TCP height in canonical desk space."""
+    """Captured right writing height in canonical desk space.
+
+    The reference is tool_tcp by default, or the opt-in physical fixture tip.
+    """
 
     calibrated_z_m: float
     lower_tolerance_m: float
@@ -344,6 +357,7 @@ class RuleBasedWritingHeightCalibration:
     frame: str = CANONICAL_DESK_ACTION_FRAME
     side: str = "right"
     enabled: bool = True
+    contact_offset_tool_tcp_m: float = 0.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -367,6 +381,10 @@ class RuleBasedWritingHeightCalibration:
             raise ValueError("writing height calibration must bind right canonical_desk TCP.")
         if not str(self.pose_frame_contract_hash).strip():
             raise ValueError("pose_frame_contract_hash must be non-empty.")
+        if not np.isfinite(self.contact_offset_tool_tcp_m) or self.contact_offset_tool_tcp_m not in (
+            0.0, RIGHT_CONTACT_OFFSET_TOOL_TCP_M
+        ):
+            raise ValueError("unsupported writing contact-point offset")
 
     @property
     def lower_bound_z_m(self) -> float:
@@ -377,7 +395,7 @@ class RuleBasedWritingHeightCalibration:
         return float(self.calibrated_z_m + self.upper_tolerance_m)
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "enabled": bool(self.enabled),
             "side": self.side,
             "frame": self.frame,
@@ -392,6 +410,14 @@ class RuleBasedWritingHeightCalibration:
             ),
             "pose_frame_contract_hash": self.pose_frame_contract_hash,
         }
+        if self.contact_offset_tool_tcp_m:
+            metadata.update(
+                {
+                    "height_reference_frame": RIGHT_CONTACT_FRAME,
+                    "contact_offset_tool_tcp_m": self.contact_offset_tool_tcp_m,
+                }
+            )
+        return metadata
 
 
 @dataclass(frozen=True)
@@ -621,6 +647,9 @@ class RuleBasedRealTeleopExtension:
         self._replay_reference_queue: deque[_ReplayReferenceCarrier] = deque()
         self._replay_reference_stage_started_at: float | None = None
         self._replay_reference_pause_started_at: float | None = None
+        self._last_fresh_arm_qpos_by_side: dict[str, np.ndarray] = {}
+        self._last_fresh_arm_at: float | None = None
+        self._paused_arm_start_qpos_by_side: dict[str, np.ndarray] = {}
         self._replay_reference_last_schedule_lag_sec = 0.0
         self._replay_reference_cumulative_schedule_shift_sec = 0.0
         self._replay_reference_rebased_tick_count = 0
@@ -631,6 +660,7 @@ class RuleBasedRealTeleopExtension:
         # fail-closed without treating the hold as a recordable rule frame.
         self._paused_hold_emission: RuleBasedCollectionEmission | None = None
         self._last_dispatched_emission: RuleBasedCollectionEmission | None = None
+        self._completion_hold_min_error_by_side: dict[str, np.ndarray] = {}
         self._target_wait_started_at: float | None = None
         self._next_due_at: float | None = None
         self._current_dispatched = False
@@ -646,6 +676,7 @@ class RuleBasedRealTeleopExtension:
         self._execution_begun = False
         self._completed = False
         self._completion_stop_requested = False
+        self._completed_hold_stream_suspended = False
         self._aborted = False
         self._held = False
         self._restart_after_hold_requested = False
@@ -665,6 +696,7 @@ class RuleBasedRealTeleopExtension:
         self._manual_gripper_started_at: float | None = None
         self._manual_gripper_last_command_by_side: dict[str, float] = {}
         self._manual_gripper_command_baseline_by_side: dict[str, float] = {}
+        self._manual_gripper_initial_baseline_by_side: dict[str, float] = {}
         self._manual_gripper_last_dispatch_at_by_side: dict[str, float] = {}
         self._manual_gripper_last_progress_at_by_side: dict[str, float] = {}
         self._manual_gripper_settle_samples_by_side: dict[str, int] = {}
@@ -692,7 +724,6 @@ class RuleBasedRealTeleopExtension:
         # dual-arm feedback cut it uses as waypoint zero.  This is a one-shot
         # pre-dispatch operation; runtime Home remains the only path allowed to
         # clear an emergency-stop latch.
-        self._manual_adjustment_motion_rebase_pending = False
         self._height_descent_planned_count_added = False
         self._height_descent_planned_sample_count = 0
         self._configuration_options: dict[str, Any] = {}
@@ -1940,13 +1971,22 @@ class RuleBasedRealTeleopExtension:
             raise RuntimeError(
                 "右臂实测状态早于本次标定请求，拒绝使用陈旧 TCP。"
             )
+        if self.config.correct_tcp:
+            require_right_tool_tcp_profile(state)
         captured = RuleBasedWritingHeightCalibration(
-            calibrated_z_m=float(canonical[2]),
+            calibrated_z_m=(
+                contact_height_from_tool_tcp(canonical)
+                if self.config.correct_tcp
+                else float(canonical[2])
+            ),
             lower_tolerance_m=float(lower_tolerance_m),
             upper_tolerance_m=float(upper_tolerance_m),
             captured_at=float(now),
             source_timestamp=float(source_timestamp),
             pose_frame_contract_hash=self.runtime_pose_frame_contract.contract_hash,
+            contact_offset_tool_tcp_m=(
+                RIGHT_CONTACT_OFFSET_TOOL_TCP_M if self.config.correct_tcp else 0.0
+            ),
         )
         self._height_calibration = captured
         self._invalidate_writing_reachability_preflight()
@@ -1954,13 +1994,15 @@ class RuleBasedRealTeleopExtension:
         self._height_upper_tolerance_m = float(captured.upper_tolerance_m)
         self._height_calibration_error = ""
         self._writing_height_target_z_m = None
-        self._manual_adjustment_motion_rebase_pending = True
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
+            label = (
+                "右臂 20 cm 夹具末端高度标定成功："
+                if self.config.correct_tcp else "右臂 TCP 高度标定成功："
+            )
             append_message(
                 "RuleBasedWriting",
-                "右臂 TCP 高度标定成功："
-                f"canonical_desk Z={captured.calibrated_z_m:.6f}m，"
+                label + f"canonical_desk Z={captured.calibrated_z_m:.6f}m，"
                 f"安全带=[{captured.lower_bound_z_m:.6f}, "
                 f"{captured.upper_bound_z_m:.6f}]m。",
             )
@@ -2283,6 +2325,8 @@ class RuleBasedRealTeleopExtension:
             and not self._held
             and self._last_dispatched_emission is not None
         ):
+            if self._completed_hold_stream_suspended:
+                return TeleopCommandOverride(None)
             return self._paused_arm_hold_override(
                 reason=(
                     "successful_next_attempt_rebuild"
@@ -2314,18 +2358,33 @@ class RuleBasedRealTeleopExtension:
             )
             if self._execution_begun and recoverable_pause:
                 if self._replay_reference_pause_started_at is None:
-                    self._replay_reference_pause_started_at = float(now)
+                    if not self._begin_replay_reference_pause(float(now)):
+                        return TeleopCommandOverride(None)
                 return self._paused_arm_hold_override(
                     reason=reason,
                     now=float(now),
                 )
             if self._execution_begun:
+                if reason.startswith("causal_arm_feedback_invalid:"):
+                    self._abort_session_step(
+                        "rule-based execution received invalid measured arm feedback: "
+                        + reason
+                    )
+                    self._publish_status(recording_ready=False)
+                    return TeleopCommandOverride(None)
                 raise RuntimeError(
                     "rule-based execution lost formal collection readiness: " + reason
                 )
             return TeleopCommandOverride(None)
-        self._arm_feedback_pause_started_at = None
         if self._replay_reference_pause_started_at is not None:
+            displacement = self._paused_hold_displacement(snapshots)
+            if displacement is not None:
+                self._abort_session_step(
+                    "measured arm position changed during rule pause; "
+                    "the old trajectory cannot resume safely: " + displacement
+                )
+                self._publish_status(recording_ready=False)
+                return TeleopCommandOverride(None)
             paused_sec = max(
                 0.0,
                 float(now) - float(self._replay_reference_pause_started_at),
@@ -2350,6 +2409,8 @@ class RuleBasedRealTeleopExtension:
                 if started_at is not None:
                     setattr(self, attribute, float(started_at) + paused_sec)
             self._replay_reference_pause_started_at = None
+            self._paused_arm_start_qpos_by_side.clear()
+        self._arm_feedback_pause_started_at = None
         self._waiting_reason = ""
         if self._current is not None and self._advance_due(
             float(now),
@@ -2386,6 +2447,9 @@ class RuleBasedRealTeleopExtension:
                     "coupled terminal rule pose resolution failed: "
                     f"{type(exc).__name__}: {exc}"
                 )
+        if self._aborted:
+            self._publish_status(recording_ready=False)
+            return TeleopCommandOverride(None)
         if self._completed:
             self._publish_status(recording_ready=ready)
             return TeleopCommandOverride(None)
@@ -2492,6 +2556,7 @@ class RuleBasedRealTeleopExtension:
         self._manual_gripper_started_at = None
         self._manual_gripper_last_command_by_side.clear()
         self._manual_gripper_command_baseline_by_side.clear()
+        self._manual_gripper_initial_baseline_by_side.clear()
         self._manual_gripper_last_dispatch_at_by_side.clear()
         self._manual_gripper_last_progress_at_by_side.clear()
         self._manual_gripper_settle_samples_by_side.clear()
@@ -2759,7 +2824,10 @@ class RuleBasedRealTeleopExtension:
             > float(self.config.manual_gripper_endpoint_tolerance)
         ):
             return False
-        baseline = self._manual_gripper_command_baseline_by_side.get(side)
+        # The progress watchdog advances its rolling baseline while firmware
+        # is closing. Contact confirmation must compare against the actual
+        # start of this endpoint command, not the last moving sample.
+        baseline = self._manual_gripper_initial_baseline_by_side.get(side)
         if baseline is None:
             return False
         backend = getattr(self._components, f"{side}_hand_backend", None)
@@ -2910,13 +2978,13 @@ class RuleBasedRealTeleopExtension:
         return tuple(self.config.gripper_sides)
 
     def _dispatch_pending_gripper_action(self, observation: object, now: float) -> None:
-        """Advance one feedback-gated reset increment through the Session Rig.
+        """Advance one feedback-gated maintenance action through the Session Rig.
 
         The rule UI is intentionally not a second device loop. A reset click
         is converted to the same canonical ``RobotAction``/``TeleopCommand``
         carrier used by collection and sent through ``TeleopSession``'s
-        existing dispatch seam. Task-chain right-hand actions issue one
-        endpoint command and then only observe fresh feedback; generic
+        existing dispatch seam. Writing right-hand actions issue one endpoint
+        command and then only observe fresh feedback; other generic
         maintenance actions retain bounded incremental motion. No formal
         writer call is made and no arm effector is included.
         """
@@ -2975,6 +3043,14 @@ class RuleBasedRealTeleopExtension:
             "release_right_gripper",
             "close_right_gripper",
         }
+        # Standalone writing buttons emit generic intents. With only the
+        # right DMTAC hand configured, they need the same one-shot contract
+        # as the task chain: contact can stop short of a numeric segment.
+        one_shot_right_hand = task_chain_right_only or (
+            action_sides == ("right",)
+            and str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+        )
         is_release = intent in {"release_grippers", "release_right_gripper"}
         target_scalar = 0.0 if is_release else 1.0
         direction = -1.0 if is_release else 1.0
@@ -3041,7 +3117,8 @@ class RuleBasedRealTeleopExtension:
             except (TypeError, ValueError):
                 status_code = None
             force_stopped_grasp = bool(
-                intent == "close_right_gripper"
+                not is_release
+                and one_shot_right_hand
                 and side == "right"
                 and status_code == 6
                 and side in self._manual_gripper_last_dispatch_at_by_side
@@ -3109,7 +3186,7 @@ class RuleBasedRealTeleopExtension:
                     float(self.config.manual_gripper_endpoint_tolerance),
                     1e-4,
                 )
-                if task_chain_right_only:
+                if one_shot_right_hand:
                     if progress >= minimum_progress:
                         # The endpoint command is already owned by firmware.
                         # Fresh forward progress only refreshes the bounded
@@ -3155,7 +3232,7 @@ class RuleBasedRealTeleopExtension:
                 # final target is still feedback-gated and every new command
                 # remains bounded from the latest measured position.
             baseline = measured_scalar
-            if task_chain_right_only:
+            if one_shot_right_hand:
                 next_target = final_target
             else:
                 delta = float(np.clip(
@@ -3230,8 +3307,13 @@ class RuleBasedRealTeleopExtension:
                     action_label = "闭紧右夹爪"
                 else:
                     action_label = "闭紧"
+                feedback_label = (
+                    "等待一次性命令的实测到位"
+                    if one_shot_right_hand
+                    else "等待逐段实测到位"
+                )
                 self._gripper_action_status = (
-                    f"正在{action_label}夹爪：等待逐段实测到位（"
+                    f"正在{action_label}夹爪：{feedback_label}（"
                     + ",".join(waiting)
                     + "）。"
                 )
@@ -3256,7 +3338,7 @@ class RuleBasedRealTeleopExtension:
                     ),
                     "rule_based_manual_gripper_dispatch_mode": (
                         "single_endpoint_feedback_gated"
-                        if task_chain_right_only
+                        if one_shot_right_hand
                         else "bounded_incremental_feedback_gated"
                     ),
                     "rule_based_capture_enabled": False,
@@ -3272,16 +3354,18 @@ class RuleBasedRealTeleopExtension:
                 },
             )
             command = self.adapter.resolver.resolve(action)
-            # Task-chain right-hand motion and release are one-shot firmware
-            # operations. The writing replay keeps the same mode and target;
-            # it must not restore continuous catch or re-drive the hand.
-            manual_continuous_grasp = intent == "close_grippers"
+            # The writing right-hand actions are one-shot firmware operations.
+            # The replay keeps that same mode and target rather than restoring
+            # continuous catch or re-driving the hand.
+            manual_continuous_grasp = (
+                intent == "close_grippers" and not one_shot_right_hand
+            )
             manual_motion_mode = (
                 "one_shot_open"
                 if is_release
                 else (
                     "one_shot_close"
-                    if task_chain_right_only
+                    if one_shot_right_hand
                     else "continuous_close"
                 )
             )
@@ -3293,10 +3377,8 @@ class RuleBasedRealTeleopExtension:
                     )
                 if not isinstance(effector.metadata, dict):
                     effector.metadata = dict(effector.metadata or {})
-                # Release and the task-chain right-only close are one-shot
-                # maintenance moves. The generic all-side close retains its
-                # historical continuous-grasp behavior; writing replay keeps
-                # the task-chain right hand fixed in the same one-shot mode.
+                # Generic multi-hand maintenance retains its existing mode;
+                # the writing right hand stays in one-shot mode.
                 effector.metadata["dmtac_continuous_grasp_override"] = bool(
                     manual_continuous_grasp
                 )
@@ -3307,7 +3389,7 @@ class RuleBasedRealTeleopExtension:
                 effector.metadata["dmtac_preserve_existing_grip"] = False
                 effector.metadata["rule_based_manual_gripper_dispatch_mode"] = (
                     "single_endpoint_feedback_gated"
-                    if task_chain_right_only
+                    if one_shot_right_hand
                     else "bounded_incremental_feedback_gated"
                 )
                 effector.metadata["rule_based_manual_gripper_motion_mode"] = (
@@ -3410,6 +3492,9 @@ class RuleBasedRealTeleopExtension:
                     self._manual_gripper_command_baseline_by_side[side] = float(
                         measured_scalar_by_side[side]
                     )
+                    self._manual_gripper_initial_baseline_by_side[side] = float(
+                        measured_scalar_by_side[side]
+                    )
                     self._manual_gripper_last_progress_at_by_side[side] = float(now)
                 accepted.append(side)
             elif outcome == "retry":
@@ -3455,8 +3540,13 @@ class RuleBasedRealTeleopExtension:
                 if retrying
                 else ""
             )
+            dispatch_label = (
+                "已发送一次性终点命令"
+                if one_shot_right_hand
+                else "已发送受限分段"
+            )
             self._gripper_action_status = (
-                f"正在{action_label}夹爪：已发送受限分段 {positions}{resend_note}"
+                f"正在{action_label}夹爪：{dispatch_label} {positions}{resend_note}"
                 f"{retry_suffix}，等待实测到位。"
             )
         elif retrying:
@@ -3480,22 +3570,11 @@ class RuleBasedRealTeleopExtension:
             return False, "formal_writer_not_recording", {}
         if not bool(getattr(recorder, "can_record_samples", False)):
             return False, "formal_writer_paused", {}
-        poller = getattr(recorder, "arm_state_poller", None)
-        if poller is None:
-            return False, "causal_arm_feedback_poller_unavailable", {}
-        readiness = poller.readiness_by_side(
-            required_sides=self.deployment.active_sides,
-            sample_timestamp=now,
+        arm_ready, arm_reason, snapshots = self._fresh_arm_snapshots(
+            float(now), recorder=recorder
         )
-        blocked = {side: value for side, value in readiness.items() if value}
-        if blocked:
-            details = ",".join(f"{side}={value}" for side, value in sorted(blocked.items()))
-            return False, "causal_arm_feedback_not_ready:" + details, {}
-        snapshots = poller.latest_at_or_before(now)
-        missing = sorted(set(self.deployment.active_sides) - set(snapshots))
-        if missing:
-            return False, "causal_arm_feedback_missing:" + ",".join(missing), {}
-        snapshots = {side: dict(value) for side, value in snapshots.items()}
+        if not arm_ready:
+            return False, arm_reason, {}
         if self.config.gripper_sides:
             hand_poller = getattr(recorder, "hand_state_poller", None)
             if hand_poller is None or not callable(
@@ -3539,6 +3618,70 @@ class RuleBasedRealTeleopExtension:
                 snapshots[side]["hand_state"] = dict(state)
         return True, "", snapshots
 
+    def _fresh_arm_snapshots(
+        self,
+        now: float,
+        *,
+        recorder: object | None = None,
+    ) -> tuple[bool, str, dict[str, dict[str, Any]]]:
+        """Read measured arm feedback even when the writer cannot accept samples."""
+
+        if recorder is None:
+            provider = self._dataset_recorder_provider
+            recorder = None if provider is None else provider()
+        poller = getattr(recorder, "arm_state_poller", None)
+        if poller is None:
+            return False, "causal_arm_feedback_poller_unavailable", {}
+        readiness = poller.readiness_by_side(
+            required_sides=self.deployment.active_sides,
+            sample_timestamp=now,
+        )
+        blocked = {side: value for side, value in readiness.items() if value}
+        if blocked:
+            details = ",".join(f"{side}={value}" for side, value in sorted(blocked.items()))
+            return False, "causal_arm_feedback_not_ready:" + details, {}
+        snapshots = poller.latest_at_or_before(now)
+        missing = sorted(set(self.deployment.active_sides) - set(snapshots))
+        if missing:
+            return False, "causal_arm_feedback_missing:" + ",".join(missing), {}
+        snapshots = {side: dict(value) for side, value in snapshots.items()}
+        for side in self.deployment.active_sides:
+            state = snapshots[side]
+            if state.get("actual_state_valid") is False or state.get("actual_state_stale") is True:
+                return False, f"causal_arm_feedback_not_ready:{side}=feedback_stale", {}
+        try:
+            fresh_qpos = self._snapshot_qpos_pair(snapshots)
+        except RuntimeError as exc:
+            return False, f"causal_arm_feedback_invalid:{exc}", {}
+        self._last_fresh_arm_qpos_by_side = fresh_qpos
+        self._last_fresh_arm_at = float(now)
+        return True, "", snapshots
+
+    def _begin_replay_reference_pause(self, now: float) -> bool:
+        """Anchor pause motion to the last measured state, never to a qref."""
+
+        age = (
+            float("inf")
+            if self._last_fresh_arm_at is None
+            else max(0.0, float(now) - self._last_fresh_arm_at)
+        )
+        if (
+            age > float(self.config.arm_feedback_recovery_timeout_sec)
+            or set(self._last_fresh_arm_qpos_by_side) != set(self.deployment.active_sides)
+        ):
+            self._abort_session_step(
+                "cannot establish rule pause without recent measured arm feedback: "
+                f"age={age:.3f}s"
+            )
+            self._publish_status(recording_ready=False)
+            return False
+        self._paused_arm_start_qpos_by_side = {
+            side: qpos.copy()
+            for side, qpos in self._last_fresh_arm_qpos_by_side.items()
+        }
+        self._replay_reference_pause_started_at = float(now)
+        return True
+
     def _load_next(
         self,
         observation: object,
@@ -3576,6 +3719,20 @@ class RuleBasedRealTeleopExtension:
                         "formal dataset stage coverage is incomplete: " + detail
                     )
                     return
+                # Compare later feedback with the measured terminal state,
+                # not a qref that may still lead the arm during finalization.
+                # The in-flight pause retains its stricter qref guard.
+                if self._last_dispatched_emission is not None:
+                    try:
+                        self._completion_hold_min_error_by_side = (
+                            self._measured_to_accepted_abs_error(snapshots)
+                        )
+                    except RuntimeError as exc:
+                        self._abort_session_step(
+                            "completed rule target has invalid measured feedback: "
+                            + str(exc)
+                        )
+                        return
                 self._completed = True
                 self._armed = False
                 self._waiting_reason = "completed"
@@ -3715,10 +3872,13 @@ class RuleBasedRealTeleopExtension:
         ):
             raise RuntimeError("writing replay has an invalid right TCP action.")
         target_canonical = source_canonical.copy()
-        target_canonical[2] = max(
-            float(target_canonical[2]),
-            calibration.lower_bound_z_m,
-        )
+        if calibration.contact_offset_tool_tcp_m:
+            contact_z = contact_height_from_tool_tcp(target_canonical)
+            target_canonical[2] += max(0.0, calibration.lower_bound_z_m - contact_z)
+        else:
+            target_canonical[2] = max(
+                float(target_canonical[2]), calibration.lower_bound_z_m
+            )
         clipped = not math.isclose(
             float(target_canonical[2]),
             float(source_canonical[2]),
@@ -3747,6 +3907,17 @@ class RuleBasedRealTeleopExtension:
                 "rule_based_height_clipped": bool(clipped),
             }
         )
+        if calibration.contact_offset_tool_tcp_m:
+            metadata.update(
+                {
+                    "rule_based_contact_source_z_m": contact_height_from_tool_tcp(
+                        source_canonical
+                    ),
+                    "rule_based_contact_target_z_m": contact_height_from_tool_tcp(
+                        target_canonical
+                    ),
+                }
+            )
         action = replace(
             emission.action,
             arm_pose_by_side={
@@ -4571,6 +4742,7 @@ class RuleBasedRealTeleopExtension:
         for classifier in self._pose_action_motion_intent.values():
             classifier.reset(str(reason))
         self._pose_action_motion_intent_step_id = None
+        self._coupled_pose_solver_seeded = False
 
     def _ensure_pose_action_motion_intent_step(self, step_id: str) -> None:
         normalized = str(step_id)
@@ -4579,6 +4751,10 @@ class RuleBasedRealTeleopExtension:
         for classifier in self._pose_action_motion_intent.values():
             classifier.reset(f"rule_step_changed:{normalized}")
         self._pose_action_motion_intent_step_id = normalized
+        # A new pen_down/write/pen_up or relative replay step must start from
+        # this step's causal measured configuration, not the prior step's IK
+        # continuation state. Do not reset on each dense reference frame.
+        self._coupled_pose_solver_seeded = False
 
     def _start_initial_alignment_planning(
         self,
@@ -4624,8 +4800,15 @@ class RuleBasedRealTeleopExtension:
         # The post-plan start-drift check below still rejects real movement
         # during planning; collision, TCP-envelope, and command guards remain
         # authoritative for every emitted waypoint.
-        start = self._initial_alignment_start_qpos_pair(snapshots)
-        self._rebase_motion_transport_after_manual_adjustment(start)
+        measured_start = self._initial_alignment_start_qpos_pair(snapshots)
+        try:
+            start = self._rebase_motion_transport_from_measured_start(measured_start)
+        except RuleBasedInitialAlignmentPlanningError as exc:
+            self._abort_initial_alignment(
+                f"initial-alignment measured start is outside the safe observation envelope: {exc}",
+                recoverable_predispatch_hold=True,
+            )
+            return
         target = {
             side: np.asarray(
                 emission.directive.qpos_by_side.get(side, start[side]),
@@ -4719,11 +4902,24 @@ class RuleBasedRealTeleopExtension:
         try:
             plan = future.result()
         except Exception as exc:  # noqa: BLE001 - planning is fail closed.
+            recoverable_predispatch_hold = (
+                isinstance(exc, RuleBasedInitialAlignmentPlanningError)
+                and exc.status == "hold_current"
+                and exc.blocked_reason in {
+                    "joint_limit_hold_margin",
+                    "collision_soft",
+                }
+            )
             self._abort_initial_alignment(
                 "initial-alignment planning failed: "
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc}",
+                recoverable_predispatch_hold=recoverable_predispatch_hold,
             )
-            raise AssertionError("unreachable") from exc
+            # No rejected alignment waypoint was dispatched. Only a confirmed
+            # Session Hold may turn a known geometric planning refusal into a
+            # recoverable pre-dispatch rejection; the owner loop still gates
+            # Home on position-stream release.
+            return False
         if self._initial_alignment_plan is None:
             actual = self._snapshot_qpos_pair(snapshots)
             drift_by_side = {
@@ -4990,28 +5186,26 @@ class RuleBasedRealTeleopExtension:
 
         return self._snapshot_qpos_pair(snapshots)
 
-    def _rebase_motion_transport_after_manual_adjustment(
+    def _rebase_motion_transport_from_measured_start(
         self,
         start_qpos_by_side: Mapping[str, np.ndarray],
-    ) -> None:
-        """Align command-planner state with post-calibration arm feedback.
+    ) -> dict[str, np.ndarray]:
+        """Align every new transition's transport with fresh arm feedback.
 
-        Manual adjustment changes the physical qpos without passing through
-        the command backend.  RM65 position planners otherwise retain their
-        last accepted pre-adjustment qcmd and turn the command-inert first
-        alignment waypoint into a visible corrective kick.  Rebase all three
-        consumers from one causal snapshot before any rule command is built.
+        Manual motion and the idle target-stale quick-stop between Episodes do
+        not update the command backend's accepted qcmd. Rebase the preview,
+        command transport and coupled solver from the same causal hardware
+        snapshot before planning *each* transition, not only after a height
+        calibration. The first certified waypoint is then command-inert.
 
         This helper never rearms a stopped backend.  A stopped or incomplete
         transport remains a hard failure that must go through runtime Home.
         """
 
-        if not self._manual_adjustment_motion_rebase_pending:
-            return
         components = self._components
         if components is None:
             raise RuntimeError(
-                "post-calibration motion rebase requires attached real-arm components."
+                "measured-start motion rebase requires attached real-arm components."
             )
 
         prepared: dict[str, tuple[object, object, np.ndarray]] = {}
@@ -5020,21 +5214,21 @@ class RuleBasedRealTeleopExtension:
                 qpos = np.asarray(start_qpos_by_side[side], dtype=float).reshape(6)
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError(
-                    f"post-calibration motion rebase requires finite {side} actual_qpos."
+                    f"measured-start motion rebase requires finite {side} actual_qpos."
                 ) from exc
             if not np.all(np.isfinite(qpos)):
                 raise RuntimeError(
-                    f"post-calibration motion rebase requires finite {side} actual_qpos."
+                    f"measured-start motion rebase requires finite {side} actual_qpos."
                 )
             command_backend = getattr(components, f"{side}_command_backend", None)
             preview_backend = getattr(components, f"{side}_preview_backend", None)
             if not callable(getattr(command_backend, "reset_motion_state", None)):
                 raise RuntimeError(
-                    f"post-calibration motion rebase requires {side} command backend."
+                    f"measured-start motion rebase requires {side} command backend."
                 )
             if not callable(getattr(preview_backend, "set_local_qpos", None)):
                 raise RuntimeError(
-                    f"post-calibration motion rebase requires {side} preview backend."
+                    f"measured-start motion rebase requires {side} preview backend."
                 )
             is_stopped = getattr(command_backend, "is_emergency_stopped", None)
             if callable(is_stopped) and bool(is_stopped()):
@@ -5042,21 +5236,41 @@ class RuleBasedRealTeleopExtension:
                     f"{side} command backend is stopped; runtime Home is required "
                     "before rule initialization."
                 )
-            prepared[side] = (command_backend, preview_backend, qpos.copy())
+            normalize = getattr(command_backend, "normalize_local_qpos_observation", None)
+            if not callable(normalize):
+                raise RuntimeError(
+                    f"measured-start motion rebase requires {side} observation normalizer."
+                )
+            try:
+                normalized, _metadata = normalize(
+                    qpos, label="rule initial-alignment measured start"
+                )
+            except ValueError as exc:
+                raise RuleBasedInitialAlignmentPlanningError(
+                    f"{side} measured start: {exc}",
+                    status="hold_current",
+                    blocked_reason="measured_qpos_observation",
+                ) from exc
+            normalized = np.asarray(normalized, dtype=float).reshape(6)
+            if not np.all(np.isfinite(normalized)):
+                raise RuntimeError(f"{side} observation normalizer returned invalid qpos.")
+            prepared[side] = (command_backend, preview_backend, normalized.copy())
 
         for command_backend, preview_backend, qpos in prepared.values():
             preview_backend.set_local_qpos(qpos)
             command_backend.reset_motion_state(qpos)
         _sync_dual_arm_retargeter_for_real_control(components)
-        self._manual_adjustment_motion_rebase_pending = False
+        self._coupled_pose_solver_seeded = False
+        rebased = {side: values[2].copy() for side, values in prepared.items()}
 
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
             append_message(
-                "Calibration",
-                "已用标定后的双臂新鲜实测姿态重置位控规划锚点；"
-                "初始化首帧不会沿用标定前命令状态。",
+                "RuleBased",
+                "已用本次过渡前的双臂新鲜实测姿态重置位控规划锚点；"
+                "初始化首帧不会沿用上次采集或暂停前命令状态。",
             )
+        return rebased
 
     def _hand_qpos_from_state(
         self,
@@ -5103,13 +5317,23 @@ class RuleBasedRealTeleopExtension:
         result[command_dim] = float(np.clip(scalar, 0.0, max_action))
         return result
 
-    def _abort_initial_alignment(self, message: str) -> None:
+    def _abort_initial_alignment(
+        self,
+        message: str,
+        *,
+        recoverable_predispatch_hold: bool = False,
+    ) -> None:
         self._aborted = True
         self._armed = False
         self._waiting_reason = "initial_alignment_safety_rejected"
         self._clear_current()
-        self._establish_hold(str(message))
+        hold_confirmed = self._establish_hold(str(message))
         self._request_failure_stop()
+        if recoverable_predispatch_hold and hold_confirmed:
+            session = getattr(self._components, "session", None)
+            state = getattr(getattr(session, "state_machine", None), "state", None)
+            if str(getattr(state, "value", state) or "").upper() == "DEBUG_ONLY":
+                return
         raise RuleBasedInitialAlignmentPlanningError(str(message))
 
     def _abort_coupled_pose(self, message: str) -> None:
@@ -5636,7 +5860,7 @@ class RuleBasedRealTeleopExtension:
         reason: str,
         now: float,
     ) -> TeleopCommandOverride:
-        """Keep the last accepted arm qref alive without advancing the rule.
+        """Keep a near-measured accepted qref alive without advancing the rule.
 
         This is a dispatch-preserving pause, not a second motion controller.
         The canonical Session/Rig path still validates and sends the exact
@@ -5649,6 +5873,56 @@ class RuleBasedRealTeleopExtension:
                 "rule-based execution has no certified command to hold during "
                 "a recoverable pause"
             )
+        feedback_ready, feedback_reason, snapshots = self._fresh_arm_snapshots(float(now))
+        if not feedback_ready:
+            if self._completed and self._completion_stop_requested:
+                # The completed Episode no longer owns motion. A detached
+                # recorder, stale sample, or failed background hardware read
+                # all mean the old terminal qref cannot be certified again.
+                # Make this handoff sticky: even if feedback later recovers,
+                # never restart the old stream after its target-stale stop.
+                # The next attempt must rebase from fresh measured qpos.
+                self._completed_hold_stream_suspended = True
+                self._waiting_reason = (
+                    "successful_episode_feedback_handoff:" + feedback_reason
+                )
+                append_message = getattr(self._control_ui, "append_message", None)
+                if callable(append_message):
+                    append_message(
+                        "RuleBased",
+                        "本条采集已完成；末端保持命令因实测反馈不可用而停止刷新。"
+                        "不会重发上一条轨迹，下一条运动须等待双臂新鲜实测并重新建立起点。"
+                        f" 原因：{feedback_reason}",
+                    )
+                self._publish_status(recording_ready=False)
+                return TeleopCommandOverride(None)
+            if self._recoverable_arm_feedback_pause(
+                reason=feedback_reason, now=float(now)
+            ):
+                self._waiting_reason = feedback_reason
+                self._publish_status(recording_ready=False)
+                return TeleopCommandOverride(None)
+            self._abort_session_step(
+                "cannot safely keep the paused arm target without fresh measured "
+                "feedback: " + feedback_reason
+            )
+            self._publish_status(recording_ready=False)
+            return TeleopCommandOverride(None)
+        self._arm_feedback_pause_started_at = None
+        displacement = self._paused_hold_displacement(snapshots)
+        if displacement is not None:
+            movement = (
+                "measured arm moved away from the accepted terminal target "
+                "during Episode finalization"
+                if self._completed
+                else "measured arm position changed during rule pause"
+            )
+            self._abort_session_step(
+                movement + "; the previous arm target is no longer safe: "
+                + displacement
+            )
+            self._publish_status(recording_ready=False)
+            return TeleopCommandOverride(None)
         paused_hold = self._certified_arm_hold_emission(held)
         paused_hold.command.metadata.update(
             {
@@ -5663,6 +5937,91 @@ class RuleBasedRealTeleopExtension:
         self._waiting_reason = str(reason)
         self._publish_status(recording_ready=False)
         return TeleopCommandOverride(paused_hold.command)
+
+    def _paused_hold_displacement(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> str | None:
+        """Reject an old target after measured arm motion, not normal lag.
+
+        In-flight pauses allow normal convergence from the measured pause
+        anchor toward qref, but reject movement outside that corridor.
+        After a successful terminal arrival, the accepted qref can normally
+        lead feedback by more than that limit.  Reject only *new* movement
+        away from the terminal reference; convergence toward qref is safe.
+        """
+
+        try:
+            errors = self._measured_to_accepted_abs_error(snapshots)
+            actual = self._snapshot_qpos_pair(snapshots)
+        except RuntimeError as exc:
+            return str(exc)
+        limit = float(self.config.pause_hold_max_joint_delta_rad)
+        for side in self.deployment.active_sides:
+            error = errors[side]
+            if self._completed:
+                prior_minimum = self._completion_hold_min_error_by_side.get(side)
+                if prior_minimum is None:
+                    self._completion_hold_min_error_by_side[side] = error.copy()
+                    continue
+                growth = error - prior_minimum
+                joint = int(np.argmax(growth))
+                if float(growth[joint]) > limit:
+                    return (
+                        f"{side} joint {joint + 1} measured-to-accepted "
+                        f"error increased by {math.degrees(float(growth[joint])):.3f}deg "
+                        f"from terminal minimum {math.degrees(float(prior_minimum[joint])):.3f}deg "
+                        f"to {math.degrees(float(error[joint])):.3f}deg "
+                        f"(limit {math.degrees(limit):.3f}deg)"
+                    )
+                self._completion_hold_min_error_by_side[side] = np.minimum(
+                    prior_minimum, error
+                )
+            else:
+                anchor = self._paused_arm_start_qpos_by_side.get(side)
+                if anchor is None:
+                    return f"{side} measured pause anchor is missing"
+                held = self._last_dispatched_emission
+                command = None if held is None else held.command.commands.get(f"{side}_arm")
+                if command is None:
+                    return f"{side} accepted arm target is missing"
+                target = np.asarray(command.value, dtype=float).reshape(6)
+                lower = np.minimum(anchor, target) - limit
+                upper = np.maximum(anchor, target) + limit
+                excess = np.maximum(lower - actual[side], actual[side] - upper)
+                joint = int(np.argmax(excess))
+                if float(excess[joint]) > 0.0:
+                    return (
+                        f"{side} joint {joint + 1} moved outside the measured-pause "
+                        f"to accepted-target corridor by "
+                        f"{math.degrees(float(excess[joint])):.3f}deg "
+                        f"(limit {math.degrees(limit):.3f}deg)"
+                    )
+        return None
+
+    def _measured_to_accepted_abs_error(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, np.ndarray]:
+        held = self._last_dispatched_emission
+        if held is None:
+            raise RuntimeError("no previously accepted arm target")
+        actual = self._snapshot_qpos_pair(snapshots)
+        errors: dict[str, np.ndarray] = {}
+        for side in self.deployment.active_sides:
+            command = held.command.commands.get(f"{side}_arm")
+            if command is None:
+                raise RuntimeError(f"{side} accepted arm target is missing")
+            try:
+                target = np.asarray(command.value, dtype=float).reshape(6)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{side} accepted arm target is invalid"
+                ) from exc
+            if not np.all(np.isfinite(target)):
+                raise RuntimeError(f"{side} accepted arm target is non-finite")
+            errors[side] = np.abs(actual[side] - target)
+        return errors
 
     @staticmethod
     def _is_transient_arm_read_failure(reason: str) -> bool:
@@ -5899,7 +6258,7 @@ class RuleBasedRealTeleopExtension:
             if self._recoverable_arm_feedback_pause(reason=reason, now=float(now)):
                 self._waiting_reason = reason
                 if self._replay_reference_pause_started_at is None:
-                    self._replay_reference_pause_started_at = float(now)
+                    self._begin_replay_reference_pause(float(now))
                 return
             raise RuntimeError("target arrival feedback unavailable: " + reason)
         self._arm_feedback_pause_started_at = None
@@ -6333,6 +6692,7 @@ class RuleBasedRealTeleopExtension:
         self._replay_reference_queue.clear()
         self._replay_reference_stage_started_at = None
         self._replay_reference_pause_started_at = None
+        self._paused_arm_start_qpos_by_side.clear()
         self._replay_reference_last_schedule_lag_sec = 0.0
         self._replay_reference_cumulative_schedule_shift_sec = 0.0
         self._replay_reference_rebased_tick_count = 0
@@ -6535,6 +6895,7 @@ class RuleBasedRealTeleopExtension:
         self._clear_current()
         self._clear_replay_reference_schedule()
         self._last_dispatched_emission = None
+        self._completion_hold_min_error_by_side = {}
         self._frame_emission = None
         self._paused_hold_emission = None
         self._deferred_progress_arm_contract = None
@@ -6560,8 +6921,12 @@ class RuleBasedRealTeleopExtension:
         self._execution_begun = False
         self._completed = False
         self._completion_stop_requested = False
+        self._completed_hold_stream_suspended = False
         self._aborted = False
         self._arm_feedback_pause_started_at = None
+        self._last_fresh_arm_qpos_by_side.clear()
+        self._last_fresh_arm_at = None
+        self._paused_arm_start_qpos_by_side.clear()
         self._initial_alignment_reacquire_samples = 0
         self._clear_manual_gripper_action()
 
@@ -6848,6 +7213,8 @@ class RuleBasedRealTeleopExtension:
         phases = phases if isinstance(phases, Mapping) else {}
         pen_down = phases.get("pen_down", {})
         pen_down = pen_down if isinstance(pen_down, Mapping) else {}
+        pen_up = phases.get("pen_up", {})
+        pen_up = pen_up if isinstance(pen_up, Mapping) else {}
         catalog = self.source_selection.get("trajectory_catalog", {})
         catalog = catalog if isinstance(catalog, Mapping) else {}
         return (
@@ -6860,11 +7227,15 @@ class RuleBasedRealTeleopExtension:
             ),
             str(variant.get("selected_trajectory_id") or ""),
             str(variant.get("selected_direction") or ""),
+            float(variant.get("selected_yaw_rad") or 0.0),
             float(variant.get("selected_size_m") or 0.0),
             str(pen_down.get("candidate_id") or ""),
             str(pen_down.get("source_contract_hash") or ""),
+            str(pen_up.get("candidate_id") or ""),
+            str(pen_up.get("source_contract_hash") or ""),
             str(catalog.get("combined_sha256") or ""),
             float(calibration.upper_bound_z_m),
+            float(calibration.contact_offset_tool_tcp_m),
         )
 
     def _writing_reachability_passed_for_current_selection(self) -> bool:
@@ -6956,8 +7327,8 @@ class RuleBasedRealTeleopExtension:
     def _writing_reachability_request(self) -> dict[str, Any]:
         metadata = self._writing_reachability_metadata()
         probes = metadata.get("probes")
-        if not isinstance(probes, (list, tuple)) or len(probes) != 4:
-            raise RuntimeError("writing reachability requires exactly four probes")
+        if not isinstance(probes, (list, tuple)) or len(probes) not in {4, 6}:
+            raise RuntimeError("writing reachability requires four writing probes and optional pen-up probes")
         calibration = self._height_calibration
         if calibration is None or not calibration.enabled:
             raise RuntimeError("writing reachability requires calibrated writing height")
@@ -7031,7 +7402,22 @@ class RuleBasedRealTeleopExtension:
                 ).reshape(7)
             )
             right_pose = np.asarray(right_pose, dtype=float).copy()
-            right_pose[2, 3] = float(calibration.upper_bound_z_m)
+            pen_up_probe = str(raw_probe.get("name") or "").startswith("pen_up_")
+            if not pen_up_probe:
+                probe_pose = pose_matrix_to_xyzquat(right_pose)
+                if calibration.contact_offset_tool_tcp_m:
+                    right_pose[2, 3] = tool_tcp_z_for_contact_height(
+                        probe_pose, calibration.upper_bound_z_m
+                    )
+                else:
+                    right_pose[2, 3] = float(calibration.upper_bound_z_m)
+            elif calibration.contact_offset_tool_tcp_m:
+                probe_pose = pose_matrix_to_xyzquat(right_pose)
+                right_pose[2, 3] += max(
+                    0.0,
+                    calibration.lower_bound_z_m
+                    - contact_height_from_tool_tcp(probe_pose),
+                )
             # Mirror the formal execution path in _coupled_pose_emission:
             # canonical desk -> runtime arm base -> calibrated solver world ->
             # solver endpoint.  Feeding canonical desk directly to the solver
@@ -7069,6 +7455,11 @@ class RuleBasedRealTeleopExtension:
             prepared_probes.append(
                 {
                     "name": str(raw_probe.get("name") or "unknown"),
+                    "active_sides": (
+                        ("right",)
+                        if str(raw_probe.get("name") or "").startswith("pen_up_")
+                        else ("left", "right")
+                    ),
                     "target_pose_by_side": {
                         side: np.asarray(effective_targets[side], dtype=float).copy()
                         for side in ("left", "right")
@@ -7122,7 +7513,7 @@ class RuleBasedRealTeleopExtension:
     def _run_writing_reachability_preflight(
         request: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        """Check four endpoints without backend, Session, or dispatch access."""
+        """Check writing bounds and sampled relative replay without dispatch."""
 
         started_at = time.monotonic()
         deadline = started_at + _WRITING_REACHABILITY_MAX_CHECK_SEC
@@ -7183,7 +7574,9 @@ class RuleBasedRealTeleopExtension:
                         # Fixed writing sends both poses to the live coupled
                         # solver. The downstream FixArm owner holds the left
                         # qpos, checked explicitly below after this solve.
-                        active_sides=("left", "right"),
+                        active_sides=tuple(
+                            probe.get("active_sides", ("left", "right"))
+                        ),
                         hard_hold_inactive_sides=True,
                         world_to_base_by_side=request["world_to_base_by_side"],
                     )
@@ -7247,8 +7640,20 @@ class RuleBasedRealTeleopExtension:
                 ))
             if reason == "solver_budget_exhausted":
                 break
+        if len(results) < len(probes):
+            results.extend(
+                {
+                    "name": str(probe["name"]),
+                    "reachable": False,
+                    "reason": "solver_budget_exhausted",
+                    "solver_status": "not_run",
+                    "solve_frames": 0,
+                }
+                for probe in probes[len(results):]
+            )
         return {
-            "reachable": all(bool(item["reachable"]) for item in results),
+            "reachable": len(results) == len(probes)
+            and all(bool(item["reachable"]) for item in results),
             "probes": results,
             "pose_projection": dict(request.get("pose_projection") or {}),
             "elapsed_ms": (time.monotonic() - started_at) * 1000.0,
@@ -7445,8 +7850,11 @@ class RuleBasedRealTeleopExtension:
                 request["progress_callback"] = progress.put
                 self._writing_reachability_progress = progress
                 self._writing_reachability_started_at = time.monotonic()
+                probe_count = len(request.get("probes") or ())
                 self._writing_reachability_progress_detail = (
-                    "独立计算进程正在检查四个边界点"
+                    f"独立计算进程正在检查 {probe_count} 个抽样点"
+                    if probe_count
+                    else "独立计算进程正在检查抽样点"
                 )
                 self._writing_reachability_future = (
                     self._submit_writing_reachability_preflight(request)
@@ -7455,7 +7863,7 @@ class RuleBasedRealTeleopExtension:
                 self._writing_reachability_detail = (
                     f"{self._writing_reachability_candidate_label}；"
                     f"前台准备 {self._writing_reachability_preparation_ms:.0f}ms；"
-                    "正在独立计算进程检查书写四边界接触点；尚未启动 Episode。"
+                    "正在独立计算进程检查书写边界与相对提笔；尚未启动 Episode。"
                 )
                 self._waiting_reason = "writing_reachability_preflight"
             except Exception as exc:  # noqa: BLE001 - no motion was authorized.
@@ -7515,7 +7923,7 @@ class RuleBasedRealTeleopExtension:
                 f"{self._writing_reachability_candidate_label}；"
                 + elapsed_detail
                 + (f"各点 {probe_timings}；" if probe_timings else "")
-                + "书写四边界接触点 IK/碰撞检查通过。"
+                + "书写边界与相对提笔抽样 IK/碰撞检查通过。"
             )
             self._waiting_reason = "waiting_for_rule_start"
             append_message = getattr(self._control_ui, "append_message", None)
@@ -7644,10 +8052,6 @@ class RuleBasedRealTeleopExtension:
             raise RuntimeError("cancelled rule Episode is still active")
         self._invalidate_writing_reachability_preflight()
         self._held = False
-        # Explicit runtime Home already resets preview, command transport and
-        # coupled IK from one live snapshot, so no additional rule-owned
-        # pre-dispatch rebase is needed.
-        self._manual_adjustment_motion_rebase_pending = False
         self._armed = bool(self._legacy_generic_ui)
         self._waiting_reason = (
             "waiting_for_formal_episode"
@@ -7785,10 +8189,10 @@ class RuleBasedRealTeleopExtension:
             if self._target_arrival_confirmed:
                 self._finish_arrived_current(float(now))
 
-    def _establish_hold(self, reason: str) -> None:
+    def _establish_hold(self, reason: str) -> bool:
         self._reset_pose_action_motion_intent("runtime_hold")
         if self._held or self._components is None:
-            return
+            return False
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
             append_message(
@@ -7800,7 +8204,7 @@ class RuleBasedRealTeleopExtension:
             request_hold(reason="rule_based_runtime_hold")
         self._held = True
         try:
-            self._components.session.hold_hardware(str(reason))
+            confirmed = self._components.session.hold_hardware(str(reason))
         except Exception as exc:  # noqa: BLE001 - queued owner-loop Hold remains authoritative.
             if callable(append_message):
                 append_message(
@@ -7808,6 +8212,8 @@ class RuleBasedRealTeleopExtension:
                     "规则运行时直接 Hold 未获得回执；已转交权威控制循环重试："
                     f"{type(exc).__name__}: {exc}",
                 )
+            return False
+        return confirmed is True
 
     def close_before_session(
         self,
@@ -8183,7 +8589,9 @@ class RuleBasedRealTeleopExtension:
         )
         gripper_action_pending = self._pending_gripper_action is not None
         if (
-            self._writing_reachability_enabled()
+            session_state_value in {"ARMED", "RUNNING"}
+            and not self._held
+            and self._writing_reachability_enabled()
             and self._height_calibration is not None
             and self._height_calibration.enabled
             and not self._writing_reachability_passed_for_current_selection()

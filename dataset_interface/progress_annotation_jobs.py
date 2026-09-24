@@ -978,11 +978,17 @@ def load_episode_sample_continuity(
     if pause_breaks:
         breaks.update(pause_breaks)
         sources.append("EPISODE_PAUSE_SUMMARY")
-    if not has_continuity_column and not work_item.recording_pause_segments:
-        inferred = _inferred_timestamp_break_indices(values)
-        if inferred:
-            breaks.update(inferred)
-            sources.append("TIMESTAMP_GAP_LEGACY")
+    # A writer continuity segment records explicit pauses, not every stalled
+    # sampling interval. Never bridge an unobserved long gap merely because
+    # the segment column exists and did not change.
+    inferred = set(_inferred_timestamp_break_indices(values)) - breaks
+    if inferred:
+        breaks.update(inferred)
+        sources.append(
+            "TIMESTAMP_GAP_INFERRED"
+            if has_continuity_column or work_item.recording_pause_segments
+            else "TIMESTAMP_GAP_LEGACY"
+        )
     return EpisodeSampleContinuity(
         sample_axis=sample_axis,
         segment_indices=segment_indices,

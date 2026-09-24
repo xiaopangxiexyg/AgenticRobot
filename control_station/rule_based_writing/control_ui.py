@@ -84,6 +84,13 @@ class RuleBasedWritingWebUi:
                         (_ASSET_DIR / "diagnostics.js").read_bytes(),
                     )
                     return
+                if route == "/selection.js":
+                    self._send(
+                        200,
+                        "text/javascript; charset=utf-8",
+                        (_ASSET_DIR / "selection.js").read_bytes(),
+                    )
+                    return
                 if route == "/styles.css":
                     self._send(200, "text/css; charset=utf-8", (_ASSET_DIR / "styles.css").read_bytes())
                     return

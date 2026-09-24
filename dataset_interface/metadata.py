@@ -17,6 +17,7 @@ from dataset_contracts.capture_modalities import CaptureModalityContract
 from dataset_contracts.episode_curation import EpisodeCurationRecord
 
 from .episode_curation import EpisodeCurationReader
+from .episode_exclusion import read_episode_exclusions
 
 if TYPE_CHECKING:
     from .pose_chunk import PoseActionChunkLocation
@@ -196,6 +197,7 @@ class DexTeleopDatasetIndex:
             raise ValueError(f"duplicate episode_index in {self.episodes_path}")
         self._declared_camera_keys = _camera_keys_from_records(records)
         self._training_validity = self._parse_training_validity()
+        self._episode_exclusions = read_episode_exclusions(self.dataset_root)
         self._plus_curation_readers: dict[Path, EpisodeCurationReader] = {}
 
     @property
@@ -354,6 +356,8 @@ class DexTeleopDatasetIndex:
         episode = self.episode(episode_index)
         requested = _unique_camera_keys(camera_keys, label="camera_keys")
         reasons: list[str] = []
+        if self._episode_exclusions.get(episode.episode_index, False):
+            reasons.append(f"episode {episode.episode_index} was excluded by operator curation")
         policy = self._training_validity
         if not policy.status.valid:
             reasons.append(_invalid_reason("dataset training data", policy.status))

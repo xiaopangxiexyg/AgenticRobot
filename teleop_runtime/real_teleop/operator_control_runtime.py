@@ -403,6 +403,7 @@ class RealTeleopControlInput:
             "blocked_reason": "progress_not_configured",
         }
         self._episode_delete_requested: int | None = None
+        self._episode_exclude_requested: int | None = None
         self._episode_last_episode_index: int | None = None
         self._episode_last_frame_count: int | None = None
         self._episode_recording_ui_active = False
@@ -1697,6 +1698,12 @@ class RealTeleopControlInput:
                             self.ui.publish(
                                 active_controls=self._current_active_controls()
                             )
+                elif event.startswith("episode_exclude:"):
+                    try:
+                        self._episode_exclude_requested = int(event.split(":", 1)[1])
+                    except ValueError:
+                        if self.ui is not None:
+                            self.ui.append_message("Dataset", f"无效排除请求: {event}")
                 elif event == "round_trip_toggle":
                     self._toggle_round_trip_collection_task(source="manual")
                 elif event.startswith("fix_arm_select:"):
@@ -5111,6 +5118,11 @@ class RealTeleopControlInput:
     def consume_episode_delete_request(self) -> int | None:
         requested = self._episode_delete_requested
         self._episode_delete_requested = None
+        return requested
+
+    def consume_episode_exclude_last_request(self) -> int | None:
+        requested = self._episode_exclude_requested
+        self._episode_exclude_requested = None
         return requested
 
     def consume_camera_visualization_toggle_request(self) -> bool:

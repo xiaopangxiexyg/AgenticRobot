@@ -29,6 +29,7 @@ class RuleBasedWritingIntent(str, Enum):
     CLOSE_GRIPPERS = "close_grippers"
     CLOSE_RIGHT_GRIPPER = "close_right_gripper"
     DEBUG_TOGGLE = "debug_toggle"
+    EXCLUDE_LAST_EPISODE = "exclude_last_episode"
     QUIT = "q"
 
 
@@ -69,6 +70,8 @@ class RuleBasedWritingUiState:
     writer_retry_pending: bool = False
     episode_event_status: str = ""
     episode_event_message: str = ""
+    can_exclude_last_episode: bool = False
+    last_completed_episode_index: int | None = None
     gripper_sides: list[str] = field(default_factory=list)
     control_topology: str = "双臂（无夹爪）"
     gripper_control_available: bool = False
@@ -167,6 +170,7 @@ class RuleBasedWritingApplication:
         self._task_chain = RuleWritingTaskChain()
         self._task_chain_cancel_pending = False
         self._last_gripper_action_id: int | None = None
+        self._episode_exclusion_pending = False
         self._task_chain_configuration_pool: list[dict[str, object]] = []
         self._task_chain_choice_index = task_chain_choice_index or secrets.randbelow
         self._configuration_options: dict[str, object] = {}
@@ -366,6 +370,27 @@ class RuleBasedWritingApplication:
             and not self._state.shutdown
         )
 
+    def _next_rule_owner_recovery_window_locked(self) -> bool:
+        """Allow a closed-grip receipt to be renewed between cadence episodes.
+
+        COMPLETE suppresses only the owner's rule-start blocker so the task
+        chain can finish.  A lost serial session must not force a new release
+        or height calibration before the configured grasp interval, but it
+        also cannot authorize the next rule until a fresh close receipt exists.
+        """
+
+        return bool(
+            self._task_chain.phase is RuleWritingTaskChainPhase.COMPLETE
+            and not self._task_chain.grasp_adjustment_due
+            and self._task_chain.configuration_prepared
+            and bool(self._task_chain.selected_configuration)
+            and set(self._state.startup_blockers) == {"rule.right_hand_hold_owner"}
+            and not self._state.held
+            and not self._state.completed
+            and not self._state.aborted
+            and not self._state.shutdown
+        )
+
     def observe_runtime_publication(self, updates: Mapping[str, object]) -> None:
         """Consume the generic projection without exposing its controls or progress."""
 
@@ -410,10 +435,24 @@ class RuleBasedWritingApplication:
                 self._state.episode_event_status = str(
                     updates.get("episode_event_status", "") or ""
                 )
+            if "episode_last_episode_index" in updates:
+                self._state.last_completed_episode_index = self._optional_int(
+                    updates.get("episode_last_episode_index")
+                )
             if "episode_event_message" in updates:
                 self._state.episode_event_message = str(
                     updates.get("episode_event_message", "") or ""
                 )
+            if self._episode_exclusion_pending and "episode_event_message" in updates and (
+                self._state.episode_event_status == "excluded"
+                or (
+                    self._state.episode_event_status == "error"
+                    and self._state.episode_event_message.startswith("舍弃失败：")
+                )
+            ):
+                self._episode_exclusion_pending = False
+                if self._state.episode_event_status == "error":
+                    self._state.can_exclude_last_episode = True
             if (
                 self._state.device_retry_pending
                 and self._device_retry_waiting_for_hold
@@ -544,6 +583,20 @@ class RuleBasedWritingApplication:
         if not isinstance(intent, RuleBasedWritingIntent):
             raise TypeError("intent must be RuleBasedWritingIntent.")
         with self._lock:
+            if intent is RuleBasedWritingIntent.EXCLUDE_LAST_EPISODE:
+                if (
+                    not self._state.can_exclude_last_episode
+                    or self._state.last_completed_episode_index is None
+                ):
+                    return False
+                self._state.can_exclude_last_episode = False
+                self._episode_exclusion_pending = True
+                self._runtime_events.put(
+                    f"episode_exclude:{self._state.last_completed_episode_index}"
+                )
+                self._append_message_locked("Dataset", "正在可恢复地排除上一条已保存轨迹。")
+                self._touch()
+                return True
             if intent is RuleBasedWritingIntent.STOP and self._task_chain.active:
                 if self._task_chain_cancel_pending:
                     return False
@@ -584,6 +637,7 @@ class RuleBasedWritingApplication:
                 return False
             retry_writer_only = bool(self._state.writer_blocked)
             if not retry_writer_only:
+                self._state.can_exclude_last_episode = False
                 self._completion_stop_queued = False
                 self._rule_intents.put(intent)
                 self._pre_episode_start_admission_open = True
@@ -963,6 +1017,21 @@ class RuleBasedWritingApplication:
                     phase is RuleWritingTaskChainPhase.COMPLETE
                     and not self._task_chain.grasp_adjustment_due
                 ):
+                    if self._next_rule_owner_recovery_window_locked():
+                        # This click authorizes only a right-hand one-shot close.
+                        # Existing READY_RULE recovery owns the fresh-feedback
+                        # gate and the subsequent start of this prepared rule.
+                        self._task_chain.wait_for_next_rule_owner_recovery()
+                        self._task_chain_owner_recovery_attempts = 0
+                        if not self._request_task_chain_owner_recovery_locked(
+                            automatic=False
+                        ):
+                            self._rebuild_controls()
+                            self._touch()
+                            return False
+                        self._rebuild_controls()
+                        self._touch()
+                        return True
                     if not self._start_prepared_task_chain_rule_locked():
                         return False
                     self._task_chain_owner_recovery_attempts = 0
@@ -1895,6 +1964,9 @@ class RuleBasedWritingApplication:
             # The lower runtime increments this count only after the writer has
             # fully closed the singleton chain Episode and reset to pre-start.
             self._task_chain.finish_rule()
+            self._state.can_exclude_last_episode = (
+                self._state.last_completed_episode_index is not None
+            )
 
     @staticmethod
     def _waiting_detail(waiting: str) -> str:
@@ -2026,7 +2098,10 @@ class RuleBasedWritingApplication:
         self._state.task_chain_can_advance = self._task_chain_can_advance_locked(
             available
         )
-        owner_recovery_required = self._rule_owner_recovery_window_locked()
+        owner_recovery_required = (
+            self._rule_owner_recovery_window_locked()
+            or self._next_rule_owner_recovery_window_locked()
+        )
         self._state.task_chain_owner_recovery_required = owner_recovery_required
         task_chain_detail = str(chain["detail"])
         if (
@@ -2049,9 +2124,9 @@ class RuleBasedWritingApplication:
             task_chain_detail = self._task_chain_blocked_detail_locked(available)
         elif owner_recovery_required:
             task_chain_detail = (
-                "右夹爪串口会话已变化，先前闭爪 owner 已安全失效。"
-                "点击下一步只会重新发送右夹爪一次性闭合命令；"
-                "收到新的实测闭紧反馈后，任务链才会恢复规则采集。"
+                "右夹爪先前的闭合 owner 已失效；实测位置闭紧不能替代"
+                "当前串口会话的一次性闭合回执。点击下一步只会重建右夹爪"
+                "闭合 owner；新鲜实测反馈确认后才继续已准备的规则采集。"
             )
             if self._state.gripper_action_pending:
                 task_chain_detail = (
@@ -2158,6 +2233,7 @@ class RuleBasedWritingApplication:
         runtime_home = bool(
             self._rule_runtime_bound
             and not terminal
+            and str(self._state.session_state or "").upper() not in {"FAULT", "ESTOP"}
             and not self._state.runtime_home_pending
             and self._state.phase in {"ready", "blocked"}
             and not self._state.configuration_pending
@@ -2232,7 +2308,15 @@ class RuleBasedWritingApplication:
             and not self._task_chain.grasp_adjustment_due
         ):
             return bool(
-                self._task_chain.configuration_prepared and available["start"]
+                self._task_chain.configuration_prepared
+                and self._task_chain.selected_configuration
+                and (
+                    available["start"]
+                    or (
+                        self._next_rule_owner_recovery_window_locked()
+                        and available["close_right_gripper"]
+                    )
+                )
             )
         return bool(
             available["release_grippers"]
@@ -2261,6 +2345,16 @@ class RuleBasedWritingApplication:
             return "等待规则运行时完成绑定；就绪前不能开始任务链。"
         effective_blockers = self._effective_startup_blockers_locked()
         if effective_blockers:
+            if str(self._state.session_state or "").upper() in {"FAULT", "ESTOP"}:
+                return (
+                    "规则采集保持禁用；Session 已进入终止安全状态，当前进程不能"
+                    "重新采集 runtime Home。请保持 Hold，检查设备与机械臂位置；"
+                    "确认安全后退出并重新启动程序。\n"
+                    + "; ".join(
+                        f"{key}: {value}"
+                        for key, value in sorted(effective_blockers.items())
+                    )
+                )
             if "rule.right_hand_hold_owner" in effective_blockers:
                 return (
                     "规则采集保持禁用；请先完成任务链中的“闭紧右夹爪”，"
@@ -2542,15 +2636,22 @@ class RuleBasedWritingApplication:
         self._set_device_retry_running_locked()
 
     def _session_requires_runtime_home_locked(self) -> bool:
+        # Candidate preflight cannot run while the rule runtime is held.  It
+        # still blocks rule START, but must not hide the Home recovery needed
+        # to leave DEBUG_ONLY after an operator Hold.  The lower Home bridge
+        # still requires a positive hardware Hold receipt before recalibration.
         blockers = {
             key: detail
             for key, detail in self._effective_startup_blockers_locked().items()
             if key != "rule.right_hand_hold_owner"
+            and not self._is_rule_planning_blocker(key)
         }
+        state = str(self._state.session_state or "").upper()
+        if state in {"FAULT", "ESTOP"}:
+            return False
         if self._runtime_home_retry_available:
             return True
-        state = str(self._state.session_state or "").upper()
-        if state in {"", "ARMED", "RUNNING", "FAULT", "ESTOP", "INIT"}:
+        if state in {"", "ARMED", "RUNNING", "INIT"}:
             return any(
                 self._is_runtime_home_requirement(key, detail)
                 for key, detail in blockers.items()
@@ -2578,6 +2679,19 @@ class RuleBasedWritingApplication:
             return
         self._state.phase = "blocked"
         self._state.title = "机械臂安全接入未完成"
+        if str(self._state.session_state or "").upper() in {"FAULT", "ESTOP"}:
+            self._state.title = "Session 已进入终止安全状态"
+            details = "; ".join(
+                f"{key}: {value}"
+                for key, value in sorted(self._state.startup_blockers.items())
+            )
+            self._state.detail = (
+                "规则采集保持禁用；当前进程不能重新采集 runtime Home。"
+                "请保持 Hold，检查设备与机械臂位置；确认安全后退出并"
+                "重新启动程序。"
+                + ("\n" + details if details else "")
+            )
+            return
         if self._runtime_home_retry_available:
             self._state.detail = (
                 "规则采集保持禁用；上一次安全初始化未完成。"

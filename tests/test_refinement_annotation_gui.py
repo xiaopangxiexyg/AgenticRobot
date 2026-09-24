@@ -912,6 +912,33 @@ def test_legacy_episode_without_continuity_column_infers_large_gap(
     assert continuity.sources == ("TIMESTAMP_GAP_LEGACY",)
 
 
+def test_continuity_column_does_not_hide_unmarked_sampling_gap(
+    tmp_path: Path,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    _finalized_failure_retry_dataset(tmp_path)
+    pq.write_table(
+        pa.table(
+            {
+                "timestamp": [0.0, 0.1, 0.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8],
+                "collection.continuity_segment_index": [0] * 9,
+            }
+        ),
+        tmp_path / "data/chunk-000/episode_000000.parquet",
+    )
+
+    item = list_progress_annotation_work_items(tmp_path)[0]
+    continuity = load_episode_sample_continuity(item)
+
+    assert continuity.break_indices == (3,)
+    assert continuity.sources == (
+        "PARQUET_CONTINUITY_SEGMENT",
+        "TIMESTAMP_GAP_INFERRED",
+    )
+
+
 def test_manual_stop_defaults_to_recorded_step_and_can_reflow_to_early_step(
     tmp_path: Path,
 ) -> None:

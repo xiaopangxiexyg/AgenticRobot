@@ -178,6 +178,13 @@
         instruction: "这不是设备断联。执行任务链的“闭紧右夹爪”，并等待实测夹持反馈建立本轮 owner。",
       };
     }
+    if (domain === "session" && containsAny(evidence, ["session state=fault", "session state=estop"])) {
+      return {
+        id: "restart_after_terminal_session",
+        label: "保持 Hold，检查后重启程序",
+        instruction: "当前 Session 为终止安全状态，不能在本进程重新采集 runtime Home。检查设备与机械臂位置，确认安全后退出并重新启动程序；不要反复点击重新安全初始化。",
+      };
+    }
     if (domain === "arm_force" && containsAny(evidence, ["stale", "timeout", "陈旧", "超时"])) {
       return {
         id: "force_telemetry_check",
@@ -308,14 +315,26 @@
     const blockers = state.startup_blockers && typeof state.startup_blockers === "object"
       ? state.startup_blockers
       : {};
+    const rehomeAvailable = Boolean(state.can_runtime_home) && containsAny(
+      lower(blockers["rig.session"]),
+      ["runtime home", "runtime_home", "session state="],
+    );
     Object.entries(blockers).forEach(([key, message]) => {
-      diagnostics.push(classifyDiagnostic({
+      const diagnostic = classifyDiagnostic({
         key,
         message,
         source: "blocker",
         waitingReason: state.waiting_reason,
         reachabilityStatus: state.writing_reachability_status,
-      }));
+      });
+      if (rehomeAvailable && diagnostic.planningMode === "progress") {
+        diagnostic.recovery = {
+          id: "runtime_home_then_wait_candidate_check",
+          label: "先重新安全初始化",
+          instruction: "当前 Session 需要重采 runtime Home；确认机械臂安全后点击“重新安全初始化”。Home 完成后再等待候选可达性检查，未通过前不会启动 Episode。",
+        };
+      }
+      diagnostics.push(diagnostic);
     });
     if (normalize(state.configuration_error)) {
       diagnostics.push(classifyDiagnostic({

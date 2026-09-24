@@ -3,6 +3,7 @@ const text = (id, value) => {
 };
 
 const diagnosticApi = window.RuleWritingDiagnostics;
+const selectionApi = window.RuleWritingSelection;
 
 function diagnosticBadge(label, kind) {
   const badge = document.createElement("span");
@@ -131,6 +132,7 @@ async function advanceTaskChain() {
 }
 
 let optionsLoaded = false;
+let trajectoryChoices = [];
 let latestState = null;
 let configurationDirty = false;
 let configurationBatch = [];
@@ -224,6 +226,7 @@ async function loadOptions() {
     addOptions(document.getElementById("write-source"), sources.write);
     addOptions(document.getElementById("pen-up-source"), sources.pen_up);
     addOptions(document.getElementById("trajectory"), options.trajectory_ids);
+    trajectoryChoices = options.trajectory_ids;
     addOptions(document.getElementById("direction"), options.directions);
   }
   applyModeUi();
@@ -521,13 +524,20 @@ async function refresh() {
   const resolvedSources = Object.keys(resolvedPhases).length
     ? ` · 实际来源 靠近:${resolvedCandidate("pen_down")} / 书写:${resolvedCandidate("write")} / 离开:${resolvedCandidate("pen_up")}`
     : "";
+  const variant = resolvedSelection.writing_variant_selection || {};
+  const writingDetail = fullReplayMode()
+    ? chainSelection.full_replay_candidate_id || "已验证组合"
+    : selectionApi.describeWritingVariant(variant, chainSelection, trajectoryChoices);
+  const runningWithoutChain = state.phase === "running"
+    && !fullReplayMode() && Boolean(variant.selected_trajectory_id);
   const cadence = ` · 抓笔周期 ${Number(state.task_chain_episodes_since_grasp_adjustment || 0)}/${Number(state.task_chain_grasp_adjustment_interval || 10)}`;
-  text(
-    "task-chain-selection",
-    Object.keys(chainSelection).length
-      ? `本轮组合：池中第 ${Number(chainIndex) + 1} 条 · ${chainSelection.trajectory_id || chainSelection.full_replay_candidate_id || "已验证组合"}${resolvedSources}${cadence}`
-      : `尚未选择本轮轨迹${cadence}。`,
-  );
+  let selectionText = `尚未选择本轮轨迹${cadence}。`;
+  if (Object.keys(chainSelection).length) {
+    selectionText = `本轮组合：池中第 ${Number(chainIndex) + 1} 条 · ${writingDetail}${resolvedSources}${cadence}`;
+  } else if (runningWithoutChain) {
+    selectionText = `当前${writingDetail}${resolvedSources}${cadence}`;
+  }
+  text("task-chain-selection", selectionText);
   const chainButton = document.getElementById("task-chain-advance");
   chainButton.disabled = !state.task_chain_can_advance
     || configurationDirty
@@ -556,6 +566,11 @@ async function refresh() {
         ? `开始下一条（${batchIndex + 1}/${batchCount}）`
         : `${fullReplayMode() ? "开始完整 Replay 采集" : "开始规则采集"}（${batchIndex + 1}/${batchCount}）`;
   document.getElementById("stop").disabled = !state.can_stop || pendingRequests.has("event:rule_stop");
+  document.getElementById("exclude-last").disabled = !state.can_exclude_last_episode
+    || pendingRequests.has("event:exclude_last_episode");
+  text("curation-status", ["excluded", "error"].includes(state.episode_event_status)
+    && /^(舍弃|已可恢复地排除)/.test(state.episode_event_message || "")
+    ? state.episode_event_message : "");
   document.getElementById("retry").disabled = !state.can_retry_devices || pendingRequests.has("event:device_retry");
   document.getElementById("runtime-home-retry").disabled = !state.can_runtime_home || pendingRequests.has("event:runtime_home_retry");
   document.getElementById("release").disabled = !state.can_release_grippers || pendingRequests.has("event:release_grippers");

@@ -32,6 +32,12 @@ from teleop_runtime.real_teleop import rule_based_writing_plan as rule_based_pla
 from teleop_runtime.real_teleop.pose_frame_runtime import (
     resolve_runtime_pose_frame_contract,
 )
+from teleop_runtime.real_teleop.writing_contact_point import (
+    RIGHT_CONTACT_OFFSET_TOOL_TCP_M,
+    contact_height_from_tool_tcp,
+    require_right_tool_tcp_profile,
+    tool_tcp_z_for_contact_height,
+)
 from teleop_runtime.real_teleop.progress_adapter import (
     load_real_teleop_progress_profile,
     resolve_real_teleop_progress_entry,
@@ -1030,6 +1036,105 @@ def test_fixed_writing_uses_calibrated_descent_endpoint_when_supplied() -> None:
         },
     )
     assert first.arm_pose_by_side["right"][2] == pytest.approx(0.301)
+
+
+def test_correct_tcp_uses_local_flange_axis_and_rejects_wrong_profile() -> None:
+    assert RIGHT_CONTACT_OFFSET_TOOL_TCP_M == pytest.approx(0.06)
+    profile = {"tool_tcp_pose_flange_m_rad": [0, 0, 0.14, 0, 0, 0]}
+    require_right_tool_tcp_profile(profile)
+    for invalid in (
+        {},
+        {"tool_tcp_pose_flange_m_rad": [0, 0, 0.20, 0, 0, 0]},
+        {"tool_tcp_pose_flange_m_rad": [0.01, 0, 0.14, 0, 0, 0]},
+    ):
+        with pytest.raises(RuntimeError, match="--correct-tcp requires"):
+            require_right_tool_tcp_profile(invalid)
+
+    upright = _pose(0.2, 0.1, 0.30)
+    tilted = upright.copy()
+    tilted[3:7] = [np.sqrt(0.5), 0, 0, np.sqrt(0.5)]
+    inverted = upright.copy()
+    inverted[3:7] = [1, 0, 0, 0]
+    assert contact_height_from_tool_tcp(upright) == pytest.approx(0.36)
+    assert contact_height_from_tool_tcp(tilted) == pytest.approx(0.30)
+    assert contact_height_from_tool_tcp(inverted) == pytest.approx(0.24)
+    for pose in (upright, tilted, inverted):
+        corrected = pose.copy()
+        corrected[2] = tool_tcp_z_for_contact_height(pose, 0.31)
+        assert contact_height_from_tool_tcp(corrected) == pytest.approx(0.31)
+
+
+def test_correct_tcp_writing_and_descent_keep_physical_tip_at_calibrated_height() -> None:
+    runtime_contract = resolve_runtime_pose_frame_contract(_contract())
+    right_desk = _pose(0.3, 0.4, 0.40)
+    right_desk[3:7] = [1, 0, 0, 0]
+    right_raw = runtime_contract.canonical_desk_pose_vector_to_storage(
+        right_desk, side="right"
+    )
+    left_desk = _pose(0.1, 0.2, 0.45)
+    left_raw = runtime_contract.canonical_desk_pose_vector_to_storage(
+        left_desk, side="left"
+    )
+    calibration = {
+        "enabled": True,
+        "calibrated_z_m": 0.25,
+        "lower_tolerance_m": 0.001,
+        "upper_tolerance_m": 0.001,
+        "lower_bound_z_m": 0.249,
+        "upper_bound_z_m": 0.251,
+        "contact_offset_tool_tcp_m": RIGHT_CONTACT_OFFSET_TOOL_TCP_M,
+    }
+    context = {
+        "runtime_pose_frame_contract": runtime_contract,
+        "actual_arm_state_by_side": {
+            "left": {"actual_tcp_pose": xyzquat_to_pose_matrix(left_raw)},
+            "right": {"actual_tcp_pose": xyzquat_to_pose_matrix(right_raw)},
+        },
+        "writing_height_calibration": calibration,
+    }
+    descent = rule_based_plan.CalibratedHeightDescentActionSource(
+        reference_hz=60.0, linear_speed_m_s=0.02
+    )
+    actions = []
+    while not actions or not actions[-1].metadata["rule_based_height_descent_terminal"]:
+        actions.append(descent.produce_action(None, context=context))
+    assert contact_height_from_tool_tcp(actions[-1].arm_pose_by_side["right"]) == pytest.approx(0.251)
+    assert actions[-1].arm_pose_by_side["right"][2] == pytest.approx(0.311)
+
+    writing = rule_based_plan.FixedWritingActionSource(
+        trajectory_id="digit_1_v1", scale_m=0.02, speed_m_s=0.02,
+        direction="up", left_hold_pose=left_desk, reference_hz=10.0,
+    )
+    writing_context = {**context, "writing_height_target_z_m": 0.251}
+    first = writing.produce_action(None, context=writing_context)
+    assert contact_height_from_tool_tcp(first.arm_pose_by_side["right"]) == pytest.approx(0.251)
+    assert first.metadata["rule_based_height_calibration"]["contact_offset_tool_tcp_m"] == pytest.approx(0.06)
+
+
+def test_correct_tcp_launcher_is_opt_in_and_writing_only(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    source.mkdir()
+    detail.mkdir()
+    base = [
+        "bash", str(LAUNCHER), "--source-dataset", str(source),
+        "--source-episode", "3", "--detail-annotation-dir", str(detail),
+        "--no-collect-tactile", "--dry-run",
+    ]
+    unchanged = subprocess.run(base, cwd=ROOT, capture_output=True, text=True)
+    assert unchanged.returncode == 0, unchanged.stderr
+    assert "--rule-writing-correct-tcp" not in unchanged.stdout
+
+    enabled = subprocess.run(base + ["--correct-tcp"], cwd=ROOT, capture_output=True, text=True)
+    assert enabled.returncode == 0, enabled.stderr
+    assert "--rule-writing-correct-tcp" in enabled.stdout
+
+    invalid = subprocess.run(
+        base + ["--mode", "full-replay", "--correct-tcp"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert invalid.returncode != 0
+    assert "--correct-tcp is only valid" in invalid.stderr
 
 
 @pytest.mark.parametrize(
