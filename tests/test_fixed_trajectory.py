@@ -35,6 +35,67 @@ def test_digit_catalog_contains_nine_verified_one_stroke_paths() -> None:
         assert spec.bounding_height == pytest.approx(1.0)
 
 
+def test_reconstructed_digits_keep_clear_single_stroke_geometry() -> None:
+    paths = {
+        digit: np.asarray(get_fixed_trajectory(f"digit_{digit}_v1").points)
+        for digit in (2, 3, 4, 9)
+    }
+    for digit, points in paths.items():
+        steps = np.diff(points, axis=0)
+        lengths = np.linalg.norm(steps, axis=1)
+        turns = np.rad2deg(np.arccos(np.clip(
+            np.sum(steps[:-1] * steps[1:], axis=1)
+            / (lengths[:-1] * lengths[1:]),
+            -1.0,
+            1.0,
+        )))
+        assert np.all(lengths > 0.0), digit
+        assert float(lengths.sum()) < 3.0, digit
+        assert float(np.max(turns)) < (110.0 if digit == 4 else 95.0), digit
+
+    two = paths[2]
+    assert two[np.argmax(two[:, 1]), 0] > two[0, 0]
+    np.testing.assert_allclose(two[-2:, 1], 0.0)
+    assert two[-1, 0] > two[-2, 0]
+
+    three = paths[3]
+    assert np.max(three[three[:, 1] > 0.6, 0]) > 0.3
+    assert np.max(three[three[:, 1] < 0.4, 0]) > 0.3
+    assert np.min(three[(three[:, 1] > 0.45) & (three[:, 1] < 0.55), 0]) < 0.0
+
+    four = paths[4]
+    assert four[0, 1] == pytest.approx(1.0)
+    assert four[1, 0] < 0.0
+    assert four[-1, 1] == pytest.approx(0.0)
+    assert four[-1, 0] == pytest.approx(four[-2, 0])
+
+    nine = paths[9]
+    np.testing.assert_allclose(nine[0], nine[-5])  # loop joins its descender
+    assert nine[-1, 1] == pytest.approx(0.0)
+    assert nine[-1, 0] < nine[-5, 0]
+
+
+@pytest.mark.parametrize("digit", (2, 3, 4, 9))
+def test_reconstructed_digit_targets_preserve_canonical_motion_contract(digit: int) -> None:
+    boundary = {"left": _pose(-0.2, 0.1, 0.4), "right": _pose(0.2, -0.1, 0.4)}
+    targets = build_fixed_trajectory_targets(
+        boundary,
+        f"digit_{digit}_v1",
+        scale_m=0.08,
+        linear_speed_m_s=0.09,
+    )
+    positions = np.stack([target.pose_by_side["right"][:3, 3] for target in targets])
+    np.testing.assert_allclose(positions[0], boundary["right"][:3, 3])
+    np.testing.assert_allclose(positions[:, 2], 0.4)
+    assert all(
+        np.array_equal(target.pose_by_side["left"], boundary["left"])
+        for target in targets
+    )
+    assert np.all(np.diff([target.timestamp for target in targets]) > 0.0)
+    assert targets[0].metadata["catalog_hash"] == fixed_trajectory_catalog_hash()
+    assert targets[0].metadata["symbol"] == str(digit)
+
+
 def test_greek_catalog_contains_complete_verified_one_stroke_alphabet() -> None:
     names = (
         "alpha",

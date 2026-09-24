@@ -3,6 +3,7 @@ const text = (id, value) => {
 };
 
 const diagnosticApi = window.RuleWritingDiagnostics;
+const selectionApi = window.RuleWritingSelection;
 
 function diagnosticBadge(label, kind) {
   const badge = document.createElement("span");
@@ -131,6 +132,7 @@ async function advanceTaskChain() {
 }
 
 let optionsLoaded = false;
+let trajectoryChoices = [];
 let latestState = null;
 let configurationDirty = false;
 let configurationBatch = [];
@@ -224,6 +226,7 @@ async function loadOptions() {
     addOptions(document.getElementById("write-source"), sources.write);
     addOptions(document.getElementById("pen-up-source"), sources.pen_up);
     addOptions(document.getElementById("trajectory"), options.trajectory_ids);
+    trajectoryChoices = options.trajectory_ids;
     addOptions(document.getElementById("direction"), options.directions);
   }
   applyModeUi();
@@ -522,17 +525,19 @@ async function refresh() {
     ? ` · 实际来源 靠近:${resolvedCandidate("pen_down")} / 书写:${resolvedCandidate("write")} / 离开:${resolvedCandidate("pen_up")}`
     : "";
   const variant = resolvedSelection.writing_variant_selection || {};
-  const directionOffset = Number(variant.selected_direction_deviation_deg || 0);
-  const directionDetail = Number.isFinite(directionOffset) && directionOffset !== 0
-    ? ` · 主方向偏角 ${directionOffset > 0 ? "+" : ""}${directionOffset.toFixed(1)}°`
-    : "";
+  const writingDetail = fullReplayMode()
+    ? chainSelection.full_replay_candidate_id || "已验证组合"
+    : selectionApi.describeWritingVariant(variant, chainSelection, trajectoryChoices);
+  const runningWithoutChain = state.phase === "running"
+    && !fullReplayMode() && Boolean(variant.selected_trajectory_id);
   const cadence = ` · 抓笔周期 ${Number(state.task_chain_episodes_since_grasp_adjustment || 0)}/${Number(state.task_chain_grasp_adjustment_interval || 10)}`;
-  text(
-    "task-chain-selection",
-    Object.keys(chainSelection).length
-      ? `本轮组合：池中第 ${Number(chainIndex) + 1} 条 · ${chainSelection.trajectory_id || chainSelection.full_replay_candidate_id || "已验证组合"}${directionDetail}${resolvedSources}${cadence}`
-      : `尚未选择本轮轨迹${cadence}。`,
-  );
+  let selectionText = `尚未选择本轮轨迹${cadence}。`;
+  if (Object.keys(chainSelection).length) {
+    selectionText = `本轮组合：池中第 ${Number(chainIndex) + 1} 条 · ${writingDetail}${resolvedSources}${cadence}`;
+  } else if (runningWithoutChain) {
+    selectionText = `当前${writingDetail}${resolvedSources}${cadence}`;
+  }
+  text("task-chain-selection", selectionText);
   const chainButton = document.getElementById("task-chain-advance");
   chainButton.disabled = !state.task_chain_can_advance
     || configurationDirty

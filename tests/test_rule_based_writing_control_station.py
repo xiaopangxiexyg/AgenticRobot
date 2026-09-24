@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+import shutil
+import subprocess
+from pathlib import Path
+from urllib.request import urlopen
 
 import pytest
 
@@ -12,15 +15,15 @@ from control_station.rule_based_writing import (
     RuleWritingTaskChain,
     RuleWritingTaskChainPhase,
 )
-from teleop_runtime.real_teleop.rule_based_writing_plan import (
-    RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
-)
 from dataset_interface.episode_exclusion import (
     DECISIONS_RELATIVE_PATH,
     read_episode_exclusions,
     set_episode_excluded,
 )
 from dataset_interface.metadata import DexTeleopDatasetIndex
+from teleop_runtime.real_teleop.rule_based_writing_plan import (
+    RULE_BASED_RANDOM_SOURCE_SELECTION_ID,
+)
 
 
 def test_rule_gui_exclusion_requires_completed_episode_intent() -> None:
@@ -2563,3 +2566,64 @@ def test_gripper_status_distinguishes_topology_from_lifecycle_availability() -> 
     assert "夹爪已配置" in script
     assert "当前安全/Session 阶段不允许独立控制" in script
     assert "夹爪独立控制：当前拓扑未启用" in script
+
+
+def test_rule_ui_displays_actual_random_writing_instead_of_configured_default() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the browser selection contract")
+    selection_script = (
+        Path(__file__).parents[1]
+        / "control_station/rule_based_writing/static/selection.js"
+    )
+    choices = [{"value": "digit_2_v1", "label": "数字 2"}]
+    configured = {"trajectory_id": "digit_1_v1"}
+    variants = [
+        {"selected_trajectory_id": "digit_2_v1", "selected_direction": "left",
+         "selected_direction_deviation_deg": 12.4, "selected_size_m": 0.072},
+        {"selected_trajectory_id": "digit_9_v1", "selected_direction": "down",
+         "selected_direction_deviation_deg": -8.1, "selected_size_m": 0.065},
+        {"selected_trajectory_id": "latin_a_v1", "selected_direction": "up",
+         "selected_direction_deviation_deg": 0.0, "selected_size_m": 0.06},
+        {},
+    ]
+    script = (
+        "const selection=require(process.argv[1]);"
+        "const [variants,configured,choices]=JSON.parse(process.argv[2]);"
+        "process.stdout.write(JSON.stringify(variants.map(variant=>"
+        "selection.describeWritingVariant(variant,configured,choices))));"
+    )
+    result = subprocess.run(
+        [node, "-e", script, str(selection_script),
+         json.dumps([variants, configured, choices])],
+        check=True, capture_output=True, text=True,
+    )
+    first, second, letter, unresolved = json.loads(result.stdout)
+    assert "实际书写：数字 2（digit_2_v1）" in first
+    assert "方向 向左（偏角 +12.4°）" in first
+    assert "字高 0.072m" in first
+    assert "实际书写：数字 9（digit_9_v1）" in second
+    assert "方向 向下（偏角 -8.1°）" in second
+    assert "实际书写：字母 A（latin_a_v1）" in letter
+    assert "实际书写待确定（配置默认 digit_1_v1）" == unresolved
+
+
+def test_rule_ui_serves_selected_writing_display_before_app() -> None:
+    ui = RuleBasedWritingWebUi(port=0, open_browser=False)
+    ui.start()
+    try:
+        with urlopen(ui.url, timeout=2.0) as response:
+            html = response.read().decode("utf-8")
+        with urlopen(f"{ui.url}selection.js", timeout=2.0) as response:
+            selection_script = response.read().decode("utf-8")
+    finally:
+        ui.close()
+    assert html.index('<script src="/selection.js"></script>') < html.index(
+        '<script src="/app.js"></script>'
+    )
+    assert "RuleWritingSelection" in selection_script
+    app = (
+        Path(__file__).parents[1]
+        / "control_station/rule_based_writing/static/app.js"
+    ).read_text(encoding="utf-8")
+    assert "selectionApi.describeWritingVariant(variant, chainSelection, trajectoryChoices)" in app
