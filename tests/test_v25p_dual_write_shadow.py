@@ -19,17 +19,22 @@ from collection_runtime.v25p_producer import V25pProducedSample
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.v22 import PolicyIOLayout
-from dataset_contracts.v25p_native_storage import V25P_PARQUET_CHUNK_LAYOUT_V1
+from dataset_contracts.v25p_native_storage import (
+    V25P_PARQUET_CHUNK_LAYOUT_V1,
+    V25P_RECORD_CJSON_LAYOUT_V1,
+)
 from dataset_interface.v25p_native import V25pNativeReadError, load_v25p_native_episode
 from dataset_interface.v25p_v23_adapter import project_native_episode_to_v23_rows
 from teleop_runtime.collection import v25p_dual_write_shadow as shadow_module
 from teleop_runtime.collection.v25p_capture_profiles import (
     V25P_REAL_TELEOP_SOURCE,
+    V25P_UMI_SOURCE,
     build_policy_io_v25p_capture_profiles,
 )
 from teleop_runtime.collection.v25p_dual_write_shadow import (
     V25pDualWriteShadow,
     append_shadow_from_legacy_jobs,
+    build_policy_io_v25p_shadow,
     finalize_shadow_after_legacy,
 )
 
@@ -37,6 +42,108 @@ POSE_HASH = canonical_content_hash(
     {"name": "shadow_test_pose_frames"},
     domain="test.v25p.dual_write_shadow.v1",
 )
+
+
+@pytest.mark.parametrize("source", (V25P_REAL_TELEOP_SOURCE, V25P_UMI_SOURCE))
+@pytest.mark.parametrize(
+    "storage_layout", (V25P_RECORD_CJSON_LAYOUT_V1, V25P_PARQUET_CHUNK_LAYOUT_V1)
+)
+@pytest.mark.parametrize("sides", (None, ("left",), ("right",), ("right", "left")))
+def test_builtin_shadow_binds_one_profile_bundle_without_starting_episode(
+    tmp_path, source, storage_layout, sides
+) -> None:
+    from teleop_runtime.collection.umi.v25p_producer import UmiV25pProducer
+    from teleop_runtime.collection.v25p_real_teleop_producer import (
+        RealTeleopV25pProducer,
+    )
+
+    layout = PolicyIOLayout(name="builtin_shadow_no_end_effector")
+    expected = build_policy_io_v25p_capture_profiles(
+        source=source,
+        layout=layout,
+        pose_frame_contract_hash=POSE_HASH,
+        component_sides=sides,
+    )
+    shadow = build_policy_io_v25p_shadow(
+        source=source,
+        layout=layout,
+        dataset_root=tmp_path,
+        dataset_id="builtin-shadow",
+        pose_frame_contract_hash=POSE_HASH,
+        physical_storage_layout=storage_layout,
+        component_sides=sides,
+    )
+    assert shadow.bundle == expected
+    assert shadow.store.dataset_root == tmp_path
+    assert shadow.store.dataset_id == "builtin-shadow"
+    assert shadow.store.embodiment_profile is shadow.bundle.embodiment
+    assert shadow.store.component_stream_profile is shadow.bundle.streams
+    assert shadow.store.compatibility_projection_profiles == (expected.v23_projection,)
+    assert shadow.store.physical_storage_layout == storage_layout
+    assert shadow.store.defer_sample_file_writes is (
+        storage_layout == V25P_RECORD_CJSON_LAYOUT_V1
+    )
+    assert shadow.producer.stream_profile is shadow.bundle.streams
+    assert shadow.producer.bindings is shadow.bundle.producer_bindings
+    assert shadow.producer.component_action_schema is shadow.bundle.component_action_schema
+    assert shadow.producer.component_action_projection is shadow.bundle.component_action_projection
+    if source == V25P_REAL_TELEOP_SOURCE:
+        assert isinstance(shadow.producer, RealTeleopV25pProducer)
+        assert shadow.producer.layout is layout
+        assert shadow.producer.strict is True
+        assert shadow.producer.clock_domain_id == "local_wall_time"
+    else:
+        assert isinstance(shadow.producer, UmiV25pProducer)
+        assert shadow.producer.cut_clock_domain_id == "local_wall_time"
+    assert shadow.active_identity is None
+    assert not shadow.store.episode_root.exists()
+
+
+@pytest.mark.parametrize("source", (V25P_REAL_TELEOP_SOURCE, V25P_UMI_SOURCE))
+@pytest.mark.parametrize("failure_stage", ("profiles", "store", "producer", "shadow"))
+def test_builtin_shadow_preserves_construction_failure_order(
+    tmp_path, monkeypatch, source, failure_stage
+) -> None:
+    from teleop_runtime.collection import v25p_real_teleop_producer
+    from teleop_runtime.collection.umi import v25p_producer as umi_producer
+
+    failure = RuntimeError(f"{failure_stage} failed")
+    calls = []
+
+    def observe(module, name, stage):
+        construct = getattr(module, name)
+
+        def observed(**kwargs):
+            calls.append(stage)
+            if stage == failure_stage:
+                raise failure
+            return construct(**kwargs)
+
+        monkeypatch.setattr(module, name, observed)
+
+    observe(shadow_module, "build_policy_io_v25p_capture_profiles", "profiles")
+    observe(shadow_module, "ComponentCaptureEpisodeStore", "store")
+    if source == V25P_REAL_TELEOP_SOURCE:
+        observe(v25p_real_teleop_producer, "RealTeleopV25pProducer", "producer")
+    else:
+        observe(umi_producer, "UmiV25pProducer", "producer")
+    observe(shadow_module, "V25pDualWriteShadow", "shadow")
+
+    with pytest.raises(RuntimeError) as raised:
+        build_policy_io_v25p_shadow(
+            source=source,
+            layout=PolicyIOLayout(name="construction_failure"),
+            dataset_root=tmp_path,
+            dataset_id="builtin-shadow",
+            pose_frame_contract_hash=POSE_HASH,
+            physical_storage_layout=V25P_RECORD_CJSON_LAYOUT_V1,
+        )
+    assert raised.value is failure
+    stages = ["profiles", "store", "producer", "shadow"]
+    assert calls == stages[: stages.index(failure_stage) + 1]
+    assert (tmp_path / "meta/v25p/native").exists() is (
+        failure_stage in {"producer", "shadow"}
+    )
 
 
 class _Producer:

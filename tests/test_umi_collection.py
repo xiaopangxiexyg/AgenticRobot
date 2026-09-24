@@ -20,9 +20,14 @@ from control_station.umi.application_policy import (
     DEFAULT_STATION_UMI_OPERATOR_POLICY,
 )
 from control_station.umi_application import (
+    _run_collection_session,
     run_umi_collection as run_station_umi_collection,
 )
 from dataset_contracts.v23_validation import validate_v23_row_causal_snapshots
+from dataset_contracts.v25p_native_storage import (
+    V25P_PARQUET_CHUNK_LAYOUT_V1,
+    V25P_RECORD_CJSON_LAYOUT_V1,
+)
 from teleop_runtime.collection.operator_labels import (
     LABEL_FIX_ARM,
     LABEL_INIT_ARM,
@@ -110,6 +115,61 @@ def test_umi_runtime_factories_are_injectable_without_changing_cli_defaults():
         DEFAULT_STATION_UMI_OPERATOR_POLICY,
         UmiOperatorPolicyPort,
     )
+
+
+@pytest.mark.parametrize("enabled", (False, True))
+@pytest.mark.parametrize(
+    "storage_layout", (V25P_RECORD_CJSON_LAYOUT_V1, V25P_PARQUET_CHUNK_LAYOUT_V1)
+)
+def test_umi_application_binds_shadow_only_when_enabled(
+    tmp_path, monkeypatch, enabled, storage_layout
+) -> None:
+    from dataset_contracts.v22 import PolicyIOLayout
+    from teleop_runtime.collection.umi.v25p_producer import UmiV25pProducer
+
+    config = SimpleNamespace(
+        dataset_root=tmp_path,
+        task_id="umi-shadow-binding",
+        v25p_native_shadow=enabled,
+        v25p_native_storage_layout=storage_layout,
+    )
+    calibrations = SimpleNamespace(
+        desk=SimpleNamespace(
+            T_vive_world_to_desk=np.eye(4),
+            pose_frame_contract=lambda: SimpleNamespace(contract_hash="a" * 64),
+        ),
+        T_tcp_to_tracker_by_side={},
+        by_side={},
+    )
+    received = {}
+    reached_recorder = RuntimeError("stop before device construction")
+
+    def capture_recorder(**kwargs):
+        received.update(kwargs)
+        raise reached_recorder
+
+    monkeypatch.setattr("control_station.umi_application.UmiDatasetRecorder", capture_recorder)
+    with pytest.raises(RuntimeError) as raised:
+        _run_collection_session(
+            config=config,
+            calibrations=calibrations,
+            layout=PolicyIOLayout(name="umi_shadow_binding"),
+            ui=None,
+            prepared_hardware=None,
+            component_builder=lambda *_args, **_kwargs: pytest.fail("device construction"),
+            pose_adapter_builder=lambda **_kwargs: object(),
+        )
+    assert raised.value is reached_recorder
+    shadow = received["v25p_native_shadow"]
+    if enabled:
+        assert isinstance(shadow.producer, UmiV25pProducer)
+        assert shadow.store.dataset_root == tmp_path
+        assert shadow.store.dataset_id == "umi:umi-shadow-binding"
+        assert shadow.store.physical_storage_layout == storage_layout
+        assert shadow.active_identity is None
+    else:
+        assert shadow is None
+        assert not (tmp_path / "meta").exists()
 
 
 def test_umi_component_bundle_exposes_backend_neutral_ports():

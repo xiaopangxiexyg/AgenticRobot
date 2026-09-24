@@ -10,7 +10,6 @@ from __future__ import annotations
 import time
 from typing import Callable
 
-from dataset_contracts.v25p_native_storage import V25P_RECORD_CJSON_LAYOUT_V1
 from dataset_interface.policy_io_layout import load_policy_io_layout
 from robot_motion.runtime.lifecycle import run_best_effort_cleanup
 
@@ -225,40 +224,18 @@ def _run_collection_session(
     labels = OperatorLabelStateMachine()
     v25p_native_shadow = None
     if config.v25p_native_shadow:
-        from teleop_runtime.collection.v25p_capture_profiles import (
-            V25P_UMI_SOURCE,
-            build_policy_io_v25p_capture_profiles,
+        from teleop_runtime.collection.v25p_capture_profiles import V25P_UMI_SOURCE
+        from teleop_runtime.collection.v25p_dual_write_shadow import (
+            build_policy_io_v25p_shadow,
         )
-        from teleop_runtime.collection.v25p_dual_write_shadow import V25pDualWriteShadow
-        from collection_runtime.component_capture import ComponentCaptureEpisodeStore
-        from teleop_runtime.collection.umi.v25p_producer import UmiV25pProducer
 
-        bundle = build_policy_io_v25p_capture_profiles(
+        v25p_native_shadow = build_policy_io_v25p_shadow(
             source=V25P_UMI_SOURCE,
             layout=layout,
-            pose_frame_contract_hash=calibration.pose_frame_contract().contract_hash,
-        )
-        store = ComponentCaptureEpisodeStore(
             dataset_root=config.dataset_root,
             dataset_id=f"umi:{config.task_id}",
-            embodiment_profile=bundle.embodiment,
-            component_stream_profile=bundle.streams,
-            compatibility_projection_profiles=(bundle.v23_projection,),
+            pose_frame_contract_hash=calibration.pose_frame_contract().contract_hash,
             physical_storage_layout=config.v25p_native_storage_layout,
-            defer_sample_file_writes=(
-                config.v25p_native_storage_layout
-                == V25P_RECORD_CJSON_LAYOUT_V1
-            ),
-        )
-        v25p_native_shadow = V25pDualWriteShadow(
-            store=store,
-            bundle=bundle,
-            producer=UmiV25pProducer(
-                stream_profile=bundle.streams,
-                bindings=bundle.producer_bindings,
-                component_action_schema=bundle.component_action_schema,
-                component_action_projection=bundle.component_action_projection,
-            ),
         )
     recorder = UmiDatasetRecorder(
         config=config,

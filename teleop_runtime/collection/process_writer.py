@@ -910,51 +910,21 @@ def _worker_main(
             publish_startup_progress("initialize_native_shadow")
             if writer_config.policy_io_layout is None:
                 raise ValueError("v2.5-p native shadow requires a policy-I/O layout.")
-            from .v25p_capture_profiles import (
-                V25P_REAL_TELEOP_SOURCE,
-                build_policy_io_v25p_capture_profiles,
-            )
+            from .v25p_capture_profiles import V25P_REAL_TELEOP_SOURCE
             from .v25p_dual_write_shadow import (
-                V25pDualWriteShadow,
                 append_shadow_from_legacy_jobs,
+                build_policy_io_v25p_shadow,
                 finalize_shadow_after_legacy,
             )
-            from collection_runtime.component_capture import (
-                ComponentCaptureEpisodeStore,
-            )
-            from .v25p_real_teleop_producer import RealTeleopV25pProducer
 
-            bundle = build_policy_io_v25p_capture_profiles(
+            v25p_native_shadow = build_policy_io_v25p_shadow(
                 source=V25P_REAL_TELEOP_SOURCE,
                 layout=writer_config.policy_io_layout,
+                dataset_root=writer_config.root_dir,
+                dataset_id=v25p_shadow_config.dataset_id,
                 pose_frame_contract_hash=v25p_shadow_config.pose_frame_contract_hash,
+                physical_storage_layout=v25p_shadow_config.physical_storage_layout,
                 component_sides=tuple(sample_builder_config.active_sides),
-            )
-            v25p_native_shadow = V25pDualWriteShadow(
-                store=ComponentCaptureEpisodeStore(
-                    dataset_root=writer_config.root_dir,
-                    dataset_id=v25p_shadow_config.dataset_id,
-                    embodiment_profile=bundle.embodiment,
-                    component_stream_profile=bundle.streams,
-                    compatibility_projection_profiles=(bundle.v23_projection,),
-                    physical_storage_layout=(
-                        v25p_shadow_config.physical_storage_layout
-                    ),
-                    defer_sample_file_writes=(
-                        v25p_shadow_config.physical_storage_layout
-                        == V25P_RECORD_CJSON_LAYOUT_V1
-                    ),
-                ),
-                bundle=bundle,
-                producer=RealTeleopV25pProducer(
-                    layout=writer_config.policy_io_layout,
-                    stream_profile=bundle.streams,
-                    bindings=bundle.producer_bindings,
-                    component_action_schema=bundle.component_action_schema,
-                    component_action_projection=(
-                        bundle.component_action_projection
-                    ),
-                ),
             )
         publish_startup_progress("initialize_sample_builder")
         detached_builder_config = replace(

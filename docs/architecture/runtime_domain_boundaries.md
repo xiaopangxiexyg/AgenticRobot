@@ -59,6 +59,9 @@ lower domains must not import application/profile layers
 影子失败不改写正式保存结果；UMI 仍提交与 Writer 相同的下一帧动作对齐样本。
 有状态的入口通过窄回调在清理前发布操作错误，清理失败再追加错误；新报告在读取 receipt 前
 交给任务，操作未返回新报告时不清空既有报告。抽取共用逻辑不能改变这些状态发布时点。
+三种入口的内置 policy-I/O shadow 也由该模块统一构造，同一组 capture profiles 同时绑定
+store、producer 和投影；保留 real-teleop 与 UMI 各自的动作时序语义。启用条件、数据集身份、
+参与侧和存储格式仍由调用方明确传入，不新增 episode owner 或第二套配置状态。
 
 真实遥操的正式 writer 由 `EpisodeRecordingRuntime` 的异步准备／数据集选择事务构造，
 ready 后才发布；配置未变的 ready recorder 直接复用，不重新扫描已封存数据。全局启动不构造
