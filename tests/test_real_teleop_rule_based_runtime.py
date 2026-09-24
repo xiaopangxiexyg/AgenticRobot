@@ -60,6 +60,7 @@ from teleop_runtime.real_teleop.rule_based_writing_plan import (
     CalibratedHeightDescentActionSource,
 )
 from teleop_runtime.real_teleop import rule_based_runtime as rule_runtime_module
+from teleop_runtime.real_teleop.writing_contact_point import contact_height_from_tool_tcp
 from teleop_runtime.real_teleop.runtime_extension import (
     RealTeleopDatasetSampleAdmission,
     runtime_extension_allows_active_episode_bootstrap_without_dispatch,
@@ -2276,6 +2277,42 @@ def test_height_calibration_rebase_never_rearms_stopped_arm() -> None:
         )
 
 
+def test_correct_tcp_height_capture_requires_measured_profile_and_uses_tip() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        config=RuleBasedRealTeleopConfig(correct_tcp=True),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    canonical = _pose(0.2, 0.1, 0.30)
+    raw = extension.runtime_pose_frame_contract.canonical_desk_pose_vector_to_storage(
+        canonical, side="right"
+    )
+    state = {
+        "current_tcp_pose": _matrix(raw),
+        "measured_timestamp": 10.0,
+        "tool_tcp_pose_flange_m_rad": np.array([0, 0, 0.14, 0, 0, 0]),
+    }
+    extension._commit_writing_height(
+        state, now=10.1, requested_at=9.9,
+        lower_tolerance_m=0.001, upper_tolerance_m=0.001,
+    )
+    assert extension._height_calibration.calibrated_z_m == pytest.approx(0.36)
+    assert extension._height_calibration.to_metadata()["contact_offset_tool_tcp_m"] == pytest.approx(0.06)
+
+    extension._height_calibration = None
+    state["tool_tcp_pose_flange_m_rad"] = np.array([0, 0, 0.20, 0, 0, 0])
+    with pytest.raises(RuntimeError, match="--correct-tcp requires"):
+        extension._commit_writing_height(
+            state, now=10.1, requested_at=9.9,
+            lower_tolerance_m=0.001, upper_tolerance_m=0.001,
+        )
+    assert extension._height_calibration is None
+
+
 def test_writing_replay_height_projection_is_lower_floor_only_and_opt_in() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -2347,6 +2384,37 @@ def test_writing_replay_height_projection_is_lower_floor_only_and_opt_in() -> No
         pen_up.action.arm_pose_by_side["right"],
     )
     assert unbounded_above.action.metadata["rule_based_height_clipped"] is False
+
+
+def test_correct_tcp_replay_projection_preserves_tool_command_frame() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedReplay(
+                step_id="right_write.pen_down", group_key="source",
+                start_index=0, end_index=1,
+            ),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    original = extension.adapter.next_runtime(None)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.60,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=None,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+        contact_offset_tool_tcp_m=0.06,
+    )
+    projected = extension._project_writing_replay_height(original)
+    pose = extension.runtime_pose_frame_contract.storage_pose_vector_to_canonical_desk(
+        projected.action.arm_pose_by_side["right"], side="right"
+    )
+    assert contact_height_from_tool_tcp(pose) == pytest.approx(0.599)
+    assert projected.action.controlled_frame_by_effector["right_arm"] == "tool_tcp"
+    assert projected.action.metadata["rule_based_height_calibration"]["contact_offset_tool_tcp_m"] == pytest.approx(0.06)
 
 
 def test_calibrated_height_descent_uses_existing_coupled_safety_and_admission() -> None:

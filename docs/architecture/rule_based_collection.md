@@ -1,5 +1,11 @@
 # Rule-based collection boundary
 
+## 可回退的书写接触点校正
+
+书写专用启动脚本可选 `--correct-tcp`。默认不启用，普通遥操和原有规则采集仍使用右臂 DMTAC_M 配置的法兰局部 +Z 0.14 m `tool_tcp`。启用后，高度标定以法兰局部 +Z 0.20 m 的实际夹具末端为参考；书写、落笔下降、靠近/离开阶段的高度下限和对应可达性预检，都先按当前姿态把夹具末端高度换算成原有 `tool_tcp` 的目标。命令的受控坐标系仍是 `tool_tcp`，继续由原有 IK、碰撞、位置与受力安全链路处理。数据中的高度标定元数据会标出夹具末端参考系与 0.06 m 偏移。
+
+该开关要求右臂实测状态报告的工具 TCP 仍为法兰局部 `[0, 0, 0.14, 0, 0, 0]`；不符或缺失时标定拒绝继续。移除开关并重新采集高度即可回到原行为，不应把两种几何定义的数据混入同一任务名。离线检查不证明新增夹具的碰撞几何已经被现有代理模型覆盖；现场运动前仍须确认夹具与桌面、相机杆及双臂的间隙，并由操作员按安全流程验收。
+
 The rule-based collector is a small plan-composition seam for collection
 workflows that need a deterministic combination of existing operations, for
 example:

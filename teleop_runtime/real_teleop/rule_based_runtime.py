@@ -83,6 +83,13 @@ from .rule_based_initial_alignment import (
     rule_based_initial_alignment_command_fault,
 )
 from .runtime_extension import RealTeleopDatasetSampleAdmission
+from .writing_contact_point import (
+    RIGHT_CONTACT_FRAME,
+    RIGHT_CONTACT_OFFSET_TOOL_TCP_M,
+    contact_height_from_tool_tcp,
+    require_right_tool_tcp_profile,
+    tool_tcp_z_for_contact_height,
+)
 
 RULE_BASED_REAL_TELEOP_SCHEMA_V1 = "dexteleop.rule_based_real_teleop.v1"
 
@@ -237,6 +244,7 @@ class RuleBasedRealTeleopConfig:
     minimum_stage_sample_coverage: float = 0.8
     minimum_stage_sample_count: int = 2
     pause_hold_max_joint_delta_rad: float = math.radians(0.75)
+    correct_tcp: bool = False
 
     def __post_init__(self) -> None:
         if self.action_hz is not None and (
@@ -335,7 +343,10 @@ class RuleBasedRealTeleopConfig:
 
 @dataclass(frozen=True)
 class RuleBasedWritingHeightCalibration:
-    """One operator-captured right tool-TCP height in canonical desk space."""
+    """Captured right writing height in canonical desk space.
+
+    The reference is tool_tcp by default, or the opt-in physical fixture tip.
+    """
 
     calibrated_z_m: float
     lower_tolerance_m: float
@@ -346,6 +357,7 @@ class RuleBasedWritingHeightCalibration:
     frame: str = CANONICAL_DESK_ACTION_FRAME
     side: str = "right"
     enabled: bool = True
+    contact_offset_tool_tcp_m: float = 0.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -369,6 +381,10 @@ class RuleBasedWritingHeightCalibration:
             raise ValueError("writing height calibration must bind right canonical_desk TCP.")
         if not str(self.pose_frame_contract_hash).strip():
             raise ValueError("pose_frame_contract_hash must be non-empty.")
+        if not np.isfinite(self.contact_offset_tool_tcp_m) or self.contact_offset_tool_tcp_m not in (
+            0.0, RIGHT_CONTACT_OFFSET_TOOL_TCP_M
+        ):
+            raise ValueError("unsupported writing contact-point offset")
 
     @property
     def lower_bound_z_m(self) -> float:
@@ -379,7 +395,7 @@ class RuleBasedWritingHeightCalibration:
         return float(self.calibrated_z_m + self.upper_tolerance_m)
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "enabled": bool(self.enabled),
             "side": self.side,
             "frame": self.frame,
@@ -394,6 +410,14 @@ class RuleBasedWritingHeightCalibration:
             ),
             "pose_frame_contract_hash": self.pose_frame_contract_hash,
         }
+        if self.contact_offset_tool_tcp_m:
+            metadata.update(
+                {
+                    "height_reference_frame": RIGHT_CONTACT_FRAME,
+                    "contact_offset_tool_tcp_m": self.contact_offset_tool_tcp_m,
+                }
+            )
+        return metadata
 
 
 @dataclass(frozen=True)
@@ -1947,13 +1971,22 @@ class RuleBasedRealTeleopExtension:
             raise RuntimeError(
                 "右臂实测状态早于本次标定请求，拒绝使用陈旧 TCP。"
             )
+        if self.config.correct_tcp:
+            require_right_tool_tcp_profile(state)
         captured = RuleBasedWritingHeightCalibration(
-            calibrated_z_m=float(canonical[2]),
+            calibrated_z_m=(
+                contact_height_from_tool_tcp(canonical)
+                if self.config.correct_tcp
+                else float(canonical[2])
+            ),
             lower_tolerance_m=float(lower_tolerance_m),
             upper_tolerance_m=float(upper_tolerance_m),
             captured_at=float(now),
             source_timestamp=float(source_timestamp),
             pose_frame_contract_hash=self.runtime_pose_frame_contract.contract_hash,
+            contact_offset_tool_tcp_m=(
+                RIGHT_CONTACT_OFFSET_TOOL_TCP_M if self.config.correct_tcp else 0.0
+            ),
         )
         self._height_calibration = captured
         self._invalidate_writing_reachability_preflight()
@@ -1963,10 +1996,13 @@ class RuleBasedRealTeleopExtension:
         self._writing_height_target_z_m = None
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
+            label = (
+                "右臂 20 cm 夹具末端高度标定成功："
+                if self.config.correct_tcp else "右臂 TCP 高度标定成功："
+            )
             append_message(
                 "RuleBasedWriting",
-                "右臂 TCP 高度标定成功："
-                f"canonical_desk Z={captured.calibrated_z_m:.6f}m，"
+                label + f"canonical_desk Z={captured.calibrated_z_m:.6f}m，"
                 f"安全带=[{captured.lower_bound_z_m:.6f}, "
                 f"{captured.upper_bound_z_m:.6f}]m。",
             )
@@ -3836,10 +3872,13 @@ class RuleBasedRealTeleopExtension:
         ):
             raise RuntimeError("writing replay has an invalid right TCP action.")
         target_canonical = source_canonical.copy()
-        target_canonical[2] = max(
-            float(target_canonical[2]),
-            calibration.lower_bound_z_m,
-        )
+        if calibration.contact_offset_tool_tcp_m:
+            contact_z = contact_height_from_tool_tcp(target_canonical)
+            target_canonical[2] += max(0.0, calibration.lower_bound_z_m - contact_z)
+        else:
+            target_canonical[2] = max(
+                float(target_canonical[2]), calibration.lower_bound_z_m
+            )
         clipped = not math.isclose(
             float(target_canonical[2]),
             float(source_canonical[2]),
@@ -3868,6 +3907,17 @@ class RuleBasedRealTeleopExtension:
                 "rule_based_height_clipped": bool(clipped),
             }
         )
+        if calibration.contact_offset_tool_tcp_m:
+            metadata.update(
+                {
+                    "rule_based_contact_source_z_m": contact_height_from_tool_tcp(
+                        source_canonical
+                    ),
+                    "rule_based_contact_target_z_m": contact_height_from_tool_tcp(
+                        target_canonical
+                    ),
+                }
+            )
         action = replace(
             emission.action,
             arm_pose_by_side={
@@ -7185,6 +7235,7 @@ class RuleBasedRealTeleopExtension:
             str(pen_up.get("source_contract_hash") or ""),
             str(catalog.get("combined_sha256") or ""),
             float(calibration.upper_bound_z_m),
+            float(calibration.contact_offset_tool_tcp_m),
         )
 
     def _writing_reachability_passed_for_current_selection(self) -> bool:
@@ -7351,8 +7402,22 @@ class RuleBasedRealTeleopExtension:
                 ).reshape(7)
             )
             right_pose = np.asarray(right_pose, dtype=float).copy()
-            if not str(raw_probe.get("name") or "").startswith("pen_up_"):
-                right_pose[2, 3] = float(calibration.upper_bound_z_m)
+            pen_up_probe = str(raw_probe.get("name") or "").startswith("pen_up_")
+            if not pen_up_probe:
+                probe_pose = pose_matrix_to_xyzquat(right_pose)
+                if calibration.contact_offset_tool_tcp_m:
+                    right_pose[2, 3] = tool_tcp_z_for_contact_height(
+                        probe_pose, calibration.upper_bound_z_m
+                    )
+                else:
+                    right_pose[2, 3] = float(calibration.upper_bound_z_m)
+            elif calibration.contact_offset_tool_tcp_m:
+                probe_pose = pose_matrix_to_xyzquat(right_pose)
+                right_pose[2, 3] += max(
+                    0.0,
+                    calibration.lower_bound_z_m
+                    - contact_height_from_tool_tcp(probe_pose),
+                )
             # Mirror the formal execution path in _coupled_pose_emission:
             # canonical desk -> runtime arm base -> calibrated solver world ->
             # solver endpoint.  Feeding canonical desk directly to the solver

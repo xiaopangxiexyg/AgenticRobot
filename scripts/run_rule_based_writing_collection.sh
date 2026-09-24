@@ -50,6 +50,10 @@ Options:
                               relative pen-up midpoint/end IK/collision checks
                               before each Episode; unreachable
                               random candidates are skipped without opening data.
+  --correct-tcp             Writing mode only; use the physical right fixture
+                              tip at flange +Z 20 cm for height calibration and
+                              writing-height targets. Default remains the
+                              existing 14 cm tool TCP; remove flag to revert.
   --speed-m-s MPS             Writing mode only; override source average speed.
   --initial-alignment-speed-scale S
                               Initial dual-arm alignment speed multiplier in (0, 1].
@@ -142,6 +146,7 @@ RANDOM_DIRECTIONS=""
 RANDOM_DIRECTION_DEVIATION_DEG="45"
 RANDOM_SIZE_RANGE=""
 WRITING_REACHABILITY_CHECK=0
+CORRECT_TCP=0
 SPEED_M_S=""
 INITIAL_ALIGNMENT_SPEED_SCALE="1.0"
 LEFT_GRIPPER_PORT=""
@@ -248,6 +253,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --writing-reachability-check)
       WRITING_REACHABILITY_CHECK=1
+      shift
+      ;;
+    --correct-tcp)
+      CORRECT_TCP=1
       shift
       ;;
     --with-left-gripper)
@@ -457,6 +466,12 @@ if [[ "$COLLECTION_MODE" == "rule-based-writing" ]]; then
   if [[ "$WRITING_REACHABILITY_CHECK" -eq 1 ]]; then
     RULE_ARGS+=(--rule-writing-reachability-check)
   fi
+  if [[ "$CORRECT_TCP" -eq 1 ]]; then
+    RULE_ARGS+=(--rule-writing-correct-tcp)
+  fi
+fi
+if [[ "$CORRECT_TCP" -eq 1 && "$COLLECTION_MODE" != "rule-based-writing" ]]; then
+  die "--correct-tcp is only valid in rule-based-writing mode."
 fi
 if [[ -n "$SOURCE_POOL_MANIFEST" ]]; then
   RULE_ARGS+=(

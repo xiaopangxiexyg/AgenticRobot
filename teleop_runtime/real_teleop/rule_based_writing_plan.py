@@ -98,6 +98,10 @@ from teleop_runtime.real_teleop.rule_based_runtime import (
     RuleBasedRealTeleopExtension,
     preflight_rule_based_real_teleop_deployment,
 )
+from teleop_runtime.real_teleop.writing_contact_point import (
+    contact_height_from_tool_tcp,
+    tool_tcp_z_for_contact_height,
+)
 from teleop_runtime.replay.dataset import LoadedReplayEpisode, ReplayDatasetIndex
 
 DETAIL_PROGRESS_STEP_ID = "right_write"
@@ -580,6 +584,16 @@ def add_rule_based_writing_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Before each Episode, certify the four centerline/bounding-box contact "
             "points with a command-inert copy of the production IK/collision solver."
+        ),
+    )
+    group.add_argument(
+        "--correct-tcp", "--rule-writing-correct-tcp",
+        dest="rule_writing_correct_tcp",
+        action="store_true",
+        help=(
+            "Use the measured right fixture tip at flange +Z 0.20 m for writing "
+            "height; commands still target the existing 0.14 m tool_tcp. "
+            "Default is unchanged."
         ),
     )
     group.add_argument(
@@ -1179,6 +1193,7 @@ class FixedWritingActionSource:
         self.reference_hz = float(reference_hz)
         self._targets: list[Any] | None = None
         self._index = 0
+        self._height_calibration_metadata: dict[str, Any] = {}
 
     def start(self) -> None:
         return None
@@ -1191,6 +1206,7 @@ class FixedWritingActionSource:
 
         self._targets = None
         self._index = 0
+        self._height_calibration_metadata = {}
 
     def produce_action(self, observation: Any, *, context: Any = None) -> RobotAction:
         del observation
@@ -1210,14 +1226,23 @@ class FixedWritingActionSource:
                 side="right",
             )
             writing_height = context.get("writing_height_target_z_m")
+            height_calibration = context.get("writing_height_calibration")
+            if isinstance(height_calibration, Mapping):
+                self._height_calibration_metadata = dict(height_calibration)
+            correct_tcp = bool(
+                isinstance(height_calibration, Mapping)
+                and height_calibration.get("contact_offset_tool_tcp_m", 0.0)
+            )
             if writing_height is not None:
                 writing_height = float(writing_height)
                 if not np.isfinite(writing_height):
                     raise RuntimeError("fixed writing received a non-finite height target.")
                 right_desk = np.asarray(right_desk, dtype=float).reshape(7).copy()
-                right_desk[2] = writing_height
+                right_desk[2] = (
+                    tool_tcp_z_for_contact_height(right_desk, writing_height)
+                    if correct_tcp else writing_height
+                )
             else:
-                height_calibration = context.get("writing_height_calibration")
                 if isinstance(height_calibration, Mapping) and bool(
                     height_calibration.get("enabled", False)
                 ):
@@ -1227,7 +1252,13 @@ class FixedWritingActionSource:
                             "fixed writing received a non-finite calibrated lower bound."
                         )
                     right_desk = np.asarray(right_desk, dtype=float).reshape(7).copy()
-                    right_desk[2] = max(float(right_desk[2]), lower_bound)
+                    right_desk[2] += max(
+                        0.0,
+                        lower_bound - (
+                            contact_height_from_tool_tcp(right_desk)
+                            if correct_tcp else float(right_desk[2])
+                        ),
+                    )
             keyframes = build_fixed_trajectory_targets(
                 {
                     "left": self.left_hold_pose,
@@ -1280,6 +1311,11 @@ class FixedWritingActionSource:
             source="rule_based_fixed_writing",
             metadata={
                 **dict(target.metadata),
+                **(
+                    {"rule_based_height_calibration": self._height_calibration_metadata}
+                    if self._height_calibration_metadata.get("contact_offset_tool_tcp_m")
+                    else {}
+                ),
                 "rule_based_writing_trajectory_id": self.trajectory_id,
                 "rule_based_writing_direction": self.direction,
                 "rule_based_writing_size_m": self.scale_m,
@@ -1416,7 +1452,11 @@ class CalibratedHeightDescentActionSource:
                 raise RuntimeError(f"height descent received non-finite {side} TCP feedback.")
 
         upper_z = float(calibration["upper_bound_z_m"])
-        start_z = float(poses["right"][2])
+        correct_tcp = bool(calibration.get("contact_offset_tool_tcp_m", 0.0))
+        start_z = (
+            contact_height_from_tool_tcp(poses["right"])
+            if correct_tcp else float(poses["right"][2])
+        )
         if not np.isfinite(upper_z):
             raise RuntimeError("height descent received a non-finite upper bound.")
         distance = start_z - upper_z
@@ -1460,7 +1500,11 @@ class CalibratedHeightDescentActionSource:
             alpha = index / step_count
             blend = 10.0 * alpha**3 - 15.0 * alpha**4 + 6.0 * alpha**5
             right = poses["right"].copy()
-            right[2] = start_z - distance * blend
+            desired_z = start_z - distance * blend
+            right[2] = (
+                tool_tcp_z_for_contact_height(right, desired_z)
+                if correct_tcp else desired_z
+            )
             samples.append(
                 TimestampedMotionTarget(
                     timestamp=index / self.reference_hz,
@@ -3054,6 +3098,8 @@ def build_rule_based_writing(
         or RULE_COLLECTION_MODE_WRITING
     )
     if collection_mode == RULE_COLLECTION_MODE_FULL_REPLAY:
+        if getattr(args, "rule_writing_correct_tcp", False):
+            raise ValueError("--correct-tcp is only valid for rule-based writing")
         if getattr(args, "rule_writing_trajectory_catalog", None):
             raise ValueError(
                 "rule writing trajectory catalog is not valid in full replay mode."
@@ -3665,6 +3711,7 @@ def build_rule_based_writing(
             pre_pen_down_replay_normal_episodes=pre_pen_down_normal_episodes,
             gripper_sides=configured_gripper_sides,
             gripper_max_step=gripper_max_step,
+            correct_tcp=bool(getattr(args, "rule_writing_correct_tcp", False)),
         ),
         source_selection=source_selection,
         pre_pen_down_replay_plan=pre_pen_down_plan,
@@ -3785,6 +3832,8 @@ def build_rule_based_writing_extension(
         f"action_hz={build.writing_action_hz:.3f} "
         f"pose_contract={build.source_contract_hash} "
         f"selected_sources={selected_summary}"
+        + (" correct_tcp=right_flange_plus_z_0p20m"
+           if getattr(args, "rule_writing_correct_tcp", False) else "")
     )
     return build.extension
 
