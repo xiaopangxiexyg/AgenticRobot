@@ -111,11 +111,14 @@ def _close_failed_shadow(
     shadow: V25pDualWriteShadow,
     identity: EpisodeCaptureIdentity,
     error: str,
+    record_error: Callable[[str], None] | None,
 ) -> str:
     try:
         shadow.close_unsealed(identity)
     except BaseException as exc:  # noqa: BLE001 - Preserve the subordinate failure.
         error += f";close_unsealed:{type(exc).__name__}: {exc}"
+        if record_error is not None:
+            record_error(error)
     return error
 
 
@@ -125,8 +128,9 @@ def append_shadow_from_legacy_jobs(
     *,
     source_sample: Any,
     jobs: object,
+    record_error: Callable[[str], None] | None = None,
 ) -> str:
-    """Observe already planned jobs without vetoing authoritative capture."""
+    """Observe planned jobs, publishing an error before potentially slow cleanup."""
 
     try:
         shadow.append(
@@ -135,9 +139,10 @@ def append_shadow_from_legacy_jobs(
             legacy_row=legacy_row_from_planned_jobs(jobs),
         )
     except BaseException as exc:  # noqa: BLE001 - Legacy capture stays authoritative.
-        return _close_failed_shadow(
-            shadow, identity, f"append:{type(exc).__name__}: {exc}"
-        )
+        error = f"append:{type(exc).__name__}: {exc}"
+        if record_error is not None:
+            record_error(error)
+        return _close_failed_shadow(shadow, identity, error, record_error)
     return ""
 
 
@@ -150,6 +155,8 @@ def finalize_shadow_after_legacy(
     error_prefix: str = "finalize",
     incomplete_message: str = "v2.5-p compatibility projection failed",
     record_finalize_elapsed: Callable[[float], None] | None = None,
+    record_report: Callable[[V25pShadowFinalizeReport], None] | None = None,
+    record_error: Callable[[str], None] | None = None,
 ) -> tuple[V25pShadowFinalizeReport | None, str | None]:
     """Seal the subordinate shadow after its owner finalized the legacy row.
 
@@ -157,6 +164,9 @@ def finalize_shadow_after_legacy(
     and cleanup failures separately from the already committed legacy result;
     never close a different active identity. Timing excludes failure cleanup.
     A complete receipt returns no error update, preserving prior owner errors.
+    Owners can publish a returned report before its receipt is inspected, and
+    operational errors before cleanup. A failed operation never clears a report
+    the owner already holds; only a new return value triggers record_report.
     """
 
     report = None
@@ -175,15 +185,21 @@ def finalize_shadow_after_legacy(
             if record_finalize_elapsed is not None:
                 record_finalize_elapsed(time.perf_counter() - started_at)
         report = candidate_report
+        if record_report is not None:
+            record_report(report)
         error = (
             str(report.receipt.message or incomplete_message)
             if report.receipt.status != "complete"
             else None
         )
+        if error is not None and record_error is not None:
+            record_error(error)
     except BaseException as exc:  # noqa: BLE001 - Legacy finalization already succeeded.
         error = f"{error_prefix}:{type(exc).__name__}: {exc}"
+        if record_error is not None:
+            record_error(error)
         if shadow.active_identity == identity:
-            error = _close_failed_shadow(shadow, identity, error)
+            error = _close_failed_shadow(shadow, identity, error, record_error)
     return report, error
 
 

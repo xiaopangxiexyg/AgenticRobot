@@ -600,10 +600,10 @@ class UmiDatasetRecorder:
             and self._v25p_native_shadow_active
         ):
             error = append_shadow_from_legacy_jobs(
-                shadow, identity, source_sample=aligned, jobs=jobs
+                shadow, identity, source_sample=aligned, jobs=jobs,
+                record_error=lambda error: setattr(self, "_v25p_native_shadow_error", error),
             )
             if error:
-                self._v25p_native_shadow_error = error
                 self._v25p_native_shadow_active = False
         for job in jobs:
             self.pool.submit(job)
@@ -719,15 +719,14 @@ class UmiDatasetRecorder:
             and getattr(self, "_v25p_native_shadow_active", False)
         ):
             try:
-                _report, error = finalize_shadow_after_legacy(
+                finalize_shadow_after_legacy(
                     native_shadow,
                     identity,
                     dataset_root=self.writer.root_dir,
                     episode_index=index,
                     incomplete_message="",
+                    record_error=lambda error: setattr(self, "_v25p_native_shadow_error", error),
                 )
-                if error is not None:
-                    self._v25p_native_shadow_error = error
             finally:
                 self._v25p_native_shadow_active = False
         self.episode_index = None

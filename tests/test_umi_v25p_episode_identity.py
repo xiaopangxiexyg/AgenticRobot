@@ -127,6 +127,10 @@ def test_umi_native_shadow_observes_aligned_sample_without_replanning(append_fai
     recorder.pool.submit = Mock()
     if append_fails:
         shadow.append.side_effect = RuntimeError("shadow unavailable")
+    cleanup_observations = []
+    shadow.close_unsealed.side_effect = lambda _identity: cleanup_observations.append(
+        (recorder._v25p_native_shadow_error, recorder._v25p_native_shadow_active)
+    )
     sample = UmiSample(
         episode_index=episode_index, frame_index=0, timestamp=10.0,
         poses={"left": object(), "right": object()},
@@ -157,6 +161,7 @@ def test_umi_native_shadow_observes_aligned_sample_without_replanning(append_fai
     if append_fails:
         assert recorder._v25p_native_shadow_error == "append:RuntimeError: shadow unavailable"
         shadow.close_unsealed.assert_called_once_with(recorder.active_episode_identity)
+        assert cleanup_observations == [("append:RuntimeError: shadow unavailable", True)]
         assert recorder.submit(replace(next_sample, frame_index=2, timestamp=10.2))
         assert recorder.frame_count == 2
         assert shadow.append.call_count == 1
@@ -183,6 +188,10 @@ def test_umi_native_finalize_keeps_saved_outcome_and_clears_active_state(
         return report
 
     shadow.finalize_after_legacy.side_effect = finalize
+    cleanup_observations = []
+    shadow.close_unsealed.side_effect = lambda _identity: cleanup_observations.append(
+        (recorder._v25p_native_shadow_error, recorder._v25p_native_shadow_active)
+    )
     monkeypatch.setattr(
         shadow_module, "load_finalized_legacy_episode_record",
         Mock(return_value={"episode_index": episode_index}),
@@ -197,6 +206,7 @@ def test_umi_native_finalize_keeps_saved_outcome_and_clears_active_state(
     assert shadow.close_unsealed.call_count == int(outcome == "raises")
     assert shadow.discard_episode.call_count == int(outcome == "discard")
     if outcome == "raises":
+        assert cleanup_observations == [("finalize:RuntimeError: seal failed", True)]
         assert recorder._v25p_native_shadow_error == "finalize:RuntimeError: seal failed"
         assert recorder.last_message.endswith(
             "; v2.5-p native shadow incomplete: finalize:RuntimeError: seal failed"

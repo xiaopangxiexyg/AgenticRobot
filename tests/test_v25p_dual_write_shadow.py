@@ -223,13 +223,19 @@ def test_finalize_helper_preserves_receipt_and_owner_message_policy(
     report = SimpleNamespace(receipt=SimpleNamespace(status=status, message=message))
     shadow, identity = Mock(), object()
     shadow.finalize_after_legacy.return_value = report
+    published_reports = []
+    published_errors = []
 
     actual, error = finalize_shadow_after_legacy(
         shadow, identity, dataset_root=tmp_path, episode_index=7,
         incomplete_message=fallback,
+        record_report=published_reports.append,
+        record_error=published_errors.append,
     )
 
     assert actual is report
+    assert published_reports == [report]
+    assert published_errors == ([] if expected is None else [expected])
     assert error == expected
     shadow.finalize_after_legacy.assert_called_once()
     args, kwargs = shadow.finalize_after_legacy.call_args
@@ -242,8 +248,9 @@ def test_finalize_helper_preserves_receipt_and_owner_message_policy(
 @pytest.mark.parametrize("failure_stage", ["load", "finalize"])
 @pytest.mark.parametrize("same_identity", [False, True])
 @pytest.mark.parametrize("close_failure", [False, True])
+@pytest.mark.parametrize("publish_error", [False, True])
 def test_finalize_helper_cleans_only_failed_identity_after_recording_timing(
-    tmp_path: Path, monkeypatch, failure_stage, same_identity, close_failure,
+    tmp_path: Path, monkeypatch, failure_stage, same_identity, close_failure, publish_error,
 ) -> None:
     identity = object()
     shadow = Mock(active_identity=identity if same_identity else object())
@@ -267,16 +274,24 @@ def test_finalize_helper_cleans_only_failed_identity_after_recording_timing(
         shadow, identity, dataset_root=tmp_path, episode_index=7,
         error_prefix="post_finalize",
         record_finalize_elapsed=lambda elapsed: events.append(("timing", elapsed)),
+        record_error=(lambda error: events.append(("error", error))) if publish_error else None,
     )
 
     assert report is None
     expected = "post_finalize:" + (
         "ValueError: record missing" if failure_stage == "load" else "RuntimeError: seal failed"
     )
+    expected_events = [("timing", 0.25)]
+    if publish_error:
+        expected_events.append(("error", expected))
+    if same_identity:
+        expected_events.append("close")
     if same_identity and close_failure:
         expected += ";close_unsealed:OSError: cleanup failed"
+        if publish_error:
+            expected_events.append(("error", expected))
     assert error == expected
-    assert events == [("timing", 0.25)] + (["close"] if same_identity else [])
+    assert events == expected_events
     assert shadow.finalize_after_legacy.call_count == int(failure_stage == "finalize")
     assert shadow.close_unsealed.call_count == int(same_identity)
 

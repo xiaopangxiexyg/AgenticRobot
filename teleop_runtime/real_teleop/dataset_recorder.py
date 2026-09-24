@@ -803,10 +803,10 @@ class RealTeleopDatasetRecorder:
         ):
             return jobs
         error = append_shadow_from_legacy_jobs(
-            shadow, identity, source_sample=sample, jobs=jobs
+            shadow, identity, source_sample=sample, jobs=jobs,
+            record_error=lambda error: setattr(self, "_v25p_native_shadow_error", error),
         )
         if error:
-            self._v25p_native_shadow_error = error
             self._v25p_native_shadow_active = False
         return jobs
 
@@ -2984,7 +2984,7 @@ class RealTeleopDatasetRecorder:
             and task.episode_identity is not None
             and self._v25p_native_shadow_active
         ):
-            task.v25p_native_finalize_report, error = finalize_shadow_after_legacy(
+            finalize_shadow_after_legacy(
                 v25p_native_shadow,
                 task.episode_identity,
                 dataset_root=self.dataset_root,
@@ -2993,9 +2993,9 @@ class RealTeleopDatasetRecorder:
                 record_finalize_elapsed=lambda elapsed: task.record_stage_timing(
                     "v25p_native_post_finalize", elapsed
                 ),
+                record_report=lambda report: setattr(task, "v25p_native_finalize_report", report),
+                record_error=lambda error: setattr(task, "v25p_native_error", error),
             )
-            if error is not None:
-                task.v25p_native_error = error
         elif getattr(self, "_v25p_native_shadow_error", ""):
             task.v25p_native_error = str(self._v25p_native_shadow_error)
         if task.progress_episode is not None and not task.progress_error:
