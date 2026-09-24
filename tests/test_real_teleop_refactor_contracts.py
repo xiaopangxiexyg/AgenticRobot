@@ -33,7 +33,6 @@ from teleop_runtime.real_teleop import (
     component_builder,
     components,
     control_loop,
-    dataset_recorder as dataset_recorder_module,
     dataset_finalize,
     dataset_layout,
     dataset_selection,

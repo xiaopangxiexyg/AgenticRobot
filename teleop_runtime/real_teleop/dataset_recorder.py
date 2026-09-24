@@ -29,10 +29,7 @@ from dataset_contracts.v25p_native_storage import (
     V25P_RECORD_CJSON_LAYOUT_V1,
 )
 from dataset_interface.capture_modalities import bind_capture_modality_contract
-from dataset_interface.gripper_force import (
-    bind_gripper_force_contract,
-    read_gripper_force_contract,
-)
+from dataset_interface.gripper_force import read_gripper_force_contract
 from dataset_interface.hitl import validate_exclusive_hitl_dataset_append
 from dataset_interface.modality_artifacts import (
     assert_dataset_capture_integrity_compatible,
@@ -901,70 +898,6 @@ class RealTeleopDatasetRecorder:
         if self.arm_state_poller is None:
             return {}
         return self.arm_state_poller.latest_by_side(sample_timestamp=float(sample_timestamp))
-
-    def reconfigure_for_current_args(self, *, force: bool = False) -> None:
-        desired_root = Path(self.args.dataset_root)
-        desired_contract = CaptureModalityContract(
-            ignored_camera_keys=tuple(getattr(self.args, "ignore_camera", ()) or ()),
-            ignored_tactile_keys=tuple(getattr(self.args, "ignore_tactile", ()) or ()),
-        )
-        desired_force_contract = _gripper_force_dataset_contract_from_args(self.args)
-        if desired_force_contract is None and desired_root == self.dataset_root:
-            desired_force_contract = getattr(self, "gripper_force_contract", None)
-        if desired_force_contract is not None:
-            current_force_contract = _current_gripper_force_dataset_contract(
-                self.args, self.components.active_sides
-            )
-            if current_force_contract != desired_force_contract:
-                raise ValueError(
-                    "selected task/profile does not match the dataset gripper force profile: "
-                    f"expected={desired_force_contract.to_dict()}, "
-                    f"current={None if current_force_contract is None else current_force_contract.to_dict()}"
-                )
-        if not force and self.configured_for_current_args():
-            # The live writer is the authoritative owner of episode/sample
-            # counters for this process.  Re-scanning the complete finalized
-            # dataset here used to put filesystem/process-RPC work directly in
-            # the teleop hot loop every time the operator started an episode.
-            # On a populated dataset that pause can exceed the VIVE history
-            # window and the arm target-stale watchdog.  Explicit dataset
-            # maintenance already updates the live writer, while a task/root/
-            # modality change takes the rebuild path below.
-            return
-        if self.is_recording:
-            raise RuntimeError("Cannot reconfigure dataset recorder while recording.")
-        trace_sink = getattr(self, "control_trace_episode_sink", None)
-        v25p_store = getattr(self, "v25p_sidecar_store", None)
-        if trace_sink is not None and desired_root != self.dataset_root:
-            raise RuntimeError(
-                "Formal ControlTrace capture cannot move dataset_root within one runtime "
-                "session; restart the frontend for the new root."
-            )
-        if v25p_store is not None and desired_root != self.dataset_root:
-            raise RuntimeError(
-                "v2.5-p sidecars cannot move dataset_root within one runtime session; "
-                "restart the frontend for the new root."
-            )
-        # Validate/bind before closing the current writer.  A mismatched
-        # populated dataset must leave the currently usable recorder intact.
-        bind_capture_modality_contract(desired_root, desired_contract)
-        if desired_force_contract is not None and desired_root != self.dataset_root:
-            bind_gripper_force_contract(desired_root, desired_force_contract)
-        elif desired_force_contract is not None and getattr(self, "gripper_force_contract", None) is None:
-            bind_gripper_force_contract(desired_root, desired_force_contract)
-        all_camera_sources = dict(self.all_camera_sources)
-        self.close()
-        self.__init__(
-            args=self.args,
-            components=self.components,
-            camera_sources=all_camera_sources,
-        )
-        if trace_sink is not None:
-            self.attach_control_trace_episode_sink(trace_sink)
-        if v25p_store is not None:
-            self.attach_v25p_sidecar_store(v25p_store)
-        self.start()
-        self.write_camera_device_config()
 
     def configured_for_current_args(self) -> bool:
         desired_root = Path(self.args.dataset_root)

@@ -60,6 +60,12 @@ lower domains must not import application/profile layers
 有状态的入口通过窄回调在清理前发布操作错误，清理失败再追加错误；新报告在读取 receipt 前
 交给任务，操作未返回新报告时不清空既有报告。抽取共用逻辑不能改变这些状态发布时点。
 
+真实遥操的正式 writer 由 `EpisodeRecordingRuntime` 的异步准备／数据集选择事务构造，
+ready 后才发布；配置未变的 ready recorder 直接复用，不重新扫描已封存数据。全局启动不构造
+writer，recorder 自身不再提供关闭后原地重建的第二套生命周期。旧的
+`prepare_startup_dataset_recorder()` 与 `reconfigure_for_current_args()` 已退役；现行配置校验、
+候选失败回收、旧 recorder 可恢复边界和单次进程启动约束保持不变。
+
 ## 执行模式边界
 
 执行模式按同时参与控制决策的 source 数量划分，而不是按是否启用 GUI、trace 或被动 shadow 划分：

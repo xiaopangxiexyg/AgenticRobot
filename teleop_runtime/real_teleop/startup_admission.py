@@ -1,8 +1,9 @@
 """Device-neutral admission transactions before real-teleop device startup.
 
-This module owns optional operator-UI startup, camera source configuration,
-and collection-recorder construction.  It does not start camera or robot
-devices, begin an episode, or own steady-state control and recording.
+This module owns optional operator-UI startup, component assembly, and camera
+source configuration.  The recording runtime prepares dataset writers only
+after collection or dataset selection is requested.  This module does not start
+camera or robot devices, begin an episode, or own steady-state recording.
 """
 
 from __future__ import annotations
@@ -208,71 +209,6 @@ def configure_startup_cameras(
     )
 
 
-def prepare_startup_dataset_recorder(
-    args: Any,
-    *,
-    components: Any,
-    camera_sources: Mapping[str, Any],
-    startup_cleanup: Any,
-    startup_progress: Any | None,
-    control_ui: Any | None,
-    capability_admission: bool,
-    recorder_type: type,
-    log: Callable[..., None],
-) -> Any | None:
-    """Construct and register the optional collection recorder.
-
-    Successful construction is registered immediately with the early-startup
-    cleanup owner.  The writer subprocess is not started here.
-    """
-
-    if bool(getattr(args, "no_collection", False)):
-        return None
-
-    if startup_progress is not None:
-        startup_progress.begin(
-            "dataset.writer.prepare",
-            label="数采 writer 配置",
-            message="正在校验数据集路径、模态声明与 writer 配置",
-            requirement="required_for_collection",
-        )
-    try:
-        recorder = recorder_type(
-            args=args,
-            components=components,
-            camera_sources=camera_sources,
-        )
-        startup_cleanup.add("dataset_recorder", recorder.close)
-    except (OSError, RuntimeError, ValueError) as exc:
-        if startup_progress is not None:
-            startup_progress.fail(
-                "dataset.writer.prepare",
-                f"{type(exc).__name__}: {exc}",
-                message="writer 配置校验失败",
-            )
-        if not capability_admission:
-            if startup_progress is not None:
-                startup_progress.close()
-            raise
-        detail = f"{type(exc).__name__}: {exc}"
-        args.dataset_startup_error = detail
-        log(
-            "Dataset",
-            "WARNING: dataset writer construction was isolated from GUI and "
-            f"arm controls: {detail}",
-        )
-        if control_ui is not None:
-            control_ui.append_message("Dataset", detail)
-        return None
-
-    if startup_progress is not None:
-        startup_progress.succeed(
-            "dataset.writer.prepare",
-            message="writer 配置已就绪，尚未启动子进程",
-        )
-    return recorder
-
-
 __all__ = [
     "StartupCameraConfiguration",
     "StartupComponentAssembly",
@@ -280,5 +216,4 @@ __all__ = [
     "assemble_startup_components",
     "configure_startup_cameras",
     "initialize_startup_ui",
-    "prepare_startup_dataset_recorder",
 ]
