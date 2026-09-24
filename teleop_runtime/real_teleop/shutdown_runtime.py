@@ -98,13 +98,14 @@ def shutdown_real_teleop_runtime(
         shutdown_steps.append(
             ("position_force_guard_monitor", position_force_guard_monitor.close)
         )
-    if "main_loop_watchdog" in runtime_state:
+    # Startup may create a local slot before constructing its resource.
+    if main_loop_watchdog is not None:
         shutdown_steps.append(("main_loop_watchdog", main_loop_watchdog.stop))
-    if "debug_timing_console_writer" in runtime_state and debug_timing_console_writer is not None:
+    if debug_timing_console_writer is not None:
         shutdown_steps.append(
             ("debug_timing_console_writer", debug_timing_console_writer.close)
         )
-    if "debug_timing_log_recorder" in runtime_state:
+    if debug_timing_log_recorder is not None:
         shutdown_steps.append(
             (
                 "debug_timing_log_recorder",
@@ -114,7 +115,7 @@ def shutdown_real_teleop_runtime(
                 ),
             )
         )
-    if "action_debug_log_recorder" in runtime_state:
+    if action_debug_log_recorder is not None:
         shutdown_steps.append(
             (
                 "action_debug_log_recorder",
@@ -124,7 +125,7 @@ def shutdown_real_teleop_runtime(
                 ),
             )
         )
-    if "ik_debug_log_recorder" in runtime_state:
+    if ik_debug_log_recorder is not None:
         shutdown_steps.append(
             (
                 "ik_debug_log_recorder",
@@ -134,7 +135,7 @@ def shutdown_real_teleop_runtime(
                 ),
             )
         )
-    if "recording_active" in runtime_state and recording_active():
+    if recording_active is not None and recording_active():
         recording_end_reason = (
             "position_force_guard"
             if position_force_guard_fault is not None
