@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import fields
 import inspect
 import threading
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from robot_motion.runtime import LifecycleCleanupError
 from teleop_runtime import calibration_flow as shared_calibration_flow
 from teleop_runtime import cli_value_parsers as shared_cli_value_parsers
 from teleop_runtime import log_utils as shared_log_utils
@@ -1178,33 +1180,48 @@ def test_runtime_setup_helpers_live_in_non_authoritative_modules() -> None:
     assert not hasattr(legacy_entrypoint, "_refresh_cli_runtime_config_support")
 
 
-def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
+@pytest.mark.parametrize("terminal_error", [None, KeyboardInterrupt()])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_shutdown_runtime_preserves_cleanup_registration_order(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_error: BaseException | None,
+    close_fails: bool,
+) -> None:
     labels: list[str] = []
+    executed: list[str] = []
+    logs: list[str] = []
 
-    def closeable() -> SimpleNamespace:
-        return SimpleNamespace(close=lambda: None)
+    def record(label: str) -> None:
+        executed.append(label)
+        if close_fails and label == "episode_recorder":
+            raise RuntimeError("synthetic recorder close failure")
+
+    def closeable(label: str) -> SimpleNamespace:
+        return SimpleNamespace(close=lambda: record(label))
 
     runtime_state = {
         "args": SimpleNamespace(),
-        "startup_progress": closeable(),
+        "startup_progress": closeable("startup_progress"),
         "position_force_guard_monitor": None,
-        "episode_recorder": closeable(),
-        "clutch_input": closeable(),
-        "dataset_recorder": closeable(),
-        "camera_previewer": closeable(),
+        "episode_recorder": closeable("episode_recorder"),
+        "clutch_input": closeable("clutch_input"),
+        "dataset_recorder": closeable("dataset_recorder"),
+        "camera_previewer": closeable("camera_previewer"),
         "camera_sources": {"camera": object()},
-        "tactile_visualizer": closeable(),
+        "tactile_visualizer": closeable("tactile_visualizer"),
         "actuator_trace_recorder": None,
         "components": SimpleNamespace(
-            human_shadow_frontend=closeable(),
-            session=closeable(),
-            arm_state_read_executor=SimpleNamespace(shutdown=lambda **kwargs: None),
-            right_hand_backend=closeable(),
+            human_shadow_frontend=closeable("human_action_shadow"),
+            session=closeable("teleop_session"),
+            arm_state_read_executor=SimpleNamespace(
+                shutdown=lambda **kwargs: record("arm_state_read_executor")
+            ),
+            right_hand_backend=closeable("right_hand_backend"),
             right_hand_control_via_rig=False,
-            left_hand_backend=closeable(),
+            left_hand_backend=closeable("left_hand_backend"),
             left_hand_control_via_rig=False,
-            right_state_backend=closeable(),
-            left_state_backend=closeable(),
+            right_state_backend=closeable("right_state_backend"),
+            left_state_backend=closeable("left_state_backend"),
         ),
         "position_audit_fanout": None,
         "position_debug_session_recorder": None,
@@ -1212,28 +1229,35 @@ def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
         "position_episode_debug_runtime": None,
         "original_stdout": None,
         "silenced_stdout": None,
-        "update_control_debug_runtime_metadata": lambda **kwargs: None,
-    }
-    support = {
-        "_arm_control_mode_arg": lambda args: "position",
-            "_attach_actuator_command_trace_sink": lambda *args: None,
-            "_attach_ik_shadow_trace_sink": lambda *args: None,
-            "_attach_position_audit_sink": lambda *args: None,
-        "_attach_singularity_transition_trace_sink": lambda *args: None,
-        "_close_camera_sources": lambda sources: None,
-        "_log": lambda *args: None,
-        "_position_force_guard_collision_summary": lambda fault: {},
-        "_terminal_force_collision_summary": lambda *args, **kwargs: {},
-        "run_best_effort_cleanup": (
-            lambda _name, steps: labels.extend(label for label, _action in steps)
+        "update_control_debug_runtime_metadata": (
+            lambda **kwargs: record("position_audit.metadata_detach")
         ),
     }
+    cleanup = shutdown_runtime.run_best_effort_cleanup
 
-    shutdown_runtime.shutdown_real_teleop_runtime(
-        runtime_state,
-        terminal_error=None,
-        support=support,
+    def capture_cleanup(name, steps) -> None:
+        labels.extend(label for label, _action in steps)
+        cleanup(name, steps)
+
+    monkeypatch.setattr(shutdown_runtime, "run_best_effort_cleanup", capture_cleanup)
+    monkeypatch.setattr(
+        shutdown_runtime, "_close_camera_sources", lambda sources: record("camera_sources")
     )
+    monkeypatch.setattr(
+        shutdown_runtime, "_attach_position_audit_sink",
+        lambda *_args: record("position_audit.detach"),
+    )
+    monkeypatch.setattr(shutdown_runtime, "_log", lambda _tag, message: logs.append(message))
+
+    with (
+        pytest.raises(LifecycleCleanupError, match="synthetic recorder close failure")
+        if close_fails and terminal_error is None
+        else nullcontext()
+    ):
+        shutdown_runtime.shutdown_real_teleop_runtime(
+            runtime_state,
+            terminal_error=terminal_error,
+        )
 
     assert labels == [
         "startup_progress",
@@ -1253,24 +1277,28 @@ def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
         "right_state_backend",
         "left_state_backend",
     ]
+    assert executed == labels
+    assert bool(logs) is close_fails
 
 
-def test_runtime_exit_stops_arms_before_collection_drain() -> None:
+def test_runtime_exit_stops_arms_before_collection_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     events: list[tuple[object, ...]] = []
     components = object()
+
+    monkeypatch.setattr(
+        runtime,
+        "_emergency_stop_real_arms",
+        lambda received, *, reason, now, raise_on_failure: events.append(
+            (received, reason, now, raise_on_failure)
+        ),
+    )
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(time=lambda: 123.5))
 
     error = runtime._emergency_stop_runtime_arms_before_collection_drain(
         {"session_started": True, "components": components},
         terminal_error=KeyboardInterrupt(),
-        support={
-            "_emergency_stop_real_arms": (
-                lambda received, *, reason, now, raise_on_failure: events.append(
-                    (received, reason, now, raise_on_failure)
-                )
-            ),
-            "_log": lambda *_args, **_kwargs: None,
-            "time": SimpleNamespace(time=lambda: 123.5),
-        },
     )
 
     assert error is None
@@ -1281,6 +1309,45 @@ def test_runtime_exit_stops_arms_before_collection_drain() -> None:
     assert source.index(
         "_emergency_stop_runtime_arms_before_collection_drain("
     ) < source.index("_close_episode_recording_runtime_before_resources(")
+
+
+@pytest.mark.parametrize(
+    "runtime_state",
+    [{}, {"session_started": False}, {"session_started": True, "components": None}],
+)
+def test_runtime_exit_does_not_stop_unstarted_session(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_state: dict[str, object],
+) -> None:
+    monkeypatch.setattr(
+        runtime, "_emergency_stop_real_arms",
+        lambda *_args, **_kwargs: pytest.fail("session has not started"),
+    )
+    assert runtime._emergency_stop_runtime_arms_before_collection_drain(
+        runtime_state, terminal_error=KeyboardInterrupt()
+    ) is None
+
+
+def test_runtime_exit_returns_stop_failure_for_later_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = RuntimeError("synthetic stop failure")
+    logs: list[str] = []
+
+    def fail_stop(_components, *, reason, now, raise_on_failure) -> None:
+        assert reason == "runtime_loop_exit"
+        assert now == 123.5
+        assert raise_on_failure is True
+        raise failure
+
+    monkeypatch.setattr(runtime, "_emergency_stop_real_arms", fail_stop)
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(time=lambda: 123.5))
+    monkeypatch.setattr(runtime, "_log", lambda _tag, message: logs.append(message))
+    assert runtime._emergency_stop_runtime_arms_before_collection_drain(
+        {"session_started": True, "components": object()}, terminal_error=None
+    ) is failure
+    assert len(logs) == 1
+    assert "synthetic stop failure" in logs[0]
 
 
 def test_repeated_runtime_emergency_stop_skips_already_latched_backend(
@@ -1314,7 +1381,11 @@ def test_repeated_runtime_emergency_stop_skips_already_latched_backend(
     assert errors == {}
 
 
-def test_episode_recording_shutdown_commits_force_guard_reason_before_resources() -> None:
+@pytest.mark.parametrize("close_result", [True, False])
+def test_episode_recording_shutdown_commits_force_guard_reason_before_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    close_result: bool,
+) -> None:
     close_calls: list[dict[str, object]] = []
 
     class Fault:
@@ -1322,8 +1393,20 @@ def test_episode_recording_shutdown_commits_force_guard_reason_before_resources(
             return {"code": "joint_force_limit"}
 
     episode_runtime = SimpleNamespace(
-        close=lambda **kwargs: close_calls.append(dict(kwargs)) or True
+        close=lambda **kwargs: close_calls.append(dict(kwargs)) or close_result
     )
+    monkeypatch.setattr(runtime, "_arm_control_mode_arg", lambda _args: "position")
+    monkeypatch.setattr(
+        runtime, "_position_force_guard_collision_summary",
+        lambda _fault: {"peak_force_n": 42.0},
+    )
+    monkeypatch.setattr(
+        runtime, "_terminal_force_collision_summary",
+        lambda *_args, **_kwargs: pytest.fail(
+            "force-guard summary must remain authoritative"
+        ),
+    )
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(time=lambda: 123.5))
     result = runtime._close_episode_recording_runtime_before_resources(
         {
             "args": SimpleNamespace(),
@@ -1331,21 +1414,9 @@ def test_episode_recording_shutdown_commits_force_guard_reason_before_resources(
             "position_force_guard_monitor": SimpleNamespace(fault=Fault()),
         },
         terminal_error=RuntimeError("force guard"),
-        support={
-            "_arm_control_mode_arg": lambda _args: "position",
-            "_position_force_guard_collision_summary": (
-                lambda _fault: {"peak_force_n": 42.0}
-            ),
-            "_terminal_force_collision_summary": (
-                lambda *_args, **_kwargs: pytest.fail(
-                    "force-guard summary must remain authoritative"
-                )
-            ),
-            "time": SimpleNamespace(time=lambda: 123.5),
-        },
     )
 
-    assert result is True
+    assert result is close_result
     assert close_calls == [
         {
             "now": 123.5,
@@ -1360,6 +1431,18 @@ def test_episode_recording_shutdown_commits_force_guard_reason_before_resources(
             "timeout_sec": 15.0,
         }
     ]
+
+
+def test_episode_recording_shutdown_before_runtime_creation_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime, "_position_force_guard_collision_summary",
+        lambda _fault: pytest.fail("no episode runtime exists to close"),
+    )
+    assert runtime._close_episode_recording_runtime_before_resources(
+        {}, terminal_error=RuntimeError("startup failed")
+    ) is True
 
 
 def test_real_component_builder_uses_canonical_config_owner_and_import_boundary() -> None:
@@ -1502,14 +1585,29 @@ def test_runtime_rejects_missing_application_ports_before_resource_assembly(
         )
 
 
-def test_real_teleop_runtime_exposes_shutdown_support() -> None:
+def test_real_teleop_shutdown_uses_canonical_dependencies() -> None:
+    assert shutdown_runtime._close_camera_sources is camera_runtime._close_camera_sources
+    assert shutdown_runtime._arm_control_mode_arg is runtime._arm_control_mode_arg
+    assert shutdown_runtime._log is shared_log_utils.log_event
     for name in (
-        "_close_camera_sources",
         "_position_force_guard_collision_summary",
         "_terminal_force_collision_summary",
-        "run_best_effort_cleanup",
     ):
-        assert callable(getattr(runtime, name))
+        assert getattr(shutdown_runtime, name) is getattr(impedance_force_runtime, name)
+    for name in (
+        "_attach_actuator_command_trace_sink",
+        "_attach_ik_shadow_trace_sink",
+        "_attach_position_audit_sink",
+        "_attach_singularity_transition_trace_sink",
+    ):
+        assert getattr(shutdown_runtime, name) is getattr(diagnostic_setup, name)
+    assert shutdown_runtime.run_best_effort_cleanup is runtime.run_best_effort_cleanup
+    for function in (
+        shutdown_runtime.shutdown_real_teleop_runtime,
+        runtime._close_episode_recording_runtime_before_resources,
+        runtime._emergency_stop_runtime_arms_before_collection_drain,
+    ):
+        assert "support" not in inspect.signature(function).parameters
 
 
 def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(

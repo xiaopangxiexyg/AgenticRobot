@@ -1,8 +1,8 @@
 """Ordered best-effort shutdown for the real-teleop application runtime.
 
-This module owns resource release ordering only.  It receives the completed
-runtime local-state snapshot and the legacy support mapping; it does not start
-hardware or make control decisions.
+This module owns resource release ordering only. It receives the runtime
+local-state snapshot, including partial startup, and imports fixed operations
+from their canonical owners; it does not start hardware or make control decisions.
 """
 
 from __future__ import annotations
@@ -13,18 +13,20 @@ import time
 from collections.abc import Mapping
 from typing import Any, Callable
 
+from robot_motion.runtime import run_best_effort_cleanup
+from teleop_runtime.log_utils import log_event as _log
 
-_REQUIRED_SUPPORT_NAMES = (
-    "_arm_control_mode_arg",
-    "_attach_actuator_command_trace_sink",
-    "_attach_ik_shadow_trace_sink",
-    "_attach_position_audit_sink",
-    "_attach_singularity_transition_trace_sink",
-    "_close_camera_sources",
-    "_log",
-    "_position_force_guard_collision_summary",
-    "_terminal_force_collision_summary",
-    "run_best_effort_cleanup",
+from .camera_runtime import _close_camera_sources
+from .control_profile import arm_control_mode as _arm_control_mode_arg
+from .diagnostic_setup import (
+    _attach_actuator_command_trace_sink,
+    _attach_ik_shadow_trace_sink,
+    _attach_position_audit_sink,
+    _attach_singularity_transition_trace_sink,
+)
+from .impedance_force_runtime import (
+    _position_force_guard_collision_summary,
+    _terminal_force_collision_summary,
 )
 
 
@@ -32,17 +34,7 @@ def shutdown_real_teleop_runtime(
     runtime_state: Mapping[str, Any],
     *,
     terminal_error: BaseException | None,
-    support: Mapping[str, Any],
 ) -> None:
-    missing_support = [
-        name for name in _REQUIRED_SUPPORT_NAMES if name not in support
-    ]
-    if missing_support:
-        raise RuntimeError(
-            "real-teleop shutdown support is incomplete: "
-            + ", ".join(missing_support)
-        )
-
     args = runtime_state["args"]
     startup_progress = runtime_state["startup_progress"]
     position_force_guard_monitor = runtime_state["position_force_guard_monitor"]
@@ -78,25 +70,6 @@ def shutdown_real_teleop_runtime(
     recording_active = runtime_state.get("recording_active")
     stop_recording = runtime_state.get("stop_recording")
     idle_tactile_compression = runtime_state.get("idle_tactile_compression")
-
-    _arm_control_mode_arg = support["_arm_control_mode_arg"]
-    _attach_actuator_command_trace_sink = support[
-        "_attach_actuator_command_trace_sink"
-    ]
-    _attach_ik_shadow_trace_sink = support["_attach_ik_shadow_trace_sink"]
-    _attach_position_audit_sink = support["_attach_position_audit_sink"]
-    _attach_singularity_transition_trace_sink = support[
-        "_attach_singularity_transition_trace_sink"
-    ]
-    _close_camera_sources = support["_close_camera_sources"]
-    _log = support["_log"]
-    _position_force_guard_collision_summary = support[
-        "_position_force_guard_collision_summary"
-    ]
-    _terminal_force_collision_summary = support[
-        "_terminal_force_collision_summary"
-    ]
-    run_best_effort_cleanup = support["run_best_effort_cleanup"]
 
     shutdown_steps: list[tuple[str, Callable[[], None]]] = []
     position_force_guard_fault = (

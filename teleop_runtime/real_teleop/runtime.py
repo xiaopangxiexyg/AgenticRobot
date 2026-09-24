@@ -72,7 +72,6 @@ from .arm_tool_config import (
 from .artifact_context import materialize_real_teleop_artifact_context
 from .camera_runtime import (
     _build_camera_sources,
-    _close_camera_sources,
     _select_preview_camera_sources,
     _start_camera_sources,
     _start_camera_sources_best_effort,
@@ -324,7 +323,6 @@ def _close_episode_recording_runtime_before_resources(
     runtime_state: Mapping[str, Any],
     *,
     terminal_error: BaseException | None,
-    support: Mapping[str, Any],
 ) -> bool:
     """Commit an active Episode before generic device/resource teardown."""
 
@@ -340,15 +338,13 @@ def _close_episode_recording_runtime_before_resources(
         if position_force_guard_monitor is None
         else position_force_guard_monitor.fault
     )
-    force_collision_summary = support[
-        "_position_force_guard_collision_summary"
-    ](position_force_guard_fault)
+    force_collision_summary = _position_force_guard_collision_summary(
+        position_force_guard_fault
+    )
     if not force_collision_summary:
-        force_collision_summary = support[
-            "_terminal_force_collision_summary"
-        ](
+        force_collision_summary = _terminal_force_collision_summary(
             terminal_error,
-            control_mode=support["_arm_control_mode_arg"](args),
+            control_mode=_arm_control_mode_arg(args),
         )
     end_reason = (
         "position_force_guard"
@@ -373,7 +369,7 @@ def _close_episode_recording_runtime_before_resources(
     summary.update(force_collision_summary)
     return bool(
         episode_recording_runtime.close(
-            now=support["time"].time(),
+            now=time.time(),
             end_reason=end_reason,
             summary=summary,
             timeout_sec=15.0,
@@ -385,7 +381,6 @@ def _emergency_stop_runtime_arms_before_collection_drain(
     runtime_state: Mapping[str, Any],
     *,
     terminal_error: BaseException | None,
-    support: Mapping[str, Any],
 ) -> BaseException | None:
     """Request the final arm stop before any writer/storage shutdown wait."""
 
@@ -394,30 +389,24 @@ def _emergency_stop_runtime_arms_before_collection_drain(
     components = runtime_state.get("components")
     if components is None:
         return None
-    stop = support.get("_emergency_stop_real_arms")
-    log = support.get("_log")
-    clock = support.get("time")
-    if not callable(stop):
-        return RuntimeError("runtime shutdown support lacks _emergency_stop_real_arms")
     reason = (
         f"runtime_exception_exit:{type(terminal_error).__name__}"
         if terminal_error is not None
         else "runtime_loop_exit"
     )
     try:
-        stop(
+        _emergency_stop_real_arms(
             components,
             reason=reason,
-            now=(clock.time() if clock is not None else None),
+            now=time.time(),
             raise_on_failure=True,
         )
     except BaseException as exc:  # noqa: BLE001 - preserve primary exit through cleanup.
-        if callable(log):
-            log(
-                "EmergencyStop",
-                "runtime exit could not confirm every arm stop before collection "
-                f"drain: {type(exc).__name__}: {exc}",
-            )
+        _log(
+            "EmergencyStop",
+            "runtime exit could not confirm every arm stop before collection "
+            f"drain: {type(exc).__name__}: {exc}",
+        )
         return exc
     return None
 
@@ -2746,14 +2735,12 @@ def run_real_teleop(
         emergency_stop_error = _emergency_stop_runtime_arms_before_collection_drain(
             locals(),
             terminal_error=terminal_error,
-            support=globals(),
         )
         episode_shutdown_error: BaseException | None = None
         try:
             if not _close_episode_recording_runtime_before_resources(
                 locals(),
                 terminal_error=terminal_error,
-                support=globals(),
             ):
                 raise RuntimeError(
                     "formal collection lifecycle did not drain before "
@@ -2769,7 +2756,6 @@ def run_real_teleop(
         shutdown_real_teleop_runtime(
             locals(),
             terminal_error=terminal_error,
-            support=globals(),
         )
         if terminal_error is None:
             if emergency_stop_error is not None:
