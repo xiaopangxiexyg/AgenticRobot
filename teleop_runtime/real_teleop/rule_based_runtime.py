@@ -649,6 +649,7 @@ class RuleBasedRealTeleopExtension:
         self._execution_begun = False
         self._completed = False
         self._completion_stop_requested = False
+        self._completed_hold_stream_suspended = False
         self._aborted = False
         self._held = False
         self._restart_after_hold_requested = False
@@ -2284,6 +2285,8 @@ class RuleBasedRealTeleopExtension:
             and not self._held
             and self._last_dispatched_emission is not None
         ):
+            if self._completed_hold_stream_suspended:
+                return TeleopCommandOverride(None)
             return self._paused_arm_hold_override(
                 reason=(
                     "successful_next_attempt_rebuild"
@@ -5699,19 +5702,25 @@ class RuleBasedRealTeleopExtension:
             )
         feedback_ready, feedback_reason, snapshots = self._fresh_arm_snapshots(float(now))
         if not feedback_ready:
-            if (
-                self._completed
-                and self._completion_stop_requested
-                and feedback_reason == "causal_arm_feedback_poller_unavailable"
-                and self._collection_transition_pending()
-            ):
-                # stop_episode temporarily detaches the formal recorder while
-                # its worker owns the writer. Its arm poller is unavailable in
-                # this handoff, not faulty. Never resend the terminal qref
-                # without measured feedback; the backend's target-stale
-                # quick-stop owns the idle stream until the next attempt is
-                # rebuilt from fresh hardware state.
-                self._waiting_reason = "successful_episode_stop_handoff"
+            if self._completed and self._completion_stop_requested:
+                # The completed Episode no longer owns motion. A detached
+                # recorder, stale sample, or failed background hardware read
+                # all mean the old terminal qref cannot be certified again.
+                # Make this handoff sticky: even if feedback later recovers,
+                # never restart the old stream after its target-stale stop.
+                # The next attempt must rebase from fresh measured qpos.
+                self._completed_hold_stream_suspended = True
+                self._waiting_reason = (
+                    "successful_episode_feedback_handoff:" + feedback_reason
+                )
+                append_message = getattr(self._control_ui, "append_message", None)
+                if callable(append_message):
+                    append_message(
+                        "RuleBased",
+                        "本条采集已完成；末端保持命令因实测反馈不可用而停止刷新。"
+                        "不会重发上一条轨迹，下一条运动须等待双臂新鲜实测并重新建立起点。"
+                        f" 原因：{feedback_reason}",
+                    )
                 self._publish_status(recording_ready=False)
                 return TeleopCommandOverride(None)
             if self._recoverable_arm_feedback_pause(
@@ -6724,6 +6733,7 @@ class RuleBasedRealTeleopExtension:
         self._execution_begun = False
         self._completed = False
         self._completion_stop_requested = False
+        self._completed_hold_stream_suspended = False
         self._aborted = False
         self._arm_feedback_pause_started_at = None
         self._initial_alignment_reacquire_samples = 0

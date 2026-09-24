@@ -1328,6 +1328,7 @@ def test_completed_episode_stop_handoff_does_not_hold_without_recorder() -> None
     extension.after_control_input_poll(now=2.02)
     during_stop = session.command_override_provider(SimpleNamespace(), 2.02)
     assert during_stop.command is None
+    assert extension._completed_hold_stream_suspended is True
     extension.after_session_step(
         step_result=SimpleNamespace(
             command=None,
@@ -1343,6 +1344,10 @@ def test_completed_episode_stop_handoff_does_not_hold_without_recorder() -> None
     assert session.hold_reasons == []
 
     transition_pending = False
+    # Recovery of the recorder must not restart the old terminal qref after
+    # the backend has been allowed to expire that target.
+    recovered = session.command_override_provider(SimpleNamespace(), 2.025)
+    assert recovered.command is None
     extension.after_control_input_poll(now=2.03)
     assert extension.status().completed is False
     assert extension.status().held is False
@@ -1361,7 +1366,17 @@ def test_completed_episode_stop_handoff_does_not_hold_without_recorder() -> None
         )
 
 
-def test_missing_arm_feedback_outside_completed_stop_handoff_still_holds() -> None:
+@pytest.mark.parametrize(
+    "blocked",
+    [
+        {"left": "hardware_read_failed", "right": "feedback_stale"},
+        {"right": "hardware_read_failed"},
+        {"left": "feedback_stale"},
+    ],
+)
+def test_completed_episode_feedback_failure_releases_old_stream_without_hold(
+    blocked: dict[str, str],
+) -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -1376,7 +1391,65 @@ def test_missing_arm_feedback_outside_completed_stop_handoff_still_holds() -> No
         ),
         trajectory_groups={},
     )
-    recorder = _Recorder(_Poller())
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=2.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=2.0,
+    )
+    extension._clear_current()
+    extension._load_next(SimpleNamespace(), 2.01, poller.latest_at_or_before(2.01))
+    assert extension.status().completed is True
+    extension._completion_stop_requested = True
+    recorder.is_recording = False
+    poller.blocked.update(blocked)
+
+    after_stop = session.command_override_provider(SimpleNamespace(), 2.02)
+    assert after_stop.command is None
+    assert extension._completed_hold_stream_suspended is True
+    assert extension.status().held is False
+    assert extension.status().aborted is False
+    assert session.hold_reasons == []
+
+    poller.blocked.clear()
+    # A late read cannot resurrect the terminal qref, including during a
+    # next-selection rebuild. Motion only resumes from the next measured start.
+    assert session.command_override_provider(SimpleNamespace(), 2.03).command is None
+    assert sum("本条采集已完成；末端保持命令" in message for _, message in ui.messages) == 1
+    extension.after_control_input_poll(now=2.04)
+    assert extension._completed_hold_stream_suspended is False
+    assert extension.status().rule_start_available is True
+    assert session.hold_reasons == []
+
+
+@pytest.mark.parametrize("feedback_mode", ["poller_unavailable", "mixed_not_ready"])
+def test_missing_arm_feedback_outside_completed_stop_handoff_still_holds(
+    feedback_mode: str,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6), right_arm=np.zeros(6)
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
     recorder.is_recording = True
     session, _clutch, _ui = _bind(extension, recorder)
     active = _wait_for_command(session, now=2.0)
@@ -1391,14 +1464,23 @@ def test_missing_arm_feedback_outside_completed_stop_handoff_still_holds() -> No
     )
     extension._completed = True
     extension._armed = False
-    extension._dataset_recorder_provider = lambda: None
+    if feedback_mode == "poller_unavailable":
+        extension._dataset_recorder_provider = lambda: None
+    else:
+        poller.blocked.update(
+            {"left": "hardware_read_failed", "right": "feedback_stale"}
+        )
     extension._collection_transition_active = lambda: False
 
     missing = session.command_override_provider(SimpleNamespace(), 2.01)
     assert missing.command is None
     assert extension.status().held is True
     assert extension.status().aborted is True
-    assert "causal_arm_feedback_poller_unavailable" in session.hold_reasons[-1]
+    assert (
+        "causal_arm_feedback_poller_unavailable"
+        if feedback_mode == "poller_unavailable"
+        else "causal_arm_feedback_not_ready:left=hardware_read_failed,right=feedback_stale"
+    ) in session.hold_reasons[-1]
 
 
 @pytest.mark.parametrize("moved_away", [False, True])
