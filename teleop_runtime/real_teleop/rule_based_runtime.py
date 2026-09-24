@@ -633,6 +633,7 @@ class RuleBasedRealTeleopExtension:
         # fail-closed without treating the hold as a recordable rule frame.
         self._paused_hold_emission: RuleBasedCollectionEmission | None = None
         self._last_dispatched_emission: RuleBasedCollectionEmission | None = None
+        self._completion_hold_min_error_by_side: dict[str, np.ndarray] = {}
         self._target_wait_started_at: float | None = None
         self._next_due_at: float | None = None
         self._current_dispatched = False
@@ -3606,6 +3607,20 @@ class RuleBasedRealTeleopExtension:
                         "formal dataset stage coverage is incomplete: " + detail
                     )
                     return
+                # Compare later feedback with the measured terminal state,
+                # not a qref that may still lead the arm during finalization.
+                # The in-flight pause retains its stricter qref guard.
+                if self._last_dispatched_emission is not None:
+                    try:
+                        self._completion_hold_min_error_by_side = (
+                            self._measured_to_accepted_abs_error(snapshots)
+                        )
+                    except RuntimeError as exc:
+                        self._abort_session_step(
+                            "completed rule target has invalid measured feedback: "
+                            + str(exc)
+                        )
+                        return
                 self._completed = True
                 self._armed = False
                 self._waiting_reason = "completed"
@@ -5699,9 +5714,15 @@ class RuleBasedRealTeleopExtension:
         self._arm_feedback_pause_started_at = None
         displacement = self._paused_hold_displacement(snapshots)
         if displacement is not None:
+            movement = (
+                "measured arm moved away from the accepted terminal target "
+                "during Episode finalization"
+                if self._completed
+                else "measured arm position changed during rule pause"
+            )
             self._abort_session_step(
-                "measured arm position changed during rule pause; "
-                "the previous arm target is no longer safe: " + displacement
+                movement + "; the previous arm target is no longer safe: "
+                + displacement
             )
             self._publish_status(recording_ready=False)
             return TeleopCommandOverride(None)
@@ -5724,40 +5745,72 @@ class RuleBasedRealTeleopExtension:
         self,
         snapshots: Mapping[str, Mapping[str, Any]],
     ) -> str | None:
-        """Reject a cached hold/resume target that no longer matches the robot.
+        """Reject an old target after measured arm motion, not normal lag.
 
-        The accepted qref is retained only for a bounded, already-nearby
-        position hold. An operator-moved arm needs a new runtime Home and a
-        measured-start transition; a pause is not a path replanner.
+        In-flight pauses require the measured joints to stay close to qref.
+        After a successful terminal arrival, the accepted qref can normally
+        lead feedback by more than that limit.  Reject only *new* movement
+        away from the terminal reference; convergence toward qref is safe.
         """
 
-        held = self._last_dispatched_emission
-        if held is None:
-            return "no previously accepted arm target"
         try:
-            actual = self._snapshot_qpos_pair(snapshots)
+            errors = self._measured_to_accepted_abs_error(snapshots)
         except RuntimeError as exc:
             return str(exc)
         limit = float(self.config.pause_hold_max_joint_delta_rad)
         for side in self.deployment.active_sides:
+            error = errors[side]
+            if self._completed:
+                prior_minimum = self._completion_hold_min_error_by_side.get(side)
+                if prior_minimum is None:
+                    self._completion_hold_min_error_by_side[side] = error.copy()
+                    continue
+                growth = error - prior_minimum
+                joint = int(np.argmax(growth))
+                if float(growth[joint]) > limit:
+                    return (
+                        f"{side} joint {joint + 1} measured-to-accepted "
+                        f"error increased by {math.degrees(float(growth[joint])):.3f}deg "
+                        f"from terminal minimum {math.degrees(float(prior_minimum[joint])):.3f}deg "
+                        f"to {math.degrees(float(error[joint])):.3f}deg "
+                        f"(limit {math.degrees(limit):.3f}deg)"
+                    )
+                self._completion_hold_min_error_by_side[side] = np.minimum(
+                    prior_minimum, error
+                )
+            else:
+                joint = int(np.argmax(error))
+                if float(error[joint]) > limit:
+                    return (
+                        f"{side} joint {joint + 1} measured-to-accepted delta="
+                        f"{math.degrees(float(error[joint])):.3f}deg > "
+                        f"{math.degrees(limit):.3f}deg"
+                    )
+        return None
+
+    def _measured_to_accepted_abs_error(
+        self,
+        snapshots: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, np.ndarray]:
+        held = self._last_dispatched_emission
+        if held is None:
+            raise RuntimeError("no previously accepted arm target")
+        actual = self._snapshot_qpos_pair(snapshots)
+        errors: dict[str, np.ndarray] = {}
+        for side in self.deployment.active_sides:
             command = held.command.commands.get(f"{side}_arm")
             if command is None:
-                return f"{side} accepted arm target is missing"
+                raise RuntimeError(f"{side} accepted arm target is missing")
             try:
                 target = np.asarray(command.value, dtype=float).reshape(6)
-            except (TypeError, ValueError):
-                return f"{side} accepted arm target is invalid"
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{side} accepted arm target is invalid"
+                ) from exc
             if not np.all(np.isfinite(target)):
-                return f"{side} accepted arm target is non-finite"
-            delta = np.abs(actual[side] - target)
-            joint = int(np.argmax(delta))
-            if float(delta[joint]) > limit:
-                return (
-                    f"{side} joint {joint + 1} measured-to-accepted delta="
-                    f"{math.degrees(float(delta[joint])):.3f}deg > "
-                    f"{math.degrees(limit):.3f}deg"
-                )
-        return None
+                raise RuntimeError(f"{side} accepted arm target is non-finite")
+            errors[side] = np.abs(actual[side] - target)
+        return errors
 
     @staticmethod
     def _is_transient_arm_read_failure(reason: str) -> bool:
@@ -6630,6 +6683,7 @@ class RuleBasedRealTeleopExtension:
         self._clear_current()
         self._clear_replay_reference_schedule()
         self._last_dispatched_emission = None
+        self._completion_hold_min_error_by_side = {}
         self._frame_emission = None
         self._paused_hold_emission = None
         self._deferred_progress_arm_contract = None

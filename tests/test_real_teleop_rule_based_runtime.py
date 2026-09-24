@@ -1284,6 +1284,77 @@ def test_successful_next_attempt_rebuild_keeps_certified_arm_hold_stream() -> No
         time.sleep(0.001)
 
 
+@pytest.mark.parametrize("moved_away", [False, True])
+def test_successful_episode_finalization_distinguishes_lag_from_manual_motion(
+    moved_away: bool,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6), right_arm=np.zeros(6)
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=2.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=2.0,
+    )
+    # The terminal target can be accepted with up to 2 degrees of joint
+    # tracking error. This is not evidence that someone moved the arm.
+    poller.qpos["right"][2] = np.deg2rad(1.0)
+    extension._clear_current()
+    extension._load_next(SimpleNamespace(), 2.01, poller.latest_at_or_before(2.01))
+    assert extension.status().completed is True
+
+    finalizing = session.command_override_provider(SimpleNamespace(), 2.02)
+
+    assert finalizing.command is not None
+    assert finalizing.command.metadata["rule_based_pause_hold"] is True
+    assert extension.status().aborted is False
+    assert extension.status().held is False
+    assert session.hold_reasons == []
+
+    # Servo convergence cannot invalidate a completed Episode either.
+    poller.qpos["right"][2] = np.deg2rad(0.4)
+    converging = session.command_override_provider(SimpleNamespace(), 2.03)
+    assert converging.command is not None
+    assert extension.status().held is False
+
+    if moved_away:
+        # A subsequent move *away* from the accepted target is still caught
+        # under the unchanged 0.75-degree movement limit.
+        poller.qpos["right"][2] = np.deg2rad(1.3)
+        moved = session.command_override_provider(SimpleNamespace(), 2.04)
+        assert moved.command is None
+        assert extension.status().aborted is True
+        assert extension.status().held is True
+        assert "error increased by" in session.hold_reasons[-1]
+    else:
+        recorder.is_recording = False
+        extension.after_control_input_poll(now=2.04)
+        assert extension.status().completed is False
+        assert extension.status().held is False
+        assert extension.status().rule_start_available is True
+        assert session.hold_reasons == []
+
+
 def test_successful_episode_reset_uses_current_qpos() -> None:
     plan = RuleBasedCollectionPlan(
         steps=(
