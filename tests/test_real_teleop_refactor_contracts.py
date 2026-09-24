@@ -1182,10 +1182,12 @@ def test_runtime_setup_helpers_live_in_non_authoritative_modules() -> None:
 
 @pytest.mark.parametrize("terminal_error", [None, KeyboardInterrupt()])
 @pytest.mark.parametrize("close_fails", [False, True])
+@pytest.mark.parametrize("optional_state", ["absent", "partial", "none", "ready"])
 def test_shutdown_runtime_preserves_cleanup_registration_order(
     monkeypatch: pytest.MonkeyPatch,
     terminal_error: BaseException | None,
     close_fails: bool,
+    optional_state: str,
 ) -> None:
     labels: list[str] = []
     executed: list[str] = []
@@ -1233,6 +1235,27 @@ def test_shutdown_runtime_preserves_cleanup_registration_order(
             lambda **kwargs: record("position_audit.metadata_detach")
         ),
     }
+    optional_labels = [
+        "main_loop_watchdog", "debug_timing_console_writer",
+        "debug_timing_log_recorder", "action_debug_log_recorder",
+        "ik_debug_log_recorder", "active_recording",
+    ]
+    if optional_state == "partial":
+        # The real startup initializes this slot before entering the main try.
+        runtime_state["ik_debug_log_recorder"] = None
+    elif optional_state == "none":
+        runtime_state.update(dict.fromkeys(optional_labels[:-1]))
+        runtime_state["recording_active"] = None
+    elif optional_state == "ready":
+        for label in optional_labels[:-1]:
+            runtime_state[label] = SimpleNamespace(
+                close=lambda name=label: record(name),
+                stop=lambda name=label, **_kwargs: record(name),
+            )
+        runtime_state["recording_active"] = lambda: True
+        runtime_state["stop_recording"] = (
+            lambda *_args, **_kwargs: record("active_recording")
+        )
     cleanup = shutdown_runtime.run_best_effort_cleanup
 
     def capture_cleanup(name, steps) -> None:
@@ -1261,6 +1284,7 @@ def test_shutdown_runtime_preserves_cleanup_registration_order(
 
     assert labels == [
         "startup_progress",
+        *(optional_labels if optional_state == "ready" else []),
         "episode_recorder",
         "clutch_input",
         "dataset_recorder",
