@@ -275,6 +275,8 @@ def _certify_continuous_waypoint_cut_impl(
             "available_last_row": int(shadow.q_rad.shape[0] - 1),
         }
 
+    # Dispatch uses discrete q samples. Certify their finite-difference state
+    # so fallback to the formal governor cannot hide a cut-boundary jump.
     dt = 1.0 / float(command_hz)
     discrete_qd = np.zeros_like(shadow.q_rad)
     discrete_qdd = np.zeros_like(shadow.q_rad)
@@ -1956,152 +1958,6 @@ class RM65OfficialAllIKGovernorPlanner:
             consumed_async=True,
         )
 
-    def _certify_continuous_waypoint_cut(
-        self,
-        shadow: OfflineJointWaypointTrajectory,
-        *,
-        initial_state: JointHorizonState,
-        collision_planner: RM65PositionPlannerProtocol,
-    ) -> tuple[bool, np.ndarray | None, np.ndarray | None, dict[str, Any]]:
-        """Certify one complete cut without mutating execution state."""
-
-        required_last_row = int(self.commands_per_source)
-        if int(shadow.q_rad.shape[0]) <= required_last_row:
-            return False, None, None, {
-                "admission_status": "formal_fallback_insufficient_cut_coverage",
-                "authoritative": False,
-                "dispatch_selected": False,
-                "formal_qcmd_unchanged": True,
-                "required_last_row": required_last_row,
-                "available_last_row": int(shadow.q_rad.shape[0] - 1),
-            }
-
-        # Position control ultimately dispatches q samples, not the analytic
-        # derivative fields of the quintic.  Certify the finite-difference
-        # state seen by the 120 Hz command stream so a later fallback to the
-        # semi-implicit formal governor cannot introduce an unmodelled state
-        # discontinuity at a source-cut boundary.
-        dt = 1.0 / self.command_hz
-        discrete_qd = np.zeros_like(shadow.q_rad)
-        discrete_qdd = np.zeros_like(shadow.q_rad)
-        discrete_qd[0] = np.asarray(initial_state.qd_rad_s, dtype=float)
-        discrete_qdd[0] = np.asarray(initial_state.qdd_rad_s2, dtype=float)
-        tolerance = 1e-7
-        for row in range(1, required_last_row + 1):
-            discrete_qd[row] = (
-                np.asarray(shadow.q_rad[row], dtype=float)
-                - np.asarray(shadow.q_rad[row - 1], dtype=float)
-            ) / dt
-            discrete_qdd[row] = (
-                discrete_qd[row] - discrete_qd[row - 1]
-            ) / dt
-            discrete_jerk = (
-                discrete_qdd[row] - discrete_qdd[row - 1]
-            ) / dt
-            violations = (
-                (
-                    "velocity",
-                    np.abs(discrete_qd[row]),
-                    self._dual_limits.max_velocity_rad_s,
-                ),
-                (
-                    "acceleration",
-                    np.abs(discrete_qdd[row]),
-                    self._dual_limits.max_acceleration_rad_s2,
-                ),
-                (
-                    "jerk",
-                    np.abs(discrete_jerk),
-                    self._dual_limits.max_jerk_rad_s3,
-                ),
-            )
-            for quantity, observed, limit in violations:
-                failing = np.flatnonzero(observed > limit + tolerance)
-                if failing.size:
-                    joint = int(failing[0])
-                    return False, None, None, {
-                        "admission_status": (
-                            "formal_fallback_discrete_dynamic_rejected"
-                        ),
-                        "authoritative": False,
-                        "dispatch_selected": False,
-                        "formal_qcmd_unchanged": True,
-                        "discrete_command_certificate_passed": False,
-                        "discrete_rejected_row": row,
-                        "discrete_rejected_joint_index": joint + 1,
-                        "discrete_rejected_quantity": quantity,
-                        "discrete_rejected_observed": float(observed[joint]),
-                        "discrete_rejected_limit": float(limit[joint]),
-                    }
-
-        previous = np.asarray(initial_state.q_rad, dtype=float).reshape(12)
-        min_distance_m = math.inf
-        checked_count = 0
-        for row in range(1, required_last_row + 1):
-            candidate = np.asarray(shadow.q_rad[row], dtype=float).reshape(12)
-            checks = ((1.0, candidate),) + tuple(
-                (
-                    alpha,
-                    (1.0 - alpha) * previous + alpha * candidate,
-                )
-                for alpha in (0.25, 0.5, 0.75)
-            )
-            for alpha, sample in checks:
-                checked_count += 1
-                validation = collision_planner.validate_qpos_reference(
-                    {
-                        "left": sample[:6],
-                        "right": sample[6:],
-                    },
-                    source=(
-                        "deploy_continuous_waypoint_admission_endpoint"
-                        if alpha == 1.0
-                        else "deploy_continuous_waypoint_admission_interval_sample"
-                    ),
-                )
-                if validation.collision_distance_m is not None:
-                    min_distance_m = min(
-                        min_distance_m,
-                        float(validation.collision_distance_m),
-                    )
-                if not validation.safe:
-                    return False, None, None, {
-                        "admission_status": "formal_fallback_collision_rejected",
-                        "authoritative": False,
-                        "dispatch_selected": False,
-                        "formal_qcmd_unchanged": True,
-                        "collision_checked": True,
-                        "collision_admitted": False,
-                        "collision_check_count": checked_count,
-                        "collision_rejected_row": row,
-                        "collision_rejected_alpha": alpha,
-                        "collision_rejected_reason": validation.reason,
-                        "collision_min_distance_m": (
-                            None
-                            if not math.isfinite(min_distance_m)
-                            else min_distance_m
-                        ),
-                    }
-            previous = candidate
-
-        return True, discrete_qd, discrete_qdd, {
-            "admission_status": "admitted_for_complete_source_cut",
-            "authoritative": True,
-            "dispatch_selected": True,
-            "formal_qcmd_unchanged": False,
-            "collision_checked": True,
-            "collision_admitted": True,
-            "collision_check_count": checked_count,
-            "collision_min_distance_m": (
-                None if not math.isfinite(min_distance_m) else min_distance_m
-            ),
-            "committed_cut_rows": required_last_row,
-            "discrete_command_certificate_passed": True,
-            "discrete_command_certificate_scope": "complete_source_cut",
-            "selection_scope": "complete_source_cut",
-            "selection_switching": "forbidden_within_source_cut",
-        }
-
     def _pre_admit_continuous_waypoint_cut(
         self,
         *,
@@ -2166,10 +2022,13 @@ class RM65OfficialAllIKGovernorPlanner:
             }
             return
         admitted, discrete_qd, discrete_qdd, admission_metadata = (
-            self._certify_continuous_waypoint_cut(
+            _certify_continuous_waypoint_cut_impl(
                 shadow,
                 initial_state=initial_state,
                 collision_planner=self._collision_planner,
+                commands_per_source=self.commands_per_source,
+                command_hz=self.command_hz,
+                dual_limits=self._dual_limits,
             )
         )
         self._cached_continuous_waypoint_admitted = bool(admitted)
