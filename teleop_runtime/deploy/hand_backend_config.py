@@ -19,8 +19,8 @@ from ..backends.grippers import (
     DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
     GRIPPER_ACTION_MAX,
     DMTacGripperBackendConfig,
-    normalize_dmtac_tactile_fields,
 )
+from ..dmtac_config import apply_dmtac_policy_options
 from ..gripper_policy_core import (
     load_gripper_task_profile,
     normalize_gripper_policy,
@@ -116,36 +116,7 @@ def _apply_gripper_policy_to_dmtac_config(
     args: argparse.Namespace,
     policy: Mapping[str, Any],
 ) -> DMTacGripperBackendConfig:
-    config.speed = float(policy["speed"])
-    config.torque = float(policy["torque"])
-    config.max_action = float(policy["max_action"])
-    config.command_dim = int(policy["output_dim"])
-    config.send_threshold = float(policy["send_threshold"])
-    config.command_hz = float(policy["command_hz"])
-    config.continuous_grasp = bool(policy["continuous_grasp"])
-    config.telemetry_hz = float(policy["telemetry_hz"])
-    config.gripper_telemetry_command_grace_s = float(
-        policy.get(
-            "telemetry_command_grace_s",
-            DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
-        )
-    )
-    tactile_timeout_ms = getattr(args, "dmtac_tactile_timeout_ms", None)
-    if tactile_timeout_ms is not None:
-        config.tactile_timeout_ms = int(tactile_timeout_ms)
-    tactile_wait_for_new = getattr(args, "dmtac_tactile_wait_for_new", None)
-    if tactile_wait_for_new is not None:
-        config.tactile_wait_for_new = bool(tactile_wait_for_new)
-    tactile_fields = getattr(args, "dmtac_tactile_fields", None)
-    if tactile_fields is None:
-        tactile_fields = policy.get("tactile_fields")
-    if tactile_fields is not None:
-        config.tactile_fields = normalize_dmtac_tactile_fields(tactile_fields)
-    tactile_compute_profile = getattr(args, "dmtac_tactile_compute_profile", None)
-    if tactile_compute_profile:
-        config.tactile_compute_profile = str(tactile_compute_profile)
-    elif policy.get("tactile_compute_profile"):
-        config.tactile_compute_profile = str(policy["tactile_compute_profile"])
+    apply_dmtac_policy_options(config, args=args, policy=policy)
     if bool(getattr(args, "dmtac_tactile_sequential_read", False)):
         config.tactile_parallel_read = False
     if not _dmtac_tactile_enabled(args):
