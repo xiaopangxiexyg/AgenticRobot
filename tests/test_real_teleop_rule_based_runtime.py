@@ -1284,6 +1284,123 @@ def test_successful_next_attempt_rebuild_keeps_certified_arm_hold_stream() -> No
         time.sleep(0.001)
 
 
+def test_completed_episode_stop_handoff_does_not_hold_without_recorder() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6), right_arm=np.zeros(6)
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=2.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=2.0,
+    )
+    extension._clear_current()
+    extension._load_next(SimpleNamespace(), 2.01, poller.latest_at_or_before(2.01))
+    assert extension.status().completed is True
+    extension._completion_stop_requested = True
+
+    # The real stop worker detaches the recorder before publishing completion.
+    # This gap must neither resend a qref without feedback nor become a robot
+    # Hold, which would prevent the next successful attempt from starting.
+    transition_pending = True
+    extension._dataset_recorder_provider = lambda: None if transition_pending else recorder
+    extension._collection_transition_active = lambda: transition_pending
+    recorder.is_recording = False
+    extension.after_control_input_poll(now=2.02)
+    during_stop = session.command_override_provider(SimpleNamespace(), 2.02)
+    assert during_stop.command is None
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=None,
+            command_dispatched=False,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=2.02,
+    )
+    assert extension.status().completed is True
+    assert extension.status().held is False
+    assert extension.status().aborted is False
+    assert session.hold_reasons == []
+
+    transition_pending = False
+    extension.after_control_input_poll(now=2.03)
+    assert extension.status().completed is False
+    assert extension.status().held is False
+    assert extension.status().rule_start_available is True
+    assert session.hold_reasons == []
+    # The following transition must use post-stop measured state, not the
+    # successful Episode's last accepted command.
+    current_after_stop = {
+        side: {"actual_qpos": np.full(6, 0.1, dtype=float)}
+        for side in ("left", "right")
+    }
+    selected = extension._initial_alignment_start_qpos_pair(current_after_stop)
+    for side in ("left", "right"):
+        np.testing.assert_array_equal(
+            selected[side], current_after_stop[side]["actual_qpos"]
+        )
+
+
+def test_missing_arm_feedback_outside_completed_stop_handoff_still_holds() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(
+                        left_arm=np.zeros(6), right_arm=np.zeros(6)
+                    ),
+                ),
+            )
+        ),
+        trajectory_groups={},
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=2.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=2.0,
+    )
+    extension._completed = True
+    extension._armed = False
+    extension._dataset_recorder_provider = lambda: None
+    extension._collection_transition_active = lambda: False
+
+    missing = session.command_override_provider(SimpleNamespace(), 2.01)
+    assert missing.command is None
+    assert extension.status().held is True
+    assert extension.status().aborted is True
+    assert "causal_arm_feedback_poller_unavailable" in session.hold_reasons[-1]
+
+
 @pytest.mark.parametrize("moved_away", [False, True])
 def test_successful_episode_finalization_distinguishes_lag_from_manual_motion(
     moved_away: bool,

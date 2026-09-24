@@ -5699,6 +5699,21 @@ class RuleBasedRealTeleopExtension:
             )
         feedback_ready, feedback_reason, snapshots = self._fresh_arm_snapshots(float(now))
         if not feedback_ready:
+            if (
+                self._completed
+                and self._completion_stop_requested
+                and feedback_reason == "causal_arm_feedback_poller_unavailable"
+                and self._collection_transition_pending()
+            ):
+                # stop_episode temporarily detaches the formal recorder while
+                # its worker owns the writer. Its arm poller is unavailable in
+                # this handoff, not faulty. Never resend the terminal qref
+                # without measured feedback; the backend's target-stale
+                # quick-stop owns the idle stream until the next attempt is
+                # rebuilt from fresh hardware state.
+                self._waiting_reason = "successful_episode_stop_handoff"
+                self._publish_status(recording_ready=False)
+                return TeleopCommandOverride(None)
             if self._recoverable_arm_feedback_pause(
                 reason=feedback_reason, now=float(now)
             ):
