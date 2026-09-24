@@ -10,6 +10,8 @@ import numpy as np
 from robot_motion.primitives import LEVEL_TCP_ORIENTATION_PRIMITIVES
 from robot_motion.transforms import as_pose_matrix
 
+from ._viewer_geometry import write_arrow, write_sphere
+
 _SIDES = ("left", "right")
 _SIDE_COLORS = {
     "left": np.array([1.0, 0.10, 0.78, 0.95], dtype=np.float32),
@@ -139,7 +141,7 @@ class LevelTcpOrientationVisualizer:
                 )
             cursor = self._base_geom_index
             for side in _SIDES:
-                self._write_sphere(
+                write_sphere(
                     scene.geoms[cursor],
                     position=self.anchor_pose_world_by_side[side][:3, 3],
                     radius=self.config.anchor_radius_m,
@@ -151,7 +153,7 @@ class LevelTcpOrientationVisualizer:
                 origin = self.anchor_pose_world_by_side[side][:3, 3]
                 for primitive in LEVEL_TCP_ORIENTATION_PRIMITIVES:
                     heading = primitive.heading.value
-                    self._write_arrow(
+                    write_arrow(
                         scene.geoms[cursor],
                         start=origin,
                         end=self.static_forward_endpoint_by_side_and_heading[
@@ -164,7 +166,7 @@ class LevelTcpOrientationVisualizer:
                     cursor += 1
             for side in _SIDES:
                 actual = self.actual_pose_world_by_side[side][index]
-                self._write_arrow(
+                write_arrow(
                     scene.geoms[cursor],
                     start=actual[:3, 3],
                     end=(
@@ -185,7 +187,7 @@ class LevelTcpOrientationVisualizer:
                 if active_side in _SIDES and heading in _HEADING_COLORS
                 else np.array([1.0, 0.88, 0.04, 0.0], dtype=np.float32)
             )
-            self._write_arrow(
+            write_arrow(
                 scene.geoms[cursor],
                 start=target[:3, 3],
                 end=(
@@ -204,59 +206,6 @@ class LevelTcpOrientationVisualizer:
             if cursor != stop:
                 raise RuntimeError("Level TCP orientation geom count drifted")
         return True
-
-    @staticmethod
-    def _write_sphere(
-        geom: Any,
-        *,
-        position: np.ndarray,
-        radius: float,
-        rgba: np.ndarray,
-        label: str,
-    ) -> None:
-        import mujoco
-
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_SPHERE,
-            np.full(3, float(radius), dtype=float),
-            np.asarray(position, dtype=float),
-            np.eye(3, dtype=float).reshape(-1),
-            np.asarray(rgba, dtype=np.float32),
-        )
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = label
-
-    @staticmethod
-    def _write_arrow(
-        geom: Any,
-        *,
-        start: np.ndarray,
-        end: np.ndarray,
-        width: float,
-        rgba: np.ndarray,
-        label: str,
-    ) -> None:
-        import mujoco
-
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_ARROW,
-            np.zeros(3, dtype=float),
-            np.zeros(3, dtype=float),
-            np.eye(3, dtype=float).reshape(-1),
-            np.asarray(rgba, dtype=np.float32),
-        )
-        mujoco.mjv_connector(
-            geom,
-            mujoco.mjtGeom.mjGEOM_ARROW,
-            float(width),
-            np.asarray(start, dtype=float),
-            np.asarray(end, dtype=float),
-        )
-        geom.rgba = np.asarray(rgba, dtype=np.float32)
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = label
 
 
 __all__ = [
