@@ -38,6 +38,7 @@ from robot_motion.replay import (
 )
 from robot_motion.rm65 import DualArmCollisionAwareRetargeterConfig
 from teleop_runtime.command_override import TeleopCommandOverride
+from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 from teleop_runtime.backends.grippers.dmtac import (
     DMTacGripperBackend,
     DMTacGripperBackendConfig,
@@ -1886,6 +1887,11 @@ def _components(session: _Session, *, hand_sides: tuple[str, ...] = ()):
         def is_emergency_stopped() -> bool:
             return False
 
+        @staticmethod
+        def normalize_local_qpos_observation(qpos, *, label):
+            del label
+            return np.asarray(qpos, dtype=float).copy(), {"status": "exact"}
+
         def reset_motion_state(self, qpos) -> None:
             self.resets.append(np.asarray(qpos, dtype=float).copy())
 
@@ -2108,6 +2114,11 @@ def test_each_alignment_rebases_command_transport_from_measured_snapshot() -> No
         def is_emergency_stopped(self) -> bool:
             return self.stopped
 
+        @staticmethod
+        def normalize_local_qpos_observation(qpos, *, label):
+            del label
+            return np.asarray(qpos, dtype=float).copy(), {"status": "exact"}
+
         def reset_motion_state(self, qpos) -> None:
             self.resets.append(np.asarray(qpos, dtype=float).copy())
 
@@ -2171,6 +2182,47 @@ def test_each_alignment_rebases_command_transport_from_measured_snapshot() -> No
         assert len(command_backends[side].resets) == 2
         np.testing.assert_allclose(command_backends[side].resets[1], next_start[side])
         np.testing.assert_allclose(preview_backends[side].qpos, next_start[side])
+
+
+def test_alignment_rebase_normalizes_only_tiny_measured_limit_roundoff() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    components = _components(_Session())
+    for side in ("left", "right"):
+        setattr(
+            components,
+            f"{side}_command_backend",
+            RM65ArmBackend(
+                RM65ArmBackendConfig(
+                    arm_ip="192.0.2.1",
+                    side=side,
+                    connect_hardware=False,
+                    initial_qpos=(0.0,) * 6,
+                    singularity_protection_enabled=False,
+                )
+            ),
+        )
+    extension.attach_components(components)
+    measured = {"left": np.zeros(6), "right": np.zeros(6)}
+    measured["right"][2] = 2.355008
+
+    anchor = extension._rebase_motion_transport_from_measured_start(measured)
+
+    assert measured["right"][2] == pytest.approx(2.355008)
+    assert anchor["right"][2] == pytest.approx(2.355)
+    assert components.right_preview_backend.qpos[2] == pytest.approx(2.355)
+    assert components.right_command_backend.get_state()["current_qpos"][2] == pytest.approx(2.355)
+
+    outside = {side: qpos.copy() for side, qpos in measured.items()}
+    outside["right"][2] = 2.355 + np.deg2rad(0.02)
+    with pytest.raises(RuleBasedInitialAlignmentPlanningError, match="local-observation tolerance"):
+        extension._rebase_motion_transport_from_measured_start(outside)
+    assert components.right_preview_backend.qpos[2] == pytest.approx(2.355)
 
 
 def test_coupled_pose_solver_reseeds_only_at_new_rule_step() -> None:
@@ -6451,6 +6503,130 @@ def test_transient_arm_read_failure_holds_then_resumes_without_cursor_advance() 
     assert resumed.command is not None
     assert resumed.command.metadata.get("rule_based_pause_hold") is not True
     assert extension.status().aborted is False
+
+
+def test_transient_read_pause_allows_normal_tracking_lag_to_converge() -> None:
+    target = np.zeros(6)
+    target[2] = 0.03  # More than the 0.75 degree pause-motion tolerance.
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6), right_arm=target,
+                ),
+            ),)
+        ),
+        trajectory_groups={},
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=32.0)
+    assert active.command.commands["right_arm"].value[2] == pytest.approx(0.03)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=32.0,
+    )
+    poller.blocked["right"] = "hardware_read_failed"
+    assert session.command_override_provider(SimpleNamespace(), 32.1).command is None
+    assert extension.status().aborted is False
+
+    poller.blocked.clear()
+    poller.qpos["right"][2] = 0.005
+    session.command_override_provider(SimpleNamespace(), 32.2)
+
+    assert extension.status().aborted is False, session.hold_reasons
+    assert session.hold_reasons == []
+    assert extension._replay_reference_pause_started_at is None
+    assert extension._paused_arm_start_qpos_by_side == {}
+
+
+def test_writer_pause_keeps_certified_qref_with_ordinary_tracking_lag() -> None:
+    target = np.zeros(6)
+    target[2] = 0.03
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6), right_arm=target,
+                ),
+            ),)
+        ),
+        trajectory_groups={},
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=35.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=35.0,
+    )
+
+    recorder.is_paused = True
+    paused = session.command_override_provider(SimpleNamespace(), 35.01)
+
+    assert paused.command is not None
+    assert paused.command.metadata["rule_based_pause_hold"] is True
+    assert extension.status().aborted is False
+    assert session.hold_reasons == []
+
+
+def test_transient_read_pause_rejects_motion_away_from_tracking_corridor() -> None:
+    target = np.zeros(6)
+    target[2] = 0.03
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(
+                    left_arm=np.zeros(6), right_arm=target,
+                ),
+            ),)
+        ),
+        trajectory_groups={},
+    )
+    poller = _Poller()
+    recorder = _Recorder(poller)
+    recorder.is_recording = True
+    session, _clutch, _ui = _bind(extension, recorder)
+    active = _wait_for_command(session, now=33.0)
+    extension.after_session_step(
+        step_result=SimpleNamespace(
+            command=active.command,
+            command_dispatched=True,
+            state=SimpleNamespace(value="RUNNING"),
+            faults=(),
+        ),
+        now=33.0,
+    )
+    poller.blocked["right"] = "hardware_read_failed"
+    assert session.command_override_provider(SimpleNamespace(), 33.1).command is None
+    poller.blocked.clear()
+    poller.qpos["right"][2] = -0.02
+
+    rejected = session.command_override_provider(SimpleNamespace(), 33.2)
+
+    assert rejected.command is None
+    assert extension.status().aborted is True
+    assert "right joint 3 moved outside" in session.hold_reasons[-1]
 
 
 def test_sustained_arm_read_failure_remains_fail_closed_after_grace() -> None:

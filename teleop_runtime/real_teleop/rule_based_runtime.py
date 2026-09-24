@@ -623,6 +623,9 @@ class RuleBasedRealTeleopExtension:
         self._replay_reference_queue: deque[_ReplayReferenceCarrier] = deque()
         self._replay_reference_stage_started_at: float | None = None
         self._replay_reference_pause_started_at: float | None = None
+        self._last_fresh_arm_qpos_by_side: dict[str, np.ndarray] = {}
+        self._last_fresh_arm_at: float | None = None
+        self._paused_arm_start_qpos_by_side: dict[str, np.ndarray] = {}
         self._replay_reference_last_schedule_lag_sec = 0.0
         self._replay_reference_cumulative_schedule_shift_sec = 0.0
         self._replay_reference_rebased_tick_count = 0
@@ -2319,12 +2322,20 @@ class RuleBasedRealTeleopExtension:
             )
             if self._execution_begun and recoverable_pause:
                 if self._replay_reference_pause_started_at is None:
-                    self._replay_reference_pause_started_at = float(now)
+                    if not self._begin_replay_reference_pause(float(now)):
+                        return TeleopCommandOverride(None)
                 return self._paused_arm_hold_override(
                     reason=reason,
                     now=float(now),
                 )
             if self._execution_begun:
+                if reason.startswith("causal_arm_feedback_invalid:"):
+                    self._abort_session_step(
+                        "rule-based execution received invalid measured arm feedback: "
+                        + reason
+                    )
+                    self._publish_status(recording_ready=False)
+                    return TeleopCommandOverride(None)
                 raise RuntimeError(
                     "rule-based execution lost formal collection readiness: " + reason
                 )
@@ -2362,6 +2373,7 @@ class RuleBasedRealTeleopExtension:
                 if started_at is not None:
                     setattr(self, attribute, float(started_at) + paused_sec)
             self._replay_reference_pause_started_at = None
+            self._paused_arm_start_qpos_by_side.clear()
         self._arm_feedback_pause_started_at = None
         self._waiting_reason = ""
         if self._current is not None and self._advance_due(
@@ -3601,7 +3613,38 @@ class RuleBasedRealTeleopExtension:
             state = snapshots[side]
             if state.get("actual_state_valid") is False or state.get("actual_state_stale") is True:
                 return False, f"causal_arm_feedback_not_ready:{side}=feedback_stale", {}
+        try:
+            fresh_qpos = self._snapshot_qpos_pair(snapshots)
+        except RuntimeError as exc:
+            return False, f"causal_arm_feedback_invalid:{exc}", {}
+        self._last_fresh_arm_qpos_by_side = fresh_qpos
+        self._last_fresh_arm_at = float(now)
         return True, "", snapshots
+
+    def _begin_replay_reference_pause(self, now: float) -> bool:
+        """Anchor pause motion to the last measured state, never to a qref."""
+
+        age = (
+            float("inf")
+            if self._last_fresh_arm_at is None
+            else max(0.0, float(now) - self._last_fresh_arm_at)
+        )
+        if (
+            age > float(self.config.arm_feedback_recovery_timeout_sec)
+            or set(self._last_fresh_arm_qpos_by_side) != set(self.deployment.active_sides)
+        ):
+            self._abort_session_step(
+                "cannot establish rule pause without recent measured arm feedback: "
+                f"age={age:.3f}s"
+            )
+            self._publish_status(recording_ready=False)
+            return False
+        self._paused_arm_start_qpos_by_side = {
+            side: qpos.copy()
+            for side, qpos in self._last_fresh_arm_qpos_by_side.items()
+        }
+        self._replay_reference_pause_started_at = float(now)
+        return True
 
     def _load_next(
         self,
@@ -4707,8 +4750,15 @@ class RuleBasedRealTeleopExtension:
         # The post-plan start-drift check below still rejects real movement
         # during planning; collision, TCP-envelope, and command guards remain
         # authoritative for every emitted waypoint.
-        start = self._initial_alignment_start_qpos_pair(snapshots)
-        self._rebase_motion_transport_from_measured_start(start)
+        measured_start = self._initial_alignment_start_qpos_pair(snapshots)
+        try:
+            start = self._rebase_motion_transport_from_measured_start(measured_start)
+        except RuleBasedInitialAlignmentPlanningError as exc:
+            self._abort_initial_alignment(
+                f"initial-alignment measured start is outside the safe observation envelope: {exc}",
+                recoverable_predispatch_hold=True,
+            )
+            return
         target = {
             side: np.asarray(
                 emission.directive.qpos_by_side.get(side, start[side]),
@@ -5089,7 +5139,7 @@ class RuleBasedRealTeleopExtension:
     def _rebase_motion_transport_from_measured_start(
         self,
         start_qpos_by_side: Mapping[str, np.ndarray],
-    ) -> None:
+    ) -> dict[str, np.ndarray]:
         """Align every new transition's transport with fresh arm feedback.
 
         Manual motion and the idle target-stale quick-stop between Episodes do
@@ -5136,13 +5186,32 @@ class RuleBasedRealTeleopExtension:
                     f"{side} command backend is stopped; runtime Home is required "
                     "before rule initialization."
                 )
-            prepared[side] = (command_backend, preview_backend, qpos.copy())
+            normalize = getattr(command_backend, "normalize_local_qpos_observation", None)
+            if not callable(normalize):
+                raise RuntimeError(
+                    f"measured-start motion rebase requires {side} observation normalizer."
+                )
+            try:
+                normalized, _metadata = normalize(
+                    qpos, label="rule initial-alignment measured start"
+                )
+            except ValueError as exc:
+                raise RuleBasedInitialAlignmentPlanningError(
+                    f"{side} measured start: {exc}",
+                    status="hold_current",
+                    blocked_reason="measured_qpos_observation",
+                ) from exc
+            normalized = np.asarray(normalized, dtype=float).reshape(6)
+            if not np.all(np.isfinite(normalized)):
+                raise RuntimeError(f"{side} observation normalizer returned invalid qpos.")
+            prepared[side] = (command_backend, preview_backend, normalized.copy())
 
         for command_backend, preview_backend, qpos in prepared.values():
             preview_backend.set_local_qpos(qpos)
             command_backend.reset_motion_state(qpos)
         _sync_dual_arm_retargeter_for_real_control(components)
         self._coupled_pose_solver_seeded = False
+        rebased = {side: values[2].copy() for side, values in prepared.items()}
 
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
@@ -5151,6 +5220,7 @@ class RuleBasedRealTeleopExtension:
                 "已用本次过渡前的双臂新鲜实测姿态重置位控规划锚点；"
                 "初始化首帧不会沿用上次采集或暂停前命令状态。",
             )
+        return rebased
 
     def _hand_qpos_from_state(
         self,
@@ -5824,7 +5894,8 @@ class RuleBasedRealTeleopExtension:
     ) -> str | None:
         """Reject an old target after measured arm motion, not normal lag.
 
-        In-flight pauses require the measured joints to stay close to qref.
+        In-flight pauses allow normal convergence from the measured pause
+        anchor toward qref, but reject movement outside that corridor.
         After a successful terminal arrival, the accepted qref can normally
         lead feedback by more than that limit.  Reject only *new* movement
         away from the terminal reference; convergence toward qref is safe.
@@ -5832,6 +5903,7 @@ class RuleBasedRealTeleopExtension:
 
         try:
             errors = self._measured_to_accepted_abs_error(snapshots)
+            actual = self._snapshot_qpos_pair(snapshots)
         except RuntimeError as exc:
             return str(exc)
         limit = float(self.config.pause_hold_max_joint_delta_rad)
@@ -5856,12 +5928,24 @@ class RuleBasedRealTeleopExtension:
                     prior_minimum, error
                 )
             else:
-                joint = int(np.argmax(error))
-                if float(error[joint]) > limit:
+                anchor = self._paused_arm_start_qpos_by_side.get(side)
+                if anchor is None:
+                    return f"{side} measured pause anchor is missing"
+                held = self._last_dispatched_emission
+                command = None if held is None else held.command.commands.get(f"{side}_arm")
+                if command is None:
+                    return f"{side} accepted arm target is missing"
+                target = np.asarray(command.value, dtype=float).reshape(6)
+                lower = np.minimum(anchor, target) - limit
+                upper = np.maximum(anchor, target) + limit
+                excess = np.maximum(lower - actual[side], actual[side] - upper)
+                joint = int(np.argmax(excess))
+                if float(excess[joint]) > 0.0:
                     return (
-                        f"{side} joint {joint + 1} measured-to-accepted delta="
-                        f"{math.degrees(float(error[joint])):.3f}deg > "
-                        f"{math.degrees(limit):.3f}deg"
+                        f"{side} joint {joint + 1} moved outside the measured-pause "
+                        f"to accepted-target corridor by "
+                        f"{math.degrees(float(excess[joint])):.3f}deg "
+                        f"(limit {math.degrees(limit):.3f}deg)"
                     )
         return None
 
@@ -6124,7 +6208,7 @@ class RuleBasedRealTeleopExtension:
             if self._recoverable_arm_feedback_pause(reason=reason, now=float(now)):
                 self._waiting_reason = reason
                 if self._replay_reference_pause_started_at is None:
-                    self._replay_reference_pause_started_at = float(now)
+                    self._begin_replay_reference_pause(float(now))
                 return
             raise RuntimeError("target arrival feedback unavailable: " + reason)
         self._arm_feedback_pause_started_at = None
@@ -6558,6 +6642,7 @@ class RuleBasedRealTeleopExtension:
         self._replay_reference_queue.clear()
         self._replay_reference_stage_started_at = None
         self._replay_reference_pause_started_at = None
+        self._paused_arm_start_qpos_by_side.clear()
         self._replay_reference_last_schedule_lag_sec = 0.0
         self._replay_reference_cumulative_schedule_shift_sec = 0.0
         self._replay_reference_rebased_tick_count = 0
@@ -6789,6 +6874,9 @@ class RuleBasedRealTeleopExtension:
         self._completed_hold_stream_suspended = False
         self._aborted = False
         self._arm_feedback_pause_started_at = None
+        self._last_fresh_arm_qpos_by_side.clear()
+        self._last_fresh_arm_at = None
+        self._paused_arm_start_qpos_by_side.clear()
         self._initial_alignment_reacquire_samples = 0
         self._clear_manual_gripper_action()
 
