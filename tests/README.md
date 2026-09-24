@@ -90,6 +90,22 @@ do not establish equivalent coverage. Record this reasoning in the existing
 review, with measured runtime impact when execution cost motivates the change;
 neither net line reductions nor test-count quotas are acceptance criteria.
 
+### Runtime artifact 重复迁移压缩
+
+`test_runtime_artifact_migration.py` 将已发布迁移的幂等检查接在已有完整成功场景后，
+复用同一份稀疏 WAL、硬链接和符号链接目录树。保留真实 `create_plan`、`copy_verify`、
+独立 `verify_plan` 以及第二次 `copy_verify`；检查源身份哈希相同且 journal 不增加事件，
+不再为幂等断言额外准备并发布一次相同迁移。
+
+`test_runtime_artifact_resolution.py` 在真实发布、移动旧 source locator 并验证成功解析后，
+对同一目标文件写入等长错误内容，再验证 content hash 拒绝。成功和损坏检查都使用真实
+迁移计划与落盘内容，不再重复创建发布 receipt，也能检查成功读取后的内容是否被重新验证。
+
+这两处各减少一个独立测试结果；前置断言失败时，后续断言不会执行。其余恢复、xattr、
+外部硬链接、源变化、目标替换和未发布计划拒绝场景仍独立保留。生产 writer 扫描、真实
+`fsync`、复制/哈希/发布实现和验收 selector 不变。迁移测试会反复扫描主机 `/proc/*/fd`，
+成本依赖可见进程与文件描述符数量；受限进程环境和主机运行的耗时不能混作优化前后证据。
+
 ### 分类逻辑与架构检查的覆盖归属
 
 禁止下层反向依赖 `control_station` 的检查统一由

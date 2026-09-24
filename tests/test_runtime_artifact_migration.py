@@ -81,6 +81,15 @@ def test_plan_copy_verify_preserves_sparse_links_and_source(tmp_path: Path) -> N
     ]
     assert migration.verify_plan(plan_dir)["source_retained"] is True
 
+    # Reuse the published tree to check idempotency, including its special files.
+    event_count = len(events)
+    second = migration.copy_verify(plan_dir)
+
+    assert receipt["source_identity_hash"] == second["source_identity_hash"]
+    assert len(migration._read_journal(plan_dir / migration.JOURNAL_FILENAME)) == (
+        event_count
+    )
+
 
 def test_plan_records_external_hardlinks_without_recreating_them(
     tmp_path: Path,
@@ -224,28 +233,6 @@ def test_plan_hash_and_journal_chain_are_fail_closed(tmp_path: Path) -> None:
         migration.copy_verify(plan_dir)
 
     assert not target.exists()
-
-
-def test_copy_verify_is_idempotent_after_publication(tmp_path: Path) -> None:
-    source, target, plan_dir = _paths(tmp_path)
-    _build_source_tree(source)
-    migration.create_plan(
-        source=source,
-        target=target,
-        plan_dir=plan_dir,
-        migration_id="tx-1",
-    )
-    first = migration.copy_verify(plan_dir)
-    event_count = len(
-        migration._read_journal(plan_dir / migration.JOURNAL_FILENAME)
-    )
-
-    second = migration.copy_verify(plan_dir)
-
-    assert first["source_identity_hash"] == second["source_identity_hash"]
-    assert len(migration._read_journal(plan_dir / migration.JOURNAL_FILENAME)) == (
-        event_count
-    )
 
 
 def test_copy_recovers_recorded_post_publish_identity_failure(

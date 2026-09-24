@@ -304,13 +304,7 @@ def test_missing_historical_path_resolves_through_published_copy_plan(
     assert resolution.path == (target / "nested" / "trace.jsonl").resolve()
     assert resolution.path.read_text(encoding="utf-8") == "trace-content"
 
-
-def test_copy_plan_historical_resolution_hashes_the_selected_file(
-    tmp_path: Path,
-) -> None:
-    source, target, plan_dir = _published_copy_plan(tmp_path)
-    requested = source / "nested" / "trace.jsonl"
-    source.rename(tmp_path / "retained-source-outside-old-locator")
+    # A successful read must not make later same-size corruption acceptable.
     (target / "nested" / "trace.jsonl").write_text(
         "other-content",
         encoding="utf-8",
