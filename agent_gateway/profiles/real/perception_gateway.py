@@ -12,6 +12,10 @@ from agent_gateway.profiles.segmentation import (
     SegmentationRegistration,
     build_segmentation_executor,
 )
+from agent_gateway.profiles.back_projection import (
+    LiveBackProjectionProvider,
+    build_back_projection_executor,
+)
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.protocol.contracts import AgentObservationSnapshot
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
@@ -65,6 +69,7 @@ from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .localization_deployment import RealObjectLocalizationRegistration
+from .back_projection import RealSenseBackProjectionCapturePort
 from .localization_gateway import (
     ObjectLocalizationProvider,
     build_real_object_localization_executor,
@@ -161,6 +166,7 @@ class RealPerceptionContractBundle:
             raise ValueError("Camera-only perception requires real_observe mode.")
         expected_routes = (
             2
+            + int(self.registration.back_projection is not None)
             + int(self.localization_registration is not None)
             + int(self.segmentation_registration is not None)
             + int(self.station_point_grasp_registration is not None)
@@ -269,6 +275,14 @@ def build_real_perception_contract_bundle(
             ],
         ),
     ]
+    if registration.back_projection is not None:
+        raw_pairs.append(
+            (
+                registration.back_projection.skill,
+                registration.back_projection.binding,
+                registration.back_projection.availability_hash,
+            )
+        )
     if localization_registration is not None:
         raw_pairs.append(
             (
@@ -377,6 +391,8 @@ def build_real_perception_contract_bundle(
         ),
     )
     optional_validators = []
+    if registration.back_projection is not None:
+        optional_validators.append(registration.back_projection.payload_validator)
     if localization_registration is not None:
         optional_validators.append(localization_registration.payload_validator)
     if segmentation_registration is not None:
@@ -782,6 +798,8 @@ class RealPerceptionGatewaySession:
     observation_producer: RealPerceptionObservationProducer
     rgb_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor
+    back_projection_provider: LiveBackProjectionProvider | None
+    back_projection_executor: PassiveReadSkillExecutor | None
     localization_executor: PassiveReadSkillExecutor | None
     segmentation_provider: LiveSegmentationProvider | None
     segmentation_executor: PassiveReadSkillExecutor | None
@@ -851,6 +869,11 @@ class RealPerceptionGatewaySession:
             raise RuntimeError("Passive RGB reads did not quiesce during close.")
         if not self.depth_executor.wait_all(timeout_sec=5.0):
             raise RuntimeError("Passive depth reads did not quiesce during close.")
+        if (
+            self.back_projection_executor is not None
+            and not self.back_projection_executor.wait_all(timeout_sec=5.0)
+        ):
+            raise RuntimeError("Passive back-projection did not quiesce during close.")
         if (
             self.localization_executor is not None
             and not self.localization_executor.wait_all(timeout_sec=65.0)
@@ -927,6 +950,30 @@ def assemble_real_perception_gateway_session(
         bundle.registration.rgb.routes[0].semantic_content_hash: rgb_executor,
         bundle.registration.depth.routes[0].semantic_content_hash: depth_executor,
     }
+    back_projection_provider = None
+    back_projection_executor = None
+    back_projection_registration = bundle.registration.back_projection
+    if back_projection_registration is not None:
+        frame_binding = bundle.registration.frame_binding
+        if frame_binding is None:
+            raise ValueError("Back-projection requires a Station frame binding.")
+        back_projection_provider = LiveBackProjectionProvider(
+            capture_port=RealSenseBackProjectionCapturePort(
+                perception_provider=provider,
+                frame_binding=frame_binding,
+            ),
+            registration=back_projection_registration,
+        )
+        back_projection_executor = build_back_projection_executor(
+            registration=back_projection_registration,
+            provider=back_projection_provider,
+            current_station_revision=lambda: producer.current_station_revision,
+            max_retained_operations=max_retained_operations,
+            clock=clock,
+        )
+        ports[back_projection_registration.skill.routes[0].semantic_content_hash] = (
+            back_projection_executor
+        )
     localization_executor = None
     if bundle.localization_registration is not None:
         if localization_provider is None:
@@ -1087,6 +1134,10 @@ def assemble_real_perception_gateway_session(
         bundle.registration.rgb.routes[0].semantic_content_hash,
         bundle.registration.depth.routes[0].semantic_content_hash,
     ]
+    if bundle.registration.back_projection is not None:
+        camera_route_hashes.append(
+            bundle.registration.back_projection.skill.routes[0].semantic_content_hash
+        )
     if bundle.segmentation_registration is not None:
         camera_route_hashes.append(
             bundle.segmentation_registration.skill.routes[0].semantic_content_hash
@@ -1170,6 +1221,8 @@ def assemble_real_perception_gateway_session(
         observation_producer=producer,
         rgb_executor=rgb_executor,
         depth_executor=depth_executor,
+        back_projection_provider=back_projection_provider,
+        back_projection_executor=back_projection_executor,
         localization_executor=localization_executor,
         segmentation_provider=segmentation_provider,
         segmentation_executor=segmentation_executor,

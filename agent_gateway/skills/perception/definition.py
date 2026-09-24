@@ -6,10 +6,41 @@ from agent_gateway.protocol.skill_catalog import SkillDefinition
 
 CAPTURE_DEPTH_SKILL_ID_V1 = "perception.capture_depth"
 CAPTURE_RGB_SKILL_ID_V1 = "perception.capture_rgb"
+BACK_PROJECT_SKILL_ID_V1 = "perception.back_project"
 LOCALIZE_OBJECTS_SKILL_ID_V1 = "perception.localize_objects"
 PLAN_POINT_GRASP_SKILL_ID_V1 = "perception.plan_point_grasp"
 RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1 = "perception.render_point_grasp_candidate"
 SEGMENT_SKILL_ID_V1 = "perception.segment"
+
+
+def back_project_skill_definition_v1() -> SkillDefinition:
+    """Describe passive pixel or region back-projection into Station XYZ."""
+
+    return SkillDefinition(
+        skill_id=BACK_PROJECT_SKILL_ID_V1,
+        skill_version="1",
+        skill_kind="inspection",
+        summary=(
+            "Back-project exactly one zero-based [u, v] pixel or one half-open "
+            "[x0, y0, x1, y1] image region from a live deployment-registered "
+            "aligned depth source into its bound Station reference frame. "
+            "Region mode may filter by Station Z and returns robust center, "
+            "median, bounds, and extent without moving the robot."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "registered_aligned_depth_role.exclusive_pixel_or_region."
+            "optional_station_z_band.v1"
+        ),
+        execution_result_semantics_id=(
+            "station_bound_depth_back_projection_geometry.v1"
+        ),
+        task_outcome_semantics_id="passive_depth_back_projection.v1",
+        entry_predicate_ids=("trusted_live_aligned_depth_binding_available.v1",),
+        task_outcome_predicate_ids=("depth_geometry_back_projected.v1",),
+    )
 
 
 def capture_depth_skill_definition_v1() -> SkillDefinition:
@@ -284,12 +315,14 @@ def render_point_grasp_candidate_skill_definition_v1() -> SkillDefinition:
 
 
 __all__ = [
+    "BACK_PROJECT_SKILL_ID_V1",
     "CAPTURE_DEPTH_SKILL_ID_V1",
     "CAPTURE_RGB_SKILL_ID_V1",
     "LOCALIZE_OBJECTS_SKILL_ID_V1",
     "PLAN_POINT_GRASP_SKILL_ID_V1",
     "RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1",
     "SEGMENT_SKILL_ID_V1",
+    "back_project_skill_definition_v1",
     "capture_depth_skill_definition_v1",
     "capture_depth_skill_definition_v2",
     "capture_rgb_skill_definition_v1",

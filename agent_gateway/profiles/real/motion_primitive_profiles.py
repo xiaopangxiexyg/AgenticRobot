@@ -726,6 +726,10 @@ class RealAgentPrimitiveContractBundle:
         expected_route_count = (
             (11 + int(pose_target_enabled) + int(grasp_approach_enabled))
             + (2 if self.perception_capture is not None else 0)
+            + int(
+                self.perception_capture is not None
+                and self.perception_capture.back_projection is not None
+            )
             + (3 if self.localization_registration is not None else 0)
             + int(self.segmentation_registration is not None)
             + (2 if grasp_approach_plan_enabled else 0)
@@ -1495,6 +1499,11 @@ def build_real_agent_primitive_contract_bundle(
         if perception_capture is None
         else (perception_capture.rgb, perception_capture.depth)
     )
+    if (
+        perception_capture is not None
+        and perception_capture.back_projection is not None
+    ):
+        perception_registrations.append(perception_capture.back_projection.skill)
     if localization_registration is not None:
         assert station_point_grasp_registration is not None
         assert station_point_grasp_render_registration is not None
@@ -1588,6 +1597,16 @@ def build_real_agent_primitive_contract_bundle(
                             perception_route.semantic_content_hash
                         ]
                     ),
+                )
+            )
+        if perception_capture.back_projection is not None:
+            back_projection = perception_capture.back_projection
+            route_items.append(
+                SkillRouteManifestEntry(
+                    route=back_projection.skill.routes[0],
+                    deployment_binding=back_projection.binding.to_ref(),
+                    evaluation_plan_hash=None,
+                    availability_hash=back_projection.availability_hash,
                 )
             )
     if localization_registration is not None:
@@ -1767,7 +1786,14 @@ def build_real_agent_primitive_contract_bundle(
             *(
                 ()
                 if perception_capture is None
-                else perception_capture.payload_validators
+                else (
+                    *perception_capture.payload_validators,
+                    *(
+                        ()
+                        if perception_capture.back_projection is None
+                        else (perception_capture.back_projection.payload_validator,)
+                    ),
+                )
             ),
             *(
                 ()

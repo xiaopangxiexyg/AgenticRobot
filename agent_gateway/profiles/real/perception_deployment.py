@@ -10,6 +10,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from agent_gateway.profiles.back_projection import (
+    BackProjectionRegistration,
+    build_back_projection_registration,
+)
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillExecutionRoute,
@@ -312,9 +316,12 @@ class RealPerceptionCaptureRegistration:
     payload_validators: tuple[AgentSkillPayloadValidatorSet, ...]
     availability_hash_by_route_hash: Mapping[str, str]
     frame_binding: RealPerceptionFrameBinding | None = None
+    back_projection: BackProjectionRegistration | None = None
 
     def __post_init__(self) -> None:
         if self.frame_binding is None:
+            if self.back_projection is not None:
+                raise ValueError("Real Depth v1 cannot expose Station back-projection.")
             if not isinstance(self.depth_binding, RealPerceptionDeploymentBinding):
                 raise TypeError("Real Depth v1 requires its v1 deployment binding.")
             return
@@ -337,6 +344,18 @@ class RealPerceptionCaptureRegistration:
             for field_name, value in expected.items()
         ):
             raise ValueError("Real Depth v2 binding differs from its typed frame graph.")
+        if self.back_projection is not None:
+            profile = self.back_projection.profile
+            if (
+                profile.target_kind != "real"
+                or profile.current_mode not in {"real_active", "real_observe"}
+                or profile.reference_frame_id != self.frame_binding.reference_frame_id
+                or profile.reference_frame_spec_hash
+                != self.frame_binding.reference_frame_spec_hash
+                or profile.frame_graph_hash
+                != self.frame_binding.frame_graph.semantic_content_hash
+            ):
+                raise ValueError("Real back-projection frame binding differs.")
 
 
 def _source_tuples(
@@ -372,6 +391,7 @@ def _build_real_perception_capture_registration(
     source_binding_hash: str,
     current_mode: str = "real_active",
     frame_binding: RealPerceptionFrameBinding | None = None,
+    aligned_rgbd_source_catalog: tuple[Mapping[str, object], ...] | None = None,
 ) -> RealPerceptionCaptureRegistration:
     """Build both exact T0 Routes from one reviewed real-camera inventory."""
 
@@ -380,6 +400,10 @@ def _build_real_perception_capture_registration(
         raise ValueError("current_mode must be real_active or real_observe.")
 
     is_v2 = frame_binding is not None
+    if (aligned_rgbd_source_catalog is None) != (frame_binding is None):
+        raise ValueError(
+            "Aligned RGB-D sources and the Station frame binding must coexist."
+        )
     profile = RealPerceptionCaptureProfile(
         rgb_sources=_source_tuples(rgb_source_catalog, label="RGB"),
         depth_sources=_source_tuples(depth_source_catalog, label="Depth"),
@@ -678,6 +702,23 @@ def _build_real_perception_capture_registration(
             (depth_route, depth_binding),
         )
     }
+    back_projection = (
+        None
+        if frame_binding is None or aligned_rgbd_source_catalog is None
+        else build_back_projection_registration(
+            target_kind="real",
+            current_mode=mode,
+            source_catalog=aligned_rgbd_source_catalog,
+            reference_frame_id=frame_binding.reference_frame_id,
+            reference_frame_spec_hash=frame_binding.reference_frame_spec_hash,
+            frame_graph_hash=frame_binding.frame_graph.semantic_content_hash,
+            runtime_session_id=runtime_session_id,
+            control_domain_id=control_domain_id,
+            target_binding_id=target_binding_id,
+            station_manifest_hash=station_manifest_hash,
+            execution_manifest_hash=execution_manifest_hash,
+        )
+    )
     return RealPerceptionCaptureRegistration(
         profile=profile,
         rgb=rgb_registration,
@@ -690,6 +731,7 @@ def _build_real_perception_capture_registration(
         ),
         availability_hash_by_route_hash=availability,
         frame_binding=frame_binding,
+        back_projection=back_projection,
     )
 
 
@@ -718,6 +760,7 @@ def build_real_perception_capture_registration(
         source_binding_hash=source_binding_hash,
         current_mode=current_mode,
         frame_binding=None,
+        aligned_rgbd_source_catalog=None,
     )
 
 
@@ -732,6 +775,7 @@ def build_real_perception_capture_registration_v2(
     execution_manifest_hash: str,
     source_binding_hash: str,
     frame_binding: RealPerceptionFrameBinding,
+    aligned_rgbd_source_catalog: tuple[Mapping[str, object], ...],
     current_mode: str = "real_active",
 ) -> RealPerceptionCaptureRegistration:
     """Build RGB/Depth v2 against one exact source-to-Station adapter."""
@@ -747,6 +791,7 @@ def build_real_perception_capture_registration_v2(
         source_binding_hash=source_binding_hash,
         current_mode=current_mode,
         frame_binding=frame_binding,
+        aligned_rgbd_source_catalog=aligned_rgbd_source_catalog,
     )
 
 

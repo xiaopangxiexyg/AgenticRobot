@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from agent_gateway.profiles.back_projection import (
+    BackProjectionRegistration,
+    build_back_projection_registration,
+)
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillExecutionRoute,
@@ -245,6 +249,7 @@ class MujocoDepthCaptureRegistration:
     )
     payload_validator: AgentSkillPayloadValidatorSet
     availability_hash: str
+    back_projection: BackProjectionRegistration | None = None
 
 
 def build_mujoco_depth_capture_registration(
@@ -391,6 +396,7 @@ def build_mujoco_depth_capture_registration(
         deployment_binding=binding,
         payload_validator=validator,
         availability_hash=availability_hash,
+        back_projection=None,
     )
 
 
@@ -557,12 +563,26 @@ def build_mujoco_depth_capture_registration_v2(
         },
         domain="dexteleop.agent_skill.mujoco_depth_capture_availability.v2",
     )
+    back_projection = build_back_projection_registration(
+        target_kind="sim",
+        current_mode="sim_active",
+        source_catalog=source_catalog,
+        reference_frame_id=reference_frame_id,
+        reference_frame_spec_hash=reference_frame_spec_hash,
+        frame_graph_hash=frame_graph_hash,
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        target_binding_id=target_binding_id,
+        station_manifest_hash=station_manifest_hash,
+        execution_manifest_hash=execution_manifest_hash,
+    )
     return MujocoDepthCaptureRegistration(
         registration=registration,
         profile=profile,
         deployment_binding=binding,
         payload_validator=validator,
         availability_hash=availability_hash,
+        back_projection=back_projection,
     )
 
 

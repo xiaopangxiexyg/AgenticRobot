@@ -305,14 +305,17 @@ disconnect handling, so the safety channel does not weaken HOLD-on-disconnect.
 
 `--artifact-root` is optional and default-off. Supplying a real,
 non-world-writable directory enables the read-only
-`perception.capture_depth` and `perception.capture_rgb` Skills. Depth returns
-role-selected native-resolution float32 metric data; RGB returns one
-role-selected JPEG per output Artifact ordinal. Production RGB v2 also reports
-the admitted Station revision, an explicit capture window, and each frame's
-acquisition timestamp while preserving the requested semantic-role order. The
-trusted MuJoCo profile maps semantic roles to lower camera sources. Inline
-results contain only bounded metadata and content hashes. Pixel arrays never
-enter the control frame.
+`perception.capture_depth`, `perception.capture_rgb`, and
+`perception.back_project` Skills. Depth returns role-selected native-resolution
+float32 metric data; RGB returns one role-selected JPEG per output Artifact
+ordinal. Back-projection takes either one pixel or a half-open pixel region,
+captures aligned live depth internally, and returns bounded geometry in the
+registered Station frame; raw depth does not enter its control result.
+Production RGB v2 also reports the admitted Station revision, an explicit
+capture window, and each frame's acquisition timestamp while preserving the
+requested semantic-role order. The trusted MuJoCo profile maps semantic roles
+to lower camera sources. Inline capture results contain only bounded metadata
+and content hashes. Pixel arrays never enter the control frame.
 
 `python -m control_station agent-gateway-mujoco ...` remains a compatibility
 forwarder. It creates no Gateway implementation or runtime state inside
@@ -481,8 +484,9 @@ python -m agent_gateway real-perception \
   --artifact-root /absolute/private/artifact_cache
 ```
 
-By default, `real-perception` exposes exactly `perception.capture_rgb` and
-`perception.capture_depth` in `real_observe` mode. It owns the configured
+By default, `real-perception` exposes `perception.capture_rgb`,
+`perception.capture_depth`, and `perception.back_project` in
+`real_observe` mode. It owns the configured
 RealSense inventory and transient Artifact store, starts and admits cameras
 before publishing the Unix socket, and has no RM65 backend, motion Route,
 operator Grant, command owner, dispatch path, or domain HOLD path. It therefore

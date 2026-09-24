@@ -316,6 +316,9 @@ def assemble_camera_only_real_perception_composition(
     registration = build_real_perception_capture_registration_v2(
         rgb_source_catalog=catalog_provider.rgb_source_catalog(),
         depth_source_catalog=catalog_provider.depth_source_catalog(),
+        aligned_rgbd_source_catalog=(
+            catalog_provider.aligned_rgbd_source_catalog()
+        ),
         runtime_session_id=runtime_id,
         control_domain_id=domain_id,
         target_binding_id=target_binding_id,

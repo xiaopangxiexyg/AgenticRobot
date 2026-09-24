@@ -619,6 +619,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         perception_capture = build_real_perception_capture_registration_v2(
             rgb_source_catalog=catalog_provider.rgb_source_catalog(),
             depth_source_catalog=catalog_provider.depth_source_catalog(),
+            aligned_rgbd_source_catalog=(
+                catalog_provider.aligned_rgbd_source_catalog()
+            ),
             runtime_session_id=runtime_id,
             control_domain_id=domain_id,
             target_binding_id=target_binding_id,

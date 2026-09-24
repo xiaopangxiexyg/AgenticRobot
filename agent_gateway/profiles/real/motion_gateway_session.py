@@ -12,6 +12,10 @@ from agent_gateway.profiles.segmentation import (
     LiveSegmentationProvider,
     build_segmentation_executor,
 )
+from agent_gateway.profiles.back_projection import (
+    LiveBackProjectionProvider,
+    build_back_projection_executor,
+)
 from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
     AgentSkillOperation,
@@ -81,6 +85,7 @@ from .grasp_approach_plan import (
     build_grasp_visible_scene_reader,
     build_real_grasp_approach_plan_executor,
 )
+from .back_projection import RealSenseBackProjectionCapturePort
 from .localization_gateway import (
     ObjectLocalizationProvider,
     build_real_object_localization_executor,
@@ -609,6 +614,8 @@ class RealAgentPrimitiveGatewaySession:
     perception_provider: RealSenseAgentPerceptionProvider | None
     rgb_executor: PassiveReadSkillExecutor | None
     depth_executor: PassiveReadSkillExecutor | None
+    back_projection_provider: LiveBackProjectionProvider | None
+    back_projection_executor: PassiveReadSkillExecutor | None
     localization_provider: ObjectLocalizationProvider | None
     localization_executor: PassiveReadSkillExecutor | None
     segmentation_provider: LiveSegmentationProvider | None
@@ -649,6 +656,20 @@ class RealAgentPrimitiveGatewaySession:
             self.rgb_executor is not None and self.depth_executor is not None
         ):
             raise ValueError("Real perception requires both passive executors.")
+        back_projection_enabled = bool(
+            self.contract_bundle.perception_capture is not None
+            and self.contract_bundle.perception_capture.back_projection is not None
+        )
+        if back_projection_enabled != all(
+            item is not None
+            for item in (
+                self.back_projection_provider,
+                self.back_projection_executor,
+            )
+        ):
+            raise ValueError(
+                "Real back-projection registration and runtime resources disagree."
+            )
         grasp_enabled = self.contract_bundle.localization_registration is not None
         if grasp_enabled != all(
             item is not None
@@ -705,6 +726,7 @@ class RealAgentPrimitiveGatewaySession:
             "state.read_tcp_pose": self.state_executor,
             "perception.capture_rgb": self.rgb_executor,
             "perception.capture_depth": self.depth_executor,
+            "perception.back_project": self.back_projection_executor,
             "perception.localize_objects": self.localization_executor,
             "perception.segment": self.segmentation_executor,
             "perception.plan_point_grasp": self.station_point_grasp_executor,
@@ -810,6 +832,7 @@ class RealAgentPrimitiveGatewaySession:
                     self.state_executor,
                     self.rgb_executor,
                     self.depth_executor,
+                    self.back_projection_executor,
                     self.localization_executor,
                     self.station_point_grasp_executor,
                     self.station_point_grasp_render_executor,
@@ -1289,6 +1312,8 @@ def assemble_real_agent_primitive_gateway_session(
         execution_port_by_route_hash[route.semantic_content_hash] = executor
     rgb_executor = None
     depth_executor = None
+    back_projection_provider = None
+    back_projection_executor = None
     localization_executor = None
     segmentation_provider = None
     segmentation_executor = None
@@ -1316,6 +1341,28 @@ def assemble_real_agent_primitive_gateway_session(
                 registration.depth.routes[0].semantic_content_hash: depth_executor,
             }
         )
+        back_projection_registration = registration.back_projection
+        if back_projection_registration is not None:
+            frame_binding = registration.frame_binding
+            if frame_binding is None:
+                raise ValueError("Back-projection requires a v2 frame binding.")
+            back_projection_provider = LiveBackProjectionProvider(
+                capture_port=RealSenseBackProjectionCapturePort(
+                    perception_provider=perception_provider,
+                    frame_binding=frame_binding,
+                ),
+                registration=back_projection_registration,
+            )
+            back_projection_executor = build_back_projection_executor(
+                registration=back_projection_registration,
+                provider=back_projection_provider,
+                current_station_revision=lambda: producer.current_station_revision,
+                max_retained_operations=max_retained_operations,
+                clock=clock,
+            )
+            execution_port_by_route_hash[
+                back_projection_registration.skill.routes[0].semantic_content_hash
+            ] = back_projection_executor
         segmentation_registration = contract_bundle.segmentation_registration
         if segmentation_registration is not None:
             assert segmentation_localizer is not None
@@ -1581,6 +1628,8 @@ def assemble_real_agent_primitive_gateway_session(
         perception_provider=perception_provider,
         rgb_executor=rgb_executor,
         depth_executor=depth_executor,
+        back_projection_provider=back_projection_provider,
+        back_projection_executor=back_projection_executor,
         localization_provider=localization_provider,
         localization_executor=localization_executor,
         segmentation_provider=segmentation_provider,

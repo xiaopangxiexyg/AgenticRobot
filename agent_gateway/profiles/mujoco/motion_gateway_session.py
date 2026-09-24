@@ -21,6 +21,10 @@ from agent_gateway.profiles.segmentation import (
     LiveSegmentationProvider,
     build_segmentation_executor,
 )
+from agent_gateway.profiles.back_projection import (
+    LiveBackProjectionProvider,
+    build_back_projection_executor,
+)
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
@@ -67,6 +71,7 @@ from agent_gateway.skills.motion.definition import (
     OPEN_GRIPPER_SKILL_ID_V1,
 )
 from agent_gateway.skills.perception.definition import (
+    BACK_PROJECT_SKILL_ID_V1,
     CAPTURE_DEPTH_SKILL_ID_V1,
     CAPTURE_RGB_SKILL_ID_V1,
     SEGMENT_SKILL_ID_V1,
@@ -90,6 +95,7 @@ from collection_runtime.source_observation_history import (
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .depth_deployment import MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1
+from .back_projection import MujocoBackProjectionCapturePort
 from .gripper_skill import build_mujoco_gripper_action_executor
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import MujocoAgentTcpPoseContractBundle
@@ -142,6 +148,8 @@ class MujocoAgentTcpPoseGatewaySession:
     gripper_state_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor | None
     rgb_executor: PassiveReadSkillExecutor | None
+    back_projection_provider: LiveBackProjectionProvider | None
+    back_projection_executor: PassiveReadSkillExecutor | None
     segmentation_localizer: object | None
     segmentation_provider: LiveSegmentationProvider | None
     segmentation_executor: PassiveReadSkillExecutor | None
@@ -218,6 +226,20 @@ class MujocoAgentTcpPoseGatewaySession:
         if (self.rgb_executor is None) != (self.artifact_store is None):
             raise ValueError(
                 "RGB executor and Artifact store must be enabled together."
+            )
+        back_projection_enabled = bool(
+            self.contract_bundle.depth_capture is not None
+            and self.contract_bundle.depth_capture.back_projection is not None
+        )
+        if back_projection_enabled != all(
+            item is not None
+            for item in (
+                self.back_projection_provider,
+                self.back_projection_executor,
+            )
+        ):
+            raise ValueError(
+                "MuJoCo back-projection registration and runtime resources disagree."
             )
         if (self.segmentation_provider is None) != (
             self.segmentation_executor is None
@@ -416,6 +438,11 @@ class MujocoAgentTcpPoseGatewaySession:
                     ("gripper_state", self.gripper_state_executor, 5.0),
                     ("depth", self.depth_executor, 5.0),
                     ("rgb", self.rgb_executor, 5.0),
+                    (
+                        "back_projection",
+                        getattr(self, "back_projection_executor", None),
+                        5.0,
+                    ),
                     ("history", self.history_executor, 5.0),
                     ("segmentation", self.segmentation_executor, 65.0),
                 ):
@@ -732,6 +759,16 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         if depth_registration is not None
         else None
     )
+    back_projection_registration = (
+        None
+        if depth_registration is None
+        else depth_registration.back_projection
+    )
+    back_projection_entry = (
+        contract_bundle.route_manifest.route(BACK_PROJECT_SKILL_ID_V1, "1")
+        if back_projection_registration is not None
+        else None
+    )
     rgb_entry = (
         contract_bundle.route_manifest.route(
             CAPTURE_RGB_SKILL_ID_V1,
@@ -774,6 +811,33 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             provider=segmentation_provider,
             artifact_store=artifact_store,
             runtime_session_id=binding.runtime_session_id,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+            max_retained_operations=retention,
+            clock=runtime_clock,
+        )
+    back_projection_provider = None
+    back_projection_executor = None
+    if back_projection_registration is not None:
+        depth_binding = depth_registration.deployment_binding
+        back_projection_provider = LiveBackProjectionProvider(
+            capture_port=MujocoBackProjectionCapturePort(
+                application=application,
+                source_id_by_role=dict(
+                    back_projection_registration.profile.source_id_by_role
+                ),
+                source_frame_id=depth_binding.source_frame_id,
+                reference_frame_id=depth_binding.reference_frame_id,
+                current_station_revision=lambda: (
+                    observation_producer.current_station_revision
+                ),
+            ),
+            registration=back_projection_registration,
+        )
+        back_projection_executor = build_back_projection_executor(
+            registration=back_projection_registration,
+            provider=back_projection_provider,
             current_station_revision=lambda: (
                 observation_producer.current_station_revision
             ),
@@ -1448,6 +1512,10 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         execution_port_by_route_hash[segmentation_entry.route.semantic_content_hash] = (
             segmentation_executor
         )
+    if back_projection_entry is not None and back_projection_executor is not None:
+        execution_port_by_route_hash[
+            back_projection_entry.route.semantic_content_hash
+        ] = back_projection_executor
     executor_registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -1568,6 +1636,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         gripper_state_executor=gripper_state_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
+        back_projection_provider=back_projection_provider,
+        back_projection_executor=back_projection_executor,
         segmentation_localizer=segmentation_localizer,
         segmentation_provider=segmentation_provider,
         segmentation_executor=segmentation_executor,

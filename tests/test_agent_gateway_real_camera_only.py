@@ -104,6 +104,7 @@ def test_camera_only_composition_exposes_only_real_observe_perception_routes(
         manifest = composition.contract_bundle.route_manifest
         assert manifest.current_mode == "real_observe"
         assert [entry.route.skill_id for entry in manifest.skill_routes] == [
+            "perception.back_project",
             "perception.capture_depth",
             "perception.capture_rgb",
         ]

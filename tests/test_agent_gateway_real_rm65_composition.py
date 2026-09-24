@@ -429,7 +429,7 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         assert session.service.protocol_runtime.session_capabilities.artifact_transfer_enabled
         assert session.rgb_executor is not None
         assert session.depth_executor is not None
-        assert len(session.contract_bundle.route_manifest.skill_routes) == 15
+        assert len(session.contract_bundle.route_manifest.skill_routes) == 16
         effects = {
             entry.route.skill_id: entry.route.control_effect_class
             for entry in session.contract_bundle.route_manifest.skill_routes

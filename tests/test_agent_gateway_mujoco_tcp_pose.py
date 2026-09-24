@@ -2083,6 +2083,9 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
     }
     assert route_to_port[CAPTURE_DEPTH_SKILL_ID_V1] is session.depth_executor
     assert route_to_port[CAPTURE_RGB_SKILL_ID_V1] is session.rgb_executor
+    assert route_to_port["perception.back_project"] is (
+        session.back_projection_executor
+    )
     assert session.depth_executor is not session.motion_executor
     assert session.service.domain_control_port is session.motion_executor
     hardware_resources = session.wire_adapter(
@@ -2098,6 +2101,7 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
         if item["resource_id"] == "simulation.runtime"
     )
     assert {item["skill_id"] for item in simulation_resource["read_skill_refs"]} == {
+        "perception.back_project",
         "perception.capture_depth",
         "perception.capture_rgb",
         "perception.segment",
@@ -2295,13 +2299,79 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
     )
     assert session.motion_executor.workers == ()
 
+    back_projection_entry = bundle.route_manifest.route(
+        "perception.back_project", "1"
+    )
+    back_projection_route = back_projection_entry.route
+    back_projection_request = AgentSkillRequest(
+        client_id="rpent:fixture",
+        request_id="request:back-project:1",
+        idempotency_key="idempotency:back-project:1",
+        client_sequence=3,
+        runtime_session_id=bundle.route_manifest.runtime_session_id,
+        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+        expected_station_revision=0,
+        skill_id=back_projection_route.skill_id,
+        skill_version=back_projection_route.skill_version,
+        skill_definition_hash=back_projection_route.skill_definition_hash,
+        route_id=back_projection_route.route_id,
+        route_version=back_projection_route.route_version,
+        route_hash=back_projection_route.semantic_content_hash,
+        deployment_binding_hash=(
+            back_projection_entry.deployment_binding.deployment_binding_hash
+        ),
+        parameter_profile_id=(
+            back_projection_route.allowed_parameter_profiles[0].parameter_profile_id
+        ),
+        parameter_profile_hash=(
+            back_projection_route.allowed_parameter_profiles[0].parameter_profile_hash
+        ),
+        parameters={
+            "role": "main",
+            "target_pixel_uv": [1, 0],
+            "pixel_region_xyxy": None,
+            "world_z_min_m": None,
+            "world_z_max_m": None,
+        },
+        observation_snapshot_id=snapshot.snapshot_id,
+        requested_mode="sim_active",
+        requested_timeout_ms=1_000,
+    )
+    back_projection_admitted = session.service.submit_request(
+        request=back_projection_request,
+        current_station_revision=0,
+        now=10.0,
+    )
+    assert (
+        back_projection_admitted.accepted
+        and back_projection_admitted.operation is not None
+    )
+    assert session.service.launch_operation(
+        back_projection_admitted.operation.operation_id
+    ).accepted
+    assert session.back_projection_executor is not None
+    assert session.back_projection_executor.wait(
+        back_projection_admitted.operation.operation_id,
+        timeout_sec=1.0,
+    )
+    projected = session.service.operation_store.get(
+        back_projection_admitted.operation.operation_id
+    )
+    assert projected is not None and projected.status == "completed"
+    assert projected.execution_result["coordinate_mode"] == "pixel"
+    assert projected.execution_result["world_center_xyz_m"] == pytest.approx(
+        [0.0, -2.0, 3.0]
+    )
+    assert projected.execution_result["depth_m"] == 2.0
+    assert projected.output_artifact_bindings == ()
+
     segment_entry = bundle.route_manifest.route(SEGMENT_SKILL_ID_V1, "1")
     segment_route = segment_entry.route
     segment_request = AgentSkillRequest(
         client_id="rpent:fixture",
         request_id="request:segment:1",
         idempotency_key="idempotency:segment:1",
-        client_sequence=3,
+        client_sequence=4,
         runtime_session_id=bundle.route_manifest.runtime_session_id,
         skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
         expected_station_revision=0,

@@ -2827,6 +2827,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if depth_capture is not None:
         definition_items.append(depth_capture.registration.definition)
         schema_items.append(depth_capture.registration.schema_entry)
+        if depth_capture.back_projection is not None:
+            definition_items.append(depth_capture.back_projection.skill.definition)
+            schema_items.append(depth_capture.back_projection.skill.schema_entry)
     if rgb_capture is not None:
         definition_items.append(rgb_capture.registration.definition)
         schema_items.append(rgb_capture.registration.schema_entry)
@@ -2988,6 +2991,16 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=depth_capture.availability_hash,
             )
         )
+        if depth_capture.back_projection is not None:
+            back_projection = depth_capture.back_projection
+            route_items.append(
+                SkillRouteManifestEntry(
+                    route=back_projection.skill.routes[0],
+                    deployment_binding=back_projection.binding.to_ref(),
+                    evaluation_plan_hash=None,
+                    availability_hash=back_projection.availability_hash,
+                )
+            )
     if rgb_capture is not None:
         rgb_route = rgb_capture.registration.routes[0]
         route_items.append(
@@ -3038,6 +3051,16 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 registration.registration.definition.skill_version,
             )
         )
+        if (
+            depth_capture is not None
+            and depth_capture.back_projection is not None
+            and key
+            == (
+                depth_capture.back_projection.skill.definition.skill_id,
+                depth_capture.back_projection.skill.definition.skill_version,
+            )
+        ):
+            explicit_contracts += (depth_capture.back_projection.skill.io_contract,)
         explicit_contracts += tuple(
             registration.skill.io_contract
             for registration in (*gripper_actions, gripper_state)
@@ -3161,6 +3184,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         )
     if depth_capture is not None:
         validator_items.append(depth_capture.payload_validator)
+        if depth_capture.back_projection is not None:
+            validator_items.append(depth_capture.back_projection.payload_validator)
     if rgb_capture is not None:
         validator_items.append(rgb_capture.payload_validator)
     if segmentation is not None:
