@@ -54,7 +54,7 @@ from teleop_runtime.tactile_visualizer import (
 )
 from teleop_runtime.tcp import legacy_tcp_mode_requested
 
-from ..operator_ui_ports import RealTeleopInputBatchPrioritizer
+from ..operator_ui_ports import RealTeleopControlPolicy, RealTeleopInputBatchPrioritizer
 from ..position_control import PositionDebugRecorder
 from .actuator_command_trace import ActuatorCommandTraceRecorder
 from .arm_state_sync import (
@@ -438,6 +438,7 @@ def run_real_teleop(
     *,
     progress_application: ProgressApplicationPort | None = None,
     input_batch_prioritizer: RealTeleopInputBatchPrioritizer | None = None,
+    control_policy: RealTeleopControlPolicy | None = None,
     control_ui_type: type | None = None,
     startup_progress_type: type | None = None,
 ) -> None:
@@ -456,6 +457,16 @@ def run_real_teleop(
         ) from exc
     if hasattr(args, "_resolved_position_admittance_profile"):
         delattr(args, "_resolved_position_admittance_profile")
+    if (
+        progress_application is None
+        or input_batch_prioritizer is None
+        or control_policy is None
+    ):
+        raise RuntimeError(
+            "RealTeleop requires explicit progress, input-batch and control-policy ports."
+        )
+    if not callable(input_batch_prioritizer):
+        raise TypeError("input_batch_prioritizer must be callable.")
     gui_requested = bool(getattr(args, "gui_requested", False))
     if control_ui_type is not None and not isinstance(control_ui_type, type):
         raise TypeError("control_ui_type must be a UI class or None.")
@@ -616,15 +627,11 @@ def run_real_teleop(
         pose_snapshot_recorder=pose_snapshot_recorder,
         foot_pad_input=foot_pad_input,
     )
-    if (progress_application is None) != (input_batch_prioritizer is None):
-        raise RuntimeError(
-            "RealTeleop application ports must be injected together."
-        )
-    if progress_application is not None and input_batch_prioritizer is not None:
-        clutch_input.bind_application_ports(
-            progress_application=progress_application,
-            input_batch_prioritizer=input_batch_prioritizer,
-        )
+    clutch_input.bind_application_ports(
+        progress_application=progress_application,
+        input_batch_prioritizer=input_batch_prioritizer,
+        control_policy=control_policy,
+    )
     startup_cleanup.add("clutch_input", clutch_input.close)
     debug_episode_recording_enabled = _debug_episode_recording_enabled(args)
     episode_recorder = EpisodeRecorder(

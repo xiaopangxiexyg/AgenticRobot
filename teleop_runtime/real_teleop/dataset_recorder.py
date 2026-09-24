@@ -29,10 +29,7 @@ from dataset_contracts.v25p_native_storage import (
     V25P_RECORD_CJSON_LAYOUT_V1,
 )
 from dataset_interface.capture_modalities import bind_capture_modality_contract
-from dataset_interface.gripper_force import (
-    bind_gripper_force_contract,
-    read_gripper_force_contract,
-)
+from dataset_interface.gripper_force import read_gripper_force_contract
 from dataset_interface.hitl import validate_exclusive_hitl_dataset_append
 from dataset_interface.modality_artifacts import (
     assert_dataset_capture_integrity_compatible,
@@ -98,8 +95,8 @@ from ..collection.v25p_capture_profiles import (
 )
 from ..collection.v25p_dual_write_shadow import (
     V25pDualWriteShadow,
-    legacy_row_from_planned_jobs,
-    load_finalized_legacy_episode_record,
+    append_shadow_from_legacy_jobs,
+    finalize_shadow_after_legacy,
 )
 from collection_runtime.component_capture import ComponentCaptureEpisodeStore
 from ..collection.v25p_real_teleop_producer import RealTeleopV25pProducer
@@ -802,21 +799,11 @@ class RealTeleopDatasetRecorder:
             or not self._v25p_native_shadow_active
         ):
             return jobs
-        try:
-            shadow.append(
-                identity,
-                source_sample=sample,
-                legacy_row=legacy_row_from_planned_jobs(jobs),
-            )
-        except BaseException as exc:  # legacy capture stays authoritative
-            self._v25p_native_shadow_error = f"append:{type(exc).__name__}: {exc}"
-            try:
-                shadow.close_unsealed(identity)
-            except BaseException as close_exc:
-                self._v25p_native_shadow_error += (
-                    ";close_unsealed:"
-                    f"{type(close_exc).__name__}: {close_exc}"
-                )
+        error = append_shadow_from_legacy_jobs(
+            shadow, identity, source_sample=sample, jobs=jobs,
+            record_error=lambda error: setattr(self, "_v25p_native_shadow_error", error),
+        )
+        if error:
             self._v25p_native_shadow_active = False
         return jobs
 
@@ -911,70 +898,6 @@ class RealTeleopDatasetRecorder:
         if self.arm_state_poller is None:
             return {}
         return self.arm_state_poller.latest_by_side(sample_timestamp=float(sample_timestamp))
-
-    def reconfigure_for_current_args(self, *, force: bool = False) -> None:
-        desired_root = Path(self.args.dataset_root)
-        desired_contract = CaptureModalityContract(
-            ignored_camera_keys=tuple(getattr(self.args, "ignore_camera", ()) or ()),
-            ignored_tactile_keys=tuple(getattr(self.args, "ignore_tactile", ()) or ()),
-        )
-        desired_force_contract = _gripper_force_dataset_contract_from_args(self.args)
-        if desired_force_contract is None and desired_root == self.dataset_root:
-            desired_force_contract = getattr(self, "gripper_force_contract", None)
-        if desired_force_contract is not None:
-            current_force_contract = _current_gripper_force_dataset_contract(
-                self.args, self.components.active_sides
-            )
-            if current_force_contract != desired_force_contract:
-                raise ValueError(
-                    "selected task/profile does not match the dataset gripper force profile: "
-                    f"expected={desired_force_contract.to_dict()}, "
-                    f"current={None if current_force_contract is None else current_force_contract.to_dict()}"
-                )
-        if not force and self.configured_for_current_args():
-            # The live writer is the authoritative owner of episode/sample
-            # counters for this process.  Re-scanning the complete finalized
-            # dataset here used to put filesystem/process-RPC work directly in
-            # the teleop hot loop every time the operator started an episode.
-            # On a populated dataset that pause can exceed the VIVE history
-            # window and the arm target-stale watchdog.  Explicit dataset
-            # maintenance already updates the live writer, while a task/root/
-            # modality change takes the rebuild path below.
-            return
-        if self.is_recording:
-            raise RuntimeError("Cannot reconfigure dataset recorder while recording.")
-        trace_sink = getattr(self, "control_trace_episode_sink", None)
-        v25p_store = getattr(self, "v25p_sidecar_store", None)
-        if trace_sink is not None and desired_root != self.dataset_root:
-            raise RuntimeError(
-                "Formal ControlTrace capture cannot move dataset_root within one runtime "
-                "session; restart the frontend for the new root."
-            )
-        if v25p_store is not None and desired_root != self.dataset_root:
-            raise RuntimeError(
-                "v2.5-p sidecars cannot move dataset_root within one runtime session; "
-                "restart the frontend for the new root."
-            )
-        # Validate/bind before closing the current writer.  A mismatched
-        # populated dataset must leave the currently usable recorder intact.
-        bind_capture_modality_contract(desired_root, desired_contract)
-        if desired_force_contract is not None and desired_root != self.dataset_root:
-            bind_gripper_force_contract(desired_root, desired_force_contract)
-        elif desired_force_contract is not None and getattr(self, "gripper_force_contract", None) is None:
-            bind_gripper_force_contract(desired_root, desired_force_contract)
-        all_camera_sources = dict(self.all_camera_sources)
-        self.close()
-        self.__init__(
-            args=self.args,
-            components=self.components,
-            camera_sources=all_camera_sources,
-        )
-        if trace_sink is not None:
-            self.attach_control_trace_episode_sink(trace_sink)
-        if v25p_store is not None:
-            self.attach_v25p_sidecar_store(v25p_store)
-        self.start()
-        self.write_camera_device_config()
 
     def configured_for_current_args(self) -> bool:
         desired_root = Path(self.args.dataset_root)
@@ -2994,37 +2917,18 @@ class RealTeleopDatasetRecorder:
             and task.episode_identity is not None
             and self._v25p_native_shadow_active
         ):
-            try:
-                task.v25p_native_finalize_report = run_stage(
-                    "v25p_native_post_finalize",
-                    lambda: v25p_native_shadow.finalize_after_legacy(
-                        task.episode_identity,
-                        legacy_episode_record=load_finalized_legacy_episode_record(
-                            self.dataset_root,
-                            task.episode_index,
-                        ),
-                        completed_at=time.time(),
-                        completed_clock_domain_id="local_wall_clock",
-                    ),
-                )
-                receipt = task.v25p_native_finalize_report.receipt
-                if receipt.status != "complete":
-                    task.v25p_native_error = str(
-                        receipt.message
-                        or "v2.5-p compatibility projection failed"
-                    )
-            except BaseException as shadow_exc:  # legacy finalize remains successful
-                task.v25p_native_error = (
-                    f"post_finalize:{type(shadow_exc).__name__}: {shadow_exc}"
-                )
-                if v25p_native_shadow.active_identity == task.episode_identity:
-                    try:
-                        v25p_native_shadow.close_unsealed(task.episode_identity)
-                    except BaseException as close_exc:
-                        task.v25p_native_error += (
-                            ";close_unsealed:"
-                            f"{type(close_exc).__name__}: {close_exc}"
-                        )
+            finalize_shadow_after_legacy(
+                v25p_native_shadow,
+                task.episode_identity,
+                dataset_root=self.dataset_root,
+                episode_index=task.episode_index,
+                error_prefix="post_finalize",
+                record_finalize_elapsed=lambda elapsed: task.record_stage_timing(
+                    "v25p_native_post_finalize", elapsed
+                ),
+                record_report=lambda report: setattr(task, "v25p_native_finalize_report", report),
+                record_error=lambda error: setattr(task, "v25p_native_error", error),
+            )
         elif getattr(self, "_v25p_native_shadow_error", ""):
             task.v25p_native_error = str(self._v25p_native_shadow_error)
         if task.progress_episode is not None and not task.progress_error:

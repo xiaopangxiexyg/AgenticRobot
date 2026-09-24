@@ -18,6 +18,7 @@ from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBa
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
 from teleop_runtime.real_teleop import (
     cli_resolution,
+    operator_control_runtime,
     impedance_force_runtime,
     startup_runtime,
 )
@@ -31,6 +32,7 @@ from collection_runtime.progress.profiles import (
     bind_dataset_progress_profile,
     load_managed_task_profile,
 )
+from tests.support.real_teleop_control import build_control_input
 
 
 class _FakeTerminal:
@@ -326,7 +328,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         components.active_sides = ("left", "right")
         components.session.calibration = calibration
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(virtual_desk_post_yaw_deg=180.0),
@@ -400,7 +402,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_tracker_side_warning_cancel_keeps_tracker_swap_available(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -426,7 +428,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_tracker_swap_clears_pending_fresh_check_metadata(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(),
@@ -456,7 +458,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
 
     def test_tracker_side_confirmation_survives_transient_tracker_dropout(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -487,7 +489,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         components = _components()
         components.active_sides = ("left", "right")
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -517,7 +519,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
 
     def test_terminal_cannot_bypass_web_tracker_side_confirmation(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -540,7 +542,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_two_pedal_fast_home_supersedes_pending_tracker_confirmation(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -587,7 +589,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
 
     def test_explicit_home_does_not_override_queued_two_pedal_fast_home(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -617,7 +619,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_two_pedal_request_replaces_queued_normal_home_kind(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -660,7 +662,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         controller = FixController()
         components = _components()
         components.fix_arm_controller = controller
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -700,7 +702,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             moving=True,
             recapturing=False,
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(special_arm_control_mode="foot-pad"),
@@ -739,7 +741,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         controller = FixController()
         components = _components()
         components.fix_arm_controller = controller
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -761,7 +763,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIsNone(control._two_pedal_transition_target_fixed_side)
 
     def test_two_pedal_transition_cleanup_does_not_depend_on_web_ui(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -787,7 +789,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(control._two_pedal_alert_level, "")
 
     def test_normal_home_is_not_misclassified_as_two_pedal_fast_home(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -816,7 +818,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_two_pedal_fresh_tracker_wait_times_out_after_one_second(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -850,7 +852,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         components = _components()
         components.active_sides = ("left", "right")
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(calibration_timeout=10.0),
@@ -892,7 +894,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         components = _components()
         components.active_sides = ("left", "right")
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(calibration_timeout=10.0),
@@ -925,7 +927,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_two_pedal_tracker_wait_and_home_share_one_second_budget(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=None,
             args=_args(special_arm_control_mode="foot-pad"),
@@ -963,7 +965,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_locked_dual_arm_tracker_warning_does_not_offer_disabled_swap(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -988,7 +990,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_tracker_side_is_rechecked_immediately_before_home_capture(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -1014,7 +1016,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_explicit_tracker_side_confirmation_completes_gui_session_check(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -1039,7 +1041,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_tracker_side_check_runs_only_for_first_home_in_gui_session(self) -> None:
         components = _components()
         components.active_sides = ("left", "right")
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -1071,7 +1073,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertFalse(gate.final_recheck_required)
 
     def test_tracker_side_evaluator_stops_after_first_gui_session_check(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -2251,7 +2253,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_gui_ik_debug_toggle_creates_log_before_teleop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             ui = _FakeUi(["d"])
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=_args(),
@@ -2281,7 +2283,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_running_gui_exposes_episode_and_visualization_controls(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2317,7 +2319,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_device_retry_is_restored_only_after_lower_hold_receipt(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2348,7 +2350,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_stale_device_retry_event_is_rejected_by_running_backend_state(self) -> None:
         ui = _FakeUi(["device_retry"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2367,7 +2369,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
 
     def test_device_retry_backend_gate_rechecks_state_after_event_was_queued(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -2386,7 +2388,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_device_retry_backend_gate_rejects_exact_qpos_activity(self) -> None:
         components = _components()
         components.init_arm_controller = SimpleNamespace(qpos_active=True)
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -2400,7 +2402,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_pending_hold_rejects_movement_change_until_hardware_hold_runs(self) -> None:
         args = _args(movement_multiple=1.0)
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=args,
@@ -2424,7 +2426,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_hold_event_is_a_barrier_for_later_events_in_same_gui_batch(self) -> None:
         ui = _FakeUi(["device_retry", "p", "h", "movement_multiple_up"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(movement_multiple=1.0),
@@ -2441,7 +2443,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_quit_event_discards_all_other_events_in_same_gui_batch(self) -> None:
         ui = _FakeUi(["device_retry", "p", "q", "movement_multiple_up"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(movement_multiple=1.0),
@@ -2460,7 +2462,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         ui = _FakeUi(
             ["device_retry", "p", "init_qpos_emergency_stop", "movement_multiple_up"]
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(movement_multiple=1.0),
@@ -2477,7 +2479,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_visualization_refresh_cannot_reenable_controls_during_recording(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2496,7 +2498,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_rejected_episode_start_restores_one_shot_controls(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2525,7 +2527,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                     "fix_arm_min_samples": None,
                 }
             )
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=_args(),
@@ -2563,7 +2565,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 "init_arm_profile_path": "profile.json",
             }
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2616,7 +2618,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                     "init_arm_profile_path": "profile.json",
                 }
             )
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=_args(),
@@ -2660,7 +2662,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                     "init_arm_profile_path": "profile.json",
                 }
             )
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=_args(),
@@ -2724,7 +2726,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         components.fix_arm_controller = FakeFixArmController()
         components.session.safety_monitor = safety_monitor
         components.dual_arm_retargeter = dual_arm_retargeter
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2764,7 +2766,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         ui = _FakeUi(["c"])
         components = _components()
         components.fix_arm_controller = FakeFixArmController()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2784,7 +2786,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_stale_c_event_without_running_fix_arm_does_not_request_runtime_home(self) -> None:
         ui = _FakeUi(["c"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2876,7 +2878,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_hold_gui_allows_stopping_active_ik_debug_log(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2897,7 +2899,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_ready_gui_exposes_movement_multiple_controls(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2925,7 +2927,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_debug_episode_only_mode_does_not_expose_formal_dataset_delete(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(no_collection=True, no_episode_recording=False),
@@ -2954,7 +2956,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 "enable_tactile_solving",
             ]
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2972,7 +2974,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_rule_completion_stop_preserves_finalize_reason(self) -> None:
         ui = _FakeUi(["episode_stop:rule_based_complete"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -2993,7 +2995,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_rule_runtime_home_retry_event_uses_robot_state_only_bridge(self) -> None:
         ui = _FakeUi(["runtime_home_retry"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -3018,7 +3020,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
 
     def test_progress_gui_without_profile_does_not_block_episode_start(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(
@@ -3071,7 +3073,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 collection_progress_entry_condition="recovery_from_failure",
             )
             real_teleop._apply_formal_dataset_layout(args)
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=args,
@@ -3079,7 +3081,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
             control._teleop_started = True
 
-            with patch.object(real_teleop, "datetime") as fake_datetime:
+            with patch.object(operator_control_runtime, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-07-02"
                 applied = control._apply_episode_start_payload(
                     json.dumps(
@@ -3113,14 +3115,14 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 collection_progress_profile=None,
             )
             real_teleop._apply_formal_dataset_layout(args)
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=_FakeUi(),
                 args=args,
                 components=_components(),
             )
 
-            with patch.object(real_teleop, "datetime") as fake_datetime:
+            with patch.object(operator_control_runtime, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-08-03"
                 applied = control._apply_episode_start_payload(
                     json.dumps(
@@ -3147,7 +3149,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             collection_task_id="original_task",
             dataset_root="/tmp/original_dataset",
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -3182,7 +3184,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             tactile_visualization_available=False,
         )
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(), ui=ui, args=args, components=_components()
         )
 
@@ -3221,7 +3223,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             right_pose_retargeter=components.right_retargeter,
         )
         args = _args()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -3243,7 +3245,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_gui_movement_multiple_button_steps_and_resets(self) -> None:
         ui = _FakeUi(["movement_multiple_up", "movement_multiple_down", "movement_multiple_reset"])
         args = _args(movement_multiple=1.2, translation_scale=1.2)
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -3258,7 +3260,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_gui_movement_multiple_change_is_rejected_while_running(self) -> None:
         ui = _FakeUi(["movement_multiple_set:2.5"])
         args = _args(movement_multiple=1.0, translation_scale=1.0)
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -3300,7 +3302,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_gui_init_qpos_speed_updates_both_sides_atomically(self) -> None:
         ui = _FakeUi(['init_arm_qpos_speed_set:{"left":4.0,"right":6.0}'])
         args = _args()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -3325,7 +3327,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
     def test_gui_init_qpos_speed_rejects_partial_invalid_update(self) -> None:
         ui = _FakeUi(['init_arm_qpos_speed_set:{"left":4.0,"right":20.0}'])
         args = _args()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -3343,7 +3345,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(any("倍率无效" in message for _, message in ui.messages))
 
     def test_init_qpos_emergency_stop_is_operation_stop_not_process_quit(self) -> None:
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(["init_qpos_emergency_stop"]),
             args=_args(),
@@ -3424,7 +3426,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
         )
         ui = _FakeUi(['gripper_force_set:{"left":0.31,"right":0.64}'])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -3460,7 +3462,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 )
             )
             args = _args(dataset_root=str(Path(tmp_dir) / "new_dataset"))
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=_FakeUi(),
                 args=args,
@@ -3510,7 +3512,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                     connect_tactile=False,
                 )
             )
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=_FakeUi(),
                 args=_args(
@@ -3701,7 +3703,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_fix_hold_disables_gripper_and_blocks_new_episode_start(self) -> None:
         ui = _FakeUi(["episode_start"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -3733,7 +3735,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 return requested
 
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=StartTerminal(),
             ui=ui,
             args=_args(),
@@ -3762,7 +3764,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             },
         )
         components.init_arm_controller = controller
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(arm_control_mode="position"),
@@ -3771,7 +3773,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         control._teleop_started = True
         transition = SimpleNamespace(ok=True, side="left", message="planning")
 
-        with patch.object(real_teleop, "_start_gui_qpos_init", return_value=transition) as start:
+        with patch.object(operator_control_runtime, "_start_gui_qpos_init", return_value=transition) as start:
             control.poll()
 
         start.assert_called_once()
@@ -3788,7 +3790,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             qpos_active=False,
             status_payload=lambda: {"init_arm_available": True},
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(arm_control_mode="position"),
@@ -3796,7 +3798,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         transition = SimpleNamespace(ok=True, side="left", message="planning")
 
-        with patch.object(real_teleop, "_start_gui_qpos_init", return_value=transition) as start:
+        with patch.object(operator_control_runtime, "_start_gui_qpos_init", return_value=transition) as start:
             self.assertFalse(control._handle_init_arm_move_to_qpos_event(now=1.0))
             control.set_startup_qpos_maintenance_enabled(True)
             self.assertTrue(control._handle_init_arm_move_to_qpos_event(now=2.0))
@@ -3813,7 +3815,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             qpos_active=False,
             status_payload=lambda: {"init_arm_available": True},
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(arm_control_mode="position"),
@@ -3825,7 +3827,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         transition = SimpleNamespace(ok=True, side="left", message="planning")
 
         with patch.object(
-            real_teleop,
+            operator_control_runtime,
             "_start_gui_qpos_init",
             return_value=transition,
         ) as start:
@@ -3842,7 +3844,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             qpos_active=False,
             status_payload=lambda: {"init_arm_available": True},
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(arm_control_mode="position"),
@@ -3856,7 +3858,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         transition = SimpleNamespace(ok=True, side="left", message="planning")
 
         with patch.object(
-            real_teleop,
+            operator_control_runtime,
             "_start_gui_qpos_init",
             side_effect=lambda *_args, **_kwargs: (
                 calls.append("start") or transition
@@ -3874,7 +3876,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             qpos_active=False,
             status_payload=lambda: {"init_arm_available": True},
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(arm_control_mode="position"),
@@ -3885,7 +3887,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             lambda _reason: (_ for _ in ()).throw(RuntimeError("worker busy"))
         )
 
-        with patch.object(real_teleop, "_start_gui_qpos_init") as start:
+        with patch.object(operator_control_runtime, "_start_gui_qpos_init") as start:
             self.assertTrue(control._handle_init_arm_move_to_qpos_event(now=2.0))
 
         start.assert_not_called()
@@ -4025,7 +4027,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         components = _components()
         controller = InitController()
         components.init_arm_controller = controller
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(arm_control_mode="position"),
@@ -4045,7 +4047,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             controller.qpos_operation_id = "operation-" + side
             return SimpleNamespace(ok=True, side=side, message="planning")
 
-        with patch.object(real_teleop, "_start_gui_qpos_init", side_effect=start_selected):
+        with patch.object(operator_control_runtime, "_start_gui_qpos_init", side_effect=start_selected):
             self.assertTrue(control._handle_init_arm_move_both_to_qpos_event(now=1.0))
             self.assertEqual(started_sides, ["left"])
 
@@ -4079,7 +4081,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             qpos_active=True,
             status_payload=lambda: {"init_arm_available": True},
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(arm_control_mode="position"),
@@ -4114,7 +4116,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             qpos_active=False,
             status_payload=lambda: {"init_arm_available": True},
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(arm_control_mode="position"),
@@ -4125,7 +4127,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
         transition = SimpleNamespace(ok=True, side="left", message="planning")
         with patch.object(
-            real_teleop,
+            operator_control_runtime,
             "_start_gui_qpos_init",
             return_value=transition,
         ) as start:
@@ -4590,7 +4592,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 gripper_task_profile=str(gripper_profile),
             )
             real_teleop._apply_formal_dataset_layout(args)
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=args,
@@ -4598,7 +4600,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
             control._teleop_started = True
 
-            with patch.object(real_teleop, "datetime") as fake_datetime:
+            with patch.object(operator_control_runtime, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-07-02"
                 control.poll()
 
@@ -4647,7 +4649,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                     )
                 ]
             )
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=args,
@@ -4656,7 +4658,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             control._teleop_started = True
 
             with patch.object(
-                real_teleop,
+                operator_control_runtime,
                 "bind_capture_modality_contract",
                 side_effect=RuntimeError("contract mismatch"),
             ):
@@ -4687,7 +4689,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 )
             ]
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -4736,7 +4738,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
             args = _args(dataset_root=str(base_root), task_config=str(task_config))
             real_teleop._apply_formal_dataset_layout(args)
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=args,
@@ -4744,7 +4746,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
             control._teleop_started = True
 
-            with patch.object(real_teleop, "datetime") as fake_datetime:
+            with patch.object(operator_control_runtime, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-07-02"
                 control.poll()
 
@@ -4790,7 +4792,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             args = _args(dataset_root=str(base_root), task_config=str(task_config))
             real_teleop._apply_formal_dataset_layout(args)
             original_root = Path(args.dataset_root)
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=args,
@@ -4798,7 +4800,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
             control._teleop_started = True
 
-            with patch.object(real_teleop, "datetime") as fake_datetime:
+            with patch.object(operator_control_runtime, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-07-02"
                 control.poll()
 
@@ -4855,7 +4857,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 gripper_task="",
             )
             real_teleop._apply_formal_dataset_layout(args)
-            control = real_teleop.RealTeleopControlInput(
+            control = build_control_input(
                 terminal=_FakeTerminal(),
                 ui=ui,
                 args=args,
@@ -4863,7 +4865,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             )
             control._teleop_started = True
 
-            with patch.object(real_teleop, "datetime") as fake_datetime:
+            with patch.object(operator_control_runtime, "datetime") as fake_datetime:
                 fake_datetime.now.return_value.strftime.return_value = "2026-07-04"
                 control.poll()
                 self.assertTrue(control.consume_episode_start_request())
@@ -4886,7 +4888,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_gui_vive_calibration_button_calibrates_coordinate_profile(self) -> None:
         ui = _FakeUi(["calibrate_vive_coordinate_profile"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -4894,7 +4896,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
 
         with patch.object(
-            real_teleop,
+            operator_control_runtime,
             "_calibrate_gui_vive_coordinate_profile",
             return_value=Path("/tmp/vive_profile.json"),
         ) as quick_calibrate:
@@ -5232,7 +5234,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         components.session.sources = [source]
         ui = _FakeUi(events=["w"])
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -5262,7 +5264,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         components.session.sources = [source]
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=args,
@@ -5810,7 +5812,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             frames=repeated_frames,
         )
         ui = _FakeUi()
-        clutch_input = real_teleop.RealTeleopControlInput(
+        clutch_input = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(wrist_depth_mask=True),
@@ -5862,7 +5864,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                     "stale_after_sec": 1.0,
                 }
 
-        clutch_input = real_teleop.RealTeleopControlInput(
+        clutch_input = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=_args(),
@@ -5908,7 +5910,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 }
 
         ui = _FakeUi()
-        clutch_input = real_teleop.RealTeleopControlInput(
+        clutch_input = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -5938,7 +5940,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_camera_startup_self_check_fails_empty_sources_when_wrist_depth_required(self) -> None:
         ui = _FakeUi()
-        clutch_input = real_teleop.RealTeleopControlInput(
+        clutch_input = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(wrist_depth_mask=True),
@@ -6285,7 +6287,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_episode_recording_state_publishes_frequency_warning(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -6336,7 +6338,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 "init_arm_profile_path": "profile.json",
             }
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -6376,7 +6378,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_episode_finalizing_state_blocks_restart_controls(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -6403,7 +6405,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_episode_finalize_completion_restores_hold_controls(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -6460,7 +6462,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 "init_arm_profile_path": "profile.json",
             }
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -6510,7 +6512,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_episode_hold_can_be_requested_again_after_resume(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),
@@ -6540,7 +6542,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
     def test_episode_start_countdown_state_is_visible_and_blocks_restart(self) -> None:
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=_args(),

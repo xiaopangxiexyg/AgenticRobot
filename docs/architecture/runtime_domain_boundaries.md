@@ -47,6 +47,25 @@ lower domains must not import application/profile layers
 任何跨域适配器都应能回答三个问题：输入由谁推进、最终 authority/dispatch 由谁拥有、资源由谁关闭。
 如果答案出现两个 owner，应先修正所有权，而不是增加同步队列或兼容状态。
 
+真实遥操的 `RealTeleopControlInput` 直接引用 lower runtime 的实体操作，不依赖入口模块导入后
+回填全局函数。Control Station 在 `run_real_teleop()` 中显式传入 progress application、输入批次
+优先级和控制可用性策略，由运行时按实例绑定；缺少依赖时在资源装配前拒绝启动，同一实例不能
+换绑为另一组策略。可用性策略直接使用既有纯策略模块，snapshot/event 类型仍由该模块持有，
+不新增策略容器或第二套状态定义。旧 CLI 与控制器导出保留，但不再改变 lower module 的依赖。
+
+数采的 v2.5-p native shadow 由 `teleop_runtime.collection.v25p_dual_write_shadow` 统一处理
+已规划 legacy row 的追加、正式封存后的投影及失败清理；线程、子进程和 UMI 入口只保留各自的
+启用条件、状态发布与生命周期所有权。共享操作不重新规划样本，不调用正式 Writer 的封存，
+影子失败不改写正式保存结果；UMI 仍提交与 Writer 相同的下一帧动作对齐样本。
+有状态的入口通过窄回调在清理前发布操作错误，清理失败再追加错误；新报告在读取 receipt 前
+交给任务，操作未返回新报告时不清空既有报告。抽取共用逻辑不能改变这些状态发布时点。
+
+真实遥操的正式 writer 由 `EpisodeRecordingRuntime` 的异步准备／数据集选择事务构造，
+ready 后才发布；配置未变的 ready recorder 直接复用，不重新扫描已封存数据。全局启动不构造
+writer，recorder 自身不再提供关闭后原地重建的第二套生命周期。旧的
+`prepare_startup_dataset_recorder()` 与 `reconfigure_for_current_args()` 已退役；现行配置校验、
+候选失败回收、旧 recorder 可恢复边界和单次进程启动约束保持不变。
+
 ## 执行模式边界
 
 执行模式按同时参与控制决策的 source 数量划分，而不是按是否启用 GUI、trace 或被动 shadow 划分：

@@ -33,7 +33,6 @@ from teleop_runtime.real_teleop import (
     component_builder,
     components,
     control_loop,
-    dataset_recorder as dataset_recorder_module,
     dataset_finalize,
     dataset_layout,
     dataset_selection,
@@ -78,6 +77,12 @@ from teleop_runtime.real_teleop import (
     vive_calibration_runtime,
     vive_calibration_profiles,
     visualization_runtime,
+)
+from tests.support.real_teleop_control import bind_control_application
+from tests.support.real_teleop_recording import (
+    _Clutch,
+    _episode_runtime,
+    poll_recording_transition,
 )
 
 
@@ -276,32 +281,45 @@ def test_formal_writer_ready_handshake_is_not_global_startup_work() -> None:
     assert "set_current_dataset_recorder" not in runtime_source
 
 
-def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
-    monkeypatch: pytest.MonkeyPatch,
+def test_unchanged_dataset_prepare_reuses_writer_without_rescanning(
     tmp_path: Path,
 ) -> None:
-    recorder = object.__new__(dataset_recorder_module.RealTeleopDatasetRecorder)
-    recorder.args = SimpleNamespace(
-        dataset_root=tmp_path,
-        ignore_camera=(),
-        ignore_tactile=(),
-    )
-    recorder.components = SimpleNamespace(active_sides=())
-    recorder.dataset_root = tmp_path
-    recorder.gripper_force_contract = None
-    recorder.configured_for_current_args = lambda: True
     calls: list[str] = []
-    recorder.reload_finalized_dataset_state = lambda: calls.append("reload")
-    recorder.write_camera_device_config = lambda: calls.append("camera_config")
-    monkeypatch.setattr(
-        dataset_recorder_module,
-        "_gripper_force_dataset_contract_from_args",
-        lambda _args: None,
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer_started=True,
+        is_recording=False,
+        finalizing=False,
+        frame_count=0,
+        configured_for_current_args=lambda: True,
+        reload_finalized_dataset_state=lambda: calls.append("reload"),
+        write_camera_device_config=lambda: calls.append("camera_config"),
+        close=lambda: calls.append("close"),
+        poll_finalize_tasks=list,
     )
+    slot = [recorder]
 
-    recorder.reconfigure_for_current_args()
+    class UnexpectedReplacement:
+        def __init__(self, **_kwargs: object) -> None:
+            pytest.fail("An unchanged ready writer must not be reconstructed")
 
-    assert calls == []
+    runtime, _args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=UnexpectedReplacement,
+        dataset_slot=slot,
+        clutch=_Clutch(),
+        transition_calls=[],
+    )
+    try:
+        assert runtime.schedule_recording_countdown(10.0, start_reason="reuse")
+        assert slot[0] is None
+        poll_recording_transition(runtime)
+        assert slot[0] is recorder
+        assert calls == ["camera_config"]
+        assert runtime.countdown_deadline() is not None
+    finally:
+        assert runtime.close()
+    assert calls == ["camera_config"]
 
 
 def test_transactional_dataset_selection_defers_live_state_and_start_request(
@@ -343,6 +361,7 @@ def test_transactional_dataset_selection_defers_live_state_and_start_request(
         operator_control_runtime.RealTeleopControlInput
     )
     control.args = args
+    bind_control_application(control)
     control.ui = Ui()
     control.components = SimpleNamespace(active_sides=(), gripper_policy={})
     control.plus_curation = plus
@@ -461,6 +480,7 @@ def test_transactional_dataset_selection_rolls_back_side_effects_on_failure(
         operator_control_runtime.RealTeleopControlInput
     )
     control.args = args
+    bind_control_application(control)
     control.ui = ui
     control.components = SimpleNamespace(active_sides=(), gripper_policy={})
     control.plus_curation = plus
@@ -521,6 +541,7 @@ def test_pending_dataset_selection_rejects_progress_configuration_intents() -> N
     control = operator_control_runtime.RealTeleopControlInput.__new__(
         operator_control_runtime.RealTeleopControlInput
     )
+    bind_control_application(control)
     control._dataset_selection_pending = True
     control._progress_profile_selection_intents = __import__("collections").deque()
     control._progress_arm_control_mode_selection_intents = (
@@ -1376,6 +1397,7 @@ def test_extracted_application_runtime_preserves_entrypoint_support_contract() -
         "args",
         "progress_application",
         "input_batch_prioritizer",
+        "control_policy",
         "control_ui_type",
         "startup_progress_type",
     ]
@@ -1445,9 +1467,39 @@ def test_control_station_passes_explicit_runtime_ui_factories(
     )
 
     assert captured["args"] is args
+    assert captured["progress_application"] == "progress"
+    assert captured["input_batch_prioritizer"] is legacy_entrypoint.prioritize_input_batch
+    assert captured["control_policy"] is legacy_entrypoint.real_teleop_control_policy
     assert captured["control_ui_type"] is CustomUi
     assert captured["startup_progress_type"] is legacy_entrypoint.GuiStartupProgress
     assert not hasattr(args, "_real_teleop_control_ui_type")
+
+
+@pytest.mark.parametrize(
+    "missing_port", ["progress_application", "input_batch_prioritizer", "control_policy"]
+)
+def test_runtime_rejects_missing_application_ports_before_resource_assembly(
+    missing_port: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_assembly(*_args, **_kwargs):
+        pytest.fail("incomplete application ports must not activate runtime resources")
+
+    monkeypatch.setattr(runtime, "resolve_position_admittance_profile", lambda _args: None)
+    monkeypatch.setattr(runtime, "materialize_real_teleop_artifact_context", unexpected_assembly)
+    monkeypatch.setattr(runtime, "_activate_startup_cleanup", unexpected_assembly)
+    monkeypatch.setattr(runtime, "_build_components", unexpected_assembly)
+    ports = {
+        "progress_application": object(),
+        "input_batch_prioritizer": lambda *_args, **_kwargs: None,
+        "control_policy": object(),
+    }
+    ports.pop(missing_port)
+    with pytest.raises(RuntimeError, match="requires explicit"):
+        runtime.run_real_teleop(
+            SimpleNamespace(gui_requested=True),
+            control_ui_type=type("UnexpectedUi", (), {"__init__": unexpected_assembly}),
+            **ports,
+        )
 
 
 def test_real_teleop_runtime_exposes_shutdown_support() -> None:
@@ -3992,6 +4044,7 @@ def test_teleop_running_projection_requires_an_actual_arm_dispatch(
     control = operator_control_runtime.RealTeleopControlInput.__new__(
         operator_control_runtime.RealTeleopControlInput
     )
+    bind_control_application(control)
     control.components = SimpleNamespace(
         active_sides=("left", "right"),
         session=SimpleNamespace(
@@ -4068,6 +4121,7 @@ def test_rule_ui_can_open_writer_before_first_arm_dispatch() -> None:
     control = operator_control_runtime.RealTeleopControlInput.__new__(
         operator_control_runtime.RealTeleopControlInput
     )
+    bind_control_application(control)
     control.components = SimpleNamespace(
         session=SimpleNamespace(
             state_machine=SimpleNamespace(
@@ -4091,6 +4145,7 @@ def test_rule_ui_reports_its_blocker_when_pre_episode_dispatch_is_not_confirmed(
     control = operator_control_runtime.RealTeleopControlInput.__new__(
         operator_control_runtime.RealTeleopControlInput
     )
+    bind_control_application(control)
     control.components = SimpleNamespace(
         session=SimpleNamespace(
             state_machine=SimpleNamespace(
@@ -4127,6 +4182,7 @@ def test_two_pedal_transition_cannot_bypass_missing_dispatch_receipt() -> None:
     control = operator_control_runtime.RealTeleopControlInput.__new__(
         operator_control_runtime.RealTeleopControlInput
     )
+    bind_control_application(control)
     control.components = SimpleNamespace(
         session=SimpleNamespace(state_machine=SimpleNamespace()),
         fix_arm_controller=controller,
@@ -4155,6 +4211,7 @@ def test_episode_lifecycle_state_is_authoritative_without_a_gui() -> None:
     control = operator_control_runtime.RealTeleopControlInput.__new__(
         operator_control_runtime.RealTeleopControlInput
     )
+    bind_control_application(control)
     control.ui = None
     control._episode_recording_ui_active = False
     control._episode_recording_ui_paused = False
@@ -4214,6 +4271,7 @@ def test_control_lifecycle_state_survives_ui_transport_failure(
     )
     control.ui = FailingUi()
     control.args = SimpleNamespace(collection_warning_hz=15.0)
+    bind_control_application(control)
     control.components = SimpleNamespace(active_sides=("left", "right"))
     control._current_active_controls = lambda: ("p",)
     control._episode_recording_available = lambda: True
@@ -4411,6 +4469,7 @@ def test_round_trip_switch_is_transactional_and_ui_observational(
         operator_control_runtime.RealTeleopControlInput
     )
     control.args = args
+    bind_control_application(control)
     control.ui = FailingUi()
     control._dataset_configuration_transition_active = lambda: False
     control._episode_busy = lambda: False
@@ -4791,6 +4850,7 @@ def test_control_input_poll_keeps_input_and_publish_order_without_hardware() -> 
     control = legacy_entrypoint.RealTeleopControlInput.__new__(
         legacy_entrypoint.RealTeleopControlInput
     )
+    bind_control_application(control)
     control.terminal = FakeTerminal()
     control.ui = FakeUi()
     control.foot_pad_input = FakeFootPad()

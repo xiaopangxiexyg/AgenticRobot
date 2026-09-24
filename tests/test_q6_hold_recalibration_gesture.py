@@ -7,6 +7,7 @@ import numpy as np
 
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
 from teleop_runtime.schemas import ObservationChannel
+from tests.support.real_teleop_control import build_control_input
 
 
 def _q6(tail: tuple[float, float, float]) -> np.ndarray:
@@ -243,7 +244,7 @@ class Q6HoldRecalibrationGestureTests(unittest.TestCase):
             session=SimpleNamespace(sources=[source]),
             gripper_policy={},
         )
-        return real_teleop.RealTeleopControlInput(
+        return build_control_input(
             terminal=SimpleNamespace(
                 enabled=False,
                 should_quit=False,

@@ -33,6 +33,7 @@ from control_station.real_teleop.control_availability import (
 from control_station.real_teleop_application import (
     build_real_teleop_progress_application,
 )
+from tests.support.real_teleop_control import bind_control_application
 
 
 class FootPadControlModeTests(unittest.TestCase):
@@ -98,6 +99,7 @@ class FootPadControlModeTests(unittest.TestCase):
             ):
                 control = RealTeleopControlInput.__new__(RealTeleopControlInput)
                 control.args = SimpleNamespace(arm_control_mode=arm_control_mode)
+                bind_control_application(control)
                 control.foot_pad_input = SimpleNamespace(
                     foot_pad_count=5,
                     is_online=True,
@@ -118,6 +120,7 @@ class FootPadControlModeTests(unittest.TestCase):
             foot_pad_requested=True,
             foot_pad_startup_error="FootPadUnavailableError: virtual keyboard missing",
         )
+        bind_control_application(control)
         control._foot_pad_test_active = False
         control._foot_pad_test_completed = False
         control._foot_pad_test_seen_events = set()
@@ -657,6 +660,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control.args = SimpleNamespace(
             special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
         )
+        bind_control_application(control)
         control.foot_pad_input = SimpleNamespace(foot_pad_count=5, is_online=True)
         control._foot_pad_mode_enabled = lambda: True
         control._gui_control_state = lambda: GuiControlState(
@@ -678,7 +682,7 @@ class FootPadControlModeTests(unittest.TestCase):
 
         self.assertIn(5, FOOT_PAD_TWO_PEDAL_STYLE_COUNTS)
         with mock.patch(
-            "teleop_runtime.real_teleop.operator_control_runtime._gui_current_active_controls",
+            "control_station.real_teleop.control_availability.current_active_controls",
             return_value=controls,
             create=True,
         ):
@@ -692,6 +696,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control.args = SimpleNamespace(
             special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
         )
+        bind_control_application(control)
         control.foot_pad_input = SimpleNamespace(foot_pad_count=5, is_online=False)
         control.components = SimpleNamespace(
             session=None,
@@ -720,10 +725,8 @@ class FootPadControlModeTests(unittest.TestCase):
         self.assertFalse(control._foot_pad_mode_enabled())
         self.assertTrue(control._two_pedal_mode_active())
         with mock.patch(
-            "teleop_runtime.real_teleop.operator_control_runtime."
-            "_gui_current_active_controls",
+            "control_station.real_teleop.control_availability.current_active_controls",
             return_value=controls,
-            create=True,
         ):
             active_controls = control._current_active_controls()
         self.assertIn("two_pedal_b", active_controls)
@@ -796,6 +799,7 @@ class FootPadControlModeTests(unittest.TestCase):
 
     def test_five_pedal_test_remains_available_during_regular_hold(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        bind_control_application(control)
         control._gui_control_state = lambda: GuiControlState(
             teleop_started=True,
             hold_active=True,
@@ -810,10 +814,8 @@ class FootPadControlModeTests(unittest.TestCase):
         control._hold_requested = True
 
         with mock.patch(
-            "teleop_runtime.real_teleop.operator_control_runtime."
-            "_gui_current_active_controls",
+            "control_station.real_teleop.control_availability.current_active_controls",
             current_active_controls,
-            create=True,
         ):
             self.assertIn(
                 "foot_pad_test_start",
@@ -876,6 +878,7 @@ class FootPadControlModeTests(unittest.TestCase):
                 self.messages.append((tag, message))
 
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        bind_control_application(control)
         control.ui = FakeUi()
         control.foot_pad_input = object()
         control._foot_pad_test_active = False
@@ -924,6 +927,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control._current_active_controls = lambda: ["q", "two_pedal_b", "two_pedal_c"]
         control._control_hint = lambda: "normal"
         control.args = SimpleNamespace(foot_pad_requested=True)
+        bind_control_application(control)
 
         for index, event in enumerate(("fix_arm_left", "fix_arm_right"), start=1):
             control._record_foot_pad_test_event(event, now=float(index))
@@ -954,6 +958,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control._current_active_controls = lambda: ["q"]
         control._control_hint = lambda: "normal"
         control.args = SimpleNamespace(foot_pad_requested=True)
+        bind_control_application(control)
 
         control._record_foot_pad_test_event("init_arm_left", now=1.0)
         self.assertTrue(control._foot_pad_test_active)
@@ -985,6 +990,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control._current_active_controls = lambda: ["q"]
         control._control_hint = lambda: "normal"
         control.args = SimpleNamespace(foot_pad_requested=True)
+        bind_control_application(control)
 
         for index, event in enumerate(
             ("fix_arm_left", "fix_arm_right", "init_arm_left", "init_arm_right"),
@@ -1017,6 +1023,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control._current_active_controls = lambda: ["q"]
         control._control_hint = lambda: "normal"
         control.args = SimpleNamespace(foot_pad_requested=True)
+        bind_control_application(control)
 
         events = (
             "fix_arm_left",
@@ -1054,6 +1061,7 @@ class FootPadControlModeTests(unittest.TestCase):
 
         controller = InitController()
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        bind_control_application(control)
         control.components = SimpleNamespace(init_arm_controller=controller)
         control._foot_pad_mode_enabled = lambda: True
         control._foot_pad_count = lambda: 4
@@ -1078,6 +1086,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control.args = SimpleNamespace(
             collection_progress_profile=object(),
         )
+        bind_control_application(control)
         self._attach_progress_application(control)
         control.ui = SimpleNamespace(
             messages=[],
@@ -1139,6 +1148,7 @@ class FootPadControlModeTests(unittest.TestCase):
         control.args = SimpleNamespace(
             collection_progress_profile=object(),
         )
+        bind_control_application(control)
         self._attach_progress_application(control)
         control.ui = None
         control._progress_operator_intents = __import__("collections").deque()
@@ -1175,6 +1185,7 @@ class FootPadControlModeTests(unittest.TestCase):
     def test_progress_pedal_admission_is_independent_of_hidden_gui(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(collection_progress_profile=object())
+        bind_control_application(control)
         self._attach_progress_application(control)
         control.ui = None
         control._progress_operator_intents = __import__("collections").deque()
@@ -1202,6 +1213,7 @@ class FootPadControlModeTests(unittest.TestCase):
     def test_progress_pedal_rejection_reports_idle_episode_reason(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(collection_progress_profile=object())
+        bind_control_application(control)
         self._attach_progress_application(control)
         control.ui = None
         control._progress_operator_intents = __import__("collections").deque()
@@ -1232,6 +1244,7 @@ class FootPadControlModeTests(unittest.TestCase):
     def test_five_pedal_routes_fifth_pedal_to_existing_undo_intent(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(collection_progress_profile=object())
+        bind_control_application(control)
         self._attach_progress_application(control)
         control.ui = None
         control._progress_operator_intents = __import__("collections").deque()
@@ -1256,6 +1269,7 @@ class FootPadControlModeTests(unittest.TestCase):
     ) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(collection_progress_profile=object())
+        bind_control_application(control)
         self._attach_progress_application(control)
         control.ui = None
         control._progress_operator_intents = __import__("collections").deque()
@@ -1279,6 +1293,7 @@ class FootPadControlModeTests(unittest.TestCase):
                 arm_control_mode=arm_control_mode,
                 collection_progress_profile=None,
             )
+            bind_control_application(control)
             control.ui = None
             control._foot_pad_mode_enabled = lambda: True
             control._foot_pad_count = lambda: 5
@@ -1311,6 +1326,7 @@ class FootPadControlModeTests(unittest.TestCase):
                 arm_control_mode=arm_control_mode,
                 collection_progress_profile=object(),
             )
+            bind_control_application(control)
             self._attach_progress_application(control)
             control.ui = None
             control._progress_operator_intents = __import__("collections").deque()
@@ -1364,6 +1380,7 @@ class FootPadControlModeTests(unittest.TestCase):
         controller = InitController()
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(collection_progress_profile=None)
+        bind_control_application(control)
         control.components = SimpleNamespace(init_arm_controller=controller)
         control._foot_pad_mode_enabled = lambda: True
         control._foot_pad_count = lambda: 4
@@ -1383,6 +1400,7 @@ class FootPadControlModeTests(unittest.TestCase):
 
     def test_two_pedal_routes_mean_moving_side_and_never_init(self) -> None:
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        bind_control_application(control)
         control._foot_pad_mode_enabled = lambda: True
         control._foot_pad_count = lambda: 2
         control._two_pedal_mode_active = lambda: True
@@ -1408,6 +1426,7 @@ class FootPadControlModeTests(unittest.TestCase):
         messages: list[tuple[str, str]] = []
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(rule_task_chain_foot_pad=True)
+        bind_control_application(control)
         control.ui = SimpleNamespace(
             submit_task_chain_advance_from_foot_pad=lambda: (
                 calls.append("advance") or True
@@ -1432,6 +1451,7 @@ class FootPadControlModeTests(unittest.TestCase):
     def test_two_pedal_alerts_replace_each_other_and_red_expires(self) -> None:
         published = []
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        bind_control_application(control)
         control.ui = SimpleNamespace(
             publish=lambda **updates: published.append(updates)
         )
@@ -1479,6 +1499,7 @@ class FootPadControlModeTests(unittest.TestCase):
         controller = InitController()
         control = RealTeleopControlInput.__new__(RealTeleopControlInput)
         control.args = SimpleNamespace(calibration_timeout=7.0, calibration_samples=12)
+        bind_control_application(control)
         control.components = SimpleNamespace(init_arm_controller=controller)
         control._foot_pad_mode_enabled = lambda: True
         control._foot_pad_count = lambda: 4

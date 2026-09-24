@@ -52,8 +52,33 @@ class RealTeleopInputBatchPrioritizer(Protocol):
     ) -> OperatorInputBatchView: ...
 
 
+class RealTeleopControlPolicy(Protocol):
+    """Station-owned pure availability policy, bound to one control input.
+
+    Snapshot and event types stay with the presentation policy. The runtime
+    supplies their existing keyword fields without importing the application.
+    The Station policy module itself satisfies this port; no adapter is needed.
+    """
+
+    GuiControlState: type
+    GuiControlEvents: type
+
+    def episode_busy(self, state: Any) -> bool: ...
+
+    def visualization_controls(self, state: Any) -> list[str]: ...
+
+    def fix_init_allowed_in_controls(self, state: Any) -> bool: ...
+
+    def current_active_controls(self, state: Any, events: Any) -> list[str]: ...
+
+    def single_arm_tracker_swap_allowed_in_hold(self, state: Any) -> bool: ...
+
+    def hold_controls(self, state: Any, events: Any) -> list[str]: ...
+
+
 __all__ = [
     "OperatorInputBatchView",
     "OperatorUiPort",
+    "RealTeleopControlPolicy",
     "RealTeleopInputBatchPrioritizer",
 ]

@@ -6,11 +6,13 @@ from collections import deque
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
-from dataset_contracts.capture_modalities import CaptureModalityContract
 from collection_runtime.async_writer import AsyncWriterStats
+from dataset_contracts.capture_modalities import CaptureModalityContract
+from teleop_runtime.collection import v25p_dual_write_shadow as shadow_module
 from teleop_runtime.collection.schema_v22 import StrictV22SampleRejection
 from teleop_runtime.collection.writer_v21 import LeRobotV21WriterConfig
 from teleop_runtime.control_trace import (
@@ -130,6 +132,164 @@ def _new_recorder(tmp_path: Path, events: list[str]) -> real_teleop.RealTeleopDa
     recorder.collection_frequency_status = lambda: {"sample_hz": 15.0}
     recorder.pause_summary = lambda: {}
     return recorder
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("has_identity", [False, True])
+def test_thread_shadow_append_plans_once_and_retains_owner_admission(
+    tmp_path: Path, active: bool, has_identity: bool,
+) -> None:
+    recorder = _new_recorder(tmp_path, [])
+    row, sample = {"frame_index": 7}, object()
+    jobs = (SimpleNamespace(kind="lerobot_v21.row", payload={"row": row}),)
+    recorder.writer.plan_sample_jobs = Mock(return_value=jobs)
+    recorder.v25p_native_shadow = shadow = Mock()
+    shadow.append.side_effect = RuntimeError("shadow unavailable")
+    recorder._active_episode_identity = object() if has_identity else None
+    recorder._v25p_native_shadow_active = active
+    recorder._v25p_native_shadow_error = ""
+
+    assert recorder._plan_thread_write_jobs(sample, None) is jobs
+
+    recorder.writer.plan_sample_jobs.assert_called_once_with(sample)
+    assert shadow.append.call_count == int(active and has_identity)
+    assert shadow.close_unsealed.call_count == int(active and has_identity)
+    if active and has_identity:
+        assert recorder._v25p_native_shadow_active is False
+        assert recorder._v25p_native_shadow_error == "append:RuntimeError: shadow unavailable"
+        assert recorder._plan_thread_write_jobs(sample, None) is jobs
+        assert shadow.append.call_count == 1
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_thread_shadow_append_publishes_error_before_cleanup(tmp_path, close_fails) -> None:
+    recorder = _new_recorder(tmp_path, [])
+    identity = object()
+    jobs = (SimpleNamespace(kind="lerobot_v21.row", payload={"row": {}}),)
+    recorder.writer.plan_sample_jobs = Mock(return_value=jobs)
+    recorder.v25p_native_shadow = shadow = Mock()
+    recorder._active_episode_identity = identity
+    recorder._v25p_native_shadow_active = True
+    recorder._v25p_native_shadow_error = ""
+    shadow.append.side_effect = RuntimeError("append failed")
+    observations = []
+
+    def close(active_identity):
+        observations.append(
+            (active_identity, recorder._v25p_native_shadow_error,
+             recorder._v25p_native_shadow_active)
+        )
+        if close_fails:
+            raise OSError("close failed")
+
+    shadow.close_unsealed.side_effect = close
+    assert recorder._plan_thread_write_jobs(object(), None) is jobs
+    assert observations == [(identity, "append:RuntimeError: append failed", True)]
+    assert recorder._v25p_native_shadow_active is False
+    assert recorder._v25p_native_shadow_error == (
+        "append:RuntimeError: append failed"
+        + (";close_unsealed:OSError: close failed" if close_fails else "")
+    )
+
+
+@pytest.mark.parametrize("failure_stage", ["load", "finalize", "timing"])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_thread_shadow_failure_preserves_prior_report_and_publishes_before_cleanup(
+    tmp_path, monkeypatch, failure_stage, close_fails,
+) -> None:
+    recorder = _new_recorder(tmp_path, [])
+    recorder.writer_observer.release_flush.set()
+    identity, prior_report = object(), object()
+    recorder.v25p_native_shadow = shadow = Mock(active_identity=identity)
+    recorder._v25p_native_shadow_active = True
+    task = real_teleop.RealDatasetFinalizeTask(
+        episode_index=12, frame_count=1, reason="test", queued_at=time.time(),
+        episode_identity=identity, v25p_native_finalize_report=prior_report,
+    )
+    loader = Mock(return_value={"episode_index": 12})
+    if failure_stage == "load":
+        loader.side_effect = RuntimeError("load failed")
+    elif failure_stage == "finalize":
+        shadow.finalize_after_legacy.side_effect = RuntimeError("finalize failed")
+    else:
+        record_timing = task.record_stage_timing
+
+        def fail_timing(name, elapsed):
+            if name == "v25p_native_post_finalize":
+                raise RuntimeError("timing failed")
+            record_timing(name, elapsed)
+
+        task.record_stage_timing = fail_timing
+    monkeypatch.setattr(shadow_module, "load_finalized_legacy_episode_record", loader)
+    observations = []
+
+    def close(active_identity):
+        observations.append(
+            (active_identity, task.v25p_native_error, task.v25p_native_finalize_report)
+        )
+        if close_fails:
+            raise OSError("close failed")
+
+    shadow.close_unsealed.side_effect = close
+    recorder._run_finalize_task(task)
+
+    error = f"post_finalize:RuntimeError: {failure_stage} failed"
+    assert observations == [(identity, error, prior_report)]
+    assert task.v25p_native_finalize_report is prior_report
+    assert task.v25p_native_error == error + (
+        ";close_unsealed:OSError: close failed" if close_fails else ""
+    )
+    assert task.done and task.success
+    assert recorder.writer.finalized[0][0] == 12
+
+
+@pytest.mark.parametrize("outcome", ["inactive", "complete", "failed", "raises"])
+def test_thread_shadow_finalize_keeps_legacy_success_and_stage_timing(
+    tmp_path: Path, monkeypatch, outcome: str,
+) -> None:
+    events = []
+    recorder = _new_recorder(tmp_path, events)
+    recorder.writer_observer.release_flush.set()
+    identity = object()
+    shadow = Mock(active_identity=identity)
+    report = SimpleNamespace(receipt=SimpleNamespace(status=outcome, message=""))
+
+    def finalize(_identity, **_kwargs):
+        assert recorder.writer.finalized[0][0] == 12
+        assert _identity is identity
+        if outcome == "raises":
+            raise RuntimeError("seal failed")
+        return report
+
+    shadow.finalize_after_legacy.side_effect = finalize
+    recorder.v25p_native_shadow = shadow
+    recorder._v25p_native_shadow_active = outcome != "inactive"
+    recorder._v25p_native_shadow_error = "append:prior failure"
+    monkeypatch.setattr(
+        shadow_module, "load_finalized_legacy_episode_record",
+        Mock(return_value={"episode_index": 12}),
+    )
+    task = real_teleop.RealDatasetFinalizeTask(
+        episode_index=12, frame_count=1, reason="test", queued_at=time.time(),
+        episode_identity=identity,
+    )
+
+    recorder._run_finalize_task(task)
+
+    assert task.done and task.success
+    assert task.error == ""
+    assert len(recorder.writer.finalized) == 1
+    assert task.v25p_native_error == {
+        "inactive": "append:prior failure",
+        "complete": "",
+        "failed": "v2.5-p compatibility projection failed",
+        "raises": "post_finalize:RuntimeError: seal failed",
+    }[outcome]
+    assert shadow.finalize_after_legacy.call_count == int(outcome != "inactive")
+    assert shadow.close_unsealed.call_count == int(outcome == "raises")
+    assert ("v25p_native_post_finalize" in task.stage_timings_ms) == (outcome != "inactive")
+    if outcome in {"complete", "failed"}:
+        assert task.v25p_native_finalize_report is report
 
 
 def test_recorder_configuration_guard_detects_post_warmup_task_change(tmp_path: Path) -> None:

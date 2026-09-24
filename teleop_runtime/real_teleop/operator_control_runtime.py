@@ -1,10 +1,8 @@
 """Entity-side operator-control adapter for the real teleoperation runtime.
 
-The legacy debug entrypoint owns hardware/runtime assembly.  It binds the
-small, explicit support namespace below after importing this file, so this
-module can own the coordinator without importing the legacy entrypoint back.
-The binding is intentionally explicit: adding a new runtime dependency to the
-GUI coordinator requires reviewing its ownership and side effects.
+Entity operations import their canonical owners directly. The application
+binds its pure input, availability, and progress policies to each instance;
+importing a legacy entrypoint does not configure this module.
 """
 
 from __future__ import annotations
@@ -13,32 +11,42 @@ import argparse
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-import inspect
+from datetime import datetime
 import json
 from pathlib import Path
 import time
+from typing import Any
 
 import numpy as np
 
 from dataset_contracts.capture_modalities import CaptureModalityContract
 from dataset_contracts.gripper_force import GripperForceDatasetContract
+from dataset_interface.capture_modalities import bind_capture_modality_contract
 from dataset_interface.gripper_force import bind_gripper_force_contract
 from robot_motion.runtime import run_best_effort_cleanup
 
+from ..backends.arms import RM65ImpedanceArmBackend
 from ..backends.grippers import DMTacGripperBackend
 from ..collection.camera_preview import CameraPreviewer
 from ..collection.episode_curation import EpisodeCurationSession
 from ..gui import collection_tasks as gui_collection_tasks
+from ..log_utils import log_event as _log
 from ..operator_ui_ports import (
     OperatorUiPort,
+    RealTeleopControlPolicy,
     RealTeleopInputBatchPrioritizer,
 )
 from ..sources.camera import RealSenseRGBSource
 from ..special_tasks.fix_arm import FixArmPoseSnapshotRecorder
+from ..special_tasks.init_arm import InitArmTransition
+from . import dataset_layout
+from .arm_runtime import _impedance_force_control_not_ready_sides
 from .components import RealTeleopComponents
 from .dataset_layout import (
+    collection_task_ui_state as _collection_task_ui_state,
     default_task_id_from_name as _default_task_id_from_name,
     expand_cli_path as _expand_cli_path,
+    task_definition_for_key as _task_definition_for_key,
 )
 from .debug_timing import debug_timing_modules as _debug_timing_modules
 from .defaults import (
@@ -83,6 +91,9 @@ from .gui_special_arm_status import (
 from .gui_vive_calibration import (
     vive_calibration_profile_ui_state as _vive_calibration_profile_ui_state,
 )
+from .gui_tracker_status import (
+    publish_raw_tracker_pose_state as _publish_raw_tracker_pose_state,
+)
 from .hand_runtime import (
     _gripper_backend_for_side,
     _gripper_gui_available,
@@ -108,13 +119,16 @@ from .q6_hold_gesture import (
 )
 from .runtime_home import DEFAULT_RUNTIME_HOME_START_DELAY_SEC
 from .side_mapping import (
+    build_vive_tracker_configs_for_args,
     tracker_source_side_for_logical_side as _tracker_source_side_for_logical_side,
 )
 from .special_arm_runtime import (
     MAX_INIT_ARM_QPOS_SPEED_SCALE,
     MIN_INIT_ARM_QPOS_SPEED_SCALE,
+    _fresh_gui_init_qpos_by_side,
     _init_arm_qpos_speed_scale_for_side,
     _release_gui_qpos_init_transit,
+    start_gui_qpos_init,
 )
 from .status_payloads import (
     _build_camera_status,
@@ -125,47 +139,15 @@ from .status_payloads import (
 )
 from .terminal_input import TerminalClutchInput
 from .tracker_side_check import evaluate_tracker_side_assignment
-from .wrist_depth_freshness import WristDepthFreshnessMonitor
-
-
-_SUPPORT_NAMES = (
-    "EPISODE_GUI_EVENTS",
-    "GuiControlEvents",
-    "GuiControlState",
-    "POSE_SNAPSHOT_GUI_EVENT",
-    "VIVE_CALIBRATION_GUI_EVENTS",
-    "_apply_vive_tracker_mapping",
-    "_calibrate_gui_vive_coordinate_profile",
-    "_collection_task_ui_state",
-    "_gui_collection_task_controls",
-    "_gui_current_active_controls",
-    "_gui_episode_busy",
-    "_gui_episode_controls",
-    "_gui_finalizing_controls",
-    "_gui_fix_arm_controls",
-    "_gui_fix_init_allowed_in_controls",
-    "_gui_hold_controls",
-    "_gui_init_arm_controls",
-    "_gui_movement_multiple_controls",
-    "_gui_pose_snapshot_controls",
-    "_gui_pre_home_controls",
-    "_gui_single_arm_tracker_swap_allowed_in_hold",
-    "_gui_teleop_controls",
-    "_gui_visualization_controls",
-    "_gui_vive_calibration_controls",
-    "_load_gui_vive_calibration_profile",
-    "_log",
-    "_publish_raw_tracker_pose_state",
-    "_refresh_formal_dataset_layout",
-    "_save_gui_vive_calibration_profile",
-    "_start_gui_qpos_init",
-    "_task_definition_for_key",
-    "_toggle_collection_round_trip_phase",
-    "_vive_pose_source_from_components",
-    "bind_capture_modality_contract",
-    "build_real_teleop_progress_application",
-    "prioritize_input_batch",
+from .vive_calibration_profiles import (
+    _load_gui_vive_calibration_profile,
+    _save_gui_vive_calibration_profile,
 )
+from .vive_calibration_runtime import (
+    _vive_pose_source_from_components,
+    calibrate_gui_vive_coordinate_profile,
+)
+from .wrist_depth_freshness import WristDepthFreshnessMonitor
 
 
 _FOOT_PAD_TEST_LABELS = {
@@ -190,44 +172,39 @@ _FIVE_PEDAL_TEST_LABELS = {
 }
 
 
-def bind_legacy_support(namespace: Mapping[str, object]) -> None:
-    """Bind legacy runtime helpers while preserving the old import contract."""
-
-    missing = [name for name in _SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "real_teleop GUI coordinator support is incomplete: "
-            + ", ".join(sorted(missing))
-        )
-    globals().update(
-        {
-            name: (
-                _LegacyFunctionProxy(namespace, name)
-                if inspect.isroutine(namespace[name])
-                else namespace[name]
-            )
-            for name in _SUPPORT_NAMES
-        }
+def _refresh_formal_dataset_layout(args: argparse.Namespace) -> None:
+    dataset_layout.refresh_formal_dataset_layout(
+        args,
+        date_prefix=datetime.now().strftime("%Y-%m-%d"),  # noqa: DTZ005 - Dataset names use the local calendar date.
     )
 
 
-class _LegacyFunctionProxy:
-    """Keep old-entrypoint monkeypatch points live after the class moves."""
+def _toggle_collection_round_trip_phase(args: argparse.Namespace) -> bool:
+    return dataset_layout.toggle_collection_round_trip_phase(
+        args,
+        date_prefix=datetime.now().strftime("%Y-%m-%d"),  # noqa: DTZ005 - Dataset names use the local calendar date.
+    )
 
-    __slots__ = ("_namespace", "_name")
 
-    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
-        self._namespace = namespace
-        self._name = str(name)
+def _start_gui_qpos_init(
+    args: argparse.Namespace, components: RealTeleopComponents, *, now: float
+) -> InitArmTransition:
+    return start_gui_qpos_init(
+        args,
+        components,
+        now=now,
+        fresh_qpos_reader=_fresh_gui_init_qpos_by_side,
+        impedance_force_control_not_ready_sides=_impedance_force_control_not_ready_sides,
+        impedance_backend_type=RM65ImpedanceArmBackend,
+    )
 
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        target = self._namespace[self._name]
-        if target is self:
-            raise RuntimeError(f"recursive GUI support proxy: {self._name}")
-        return target(*args, **kwargs)  # type: ignore[operator]
 
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._namespace[self._name], attribute)
+def _calibrate_gui_vive_coordinate_profile(
+    args: argparse.Namespace, components: RealTeleopComponents, ui: OperatorUiPort
+) -> Path:
+    return calibrate_gui_vive_coordinate_profile(
+        args, components, ui, save_profile=_save_gui_vive_calibration_profile
+    )
 
 
 @dataclass(frozen=True)
@@ -457,12 +434,6 @@ class RealTeleopControlInput:
         self._pose_snapshot_requested = False
         self._pose_snapshot_last_path = ""
         self._pose_snapshot_status = ""
-        self._gui_control_events = GuiControlEvents(
-            episode_events=tuple(EPISODE_GUI_EVENTS),
-            pose_snapshot_event=POSE_SNAPSHOT_GUI_EVENT,
-            vive_calibration_events=tuple(VIVE_CALIBRATION_GUI_EVENTS),
-            movement_multiple_events=tuple(MOVEMENT_MULTIPLE_GUI_EVENTS),
-        )
 
     def _publish_ui_observation(
         self,
@@ -519,25 +490,38 @@ class RealTeleopControlInput:
         *,
         progress_application: ProgressApplicationPort,
         input_batch_prioritizer: RealTeleopInputBatchPrioritizer,
+        control_policy: RealTeleopControlPolicy,
     ) -> None:
         """Bind Station policy before the runtime begins polling inputs."""
 
+        if progress_application is None or control_policy is None:
+            raise RuntimeError("RealTeleop application ports must be injected together.")
         if not callable(input_batch_prioritizer):
             raise TypeError("input_batch_prioritizer must be callable.")
         existing_application = getattr(self, "_progress_application", None)
         existing_prioritizer = getattr(self, "_input_batch_prioritizer", None)
+        existing_policy = getattr(self, "_control_policy", None)
         if (
             existing_application is not None
             and existing_application is not progress_application
         ) or (
             existing_prioritizer is not None
             and existing_prioritizer is not input_batch_prioritizer
+        ) or (
+            existing_policy is not None and existing_policy is not control_policy
         ):
             raise RuntimeError("RealTeleop application ports are already bound.")
         self._progress_application = progress_application
         self._input_batch_prioritizer = input_batch_prioritizer
+        self._control_policy = control_policy
 
-    def _gui_control_state(self) -> GuiControlState:
+    def _control_policy_port(self) -> RealTeleopControlPolicy:
+        policy = getattr(self, "_control_policy", None)
+        if policy is None:
+            raise RuntimeError("RealTeleop control policy was not injected.")
+        return policy
+
+    def _gui_control_state(self) -> Any:
         init_controller = getattr(self.components, "init_arm_controller", None)
         arm_control_mode = str(getattr(self.args, "arm_control_mode", "position"))
         impedance_exact_qpos_available = bool(
@@ -556,7 +540,7 @@ class RealTeleopControlInput:
             if plus_curation is not None
             else ""
         )
-        return GuiControlState(
+        return self._control_policy_port().GuiControlState(
             teleop_started=bool(getattr(self, "_teleop_started", False)),
             teleop_dispatch_confirmed=self._teleop_arm_dispatch_confirmed(),
             hold_active=bool(getattr(self, "_hold_active", False)),
@@ -839,16 +823,14 @@ class RealTeleopControlInput:
 
         return True
 
-    def _gui_events(self) -> GuiControlEvents:
+    def _gui_events(self) -> Any:
         events = getattr(self, "_gui_control_events", None)
-        if isinstance(events, GuiControlEvents):
-            return events
-        return GuiControlEvents(
-            episode_events=tuple(EPISODE_GUI_EVENTS),
-            pose_snapshot_event=POSE_SNAPSHOT_GUI_EVENT,
-            vive_calibration_events=tuple(VIVE_CALIBRATION_GUI_EVENTS),
-            movement_multiple_events=tuple(MOVEMENT_MULTIPLE_GUI_EVENTS),
-        )
+        if events is None:
+            events = self._control_policy_port().GuiControlEvents(
+                movement_multiple_events=tuple(MOVEMENT_MULTIPLE_GUI_EVENTS),
+            )
+            self._gui_control_events = events
+        return events
 
     def _episode_recording_available(self) -> bool:
         return self._gui_control_state().episode_recording_available
@@ -956,13 +938,15 @@ class RealTeleopControlInput:
         return self._gui_control_state().tactile_visualization_available
 
     def _visualization_controls(self) -> list[str]:
-        return _gui_visualization_controls(self._gui_control_state())
+        return self._control_policy_port().visualization_controls(
+            self._gui_control_state()
+        )
 
     def _dataset_configuration_blocked_reason(self) -> str:
         return self.plus_curation.persisted_binding_lock_reason()
 
     def _episode_busy(self) -> bool:
-        return _gui_episode_busy(self._gui_control_state())
+        return self._control_policy_port().episode_busy(self._gui_control_state())
 
     def _teleop_arm_dispatch_confirmed(self) -> bool:
         """Return the production dispatch fact with thin-adapter compatibility."""
@@ -1106,11 +1090,13 @@ class RealTeleopControlInput:
         )
 
     def _fix_init_allowed_in_controls(self) -> bool:
-        return _gui_fix_init_allowed_in_controls(self._gui_control_state())
+        return self._control_policy_port().fix_init_allowed_in_controls(
+            self._gui_control_state()
+        )
 
     def _current_active_controls(self) -> list[str]:
         gui_state = self._gui_control_state()
-        controls = list(_gui_current_active_controls(
+        controls = list(self._control_policy_port().current_active_controls(
             gui_state, self._gui_events()
         ))
         if not self._manual_single_arm_switch_enabled():
@@ -1211,12 +1197,19 @@ class RealTeleopControlInput:
         }
 
     def _single_arm_tracker_swap_allowed_in_hold(self) -> bool:
-        return _gui_single_arm_tracker_swap_allowed_in_hold(self._gui_control_state())
+        return self._control_policy_port().single_arm_tracker_swap_allowed_in_hold(
+            self._gui_control_state()
+        )
 
     def _hold_controls(self) -> list[str]:
-        return _gui_hold_controls(self._gui_control_state(), self._gui_events())
+        return self._control_policy_port().hold_controls(
+            self._gui_control_state(), self._gui_events()
+        )
 
     def start(self) -> None:
+        self._progress_application_port()
+        self._input_batch_policy()
+        self._control_policy_port()
         self.terminal.start()
         if self.ui is None:
             self.enabled = bool(self.terminal.enabled)
@@ -1349,27 +1342,17 @@ class RealTeleopControlInput:
     def _progress_application_port(self) -> ProgressApplicationPort:
         application = getattr(self, "_progress_application", None)
         if application is None:
-            factory = globals().get("build_real_teleop_progress_application")
-            if not callable(factory):
-                raise RuntimeError(
-                    "RealTeleop progress application was not injected."
-                )
-            application = factory(getattr(self, "args", None))
-            self._progress_application = application
+            raise RuntimeError("RealTeleop progress application was not injected.")
         return application
 
     def _input_batch_policy(self) -> RealTeleopInputBatchPrioritizer:
         policy = getattr(self, "_input_batch_prioritizer", None)
         if policy is None:
-            policy = globals().get("prioritize_input_batch")
-            if not callable(policy):
-                raise RuntimeError(
-                    "RealTeleop input-batch prioritizer was not injected."
-                )
-            self._input_batch_prioritizer = policy
+            raise RuntimeError("RealTeleop input-batch prioritizer was not injected.")
         return policy
 
     def poll(self) -> None:
+        input_batch_policy = self._input_batch_policy()
         current_time = time.time()
         self._poll_two_pedal_alert_timeout(now=current_time)
         self._poll_tracker_side_request_timeout(now=current_time)
@@ -1393,7 +1376,7 @@ class RealTeleopControlInput:
         )
         # Station owns application-level input precedence. Device polling and
         # all resulting entity operations remain in this lower runtime.
-        input_batch = self._input_batch_policy()(
+        input_batch = input_batch_policy(
             ui_events,
             terminal_quit_requested=bool(self.terminal.should_quit),
             teleop_started=bool(self._teleop_started),
@@ -1712,7 +1695,7 @@ class RealTeleopControlInput:
                 elif event.startswith("init_arm_select:"):
                     if self._gui_init_arm_controls_enabled():
                         self._set_init_arm_side_from_gui(event.split(":", 1)[1])
-                elif event == POSE_SNAPSHOT_GUI_EVENT:
+                elif event == self._gui_events().pose_snapshot_event:
                     self.request_pose_snapshot()
                 elif event == "toggle_camera_vis":
                     self._camera_visualization_toggle_requested = True
@@ -1913,9 +1896,7 @@ class RealTeleopControlInput:
         *,
         now: float,
     ) -> None:
-        logger = globals().get("_log")
-        if callable(logger):
-            logger("Progress", message, now=now)
+        _log("Progress", message, now=now)
         ui = getattr(self, "ui", None)
         if ui is not None:
             ui.append_message("Progress", message)
@@ -2086,9 +2067,7 @@ class RealTeleopControlInput:
         append_message = getattr(self.ui, "append_message", None)
         if callable(append_message):
             append_message("FootPad", message)
-        logger = globals().get("_log")
-        if callable(logger):
-            logger("FootPad", message, now=now)
+        _log("FootPad", message, now=now)
         return True
 
     def _handle_foot_pad_special_arm_event(self, event: str, *, now: float) -> None:
@@ -6307,7 +6286,11 @@ class RealTeleopControlInput:
         self.args.swap_operator_sides = not bool(
             getattr(self.args, "swap_operator_sides", False)
         )
-        _apply_vive_tracker_mapping(self.args, self.components)
+        source = _vive_pose_source_from_components(self.components)
+        if source is not None:
+            source.set_tracker_configs(
+                build_vive_tracker_configs_for_args(self.args, self.components.active_sides)
+            )
         message = self._control_hint()
         if hold_swap_allowed:
             message = (
