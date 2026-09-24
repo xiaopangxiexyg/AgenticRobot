@@ -7,6 +7,7 @@ import pytest
 
 mujoco = pytest.importorskip("mujoco")
 
+from sim.mujoco.replay._viewer_geometry import write_capsule, write_segment
 from sim.mujoco.replay.tcp_pose_absolute_workspace_visualization import (  # noqa: E402
     AbsoluteWorkspaceVisualizer,
     build_review_trajectory,
@@ -31,6 +32,37 @@ class _FakeViewerHandle:
 
     def lock(self):
         return nullcontext()
+
+
+def test_shared_segment_preserves_degenerate_and_explicit_capsule_geometry() -> None:
+    model = mujoco.MjModel.from_xml_string("<mujoco model='segment_geometry'/>")
+    scene = mujoco.MjvScene(model, 3)
+    start = np.array([0.1, 0.2, 0.3], dtype=float)
+    color = np.array([0.2, 0.4, 0.6, 0.8], dtype=np.float32)
+
+    write_segment(
+        scene.geoms[0], start=start, end=start, radius=0.004,
+        rgba=color, label="stationary_segment",
+    )
+    write_segment(
+        scene.geoms[1], start=start, end=start + np.array([0.01, 0.0, 0.0]),
+        radius=0.004, rgba=color, label="moving_segment",
+    )
+    write_capsule(
+        scene.geoms[2], start=start, end=start, radius=0.004,
+        rgba=color, label="explicit_stationary_capsule",
+    )
+
+    assert int(scene.geoms[0].type) == int(mujoco.mjtGeom.mjGEOM_SPHERE)
+    assert int(scene.geoms[1].type) == int(mujoco.mjtGeom.mjGEOM_CAPSULE)
+    assert int(scene.geoms[2].type) == int(mujoco.mjtGeom.mjGEOM_CAPSULE)
+    for index, label in enumerate(
+        ("stationary_segment", "moving_segment", "explicit_stationary_capsule")
+    ):
+        geom = scene.geoms[index]
+        assert str(geom.label) == label
+        assert int(geom.category) == int(mujoco.mjtCatBit.mjCAT_DECOR)
+        np.testing.assert_allclose(geom.rgba, color, rtol=0.0, atol=1e-6)
 
 
 def test_urdf_derived_absolute_workspace_candidates_have_expected_dimensions() -> None:

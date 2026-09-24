@@ -17,7 +17,7 @@ from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.primitives import CARDINAL_TCP_SHORT_STEP_PRIMITIVES
 from robot_motion.transforms import as_pose_matrix
 
-from ._viewer_geometry import write_arrow, write_sphere
+from ._viewer_geometry import write_arrow, write_capsule, write_sphere
 
 _SIDES = ("left", "right")
 _DESK_REFERENCE_FRAME_SPEC = CoordinateFrameSpec(
@@ -225,11 +225,11 @@ class CardinalTcpPrimitiveVisualizer:
                 trail_color = _SIDE_COLORS[side].copy()
                 trail_color[3] = 0.42
                 for start, end in self._trail_segments_by_side[side]:
-                    self._write_capsule(
+                    write_capsule(
                         scene.geoms[cursor],
                         start=start,
                         end=end,
-                        width=self.config.trail_width_m,
+                        radius=self.config.trail_width_m,
                         rgba=trail_color,
                         label="",
                     )
@@ -269,38 +269,6 @@ class CardinalTcpPrimitiveVisualizer:
             if cursor != stop:
                 raise RuntimeError("Cardinal TCP visualizer geometry count drifted")
         return True
-
-    @staticmethod
-    def _write_capsule(
-        geom: Any,
-        *,
-        start: np.ndarray,
-        end: np.ndarray,
-        width: float,
-        rgba: np.ndarray,
-        label: str,
-    ) -> None:
-        import mujoco
-
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_CAPSULE,
-            np.zeros(3, dtype=float),
-            np.zeros(3, dtype=float),
-            np.eye(3, dtype=float).reshape(-1),
-            np.asarray(rgba, dtype=np.float32),
-        )
-        mujoco.mjv_connector(
-            geom,
-            mujoco.mjtGeom.mjGEOM_CAPSULE,
-            float(width),
-            np.asarray(start, dtype=float),
-            np.asarray(end, dtype=float),
-        )
-        geom.rgba = np.asarray(rgba, dtype=np.float32)
-        geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
-        geom.label = label
-
 
 __all__ = [
     "CardinalTcpPrimitiveVisualizationConfig",
