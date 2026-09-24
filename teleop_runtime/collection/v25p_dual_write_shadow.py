@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 from collection_runtime.component_capture import (
     ComponentCaptureCommitReport,
@@ -22,8 +22,10 @@ from collection_runtime.component_capture import (
     ProducedComponentSample,
 )
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
+from dataset_contracts.v22 import PolicyIOLayout
 from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
 from dataset_contracts.v25p import v25p_base_episode_manifest_hash
+from dataset_contracts.v25p_native_storage import V25P_RECORD_CJSON_LAYOUT_V1
 from dataset_contracts.v25p_projection import V25pCompatibilityProjectionReceipt
 from dataset_interface.v25p_dual_write import (
     V25pDualWriteEquivalenceReport,
@@ -36,7 +38,11 @@ from dataset_interface.v25p_projection_plan import (
 )
 from dataset_interface.v25p_v23_adapter import V25pV23ProjectedRow
 
-from .v25p_capture_profiles import V25pCaptureProfileBundle
+from .v25p_capture_profiles import (
+    V25P_REAL_TELEOP_SOURCE,
+    V25pCaptureProfileBundle,
+    build_policy_io_v25p_capture_profiles,
+)
 
 _LEGACY_ROW_JOB_KIND = "lerobot_v21.row"
 
@@ -59,6 +65,63 @@ class V25pShadowFinalizeReport:
     commit: ComponentCaptureCommitReport
     equivalent_sample_count: int
     mismatched_sample_count: int
+
+
+def build_policy_io_v25p_shadow(
+    *,
+    source: Literal["real_teleop", "umi"],
+    layout: PolicyIOLayout,
+    dataset_root: str | Path,
+    dataset_id: str,
+    pose_frame_contract_hash: str,
+    physical_storage_layout: str,
+    component_sides: tuple[str, ...] | None = None,
+) -> V25pDualWriteShadow:
+    """Bind one built-in producer, store and projection to the same profiles.
+
+    Callers retain activation and episode ownership. Keep construction ordered
+    as profiles, store, producer, shadow: a later failure must not move or hide
+    the store's existing dataset-contract validation/publication boundary.
+    """
+
+    if source == V25P_REAL_TELEOP_SOURCE:
+        from .v25p_real_teleop_producer import RealTeleopV25pProducer
+
+        producer_type = RealTeleopV25pProducer
+        producer_args = {"layout": layout}
+    else:
+        from .umi.v25p_producer import UmiV25pProducer
+
+        producer_type = UmiV25pProducer
+        producer_args = {}
+    bundle = build_policy_io_v25p_capture_profiles(
+        source=source,
+        layout=layout,
+        pose_frame_contract_hash=pose_frame_contract_hash,
+        component_sides=component_sides,
+    )
+    store = ComponentCaptureEpisodeStore(
+        dataset_root=dataset_root,
+        dataset_id=dataset_id,
+        embodiment_profile=bundle.embodiment,
+        component_stream_profile=bundle.streams,
+        compatibility_projection_profiles=(bundle.v23_projection,),
+        physical_storage_layout=physical_storage_layout,
+        defer_sample_file_writes=(
+            physical_storage_layout == V25P_RECORD_CJSON_LAYOUT_V1
+        ),
+    )
+    return V25pDualWriteShadow(
+        store=store,
+        bundle=bundle,
+        producer=producer_type(
+            **producer_args,
+            stream_profile=bundle.streams,
+            bindings=bundle.producer_bindings,
+            component_action_schema=bundle.component_action_schema,
+            component_action_projection=bundle.component_action_projection,
+        ),
+    )
 
 
 def legacy_row_from_planned_jobs(jobs: object) -> Mapping[str, Any]:
