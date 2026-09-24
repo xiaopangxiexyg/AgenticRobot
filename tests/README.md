@@ -221,8 +221,11 @@ The sparse full-suite weights come from testcase durations in a complete,
 socket-capable green Run and cover only modules that contributed at least five
 seconds there. Refresh them only from another exact green full-suite artifact;
 failed, capability-limited, or focused runs are not representative inputs.
-Current module and replay-function weights use the green six-shard baseline at
-`47d7be6e`; they are scheduling estimates, not timeouts or acceptance thresholds.
+完整验证的模块和 replay 函数权重以绿色六分片基线 `47d7be6e` 为基础；其中
+artifact migration / resolution 两个 I/O 模块按 `c3c06be6` 在 2026-09-25 的
+绿色全量结果更新为 49.666 / 15.847 秒，避免旧估值将耗时集中在同一分片。
+这些值只用于调度，不是 timeout 或验收阈值；不改变测试内容、真实 `fsync`、
+模块隔离边界、参数矩阵或 fast Profile 的权重。
 The default remains four shards. Each shard has separate pytest, Python, XDG,
 Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
 Run share only its content-addressed MuJoCo model cache; that cache uses process

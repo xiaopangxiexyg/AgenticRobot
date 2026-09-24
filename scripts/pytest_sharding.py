@@ -20,14 +20,15 @@ from pathlib import Path
 # here makes the default plan useful in a clean checkout without depending on
 # mutable Harness history.
 FULL_WEIGHTS = {
-    # Exact testcase sums from the green six-shard baseline at 47d7be6e.
+    # Exact testcase sums from the green six-shard baseline at 47d7be6e,
+    # except the two artifact I/O modules refreshed at c3c06be6 (2026-09-25).
     # These are scheduling estimates only; they do not change test selection.
     "tests/test_mujoco_temp_pipeline.py": 134.914,
     "tests/test_replay_position_admittance_active_pipeline.py": 108.657,
     "tests/test_rm65_grasp_trajectory.py": 91.046,
     "tests/test_mujoco_fast_runtime.py": 48.101,
     "tests/test_control_station_mujoco_sim_hil.py": 36.534,
-    "tests/test_runtime_artifact_migration.py": 26.372,
+    "tests/test_runtime_artifact_migration.py": 49.666,
     "tests/test_rebot_b601_real2sim.py": 23.742,
     "tests/test_collection_process_writer.py": 22.553,
     "tests/test_rebot_b601_mujoco_haptics.py": 22.540,
@@ -49,7 +50,7 @@ FULL_WEIGHTS = {
     "tests/test_mujoco_actuated_position.py": 10.211,
     "tests/test_mujoco_state_bc_live_hitl.py": 9.473,
     "tests/test_mujoco_collision_safety.py": 8.356,
-    "tests/test_runtime_artifact_resolution.py": 8.129,
+    "tests/test_runtime_artifact_resolution.py": 15.847,
     "tests/test_v25p_producer_dual_write.py": 8.031,
     "tests/test_control_station_exclusive_hitl.py": 7.844,
     "tests/test_sim_point_grasp_terminal.py": 7.738,

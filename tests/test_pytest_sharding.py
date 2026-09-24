@@ -114,7 +114,12 @@ def test_full_profile_tracks_recent_dominant_modules() -> None:
     assert module.FULL_WEIGHTS["tests/test_rebot_b601_real2sim.py"] == pytest.approx(
         23.742
     )
-    assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] > 26.0
+    assert module.FULL_WEIGHTS["tests/test_runtime_artifact_migration.py"] == pytest.approx(
+        49.666
+    )
+    assert module.FULL_WEIGHTS["tests/test_runtime_artifact_resolution.py"] == pytest.approx(
+        15.847
+    )
     assert module.FULL_WEIGHTS["tests/test_modality_storage.py"] > 7.0
 
 
