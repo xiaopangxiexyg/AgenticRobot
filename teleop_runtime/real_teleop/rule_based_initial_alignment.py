@@ -163,6 +163,17 @@ class RuleBasedInitialAlignmentPlan:
 class RuleBasedInitialAlignmentPlanningError(RuntimeError):
     """A pre-dispatch transition could not be certified."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: str | None = None,
+        blocked_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.blocked_reason = blocked_reason
+
 
 class _RuntimeTransitionSafetyModel:
     def __init__(self, retargeter: Any, target_filter: Any) -> None:
@@ -383,6 +394,10 @@ class RuleBasedInitialAlignmentPlanner:
             joint_upper_rad=tuple(float(value) for value in RM65_ABSOLUTE_Q_MAX_RAD),
             joint_slow_margin_deg=8.0,
             joint_hold_margin_deg=1.0,
+            # The shared transition planner permits only a certified inward
+            # escape from a joint-limit hold.  Outward, hard-limit, collision,
+            # and TCP-envelope violations remain blocked.
+            allow_joint_limit_escape=True,
             max_endpoint_excursion_m=0.5,
             collision_slow_distance_m=(
                 required_distance + float(self.config.collision_slow_margin_m)
@@ -407,9 +422,28 @@ class RuleBasedInitialAlignmentPlanner:
             config=transition_config,
         )
         if not raw_plan.completed:
+            held_joints = []
+            assessment = raw_plan.metadata.get("blocked_current_assessment", {})
+            for event in assessment.get("events", ()):
+                if event.get("code") != "joint_limit_hold_margin":
+                    continue
+                joint = event.get("metadata", {}).get("joint_index")
+                side = event.get("side")
+                if side not in target or not isinstance(joint, int) or not 1 <= joint <= 6:
+                    continue
+                held_joints.append(
+                    f"{side}.j{joint} distance_to_limit_deg="
+                    f"{math.degrees(float(event['value'])):.3f} "
+                    f"current_deg={math.degrees(float(event['metadata']['qpos_rad'])):.3f} "
+                    f"target_deg={math.degrees(float(target[side][joint - 1])):.3f}"
+                )
+            joint_detail = f" joints={'; '.join(held_joints)}" if held_joints else ""
             raise RuleBasedInitialAlignmentPlanningError(
                 "initial alignment direct coupled transition was rejected: "
                 f"status={raw_plan.status} reason={raw_plan.blocked_reason}"
+                f"{joint_detail}",
+                status=raw_plan.status,
+                blocked_reason=raw_plan.blocked_reason,
             )
         transition_waypoints = tuple(
             _qpos_pair(step.qpos_by_side, name="planned_waypoint")

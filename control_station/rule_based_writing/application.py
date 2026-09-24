@@ -2233,6 +2233,7 @@ class RuleBasedWritingApplication:
         runtime_home = bool(
             self._rule_runtime_bound
             and not terminal
+            and str(self._state.session_state or "").upper() not in {"FAULT", "ESTOP"}
             and not self._state.runtime_home_pending
             and self._state.phase in {"ready", "blocked"}
             and not self._state.configuration_pending
@@ -2344,6 +2345,16 @@ class RuleBasedWritingApplication:
             return "等待规则运行时完成绑定；就绪前不能开始任务链。"
         effective_blockers = self._effective_startup_blockers_locked()
         if effective_blockers:
+            if str(self._state.session_state or "").upper() in {"FAULT", "ESTOP"}:
+                return (
+                    "规则采集保持禁用；Session 已进入终止安全状态，当前进程不能"
+                    "重新采集 runtime Home。请保持 Hold，检查设备与机械臂位置；"
+                    "确认安全后退出并重新启动程序。\n"
+                    + "; ".join(
+                        f"{key}: {value}"
+                        for key, value in sorted(effective_blockers.items())
+                    )
+                )
             if "rule.right_hand_hold_owner" in effective_blockers:
                 return (
                     "规则采集保持禁用；请先完成任务链中的“闭紧右夹爪”，"
@@ -2635,10 +2646,12 @@ class RuleBasedWritingApplication:
             if key != "rule.right_hand_hold_owner"
             and not self._is_rule_planning_blocker(key)
         }
+        state = str(self._state.session_state or "").upper()
+        if state in {"FAULT", "ESTOP"}:
+            return False
         if self._runtime_home_retry_available:
             return True
-        state = str(self._state.session_state or "").upper()
-        if state in {"", "ARMED", "RUNNING", "FAULT", "ESTOP", "INIT"}:
+        if state in {"", "ARMED", "RUNNING", "INIT"}:
             return any(
                 self._is_runtime_home_requirement(key, detail)
                 for key, detail in blockers.items()
@@ -2666,6 +2679,19 @@ class RuleBasedWritingApplication:
             return
         self._state.phase = "blocked"
         self._state.title = "机械臂安全接入未完成"
+        if str(self._state.session_state or "").upper() in {"FAULT", "ESTOP"}:
+            self._state.title = "Session 已进入终止安全状态"
+            details = "; ".join(
+                f"{key}: {value}"
+                for key, value in sorted(self._state.startup_blockers.items())
+            )
+            self._state.detail = (
+                "规则采集保持禁用；当前进程不能重新采集 runtime Home。"
+                "请保持 Hold，检查设备与机械臂位置；确认安全后退出并"
+                "重新启动程序。"
+                + ("\n" + details if details else "")
+            )
+            return
         if self._runtime_home_retry_available:
             self._state.detail = (
                 "规则采集保持禁用；上一次安全初始化未完成。"

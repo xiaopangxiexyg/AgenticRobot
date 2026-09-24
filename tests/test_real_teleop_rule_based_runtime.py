@@ -3538,6 +3538,105 @@ def test_initial_alignment_planning_timeout_holds_and_requests_episode_reclaim(
     assert ui.failure_stop_requests == 1
 
 
+def test_joint_limit_alignment_rejection_holds_without_faulting_command_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, clutch, ui = _bind(extension, recorder)
+    planner = extension._initial_alignment_planner
+    assert planner is not None
+
+    def reject_limit(**_kwargs):
+        raise RuleBasedInitialAlignmentPlanningError(
+            "status=hold_current reason=joint_limit_hold_margin right.j1",
+            status="hold_current",
+            blocked_reason="joint_limit_hold_margin",
+        )
+
+    monkeypatch.setattr(planner, "plan", reject_limit)
+
+    def confirmed_hold(reason: str) -> bool:
+        session.hold_reasons.append(reason)
+        session.state_machine.state = SimpleNamespace(value="DEBUG_ONLY")
+        return True
+
+    monkeypatch.setattr(session, "hold_hardware", confirmed_hold)
+    assert session.command_override_provider(SimpleNamespace(), 4.0).command is None
+    future = extension._initial_alignment_future
+    assert future is not None
+    for _ in range(200):
+        if future.done():
+            break
+        time.sleep(0.001)
+    assert future.done()
+
+    assert session.command_override_provider(SimpleNamespace(), 4.1).command is None
+    assert extension.status().aborted is True
+    assert extension.status().held is True
+    assert len(session.hold_reasons) == 1
+    assert clutch.reasons == ["rule_based_runtime_hold"]
+    assert ui.failure_stop_requests == 1
+    assert session.command_override_provider(SimpleNamespace(), 4.2).command is None
+
+    # The normal Hold owner then retires the failed Episode before Home.  A
+    # planning rejection must not leave an aborted cursor blocking that path.
+    recorder.is_recording = False
+    extension.after_runtime_hold(
+        reason="rule_based_runtime_hold", hardware_hold_confirmed=True
+    )
+    assert extension.status().aborted is False
+    extension.after_runtime_home(now=4.3)
+    assert extension.status().held is False
+
+
+def test_joint_limit_alignment_rejection_faults_if_hold_is_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+    )
+    recorder = _Recorder(_Poller())
+    recorder.is_recording = True
+    session, _clutch, ui = _bind(extension, recorder)
+    planner = extension._initial_alignment_planner
+    assert planner is not None
+
+    def reject_limit(**_kwargs):
+        raise RuleBasedInitialAlignmentPlanningError(
+            "status=hold_current reason=joint_limit_hold_margin",
+            status="hold_current",
+            blocked_reason="joint_limit_hold_margin",
+        )
+
+    monkeypatch.setattr(planner, "plan", reject_limit)
+    monkeypatch.setattr(session, "hold_hardware", lambda _reason: False)
+    assert session.command_override_provider(SimpleNamespace(), 4.0).command is None
+    future = extension._initial_alignment_future
+    assert future is not None
+    for _ in range(200):
+        if future.done():
+            break
+        time.sleep(0.001)
+    assert future.done()
+
+    with pytest.raises(RuleBasedInitialAlignmentPlanningError):
+        session.command_override_provider(SimpleNamespace(), 4.1)
+    assert extension.status().aborted is True
+    assert ui.failure_stop_requests == 1
+
+
 def test_consecutive_initializations_plan_from_their_own_targets() -> None:
     first_group = _group()
     second_qpos = np.full((2, 6), 0.08, dtype=np.float32)

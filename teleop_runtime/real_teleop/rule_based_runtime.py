@@ -2398,6 +2398,9 @@ class RuleBasedRealTeleopExtension:
                     "coupled terminal rule pose resolution failed: "
                     f"{type(exc).__name__}: {exc}"
                 )
+        if self._aborted:
+            self._publish_status(recording_ready=False)
+            return TeleopCommandOverride(None)
         if self._completed:
             self._publish_status(recording_ready=ready)
             return TeleopCommandOverride(None)
@@ -4772,11 +4775,20 @@ class RuleBasedRealTeleopExtension:
         try:
             plan = future.result()
         except Exception as exc:  # noqa: BLE001 - planning is fail closed.
+            recoverable_limit_hold = (
+                isinstance(exc, RuleBasedInitialAlignmentPlanningError)
+                and exc.status == "hold_current"
+                and exc.blocked_reason == "joint_limit_hold_margin"
+            )
             self._abort_initial_alignment(
                 "initial-alignment planning failed: "
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc}",
+                recoverable_limit_hold=recoverable_limit_hold,
             )
-            raise AssertionError("unreachable") from exc
+            # A certified inward escape was unavailable.  Only a confirmed
+            # Session Hold may turn this into a recoverable pre-dispatch
+            # rejection; the operator loop still gates Home on stream release.
+            return False
         if self._initial_alignment_plan is None:
             actual = self._snapshot_qpos_pair(snapshots)
             drift_by_side = {
@@ -5154,13 +5166,23 @@ class RuleBasedRealTeleopExtension:
         result[command_dim] = float(np.clip(scalar, 0.0, max_action))
         return result
 
-    def _abort_initial_alignment(self, message: str) -> None:
+    def _abort_initial_alignment(
+        self,
+        message: str,
+        *,
+        recoverable_limit_hold: bool = False,
+    ) -> None:
         self._aborted = True
         self._armed = False
         self._waiting_reason = "initial_alignment_safety_rejected"
         self._clear_current()
-        self._establish_hold(str(message))
+        hold_confirmed = self._establish_hold(str(message))
         self._request_failure_stop()
+        if recoverable_limit_hold and hold_confirmed:
+            session = getattr(self._components, "session", None)
+            state = getattr(getattr(session, "state_machine", None), "state", None)
+            if str(getattr(state, "value", state) or "").upper() == "DEBUG_ONLY":
+                return
         raise RuleBasedInitialAlignmentPlanningError(str(message))
 
     def _abort_coupled_pose(self, message: str) -> None:
@@ -7983,10 +8005,10 @@ class RuleBasedRealTeleopExtension:
             if self._target_arrival_confirmed:
                 self._finish_arrived_current(float(now))
 
-    def _establish_hold(self, reason: str) -> None:
+    def _establish_hold(self, reason: str) -> bool:
         self._reset_pose_action_motion_intent("runtime_hold")
         if self._held or self._components is None:
-            return
+            return False
         append_message = getattr(self._control_ui, "append_message", None)
         if callable(append_message):
             append_message(
@@ -7998,7 +8020,7 @@ class RuleBasedRealTeleopExtension:
             request_hold(reason="rule_based_runtime_hold")
         self._held = True
         try:
-            self._components.session.hold_hardware(str(reason))
+            confirmed = self._components.session.hold_hardware(str(reason))
         except Exception as exc:  # noqa: BLE001 - queued owner-loop Hold remains authoritative.
             if callable(append_message):
                 append_message(
@@ -8006,6 +8028,8 @@ class RuleBasedRealTeleopExtension:
                     "规则运行时直接 Hold 未获得回执；已转交权威控制循环重试："
                     f"{type(exc).__name__}: {exc}",
                 )
+            return False
+        return confirmed is True
 
     def close_before_session(
         self,

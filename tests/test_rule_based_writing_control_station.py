@@ -756,6 +756,41 @@ def test_operator_hold_rehome_is_not_blocked_by_pending_writing_preflight() -> N
     assert application.snapshot()["can_start"] is True
 
 
+@pytest.mark.parametrize("terminal_state", ["FAULT", "ESTOP"])
+def test_terminal_session_fault_does_not_advertise_unavailable_runtime_home(
+    terminal_state: str,
+) -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    application._runtime_home_retry_available = True
+    blockers = {
+        "rig.session": f"Session state={terminal_state}; runtime Home required",
+        "rule.writing_reachability": "书写四边界接触点尚未完成可达性检查。",
+    }
+    application.observe_runtime_publication(
+        {
+            "capture_stage": "runtime_home",
+            "capture_phase": "ready",
+            "startup_blockers": blockers,
+        }
+    )
+    application.observe_rule_status(
+        {
+            "started": True,
+            "session_state": terminal_state,
+            "rule_start_available": False,
+            "readiness_blockers": blockers,
+        }
+    )
+
+    state = application.snapshot()
+    assert state["can_runtime_home"] is False
+    assert state["can_start"] is False
+    assert "当前进程不能重新采集 runtime Home" in state["detail"]
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is False
+    assert application.consume_runtime_events() == []
+
+
 def test_writing_preflight_does_not_mask_real_device_fault_before_rehome() -> None:
     application = RuleBasedWritingApplication()
     application.bind_rule_runtime()
