@@ -171,6 +171,13 @@
 
   function recoveryFor(domain, key, message, planningMode) {
     const evidence = `${lower(key)} ${lower(message)}`;
+    if (lower(key) === "rule.writing_height") {
+      return {
+        id: "recalibrate_writing_height",
+        label: "闭紧右夹爪并重新标定书写高度",
+        instruction: "右夹爪释放后，原抓笔高度已失效。按任务链重新调整抓笔并标定高度；无需重连设备或重采 runtime Home。",
+      };
+    }
     if (lower(key) === "rule.right_hand_hold_owner") {
       return {
         id: "close_right_gripper",

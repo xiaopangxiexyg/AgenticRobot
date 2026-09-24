@@ -330,10 +330,10 @@ class RuleBasedWritingApplication:
         return blockers
 
     def _is_expected_task_chain_gripper_blocker_locked(self, *, key: str) -> bool:
-        """Keep the pre-rule gripper steps available while owner is absent.
+        """Keep grip/height preparation available while their receipts are absent.
 
         The writing runtime correctly blocks rule START until the one-shot
-        closed right-gripper owner exists.  The task chain itself must still
+        closed right-gripper owner and post-release height exist. The chain must still
         be able to perform its first release and close steps, and its final
         release must be allowed to end a cycle.  This exception is limited to
         a configured task-chain pool and never applies in the READY_RULE or
@@ -341,7 +341,7 @@ class RuleBasedWritingApplication:
         """
 
         return bool(
-            str(key) == "rule.right_hand_hold_owner"
+            str(key) in {"rule.right_hand_hold_owner", "rule.writing_height"}
             and self._task_chain_configuration_pool
             and self._task_chain.phase
             in {
@@ -1410,6 +1410,12 @@ class RuleBasedWritingApplication:
                         str(key): str(value) for key, value in raw_blockers.items()
                     }
                     self._rule_readiness_blockers = readiness_blockers
+                    if "rule.writing_height" in readiness_blockers:
+                        # A released pen invalidates the whole calibration
+                        # cycle, including standalone maintenance buttons.
+                        # Preserve completed episode counts until a new
+                        # successful height capture starts the next cycle.
+                        self._task_chain.grasp_adjustment_initialized = False
                     self._rebuild_startup_blockers_locked()
             self._state.step_id = (
                 None if status.get("step_id") is None else str(status["step_id"])
@@ -2504,12 +2510,9 @@ class RuleBasedWritingApplication:
         if not self._rule_status_seen:
             self._set_preparing_status_locked()
             return
-        if (
-            self._task_chain_configuration_pool
-            and self._is_expected_task_chain_gripper_blocker_locked(
-                key="rule.right_hand_hold_owner"
-            )
-            and "rule.right_hand_hold_owner" in self._state.startup_blockers
+        if any(
+            self._is_expected_task_chain_gripper_blocker_locked(key=key)
+            for key in self._state.startup_blockers
         ):
             # The dedicated chain is intentionally ready for its command-inert
             # release/close gates even though rule START itself remains
@@ -2583,7 +2586,7 @@ class RuleBasedWritingApplication:
     def _has_retryable_device_blockers_locked(self) -> bool:
         return any(
             not self._is_runtime_home_requirement(key, detail)
-            and str(key) != "rule.right_hand_hold_owner"
+            and str(key) not in {"rule.right_hand_hold_owner", "rule.writing_height"}
             and not self._is_rule_planning_blocker(key)
             for key, detail in self._state.startup_blockers.items()
         )
@@ -2643,7 +2646,7 @@ class RuleBasedWritingApplication:
         blockers = {
             key: detail
             for key, detail in self._effective_startup_blockers_locked().items()
-            if key != "rule.right_hand_hold_owner"
+            if key not in {"rule.right_hand_hold_owner", "rule.writing_height"}
             and not self._is_rule_planning_blocker(key)
         }
         state = str(self._state.session_state or "").upper()

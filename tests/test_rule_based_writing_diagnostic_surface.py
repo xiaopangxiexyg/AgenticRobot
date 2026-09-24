@@ -263,6 +263,14 @@ def test_active_blockers_do_not_duplicate_generic_phase_detail() -> None:
     assert [item["domain"] for item in diagnostics] == ["gripper", "camera"]
 
 
+def test_released_grip_requests_height_capture_not_device_reconnect() -> None:
+    result = _classify(
+        key="rule.writing_height",
+        message="右夹爪已松开，原书写高度已失效；请闭紧夹爪后重新标定书写高度。",
+    )
+    assert result["recovery"]["id"] == "recalibrate_writing_height"
+
+
 def test_ui_serves_diagnostic_asset_and_loads_it_before_application() -> None:
     ui = RuleBasedWritingWebUi(port=0, open_browser=False)
     ui.start()
