@@ -669,6 +669,7 @@ class RuleBasedRealTeleopExtension:
         self._manual_gripper_started_at: float | None = None
         self._manual_gripper_last_command_by_side: dict[str, float] = {}
         self._manual_gripper_command_baseline_by_side: dict[str, float] = {}
+        self._manual_gripper_initial_baseline_by_side: dict[str, float] = {}
         self._manual_gripper_last_dispatch_at_by_side: dict[str, float] = {}
         self._manual_gripper_last_progress_at_by_side: dict[str, float] = {}
         self._manual_gripper_settle_samples_by_side: dict[str, int] = {}
@@ -2507,6 +2508,7 @@ class RuleBasedRealTeleopExtension:
         self._manual_gripper_started_at = None
         self._manual_gripper_last_command_by_side.clear()
         self._manual_gripper_command_baseline_by_side.clear()
+        self._manual_gripper_initial_baseline_by_side.clear()
         self._manual_gripper_last_dispatch_at_by_side.clear()
         self._manual_gripper_last_progress_at_by_side.clear()
         self._manual_gripper_settle_samples_by_side.clear()
@@ -2774,7 +2776,10 @@ class RuleBasedRealTeleopExtension:
             > float(self.config.manual_gripper_endpoint_tolerance)
         ):
             return False
-        baseline = self._manual_gripper_command_baseline_by_side.get(side)
+        # The progress watchdog advances its rolling baseline while firmware
+        # is closing. Contact confirmation must compare against the actual
+        # start of this endpoint command, not the last moving sample.
+        baseline = self._manual_gripper_initial_baseline_by_side.get(side)
         if baseline is None:
             return False
         backend = getattr(self._components, f"{side}_hand_backend", None)
@@ -2925,13 +2930,13 @@ class RuleBasedRealTeleopExtension:
         return tuple(self.config.gripper_sides)
 
     def _dispatch_pending_gripper_action(self, observation: object, now: float) -> None:
-        """Advance one feedback-gated reset increment through the Session Rig.
+        """Advance one feedback-gated maintenance action through the Session Rig.
 
         The rule UI is intentionally not a second device loop. A reset click
         is converted to the same canonical ``RobotAction``/``TeleopCommand``
         carrier used by collection and sent through ``TeleopSession``'s
-        existing dispatch seam. Task-chain right-hand actions issue one
-        endpoint command and then only observe fresh feedback; generic
+        existing dispatch seam. Writing right-hand actions issue one endpoint
+        command and then only observe fresh feedback; other generic
         maintenance actions retain bounded incremental motion. No formal
         writer call is made and no arm effector is included.
         """
@@ -2990,6 +2995,14 @@ class RuleBasedRealTeleopExtension:
             "release_right_gripper",
             "close_right_gripper",
         }
+        # Standalone writing buttons emit generic intents. With only the
+        # right DMTAC hand configured, they need the same one-shot contract
+        # as the task chain: contact can stop short of a numeric segment.
+        one_shot_right_hand = task_chain_right_only or (
+            action_sides == ("right",)
+            and str(self.source_selection.get("collection_mode") or "")
+            == "rule_based_writing"
+        )
         is_release = intent in {"release_grippers", "release_right_gripper"}
         target_scalar = 0.0 if is_release else 1.0
         direction = -1.0 if is_release else 1.0
@@ -3056,7 +3069,8 @@ class RuleBasedRealTeleopExtension:
             except (TypeError, ValueError):
                 status_code = None
             force_stopped_grasp = bool(
-                intent == "close_right_gripper"
+                not is_release
+                and one_shot_right_hand
                 and side == "right"
                 and status_code == 6
                 and side in self._manual_gripper_last_dispatch_at_by_side
@@ -3124,7 +3138,7 @@ class RuleBasedRealTeleopExtension:
                     float(self.config.manual_gripper_endpoint_tolerance),
                     1e-4,
                 )
-                if task_chain_right_only:
+                if one_shot_right_hand:
                     if progress >= minimum_progress:
                         # The endpoint command is already owned by firmware.
                         # Fresh forward progress only refreshes the bounded
@@ -3170,7 +3184,7 @@ class RuleBasedRealTeleopExtension:
                 # final target is still feedback-gated and every new command
                 # remains bounded from the latest measured position.
             baseline = measured_scalar
-            if task_chain_right_only:
+            if one_shot_right_hand:
                 next_target = final_target
             else:
                 delta = float(np.clip(
@@ -3245,8 +3259,13 @@ class RuleBasedRealTeleopExtension:
                     action_label = "闭紧右夹爪"
                 else:
                     action_label = "闭紧"
+                feedback_label = (
+                    "等待一次性命令的实测到位"
+                    if one_shot_right_hand
+                    else "等待逐段实测到位"
+                )
                 self._gripper_action_status = (
-                    f"正在{action_label}夹爪：等待逐段实测到位（"
+                    f"正在{action_label}夹爪：{feedback_label}（"
                     + ",".join(waiting)
                     + "）。"
                 )
@@ -3271,7 +3290,7 @@ class RuleBasedRealTeleopExtension:
                     ),
                     "rule_based_manual_gripper_dispatch_mode": (
                         "single_endpoint_feedback_gated"
-                        if task_chain_right_only
+                        if one_shot_right_hand
                         else "bounded_incremental_feedback_gated"
                     ),
                     "rule_based_capture_enabled": False,
@@ -3287,16 +3306,18 @@ class RuleBasedRealTeleopExtension:
                 },
             )
             command = self.adapter.resolver.resolve(action)
-            # Task-chain right-hand motion and release are one-shot firmware
-            # operations. The writing replay keeps the same mode and target;
-            # it must not restore continuous catch or re-drive the hand.
-            manual_continuous_grasp = intent == "close_grippers"
+            # The writing right-hand actions are one-shot firmware operations.
+            # The replay keeps that same mode and target rather than restoring
+            # continuous catch or re-driving the hand.
+            manual_continuous_grasp = (
+                intent == "close_grippers" and not one_shot_right_hand
+            )
             manual_motion_mode = (
                 "one_shot_open"
                 if is_release
                 else (
                     "one_shot_close"
-                    if task_chain_right_only
+                    if one_shot_right_hand
                     else "continuous_close"
                 )
             )
@@ -3308,10 +3329,8 @@ class RuleBasedRealTeleopExtension:
                     )
                 if not isinstance(effector.metadata, dict):
                     effector.metadata = dict(effector.metadata or {})
-                # Release and the task-chain right-only close are one-shot
-                # maintenance moves. The generic all-side close retains its
-                # historical continuous-grasp behavior; writing replay keeps
-                # the task-chain right hand fixed in the same one-shot mode.
+                # Generic multi-hand maintenance retains its existing mode;
+                # the writing right hand stays in one-shot mode.
                 effector.metadata["dmtac_continuous_grasp_override"] = bool(
                     manual_continuous_grasp
                 )
@@ -3322,7 +3341,7 @@ class RuleBasedRealTeleopExtension:
                 effector.metadata["dmtac_preserve_existing_grip"] = False
                 effector.metadata["rule_based_manual_gripper_dispatch_mode"] = (
                     "single_endpoint_feedback_gated"
-                    if task_chain_right_only
+                    if one_shot_right_hand
                     else "bounded_incremental_feedback_gated"
                 )
                 effector.metadata["rule_based_manual_gripper_motion_mode"] = (
@@ -3425,6 +3444,9 @@ class RuleBasedRealTeleopExtension:
                     self._manual_gripper_command_baseline_by_side[side] = float(
                         measured_scalar_by_side[side]
                     )
+                    self._manual_gripper_initial_baseline_by_side[side] = float(
+                        measured_scalar_by_side[side]
+                    )
                     self._manual_gripper_last_progress_at_by_side[side] = float(now)
                 accepted.append(side)
             elif outcome == "retry":
@@ -3470,8 +3492,13 @@ class RuleBasedRealTeleopExtension:
                 if retrying
                 else ""
             )
+            dispatch_label = (
+                "已发送一次性终点命令"
+                if one_shot_right_hand
+                else "已发送受限分段"
+            )
             self._gripper_action_status = (
-                f"正在{action_label}夹爪：已发送受限分段 {positions}{resend_note}"
+                f"正在{action_label}夹爪：{dispatch_label} {positions}{resend_note}"
                 f"{retry_suffix}，等待实测到位。"
             )
         elif retrying:

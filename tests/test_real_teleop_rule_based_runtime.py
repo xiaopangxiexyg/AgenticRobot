@@ -4590,6 +4590,138 @@ def test_task_chain_close_right_accepts_stable_force_stopped_grasp() -> None:
     )
 
 
+@pytest.mark.parametrize("closed_status", (2, 6))
+def test_writing_gui_standalone_close_accepts_stable_contact_feedback(
+    closed_status: int,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    recorder = _Recorder(_Poller())
+
+    class ContactPoller:
+        value = 0.5
+        timestamp = 9.0
+        status_code = 2
+
+        def latest_at_or_before(self, _now):
+            measured = np.zeros(6, dtype=np.float32)
+            measured[0] = self.value
+            return {
+                "right": {
+                    "measured_joint_pos": measured,
+                    "joint_age_sec": 0.0,
+                    "joint_timestamp": self.timestamp,
+                    "gripper_status_code": self.status_code,
+                    "gripper_is_moving": self.status_code == 4,
+                    "gripper_error_code": 0,
+                }
+            }
+
+    poller = ContactPoller()
+    recorder.hand_state_poller = poller
+    session, _clutch, ui = _bind(
+        extension, recorder, arm=False, hand_sides=("right",)
+    )
+
+    # The standalone GUI emits the generic intent, not the task-chain intent.
+    ui.intents.append("close_grippers")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert len(session.external_commands) == 1
+    command = session.external_commands[0].commands["right_hand"]
+    assert float(command.value[0]) == pytest.approx(1.0)
+    assert command.metadata["dmtac_continuous_grasp_override"] is False
+    assert command.metadata["rule_based_manual_gripper_dispatch_mode"] == (
+        "single_endpoint_feedback_gated"
+    )
+
+    poller.timestamp = 10.0
+    poller.status_code = closed_status
+    poller.value = 0.53 if closed_status == 6 else 0.5
+    session.command_override_provider(SimpleNamespace(), 10.1)
+    if closed_status == 6:
+        assert "新鲜反馈" in extension.status().gripper_action_status
+    else:
+        assert extension._pending_gripper_action == "close_grippers"
+
+    if closed_status == 2:
+        # A pre-existing closed-side idle code without any motion from this
+        # command must not be mistaken for a successful grasp.
+        poller.timestamp = 10.05
+        session.command_override_provider(SimpleNamespace(), 10.15)
+        assert extension._pending_gripper_action == "close_grippers"
+        poller.value = 0.53
+
+    poller.status_code = 4
+    for timestamp, now in ((10.1, 10.2), (10.2, 10.3)):
+        poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        assert extension._pending_gripper_action == "close_grippers"
+
+    poller.status_code = closed_status
+    for timestamp, now in ((10.3, 10.4), (10.4, 10.5), (10.5, 10.6)):
+        poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), now)
+        if now < 10.6:
+            assert extension._pending_gripper_action == "close_grippers"
+    assert len(session.external_commands) == 1
+    assert extension.status().gripper_action_result == "succeeded"
+    assert extension.status().gripper_action_status == "夹爪实测已闭紧"
+
+
+def test_writing_gui_standalone_release_uses_one_shot_open_feedback() -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedCustomAction(
+                    step_id="collect",
+                    action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+                ),
+            )
+        ),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(
+        extension, recorder, arm=False, hand_sides=("right",)
+    )
+    backend = extension._components.right_hand_backend
+    backend.set_measured_scalar(0.5)
+
+    ui.intents.append("release_grippers")
+    extension.after_control_input_poll(now=10.0)
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert len(session.external_commands) == 1
+    command = session.external_commands[0].commands["right_hand"]
+    assert float(command.value[0]) == pytest.approx(0.0)
+    assert command.metadata["dmtac_continuous_grasp_override"] is False
+    assert command.metadata["rule_based_manual_gripper_motion_mode"] == (
+        "one_shot_open"
+    )
+
+    backend.set_measured_scalar(0.0)
+    for now in (10.1, 10.2, 10.3):
+        session.command_override_provider(SimpleNamespace(), now)
+    assert len(session.external_commands) == 1
+    assert extension.status().gripper_action_result == "succeeded"
+    assert extension.status().gripper_action_status == "夹爪实测已松开"
+
+
 def test_manual_gripper_reset_uses_recorder_hand_history_without_backend_read() -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -5014,8 +5146,10 @@ def test_manual_gripper_stops_on_measured_reverse_motion() -> None:
     assert "相反" in extension.status().gripper_action_status
 
 
+@pytest.mark.parametrize("writing_mode", (False, True))
 def test_manual_gripper_close_then_release_recovers_from_real_backend_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
+    writing_mode: bool,
 ) -> None:
     class _Clock:
         def __init__(self) -> None:
@@ -5041,6 +5175,9 @@ def test_manual_gripper_close_then_release_recovers_from_real_backend_rate_limit
         ),
         trajectory_groups={},
         config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection=(
+            {"collection_mode": "rule_based_writing"} if writing_mode else {}
+        ),
     )
     recorder = _Recorder(_Poller())
     session, _clutch, ui = _bind(
