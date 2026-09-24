@@ -110,6 +110,15 @@ verify_local_socket_capabilities() {
     "complete acceptance requires working loopback TCP and Unix sockets"
 }
 
+verify_required_model_input() {
+  # Several complete-suite B601 cases load this checkout-relative model.
+  # An external source override used by other cases cannot replace this input.
+  # Only check availability here; model/physics validation belongs to the tests.
+  local model_path="$REPO_ROOT/hardware/reBotArm_control_py/urdf/00-arm-rs_asm-v3/urdf/00-arm-rs_asm-v3.urdf"
+  [[ -f "$model_path" && -r "$model_path" ]] || die \
+    "required B601 URDF is missing or unreadable: $model_path; initialize hardware/reBotArm_control_py at the recorded gitlink before complete acceptance (no shards started)"
+}
+
 prepare_shards() {
   local index
   mkdir -- "$RUN_ROOT/mujoco-cache"
@@ -196,6 +205,7 @@ run_shard() {
 
 trap cleanup EXIT
 configure_shards
+verify_required_model_input
 verify_local_socket_capabilities
 prepare_run_root
 prepare_asset_compat_link

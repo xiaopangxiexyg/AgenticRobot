@@ -14,6 +14,7 @@ pytestmark = pytest.mark.integration
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_WRAPPER = SOURCE_ROOT / "scripts/run_full_acceptance.sh"
 SOURCE_SHARDING = SOURCE_ROOT / "scripts/pytest_sharding.py"
+REBOT_MODEL = Path("hardware/reBotArm_control_py/urdf/00-arm-rs_asm-v3/urdf/00-arm-rs_asm-v3.urdf")
 
 
 def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -22,6 +23,10 @@ def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     tests = checkout / "tests"
     scripts.mkdir(parents=True)
     tests.mkdir()
+    model = checkout / REBOT_MODEL
+    model.parent.mkdir(parents=True)
+    model.write_text("<robot name='preflight-fixture'/>", encoding="utf-8")
+    model.chmod(0o444)
     for index in range(9):
         (tests / f"test_case_{index}.py").write_text(
             "#" * (1_000 + index * 200), encoding="utf-8"
@@ -221,6 +226,34 @@ def test_wrapper_rejects_unsupported_shard_counts(
 
     assert completed.returncode == 2
     assert "must be an integer from 1 to 6" in completed.stderr
+    assert not list(sync_root.glob("*.started"))
+    assert not os.path.lexists(checkout / "assets")
+
+
+@pytest.mark.parametrize("model_state", ["absent", "directory", "dangling-link"])
+def test_wrapper_rejects_missing_model_before_artifacts_or_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model_state: str,
+) -> None:
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    model = checkout / REBOT_MODEL
+    model.unlink()
+    if model_state == "directory":
+        model.mkdir()
+    elif model_state == "dangling-link":
+        model.symlink_to(tmp_path / "missing.urdf")
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    run_root = tmp_path / "model-blocked"
+    # Some tests accept an external input; it cannot hide the missing checkout input.
+    monkeypatch.setenv("DEXTELEOP_REBOT_SOURCE_ROOT", str(assets))
+
+    completed = _run_wrapper(wrapper, sync_root, assets, run_root)
+
+    assert completed.returncode == 2
+    assert "required B601 URDF is missing or unreadable" in completed.stderr
+    assert str(model) in completed.stderr
+    assert "recorded gitlink" in completed.stderr
+    assert not os.path.lexists(run_root)
     assert not list(sync_root.glob("*.started"))
     assert not os.path.lexists(checkout / "assets")
 

@@ -40,6 +40,8 @@ bash scripts/run_pytest.sh -q -m "integration and not optional and not hardware 
 bash scripts/run_fast_feedback.sh
 # Complete compatibility and integration-commit acceptance:
 bash scripts/run_full_acceptance.sh --durations=50
+# On the validated six-shard integration host, use the same setting as Harness:
+DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 bash scripts/run_full_acceptance.sh --durations=50
 ```
 
 The current `pytest.ini` default discovers the root `tests/` directory.
@@ -190,7 +192,14 @@ may be appended, but the marker, cache, JUnit, and basetemp options remain
 owned by the wrapper.
 
 `scripts/run_full_acceptance.sh` is the complete non-hardware integration gate.
-Before allocating an artifact root or starting any shard, it verifies that the
+Before allocating an artifact root or starting any shard, it requires the
+checkout-relative B601 URDF under the recorded `hardware/reBotArm_control_py`
+gitlink to be a readable file. Some complete-suite cases use that fixed input;
+`DEXTELEOP_REBOT_SOURCE_ROOT` for other cases does not replace it. Missing input
+fails immediately without initializing a submodule, changing inputs, or skipping
+tests. This is only an availability check, not proof of model correctness or
+gitlink identity; the original model and boundary tests still run.
+The wrapper also verifies that the
 host can create both loopback TCP and Unix sockets required by the complete
 suite. An incapable sandbox therefore fails immediately instead of running the
 remaining modules and reporting predictable transport errors at the end.
