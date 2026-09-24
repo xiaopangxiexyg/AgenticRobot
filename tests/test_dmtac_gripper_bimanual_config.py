@@ -46,6 +46,7 @@ from teleop_runtime.schemas import (
     ObservationChannel,
     TeleopObservation,
 )
+from tests.support.real_teleop_control import build_control_input
 
 
 class DMTacGripperBimanualConfigTest(unittest.TestCase):
@@ -1408,7 +1409,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             session=SimpleNamespace(sources=[], calibration=None),
             gripper_policy={},
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=SimpleNamespace(host="127.0.0.1", port=8765, load_profile="", debug_ik_timing=False),
@@ -1486,7 +1487,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             session=SimpleNamespace(sources=[], calibration=None),
             gripper_policy={"source_dim": 2, "output_dim": 0, "max_action": 0.95},
         )
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=_FakeUi(),
             args=SimpleNamespace(host="127.0.0.1", port=8765, load_profile="", debug_ik_timing=False),
@@ -1569,7 +1570,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             gripper_policy={"source_dim": 2, "output_dim": 0, "max_action": 0.95},
         )
         ui = _FakeUi()
-        control = real_teleop.RealTeleopControlInput(
+        control = build_control_input(
             terminal=_FakeTerminal(),
             ui=ui,
             args=SimpleNamespace(host="127.0.0.1", port=8765, load_profile="", debug_ik_timing=False),

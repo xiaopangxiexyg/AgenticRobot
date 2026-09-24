@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import teleop_runtime.real_teleop.operator_control_runtime as operator_runtime
+from control_station.real_teleop import control_availability
 from control_station.real_teleop.progress import (
     ProgressControlAvailability,
     ProgressProfileOption,
@@ -27,6 +27,7 @@ from teleop_runtime.real_teleop.progress_contracts import (
     ProgressMutationCommand,
     ProgressProfileSelectionCommand,
 )
+from tests.support.real_teleop_control import bind_control_application
 
 
 def test_progress_controls_require_active_attempt() -> None:
@@ -593,6 +594,7 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
     control._progress_application = build_real_teleop_progress_application(
         SimpleNamespace()
     )
+    bind_control_application(control)
     control._progress_operator_intents = __import__("collections").deque()
     control._progress_profile_selection_intents = (
         __import__("collections").deque()
@@ -669,6 +671,7 @@ def test_strict_profile_blocks_manual_fix_and_single_arm_pedal_routes(
     control._progress_application = build_real_teleop_progress_application(
         SimpleNamespace()
     )
+    bind_control_application(control)
     control._progress_ui_payload = {
         "configured": True,
         "arm_control_mode": "strict_profile",
@@ -691,8 +694,8 @@ def test_strict_profile_blocks_manual_fix_and_single_arm_pedal_routes(
 
     assert not control._manual_fix_arm_controls_enabled()
     monkeypatch.setattr(
-        operator_runtime,
-        "_gui_current_active_controls",
+        control_availability,
+        "current_active_controls",
         lambda _state, _events: [
             "fix_arm_select",
             "fix_arm_toggle",

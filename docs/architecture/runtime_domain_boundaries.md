@@ -47,6 +47,12 @@ lower domains must not import application/profile layers
 任何跨域适配器都应能回答三个问题：输入由谁推进、最终 authority/dispatch 由谁拥有、资源由谁关闭。
 如果答案出现两个 owner，应先修正所有权，而不是增加同步队列或兼容状态。
 
+真实遥操的 `RealTeleopControlInput` 直接引用 lower runtime 的实体操作，不依赖入口模块导入后
+回填全局函数。Control Station 在 `run_real_teleop()` 中显式传入 progress application、输入批次
+优先级和控制可用性策略，由运行时按实例绑定；缺少依赖时在资源装配前拒绝启动，同一实例不能
+换绑为另一组策略。可用性策略直接使用既有纯策略模块，snapshot/event 类型仍由该模块持有，
+不新增策略容器或第二套状态定义。旧 CLI 与控制器导出保留，但不再改变 lower module 的依赖。
+
 ## 执行模式边界
 
 执行模式按同时参与控制决策的 source 数量划分，而不是按是否启用 GUI、trace 或被动 shadow 划分：

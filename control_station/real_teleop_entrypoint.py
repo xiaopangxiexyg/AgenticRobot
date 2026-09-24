@@ -1339,6 +1339,7 @@ from control_station.real_teleop.control_availability import (
     vive_calibration_controls as _gui_vive_calibration_controls,
     visualization_controls as _gui_visualization_controls,
 )
+from control_station.real_teleop import control_availability as real_teleop_control_policy
 from control_station.real_teleop.input_mapping import prioritize_input_batch
 from control_station.real_teleop_application import (
     build_real_teleop_progress_application,
@@ -1482,14 +1483,9 @@ from teleop_runtime.real_teleop.action_debug_payload import (
 )
 
 from teleop_runtime.real_teleop.operator_control_runtime import (
-    RealTeleopControlInput,
-    bind_legacy_support as _bind_real_teleop_gui_support,
+    RealTeleopControlInput,  # noqa: F401 - Legacy controller re-export.
 )
 
-_bind_real_teleop_gui_support(globals())
-RealTeleopControlInput.__module__ = (
-    "teleop_runtime.debug.run_vive_rm65_real_teleop"
-)
 
 
 
@@ -1579,6 +1575,7 @@ def run_real_teleop_entrypoint(
             args,
             progress_application=build_real_teleop_progress_application(args),
             input_batch_prioritizer=prioritize_input_batch,
+            control_policy=real_teleop_control_policy,
             control_ui_type=control_ui_type or CalibrationWebUi,
             startup_progress_type=GuiStartupProgress,
         )

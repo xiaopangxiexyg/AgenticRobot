@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
 
 from robot_motion.runtime import run_best_effort_cleanup
 
@@ -18,6 +25,141 @@ from teleop_runtime.debug import run_vive_rm65_real_teleop as legacy_entrypoint
 from teleop_runtime.real_teleop import operator_control_runtime, terminal_input
 from teleop_runtime.real_teleop.components import RealTeleopComponents
 from teleop_runtime.real_teleop.movement import apply_movement_multiple
+from tests.support.real_teleop_control import bind_control_application
+
+
+def test_lower_controller_constructs_without_station_import_or_global_binding() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent("""
+            import sys
+            from types import SimpleNamespace
+            from teleop_runtime.real_teleop import operator_control_runtime as runtime
+
+            control_type = runtime.RealTeleopControlInput
+            control = control_type(
+                terminal=SimpleNamespace(enabled=False),
+                ui=None,
+                args=SimpleNamespace(),
+                components=SimpleNamespace(),
+            )
+            assert not any(
+                name == 'control_station' or name.startswith('control_station.')
+                for name in sys.modules
+            )
+            canonical_helpers = (
+                runtime._start_gui_qpos_init,
+                runtime._load_gui_vive_calibration_profile,
+                runtime._publish_raw_tracker_pose_state,
+            )
+            from teleop_runtime.debug import run_vive_rm65_real_teleop as legacy
+            assert legacy.RealTeleopControlInput is control_type
+            assert control_type.__module__ == runtime.__name__
+            assert canonical_helpers == (
+                runtime._start_gui_qpos_init,
+                runtime._load_gui_vive_calibration_profile,
+                runtime._publish_raw_tracker_pose_state,
+            )
+            for name in ('bind_legacy_support', '_LegacyFunctionProxy', '_SUPPORT_NAMES'):
+                assert not hasattr(runtime, name)
+            for name in ('_progress_application', '_input_batch_prioritizer', '_control_policy'):
+                assert not hasattr(control, name)
+        """)],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_control_policy_is_bound_per_instance() -> None:
+    controls = []
+    policies = []
+    for label in ("first", "second"):
+        control = operator_control_runtime.RealTeleopControlInput.__new__(
+            operator_control_runtime.RealTeleopControlInput
+        )
+        state = GuiControlState(camera_visualization_available=True)
+        control._gui_control_state = Mock(return_value=state)
+        policy = SimpleNamespace(
+            GuiControlEvents=GuiControlEvents,
+            visualization_controls=Mock(return_value=[label]),
+        )
+        control.bind_application_ports(
+            progress_application=object(),
+            input_batch_prioritizer=Mock(),
+            control_policy=policy,
+        )
+        assert control._gui_events() == GuiControlEvents()
+        assert control._gui_events() is control._gui_events()
+        controls.append(control)
+        policies.append(policy)
+
+    assert controls[0]._visualization_controls() == ["first"]
+    assert controls[1]._visualization_controls() == ["second"]
+    assert controls[0]._gui_events() is not controls[1]._gui_events()
+    for control, policy in zip(controls, policies):
+        policy.visualization_controls.assert_called_once_with(control._gui_control_state())
+
+
+@pytest.mark.parametrize(
+    "port", ["progress_application", "input_batch_prioritizer", "control_policy"]
+)
+def test_control_ports_reject_rebinding_without_partial_update(port: str) -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    ports = {
+        "progress_application": object(),
+        "input_batch_prioritizer": Mock(),
+        "control_policy": object(),
+    }
+    control.bind_application_ports(**ports)
+    control.bind_application_ports(**ports)
+    with pytest.raises(RuntimeError, match="already bound"):
+        control.bind_application_ports(**{**ports, port: Mock()})
+    for name, original in ports.items():
+        assert getattr(control, "_" + name) is original
+
+
+@pytest.mark.parametrize(
+    "port,error",
+    [
+        ("progress_application", RuntimeError),
+        ("input_batch_prioritizer", TypeError),
+        ("control_policy", RuntimeError),
+    ],
+)
+def test_control_ports_reject_missing_dependencies_atomically(port, error) -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    ports = {
+        "progress_application": object(),
+        "input_batch_prioritizer": Mock(),
+        "control_policy": object(),
+    }
+    with pytest.raises(error):
+        control.bind_application_ports(**{**ports, port: None})
+    assert all(not hasattr(control, "_" + name) for name in ports)
+
+
+@pytest.mark.parametrize("operation", ["start", "poll"])
+def test_unbound_controller_does_not_start_or_consume_input(operation: str) -> None:
+    terminal = Mock(enabled=False)
+    ui = Mock()
+    control = operator_control_runtime.RealTeleopControlInput(
+        terminal=terminal,
+        ui=ui,
+        args=SimpleNamespace(),
+        components=SimpleNamespace(),
+    )
+    with pytest.raises(RuntimeError, match="was not injected"):
+        getattr(control, operation)()
+    terminal.start.assert_not_called()
+    terminal.poll.assert_not_called()
+    ui.consume_events.assert_not_called()
 
 
 def test_operator_control_uses_canonical_lower_runtime_dependencies() -> None:
@@ -40,6 +182,7 @@ def test_legacy_control_input_delegates_active_controls_to_extracted_policy() ->
         camera_visualization_available=True,
         tactile_visualization_available=False,
     )
+    bind_control_application(control)
     control.components = SimpleNamespace(
         active_sides=("left",),
         fix_arm_controller=object(),
@@ -424,6 +567,7 @@ def test_impedance_gui_exposes_exact_qpos_only_with_capable_dual_backends() -> N
         no_collection=False,
         no_episode_recording=False,
     )
+    bind_control_application(control)
     control.components = SimpleNamespace(
         active_sides=("left", "right"),
         fix_arm_controller=None,
