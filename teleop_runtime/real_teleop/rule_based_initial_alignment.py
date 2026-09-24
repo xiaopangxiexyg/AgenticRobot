@@ -423,8 +423,18 @@ class RuleBasedInitialAlignmentPlanner:
         )
         if not raw_plan.completed:
             held_joints = []
+            held_collision = []
             assessment = raw_plan.metadata.get("blocked_current_assessment", {})
             for event in assessment.get("events", ()):
+                if event.get("code") == "collision_soft":
+                    distance = event.get("value")
+                    threshold = event.get("threshold")
+                    if distance is not None and threshold is not None:
+                        held_collision.append(
+                            f"distance_m={float(distance):.6f} "
+                            f"hold_threshold_m={float(threshold):.6f}"
+                        )
+                    continue
                 if event.get("code") != "joint_limit_hold_margin":
                     continue
                 joint = event.get("metadata", {}).get("joint_index")
@@ -438,10 +448,13 @@ class RuleBasedInitialAlignmentPlanner:
                     f"target_deg={math.degrees(float(target[side][joint - 1])):.3f}"
                 )
             joint_detail = f" joints={'; '.join(held_joints)}" if held_joints else ""
+            collision_detail = (
+                f" collision={'; '.join(held_collision)}" if held_collision else ""
+            )
             raise RuleBasedInitialAlignmentPlanningError(
                 "initial alignment direct coupled transition was rejected: "
                 f"status={raw_plan.status} reason={raw_plan.blocked_reason}"
-                f"{joint_detail}",
+                f"{joint_detail}{collision_detail}",
                 status=raw_plan.status,
                 blocked_reason=raw_plan.blocked_reason,
             )

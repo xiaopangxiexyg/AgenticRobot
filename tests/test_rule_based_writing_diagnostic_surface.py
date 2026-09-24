@@ -170,6 +170,15 @@ def test_force_trip_is_critical_but_ik_failure_is_not_a_device_retry() -> None:
     assert reachability["recovery"]["id"] != "device_retry"
 
 
+def test_terminal_session_does_not_advertise_in_process_runtime_home() -> None:
+    diagnostic = _classify(
+        key="rig.session",
+        message="Session state=FAULT; runtime Home and hardware arm admission are required",
+    )
+    assert diagnostic["recovery"]["id"] == "restart_after_terminal_session"
+    assert "重新启动程序" in diagnostic["recovery"]["instruction"]
+
+
 def test_active_reachability_diagnostics_follow_runtime_lifecycle() -> None:
     blocker = {
         "rule.writing_reachability": "待检候选 4 数值 IK 未能认证；正在后台准备下一候选"

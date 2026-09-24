@@ -4802,19 +4802,23 @@ class RuleBasedRealTeleopExtension:
         try:
             plan = future.result()
         except Exception as exc:  # noqa: BLE001 - planning is fail closed.
-            recoverable_limit_hold = (
+            recoverable_predispatch_hold = (
                 isinstance(exc, RuleBasedInitialAlignmentPlanningError)
                 and exc.status == "hold_current"
-                and exc.blocked_reason == "joint_limit_hold_margin"
+                and exc.blocked_reason in {
+                    "joint_limit_hold_margin",
+                    "collision_soft",
+                }
             )
             self._abort_initial_alignment(
                 "initial-alignment planning failed: "
                 f"{type(exc).__name__}: {exc}",
-                recoverable_limit_hold=recoverable_limit_hold,
+                recoverable_predispatch_hold=recoverable_predispatch_hold,
             )
-            # A certified inward escape was unavailable.  Only a confirmed
-            # Session Hold may turn this into a recoverable pre-dispatch
-            # rejection; the operator loop still gates Home on stream release.
+            # No rejected alignment waypoint was dispatched. Only a confirmed
+            # Session Hold may turn a known geometric planning refusal into a
+            # recoverable pre-dispatch rejection; the owner loop still gates
+            # Home on position-stream release.
             return False
         if self._initial_alignment_plan is None:
             actual = self._snapshot_qpos_pair(snapshots)
@@ -5197,7 +5201,7 @@ class RuleBasedRealTeleopExtension:
         self,
         message: str,
         *,
-        recoverable_limit_hold: bool = False,
+        recoverable_predispatch_hold: bool = False,
     ) -> None:
         self._aborted = True
         self._armed = False
@@ -5205,7 +5209,7 @@ class RuleBasedRealTeleopExtension:
         self._clear_current()
         hold_confirmed = self._establish_hold(str(message))
         self._request_failure_stop()
-        if recoverable_limit_hold and hold_confirmed:
+        if recoverable_predispatch_hold and hold_confirmed:
             session = getattr(self._components, "session", None)
             state = getattr(getattr(session, "state_machine", None), "state", None)
             if str(getattr(state, "value", state) or "").upper() == "DEBUG_ONLY":
@@ -8432,7 +8436,9 @@ class RuleBasedRealTeleopExtension:
         )
         gripper_action_pending = self._pending_gripper_action is not None
         if (
-            self._writing_reachability_enabled()
+            session_state_value in {"ARMED", "RUNNING"}
+            and not self._held
+            and self._writing_reachability_enabled()
             and self._height_calibration is not None
             and self._height_calibration.enabled
             and not self._writing_reachability_passed_for_current_selection()

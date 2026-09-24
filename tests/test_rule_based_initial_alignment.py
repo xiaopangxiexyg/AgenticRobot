@@ -208,6 +208,28 @@ def test_initial_alignment_rejects_target_remaining_in_joint_hold_margin(
     assert "target_deg=" in str(caught.value)
 
 
+def test_initial_alignment_collision_hold_reports_measured_margin() -> None:
+    class NearCollisionRetargeter(_Retargeter):
+        def _distance(self, left_qpos, right_qpos) -> float:
+            return 0.015
+
+    planner = RuleBasedInitialAlignmentPlanner(
+        dual_arm_retargeter=NearCollisionRetargeter(),
+        target_filter=_Envelope(),
+        config=RuleBasedInitialAlignmentConfig(
+            collision_slow_margin_m=0.02,
+            collision_hold_margin_m=0.01,
+        ),
+    )
+
+    with pytest.raises(RuleBasedInitialAlignmentPlanningError) as caught:
+        planner.plan(start_qpos_by_side=_pair(0.0), target_qpos_by_side=_pair(0.02))
+
+    assert caught.value.status == "hold_current"
+    assert caught.value.blocked_reason == "collision_soft"
+    assert "distance_m=0.015000 hold_threshold_m=0.020000" in str(caught.value)
+
+
 def test_planner_rejects_collision_and_tcp_envelope_projection() -> None:
     with pytest.raises(RuleBasedInitialAlignmentPlanningError, match="target state"):
         _planner(retargeter=_Retargeter(collision_above=0.01)).plan(

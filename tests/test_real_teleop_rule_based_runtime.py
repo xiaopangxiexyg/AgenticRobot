@@ -3538,8 +3538,12 @@ def test_initial_alignment_planning_timeout_holds_and_requests_episode_reclaim(
     assert ui.failure_stop_requests == 1
 
 
-def test_joint_limit_alignment_rejection_holds_without_faulting_command_provider(
+@pytest.mark.parametrize(
+    "blocked_reason", ("joint_limit_hold_margin", "collision_soft")
+)
+def test_geometric_alignment_rejection_holds_without_faulting_command_provider(
     monkeypatch: pytest.MonkeyPatch,
+    blocked_reason: str,
 ) -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -3554,14 +3558,14 @@ def test_joint_limit_alignment_rejection_holds_without_faulting_command_provider
     planner = extension._initial_alignment_planner
     assert planner is not None
 
-    def reject_limit(**_kwargs):
+    def reject_transition(**_kwargs):
         raise RuleBasedInitialAlignmentPlanningError(
-            "status=hold_current reason=joint_limit_hold_margin right.j1",
+            f"status=hold_current reason={blocked_reason}",
             status="hold_current",
-            blocked_reason="joint_limit_hold_margin",
+            blocked_reason=blocked_reason,
         )
 
-    monkeypatch.setattr(planner, "plan", reject_limit)
+    monkeypatch.setattr(planner, "plan", reject_transition)
 
     def confirmed_hold(reason: str) -> bool:
         session.hold_reasons.append(reason)
@@ -3581,6 +3585,7 @@ def test_joint_limit_alignment_rejection_holds_without_faulting_command_provider
     assert session.command_override_provider(SimpleNamespace(), 4.1).command is None
     assert extension.status().aborted is True
     assert extension.status().held is True
+    assert blocked_reason in session.hold_reasons[0]
     assert len(session.hold_reasons) == 1
     assert clutch.reasons == ["rule_based_runtime_hold"]
     assert ui.failure_stop_requests == 1
@@ -3597,8 +3602,12 @@ def test_joint_limit_alignment_rejection_holds_without_faulting_command_provider
     assert extension.status().held is False
 
 
-def test_joint_limit_alignment_rejection_faults_if_hold_is_unconfirmed(
+@pytest.mark.parametrize(
+    "blocked_reason", ("joint_limit_hold_margin", "collision_soft")
+)
+def test_geometric_alignment_rejection_faults_if_hold_is_unconfirmed(
     monkeypatch: pytest.MonkeyPatch,
+    blocked_reason: str,
 ) -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -3613,14 +3622,14 @@ def test_joint_limit_alignment_rejection_faults_if_hold_is_unconfirmed(
     planner = extension._initial_alignment_planner
     assert planner is not None
 
-    def reject_limit(**_kwargs):
+    def reject_transition(**_kwargs):
         raise RuleBasedInitialAlignmentPlanningError(
-            "status=hold_current reason=joint_limit_hold_margin",
+            f"status=hold_current reason={blocked_reason}",
             status="hold_current",
-            blocked_reason="joint_limit_hold_margin",
+            blocked_reason=blocked_reason,
         )
 
-    monkeypatch.setattr(planner, "plan", reject_limit)
+    monkeypatch.setattr(planner, "plan", reject_transition)
     monkeypatch.setattr(session, "hold_hardware", lambda _reason: False)
     assert session.command_override_provider(SimpleNamespace(), 4.0).command is None
     future = extension._initial_alignment_future
@@ -3635,6 +3644,40 @@ def test_joint_limit_alignment_rejection_faults_if_hold_is_unconfirmed(
         session.command_override_provider(SimpleNamespace(), 4.1)
     assert extension.status().aborted is True
     assert ui.failure_stop_requests == 1
+
+
+@pytest.mark.parametrize("session_state", ("DEBUG_ONLY", "FAULT"))
+def test_unarmed_session_does_not_advertise_reachability_work_in_progress(
+    session_state: str,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(
+            steps=(RuleBasedInitialize(step_id="init", group_key="source"),)
+        ),
+        trajectory_groups={"source": _group()},
+        source_selection={
+            "collection_mode": "rule_based_writing",
+            "writing_reachability": {"enabled": True},
+        },
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, _ui = _bind(extension, recorder, arm=False)
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.3,
+        lower_tolerance_m=0.001,
+        upper_tolerance_m=0.001,
+        captured_at=1.0,
+        source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    session.state_machine.state = SimpleNamespace(value=session_state)
+
+    status = extension.status()
+
+    assert "rig.session" in status.readiness_blockers
+    assert "rule.writing_reachability" not in status.readiness_blockers
+    assert status.rule_start_available is False
 
 
 def test_consecutive_initializations_plan_from_their_own_targets() -> None:

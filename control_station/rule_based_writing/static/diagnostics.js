@@ -178,6 +178,13 @@
         instruction: "这不是设备断联。执行任务链的“闭紧右夹爪”，并等待实测夹持反馈建立本轮 owner。",
       };
     }
+    if (domain === "session" && containsAny(evidence, ["session state=fault", "session state=estop"])) {
+      return {
+        id: "restart_after_terminal_session",
+        label: "保持 Hold，检查后重启程序",
+        instruction: "当前 Session 为终止安全状态，不能在本进程重新采集 runtime Home。检查设备与机械臂位置，确认安全后退出并重新启动程序；不要反复点击重新安全初始化。",
+      };
+    }
     if (domain === "arm_force" && containsAny(evidence, ["stale", "timeout", "陈旧", "超时"])) {
       return {
         id: "force_telemetry_check",
