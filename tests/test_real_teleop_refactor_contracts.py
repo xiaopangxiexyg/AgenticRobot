@@ -80,6 +80,11 @@ from teleop_runtime.real_teleop import (
     visualization_runtime,
 )
 from tests.support.real_teleop_control import bind_control_application
+from tests.support.real_teleop_recording import (
+    _Clutch,
+    _episode_runtime,
+    poll_recording_transition,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -277,32 +282,45 @@ def test_formal_writer_ready_handshake_is_not_global_startup_work() -> None:
     assert "set_current_dataset_recorder" not in runtime_source
 
 
-def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
-    monkeypatch: pytest.MonkeyPatch,
+def test_unchanged_dataset_prepare_reuses_writer_without_rescanning(
     tmp_path: Path,
 ) -> None:
-    recorder = object.__new__(dataset_recorder_module.RealTeleopDatasetRecorder)
-    recorder.args = SimpleNamespace(
-        dataset_root=tmp_path,
-        ignore_camera=(),
-        ignore_tactile=(),
-    )
-    recorder.components = SimpleNamespace(active_sides=())
-    recorder.dataset_root = tmp_path
-    recorder.gripper_force_contract = None
-    recorder.configured_for_current_args = lambda: True
     calls: list[str] = []
-    recorder.reload_finalized_dataset_state = lambda: calls.append("reload")
-    recorder.write_camera_device_config = lambda: calls.append("camera_config")
-    monkeypatch.setattr(
-        dataset_recorder_module,
-        "_gripper_force_dataset_contract_from_args",
-        lambda _args: None,
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer_started=True,
+        is_recording=False,
+        finalizing=False,
+        frame_count=0,
+        configured_for_current_args=lambda: True,
+        reload_finalized_dataset_state=lambda: calls.append("reload"),
+        write_camera_device_config=lambda: calls.append("camera_config"),
+        close=lambda: calls.append("close"),
+        poll_finalize_tasks=list,
     )
+    slot = [recorder]
 
-    recorder.reconfigure_for_current_args()
+    class UnexpectedReplacement:
+        def __init__(self, **_kwargs: object) -> None:
+            pytest.fail("An unchanged ready writer must not be reconstructed")
 
-    assert calls == []
+    runtime, _args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=UnexpectedReplacement,
+        dataset_slot=slot,
+        clutch=_Clutch(),
+        transition_calls=[],
+    )
+    try:
+        assert runtime.schedule_recording_countdown(10.0, start_reason="reuse")
+        assert slot[0] is None
+        poll_recording_transition(runtime)
+        assert slot[0] is recorder
+        assert calls == ["camera_config"]
+        assert runtime.countdown_deadline() is not None
+    finally:
+        assert runtime.close()
+    assert calls == ["camera_config"]
 
 
 def test_transactional_dataset_selection_defers_live_state_and_start_request(

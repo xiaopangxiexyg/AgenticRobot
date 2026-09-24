@@ -1,180 +1,193 @@
+"""Writer preparation contracts at the current asynchronous recording boundary."""
+
 from __future__ import annotations
 
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from teleop_runtime.real_teleop.startup_admission import (
-    prepare_startup_dataset_recorder,
+from tests.support.real_teleop_recording import (
+    _Clutch,
+    _episode_runtime,
+    poll_recording_transition,
 )
 
 
-class _Progress:
-    def __init__(self) -> None:
-        self.events: list[tuple[object, ...]] = []
-
-    def begin(self, key: str, **details: object) -> None:
-        self.events.append(("begin", key, details))
-
-    def succeed(self, key: str, **details: object) -> None:
-        self.events.append(("succeed", key, details))
-
-    def fail(self, key: str, detail: str, **details: object) -> None:
-        self.events.append(("fail", key, detail, details))
-
-    def close(self) -> None:
-        self.events.append(("close",))
-
-
-class _Cleanup:
-    def __init__(self) -> None:
-        self.entries: list[tuple[str, object]] = []
-
-    def add(self, label: str, callback: object) -> None:
-        self.entries.append((label, callback))
-
-
 class _Recorder:
-    instances: list["_Recorder"] = []
-
     def __init__(self, *, args: object, components: object, camera_sources: object) -> None:
         self.args = args
         self.components = components
         self.camera_sources = camera_sources
+        self.dataset_root = Path(args.dataset_root)
+        self.is_recording = False
+        self.finalizing = False
+        self.frame_count = 0
+        self.writer_started = False
         self.closed = False
-        self.instances.append(self)
+
+    def ensure_started(self) -> None:
+        self.writer_started = True
+
+    def poll_finalize_tasks(self) -> list[object]:
+        return []
 
     def close(self) -> None:
         self.closed = True
 
 
-def _prepare(
-    *,
-    no_collection: bool = False,
-    capability: bool = False,
-    recorder_type: type = _Recorder,
-):
-    args = SimpleNamespace(no_collection=no_collection)
-    cleanup = _Cleanup()
-    progress = _Progress()
+def test_dataset_writer_construction_is_lazy_and_ready_before_publication(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    instances: list[_Recorder] = []
+
+    class Recorder(_Recorder):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            instances.append(self)
+
+        def ensure_started(self) -> None:
+            entered.set()
+            assert release.wait(timeout=1.0)
+            super().ensure_started()
+
+    slot: list[object | None] = [None]
+    runtime, args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=_Clutch(),
+        transition_calls=[],
+    )
+    try:
+        assert instances == []
+        assert runtime.schedule_recording_countdown(10.0, start_reason="unit")
+        assert entered.wait(timeout=1.0)
+        recorder = instances[0]
+        assert recorder.args is args
+        assert recorder.camera_sources == {}
+        assert not recorder.writer_started
+        assert slot[0] is None
+        assert runtime.countdown_deadline() == float("inf")
+
+        release.set()
+        poll_recording_transition(runtime)
+        assert slot[0] is recorder
+        assert recorder.writer_started
+        assert not recorder.is_recording
+        assert not recorder.closed
+    finally:
+        release.set()
+        assert runtime.close()
+    # Publication transfers the idle writer back to the outer runtime.
+    assert slot[0] is recorder
+    assert not recorder.closed
+    recorder.close()
+    assert recorder.closed
+
+
+@pytest.mark.parametrize("debug_enabled", [False, True])
+def test_disabled_formal_collection_never_constructs_writer(
+    tmp_path: Path,
+    debug_enabled: bool,
+) -> None:
+    class UnexpectedRecorder:
+        def __init__(self, **_kwargs: object) -> None:
+            pytest.fail("--no-collection must not construct a formal writer")
+
+    slot: list[object | None] = [None]
+    transitions: list[str] = []
+    runtime, args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=UnexpectedRecorder,
+        dataset_slot=slot,
+        clutch=_Clutch(),
+        transition_calls=transitions,
+        debug_episode_enabled=debug_enabled,
+    )
+    args.no_collection = True
+    try:
+        assert runtime.schedule_recording_countdown(
+            10.0, start_reason="unit"
+        ) is debug_enabled
+        assert slot == [None]
+        assert transitions == []
+        assert not runtime.collection_transition_active()
+        assert args.dataset_startup_error == ""
+        assert (runtime.countdown_deadline() is not None) is debug_enabled
+    finally:
+        assert runtime.close()
+
+
+@pytest.mark.parametrize("failure_stage", ["construction", "ready"])
+@pytest.mark.parametrize("failure_type", [ValueError, OSError])
+def test_failed_writer_preparation_isolated_and_retry_uses_fresh_candidate(
+    tmp_path: Path,
+    failure_stage: str,
+    failure_type: type[Exception],
+) -> None:
+    should_fail = True
+    instances: list[_Recorder] = []
+    publications: list[tuple[str, tuple[bool, ...]]] = []
     messages: list[tuple[str, str]] = []
-    logs: list[tuple[str, str]] = []
-    recorder = prepare_startup_dataset_recorder(
-        args,
-        components="components",
-        camera_sources={"front": "camera"},
-        startup_cleanup=cleanup,
-        startup_progress=progress,
+
+    class Recorder(_Recorder):
+        def __init__(self, **kwargs: object) -> None:
+            if should_fail and failure_stage == "construction":
+                raise failure_type("invalid writer")
+            super().__init__(**kwargs)
+            instances.append(self)
+
+        def ensure_started(self) -> None:
+            if should_fail:
+                raise failure_type("invalid writer")
+            super().ensure_started()
+
+    slot: list[object | None] = [None]
+    clutch = _Clutch()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
         control_ui=SimpleNamespace(
-            append_message=lambda tag, message: messages.append((tag, message))
+            append_message=lambda tag, message: messages.append((tag, message)),
         ),
-        capability_admission=capability,
-        recorder_type=recorder_type,
-        log=lambda tag, message: logs.append((tag, message)),
-    )
-    return recorder, args, cleanup, progress, messages, logs
-
-
-def test_startup_dataset_recorder_success_registers_cleanup_before_receipt() -> None:
-    _Recorder.instances.clear()
-
-    recorder, args, cleanup, progress, messages, logs = _prepare()
-
-    assert recorder is _Recorder.instances[-1]
-    assert recorder.args is args
-    assert recorder.components == "components"
-    assert recorder.camera_sources == {"front": "camera"}
-    assert cleanup.entries == [("dataset_recorder", recorder.close)]
-    assert progress.events == [
-        (
-            "begin",
-            "dataset.writer.prepare",
-            {
-                "label": "数采 writer 配置",
-                "message": "正在校验数据集路径、模态声明与 writer 配置",
-                "requirement": "required_for_collection",
-            },
+        publish_runtime_hardware_status=lambda: publications.append(
+            (args.dataset_startup_error, tuple(item.closed for item in instances))
         ),
-        (
-            "succeed",
-            "dataset.writer.prepare",
-            {"message": "writer 配置已就绪，尚未启动子进程"},
-        ),
-    ]
-    assert messages == []
-    assert logs == []
-
-
-def test_startup_dataset_recorder_disabled_has_no_side_effects() -> None:
-    recorder, args, cleanup, progress, messages, logs = _prepare(
-        no_collection=True,
     )
+    detail = f"{failure_type.__name__}: invalid writer"
+    try:
+        assert runtime.schedule_recording_countdown(10.0, start_reason="unit")
+        poll_recording_transition(runtime)
+        assert slot[0] is None
+        assert runtime.countdown_deadline() is None
+        assert not runtime.recording_active()
+        assert args.dataset_startup_error == detail
+        expected_closed = () if failure_stage == "construction" else (True,)
+        assert publications == [(detail, expected_closed)]
+        assert any(detail in message for _tag, message in messages)
+        assert any(detail in message for _tag, message in logs)
+        assert clutch.recording_states[-1]["event_status"] == "error"
+        assert clutch.recording_states[-1]["active"] is False
+        assert clutch.hold_reasons == []
 
-    assert recorder is None
-    assert vars(args) == {"no_collection": True}
-    assert cleanup.entries == []
-    assert progress.events == []
-    assert messages == []
-    assert logs == []
-
-
-def test_startup_dataset_recorder_strict_failure_closes_progress_and_reraises() -> None:
-    class FailingRecorder:
-        def __init__(self, **_: object) -> None:
-            raise ValueError("invalid contract")
-
-    args = SimpleNamespace(no_collection=False)
-    cleanup = _Cleanup()
-    progress = _Progress()
-    with pytest.raises(ValueError, match="invalid contract"):
-        prepare_startup_dataset_recorder(
-            args,
-            components="components",
-            camera_sources={},
-            startup_cleanup=cleanup,
-            startup_progress=progress,
-            control_ui=None,
-            capability_admission=False,
-            recorder_type=FailingRecorder,
-            log=lambda *_: None,
-        )
-
-    assert cleanup.entries == []
-    assert progress.events[-2:] == [
-        (
-            "fail",
-            "dataset.writer.prepare",
-            "ValueError: invalid contract",
-            {"message": "writer 配置校验失败"},
-        ),
-        ("close",),
-    ]
-
-
-def test_startup_dataset_recorder_capability_failure_isolated_with_receipts() -> None:
-    class FailingRecorder:
-        def __init__(self, **_: object) -> None:
-            raise OSError("read-only target")
-
-    recorder, args, cleanup, progress, messages, logs = _prepare(
-        capability=True,
-        recorder_type=FailingRecorder,
-    )
-
-    assert recorder is None
-    assert cleanup.entries == []
-    assert args.dataset_startup_error == "OSError: read-only target"
-    assert progress.events[-1] == (
-        "fail",
-        "dataset.writer.prepare",
-        "OSError: read-only target",
-        {"message": "writer 配置校验失败"},
-    )
-    assert messages == [("Dataset", "OSError: read-only target")]
-    assert logs == [
-        (
-            "Dataset",
-            "WARNING: dataset writer construction was isolated from GUI and "
-            "arm controls: OSError: read-only target",
-        )
-    ]
+        should_fail = False
+        failed_candidates = tuple(instances)
+        assert runtime.schedule_recording_countdown(11.0, start_reason="retry")
+        poll_recording_transition(runtime)
+        assert slot[0] is instances[-1]
+        assert all(slot[0] is not previous for previous in failed_candidates)
+        assert instances[-1].writer_started
+        assert not instances[-1].closed
+        assert args.dataset_startup_error == ""
+        assert publications[-1][0] == ""
+    finally:
+        assert runtime.close()
+        if slot[0] is not None:
+            slot[0].close()
