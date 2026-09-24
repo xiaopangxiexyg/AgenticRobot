@@ -212,6 +212,23 @@ def test_active_reachability_diagnostics_follow_runtime_lifecycle() -> None:
     assert failed["recovery"]["id"] != "device_retry"
 
 
+def test_held_session_recovery_precedes_pending_candidate_advice() -> None:
+    diagnostics = _build_active(
+        {
+            "can_runtime_home": True,
+            "startup_blockers": {
+                "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+                "rule.writing_reachability": "书写四边界接触点尚未完成可达性检查。",
+            },
+            "writing_reachability_status": "pending",
+        }
+    )
+    planning = next(item for item in diagnostics if item["planningMode"] == "progress")
+    assert planning["recovery"]["id"] == "runtime_home_then_wait_candidate_check"
+    assert "重新安全初始化" in planning["recovery"]["instruction"]
+    assert all(item["recovery"]["id"] != "device_retry" for item in diagnostics)
+
+
 def test_right_hand_owner_requirement_is_not_misreported_as_disconnect() -> None:
     result = _classify(
         key="rule.right_hand_hold_owner",

@@ -690,6 +690,96 @@ def test_failed_rule_attempt_exposes_rehome_after_confirmed_hold_reset() -> None
     assert application.consume_runtime_events() == ["runtime_home_retry"]
 
 
+def test_operator_hold_rehome_is_not_blocked_by_pending_writing_preflight() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    home_blocker = "Session state=DEBUG_ONLY; runtime Home required"
+    planning_blocker = "书写四边界接触点尚未完成可达性检查。"
+    blockers = {
+        "rig.session": home_blocker,
+        "rule.writing_reachability": planning_blocker,
+    }
+    application.observe_runtime_publication(
+        {
+            "capture_stage": "runtime_home",
+            "capture_phase": "ready",
+            "hardware_hold_confirmed": True,
+            "startup_blockers": blockers,
+        }
+    )
+    application.observe_rule_status(
+        {
+            "started": True,
+            "held": True,
+            "execution_begun": False,
+            "session_state": "DEBUG_ONLY",
+            "rule_start_available": False,
+            "readiness_blockers": blockers,
+        }
+    )
+
+    held = application.snapshot()
+    assert held["phase"] == "blocked"
+    assert held["can_start"] is False
+    assert held["can_runtime_home"] is True
+    assert held["can_retry_devices"] is False
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY)
+    assert application.consume_runtime_events() == ["runtime_home_retry"]
+    assert application.snapshot()["can_runtime_home"] is False
+
+    # Home does not certify the candidate: rule START remains blocked until
+    # its independent reachability check passes.
+    application.observe_runtime_publication(
+        {
+            "home_ready": True,
+            "startup_blockers": {"rule.writing_reachability": planning_blocker},
+        }
+    )
+    application.observe_rule_status(
+        {
+            "started": True,
+            "held": False,
+            "session_state": "ARMED",
+            "rule_start_available": True,
+            "readiness_blockers": {"rule.writing_reachability": planning_blocker},
+        }
+    )
+    assert application.snapshot()["can_start"] is False
+    application.observe_runtime_publication({"startup_blockers": {}})
+    application.observe_rule_status(
+        {
+            "session_state": "ARMED",
+            "readiness_blockers": {},
+            "rule_start_available": True,
+        }
+    )
+    assert application.snapshot()["can_start"] is True
+
+
+def test_writing_preflight_does_not_mask_real_device_fault_before_rehome() -> None:
+    application = RuleBasedWritingApplication()
+    application.bind_rule_runtime()
+    blockers = {
+        "rig.session": "Session state=DEBUG_ONLY; runtime Home required",
+        "rule.writing_reachability": "书写四边界接触点尚未完成可达性检查。",
+        "hand.right": "DMTAC gripper disconnected",
+    }
+    application.observe_runtime_publication({"startup_blockers": blockers})
+    application.observe_rule_status(
+        {
+            "started": True,
+            "held": True,
+            "session_state": "DEBUG_ONLY",
+            "readiness_blockers": blockers,
+        }
+    )
+
+    state = application.snapshot()
+    assert state["can_runtime_home"] is False
+    assert state["can_start"] is False
+    assert application.submit_intent(RuleBasedWritingIntent.RUNTIME_HOME_RETRY) is False
+
+
 def test_transient_writer_pause_keeps_running_controls_stable() -> None:
     application = RuleBasedWritingApplication()
     application.bind_rule_runtime()

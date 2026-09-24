@@ -2625,10 +2625,15 @@ class RuleBasedWritingApplication:
         self._set_device_retry_running_locked()
 
     def _session_requires_runtime_home_locked(self) -> bool:
+        # Candidate preflight cannot run while the rule runtime is held.  It
+        # still blocks rule START, but must not hide the Home recovery needed
+        # to leave DEBUG_ONLY after an operator Hold.  The lower Home bridge
+        # still requires a positive hardware Hold receipt before recalibration.
         blockers = {
             key: detail
             for key, detail in self._effective_startup_blockers_locked().items()
             if key != "rule.right_hand_hold_owner"
+            and not self._is_rule_planning_blocker(key)
         }
         if self._runtime_home_retry_available:
             return True
