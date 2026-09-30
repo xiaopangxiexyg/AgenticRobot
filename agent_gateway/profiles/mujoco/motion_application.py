@@ -461,13 +461,34 @@ class MujocoAgentSkillMotionApplication:
                 values_by_component=provided,
             )
         with self._lock:
-            captured = self.runtime.rig.capture_scene(
-                self._capture_arm_gripper_state_from_scene
-            )
-            gripper = captured["right_gripper"]
+            def capture_support(scene: Any) -> Mapping[str, object]:
+                captured = self._capture_arm_gripper_state_from_scene(scene)
+                if "right_gripper" not in provided:
+                    name = str(self.task_config.right_gripper_name)
+                    profile = self.runtime.rig.config.gripper_actuation_profile
+                    spec = scene.gripper_specs[name]
+                    master = spec.joint_names.index(
+                        profile.master_joint_by_gripper[name]
+                    )
+                    span = spec.closed_qpos[master] - spec.open_qpos[master]
+                    if abs(span) <= 1e-12:
+                        raise ValueError("Gripper master joint has no closing range.")
+                    close = (
+                        captured["right_gripper"]["qpos"][master]
+                        - spec.open_qpos[master]
+                    ) / span
+                    # Measured mimic residuals are not independent commands.
+                    # Keep the master position; executable limits remain lower-owned.
+                    captured["right_gripper"]["qpos"] = tuple(
+                        opened + close * (closed - opened)
+                        for opened, closed in zip(spec.open_qpos, spec.closed_qpos)
+                    )
+                return captured
+
+            captured = self.runtime.rig.capture_scene(capture_support)
             complete = {
                 "right_arm": captured["right_arm"],
-                "right_gripper": gripper["qpos"],
+                "right_gripper": captured["right_gripper"]["qpos"],
                 **provided,
             }
             return ComponentAction(

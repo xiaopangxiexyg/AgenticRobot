@@ -1,25 +1,151 @@
 from __future__ import annotations
 
+import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 from agent_gateway.profiles.mujoco.gripper_skill import (
     MujocoGripperActionSkillLifecycle,
+)
+from agent_gateway.profiles.mujoco.motion_application import (
+    MujocoAgentSkillMotionApplication,
 )
 from agent_gateway.profiles.mujoco.motion_factory import (
     build_mujoco_agent_tcp_pose_gateway_session,
     mujoco_agent_tcp_pose_execution_observation_plan_v1,
 )
 from agent_gateway.protocol.contracts import AgentSkillRequest
+from sim.mujoco.actuation.gripper_profile import cad_bimanual_dmtac_gripper_profile
+from sim.mujoco.config import GripperSpec
 from sim.mujoco.deploy import MujocoSimHILTargetConfig
+from sim.mujoco.deploy.component_action_profile import (
+    MujocoComponentActionRobotActionV1Materializer,
+    build_mujoco_pose_qpos_component_target_profile,
+)
 
 
 TASK_CONFIG = Path(
     "sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json"
 )
+
+
+@pytest.fixture
+def master_joint_application(monkeypatch):
+    profile = cad_bimanual_dmtac_gripper_profile()
+    name = profile.gripper_for_side("right")
+    spec = GripperSpec(
+        name=name, joint_names=profile.joint_names_by_gripper[name],
+        open_qpos=profile.open_qpos_by_gripper[name],
+        closed_qpos=profile.closed_qpos_by_gripper[name], side="right",
+    )
+    # Measured V4 residuals from the previously rejected return movement.
+    measured = np.array([
+        -5.053170752944425e-05, -3.963131803175202e-06,
+        6.590426346519962e-05, -4.054239070683252e-06,
+        -4.5451964979292825e-05, 4.1206105379387736e-05,
+    ])
+    scene = SimpleNamespace(
+        arm_specs={"right": object()}, gripper_specs={name: spec},
+        state_is_finite=lambda: bool(np.isfinite(measured).all()),
+        get_gripper_qpos=lambda _name: measured.copy(),
+        get_gripper_close=lambda _name: spec.close_from_qpos(measured),
+    )
+    target_profile = build_mujoco_pose_qpos_component_target_profile(
+        scene, profile_id="test.master-joint-support.v1",
+        arm_side_by_component={"right_arm": "right"},
+        gripper_name_by_component={"right_gripper": name},
+        arm_reference_frame_by_component={"right_arm": "right_arm_base"},
+        arm_controlled_frame_by_component={"right_arm": "tool_tcp"},
+        selection_group_by_component={"right_arm": "arms", "right_gripper": "gripper"},
+    )
+    application = object.__new__(MujocoAgentSkillMotionApplication)
+    application._lock = threading.RLock()
+    application._closed = False
+    application.task_config = SimpleNamespace(right_gripper_name=name)
+    capture = Mock(side_effect=lambda callback: callback(scene))
+    application.runtime = SimpleNamespace(
+        action_schema=target_profile.action_schema, clock=lambda: 10.0,
+        rig=SimpleNamespace(capture_scene=capture, config=SimpleNamespace(
+            gripper_actuation_profile=profile,
+        )),
+    )
+    monkeypatch.setattr(
+        "agent_gateway.profiles.mujoco.motion_application."
+        "capture_mujoco_sim_hil_tool_tcp_pose_by_side",
+        lambda *_args: {"right": np.eye(4)},
+    )
+    return application, scene, measured, capture
+
+
+@pytest.mark.parametrize("master_index", (0, 2))
+def test_arm_only_support_uses_configured_master_without_changing_measurements(
+    master_joint_application, master_index,
+):
+    application, scene, measured, capture = master_joint_application
+    name, spec = next(iter(scene.gripper_specs.items()))
+    config = application.runtime.rig.config
+    config.gripper_actuation_profile = replace(
+        config.gripper_actuation_profile,
+        master_joint_by_gripper={name: spec.joint_names[master_index]},
+    )
+    action = application.complete_component_action({})
+    assert capture.call_count == 1  # Arm and gripper use the same locked cut.
+    target = action.value("right_gripper").values
+    assert target == pytest.approx([measured[master_index]] * 6)
+    convert = MujocoComponentActionRobotActionV1Materializer._physical_qpos_to_close
+    assert convert(target, open_qpos=spec.open_qpos, closed_qpos=spec.closed_qpos) == (
+        pytest.approx(measured[master_index] / 0.864)
+    )
+    readback = application.capture_gripper_state_by_component()["right_gripper"]
+    assert readback["qpos"] == pytest.approx(measured)
+    assert readback["close_fraction"] == pytest.approx(spec.close_from_qpos(measured))
+    # Explicit independent joint targets are not repaired or silently accepted.
+    explicit = application.complete_component_action({"right_gripper": measured})
+    assert explicit.value("right_gripper").values == pytest.approx(measured)
+    with pytest.raises(ValueError, match="scalar-close compatibility manifold"):
+        convert(explicit.value("right_gripper").values,
+                open_qpos=spec.open_qpos, closed_qpos=spec.closed_qpos)
+
+
+@pytest.mark.parametrize("close", (0.25, 1.1))
+def test_master_support_respects_joint_geometry_without_clamping(
+    master_joint_application, close,
+):
+    application, scene, measured, _capture = master_joint_application
+    name, spec = next(iter(scene.gripper_specs.items()))
+    opened = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    closed = np.array([0.7, 0.8, -0.3, 1.0, 1.1, 1.2])
+    scene.gripper_specs[name] = replace(
+        spec, open_qpos=tuple(opened), closed_qpos=tuple(closed),
+    )
+    measured[2] = opened[2] + close * (closed[2] - opened[2])
+    action = application.complete_component_action({})
+    assert action.value("right_gripper").values == pytest.approx(
+        opened + close * (closed - opened)
+    )
+
+
+@pytest.mark.parametrize("invalid", ("nonfinite", "fixed_master"))
+def test_arm_only_support_rejects_invalid_measurement_or_master(
+    master_joint_application, invalid,
+):
+    application, scene, measured, _capture = master_joint_application
+    name, spec = next(iter(scene.gripper_specs.items()))
+    if invalid == "nonfinite":
+        measured[0] = np.nan  # A follower remains subject to finite-state checks.
+        error, message = RuntimeError, "non-finite"
+    else:
+        closed = list(spec.closed_qpos)
+        closed[2] = spec.open_qpos[2]
+        scene.gripper_specs[name] = replace(spec, closed_qpos=tuple(closed))
+        error, message = ValueError, "master joint has no closing range"
+    with pytest.raises(error, match=message):
+        application.complete_component_action({})
 
 
 def _request(
