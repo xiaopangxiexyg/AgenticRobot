@@ -212,14 +212,16 @@ def test_segment_schema_uses_simple_nullable_fields_and_validates_exclusivity() 
             )
 
 
-def test_shared_localizer_point_segmentation_preserves_score_and_mask() -> None:
+@pytest.mark.parametrize("mask_dtype", [np.bool_, np.float32, np.float64, np.uint8])
+def test_shared_localizer_point_segmentation_preserves_score_and_mask(mask_dtype) -> None:
     class _Predictor:
         def set_image(self, image):
             assert image.shape == (6, 8, 3)
 
         def predict(self, **kwargs):
             assert kwargs["point_coords"].tolist() == [[3.0, 2.0]]
-            masks = np.zeros((2, 6, 8), dtype=bool)
+            assert kwargs.get("return_logits", False) is False
+            masks = np.zeros((2, 6, 8), dtype=mask_dtype)
             masks[0, 2, 3] = True
             masks[1, 1:4, 2:5] = True
             return masks, np.asarray([0.4, 0.9]), None
@@ -241,6 +243,7 @@ def test_shared_localizer_point_segmentation_preserves_score_and_mask() -> None:
     assert result is not None
     assert result.score == pytest.approx(0.9)
     assert result.box_xyxy == (2, 1, 5, 4)
+    assert result.mask.dtype == np.bool_
     assert result.mask.flags.writeable is False
     np.testing.assert_array_equal(
         localizer.segment_point(image, pixel_uv=(3, 2)), result.mask
@@ -272,7 +275,8 @@ def test_shared_localizer_rejects_non_finite_point_score() -> None:
         )
 
 
-def test_shared_localizer_rejects_non_boolean_point_mask() -> None:
+@pytest.mark.parametrize("invalid_value", [-1.0, 0.5, 2.0, np.nan, np.inf, -np.inf])
+def test_shared_localizer_rejects_non_binary_point_mask(invalid_value) -> None:
     class _Predictor:
         def set_image(self, _image):
             return None
@@ -280,6 +284,7 @@ def test_shared_localizer_rejects_non_boolean_point_mask() -> None:
         def predict(self, **_kwargs):
             masks = np.zeros((1, 3, 4), dtype=np.float32)
             masks[0, 1, 1] = 1.0
+            masks[0, 0, 0] = invalid_value
             return masks, np.asarray([0.9]), None
 
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
@@ -288,7 +293,7 @@ def test_shared_localizer_rejects_non_boolean_point_mask() -> None:
     localizer._closed = False
     localizer._predictor = _Predictor()
 
-    with pytest.raises(RuntimeError, match="non-boolean point mask"):
+    with pytest.raises(RuntimeError, match="non-binary mask"):
         localizer.segment(
             Image.new("RGB", (4, 3), "white"),
             language_prompt=None,
@@ -297,14 +302,16 @@ def test_shared_localizer_rejects_non_boolean_point_mask() -> None:
         )
 
 
-def test_shared_localizer_text_segmentation_combines_grounding_and_sam_scores() -> None:
+@pytest.mark.parametrize("mask_dtype", [np.bool_, np.float32, np.float64, np.uint8])
+def test_shared_localizer_text_segmentation_combines_grounding_and_sam_scores(mask_dtype) -> None:
     class _Predictor:
         def set_image(self, image):
             assert image.shape == (6, 8, 3)
 
         def predict(self, **kwargs):
             np.testing.assert_allclose(kwargs["box"], [2.0, 1.5, 6.0, 4.5])
-            masks = np.zeros((2, 6, 8), dtype=bool)
+            assert kwargs.get("return_logits", False) is False
+            masks = np.zeros((2, 6, 8), dtype=mask_dtype)
             masks[0, 2:4, 3:6] = True
             masks[1, 1:5, 2:7] = True
             return masks, np.asarray([0.4, 0.7]), None
@@ -340,6 +347,7 @@ def test_shared_localizer_text_segmentation_combines_grounding_and_sam_scores() 
     assert result.score == pytest.approx(0.7)
     assert result.label == "red cube"
     assert result.box_xyxy == (2, 1, 7, 5)
+    assert result.mask.dtype == np.bool_
     assert result.mask.flags.writeable is False
 
 
@@ -377,13 +385,16 @@ def test_shared_localizer_rejects_non_finite_text_score() -> None:
         )
 
 
-def test_shared_localizer_rejects_non_boolean_text_mask() -> None:
+@pytest.mark.parametrize("invalid_value", [-1.0, 0.5, 2.0, np.nan, np.inf, -np.inf])
+def test_shared_localizer_rejects_non_binary_text_mask(invalid_value) -> None:
     class _Predictor:
         def set_image(self, _image):
             return None
 
         def predict(self, **_kwargs):
-            return np.ones((1, 3, 4), dtype=np.uint8), np.asarray([0.9]), None
+            masks = np.ones((1, 3, 4), dtype=np.float32)
+            masks[0, 0, 0] = invalid_value
+            return masks, np.asarray([0.9]), None
 
     localizer = object.__new__(Sam2GroundingDinoLocalizer)
     localizer._lock = threading.RLock()
@@ -401,7 +412,7 @@ def test_shared_localizer_rejects_non_boolean_text_mask() -> None:
     localizer.text_threshold = 0.25
     localizer.device = "cpu"
 
-    with pytest.raises(RuntimeError, match="non-boolean box mask"):
+    with pytest.raises(RuntimeError, match="non-binary mask"):
         localizer.segment(
             Image.new("RGB", (4, 3), "white"),
             language_prompt="cube",

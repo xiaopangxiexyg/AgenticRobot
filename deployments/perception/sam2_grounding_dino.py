@@ -433,6 +433,18 @@ def _bounded_nms(
     return tuple(selected)
 
 
+def _sam_binary_mask(mask: object) -> np.ndarray:
+    """Normalize SAM2's binary float output without accepting logits or NaNs."""
+
+    if (
+        not isinstance(mask, np.ndarray)
+        or mask.dtype.kind not in "buif"
+        or not bool(np.all((mask == 0) | (mask == 1)))
+    ):
+        raise RuntimeError("SAM2 returned a non-binary mask.")
+    return mask.astype(np.bool_, copy=False)
+
+
 def _mask_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     rows, columns = np.nonzero(np.asarray(mask, dtype=bool))
     if not len(columns):
@@ -697,6 +709,7 @@ class Sam2GroundingDinoLocalizer:
                 point_coords=np.asarray([[u, v]], dtype=np.float32),
                 point_labels=np.asarray([1], dtype=np.int32),
                 multimask_output=True,
+                return_logits=False,
             )
         if not len(masks):
             raise RuntimeError("SAM2 did not return a point-prompted mask.")
@@ -704,9 +717,7 @@ class Sam2GroundingDinoLocalizer:
         if len(score_values) != len(masks) or not bool(np.isfinite(score_values).all()):
             raise RuntimeError("SAM2 returned non-finite point-mask scores.")
         best = int(np.argmax(score_values))
-        mask = masks[best]
-        if not isinstance(mask, np.ndarray) or mask.dtype != np.bool_:
-            raise RuntimeError("SAM2 returned a non-boolean point mask.")
+        mask = _sam_binary_mask(masks[best])
         if mask.shape != (rgb.height, rgb.width) or not bool(mask[v, u]):
             raise RuntimeError("SAM2 point mask does not contain the requested pixel.")
         score = min(1.0, max(0.0, float(score_values[best])))
@@ -839,6 +850,7 @@ class Sam2GroundingDinoLocalizer:
             masks, mask_scores, _logits = self._predictor.predict(
                 box=input_box,
                 multimask_output=True,
+                return_logits=False,
             )
             if not len(masks):
                 continue
@@ -848,9 +860,7 @@ class Sam2GroundingDinoLocalizer:
             ):
                 raise RuntimeError("SAM2 returned non-finite box-mask scores.")
             best = int(np.argmax(score_values))
-            mask = masks[best]
-            if not isinstance(mask, np.ndarray) or mask.dtype != np.bool_:
-                raise RuntimeError("SAM2 returned a non-boolean box mask.")
+            mask = _sam_binary_mask(masks[best])
             bounds = _mask_box(mask)
             if mask.shape != (height, width) or bounds is None:
                 continue
