@@ -4,6 +4,7 @@ import io
 import math
 import threading
 from dataclasses import replace
+from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,11 +62,13 @@ from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
     AgentSkillOperation,
     AgentSkillRequest,
+    agent_skill_request_from_json,
 )
 from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
 )
+from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.protocol.skill_catalog import (
     SkillExecutionRoute,
     SkillParameterProfileRef,
@@ -2518,24 +2521,21 @@ def test_artifact_perception_routes_use_passive_executors_and_artifact_runtime(
 
 @pytest.mark.integration
 @pytest.mark.optional
-def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
+def test_rpent_gateway_consumes_exact_motion_and_state_routes(
     monkeypatch,
 ) -> None:
-    client_module = pytest.importorskip(
-        "rpent_dexteleop.gateway.client",
-        reason="paired RPent integration wheel is not installed",
+    if find_spec("rpent_agent_gateway") is None:
+        pytest.skip("optional rpent-agent-gateway package is not available")
+    # A present but broken integration must fail, not masquerade as an optional skip.
+    from rpent.dashboard.events import NullDashboardEventSink
+    from rpent_agent_gateway import (
+        AgentGatewaySession,
+        AgentGatewayToolModule,
+        GatewayExposurePolicy,
+        GatewaySafetySelection,
+        ValidatedAgentGatewayClient,
     )
-    toolkit_module = pytest.importorskip(
-        "rpent_dexteleop.toolkit",
-        reason="paired RPent integration wheel is not installed",
-    )
-    session_module = pytest.importorskip(
-        "rpent_dexteleop.gateway.session",
-        reason="paired RPent integration wheel is not installed",
-    )
-    InMemoryDexTeleopGatewayClient = client_module.InMemoryDexTeleopGatewayClient
-    DexTeleopToolkit = toolkit_module.DexTeleopToolkit
-    DexTeleopConsumerSession = session_module.DexTeleopConsumerSession
+
     _application, runtime, direct, bundle, _captured_manifest_args = (
         _build_no_model_contract_bundle_fixture(monkeypatch)
     )
@@ -2598,47 +2598,123 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         measurement_freshness_ms=0,
         measurement_valid=True,
     )
-    client = InMemoryDexTeleopGatewayClient(
-        definition_catalog=bundle.definition_catalog.to_wire(),
-        schema_catalog=bundle.schema_catalog.to_wire(),
-        route_manifest=bundle.route_manifest.to_wire(),
-        observation_snapshot=snapshot.to_wire(),
-    )
-    consumer_session = DexTeleopConsumerSession(
-        client=client,
-        client_id="rpent:fixture",
-        request_id_factory=lambda: "request:rpent-agent-motion-fixture",
-    )
-    toolkit = DexTeleopToolkit(session=consumer_session)
-    motion_spec = next(
-        spec
-        for spec in toolkit.get_tools_spec()
-        if spec["name"].startswith("dex__motion_move_tcp_to_pose")
-    )
-    cardinal_spec = next(
-        spec
-        for spec in toolkit.get_tools_spec()
-        if spec["name"].startswith("dex__motion_step_tcp_cardinal")
-    )
+    documents = {
+        "get_skill_definition_catalog": bundle.definition_catalog.to_wire(),
+        "get_agent_skill_schema_catalog": bundle.schema_catalog.to_wire(),
+        "get_skill_io_catalog": bundle.io_catalog.to_wire(),
+        "get_skill_route_manifest": bundle.route_manifest.to_wire(),
+        "get_gateway_session_capabilities": (
+            AgentGatewaySessionCapabilities.control_plane_only(
+                runtime_session_id=bundle.route_manifest.runtime_session_id,
+                max_control_request_bytes=2 * 1024 * 1024,
+                max_control_response_bytes=2 * 1024 * 1024,
+            ).to_wire()
+        ),
+        "get_observation_snapshot": snapshot.to_wire(),
+    }
+    submitted_requests = []
 
-    assert set(motion_spec["input_schema"]["properties"]) == set(parameters)
-    assert "requested_duration_ms" not in motion_spec["input_schema"]["properties"]
-    response = toolkit.execute_tool(
-        motion_spec["name"],
-        parameters,
-    ).result
-    assert response["accepted"]
-    assert client.submitted_requests[0]["route_hash"] == (
-        motion_entry.route.semantic_content_hash
+    class FixtureWirePort:
+        """Real discovery documents, with synthetic execution receipts only."""
+
+        closed = False
+
+        def call(self, method, payload=None):
+            if method in documents:
+                return documents[method]
+            assert method == "submit_skill_request"
+            request = agent_skill_request_from_json(payload)
+            submitted_requests.append(request)
+            operation = AgentSkillOperation(
+                operation_id=f"operation:fixture:{request.client_sequence}",
+                request_hash=request.semantic_content_hash,
+                runtime_session_id=request.runtime_session_id,
+                status="completed",
+                reason_code="fixture_completed",
+                station_revision_at_admission=1,
+                current_station_revision=1,
+                started_at=10.0,
+                updated_at=10.1,
+                deadline_at=20.0,
+                execution_outcome="completed",
+                execution_receipt_refs=("receipt:fixture",),
+                execution_result={
+                    "execution_receipt_refs": ["receipt:fixture"],
+                    "final_measured_state_hash": "state:fixture",
+                },
+            )
+            return {
+                "accepted": True,
+                "reason_code": "fixture_admitted",
+                "idempotent_replay": False,
+                "operation": operation.to_wire(),
+            }
+
+        def close(self):
+            self.closed = True
+
+    selections = {}
+    for entry in (motion_entry, cardinal_entry):
+        envelope = entry.deployment_binding.safety_envelope_refs[0]
+        selections[entry.route.semantic_content_hash] = GatewaySafetySelection(
+            safety_profile_id="safety-profile:fixture",
+            safety_profile_hash="safety-profile-hash:fixture",
+            deployment_safety_envelope_id=envelope.object_id,
+            deployment_safety_envelope_hash=envelope.content_hash,
+            safety_constraint_set_hash=envelope.constraint_set_hash,
+        )
+    port = FixtureWirePort()
+    client = ValidatedAgentGatewayClient(
+        port=port,
+        client_id="rpent:fixture",
+        exposure_policy=GatewayExposurePolicy(
+            allowed_skill_ids=frozenset(
+                {
+                    "motion.move_tcp_to_pose",
+                    "motion.step_tcp_cardinal",
+                    "state.read_tcp_pose",
+                }
+            ),
+        ),
+        safety_selection_by_route_hash=selections,
     )
-    assert set(cardinal_spec["input_schema"]["properties"]) == set(cardinal_parameters)
-    assert "distance_m" not in cardinal_spec["input_schema"]["properties"]
-    cardinal_response = toolkit.execute_tool(
-        cardinal_spec["name"],
-        cardinal_parameters,
-    ).result
-    assert cardinal_response["accepted"]
-    assert client.submitted_requests[1]["route_hash"] == (
-        cardinal_entry.route.semantic_content_hash
+    consumer_session = AgentGatewaySession(client=client)
+    toolkit = AgentGatewayToolModule(
+        session=consumer_session,
+        bindings=consumer_session.surface.bindings,
+        dashboard_events=NullDashboardEventSink(),
     )
-    consumer_session.close()
+    try:
+        specs = {spec["name"]: spec for spec in toolkit.get_tools_spec()}
+        assert "gateway_state_read_tcp_pose" in specs
+        for index, (name, params, entry, forbidden) in enumerate(
+            (
+                (
+                    "gateway_motion_move_tcp_to_pose",
+                    parameters,
+                    motion_entry,
+                    "requested_duration_ms",
+                ),
+                (
+                    "gateway_motion_step_tcp_cardinal",
+                    cardinal_parameters,
+                    cardinal_entry,
+                    "distance_m",
+                ),
+            )
+        ):
+            assert set(specs[name]["input_schema"]["properties"]) == set(params)
+            assert forbidden not in specs[name]["input_schema"]["properties"]
+            rejected = toolkit.execute_tool(name, {**params, forbidden: 1}).result
+            assert rejected["code"] == "agent_gateway_tool_failed"
+            assert len(submitted_requests) == index
+            response = toolkit.execute_tool(name, params).result
+            assert response["accepted"]
+            assert response["operation_status"] == "completed"
+            request = submitted_requests[index]
+            assert request.route_hash == entry.route.semantic_content_hash
+            assert request.to_wire()["parameters"] == params
+        assert submitted_requests[0].request_id != submitted_requests[1].request_id
+    finally:
+        toolkit.close()
+    assert port.closed
