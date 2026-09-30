@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from agent_gateway.profiles.mujoco.gripper_skill import (
+    MujocoGripperActionSkillLifecycle,
+)
 from agent_gateway.profiles.mujoco.motion_factory import (
     build_mujoco_agent_tcp_pose_gateway_session,
     mujoco_agent_tcp_pose_execution_observation_plan_v1,
@@ -84,7 +88,10 @@ def _submit_and_wait(
 
 
 @pytest.mark.integration
-def test_gripper_close_state_open_round_trip_on_real_mujoco() -> None:
+@pytest.mark.parametrize("inject_not_due", (False, True))
+def test_gripper_close_state_open_round_trip_on_real_mujoco(
+    monkeypatch, inject_not_due: bool
+) -> None:
     trace_facts = []
     session = build_mujoco_agent_tcp_pose_gateway_session(
         target_config=MujocoSimHILTargetConfig(
@@ -105,6 +112,20 @@ def test_gripper_close_state_open_round_trip_on_real_mujoco() -> None:
         session.application.start_observation_ready()
         adapter = session.wire_adapter(
             authenticated_client_id="test:mujoco-gripper"
+        )
+        original_submit = session.application.submit_and_step
+
+        def submit_with_pending_ticks(**kwargs):
+            cycle = int(kwargs["source_event_id"].rsplit(":", 1)[1])
+            if inject_not_due and cycle in (0, 2):
+                return SimpleNamespace(
+                    proposal_admission=SimpleNamespace(accepted=True),
+                    authoritative_step=SimpleNamespace(status="not_due"),
+                )
+            return original_submit(**kwargs)
+
+        monkeypatch.setattr(
+            session.application, "submit_and_step", submit_with_pending_ticks
         )
         initial_arm = session.application.capture_tcp_pose_by_component()[
             "right_arm"
@@ -219,6 +240,80 @@ def test_gripper_close_state_open_round_trip_on_real_mujoco() -> None:
         assert final_arm == pytest.approx(initial_arm, abs=2e-3)
     finally:
         session.close()
+
+
+@pytest.mark.parametrize(
+    ("stop", "status", "reason", "attempts"),
+    (
+        ("cancel", "not_due", "gripper_action_cancelled", 1),
+        ("deadline", "not_due", "gripper_action_deadline_exceeded", 1),
+        ("budget", "not_due", "gripper_action_control_cycles_exhausted", 3),
+        ("fault", "no_action", "gripper_action_authoritative_step_not_dispatched", 1),
+    ),
+)
+def test_gripper_pending_ticks_remain_bounded_and_never_prove_completion(
+    stop: str, status: str, reason: str, attempts: int
+) -> None:
+    # Isolate the run loop from activation/physics; the tests above exercise
+    # the actual constructor, dispatch receipts, measurements and lower HOLD.
+    lifecycle = object.__new__(MujocoGripperActionSkillLifecycle)
+    lifecycle.request = SimpleNamespace(
+        skill_id="motion.close_gripper", semantic_content_hash="request:pending"
+    )
+    lifecycle.operation = SimpleNamespace(
+        operation_id="operation:pending",
+        deadline_at=0.01 if stop == "deadline" else 1.0,
+    )
+    lifecycle.registration = SimpleNamespace(
+        profile=SimpleNamespace(
+            max_control_cycles=3,
+            physics_ticks_per_control_cycle=6,
+            open_endpoint_tolerance=0.05,
+        )
+    )
+    step = SimpleNamespace(
+        proposal_admission=SimpleNamespace(accepted=True),
+        authoritative_step=SimpleNamespace(status=status),
+    )
+    lifecycle.application = SimpleNamespace(
+        runtime=SimpleNamespace(config=SimpleNamespace(decision_hz=20.0)),
+        submit_and_step=Mock(return_value=step),
+    )
+    lifecycle._initial = {"close_fraction": 0.0}
+    lifecycle._action = object()
+    lifecycle._execution_refs = {"activation:pending"}
+    lifecycle._first_step_refs = lifecycle._latest_step_refs = ()
+    lifecycle._capture = Mock(side_effect=AssertionError("No dispatch to measure"))
+    lifecycle.request_hold = Mock(
+        return_value=SimpleNamespace(lower_hold_confirmed=True)
+    )
+    now = 0.0
+    waits = []
+
+    def sleep(seconds):
+        nonlocal now
+        waits.append(seconds)
+        now += seconds
+
+    lifecycle.clock = lambda: now
+    lifecycle.sleep = sleep
+    result = lifecycle.run(
+        request=lifecycle.request,
+        operation=lifecycle.operation,
+        cancel_requested=lambda: stop == "cancel" and bool(waits),
+    )
+    assert not result.succeeded
+    assert result.reason_code == reason
+    assert result.terminal_hold_confirmed
+    assert result.execution_result is None
+    assert result.evaluation is None
+    assert lifecycle.application.submit_and_step.call_count == attempts
+    lifecycle._capture.assert_not_called()
+    lifecycle.request_hold.assert_called_once_with(
+        operation=lifecycle.operation, reason=reason
+    )
+    expected_waits = [0.05] * attempts if status == "not_due" else []
+    assert waits == ([0.01] if stop == "deadline" else expected_waits)
 
 
 @pytest.mark.integration

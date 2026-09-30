@@ -108,6 +108,7 @@ class MujocoGripperActionSkillLifecycle:
         operation: AgentSkillOperation,
         current_station_revision: Callable[[], int],
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not isinstance(application, MujocoAgentSkillMotionApplication):
             raise TypeError("application must be a motion application.")
@@ -117,8 +118,10 @@ class MujocoGripperActionSkillLifecycle:
             operation, AgentSkillOperation
         ):
             raise TypeError("request and operation must be typed.")
-        if not callable(current_station_revision) or not callable(clock):
-            raise TypeError("revision and clock providers must be callable.")
+        if not all(
+            callable(value) for value in (current_station_revision, clock, sleep)
+        ):
+            raise TypeError("revision, clock, and sleep providers must be callable.")
         route = registration.skill.routes[0]
         binding = registration.binding
         checks = (
@@ -151,6 +154,7 @@ class MujocoGripperActionSkillLifecycle:
         self.operation = operation
         self.current_station_revision = current_station_revision
         self.clock = clock
+        self.sleep = sleep
         self.component_id = component_id
         self.target_close_fraction = (
             0.0 if request.skill_id == OPEN_GRIPPER_SKILL_ID_V1 else 1.0
@@ -408,6 +412,13 @@ class MujocoGripperActionSkillLifecycle:
                 return self._failure(
                     reason_code="gripper_action_authoritative_step_missing",
                 )
+            if authoritative.status == "not_due":
+                # Wait for the lower decision cadence; a pending tick is not
+                # dispatch evidence and must not advance settling samples.
+                period = 1.0 / float(self.application.runtime.config.decision_hz)
+                remaining = max(0.0, operation.deadline_at - float(self.clock()))
+                self.sleep(min(period, remaining))
+                continue
             if authoritative.status != "dispatched":
                 return self._failure(
                     reason_code="gripper_action_authoritative_step_not_dispatched",
