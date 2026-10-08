@@ -8,17 +8,18 @@ cloud remains fixed while the robot moves in the planner.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
 import hashlib
 import math
-from pathlib import Path
 import threading
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+from scipy.spatial import cKDTree
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
@@ -27,6 +28,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 class RM65CapturedRobotObservationFilterConfig:
     silhouette_radius_px: float = 12.0
     depth_tolerance_m: float = 0.015
+    depth_consistent_neighbor_candidates: int = 8
     finger_sweep_q_rad: tuple[float, ...] = (0.0, 0.216, 0.432, 0.648, 0.864)
 
     def __post_init__(self) -> None:
@@ -44,6 +46,15 @@ class RM65CapturedRobotObservationFilterConfig:
             or not 0.0 < depth <= 0.015
         ):
             raise ValueError("depth_tolerance_m must be finite and in (0, 0.015]")
+        neighbor_candidates = self.depth_consistent_neighbor_candidates
+        if (
+            isinstance(neighbor_candidates, bool)
+            or not isinstance(neighbor_candidates, int)
+            or not 1 <= neighbor_candidates <= 32
+        ):
+            raise ValueError(
+                "depth_consistent_neighbor_candidates must be an integer in [1, 32]"
+            )
         samples = tuple(float(value) for value in self.finger_sweep_q_rad)
         if (
             not samples
@@ -58,6 +69,11 @@ class RM65CapturedRobotObservationFilterConfig:
             )
         object.__setattr__(self, "silhouette_radius_px", radius)
         object.__setattr__(self, "depth_tolerance_m", depth)
+        object.__setattr__(
+            self,
+            "depth_consistent_neighbor_candidates",
+            neighbor_candidates,
+        )
         object.__setattr__(self, "finger_sweep_q_rad", samples)
 
     @property
@@ -100,6 +116,7 @@ def captured_robot_observation_mask(
     rendered_depth_maps_m: Sequence[np.ndarray],
     silhouette_radius_px: float,
     depth_tolerance_m: float,
+    depth_consistent_neighbor_candidates: int = 8,
 ) -> np.ndarray:
     """Return background pixels explained by one of the rendered robot states."""
 
@@ -119,6 +136,15 @@ def captured_robot_observation_mask(
         raise ValueError("silhouette_radius_px must be finite and nonnegative")
     if not math.isfinite(tolerance) or tolerance <= 0:
         raise ValueError("depth_tolerance_m must be finite and positive")
+    neighbor_candidates = depth_consistent_neighbor_candidates
+    if (
+        isinstance(neighbor_candidates, bool)
+        or not isinstance(neighbor_candidates, int)
+        or neighbor_candidates < 1
+    ):
+        raise ValueError(
+            "depth_consistent_neighbor_candidates must be a positive integer"
+        )
     maps = tuple(np.asarray(value, dtype=float) for value in rendered_depth_maps_m)
     if not maps:
         raise ValueError("rendered_depth_maps_m must not be empty")
@@ -144,13 +170,79 @@ def captured_robot_observation_mask(
             & np.isfinite(nearest_depth)
             & (np.abs(depth - nearest_depth) <= tolerance)
         )
+        if radius <= 0.0:
+            continue
+
+        # A projected silhouette may contain several robot surfaces at nearby
+        # pixels.  The nearest silhouette pixel is not necessarily the surface
+        # that produced the captured depth (for example where a DMTAC module
+        # overlaps a finger in the image).  Search a bounded set of nearby
+        # rendered samples in normalized (row, column, depth) space, then apply
+        # the original exact pixel/depth limits before removing anything.  This
+        # can only add depth-consistent background pixels inside the existing
+        # cylinder; the finite neighbour count is deliberately conservative.
+        captured_rows, captured_columns = np.nonzero(
+            (depth > 0) & ~target & ~remove
+        )
+        if not len(captured_rows):
+            continue
+        rendered_rows, rendered_columns = np.nonzero(valid)
+        rendered_depth = rendered[rendered_rows, rendered_columns]
+        rendered_samples = np.column_stack(
+            (
+                rendered_rows / radius,
+                rendered_columns / radius,
+                rendered_depth / tolerance,
+            )
+        )
+        captured_samples = np.column_stack(
+            (
+                captured_rows / radius,
+                captured_columns / radius,
+                depth[captured_rows, captured_columns] / tolerance,
+            )
+        )
+        candidate_count = min(neighbor_candidates, len(rendered_samples))
+        _distances, candidate_indices = cKDTree(rendered_samples).query(
+            captured_samples,
+            k=candidate_count,
+            distance_upper_bound=math.sqrt(2.0) + 1e-12,
+        )
+        if candidate_count == 1:
+            candidate_indices = candidate_indices[:, np.newaxis]
+        valid_candidate = candidate_indices < len(rendered_samples)
+        safe_indices = np.minimum(candidate_indices, len(rendered_samples) - 1)
+        candidate_rows = rendered_rows[safe_indices]
+        candidate_columns = rendered_columns[safe_indices]
+        candidate_depth = rendered_depth[safe_indices]
+        pixel_distance_squared = (
+            (candidate_rows - captured_rows[:, np.newaxis]) ** 2
+            + (candidate_columns - captured_columns[:, np.newaxis]) ** 2
+        )
+        depth_difference = np.abs(
+            candidate_depth - depth[captured_rows, captured_columns, np.newaxis]
+        )
+        depth_consistent = np.any(
+            valid_candidate
+            & (pixel_distance_squared <= radius * radius)
+            & (depth_difference <= tolerance),
+            axis=1,
+        )
+        remove[captured_rows[depth_consistent], captured_columns[depth_consistent]] = (
+            True
+        )
     remove &= ~target
     return remove
 
 
 def _is_robot_visual_mesh(name: str, *, finger_only: bool) -> bool:
     if finger_only:
-        return "_eg2_4b2_cad_" in name
+        # The DMTAC modules are fixed to the moving 4B2 fingertip links.  They
+        # therefore have to follow every sampled gripper state just like the
+        # 4B2 CAD meshes.  Rendering them only in the first (fully-open) state
+        # leaves capture-time tactile-sensor points in the static obstacle
+        # cloud whenever the physical gripper is not exactly at that state.
+        return "_eg2_4b2_cad_" in name or "_dm_tac_w2m_" in name
     return name.startswith(("left_", "right_"))
 
 
@@ -329,7 +421,7 @@ class RM65CapturedRobotObservationFilter:
             rendered = np.full(depth_m.shape, np.nan, dtype=float)
             rendered[rows[ray_indices], columns[ray_indices]] = locations[:, 2]
             rendered_depth_maps.append(rendered)
-            triangle_counts.append(int(len(faces)))
+            triangle_counts.append(len(faces))
             geometry_counts.append(geometry_count)
         return tuple(rendered_depth_maps), {
             "rendered_depth_map_count": len(rendered_depth_maps),
@@ -370,6 +462,9 @@ class RM65CapturedRobotObservationFilter:
             rendered_depth_maps_m=rendered,
             silhouette_radius_px=self.config.silhouette_radius_px,
             depth_tolerance_m=self.config.depth_tolerance_m,
+            depth_consistent_neighbor_candidates=(
+                self.config.depth_consistent_neighbor_candidates
+            ),
         )
         if np.any(remove & target):
             raise RuntimeError("captured-robot filter attempted to remove target pixels")
@@ -377,11 +472,16 @@ class RM65CapturedRobotObservationFilter:
         filtered[remove] = 0.0
         semantic_evidence = {
             "schema": "dexteleop.rm65.captured_robot_observation_filter.v1",
-            "method": "urdf_cad_depth_finger_sweep_silhouette_neighborhood",
+            "method": (
+                "urdf_cad_depth_finger_sweep_depth_consistent_neighborhood_v2"
+            ),
             "urdf_sha256": self.urdf_sha256,
             "filter_config_hash": self.config.semantic_content_hash,
             "silhouette_radius_px": self.config.silhouette_radius_px,
             "depth_tolerance_m": self.config.depth_tolerance_m,
+            "depth_consistent_neighbor_candidates": (
+                self.config.depth_consistent_neighbor_candidates
+            ),
             "finger_sweep_q_rad": self.config.finger_sweep_q_rad,
             "rendered_depth_map_count": render_evidence["rendered_depth_map_count"],
             "rendered_geometry_count_by_state": render_evidence[

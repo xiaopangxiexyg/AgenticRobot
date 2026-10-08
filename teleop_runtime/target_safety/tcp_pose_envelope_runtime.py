@@ -2,8 +2,9 @@
 
 The target filter sits on the existing coupled pre-IK target-filter seam.  It
 converts the retargeter's solver-frame target to the configured ``tool_tcp``,
-projects that pose once, then converts the result back to the solver frame.
-It never calls IK or FK and it does not participate in 120 Hz qpos dispatch.
+expresses that TCP in the bound envelope reference frame, projects it once,
+then converts the result back to the solver frame.  It never calls IK or FK
+and it does not participate in 120 Hz qpos dispatch.
 The same adapter also projects the final composed host-side impedance TCP.
 
 Anchor capture consumes the ``tool_tcp`` Home pose already committed by the
@@ -113,6 +114,7 @@ def target_frame_binding_hash_from_transforms(
     target_world_from_base_by_side: Mapping[str, Any],
     sides: Sequence[str],
     reference_frame_by_side: Mapping[str, str],
+    target_world_from_solver_world: Any | None = None,
 ) -> str:
     """Hash an explicit, lower-owned base-to-target-world frame binding."""
 
@@ -122,6 +124,11 @@ def target_frame_binding_hash_from_transforms(
         "reference_frame_by_side": {},
         "target_world_from_base_by_side": {},
     }
+    if target_world_from_solver_world is not None:
+        payload["target_world_from_solver_world"] = _pose(
+            target_world_from_solver_world,
+            name="target_world_from_solver_world",
+        ).tolist()
     references = payload["reference_frame_by_side"]
     transforms = payload["target_world_from_base_by_side"]
     assert isinstance(references, dict)
@@ -252,6 +259,7 @@ class TCPPoseEnvelopeTargetFrameBinding:
 
     reference_frame_by_side: Mapping[str, str]
     target_world_from_base_by_side: Mapping[str, np.ndarray]
+    target_world_from_solver_world: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         references: dict[str, str] = {}
@@ -278,6 +286,12 @@ class TCPPoseEnvelopeTargetFrameBinding:
                 transform,
                 name=f"target_world_from_base_by_side.{side}",
             )
+        solver_world_transform = None
+        if self.target_world_from_solver_world is not None:
+            solver_world_transform = _pose(
+                self.target_world_from_solver_world,
+                name="target_world_from_solver_world",
+            )
         if not references or set(references) != set(transforms):
             raise ValueError(
                 "reference_frame_by_side and target_world_from_base_by_side "
@@ -287,6 +301,8 @@ class TCPPoseEnvelopeTargetFrameBinding:
         for side, transform in transforms.items():
             transform.setflags(write=False)
             frozen_transforms[side] = transform
+        if solver_world_transform is not None:
+            solver_world_transform.setflags(write=False)
         object.__setattr__(
             self,
             "reference_frame_by_side",
@@ -297,12 +313,18 @@ class TCPPoseEnvelopeTargetFrameBinding:
             "target_world_from_base_by_side",
             MappingProxyType(dict(sorted(frozen_transforms.items()))),
         )
+        object.__setattr__(
+            self,
+            "target_world_from_solver_world",
+            solver_world_transform,
+        )
 
     def semantic_hash(self, *, sides: Sequence[str]) -> str:
         return target_frame_binding_hash_from_transforms(
             target_world_from_base_by_side=self.target_world_from_base_by_side,
             sides=sides,
             reference_frame_by_side=self.reference_frame_by_side,
+            target_world_from_solver_world=self.target_world_from_solver_world,
         )
 
 
@@ -636,6 +658,18 @@ class TCPPoseEnvelopeTargetFilter:
         self.profile = profile
         self.calibration = calibration
         self.target_frame_binding = target_frame_binding
+        self._target_world_from_solver_world = np.eye(4, dtype=float)
+        if (
+            target_frame_binding is not None
+            and target_frame_binding.target_world_from_solver_world is not None
+        ):
+            self._target_world_from_solver_world = _pose(
+                target_frame_binding.target_world_from_solver_world,
+                name="target_frame_binding.target_world_from_solver_world",
+            )
+        self._solver_world_from_target_world = np.linalg.inv(
+            self._target_world_from_solver_world
+        )
         self.apply_to_target = bool(apply_to_target)
         self._tool_frame_binding_hash_by_side = (
             tool_frame_binding_hashes_from_retargeter(
@@ -798,6 +832,47 @@ class TCPPoseEnvelopeTargetFilter:
             for side in targets
         }
 
+    def reference_tool_tcp_world_target_from_solver_tool_tcp_world_target(
+        self,
+        solver_tool_tcp_world_target: np.ndarray,
+    ) -> np.ndarray:
+        """Convert a solver-world tool TCP pose into the envelope frame."""
+
+        solver_pose = _pose(
+            solver_tool_tcp_world_target,
+            name="solver_tool_tcp_world_target",
+        )
+        return _pose(
+            self._target_world_from_solver_world @ solver_pose,
+            name="reference_tool_tcp_world_target",
+        )
+
+    def solver_tool_tcp_world_target_from_reference_tool_tcp_world_target(
+        self,
+        reference_tool_tcp_world_target: np.ndarray,
+    ) -> np.ndarray:
+        """Convert an envelope-frame tool TCP pose back to solver-world."""
+
+        reference_pose = _pose(
+            reference_tool_tcp_world_target,
+            name="reference_tool_tcp_world_target",
+        )
+        return _pose(
+            self._solver_world_from_target_world @ reference_pose,
+            name="solver_tool_tcp_world_target",
+        )
+
+    def _reference_tool_targets(
+        self,
+        targets: Mapping[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        return {
+            side: self.reference_tool_tcp_world_target_from_solver_tool_tcp_world_target(
+                target
+            )
+            for side, target in targets.items()
+        }
+
     def __call__(
         self,
         targets: Mapping[str, np.ndarray],
@@ -809,7 +884,8 @@ class TCPPoseEnvelopeTargetFilter:
             anchor_receipt = self._anchor_receipt
         try:
             target_hash = self._current_target_frame_binding_hash()
-            tool_targets = self._tool_targets(effective_targets)
+            solver_tool_targets = self._tool_targets(effective_targets)
+            tool_targets = self._reference_tool_targets(solver_tool_targets)
             projection = project_tcp_pose_envelope(
                 tool_targets,
                 profile=self.profile,
@@ -835,9 +911,15 @@ class TCPPoseEnvelopeTargetFilter:
                 for side in projection.modified_sides
             }
             if modified_tool_targets:
-                applied_targets.update(
-                    self._solver_targets(modified_tool_targets)
-                )
+                for side, reference_target in modified_tool_targets.items():
+                    solver_tool_target = (
+                        self.solver_tool_tcp_world_target_from_reference_tool_tcp_world_target(
+                            reference_target
+                        )
+                    )
+                    applied_targets.update(
+                        self._solver_targets({side: solver_tool_target})
+                    )
         except Exception as exc:  # noqa: BLE001 - Shadow records; Active fails closed.
             error = f"{type(exc).__name__}: {exc}"
             with self._lock:

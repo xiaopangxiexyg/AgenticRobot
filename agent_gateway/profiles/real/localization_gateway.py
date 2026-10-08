@@ -30,7 +30,7 @@ from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,
     LOCALIZATION_ANNOTATED_IMAGE_SCHEMA_ID_V1,
     LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
-    LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1,
+    LOCALIZATION_INPUT_IMAGE_SCHEMA_IDS_V1,
     LOCALIZATION_INPUT_JPEG_ENCODING_V1,
     LOCALIZATION_INPUT_JPEG_MEDIA_TYPE_V1,
     LOCALIZATION_INPUT_PNG_ENCODING_V1,
@@ -250,7 +250,7 @@ class ObjectLocalizationProvider:
                         LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
                     ),
                 }
-                or artifact.schema_id != LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1
+                or artifact.schema_id not in LOCALIZATION_INPUT_IMAGE_SCHEMA_IDS_V1
             ):
                 raise ValueError(
                     "Object-localization input Artifact identity is invalid."

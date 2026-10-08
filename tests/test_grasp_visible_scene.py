@@ -58,6 +58,42 @@ def test_target_is_not_deleted_from_noncontact_approach():
     assert view.approach_collision_counts(np.eye(4), opening_m=0.07, distance_m=0.06) == (1, 0)
 
 
+def test_terminal_contact_allows_only_target_on_inner_tactile_pad_skin():
+    # With a 70 mm opening, the nominal inner finger faces are at +/-35 mm.
+    # The first two target points enter those faces by 3 mm.  The remaining
+    # target points are respectively too deep, on the outer face, and in the
+    # palm.  A background point at an otherwise allowed pad location must stay
+    # an obstacle.
+    view = scene(
+        [
+            [0.038, 0.0, -0.020],
+            [-0.038, 0.0, -0.020],
+            [0.044, 0.0, -0.020],
+            [0.044, 0.0, -0.020],
+            [0.038, 0.0, -0.050],
+            [0.038, 0.0, -0.020],
+        ],
+        [True, True, True, True, True, False],
+    )
+
+    target_hits, allowed_contacts, background_hits = (
+        view.collision_counts_with_terminal_target_contact(
+            np.eye(4), opening_m=0.07, contact_depth_m=0.006
+        )
+    )
+
+    assert allowed_contacts == 2
+    assert target_hits == 3
+    assert background_hits == 1
+
+
+def test_terminal_contact_depth_is_bounded_by_finger_thickness():
+    with pytest.raises(ValueError, match="within finger thickness"):
+        scene([], []).collision_counts_with_terminal_target_contact(
+            np.eye(4), opening_m=0.07, contact_depth_m=0.0101
+        )
+
+
 def test_captured_gripper_filter_preserves_targets_gap_sweep_and_nearby_background():
     view = scene([[0, 0, -.05], [0, 0, -.05], [.04, 0, -.02],
                   [0, 0, -.054], [0, .013, -.05], [0, 0, -.02],

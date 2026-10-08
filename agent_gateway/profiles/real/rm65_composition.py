@@ -38,6 +38,7 @@ from teleop_runtime.skill_deploy import (
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
     RM65GraspJointTrajectoryPlanner,
     RM65GraspReachabilityConfig,
+    RM65GraspTrajectoryPlanningConfig,
 )
 
 from .exclusive_application import (
@@ -47,6 +48,9 @@ from .exclusive_application import (
 from .exclusive_factory import (
     ExclusiveRealAgentPrimitiveDeployment,
     assemble_exclusive_rm65_agent_primitive_deployment,
+)
+from .grasp_approach_plan import (
+    DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
 )
 from .localization_deployment import (
     RealObjectLocalizationRegistration,
@@ -82,7 +86,10 @@ from .rm65_camera_geometry import (
     RM65RgbCameraGeometry,
     build_rm65_rgb_camera_geometry,
 )
-from .rm65_grasp_reachability import RM65PointGraspReachabilityAdapter
+from .rm65_grasp_reachability import (
+    RM65PointGraspReachabilityAdapter,
+    arm_base_origin_in_candidate_frame,
+)
 from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
     StationPointGraspArmReachabilityProfile,
@@ -236,17 +243,21 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     runtime_session_id: str,
     control_domain_id: str,
     embodiment_instance_id: str,
+    grasp_execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     max_retained_operations: int = 16,
     peer_idle_timeout_sec: float = 10.0,
     grant_lifetime_sec: float = 5.0,
     camera_config_path: str | Path | None = None,
     camera_registry_path: str | Path | None = None,
     artifact_root: str | Path | None = None,
+    planned_trajectory_dir: str | Path | None = None,
     camera_mount_urdf_path: str | Path | None = None,
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
+    enable_grasp_observation: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
+    grasp_trajectory_config: RM65GraspTrajectoryPlanningConfig | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> ExclusiveRM65AgentPrimitiveComposition:
@@ -258,6 +269,16 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("debug_render_object_coordinates must be bool.")
     if not isinstance(enable_point_grasp_arm_reachability, bool):
         raise TypeError("enable_point_grasp_arm_reachability must be bool.")
+    if not isinstance(enable_grasp_observation, bool):
+        raise TypeError("enable_grasp_observation must be bool.")
+    if grasp_trajectory_config is not None and not isinstance(
+        grasp_trajectory_config,
+        RM65GraspTrajectoryPlanningConfig,
+    ):
+        raise TypeError(
+            "grasp_trajectory_config must be RM65GraspTrajectoryPlanningConfig "
+            "or None."
+        )
     side = str(authorized_side).strip().lower()
     if side not in {"left", "right"}:
         raise ValueError("authorized_side must be left or right.")
@@ -323,6 +344,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "provided together."
         )
     grasp_enabled = point_grasp_planner is not None
+    if enable_grasp_observation and (
+        not grasp_enabled or getattr(point_grasp_planner, "backend_id", None) != "graspgenx"
+    ):
+        raise ValueError("Frozen grasp observations require a GraspGenX planner.")
     if (object_localizer is None) != (point_grasp_planner is None):
         raise ValueError(
             "object_localizer and point_grasp_planner must be supplied together."
@@ -702,6 +727,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     station_manifest_hash=station_manifest_hash,
                     execution_manifest_hash=execution_manifest_hash,
                     current_mode="real_active",
+                    frozen_observation=enable_grasp_observation,
                     arm_reachability_profile=(
                         StationPointGraspArmReachabilityProfile(
                             arm_side=side,
@@ -805,7 +831,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 lower.profile
             ),
             target_envelope_filter=(lower.target_builder.pre_ik_target_safety_filter),
+            config=grasp_trajectory_config,
             reachability_config=reachability_config,
+            trajectory_record_dir=planned_trajectory_dir,
         )
 
         def reachability_evaluator_factory(port):
@@ -817,6 +845,16 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 motion_port=port,
                 frame_graph=frame_graph,
                 candidate_reference_frame_id=station_frame.frame_id,
+                arm_base_origin_candidate_m=arm_base_origin_in_candidate_frame(
+                    scene_world_from_candidate=(
+                        lower.profile.scene_world_from_canonical_station
+                    ),
+                    scene_world_from_arm_base=(
+                        lower.profile.scene_world_from_arm_base_by_side[
+                            arm_reachability_profile.arm_side
+                        ]
+                    ),
+                ),
                 clock=clock,
             )
 
@@ -846,6 +884,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             captured_robot_observation_filter=(
                 captured_robot_observation_filter
             ),
+            non_motion_read_window=lower.ports.non_motion_read_window,
             perception_provider_factory=provider_factory,
             measured_qpos_observer=(
                 measured_qpos_observer if rgb_camera_geometry is not None else None
@@ -854,6 +893,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             # The aggregate application resource closes the shared store after
             # Gateway executors/models and cameras have settled.
             owns_artifact_store=False,
+            grasp_execution_operation_timeout_sec=grasp_execution_operation_timeout_sec,
             max_retained_operations=max_retained_operations,
             clock=clock,
             sleep=sleep,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -49,6 +50,70 @@ def _world_to_desk(control: DeskTcpPositionControl, pose_world: np.ndarray) -> n
     return np.linalg.inv(control.world_from_desk) @ np.asarray(pose_world, dtype=float)
 
 
+def _review_start_inside_workspace(
+    pose_desk: np.ndarray,
+    *,
+    workspace: Any,
+) -> np.ndarray:
+    pose = np.asarray(pose_desk, dtype=float).copy()
+    lower = np.asarray(workspace.absolute_min_xyz_m, dtype=float)
+    upper = np.asarray(workspace.absolute_max_xyz_m, dtype=float)
+    position = pose[:3, 3].copy()
+    projected = np.clip(position, lower, upper)
+    if not np.allclose(position, projected, atol=1e-12, rtol=0.0):
+        print(
+            "[AbsoluteWorkspaceView] initial MuJoCo TCP is outside the "
+            "selected envelope; using its boundary projection as the review "
+            "trajectory start while keeping the actual TCP visible",
+            flush=True,
+        )
+        pose[:3, 3] = projected
+    return pose
+
+
+def _load_runtime_absolute_bounds(
+    path: Path,
+    *,
+    side: str,
+) -> tuple[str, tuple[float, float, float], tuple[float, float, float]]:
+    payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("runtime envelope profile must be a JSON object")
+    profile_id = str(payload.get("profile_id", "")).strip() or path.stem
+    sides = payload.get("sides")
+    if not isinstance(sides, dict) or side not in sides:
+        raise ValueError(f"runtime envelope profile has no side {side!r}")
+    side_payload = sides[side]
+    if not isinstance(side_payload, dict):
+        raise ValueError(f"runtime envelope side {side!r} must be an object")
+    if side_payload.get("relative_bounds") is not None:
+        raise ValueError(
+            "runtime envelope visualization requires absolute-only bounds; "
+            "relative_bounds is not supported"
+        )
+    absolute = side_payload.get("absolute_bounds")
+    if not isinstance(absolute, dict):
+        raise ValueError(f"runtime envelope side {side!r} has no absolute_bounds")
+    lower = np.asarray(absolute.get("min_xyz_m"), dtype=float)
+    upper = np.asarray(absolute.get("max_xyz_m"), dtype=float)
+    if (
+        lower.shape != (3,)
+        or upper.shape != (3,)
+        or not np.all(np.isfinite(lower))
+        or not np.all(np.isfinite(upper))
+        or np.any(lower >= upper)
+    ):
+        raise ValueError(
+            f"runtime envelope side {side!r} must contain finite non-empty "
+            "absolute min_xyz_m/max_xyz_m bounds"
+        )
+    return (
+        profile_id,
+        tuple(float(value) for value in lower),
+        tuple(float(value) for value in upper),
+    )
+
+
 def _generate_closed_loop_playback(
     *,
     control: DeskTcpPositionControl,
@@ -69,10 +134,14 @@ def _generate_closed_loop_playback(
         side: _world_to_desk(control, initial_world[side])
         for side in ("left", "right")
     }
+    review_start_desk = _review_start_inside_workspace(
+        initial_desk["left"],
+        workspace=workspace,
+    )
     raw_desk, effective_desk = build_review_trajectory(
         workspace,
         samples_per_leg=int(samples_per_leg),
-        start_pose_desk=initial_desk["left"],
+        start_pose_desk=review_start_desk,
         include_negative_faces=bool(include_negative_faces),
         endpoint_hold_frames=int(endpoint_hold_frames),
     )
@@ -199,6 +268,22 @@ def _generate_closed_loop_playback(
 def run_viewer(args: argparse.Namespace) -> dict[str, object]:
     config = load_absolute_workspace_preview_config(args.config)
     workspace = derive_absolute_workspace(config, args.profile)
+    if args.envelope_profile is not None:
+        profile_id, lower, upper = _load_runtime_absolute_bounds(
+            args.envelope_profile,
+            side=args.envelope_side,
+        )
+        workspace = replace(
+            workspace,
+            profile_name=f"{workspace.profile_name}:{profile_id}:{args.envelope_side}",
+            absolute_min_xyz_m=lower,
+            absolute_max_xyz_m=upper,
+        )
+        print(
+            "[AbsoluteWorkspaceView] using runtime absolute envelope: "
+            f"{args.envelope_profile} side={args.envelope_side}",
+            flush=True,
+        )
     print(
         "[AbsoluteWorkspaceView] review-only candidate:\n"
         + json.dumps(workspace.to_payload(), ensure_ascii=False, indent=2),
@@ -326,6 +411,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         choices=PREVIEW_PROFILE_NAMES,
         required=True,
+    )
+    parser.add_argument(
+        "--envelope-profile",
+        type=Path,
+        help=(
+            "optional production TCP envelope JSON; when supplied, its "
+            "absolute bounds replace the URDF-derived preview bounds"
+        ),
+    )
+    parser.add_argument(
+        "--envelope-side",
+        choices=("left", "right"),
+        default="right",
     )
     parser.add_argument("--playback-hz", type=float, default=60.0)
     parser.add_argument("--samples-per-leg", type=int, default=90)

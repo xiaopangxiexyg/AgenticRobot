@@ -24,8 +24,10 @@ from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from dataset_contracts.perception_artifacts import (
     LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
     LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1,
+    LOCALIZATION_INPUT_IMAGE_SCHEMA_IDS_V1,
     LOCALIZATION_INPUT_JPEG_ENCODING_V1,
     LOCALIZATION_INPUT_JPEG_MEDIA_TYPE_V1,
+    RGB_FRAME_SCHEMA_ID_V1,
 )
 from deployments.perception.sam2_grounding_dino import (
     GroundedObjectDetection,
@@ -106,6 +108,10 @@ def test_localization_registration_closes_over_input_and_output_artifacts() -> N
         REAL_LOCALIZE_OBJECTS_INPUT_SLOT_ID_V1
     )
     assert registration.skill.io_contract.input_artifact_slots[0].min_count == 1
+    assert (
+        registration.skill.io_contract.input_artifact_slots[0].allowed_schema_ids
+        == LOCALIZATION_INPUT_IMAGE_SCHEMA_IDS_V1
+    )
     assert registration.skill.io_contract.output_artifact_slots[0].slot_id == (
         REAL_LOCALIZE_OBJECTS_OUTPUT_SLOT_ID_V1
     )
@@ -186,8 +192,14 @@ def test_local_path_mode_is_bounded_to_explicit_test_root(tmp_path: Path) -> Non
         provider.localize_request(request, artifact_store=SimpleNamespace())
 
 
+@pytest.mark.parametrize(
+    "input_schema_id",
+    (LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1, RGB_FRAME_SCHEMA_ID_V1),
+    ids=("localization-input", "captured-rgb-frame"),
+)
 def test_artifact_mode_reads_committed_bytes_and_preserves_prompt(
     tmp_path: Path,
+    input_schema_id: str,
 ) -> None:
     data = _jpeg_bytes()
     registration = _registration(local_path_enabled=False)
@@ -200,7 +212,7 @@ def test_artifact_mode_reads_committed_bytes_and_preserves_prompt(
         artifact = artifact_ref_for_bytes(
             data,
             media_type=LOCALIZATION_INPUT_JPEG_MEDIA_TYPE_V1,
-            schema_id=LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1,
+            schema_id=input_schema_id,
             encoding=LOCALIZATION_INPUT_JPEG_ENCODING_V1,
             compression=LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
         )
@@ -210,7 +222,7 @@ def test_artifact_mode_reads_committed_bytes_and_preserves_prompt(
             artifact=artifact,
             producer_id="test-client",
             runtime_session_id="session:test",
-            idempotency_key="input:test",
+            idempotency_key=f"input:{input_schema_id}",
             now=1.0,
         )
         request = SimpleNamespace(

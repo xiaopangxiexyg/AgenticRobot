@@ -30,6 +30,8 @@ class AttachedBoxCollisionProxy:
     parent_frame_name: str
     center_xyz_m: tuple[float, float, float]
     size_xyz_m: tuple[float, float, float]
+    rotation_row_major: tuple[float, ...] = (1., 0., 0., 0., 1., 0., 0., 0., 1.)
+    collision_geometry_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.geometry_name.strip() or not self.parent_frame_name.strip():
@@ -42,6 +44,14 @@ class AttachedBoxCollisionProxy:
             raise ValueError(
                 "attached collision proxy size must be positive finite XYZ."
             )
+        rotation = np.asarray(self.rotation_row_major, dtype=float)
+        if (rotation.shape != (9,) or not np.isfinite(rotation).all()
+                or not np.allclose(rotation.reshape(3, 3).T @ rotation.reshape(3, 3), np.eye(3), atol=1e-6, rtol=0)
+                or not np.isclose(np.linalg.det(rotation.reshape(3, 3)), 1., atol=1e-6, rtol=0)):
+            raise ValueError("attached collision proxy requires a rigid rotation")
+        if (len(set(self.collision_geometry_names)) != len(self.collision_geometry_names)
+                or any(not name or name.strip() != name for name in self.collision_geometry_names)):
+            raise ValueError("attached collision pair names must be distinct nonempty names")
 
 
 # Conservative wrist-camera bounds shared by real URDF planning and MuJoCo
@@ -104,6 +114,7 @@ class RM65ObstacleCollisionOracle:
         attached_box_proxies: Sequence[AttachedBoxCollisionProxy] = (),
         obstacle_moving_geometry_names: Sequence[str] | None = None,
         stop_at_first_clearance_violation: bool = False,
+        collision_scope: str = "full_pinocchio_collision_model",
         pin_module: Any | None = None,
         hppfcl_module: Any | None = None,
     ) -> None:
@@ -167,7 +178,7 @@ class RM65ObstacleCollisionOracle:
                 )
             frame = model.frames[frame_id]
             placement = frame.placement * pin.SE3(
-                np.eye(3), np.asarray(proxy.center_xyz_m, dtype=float)
+                np.asarray(proxy.rotation_row_major).reshape(3, 3), np.asarray(proxy.center_xyz_m, dtype=float)
             )
             collision_model.addGeometryObject(
                 pin.GeometryObject(
@@ -235,6 +246,18 @@ class RM65ObstacleCollisionOracle:
             tuple(sorted((int(pair.first), int(pair.second))))
             for pair in collision_model.collisionPairs
         }
+        # Carried objects need explicit pairs with robot proxies too, not only
+        # the static world. The application binds the reviewed contact pairs;
+        # default camera proxies retain their existing collision scope.
+        geometry_ids = {str(g.name): i for i, g in enumerate(collision_model.geometryObjects)}
+        for proxy in attached_box_proxies:
+            for name in proxy.collision_geometry_names:
+                if name not in geometry_ids or name == proxy.geometry_name:
+                    raise ValueError(f"Invalid attached collision pair: {proxy.geometry_name}, {name}")
+                key = tuple(sorted((geometry_ids[proxy.geometry_name], geometry_ids[name])))
+                if key not in existing_pairs:
+                    collision_model.addCollisionPair(pin.CollisionPair(*key))
+                    existing_pairs.add(key)
         for obstacle_geometry_id in obstacle_ids:
             for moving_geometry_id in obstacle_pair_geometry_ids:
                 key = tuple(sorted((obstacle_geometry_id, moving_geometry_id)))
@@ -250,6 +273,7 @@ class RM65ObstacleCollisionOracle:
         self._stop_at_first_clearance_violation = (
             stop_at_first_clearance_violation
         )
+        self._collision_scope = str(collision_scope)
         self._collision_query_margin_m: float | None = None
         if self._stop_at_first_clearance_violation:
             for request in self._collision_data.collisionRequests:
@@ -264,6 +288,7 @@ class RM65ObstacleCollisionOracle:
         self._moving_geometry_ids = moving_geometry_ids
         self._obstacle_pair_geometry_ids = obstacle_pair_geometry_ids
         self._check_cache: dict[bytes, JointConfigurationCheck] = {}
+        self._clearance_check_cache: dict[bytes, JointConfigurationCheck] = {}
         self._search_check_cache: dict[tuple[float, bytes], JointConfigurationCheck] = {}
 
     @classmethod
@@ -279,6 +304,7 @@ class RM65ObstacleCollisionOracle:
         attached_box_proxies: Sequence[AttachedBoxCollisionProxy] = (),
         obstacle_moving_geometry_names: Sequence[str] | None = None,
         stop_at_first_clearance_violation: bool = False,
+        collision_scope: str = "full_pinocchio_collision_model",
     ) -> RM65ObstacleCollisionOracle:
         if (
             expected_reference_frame_id is None
@@ -321,6 +347,7 @@ class RM65ObstacleCollisionOracle:
             stop_at_first_clearance_violation=(
                 stop_at_first_clearance_violation
             ),
+            collision_scope=collision_scope,
         )
 
     @property
@@ -345,6 +372,36 @@ class RM65ObstacleCollisionOracle:
         if key not in self._check_cache:
             self._check_cache[key] = self._check_embedded(full_q)
         return self._check_cache[key]
+
+    def check_clearance_only(
+        self, qpos_by_component: Mapping[str, np.ndarray]
+    ) -> JointConfigurationCheck:
+        """Check the full collision model at the scene's clearance threshold.
+
+        A safe fast result proves the requested clearance but reports only a
+        lower distance bound. Borderline or blocked guard results are resolved
+        with an exact query so a conservative guard cannot reject a safe path.
+        """
+
+        try:
+            full_q = self._embed(qpos_by_component)
+        except (TypeError, ValueError):
+            return self.check(qpos_by_component)
+        key = full_q.tobytes()
+        if key not in self._clearance_check_cache:
+            pair_count = len(self._collision_model.collisionPairs)
+            if not self._moving_geometry_ids or pair_count == 0:
+                result = self._check_embedded(full_q)
+            else:
+                result = self._check_embedded_early_exit(
+                    full_q,
+                    pair_count=pair_count,
+                    clearance_m=self._scene.minimum_clearance_m,
+                )
+                if result.collision_check_available and not result.safe:
+                    result = self.check(qpos_by_component)
+            self._clearance_check_cache[key] = result
+        return self._clearance_check_cache[key]
 
     def _check_embedded(self, full_q: np.ndarray) -> JointConfigurationCheck:
         pair_count = len(self._collision_model.collisionPairs)
@@ -604,7 +661,7 @@ class RM65ObstacleCollisionOracle:
             "scene_hash": self._scene.semantic_content_hash,
             "scene_revision": self._scene.revision,
             "collision_model_is_independent": True,
-            "collision_scope": "full_pinocchio_collision_model",
+            "collision_scope": self._collision_scope,
             "query_mode": (
                 "first_clearance_violation"
                 if self._stop_at_first_clearance_violation
@@ -665,6 +722,10 @@ def build_rm65_profile_obstacle_collision_oracle(
             else None
         ),
         stop_at_first_clearance_violation=stop_at_first_clearance_violation,
+        collision_scope=(
+            "profile_sparse_proxy_pairs"
+            if use_profile_proxy_geometry else "profile_collision_pairs"
+        ),
     )
 
 

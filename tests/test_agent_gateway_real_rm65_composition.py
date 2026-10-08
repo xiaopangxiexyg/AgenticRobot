@@ -498,13 +498,17 @@ def test_composition_requires_complete_perception_attachment(
         )
 
 
+@pytest.mark.parametrize("frozen_observation", [False, True])
 def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
     monkeypatch,
     tmp_path,
+    frozen_observation,
 ) -> None:
     lower, guard = _lower(monkeypatch)
     localizer = _Localizer()
     planner = _PointGraspPlanner(localizer)
+    if frozen_observation:
+        planner.backend_id = "graspgenx"
 
     composition = assemble_exclusive_rm65_agent_primitive_composition(
         lower=lower,
@@ -526,6 +530,7 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         object_localizer=localizer,
         point_grasp_planner=planner,
         debug_render_object_coordinates=True,
+        enable_grasp_observation=frozen_observation,
     )
     session = composition.deployment.gateway_session
     try:
@@ -548,7 +553,7 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         assert composition.station_point_grasp_registration is not None
         assert (
             composition.station_point_grasp_registration.skill.definition.skill_version
-            == "2"
+            == ("4" if frozen_observation else "2")
         )
         assert (
             composition.station_point_grasp_registration.profile.arm_reachability_profile
@@ -569,7 +574,7 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         )
         assert session.station_point_grasp_executor is not None
         assert session.station_point_grasp_render_executor is not None
-        assert set(session.passive_read_executors_by_skill_id) == {
+        expected_reads = {
             "state.read_tcp_pose",
             "perception.capture_rgb",
             "perception.capture_depth",
@@ -578,6 +583,11 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
             "perception.render_point_grasp_candidate",
             "perception.plan_grasp_approach",
         }
+        if frozen_observation:
+            expected_reads.add("perception.capture_grasp_observation")
+            assert routes["perception.capture_grasp_observation"] == "read_only"
+            assert callable(session.station_point_grasp_provider.observation_reader)
+        assert set(session.passive_read_executors_by_skill_id) == expected_reads
         assert session.owns_artifact_store is False
         assert composition.resources.artifact_store is session.artifact_store
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())
@@ -889,6 +899,15 @@ def test_composition_opt_in_binds_point_grasp_v3_to_lower_ik_without_starting(
         assert context["candidate_reference_frame_id"] == "canonical_station"
         assert context["measured_qpos_age_ms"] == pytest.approx(50.0)
         assert annotations[0]["classification"] == "standard_reachable"
+        evaluator.clock = lambda: 10.3
+        matched_cut = session.port.latest_measured_qpos()
+        assert matched_cut is not None
+        matched_context, _ = evaluator(
+            (np.eye(4),),
+            measured_qpos_cut=matched_cut,
+            measurement_reference_time=10.0,
+        )
+        assert matched_context["measured_qpos_age_ms"] == pytest.approx(50.0)
         assert all(backend.starts == 0 for backend in lower.arm_backends.values())
         assert guard.starts == 0
     finally:

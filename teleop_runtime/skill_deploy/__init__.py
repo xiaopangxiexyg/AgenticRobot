@@ -10,6 +10,7 @@ from .control_runtime import (
     RealSkillMotionEmergencyStopReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
+    RealSkillMotionObservationPaused,
     RealSkillMotionObservationUnavailable,
     RealSkillMotionTargetSynchronizer,
 )
@@ -61,6 +62,7 @@ from .rm65_ports import (
     build_exclusive_rm65_skill_position_force_guard,
 )
 from .rm65_profile import (
+    RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1,
     RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
     ExclusiveRM65SkillDeploymentProfile,
     ResolvedExclusiveRM65SkillDeploymentProfile,
@@ -76,6 +78,7 @@ from .rm65_urdf_grasp_planning import RM65UrdfGraspPlanningContext
 
 __all__ = [
     "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
+    "RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1",
     "RM65_SKILL_SCENE_WORLD_FRAME_ID_V1",
     "DMTacRM65RegisteredTrajectoryPorts",
     "DMTacShadowReplayPortProfile",
@@ -116,6 +119,7 @@ __all__ = [
     "RealSkillMotionEmergencyStopReceipt",
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
+    "RealSkillMotionObservationPaused",
     "RealSkillMotionObservationUnavailable",
     "RealSkillMotionTargetSynchronizer",
     "RegisteredTrajectoryAuthorityConsumptionReceipt",

@@ -87,6 +87,8 @@ from .motion_primitive_profiles import (
 from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
 from .observation_gateway import RealControlOwnerState
 from .perception_gateway import build_real_perception_passive_executors
+from .grasp_observation import build_grasp_observation_executor, read_retained_grasp_observation
+from .object_transport import build_object_transport_executor
 from .point_grasp_gateway import (
     StationBoundPointGraspProvider,
     build_station_bound_point_grasp_executor,
@@ -617,6 +619,8 @@ class RealAgentPrimitiveGatewaySession:
     owns_artifact_store: bool
     hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
+    grasp_observation_executor: PassiveReadSkillExecutor | None = None
+    object_transport_executor: PassiveReadSkillExecutor | None = None
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
@@ -660,6 +664,12 @@ class RealAgentPrimitiveGatewaySession:
         grasp_plan_enabled = (
             self.contract_bundle.grasp_approach_plan_registration is not None
         )
+        point_registration = self.contract_bundle.station_point_grasp_registration
+        if (self.contract_bundle.object_transport_registration is not None) != (self.object_transport_executor is not None):
+            raise ValueError("Object transport registration and executor disagree.")
+        observation_enabled = point_registration is not None and point_registration.observation_registration is not None
+        if observation_enabled != (self.grasp_observation_executor is not None):
+            raise ValueError("Frozen grasp observation registration and executor disagree.")
         if grasp_plan_enabled != all(
             item is not None
             for item in (
@@ -685,6 +695,8 @@ class RealAgentPrimitiveGatewaySession:
         """Return the live read-only executors under their public Skill ids."""
 
         executors = {
+            "perception.plan_object_move": self.object_transport_executor,
+            "perception.capture_grasp_observation": self.grasp_observation_executor,
             "state.read_tcp_pose": self.state_executor,
             "perception.capture_rgb": self.rgb_executor,
             "perception.capture_depth": self.depth_executor,
@@ -796,6 +808,8 @@ class RealAgentPrimitiveGatewaySession:
                     self.station_point_grasp_executor,
                     self.station_point_grasp_render_executor,
                     self.grasp_approach_plan_executor,
+                    self.grasp_observation_executor,
+                    self.object_transport_executor,
                 )
             )
             if not passive_reads_settled:
@@ -1016,7 +1030,10 @@ def assemble_real_agent_primitive_gateway_session(
     station_point_grasp_planner: object | None = None,
     station_point_grasp_reachability_evaluator: Callable[..., object] | None = None,
     grasp_trajectory_planner: Callable[..., object] | None = None,
+    held_object_observer: Callable[..., object] | None = None,
+    object_transport_planner_factory: Callable[..., object] | None = None,
     captured_robot_observation_filter: Callable[..., object] | None = None,
+    non_motion_read_window: Callable[[], object] | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     revision_tracker: AgentStationRevisionTracker | None = None,
@@ -1065,6 +1082,10 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError("Real perception registration requires its Artifact store.")
     if owns_artifact_store and artifact_store is None:
         raise ValueError("Owned Artifact store must be injected.")
+    transport_enabled = contract_bundle.object_transport_registration is not None
+    if (transport_enabled != callable(held_object_observer)
+            or transport_enabled != callable(object_transport_planner_factory)):
+        raise ValueError("Object transport requires its bound observation owner and planner factory.")
     grasp_enabled = contract_bundle.localization_registration is not None
     if grasp_enabled != (localization_provider is not None):
         raise ValueError("Localization registration requires its exact provider.")
@@ -1257,6 +1278,8 @@ def assemble_real_agent_primitive_gateway_session(
     station_point_grasp_render_executor = None
     grasp_approach_plan_provider = None
     grasp_approach_plan_executor = None
+    grasp_observation_executor = None
+    object_transport_executor = None
     if perception_provider is not None and artifact_store is not None:
         registration = contract_bundle.perception_capture
         assert registration is not None
@@ -1297,6 +1320,24 @@ def assemble_real_agent_primitive_gateway_session(
                 max_retained_operations=max_retained_operations,
                 clock=clock,
             )
+            observation_reader = None
+            if point_grasp_registration.observation_registration is not None:
+                observation_registration = point_grasp_registration.observation_registration
+                grasp_observation_executor = build_grasp_observation_executor(
+                    registration=observation_registration, perception_provider=perception_provider,
+                    frame_binding=frame_binding, artifact_store=artifact_store,
+                    runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                    current_station_revision=lambda: producer.current_station_revision,
+                    max_retained_operations=max_retained_operations, clock=clock,
+                    non_motion_read_window=non_motion_read_window)
+                execution_port_by_route_hash[observation_registration.skill.routes[0].semantic_content_hash] = grasp_observation_executor
+
+                def observation_reader(operation_id, revision):
+                    return read_retained_grasp_observation(
+                        executor=grasp_observation_executor, operation_id=operation_id, artifact_store=artifact_store,
+                        runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                        expected_station_revision=revision, frame_binding_hash=frame_binding.semantic_content_hash)
+
             station_point_grasp_provider = StationBoundPointGraspProvider(
                 planner=station_point_grasp_planner,
                 registration=point_grasp_registration,
@@ -1305,6 +1346,11 @@ def assemble_real_agent_primitive_gateway_session(
                 current_station_revision=lambda: producer.current_station_revision,
                 arm_reachability_evaluator=(station_point_grasp_reachability_evaluator),
                 motion_port=port,
+                captured_robot_observation_filter=(
+                    captured_robot_observation_filter
+                ),
+                non_motion_read_window=non_motion_read_window,
+                observation_reader=observation_reader,
             )
             station_point_grasp_executor = build_station_bound_point_grasp_executor(
                 registration=point_grasp_registration,
@@ -1361,6 +1407,7 @@ def assemble_real_agent_primitive_gateway_session(
                         lambda: producer.current_station_revision
                     ),
                     clock=clock,
+                    non_motion_read_window=non_motion_read_window,
                 )
                 grasp_approach_plan_executor = build_real_grasp_approach_plan_executor(
                     registration=plan_registration,
@@ -1394,6 +1441,18 @@ def assemble_real_agent_primitive_gateway_session(
                     ),
                 }
             )
+    if transport_enabled:
+        from contextlib import nullcontext
+
+        transport_registration = contract_bundle.object_transport_registration
+        object_transport_executor = build_object_transport_executor(
+            registration=transport_registration, observe_held_object=held_object_observer,
+            planner_factory=object_transport_planner_factory, artifact_store=artifact_store,
+            runtime_session_id=contract_bundle.attachment.runtime_session_id,
+            current_station_revision=lambda: producer.current_station_revision,
+            max_retained_operations=max_retained_operations, clock=clock,
+            non_motion_read_window=non_motion_read_window or nullcontext)
+        execution_port_by_route_hash[transport_registration.skill.routes[0].semantic_content_hash] = object_transport_executor
     registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -1528,6 +1587,8 @@ def assemble_real_agent_primitive_gateway_session(
         owns_artifact_store=owns_artifact_store,
         hardware_view_provider=hardware_view_provider,
         service=service,
+        grasp_observation_executor=grasp_observation_executor,
+        object_transport_executor=object_transport_executor,
     )
 
 

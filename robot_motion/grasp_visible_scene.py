@@ -32,6 +32,108 @@ _IDENTITY_ROTATION_FLAT = (
 
 
 @dataclass(frozen=True)
+class VisibleGraspDepthFilterConfig:
+    """Conservative image-space rejection for isolated background depth spikes.
+
+    The filter intentionally removes only background pixels that have no
+    locally depth-consistent neighbour.  Target-labelled pixels are immutable,
+    and connected surfaces remain untouched; this is not a general point-cloud
+    smoother and cannot erase an obstacle merely because it is small.
+    """
+
+    neighborhood_radius_px: int = 1
+    maximum_neighbor_depth_delta_m: float = 0.012
+    minimum_supporting_neighbors: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.neighborhood_radius_px, bool)
+            or not isinstance(self.neighborhood_radius_px, int)
+            or not 1 <= self.neighborhood_radius_px <= 2
+        ):
+            raise ValueError("neighborhood_radius_px must be an integer in [1, 2]")
+        if (
+            not math.isfinite(self.maximum_neighbor_depth_delta_m)
+            or not 0.0 < self.maximum_neighbor_depth_delta_m <= 0.05
+        ):
+            raise ValueError(
+                "maximum_neighbor_depth_delta_m must be finite and in (0, 0.05]"
+            )
+        if (
+            isinstance(self.minimum_supporting_neighbors, bool)
+            or not isinstance(self.minimum_supporting_neighbors, int)
+            or not 1 <= self.minimum_supporting_neighbors <= 8
+        ):
+            raise ValueError(
+                "minimum_supporting_neighbors must be an integer in [1, 8]"
+            )
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            asdict(self),
+            domain="dexteleop.motion.visible_grasp_depth_filter_config.v1",
+        )
+
+
+PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER = VisibleGraspDepthFilterConfig()
+
+
+def _filter_isolated_background_depth(
+    *,
+    depth_m: np.ndarray,
+    target_mask: np.ndarray,
+    config: VisibleGraspDepthFilterConfig,
+) -> tuple[np.ndarray, Mapping[str, object]]:
+    """Return a valid-depth mask and hashable preprocessing evidence."""
+
+    valid = depth_m > 0
+    supporting = np.zeros(depth_m.shape, dtype=np.uint8)
+    radius = config.neighborhood_radius_px
+    height, width = depth_m.shape
+    for row_offset in range(-radius, radius + 1):
+        for column_offset in range(-radius, radius + 1):
+            if row_offset == 0 and column_offset == 0:
+                continue
+            source_rows = slice(max(0, -row_offset), min(height, height - row_offset))
+            source_columns = slice(
+                max(0, -column_offset), min(width, width - column_offset)
+            )
+            neighbor_rows = slice(max(0, row_offset), min(height, height + row_offset))
+            neighbor_columns = slice(
+                max(0, column_offset), min(width, width + column_offset)
+            )
+            source_depth = depth_m[source_rows, source_columns]
+            neighbor_depth = depth_m[neighbor_rows, neighbor_columns]
+            consistent = (
+                valid[source_rows, source_columns]
+                & valid[neighbor_rows, neighbor_columns]
+                & (
+                    np.abs(source_depth - neighbor_depth)
+                    <= config.maximum_neighbor_depth_delta_m
+                )
+            )
+            supporting[source_rows, source_columns] += consistent.astype(np.uint8)
+    remove = (
+        valid
+        & ~target_mask
+        & (supporting < config.minimum_supporting_neighbors)
+    )
+    keep = valid & ~remove
+    evidence = {
+        "schema": "dexteleop.motion.visible_grasp_depth_preprocessing.v1",
+        "method": "isolated_background_depth_spike_filter_v1",
+        "input_valid_point_count": int(np.count_nonzero(valid)),
+        "output_valid_point_count": int(np.count_nonzero(keep)),
+        "removed_isolated_background_points": int(np.count_nonzero(remove)),
+        "removed_target_points": 0,
+        "config": asdict(config),
+        "config_hash": config.semantic_content_hash,
+    }
+    return keep, evidence
+
+
+@dataclass(frozen=True)
 class ParallelJawSolidGeometry:
     palm_z_m: float
     finger_length_m: float
@@ -92,6 +194,9 @@ class VisibleGraspScene:
                  capture_qpos_by_side: Mapping[str, np.ndarray] | None = None,
                  capture_self_observation_evidence: (
                      Mapping[str, object] | None
+                 ) = None,
+                 depth_preprocessing_evidence: (
+                     Mapping[str, object] | None
                  ) = None) -> None:
         xyz = np.asarray(points, dtype=float)
         labels = np.asarray(target_mask)
@@ -132,6 +237,29 @@ class VisibleGraspScene:
                 domain="dexteleop.motion.capture_self_observation_evidence.v1",
             )
             self.capture_self_observation_evidence = MappingProxyType(evidence)
+        self.depth_preprocessing_evidence = None
+        if depth_preprocessing_evidence is not None:
+            evidence = dict(depth_preprocessing_evidence)
+            removed_background = evidence.get(
+                "removed_isolated_background_points"
+            )
+            if (
+                evidence.get("schema")
+                != "dexteleop.motion.visible_grasp_depth_preprocessing.v1"
+                or isinstance(removed_background, bool)
+                or not isinstance(removed_background, int)
+                or removed_background < 0
+                or evidence.get("removed_target_points") != 0
+            ):
+                raise ValueError(
+                    "depth preprocessing evidence must preserve target points "
+                    "and contain a nonnegative background count"
+                )
+            canonical_content_hash(
+                evidence,
+                domain="dexteleop.motion.visible_grasp_depth_preprocessing.v1",
+            )
+            self.depth_preprocessing_evidence = MappingProxyType(evidence)
         self.points.setflags(write=False)
         self.target_mask.setflags(write=False)
         self._tree = cKDTree(self.points)
@@ -143,6 +271,11 @@ class VisibleGraspScene:
                 None
                 if self.capture_self_observation_evidence is None
                 else dict(self.capture_self_observation_evidence)
+            ),
+            "depth_preprocessing_evidence": (
+                None
+                if self.depth_preprocessing_evidence is None
+                else dict(self.depth_preprocessing_evidence)
             ),
         }, domain="dexteleop.motion.visible_grasp_scene.v1")
 
@@ -164,7 +297,9 @@ class VisibleGraspScene:
                    capture_qpos_by_side: Mapping[str, np.ndarray] | None = None,
                    capture_self_observation_evidence: (
                        Mapping[str, object] | None
-                   ) = None) -> VisibleGraspScene:
+                   ) = None,
+                   depth_filter: VisibleGraspDepthFilterConfig | None = None,
+                   ) -> VisibleGraspScene:
         depth = np.asarray(depth_m)
         mask = np.asarray(target_mask)
         if (depth.ndim != 2 or mask.shape != depth.shape or mask.dtype != np.bool_
@@ -179,7 +314,19 @@ class VisibleGraspScene:
                 or not np.allclose(transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-7)
                 or not np.isclose(np.linalg.det(transform[:3, :3]), 1)):
             raise ValueError("camera transform must be rigid")
-        rows, columns = np.nonzero(depth > 0)
+        depth_preprocessing_evidence = None
+        valid_depth = depth > 0
+        if depth_filter is not None:
+            if not isinstance(depth_filter, VisibleGraspDepthFilterConfig):
+                raise TypeError("depth_filter must be VisibleGraspDepthFilterConfig or None")
+            valid_depth, depth_preprocessing_evidence = (
+                _filter_isolated_background_depth(
+                    depth_m=depth,
+                    target_mask=mask,
+                    config=depth_filter,
+                )
+            )
+        rows, columns = np.nonzero(valid_depth)
         z = depth[rows, columns]
         xyz = np.column_stack(((columns-cx)*z/fx, (rows-cy)*z/fy, z))
         xyz = xyz @ transform[:3, :3].T + transform[:3, 3]
@@ -187,19 +334,62 @@ class VisibleGraspScene:
                    capture_qpos_by_side=capture_qpos_by_side,
                    capture_self_observation_evidence=(
                        capture_self_observation_evidence
-                   ))
+                   ),
+                   depth_preprocessing_evidence=depth_preprocessing_evidence)
 
     def _solid_mask(self, local: np.ndarray, *, opening_m: float,
                     distance_m: float = 0) -> np.ndarray:
         """Use the same separate palm/finger solids for filtering and checks."""
         g = self.geometry
         x, y, z = local.T
-        fingers = ((z > g.palm_z_m-distance_m) & (z < g.palm_z_m+g.finger_length_m)
-                   & (np.abs(x) > opening_m/2)
-                   & (np.abs(x) < opening_m/2+g.finger_thickness_m))
+        fingers = self._finger_mask(local, opening_m=opening_m, distance_m=distance_m)
         palm = ((z > g.palm_z_m-g.finger_thickness_m-distance_m)
                 & (z <= g.palm_z_m) & (np.abs(x) < opening_m/2+g.finger_thickness_m))
         return (np.abs(y) < g.pad_height_m/2) & (fingers | palm)
+
+    def _finger_mask(self, local: np.ndarray, *, opening_m: float,
+                     distance_m: float = 0) -> np.ndarray:
+        g = self.geometry
+        x, _y, z = local.T
+        return (
+            (z > g.palm_z_m - distance_m)
+            & (z < g.palm_z_m + g.finger_length_m)
+            & (np.abs(x) > opening_m / 2)
+            & (np.abs(x) < opening_m / 2 + g.finger_thickness_m)
+        )
+
+    def _terminal_target_contact_mask(
+        self,
+        local: np.ndarray,
+        *,
+        opening_m: float,
+        contact_depth_m: float,
+    ) -> np.ndarray:
+        """Return target points allowed to enter the inner tactile-pad skin.
+
+        The parallel jaws close along local X.  Expected grasp contact is
+        therefore on each finger's inner X face, not in a local-Z band at the
+        distal fingertip.  ``contact_depth_m`` is a bounded penetration allowance
+        into that inner face for depth/segmentation uncertainty; it never opens
+        the palm, the outer finger faces, or any background collision pair.
+        """
+        if (
+            not math.isfinite(contact_depth_m)
+            or contact_depth_m <= 0.0
+            or contact_depth_m > self.geometry.finger_thickness_m
+        ):
+            raise ValueError(
+                "contact_depth_m must be finite and within finger thickness"
+            )
+        x, y, z = local.T
+        inner_face_x = opening_m / 2.0
+        return (
+            (np.abs(x) > inner_face_x)
+            & (np.abs(x) <= inner_face_x + contact_depth_m)
+            & (z > self.geometry.palm_z_m)
+            & (z < self.geometry.palm_z_m + self.geometry.finger_length_m)
+            & (np.abs(y) < self.geometry.pad_height_m / 2)
+        )
 
     def without_captured_gripper_observations(
         self,
@@ -264,11 +454,15 @@ class VisibleGraspScene:
                                   capture_qpos_by_side=self.capture_qpos_by_side,
                                   capture_self_observation_evidence=(
                                       self.capture_self_observation_evidence
+                                  ),
+                                  depth_preprocessing_evidence=(
+                                      self.depth_preprocessing_evidence
                                   )),
                 int(np.count_nonzero(remove)))
 
-    def collision_counts(self, pose: np.ndarray, *, opening_m: float) -> tuple[int, int]:
-        """Count observed target/background points inside the nominal solids."""
+    def _collision_local_points(
+        self, pose: np.ndarray, *, opening_m: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
         g = self.geometry
         if not math.isfinite(opening_m) or not 0 < opening_m <= g.maximum_opening_m:
             raise ValueError("opening is outside the geometry bound")
@@ -279,13 +473,50 @@ class VisibleGraspScene:
                 or not np.isclose(np.linalg.det(pose[:3, :3]), 1)):
             raise ValueError("grasp pose must be rigid")
         pose = g.solid_pose(pose)
-        local, labels = self._local_points(pose, opening_m=opening_m)
+        return self._local_points(pose, opening_m=opening_m)
+
+    def collision_counts(self, pose: np.ndarray, *, opening_m: float) -> tuple[int, int]:
+        """Count observed target/background points inside the nominal solids."""
+        local, labels = self._collision_local_points(pose, opening_m=opening_m)
         occupied = self._solid_mask(local, opening_m=opening_m)
         return (int(np.count_nonzero(occupied & labels)),
                 int(np.count_nonzero(occupied & ~labels)))
 
-    def approach_collision_counts(self, grasp_pose: np.ndarray, *, opening_m: float,
-                                  distance_m: float) -> tuple[int, int]:
+    def collision_counts_with_terminal_target_contact(
+        self,
+        pose: np.ndarray,
+        *,
+        opening_m: float,
+        contact_depth_m: float,
+    ) -> tuple[int, int, int]:
+        """Separate allowed inner-pad contact from target and background hits.
+
+        The target is still treated as an obstacle everywhere except the
+        terminal inner tactile-pad skin.  This is the grasp-goal contact rule; callers
+        that need a strict no-contact check should continue using
+        :meth:`collision_counts`.
+        """
+        local, labels = self._collision_local_points(pose, opening_m=opening_m)
+        occupied = self._solid_mask(local, opening_m=opening_m)
+        target = occupied & labels
+        terminal_contact = self._terminal_target_contact_mask(
+            local, opening_m=opening_m, contact_depth_m=contact_depth_m
+        )
+        return (
+            int(np.count_nonzero(target & ~terminal_contact)),
+            int(np.count_nonzero(target & terminal_contact)),
+            int(np.count_nonzero(occupied & ~labels)),
+        )
+
+    def approach_collision_counts(
+        self,
+        grasp_pose: np.ndarray,
+        *,
+        opening_m: float,
+        distance_m: float,
+        allow_terminal_target_contact: bool = False,
+        terminal_target_contact_depth_m: float = 0.006,
+    ) -> tuple[int, int]:
         """Check the entire fixed-orientation +Z approach analytically.
 
         In the final TCP frame, a stationary point moves only along local Z;
@@ -299,5 +530,12 @@ class VisibleGraspScene:
         pose = self.geometry.solid_pose(np.asarray(grasp_pose))
         local, labels = self._local_points(pose, opening_m=opening_m, distance_m=distance_m)
         occupied = self._solid_mask(local, opening_m=opening_m, distance_m=distance_m)
-        return (int(np.count_nonzero(occupied & labels)),
+        target = occupied & labels
+        if allow_terminal_target_contact:
+            target &= ~self._terminal_target_contact_mask(
+                local,
+                opening_m=opening_m,
+                contact_depth_m=terminal_target_contact_depth_m,
+            )
+        return (int(np.count_nonzero(target)),
                 int(np.count_nonzero(occupied & ~labels)))

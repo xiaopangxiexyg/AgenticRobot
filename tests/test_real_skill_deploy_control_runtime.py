@@ -263,6 +263,120 @@ def test_preplanned_grasp_path_dispatch_never_enters_dynamic_target_builder() ->
     assert metadata["joint_trajectory_hash"] == trajectory.semantic_content_hash
 
 
+def test_preplanned_path_clock_rebases_after_non_dispatch_gap() -> None:
+    class _ReadyOwner:
+        def skill_motion_owner_state(self) -> tuple[str, str]:
+            return ("running", "ready")
+
+        def hold_skill_motion(self, reason: str) -> bool:
+            del reason
+            return True
+
+    trajectory = RealAgentJointTrajectory(
+        time_from_start_sec=np.array([0.0, 1.0, 2.0], dtype=float),
+        qpos_by_side={
+            "left": np.array(
+                [[0.0] * 6, [0.1] * 6, [0.2] * 6],
+                dtype=float,
+            ),
+            "right": np.zeros((3, 6), dtype=float),
+        },
+        planner_evidence_refs=("rm65-grasp-path:clock-rebase",),
+    )
+    port = _port(_TargetBuilder())
+    initial = {"left": np.zeros(6), "right": np.zeros(6)}
+    port.publish_measured_qpos_pair(
+        qpos_by_side=initial,
+        measured_at=1.0,
+        available_at=1.0,
+        source_evidence_refs=("hardware-qpos-cut:clock-rebase",),
+    )
+    port.submit_activation(
+        replace(_activation(suffix="clock-rebase"), joint_trajectory=trajectory)
+    )
+    port.apply_control_owner_requests(owner=_ReadyOwner(), now=1.0)
+
+    first = port.command_for_observation(
+        TeleopObservation(timestamp=1.05),
+        1.05,
+    )
+    assert isinstance(first, TeleopCommand)
+    port.observe_session_step(command=first, command_dispatched=False)
+
+    delayed = port.command_for_observation(
+        TeleopObservation(timestamp=2.75),
+        2.75,
+    )
+    assert isinstance(delayed, TeleopCommand)
+    np.testing.assert_allclose(delayed.commands["left_arm"].value, 0.01)
+    operation = delayed.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
+    assert operation["source"] == "replay_qpos_trajectory"
+    assert operation["singularity_replay_slowdown_preapplied"] is True
+    assert operation["singularity_replay_slowdown_collision_rechecked"] is True
+    effector_operation = delayed.commands["left_arm"].metadata
+    assert effector_operation["source"] == "replay_qpos_trajectory"
+    assert effector_operation["singularity_replay_slowdown_preapplied"] is True
+    assert operation["trajectory_elapsed_sec"] == pytest.approx(0.1)
+    assert operation["trajectory_clock_advance_capped"] is True
+
+    snapshot = port.observe_session_step(
+        command=delayed,
+        command_dispatched=True,
+    )
+    assert snapshot.trajectory_clock_rebased_count == 1
+    assert snapshot.trajectory_elapsed_sec == pytest.approx(0.1)
+    resumed = port.command_for_observation(
+        TeleopObservation(timestamp=2.85),
+        2.85,
+    )
+    assert isinstance(resumed, TeleopCommand)
+    np.testing.assert_allclose(resumed.commands["left_arm"].value, 0.02)
+
+
+
+def test_unverified_preplanned_path_does_not_claim_singularity_replay() -> None:
+    class _ReadyOwner:
+        def skill_motion_owner_state(self) -> tuple[str, str]:
+            return ("running", "ready")
+
+        def hold_skill_motion(self, reason: str) -> bool:
+            del reason
+            return True
+
+    trajectory = RealAgentJointTrajectory(
+        time_from_start_sec=np.array([0.0, 1.0], dtype=float),
+        qpos_by_side={
+            "left": np.array([[0.0] * 6, [0.1] * 6], dtype=float),
+            "right": np.zeros((2, 6), dtype=float),
+        },
+        planner_evidence_refs=("external-path:test",),
+    )
+    port = _port(_TargetBuilder())
+    port.publish_measured_qpos_pair(
+        qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
+        measured_at=1.0,
+        available_at=1.0,
+        source_evidence_refs=("hardware-qpos-cut:unverified",),
+    )
+    port.submit_activation(
+        replace(_activation(suffix="unverified"), joint_trajectory=trajectory)
+    )
+    port.apply_control_owner_requests(owner=_ReadyOwner(), now=1.0)
+
+    command = port.command_for_observation(
+        TeleopObservation(timestamp=1.1),
+        1.1,
+    )
+    assert isinstance(command, TeleopCommand)
+    operation = command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY]
+    assert operation["source"] == "joint_vector"
+    assert operation["singularity_replay_slowdown_preapplied"] is False
+    assert operation["singularity_replay_slowdown_collision_rechecked"] is False
+    effector_operation = command.commands["left_arm"].metadata
+    assert effector_operation["source"] == "joint_vector"
+    assert effector_operation["singularity_replay_slowdown_preapplied"] is False
+
+
 def test_measured_qpos_projection_uses_post_synchronization_availability() -> None:
     builder = _TargetBuilder()
     port = _port(builder)

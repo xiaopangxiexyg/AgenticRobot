@@ -43,6 +43,16 @@ from .camera_input_contract import resolve_policy_camera_input_keys
 DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC = 0.2
 DEFAULT_DEPLOYMENT_CAMERA_KEEP_LAST = 4
 
+# This is an operator hint, not an automatic downgrade or a recovery action.
+_CAMERA_STREAM_RECOVERY_HINT = (
+    "Camera recovery guidance: a started stream may still deliver no frames. "
+    "A bounded clean restart can recover it, but cannot guarantee both streams. "
+    "RGB-D tasks require fresh color and depth together; a color-only frame is "
+    "not sufficient. If the failure persists, inspect the camera's USB "
+    "connection and reconnect it manually. Only tasks explicitly configured "
+    "with enable_depth=false may continue as RGB-only."
+)
+
 
 def build_camera_sources(
     args: argparse.Namespace,
@@ -176,7 +186,7 @@ def start_camera_sources(
         )
         raise RuntimeError(
             "RealSense startup failed after the formal real-teleop deferred "
-            f"retry lifecycle: {detail}"
+            f"retry lifecycle. {_CAMERA_STREAM_RECOVERY_HINT} {detail}"
         )
 
 
@@ -225,6 +235,7 @@ def run_camera_startup_self_check(
             )
             raise RuntimeError(
                 "RealSense formal real-teleop startup self-check failed: "
+                f"{_CAMERA_STREAM_RECOVERY_HINT} "
                 f"elapsed={elapsed_sec:.3f}s "
                 f"streaks={freshness_gate.fresh_frame_streaks}; {status_detail}"
             )

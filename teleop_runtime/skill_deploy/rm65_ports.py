@@ -11,7 +11,8 @@ import json
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -44,6 +45,7 @@ from .control_runtime import (
     RealSkillMotionEmergencyStopReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
+    RealSkillMotionObservationPaused,
     RealSkillMotionObservationUnavailable,
 )
 from .motion_port import REAL_AGENT_MOTION_COMMAND_METADATA_KEY
@@ -177,7 +179,7 @@ def _bounded_backend_diagnostics_state(
         if isinstance(raw_health_reasons, (list, tuple))
         else []
     )
-    return {
+    result = {
         "hardware_ready": state.get("hardware_ready"),
         "emergency_stopped": bool(state.get("emergency_stopped", False)),
         "send_result_code": state.get("send_result_code"),
@@ -216,6 +218,51 @@ def _bounded_backend_diagnostics_state(
         ),
         "background_join_timed_out": background_state.get("join_timed_out"),
     }
+    if bool(background_state.get("debug_timing_enabled", False)):
+        raw_percentiles = background_state.get("timing_percentiles")
+        bounded_percentiles: dict[str, dict[str, int | float | None]] = {}
+        if isinstance(raw_percentiles, Mapping):
+            for phase, raw_metrics in list(raw_percentiles.items())[:16]:
+                if not isinstance(raw_metrics, Mapping):
+                    continue
+                bounded_percentiles[str(phase)[:64]] = {
+                    key: raw_metrics.get(key)
+                    for key in ("count", "p50", "p95", "p99", "max")
+                }
+        raw_last_phase = background_state.get("last_phase_timing_ms")
+        last_phase = (
+            {
+                str(name)[:64]: float(value)
+                for name, value in list(raw_last_phase.items())[:16]
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            }
+            if isinstance(raw_last_phase, Mapping)
+            else {}
+        )
+        result["background_stream_timing"] = {
+            "target_hz": background_state.get("hz"),
+            "warning_threshold_hz": background_state.get(
+                "warning_threshold_hz"
+            ),
+            "actual_hz": background_state.get("actual_hz"),
+            "send_count": background_state.get("send_count"),
+            "scheduled_tick_count": background_state.get(
+                "scheduled_tick_count"
+            ),
+            "executed_tick_count": background_state.get(
+                "executed_tick_count"
+            ),
+            "skipped_tick_count": background_state.get("skipped_tick_count"),
+            "deadline_miss_count": background_state.get(
+                "deadline_miss_count"
+            ),
+            "low_rate_count": background_state.get("low_rate_count"),
+            "last_phase_timing_ms": last_phase,
+            "timing_percentiles": bounded_percentiles,
+        }
+    return result
 
 
 def _bounded_diagnostic_text(value: object, *, limit: int = 512) -> str | None:
@@ -337,6 +384,7 @@ class ExclusiveRM65SkillDeployPorts:
             RealSkillMotionEmergencyStopReceipt | None
         ) = None
         self._measurement_lock = threading.Lock()
+        self._measurement_read_lock = threading.Lock()
         self._measurement_stop = threading.Event()
         self._measurement_thread: threading.Thread | None = None
         self._latest_observation_cut: RealSkillMotionObservationCut | None = None
@@ -345,6 +393,7 @@ class ExclusiveRM65SkillDeployPorts:
         self._measurement_transient_failure_count = 0
         self._measurement_consecutive_transient_failures = 0
         self._last_measurement_transient_failure: str | None = None
+        self._non_motion_read_window_active = False
 
     @property
     def resources_started(self) -> bool:
@@ -355,6 +404,151 @@ class ExclusiveRM65SkillDeployPorts:
     def resources_closed(self) -> bool:
         with self._resource_lock:
             return self._resources_closed
+
+    @contextmanager
+    def non_motion_read_window(self) -> Iterator[None]:
+        """Pause stale trips and background qpos refresh for read-only work.
+
+        The position-force guard keeps force/torque and reader-error checks
+        active in this window.  It also clears ``motion_ready``; therefore the
+        existing command admission boundary cannot accept a motion command.
+        When background measurement sampling is enabled, the sampler's read
+        lock is held for the whole window.  This gives the force pollers sole
+        access to the shared RM65 SDK I/O path instead of allowing a slow qpos
+        refresh to block a force read.  Exiting the window requires one fresh
+        dual-arm qpos cut before motion readiness is restored.
+        """
+
+        if not self.resources_started:
+            raise RuntimeError(
+                "exclusive RM65 Skill resources are not started."
+            )
+        suspend = getattr(
+            self.position_force_guard,
+            "suspend_stale_watchdog_for_non_motion",
+            None,
+        )
+        resume = getattr(
+            self.position_force_guard,
+            "resume_stale_watchdog_after_non_motion",
+            None,
+        )
+        if not callable(suspend) or not callable(resume):
+            raise RuntimeError(
+                "position force guard does not support non-motion read windows"
+            )
+        token = suspend()
+        window_marked_active = False
+        measurement_lock_acquired = False
+        previous_sample_count: int | None = None
+        primary_error: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        try:
+            with self._measurement_lock:
+                if self._non_motion_read_window_active:
+                    raise RuntimeError(
+                        "RM65 non-motion read windows cannot overlap."
+                    )
+                self._non_motion_read_window_active = True
+                window_marked_active = True
+            if self.profile.background_measurement_sampling:
+                # If a sampler read is already in flight, wait for that one
+                # read to finish after stale admission has been suspended.
+                # Thereafter no new qpos SDK call can start while the
+                # read-only operation is running.
+                self._measurement_read_lock.acquire()
+                measurement_lock_acquired = True
+                with self._measurement_lock:
+                    previous_sample_count = self._measurement_sample_count
+            try:
+                yield
+            except BaseException as exc:  # noqa: BLE001 - preserve the primary failure.
+                primary_error = exc
+        finally:
+            if measurement_lock_acquired:
+                self._measurement_read_lock.release()
+                try:
+                    assert previous_sample_count is not None
+                    self._wait_for_fresh_measurement_sample(
+                        previous_sample_count
+                    )
+                except BaseException as exc:  # noqa: BLE001 - fail closed.
+                    cleanup_errors.append(exc)
+                    with self._measurement_lock:
+                        if self._measurement_fault is None:
+                            self._measurement_fault = (
+                                f"post-window measurement freshness failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+            try:
+                # Re-arm only after the post-window qpos cut is available.
+                # Force/torque and reader-error protection stayed active
+                # throughout the window and during this wait.
+                resume(token)
+            except BaseException as exc:  # noqa: BLE001 - retain evidence.
+                cleanup_errors.append(exc)
+
+            if window_marked_active:
+                with self._measurement_lock:
+                    self._non_motion_read_window_active = False
+
+            if primary_error is not None:
+                for cleanup_error in cleanup_errors:
+                    add_note = getattr(primary_error, "add_note", None)
+                    note = (
+                        "non-motion read window cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    if callable(add_note):
+                        add_note(note)
+                    else:
+                        notes = getattr(primary_error, "__notes__", None)
+                        if notes is None:
+                            notes = []
+                            setattr(primary_error, "__notes__", notes)
+                        notes.append(note)
+                raise primary_error
+            if cleanup_errors:
+                raise RuntimeError(
+                    "RM65 non-motion read window cleanup failed: "
+                    + "; ".join(
+                        f"{type(error).__name__}: {error}"
+                        for error in cleanup_errors
+                    )
+                ) from cleanup_errors[0]
+
+    def _wait_for_fresh_measurement_sample(
+        self,
+        previous_sample_count: int,
+    ) -> None:
+        """Require one sampler cut published after a read-only window."""
+
+        timeout_sec = max(1.0, 4.0 / self.profile.state_refresh_hz)
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            with self._measurement_lock:
+                fault = self._measurement_fault
+                sample_count = self._measurement_sample_count
+            if fault is not None:
+                raise RuntimeError(
+                    "RM65 measurement sampler failed after non-motion read: "
+                    + fault
+                )
+            if sample_count > previous_sample_count:
+                return
+            thread = self._measurement_thread
+            if thread is None or not thread.is_alive():
+                raise RuntimeError(
+                    "RM65 measurement sampler stopped before publishing a "
+                    "fresh post-window qpos cut."
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise RuntimeError(
+                    "RM65 measurement sampler did not publish a fresh "
+                    f"post-window qpos cut within {timeout_sec:.3f}s."
+                )
+            self._measurement_stop.wait(min(0.01, remaining))
 
     @property
     def startup_hold_receipt(self) -> RealSkillMotionHoldReceipt | None:
@@ -664,6 +858,9 @@ class ExclusiveRM65SkillDeployPorts:
                 self._measurement_consecutive_transient_failures
             )
             last_transient = self._last_measurement_transient_failure
+            non_motion_read_window_active = (
+                self._non_motion_read_window_active
+            )
         now = float(self.clock())
         return {
             "enabled": self.profile.background_measurement_sampling,
@@ -679,6 +876,9 @@ class ExclusiveRM65SkillDeployPorts:
                 RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES
             ),
             "last_transient_failure": last_transient,
+            "non_motion_read_window_active": (
+                non_motion_read_window_active
+            ),
             "latest_measurement_age_sec": (
                 None if cut is None else max(0.0, now - cut.measured_at)
             ),
@@ -717,6 +917,14 @@ class ExclusiveRM65SkillDeployPorts:
         with self._measurement_lock:
             cut = self._latest_observation_cut
             fault = self._measurement_fault
+            non_motion_read_window_active = (
+                self._non_motion_read_window_active
+            )
+        if non_motion_read_window_active:
+            raise RealSkillMotionObservationPaused(
+                "RM65 qpos publication is intentionally paused during a "
+                "non-motion read window."
+            )
         if fault is not None:
             raise RuntimeError("RM65 measurement sampler failed: " + fault)
         if cut is None:
@@ -732,6 +940,10 @@ class ExclusiveRM65SkillDeployPorts:
         return cut
 
     def _read_hardware_cut(self) -> RealSkillMotionObservationCut:
+        with self._measurement_read_lock:
+            return self._read_hardware_cut_unlocked()
+
+    def _read_hardware_cut_unlocked(self) -> RealSkillMotionObservationCut:
         """Read one fresh dual hardware cut; command/preview qpos is forbidden."""
 
         if not self.resources_started:
@@ -750,6 +962,7 @@ class ExclusiveRM65SkillDeployPorts:
         qpos_by_side: dict[str, np.ndarray] = {}
         measured_at_by_side: dict[str, float] = {}
         hardware_read_phase_timing_by_side: dict[str, dict[str, float]] = {}
+        hardware_observation_phase_timing_by_side: dict[str, dict[str, float]] = {}
         evidence_payload: dict[str, Any] = {}
         source_sequence_by_side: dict[str, int] = {}
         for side in ("left", "right"):
@@ -785,6 +998,7 @@ class ExclusiveRM65SkillDeployPorts:
             age_sec = max(0.0, available_at - measured_at)
             if age_sec > self.profile.max_measurement_age_sec:
                 timing_by_side = {}
+                observation_timing_by_side = {}
                 age_by_side = {}
                 measured_by_side = {}
                 for diagnostic_side in ("left", "right"):
@@ -811,6 +1025,17 @@ class ExclusiveRM65SkillDeployPorts:
                             and not isinstance(value, bool)
                             and math.isfinite(float(value))
                         }
+                    raw_observation_timing = diagnostic_state.get(
+                        "hardware_observation_phase_timing"
+                    )
+                    if isinstance(raw_observation_timing, Mapping):
+                        observation_timing_by_side[diagnostic_side] = {
+                            str(key): float(value)
+                            for key, value in raw_observation_timing.items()
+                            if isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value))
+                        }
                 diagnostic = {
                     "available_at": available_at,
                     "measurement_age_sec_by_side": age_by_side,
@@ -822,6 +1047,9 @@ class ExclusiveRM65SkillDeployPorts:
                     ),
                     "concurrently_refreshed_sides": ["left", "right"],
                     "hardware_read_phase_timing_by_side": timing_by_side,
+                    "hardware_observation_phase_timing_by_side": (
+                        observation_timing_by_side
+                    ),
                 }
                 raise RealSkillMotionObservationUnavailable(
                     f"{side} RM65 hardware qpos cut is stale: {age_sec:.6f}s; "
@@ -836,6 +1064,17 @@ class ExclusiveRM65SkillDeployPorts:
                 hardware_read_phase_timing_by_side[side] = {
                     str(key): float(value)
                     for key, value in raw_timing.items()
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                }
+            raw_observation_timing = state.get(
+                "hardware_observation_phase_timing"
+            )
+            if isinstance(raw_observation_timing, Mapping):
+                hardware_observation_phase_timing_by_side[side] = {
+                    str(key): float(value)
+                    for key, value in raw_observation_timing.items()
                     if isinstance(value, (int, float))
                     and not isinstance(value, bool)
                     and math.isfinite(float(value))
@@ -867,6 +1106,9 @@ class ExclusiveRM65SkillDeployPorts:
                     "hardware_measurement_span_sec": measurement_span_sec,
                     "hardware_read_phase_timing_by_side": (
                         hardware_read_phase_timing_by_side
+                    ),
+                    "hardware_observation_phase_timing_by_side": (
+                        hardware_observation_phase_timing_by_side
                     ),
                 },
             ),
@@ -973,6 +1215,15 @@ class ExclusiveRM65SkillDeployPorts:
                         dict(post_health.get("sides") or {})
                         .get(side, {})
                         .get("background_streaming")
+                        or {}
+                    )
+                    for side in ("left", "right")
+                },
+                "singularity_by_side": {
+                    side: dict(
+                        dict(post_health.get("sides") or {})
+                        .get(side, {})
+                        .get("singularity_metadata")
                         or {}
                     )
                     for side in ("left", "right")

@@ -413,7 +413,7 @@ MuJoCo/contract 路径；真机命令只从 [`docs/real/README.md`](../docs/real
 
 - `--translation-scale`：调整平移缩放比
 - `--collision-avoidance-mode boundary_slide|freeze_on_contact`：双臂推向碰撞区时的默认行为
-- `--collision-scene-profile dual_arm|dual_arm_hand_proxy_open|dual_arm_hand|dual_arm_cylinder_table`：当前 joint-space 双臂碰撞场景 profile，默认先用 `dual_arm_hand_proxy_open`
+- `--collision-scene-profile dual_arm|dual_arm_hand_proxy_open|dual_arm_hand_proxy_dmtac_strict|dual_arm_hand|dual_arm_cylinder_table`：当前 joint-space 双臂碰撞场景 profile，默认先用 `dual_arm_hand_proxy_open`；`dual_arm_hand_proxy_dmtac_strict` 仅在 DMTAC 装配下显式启用
 - `--no-collision`：退回旧的两条独立单臂链路
 - `--tcp-mode hand_base`：历史兼容参数；当前 action 主 frame 是 `tool_tcp`
 - `--skip-renderer`：不启动 SAPIEN，只跑控制主链

@@ -303,6 +303,10 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # The concrete RM65 approach profile decodes RGBD and binds its
         # retained visible scene; numerical work stays outside Gateway core.
         "agent_gateway/profiles/real/grasp_approach_plan.py": ["numpy"],
+        # Frozen RGB-D/FK decoding and held-object/tool transforms belong to
+        # these concrete real-profile leaves, not to Gateway core.
+        "agent_gateway/profiles/real/grasp_observation.py": ["numpy"],
+        "agent_gateway/profiles/real/object_transport.py": ["numpy"],
         "agent_gateway/profiles/real/perception_probe.py": ["numpy"],
         # Offline v1 and deployment-bound live v2 point-grasp stay in one
         # concrete profile leaf: NumPy decodes/projects only at this boundary.

@@ -163,6 +163,7 @@ class StationBoundPointGraspProfile:
     max_candidates: int = 5
     max_annotated_bytes: int = 16 * 1024 * 1024
     profile_id: str = "real-live-station-bound-dmtac-m-point-grasp-v2"
+    frozen_observation: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -186,6 +187,8 @@ class StationBoundPointGraspProfile:
             )
         if self.backend_id not in SUPPORTED_POINT_GRASP_BACKEND_IDS:
             raise ValueError("Station point-grasp backend is unsupported.")
+        if not isinstance(self.frozen_observation, bool) or (self.frozen_observation and self.backend_id != "graspgenx"):
+            raise ValueError("Frozen grasp observations require GraspGenX")
         if self.arm_reachability_profile is not None and not isinstance(
             self.arm_reachability_profile,
             StationPointGraspArmReachabilityProfile,
@@ -261,6 +264,8 @@ class StationBoundPointGraspProfile:
             "selection_authority": "none",
             "downstream_control_effects": "forbidden",
         }
+        if self.frozen_observation:
+            payload["input"] = "retained_stationary_rgbd_observation_with_optional_view_fusion"
         if self.arm_reachability_profile is None:
             return canonical_content_hash(
                 payload,
@@ -299,16 +304,12 @@ class StationBoundPointGraspBinding:
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
-        if self.deployment_binding_version not in {"2", "3"}:
-            raise ValueError("deployment_binding_version must be 2 or 3.")
+        if self.deployment_binding_version not in {"2", "3", "4"}:
+            raise ValueError("deployment_binding_version must be 2, 3 or 4.")
 
     @property
     def semantic_content_hash(self) -> str:
-        domain = (
-            "dexteleop.agent_skill.station_point_grasp_deployment.v3"
-            if self.deployment_binding_version == "3"
-            else "dexteleop.agent_skill.station_point_grasp_deployment.v2"
-        )
+        domain = "dexteleop.agent_skill.station_point_grasp_deployment.v" + self.deployment_binding_version
         return canonical_content_hash(
             {
                 field_name: getattr(self, field_name)
@@ -342,6 +343,7 @@ class StationBoundPointGraspRegistration:
     binding: StationBoundPointGraspBinding
     payload_validator: AgentSkillPayloadValidatorSet
     availability_hash: str
+    observation_registration: object | None = None
 
 
 def build_station_bound_point_grasp_registration(
@@ -365,6 +367,7 @@ def build_station_bound_point_grasp_registration(
     execution_manifest_hash: str,
     current_mode: str = "real_observe",
     arm_reachability_profile: StationPointGraspArmReachabilityProfile | None = None,
+    frozen_observation: bool = False,
 ) -> StationBoundPointGraspRegistration:
     """Build one closed, proposal-only live point-grasp registration."""
 
@@ -391,6 +394,7 @@ def build_station_bound_point_grasp_registration(
         model_profile_hash=model_profile_hash,
         inference_implementation_hash=inference_implementation_hash,
         arm_reachability_profile=arm_reachability_profile,
+        frozen_observation=frozen_observation,
         profile_id=(
             "real-live-station-bound-dmtac-m-point-grasp-v3"
             if arm_reachability_profile is not None
@@ -602,13 +606,17 @@ def build_station_bound_point_grasp_registration(
             else "dexteleop.agent_skill.station_point_grasp_availability.v2"
         ),
     )
-    return StationBoundPointGraspRegistration(
+    registration = StationBoundPointGraspRegistration(
         profile=profile,
         skill=skill,
         binding=binding,
         payload_validator=validator,
         availability_hash=availability_hash,
     )
+    if frozen_observation:
+        from .grasp_observation import upgrade_frozen_point_grasp_registration
+        return upgrade_frozen_point_grasp_registration(registration)
+    return registration
 
 
 __all__ = [

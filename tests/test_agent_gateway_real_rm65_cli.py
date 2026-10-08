@@ -139,6 +139,21 @@ def test_cli_defaults_to_the_detailed_v4_camera_mount_urdf() -> None:
     )
 
 
+def test_cli_accepts_opt_in_continuous_grasp_trajectory_preferences() -> None:
+    parsed = gateway_cli.build_parser().parse_args(
+        [
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--grasp-trajectory-parameterization",
+            "continuous_c2",
+            "--grasp-endpoint-candidate-ordering",
+            "estimated_execution_time",
+        ]
+    )
+
+    assert parsed.grasp_trajectory_parameterization == "continuous_c2"
+    assert parsed.grasp_endpoint_candidate_ordering == "estimated_execution_time"
+
+
 def test_point_grasp_defaults_to_v4_registry_without_changing_camera_only() -> None:
     parser = gateway_cli.build_parser()
     camera_only = parser.parse_args(
@@ -714,6 +729,12 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             profile=resolved,
             ports=SimpleNamespace(
                 last_emergency_stop_receipt=None,
+                position_force_guard=SimpleNamespace(
+                    snapshot=lambda: {
+                        "motion_ready": False,
+                        "fault": {"reason": "force_read_stale", "side": "right"},
+                    }
+                ),
                 arm_backend_diagnostics_snapshot=lambda: {
                     "left": {"background_fault": None},
                     "right": {
@@ -787,6 +808,10 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             "--ssh-read-only-client",
             "rpent.remote.alice",
             "1101",
+            "--grasp-trajectory-parameterization",
+            "continuous_c2",
+            "--grasp-endpoint-candidate-ordering",
+            "estimated_execution_time",
         ]
     )
     assert gateway_cli.main(argv) == 0
@@ -802,6 +827,11 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert events[1]["emergency_stop_latched"] is False
     assert events[1]["emergency_stop_confirmed"] is False
     assert events[1]["control_fault"] is None
+    assert events[1]["position_force_guard"] == {
+        "motion_ready": False,
+        "fault": {"reason": "force_read_stale", "side": "right"},
+    }
+    assert events[1]["position_force_guard_snapshot_error"] is None
     assert events[1]["measurement_sampler"]["sample_count"] == 7
     assert events[1]["arm_backend_diagnostics"]["right"] == {
         "background_fault": (
@@ -833,6 +863,9 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert captured["authorized_side"] == "right"
     assert captured["authorized_action"] == "forward"
     assert captured["ssh_read_only_client_id_by_uid"] == {1101: "rpent.remote.alice"}
+    grasp_config = captured["grasp_trajectory_config"]
+    assert grasp_config.trajectory_parameterization == "continuous_c2"
+    assert grasp_config.endpoint_candidate_ordering == "estimated_execution_time"
 
     composition.lower.ports.last_emergency_stop_receipt = SimpleNamespace(
         succeeded=True,

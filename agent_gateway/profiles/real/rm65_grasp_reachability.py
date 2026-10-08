@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -9,6 +10,9 @@ from typing import Any
 
 import numpy as np
 
+from deployments.perception.sam2_graspgenx_point_grasp import (
+    GraspGenXCandidateSelection,
+)
 from robot_motion.coordinate_frames import CoordinateFrameGraph
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPort
 from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
@@ -19,6 +23,51 @@ from .station_point_grasp_deployment import (
     StationPointGraspArmReachabilityProfile,
 )
 
+_ARM_SHORTLIST_TOTAL_BUDGET_SEC = 8.0
+_ARM_SHORTLIST_CANDIDATE_BUDGET_SEC = 2.0
+_ARM_SHORTLIST_RESCUE_BUDGET_SEC = 8.0
+_ARM_SHORTLIST_PROBE_TOTAL_BUDGET_SEC = 4.0
+_ARM_SHORTLIST_PROBE_CANDIDATE_BUDGET_SEC = 0.35
+_ARM_SHORTLIST_PROBE_MAX_COUNT = 24
+_ARM_SHORTLIST_PROBE_PRIORITY = {
+    "clearance_safe": 0,
+    # A bounded probe's timeout or missing evaluation is not negative evidence.
+    # Explore unknown candidates before spending the shortlist on known clashes.
+    "unresolved": 1,
+    "not_probed": 1,
+    "clearance_blocked": 2,
+    "collision_blocked": 3,
+    "check_unavailable": 4,
+}
+
+
+def arm_base_origin_in_candidate_frame(
+    *,
+    scene_world_from_candidate: np.ndarray,
+    scene_world_from_arm_base: np.ndarray,
+) -> tuple[float, float, float]:
+    """Resolve one arm-base origin in the point-grasp candidate frame."""
+
+    world_from_candidate = np.asarray(
+        scene_world_from_candidate, dtype=np.float64
+    )
+    world_from_arm_base = np.asarray(
+        scene_world_from_arm_base, dtype=np.float64
+    )
+    if (
+        world_from_candidate.shape != (4, 4)
+        or world_from_arm_base.shape != (4, 4)
+        or not np.all(np.isfinite(world_from_candidate))
+        or not np.all(np.isfinite(world_from_arm_base))
+    ):
+        raise ValueError(
+            "Arm-base candidate-frame transforms must be finite 4x4 matrices."
+        )
+    candidate_from_arm_base = (
+        np.linalg.inv(world_from_candidate) @ world_from_arm_base
+    )
+    return tuple(float(value) for value in candidate_from_arm_base[:3, 3])
+
 
 class RM65PointGraspReachabilityAdapter:
     """Evaluate Station candidates from one fresh measured dual-arm qpos cut."""
@@ -28,9 +77,10 @@ class RM65PointGraspReachabilityAdapter:
         *,
         profile: StationPointGraspArmReachabilityProfile,
         planner: RM65GraspJointTrajectoryPlanner,
-        motion_port: RealAgentMotionPort,
+        motion_port: RealAgentMotionPort | None,
         frame_graph: CoordinateFrameGraph,
         candidate_reference_frame_id: str,
+        arm_base_origin_candidate_m: tuple[float, float, float],
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> None:
@@ -38,8 +88,8 @@ class RM65PointGraspReachabilityAdapter:
             raise TypeError("profile must be typed.")
         if not isinstance(planner, RM65GraspJointTrajectoryPlanner):
             raise TypeError("planner must be typed.")
-        if not isinstance(motion_port, RealAgentMotionPort):
-            raise TypeError("motion_port must be typed.")
+        if motion_port is not None and not isinstance(motion_port, RealAgentMotionPort):
+            raise TypeError("motion_port must be typed or None for frozen replay.")
         if not isinstance(frame_graph, CoordinateFrameGraph):
             raise TypeError("frame_graph must be typed.")
         if not callable(clock) or not callable(monotonic):
@@ -76,43 +126,448 @@ class RM65PointGraspReachabilityAdapter:
         }
         if any(getattr(profile, name) != value for name, value in expected.items()):
             raise ValueError("Reachability evaluator bounds changed.")
+        arm_origin = np.asarray(arm_base_origin_candidate_m, dtype=np.float64)
+        if arm_origin.shape != (3,) or not np.all(np.isfinite(arm_origin)):
+            raise ValueError("arm_base_origin_candidate_m must be three finite values.")
         self.profile = profile
         self.planner = planner
         self.motion_port = motion_port
         self.frame_graph = frame_graph
         self.candidate_reference_frame_id = candidate_frame
+        self.arm_base_origin_candidate_m = tuple(float(value) for value in arm_origin)
         self.clock = clock
         self.monotonic = monotonic
 
+    def _resolve_measured_qpos(
+        self,
+        *,
+        measured_qpos_cut: Any | None,
+        measurement_reference_time: float | None,
+    ) -> tuple[Any, float]:
+        if measured_qpos_cut is None and self.motion_port is None:
+            raise RuntimeError("Frozen reachability requires capture-matched measured qpos.")
+        qpos_cut = (
+            measured_qpos_cut
+            if measured_qpos_cut is not None
+            else self.motion_port.latest_measured_qpos()
+        )
+        if qpos_cut is None:
+            raise RuntimeError("Arm reachability measured qpos is unavailable.")
+        try:
+            measured_at = float(qpos_cut.measured_at)
+            reference_time = (
+                float(self.clock())
+                if measurement_reference_time is None
+                else float(measurement_reference_time)
+            )
+            age_offset_ms = (reference_time - measured_at) * 1_000.0
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError("Arm reachability measured qpos age is invalid.")
+        if not math.isfinite(age_offset_ms):
+            raise RuntimeError("Arm reachability measured qpos age is invalid.")
+        if measured_qpos_cut is None:
+            if age_offset_ms < 0.0:
+                raise RuntimeError("Arm reachability measured qpos age is invalid.")
+            age_ms = age_offset_ms
+        else:
+            if abs(age_offset_ms) > self.profile.max_measured_qpos_age_ms:
+                raise RuntimeError(
+                    "Arm reachability measured qpos is not camera-matched."
+                )
+            age_ms = max(0.0, age_offset_ms)
+        if age_ms > self.profile.max_measured_qpos_age_ms:
+            raise RuntimeError("Arm reachability measured qpos is stale.")
+        return qpos_cut, age_ms
+
+    def _solver_pose(self, candidate_reference_from_tool_tcp: np.ndarray) -> np.ndarray:
+        reference_pose = np.asarray(candidate_reference_from_tool_tcp, dtype=float)
+        if reference_pose.shape != (4, 4) or not np.all(np.isfinite(reference_pose)):
+            raise ValueError("Reachability candidate must be one finite 4x4 pose.")
+        solver_pose, resolution = self.frame_graph.transform_pose_matrix(
+            reference_pose,
+            source_reference_frame_id=self.candidate_reference_frame_id,
+            target_reference_frame_id=self.profile.solver_reference_frame_id,
+        )
+        if resolution.frame_graph_hash != self.profile.frame_graph_hash:
+            raise RuntimeError("Reachability frame resolution identity changed.")
+        return solver_pose
+
+    def select_candidates(
+        self,
+        candidates: tuple[Any, ...],
+        target_point_reference_m: tuple[float, float, float],
+        maximum: int,
+        *,
+        measured_qpos_cut: Any | None = None,
+        measurement_reference_time: float | None = None,
+    ) -> GraspGenXCandidateSelection:
+        """Admit candidates whose production local grasp chain is feasible."""
+
+        if not candidates:
+            return GraspGenXCandidateSelection(
+                selected_indices=(),
+                diagnostics={
+                    "arm_shortlist_status": "empty_physical_candidate_pool",
+                    "arm_shortlist_pool_count": 0,
+                    "arm_shortlist_selected_count": 0,
+                },
+            )
+        if isinstance(maximum, bool) or not 1 <= int(maximum) <= 5:
+            raise ValueError("maximum must be in [1, 5].")
+        target = np.asarray(target_point_reference_m, dtype=np.float64)
+        if target.shape != (3,) or not np.all(np.isfinite(target)):
+            raise ValueError("target_point_reference_m must be three finite values.")
+        qpos_cut, _age_ms = self._resolve_measured_qpos(
+            measured_qpos_cut=measured_qpos_cut,
+            measurement_reference_time=measurement_reference_time,
+        )
+        desired_horizontal = target[:2] - np.asarray(
+            self.arm_base_origin_candidate_m[:2], dtype=np.float64
+        )
+        desired_norm = float(np.linalg.norm(desired_horizontal))
+        if desired_norm < 1e-6:
+            raise RuntimeError("Arm base and grasp target have no horizontal separation.")
+        desired_horizontal /= desired_norm
+
+        candidate_evidence: list[dict[str, Any]] = []
+        for index, candidate in enumerate(candidates):
+            reference_pose = np.asarray(candidate.base_from_tcp, dtype=np.float64).reshape(
+                4, 4
+            )
+            solver_pose = self._solver_pose(reference_pose)
+            approach = reference_pose[:3, 2]
+            top_approach = -float(approach[2]) >= 0.7
+            horizontal = approach[:2]
+            horizontal_norm = float(np.linalg.norm(horizontal))
+            if top_approach:
+                side_angle_deg = 25.0
+                side_admissible = True
+            elif horizontal_norm < 1e-6:
+                side_angle_deg = 180.0
+                side_admissible = False
+            else:
+                # This slice aliases the pose's approach column.  Normalizing
+                # it in place corrupts both the rotation and 3-D diversity dots.
+                horizontal = horizontal / horizontal_norm
+                side_angle_deg = math.degrees(
+                    math.acos(
+                        float(
+                            np.clip(
+                                np.dot(horizontal, desired_horizontal), -1.0, 1.0
+                            )
+                        )
+                    )
+                )
+                side_admissible = side_angle_deg <= 85.0
+            score = float(candidate.score)
+            heuristic_score = score * math.exp(-side_angle_deg / 90.0)
+            candidate_evidence.append(
+                {
+                    "index": index,
+                    "reference_pose": reference_pose,
+                    "solver_pose": solver_pose,
+                    "approach": approach,
+                    "side_angle_deg": side_angle_deg,
+                    "side_admissible": side_admissible,
+                    "heuristic_score": heuristic_score,
+                    "score": score,
+                    "pose_source": str(
+                        getattr(candidate, "pose_source", "model_scored")
+                    ),
+                }
+            )
+
+        eligible = [item for item in candidate_evidence if item["side_admissible"]]
+        eligible.sort(
+            key=lambda item: (
+                -float(item["heuristic_score"]),
+                float(item["side_angle_deg"]),
+                -float(item["score"]),
+                int(item["index"]),
+            )
+        )
+        diverse: list[dict[str, Any]] = []
+        deferred: list[dict[str, Any]] = []
+        diversity_cosine = math.cos(math.radians(20.0))
+        for item in eligible:
+            approach = np.asarray(item["approach"], dtype=np.float64)
+            if any(
+                float(np.dot(approach, np.asarray(previous["approach"])))
+                > diversity_cosine
+                for previous in diverse
+            ):
+                deferred.append(item)
+            else:
+                diverse.append(item)
+        # A pose a few millimetres away can avoid the table or wrist-camera
+        # collision even when its approach direction is nearly identical.
+        # Give a few such variants a chance before spending the entire budget
+        # on distinct but remote IK basins.
+        base_evaluation = (
+            diverse[:4]
+            + deferred[:2]
+            + diverse[4:8]
+            + deferred[2:4]
+            + diverse[8:]
+            + deferred[4:]
+        )
+        # World-Z support refinements exist specifically to escape table and
+        # wrist-camera clearance failures that a visually valid nominal pose
+        # cannot reveal. Give a bounded set an early terminal-IK probe instead
+        # of leaving all of them behind dozens of higher model scores.
+        support_priority = [
+            item
+            for item in eligible
+            if item["pose_source"] == "dmtac_support_clearance_variant_v1"
+        ][:_ARM_SHORTLIST_PROBE_MAX_COUNT // 6]
+        support_priority_indices = {
+            int(item["index"]) for item in support_priority
+        }
+        evaluation = support_priority + [
+            item
+            for item in base_evaluation
+            if int(item["index"]) not in support_priority_indices
+        ]
+
+        # A bounded endpoint probe orders, but never removes, candidates before
+        # the expensive local approach validation.  This gives every physical
+        # family a cheap chance to expose a clearance-safe or positive-gap IK
+        # branch and prevents the first few high model scores from consuming the
+        # entire full-chain budget.  A missed probe remains eligible below.
+        probe = getattr(self.planner, "probe_grasp_endpoint_clearance", None)
+        endpoint_probe_attempts: list[dict[str, Any]] = []
+        endpoint_probe_elapsed_ms = 0.0
+        endpoint_probe_budget_exhausted = False
+        if callable(probe):
+            probe_started = float(self.monotonic())
+            probe_deadline = probe_started + _ARM_SHORTLIST_PROBE_TOTAL_BUDGET_SEC
+            for item in evaluation[:_ARM_SHORTLIST_PROBE_MAX_COUNT]:
+                remaining_sec = probe_deadline - float(self.monotonic())
+                if remaining_sec <= 0.0:
+                    endpoint_probe_budget_exhausted = True
+                    break
+                try:
+                    result = probe(
+                        qpos_by_side=qpos_cut.qpos_by_side,
+                        side=self.profile.arm_side,
+                        target_tool_tcp_world=item["solver_pose"],
+                        time_budget_sec=min(
+                            _ARM_SHORTLIST_PROBE_CANDIDATE_BUDGET_SEC,
+                            remaining_sec,
+                        ),
+                        monotonic=self.monotonic,
+                    )
+                except (RuntimeError, ValueError, np.linalg.LinAlgError) as error:
+                    classification = "check_unavailable"
+                    evidence = {
+                        "classification": classification,
+                        "elapsed_ms": 0.0,
+                        "reason_code": "endpoint_probe_exception",
+                        "best_minimum_distance_m": None,
+                        "attempted_seed_count": 0,
+                        "exception_type": type(error).__name__,
+                    }
+                else:
+                    classification = str(result.classification)
+                    if classification not in _ARM_SHORTLIST_PROBE_PRIORITY:
+                        classification = "check_unavailable"
+                    evidence = {
+                        "classification": classification,
+                        "elapsed_ms": float(result.elapsed_ms),
+                        "reason_code": result.reason_code,
+                        "best_minimum_distance_m": (
+                            result.best_minimum_distance_m
+                        ),
+                        "attempted_seed_count": int(
+                            result.attempted_seed_count
+                        ),
+                    }
+                item["endpoint_probe"] = evidence
+                endpoint_probe_attempts.append(
+                    {"index": int(item["index"]), **evidence}
+                )
+            endpoint_probe_elapsed_ms = max(
+                0.0,
+                (float(self.monotonic()) - probe_started) * 1_000.0,
+            )
+            evaluation.sort(
+                key=lambda item: _ARM_SHORTLIST_PROBE_PRIORITY[
+                    str(
+                        item.get("endpoint_probe", {}).get(
+                            "classification", "not_probed"
+                        )
+                    )
+                ]
+            )
+
+        local_chain_assessment_count = 0
+        local_chain_elapsed_ms = 0.0
+        shortlist_started = float(self.monotonic())
+        shortlist_deadline = shortlist_started + _ARM_SHORTLIST_TOTAL_BUDGET_SEC
+        shortlist_budget_exhausted = False
+        rescue_activated = False
+        rescue_assessment_count = 0
+        feasible: list[dict[str, Any]] = []
+        shortlist_attempts: list[dict[str, Any]] = []
+        rejection_counts: dict[str, int] = {}
+        for item in evaluation:
+            remaining_sec = shortlist_deadline - float(self.monotonic())
+            if (
+                remaining_sec < _ARM_SHORTLIST_CANDIDATE_BUDGET_SEC
+                and not feasible
+                and not rescue_activated
+            ):
+                # Only a zero-solution shortlist spends a second bounded window.
+                # Do not start a nearly-zero-budget IK and mistake its timeout
+                # for evidence that this candidate is physically unreachable.
+                shortlist_deadline += _ARM_SHORTLIST_RESCUE_BUDGET_SEC
+                rescue_activated = True
+                remaining_sec = shortlist_deadline - float(self.monotonic())
+            if remaining_sec <= 0.0:
+                shortlist_budget_exhausted = True
+                break
+            local_chain = self.planner.assess_local_grasp_chain(
+                qpos_by_side=qpos_cut.qpos_by_side,
+                side=self.profile.arm_side,
+                target_tool_tcp_world=item["solver_pose"],
+                time_budget_sec=min(
+                    _ARM_SHORTLIST_CANDIDATE_BUDGET_SEC,
+                    remaining_sec,
+                ),
+                monotonic=self.monotonic,
+            )
+            local_chain_assessment_count += 1
+            if rescue_activated:
+                rescue_assessment_count += 1
+            local_chain_elapsed_ms += float(local_chain.elapsed_ms)
+            attempt_reasons = tuple(
+                str(attempt.get("reason_code"))
+                for attempt in local_chain.attempts
+                if attempt.get("reason_code") is not None
+            )
+            reason = str(local_chain.reason_code or "feasible")
+            shortlist_attempts.append(
+                {
+                    "index": int(item["index"]),
+                    "score": float(item["score"]),
+                    "side_angle_deg": float(item["side_angle_deg"]),
+                    "elapsed_ms": float(local_chain.elapsed_ms),
+                    "reason_code": reason,
+                    "branch_reasons": attempt_reasons,
+                    "branch_attempts": tuple(
+                        dict(attempt) for attempt in local_chain.attempts
+                    ),
+                    "endpoint_probe": item.get("endpoint_probe"),
+                }
+            )
+            if not local_chain.feasible:
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                shortlist_budget_exhausted = shortlist_budget_exhausted or (
+                    local_chain.reason_code
+                    == "path_planning_time_budget_exhausted"
+                )
+                continue
+            feasible.append(
+                {
+                    **item,
+                    "local_chain": local_chain,
+                    "pregrasp_distance_m": (
+                        local_chain.selected_pregrasp_distance_m
+                    ),
+                }
+            )
+            if len(feasible) >= int(maximum):
+                break
+
+        feasible.sort(
+            key=lambda item: (
+                float(item["side_angle_deg"]),
+                -float(item["pregrasp_distance_m"]),
+                -float(item["score"]),
+                int(item["index"]),
+            )
+        )
+        selected: list[dict[str, Any]] = []
+        deferred = []
+        for item in feasible:
+            approach = np.asarray(item["approach"], dtype=np.float64)
+            if any(
+                float(np.dot(approach, np.asarray(previous["approach"])))
+                > diversity_cosine
+                for previous in selected
+            ):
+                deferred.append(item)
+            else:
+                selected.append(item)
+        selected = (selected + deferred)[: int(maximum)]
+        return GraspGenXCandidateSelection(
+            selected_indices=tuple(int(item["index"]) for item in selected),
+            diagnostics={
+                "arm_shortlist_status": (
+                    "production_local_grasp_chain_admitted"
+                    if selected
+                    else "no_production_local_grasp_chain_candidate"
+                ),
+                "arm_shortlist_pool_count": len(candidates),
+                "arm_shortlist_side_admissible_count": len(eligible),
+                "arm_shortlist_evaluated_count": local_chain_assessment_count,
+                "arm_shortlist_local_chain_assessment_count": (
+                    local_chain_assessment_count
+                ),
+                "arm_shortlist_local_chain_feasible_count": len(feasible),
+                "arm_shortlist_local_chain_elapsed_ms": (
+                    local_chain_elapsed_ms
+                ),
+                "arm_shortlist_budget_exhausted": shortlist_budget_exhausted,
+                "arm_shortlist_rescue_activated": rescue_activated,
+                "arm_shortlist_rescue_assessment_count": rescue_assessment_count,
+                "arm_shortlist_budget_sec": (
+                    _ARM_SHORTLIST_TOTAL_BUDGET_SEC
+                    + (_ARM_SHORTLIST_RESCUE_BUDGET_SEC if rescue_activated else 0.0)
+                ),
+                "arm_shortlist_endpoint_probe_count": len(
+                    endpoint_probe_attempts
+                ),
+                "arm_shortlist_endpoint_probe_elapsed_ms": (
+                    endpoint_probe_elapsed_ms
+                ),
+                "arm_shortlist_endpoint_probe_budget_exhausted": (
+                    endpoint_probe_budget_exhausted
+                ),
+                "arm_shortlist_endpoint_probe_attempts_json": json.dumps(
+                    endpoint_probe_attempts, separators=(",", ":")
+                ),
+                "arm_shortlist_attempts_json": json.dumps(
+                    shortlist_attempts, separators=(",", ":")
+                ),
+                "arm_shortlist_rejections_json": json.dumps(
+                    rejection_counts, sort_keys=True, separators=(",", ":")
+                ),
+                "arm_shortlist_selected_count": len(selected),
+                "arm_shortlist_policy": (
+                    "arm_side_family_then_advisory_endpoint_probe_then_"
+                    "production_local_grasp_chain_v3"
+                ),
+            },
+        )
+
     def __call__(
-        self, candidate_reference_from_tool_tcp: tuple[np.ndarray, ...]
+        self,
+        candidate_reference_from_tool_tcp: tuple[np.ndarray, ...],
+        *,
+        measured_qpos_cut: Any | None = None,
+        measurement_reference_time: float | None = None,
     ) -> tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
         if not 1 <= len(candidate_reference_from_tool_tcp) <= 5:
             raise ValueError("Reachability requires one to five candidates.")
-        qpos_cut = self.motion_port.latest_measured_qpos()
-        if qpos_cut is None:
-            raise RuntimeError("Arm reachability measured qpos is unavailable.")
-        now = float(self.clock())
-        age_ms = (now - qpos_cut.measured_at) * 1_000.0
-        if not math.isfinite(age_ms) or age_ms < 0.0:
-            raise RuntimeError("Arm reachability measured qpos age is invalid.")
-        if age_ms > self.profile.max_measured_qpos_age_ms:
-            raise RuntimeError("Arm reachability measured qpos is stale.")
+        qpos_cut, age_ms = self._resolve_measured_qpos(
+            measured_qpos_cut=measured_qpos_cut,
+            measurement_reference_time=measurement_reference_time,
+        )
 
         results = []
         for candidate in candidate_reference_from_tool_tcp:
-            reference_pose = np.asarray(candidate, dtype=float)
-            if reference_pose.shape != (4, 4) or not np.all(
-                np.isfinite(reference_pose)
-            ):
-                raise ValueError("Reachability candidate must be one finite 4x4 pose.")
-            solver_pose, resolution = self.frame_graph.transform_pose_matrix(
-                reference_pose,
-                source_reference_frame_id=self.candidate_reference_frame_id,
-                target_reference_frame_id=self.profile.solver_reference_frame_id,
-            )
-            if resolution.frame_graph_hash != self.profile.frame_graph_hash:
-                raise RuntimeError("Reachability frame resolution identity changed.")
+            solver_pose = self._solver_pose(candidate)
             result = self.planner.assess_endpoint_ik(
                 qpos_by_side=qpos_cut.qpos_by_side,
                 side=self.profile.arm_side,

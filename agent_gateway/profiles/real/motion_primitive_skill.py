@@ -195,8 +195,9 @@ class RealAgentPrimitiveSkillLifecycle:
         if operation.operation_id != self.operation.operation_id:
             raise ValueError("Real primitive operation changed.")
 
-    def _latest_measured(self, *, now: float, wait_for_fresh: bool = False):
+    def _latest_measured(self, *, wait_for_fresh: bool = False):
         cut = self.port.latest_measured_pose()
+        now = float(self.clock())
         if cut is None:
             if wait_for_fresh:
                 return None
@@ -354,8 +355,8 @@ class RealAgentPrimitiveSkillLifecycle:
                 evidence_refs=hold.evidence_refs,
                 lower_hold_confirmed=hold.lower_hold_confirmed,
             )
+        cut = self._latest_measured()
         now = float(self.clock())
-        cut = self._latest_measured(now=now)
         measured_pose = tuple(
             float(value)
             for value in pose_matrix_to_xyzquat(
@@ -416,6 +417,7 @@ class RealAgentPrimitiveSkillLifecycle:
         )
         if self.route.skill_id == GRASP_APPROACH_SKILL_ID_V1:
             qpos_cut = self.port.latest_measured_qpos()
+            now = float(self.clock())
             qpos_problem = self._measured_qpos_problem(cut=qpos_cut, now=now)
             if qpos_problem is not None:
                 reason = f"grasp_path_measured_qpos_{qpos_problem}"
@@ -965,10 +967,7 @@ class RealAgentPrimitiveSkillLifecycle:
                     reason_code="real_primitive_lower_not_active",
                     evidence_refs=current_evidence(),
                 )
-            cut = self._latest_measured(
-                now=float(self.clock()),
-                wait_for_fresh=True,
-            )
+            cut = self._latest_measured(wait_for_fresh=True)
             if cut is None:
                 # A derived TCP cut can temporarily lag while the sole lower
                 # control owner finishes an expensive IK/collision cycle.  The
@@ -997,10 +996,9 @@ class RealAgentPrimitiveSkillLifecycle:
                     trajectory = self._planned_joint_trajectory
                     planned_trajectory_elapsed = bool(
                         trajectory is not None
-                        and snapshot.activated_at is not None
-                        and float(self.clock())
-                        >= snapshot.activated_at
-                        + float(trajectory.time_from_start_sec[-1])
+                        and snapshot.trajectory_elapsed_sec is not None
+                        and snapshot.trajectory_elapsed_sec
+                        >= float(trajectory.time_from_start_sec[-1]) - 1e-9
                     )
                 if (
                     snapshot.dispatch_count > 0

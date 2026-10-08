@@ -12,6 +12,7 @@ from .graspgenx_runtime_contract import (
     verify_graspgenx_inprocess_runtime,
 )
 from .sam2_graspgenx_point_grasp import (
+    GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
     GraspGenXPointGraspModelSpec,
     Sam2GraspGenXPointGraspPlanner,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "DMTAC_M_MAX_VISIBLE_COLLISION_POINTS",
     "GRASPGENX_DEFAULT_MODE",
     "GRASPGENX_INPROCESS_RUNTIME_CONTRACT_ID",
+    "GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG",
     "GraspGenXClient",
     "GraspGenXInProcessBackend",
     "GraspGenXInferenceBackend",

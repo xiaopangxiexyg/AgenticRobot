@@ -36,6 +36,14 @@
       ]
     },
     {
+      "bundle_id": "rm65.dmtac_proxy_models",
+      "relative_path": "rm65_inspire_tac",
+      "required_by_default": false,
+      "required_paths": [
+        "rm65_dual_arm_hand_proxy_dmtac_strict.urdf"
+      ]
+    },
+    {
       "bundle_id": "inspire_gripper.tools",
       "relative_path": "inspire_gripper",
       "required_by_default": false,

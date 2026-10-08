@@ -342,7 +342,100 @@ capture group、相机/Station frame identity 和三个齐次矩阵共同闭合�
 measured qpos 和既有 coupled FK owner 发布。render 请求只读取已经发布的不可变 pose cut，调用方
 不能注入相机位姿。默认 mount URDF 为：
 
-该组合还可额外传入 `--enable-point-grasp-arm-reachability`，此时注册显式升级的
+```text
+assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf
+```
+
+本流程使用 `robot_motion/configs/rm65_camera_registry_v4.json`：它登记 v4 主相机标定和上述详细
+URDF placement，同时保留现场已验证的左右腕相机 serial 绑定。组合成功时 render 的可选角色严格为
+`main`、`wrist_left`、`wrist_right`；腕部 pose 缺失、过期、晚于当前时刻或与图像采集时间偏差过大
+都会 fail closed。启动这个组合会连接双 RM65 并建立 startup HOLD，因此不能把它当作 camera-only
+验收入口；离线测试也不构成真机坐标或运动验收。
+
+### 可选：静止多视角观测与抓姿 v4
+
+组合真机 Gateway 在启用 GraspGenX 的前提下，可额外传入
+`--enable-grasp-observation`。默认不启用，原 v2/v3 的请求和运行方式不变。
+启用后新增只读 `perception.capture_grasp_observation@1`，并将当前抓姿 Route 显式注册为
+`perception.plan_point_grasp@4`。流程如下：
+
+1. 采集 Skill 接受 `selected_roles`，保留相关 RGB-D、部署内外参、采集附近的双臂 qpos
+   及同一张 RGB 的预览 Artifact。缺帧视角列入 `excluded_views`；所有视角不可用时失败。
+2. 从某张保留的图像选目标；`main`、`wrist_left`、`wrist_right` 均可作为主视角。
+   v4 请求在原参数之外必填 `observation_operation_id` 和 `view_policy`（`single` 或 `auto`），
+   只能引用本 session、同一 Station revision 下仍保留的成功采集 operation，不能注入外参。
+3. `single` 只用选中视角；`auto` 先把目标表面投影到辅助视角，检查观测深度及分割对应关系，
+   再融合有效的目标/环境点。遮挡、视野外、深度不匹配、跨视角超过 200 ms 等均有排除原因。
+   辅助目标若与主视角确认的背景冲突，也不能把背景改标为可接触目标。
+   没有关联上目标的视角，第一阶段整幅排除，不将其目标误标成背景。
+4. 沿用生产深度去噪、捕获时自体过滤及 4 mm 体素降采样；目标和背景分别保留。
+   点击视角先按 14 mm 邻接距离检查目标深度连通分量；仅保留包含点击深度且占至少 80%
+   目标体素的主体。分离的深度岛改标为背景，原观测几何仍参与碰撞检查，不通过删点制造空隙。
+   点击落在小分量或目标严重分裂时明确拒绝，不擅自换选另一个物体。
+   GraspGenX **一次推理**使用融合后的目标点，候选碰撞预筛使用对应融合场景。
+   路径规划读取同一份保留的融合点云，不退回只用主视角深度重新建场景。
+
+RPent 手动入口的对应显式选项是 `--grasp-view-policy single|auto`；`legacy` 为原默认模式。
+搭配 `--debug-target-image-click` 可在同一个拼图窗口选择任一可用视角的目标，坐标会映射回
+该视角原图。此组合直接使用人工点击，不另外运行文本检测；非点击模式保留选定视角的
+文本检测/终端 UV 选择。单击图像以外的标题或空白区域不会提交目标。
+`--graspgenx-wrist-multiview` 对应 `auto`，不再要求主视角必须为 `main`。
+
+新采集证据为 `grasp_observation.zip`；新抓姿场景为
+`dexteleop.perception.grasp_multiview_snapshot.v1`，内含各视角原始 RGB-D、目标 mask、元数据和
+实际使用的融合点云/标签。结果 `view_fusion` 说明每个参与关联的视角是否采用及原因。
+原 `perception.render_point_grasp_candidate@1` 仍是单独的实时投影渲染；不是深度遮挡检查，
+其新图像不参与本次冻结观测的推理或规划。
+
+边界：这不是移动中的多视角建图或主动找视角。使用已有 lower 发布的 FK/qpos 历史，要求
+两臂在采集附近至少有 100 ms 的连续稳定证据（关节跨度不超过 0.002 rad），并保持原有
+250 ms pose age、150 ms 图像/pose 偏差校验；不把接收时间冒充精确曝光时间。
+无足够静止历史或检测到运动时拒绝，不发 HOLD、STOP 或位姿命令来制造静止。
+没有持续跟踪目标，也不保证观测之后场景不变：物体/机械臂状态变化后应重新采集、选点、规划。
+保持已有独立规划、确认执行、碰撞、状态新鲜度和力保护；融合成功不等于可安全执行或抓取成功。
+合成测试覆盖主相机不可用、腕部作为点击视角、辅助视角遮挡/视野外、运动/过期及背景标签保护。
+另外已经使用只读双腕 RGB-D/qpos 和真实 SAM2/GraspGenX 权重做冻结回放：左腕可见蓝色方块，
+右腕不含目标，主相机当次因设备出帧失败不可用。该记录验证了腕部独立观测和深度岛修复，
+不是三相机融合增益、完整路径或实际抓取成功的验收。
+
+#### 无运动实验与左右臂对照
+
+只读硬件授权下不要启动会初始化 HOLD 的手动 Gateway。使用
+`codex_remote/remote_rm65_grasp_snapshot.sh` 限定探针获取 RGB-D/qpos；它不发送运动、HOLD、STOP、
+夹爪或相机 reset。原始数据保留相机内参、设备时间与主机接收时间、双臂关节序列及清理结果。
+模型测试由 `remote_grasp_snapshot_inference.sh` 在已保存数组上运行，不再次连接设备。
+采集探针复用 rule-base / real-teleop 的 `RealSenseRGBSource` 和串行启动/反序关闭流程，
+按配置优先级错峰启动并持续取帧；软件重试预算由共享生命周期管理，没有另一套原生 pipeline
+预热/轮询循环。保留颜色传输格式、分辨率、帧率和 RGB-D 对齐，保存图像统一转换为 RGB。
+始终禁用三种 hardware-reset 配置及曝光参数写入；诊断读取 source 缓存，不追加原生 SDK 查询。
+只有相机连续新鲜帧检查通过后才连接双臂，避免相机启动阻塞连带保留机械臂连接。
+阶段和初始 qpos 实时写入 `capture_stages.jsonl`；帧数据与 `snapshot.json` 在设备关闭前保存，
+主错误、清理错误分别保留。若原生 USB 调用卡在 Linux D 状态，外层 60 s timeout 仍不能保证
+进程退出；启动超时终止本批次，不继续开相机或连接双臂，也不自动重置设备。
+`cleanup_complete=false` 不能解释为设备已释放。`captured` 只证明可用视角已完成静止采集且清理
+成功，缺失视角列在 `missing_roles`，只有 `all_views_captured=true` 才表示三个视角都保存了五帧，
+仍不代表三视角融合、规划或真实抓取验收。RGB-D 同帧，接收/可用/设备时间分别保留，
+不会用读取缓存的当前时间把旧帧伪装成新帧。
+
+离线多视角回放可重复传入 `--aux-segmentation DIR`，使用 `infer_frozen_grasp.py` 保存的真实辅助视角
+分割。目录中的 RGB 数组和关联种子必须与请求逐一匹配；缺少/错配分割不能用全图 mask 冒充成功融合。
+
+`scripts/probes/replay_bimanual_grasp_snapshot.py` 以冻结 RGB-D、目标 mask、原始关节状态和对应
+模型输出进行本地离线对照，`--sides left right` 分别建立左右臂的工具/包络、臂基座方向先验、
+候选筛选、IK、局部接近与完整路径请求。相机角色不决定执行臂，也不镜像另一臂的抓姿或 IK。
+固定另一臂的实际关节状态参与碰撞；一侧规划失败不阻止另一侧产生诊断。
+真实点云需要 `--refine-target-depth`；保留模型输出必须与它逐点匹配，并通过 `--model-manifest`
+传入实际推理生产者的 manifest。`--diagnose-endpoints` 额外保留少量终点失败细节，不改变候选选择。
+
+每侧结果单独保存候选池、起点碰撞、筛选漏斗、耗时和路径状态。`no_admitted_candidate` 是预算内
+没有方案，不是物体物理上不可抓；`path_found` 才能声明已找到本次离线路径。局部验证在同一次
+候选请求内复用固定终点的 IK 搜索，不跨候选/观测/左右臂缓存；不同预抓取距离仍各自验证接近段。
+此工具不注册双臂自动执行 Skill，不向设备下发任何轨迹。实时接口仍保持当前部署的单臂授权与
+独立执行确认；离线双臂对照不扩大实时运动权限。
+
+### 可选端点可达性注释（v3，或 v4 的同名选项）
+
+未启用冻结观测时，该组合还可额外传入 `--enable-point-grasp-arm-reachability`，此时注册显式升级的
 `perception.plan_point_grasp@3`；未传入时仍注册原样的 v2，Definition、Schema、Route、Profile 与
 Binding hash 均不改变。v3 请求增加必填布尔量 `include_arm_reachability`：为 `false` 时不调用 IK，
 结果仍不带可达性字段；为 `true` 时，从同一份新鲜双臂 measured-qpos 快照出发，经现有 FrameGraph
@@ -353,16 +446,6 @@ Binding hash 均不改变。v3 请求增加必填布尔量 `include_arm_reachabi
 `difficult_to_reach`，同时返回实际残差、cycle 数和终止原因。该字段只用于筛选提示，不改变模型分数、
 候选顺序或选择权；它也不检查整条路径，不证明无碰撞、可执行或抓取成功。qpos 不存在、过期或帧身份
 不一致时整个带注释请求 fail closed，而不是把未知状态误报为不可达。
-
-```text
-assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf
-```
-
-本流程使用 `robot_motion/configs/rm65_camera_registry_v4.json`：它登记 v4 主相机标定和上述详细
-URDF placement，同时保留现场已验证的左右腕相机 serial 绑定。组合成功时 render 的可选角色严格为
-`main`、`wrist_left`、`wrist_right`；腕部 pose 缺失、过期、晚于当前时刻或与图像采集时间偏差过大
-都会 fail closed。启动这个组合会连接双 RM65 并建立 startup HOLD，因此不能把它当作 camera-only
-验收入口；离线测试也不构成真机坐标或运动验收。
 
 双臂 observation 不再串行等待两个控制器后才检查第一臂的新鲜度，而是对两个独立 RM65 backend
 并行发起硬件读取，再在同一个 causal cutoff 下选择结果。每臂 `0.2 s` freshness 上限保持不变；
@@ -476,6 +559,45 @@ GraspGenX 与 DMTAC M 已共享 +Z 接近、+X 闭合的模型基座约定；适
 registry。生产 Skill 只广告当前部署已经具备可信 RGB 和相机 pose 的角色。camera-only profile
 仍只有具备静态外参和 aligned depth 的 `main`；组合 `real-rm65` 则由同一 lower owner 提供两个腕部
 的动态 FK pose，因此可额外广告 `wrist_left`/`wrist_right`。任何角色都不能仅靠调用方字符串启用。
+
+## 抓后物体目标规划（可选，只读）
+
+`perception.plan_object_move@1` 在显式装配后提供物体中心的 Motion Plan：
+已有抓姿/到达/夹爪 Skill → 抓后位姿与夹持验证 → 手物相对变换 → 物体目标位姿 → 携物路径规划。
+它不把“闭爪命令完成”解释为抓取成功，不自动试抬、开闭夹爪、执行搬运或放置。
+现有真机 CLI 默认不广告此能力；缺少抓后观测提供者时不能仅加一个开关启用。
+
+参数为 `object_id`、`side`、`reference_frame_id`、16 个 row-major 数值的
+`T_reference_from_object_goal` 和 `speed_scale`。目标位姿是**物体**的目标，不是 TCP 目标。
+若抓后观测给出 `T_reference_from_tool` 与 `T_reference_from_object`，则
+`T_tool_from_object = inv(T_reference_from_tool) @ T_reference_from_object`，
+`T_reference_from_tool_goal = T_reference_from_object_goal @ inv(T_tool_from_object)`。
+物体坐标必须是稳定的实体坐标；对称性/遮挡造成的不可观测方向不能由包围盒任意决定。
+请求、观测、场景、求解器必须使用同一已绑定参考系；本入口不猜测坐标系，也不自动投影或裁剪目标。
+
+装配入口为 `build_object_transport_registration`，把注册传入
+`build_real_agent_primitive_contract_bundle(object_transport_registration=...)`，再向
+`assemble_real_agent_primitive_gateway_session` 传入 `held_object_observer` 和
+`object_transport_planner_factory`。前者必须提供相关联的 `GraspedObjectObservation` 和
+`ObstacleSceneSnapshot`；后者每次构造独立的 `RM65ObjectTransportPlanner`。
+观测来自部署绑定的提供者，调用方不得在 Skill 参数中伪造附着关系、夹持证据或删除障碍。
+
+- 抓后观测包含双臂 qpos、工具/物体位姿、完整保守的物体定向包围盒、位姿及夹持证据引用；
+  同次观测必须相关联且不超过 200 ms。必须已经离开支撑面；初始离桌接触转换不属于这个自由空间搬运规划器。
+- `verify_rigid_follow` 检查已有、独立授权运动前后的手物关系；静止两帧不能证明抓稳。
+  位姿引用和夹持引用由可信观测提供者承担证据责任，非空字符串本身不构成物理证明。
+- 只按目标物体身份移除原世界占据；保留桌面、邻物、另一臂及固定场景结构。携物几何会随工具旋转和平移。
+- 复用当前稀疏 proxy 碰撞对、IK、路径搜索、C2 时间参数化及最终稠密复查，不改安全包络和 clearance。
+  仅所选臂的手部 proxy 作为已验证夹持的接触伙伴豁免；这些粗 proxy **不能证明指腹/掌部接触细节**，
+  不能把本规划结果当成首次抓取质量验证。未知或不完整的物体几何拒绝规划。
+- 成功返回不可变 NPZ（双臂 qpos、时间、手物关系、目标与验证信息）；`execution_authorized=false`。
+  它不是 `motion.execute_grasp_approach_plan` 的令牌，不可借用该 Skill 直接执行搬运。
+
+当前验证分开计量：原生 RM65 左右臂/两种 proxy profile 的规划测试；Gateway 注册、拒绝和 Artifact
+测试；MuJoCo 简化平行夹爪物理试抬/绕障搬运测试。最后一项使用仿真真值位姿、自由物体（无物体焊接约束），
+不是 DMTAC 真机抓取成功证明，也不是视觉 6D 位姿模型验收。
+暂未部署新的真机位姿模型。[FoundationPose](https://github.com/NVlabs/FoundationPose) 可作为后续提供者，
+但需要 CAD，或先准备参考图像/物体表示；单帧分割与可见点云不能代替完整物体几何。
 
 ## 已知局限
 

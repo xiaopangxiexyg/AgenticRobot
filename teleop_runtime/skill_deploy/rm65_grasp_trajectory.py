@@ -5,17 +5,19 @@ from __future__ import annotations
 import math
 import threading
 import time
-from robot_motion.grasp_visible_scene import VisibleGraspScene
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from itertools import pairwise
+from pathlib import Path
 from typing import NoReturn
+from zipfile import BadZipFile
 
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.grasp_visible_scene import VisibleGraspScene
 from robot_motion.joint_limits import load_joint_velocity_limit_profiles
 from robot_motion.path_planning import (
     JointConfigurationCheck,
@@ -25,29 +27,92 @@ from robot_motion.path_planning import (
     plan_collision_aware_joint_path,
 )
 from robot_motion.pose import pose_delta_metrics
+from robot_motion.position_control.horizon_governor import JointHorizonLimits
+from robot_motion.position_control.offline_waypoint_trajectory import (
+    OFFLINE_WAYPOINT_TIMING_SAFE_RETIME_GLOBAL,
+    OfflineWaypointTrajectoryInfeasibleError,
+    build_offline_quintic_waypoint_trajectory,
+)
 from robot_motion.rm65 import (
+    DEFAULT_GRASP_PATH_COLLISION_SCENE,
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
     RM65_ABSOLUTE_Q_MAX_RAD,
     RM65_ABSOLUTE_Q_MIN_RAD,
-    RM65DualArmCollisionIKConfig,
+    RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
     build_dual_arm_scene_profile,
-    build_rm65_dual_arm_collision_ik_solver,
 )
 from robot_motion.rm65.obstacle_collision import (
     RM65_D405_ATTACHED_COLLISION_PROXIES,
     RM65ObstacleCollisionOracle,
+    build_rm65_profile_obstacle_collision_oracle,
 )
 from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 
+from .grasp_trajectory_record import write_grasp_trajectory_record
 from .motion_port import RealAgentJointTrajectory
+from .rm65_ports import RM65SkillTargetBuilder
 from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
 
 _SIDES = ("left", "right")
-_STRICT_SCENE_PROFILE = "dual_arm_hand_proxy_grasp_full"
+_PATH_COLLISION_SCENE_PROFILE = DEFAULT_GRASP_PATH_COLLISION_SCENE
+_DMTAC_PATH_COLLISION_SCENE_PROFILE = "dual_arm_hand_proxy_dmtac_strict"
 RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC = 120.0
-RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M = 0.005
+# The capture-time CAD/depth filter is accurate to a bounded image/depth
+# neighbourhood, but DMTAC points at the pad-height silhouette can still land
+# just outside the analytic open-gripper proxy after reprojection.  Six
+# millimetres covers the measured 5.2--6.0 mm boundary residual while remaining
+# below the 19.9 mm finger thickness.  This margin applies only at the captured
+# robot pose, never to arbitrary world points along the planned path, and target
+# labels remain immutable.
+RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M = 0.006
+RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M = 0.006
+RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG = 3.0
+RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP = "segmented_stop"
+RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2 = "continuous_c2"
+RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES = (
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
+)
+RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM = "uniform"
+RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X = (
+    "far_4x_approach_1x"
+)
+RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES = (
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM,
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X,
+)
+RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE = "joint_distance"
+RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME = (
+    "estimated_execution_time"
+)
+RM65_GRASP_ENDPOINT_ORDER_MODES = (
+    RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE,
+    RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME,
+)
+# A failed fixed-orientation pregrasp is a local-route rejection, not proof
+# that the terminal grasp target is unreachable.  These failures may fall
+# back to the existing global target search; unavailable checks, a blocked
+# measured start, and exhausted global time must remain terminal.
+_RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS = frozenset(
+    {
+        "ik_search_exhausted",
+        "approach_ik_search_exhausted",
+        "approach_branch_discontinuous",
+        "endpoint_collision_blocked",
+        "endpoint_clearance_blocked",
+        "endpoint_safety_envelope_blocked",
+        "approach_endpoint_collision_blocked",
+        "approach_endpoint_clearance_blocked",
+        "approach_endpoint_safety_envelope_blocked",
+        "path_search_exhausted",
+        "path_target_collision_blocked",
+        "path_collision_blocked",
+        "path_target_safety_envelope_blocked",
+        "target_safety_envelope_blocked",
+    }
+)
 
 
 class RM65GraspTrajectoryPlanningError(RuntimeError):
@@ -75,7 +140,8 @@ class RM65GraspTrajectoryPlanningConfig:
     approach_waypoint_spacing_m: float = 0.005
     maximum_approach_joint_step_rad: float = float(np.deg2rad(12.0))
     maximum_approach_lateral_error_m: float = 0.002
-    maximum_approach_orientation_error_deg: float = 1.0
+    pregrasp_orientation_tolerance_deg: float = 3.0
+    maximum_approach_orientation_error_deg: float = 3.0
     approach_progress_tolerance_m: float = 0.0005
     maximum_endpoint_solve_cycles: int = 180
     endpoint_seed_count: int = 24
@@ -92,6 +158,14 @@ class RM65GraspTrajectoryPlanningConfig:
     maximum_path_envelope_ingress_distance_m: float = 0.16
     path_envelope_ingress_progress_tolerance_m: float = 0.002
     path_envelope_ingress_tangent_tolerance_m: float = 0.0005
+    singularity_soft_margin_deg: float = 6.0
+    singularity_replay_slowdown: float = 0.5
+    trajectory_parameterization: str = (
+        RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP
+    )
+    trajectory_speed_profile: str = RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM
+    endpoint_candidate_ordering: str = RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE
+    allow_unconstrained_terminal_fallback: bool = False
     path_envelope_ingress_waypoint_fractions: tuple[float, ...] = (
         0.05,
         0.10,
@@ -100,6 +174,8 @@ class RM65GraspTrajectoryPlanningConfig:
     )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.allow_unconstrained_terminal_fallback, bool):
+            raise ValueError("allow_unconstrained_terminal_fallback must be bool.")
         for name in (
             "minimum_clearance_m",
             "linear_speed_m_s",
@@ -111,6 +187,7 @@ class RM65GraspTrajectoryPlanningConfig:
             "approach_waypoint_spacing_m",
             "maximum_approach_joint_step_rad",
             "maximum_approach_lateral_error_m",
+            "pregrasp_orientation_tolerance_deg",
             "maximum_approach_orientation_error_deg",
             "approach_progress_tolerance_m",
             "endpoint_position_tolerance_m",
@@ -123,11 +200,64 @@ class RM65GraspTrajectoryPlanningConfig:
             "maximum_path_envelope_ingress_distance_m",
             "path_envelope_ingress_progress_tolerance_m",
             "path_envelope_ingress_tangent_tolerance_m",
+            "singularity_soft_margin_deg",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
             object.__setattr__(self, name, value)
+        if (
+            self.pregrasp_orientation_tolerance_deg
+            > self.maximum_approach_orientation_error_deg
+        ):
+            raise ValueError(
+                "pregrasp orientation tolerance must fit the approach bound."
+            )
+        if (
+            self.pregrasp_orientation_tolerance_deg
+            < self.endpoint_orientation_tolerance_deg
+        ):
+            raise ValueError(
+                "pregrasp orientation tolerance must not be stricter than "
+                "the terminal endpoint tolerance."
+            )
+        if self.singularity_soft_margin_deg <= RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG:
+            raise ValueError(
+                "singularity_soft_margin_deg must exceed the hard threshold."
+            )
+        slowdown = float(self.singularity_replay_slowdown)
+        if not math.isfinite(slowdown) or not 0.0 < slowdown <= 1.0:
+            raise ValueError("singularity_replay_slowdown must be in (0, 1].")
+        object.__setattr__(self, "singularity_replay_slowdown", slowdown)
+        parameterization = str(self.trajectory_parameterization).strip().lower()
+        if parameterization not in RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES:
+            raise ValueError(
+                "trajectory_parameterization must be one of "
+                f"{RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES}."
+            )
+        object.__setattr__(
+            self,
+            "trajectory_parameterization",
+            parameterization,
+        )
+        speed_profile = str(self.trajectory_speed_profile).strip().lower()
+        if speed_profile not in RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES:
+            raise ValueError(
+                "trajectory_speed_profile must be one of "
+                f"{RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES}."
+            )
+        object.__setattr__(self, "trajectory_speed_profile", speed_profile)
+        endpoint_ordering = str(self.endpoint_candidate_ordering).strip().lower()
+        if endpoint_ordering not in RM65_GRASP_ENDPOINT_ORDER_MODES:
+            raise ValueError(
+                "endpoint_candidate_ordering must be one of "
+                f"{RM65_GRASP_ENDPOINT_ORDER_MODES}."
+            )
+        object.__setattr__(
+            self,
+            "endpoint_candidate_ordering",
+            endpoint_ordering,
+        )
         if self.minimum_pregrasp_distance_m > self.pregrasp_distance_m:
             raise ValueError(
                 "minimum_pregrasp_distance_m must not exceed pregrasp_distance_m."
@@ -272,6 +402,50 @@ class RM65GraspReachabilityResult:
 
 
 @dataclass(frozen=True)
+class RM65GraspLocalChainResult:
+    """Read-only admission result for the production pregrasp and approach."""
+
+    feasible: bool
+    selected_pregrasp_distance_m: float | None
+    branch_count: int
+    elapsed_ms: float
+    reason_code: str | None
+    attempts: tuple[Mapping[str, object], ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "feasible": self.feasible,
+            "selected_pregrasp_distance_m": self.selected_pregrasp_distance_m,
+            "branch_count": self.branch_count,
+            "elapsed_ms": self.elapsed_ms,
+            "reason_code": self.reason_code,
+            "attempts": [dict(item) for item in self.attempts],
+        }
+
+
+@dataclass(frozen=True)
+class RM65GraspEndpointProbeResult:
+    """Advisory terminal IK/clearance evidence used to order candidates.
+
+    A negative probe is never a physical rejection: its small wall-time budget
+    can miss an IK branch.  The production local-chain validator remains the
+    admission authority.
+    """
+
+    classification: str
+    elapsed_ms: float
+    reason_code: str | None
+    best_minimum_distance_m: float | None
+    attempted_seed_count: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            field_name: getattr(self, field_name)
+            for field_name in self.__dataclass_fields__
+        }
+
+
+@dataclass(frozen=True)
 class _EndpointIKCandidate:
     qpos_by_side: Mapping[str, np.ndarray]
     seed_index: int
@@ -319,7 +493,7 @@ class _TargetEnvelopePathOracle:
     ) -> None:
         self._collision_oracle = collision_oracle
         self._envelope_check = envelope_check
-        self.scene_hash = getattr(collision_oracle, "scene_hash")
+        self.scene_hash = collision_oracle.scene_hash
 
     def check(
         self,
@@ -363,17 +537,66 @@ class _TargetEnvelopePathOracle:
         return collision_check
 
 
+def _terminal_target_contact_region(
+    *,
+    tool_tcp_world: np.ndarray,
+    terminal_tool_tcp_world: np.ndarray,
+    position_tolerance_m: float,
+    orientation_tolerance_deg: float,
+) -> tuple[bool, float, float]:
+    position_error_m, orientation_error_deg = pose_delta_metrics(
+        tool_tcp_world,
+        terminal_tool_tcp_world,
+    )
+    return (
+        position_error_m <= position_tolerance_m
+        and orientation_error_deg <= orientation_tolerance_deg,
+        position_error_m,
+        orientation_error_deg,
+    )
+
+
 class _VisibleGripperPathOracle:
     """Compose observed gripper solids with, never replace, canonical safety."""
     def __init__(self, *, oracle: object, visible_scene: VisibleGraspScene,
-                 target_builder: RM65SkillTargetBuilder, side: str) -> None:
+                 target_builder: RM65SkillTargetBuilder, side: str,
+                 terminal_tool_tcp_world: np.ndarray | None = None,
+                 terminal_position_tolerance_m: float = (
+                     RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M
+                 ),
+                 terminal_orientation_tolerance_deg: float = 1.0) -> None:
         self.oracle = oracle
         self.visible_scene = visible_scene
         self.target_builder = target_builder
         self.side = side
+        self.terminal_tool_tcp_world = (
+            None
+            if terminal_tool_tcp_world is None
+            else np.asarray(terminal_tool_tcp_world, dtype=float).copy()
+        )
+        self.terminal_position_tolerance_m = float(
+            terminal_position_tolerance_m
+        )
+        self.terminal_orientation_tolerance_deg = float(
+            terminal_orientation_tolerance_deg
+        )
         self.scene_hash = canonical_content_hash({
             "production_scene_hash": oracle.scene_hash,
             "visible_scene_hash": visible_scene.semantic_content_hash,
+            "terminal_contact_target": (
+                None
+                if self.terminal_tool_tcp_world is None
+                else self.terminal_tool_tcp_world.reshape(-1).tolist()
+            ),
+            "terminal_contact_depth_m": (
+                RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M
+            ),
+            "terminal_contact_position_tolerance_m": (
+                self.terminal_position_tolerance_m
+            ),
+            "terminal_contact_orientation_tolerance_deg": (
+                self.terminal_orientation_tolerance_deg
+            ),
         }, domain="dexteleop.motion.composed_grasp_scene.v1")
 
     def check(self, qpos_by_component: Mapping[str, np.ndarray]) -> JointConfigurationCheck:
@@ -384,9 +607,31 @@ class _VisibleGripperPathOracle:
         pose = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
             left_qpos=qpos_by_component["left"], right_qpos=qpos_by_component["right"]
         )[self.side]
-        target_hits, background_hits = self.visible_scene.collision_counts(
-            pose, opening_m=self.visible_scene.geometry.maximum_opening_m
-        )
+        terminal_contact_points = 0
+        terminal_contact_allowed = False
+        if self.terminal_tool_tcp_world is not None:
+            terminal_contact_allowed, _, _ = _terminal_target_contact_region(
+                tool_tcp_world=pose,
+                terminal_tool_tcp_world=self.terminal_tool_tcp_world,
+                position_tolerance_m=self.terminal_position_tolerance_m,
+                orientation_tolerance_deg=(
+                    self.terminal_orientation_tolerance_deg
+                ),
+            )
+        if terminal_contact_allowed:
+            (
+                target_hits,
+                terminal_contact_points,
+                background_hits,
+            ) = self.visible_scene.collision_counts_with_terminal_target_contact(
+                pose,
+                opening_m=self.visible_scene.geometry.maximum_opening_m,
+                contact_depth_m=RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M,
+            )
+        else:
+            target_hits, background_hits = self.visible_scene.collision_counts(
+                pose, opening_m=self.visible_scene.geometry.maximum_opening_m
+            )
         if not target_hits and not background_hits:
             return check
         return JointConfigurationCheck(
@@ -394,7 +639,9 @@ class _VisibleGripperPathOracle:
             reason="visible_gripper_path_collision",
             metadata={"production_collision_check": check.to_dict(),
                       "target_collision_points": target_hits,
-                      "background_collision_points": background_hits},
+                      "background_collision_points": background_hits,
+                      "terminal_target_contact_points": terminal_contact_points,
+                      "terminal_contact_allowed": terminal_contact_allowed},
         )
 
 
@@ -412,6 +659,7 @@ class RM65GraspJointTrajectoryPlanner:
         config: RM65GraspTrajectoryPlanningConfig | None = None,
         planner_config: JointPathPlannerConfig | None = None,
         reachability_config: RM65GraspReachabilityConfig | None = None,
+        trajectory_record_dir: str | Path | None = None,
     ) -> None:
         if not isinstance(profile, ResolvedExclusiveRM65SkillDeploymentProfile):
             raise TypeError("profile must be resolved and typed.")
@@ -432,14 +680,29 @@ class RM65GraspJointTrajectoryPlanner:
         self.target_envelope_filter = target_envelope_filter
         self.config = config or RM65GraspTrajectoryPlanningConfig()
         self.reachability_config = reachability_config or RM65GraspReachabilityConfig()
+        if trajectory_record_dir is None:
+            self.trajectory_record_dir = None
+        else:
+            record_dir = Path(trajectory_record_dir)
+            if not record_dir.is_dir() or record_dir.is_symlink():
+                raise ValueError("trajectory_record_dir must be an existing real directory.")
+            self.trajectory_record_dir = record_dir
         self._solver_lock = threading.Lock()
         self.planner_config = planner_config or JointPathPlannerConfig(
             shortcut_attempts=80,
             adaptive_edge_resolution_rad=self.config.final_edge_resolution_rad,
             adaptive_refinement_distance_m=0.03,
         )
-        strict_profile = build_dual_arm_scene_profile(_STRICT_SCENE_PROFILE)
-        fixed_obstacles = fixed_scene_aabb_obstacles(strict_profile)
+        self.path_collision_scene_profile = (
+            _DMTAC_PATH_COLLISION_SCENE_PROFILE
+            if profile.collision_scene_profile
+            == _DMTAC_PATH_COLLISION_SCENE_PROFILE
+            else _PATH_COLLISION_SCENE_PROFILE
+        )
+        path_profile = build_dual_arm_scene_profile(
+            self.path_collision_scene_profile
+        )
+        fixed_obstacles = fixed_scene_aabb_obstacles(path_profile)
         required = {
             "fixed-scene:camera_pole",
             "fixed-scene:left_camera_pole",
@@ -453,8 +716,8 @@ class RM65GraspJointTrajectoryPlanner:
         frame_hash = canonical_content_hash(
             {
                 "deployment_profile_hash": profile.semantic_content_hash,
-                "collision_scene_profile": _STRICT_SCENE_PROFILE,
-                "arm_collision_representation": "cad_convex_hulls_v1",
+                "collision_scene_profile": self.path_collision_scene_profile,
+                "arm_collision_representation": "ik_sparse_proxy_pairs_v1",
                 "fixed_obstacles": [item.to_dict() for item in fixed_obstacles],
             },
             domain="dexteleop.real_skill.rm65_fixed_obstacle_frame.v1",
@@ -466,63 +729,17 @@ class RM65GraspJointTrajectoryPlanner:
             obstacles=fixed_obstacles,
             minimum_clearance_m=self.config.minimum_clearance_m,
         )
-        collision_bundle = build_rm65_dual_arm_collision_ik_solver(
-            RM65DualArmCollisionIKConfig(scene_profile=_STRICT_SCENE_PROFILE)
-        )
-        self._use_convex_arm_meshes(collision_bundle.solver.robot.collision_model)
-        self.oracle = RM65ObstacleCollisionOracle.from_solver(
-            collision_bundle.solver,
+        # The reviewed IK profile's sparse pairs are authoritative for both
+        # search and final path admission. This deliberately does not certify
+        # full arm-mesh or finger-mesh clearance.
+        self.oracle = build_rm65_profile_obstacle_collision_oracle(
+            scene_profile=self.path_collision_scene_profile,
             scene=self.scene,
-            solution_layout=collision_bundle.scene_profile.solution_layout,
             expected_reference_frame_id=self.scene.reference_frame_id,
             expected_reference_frame_spec_hash=self.scene.reference_frame_spec_hash,
             attached_box_proxies=RM65_D405_ATTACHED_COLLISION_PROXIES,
+            use_profile_proxy_geometry=True,
         )
-
-    @staticmethod
-    def _use_convex_arm_meshes(collision_model: object) -> None:
-        """Match MuJoCo's conservative CAD collision representation, not triangles.
-
-        The collision bundle is private to this planner.  The oracle clones it
-        afterward; the live IK solver and on-disk meshes are not modified.
-        """
-
-        expected = {
-            f"{prefix}arm_link{index}_0"
-            for prefix in ("", "right_")
-            for index in range(1, 7)
-        }
-        geometries = {
-            str(geometry.name): geometry
-            for geometry in collision_model.geometryObjects
-            if str(geometry.name) in expected
-        }
-        if set(geometries) != expected:
-            raise RM65GraspTrajectoryPlanningError(
-                "arm_collision_model_unavailable",
-                details={"missing_geometries": sorted(expected - set(geometries))},
-            )
-        for name, geometry in geometries.items():
-            mesh = geometry.geometry
-            try:
-                # A false return can mean the hull was already cached.  The
-                # actual postcondition is a retained, non-null convex shape.
-                mesh.buildConvexHull(True, "Qt")
-                hull = mesh.convex
-            except (AttributeError, RuntimeError, ValueError) as error:
-                raise RM65GraspTrajectoryPlanningError(
-                    "arm_collision_model_unavailable",
-                    details={
-                        "geometry_name": name,
-                        "exception_type": type(error).__name__,
-                    },
-                ) from error
-            if hull is None:
-                raise RM65GraspTrajectoryPlanningError(
-                    "arm_collision_model_unavailable",
-                    details={"geometry_name": name, "reason": "convex_hull_missing"},
-                )
-            geometry.geometry = hull
 
     def _remaining_path_planning_time_sec(
         self,
@@ -741,7 +958,8 @@ class RM65GraspJointTrajectoryPlanner:
     def _path_search_oracle(self, *, planning_phase: str,
                             visible_scene: VisibleGraspScene | None = None,
                             side: str | None = None,
-                            start_qpos_by_side: Mapping[str, np.ndarray] | None = None) -> object:
+                            start_qpos_by_side: Mapping[str, np.ndarray] | None = None,
+                            terminal_tool_tcp_world: np.ndarray | None = None) -> object:
         collision_oracle = self.oracle
         if isinstance(collision_oracle, RM65ObstacleCollisionOracle):
             refinement = (
@@ -781,6 +999,16 @@ class RM65GraspJointTrajectoryPlanner:
             return _VisibleGripperPathOracle(
                 oracle=oracle, visible_scene=visible_scene,
                 target_builder=self.target_builder, side=side,
+                terminal_tool_tcp_world=terminal_tool_tcp_world,
+                terminal_position_tolerance_m=(
+                    max(
+                        self.config.endpoint_position_tolerance_m,
+                        RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M,
+                    )
+                ),
+                terminal_orientation_tolerance_deg=(
+                    self.config.endpoint_orientation_tolerance_deg
+                ),
             )
         return oracle
 
@@ -837,6 +1065,538 @@ class RM65GraspJointTrajectoryPlanner:
         if values[-1] > minimum + 1e-12:
             values.append(minimum)
         return tuple(values)
+
+    def pregrasp_distance_candidates(self) -> tuple[float, ...]:
+        """Expose the exact production approach distances for read-only admission."""
+
+        return self._pregrasp_distance_candidates()
+
+    def pregrasp_target_pose(
+        self,
+        target_tool_tcp_world: np.ndarray,
+        *,
+        distance_m: float,
+    ) -> np.ndarray:
+        """Build the same pregrasp pose used by production path planning."""
+
+        return self._pregrasp_target_pose(
+            target_tool_tcp_world,
+            distance_m=distance_m,
+        )
+
+    def _singularity_interval_scale(
+        self,
+        start_qpos: np.ndarray,
+        end_qpos: np.ndarray,
+    ) -> float:
+        """Return the established soft singularity slowdown for one path edge."""
+
+        start = np.asarray(start_qpos, dtype=float).reshape(6)
+        end = np.asarray(end_qpos, dtype=float).reshape(6)
+        distances: list[float] = []
+        for joint_index in (2, 4):
+            left = float(start[joint_index])
+            right = float(end[joint_index])
+            distances.append(
+                0.0
+                if left == 0.0 or right == 0.0 or left * right < 0.0
+                else min(abs(left), abs(right))
+            )
+        distance_rad = min(distances)
+        hard_rad = math.radians(RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG)
+        soft_rad = math.radians(self.config.singularity_soft_margin_deg)
+        maximum_scale = 1.0 / self.config.singularity_replay_slowdown
+        if distance_rad <= hard_rad:
+            return maximum_scale
+        if distance_rad >= soft_rad:
+            return 1.0
+        fraction = (soft_rad - distance_rad) / (soft_rad - hard_rad)
+        return 1.0 + fraction * (maximum_scale - 1.0)
+
+    def _ordered_endpoint_candidates(
+        self,
+        *,
+        candidates: tuple[_EndpointIKCandidate, ...],
+        current_qpos: np.ndarray,
+        side: str,
+    ) -> tuple[_EndpointIKCandidate, ...]:
+        """Order valid IK branches without adding another path-search pass."""
+
+        current = np.asarray(current_qpos, dtype=float).reshape(6)
+        if self.config.endpoint_candidate_ordering == (
+            RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE
+        ):
+            return tuple(
+                sorted(
+                    candidates,
+                    key=lambda item: float(
+                        np.linalg.norm(
+                            np.asarray(item.qpos_by_side[side], dtype=float)
+                            - current
+                        )
+                    ),
+                )
+            )
+
+        velocity_profile_name = (
+            self.profile.position_profile.ik_execution.joint_velocity_limit_profile
+        )
+        velocity_profile = load_joint_velocity_limit_profiles()[
+            velocity_profile_name
+        ]
+        velocity_limit = np.deg2rad(
+            np.asarray(velocity_profile.max_velocity_deg_s, dtype=float)
+        )
+        if velocity_limit.shape != (6,) or not np.all(velocity_limit > 0.0):
+            raise ValueError(
+                "joint velocity profile must expose six positive limits."
+            )
+
+        def key(item: _EndpointIKCandidate) -> tuple[float, float, int]:
+            target = np.asarray(item.qpos_by_side[side], dtype=float)
+            delta = np.abs(target - current)
+            minimum_joint_time = float(np.max(delta / velocity_limit))
+            estimated_time = minimum_joint_time * self._singularity_interval_scale(
+                current,
+                target,
+            )
+            return estimated_time, float(np.linalg.norm(delta)), item.seed_index
+
+        return tuple(sorted(candidates, key=key))
+
+    def _segment_duration_diagnostics(
+        self,
+        *,
+        start: Mapping[str, np.ndarray],
+        end: Mapping[str, np.ndarray],
+        moving_side: str,
+        speed_scale: float,
+        joint_velocity_rad_s: np.ndarray,
+    ) -> tuple[float, dict[str, object]]:
+        """Compute the legacy conservative duration and name its active limiter."""
+
+        start_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=start["left"], right_qpos=start["right"]
+        )[moving_side]
+        end_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=end["left"], right_qpos=end["right"]
+        )[moving_side]
+        translation_m, rotation_deg = pose_delta_metrics(start_tcp, end_tcp)
+        delta = np.abs(
+            np.asarray(end[moving_side], dtype=float)
+            - np.asarray(start[moving_side], dtype=float)
+        )
+        candidates = {
+            "minimum_segment_duration": self.config.minimum_segment_duration_sec,
+            "tcp_translation": (
+                1.875
+                * translation_m
+                / (self.config.linear_speed_m_s * speed_scale)
+            ),
+            "tcp_rotation": (
+                1.875
+                * rotation_deg
+                / (self.config.angular_speed_deg_s * speed_scale)
+            ),
+            "joint_velocity": 1.875
+            * float(np.max(delta / joint_velocity_rad_s)),
+        }
+        duration = max(candidates.values())
+        active_limiters = tuple(
+            name
+            for name, value in candidates.items()
+            if math.isclose(value, duration, rel_tol=1e-9, abs_tol=1e-12)
+        )
+        return duration, {
+            "duration_sec": float(duration),
+            "active_limiters": active_limiters,
+            "limiter_duration_sec": {
+                name: float(value) for name, value in candidates.items()
+            },
+            "translation_m": float(translation_m),
+            "rotation_deg": float(rotation_deg),
+            "maximum_joint_delta_rad": float(np.max(delta)),
+        }
+
+    def _effective_trajectory_speed_scale(
+        self,
+        *,
+        base_speed_scale: float,
+        planning_phase: str,
+    ) -> float:
+        """Return the configured speed for a semantic trajectory phase.
+
+        The accelerated profile only affects the collision-checked far-field
+        ingress and pregrasp legs.  The final constrained approach and the
+        terminal grasp leg retain the caller's conservative base scale.
+        """
+
+        if (
+            self.config.trajectory_speed_profile
+            == RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X
+            and planning_phase in {"envelope_ingress", "pregrasp_target"}
+        ):
+            return min(1.0, 4.0 * float(base_speed_scale))
+        return float(base_speed_scale)
+
+    def _continuous_leg_trajectory(
+        self,
+        *,
+        waypoints: tuple[Mapping[str, np.ndarray], ...],
+        moving_side: str,
+        speed_scale: float,
+        joint_velocity_rad_s: np.ndarray,
+        reference_hz: float,
+    ):
+        """Build one stop-to-stop C2 leg with non-zero internal knot velocities."""
+
+        if len(waypoints) < 2:
+            raise ValueError("continuous trajectory leg requires at least two waypoints.")
+        source_times = [0.0]
+        segment_diagnostics: list[dict[str, object]] = []
+        for segment_index, (start, end) in enumerate(pairwise(waypoints)):
+            base_duration, diagnostic = self._segment_duration_diagnostics(
+                start=start,
+                end=end,
+                moving_side=moving_side,
+                speed_scale=speed_scale,
+                joint_velocity_rad_s=joint_velocity_rad_s,
+            )
+            singularity_scale = self._singularity_interval_scale(
+                np.asarray(start[moving_side], dtype=float),
+                np.asarray(end[moving_side], dtype=float),
+            )
+            duration = base_duration * singularity_scale
+            diagnostic.update(
+                {
+                    "segment_index": segment_index,
+                    "singularity_time_scale": float(singularity_scale),
+                    "scaled_duration_sec": float(duration),
+                }
+            )
+            segment_diagnostics.append(diagnostic)
+            source_times.append(source_times[-1] + duration)
+
+        source_q = np.stack(
+            [
+                np.concatenate(
+                    (
+                        np.asarray(waypoint["left"], dtype=float),
+                        np.asarray(waypoint["right"], dtype=float),
+                    )
+                )
+                for waypoint in waypoints
+            ],
+            axis=0,
+        )
+        acceleration = np.tile(
+            np.asarray(RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2, dtype=float),
+            2,
+        )
+        limits = JointHorizonLimits(
+            min_position_rad=np.tile(RM65_ABSOLUTE_Q_MIN_RAD, 2),
+            max_position_rad=np.tile(RM65_ABSOLUTE_Q_MAX_RAD, 2),
+            max_velocity_rad_s=np.tile(joint_velocity_rad_s, 2),
+            max_acceleration_rad_s2=acceleration,
+            max_jerk_rad_s3=acceleration / 0.05,
+        )
+
+        def build(timestamps: np.ndarray):
+            return build_offline_quintic_waypoint_trajectory(
+                timestamps,
+                source_q,
+                command_hz=reference_hz,
+                limits=limits,
+                timing_mode=OFFLINE_WAYPOINT_TIMING_SAFE_RETIME_GLOBAL,
+                max_time_scale=16.0,
+            )
+
+        try:
+            continuous = build(np.asarray(source_times, dtype=float))
+        except OfflineWaypointTrajectoryInfeasibleError as error:
+            raise RM65GraspTrajectoryPlanningError(
+                "trajectory_parameterization_failed",
+                details={
+                    "parameterization": (
+                        RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+                    ),
+                    "error": str(error),
+                },
+            ) from error
+
+        # Joint-space extrema are certified analytically by the shared C2
+        # builder.  TCP speed is nonlinear in q, so certify the sampled curve
+        # and conservatively retime the complete leg if needed.
+        def required_tcp_time_scale(candidate) -> float:
+            tcp_poses = [
+                self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=np.asarray(row[:6], dtype=float).copy(),
+                    right_qpos=np.asarray(row[6:], dtype=float).copy(),
+                )[moving_side]
+                for row in candidate.q_rad
+            ]
+            required = 1.0
+            for index, (start_tcp, end_tcp) in enumerate(pairwise(tcp_poses)):
+                dt = float(
+                    candidate.timestamps[index + 1]
+                    - candidate.timestamps[index]
+                )
+                translation_m, rotation_deg = pose_delta_metrics(
+                    start_tcp,
+                    end_tcp,
+                )
+                required = max(
+                    required,
+                    translation_m
+                    / (dt * self.config.linear_speed_m_s * speed_scale),
+                    rotation_deg
+                    / (dt * self.config.angular_speed_deg_s * speed_scale),
+                )
+            return float(required)
+
+        tcp_time_scale = 1.0
+        for _ in range(3):
+            required_tcp_scale = required_tcp_time_scale(continuous)
+            if required_tcp_scale <= 1.0 + 1e-6:
+                break
+            incremental_scale = required_tcp_scale * 1.01
+            tcp_time_scale *= incremental_scale
+            continuous = build(
+                np.asarray(continuous.waypoint_timestamps, dtype=float)
+                * incremental_scale
+            )
+        else:
+            raise RM65GraspTrajectoryPlanningError(
+                "trajectory_parameterization_failed",
+                details={
+                    "parameterization": (
+                        RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+                    ),
+                    "reason": "sampled_tcp_speed_limit_not_certified",
+                    "required_tcp_time_scale": required_tcp_time_scale(
+                        continuous
+                    ),
+                },
+            )
+        return continuous, tuple(segment_diagnostics), float(tcp_time_scale)
+
+    def _segmented_leg_trajectory(
+        self,
+        *,
+        waypoints: tuple[Mapping[str, np.ndarray], ...],
+        moving_side: str,
+        speed_scale: float,
+        joint_velocity_rad_s: np.ndarray,
+        reference_hz: float,
+    ) -> tuple[np.ndarray, np.ndarray, tuple[dict[str, object], ...]]:
+        """Build a path-preserving stop-to-stop trajectory for one leg.
+
+        This is the bounded fallback when C2 corner rounding leaves a route
+        that was already admitted in joint space.  Every output sample stays
+        on one validated joint-space edge; only the affected semantic leg is
+        downgraded, so unrelated approach legs remain continuous.
+        """
+
+        if len(waypoints) < 2:
+            raise ValueError("segmented trajectory leg requires at least two waypoints.")
+        times = [0.0]
+        q_rows = [
+            np.concatenate(
+                (
+                    np.asarray(waypoints[0]["left"], dtype=float),
+                    np.asarray(waypoints[0]["right"], dtype=float),
+                )
+            )
+        ]
+        diagnostics: list[dict[str, object]] = []
+        elapsed = 0.0
+        for segment_index, (start, end) in enumerate(pairwise(waypoints)):
+            base_duration, diagnostic = self._segment_duration_diagnostics(
+                start=start,
+                end=end,
+                moving_side=moving_side,
+                speed_scale=speed_scale,
+                joint_velocity_rad_s=joint_velocity_rad_s,
+            )
+            singularity_scale = self._singularity_interval_scale(
+                np.asarray(start[moving_side], dtype=float),
+                np.asarray(end[moving_side], dtype=float),
+            )
+            duration = base_duration * singularity_scale
+            diagnostic.update(
+                {
+                    "segment_index": segment_index,
+                    "singularity_time_scale": float(singularity_scale),
+                    "scaled_duration_sec": float(duration),
+                }
+            )
+            diagnostics.append(diagnostic)
+            maximum_delta = max(
+                float(
+                    np.max(
+                        np.abs(
+                            np.asarray(end[side], dtype=float)
+                            - np.asarray(start[side], dtype=float)
+                        )
+                    )
+                )
+                for side in _SIDES
+            )
+            frame_count = max(
+                2,
+                math.ceil(duration * reference_hz) + 1,
+                math.ceil(maximum_delta / self.config.final_edge_resolution_rad) + 1,
+            )
+            for frame_index in range(1, frame_count):
+                unit = float(frame_index) / float(frame_count - 1)
+                progress = unit**3 * (10.0 - 15.0 * unit + 6.0 * unit**2)
+                elapsed += duration / float(frame_count - 1)
+                times.append(elapsed)
+                q_rows.append(
+                    np.concatenate(
+                        tuple(
+                            np.asarray(start[side], dtype=float)
+                            + progress
+                            * (
+                                np.asarray(end[side], dtype=float)
+                                - np.asarray(start[side], dtype=float)
+                            )
+                            for side in _SIDES
+                        )
+                    )
+                )
+        return (
+            np.asarray(times, dtype=float),
+            np.asarray(q_rows, dtype=float),
+            tuple(diagnostics),
+        )
+
+    def _apply_singularity_replay_time_scaling(
+        self,
+        *,
+        times: list[float],
+        samples: Mapping[str, list[np.ndarray]],
+        moving_side: str,
+    ) -> tuple[list[float], dict[str, object]]:
+        """Slow only the local singular traversal; never reject it.
+
+        The spatial path has already passed the production collision checks.
+        This pass changes timing only, mirroring the real-teleop soft
+        singularity policy while keeping the path and endpoint unchanged.
+        """
+        if moving_side not in _SIDES:
+            raise ValueError("moving_side must be left or right.")
+        if len(times) < 2:
+            return list(times), {
+                "policy": "real_teleop_soft_traversal_v1",
+                "scaled_interval_count": 0,
+                "spatial_path_unchanged": True,
+                "collision_rechecked": True,
+            }
+        qpos = np.asarray(samples[moving_side], dtype=float)
+        if qpos.shape != (len(times), 6) or not np.all(np.isfinite(qpos)):
+            raise ValueError("singularity timing samples must be finite sample_count x 6.")
+        hard_deg = float(RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG)
+        soft_deg = float(self.config.singularity_soft_margin_deg)
+        slowdown = float(self.config.singularity_replay_slowdown)
+        hard_rad = np.deg2rad(hard_deg)
+        soft_rad = np.deg2rad(soft_deg)
+        max_scale = 1.0 / slowdown
+        scaled_intervals = 0
+        maximum_scale = 1.0
+        scaled_times = [0.0]
+        for index in range(1, len(times)):
+            distance_rad = min(
+                abs(float(qpos[index - 1, 2])),
+                abs(float(qpos[index - 1, 4])),
+                abs(float(qpos[index, 2])),
+                abs(float(qpos[index, 4])),
+            )
+            if distance_rad <= hard_rad:
+                interval_scale = max_scale
+            elif distance_rad < soft_rad:
+                fraction = (soft_rad - distance_rad) / (soft_rad - hard_rad)
+                interval_scale = 1.0 + fraction * (max_scale - 1.0)
+            else:
+                interval_scale = 1.0
+            if interval_scale > 1.0 + 1e-12:
+                scaled_intervals += 1
+                maximum_scale = max(maximum_scale, interval_scale)
+            delta = float(times[index]) - float(times[index - 1])
+            if not math.isfinite(delta) or delta <= 0.0:
+                raise ValueError("trajectory times must be finite and increasing.")
+            scaled_times.append(scaled_times[-1] + delta * interval_scale)
+        return scaled_times, {
+            "policy": "real_teleop_soft_traversal_v1",
+            "hard_threshold_deg": hard_deg,
+            "soft_margin_deg": soft_deg,
+            "replay_slowdown": slowdown,
+            "scaled_interval_count": int(scaled_intervals),
+            "maximum_interval_scale": float(maximum_scale),
+            "spatial_path_unchanged": True,
+            "collision_rechecked": True,
+        }
+
+    def _visible_grasp_collision_diagnostics(
+        self,
+        visible_scene: VisibleGraspScene,
+        *,
+        grasp_tool_tcp_world: np.ndarray,
+        distance_m: float,
+    ) -> dict[str, object]:
+        """Classify terminal and straight-ingress observations without routing.
+
+        The analytic straight sweep is a useful local route diagnostic, but it
+        is not a proof that every route to the same grasp target is blocked.
+        Keep the terminal goal check hard while allowing the joint path search
+        to look for a different ingress when only the fixed Cartesian sweep
+        intersects an observed point.
+        """
+
+        opening_m = visible_scene.geometry.maximum_opening_m
+        (
+            terminal_target_noncontact,
+            terminal_target_contact,
+            terminal_background,
+        ) = visible_scene.collision_counts_with_terminal_target_contact(
+            grasp_tool_tcp_world,
+            opening_m=opening_m,
+            contact_depth_m=RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M,
+        )
+        approach_target, approach_background = (
+            visible_scene.approach_collision_counts(
+                grasp_tool_tcp_world,
+                opening_m=opening_m,
+                distance_m=distance_m,
+                allow_terminal_target_contact=True,
+                terminal_target_contact_depth_m=(
+                    RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M
+                ),
+            )
+        )
+        return {
+            "distance_m": float(distance_m),
+            "opening_m": float(opening_m),
+            "terminal_target_noncontact_points": int(terminal_target_noncontact),
+            "terminal_target_contact_points": int(terminal_target_contact),
+            "terminal_background_points": int(terminal_background),
+            "approach_target_noncontact_points": int(approach_target),
+            "approach_background_points": int(approach_background),
+            "straight_ingress_target_noncontact_points": int(
+                max(0, approach_target - terminal_target_noncontact)
+            ),
+            "straight_ingress_background_points": int(
+                max(0, approach_background - terminal_background)
+            ),
+            "terminal_collision_blocked": bool(
+                terminal_target_noncontact or terminal_background
+            ),
+            "straight_ingress_blocked": bool(approach_target or approach_background),
+            "straight_ingress_only": bool(
+                (approach_target or approach_background)
+                and not (terminal_target_noncontact or terminal_background)
+            ),
+        }
 
     def _constrained_approach_targets(
         self,
@@ -1208,7 +1968,7 @@ class RM65GraspJointTrajectoryPlanner:
             return
         details = {
             "modified_sides": modified,
-            "envelope_projection_subject": "current_measured_solver_tcp",
+            "envelope_projection_subject": "current_measured_tool_tcp_in_envelope_reference_frame",
             **self._target_envelope_projection_details(modified),
         }
         try:
@@ -1249,7 +2009,7 @@ class RM65GraspJointTrajectoryPlanner:
             return ()
         projection_details = {
             "modified_sides": modified_sides,
-            "envelope_projection_subject": "current_measured_solver_tcp",
+            "envelope_projection_subject": "current_measured_tool_tcp_in_envelope_reference_frame",
             **self._target_envelope_projection_details(modified_sides),
         }
         self._bounded_ingress_projection(
@@ -1273,12 +2033,33 @@ class RM65GraspJointTrajectoryPlanner:
             phase="target",
         )
 
-        boundary = np.asarray(projected[side], dtype=float)
-        final_solver = np.asarray(final_solver_targets[side], dtype=float)
+        boundary_solver = np.asarray(projected[side], dtype=float).reshape(4, 4).copy()
+        boundary_tool = np.asarray(
+            self.target_builder.tool_tcp_world_target_from_solver_world_target(
+                side=side,
+                solver_world_target=boundary_solver,
+            ),
+            dtype=float,
+        ).reshape(4, 4)
+        final_tool = np.asarray(final_tool_tcp_world, dtype=float).reshape(4, 4).copy()
         targets: list[tuple[float, np.ndarray]] = []
         for fraction in self.config.path_envelope_ingress_waypoint_fractions:
-            ingress_solver = boundary.copy()
-            ingress_solver[:3, 3] += fraction * (final_solver[:3, 3] - boundary[:3, 3])
+            # The envelope is evaluated on the actual tool TCP. Interpolating
+            # solver-endpoint translation is incorrect when the fixed tool
+            # offset rotates with the endpoint orientation: the TCP can leave
+            # the envelope even though both endpoint poses are admissible.
+            ingress_tool = boundary_tool.copy()
+            ingress_tool[:3, 3] = (
+                boundary_tool[:3, 3]
+                + fraction * (final_tool[:3, 3] - boundary_tool[:3, 3])
+            )
+            ingress_solver = np.asarray(
+                self.target_builder.solver_world_target_from_tool_tcp_world_target(
+                    side=side,
+                    tool_tcp_world_target=ingress_tool,
+                ),
+                dtype=float,
+            ).reshape(4, 4)
             ingress_pair = {
                 name: np.asarray(projected[name], dtype=float).copy() for name in _SIDES
             }
@@ -1294,11 +2075,7 @@ class RM65GraspJointTrajectoryPlanner:
                 if error.reason_code == "ingress_waypoint_safety_envelope_blocked":
                     continue
                 raise
-            target = self.target_builder.tool_tcp_world_target_from_solver_world_target(
-                side=side,
-                solver_world_target=ingress_solver,
-            )
-            targets.append((fraction, np.asarray(target, dtype=float).copy()))
+            targets.append((fraction, ingress_tool.copy()))
         if not targets:
             raise RM65GraspTrajectoryPlanningError(
                 "path_target_safety_envelope_blocked",
@@ -1319,6 +2096,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         prefer_closest_tolerance: bool = True,
+        orientation_tolerance_deg: float | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
@@ -1328,6 +2106,7 @@ class RM65GraspJointTrajectoryPlanner:
                 side=side,
                 target_tool_tcp_world=target_tool_tcp_world,
                 prefer_closest_tolerance=prefer_closest_tolerance,
+                orientation_tolerance_deg=orientation_tolerance_deg,
                 deadline=deadline,
                 monotonic=monotonic,
             )
@@ -1577,6 +2356,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         prefer_closest_tolerance: bool = True,
+        orientation_tolerance_deg: float | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> tuple[_EndpointIKCandidate, ...]:
@@ -1595,11 +2375,27 @@ class RM65GraspJointTrajectoryPlanner:
             sides=(side,),
             phase="target",
         )
+        effective_orientation_tolerance_deg = (
+            self.config.endpoint_orientation_tolerance_deg
+            if orientation_tolerance_deg is None
+            else float(orientation_tolerance_deg)
+        )
+        if (
+            not math.isfinite(effective_orientation_tolerance_deg)
+            or effective_orientation_tolerance_deg <= 0.0
+        ):
+            raise ValueError(
+                "orientation_tolerance_deg must be finite and positive."
+            )
         inactive = "right" if side == "left" else "left"
         attempts: list[dict[str, object]] = []
         accepted: list[_EndpointIKCandidate] = []
+        clearance_rescue_seeds: list[
+            tuple[float, int, dict[str, np.ndarray]]
+        ] = []
         collision_unavailable = False
         collision_blocked = False
+        clearance_blocked = False
         endpoint_envelope_blocked = False
         for seed_index, seed in enumerate(
             self._endpoint_seed_qpos(qpos_by_side, side=side)
@@ -1618,6 +2414,7 @@ class RM65GraspJointTrajectoryPlanner:
                 )
             outcome = "ik_search_exhausted"
             evaluations = 0
+            collision_detail: dict[str, object] = {}
             try:
                 candidate, evaluations, position, orientation = (
                     self._least_squares_endpoint_from_seed(
@@ -1646,7 +2443,7 @@ class RM65GraspJointTrajectoryPlanner:
                 continue
             if (
                 position <= self.config.endpoint_position_tolerance_m
-                and orientation <= self.config.endpoint_orientation_tolerance_deg
+                and orientation <= effective_orientation_tolerance_deg
             ):
                 if not self._qpos_is_within_target_envelope(
                     candidate,
@@ -1671,8 +2468,35 @@ class RM65GraspJointTrajectoryPlanner:
                         collision_unavailable = True
                         outcome = "endpoint_collision_check_unavailable"
                     elif not check.safe:
-                        collision_blocked = True
-                        outcome = "endpoint_collision_blocked"
+                        positive_gap = (
+                            check.minimum_distance_m is not None
+                            and check.minimum_distance_m > 0.0
+                        )
+                        if positive_gap:
+                            clearance_blocked = True
+                            outcome = "endpoint_clearance_blocked"
+                            clearance_rescue_seeds.append(
+                                (
+                                    float(check.minimum_distance_m),
+                                    seed_index,
+                                    {
+                                        name: np.asarray(values, dtype=float).copy()
+                                        for name, values in candidate.items()
+                                    },
+                                )
+                            )
+                        else:
+                            collision_blocked = True
+                            outcome = "endpoint_collision_blocked"
+                        collision_detail = {
+                            "closest_geometry_names": check.metadata.get(
+                                "closest_geometry_names"
+                            ),
+                            "closest_obstacle_id": check.metadata.get(
+                                "closest_obstacle_id"
+                            ),
+                            "minimum_distance_m": check.minimum_distance_m,
+                        }
                     else:
                         accepted.append(
                             _EndpointIKCandidate(
@@ -1691,8 +2515,148 @@ class RM65GraspJointTrajectoryPlanner:
                     "outcome": outcome,
                     "best_position_residual_m": position,
                     "best_orientation_residual_deg": orientation,
+                    **collision_detail,
                 }
             )
+        # Pose-only least squares converges to the exact target and therefore
+        # cannot use the already-authorized endpoint tolerance to improve a
+        # positive but insufficient clearance.  Starting from the best such
+        # branch, probe a deterministic set of nearby target poses.  Every
+        # accepted result is still measured against the original requested
+        # pose, the same envelope, and the unchanged production collision
+        # clearance.  True penetrations do not activate this rescue.
+        if accepted == [] and clearance_rescue_seeds and (
+            deadline is None or float(monotonic()) < deadline
+        ):
+            _distance, source_seed_index, rescue_seed = max(
+                clearance_rescue_seeds,
+                key=lambda item: item[0],
+            )
+            for rescue_index, (rescue_kind, rescue_target) in enumerate(
+                self._clearance_rescue_target_poses(
+                    target_tool_tcp_world,
+                    orientation_tolerance_deg=(
+                        effective_orientation_tolerance_deg
+                    ),
+                )
+            ):
+                if deadline is not None and float(monotonic()) >= deadline:
+                    break
+                rescue_attempt: dict[str, object] = {
+                    "seed_index": source_seed_index,
+                    "clearance_rescue_index": rescue_index,
+                    "clearance_rescue_kind": rescue_kind,
+                }
+                try:
+                    candidate, evaluations, _position, _orientation = (
+                        self._least_squares_endpoint_from_seed(
+                            qpos_by_side=qpos_by_side,
+                            side=side,
+                            target_tool_tcp_world=rescue_target,
+                            seed_qpos=rescue_seed[side],
+                            maximum_evaluations=min(
+                                self.config.maximum_endpoint_solve_cycles,
+                                60,
+                            ),
+                            prefer_closest_tolerance=False,
+                        )
+                    )
+                    candidate[inactive] = np.asarray(
+                        qpos_by_side[inactive], dtype=float
+                    ).copy()
+                    realized = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                        left_qpos=candidate["left"],
+                        right_qpos=candidate["right"],
+                    )[side]
+                    position, orientation = pose_delta_metrics(
+                        realized,
+                        target_tool_tcp_world,
+                    )
+                except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+                    rescue_attempt.update(
+                        {
+                            "solve_cycles": 0,
+                            "outcome": "clearance_rescue_solver_error",
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+                    attempts.append(rescue_attempt)
+                    continue
+                rescue_attempt.update(
+                    {
+                        "solve_cycles": evaluations,
+                        "best_position_residual_m": position,
+                        "best_orientation_residual_deg": orientation,
+                    }
+                )
+                if (
+                    position > self.config.endpoint_position_tolerance_m
+                    or orientation > effective_orientation_tolerance_deg
+                ):
+                    rescue_attempt["outcome"] = (
+                        "clearance_rescue_pose_tolerance_exceeded"
+                    )
+                    attempts.append(rescue_attempt)
+                    continue
+                if not self._qpos_is_within_target_envelope(
+                    candidate,
+                    sides=(side,),
+                    phase="endpoint",
+                ):
+                    endpoint_envelope_blocked = True
+                    rescue_attempt["outcome"] = (
+                        "endpoint_safety_envelope_blocked"
+                    )
+                    attempts.append(rescue_attempt)
+                    continue
+                check = self.oracle.check(candidate)
+                rescue_attempt.update(
+                    {
+                        "closest_geometry_names": check.metadata.get(
+                            "closest_geometry_names"
+                        ),
+                        "closest_obstacle_id": check.metadata.get(
+                            "closest_obstacle_id"
+                        ),
+                        "minimum_distance_m": check.minimum_distance_m,
+                    }
+                )
+                if not check.collision_check_available:
+                    collision_unavailable = True
+                    rescue_attempt["outcome"] = (
+                        "endpoint_collision_check_unavailable"
+                    )
+                elif not check.safe:
+                    positive_gap = (
+                        check.minimum_distance_m is not None
+                        and check.minimum_distance_m > 0.0
+                    )
+                    if positive_gap:
+                        clearance_blocked = True
+                        rescue_attempt["outcome"] = (
+                            "endpoint_clearance_blocked"
+                        )
+                    else:
+                        collision_blocked = True
+                        rescue_attempt["outcome"] = (
+                            "endpoint_collision_blocked"
+                        )
+                else:
+                    accepted.append(
+                        _EndpointIKCandidate(
+                            qpos_by_side=candidate,
+                            seed_index=source_seed_index,
+                            solve_cycles=evaluations,
+                            position_residual_m=position,
+                            orientation_residual_deg=orientation,
+                        )
+                    )
+                    rescue_attempt["outcome"] = (
+                        "accepted_clearance_rescue"
+                    )
+                attempts.append(rescue_attempt)
+                if accepted:
+                    break
         if deadline is not None and not accepted and float(monotonic()) >= deadline:
             raise RM65GraspTrajectoryPlanningError(
                 "path_planning_time_budget_exhausted",
@@ -1705,16 +2669,18 @@ class RM65GraspJointTrajectoryPlanner:
             )
         if accepted:
             current = np.asarray(qpos_by_side[side], dtype=float)
-            accepted.sort(
-                key=lambda item: float(
-                    np.linalg.norm(np.asarray(item.qpos_by_side[side]) - current)
-                )
+            ordered = self._ordered_endpoint_candidates(
+                candidates=tuple(accepted),
+                current_qpos=current,
+                side=side,
             )
-            return tuple(accepted[: self.config.maximum_endpoint_candidates])
+            return ordered[: self.config.maximum_endpoint_candidates]
         if collision_unavailable:
             reason = "endpoint_collision_check_unavailable"
         elif endpoint_envelope_blocked:
             reason = "endpoint_safety_envelope_blocked"
+        elif clearance_blocked:
+            reason = "endpoint_clearance_blocked"
         elif collision_blocked:
             reason = "endpoint_collision_blocked"
         else:
@@ -1745,7 +2711,7 @@ class RM65GraspJointTrajectoryPlanner:
                 float(item["best_position_residual_m"])
                 / self.config.endpoint_position_tolerance_m,
                 float(item["best_orientation_residual_deg"])
-                / self.config.endpoint_orientation_tolerance_deg,
+                / effective_orientation_tolerance_deg,
             ),
         )
         raise RM65GraspTrajectoryPlanningError(
@@ -1760,9 +2726,56 @@ class RM65GraspJointTrajectoryPlanner:
                 "maximum_cycles_per_seed": (self.config.maximum_endpoint_solve_cycles),
                 "endpoint_solver": "scipy_least_squares_fk_multistart",
                 "solve_unit": "function_evaluations",
+                "position_tolerance_m": self.config.endpoint_position_tolerance_m,
+                "orientation_tolerance_deg": effective_orientation_tolerance_deg,
                 "attempts": attempts,
+                "collision_examples": [
+                    {
+                        "seed_index": item["seed_index"],
+                        "closest_geometry_names": item["closest_geometry_names"],
+                        "closest_obstacle_id": item["closest_obstacle_id"],
+                        "minimum_distance_m": item["minimum_distance_m"],
+                    }
+                    for item in attempts
+                    if item.get("outcome") in {
+                        "endpoint_collision_blocked",
+                        "endpoint_clearance_blocked",
+                    }
+                ][:3],
             },
         )
+
+    def _clearance_rescue_target_poses(
+        self,
+        target_tool_tcp_world: np.ndarray,
+        *,
+        orientation_tolerance_deg: float,
+    ) -> tuple[tuple[str, np.ndarray], ...]:
+        """Return deterministic poses strictly inside endpoint tolerances."""
+
+        target = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        orientation_rad = math.radians(orientation_tolerance_deg * 0.8)
+        position_offset_m = self.config.endpoint_position_tolerance_m * 0.8
+        variants: list[tuple[str, np.ndarray]] = []
+        for axis_index, axis_name in enumerate(("x", "y", "z")):
+            axis = np.zeros(3, dtype=float)
+            axis[axis_index] = 1.0
+            for sign in (-1.0, 1.0):
+                pose = target.copy()
+                pose[:3, :3] = target[:3, :3] @ Rotation.from_rotvec(
+                    sign * orientation_rad * axis
+                ).as_matrix()
+                variants.append(
+                    (f"tool_rotation_{axis_name}_{'neg' if sign < 0 else 'pos'}", pose)
+                )
+        for axis_index, axis_name in enumerate(("x", "y", "z")):
+            for sign in (-1.0, 1.0):
+                pose = target.copy()
+                pose[axis_index, 3] += sign * position_offset_m
+                variants.append(
+                    (f"world_translation_{axis_name}_{'neg' if sign < 0 else 'pos'}", pose)
+                )
+        return tuple(variants)
 
     def assess_endpoint_ik(
         self,
@@ -1861,6 +2874,89 @@ class RM65GraspJointTrajectoryPlanner:
                 termination_reason=termination,
             )
 
+    def probe_grasp_endpoint_clearance(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        target_tool_tcp_world: np.ndarray,
+        time_budget_sec: float,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> RM65GraspEndpointProbeResult:
+        """Quickly rank terminal branches without deciding candidate validity.
+
+        This uses the same endpoint solver, envelope and sparse URDF/FCL oracle
+        as production planning.  The deadline is intentionally small and is
+        checked between deterministic seeds, so every non-success result is
+        advisory and must not remove the candidate from the later full-chain
+        search.
+        """
+
+        if side not in _SIDES:
+            raise ValueError("side must be left or right.")
+        budget = float(time_budget_sec)
+        if not math.isfinite(budget) or budget <= 0.0:
+            raise ValueError("time_budget_sec must be finite and positive.")
+        target = np.asarray(target_tool_tcp_world, dtype=float)
+        if target.shape != (4, 4) or not np.all(np.isfinite(target)):
+            raise ValueError("target_tool_tcp_world must be one finite 4x4 pose.")
+        started = float(monotonic())
+        attempts: tuple[Mapping[str, object], ...] = ()
+        reason_code: str | None = None
+        try:
+            candidates = self._endpoint_qpos_candidates(
+                qpos_by_side=qpos_by_side,
+                side=side,
+                target_tool_tcp_world=target,
+                deadline=started + budget,
+                monotonic=monotonic,
+            )
+        except RM65GraspTrajectoryPlanningError as error:
+            reason_code = error.reason_code
+            raw_attempts = error.details.get("attempts", ())
+            if isinstance(raw_attempts, (tuple, list)):
+                attempts = tuple(
+                    dict(item) for item in raw_attempts if isinstance(item, Mapping)
+                )
+            outcomes = {
+                str(item.get("outcome"))
+                for item in attempts
+                if item.get("outcome") is not None
+            }
+            if "endpoint_clearance_blocked" in outcomes:
+                classification = "clearance_blocked"
+            elif "endpoint_collision_blocked" in outcomes:
+                classification = "collision_blocked"
+            elif error.reason_code in {
+                "endpoint_collision_check_unavailable",
+                "target_safety_envelope_unavailable",
+            }:
+                classification = "check_unavailable"
+            else:
+                classification = "unresolved"
+        else:
+            classification = "clearance_safe"
+            attempts = tuple(
+                {
+                    "outcome": "accepted",
+                    "seed_index": candidate.seed_index,
+                }
+                for candidate in candidates
+            )
+        distances = [
+            float(item["minimum_distance_m"])
+            for item in attempts
+            if item.get("minimum_distance_m") is not None
+            and math.isfinite(float(item["minimum_distance_m"]))
+        ]
+        return RM65GraspEndpointProbeResult(
+            classification=classification,
+            elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
+            reason_code=reason_code,
+            best_minimum_distance_m=(max(distances) if distances else None),
+            attempted_seed_count=len(attempts),
+        )
+
     def _revalidate(
         self,
         waypoints: tuple[Mapping[str, np.ndarray], ...],
@@ -1871,6 +2967,8 @@ class RM65GraspJointTrajectoryPlanner:
     ) -> dict[str, object]:
         checks = 0
         minimum_distance = math.inf
+        minimum_distance_lower_bound = math.inf
+        clearance_only = type(self.oracle) is RM65ObstacleCollisionOracle
         ingress_constraints: frozenset[str] | None = None
         ingress_initial_adjustment_m: float | None = None
         ingress_best_adjustment_m: float | None = None
@@ -1969,7 +3067,13 @@ class RM65GraspJointTrajectoryPlanner:
                             "segment_index": segment_index,
                             "edge_sample_index": index,
                         }
-                check = self.oracle.check(qpos)
+                # Validate every sample against the selected sparse proxy
+                # pairs at the same clearance threshold. Exact distances are
+                # unnecessary for this Boolean proxy-clearance decision.
+                check = (
+                    self.oracle.check_clearance_only(qpos)
+                    if clearance_only else self.oracle.check(qpos)
+                )
                 checks += 1
                 if deadline is not None:
                     self._remaining_path_planning_time_sec(
@@ -1982,7 +3086,11 @@ class RM65GraspJointTrajectoryPlanner:
                         },
                     )
                 if check.minimum_distance_m is not None:
-                    minimum_distance = min(minimum_distance, check.minimum_distance_m)
+                    minimum_distance_lower_bound = min(
+                        minimum_distance_lower_bound, check.minimum_distance_m
+                    )
+                    if not clearance_only:
+                        minimum_distance = min(minimum_distance, check.minimum_distance_m)
                 if not check.collision_check_available or not check.safe:
                     raise RM65GraspTrajectoryPlanningError(
                         (
@@ -1995,6 +3103,32 @@ class RM65GraspJointTrajectoryPlanner:
                             "edge_sample_index": index,
                             "collision_check": check.to_dict(),
                         },
+                    )
+        waypoint_minimum_distance = math.inf
+        if clearance_only:
+            # Preserve exact endpoint diagnostics and fail closed if the two
+            # FCL query modes ever disagree at a waypoint.
+            for waypoint_index, waypoint in enumerate(waypoints):
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        planning_phase="dense_revalidation",
+                        details={"waypoint_index": waypoint_index},
+                    )
+                exact = self.oracle.check(waypoint)
+                if not exact.collision_check_available or not exact.safe:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "path_collision_check_unavailable"
+                        if not exact.collision_check_available else "path_collision_blocked",
+                        details={
+                            "waypoint_index": waypoint_index,
+                            "collision_check": exact.to_dict(),
+                        },
+                    )
+                if exact.minimum_distance_m is not None:
+                    waypoint_minimum_distance = min(
+                        waypoint_minimum_distance, exact.minimum_distance_m
                     )
         if ingress_constraints is not None and ingress_entered_at is None:
             raise RM65GraspTrajectoryPlanningError(
@@ -2009,6 +3143,21 @@ class RM65GraspJointTrajectoryPlanner:
             "minimum_distance_m": (
                 None if not math.isfinite(minimum_distance) else minimum_distance
             ),
+            "minimum_distance_lower_bound_m": (
+                None
+                if not math.isfinite(minimum_distance_lower_bound)
+                else minimum_distance_lower_bound
+            ),
+            "waypoint_minimum_distance_m": (
+                None
+                if not math.isfinite(waypoint_minimum_distance)
+                else waypoint_minimum_distance
+            ),
+            "collision_query_mode": (
+                "clearance_guard_with_exact_waypoints"
+                if clearance_only else "all_pair_minimum_distance"
+            ),
+            "collision_scene_profile": self.path_collision_scene_profile,
             "envelope_ingress": (
                 None
                 if ingress_constraints is None
@@ -2021,6 +3170,148 @@ class RM65GraspJointTrajectoryPlanner:
                     ),
                     "entered_at": ingress_entered_at,
                 }
+            ),
+        }
+
+    def _revalidate_visible_gripper_path(
+        self,
+        waypoints: tuple[Mapping[str, np.ndarray], ...],
+        *,
+        moving_side: str,
+        visible_scene: VisibleGraspScene,
+        terminal_tool_tcp_world: np.ndarray | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> dict[str, object]:
+        """Densely admit the observed gripper sweep of a found joint path.
+
+        The sampling planner checks the composed visible-scene oracle while it
+        grows its trees, but its adaptive refinement is driven by the sparse
+        URDF/FCL clearance.  A very small observed-point collision can
+        therefore lie between two coarse tree-edge samples even when the FCL
+        proxy is far from a fixed obstacle.  Recheck every found edge at the
+        final 0.1-degree joint resolution before accepting the route.
+        """
+
+        terminal = (
+            None
+            if terminal_tool_tcp_world is None
+            else np.asarray(terminal_tool_tcp_world, dtype=float).reshape(4, 4)
+        )
+        checks = 0
+        terminal_contact_points = 0
+        terminal_contact_sample_count = 0
+        for segment_index, (start, end) in enumerate(pairwise(waypoints)):
+            maximum_delta = max(
+                float(
+                    np.max(
+                        np.abs(
+                            np.asarray(end[side], dtype=float)
+                            - np.asarray(start[side], dtype=float)
+                        )
+                    )
+                )
+                for side in _SIDES
+            )
+            steps = max(
+                1,
+                math.ceil(maximum_delta / self.config.final_edge_resolution_rad),
+            )
+            for edge_sample_index in range(steps + 1):
+                if deadline is not None:
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        planning_phase="visible_scene_dense_revalidation",
+                        details={
+                            "segment_index": segment_index,
+                            "edge_sample_index": edge_sample_index,
+                        },
+                    )
+                alpha = float(edge_sample_index) / float(steps)
+                qpos = {
+                    side: np.asarray(start[side], dtype=float)
+                    + alpha
+                    * (
+                        np.asarray(end[side], dtype=float)
+                        - np.asarray(start[side], dtype=float)
+                    )
+                    for side in _SIDES
+                }
+                pose = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                    left_qpos=qpos["left"],
+                    right_qpos=qpos["right"],
+                )[moving_side]
+                contact_allowed = False
+                position_error_m: float | None = None
+                orientation_error_deg: float | None = None
+                if terminal is not None:
+                    (
+                        contact_allowed,
+                        position_error_m,
+                        orientation_error_deg,
+                    ) = _terminal_target_contact_region(
+                        tool_tcp_world=pose,
+                        terminal_tool_tcp_world=terminal,
+                        position_tolerance_m=max(
+                            self.config.endpoint_position_tolerance_m,
+                            RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M,
+                        ),
+                        orientation_tolerance_deg=(
+                            self.config.endpoint_orientation_tolerance_deg
+                        ),
+                    )
+                if contact_allowed:
+                    (
+                        target_hits,
+                        sample_terminal_contact_points,
+                        background_hits,
+                    ) = visible_scene.collision_counts_with_terminal_target_contact(
+                        pose,
+                        opening_m=visible_scene.geometry.maximum_opening_m,
+                        contact_depth_m=RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M,
+                    )
+                    terminal_contact_points = max(
+                        terminal_contact_points,
+                        int(sample_terminal_contact_points),
+                    )
+                    terminal_contact_sample_count += int(
+                        sample_terminal_contact_points > 0
+                    )
+                else:
+                    sample_terminal_contact_points = 0
+                    target_hits, background_hits = visible_scene.collision_counts(
+                        pose,
+                        opening_m=visible_scene.geometry.maximum_opening_m,
+                    )
+                checks += 1
+                if target_hits or background_hits:
+                    raise RM65GraspTrajectoryPlanningError(
+                        "visible_gripper_path_collision",
+                        details={
+                            "planning_phase": "visible_scene_dense_revalidation",
+                            "segment_index": segment_index,
+                            "edge_sample_index": edge_sample_index,
+                            "target_collision_points": int(target_hits),
+                            "background_collision_points": int(background_hits),
+                            "terminal_target_contact_points": int(
+                                sample_terminal_contact_points
+                            ),
+                            "terminal_contact_allowed": contact_allowed,
+                            "terminal_position_error_m": position_error_m,
+                            "terminal_orientation_error_deg": (
+                                orientation_error_deg
+                            ),
+                        },
+                    )
+        return {
+            "sample_count": checks,
+            "scene_hash": visible_scene.semantic_content_hash,
+            "opening_m": visible_scene.geometry.maximum_opening_m,
+            "joint_edge_resolution_rad": self.config.final_edge_resolution_rad,
+            "terminal_target_contact_points": terminal_contact_points,
+            "terminal_target_contact_sample_count": (
+                terminal_contact_sample_count
             ),
         }
 
@@ -2058,6 +3349,11 @@ class RM65GraspJointTrajectoryPlanner:
         search_oracle = self._path_search_oracle(
             planning_phase=planning_phase, visible_scene=visible_scene, side=side,
             start_qpos_by_side=qpos_by_side,
+            terminal_tool_tcp_world=(
+                target_tool_tcp_world
+                if planning_phase == "grasp_target"
+                else None
+            ),
         )
         search_attempts: list[dict[str, object]] = []
         terminal_error: RM65GraspTrajectoryPlanningError | None = None
@@ -2105,6 +3401,10 @@ class RM65GraspJointTrajectoryPlanner:
             )
             attempt_record: dict[str, object] = {
                 "planning_phase": planning_phase,
+                "search_collision_model": "ik_sparse_proxy_pairs",
+                "endpoint_candidate_ordering": (
+                    self.config.endpoint_candidate_ordering
+                ),
                 "endpoint_seed_indices": tuple(e.seed_index for e in search_candidates),
                 "path_attempt": path_attempt,
                 "search_seed": attempt_config.seed,
@@ -2163,6 +3463,22 @@ class RM65GraspJointTrajectoryPlanner:
                 dense = self._revalidate(
                     path.waypoints, moving_side=side, deadline=deadline, monotonic=monotonic,
                 )
+                if visible_scene is not None:
+                    dense = {
+                        **dense,
+                        "visible_scene": self._revalidate_visible_gripper_path(
+                            path.waypoints,
+                            moving_side=side,
+                            visible_scene=visible_scene,
+                            terminal_tool_tcp_world=(
+                                target_tool_tcp_world
+                                if planning_phase == "grasp_target"
+                                else None
+                            ),
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        ),
+                    }
             except RM65GraspTrajectoryPlanningError as error:
                 attempt_record["dense_revalidation_error"] = error.reason_code
                 attempt_record["dense_revalidation_details"] = dict(error.details)
@@ -2230,29 +3546,66 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         pregrasp_tool_tcp_world: np.ndarray,
         grasp_tool_tcp_world: np.ndarray,
+        visible_scene: VisibleGraspScene | None = None,
+        terminal_endpoint: _EndpointIKCandidate | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> _PlannedPathLeg:
-        """Resolve a fixed-orientation, same-branch Cartesian grasp approach."""
+        """Resolve a fixed-orientation, same-branch Cartesian grasp approach.
+
+        Normal planning propagates a pregrasp IK branch toward the grasp.  If
+        ``terminal_endpoint`` is supplied, the same corridor is solved in
+        reverse from an already collision-safe terminal branch, then returned
+        in execution order.  The reverse form prevents an independently solved
+        pregrasp branch from hiding a valid terminal branch; all envelope,
+        collision, continuity, dense-path, and realized-TCP checks are shared.
+        """
 
         targets = self._constrained_approach_targets(
             pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
             grasp_tool_tcp_world=grasp_tool_tcp_world,
         )
+        reverse_from_terminal = terminal_endpoint is not None
         inactive = "right" if side == "left" else "left"
         current = {
             name: np.asarray(qpos_by_side[name], dtype=float).copy()
             for name in _SIDES
         }
-        start = {name: value.copy() for name, value in current.items()}
-        waypoints: list[Mapping[str, np.ndarray]] = [start]
+        solve_start = {name: value.copy() for name, value in current.items()}
+        waypoints: list[Mapping[str, np.ndarray]] = [solve_start]
         attempts: list[dict[str, object]] = []
         total_cycles = 0
         final_position_residual_m = math.inf
         final_orientation_residual_deg = math.inf
+        if reverse_from_terminal:
+            assert terminal_endpoint is not None
+            forward_targets = tuple(
+                (target, float(index) / float(len(targets)))
+                for index, target in enumerate(targets, start=1)
+            )
+            solve_targets = (
+                *tuple(reversed(forward_targets[:-1])),
+                (np.asarray(pregrasp_tool_tcp_world, dtype=float), 0.0),
+            )
+        else:
+            solve_targets = tuple(
+                (target, float(index) / float(len(targets)))
+                for index, target in enumerate(targets, start=1)
+            )
 
         with self._solver_lock:
-            for waypoint_index, target in enumerate(targets, start=1):
+            for waypoint_index, (target, approach_progress) in enumerate(
+                solve_targets,
+                start=1,
+            ):
+                orientation_tolerance_deg = (
+                    self.config.endpoint_orientation_tolerance_deg
+                    + (1.0 - approach_progress)
+                    * (
+                        self.config.pregrasp_orientation_tolerance_deg
+                        - self.config.endpoint_orientation_tolerance_deg
+                    )
+                )
                 if deadline is not None:
                     self._remaining_path_planning_time_sec(
                         deadline=deadline,
@@ -2260,7 +3613,12 @@ class RM65GraspJointTrajectoryPlanner:
                         planning_phase="constrained_approach_ik",
                         details={
                             "approach_waypoint_index": waypoint_index,
-                            "approach_waypoint_count": len(targets),
+                            "approach_waypoint_count": len(solve_targets),
+                            "solve_direction": (
+                                "reverse_from_terminal"
+                                if reverse_from_terminal
+                                else "forward_from_pregrasp"
+                            ),
                         },
                     )
                 try:
@@ -2283,25 +3641,37 @@ class RM65GraspJointTrajectoryPlanner:
                         "approach_ik_solver_error",
                         details={
                             "approach_waypoint_index": waypoint_index,
-                            "approach_waypoint_count": len(targets),
+                            "approach_waypoint_count": len(solve_targets),
+                            "solve_direction": (
+                                "reverse_from_terminal"
+                                if reverse_from_terminal
+                                else "forward_from_pregrasp"
+                            ),
                             "exception_type": type(exc).__name__,
                             "attempts": attempts,
                         },
                     ) from exc
                 total_cycles += cycles
-                candidate[inactive] = start[inactive].copy()
+                candidate[inactive] = solve_start[inactive].copy()
                 attempt = {
                     "planning_phase": "constrained_approach",
                     "approach_waypoint_index": waypoint_index,
-                    "approach_waypoint_count": len(targets),
+                    "approach_waypoint_count": len(solve_targets),
+                    "approach_progress": approach_progress,
+                    "solve_direction": (
+                        "reverse_from_terminal"
+                        if reverse_from_terminal
+                        else "forward_from_pregrasp"
+                    ),
                     "solve_cycles": cycles,
                     "position_residual_m": position,
                     "orientation_residual_deg": orientation,
+                    "orientation_tolerance_deg": orientation_tolerance_deg,
                 }
                 attempts.append(attempt)
                 if (
                     position > self.config.endpoint_position_tolerance_m
-                    or orientation > self.config.endpoint_orientation_tolerance_deg
+                    or orientation > orientation_tolerance_deg
                 ):
                     attempt["outcome"] = "ik_search_exhausted"
                     raise RM65GraspTrajectoryPlanningError(
@@ -2312,7 +3682,7 @@ class RM65GraspJointTrajectoryPlanner:
                                 self.config.endpoint_position_tolerance_m
                             ),
                             "endpoint_orientation_tolerance_deg": (
-                                self.config.endpoint_orientation_tolerance_deg
+                                orientation_tolerance_deg
                             ),
                             "attempts": attempts,
                         },
@@ -2355,9 +3725,19 @@ class RM65GraspJointTrajectoryPlanner:
                         },
                     )
                 if not check.safe:
-                    attempt["outcome"] = "collision_blocked"
+                    positive_gap = (
+                        check.minimum_distance_m is not None
+                        and check.minimum_distance_m > 0.0
+                    )
+                    attempt["outcome"] = (
+                        "clearance_blocked" if positive_gap else "collision_blocked"
+                    )
                     raise RM65GraspTrajectoryPlanningError(
-                        "approach_endpoint_collision_blocked",
+                        (
+                            "approach_endpoint_clearance_blocked"
+                            if positive_gap
+                            else "approach_endpoint_collision_blocked"
+                        ),
                         details={
                             **attempt,
                             "collision_check": check.to_dict(),
@@ -2397,13 +3777,29 @@ class RM65GraspJointTrajectoryPlanner:
                 final_position_residual_m = position
                 final_orientation_residual_deg = orientation
 
-        waypoint_tuple = tuple(waypoints)
+        waypoint_tuple = (
+            tuple(reversed(waypoints))
+            if reverse_from_terminal
+            else tuple(waypoints)
+        )
         dense = self._revalidate(
             waypoint_tuple,
             moving_side=side,
             deadline=deadline,
             monotonic=monotonic,
         )
+        if visible_scene is not None:
+            dense = {
+                **dense,
+                "visible_scene": self._revalidate_visible_gripper_path(
+                    waypoint_tuple,
+                    moving_side=side,
+                    visible_scene=visible_scene,
+                    terminal_tool_tcp_world=grasp_tool_tcp_world,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                ),
+            }
         approach_geometry = self._validate_constrained_approach_geometry(
             waypoint_tuple,
             moving_side=side,
@@ -2415,23 +3811,32 @@ class RM65GraspJointTrajectoryPlanner:
         dense = {**dense, "approach_geometry": approach_geometry}
         path = JointPathPlanResult(
             status=JointPathStatus.PATH_FOUND,
-            start_qpos_by_component=start,
-            target_qpos_by_component=current,
+            start_qpos_by_component=waypoint_tuple[0],
+            target_qpos_by_component=waypoint_tuple[-1],
             movable_components=(side,),
             waypoints=waypoint_tuple,
             scene_hash=self.scene.semantic_content_hash,
             metadata={
                 "planning_phase": "constrained_approach",
                 "approach_waypoint_count": len(targets),
+                "solve_direction": (
+                    "reverse_from_terminal"
+                    if reverse_from_terminal
+                    else "forward_from_pregrasp"
+                ),
                 "approach_geometry": approach_geometry,
             },
         )
-        endpoint = _EndpointIKCandidate(
-            qpos_by_side=current,
-            seed_index=-1,
-            solve_cycles=total_cycles,
-            position_residual_m=final_position_residual_m,
-            orientation_residual_deg=final_orientation_residual_deg,
+        endpoint = (
+            terminal_endpoint
+            if terminal_endpoint is not None
+            else _EndpointIKCandidate(
+                qpos_by_side=current,
+                seed_index=-1,
+                solve_cycles=total_cycles,
+                position_residual_m=final_position_residual_m,
+                orientation_residual_deg=final_orientation_residual_deg,
+            )
         )
         return _PlannedPathLeg(
             endpoint=endpoint,
@@ -2447,62 +3852,208 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         pregrasp_tool_tcp_world: np.ndarray,
         grasp_tool_tcp_world: np.ndarray,
+        visible_scene: VisibleGraspScene | None = None,
         deadline: float,
         monotonic: Callable[[], float],
+        terminal_endpoint_search: Callable[
+            [], tuple[_EndpointIKCandidate, ...]
+        ] | None = None,
     ) -> _PreparedGraspApproaches:
-        """Validate local branches before spending any global/ingress budget."""
+        """Validate local branches before spending global/ingress budget.
 
+        A pregrasp-first solve remains the fast path.  If that independently
+        selected IK branch cannot enter the grasp, retry by solving collision-
+        safe terminal branches and propagating them backward to the pregrasp.
+        This mirrors bidirectional task planning: a failed local seed is not
+        treated as proof that every terminal branch lacks an approach.
+        """
+
+        fatal_reasons = {
+            "path_collision_check_unavailable",
+            "path_planning_time_budget_exhausted",
+            "endpoint_collision_check_unavailable",
+            "approach_endpoint_collision_check_unavailable",
+            "path_target_safety_envelope_unavailable",
+            "approach_endpoint_safety_envelope_unavailable",
+            "target_safety_envelope_unavailable",
+        }
+        candidates: list[tuple[_EndpointIKCandidate, _PlannedPathLeg]] = []
+        attempts: list[dict[str, object]] = []
+        last_error: RM65GraspTrajectoryPlanningError | None = None
         try:
             endpoints = self._endpoint_qpos_candidates(
                 qpos_by_side=qpos_by_side,
                 side=side,
                 target_tool_tcp_world=pregrasp_tool_tcp_world,
                 prefer_closest_tolerance=False,
+                orientation_tolerance_deg=(
+                    self.config.pregrasp_orientation_tolerance_deg
+                ),
                 deadline=deadline,
                 monotonic=monotonic,
             )
         except RM65GraspTrajectoryPlanningError as error:
-            raise RM65GraspTrajectoryPlanningError(
+            last_error = RM65GraspTrajectoryPlanningError(
                 error.reason_code,
-                details={"planning_phase": "local_pregrasp_ik", **error.details},
-            ) from error
-        candidates: list[tuple[_EndpointIKCandidate, _PlannedPathLeg]] = []
-        attempts: list[dict[str, object]] = []
-        last_error: RM65GraspTrajectoryPlanningError | None = None
-        for endpoint in endpoints:
-            attempt: dict[str, object] = {
-                "planning_phase": "pregrasp_branch_selection",
-                "endpoint_seed_index": endpoint.seed_index,
-            }
-            attempts.append(attempt)
-            try:
-                approach = self._plan_constrained_approach_leg(
-                    qpos_by_side=endpoint.qpos_by_side,
+                details={
+                    "planning_phase": "local_pregrasp_ik",
+                    **error.details,
+                },
+            )
+            attempts.append(
+                {
+                    "planning_phase": "local_pregrasp_ik",
+                    "solve_direction": "forward_from_pregrasp",
+                    "status": "rejected",
+                    "reason_code": error.reason_code,
+                }
+            )
+            if error.reason_code in fatal_reasons:
+                raise RM65GraspTrajectoryPlanningError(
+                    error.reason_code,
+                    details={
+                        "planning_phase": "local_pregrasp_ik",
+                        **error.details,
+                        "pregrasp_branch_attempts": attempts,
+                    },
+                ) from error
+        else:
+            for endpoint in endpoints:
+                attempt: dict[str, object] = {
+                    "planning_phase": "pregrasp_branch_selection",
+                    "solve_direction": "forward_from_pregrasp",
+                    "endpoint_seed_index": endpoint.seed_index,
+                }
+                attempts.append(attempt)
+                try:
+                    approach = self._plan_constrained_approach_leg(
+                        qpos_by_side=endpoint.qpos_by_side,
+                        side=side,
+                        pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+                        grasp_tool_tcp_world=grasp_tool_tcp_world,
+                        visible_scene=visible_scene,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    last_error = error
+                    attempt.update(
+                        {"status": "rejected", "reason_code": error.reason_code}
+                    )
+                    if error.reason_code in fatal_reasons:
+                        raise RM65GraspTrajectoryPlanningError(
+                            error.reason_code,
+                            details={
+                                **error.details,
+                                "pregrasp_branch_attempts": attempts,
+                            },
+                        ) from error
+                    continue
+                attempt["status"] = "local_chain_valid"
+                candidates.append((endpoint, approach))
+        if candidates:
+            return _PreparedGraspApproaches(tuple(candidates), tuple(attempts))
+
+        # A forward solve can converge to a convenient pregrasp branch that
+        # has no continuous route to any valid terminal IK branch.  Search the
+        # necessary endpoint first, then propagate the exact branch backward.
+        try:
+            terminal_endpoints = (
+                terminal_endpoint_search()
+                if terminal_endpoint_search is not None
+                else self._endpoint_qpos_candidates(
+                    qpos_by_side=qpos_by_side,
                     side=side,
-                    pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
-                    grasp_tool_tcp_world=grasp_tool_tcp_world,
+                    target_tool_tcp_world=grasp_tool_tcp_world,
+                    prefer_closest_tolerance=False,
                     deadline=deadline,
                     monotonic=monotonic,
                 )
-            except RM65GraspTrajectoryPlanningError as error:
-                last_error = error
-                attempt.update(
-                    {"status": "rejected", "reason_code": error.reason_code}
+            )
+        except RM65GraspTrajectoryPlanningError as error:
+            last_error = RM65GraspTrajectoryPlanningError(
+                error.reason_code,
+                details={
+                    "planning_phase": "terminal_branch_selection",
+                    **error.details,
+                },
+            )
+            attempts.append(
+                {
+                    "planning_phase": "terminal_branch_selection",
+                    "solve_direction": "reverse_from_terminal",
+                    "status": "rejected",
+                    "reason_code": error.reason_code,
+                }
+            )
+            if error.reason_code in fatal_reasons:
+                raise RM65GraspTrajectoryPlanningError(
+                    error.reason_code,
+                    details={
+                        "planning_phase": "terminal_branch_selection",
+                        **error.details,
+                        "pregrasp_branch_attempts": attempts,
+                    },
+                ) from error
+        else:
+            for terminal_endpoint in terminal_endpoints:
+                attempt = {
+                    "planning_phase": "terminal_branch_selection",
+                    "solve_direction": "reverse_from_terminal",
+                    "endpoint_seed_index": terminal_endpoint.seed_index,
+                }
+                attempts.append(attempt)
+                try:
+                    approach = self._plan_constrained_approach_leg(
+                        qpos_by_side=terminal_endpoint.qpos_by_side,
+                        side=side,
+                        pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+                        grasp_tool_tcp_world=grasp_tool_tcp_world,
+                        visible_scene=visible_scene,
+                        terminal_endpoint=terminal_endpoint,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    last_error = error
+                    attempt.update(
+                        {"status": "rejected", "reason_code": error.reason_code}
+                    )
+                    if error.reason_code in fatal_reasons:
+                        raise RM65GraspTrajectoryPlanningError(
+                            error.reason_code,
+                            details={
+                                **error.details,
+                                "pregrasp_branch_attempts": attempts,
+                            },
+                        ) from error
+                    continue
+                pregrasp_qpos = {
+                    name: np.asarray(values, dtype=float).copy()
+                    for name, values in approach.path.waypoints[0].items()
+                }
+                realized_pregrasp = (
+                    self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                        left_qpos=pregrasp_qpos["left"],
+                        right_qpos=pregrasp_qpos["right"],
+                    )[side]
                 )
-                if error.reason_code in {
-                    "path_collision_check_unavailable",
-                    "path_planning_time_budget_exhausted",
-                    "approach_endpoint_collision_check_unavailable",
-                    "path_target_safety_envelope_unavailable",
-                    "approach_endpoint_safety_envelope_unavailable",
-                }:
-                    raise RM65GraspTrajectoryPlanningError(
-                        error.reason_code,
-                        details={**error.details, "pregrasp_branch_attempts": attempts},
-                    ) from error
-                continue
-            attempt["status"] = "local_chain_valid"
-            candidates.append((endpoint, approach))
+                position, orientation = pose_delta_metrics(
+                    realized_pregrasp,
+                    pregrasp_tool_tcp_world,
+                )
+                pregrasp_endpoint = _EndpointIKCandidate(
+                    qpos_by_side=pregrasp_qpos,
+                    seed_index=terminal_endpoint.seed_index,
+                    solve_cycles=sum(
+                        int(item.get("solve_cycles", 0))
+                        for item in approach.search_attempts
+                    ),
+                    position_residual_m=position,
+                    orientation_residual_deg=orientation,
+                )
+                attempt["status"] = "local_chain_valid"
+                candidates.append((pregrasp_endpoint, approach))
         if candidates:
             return _PreparedGraspApproaches(tuple(candidates), tuple(attempts))
         assert last_error is not None
@@ -2511,6 +4062,148 @@ class RM65GraspJointTrajectoryPlanner:
             details={"planning_phase": "local_approach_validation", **last_error.details,
                      "pregrasp_branch_attempts": attempts},
         ) from last_error
+
+    def assess_local_grasp_chain(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        side: str,
+        target_tool_tcp_world: np.ndarray,
+        time_budget_sec: float,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> RM65GraspLocalChainResult:
+        """Run the production terminal/pregrasp IK and local approach checks.
+
+        This is a read-only admission primitive for perception shortlisting. It
+        deliberately stops before global path search, but shares the exact
+        endpoint tolerances, envelope checks, sparse URDF/FCL collision oracle,
+        branch continuity, and constrained-approach implementation used by
+        :meth:`plan`.
+        """
+
+        if side not in _SIDES:
+            raise ValueError("side must be left or right.")
+        target = np.asarray(target_tool_tcp_world, dtype=float)
+        if target.shape != (4, 4) or not np.all(np.isfinite(target)):
+            raise ValueError("target_tool_tcp_world must be one finite 4x4 pose.")
+        budget = float(time_budget_sec)
+        if not math.isfinite(budget) or budget <= 0.0:
+            raise ValueError("time_budget_sec must be finite and positive.")
+        started = float(monotonic())
+        deadline = started + min(budget, self.config.path_planning_time_budget_sec)
+        attempts: list[Mapping[str, object]] = []
+        last_error: RM65GraspTrajectoryPlanningError | None = None
+        terminal_endpoints: tuple[_EndpointIKCandidate, ...] | None = None
+        terminal_error: RM65GraspTrajectoryPlanningError | None = None
+
+        def terminal_endpoint_search() -> tuple[_EndpointIKCandidate, ...]:
+            # Distance changes the pregrasp, not this fixed terminal request.
+            # Share its deterministic search only within this one assessment;
+            # every distance still attempts its own forward approach first.
+            nonlocal terminal_endpoints, terminal_error
+            if float(monotonic()) >= deadline:
+                raise RM65GraspTrajectoryPlanningError(
+                    "path_planning_time_budget_exhausted",
+                    details={"planning_phase": "terminal_branch_selection"},
+                )
+            if terminal_error is not None:
+                raise terminal_error
+            if terminal_endpoints is None:
+                try:
+                    terminal_endpoints = self._endpoint_qpos_candidates(
+                        qpos_by_side=qpos_by_side,
+                        side=side,
+                        target_tool_tcp_world=target,
+                        prefer_closest_tolerance=False,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
+                except RM65GraspTrajectoryPlanningError as error:
+                    terminal_error = error
+                    raise
+            return terminal_endpoints
+
+        for distance_m in self._pregrasp_distance_candidates():
+            if float(monotonic()) >= deadline:
+                last_error = RM65GraspTrajectoryPlanningError(
+                    "path_planning_time_budget_exhausted",
+                    details={"planning_phase": "local_grasp_chain_admission"},
+                )
+                break
+            pregrasp = self._pregrasp_target_pose(
+                target,
+                distance_m=distance_m,
+            )
+            try:
+                prepared = self._prepare_grasp_approaches(
+                    qpos_by_side=qpos_by_side,
+                    side=side,
+                    pregrasp_tool_tcp_world=pregrasp,
+                    grasp_tool_tcp_world=target,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    terminal_endpoint_search=terminal_endpoint_search,
+                )
+            except RM65GraspTrajectoryPlanningError as error:
+                last_error = error
+                attempts.append(
+                    {
+                        "distance_m": float(distance_m),
+                        "status": "rejected",
+                        "reason_code": error.reason_code,
+                        "planning_phase": error.details.get("planning_phase"),
+                        "best_position_residual_m": error.details.get(
+                            "best_position_residual_m"
+                        ),
+                        "best_orientation_residual_deg": error.details.get(
+                            "best_orientation_residual_deg"
+                        ),
+                        "endpoint_seed_count": error.details.get(
+                            "endpoint_seed_count"
+                        ),
+                        "collision_examples": error.details.get(
+                            "collision_examples", []
+                        ),
+                    }
+                )
+                if error.reason_code in {
+                    "path_planning_time_budget_exhausted",
+                    "path_collision_check_unavailable",
+                    "endpoint_collision_check_unavailable",
+                    "approach_endpoint_collision_check_unavailable",
+                    "approach_endpoint_safety_envelope_unavailable",
+                    "path_target_safety_envelope_unavailable",
+                    "target_safety_envelope_unavailable",
+                }:
+                    break
+                continue
+            attempts.append(
+                {
+                    "distance_m": float(distance_m),
+                    "status": "local_chain_valid",
+                    "branch_count": len(prepared.candidates),
+                }
+            )
+            return RM65GraspLocalChainResult(
+                feasible=True,
+                selected_pregrasp_distance_m=float(distance_m),
+                branch_count=len(prepared.candidates),
+                elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
+                reason_code=None,
+                attempts=tuple(attempts),
+            )
+        return RM65GraspLocalChainResult(
+            feasible=False,
+            selected_pregrasp_distance_m=None,
+            branch_count=0,
+            elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
+            reason_code=(
+                "local_grasp_chain_rejected"
+                if last_error is None
+                else last_error.reason_code
+            ),
+            attempts=tuple(attempts),
+        )
 
     def _plan_pregrasp_and_approach(
         self,
@@ -2530,6 +4223,7 @@ class RM65GraspJointTrajectoryPlanner:
             qpos_by_side=qpos_by_side, side=side,
             pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
             grasp_tool_tcp_world=grasp_tool_tcp_world,
+            visible_scene=visible_scene,
             deadline=deadline, monotonic=monotonic,
         )
         try:
@@ -2577,6 +4271,7 @@ class RM65GraspJointTrajectoryPlanner:
             qpos_by_side=qpos_by_side, side=side,
             pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
             grasp_tool_tcp_world=grasp_tool_tcp_world,
+            visible_scene=visible_scene,
             deadline=deadline, monotonic=monotonic,
         )
         ingress_targets = self._envelope_ingress_targets(
@@ -2644,6 +4339,15 @@ class RM65GraspJointTrajectoryPlanner:
                     deadline=route_deadline,
                     monotonic=monotonic,
                 )
+                if visible_scene is not None:
+                    self._revalidate_visible_gripper_path(
+                        combined_waypoints,
+                        moving_side=side,
+                        visible_scene=visible_scene,
+                        terminal_tool_tcp_world=grasp_tool_tcp_world,
+                        deadline=route_deadline,
+                        monotonic=monotonic,
+                    )
             except RM65GraspTrajectoryPlanningError as error:
                 route_error = error
                 route_attempt.update(
@@ -2689,6 +4393,37 @@ class RM65GraspJointTrajectoryPlanner:
             },
         ) from route_error
 
+    @staticmethod
+    def _may_fallback_to_global_grasp_target_search(
+        error: RM65GraspTrajectoryPlanningError,
+    ) -> bool:
+        """Return whether a local grasp-chain rejection may try the terminal target.
+
+        The fallback is deliberately limited to failures produced while
+        searching an artificial pregrasp/approach route.  The final target
+        envelope is checked before entering this loop, and the global target
+        search performs its own endpoint IK, sparse-proxy path checks, and
+        dense revalidation.  This therefore removes a false veto from the
+        fixed local approach without weakening the safety gates.
+        """
+
+        if error.reason_code not in _RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS:
+            return False
+        if error.reason_code != "target_safety_envelope_blocked":
+            return True
+        # A target-safety error from the final target is already raised before
+        # the pregrasp loop.  Only an artificial local target may be bypassed.
+        phase = str(error.details.get("planning_phase", ""))
+        return phase in {
+            "local_pregrasp_ik",
+            "local_approach_validation",
+            "pregrasp_target",
+            "constrained_approach",
+            "constrained_approach_ik",
+            "envelope_ingress",
+            "dense_revalidation",
+        }
+
     def __call__(
         self,
         *,
@@ -2709,11 +4444,18 @@ class RM65GraspJointTrajectoryPlanner:
             for name in _SIDES
         }
         target_pose = np.asarray(target_tool_tcp_world, dtype=float).reshape(4, 4)
+        planning_started_at = time.perf_counter()
         capture_self_observation_evidence = (
             None
             if visible_scene is None
             or visible_scene.capture_self_observation_evidence is None
             else dict(visible_scene.capture_self_observation_evidence)
+        )
+        depth_preprocessing_evidence = (
+            None
+            if visible_scene is None
+            or visible_scene.depth_preprocessing_evidence is None
+            else dict(visible_scene.depth_preprocessing_evidence)
         )
         excluded_gripper_observation_count = 0
         if visible_scene is not None and visible_scene.capture_qpos_by_side is not None:
@@ -2770,6 +4512,10 @@ class RM65GraspJointTrajectoryPlanner:
         selected_legs: tuple[_PlannedPathLeg, ...] | None = None
         ingress_route: dict[str, object] | None = None
         route_error: RM65GraspTrajectoryPlanningError | None = None
+        route_mode: str | None = "already_at_grasp" if already_at_grasp else None
+        direct_fallback_attempt: dict[str, object] | None = None
+        direct_fallback_tried = False
+        path_search_started_at = time.perf_counter()
         if already_at_grasp:
             selected_legs = (
                 self._plan_path_leg(
@@ -2792,18 +4538,86 @@ class RM65GraspJointTrajectoryPlanner:
                 pregrasp_route_attempts.append(route_attempt)
                 try:
                     if visible_scene is not None:
-                        target_hits, background_hits = visible_scene.approach_collision_counts(
-                            target_pose,
-                            opening_m=visible_scene.geometry.maximum_opening_m,
+                        visible_diagnostics = self._visible_grasp_collision_diagnostics(
+                            visible_scene,
+                            grasp_tool_tcp_world=target_pose,
                             distance_m=distance_m,
                         )
-                        if target_hits or background_hits:
+                        route_attempt["visible_gripper_diagnostics"] = (
+                            visible_diagnostics
+                        )
+                        if visible_diagnostics["terminal_collision_blocked"]:
                             raise RM65GraspTrajectoryPlanningError(
-                                "visible_gripper_approach_collision",
-                                details={"planning_phase": "local_approach",
-                                         "target_collision_points": target_hits,
-                                         "background_collision_points": background_hits},
+                                "visible_gripper_terminal_collision",
+                                details={
+                                    "planning_phase": "terminal_grasp",
+                                    **visible_diagnostics,
+                                },
                             )
+                        if visible_diagnostics["straight_ingress_only"]:
+                            # A collision on one nominal ingress distance is not
+                            # proof that every shorter constrained approach is
+                            # blocked.  Keep searching those approaches first.
+                            # Production never substitutes an unconstrained
+                            # direct terminal path for this grasp-chain check.
+                            route_error = RM65GraspTrajectoryPlanningError(
+                                "visible_gripper_approach_collision",
+                                details={
+                                    "planning_phase": "constrained_approach",
+                                    **visible_diagnostics,
+                                },
+                            )
+                            route_attempt.update(
+                                {
+                                    "status": "rejected",
+                                    "reason_code": (
+                                        "straight_ingress_collision"
+                                    ),
+                                }
+                            )
+                            if (
+                                self.config.allow_unconstrained_terminal_fallback
+                                and not direct_fallback_tried
+                            ):
+                                direct_fallback_tried = True
+                                direct_fallback_attempt = {
+                                    "planning_phase": "global_grasp_target_fallback",
+                                    "trigger_distance_m": float(distance_m),
+                                    "trigger_diagnostics": visible_diagnostics,
+                                }
+                                try:
+                                    direct_leg = self._plan_path_leg(
+                                        qpos_by_side=current,
+                                        side=selected_side,
+                                        target_tool_tcp_world=target_pose,
+                                        planning_phase="grasp_target",
+                                        visible_scene=visible_scene,
+                                        prefer_closest_tolerance=False,
+                                        deadline=deadline,
+                                        monotonic=monotonic,
+                                    )
+                                except RM65GraspTrajectoryPlanningError as error:
+                                    direct_fallback_attempt.update(
+                                        {
+                                            "status": "rejected",
+                                            "reason_code": error.reason_code,
+                                            "details": dict(error.details),
+                                        }
+                                    )
+                                    route_error = error
+                                else:
+                                    direct_fallback_attempt["status"] = "path_found"
+                                    route_attempt["status"] = "path_found"
+                                    route_attempt["fallback"] = (
+                                        "global_grasp_target"
+                                    )
+                                    selected_legs = (direct_leg,)
+                                    ingress_route = None
+                                    ingress_route_attempts = []
+                                    pregrasp_pose = target_pose.copy()
+                                    route_mode = "global_grasp_target_fallback"
+                                    break
+                            continue
                     (
                         candidate_legs,
                         candidate_ingress_route,
@@ -2827,6 +4641,7 @@ class RM65GraspJointTrajectoryPlanner:
                             "approach_waypoint_index": error.details.get(
                                 "approach_waypoint_index"
                             ),
+                            "details": dict(error.details),
                         }
                     )
                     if error.reason_code in {
@@ -2849,15 +4664,72 @@ class RM65GraspJointTrajectoryPlanner:
             if selected_legs is None:
                 if route_error is None:
                     route_error = RM65GraspTrajectoryPlanningError("path_planner_error")
-                raise RM65GraspTrajectoryPlanningError(
-                    route_error.reason_code,
-                    details={
-                        **route_error.details,
-                        "pregrasp_route_attempts": pregrasp_route_attempts,
-                    },
-                ) from route_error
+                local_route_error = route_error
+                if (
+                    self.config.allow_unconstrained_terminal_fallback
+                    and not direct_fallback_tried
+                    and self._may_fallback_to_global_grasp_target_search(
+                        local_route_error
+                    )
+                ):
+                    direct_fallback_tried = True
+                    direct_fallback_attempt = {
+                        "planning_phase": "global_grasp_target_fallback",
+                        "trigger_reason_code": local_route_error.reason_code,
+                        "trigger_details": dict(local_route_error.details),
+                        "trigger_scope": "local_pregrasp_chain",
+                    }
+                    try:
+                        direct_leg = self._plan_path_leg(
+                            qpos_by_side=current,
+                            side=selected_side,
+                            target_tool_tcp_world=target_pose,
+                            planning_phase="grasp_target",
+                            visible_scene=visible_scene,
+                            prefer_closest_tolerance=False,
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        )
+                    except RM65GraspTrajectoryPlanningError as error:
+                        direct_fallback_attempt.update(
+                            {
+                                "status": "rejected",
+                                "reason_code": error.reason_code,
+                                "details": dict(error.details),
+                            }
+                        )
+                        route_error = RM65GraspTrajectoryPlanningError(
+                            error.reason_code,
+                            details={
+                                **error.details,
+                                "local_pregrasp_failure": {
+                                    "reason_code": local_route_error.reason_code,
+                                    "details": dict(local_route_error.details),
+                                },
+                                "direct_grasp_target_fallback": (
+                                    direct_fallback_attempt
+                                ),
+                            },
+                        )
+                    else:
+                        direct_fallback_attempt["status"] = "path_found"
+                        selected_legs = (direct_leg,)
+                        ingress_route = None
+                        ingress_route_attempts = []
+                        pregrasp_pose = target_pose.copy()
+                        route_mode = "global_grasp_target_fallback"
+                if selected_legs is None:
+                    raise RM65GraspTrajectoryPlanningError(
+                        route_error.reason_code,
+                        details={
+                            **route_error.details,
+                            "pregrasp_route_attempts": pregrasp_route_attempts,
+                            "direct_grasp_target_fallback": direct_fallback_attempt,
+                        },
+                    ) from route_error
 
         assert selected_legs is not None
+        path_search_finished_at = time.perf_counter()
         self._remaining_path_planning_time_sec(
             deadline=deadline,
             monotonic=monotonic,
@@ -2871,6 +4743,18 @@ class RM65GraspJointTrajectoryPlanner:
                 leg.path.waypoints if leg_index == 0 else leg.path.waypoints[1:]
             )
         )
+        leg_end_waypoint_indices: dict[int, str] = {}
+        leg_phases = {
+            1: ("grasp_target",),
+            2: ("pregrasp_target", "constrained_approach"),
+            3: ("envelope_ingress", "pregrasp_target", "constrained_approach"),
+        }[len(selected_legs)]
+        waypoint_count = 0
+        for leg_index, leg in enumerate(selected_legs):
+            waypoint_count += len(leg.path.waypoints) - (1 if leg_index else 0)
+            leg_end_waypoint_indices[waypoint_count - 1] = str(
+                leg.path.metadata.get("planning_phase", leg_phases[leg_index])
+            )
         dense = self._revalidate(
             waypoints,
             moving_side=selected_side,
@@ -2891,80 +4775,482 @@ class RM65GraspJointTrajectoryPlanner:
         velocity_profile = load_joint_velocity_limit_profiles()[
             self.profile.position_profile.ik_execution.joint_velocity_limit_profile
         ]
-        joint_velocity = (
-            np.deg2rad(np.asarray(velocity_profile.max_velocity_deg_s, dtype=float))
-            * scale
+        joint_velocity_limit = np.deg2rad(
+            np.asarray(velocity_profile.max_velocity_deg_s, dtype=float)
         )
         reference_hz = float(self.profile.position_profile.rates.ik_hz)
         times = [0.0]
         samples = {name: [current[name].copy()] for name in _SIDES}
-        elapsed = 0.0
-        for start, end in pairwise(waypoints):
-            self._remaining_path_planning_time_sec(
-                deadline=deadline,
-                monotonic=monotonic,
-                planning_phase="trajectory_parameterization",
-            )
-            start_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                left_qpos=start["left"], right_qpos=start["right"]
-            )[selected_side]
-            end_tcp = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                left_qpos=end["left"], right_qpos=end["right"]
-            )[selected_side]
-            translation, rotation_deg = pose_delta_metrics(start_tcp, end_tcp)
-            delta = np.abs(
-                np.asarray(end[selected_side]) - np.asarray(start[selected_side])
-            )
-            duration = max(
-                self.config.minimum_segment_duration_sec,
-                1.875 * translation / (self.config.linear_speed_m_s * scale),
-                1.875 * rotation_deg / (self.config.angular_speed_deg_s * scale),
-                1.875 * float(np.max(delta / joint_velocity)),
-            )
-            frame_count = max(
-                2,
-                math.ceil(duration * reference_hz) + 1,
-                math.ceil(
-                    1.875
-                    * float(np.max(delta))
-                    / self.config.final_edge_resolution_rad
+        stage_boundaries: list[dict[str, object]] = []
+        parameterization_metadata: dict[str, object]
+        segment_diagnostics: list[dict[str, object]] = []
+        continuous_per_leg_coverage_complete = False
+        if self.config.trajectory_parameterization == (
+            RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+        ):
+            leg_parameterization: list[dict[str, object]] = []
+            fallback_leg_count = 0
+            for leg_index, leg in enumerate(selected_legs):
+                self._remaining_path_planning_time_sec(
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    planning_phase="trajectory_parameterization",
                 )
-                + 1,
-            )
-            for frame_index in range(1, frame_count):
-                unit = float(frame_index) / float(frame_count - 1)
-                progress = unit**3 * (10.0 - 15.0 * unit + 6.0 * unit**2)
-                elapsed += duration / float(frame_count - 1)
-                times.append(elapsed)
-                for name in _SIDES:
-                    samples[name].append(
-                        np.asarray(start[name])
-                        + progress * (np.asarray(end[name]) - np.asarray(start[name]))
+                phase = str(
+                    leg.path.metadata.get("planning_phase", leg_phases[leg_index])
+                )
+                effective_speed_scale = self._effective_trajectory_speed_scale(
+                    base_speed_scale=scale,
+                    planning_phase=phase,
+                )
+                effective_joint_velocity = (
+                    joint_velocity_limit * effective_speed_scale
+                )
+                leg_waypoints = tuple(leg.path.waypoints)
+                if len(leg_waypoints) >= 2:
+                    continuous, leg_segments, tcp_time_scale = (
+                        self._continuous_leg_trajectory(
+                            waypoints=leg_waypoints,
+                            moving_side=selected_side,
+                            speed_scale=effective_speed_scale,
+                            joint_velocity_rad_s=effective_joint_velocity,
+                            reference_hz=reference_hz,
+                        )
                     )
+                    leg_times = np.asarray(continuous.timestamps, dtype=float)
+                    leg_q = np.asarray(continuous.q_rad, dtype=float)
+                    execution_mode = (
+                        RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+                    )
+                    fallback: dict[str, object] | None = None
+                    parameterized_waypoints = tuple(
+                        {
+                            "left": np.asarray(row[:6], dtype=float),
+                            "right": np.asarray(row[6:], dtype=float),
+                        }
+                        for row in leg_q
+                    )
+                    try:
+                        collision_revalidation = self._revalidate(
+                            parameterized_waypoints,
+                            moving_side=selected_side,
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        )
+                        visible_revalidation = None
+                        if visible_scene is not None:
+                            visible_revalidation = (
+                                self._revalidate_visible_gripper_path(
+                                    parameterized_waypoints,
+                                    moving_side=selected_side,
+                                    visible_scene=visible_scene,
+                                    terminal_tool_tcp_world=(
+                                        target_pose
+                                        if phase
+                                        in {
+                                            "grasp_target",
+                                            "constrained_approach",
+                                        }
+                                        else None
+                                    ),
+                                    deadline=deadline,
+                                    monotonic=monotonic,
+                                )
+                            )
+                    except RM65GraspTrajectoryPlanningError as error:
+                        if error.reason_code not in {
+                            "path_collision_blocked",
+                            "path_target_safety_envelope_blocked",
+                            "visible_gripper_path_collision",
+                        }:
+                            raise
+                        fallback_leg_count += 1
+                        execution_mode = (
+                            "segmented_stop_collision_preserving_fallback"
+                        )
+                        fallback = {
+                            "reason_code": error.reason_code,
+                            "planning_phase": error.details.get(
+                                "planning_phase"
+                            ),
+                            "segment_index": error.details.get("segment_index"),
+                            "edge_sample_index": error.details.get(
+                                "edge_sample_index"
+                            ),
+                            "target_collision_points": error.details.get(
+                                "target_collision_points"
+                            ),
+                            "background_collision_points": error.details.get(
+                                "background_collision_points"
+                            ),
+                        }
+                        leg_times, leg_q, leg_segments = (
+                            self._segmented_leg_trajectory(
+                                waypoints=leg_waypoints,
+                                moving_side=selected_side,
+                                speed_scale=effective_speed_scale,
+                                joint_velocity_rad_s=effective_joint_velocity,
+                                reference_hz=reference_hz,
+                            )
+                        )
+                        fallback_waypoints = tuple(
+                            {
+                                "left": np.asarray(row[:6], dtype=float),
+                                "right": np.asarray(row[6:], dtype=float),
+                            }
+                            for row in leg_q
+                        )
+                        collision_revalidation = self._revalidate(
+                            fallback_waypoints,
+                            moving_side=selected_side,
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        )
+                        visible_revalidation = None
+                        if visible_scene is not None:
+                            visible_revalidation = (
+                                self._revalidate_visible_gripper_path(
+                                    fallback_waypoints,
+                                    moving_side=selected_side,
+                                    visible_scene=visible_scene,
+                                    terminal_tool_tcp_world=(
+                                        target_pose
+                                        if phase
+                                        in {
+                                            "grasp_target",
+                                            "constrained_approach",
+                                        }
+                                        else None
+                                    ),
+                                    deadline=deadline,
+                                    monotonic=monotonic,
+                                )
+                            )
+                    offset = float(times[-1])
+                    for sample_index in range(1, leg_times.size):
+                        times.append(
+                            offset
+                            + float(
+                                leg_times[sample_index]
+                                - leg_times[0]
+                            )
+                        )
+                        samples["left"].append(
+                            np.asarray(leg_q[sample_index, :6], dtype=float)
+                        )
+                        samples["right"].append(
+                            np.asarray(leg_q[sample_index, 6:], dtype=float)
+                        )
+                    segment_diagnostics.extend(
+                        {
+                            **dict(item),
+                            "planning_phase": phase,
+                            "effective_speed_scale": float(effective_speed_scale),
+                            "leg_index": leg_index,
+                        }
+                        for item in leg_segments
+                    )
+                    leg_parameterization.append(
+                        {
+                            "planning_phase": phase,
+                            "source_waypoint_count": len(leg_waypoints),
+                            "sample_count": int(leg_times.size),
+                            "execution_mode": execution_mode,
+                            "collision_preserving_fallback": fallback,
+                            "source_duration_sec": float(
+                                continuous.metadata["source_duration_sec"]
+                            ),
+                            "execution_duration_sec": float(
+                                leg_times[-1] - leg_times[0]
+                            ),
+                            "joint_limit_time_scale": float(
+                                continuous.metadata["time_scale"]
+                            ),
+                            "tcp_limit_time_scale": tcp_time_scale,
+                            "internal_knot_zero_velocity_required": bool(
+                                fallback is not None
+                            ),
+                            "collision_revalidation": collision_revalidation,
+                            "visible_scene_revalidation": visible_revalidation,
+                            "continuous_hard_limit_certificate": (
+                                continuous.metadata[
+                                    "continuous_hard_limit_certificate"
+                                ]
+                            ),
+                        }
+                    )
+                stage_boundaries.append(
+                    {
+                        "planning_phase": phase,
+                        "end_sample_index": len(times) - 1,
+                        "end_time_sec": float(times[-1]),
+                    }
+                )
+            singularity_scales = [
+                float(item["singularity_time_scale"])
+                for item in segment_diagnostics
+            ]
+            singularity_replay_metadata = {
+                "policy": "real_teleop_soft_traversal_v1",
+                "hard_threshold_deg": float(
+                    RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG
+                ),
+                "soft_margin_deg": float(self.config.singularity_soft_margin_deg),
+                "replay_slowdown": float(
+                    self.config.singularity_replay_slowdown
+                ),
+                "scaled_interval_count": sum(
+                    value > 1.0 + 1e-12 for value in singularity_scales
+                ),
+                "maximum_interval_scale": max(singularity_scales, default=1.0),
+                "spatial_path_unchanged": True,
+                "collision_rechecked": True,
+                "applied_before_continuous_parameterization": True,
+            }
+            parameterization_metadata = {
+                "mode": RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
+                "internal_path_waypoint_stops": bool(fallback_leg_count),
+                "stage_boundary_stops": True,
+                "collision_preserving_fallback_leg_count": fallback_leg_count,
+                "speed_profile": self.config.trajectory_speed_profile,
+                "base_speed_scale": float(scale),
+                "legs": tuple(leg_parameterization),
+                "segments": tuple(segment_diagnostics),
+            }
+            per_leg_collision = tuple(
+                {
+                    "planning_phase": item["planning_phase"],
+                    "execution_mode": item["execution_mode"],
+                    "revalidation": item["collision_revalidation"],
+                }
+                for item in leg_parameterization
+            )
+            continuous_per_leg_coverage_complete = (
+                len(leg_parameterization) == len(selected_legs)
+            )
+            # Each leg was checked after C2 parameterization, including the
+            # exact stage-boundary state shared by adjacent legs.  Singularity
+            # replay changes timestamps only, so concatenating those samples
+            # does not create a new spatial edge that needs a second full pass.
+            dense["parameterized_trajectory_revalidation"] = {
+                "coverage": "per_parameterized_leg",
+                "complete": continuous_per_leg_coverage_complete,
+                "execution_sample_count": len(times),
+                "collision_query_count": sum(
+                    int(item["collision_revalidation"].get("sample_count", 0))
+                    for item in leg_parameterization
+                ),
+                "legs": per_leg_collision,
+            }
+        else:
+            elapsed = 0.0
+            for end_waypoint_index, (start, end) in enumerate(
+                pairwise(waypoints), start=1
+            ):
+                self._remaining_path_planning_time_sec(
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    planning_phase="trajectory_parameterization",
+                )
+                segment_phase = next(
+                    (
+                        phase
+                        for waypoint_index, phase in sorted(
+                            leg_end_waypoint_indices.items()
+                        )
+                        if end_waypoint_index <= waypoint_index
+                    ),
+                    leg_phases[-1],
+                )
+                effective_speed_scale = self._effective_trajectory_speed_scale(
+                    base_speed_scale=scale,
+                    planning_phase=segment_phase,
+                )
+                duration, diagnostic = self._segment_duration_diagnostics(
+                    start=start,
+                    end=end,
+                    moving_side=selected_side,
+                    speed_scale=effective_speed_scale,
+                    joint_velocity_rad_s=joint_velocity_limit * effective_speed_scale,
+                )
+                diagnostic.update(
+                    {
+                        "segment_index": end_waypoint_index - 1,
+                        "planning_phase": segment_phase,
+                        "effective_speed_scale": float(effective_speed_scale),
+                    }
+                )
+                segment_diagnostics.append(diagnostic)
+                delta = np.abs(
+                    np.asarray(end[selected_side])
+                    - np.asarray(start[selected_side])
+                )
+                frame_count = max(
+                    2,
+                    math.ceil(duration * reference_hz) + 1,
+                    math.ceil(
+                        1.875
+                        * float(np.max(delta))
+                        / self.config.final_edge_resolution_rad
+                    )
+                    + 1,
+                )
+                for frame_index in range(1, frame_count):
+                    unit = float(frame_index) / float(frame_count - 1)
+                    progress = unit**3 * (10.0 - 15.0 * unit + 6.0 * unit**2)
+                    elapsed += duration / float(frame_count - 1)
+                    times.append(elapsed)
+                    for name in _SIDES:
+                        samples[name].append(
+                            np.asarray(start[name])
+                            + progress
+                            * (np.asarray(end[name]) - np.asarray(start[name]))
+                        )
+                if end_waypoint_index in leg_end_waypoint_indices:
+                    stage_boundaries.append(
+                        {
+                            "planning_phase": leg_end_waypoint_indices[
+                                end_waypoint_index
+                            ],
+                            "end_sample_index": len(times) - 1,
+                            "end_time_sec": float(times[-1]),
+                        }
+                    )
+            times, singularity_replay_metadata = (
+                self._apply_singularity_replay_time_scaling(
+                    times=times,
+                    samples=samples,
+                    moving_side=selected_side,
+                )
+            )
+            parameterization_metadata = {
+                "mode": RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+                "internal_path_waypoint_stops": True,
+                "stage_boundary_stops": True,
+                "speed_profile": self.config.trajectory_speed_profile,
+                "base_speed_scale": float(scale),
+                "segments": tuple(segment_diagnostics),
+            }
         if len(times) == 1:
             elapsed = self.config.minimum_segment_duration_sec
             times.append(elapsed)
             for name in _SIDES:
                 samples[name].append(current[name].copy())
+        for boundary in stage_boundaries:
+            boundary["end_time_sec"] = float(
+                times[int(boundary["end_sample_index"])]
+            )
+        if (
+            self.config.trajectory_parameterization
+            == RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+            and not continuous_per_leg_coverage_complete
+        ):
+            dense["parameterized_trajectory_revalidation"] = self._revalidate(
+                tuple(
+                    {
+                        side: np.asarray(samples[side][index], dtype=float)
+                        for side in _SIDES
+                    }
+                    for index in range(len(times))
+                ),
+                moving_side=selected_side,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         if visible_scene is not None:
-            for index in range(len(times)):
-                self._remaining_path_planning_time_sec(
-                    deadline=deadline, monotonic=monotonic,
-                    planning_phase="visible_scene_final_trajectory_revalidation",
+            terminal_target_contact_points = 0
+            terminal_target_contact_sample_count = 0
+            if self.config.trajectory_parameterization == (
+                RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
+            ) and continuous_per_leg_coverage_complete:
+                visible_revalidations = tuple(
+                    item["visible_scene_revalidation"]
+                    for item in leg_parameterization
+                    if item["visible_scene_revalidation"] is not None
                 )
-                pose = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
-                    left_qpos=samples["left"][index], right_qpos=samples["right"][index]
-                )[selected_side]
-                target_hits, background_hits = visible_scene.collision_counts(
-                    pose, opening_m=visible_scene.geometry.maximum_opening_m
+                terminal_target_contact_points = max(
+                    (
+                        int(item["terminal_target_contact_points"])
+                        for item in visible_revalidations
+                    ),
+                    default=0,
                 )
-                if target_hits or background_hits:
-                    raise RM65GraspTrajectoryPlanningError(
-                        "visible_gripper_path_collision",
-                        details={"edge_sample_index": index,
-                                 "target_collision_points": target_hits,
-                                 "background_collision_points": background_hits},
+                terminal_target_contact_sample_count = sum(
+                    int(item["terminal_target_contact_sample_count"])
+                    for item in visible_revalidations
+                )
+                visible_collision_query_count = sum(
+                    int(item["sample_count"])
+                    for item in visible_revalidations
+                )
+                visible_validation_mode = "per_parameterized_leg"
+            else:
+                for index in range(len(times)):
+                    self._remaining_path_planning_time_sec(
+                        deadline=deadline, monotonic=monotonic,
+                        planning_phase="visible_scene_final_trajectory_revalidation",
                     )
+                    pose = self.target_builder.tool_tcp_world_targets_for_qpos_pair(
+                        left_qpos=samples["left"][index],
+                        right_qpos=samples["right"][index],
+                    )[selected_side]
+                    (
+                        terminal_contact_allowed,
+                        position_error_m,
+                        orientation_error_deg,
+                    ) = _terminal_target_contact_region(
+                        tool_tcp_world=pose,
+                        terminal_tool_tcp_world=target_pose,
+                        position_tolerance_m=max(
+                            self.config.endpoint_position_tolerance_m,
+                            RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M,
+                        ),
+                        orientation_tolerance_deg=(
+                            self.config.endpoint_orientation_tolerance_deg
+                        ),
+                    )
+                    if terminal_contact_allowed:
+                        (
+                            target_hits,
+                            sample_terminal_target_contact_points,
+                            background_hits,
+                        ) = visible_scene.collision_counts_with_terminal_target_contact(
+                            pose,
+                            opening_m=visible_scene.geometry.maximum_opening_m,
+                            contact_depth_m=(
+                                RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M
+                            ),
+                        )
+                        terminal_target_contact_points = max(
+                            terminal_target_contact_points,
+                            int(sample_terminal_target_contact_points),
+                        )
+                        terminal_target_contact_sample_count += int(
+                            sample_terminal_target_contact_points > 0
+                        )
+                    else:
+                        sample_terminal_target_contact_points = 0
+                        target_hits, background_hits = visible_scene.collision_counts(
+                            pose,
+                            opening_m=visible_scene.geometry.maximum_opening_m,
+                        )
+                    if target_hits or background_hits:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "visible_gripper_path_collision",
+                            details={"edge_sample_index": index,
+                                     "target_collision_points": target_hits,
+                                     "background_collision_points": background_hits,
+                                     "terminal_target_contact_points": (
+                                         sample_terminal_target_contact_points
+                                     ),
+                                     "terminal_contact_allowed": terminal_contact_allowed,
+                                     "terminal_position_error_m": position_error_m,
+                                     "terminal_orientation_error_deg": (
+                                         orientation_error_deg
+                                     )},
+                        )
+                visible_validation_mode = "whole_parameterized_trajectory"
+                visible_collision_query_count = len(times)
             dense["visible_scene_final_trajectory"] = {
                 "scene_hash": visible_scene.semantic_content_hash,
                 "excluded_captured_gripper_background_points": excluded_gripper_observation_count,
@@ -2981,14 +5267,53 @@ class RM65GraspJointTrajectoryPlanner:
                 "captured_robot_observation_filter": (
                     capture_self_observation_evidence
                 ),
+                "visible_depth_preprocessing": depth_preprocessing_evidence,
                 "self_filter_opening_basis": "nominal_maximum_opening",
                 "self_filter_surface_margin_m": (
                     RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M
                 ),
-                "sample_count": len(times),
+                "sample_count": visible_collision_query_count,
+                "execution_sample_count": len(times),
+                "validation_mode": visible_validation_mode,
                 "opening_m": visible_scene.geometry.maximum_opening_m,
+                "terminal_target_contact_depth_m": (
+                    RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M
+                ),
+                "terminal_target_contact_points": int(
+                    terminal_target_contact_points
+                ),
+                "terminal_target_contact_sample_count": int(
+                    terminal_target_contact_sample_count
+                ),
+                "terminal_contact_position_tolerance_m": float(
+                    max(
+                        self.config.endpoint_position_tolerance_m,
+                        RM65_GRASP_TERMINAL_TARGET_CONTACT_DEPTH_M,
+                    )
+                ),
+                "terminal_contact_orientation_tolerance_deg": float(
+                    self.config.endpoint_orientation_tolerance_deg
+                ),
                 "scope": "observed_points_nominal_parallel_jaw_solids_only",
             }
+        planning_timing = {
+            "clock": "host_perf_counter",
+            "pre_path_search_wall_duration_sec": float(
+                path_search_started_at - planning_started_at
+            ),
+            "path_search_wall_duration_sec": float(
+                path_search_finished_at - path_search_started_at
+            ),
+            "trajectory_parameterization_wall_duration_sec": float(
+                time.perf_counter() - path_search_finished_at
+            ),
+            "planning_wall_duration_sec": float(
+                time.perf_counter() - planning_started_at
+            ),
+            "path_planning_time_budget_sec": float(
+                self.config.path_planning_time_budget_sec
+            ),
+        }
         evidence_hash = canonical_content_hash(
             {
                 "scene_hash": self.scene.semantic_content_hash,
@@ -2997,6 +5322,8 @@ class RM65GraspJointTrajectoryPlanner:
                     leg.path.semantic_content_hash for leg in selected_legs
                 ],
                 "dense_revalidation": dense,
+                "singularity_replay": singularity_replay_metadata,
+                "trajectory_parameterization": parameterization_metadata,
                 "envelope_ingress_route": ingress_route,
                 "envelope_ingress_route_attempts": ingress_route_attempts,
                 "pregrasp_route_attempts": pregrasp_route_attempts,
@@ -3008,10 +5335,19 @@ class RM65GraspJointTrajectoryPlanner:
                 ),
                 "path_search_attempts": search_attempts,
                 "pregrasp_tool_tcp_world": pregrasp_pose,
-                "pregrasp_applied": not already_at_grasp,
+                "route_mode": route_mode or "pregrasp_and_fixed_approach",
+                "direct_grasp_target_fallback": direct_fallback_attempt,
+                "unconstrained_terminal_fallback_enabled": (
+                    self.config.allow_unconstrained_terminal_fallback
+                ),
+                "pregrasp_applied": (
+                    not already_at_grasp
+                    and route_mode != "global_grasp_target_fallback"
+                ),
                 "selected_pregrasp_distance_m": (
                     0.0
                     if already_at_grasp
+                    or route_mode == "global_grasp_target_fallback"
                     else float(
                         np.linalg.norm(
                             target_pose[:3, 3] - pregrasp_pose[:3, 3]
@@ -3027,22 +5363,66 @@ class RM65GraspJointTrajectoryPlanner:
                 ),
                 "target_tool_tcp_world": target_pose,
                 "speed_scale": scale,
+                "trajectory_speed_profile": self.config.trajectory_speed_profile,
                 "reference_hz": reference_hz,
             },
             domain="dexteleop.real_agent_motion.rm65_grasp_path.v1",
         )
-        return RealAgentJointTrajectory(
+        trajectory = RealAgentJointTrajectory(
             time_from_start_sec=np.asarray(times, dtype=float),
             qpos_by_side={name: np.stack(samples[name], axis=0) for name in _SIDES},
             planner_evidence_refs=("rm65-grasp-path:" + evidence_hash,),
         )
+        if self.trajectory_record_dir is not None:
+            try:
+                write_grasp_trajectory_record(
+                    self.trajectory_record_dir,
+                    trajectory,
+                    moving_side=selected_side,
+                    scene_hash=self.scene.semantic_content_hash,
+                    collision_scope="profile_sparse_proxy_pairs",
+                    collision_scene_profile=self.path_collision_scene_profile,
+                    target_tool_tcp_world=target_pose,
+                    speed_scale=scale,
+                    stage_boundaries=tuple(stage_boundaries),
+                    parameterization=parameterization_metadata,
+                    planning_timing=planning_timing,
+                    source_waypoints_by_side={
+                        side: np.stack(
+                            [
+                                np.asarray(waypoint[side], dtype=float)
+                                for waypoint in waypoints
+                            ],
+                            axis=0,
+                        )
+                        for side in _SIDES
+                    },
+                )
+            except (OSError, ValueError, BadZipFile) as error:
+                raise RM65GraspTrajectoryPlanningError(
+                    "trajectory_record_failed",
+                    details={"exception_type": type(error).__name__},
+                ) from error
+        return trajectory
 
 
 __all__ = [
+    "RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME",
+    "RM65_GRASP_ENDPOINT_ORDER_JOINT_DISTANCE",
+    "RM65_GRASP_ENDPOINT_ORDER_MODES",
+    "RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC",
+    "RM65_GRASP_SINGULARITY_HARD_THRESHOLD_DEG",
+    "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2",
+    "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES",
+    "RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP",
+    "RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X",
+    "RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES",
+    "RM65_GRASP_TRAJECTORY_SPEED_PROFILE_UNIFORM",
     "RM65GraspJointTrajectoryPlanner",
+    "RM65GraspEndpointProbeResult",
+    "RM65GraspLocalChainResult",
     "RM65GraspReachabilityConfig",
     "RM65GraspReachabilityResult",
-    "RM65_GRASP_PATH_PLANNING_TIME_BUDGET_SEC",
     "RM65GraspTrajectoryPlanningConfig",
     "RM65GraspTrajectoryPlanningError",
 ]

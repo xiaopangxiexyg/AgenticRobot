@@ -200,6 +200,10 @@ _BACKGROUND_WORKER_TERMINAL_STAGE = "rm65_background_stream_worker_terminal"
 # and no new motion can be admitted while these calls run.
 _EMERGENCY_STOP_RETRY_DELAY_SEC = 0.05
 _EMERGENCY_STOP_ARM_STOP_ATTEMPTS = 2
+# The RM65 SDK requires at least 50 ms between two actual force queries on one
+# handle.  Keep this as one backend-level contract: the guard poll period is
+# not the only possible caller of ``read_force_data``.
+_RM65_FORCE_DATA_MIN_INTERVAL_SEC = 0.05
 _RM65_HARDWARE_MEASUREMENT_CLOCK_DOMAIN_ID = "local_wall_time"
 
 
@@ -466,16 +470,19 @@ def _next_background_stream_schedule_after_send(
         raise ValueError("background stream period must be positive.")
     if not no_catch_up_after_send:
         return scheduled
-    long_send_gap = bool(
-        sdk_send_gap_sec is not None
-        and math.isfinite(float(sdk_send_gap_sec))
-        and float(sdk_send_gap_sec) >= 1.5 * period
-    )
-    if (
-        int(skipped_tick_count) > 0
-        or completed >= scheduled
-        or long_send_gap
-    ):
+    del sdk_send_gap_sec  # Completion gaps include the intentional wait below.
+    # Crossing one deadline by a small amount is not itself a stall.  Rebasing
+    # to ``completed + period`` in that case inserts a second full period after
+    # the SDK call and turns an otherwise recoverable 120 Hz stream into the
+    # observed 60--100 Hz cadence.  A completion-to-completion gap cannot be a
+    # rebase input: after one intentional rebase it contains both the full wait
+    # and the next SDK call, so using it feeds the previous delay back into the
+    # scheduler indefinitely.  ``resolve_periodic_tick`` already accounts for
+    # missed slots.  Rebase only after at least one whole additional period was
+    # lost or an earlier tick was skipped.  Both conditions still prevent the
+    # post-stall burst that this option is meant to forbid.
+    severe_deadline_overrun = completed >= scheduled + period
+    if int(skipped_tick_count) > 0 or severe_deadline_overrun:
         return max(scheduled, completed + period)
     return scheduled
 
@@ -547,6 +554,10 @@ class RM65ArmBackendConfig:
     # full-rate interval instead of an immediate catch-up send with a
     # materially different qcmd.
     background_streaming_no_catch_up_after_send: bool = False
+    # Opt-in phase timing for diagnosing command-worker starvation.  This does
+    # not change command generation or admission; it only separates scheduler,
+    # send-lock, shared SDK-lock, and vendor-call wall time in bounded telemetry.
+    background_streaming_debug_timing: bool = False
     # Keep the backend-wide default compatible for teleop/replay callers.
     # Policy deployment explicitly selects latest_nonblocking so a slow SDK
     # call cannot make 60 Hz reference admission wait on the 120 Hz worker.
@@ -714,6 +725,10 @@ class RM65ArmBackendConfig:
         if not isinstance(self.background_streaming_no_catch_up_after_send, bool):
             raise TypeError(
                 "background_streaming_no_catch_up_after_send must be a boolean."
+            )
+        if not isinstance(self.background_streaming_debug_timing, bool):
+            raise TypeError(
+                "background_streaming_debug_timing must be a boolean."
             )
         target_admission_mode = str(
             self.background_streaming_target_admission_mode
@@ -1180,6 +1195,9 @@ class RM65ArmBackend(EffectorBackend):
         self._force_read_waiting = threading.Event()
         self._force_read_waiters_lock = threading.Lock()
         self._force_read_waiters = 0
+        # Serialize force pacing decisions without holding the SDK lock
+        # during the minimum query interval.
+        self._force_query_lock = threading.Lock()
         self._last_force_query_monotonic: float | None = None
         self._singularity_analysis_lock = threading.RLock()
         self._emergency_stopped = False
@@ -1402,6 +1420,25 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_sdk_call_ms_stats = PercentileStats(
             max_samples=_BACKGROUND_AUDIT_STATS_MAX_SAMPLES
         )
+        self._stream_planner_lock_wait_ms_stats = PercentileStats(
+            max_samples=_BACKGROUND_AUDIT_STATS_MAX_SAMPLES
+        )
+        self._stream_send_lock_wait_ms_stats = PercentileStats(
+            max_samples=_BACKGROUND_AUDIT_STATS_MAX_SAMPLES
+        )
+        self._stream_hardware_io_lock_wait_ms_stats = PercentileStats(
+            max_samples=_BACKGROUND_AUDIT_STATS_MAX_SAMPLES
+        )
+        self._stream_vendor_sdk_call_ms_stats = PercentileStats(
+            max_samples=_BACKGROUND_AUDIT_STATS_MAX_SAMPLES
+        )
+        self._stream_vendor_sdk_thread_cpu_ms_stats = PercentileStats(
+            max_samples=_BACKGROUND_AUDIT_STATS_MAX_SAMPLES
+        )
+        self._stream_tick_work_ms_stats = PercentileStats(
+            max_samples=_BACKGROUND_AUDIT_STATS_MAX_SAMPLES
+        )
+        self._stream_last_phase_timing: dict[str, float] = {}
         self._stream_timing_snapshot_lock = threading.Lock()
         self._stream_timing_snapshot_cache: dict[str, dict[str, int | float | None]] = {}
         self._stream_timing_snapshot_cache_monotonic = 0.0
@@ -5570,6 +5607,13 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_wakeup_gap_ms_stats.reset()
         self._stream_send_gap_ms_stats.reset()
         self._stream_sdk_call_ms_stats.reset()
+        self._stream_planner_lock_wait_ms_stats.reset()
+        self._stream_send_lock_wait_ms_stats.reset()
+        self._stream_hardware_io_lock_wait_ms_stats.reset()
+        self._stream_vendor_sdk_call_ms_stats.reset()
+        self._stream_vendor_sdk_thread_cpu_ms_stats.reset()
+        self._stream_tick_work_ms_stats.reset()
+        self._stream_last_phase_timing = {}
         with self._stream_timing_snapshot_lock:
             self._stream_timing_snapshot_cache = {}
             self._stream_timing_snapshot_cache_monotonic = 0.0
@@ -5724,6 +5768,10 @@ class RM65ArmBackend(EffectorBackend):
             "actual_hz": self._stream_actual_hz,
             "last_call_ms": self._stream_last_call_ms,
             "last_deadline_lag_ms": self._stream_last_deadline_lag_ms,
+            "debug_timing_enabled": bool(
+                self.config.background_streaming_debug_timing
+            ),
+            "last_phase_timing_ms": dict(self._stream_last_phase_timing),
             "timing_percentile_window_max_samples": (
                 _BACKGROUND_AUDIT_STATS_MAX_SAMPLES
             ),
@@ -5793,6 +5841,22 @@ class RM65ArmBackend(EffectorBackend):
             "wakeup_gap_ms": self._stream_wakeup_gap_ms_stats.snapshot().as_dict(),
             "send_gap_ms": self._stream_send_gap_ms_stats.snapshot().as_dict(),
             "sdk_call_ms": self._stream_sdk_call_ms_stats.snapshot().as_dict(),
+            "planner_lock_wait_ms": (
+                self._stream_planner_lock_wait_ms_stats.snapshot().as_dict()
+            ),
+            "send_lock_wait_ms": (
+                self._stream_send_lock_wait_ms_stats.snapshot().as_dict()
+            ),
+            "hardware_io_lock_wait_ms": (
+                self._stream_hardware_io_lock_wait_ms_stats.snapshot().as_dict()
+            ),
+            "vendor_sdk_call_ms": (
+                self._stream_vendor_sdk_call_ms_stats.snapshot().as_dict()
+            ),
+            "vendor_sdk_thread_cpu_ms": (
+                self._stream_vendor_sdk_thread_cpu_ms_stats.snapshot().as_dict()
+            ),
+            "tick_work_ms": self._stream_tick_work_ms_stats.snapshot().as_dict(),
         }
         with self._stream_timing_snapshot_lock:
             self._stream_timing_snapshot_cache = {
@@ -5852,6 +5916,7 @@ class RM65ArmBackend(EffectorBackend):
         sent_at_perf: float,
         call_ms: float,
         deadline_lag_ms: float,
+        phase_timing_ms: Mapping[str, float] | None = None,
         accepted: bool = True,
         account_deadline_miss_from_lag: bool = True,
     ) -> float | None:
@@ -5878,6 +5943,11 @@ class RM65ArmBackend(EffectorBackend):
             warning = None
             if actual_hz is not None and actual_hz < warning_threshold_hz:
                 self._stream_low_rate_count += 1
+                bounded_phase_timing = {
+                    str(name): max(0.0, float(value))
+                    for name, value in dict(phase_timing_ms or {}).items()
+                    if math.isfinite(float(value))
+                }
                 warning = {
                     "active": True,
                     "message": (
@@ -5890,19 +5960,29 @@ class RM65ArmBackend(EffectorBackend):
                     "threshold_hz": float(warning_threshold_hz),
                     "last_send_dt_sec": float(send_dt_sec),
                     "low_rate_count": int(self._stream_low_rate_count),
+                    "phase_timing_ms": bounded_phase_timing,
                 }
                 now_for_print = time.monotonic()
                 if (
                     now_for_print - self._stream_last_warning_print_time
                     >= _BACKGROUND_STREAM_WARNING_PRINT_INTERVAL_SEC
                 ):
+                    phase_suffix = ""
+                    if bounded_phase_timing:
+                        phase_suffix = "; phase_ms=" + ",".join(
+                            f"{name}:{value:.2f}"
+                            for name, value in sorted(
+                                bounded_phase_timing.items()
+                            )
+                        )
                     _console_log_event(
                         "CANFD",
                         f"WARNING: {self.name} stream low rate "
                         f"actual={actual_hz:.1f}Hz target={target_hz:.1f}Hz "
                         f"threshold={warning_threshold_hz:.1f}Hz; "
                         f"suppressed repeats for "
-                        f"{_BACKGROUND_STREAM_WARNING_PRINT_INTERVAL_SEC:.0f}s",
+                        f"{_BACKGROUND_STREAM_WARNING_PRINT_INTERVAL_SEC:.0f}s"
+                        f"{phase_suffix}",
                     )
                     self._stream_last_warning_print_time = now_for_print
             else:
@@ -5913,6 +5993,11 @@ class RM65ArmBackend(EffectorBackend):
                     "threshold_hz": float(warning_threshold_hz),
                     "last_send_dt_sec": None if send_dt_sec is None else float(send_dt_sec),
                     "low_rate_count": int(self._stream_low_rate_count),
+                    "phase_timing_ms": {
+                        str(name): max(0.0, float(value))
+                        for name, value in dict(phase_timing_ms or {}).items()
+                        if math.isfinite(float(value))
+                    },
                 }
 
             step_deg = None
@@ -6190,6 +6275,8 @@ class RM65ArmBackend(EffectorBackend):
             target_stale_before_send = False
             target_stale_check_monotonic: float | None = None
             break_after_event = False
+            send_lock_wait_ms = 0.0
+            transport_phase_timing_ms: dict[str, float] = {}
 
             if late_tick_skipped and target_qpos is not None:
                 transport_block_reason = "late_tick_skipped_no_catch_up"
@@ -6230,7 +6317,14 @@ class RM65ArmBackend(EffectorBackend):
                 )
                 next_qpos = self._validate_final_joint_target(next_qpos, label="q_cmd_150")
                 if self.arm is not None:
+                    send_lock_wait_started = time.perf_counter()
                     with self._send_lock:
+                        if self.config.background_streaming_debug_timing:
+                            send_lock_wait_ms = max(
+                                0.0,
+                                (time.perf_counter() - send_lock_wait_started)
+                                * 1000.0,
+                            )
                         with self._state_lock:
                             target_is_current = bool(
                                 self._stream_target_qpos is not None
@@ -6322,6 +6416,11 @@ class RM65ArmBackend(EffectorBackend):
                                     quick_stop_active=quick_stop_active,
                                     target_sequence=target_sequence,
                                     execution_work_item=execution_work_item,
+                                    debug_phase_timing_ms=(
+                                        transport_phase_timing_ms
+                                        if self.config.background_streaming_debug_timing
+                                        else None
+                                    ),
                                 )
                             except Exception as exc:  # audited below, then fault-latched by caller.
                                 sdk_exception = exc
@@ -6345,15 +6444,93 @@ class RM65ArmBackend(EffectorBackend):
                                     f"EXCEPTION: {type(sdk_exception).__name__}: {sdk_exception}"
                                 )
                             accepted = bool(sdk_exception is None and send_code == 0)
+                            phase_timing_ms = None
+                            if self.config.background_streaming_debug_timing:
+                                phase_timing_ms = {
+                                    "raw_wakeup_lag": max(
+                                        0.0,
+                                        tick_timing.raw_wakeup_lag_sec * 1000.0,
+                                    ),
+                                    "planner_lock_wait": max(
+                                        0.0,
+                                        planner_lock_delay_sec * 1000.0,
+                                    ),
+                                    "send_lock_wait": send_lock_wait_ms,
+                                    "hardware_io_lock_wait": max(
+                                        0.0,
+                                        transport_phase_timing_ms.get(
+                                            "hardware_io_lock_wait", 0.0
+                                        ),
+                                    ),
+                                    "vendor_sdk_call": max(
+                                        0.0,
+                                        transport_phase_timing_ms.get(
+                                            "vendor_sdk_call", 0.0
+                                        ),
+                                    ),
+                                    "vendor_sdk_thread_cpu": max(
+                                        0.0,
+                                        transport_phase_timing_ms.get(
+                                            "vendor_sdk_thread_cpu", 0.0
+                                        ),
+                                    ),
+                                    "dispatch_adapter_overhead": max(
+                                        0.0,
+                                        sdk_call_ms
+                                        - transport_phase_timing_ms.get(
+                                            "hardware_io_lock_wait", 0.0
+                                        )
+                                        - transport_phase_timing_ms.get(
+                                            "vendor_sdk_call", 0.0
+                                        ),
+                                    ),
+                                    "tick_work": max(
+                                        0.0,
+                                        (call_finished - wakeup_monotonic)
+                                        * 1000.0,
+                                    ),
+                                }
+                                if phase_timing_ms["vendor_sdk_call"] >= 250.0:
+                                    _console_log_event(
+                                        "CANFD",
+                                        f"{self.name} slow vendor SDK send "
+                                        f"source={target_source or 'background_joint_target'} "
+                                        f"target_sequence={target_sequence} "
+                                        f"accepted={accepted} "
+                                        f"phase_ms={phase_timing_ms}",
+                                    )
                             sdk_send_gap_sec = self._record_background_stream_send(
                                 qpos_rad=next_qpos,
                                 sent_at_perf=call_finished,
                                 call_ms=sdk_call_ms,
                                 deadline_lag_ms=tick_timing.wakeup_lag_sec * 1000.0,
+                                phase_timing_ms=phase_timing_ms,
                                 accepted=accepted,
                                 account_deadline_miss_from_lag=False,
                             )
                             with self._state_lock:
+                                if phase_timing_ms is not None:
+                                    self._stream_last_phase_timing = dict(
+                                        phase_timing_ms
+                                    )
+                                    self._stream_planner_lock_wait_ms_stats.record(
+                                        phase_timing_ms["planner_lock_wait"]
+                                    )
+                                    self._stream_send_lock_wait_ms_stats.record(
+                                        phase_timing_ms["send_lock_wait"]
+                                    )
+                                    self._stream_hardware_io_lock_wait_ms_stats.record(
+                                        phase_timing_ms["hardware_io_lock_wait"]
+                                    )
+                                    self._stream_vendor_sdk_call_ms_stats.record(
+                                        phase_timing_ms["vendor_sdk_call"]
+                                    )
+                                    self._stream_vendor_sdk_thread_cpu_ms_stats.record(
+                                        phase_timing_ms["vendor_sdk_thread_cpu"]
+                                    )
+                                    self._stream_tick_work_ms_stats.record(
+                                        phase_timing_ms["tick_work"]
+                                    )
                                 self._last_send_result_code = send_code
                                 self._last_send_result_text = send_text
                                 if accepted:
@@ -6544,6 +6721,11 @@ class RM65ArmBackend(EffectorBackend):
                                 target_stale_check_monotonic is not None
                             ),
                             "transport_block_reason": transport_block_reason,
+                            "stream_phase_timing_ms": (
+                                None
+                                if not self.config.background_streaming_debug_timing
+                                else dict(transport_phase_timing_ms)
+                            ),
                             "arm_follow_qpos_alpha": float(
                                 self.config.arm_follow_qpos_alpha
                             ),
@@ -6831,6 +7013,7 @@ class RM65ArmBackend(EffectorBackend):
         quick_stop_active: bool = False,
         target_sequence: int | None = None,
         execution_work_item: ExecutionWorkItem | None = None,
+        debug_phase_timing_ms: dict[str, float] | None = None,
     ) -> object:
         if self.config.observation_only:
             raise RuntimeError(
@@ -6862,7 +7045,12 @@ class RM65ArmBackend(EffectorBackend):
             # or corrupt the SDK transport.  If a force read is already
             # waiting, yield before starting this command so a 120 Hz command
             # stream cannot starve the force-safety deadline.
+            lock_wait_started = time.perf_counter()
             self._acquire_command_hardware_lock()
+            lock_acquired = time.perf_counter()
+            vendor_call_cpu_started = (
+                time.thread_time() if debug_phase_timing_ms is not None else 0.0
+            )
             try:
                 if self.config.force_position_control:
                     return self.arm.Force_Position_Move_Joint(
@@ -6880,7 +7068,23 @@ class RM65ArmBackend(EffectorBackend):
                     radio=int(self.config.canfd_radio),
                 )
             finally:
+                vendor_call_finished = time.perf_counter()
                 self._hardware_read_lock.release()
+                if debug_phase_timing_ms is not None:
+                    debug_phase_timing_ms.update(
+                        {
+                            "hardware_io_lock_wait": max(
+                                0.0, (lock_acquired - lock_wait_started) * 1000.0
+                            ),
+                            "vendor_sdk_call": max(
+                                0.0, (vendor_call_finished - lock_acquired) * 1000.0
+                            ),
+                            "vendor_sdk_thread_cpu": max(
+                                0.0,
+                                (time.thread_time() - vendor_call_cpu_started) * 1000.0,
+                            ),
+                        }
+                    )
 
         adapter = self._pre_sdk_dispatch_adapter
         if adapter is None:
@@ -6989,6 +7193,7 @@ class RM65ArmBackend(EffectorBackend):
         include_derived_pose: bool = True,
         include_timing_percentiles: bool = True,
         include_pose_source_attestation: bool | None = None,
+        include_background_streaming: bool = True,
     ) -> dict[str, object]:
         if self.arm is None:
             return self.get_state(
@@ -6997,6 +7202,7 @@ class RM65ArmBackend(EffectorBackend):
                 include_pose_source_attestation=(
                     include_pose_source_attestation
                 ),
+                include_background_streaming=bool(include_background_streaming),
             )
         priority = str(hardware_read_priority or "normal").strip().lower()
         if priority not in {"normal", "background"}:
@@ -7180,11 +7386,25 @@ class RM65ArmBackend(EffectorBackend):
                 if self.config.connect_hardware and self.arm is not None:
                     self._hardware_ready = True
                     self._hardware_ready_source = "hardware_feedback"
-        return self.get_state(
+        snapshot_wall_started = time.perf_counter()
+        snapshot_cpu_started = time.thread_time()
+        state = self.get_state(
             include_derived_pose=bool(include_derived_pose),
             include_timing_percentiles=bool(include_timing_percentiles),
             include_pose_source_attestation=include_pose_source_attestation,
+            include_background_streaming=bool(include_background_streaming),
         )
+        state["hardware_observation_phase_timing"] = {
+            "refresh_to_state_snapshot_wall_ms": max(
+                0.0,
+                (time.perf_counter() - snapshot_wall_started) * 1000.0,
+            ),
+            "refresh_to_state_snapshot_thread_cpu_ms": max(
+                0.0,
+                (time.thread_time() - snapshot_cpu_started) * 1000.0,
+            ),
+        }
+        return state
 
     def read_force_data(self) -> dict[str, object]:
         """Read one validated RM65 force sample from this backend connection."""
@@ -7207,59 +7427,65 @@ class RM65ArmBackend(EffectorBackend):
         # next call occur less than 50 ms afterwards.  Enforce the interval at
         # the serialized SDK boundary while leaving the lock free during the
         # wait so qpos feedback can continue.
-        while True:
-            lock_wait_started = time.perf_counter()
-            lock_wait_cpu_started = time.thread_time()
-            self._mark_force_read_waiting()
-            lock_acquired_for_force = False
-            try:
-                self._hardware_read_lock.acquire()
-                lock_acquired_for_force = True
-                lock_acquired = time.perf_counter()
-                lock_wait_wall_sec += max(0.0, lock_acquired - lock_wait_started)
-                lock_wait_cpu_sec += max(
+        with self._force_query_lock:
+            while True:
+                lock_wait_started = time.perf_counter()
+                lock_wait_cpu_started = time.thread_time()
+                self._mark_force_read_waiting()
+                lock_acquired_for_force = False
+                try:
+                    self._hardware_read_lock.acquire()
+                    lock_acquired_for_force = True
+                    lock_acquired = time.perf_counter()
+                    lock_wait_wall_sec += max(0.0, lock_acquired - lock_wait_started)
+                    lock_wait_cpu_sec += max(
+                        0.0,
+                        time.thread_time() - lock_wait_cpu_started,
+                    )
+                    query_now = time.monotonic()
+                    previous_query = self._last_force_query_monotonic
+                    if previous_query is None:
+                        wait_sec = 0.0
+                    else:
+                        elapsed_sec = query_now - previous_query
+                        if elapsed_sec < 0.0:
+                            # A replaced clock must not turn pacing into a long sleep.
+                            self._last_force_query_monotonic = None
+                            wait_sec = 0.0
+                        else:
+                            wait_sec = _RM65_FORCE_DATA_MIN_INTERVAL_SEC - elapsed_sec
+                    if wait_sec <= 0.0:
+                        self._last_force_query_monotonic = query_now
+                        sdk_call_started = time.perf_counter()
+                        sdk_call_cpu_started = time.thread_time()
+                        try:
+                            result = self.arm.Get_Force_Data()
+                        finally:
+                            sdk_call_wall_sec += max(
+                                0.0,
+                                time.perf_counter() - sdk_call_started,
+                            )
+                            sdk_call_cpu_sec += max(
+                                0.0,
+                                time.thread_time() - sdk_call_cpu_started,
+                            )
+                        break
+                finally:
+                    if lock_acquired_for_force:
+                        self._hardware_read_lock.release()
+                    self._mark_force_read_acquired()
+                pacing_wait_requested_sec += max(0.0, wait_sec)
+                pacing_wait_started = time.perf_counter()
+                pacing_wait_cpu_started = time.thread_time()
+                time.sleep(wait_sec)
+                pacing_wait_wall_sec += max(
                     0.0,
-                    time.thread_time() - lock_wait_cpu_started,
+                    time.perf_counter() - pacing_wait_started,
                 )
-                query_now = time.monotonic()
-                previous_query = self._last_force_query_monotonic
-                wait_sec = (
-                    0.0
-                    if previous_query is None
-                    else 0.05 - (query_now - previous_query)
+                pacing_wait_cpu_sec += max(
+                    0.0,
+                    time.thread_time() - pacing_wait_cpu_started,
                 )
-                if wait_sec <= 0.0:
-                    self._last_force_query_monotonic = query_now
-                    sdk_call_started = time.perf_counter()
-                    sdk_call_cpu_started = time.thread_time()
-                    try:
-                        result = self.arm.Get_Force_Data()
-                    finally:
-                        sdk_call_wall_sec += max(
-                            0.0,
-                            time.perf_counter() - sdk_call_started,
-                        )
-                        sdk_call_cpu_sec += max(
-                            0.0,
-                            time.thread_time() - sdk_call_cpu_started,
-                        )
-                    break
-            finally:
-                if lock_acquired_for_force:
-                    self._hardware_read_lock.release()
-                self._mark_force_read_acquired()
-            pacing_wait_requested_sec += max(0.0, wait_sec)
-            pacing_wait_started = time.perf_counter()
-            pacing_wait_cpu_started = time.thread_time()
-            time.sleep(wait_sec)
-            pacing_wait_wall_sec += max(
-                0.0,
-                time.perf_counter() - pacing_wait_started,
-            )
-            pacing_wait_cpu_sec += max(
-                0.0,
-                time.thread_time() - pacing_wait_cpu_started,
-            )
         validation_wall_started = time.perf_counter()
         validation_cpu_started = time.thread_time()
         if not isinstance(result, (tuple, list)) or len(result) != 5:
@@ -7333,12 +7559,15 @@ class RM65ArmBackend(EffectorBackend):
         include_derived_pose: bool = True,
         include_timing_percentiles: bool = True,
         include_pose_source_attestation: bool | None = None,
+        include_background_streaming: bool = True,
     ) -> dict[str, object]:
         """Return a backend snapshot.
 
         The compatibility default remains the complete diagnostic snapshot.
         High-rate callers may omit FK-derived poses and percentile sorting;
-        neither field participates in command admission or transport safety.
+        Raw-qpos readers may omit background diagnostics and timing
+        aggregation when they only need the authoritative measurement.
+        Neither field participates in command admission or transport safety.
         Exact pose-source attestation is independently opt-in because its full
         model/tool revalidation is materially more expensive than FK alone.
         """
@@ -7382,8 +7611,12 @@ class RM65ArmBackend(EffectorBackend):
             hardware_ready_source = str(self._hardware_ready_source)
             singularity_metadata = dict(self._last_singularity_metadata)
             emergency_stopped = bool(self._emergency_stopped)
-            background_streaming = self._background_stream_snapshot_locked()
-        if include_timing_percentiles:
+            background_streaming = (
+                self._background_stream_snapshot_locked()
+                if include_background_streaming
+                else {}
+            )
+        if include_background_streaming and include_timing_percentiles:
             background_streaming["timing_percentiles"] = (
                 self._background_stream_timing_percentiles_snapshot()
             )

@@ -709,7 +709,8 @@ def test_rm65_backend_serializes_concurrent_force_reads():
     assert arm.call_times[1] - arm.call_times[0] >= 0.045
 
 
-def test_rm65_command_stream_yields_to_waiting_force_reader():
+@pytest.mark.parametrize("debug_timing", [False, True])
+def test_rm65_command_stream_yields_to_waiting_force_reader(debug_timing):
     command_started = threading.Event()
     command_dispatched = threading.Event()
 
@@ -727,10 +728,11 @@ def test_rm65_command_stream_yields_to_waiting_force_reader():
     )
     backend.arm = FakeArm()
     backend._mark_force_read_waiting()
+    phase_timing = {} if debug_timing else None
 
     def send_command() -> None:
         command_started.set()
-        backend._send_joint_target(np.zeros(6))
+        backend._send_joint_target(np.zeros(6), debug_phase_timing_ms=phase_timing)
 
     command_thread = threading.Thread(target=send_command)
     command_thread.start()
@@ -743,6 +745,10 @@ def test_rm65_command_stream_yields_to_waiting_force_reader():
 
     assert not command_thread.is_alive()
     assert command_dispatched.is_set()
+    if debug_timing:
+        assert phase_timing["hardware_io_lock_wait"] >= 40.0
+        assert phase_timing["vendor_sdk_call"] >= 0.0
+        assert phase_timing["vendor_sdk_thread_cpu"] >= 0.0
 
 
 def test_rm65_background_state_read_yields_to_inflight_force_reader():
@@ -795,6 +801,66 @@ def test_rm65_background_state_read_yields_to_inflight_force_reader():
         release_force.set()
         force_thread.join(timeout=0.5)
         assert not force_thread.is_alive()
+
+
+def test_rm65_backend_serializes_force_read_with_canfd_send():
+    class FakeArm:
+        def __init__(self):
+            self.active_calls = 0
+            self.max_active_calls = 0
+            self.lock = threading.Lock()
+            self.force_started = threading.Event()
+
+        def _enter(self):
+            with self.lock:
+                self.active_calls += 1
+                self.max_active_calls = max(self.max_active_calls, self.active_calls)
+
+        def _leave(self):
+            with self.lock:
+                self.active_calls -= 1
+
+        def Get_Force_Data(self):
+            self._enter()
+            self.force_started.set()
+            try:
+                time.sleep(0.03)
+                values = [0, 0, 0, 0, 0, 0]
+                return 0, values, values, values, values
+            finally:
+                self._leave()
+
+        def Movej_CANFD(self, _joint_deg, **_kwargs):
+            self._enter()
+            try:
+                time.sleep(0.03)
+                return 0
+            finally:
+                self._leave()
+
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="127.0.0.1",
+            side="left",
+            connect_hardware=False,
+        )
+    )
+    arm = FakeArm()
+    backend.arm = arm
+    force_thread = threading.Thread(target=backend.read_force_data)
+    force_thread.start()
+    assert arm.force_started.wait(timeout=0.5)
+    send_thread = threading.Thread(
+        target=lambda: backend._send_joint_target(np.zeros(6))
+    )
+    send_thread.start()
+    force_thread.join(timeout=0.5)
+    send_thread.join(timeout=0.5)
+
+    assert not force_thread.is_alive()
+    assert not send_thread.is_alive()
+    assert arm.max_active_calls == 1
+
 
 
 def test_bimanual_emergency_stop_requests_both_arms_in_parallel():

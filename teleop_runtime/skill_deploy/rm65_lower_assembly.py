@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+import numpy as np
+
 from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_ACCELERATION_LIMITED,
 )
@@ -32,7 +34,10 @@ from .rm65_ports import (
     RM65SkillTargetBuilder,
     build_exclusive_rm65_skill_position_force_guard,
 )
-from .rm65_profile import ResolvedExclusiveRM65SkillDeploymentProfile
+from .rm65_profile import (
+    RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1,
+    ResolvedExclusiveRM65SkillDeploymentProfile,
+)
 from .rm65_target_safety import (
     ExclusiveRM65SkillStartupSafetyBinder,
     ExclusiveRM65SkillTargetSafetyRuntime,
@@ -151,6 +156,7 @@ def _backend_config(
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
     *,
     side: str,
+    debug_rm65_stream_timing: bool = False,
 ) -> RM65ArmBackendConfig:
     position = profile.position_profile
     command = position.command_execution
@@ -177,6 +183,7 @@ def _backend_config(
         background_streaming_enabled=True,
         background_streaming_hz=position.rates.command_hz,
         background_streaming_no_catch_up_after_send=True,
+        background_streaming_debug_timing=debug_rm65_stream_timing,
         background_streaming_target_max_age_sec=command.reference_max_age_sec,
         background_streaming_target_admission_mode=(
             RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
@@ -257,6 +264,7 @@ def assemble_exclusive_rm65_skill_lower(
     *,
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
     debug_motion_skill: bool = False,
+    debug_rm65_stream_timing: bool = False,
     backend_factory: RM65SkillBackendFactory = RM65ArmBackend,
     target_builder_factory: RM65SkillTargetBuilderFactory = (
         DualArmCollisionAwareRetargeter
@@ -272,6 +280,8 @@ def assemble_exclusive_rm65_skill_lower(
         raise TypeError("profile must be resolved and typed.")
     if not isinstance(debug_motion_skill, bool):
         raise TypeError("debug_motion_skill must be bool.")
+    if not isinstance(debug_rm65_stream_timing, bool):
+        raise TypeError("debug_rm65_stream_timing must be bool.")
     for name, factory in (
         ("backend_factory", backend_factory),
         ("target_builder_factory", target_builder_factory),
@@ -285,7 +295,13 @@ def assemble_exclusive_rm65_skill_lower(
         target_builder_factory=target_builder_factory,
     )
     backends = {
-        side: backend_factory(_backend_config(profile, side=side))
+        side: backend_factory(
+            _backend_config(
+                profile,
+                side=side,
+                debug_rm65_stream_timing=debug_rm65_stream_timing,
+            )
+        )
         for side in ("left", "right")
     }
     for side, backend in backends.items():
@@ -310,13 +326,22 @@ def assemble_exclusive_rm65_skill_lower(
             ),
         ),
     )
+    canonical_station_from_solver_world = np.linalg.inv(
+        np.asarray(profile.scene_world_from_canonical_station, dtype=float)
+    )
+    canonical_station_from_arm_base_by_side = {
+        side: canonical_station_from_solver_world
+        @ np.asarray(profile.scene_world_from_arm_base_by_side[side], dtype=float)
+        for side in ("left", "right")
+    }
     target_safety = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
         target_builder=target_builder,
         station_world_from_arm_base_by_side=(
-            profile.scene_world_from_arm_base_by_side
+            canonical_station_from_arm_base_by_side
         ),
-        station_world_frame_id=profile.station_world_frame_id,
+        station_world_frame_id=RM65_SKILL_CANONICAL_STATION_FRAME_ID_V1,
         envelope_profile_path=profile.envelope_profile_path,
+        target_world_from_solver_world=canonical_station_from_solver_world,
     )
     startup_admission = ExclusiveRM65SkillStartupSafetyBinder(
         ports=ports,

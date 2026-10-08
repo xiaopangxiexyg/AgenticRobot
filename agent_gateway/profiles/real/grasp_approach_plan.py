@@ -8,6 +8,7 @@ the resulting fresh, session-local immutable plan exactly once.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import numpy as np
 
 import logging
@@ -54,7 +55,12 @@ from agent_gateway.skills.perception.grasp_approach_plan_schemas import (
 from agent_gateway.skills.perception.schemas import validate_no_task_evaluation_v1
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.grasp_rgbd_snapshot import decode_grasp_rgbd_snapshot
-from robot_motion.grasp_visible_scene import VisibleGraspScene, ParallelJawSolidGeometry
+from dataset_contracts.grasp_multiview_snapshot import GRASP_MULTIVIEW_SCHEMA_ID, decode_grasp_multiview_snapshot
+from robot_motion.grasp_visible_scene import (
+    PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
+    ParallelJawSolidGeometry,
+    VisibleGraspScene,
+)
 from robot_motion.coordinate_frames import CoordinateFrameGraph
 from robot_motion.rm65.captured_robot_observations import (
     RM65CapturedRobotObservationFilterResult,
@@ -97,9 +103,20 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
         data = artifact_store.managed_read_path(artifact.artifact_id).read_bytes()
         if len(data) != artifact.byte_length or hashlib.sha256(data).hexdigest() != artifact.sha256:
             raise ValueError("point-grasp snapshot Artifact identity changed")
-        arrays, metadata = decode_grasp_rgbd_snapshot(data)
-        if not np.any(arrays["target_mask"] & (arrays["depth_m"] > 0)):
-            raise ValueError("snapshot contains no observed metric target points")
+        multiview = artifact.schema_id == GRASP_MULTIVIEW_SCHEMA_ID
+        if multiview:
+            views, metadata, scene_points, scene_labels = decode_grasp_multiview_snapshot(data)
+            if scene_points is None or metadata.get("scene_frame") != "anchor_camera":
+                raise ValueError("Multi-view plan requires its retained validated scene")
+            selected_views = [decode_grasp_rgbd_snapshot(v) for v in views]
+            selected_views = [a for a, m in selected_views if m["role"] == source["role"]]
+            if len(selected_views) != 1:
+                raise ValueError("Multi-view scene anchor is missing")
+            arrays = selected_views[0]
+        else:
+            arrays, metadata = decode_grasp_rgbd_snapshot(data)
+            if not np.any(arrays["target_mask"] & (arrays["depth_m"] > 0)):
+                raise ValueError("snapshot contains no observed metric target points")
         capture = metadata["capture"]
         # NPZ JSON arrays are lists; retained operations freeze them to tuples.
         # Compare JSON semantics here without changing the typed global encoder.
@@ -117,6 +134,13 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
             if arrays["left_qpos"].size == 0
             else {side: arrays[side + "_qpos"] for side in ("left", "right")}
         )
+        if multiview:
+            # Consume the exact filtered/labelled cloud that generated the
+            # proposals. Rebuilding from anchor depth would lose wrist evidence.
+            return VisibleGraspScene(
+                points=scene_points @ pose[:3, :3].T + pose[:3, 3],
+                target_mask=scene_labels, geometry=ParallelJawSolidGeometry(**metadata["solid_geometry"]),
+                capture_qpos_by_side=capture_qpos)
         depth_m = arrays["depth_m"]
         capture_self_observation_evidence = None
         if captured_robot_observation_filter is not None and capture_qpos is not None:
@@ -143,10 +167,15 @@ def build_grasp_visible_scene_reader(*, artifact_store: RecoverableAgentArtifact
             capture_self_observation_evidence=(
                 capture_self_observation_evidence
             ),
+            depth_filter=PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
         )
     return read
 
-_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = 15.0
+REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = 15.0
+_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC = (
+    REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC
+)
+DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC = 120.0
 _LOGGER = logging.getLogger(__name__)
 
 REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1 = "real.rm65.perception.plan_grasp_approach"
@@ -394,6 +423,7 @@ def build_real_grasp_approach_plan_registration(
     max_measured_qpos_age_ms: int,
     min_speed_scale: float,
     max_speed_scale: float,
+    execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
 ) -> RealGraspApproachPlanRegistration:
     """Build both halves of the paired contract without runtime effects."""
 
@@ -402,6 +432,14 @@ def build_real_grasp_approach_plan_registration(
     source_profile = point_grasp_registration.profile
     source_binding = point_grasp_registration.binding
     source_route = point_grasp_registration.skill.routes[0]
+    execution_timeout_sec = _finite(
+        execution_operation_timeout_sec,
+        field_name="execution_operation_timeout_sec",
+    )
+    if execution_timeout_sec <= REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC:
+        raise ValueError(
+            "execution_operation_timeout_sec must exceed the activation/cleanup grace."
+        )
     profile = RealGraspApproachPlanProfile(
         component_id=component_id,
         side=side,
@@ -591,7 +629,7 @@ def build_real_grasp_approach_plan_registration(
         may_open_publication=False,
         requires_operator_confirmation=True,
         requires_deadman=False,
-        max_operation_duration_ms=60_000,
+        max_operation_duration_ms=int(math.ceil(execution_timeout_sec * 1000.0)),
         cancellation_policy="hold_on_cancel_disconnect_or_timeout",
         requires_task_evaluation=False,
         skill_io_contract_hash=execute_io.semantic_content_hash,
@@ -916,6 +954,7 @@ class RealGraspApproachPlanProvider:
         current_station_revision: Callable[[], int],
         clock: Callable[[], float] = time.time,
         visible_scene_reader: Callable | None = None,
+        non_motion_read_window: Callable[[], Any] | None = None,
     ) -> None:
         if not isinstance(registration, RealGraspApproachPlanRegistration):
             raise TypeError("registration must be typed.")
@@ -958,7 +997,13 @@ class RealGraspApproachPlanProvider:
         self.point_grasp_executor = point_grasp_executor
         if visible_scene_reader is not None and not callable(visible_scene_reader):
             raise TypeError("visible_scene_reader must be callable or None")
+        if (
+            non_motion_read_window is not None
+            and not callable(non_motion_read_window)
+        ):
+            raise TypeError("non_motion_read_window must be callable or None")
         self.visible_scene_reader = visible_scene_reader
+        self.non_motion_read_window = non_motion_read_window
         self.motion_port = motion_port
         self.frame_graph = frame_graph
         self.grasp_trajectory_planner = grasp_trajectory_planner
@@ -1020,6 +1065,42 @@ class RealGraspApproachPlanProvider:
         ) * 1_000.0 > self.registration.profile.max_measured_qpos_age_ms:
             return "stale"
         return None
+
+    def _postplan_measured_qpos(
+        self,
+    ) -> tuple[RealAgentMotionMeasuredQposCut | None, float, str | None]:
+        """Read the first fresh control-loop cut after a non-motion window.
+
+        ``non_motion_read_window`` resumes the lower RM65 sampler before its
+        context exits, but the control loop publishes that sample to the motion
+        port asynchronously.  Reading the port immediately after a long
+        planning call can therefore observe the same cut used at admission and
+        misclassify the planning duration as measurement age.  Wait only for
+        this publication hand-off; the ordinary freshness and start-state
+        drift checks remain unchanged.
+        """
+
+        cut = self.motion_port.latest_measured_qpos()
+        now = float(self._clock())
+        problem = self._qpos_problem(cut, now=now)
+        if (
+            self.non_motion_read_window is None
+            or problem not in {"unavailable", "stale"}
+        ):
+            return cut, now, problem
+
+        deadline = time.monotonic() + (
+            self.registration.profile.max_measured_qpos_age_ms / 1_000.0
+        )
+        while problem in {"unavailable", "stale"}:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            time.sleep(min(0.002, remaining))
+            cut = self.motion_port.latest_measured_qpos()
+            now = float(self._clock())
+            problem = self._qpos_problem(cut, now=now)
+        return cut, now, problem
 
     @staticmethod
     def _diagnostics(exc: RM65GraspTrajectoryPlanningError) -> dict[str, Any]:
@@ -1179,8 +1260,10 @@ class RealGraspApproachPlanProvider:
             target_execution,
             field_name="T_execution_from_tool_tcp",
         )
-        now = float(self._clock())
         qpos_cut = self.motion_port.latest_measured_qpos()
+        # Timestamp the acquired cut, not the start of its potentially blocked
+        # read.  A concurrent sampler can publish a newer cut during that read.
+        now = float(self._clock())
         qpos_problem = self._qpos_problem(qpos_cut, now=now)
         source_evidence = tuple(source_operation.execution_receipt_refs)
         rejection_seed = {
@@ -1224,29 +1307,53 @@ class RealGraspApproachPlanProvider:
                 None,
             )
         try:
-            visible_scene = None
-            if source_result["backend_id"] == "graspgenx":
-                if self.visible_scene_reader is None:
-                    raise RM65GraspTrajectoryPlanningError("grasp_scene_snapshot_unavailable")
-                try:
-                    visible_scene = self.visible_scene_reader(source_operation, source_result)
-                    if not isinstance(visible_scene, VisibleGraspScene):
-                        raise TypeError("snapshot reader did not return a typed visible scene")
-                except (ValueError, TypeError, KeyError, OSError) as error:
-                    raise RM65GraspTrajectoryPlanningError(
-                        "grasp_scene_snapshot_invalid", details={
-                            "exception_type": type(error).__name__,
-                            # Retain a bounded cause in logs, not new v1 fields.
-                            "exception_message": " ".join(str(error).split())[:512],
-                        }
-                    ) from error
-            trajectory = self.grasp_trajectory_planner(
-                qpos_by_side=qpos_cut.qpos_by_side,
-                side=profile.side,
-                target_tool_tcp_world=target_execution,
-                speed_scale=speed_scale,
-                **({"visible_scene": visible_scene} if visible_scene is not None else {}),
+            planning_window = (
+                self.non_motion_read_window()
+                if self.non_motion_read_window is not None
+                else nullcontext()
             )
+            with planning_window:
+                # Scene reconstruction may run the captured-robot URDF/FCL
+                # filter and is part of the same blocking, read-only planning
+                # operation as trajectory search.  Enter the window before
+                # this work; otherwise the force stale watchdog can trip while
+                # the planner has not even received its scene yet.
+                visible_scene = None
+                if source_result["backend_id"] == "graspgenx":
+                    if self.visible_scene_reader is None:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "grasp_scene_snapshot_unavailable"
+                        )
+                    try:
+                        visible_scene = self.visible_scene_reader(
+                            source_operation, source_result
+                        )
+                        if not isinstance(visible_scene, VisibleGraspScene):
+                            raise TypeError(
+                                "snapshot reader did not return a typed visible scene"
+                            )
+                    except (ValueError, TypeError, KeyError, OSError) as error:
+                        raise RM65GraspTrajectoryPlanningError(
+                            "grasp_scene_snapshot_invalid",
+                            details={
+                                "exception_type": type(error).__name__,
+                                # Retain a bounded cause in logs, not new v1 fields.
+                                "exception_message": " ".join(
+                                    str(error).split()
+                                )[:512],
+                            },
+                        ) from error
+                trajectory = self.grasp_trajectory_planner(
+                    qpos_by_side=qpos_cut.qpos_by_side,
+                    side=profile.side,
+                    target_tool_tcp_world=target_execution,
+                    speed_scale=speed_scale,
+                    **(
+                        {"visible_scene": visible_scene}
+                        if visible_scene is not None
+                        else {}
+                    ),
+                )
         except RM65GraspTrajectoryPlanningError as exc:
             # The published v1 diagnostics object is intentionally bounded.
             # Preserve every new lower-stage rejection detail in the retained
@@ -1270,9 +1377,7 @@ class RealGraspApproachPlanProvider:
             )
         if not isinstance(trajectory, RealAgentJointTrajectory):
             raise TypeError("RM65 planner returned an invalid trajectory type.")
-        now = float(self._clock())
-        latest_qpos = self.motion_port.latest_measured_qpos()
-        post_problem = self._qpos_problem(latest_qpos, now=now)
+        latest_qpos, now, post_problem = self._postplan_measured_qpos()
         if post_problem is not None:
             failed_base = self._base_result(
                 source_operation=source_operation,
@@ -1381,18 +1486,14 @@ class RealGraspApproachPlanProvider:
                 )
             ),
         )
-        success_base = self._base_result(
-            source_operation=source_operation,
-            source_result=source_result,
-            candidate=candidate,
-            ordinal=ordinal,
-            speed_scale=speed_scale,
-            target_reference=target_reference,
-            target_execution=target_execution,
-            qpos_cut=qpos_cut,
-            now=created_at,
-            planner_evidence_refs=plan.all_evidence_refs,
-        )
+        # Keep the reported age tied to admission of the exact qpos cut used
+        # to construct the path.  Recomputing it at completion made this field
+        # grow by the entire planning duration even though the post-plan fresh
+        # cut and start-state drift checks above had already passed.
+        success_base = {
+            **base,
+            "planner_evidence_refs": sorted(set(plan.all_evidence_refs)),
+        }
         result = {
             **success_base,
             "planning_status": "path_found",
@@ -1458,6 +1559,8 @@ __all__ = [
     "REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1",
     "BoundedRealGraspApproachPlanStore",
     "RealGraspApproachPlan",
+    "REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC",
+    "DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC",
     "RealGraspApproachPlanLookupError",
     "RealGraspApproachPlanProfile",
     "RealGraspApproachPlanProvider",

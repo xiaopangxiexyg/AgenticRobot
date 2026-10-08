@@ -30,6 +30,7 @@ from teleop_runtime.transforms import validate_pose_matrix
 
 REAL_AGENT_MOTION_COMMAND_METADATA_KEY = "real_agent_motion_operation"
 REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD = 0.01
+REAL_AGENT_TRAJECTORY_CLOCK_MAX_ADVANCE_SEC = 0.10
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -77,6 +78,9 @@ class RealAgentMotionPortConfig:
     execution_frame_id: str
     execution_frame_spec_hash: str
     exclusive_command_claim: bool = False
+    trajectory_clock_max_advance_sec: float = (
+        REAL_AGENT_TRAJECTORY_CLOCK_MAX_ADVANCE_SEC
+    )
 
     def __post_init__(self) -> None:
         active_sides = tuple(str(side).strip().lower() for side in self.active_sides)
@@ -118,6 +122,17 @@ class RealAgentMotionPortConfig:
             self,
             "exclusive_command_claim",
             bool(self.exclusive_command_claim),
+        )
+        clock_max_advance = _finite(
+            self.trajectory_clock_max_advance_sec,
+            field_name="trajectory_clock_max_advance_sec",
+        )
+        if clock_max_advance <= 0.0:
+            raise ValueError("trajectory_clock_max_advance_sec must be positive.")
+        object.__setattr__(
+            self,
+            "trajectory_clock_max_advance_sec",
+            clock_max_advance,
         )
 
 
@@ -421,6 +436,9 @@ class RealAgentMotionPortSnapshot:
     hold_applied_at: float | None
     hold_succeeded: bool | None
     fault: str | None
+    trajectory_elapsed_sec: float | None = None
+    trajectory_clock_rebased_count: int = 0
+    trajectory_clock_last_capped: bool = False
 
     @property
     def semantic_content_hash(self) -> str:
@@ -620,6 +638,14 @@ class RealAgentMotionPort:
         self._hold_applied_at: float | None = None
         self._hold_succeeded: bool | None = None
         self._fault: str | None = None
+        # Preplanned paths use a committed logical clock. A slow observation,
+        # expired reference, or other non-dispatch cycle must not advance the
+        # path by wall time and then release a future target in one frame.
+        self._trajectory_elapsed_sec = 0.0
+        self._trajectory_clock_wall_time: float | None = None
+        self._trajectory_pending_clock: tuple[str, float, float, bool] | None = None
+        self._trajectory_clock_rebased_count = 0
+        self._trajectory_clock_last_capped = False
         self._owner_attachment_evidence_ref: str | None = None
         self._owner_token_id: str | None = None
         self._owner_state_revision = 0
@@ -774,6 +800,14 @@ class RealAgentMotionPort:
             hold_applied_at=self._hold_applied_at,
             hold_succeeded=self._hold_succeeded,
             fault=self._fault,
+            trajectory_elapsed_sec=(
+                self._trajectory_elapsed_sec
+                if self._active is not None
+                and self._active.joint_trajectory is not None
+                else None
+            ),
+            trajectory_clock_rebased_count=self._trajectory_clock_rebased_count,
+            trajectory_clock_last_capped=self._trajectory_clock_last_capped,
         )
 
     def snapshot(self) -> RealAgentMotionPortSnapshot:
@@ -836,6 +870,11 @@ class RealAgentMotionPort:
             self._hold_applied_at = None
             self._hold_succeeded = None
             self._fault = None
+            self._trajectory_elapsed_sec = 0.0
+            self._trajectory_clock_wall_time = None
+            self._trajectory_pending_clock = None
+            self._trajectory_clock_rebased_count = 0
+            self._trajectory_clock_last_capped = False
             self._advance_revision()
             return self._snapshot_locked()
 
@@ -1040,6 +1079,12 @@ class RealAgentMotionPort:
                     self._pending = None
                     self._phase = RealAgentMotionPhase.ACTIVE
                     self._activated_at = current_time
+                    if trajectory is not None:
+                        self._trajectory_elapsed_sec = 0.0
+                        self._trajectory_clock_wall_time = current_time
+                        self._trajectory_pending_clock = None
+                        self._trajectory_clock_rebased_count = 0
+                        self._trajectory_clock_last_capped = False
                     self._advance_revision()
                     return self._snapshot_locked()
                 hold_operation_id = pending.operation_id
@@ -1128,11 +1173,44 @@ class RealAgentMotionPort:
         try:
             if activation.joint_trajectory is not None:
                 trajectory = activation.joint_trajectory
+                singularity_replay_prevalidated = any(
+                    str(reference).startswith(
+                        (
+                            "rm65-grasp-path:",
+                            "rm65-production-urdf-fcl-path:",
+                            "urdf-fcl-path:",
+                        )
+                    )
+                    for reference in trajectory.planner_evidence_refs
+                )
                 with self._lock:
                     activated_at = self._activated_at
                 if activated_at is None:
                     raise RuntimeError("active trajectory has no activation timestamp")
-                elapsed = max(0.0, current_time - activated_at)
+                with self._lock:
+                    clock_wall_time = self._trajectory_clock_wall_time
+                    if clock_wall_time is None:
+                        clock_wall_time = activated_at
+                        self._trajectory_clock_wall_time = clock_wall_time
+                    committed_elapsed = float(self._trajectory_elapsed_sec)
+                raw_clock_advance = max(0.0, current_time - clock_wall_time)
+                max_clock_advance = float(
+                    self.config.trajectory_clock_max_advance_sec
+                )
+                clock_advance = min(raw_clock_advance, max_clock_advance)
+                elapsed = min(
+                    float(trajectory.time_from_start_sec[-1]),
+                    committed_elapsed + clock_advance,
+                )
+                clock_capped = bool(raw_clock_advance > clock_advance + 1e-12)
+                with self._lock:
+                    self._trajectory_pending_clock = (
+                        activation.operation_id,
+                        current_time,
+                        elapsed,
+                        clock_capped,
+                    )
+                    self._trajectory_clock_last_capped = clock_capped
                 next_sample_index = int(
                     np.searchsorted(
                         trajectory.time_from_start_sec,
@@ -1180,11 +1258,26 @@ class RealAgentMotionPort:
                     "trajectory_sample_count": int(
                         trajectory.time_from_start_sec.size
                     ),
+                    "trajectory_duration_sec": float(
+                        trajectory.time_from_start_sec[-1]
+                    ),
                     "trajectory_time_from_start_sec": float(
                         trajectory.time_from_start_sec[sample_index]
                     ),
                     "target_tool_tcp_pose_world": activation.target_pose_world.copy(),
                     "target_pose_semantics": "actual_tool_tcp_world",
+                    "source": (
+                        "replay_qpos_trajectory"
+                        if singularity_replay_prevalidated
+                        else "joint_vector"
+                    ),
+                    "singularity_replay_slowdown_preapplied": singularity_replay_prevalidated,
+                    "singularity_replay_slowdown_collision_rechecked": singularity_replay_prevalidated,
+                    "singularity_policy": "real_teleop_soft_traversal_v1",
+                    "trajectory_elapsed_sec": float(elapsed),
+                    "trajectory_clock_wall_time": current_time,
+                    "trajectory_clock_advance_sec": float(clock_advance),
+                    "trajectory_clock_advance_capped": clock_capped,
                 }
                 command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = dict(
                     operation_metadata
@@ -1204,6 +1297,7 @@ class RealAgentMotionPort:
                                 )
                             ),
                             metadata={
+                                **dict(operation_metadata),
                                 REAL_AGENT_MOTION_COMMAND_METADATA_KEY: dict(
                                     operation_metadata
                                 )
@@ -1396,6 +1490,29 @@ class RealAgentMotionPort:
             return self.snapshot()
         operation_id = str(operation_metadata.get("operation_id", ""))
         with self._lock:
+            pending_clock = self._trajectory_pending_clock
+            if (
+                pending_clock is not None
+                and self._active is not None
+                and self._active.operation_id == operation_id
+                and pending_clock[0] == operation_id
+            ):
+                _, pending_wall_time, pending_elapsed, pending_capped = pending_clock
+                self._trajectory_clock_wall_time = float(pending_wall_time)
+                if command_dispatched:
+                    self._trajectory_elapsed_sec = max(
+                        self._trajectory_elapsed_sec,
+                        float(pending_elapsed),
+                    )
+                else:
+                    # A skipped/expired frame is a soft HOLD for the
+                    # trajectory clock: preserve the last committed sample,
+                    # but rebase wall time so the next healthy frame resumes
+                    # from there instead of catching up.
+                    self._trajectory_clock_rebased_count += 1
+                self._trajectory_clock_last_capped = bool(pending_capped)
+                self._trajectory_pending_clock = None
+        with self._lock:
             if (
                 command_dispatched
                 and self._active is not None
@@ -1408,6 +1525,7 @@ class RealAgentMotionPort:
 
 __all__ = [
     "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
+    "REAL_AGENT_TRAJECTORY_CLOCK_MAX_ADVANCE_SEC",
     "REAL_AGENT_TRAJECTORY_START_MAX_DRIFT_RAD",
     "RealAgentJointTrajectory",
     "RealAgentMotionActivation",

@@ -58,6 +58,7 @@ from agent_gateway.skills.motion.schemas import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.coordinate_frames import CoordinateFrameGraph
+from .object_transport import ObjectTransportRegistration
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.primitives import (
     CARDINAL_TCP_SHORT_STEP_PRIMITIVES,
@@ -69,6 +70,7 @@ from robot_motion.primitives import (
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
 from .grasp_approach_plan import (
+    DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_EXECUTOR_ID_V1,
     REAL_AGENT_EXECUTE_GRASP_APPROACH_PLAN_ROUTE_ID_V1,
     REAL_AGENT_GRASP_APPROACH_PLAN_ROUTE_ID_V1,
@@ -582,6 +584,7 @@ class RealAgentPrimitiveContractBundle:
         StationBoundPointGraspRenderRegistration | None
     ) = None
     grasp_approach_plan_registration: RealGraspApproachPlanRegistration | None = None
+    object_transport_registration: ObjectTransportRegistration | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -597,6 +600,12 @@ class RealAgentPrimitiveContractBundle:
             for entry in self.route_manifest.skill_routes
         )
         grasp_approach_plan_enabled = self.grasp_approach_plan_registration is not None
+        transport_enabled = self.object_transport_registration is not None
+        if transport_enabled != any(entry.route.skill_id == "perception.plan_object_move"
+                                    for entry in self.route_manifest.skill_routes):
+            raise ValueError("Object transport registration and manifest disagree.")
+        if transport_enabled and self.perception_capture is None:
+            raise ValueError("Object transport needs the observation Artifact store.")
         paired_plan_routes_present = (
             any(
                 entry.route.skill_id == EXECUTE_GRASP_APPROACH_PLAN_SKILL_ID_V1
@@ -721,6 +730,9 @@ class RealAgentPrimitiveContractBundle:
             + (2 if self.perception_capture is not None else 0)
             + (3 if self.localization_registration is not None else 0)
             + (2 if grasp_approach_plan_enabled else 0)
+            + int(transport_enabled)
+            + int(self.station_point_grasp_registration is not None
+                  and self.station_point_grasp_registration.observation_registration is not None)
         )
         if len(self.route_manifest.skill_routes) != expected_route_count:
             raise ValueError("Real perception registration and manifest disagree.")
@@ -936,11 +948,13 @@ def build_real_agent_primitive_contract_bundle(
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
+    object_transport_registration: ObjectTransportRegistration | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
     ) = None,
+    grasp_execution_operation_timeout_sec: float = DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
     domain_emergency_stop_available: bool = False,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects."""
@@ -1096,6 +1110,7 @@ def build_real_agent_primitive_contract_bundle(
             max_measured_qpos_age_ms=convergence.max_measurement_age_ms,
             min_speed_scale=pose_target_profile.min_speed_scale,
             max_speed_scale=pose_target_profile.max_speed_scale,
+            execution_operation_timeout_sec=grasp_execution_operation_timeout_sec,
         )
         if grasp_approach_plan_enabled
         else None
@@ -1496,6 +1511,14 @@ def build_real_agent_primitive_contract_bundle(
         )
     if grasp_approach_plan_registration is not None:
         perception_registrations.append(grasp_approach_plan_registration.skill)
+    grasp_observation_registration = (None if station_point_grasp_registration is None
+                                      else station_point_grasp_registration.observation_registration)
+    if grasp_observation_registration is not None:
+        perception_registrations.append(grasp_observation_registration.skill)
+    if object_transport_registration is not None:
+        if perception_capture is None:
+            raise ValueError("Object transport needs perception registration.")
+        perception_registrations.append(object_transport_registration.skill)
     perception_registrations = tuple(perception_registrations)
     tcp_pose_definition = tcp_pose_observe.definition_catalog.skill_definitions[0]
     tcp_pose_schema = tcp_pose_observe.schema_catalog.schema_entries[0]
@@ -1614,6 +1637,17 @@ def build_real_agent_primitive_contract_bundle(
                 availability_hash=(grasp_approach_plan_registration.availability_hash),
             )
         )
+    if grasp_observation_registration is not None:
+        route_items.append(SkillRouteManifestEntry(
+            route=grasp_observation_registration.skill.routes[0],
+            deployment_binding=grasp_observation_registration.binding, evaluation_plan_hash=None,
+            availability_hash=grasp_observation_registration.availability_hash))
+    if object_transport_registration is not None:
+        route_items.append(SkillRouteManifestEntry(
+            route=object_transport_registration.skill.routes[0],
+            deployment_binding=object_transport_registration.binding,
+            evaluation_plan_hash=None,
+            availability_hash=object_transport_registration.binding.deployment_binding_hash))
     artifact_contract_by_skill = {
         (item.definition.skill_id, item.definition.skill_version): item.io_contract
         for item in perception_registrations
@@ -1761,6 +1795,8 @@ def build_real_agent_primitive_contract_bundle(
                 if grasp_approach_plan_registration is None
                 else (grasp_approach_plan_registration.payload_validator,)
             ),
+            *((grasp_observation_registration.payload_validator,) if grasp_observation_registration is not None else ()),
+            *((object_transport_registration.payload_validator,) if object_transport_registration is not None else ()),
         ),
     )
     return RealAgentPrimitiveContractBundle(
@@ -1784,6 +1820,7 @@ def build_real_agent_primitive_contract_bundle(
             station_point_grasp_render_registration
         ),
         grasp_approach_plan_registration=grasp_approach_plan_registration,
+        object_transport_registration=object_transport_registration,
     )
 
 

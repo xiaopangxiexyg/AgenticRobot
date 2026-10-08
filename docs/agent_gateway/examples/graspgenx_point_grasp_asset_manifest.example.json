@@ -3,7 +3,7 @@
   "model_profile_id": "graspgenx-release-dmtac-m-sweep-volume-v1",
   "source": {
     "git_url": "https://github.com/NVlabs/GraspGenX.git",
-    "revision": "b9429097728cb1c430dd78b92edf17ba318aad03",
+    "revision": "d9464a263f2bcb7ad70b13d75de04cadde8d9ff7",
     "license": "Apache-2.0"
   },
   "checkpoint_repository": {

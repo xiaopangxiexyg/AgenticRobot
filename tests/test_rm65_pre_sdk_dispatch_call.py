@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
@@ -58,6 +60,26 @@ def test_default_off_path_preserves_legacy_private_call_without_context() -> Non
 
     assert backend._send_joint_target(np.zeros(6)) == 0
 
+    assert arm.calls == [(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)]
+
+
+def test_debug_send_timing_separates_vendor_wait_from_thread_cpu() -> None:
+    class _WaitingArm(_FakeArm):
+        def Movej_CANFD(self, joint_deg, **kwargs):
+            time.sleep(0.015)
+            return super().Movej_CANFD(joint_deg, **kwargs)
+
+    backend, _ = _backend()
+    arm = _WaitingArm()
+    backend.arm = arm
+    phase_timing_ms: dict[str, float] = {}
+
+    assert backend._send_joint_target(
+        np.zeros(6), debug_phase_timing_ms=phase_timing_ms
+    ) == 0
+
+    assert phase_timing_ms["vendor_sdk_call"] >= 10.0
+    assert 0.0 <= phase_timing_ms["vendor_sdk_thread_cpu"] < 10.0
     assert arm.calls == [(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)]
 
 

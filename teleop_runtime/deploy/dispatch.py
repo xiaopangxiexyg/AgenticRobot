@@ -200,6 +200,7 @@ def inspect_arm_backends_for_position_dispatch(
                 "hardware_ready": None,
                 "emergency_stopped": False,
                 "send_result_code": None,
+                "singularity_metadata": {},
                 "background_streaming": {},
                 "timing": {
                     "is_ready_ms": 0.0,
@@ -275,6 +276,7 @@ def inspect_arm_backends_for_position_dispatch(
             "hardware_ready": state.get("hardware_ready"),
             "emergency_stopped": bool(state.get("emergency_stopped", False)),
             "send_result_code": send_result_code,
+            "singularity_metadata": dict(state.get("singularity_metadata") or {}),
             "background_streaming": _compact_background_streaming_state(state),
             "warnings": background_warnings,
             "timing": {

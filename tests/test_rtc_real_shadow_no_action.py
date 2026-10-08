@@ -642,8 +642,28 @@ def test_deploy_camera_startup_fails_closed_after_collection_retry() -> None:
         with pytest.raises(
             RuntimeError,
             match="failed after the formal real-teleop deferred retry lifecycle",
-        ):
+        ) as exc_info:
             run_policy.start_camera_sources({"front": _Source()})
+    message = str(exc_info.value)
+    assert "RGB-D tasks require fresh color and depth together" in message
+    assert "enable_depth=false" in message
+    assert "reconnect it manually" in message
+
+
+def test_deploy_camera_self_check_failure_gives_stream_recovery_guidance() -> None:
+    with patch.object(
+        deploy_camera_runtime,
+        "_build_camera_status",
+        return_value={"front": {"frame_count": 0, "status_level": "missing"}},
+    ):
+        with pytest.raises(RuntimeError, match="startup self-check failed") as exc_info:
+            deploy_camera_runtime.run_camera_startup_self_check(
+                {"front": object()}, duration_sec=0.0
+            )
+
+    message = str(exc_info.value)
+    assert "RGB-D tasks require fresh color and depth together" in message
+    assert "enable_depth=false" in message
 
 
 def test_deploy_camera_defaults_match_formal_collection_startup() -> None:

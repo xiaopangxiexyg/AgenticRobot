@@ -677,9 +677,10 @@ def test_arm_state_reader_qpos_only_mode_skips_backend_derived_state() -> None:
         "include_derived_pose": False,
         "include_timing_percentiles": False,
         "include_pose_source_attestation": False,
+        "include_background_streaming": False,
     }
     assert backend.refresh_options == [expected_options]
-    assert backend.state_options == [expected_options]
+    assert backend.state_options == []
     assert backend.compute_calls == 0
     np.testing.assert_allclose(state["hardware_qpos"], backend.hardware_qpos)
     assert state["actual_tcp_pose"] is None

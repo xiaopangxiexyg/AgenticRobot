@@ -15,6 +15,7 @@ from agent_gateway.profiles.real.point_grasp_deployment import (
 from deployments.perception.graspgenx_client import (
     GRASPGENX_DEFAULT_MODE,
     GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
+    GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM,
     GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
     GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
     GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM,
@@ -34,13 +35,16 @@ from deployments.perception.sam2_graspgenx_point_grasp import (
     DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
     GRASPGENX_CHECKPOINT_REVIEWED_REVISION,
     GRASPGENX_REVIEWED_REVISION,
+    GraspGenXCandidateSelection,
     GraspGenXPointGraspModelSpec,
     Sam2GraspGenXPointGraspPlanner,
 )
 from deployments.perception.sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner
 from deployments.perception.dmtac_grasp_overlay import (
+    reviewed_4b2_cad_solid_geometry,
     reviewed_graspgenx_dmtac_solid_geometry,
 )
+from robot_motion.grasp_visible_scene import VisibleGraspScene
 
 
 class _FakeSocket:
@@ -126,6 +130,118 @@ class _DuckBackend:
 
     def infer_object(self, point_cloud, **kwargs):
         return self.grasps.copy(), self.scores.copy()
+
+
+def test_support_clearance_retains_arm_side_and_top_without_ignoring_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    depth = np.zeros((80, 80), dtype=np.float32)
+    mask = np.zeros(depth.shape, dtype=bool)
+    mask[38:43, 38:43] = True
+    depth[mask] = 1.0
+    top = np.diag((1.0, -1.0, -1.0, 1.0))
+    top[2, 3] = 1.025
+    top_poses = []
+    for index, yaw in enumerate(np.linspace(0.0, 2 * np.pi, 8, endpoint=False)):
+        cosine, sine = np.cos(yaw), np.sin(yaw)
+        yaw_rotation = np.asarray(
+            ((cosine, -sine, 0.0), (sine, cosine, 0.0), (0.0, 0.0, 1.0))
+        )
+        pose = top.copy()
+        pose[:3, :3] = yaw_rotation @ top[:3, :3]
+        pose[0, 3] = 0.0015 * ((index % 3) - 1)
+        pose[1, 3] = 0.0015 * ((index // 3) - 1)
+        top_poses.append(pose)
+    side = np.eye(4)
+    side[:3, :3] = np.column_stack(
+        ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0))
+    )
+    side[:3, 3] = (-0.025, 0.0, 1.0)
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path),
+        point_segmenter=_Segmenter(mask),
+        client=_PlannerClient(
+            np.stack((*top_poses, side)),
+            np.asarray((*np.linspace(0.9, 0.83, 8), 0.8)),
+        ),
+        solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+        preferred_approach_origin_base_m=(-0.2, 0.0, 0.0),
+    )
+    blocked_table_heights = []
+
+    def _terminal(_scene, pose, *, opening_m, contact_depth_m):
+        del opening_m, contact_depth_m
+        direction = np.asarray(pose)[:3, 2]
+        z = float(np.asarray(pose)[2, 3])
+        # The observed table remains solid: side grasps require a larger
+        # height correction than the top grasp to clear it.
+        blocked = z < (1.01 if abs(direction[2]) < 0.7 else 1.03)
+        if blocked:
+            blocked_table_heights.append(z)
+        return 0, 0, (3 if abs(direction[2]) < 0.7 else 1) if blocked else 0
+
+    monkeypatch.setattr(
+        VisibleGraspScene,
+        "collision_counts_with_terminal_target_contact",
+        _terminal,
+    )
+    monkeypatch.setattr(
+        VisibleGraspScene, "approach_collision_counts",
+        lambda *_args, **_kwargs: (0, 0),
+    )
+    pool = []
+
+    def _select(candidates, _target, maximum):
+        pool.extend(candidates)
+        return GraspGenXCandidateSelection(
+            selected_indices=tuple(range(min(maximum, len(candidates)))),
+            diagnostics={},
+        )
+
+    planner.start()
+    try:
+        planner.plan(
+            Image.new("RGB", (80, 80)), depth, pixel_uv=(40, 40),
+            intrinsics={
+                "width": 80, "height": 80, "fx": 1000.0,
+                "fy": 1000.0, "cx": 40.0, "cy": 40.0,
+            },
+            base_from_camera=np.eye(4), max_candidates=5,
+            visible_scene_factory=lambda **kwargs: VisibleGraspScene(
+                points=np.asarray(((0.0, 0.0, 1.0), (1.0, 1.0, 1.0))),
+                target_mask=np.asarray((True, False)),
+                geometry=kwargs["geometry"],
+            ),
+            candidate_selector=_select,
+        )
+        lifted = [
+            candidate for candidate in pool
+            if candidate.pose_source == "dmtac_support_clearance_variant_v1"
+        ]
+        assert any(
+            abs(np.asarray(candidate.base_from_tcp).reshape(4, 4)[2, 2]) < 0.7
+            for candidate in lifted
+        )
+        assert any(
+            -np.asarray(candidate.base_from_tcp).reshape(4, 4)[2, 2] >= 0.7
+            for candidate in lifted
+        )
+        assert blocked_table_heights
+        assert planner.last_filter_summary["support_clearance_side_admitted"] == 4
+        assert planner.last_filter_summary["support_clearance_top_admitted"] > 0
+        assert all(
+            not _terminal(
+                None,
+                planner.solid_geometry.solid_pose(
+                    np.asarray(candidate.base_from_tcp).reshape(4, 4)
+                ),
+                opening_m=0.0705,
+                contact_depth_m=0.006,
+            )[2]
+            for candidate in lifted
+        )
+    finally:
+        planner.close()
 
 
 def test_graspgenx_default_mode_is_inprocess() -> None:
@@ -340,9 +456,15 @@ def test_inprocess_backend_reuses_client_filtering_and_sampler_cache(
         == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
     )
     assert runner_calls[0][2]["moe_z_offsets_cm"] == GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
+    assert runner_calls[0][2]["moe_side_height_offsets_cm"] == (
+        GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+    )
     assert -3.0 in GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
     assert set((-8.0, -6.0, -4.0, -2.0, -1.0, 0.0)) <= set(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
     assert backend.semantic_config["graspmoe_sampling"]["z_offsets_cm"] == GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM
+    assert backend.semantic_config["graspmoe_sampling"]["side_height_offsets_cm"] == (
+        GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+    )
     assert (
         runner_calls[0][2]["moe_obb_density"]
         == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
@@ -423,6 +545,9 @@ def test_client_sends_dmtac_sweep_volume_and_sorts_top_k() -> None:
     assert request["action"] == "infer_object"
     assert request["moe_num_yaws"] == GRASPGENX_POINT_GRASP_MOE_NUM_YAWS
     assert request["moe_z_offsets_cm"] == list(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
+    assert request["moe_side_height_offsets_cm"] == list(
+        GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+    )
     assert request["moe_obb_density"] == GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY
     assert request["moe_obb_position_spacing_cm"] == pytest.approx(
         GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -496,6 +621,10 @@ def test_moe_samples_five_mm_insertion_intervals_before_scoring() -> None:
     offsets = np.asarray(GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM)
     assert set((-8., -6., -4., -2., -1., 0.)) <= set(offsets)
     np.testing.assert_allclose(np.diff(offsets[offsets >= -4.]), .5)
+
+
+def test_moe_samples_support_aware_side_heights_before_scoring() -> None:
+    assert GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM == (0.0, 1.0, 2.0)
 
 
 def test_client_rejects_score_threshold_outside_confidence_range() -> None:
@@ -778,7 +907,7 @@ def test_candidate_selection_balances_approaches_and_closing_axis_variants() -> 
     )
 
     assert representatives == [0, 5, 6, 7]
-    assert selected == [0, 5, 1, 2]
+    assert selected == [0, 5, 6, 7]
 
 
 @pytest.mark.parametrize("maximum", [2, 4, 5])
@@ -807,10 +936,23 @@ def test_planner_retains_scored_depth_variants_after_family_priority(
         intrinsics=dict(width=20, height=20, fx=200., fy=200., cx=10., cy=10.),
         base_from_camera=np.eye(4), max_candidates=maximum,
     )
-    expected_indices = [0, 3] if maximum == 2 else [0, 2, 3, 4]
+    expected_indices = (
+        [0, 3]
+        if maximum == 2
+        else [0, 2, 3, 4]
+        if maximum == 4
+        else [0, 2, 2, 3, 4]
+    )
     assert len(result.candidates) == len(expected_indices)
-    for candidate, index in zip(result.candidates, expected_indices, strict=True):
+    for ordinal, (candidate, index) in enumerate(
+        zip(result.candidates, expected_indices, strict=True)
+    ):
         expected = poses[index].copy()
+        if maximum == 5 and ordinal == 1:
+            # The fifth slot intentionally keeps the smallest support-clearance
+            # alternative before the remaining scored depth variants.
+            expected[2, 3] += 0.005
+            assert candidate.pose_source == "dmtac_support_clearance_variant_v1"
         actual = planner.solid_geometry.solid_pose(
             np.asarray(candidate.camera_from_tcp).reshape(4, 4),
         )
@@ -818,7 +960,9 @@ def test_planner_retains_scored_depth_variants_after_family_priority(
         assert candidate.model_score == pytest.approx((.9, .89, .8, .7, .6)[index])
         assert candidate.visible_collision_free
     assert planner.last_filter_summary["candidate_family_count"] == 2
-    assert planner.last_filter_summary["candidate_variant_count"] == 4
+    assert planner.last_filter_summary["candidate_variant_count"] == (
+        5 if maximum == 5 else 4
+    )
     planner.close()
 
 
@@ -871,7 +1015,12 @@ def test_planner_does_not_translate_scored_offset_grasp_to_hide_solid_collision(
             max_candidates=1,
         )
 
-    assert planner.last_filter_summary["target_solid_collision_rejected"] == 1
+    # The candidate is rejected before collision because the complete target
+    # span no longer fits between its proposed jaw faces.  This is the same
+    # no-translation invariant at the earlier, more informative boundary.
+    assert planner.last_filter_summary["target_capture_valid"] == 0
+    assert planner.last_filter_summary["target_solid_collision_rejected"] == 0
+    assert planner.last_filter_summary["min_target_capture_violation_m"] > 0
     assert grasp[:3, 3] == pytest.approx((-0.020, -0.012, 0.975))
     planner.close()
 
@@ -942,7 +1091,9 @@ def test_planner_normalizes_float32_model_rotation_for_strict_frame_contract(
     planner.close()
 
 
-def test_noncontact_endpoint_uses_open_jaws_not_estimated_closure_width(tmp_path: Path) -> None:
+def test_visible_collision_proxy_uses_open_gripper_and_keeps_ingress_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     depth = np.zeros((80, 80), dtype=np.float32)
     mask = np.zeros(depth.shape, dtype=bool)
     mask[38:43, 28:53] = True
@@ -954,24 +1105,147 @@ def test_noncontact_endpoint_uses_open_jaws_not_estimated_closure_width(tmp_path
         model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(mask),
         client=_PlannerClient(model_pose[None], np.asarray([.9])),
     )
+    endpoint_openings = []
+    approach_openings = []
+
+    def _collision_with_terminal_contact(
+        _scene, _pose, *, opening_m, contact_depth_m,
+    ):
+        endpoint_openings.append(float(opening_m))
+        assert contact_depth_m == pytest.approx(.006)
+        return 0, 0, 0
+
+    def _approach(
+        _scene, _pose, *, opening_m, distance_m,
+        allow_terminal_target_contact, terminal_target_contact_depth_m,
+    ):
+        approach_openings.append((float(opening_m), float(distance_m)))
+        assert allow_terminal_target_contact is True
+        assert terminal_target_contact_depth_m == pytest.approx(.006)
+        return 1, 1
+
+    monkeypatch.setattr(
+        VisibleGraspScene,
+        "collision_counts_with_terminal_target_contact",
+        _collision_with_terminal_contact,
+    )
+    monkeypatch.setattr(
+        VisibleGraspScene, "approach_collision_counts", _approach
+    )
     planner.start()
     try:
         result = planner.plan(Image.new("RGB", (80, 80)), depth, pixel_uv=(40, 40),
             intrinsics={"width": 80, "height": 80, "fx": 1000., "fy": 1000., "cx": 40., "cy": 40.},
             base_from_camera=np.eye(4), max_candidates=1)
         candidate = result.candidates[0]
-        pose = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
-        from robot_motion.grasp_visible_scene import VisibleGraspScene
-        scene = VisibleGraspScene.from_depth(depth_m=depth, target_mask=mask,
-            intrinsics={"fx": 1000., "fy": 1000., "cx": 40., "cy": 40.},
-            reference_from_camera=np.eye(4), geometry=planner.solid_geometry)
-        assert scene.collision_counts(pose, opening_m=candidate.gripper_width_m)[0] > 0
-        assert scene.approach_collision_counts(pose, opening_m=.07, distance_m=.06) == (0, 0)
+        expected_opening = planner.max_gripper_width_m
+        assert endpoint_openings == pytest.approx([expected_opening])
+        assert approach_openings == pytest.approx([(expected_opening, .06)])
         assert candidate.visible_collision_free
         assert candidate.model_score == pytest.approx(.9)
+        pose = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
         np.testing.assert_allclose(
             planner.solid_geometry.solid_pose(pose), model_pose, atol=1e-9
         )
+    finally:
+        planner.close()
+
+
+def test_capture_filtered_visible_scene_prefilters_terminal_background_before_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    depth = np.zeros((40, 40), dtype=np.float32)
+    mask = np.zeros(depth.shape, dtype=bool)
+    mask[18:23, 18:23] = True
+    depth[mask] = 1.0
+    poses = []
+    for x in (0.0, 0.002):
+        pose = np.eye(4, dtype=np.float64)
+        pose[0, 3] = x
+        pose[2, 3] = 0.975
+        poses.append(pose)
+    planner = Sam2GraspGenXPointGraspPlanner(
+        model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(mask),
+        client=_PlannerClient(
+            np.stack(poses), np.asarray((.9, .8), dtype=np.float64)
+        ),
+    )
+    endpoint_scene_sizes = []
+
+    def _terminal(scene, pose, *, opening_m, contact_depth_m):
+        del opening_m, contact_depth_m
+        endpoint_scene_sizes.append(len(scene.points))
+        if len(scene.points) == 2 and float(pose[0, 3]) < 0.001:
+            return 0, 0, 1
+        return 0, 0, 0
+
+    monkeypatch.setattr(
+        VisibleGraspScene,
+        "collision_counts_with_terminal_target_contact",
+        _terminal,
+    )
+    monkeypatch.setattr(
+        VisibleGraspScene,
+        "approach_collision_counts",
+        lambda *_args, **_kwargs: (0, 0),
+    )
+
+    factory_calls = []
+
+    def _factory(*, depth_m, target_mask, intrinsics, geometry):
+        del depth_m, intrinsics
+        factory_calls.append(target_mask.copy())
+        return VisibleGraspScene(
+            points=np.asarray(((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))),
+            target_mask=np.asarray((True, False), dtype=np.bool_),
+            geometry=geometry,
+        )
+
+    planner.start()
+    try:
+        result = planner.plan(
+            Image.new("RGB", (40, 40)), depth, pixel_uv=(20, 20),
+            intrinsics={
+                "width": 40, "height": 40,
+                "fx": 100.0, "fy": 100.0, "cx": 20.0, "cy": 20.0,
+            },
+            base_from_camera=np.eye(4), max_candidates=1,
+            visible_scene_factory=_factory,
+        )
+        assert len(factory_calls) == 1
+        np.testing.assert_array_equal(factory_calls[0], mask)
+        assert endpoint_scene_sizes == [2, 2]
+        assert len(result.candidates) == 1
+        assert result.candidates[0].model_score == pytest.approx(.8)
+        assert planner.last_filter_summary["terminal_background_prefilter_enabled"]
+        assert planner.last_filter_summary["terminal_background_collision_rejected"] == 1
+        assert planner.last_filter_summary["visible_scene_point_count"] == 2
+        assert planner.last_filter_summary["visible_scene_background_point_count"] == 1
+    finally:
+        planner.close()
+
+
+def test_multiview_target_points_are_the_actual_single_inference_input(tmp_path, monkeypatch):
+    depth = np.zeros((40, 40), np.float32)
+    mask = np.zeros((40, 40), bool)
+    mask[18:23, 18:23] = True
+    depth[mask] = 1.
+    pose = np.eye(4)
+    pose[2, 3] = .975
+    client = _PlannerClient(pose[None], np.array([.9]))
+    planner = Sam2GraspGenXPointGraspPlanner(model_spec=_model_spec(tmp_path), point_segmenter=_Segmenter(mask), client=client)
+    # Include real metric samples absent from the anchor depth image.
+    fused = np.array([(x*.01, y*.01, 1.) for x in range(-2, 3) for y in range(-2, 3)] + [(.007, .013, 1.008)])
+    monkeypatch.setattr(VisibleGraspScene, "collision_counts_with_terminal_target_contact", lambda *a, **kw: (0, 0, 0))
+    monkeypatch.setattr(VisibleGraspScene, "approach_collision_counts", lambda *a, **kw: (0, 0))
+    planner.start()
+    try:
+        planner.plan(Image.new("RGB", (40, 40)), depth, pixel_uv=(20, 20),
+            intrinsics={"width": 40, "height": 40, "fx": 100., "fy": 100., "cx": 20., "cy": 20.},
+            base_from_camera=np.eye(4), max_candidates=1, use_visible_target_points=True,
+            visible_scene_factory=lambda **kw: VisibleGraspScene(points=fused, target_mask=np.ones(len(fused), bool), geometry=kw["geometry"]))
+        assert len(client.calls) == 1
+        np.testing.assert_allclose(client.calls[0][0], fused)
     finally:
         planner.close()
 

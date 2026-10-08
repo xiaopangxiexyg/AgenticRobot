@@ -26,7 +26,7 @@ import numpy as np
 from .control_runtime import RealSkillControlTraceSample
 from .motion_port import REAL_AGENT_MOTION_COMMAND_METADATA_KEY
 
-SKILL_MOTION_TRACE_SCHEMA = "dexteleop.exclusive_rm65_skill_motion_trace.v2"
+SKILL_MOTION_TRACE_SCHEMA = "dexteleop.exclusive_rm65_skill_motion_trace.v3"
 SKILL_MOTION_TRACE_DATA_NAME = "motion_trace.npz"
 SKILL_MOTION_TRACE_MANIFEST_NAME = "manifest.json"
 SKILL_MOTION_TRACE_SUMMARY_NAME = "summary.json"
@@ -90,6 +90,15 @@ _REFERENCE_DTYPE = np.dtype(
         ("ik_fallback_reason", "S128"),
         ("ik_jump_gate_status", "S48"),
         ("speed_scale", "<f8"),
+        ("trajectory_sample_index", "<i8"),
+        ("trajectory_next_sample_index", "<i8"),
+        ("trajectory_sample_count", "<i8"),
+        ("trajectory_time_from_start_sec", "<f8"),
+        ("trajectory_elapsed_sec", "<f8"),
+        ("trajectory_duration_sec", "<f8"),
+        ("trajectory_clock_advance_sec", "<f8"),
+        ("trajectory_clock_advance_capped", "u1"),
+        ("trajectory_clock_rebased_count", "<i8"),
         ("collision_distance_m", "<f8"),
         ("joint_limit_margin_deg", "<f8", (2,)),
         ("ik_iterations", "<i4"),
@@ -333,8 +342,16 @@ class SkillMotionTraceRecorder:
             row["backend_deadline_miss_count"].fill(_I64_MISSING)
             row["backend_skipped_tick_count"].fill(_I64_MISSING)
             row["backend_low_rate_count"].fill(_I64_MISSING)
+            row["trajectory_sample_index"] = _I64_MISSING
+            row["trajectory_next_sample_index"] = _I64_MISSING
+            row["trajectory_sample_count"] = _I64_MISSING
+            row["trajectory_clock_rebased_count"] = _I64_MISSING
             for name in (
                 "speed_scale",
+                "trajectory_time_from_start_sec",
+                "trajectory_elapsed_sec",
+                "trajectory_duration_sec",
+                "trajectory_clock_advance_sec",
                 "collision_distance_m",
                 "ik_frame_total_ms",
                 "ik_time_budget_ms",
@@ -359,6 +376,7 @@ class SkillMotionTraceRecorder:
                 row[name] = float("nan")
             row["ik_iterations"] = _I32_MISSING
             row["active_side_index"] = -1
+            row["trajectory_clock_advance_capped"] = 0
             row["cycle_sequence"] = int(sample.cycle_sequence)
             row["control_wall_time_ns"] = _seconds_to_ns(sample.control_time)
             row["cycle_started_monotonic_ns"] = _seconds_to_ns(
@@ -434,6 +452,30 @@ class SkillMotionTraceRecorder:
                 if active_side in _SIDES:
                     row["active_side_index"] = _SIDES.index(active_side)
                 row["speed_scale"] = _number(operation.get("speed_scale"))
+                row["trajectory_sample_index"] = _integer(
+                    operation.get("trajectory_sample_index")
+                )
+                row["trajectory_next_sample_index"] = _integer(
+                    operation.get("trajectory_next_sample_index")
+                )
+                row["trajectory_sample_count"] = _integer(
+                    operation.get("trajectory_sample_count")
+                )
+                row["trajectory_time_from_start_sec"] = _number(
+                    operation.get("trajectory_time_from_start_sec")
+                )
+                row["trajectory_elapsed_sec"] = _number(
+                    operation.get("trajectory_elapsed_sec")
+                )
+                row["trajectory_duration_sec"] = _number(
+                    operation.get("trajectory_duration_sec")
+                )
+                row["trajectory_clock_advance_sec"] = _number(
+                    operation.get("trajectory_clock_advance_sec")
+                )
+                row["trajectory_clock_advance_capped"] = int(
+                    bool(operation.get("trajectory_clock_advance_capped", False))
+                )
                 target = _matrix(
                     operation.get("target_tool_tcp_pose_world"),
                     (4, 4),
@@ -479,6 +521,10 @@ class SkillMotionTraceRecorder:
                 ),
                 32,
             )
+            if port_snapshot is not None:
+                row["trajectory_clock_rebased_count"] = _integer(
+                    getattr(port_snapshot, "trajectory_clock_rebased_count", None)
+                )
             row["ik_status"] = _text(
                 metadata.get("collision_avoidance_status"), 48
             )
@@ -833,6 +879,40 @@ class SkillMotionTraceRecorder:
         return gaps[gaps >= 0.0]
 
     @staticmethod
+    def _trajectory_tracking(reference: np.ndarray) -> dict[str, object]:
+        """Summarize measured qpos against the qref sent in each control cycle."""
+
+        per_cycle_max_error_deg: list[float] = []
+        per_cycle_rms_error_deg: list[float] = []
+        for row in reference:
+            side_index = int(row["active_side_index"])
+            if side_index not in (0, 1):
+                continue
+            qref = np.asarray(row["qref_rad"][side_index], dtype=float)
+            measured = np.asarray(
+                row["measured_qpos_rad"][side_index], dtype=float
+            )
+            if not np.all(np.isfinite(qref)) or not np.all(np.isfinite(measured)):
+                continue
+            error_deg = np.abs(qref - measured) * 180.0 / np.pi
+            per_cycle_max_error_deg.append(float(np.max(error_deg)))
+            per_cycle_rms_error_deg.append(float(np.sqrt(np.mean(error_deg**2))))
+        return {
+            "valid_cycle_count": len(per_cycle_max_error_deg),
+            "max_joint_error_deg": SkillMotionTraceRecorder._percentiles(
+                np.asarray(per_cycle_max_error_deg, dtype=float)
+            ),
+            "rms_joint_error_deg": SkillMotionTraceRecorder._percentiles(
+                np.asarray(per_cycle_rms_error_deg, dtype=float)
+            ),
+            "final_max_joint_error_deg": (
+                None
+                if not per_cycle_max_error_deg
+                else per_cycle_max_error_deg[-1]
+            ),
+        }
+
+    @staticmethod
     def _pose_errors(reference: np.ndarray) -> dict[str, float | None]:
         translations: list[float] = []
         rotations: list[float] = []
@@ -868,6 +948,93 @@ class SkillMotionTraceRecorder:
                 unique[index] = True
                 previous_sequence = sequence
         return unique
+
+    @staticmethod
+    def _execution_timing(reference: np.ndarray) -> dict[str, object]:
+        """Summarize the wall-clock and trajectory-clock execution evidence."""
+
+        decoded_operation_ids = [
+            bytes(value).rstrip(b"\x00").decode("utf-8", errors="replace")
+            for value in reference["operation_id"]
+        ]
+        operation_ids = sorted({value for value in decoded_operation_ids if value})
+        operations: dict[str, object] = {}
+
+        def span_seconds(values: np.ndarray) -> float | None:
+            valid = np.asarray(values, dtype=np.int64)
+            valid = valid[valid != _I64_MISSING]
+            if valid.size == 0:
+                return None
+            return float((int(np.max(valid)) - int(np.min(valid))) / 1_000_000_000.0)
+
+        for operation_id in operation_ids:
+            mask = np.asarray(
+                [value == operation_id for value in decoded_operation_ids],
+                dtype=bool,
+            )
+            rows = reference[mask]
+            dispatched = rows[rows["dispatch_succeeded"].astype(bool)]
+            planned = rows["trajectory_duration_sec"]
+            planned = planned[np.isfinite(planned)]
+            elapsed = rows["trajectory_elapsed_sec"]
+            elapsed = elapsed[np.isfinite(elapsed)]
+            time_from_start = rows["trajectory_time_from_start_sec"]
+            time_from_start = time_from_start[np.isfinite(time_from_start)]
+            rebased = rows["trajectory_clock_rebased_count"]
+            rebased = rebased[rebased != _I64_MISSING]
+            planned_duration = (
+                None if planned.size == 0 else float(np.max(planned))
+            )
+            elapsed_max = None if elapsed.size == 0 else float(np.max(elapsed))
+            operation_wall_duration = span_seconds(rows["control_wall_time_ns"])
+            dispatch_wall_duration = span_seconds(
+                dispatched["control_wall_time_ns"]
+            )
+            duration_error = (
+                None
+                if planned_duration is None or dispatch_wall_duration is None
+                else float(dispatch_wall_duration - planned_duration)
+            )
+            duration_ratio = (
+                None
+                if planned_duration is None
+                or planned_duration <= 0.0
+                or dispatch_wall_duration is None
+                else float(dispatch_wall_duration / planned_duration)
+            )
+            operations[operation_id] = {
+                "reference_count": int(rows.shape[0]),
+                "dispatch_succeeded_count": int(
+                    np.sum(rows["dispatch_succeeded"])
+                ),
+                "operation_wall_duration_sec": operation_wall_duration,
+                "dispatch_wall_duration_sec": dispatch_wall_duration,
+                "planned_trajectory_duration_sec": planned_duration,
+                "dispatch_wall_minus_planned_sec": duration_error,
+                "dispatch_wall_to_planned_ratio": duration_ratio,
+                "trajectory_elapsed_sec_max": elapsed_max,
+                "trajectory_completion_observed": (
+                    None
+                    if planned_duration is None or elapsed_max is None
+                    else bool(elapsed_max + 1e-6 >= planned_duration)
+                ),
+                "trajectory_time_from_start_sec_max": (
+                    None
+                    if time_from_start.size == 0
+                    else float(np.max(time_from_start))
+                ),
+                "trajectory_clock_advance_capped_count": int(
+                    np.sum(rows["trajectory_clock_advance_capped"])
+                ),
+                "trajectory_clock_rebased_count_max": (
+                    None if rebased.size == 0 else int(np.max(rebased))
+                ),
+            }
+        return {
+            "available": bool(operations),
+            "operation_count": len(operations),
+            "operations": operations,
+        }
 
     def _summary(self) -> dict[str, object]:
         reference = self._reference[: self._reference_next]
@@ -916,6 +1083,7 @@ class SkillMotionTraceRecorder:
         result: dict[str, object] = {
             "schema": SKILL_MOTION_TRACE_SCHEMA,
             "operation_ids": operations,
+            "execution_timing": self._execution_timing(reference),
             "reference_count": int(reference.shape[0]),
             "ik_shadow_count": int(ik.shape[0]),
             "outcomes": dict(sorted(outcomes.items())),
@@ -970,6 +1138,7 @@ class SkillMotionTraceRecorder:
                 )
             },
             "target_vs_measured_tcp": self._pose_errors(reference),
+            "trajectory_tracking": self._trajectory_tracking(reference),
             "reference_dynamics": {},
             "measured_dynamics": {},
             "actuator_dynamics": {},

@@ -41,6 +41,10 @@ GRASPGENX_POINT_GRASP_MOE_NUM_YAWS = 18
 GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM = (
     -8.0, -6.0, -4.0, -3.5, -3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.0,
 )
+# Preserve the reviewed side-face samples and add support-aware alternatives
+# above them.  These are independent candidates that are rescored by
+# GraspGenX; the adapter does not translate an already-scored grasp afterward.
+GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM = (0.0, 1.0, 2.0)
 GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY = "dense-topandside"
 GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM = 3.0
 _GRASPGENX_IMPORT_LOCK = threading.RLock()
@@ -50,6 +54,9 @@ def _point_grasp_moe_sampling_config() -> dict[str, object]:
     return {
         "num_yaws": GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
         "z_offsets_cm": GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
+        "side_height_offsets_cm": (
+            GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+        ),
         "obb_density": GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
         "obb_position_spacing_cm": (
             GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -310,6 +317,9 @@ class GraspGenXClient:
                     "num_grasps": int(num_grasps),
                     "moe_num_yaws": GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
                     "moe_z_offsets_cm": GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
+                    "moe_side_height_offsets_cm": (
+                        GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+                    ),
                     "moe_obb_density": GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
                     "moe_obb_position_spacing_cm": (
                         GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -680,6 +690,9 @@ class GraspGenXInProcessBackend:
                         topk_num_grasps=backend_top_k,
                         moe_num_yaws=GRASPGENX_POINT_GRASP_MOE_NUM_YAWS,
                         moe_z_offsets_cm=GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM,
+                        moe_side_height_offsets_cm=(
+                            GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM
+                        ),
                         moe_obb_density=GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY,
                         moe_obb_position_spacing_cm=(
                             GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM
@@ -717,6 +730,7 @@ __all__ = [
     "GRASPGENX_INPROCESS_BACKEND_ID",
     "GRASPGENX_POINT_GRASP_MOE_NUM_YAWS",
     "GRASPGENX_POINT_GRASP_MOE_Z_OFFSETS_CM",
+    "GRASPGENX_POINT_GRASP_MOE_SIDE_HEIGHT_OFFSETS_CM",
     "GRASPGENX_POINT_GRASP_MOE_OBB_DENSITY",
     "GRASPGENX_POINT_GRASP_MOE_OBB_POSITION_SPACING_CM",
     "GraspGenXClient",

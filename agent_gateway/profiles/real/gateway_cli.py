@@ -11,8 +11,10 @@ import sys
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 
@@ -25,6 +27,7 @@ from agent_gateway.transport.unix_transport import (
 )
 from deployments.perception import (
     GRASPGENX_DEFAULT_MODE,
+    GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
     GraspGenXClient,
     GraspGenXInProcessBackend,
     GraspGenXPointGraspModelSpec,
@@ -51,8 +54,21 @@ from teleop_runtime.skill_deploy.motion_trace import (
     SkillMotionTraceConfig,
     SkillMotionTraceRecorder,
 )
+from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+    RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME,
+    RM65_GRASP_ENDPOINT_ORDER_MODES,
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES,
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X,
+    RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES,
+    RM65GraspTrajectoryPlanningConfig,
+)
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
+from .grasp_approach_plan import (
+    DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
+    REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC,
+)
 from .point_grasp_deployment import (
     DEFAULT_POINT_GRASP_BACKEND_ID,
     SUPPORTED_POINT_GRASP_BACKEND_IDS,
@@ -70,6 +86,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RM65_CAMERA_MOUNT_URDF = (
     _REPO_ROOT / "assets/rm65_inspire_gripper_v4/"
     "rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf"
+)
+DEFAULT_RM65_DMTAC_CAMERA_MOUNT_URDF = (
+    _REPO_ROOT
+    / "assets/realman_dual_arm_inspire_gripper_dmtacm/"
+    "realman_dual_arm_inspire_gripper_dmtacm.urdf"
 )
 DEFAULT_RM65_CAMERA_REGISTRY_V4 = (
     _REPO_ROOT / "robot_motion/configs/rm65_camera_registry_v4.json"
@@ -114,10 +135,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="absolute existing non-world-writable directory for the v2 Artifact CAS",
     )
     parser.add_argument(
+        "--planned-trajectory-dir",
+        type=Path,
+        help=(
+            "existing private directory for exact sampled grasp plans; a failed "
+            "record prevents plan admission"
+        ),
+    )
+    parser.add_argument(
         "--enable-point-grasp",
         action="store_true",
         help="enable main-view proposal generation and three-view candidate rendering",
     )
+    parser.add_argument("--enable-grasp-observation", action="store_true",
+        help="Use frozen stationary RGB-D target selection and optional associated-view fusion (GraspGenX only).")
     parser.add_argument(
         "--debug-render-object-coordinates",
         action="store_true",
@@ -198,11 +229,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="fixed preallocated trace duration (default: 120s)",
     )
     parser.add_argument(
+        "--execution-operation-timeout-sec",
+        type=float,
+        default=DEFAULT_REAL_GRASP_EXECUTION_OPERATION_TIMEOUT_SEC,
+        help=(
+            "maximum grasp-approach execution operation duration "
+            "(default: 120s)"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-trajectory-parameterization",
+        choices=RM65_GRASP_TRAJECTORY_PARAMETERIZATION_MODES,
+        default=RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+        help=(
+            "grasp path timing mode; continuous_c2 preserves motion through "
+            "internal waypoints but still stops at semantic stage boundaries"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-trajectory-speed-profile",
+        choices=RM65_GRASP_TRAJECTORY_SPEED_PROFILE_MODES,
+        default=RM65_GRASP_TRAJECTORY_SPEED_PROFILE_FAR_4X_APPROACH_1X,
+        help=(
+            "grasp path speed profile; far_4x_approach_1x accelerates only "
+            "envelope ingress and pregrasp while retaining the base speed "
+            "for the final approach (default: far_4x_approach_1x)"
+        ),
+    )
+    parser.add_argument(
+        "--grasp-endpoint-candidate-ordering",
+        choices=RM65_GRASP_ENDPOINT_ORDER_MODES,
+        default=RM65_GRASP_ENDPOINT_ORDER_ESTIMATED_EXECUTION_TIME,
+        help=(
+            "valid IK branch preference; estimated_execution_time uses the "
+            "configured per-joint velocity limits without adding path searches "
+            "(default: estimated_execution_time)"
+        ),
+    )
+    parser.add_argument(
         "--debug-motion-skill",
         action="store_true",
         help=(
             "debug only: add bounded IK phase profiling to the existing "
             "preallocated motion trace; requires --motion-trace-root"
+        ),
+    )
+    parser.add_argument(
+        "--debug-rm65-stream-timing",
+        action="store_true",
+        help=(
+            "debug only: record bounded CANFD worker phase timing and include "
+            "scheduler/send-lock/hardware-lock/vendor-call detail in low-rate "
+            "warnings and shutdown diagnostics"
         ),
     )
     parser.add_argument("--authorized-side", choices=("left", "right"), required=True)
@@ -277,8 +355,68 @@ def _effective_camera_mount_urdf(args: argparse.Namespace) -> Path | None:
     if args.camera_mount_urdf is not None:
         return args.camera_mount_urdf
     if args.enable_point_grasp:
+        if args.collision_scene_profile == "dual_arm_hand_proxy_dmtac_strict":
+            return DEFAULT_RM65_DMTAC_CAMERA_MOUNT_URDF
         return DEFAULT_RM65_CAMERA_MOUNT_URDF
     return None
+
+
+_REQUIRED_DMTAC_CAPTURE_VISUALS = frozenset(
+    {
+        "left_gripper_l_dm_tac_w2m_visual",
+        "left_gripper_r_dm_tac_w2m_visual",
+        "right_gripper_l_dm_tac_w2m_visual",
+        "right_gripper_r_dm_tac_w2m_visual",
+    }
+)
+
+
+def _validate_point_grasp_capture_urdf(
+    parser: argparse.ArgumentParser,
+    *,
+    urdf_path: Path,
+    collision_scene_profile: str,
+) -> None:
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except (OSError, ET.ParseError) as error:
+        parser.error(f"cannot parse --camera-mount-urdf: {error}")
+
+    missing_meshes: set[str] = set()
+    for mesh in root.findall(".//mesh"):
+        filename = str(mesh.get("filename", "")).strip()
+        if not filename:
+            continue
+        parsed = urlparse(filename)
+        if parsed.scheme not in {"", "file"}:
+            continue
+        raw_path = unquote(parsed.path) if parsed.scheme == "file" else filename
+        mesh_path = Path(raw_path)
+        if not mesh_path.is_absolute():
+            mesh_path = urdf_path.parent / mesh_path
+        if not mesh_path.is_file():
+            missing_meshes.add(str(mesh_path))
+    if missing_meshes:
+        missing_preview = sorted(missing_meshes)
+        suffix = "" if len(missing_preview) <= 8 else " ..."
+        parser.error(
+            "--camera-mount-urdf references missing mesh assets: "
+            f"{missing_preview[:8]}{suffix}"
+        )
+
+    if collision_scene_profile != "dual_arm_hand_proxy_dmtac_strict":
+        return
+    visual_names = {
+        str(visual.get("name", "")).strip()
+        for visual in root.findall(".//visual")
+    }
+    missing = sorted(_REQUIRED_DMTAC_CAPTURE_VISUALS - visual_names)
+    if missing:
+        parser.error(
+            "--collision-scene-profile dual_arm_hand_proxy_dmtac_strict "
+            "requires --camera-mount-urdf to contain both arms' reviewed "
+            f"DMTAC capture geometry; missing visuals: {missing}"
+        )
 
 
 def _graspgenx_mode_was_explicit(argv: list[str] | None) -> bool:
@@ -438,6 +576,17 @@ def _stopped_payload(
         composition.deployment.gateway_session.service.emergency_stop_receipt
     )
     control_fault = composition.application.control_fault
+    position_force_guard = getattr(composition.lower.ports, "position_force_guard", None)
+    position_force_guard_snapshot = None
+    position_force_guard_snapshot_error = None
+    snapshot_guard = getattr(position_force_guard, "snapshot", None)
+    if callable(snapshot_guard):
+        try:
+            position_force_guard_snapshot = snapshot_guard()
+        except Exception as exc:  # noqa: BLE001 - preserve shutdown evidence.
+            position_force_guard_snapshot_error = (
+                f"{type(exc).__name__}: {exc}"
+            )[:512]
     lower_hold_proved = bool(hold is not None and hold.succeeded)
     lower_emergency_stop_proved = bool(
         emergency_stop is not None
@@ -466,6 +615,8 @@ def _stopped_payload(
             if control_fault is None
             else f"{type(control_fault).__name__}: {control_fault}"[:512]
         ),
+        "position_force_guard": position_force_guard_snapshot,
+        "position_force_guard_snapshot_error": position_force_guard_snapshot_error,
         "measurement_sampler": (
             composition.lower.ports.measurement_sampler_snapshot()
         ),
@@ -629,6 +780,15 @@ def main(argv: list[str] | None = None) -> int:
         or args.motion_trace_max_duration_sec <= 0.0
     ):
         parser.error("--motion-trace-max-duration-sec must be positive and finite")
+    if (
+        not np.isfinite(float(args.execution_operation_timeout_sec))
+        or args.execution_operation_timeout_sec
+        <= REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC
+    ):
+        parser.error(
+            "--execution-operation-timeout-sec must be finite and exceed "
+            f"{REAL_GRASP_APPROACH_PLAN_OPERATION_GRACE_SEC:g}s"
+        )
     if args.debug_motion_skill and args.motion_trace_root is None:
         parser.error("--debug-motion-skill requires --motion-trace-root")
 
@@ -645,6 +805,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.enable_point_grasp and not all(perception_supplied):
         parser.error("--enable-point-grasp requires the composed camera options")
+    if args.enable_grasp_observation and (not args.enable_point_grasp or args.point_grasp_backend != "graspgenx"):
+        parser.error("--enable-grasp-observation requires --enable-point-grasp and GraspGenX")
     if args.debug_render_object_coordinates and not args.enable_point_grasp:
         parser.error("--debug-render-object-coordinates requires --enable-point-grasp")
     if args.enable_point_grasp_arm_reachability and not args.enable_point_grasp:
@@ -735,9 +897,23 @@ def main(argv: list[str] | None = None) -> int:
                 "tool_tcp pose [0, 0, 0.14, 0, 0, 0] for --authorized-side; "
                 "candidate geometry cannot be reinterpreted for another tool"
             )
+    camera_mount_urdf = None
+    if args.enable_point_grasp:
+        camera_mount_urdf = _absolute_existing_file(
+            parser,
+            camera_mount_urdf_arg,
+            flag="--camera-mount-urdf",
+        )
+        _validate_point_grasp_capture_urdf(
+            parser,
+            urdf_path=camera_mount_urdf,
+            collision_scene_profile=args.collision_scene_profile,
+        )
     lower_kwargs: dict[str, object] = {"profile": resolved}
     if args.debug_motion_skill:
         lower_kwargs["debug_motion_skill"] = True
+    if args.debug_rm65_stream_timing:
+        lower_kwargs["debug_rm65_stream_timing"] = True
     lower = assemble_exclusive_rm65_skill_lower(**lower_kwargs)
     camera_config = (
         None
@@ -760,6 +936,15 @@ def main(argv: list[str] | None = None) -> int:
             parser,
             args.artifact_root,
             flag="--artifact-root",
+        )
+    )
+    planned_trajectory_dir = (
+        None
+        if args.planned_trajectory_dir is None
+        else _absolute_managed_directory(
+            parser,
+            args.planned_trajectory_dir,
+            flag="--planned-trajectory-dir",
         )
     )
     motion_trace_root = (
@@ -785,7 +970,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     object_localizer = None
     point_grasp_planner = None
-    camera_mount_urdf = None
     if args.enable_point_grasp:
         object_bundle = _absolute_managed_directory(
             parser,
@@ -796,11 +980,6 @@ def main(argv: list[str] | None = None) -> int:
             parser,
             args.point_grasp_asset_bundle,
             flag="--point-grasp-asset-bundle",
-        )
-        camera_mount_urdf = _absolute_existing_file(
-            parser,
-            camera_mount_urdf_arg,
-            flag="--camera-mount-urdf",
         )
         try:
             localization_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(
@@ -854,11 +1033,23 @@ def main(argv: list[str] | None = None) -> int:
                         device=args.point_grasp_device,
                     )
                 )
+                reference_from_arm_base = (
+                    np.linalg.inv(resolved.scene_world_from_canonical_station)
+                    @ resolved.scene_world_from_arm_base_by_side[
+                        args.authorized_side
+                    ]
+                )
                 point_grasp_planner = Sam2GraspGenXPointGraspPlanner(
                     model_spec=point_grasp_spec,
                     point_segmenter=object_localizer,
                     client=graspgenx_backend,
                     solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+                    orientation_variants_local_axis_degrees=(
+                        GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG
+                    ),
+                    preferred_approach_origin_base_m=tuple(
+                        float(value) for value in reference_from_arm_base[:3, 3]
+                    ),
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid point-grasp model bundle: {error}")
@@ -887,17 +1078,25 @@ def main(argv: list[str] | None = None) -> int:
         runtime_session_id=runtime_session_id,
         control_domain_id=args.control_domain_id,
         embodiment_instance_id=embodiment_instance_id,
+        grasp_execution_operation_timeout_sec=args.execution_operation_timeout_sec,
         max_retained_operations=args.max_retained_operations,
         peer_idle_timeout_sec=args.peer_idle_timeout_sec,
         grant_lifetime_sec=args.grant_lifetime_sec,
         camera_config_path=camera_config,
         camera_registry_path=camera_registry,
         artifact_root=artifact_root,
+        planned_trajectory_dir=planned_trajectory_dir,
         camera_mount_urdf_path=camera_mount_urdf,
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,
+        enable_grasp_observation=args.enable_grasp_observation,
         debug_render_object_coordinates=args.debug_render_object_coordinates,
         enable_point_grasp_arm_reachability=(args.enable_point_grasp_arm_reachability),
+        grasp_trajectory_config=RM65GraspTrajectoryPlanningConfig(
+            trajectory_parameterization=(args.grasp_trajectory_parameterization),
+            trajectory_speed_profile=(args.grasp_trajectory_speed_profile),
+            endpoint_candidate_ordering=(args.grasp_endpoint_candidate_ordering),
+        ),
     )
 
     motion_trace: SkillMotionTraceRecorder | None = None
@@ -928,6 +1127,15 @@ def main(argv: list[str] | None = None) -> int:
                     "collision_scene_profile": args.collision_scene_profile,
                     "lower_profile_hash": resolved.semantic_content_hash,
                     "debug_motion_skill": args.debug_motion_skill,
+                    "grasp_trajectory_parameterization": (
+                        args.grasp_trajectory_parameterization
+                    ),
+                    "grasp_trajectory_speed_profile": (
+                        args.grasp_trajectory_speed_profile
+                    ),
+                    "grasp_endpoint_candidate_ordering": (
+                        args.grasp_endpoint_candidate_ordering
+                    ),
                 },
             )
         )
@@ -1041,6 +1249,7 @@ if __name__ == "__main__":
 __all__ = [
     "DEFAULT_RM65_CAMERA_MOUNT_URDF",
     "DEFAULT_RM65_CAMERA_REGISTRY_V4",
+    "DEFAULT_RM65_DMTAC_CAMERA_MOUNT_URDF",
     "build_parser",
     "main",
 ]
