@@ -163,10 +163,31 @@ def test_rm65_post_send_schedule_rebases_only_after_a_real_stall() -> None:
         period_sec=0.1,
         no_catch_up_after_send=True,
     )
+    after_lost_period = _next_background_stream_schedule_after_send(
+        next_scheduled=10.1,
+        sdk_result_monotonic=10.21,
+        sdk_send_gap_sec=0.1,
+        skipped_tick_count=0,
+        period_sec=0.1,
+        no_catch_up_after_send=True,
+    )
+    after_skipped_tick = _next_background_stream_schedule_after_send(
+        next_scheduled=10.1,
+        sdk_result_monotonic=10.08,
+        sdk_send_gap_sec=0.1,
+        skipped_tick_count=1,
+        period_sec=0.1,
+        no_catch_up_after_send=True,
+    )
 
     assert unchanged == 10.1
-    assert np.isclose(after_crossed_deadline, 10.21)
-    assert np.isclose(after_long_gap, 10.19)
+    # Small deadline crossings do not add another full period; a completion
+    # gap also includes intentional pacing and cannot feed back into rebasing.
+    assert after_crossed_deadline == 10.1
+    assert after_long_gap == 10.1
+    # A genuinely lost period or skipped tick still forbids catch-up sends.
+    assert np.isclose(after_lost_period, 10.31)
+    assert np.isclose(after_skipped_tick, 10.18)
 
 
 def test_rm65_post_send_schedule_keeps_legacy_profile_unchanged() -> None:

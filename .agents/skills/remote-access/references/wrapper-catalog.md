@@ -29,6 +29,11 @@ this does not extend its authority or replace fresh checks.
   `remote_arm_port_check.sh`.
 - Camera capture and retrieval: `remote_camera_snapshot.sh`; declare its local
   output path before running it.
+- Frozen RGB-D/qpos evidence: `remote_rm65_grasp_snapshot.sh`; requires explicit
+  device-read authorization and a new output directory. It does not issue
+  motion, HOLD, STOP, gripper commands or camera reset.
+- Offline frozen grasp inference: `remote_grasp_snapshot_inference.sh`; runs
+  only the fixed inference probe on retained evidence, without device access.
 - Inspection: `remote_view.sh`, `remote_tail_log.sh`,
   `remote_sync_check.sh`.
 - Remote execution: `remote_python.sh`, `remote_module.sh`,
