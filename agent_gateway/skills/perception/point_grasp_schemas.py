@@ -117,6 +117,25 @@ def point_grasp_schema_entry_v1(
             "tcp_xyz_camera_m": _vector_schema(3),
             "tcp_xyz_base_m": _vector_schema(3),
             "visible_collision_free": {"const": True},
+            "pose_source": {
+                "type": "string",
+                "enum": [
+                    "dmtac_arm_side_approach_variant_v1",
+                    "dmtac_local_orientation_variant_v1",
+                    "dmtac_support_clearance_variant_v1",
+                ],
+            },
+            "orientation_variant_axis": {"type": "string", "enum": ["x", "y", "z"]},
+            "orientation_variant_angle_deg": {
+                "type": "number",
+                "minimum": -45,
+                "maximum": 45,
+            },
+            "support_clearance_world_z_m": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 0.030,
+            },
         },
         "required": [
             "ordinal",
@@ -287,6 +306,25 @@ def point_grasp_schema_entry_v2(
             "tool_tcp_xyz_camera_m": _vector_schema(3),
             "tool_tcp_xyz_reference_m": _vector_schema(3),
             "visible_scene_collision_free": {"const": True},
+            "pose_source": {
+                "type": "string",
+                "enum": [
+                    "dmtac_arm_side_approach_variant_v1",
+                    "dmtac_local_orientation_variant_v1",
+                    "dmtac_support_clearance_variant_v1",
+                ],
+            },
+            "orientation_variant_axis": {"type": "string", "enum": ["x", "y", "z"]},
+            "orientation_variant_angle_deg": {
+                "type": "number",
+                "minimum": -45,
+                "maximum": 45,
+            },
+            "support_clearance_world_z_m": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 0.030,
+            },
         },
         "required": [
             "ordinal",
@@ -852,11 +890,27 @@ def validate_point_grasp_result_v1(
         "tcp_xyz_base_m",
         "visible_collision_free",
     }
+    orientation_variant_fields = {
+        "pose_source",
+        "orientation_variant_axis",
+        "orientation_variant_angle_deg",
+    }
+    support_clearance_variant_fields = {
+        "pose_source",
+        "support_clearance_world_z_m",
+    }
+    pose_source_fields = {"pose_source"}
     previous_score = math.inf
     for ordinal, candidate in enumerate(candidates):
         if (
             not isinstance(candidate, Mapping)
-            or set(candidate) != fields
+            or frozenset(candidate)
+            not in {
+                frozenset(fields),
+                frozenset(fields | pose_source_fields),
+                frozenset(fields | orientation_variant_fields),
+                frozenset(fields | support_clearance_variant_fields),
+            }
             or candidate["ordinal"] != ordinal
         ):
             raise ValueError("Point-grasp candidate fields or ordinals changed.")
@@ -878,6 +932,34 @@ def validate_point_grasp_result_v1(
             raise ValueError(
                 "Point-grasp candidate is not visible-scene collision free."
             )
+        if candidate.get("pose_source") == "dmtac_local_orientation_variant_v1":
+            if not orientation_variant_fields.issubset(candidate):
+                raise ValueError("Point-grasp orientation variant fields are incomplete.")
+            if candidate["orientation_variant_axis"] not in {"x", "y", "z"}:
+                raise ValueError("Point-grasp orientation variant axis is invalid.")
+            angle = candidate["orientation_variant_angle_deg"]
+            if (
+                isinstance(angle, bool)
+                or not isinstance(angle, (int, float))
+                or not math.isfinite(float(angle))
+                or not 0 < abs(float(angle)) <= 45
+            ):
+                raise ValueError("Point-grasp orientation variant is invalid.")
+        elif candidate.get("pose_source") == "dmtac_support_clearance_variant_v1":
+            if not support_clearance_variant_fields.issubset(candidate):
+                raise ValueError("Point-grasp support-clearance fields are incomplete.")
+            clearance = candidate["support_clearance_world_z_m"]
+            if (
+                isinstance(clearance, bool)
+                or not isinstance(clearance, (int, float))
+                or not math.isfinite(float(clearance))
+                or not 0 < float(clearance) <= 0.030
+            ):
+                raise ValueError("Point-grasp support clearance is invalid.")
+        elif candidate.get("pose_source") == "dmtac_arm_side_approach_variant_v1":
+            pass
+        elif "pose_source" in candidate:
+            raise ValueError("Point-grasp pose source is invalid.")
         for field in ("score", "model_score"):
             value = candidate[field]
             if (
@@ -1205,11 +1287,27 @@ def validate_point_grasp_result_v2(
         "tool_tcp_xyz_reference_m",
         "visible_scene_collision_free",
     }
+    orientation_variant_fields = {
+        "pose_source",
+        "orientation_variant_axis",
+        "orientation_variant_angle_deg",
+    }
+    support_clearance_variant_fields = {
+        "pose_source",
+        "support_clearance_world_z_m",
+    }
+    pose_source_fields = {"pose_source"}
     previous_score = math.inf
     for ordinal, candidate in enumerate(candidates):
         if (
             not isinstance(candidate, Mapping)
-            or set(candidate) != candidate_fields
+            or frozenset(candidate)
+            not in {
+                frozenset(candidate_fields),
+                frozenset(candidate_fields | pose_source_fields),
+                frozenset(candidate_fields | orientation_variant_fields),
+                frozenset(candidate_fields | support_clearance_variant_fields),
+            }
             or candidate["ordinal"] != ordinal
         ):
             raise ValueError("Station point-grasp candidate fields changed.")
@@ -1246,6 +1344,38 @@ def validate_point_grasp_result_v2(
             raise ValueError("Station point-grasp candidate xyz is inconsistent.")
         if candidate["visible_scene_collision_free"] is not True:
             raise ValueError("Candidate did not pass the bounded visible-scene check.")
+        if candidate.get("pose_source") == "dmtac_local_orientation_variant_v1":
+            if not orientation_variant_fields.issubset(candidate):
+                raise ValueError(
+                    "Station point-grasp orientation variant fields are incomplete."
+                )
+            if candidate["orientation_variant_axis"] not in {"x", "y", "z"}:
+                raise ValueError("Station point-grasp orientation variant axis is invalid.")
+            angle = candidate["orientation_variant_angle_deg"]
+            if (
+                isinstance(angle, bool)
+                or not isinstance(angle, (int, float))
+                or not math.isfinite(float(angle))
+                or not 0 < abs(float(angle)) <= 45
+            ):
+                raise ValueError("Station point-grasp orientation variant is invalid.")
+        elif candidate.get("pose_source") == "dmtac_support_clearance_variant_v1":
+            if not support_clearance_variant_fields.issubset(candidate):
+                raise ValueError(
+                    "Station point-grasp support-clearance fields are incomplete."
+                )
+            clearance = candidate["support_clearance_world_z_m"]
+            if (
+                isinstance(clearance, bool)
+                or not isinstance(clearance, (int, float))
+                or not math.isfinite(float(clearance))
+                or not 0 < float(clearance) <= 0.030
+            ):
+                raise ValueError("Station point-grasp support clearance is invalid.")
+        elif candidate.get("pose_source") == "dmtac_arm_side_approach_variant_v1":
+            pass
+        elif "pose_source" in candidate:
+            raise ValueError("Station point-grasp pose source is invalid.")
         for field in ("score", "model_score"):
             value = candidate[field]
             if (

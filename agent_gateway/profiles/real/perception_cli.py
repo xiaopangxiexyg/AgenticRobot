@@ -22,6 +22,7 @@ from agent_gateway.transport.unix_transport import (
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from deployments.perception import (
     GRASPGENX_DEFAULT_MODE,
+    GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG,
     GraspGenXClient,
     GraspGenXInProcessBackend,
     GraspGenXPointGraspModelSpec,
@@ -336,6 +337,9 @@ def main(argv: list[str] | None = None) -> int:
                     point_segmenter=object_localizer,
                     client=graspgenx_backend,
                     solid_geometry=reviewed_graspgenx_dmtac_solid_geometry(),
+                    orientation_variants_local_axis_degrees=(
+                        GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG
+                    ),
                 )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid point-grasp model bundle: {error}")

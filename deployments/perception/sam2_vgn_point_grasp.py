@@ -252,6 +252,10 @@ class PointGraspCandidate:
     camera_from_tcp: tuple[float, ...]
     base_from_tcp: tuple[float, ...]
     visible_collision_free: bool
+    pose_source: str = "model_scored"
+    orientation_variant_axis: str | None = None
+    orientation_variant_angle_deg: float = 0.0
+    support_clearance_world_z_m: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -55,6 +56,481 @@ from deployments.perception.sam2_vgn_point_grasp import (
     PointGraspResult,
 )
 from teleop_runtime.video_frame import VideoFrame
+
+
+def test_offline_reachability_never_invents_a_live_qpos_cut():
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.motion_port = None
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200)
+    with pytest.raises(RuntimeError, match="capture-matched"):
+        adapter._resolve_measured_qpos(measured_qpos_cut=None, measurement_reference_time=10.)
+    cut = SimpleNamespace(measured_at=9.95)
+    resolved, age = adapter._resolve_measured_qpos(measured_qpos_cut=cut, measurement_reference_time=10.)
+    assert resolved is cut
+    assert age == pytest.approx(50.)
+    with pytest.raises(RuntimeError, match="camera-matched"):
+        adapter._resolve_measured_qpos(measured_qpos_cut=cut, measurement_reference_time=11.)
+
+
+def test_embodied_shortlist_reports_bounded_rejection_reasons() -> None:
+    pose = np.eye(4)
+    pose[2, 2] = -1.0
+    pose[0, 0] = -1.0
+    candidates = tuple(
+        SimpleNamespace(base_from_tcp=tuple(pose.reshape(-1)), score=0.9 - i * 0.1)
+        for i in range(3)
+    )
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200.0, arm_side="right")
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    adapter.monotonic = lambda: 1.0
+    adapter._solver_pose = lambda value: value
+    reasons = iter(("approach_endpoint_collision_blocked", None, "approach_ik_search_exhausted"))
+
+    def assess(**_kwargs):
+        reason = next(reasons)
+        return SimpleNamespace(
+            feasible=reason is None,
+            selected_pregrasp_distance_m=0.08 if reason is None else None,
+            elapsed_ms=25.0,
+            reason_code=reason,
+            attempts=({"reason_code": reason},) if reason else (),
+        )
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(
+        candidates,
+        (0.0, 0.0, 0.0),
+        3,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+    assert result.selected_indices == (1,)
+    attempts = json.loads(result.diagnostics["arm_shortlist_attempts_json"])
+    assert len(attempts) == 3
+    assert attempts[0]["reason_code"] == "approach_endpoint_collision_blocked"
+    assert attempts[0]["branch_attempts"] == [
+        {"reason_code": "approach_endpoint_collision_blocked"}
+    ]
+    assert json.loads(result.diagnostics["arm_shortlist_rejections_json"]) == {
+        "approach_endpoint_collision_blocked": 1,
+        "approach_ik_search_exhausted": 1,
+    }
+    assert result.diagnostics["arm_shortlist_rescue_activated"] is False
+
+
+def test_embodied_shortlist_preserves_tilted_pose_and_direction_diversity() -> None:
+    candidates = []
+    poses = []
+    for index, tilt_deg in enumerate((-35.0, -33.0, 5.0)):
+        tilt = np.deg2rad(tilt_deg)
+        approach = np.array((-np.cos(tilt), 0.0, np.sin(tilt)))
+        pose = np.eye(4)
+        pose[:3, 0] = np.cross((0.0, 1.0, 0.0), approach)
+        pose[:3, 2] = approach
+        pose[0, 3] = float(index)
+        poses.append(pose.copy())
+        candidates.append(SimpleNamespace(base_from_tcp=pose, score=0.9 - index * 0.1))
+
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200.0, arm_side="right")
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    adapter.monotonic = lambda: 1.0
+    adapter._solver_pose = lambda value: value.copy()
+    assessed = []
+
+    def assess(**kwargs):
+        pose = kwargs["target_tool_tcp_world"]
+        index = int(pose[0, 3])
+        np.testing.assert_allclose(pose, poses[index])
+        assessed.append(index)
+        return SimpleNamespace(
+            feasible=True, selected_pregrasp_distance_m=0.06,
+            elapsed_ms=1.0, reason_code=None, attempts=(),
+        )
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(
+        tuple(candidates), (0.0, 0.0, 0.0), 2,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+
+    # The 40-degree-separated approach must precede a near duplicate.
+    assert assessed == [0, 2]
+    assert result.selected_indices == (0, 2)
+    for candidate, pose in zip(candidates, poses, strict=True):
+        np.testing.assert_array_equal(candidate.base_from_tcp, pose)
+
+
+@pytest.mark.parametrize("classification", ["unresolved", "not_probed"])
+def test_embodied_shortlist_explores_unknown_before_known_collision(
+    monkeypatch, classification
+) -> None:
+    from agent_gateway.profiles.real import rm65_grasp_reachability as reachability
+
+    if classification == "not_probed":
+        monkeypatch.setattr(reachability, "_ARM_SHORTLIST_PROBE_MAX_COUNT", 1)
+    candidates = []
+    for index in range(2):
+        pose = np.diag((-1.0, 1.0, -1.0, 1.0))
+        pose[0, 3] = float(index)
+        candidates.append(SimpleNamespace(base_from_tcp=tuple(pose.flat), score=0.9 - index * 0.1))
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200.0, arm_side="right")
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    adapter.monotonic = lambda: 1.0
+    adapter._solver_pose = lambda value: value.copy()
+    assessed = []
+
+    def probe(**kwargs):
+        index = int(kwargs["target_tool_tcp_world"][0, 3])
+        return SimpleNamespace(
+            classification="collision_blocked" if index == 0 else classification,
+            elapsed_ms=1.0, reason_code=None,
+            best_minimum_distance_m=None, attempted_seed_count=1,
+        )
+
+    def assess(**kwargs):
+        index = int(kwargs["target_tool_tcp_world"][0, 3])
+        assessed.append(index)
+        return SimpleNamespace(
+            feasible=index == 1, selected_pregrasp_distance_m=0.06,
+            elapsed_ms=1.0, reason_code=None if index == 1 else "endpoint_collision_blocked",
+            attempts=(),
+        )
+
+    adapter.planner = SimpleNamespace(
+        probe_grasp_endpoint_clearance=probe, assess_local_grasp_chain=assess,
+    )
+    result = adapter.select_candidates(
+        tuple(candidates), (0.0, 0.0, 0.0), 1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+    assert assessed == [1]
+    assert result.selected_indices == (1,)
+
+
+def test_embodied_shortlist_uses_endpoint_probe_only_to_reorder_full_checks() -> None:
+    candidates = []
+    for index in range(3):
+        pose = np.diag((-1.0, 1.0, -1.0, 1.0))
+        pose[0, 3] = float(index)
+        candidates.append(
+            SimpleNamespace(
+                base_from_tcp=tuple(pose.reshape(-1)),
+                score=0.9 - index * 0.1,
+            )
+        )
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200.0, arm_side="right")
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    adapter.monotonic = lambda: 1.0
+    adapter._solver_pose = lambda value: value
+    probed = []
+    assessed = []
+    classifications = {
+        0: "collision_blocked",
+        1: "clearance_blocked",
+        2: "clearance_safe",
+    }
+
+    def probe(**kwargs):
+        index = int(round(float(kwargs["target_tool_tcp_world"][0, 3])))
+        probed.append(index)
+        return SimpleNamespace(
+            classification=classifications[index],
+            elapsed_ms=1.0,
+            reason_code=None,
+            best_minimum_distance_m=0.03 if index == 2 else 0.003,
+            attempted_seed_count=2,
+        )
+
+    def assess(**kwargs):
+        index = int(round(float(kwargs["target_tool_tcp_world"][0, 3])))
+        assessed.append(index)
+        return SimpleNamespace(
+            feasible=index == 2,
+            selected_pregrasp_distance_m=0.06 if index == 2 else None,
+            elapsed_ms=2.0,
+            reason_code=None if index == 2 else "ik_search_exhausted",
+            attempts=(),
+        )
+
+    adapter.planner = SimpleNamespace(
+        probe_grasp_endpoint_clearance=probe,
+        assess_local_grasp_chain=assess,
+    )
+    result = adapter.select_candidates(
+        tuple(candidates),
+        (0.0, 0.0, 0.0),
+        1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+
+    assert probed == [0, 1, 2]
+    assert assessed == [2]
+    assert result.selected_indices == (2,)
+    assert result.diagnostics["arm_shortlist_endpoint_probe_count"] == 3
+
+
+def test_embodied_shortlist_probes_support_clearance_family_before_model_scores() -> None:
+    candidates = []
+    for index in range(6):
+        pose = np.diag((-1.0, 1.0, -1.0, 1.0))
+        pose[0, 3] = float(index)
+        candidates.append(
+            SimpleNamespace(
+                base_from_tcp=tuple(pose.reshape(-1)),
+                score=0.9 - index * 0.1,
+                pose_source=(
+                    "dmtac_support_clearance_variant_v1"
+                    if index == 5
+                    else "model_scored"
+                ),
+            )
+        )
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(
+        max_measured_qpos_age_ms=200.0,
+        arm_side="right",
+    )
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    adapter.monotonic = lambda: 1.0
+    adapter._solver_pose = lambda value: value
+    probed = []
+    assessed = []
+
+    def probe(**kwargs):
+        index = int(round(float(kwargs["target_tool_tcp_world"][0, 3])))
+        probed.append(index)
+        return SimpleNamespace(
+            classification=("clearance_safe" if index == 5 else "collision_blocked"),
+            elapsed_ms=1.0,
+            reason_code=None,
+            best_minimum_distance_m=0.03 if index == 5 else -0.01,
+            attempted_seed_count=2,
+        )
+
+    def assess(**kwargs):
+        index = int(round(float(kwargs["target_tool_tcp_world"][0, 3])))
+        assessed.append(index)
+        return SimpleNamespace(
+            feasible=index == 5,
+            selected_pregrasp_distance_m=0.06 if index == 5 else None,
+            elapsed_ms=2.0,
+            reason_code=None if index == 5 else "endpoint_collision_blocked",
+            attempts=(),
+        )
+
+    adapter.planner = SimpleNamespace(
+        probe_grasp_endpoint_clearance=probe,
+        assess_local_grasp_chain=assess,
+    )
+
+    result = adapter.select_candidates(
+        tuple(candidates),
+        (0.0, 0.0, 0.0),
+        1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+
+    assert probed[0] == 5
+    assert assessed == [5]
+    assert result.selected_indices == (5,)
+
+
+def test_embodied_shortlist_does_not_reject_an_unresolved_endpoint_probe() -> None:
+    pose = np.diag((-1.0, 1.0, -1.0, 1.0))
+    candidate = SimpleNamespace(base_from_tcp=tuple(pose.reshape(-1)), score=0.9)
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200.0, arm_side="right")
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    adapter.monotonic = lambda: 1.0
+    adapter._solver_pose = lambda value: value
+    adapter.planner = SimpleNamespace(
+        probe_grasp_endpoint_clearance=lambda **_kwargs: SimpleNamespace(
+            classification="unresolved",
+            elapsed_ms=1.0,
+            reason_code="path_planning_time_budget_exhausted",
+            best_minimum_distance_m=None,
+            attempted_seed_count=1,
+        ),
+        assess_local_grasp_chain=lambda **_kwargs: SimpleNamespace(
+            feasible=True,
+            selected_pregrasp_distance_m=0.04,
+            elapsed_ms=2.0,
+            reason_code=None,
+            attempts=(),
+        ),
+    )
+
+    result = adapter.select_candidates(
+        (candidate,),
+        (0.0, 0.0, 0.0),
+        1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+
+    assert result.selected_indices == (0,)
+
+
+def test_embodied_shortlist_rescues_late_feasible_pose_after_extreme_scene_budget() -> None:
+    """The recorded 8-second shortlist inspected only six of 66-97 poses."""
+
+    pose = np.eye(4)
+    pose[0, 0] = -1.0
+    pose[2, 2] = -1.0
+    candidates = tuple(
+        SimpleNamespace(base_from_tcp=tuple(pose.reshape(-1)), score=0.9 - i * 0.01)
+        for i in range(10)
+    )
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200.0, arm_side="right")
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    elapsed = [0.0]
+    adapter.monotonic = lambda: elapsed[0]
+    adapter._solver_pose = lambda value: value
+    # First five costs mirror the failed field run; the sixth has only a small
+    # remainder under the old total deadline. The seventh pose is a valid
+    # local chain, analogous to the later successful grasp on the same qpos.
+    durations = (1.009, 1.662, 2.016, 1.068, 2.009, 0.238, 0.174)
+    budgets = []
+
+    def assess(**kwargs):
+        index = len(budgets)
+        budgets.append(kwargs["time_budget_sec"])
+        elapsed[0] += durations[index]
+        feasible = index == 6
+        return SimpleNamespace(
+            feasible=feasible,
+            selected_pregrasp_distance_m=0.06 if feasible else None,
+            elapsed_ms=durations[index] * 1000.0,
+            reason_code=None if feasible else "ik_search_exhausted",
+            attempts=(),
+        )
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(
+        candidates,
+        (0.0, 0.0, 0.0),
+        1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+    assert result.selected_indices == (6,)
+    assert len(budgets) == 7
+    assert all(0 < value <= 2.0 for value in budgets)
+    assert result.diagnostics["arm_shortlist_rescue_activated"] is True
+    assert result.diagnostics["arm_shortlist_rescue_assessment_count"] == 2
+    assert result.diagnostics["arm_shortlist_budget_sec"] == 16.0
+
+
+def test_embodied_shortlist_rescue_stops_at_total_deadline() -> None:
+    pose = np.diag((-1.0, 1.0, -1.0, 1.0))
+    candidates = tuple(
+        SimpleNamespace(base_from_tcp=tuple(pose.reshape(-1)), score=1.0 - i * 0.01)
+        for i in range(20)
+    )
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200.0, arm_side="right")
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    elapsed = [0.0]
+    adapter.monotonic = lambda: elapsed[0]
+    adapter._solver_pose = lambda value: value
+    budgets = []
+
+    def assess(**kwargs):
+        budgets.append(kwargs["time_budget_sec"])
+        elapsed[0] += 2.0
+        return SimpleNamespace(
+            feasible=False,
+            selected_pregrasp_distance_m=None,
+            elapsed_ms=2000.0,
+            reason_code="ik_search_exhausted",
+            attempts=(),
+        )
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(
+        candidates,
+        (0.0, 0.0, 0.0),
+        1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+    assert result.selected_indices == ()
+    assert len(budgets) == 8
+    assert elapsed[0] == 16.0
+    assert result.diagnostics["arm_shortlist_budget_exhausted"] is True
+    assert result.diagnostics["arm_shortlist_rescue_assessment_count"] == 4
+
+
+def test_embodied_shortlist_checks_nearby_pose_before_spending_first_window() -> None:
+    approaches = (
+        (-1.0, 0.0, 0.0),
+        (-0.8660254, -0.5, 0.0),
+        (-0.5, -0.8660254, 0.0),
+        (-0.8660254, 0.5, 0.0),
+        (-0.5, 0.8660254, 0.0),
+        (-1.0, 0.0, 0.0),
+    )
+    candidates = []
+    for index, approach in enumerate(approaches):
+        pose = np.eye(4)
+        pose[:3, 2] = approach
+        pose[0, 3] = index
+        candidates.append(
+            SimpleNamespace(
+                base_from_tcp=tuple(pose.reshape(-1)),
+                score=0.2 if index == 5 else 0.9 - index * 0.01,
+            )
+        )
+    adapter = object.__new__(RM65PointGraspReachabilityAdapter)
+    adapter.profile = SimpleNamespace(max_measured_qpos_age_ms=200.0, arm_side="right")
+    adapter.arm_base_origin_candidate_m = (1.0, 0.0, 0.0)
+    adapter.clock = lambda: 10.0
+    elapsed = [0.0]
+    adapter.monotonic = lambda: elapsed[0]
+    adapter._solver_pose = lambda value: value
+    assessed = []
+
+    def assess(**kwargs):
+        index = int(kwargs["target_tool_tcp_world"][0, 3])
+        assessed.append(index)
+        elapsed[0] += 1.0
+        feasible = index == 5
+        return SimpleNamespace(
+            feasible=feasible,
+            selected_pregrasp_distance_m=0.06 if feasible else None,
+            elapsed_ms=1000.0,
+            reason_code=None if feasible else "ik_search_exhausted",
+            attempts=(),
+        )
+
+    adapter.planner = SimpleNamespace(assess_local_grasp_chain=assess)
+    result = adapter.select_candidates(
+        tuple(candidates),
+        (0.0, 0.0, 0.0),
+        1,
+        measured_qpos_cut=SimpleNamespace(measured_at=10.0, qpos_by_side={}),
+        measurement_reference_time=10.0,
+    )
+    assert assessed == [0, 1, 3, 2, 5]
+    assert result.selected_indices == (5,)
+    assert result.diagnostics["arm_shortlist_rescue_activated"] is False
 
 
 class _Source:

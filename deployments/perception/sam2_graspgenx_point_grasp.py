@@ -16,7 +16,11 @@ import numpy as np
 from PIL import Image
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.grasp_visible_scene import ParallelJawSolidGeometry, VisibleGraspScene
+from robot_motion.grasp_visible_scene import (
+    PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
+    ParallelJawSolidGeometry,
+    VisibleGraspScene,
+)
 
 from .dmtac_grasp_overlay import (
     DMTAC_M_GRASPGENX_ALIGNMENT_PROFILE_ID,
@@ -82,7 +86,41 @@ _DMTAC_GRASPGENX_IDENTITY_ROTATION = (
 GRASPGENX_CANDIDATE_FAMILY_TRANSLATION_M = 0.015
 GRASPGENX_CANDIDATE_FAMILY_APPROACH_DEG = 15.0
 GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG = 20.0
+GRASPGENX_DMTAC_REACHABILITY_ORIENTATION_VARIANTS_LOCAL_AXIS_DEG = (
+    ("x", -15.0),
+    ("x", -10.0),
+    ("x", 10.0),
+    ("x", 15.0),
+    ("y", -20.0),
+    ("y", 20.0),
+    ("z", -30.0),
+    ("z", 30.0),
+)
+GRASPGENX_DMTAC_ORIENTATION_VARIANT_SOURCE_LIMIT = 8
+GRASPGENX_DMTAC_ORIENTATION_VARIANT_RETURN_LIMIT = 2
+GRASPGENX_DMTAC_ORIENTATION_VARIANT_SCORE_DECAY_DEG = 180.0
+GRASPGENX_DMTAC_ARM_SIDE_VARIANT_SOURCE_LIMIT = 32
+GRASPGENX_DMTAC_ARM_SIDE_VARIANT_MAX_ROTATION_DEG = 100.0
+GRASPGENX_DMTAC_ARM_SIDE_APPROACH_YAW_OFFSETS_DEG = (0.0, -20.0, 20.0)
+GRASPGENX_DMTAC_TOP_APPROACH_COSINE = 0.7
+GRASPGENX_DMTAC_SUPPORT_CLEARANCE_WORLD_Z_M = (0.005, 0.010, 0.015, 0.030)
+# The saved DMTAC table scenes contain more than 200 distinct raw approach
+# directions.  Sixty-four sources can still end with only two unique admitted
+# poses because several low-collision sources describe the same physical pose.
+# Keep the search bounded, but inspect enough distinct sources to populate the
+# five-candidate UI without weakening the zero-background-collision rule.
+GRASPGENX_DMTAC_SUPPORT_CLEARANCE_SOURCE_LIMIT = 128
+GRASPGENX_DMTAC_SUPPORT_CLEARANCE_RETURN_LIMIT = 8
+GRASPGENX_DMTAC_SUPPORT_CLEARANCE_SCORE_DECAY_M = 0.060
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GraspGenXCandidateSelection:
+    """Select a bounded subset after physical admission and before publication."""
+
+    selected_indices: tuple[int, ...]
+    diagnostics: Mapping[str, int | float | str | None]
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -162,6 +200,24 @@ def _normalize_graspgenx_rigid_matrix(
     normalized = matrix.copy()
     normalized[:3, :3] = projected
     return _strict_rigid_matrix(normalized, field_name=field_name)
+
+
+def _local_axis_rotation(axis: str, angle_deg: float) -> np.ndarray:
+    """Return one grasp-local axis rotation as a homogeneous transform."""
+
+    angle_rad = math.radians(float(angle_deg))
+    cosine = math.cos(angle_rad)
+    sine = math.sin(angle_rad)
+    rotations = {
+        "x": ((1.0, 0.0, 0.0), (0.0, cosine, -sine), (0.0, sine, cosine)),
+        "y": ((cosine, 0.0, sine), (0.0, 1.0, 0.0), (-sine, 0.0, cosine)),
+        "z": ((cosine, -sine, 0.0), (sine, cosine, 0.0), (0.0, 0.0, 1.0)),
+    }
+    if axis not in rotations:
+        raise ValueError("orientation variant axis must be x, y, or z")
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.asarray(rotations[axis], dtype=np.float64)
+    return transform
 
 
 @dataclass(frozen=True)
@@ -329,6 +385,20 @@ class GraspGenXPointGraspModelSpec:
         )
 
 
+@dataclass(frozen=True)
+class _RankedGraspCandidate:
+    score: float
+    model_score: float
+    click_distance_m: float
+    gripper_width_m: float
+    camera_from_grasp_geometry: np.ndarray
+    base_from_grasp_geometry: np.ndarray
+    pose_source: str = "model_scored"
+    orientation_variant_axis: str | None = None
+    orientation_variant_angle_deg: float = 0.0
+    support_clearance_world_z_m: float = 0.0
+
+
 class Sam2GraspGenXPointGraspPlanner:
     """Proposal-only GraspGenX planner using a retained aligned RGB-D frame."""
 
@@ -347,6 +417,11 @@ class Sam2GraspGenXPointGraspPlanner:
         max_gripper_width_m: float = DMTAC_M_GRASPGENX_MAX_OPENING_M,
         max_click_distance_m: float = 0.100,
         solid_geometry: ParallelJawSolidGeometry | None = None,
+        orientation_variants_local_axis_degrees: tuple[tuple[str, float], ...] = (),
+        orientation_variant_source_limit: int = (
+            GRASPGENX_DMTAC_ORIENTATION_VARIANT_SOURCE_LIMIT
+        ),
+        preferred_approach_origin_base_m: tuple[float, float, float] | None = None,
     ) -> None:
         if not isinstance(model_spec, GraspGenXPointGraspModelSpec):
             raise TypeError("model_spec must be typed.")
@@ -383,6 +458,61 @@ class Sam2GraspGenXPointGraspPlanner:
         self.score_threshold = threshold
         self.max_gripper_width_m = float(max_gripper_width_m)
         self.max_click_distance_m = float(max_click_distance_m)
+        orientation_variants = []
+        for value in orientation_variants_local_axis_degrees:
+            if (
+                not isinstance(value, (tuple, list))
+                or len(value) != 2
+                or not isinstance(value[0], str)
+                or isinstance(value[1], bool)
+            ):
+                raise ValueError(
+                    "orientation variants must be typed (axis, angle_deg) pairs."
+                )
+            try:
+                orientation_variants.append((value[0], float(value[1])))
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    "orientation variant angles must be finite numbers."
+                ) from error
+        orientation_variants = tuple(orientation_variants)
+        if (
+            len(orientation_variants) > 8
+            or len(set(orientation_variants)) != len(orientation_variants)
+            or any(
+                axis not in {"x", "y", "z"}
+                or not math.isfinite(angle_deg)
+                or abs(angle_deg) < 1e-9
+                or abs(angle_deg) > 45.0
+                for axis, angle_deg in orientation_variants
+            )
+        ):
+            raise ValueError(
+                "orientation_variants_local_axis_degrees must contain at most "
+                "eight unique x/y/z axis-angle pairs with finite non-zero "
+                "angles within [-45, 45]."
+            )
+        source_limit = int(orientation_variant_source_limit)
+        if (
+            isinstance(orientation_variant_source_limit, bool)
+            or not 1 <= source_limit <= 32
+        ):
+            raise ValueError("orientation_variant_source_limit must be in [1, 32].")
+        self.orientation_variants_local_axis_degrees = orientation_variants
+        self.orientation_variant_source_limit = source_limit
+        preferred_origin = None
+        if preferred_approach_origin_base_m is not None:
+            preferred_origin_array = np.asarray(
+                preferred_approach_origin_base_m, dtype=np.float64
+            )
+            if preferred_origin_array.shape != (3,) or not np.all(
+                np.isfinite(preferred_origin_array)
+            ):
+                raise ValueError(
+                    "preferred_approach_origin_base_m must be three finite values."
+                )
+            preferred_origin = tuple(float(value) for value in preferred_origin_array)
+        self.preferred_approach_origin_base_m = preferred_origin
         nominal_geometry = ParallelJawSolidGeometry(
             DMTAC_M_GRASPGENX_PALM_Z_M,
             DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
@@ -441,12 +571,62 @@ class Sam2GraspGenXPointGraspPlanner:
                     ),
                 },
                 "candidate_selection": {
-                    "policy": "all_distinct_approach_families_then_scored_variants_v4",
+                    "policy": "collision_readmitted_arm_local_chain_shortlist_v10",
                     "approach_axis_deg": (
                         GRASPGENX_CANDIDATE_APPROACH_DIVERSITY_DEG
                     ),
                     "fallback": "score_ordered_scored_pose_variants",
                     "duplicate_pose_atol": 1e-6,
+                    "dmtac_orientation_variants": {
+                        "axis_angle_deg": self.orientation_variants_local_axis_degrees,
+                        "frame": "grasp_geometry_local",
+                        "source_limit": self.orientation_variant_source_limit,
+                        "return_limit": (
+                            GRASPGENX_DMTAC_ORIENTATION_VARIANT_RETURN_LIMIT
+                        ),
+                        "score_policy": "parent_score_exp_abs_angle_over_180",
+                        "physical_readmission": (
+                            "width_target_capture_terminal_collision_and_approach"
+                        ),
+                    },
+                    "dmtac_arm_side_variants": {
+                        "preferred_approach_origin_base_m": (
+                            self.preferred_approach_origin_base_m
+                        ),
+                        "source_limit": GRASPGENX_DMTAC_ARM_SIDE_VARIANT_SOURCE_LIMIT,
+                        "maximum_rotation_deg": (
+                            GRASPGENX_DMTAC_ARM_SIDE_VARIANT_MAX_ROTATION_DEG
+                        ),
+                        "top_approach_cosine": GRASPGENX_DMTAC_TOP_APPROACH_COSINE,
+                        "side_approach_yaw_offsets_deg": (
+                            GRASPGENX_DMTAC_ARM_SIDE_APPROACH_YAW_OFFSETS_DEG
+                        ),
+                        "side_grasp_axes": (
+                            "horizontal_closing_vertical_height"
+                        ),
+                        "physical_readmission": (
+                            "width_target_capture_terminal_collision_and_approach"
+                        ),
+                    },
+                    "dmtac_support_clearance_variants": {
+                        "world_z_offsets_m": (
+                            GRASPGENX_DMTAC_SUPPORT_CLEARANCE_WORLD_Z_M
+                        ),
+                        "frame": "gravity_aligned_reference",
+                        "source_limit": (
+                            GRASPGENX_DMTAC_SUPPORT_CLEARANCE_SOURCE_LIMIT
+                        ),
+                        "return_limit": (
+                            GRASPGENX_DMTAC_SUPPORT_CLEARANCE_RETURN_LIMIT
+                        ),
+                        "score_policy": "parent_score_exp_clearance_over_0_060m",
+                        "source_condition": (
+                            "terminal_blocked_then_admitted_shortlist_fallback"
+                        ),
+                        "physical_readmission": (
+                            "width_target_capture_click_terminal_collision_and_approach"
+                        ),
+                    },
                 },
                 "gripper": {
                     "profile": "DMTAC_M",
@@ -457,7 +637,7 @@ class Sam2GraspGenXPointGraspPlanner:
                     "maximum_opening_m": self.max_gripper_width_m,
                     "width_clearance_m": DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
                     "visible_collision_opening_basis": "maximum_opening",
-                    "terminal_target_contact_rule": "fingertip_band_only",
+                    "terminal_target_contact_rule": "inner_tactile_pad_band_only",
                     "terminal_target_contact_depth_m": (
                         DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
                     ),
@@ -471,9 +651,15 @@ class Sam2GraspGenXPointGraspPlanner:
                     "terminal_background_prefilter": (
                         "runtime_visible_scene_factory"
                     ),
+                    "visible_depth_filter_hash": (
+                        PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER.semantic_content_hash
+                    ),
                     "maximum_visible_collision_points": 0,
                     "visible_endpoint_opening_m": self.max_gripper_width_m,
-                    "unscored_pose_translation_allowed": False,
+                    "unscored_pose_translation_allowed": True,
+                    "variant_score_semantics": (
+                        "parent_model_score_with_pose_delta_penalty_v1"
+                    ),
                     "visible_approach_sweep_distance_m": 0.060,
                     "visible_approach_opening_m": self.max_gripper_width_m,
                     "grasp_center_from_tactile_xyz_m": list(
@@ -542,6 +728,16 @@ class Sam2GraspGenXPointGraspPlanner:
         base_from_camera: np.ndarray,
         max_candidates: int,
         visible_scene_factory: Callable[..., VisibleGraspScene] | None = None,
+        use_visible_target_points: bool = False,
+        candidate_selector: Callable[
+            [
+                tuple[PointGraspCandidate, ...],
+                tuple[float, float, float],
+                int,
+            ],
+            GraspGenXCandidateSelection,
+        ]
+        | None = None,
     ) -> PointGraspResult:
         started = time.perf_counter()
         timing: dict[str, float] = {}
@@ -557,6 +753,8 @@ class Sam2GraspGenXPointGraspPlanner:
             raise ValueError("max_candidates must be in [1, 5].")
         if visible_scene_factory is not None and not callable(visible_scene_factory):
             raise TypeError("visible_scene_factory must be callable or None.")
+        if candidate_selector is not None and not callable(candidate_selector):
+            raise TypeError("candidate_selector must be callable or None.")
         u, v = pixel_uv
         if not (0 <= u < rgb.width and 0 <= v < rgb.height):
             raise ValueError("pixel_uv is outside the image.")
@@ -612,22 +810,6 @@ class Sam2GraspGenXPointGraspPlanner:
             dtype=np.float64,
         )
         point_base = transform_base_camera @ point_camera
-        stage_started = time.perf_counter()
-        grasps, scores = self.client.infer_object(
-            # GraspMoE's OBB branch defines "top" using input-frame +Z, so
-            # inference must run in the gravity-aligned reference frame rather
-            # than the camera optical frame. In simulation this is the arm base;
-            # the real Station path uses its canonical z-up station frame.
-            target_points_base,
-            sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
-            planner=self.planner,
-            num_grasps=self.num_grasps,
-            score_threshold=self.score_threshold,
-            # Preserve the full generated union until embodiment-specific
-            # capture, visibility, and reachability filters have run.
-            top_k=self.server_top_k,
-        )
-        timing["graspgenx_inference"] = (time.perf_counter() - stage_started) * 1000.0
         visible_scene = None
         if visible_scene_factory is not None:
             stage_started = time.perf_counter()
@@ -649,8 +831,50 @@ class Sam2GraspGenXPointGraspPlanner:
             timing["visible_scene_construction"] = (
                 time.perf_counter() - stage_started
             ) * 1000.0
+        if use_visible_target_points:
+            if visible_scene is None:
+                raise ValueError("Fused target inference requires its matching visible scene")
+            target_points_camera = np.ascontiguousarray(visible_scene.points[visible_scene.target_mask], dtype=np.float32)
+            if len(target_points_camera) < 3:
+                raise RuntimeError("Fused scene contains insufficient target points")
+            target_points_base = np.ascontiguousarray(
+                target_points_camera @ transform_base_camera[:3, :3].T + transform_base_camera[:3, 3], dtype=np.float32)
+        stage_started = time.perf_counter()
+        grasps, scores = self.client.infer_object(
+            # GraspMoE's OBB branch defines top in the gravity-aligned input
+            # frame. Fuse target points before this single model invocation.
+            target_points_base,
+            sweep_volume_params=DMTAC_M_GRASPGENX_SWEEP_VOLUME_V1,
+            planner=self.planner, num_grasps=self.num_grasps,
+            score_threshold=self.score_threshold, top_k=self.server_top_k,
+        )
+        timing["graspgenx_inference"] = (time.perf_counter() - stage_started) * 1000.0
         stage_started = time.perf_counter()
         filter_summary: dict[str, int | float | str | None] = {}
+        if (
+            visible_scene is not None
+            and visible_scene.depth_preprocessing_evidence is not None
+        ):
+            depth_evidence = visible_scene.depth_preprocessing_evidence
+            filter_summary.update(
+                {
+                    "depth_filter_config_hash": str(
+                        depth_evidence["config_hash"]
+                    ),
+                    "depth_filter_input_valid_points": int(
+                        depth_evidence["input_valid_point_count"]
+                    ),
+                    "depth_filter_output_valid_points": int(
+                        depth_evidence["output_valid_point_count"]
+                    ),
+                    "depth_filter_removed_isolated_background_points": int(
+                        depth_evidence["removed_isolated_background_points"]
+                    ),
+                    "depth_filter_removed_target_points": int(
+                        depth_evidence["removed_target_points"]
+                    ),
+                }
+            )
         candidates = self._rank(
             grasps,
             scores,
@@ -662,6 +886,7 @@ class Sam2GraspGenXPointGraspPlanner:
             maximum=int(max_candidates),
             filter_summary=filter_summary,
             visible_scene=visible_scene,
+            candidate_selector=candidate_selector,
         )
         timing["candidate_ranking_and_visible_collision"] = (
             time.perf_counter() - stage_started
@@ -707,7 +932,19 @@ class Sam2GraspGenXPointGraspPlanner:
         maximum: int,
         filter_summary: dict[str, int | float | str | None] | None = None,
         visible_scene: VisibleGraspScene | None = None,
+        candidate_selector: Callable[
+            [
+                tuple[PointGraspCandidate, ...],
+                tuple[float, float, float],
+                int,
+            ],
+            GraspGenXCandidateSelection,
+        ]
+        | None = None,
     ) -> tuple[PointGraspCandidate, ...]:
+        internal_candidate_target = (
+            max(maximum, 24) if candidate_selector is not None else maximum
+        )
         model_base_from_tcp = np.eye(4, dtype=np.float64)
         # The saved DMTAC alignment defines GraspGenX's output as the model
         # base itself.  Its palm boundary is model-local ``palm_z_m``; do not
@@ -739,7 +976,7 @@ class Sam2GraspGenXPointGraspPlanner:
                     "visible_scene geometry must use the GraspGenX grasp frame."
                 )
             terminal_scene = visible_scene
-        ranked: list[tuple[float, float, float, float, np.ndarray, np.ndarray]] = []
+        ranked: list[_RankedGraspCandidate] = []
         counts: dict[str, int | float | str | None] = {
             "detected": 0,
             "width_valid": 0,
@@ -787,20 +1024,296 @@ class Sam2GraspGenXPointGraspPlanner:
             ),
             "terminal_background_prefilter_enabled": visible_scene is not None,
             "terminal_background_collision_rejected": 0,
-            "visible_scene_point_count": int(len(terminal_scene.points)),
+            "visible_scene_point_count": len(terminal_scene.points),
             "visible_scene_background_point_count": int(
                 np.count_nonzero(~terminal_scene.target_mask)
             ),
             "visible_collision_opening_basis": "maximum_opening",
             "visible_collision_opening_m": self.max_gripper_width_m,
-            "terminal_target_contact_rule": "fingertip_band_only",
+            "terminal_target_contact_rule": "inner_tactile_pad_band_only",
             "terminal_target_contact_depth_m": (
                 DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
             ),
             "terminal_target_contact_points": 0,
             "min_visible_collision_opening_m": None,
             "max_visible_collision_opening_m": None,
+            "orientation_variant_attempted": 0,
+            "orientation_variant_width_valid": 0,
+            "orientation_variant_target_capture_valid": 0,
+            "orientation_variant_click_distance_valid": 0,
+            "orientation_variant_visible_collision_valid": 0,
+            "orientation_variant_visible_approach_valid": 0,
+            "orientation_variant_visible_approach_collision_candidates": 0,
+            "orientation_variant_target_solid_collision_rejected": 0,
+            "orientation_variant_background_solid_collision_rejected": 0,
+            "orientation_variant_selected": 0,
+            "orientation_variant_reserved": 0,
+            "arm_side_variant_attempted": 0,
+            "arm_side_variant_width_valid": 0,
+            "arm_side_variant_target_capture_valid": 0,
+            "arm_side_variant_click_distance_valid": 0,
+            "arm_side_variant_visible_collision_valid": 0,
+            "arm_side_variant_visible_approach_valid": 0,
+            "arm_side_variant_visible_approach_collision_candidates": 0,
+            "arm_side_variant_target_solid_collision_rejected": 0,
+            "arm_side_variant_background_solid_collision_rejected": 0,
+            "arm_side_variant_selected": 0,
+            "support_clearance_variant_attempted": 0,
+            "support_clearance_variant_width_valid": 0,
+            "support_clearance_variant_target_capture_valid": 0,
+            "support_clearance_variant_click_distance_valid": 0,
+            "support_clearance_variant_visible_collision_valid": 0,
+            "support_clearance_variant_visible_approach_valid": 0,
+            "support_clearance_variant_visible_approach_collision_candidates": 0,
+            "support_clearance_variant_target_solid_collision_rejected": 0,
+            "support_clearance_variant_background_solid_collision_rejected": 0,
+            "support_clearance_variant_selected": 0,
+            "support_clearance_variant_reserved": 0,
+            "support_clearance_side_admitted": 0,
+            "support_clearance_top_admitted": 0,
         }
+
+        def increment(name: str, *, pose_source: str, amount: int = 1) -> None:
+            if pose_source == "model_scored":
+                key = name
+            elif pose_source == "dmtac_local_orientation_variant_v1":
+                key = f"orientation_variant_{name}"
+            elif pose_source == "dmtac_arm_side_approach_variant_v1":
+                key = f"arm_side_variant_{name}"
+            elif pose_source == "dmtac_support_clearance_variant_v1":
+                key = f"support_clearance_variant_{name}"
+            else:
+                raise ValueError(f"Unsupported DMTAC pose source: {pose_source}")
+            counts[key] = int(counts[key]) + int(amount)
+
+        def prepare_pose(
+            *,
+            camera_from_grasp_geometry: np.ndarray,
+            base_from_grasp_geometry: np.ndarray,
+            raw_model_score: float,
+            pose_source: str,
+            orientation_variant_axis: str | None,
+            orientation_variant_angle_deg: float,
+            support_clearance_world_z_m: float,
+        ) -> _RankedGraspCandidate | None:
+            is_variant = pose_source != "model_scored"
+            if is_variant:
+                increment("attempted", pose_source=pose_source)
+            tcp_from_camera = np.linalg.inv(camera_from_grasp_geometry)
+            local = (
+                target_points_camera @ tcp_from_camera[:3, :3].T
+                + tcp_from_camera[:3, 3]
+            )
+            low, high = np.percentile(local, (5.0, 95.0), axis=0)
+            target_center = (low + high) * 0.5
+            requested_width = (
+                float(high[0] - low[0]) + DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M
+            )
+            if requested_width > self.max_gripper_width_m:
+                return None
+            increment("width_valid", pose_source=pose_source)
+            downward_cosine = -float(base_from_grasp_geometry[2, 2])
+            if not is_variant:
+                for name, combine in (
+                    ("min_width_valid_downward_approach_cosine", min),
+                    ("max_width_valid_downward_approach_cosine", max),
+                ):
+                    previous = counts[name]
+                    counts[name] = (
+                        downward_cosine
+                        if previous is None
+                        else combine(float(previous), downward_cosine)
+                    )
+                if downward_cosine >= 0.5:
+                    counts["width_valid_downward_approach_count"] = (
+                        int(counts["width_valid_downward_approach_count"]) + 1
+                    )
+            width = max(0.005, requested_width)
+            # Candidate width is retained as proposal metadata and for the
+            # grasp-fit check. It is not an execution input today, so the
+            # visible collision proxy must match the open gripper used by the
+            # motion planner rather than a narrower candidate-specific proxy.
+            visible_collision_opening = self.max_gripper_width_m
+            if not is_variant:
+                for name, combine in (
+                    ("min_visible_collision_opening_m", min),
+                    ("max_visible_collision_opening_m", max),
+                ):
+                    previous = counts[name]
+                    counts[name] = (
+                        visible_collision_opening
+                        if previous is None
+                        else combine(float(previous), visible_collision_opening)
+                    )
+            palm_z = DMTAC_M_GRASPGENX_PALM_Z_M
+            fingertip_z = palm_z + DMTAC_M_GRASPGENX_FINGER_LENGTH_M
+            # Keep the closing-axis centre close to the jaw mid-plane, while
+            # requiring overlap (rather than centroid containment) on the pad
+            # height and finger-length axes.  The latter is important for tall
+            # objects and partial point clouds: a valid local pinch need not
+            # contain the centroid of the whole segmented object.  The previous
+            # ``abs(center_x) <= width / 2`` was nearly tautological because the
+            # width came from the same span, and admitted strongly one-sided
+            # grasps.  The reviewed width-clearance is the bounded centring
+            # tolerance instead.
+            capture_violation = max(
+                0.0,
+                abs(float(target_center[0]))
+                - DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M,
+                float(low[1]) - DMTAC_M_GRASPGENX_PAD_HEIGHT_M / 2.0,
+                -DMTAC_M_GRASPGENX_PAD_HEIGHT_M / 2.0 - float(high[1]),
+                palm_z - float(high[2]),
+                float(low[2]) - fingertip_z,
+            )
+            if not is_variant:
+                previous_violation = counts["min_target_capture_violation_m"]
+                if previous_violation is None or capture_violation < float(
+                    previous_violation
+                ):
+                    counts["min_target_capture_violation_m"] = capture_violation
+                    counts["closest_target_center_tcp_x_m"] = float(target_center[0])
+                    counts["closest_target_center_tcp_y_m"] = float(target_center[1])
+                    counts["closest_target_center_tcp_z_m"] = float(target_center[2])
+                downward_violation = counts["min_downward_target_capture_violation_m"]
+                if downward_cosine >= 0.5 and (
+                    downward_violation is None
+                    or capture_violation < float(downward_violation)
+                ):
+                    counts["min_downward_target_capture_violation_m"] = (
+                        capture_violation
+                    )
+                    counts["closest_downward_target_center_tcp_x_m"] = float(
+                        target_center[0]
+                    )
+                    counts["closest_downward_target_center_tcp_y_m"] = float(
+                        target_center[1]
+                    )
+                    counts["closest_downward_target_center_tcp_z_m"] = float(
+                        target_center[2]
+                    )
+            if capture_violation > 0.0:
+                return None
+            increment("target_capture_valid", pose_source=pose_source)
+            if not is_variant and downward_cosine >= 0.5:
+                counts["target_capture_downward_approach_count"] = (
+                    int(counts["target_capture_downward_approach_count"]) + 1
+                )
+            centered_camera_from_model_base = (
+                camera_from_grasp_geometry @ np.linalg.inv(model_base_from_tcp)
+            )
+            click_distance = float(
+                np.linalg.norm(centered_camera_from_model_base[:3, 3] - target_camera)
+            )
+            if click_distance > self.max_click_distance_m:
+                return None
+            increment("click_distance_valid", pose_source=pose_source)
+            model_score = float(np.clip(raw_model_score, 0.0, 1.0))
+            score = model_score * math.exp(-click_distance / 0.060)
+            if is_variant:
+                score *= math.exp(
+                    -abs(orientation_variant_angle_deg)
+                    / GRASPGENX_DMTAC_ORIENTATION_VARIANT_SCORE_DECAY_DEG
+                )
+            if support_clearance_world_z_m > 0.0:
+                score *= math.exp(
+                    -support_clearance_world_z_m
+                    / GRASPGENX_DMTAC_SUPPORT_CLEARANCE_SCORE_DECAY_M
+                )
+            return _RankedGraspCandidate(
+                score=score,
+                model_score=model_score,
+                click_distance_m=click_distance,
+                gripper_width_m=width,
+                camera_from_grasp_geometry=camera_from_grasp_geometry,
+                base_from_grasp_geometry=base_from_grasp_geometry,
+                pose_source=pose_source,
+                orientation_variant_axis=orientation_variant_axis,
+                orientation_variant_angle_deg=orientation_variant_angle_deg,
+                support_clearance_world_z_m=support_clearance_world_z_m,
+            )
+
+        terminal_collision_evidence_by_candidate: dict[int, tuple[int, int]] = {}
+
+        def admit_visible_scene(
+            item: _RankedGraspCandidate,
+        ) -> _RankedGraspCandidate | None:
+            is_variant = item.pose_source != "model_scored"
+            downward_cosine = -float(item.base_from_grasp_geometry[2, 2])
+            target_hits, target_contact_points, background_hits = (
+                terminal_scene.collision_counts_with_terminal_target_contact(
+                    item.camera_from_grasp_geometry,
+                    opening_m=self.max_gripper_width_m,
+                    contact_depth_m=(DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M),
+                )
+            )
+            terminal_collision_evidence_by_candidate[id(item)] = (
+                int(target_hits),
+                int(background_hits),
+            )
+            if not is_variant:
+                counts["terminal_target_contact_points"] = (
+                    int(counts["terminal_target_contact_points"])
+                    + target_contact_points
+                )
+            if target_hits or background_hits:
+                increment(
+                    "target_solid_collision_rejected",
+                    pose_source=item.pose_source,
+                    amount=int(bool(target_hits)),
+                )
+                increment(
+                    "background_solid_collision_rejected",
+                    pose_source=item.pose_source,
+                    amount=int(bool(background_hits)),
+                )
+                if not is_variant and background_hits:
+                    counts["terminal_background_collision_rejected"] = (
+                        int(counts["terminal_background_collision_rejected"]) + 1
+                    )
+                return None
+            increment("visible_collision_valid", pose_source=item.pose_source)
+            approach_target_hits, approach_background_hits = (
+                terminal_scene.approach_collision_counts(
+                    item.camera_from_grasp_geometry,
+                    opening_m=self.max_gripper_width_m,
+                    distance_m=0.060,
+                    allow_terminal_target_contact=True,
+                    terminal_target_contact_depth_m=(
+                        DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
+                    ),
+                )
+            )
+            if approach_target_hits or approach_background_hits:
+                increment(
+                    "visible_approach_collision_candidates",
+                    pose_source=item.pose_source,
+                )
+                if not is_variant:
+                    counts["visible_approach_target_collision_candidates"] = int(
+                        counts["visible_approach_target_collision_candidates"]
+                    ) + int(bool(approach_target_hits))
+                    counts["visible_approach_background_collision_candidates"] = int(
+                        counts["visible_approach_background_collision_candidates"]
+                    ) + int(bool(approach_background_hits))
+            else:
+                increment("visible_approach_valid", pose_source=item.pose_source)
+            if not is_variant:
+                for name, combine in (
+                    ("min_downward_approach_cosine", min),
+                    ("max_downward_approach_cosine", max),
+                ):
+                    previous = counts[name]
+                    counts[name] = (
+                        downward_cosine
+                        if previous is None
+                        else combine(float(previous), downward_cosine)
+                    )
+                if downward_cosine >= 0.5:
+                    counts["downward_approach_count"] = (
+                        int(counts["downward_approach_count"]) + 1
+                    )
+            return item
+
         for base_from_model_base, raw_score in zip(grasps, scores, strict=True):
             counts["detected"] = int(counts["detected"]) + 1
             try:
@@ -823,197 +1336,576 @@ class Sam2GraspGenXPointGraspPlanner:
                 base_from_tcp,
                 field_name="GraspGenX base_from_tcp candidate",
             )
-            tcp_from_camera = np.linalg.inv(camera_from_tcp)
-            local = (
-                target_points_camera @ tcp_from_camera[:3, :3].T
-                + tcp_from_camera[:3, 3]
+            prepared = prepare_pose(
+                camera_from_grasp_geometry=camera_from_tcp,
+                base_from_grasp_geometry=base_from_tcp,
+                raw_model_score=float(raw_score),
+                pose_source="model_scored",
+                orientation_variant_axis=None,
+                orientation_variant_angle_deg=0.0,
+                support_clearance_world_z_m=0.0,
             )
-            low, high = np.percentile(local, (5.0, 95.0), axis=0)
-            target_center = (low + high) * 0.5
-            requested_width = (
-                float(high[0] - low[0]) + DMTAC_M_GRASPGENX_WIDTH_CLEARANCE_M
-            )
-            if requested_width > self.max_gripper_width_m:
-                continue
-            counts["width_valid"] = int(counts["width_valid"]) + 1
-            downward_cosine = -float(base_from_tcp[2, 2])
-            for name, combine in (
-                ("min_width_valid_downward_approach_cosine", min),
-                ("max_width_valid_downward_approach_cosine", max),
-            ):
-                previous = counts[name]
-                counts[name] = (
-                    downward_cosine
-                    if previous is None
-                    else combine(float(previous), downward_cosine)
-                )
-            if downward_cosine >= 0.5:
-                counts["width_valid_downward_approach_count"] = int(
-                    counts["width_valid_downward_approach_count"]
-                ) + 1
-            width = max(0.005, requested_width)
-            # Candidate width is retained as proposal metadata and for the
-            # grasp-fit check. It is not an execution input today, so the
-            # visible collision proxy must match the open gripper used by the
-            # motion planner rather than a narrower candidate-specific proxy.
-            visible_collision_opening = self.max_gripper_width_m
-            for name, combine in (
-                ("min_visible_collision_opening_m", min),
-                ("max_visible_collision_opening_m", max),
-            ):
-                previous = counts[name]
-                counts[name] = (
-                    visible_collision_opening
-                    if previous is None
-                    else combine(float(previous), visible_collision_opening)
-                )
-            palm_z = DMTAC_M_GRASPGENX_PALM_Z_M
-            fingertip_z = palm_z + DMTAC_M_GRASPGENX_FINGER_LENGTH_M
-            capture_violation = max(
-                0.0,
-                abs(float(target_center[0])) - width / 2.0,
-                abs(float(target_center[1])) - DMTAC_M_GRASPGENX_PAD_HEIGHT_M / 2.0,
-                palm_z - float(target_center[2]),
-                float(target_center[2]) - fingertip_z,
-            )
-            previous_violation = counts["min_target_capture_violation_m"]
-            if previous_violation is None or capture_violation < float(
-                previous_violation
-            ):
-                counts["min_target_capture_violation_m"] = capture_violation
-                counts["closest_target_center_tcp_x_m"] = float(target_center[0])
-                counts["closest_target_center_tcp_y_m"] = float(target_center[1])
-                counts["closest_target_center_tcp_z_m"] = float(target_center[2])
-            downward_violation = counts[
-                "min_downward_target_capture_violation_m"
-            ]
-            if downward_cosine >= 0.5 and (
-                downward_violation is None
-                or capture_violation < float(downward_violation)
-            ):
-                counts["min_downward_target_capture_violation_m"] = (
-                    capture_violation
-                )
-                counts["closest_downward_target_center_tcp_x_m"] = float(
-                    target_center[0]
-                )
-                counts["closest_downward_target_center_tcp_y_m"] = float(
-                    target_center[1]
-                )
-                counts["closest_downward_target_center_tcp_z_m"] = float(
-                    target_center[2]
-                )
-            if capture_violation > 0.0:
-                continue
-            counts["target_capture_valid"] = int(counts["target_capture_valid"]) + 1
-            if downward_cosine >= 0.5:
-                counts["target_capture_downward_approach_count"] = int(
-                    counts["target_capture_downward_approach_count"]
-                ) + 1
-            centered_camera_from_model_base = camera_from_tcp @ np.linalg.inv(
-                model_base_from_tcp
-            )
-            click_distance = float(
-                np.linalg.norm(
-                    centered_camera_from_model_base[:3, 3] - target_camera
-                )
-            )
-            if click_distance > self.max_click_distance_m:
-                continue
-            counts["click_distance_valid"] = int(counts["click_distance_valid"]) + 1
-            target_hits, target_contact_points, background_hits = (
-                terminal_scene.collision_counts_with_terminal_target_contact(
-                    # This is the terminal grasp-admission proxy. Use the
-                    # maximum opening used by the motion planner. Target
-                    # fingertip contact is the only permitted target exception;
-                    # a capture-filtered scene also rejects observed background
-                    # hits at this endpoint.
-                    camera_from_tcp,
-                    opening_m=visible_collision_opening,
-                    contact_depth_m=(
-                        DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
-                    ),
-                )
-            )
-            counts["terminal_target_contact_points"] = int(
-                counts["terminal_target_contact_points"]
-            ) + target_contact_points
-            if target_hits or background_hits:
-                counts["target_solid_collision_rejected"] = int(
-                    counts["target_solid_collision_rejected"]
-                ) + int(bool(target_hits))
-                counts["background_solid_collision_rejected"] = int(
-                    counts["background_solid_collision_rejected"]
-                ) + int(bool(background_hits))
-                if background_hits:
-                    counts["terminal_background_collision_rejected"] = int(
-                        counts["terminal_background_collision_rejected"]
-                    ) + 1
-                continue
-            counts["visible_collision_valid"] = int(
-                counts["visible_collision_valid"]
-            ) + 1
-            approach_target_hits, approach_background_hits = (
-                terminal_scene.approach_collision_counts(
-                    camera_from_tcp,
-                    opening_m=visible_collision_opening,
-                    distance_m=0.060,
-                    allow_terminal_target_contact=True,
-                    terminal_target_contact_depth_m=(
-                        DMTAC_M_GRASPGENX_TERMINAL_TARGET_CONTACT_DEPTH_M
-                    ),
-                )
-            )
-            if approach_target_hits or approach_background_hits:
-                # This fixed +Z sweep is a diagnostic only. A different
-                # ingress can still be valid and must be searched downstream.
-                counts["visible_approach_collision_candidates"] = int(
-                    counts["visible_approach_collision_candidates"]
-                ) + 1
-                counts["visible_approach_target_collision_candidates"] = int(
-                    counts["visible_approach_target_collision_candidates"]
-                ) + int(bool(approach_target_hits))
-                counts["visible_approach_background_collision_candidates"] = int(
-                    counts["visible_approach_background_collision_candidates"]
-                ) + int(bool(approach_background_hits))
-            else:
-                counts["visible_approach_valid"] = int(
-                    counts["visible_approach_valid"]
-                ) + 1
-            for name, combine in (
-                ("min_downward_approach_cosine", min),
-                ("max_downward_approach_cosine", max),
-            ):
-                previous = counts[name]
-                counts[name] = (
-                    downward_cosine
-                    if previous is None
-                    else combine(float(previous), downward_cosine)
-                )
-            if downward_cosine >= 0.5:
-                counts["downward_approach_count"] = int(
-                    counts["downward_approach_count"]
-                ) + 1
-            model_score = float(np.clip(raw_score, 0.0, 1.0))
-            score = model_score * math.exp(-click_distance / 0.060)
-            ranked.append(
-                (
-                    score,
-                    model_score,
-                    click_distance,
-                    width,
-                    camera_from_tcp,
-                    base_from_tcp,
-                )
-            )
-        ranked.sort(key=lambda item: (-item[0], item[2]))
-        deduplicated: list[
-            tuple[float, float, float, float, np.ndarray, np.ndarray]
-        ] = []
+            if prepared is not None:
+                ranked.append(prepared)
+
+        ranked.sort(key=lambda item: (-item.score, item.click_distance_m))
+        model_candidates: list[_RankedGraspCandidate] = []
         for item in ranked:
-            pose = item[4]
-            if any(np.allclose(pose, previous[4], rtol=0, atol=1e-6)
-                   for previous in deduplicated):
+            pose = item.camera_from_grasp_geometry
+            if any(
+                np.allclose(
+                    pose,
+                    previous.camera_from_grasp_geometry,
+                    rtol=0,
+                    atol=1e-6,
+                )
+                for previous in model_candidates
+            ):
+                continue
+            model_candidates.append(item)
+
+        target_points_base = (
+            target_points_camera @ base_from_camera[:3, :3].T
+            + base_from_camera[:3, 3]
+        )
+        target_base_low, target_base_high = np.percentile(
+            target_points_base,
+            (5.0, 95.0),
+            axis=0,
+        )
+        target_center_base = (target_base_low + target_base_high) * 0.5
+
+        def prepare_orientation_variants(
+            source: _RankedGraspCandidate,
+        ) -> list[_RankedGraspCandidate]:
+            variants: list[_RankedGraspCandidate] = []
+            source_grasp_from_camera = np.linalg.inv(
+                source.camera_from_grasp_geometry
+            )
+            source_target_local = (
+                target_points_camera @ source_grasp_from_camera[:3, :3].T
+                + source_grasp_from_camera[:3, 3]
+            )
+            source_target_low, source_target_high = np.percentile(
+                source_target_local,
+                (5.0, 95.0),
+                axis=0,
+            )
+            source_target_center_local = (
+                source_target_low + source_target_high
+            ) * 0.5
+            source_target_center_camera = (
+                source.camera_from_grasp_geometry[:3, :3]
+                @ source_target_center_local
+                + source.camera_from_grasp_geometry[:3, 3]
+            )
+            for axis, angle_deg in self.orientation_variants_local_axis_degrees:
+                variant_camera_from_grasp_geometry = (
+                    source.camera_from_grasp_geometry
+                    @ _local_axis_rotation(axis, angle_deg)
+                )
+                # Rotate around the observed target center, not around the TCP.
+                # Keeping the TCP translation fixed would move the object in
+                # gripper-local Y/Z and turn an otherwise useful wrist tilt
+                # into a target/palm collision. Preserve the target's local
+                # capture position while changing only the approach plane.
+                variant_camera_from_grasp_geometry[:3, 3] = (
+                    source_target_center_camera
+                    - variant_camera_from_grasp_geometry[:3, :3]
+                    @ source_target_center_local
+                )
+                variant_camera_from_grasp_geometry = _strict_rigid_matrix(
+                    variant_camera_from_grasp_geometry,
+                    field_name="DMTAC camera orientation variant",
+                )
+                variant = prepare_pose(
+                    camera_from_grasp_geometry=variant_camera_from_grasp_geometry,
+                    base_from_grasp_geometry=_strict_rigid_matrix(
+                        base_from_camera @ variant_camera_from_grasp_geometry,
+                        field_name="DMTAC base orientation variant",
+                    ),
+                    raw_model_score=source.model_score,
+                    pose_source="dmtac_local_orientation_variant_v1",
+                    orientation_variant_axis=axis,
+                    orientation_variant_angle_deg=angle_deg,
+                    support_clearance_world_z_m=0.0,
+                )
+                if variant is not None:
+                    variants.append(variant)
+            return variants
+
+        def prepare_arm_side_variant(
+            source: _RankedGraspCandidate,
+        ) -> list[_RankedGraspCandidate]:
+            if self.preferred_approach_origin_base_m is None:
+                return []
+            source_approach = np.asarray(
+                source.base_from_grasp_geometry[:3, 2], dtype=np.float64
+            )
+            desired_horizontal = (
+                target_center_base[:2]
+                - np.asarray(self.preferred_approach_origin_base_m[:2])
+            )
+            desired_norm = float(np.linalg.norm(desired_horizontal))
+            if desired_norm < 1e-6:
+                return []
+            desired_unit = desired_horizontal / desired_norm
+            top_approach = (
+                -float(source_approach[2])
+                >= GRASPGENX_DMTAC_TOP_APPROACH_COSINE
+            )
+            source_grasp_from_camera = np.linalg.inv(
+                source.camera_from_grasp_geometry
+            )
+            source_target_local = (
+                target_points_camera @ source_grasp_from_camera[:3, :3].T
+                + source_grasp_from_camera[:3, 3]
+            )
+            source_target_low, source_target_high = np.percentile(
+                source_target_local,
+                (5.0, 95.0),
+                axis=0,
+            )
+            source_target_center_local = (
+                source_target_low + source_target_high
+            ) * 0.5
+            if not top_approach:
+                source_horizontal = source_approach[:2]
+                source_norm = float(np.linalg.norm(source_horizontal))
+                if source_norm < 1e-6:
+                    return []
+                source_unit = source_horizontal / source_norm
+                side_angle_deg = math.degrees(
+                    math.acos(
+                        float(
+                            np.clip(
+                                np.dot(source_unit, desired_unit), -1.0, 1.0
+                            )
+                        )
+                    )
+                )
+                if side_angle_deg > (
+                    GRASPGENX_DMTAC_ARM_SIDE_VARIANT_MAX_ROTATION_DEG
+                ):
+                    return []
+                variants: list[_RankedGraspCandidate] = []
+                # A horizontal closing axis and vertical pad-height axis avoid
+                # inheriting a source roll that lowers one long DMTAC finger
+                # into the support surface. A bounded horizontal cone avoids
+                # collapsing every proposal to one ray while preserving the
+                # authorized arm-side prior. Both 180-degree-equivalent wrist
+                # branches are retained because they have different RM65 IK.
+                for yaw_offset_deg in (
+                    GRASPGENX_DMTAC_ARM_SIDE_APPROACH_YAW_OFFSETS_DEG
+                ):
+                    yaw_offset_rad = math.radians(yaw_offset_deg)
+                    c, s = math.cos(yaw_offset_rad), math.sin(yaw_offset_rad)
+                    approach_horizontal = np.asarray(
+                        (
+                            c * desired_unit[0] - s * desired_unit[1],
+                            s * desired_unit[0] + c * desired_unit[1],
+                        ),
+                        dtype=np.float64,
+                    )
+                    approach_axis = np.asarray(
+                        (
+                            approach_horizontal[0],
+                            approach_horizontal[1],
+                            0.0,
+                        ),
+                        dtype=np.float64,
+                    )
+                    candidate_rotation_deg = math.degrees(
+                        math.acos(
+                            float(
+                                np.clip(
+                                    np.dot(source_unit, approach_horizontal),
+                                    -1.0,
+                                    1.0,
+                                )
+                            )
+                        )
+                    )
+                    if candidate_rotation_deg > (
+                        GRASPGENX_DMTAC_ARM_SIDE_VARIANT_MAX_ROTATION_DEG
+                    ):
+                        continue
+                    for vertical_sign in (1.0, -1.0):
+                        height_axis = np.asarray(
+                            (0.0, 0.0, vertical_sign), dtype=np.float64
+                        )
+                        closing_axis = np.cross(height_axis, approach_axis)
+                        closing_axis /= np.linalg.norm(closing_axis)
+                        rotation = np.column_stack(
+                            (closing_axis, height_axis, approach_axis)
+                        )
+                        target_center_local = np.asarray(
+                            (0.0, 0.0, source_target_center_local[2]),
+                            dtype=np.float64,
+                        )
+                        variant_base_from_grasp_geometry = np.eye(
+                            4, dtype=np.float64
+                        )
+                        variant_base_from_grasp_geometry[:3, :3] = rotation
+                        variant_base_from_grasp_geometry[:3, 3] = (
+                            target_center_base - rotation @ target_center_local
+                        )
+                        variant_base_from_grasp_geometry = _strict_rigid_matrix(
+                            variant_base_from_grasp_geometry,
+                            field_name="DMTAC canonical arm-side base variant",
+                        )
+                        variant_camera_from_grasp_geometry = _strict_rigid_matrix(
+                            camera_from_base @ variant_base_from_grasp_geometry,
+                            field_name="DMTAC canonical arm-side camera variant",
+                        )
+                        variant = prepare_pose(
+                            camera_from_grasp_geometry=(
+                                variant_camera_from_grasp_geometry
+                            ),
+                            base_from_grasp_geometry=(
+                                variant_base_from_grasp_geometry
+                            ),
+                            raw_model_score=source.model_score,
+                            pose_source="dmtac_arm_side_approach_variant_v1",
+                            orientation_variant_axis=None,
+                            orientation_variant_angle_deg=(
+                                yaw_offset_deg
+                            ),
+                            support_clearance_world_z_m=0.0,
+                        )
+                        if variant is not None:
+                            variants.append(variant)
+                return variants
+            source_horizontal = (
+                source.base_from_grasp_geometry[:2, 0]
+                if top_approach
+                else source_approach[:2]
+            )
+            source_norm = float(np.linalg.norm(source_horizontal))
+            if source_norm < 1e-6:
+                return []
+            source_unit = source_horizontal / source_norm
+            desired_directions = [desired_unit]
+            if top_approach:
+                desired_directions.append(
+                    np.asarray((-desired_unit[1], desired_unit[0]))
+                )
+            variants: list[_RankedGraspCandidate] = []
+            for desired_direction in desired_directions:
+                rotation_rad = math.atan2(
+                    float(
+                        source_unit[0] * desired_direction[1]
+                        - source_unit[1] * desired_direction[0]
+                    ),
+                    float(
+                        np.clip(np.dot(source_unit, desired_direction), -1.0, 1.0)
+                    ),
+                )
+                rotation_deg = math.degrees(rotation_rad)
+                if top_approach:
+                    while rotation_deg > 90.0:
+                        rotation_deg -= 180.0
+                    while rotation_deg < -90.0:
+                        rotation_deg += 180.0
+                if abs(rotation_deg) < 1e-6 or abs(rotation_deg) > (
+                    GRASPGENX_DMTAC_ARM_SIDE_VARIANT_MAX_ROTATION_DEG
+                ):
+                    continue
+                base_rotation = _local_axis_rotation("z", rotation_deg)
+                variant_base_from_grasp_geometry = (
+                    source.base_from_grasp_geometry.copy()
+                )
+                variant_base_from_grasp_geometry[:3, :3] = (
+                    base_rotation[:3, :3]
+                    @ source.base_from_grasp_geometry[:3, :3]
+                )
+                variant_base_from_grasp_geometry[:3, 3] = (
+                    target_center_base
+                    + base_rotation[:3, :3]
+                    @ (
+                        source.base_from_grasp_geometry[:3, 3]
+                        - target_center_base
+                    )
+                )
+                variant_base_from_grasp_geometry = _strict_rigid_matrix(
+                    variant_base_from_grasp_geometry,
+                    field_name="DMTAC arm-side base variant",
+                )
+                variant_camera_from_grasp_geometry = _strict_rigid_matrix(
+                    camera_from_base @ variant_base_from_grasp_geometry,
+                    field_name="DMTAC arm-side camera variant",
+                )
+                variant = prepare_pose(
+                    camera_from_grasp_geometry=variant_camera_from_grasp_geometry,
+                    base_from_grasp_geometry=variant_base_from_grasp_geometry,
+                    raw_model_score=source.model_score,
+                    pose_source="dmtac_arm_side_approach_variant_v1",
+                    orientation_variant_axis=None,
+                    orientation_variant_angle_deg=rotation_deg,
+                    support_clearance_world_z_m=0.0,
+                )
+                if variant is not None:
+                    variants.append(variant)
+            return variants
+
+        _representatives, variant_source_indices = (
+            self._distinct_approach_first_indices(
+                tuple(
+                    item.camera_from_grasp_geometry for item in model_candidates
+                ),
+                maximum=min(
+                    self.orientation_variant_source_limit,
+                    len(model_candidates),
+                ),
+            )
+        )
+        prepared_candidates = list(model_candidates)
+        for source_index in variant_source_indices:
+            source = model_candidates[source_index]
+            prepared_candidates.extend(prepare_orientation_variants(source))
+        _arm_representatives, distinct_arm_source_indices = (
+            self._distinct_approach_first_indices(
+                tuple(
+                    item.camera_from_grasp_geometry for item in model_candidates
+                ),
+                maximum=min(
+                    GRASPGENX_DMTAC_ARM_SIDE_VARIANT_SOURCE_LIMIT,
+                    len(model_candidates),
+                ),
+            )
+        )
+        arm_source_indices = list(
+            range(
+                min(
+                    GRASPGENX_DMTAC_ARM_SIDE_VARIANT_SOURCE_LIMIT // 2,
+                    len(model_candidates),
+                )
+            )
+        )
+        for source_index in distinct_arm_source_indices:
+            if source_index not in arm_source_indices:
+                arm_source_indices.append(source_index)
+            if len(arm_source_indices) >= GRASPGENX_DMTAC_ARM_SIDE_VARIANT_SOURCE_LIMIT:
+                break
+        for source_index in arm_source_indices:
+            prepared_candidates.extend(
+                prepare_arm_side_variant(model_candidates[source_index])
+            )
+
+        ranked = []
+        admitted_pose_variants: list[np.ndarray] = []
+        blocked_model_candidates: list[_RankedGraspCandidate] = []
+        blocked_arm_side_candidates: list[_RankedGraspCandidate] = []
+        admitted_model_candidates: list[_RankedGraspCandidate] = []
+        for item in prepared_candidates:
+            admitted = admit_visible_scene(item)
+            if admitted is not None and not any(
+                np.allclose(
+                    admitted.camera_from_grasp_geometry,
+                    previous,
+                    rtol=0,
+                    atol=1e-6,
+                )
+                for previous in admitted_pose_variants
+            ):
+                ranked.append(admitted)
+                admitted_pose_variants.append(
+                    admitted.camera_from_grasp_geometry
+                )
+            if item.pose_source == "model_scored":
+                if admitted is None:
+                    blocked_model_candidates.append(item)
+                else:
+                    admitted_model_candidates.append(item)
+            elif (
+                item.pose_source == "dmtac_arm_side_approach_variant_v1"
+                and admitted is None
+            ):
+                blocked_arm_side_candidates.append(item)
+
+        # Pre-collision source selection preserves raw approach diversity, but
+        # the few model poses that survive a dense observed scene can be low in
+        # the score order and therefore absent from that source set. If the
+        # shortlist remains short, derive bounded wrist variants from those
+        # physically admitted poses and run the complete admission check again.
+        if len(ranked) < internal_candidate_target:
+            for source in admitted_model_candidates:
+                for variant in prepare_orientation_variants(source):
+                    if any(
+                        np.allclose(
+                            variant.camera_from_grasp_geometry,
+                            previous,
+                            rtol=0,
+                            atol=1e-6,
+                        )
+                        for previous in admitted_pose_variants
+                    ):
+                        continue
+                    admitted = admit_visible_scene(variant)
+                    if admitted is None:
+                        continue
+                    ranked.append(admitted)
+                    admitted_pose_variants.append(
+                        admitted.camera_from_grasp_geometry
+                    )
+                    if len(ranked) >= internal_candidate_target:
+                        break
+                if len(ranked) >= internal_candidate_target:
+                    break
+
+        # The dominant false bottleneck in saved table scenes is a physically
+        # plausible grasp whose long DMTAC finger/palm proxy intersects the
+        # observed support surface at its model-proposed depth.  Search a
+        # bounded set of upward world-Z refinements for distinct model poses.
+        # Try collision-blocked poses first.  With an embodiment selector,
+        # visible-scene abundance is not evidence of whole-arm feasibility, so
+        # retain a bounded clearance family even when the perception shortlist
+        # is already full.  Without one, preserve the generic underfill-only
+        # behavior. Every refined pose is sent back through target capture,
+        # click distance, and the exact same zero-background terminal collision
+        # check; this never turns collision points into a tolerance.
+        support_candidates: list[_RankedGraspCandidate] = []
+        support_candidate_poses = [
+            item.camera_from_grasp_geometry for item in ranked
+        ]
+        support_target_count = min(
+            GRASPGENX_DMTAC_SUPPORT_CLEARANCE_RETURN_LIMIT,
+            (
+                GRASPGENX_DMTAC_SUPPORT_CLEARANCE_RETURN_LIMIT
+                if candidate_selector is not None
+                else max(0, internal_candidate_target - len(ranked))
+            ),
+        )
+        def append_support_candidates(
+            sources: list[_RankedGraspCandidate],
+            *,
+            limit: int,
+        ) -> None:
+            if not sources or len(support_candidates) >= limit:
+                return
+            sources.sort(
+                key=lambda item: (
+                    sum(terminal_collision_evidence_by_candidate[id(item)]),
+                    terminal_collision_evidence_by_candidate[id(item)][1],
+                    terminal_collision_evidence_by_candidate[id(item)][0],
+                    -item.score,
+                )
+            )
+            _representatives, source_indices = (
+                self._distinct_approach_first_indices(
+                    tuple(item.camera_from_grasp_geometry for item in sources),
+                    maximum=min(
+                        GRASPGENX_DMTAC_SUPPORT_CLEARANCE_SOURCE_LIMIT,
+                        len(sources),
+                    ),
+                )
+            )
+            # Search the smallest clearance across all diverse source poses
+            # before trying a larger offset. Count unique admitted poses, not
+            # successful checks: GraspMoE can emit duplicate OBB poses.
+            for clearance_m in GRASPGENX_DMTAC_SUPPORT_CLEARANCE_WORLD_Z_M:
+                for source_index in source_indices:
+                    source = sources[source_index]
+                    variant_base_from_grasp_geometry = (
+                        source.base_from_grasp_geometry.copy()
+                    )
+                    variant_base_from_grasp_geometry[2, 3] += clearance_m
+                    variant_base_from_grasp_geometry = _strict_rigid_matrix(
+                        variant_base_from_grasp_geometry,
+                        field_name="DMTAC support-clearance base variant",
+                    )
+                    variant_camera_from_grasp_geometry = _strict_rigid_matrix(
+                        camera_from_base @ variant_base_from_grasp_geometry,
+                        field_name="DMTAC support-clearance camera variant",
+                    )
+                    variant = prepare_pose(
+                        camera_from_grasp_geometry=(
+                            variant_camera_from_grasp_geometry
+                        ),
+                        base_from_grasp_geometry=(
+                            variant_base_from_grasp_geometry
+                        ),
+                        raw_model_score=source.model_score,
+                        pose_source="dmtac_support_clearance_variant_v1",
+                        orientation_variant_axis=None,
+                        orientation_variant_angle_deg=0.0,
+                        support_clearance_world_z_m=clearance_m,
+                    )
+                    if variant is None:
+                        continue
+                    admitted = admit_visible_scene(variant)
+                    if admitted is None or any(
+                        np.allclose(
+                            admitted.camera_from_grasp_geometry,
+                            previous,
+                            rtol=0,
+                            atol=1e-6,
+                        )
+                        for previous in support_candidate_poses
+                    ):
+                        continue
+                    support_candidates.append(admitted)
+                    support_candidate_poses.append(
+                        admitted.camera_from_grasp_geometry
+                    )
+                    group = (
+                        "top" if -float(admitted.base_from_grasp_geometry[2, 2])
+                        >= GRASPGENX_DMTAC_TOP_APPROACH_COSINE else "side"
+                    )
+                    counts[f"support_clearance_{group}_admitted"] = (
+                        int(counts[f"support_clearance_{group}_admitted"]) + 1
+                    )
+                    if len(support_candidates) >= limit:
+                        break
+                if len(support_candidates) >= limit:
+                    break
+        if support_target_count:
+            # The closest-to-collision ordering otherwise fills all eight
+            # clearance slots with near-identical top grasps. Give side
+            # approaches their own bounded search before filling the remaining
+            # slots; every pose still passes the exact target and background
+            # solid checks above.
+            blocked_side_candidates = [
+                item for item in blocked_arm_side_candidates
+                if -float(item.base_from_grasp_geometry[2, 2])
+                < GRASPGENX_DMTAC_TOP_APPROACH_COSINE
+            ]
+            blocked_top_candidates = [
+                item for item in blocked_arm_side_candidates
+                if -float(item.base_from_grasp_geometry[2, 2])
+                >= GRASPGENX_DMTAC_TOP_APPROACH_COSINE
+            ]
+            append_support_candidates(
+                blocked_side_candidates,
+                limit=min(4, support_target_count),
+            )
+            append_support_candidates(
+                blocked_top_candidates,
+                limit=support_target_count,
+            )
+        if len(support_candidates) < support_target_count:
+            append_support_candidates(
+                blocked_model_candidates, limit=support_target_count
+            )
+        if len(support_candidates) < support_target_count:
+            append_support_candidates(
+                admitted_model_candidates, limit=support_target_count
+            )
+        ranked.extend(support_candidates)
+
+        ranked.sort(key=lambda item: (-item.score, item.click_distance_m))
+        deduplicated: list[_RankedGraspCandidate] = []
+        for item in ranked:
+            pose = item.camera_from_grasp_geometry
+            if any(
+                np.allclose(
+                    pose,
+                    previous.camera_from_grasp_geometry,
+                    rtol=0,
+                    atol=1e-6,
+                )
+                for previous in deduplicated
+            ):
                 continue
             deduplicated.append(item)
 
@@ -1021,51 +1913,183 @@ class Sam2GraspGenXPointGraspPlanner:
         # Nearby scored depths can differ in support clearance and arm feasibility.
         family_indices: list[int] = []
         for index, item in enumerate(deduplicated):
-            if not any(self._same_candidate_family(item[4], deduplicated[previous][4])
-                       for previous in family_indices):
+            if not any(
+                self._same_candidate_family(
+                    item.camera_from_grasp_geometry,
+                    deduplicated[previous].camera_from_grasp_geometry,
+                )
+                for previous in family_indices
+            ):
                 family_indices.append(index)
-        representative_indices, selected_indices = (
+        representative_indices, default_selected_indices = (
             self._distinct_approach_first_indices(
-                tuple(deduplicated[index][4] for index in family_indices),
+                tuple(
+                    deduplicated[index].camera_from_grasp_geometry
+                    for index in family_indices
+                ),
                 maximum=maximum,
             )
         )
-        selected_indices = [family_indices[index] for index in selected_indices]
-        selected_set = set(selected_indices)
-        for index in range(len(deduplicated)):
-            if len(selected_indices) == maximum:
-                break
-            if index not in selected_set:
-                selected_indices.append(index)
-                selected_set.add(index)
-        selected = [deduplicated[index] for index in sorted(selected_indices)]
+        default_selected_indices = [
+            family_indices[index] for index in default_selected_indices
+        ]
+        geometry_from_tool = np.linalg.inv(
+            self.solid_geometry.solid_pose(np.eye(4))
+        )
+
+        def public_candidate(item: _RankedGraspCandidate) -> PointGraspCandidate:
+            return PointGraspCandidate(
+                score=float(item.score),
+                model_score=float(item.model_score),
+                click_distance_m=float(item.click_distance_m),
+                gripper_width_m=float(item.gripper_width_m),
+                camera_from_tcp=tuple(
+                    float(value)
+                    for value in (
+                        item.camera_from_grasp_geometry @ geometry_from_tool
+                    ).reshape(-1)
+                ),
+                base_from_tcp=tuple(
+                    float(value)
+                    for value in (
+                        item.base_from_grasp_geometry @ geometry_from_tool
+                    ).reshape(-1)
+                ),
+                visible_collision_free=True,
+                pose_source=item.pose_source,
+                orientation_variant_axis=item.orientation_variant_axis,
+                orientation_variant_angle_deg=item.orientation_variant_angle_deg,
+                support_clearance_world_z_m=item.support_clearance_world_z_m,
+            )
+
+        reserved_variant_indices: list[int] = []
+        if candidate_selector is not None:
+            target_reference = base_from_camera @ np.asarray(
+                (*target_camera, 1.0), dtype=np.float64
+            )
+            selection = candidate_selector(
+                tuple(public_candidate(item) for item in deduplicated),
+                tuple(float(value) for value in target_reference[:3]),
+                maximum,
+            )
+            if not isinstance(selection, GraspGenXCandidateSelection):
+                raise TypeError(
+                    "candidate_selector must return GraspGenXCandidateSelection."
+                )
+            selected_indices = tuple(selection.selected_indices)
+            if (
+                len(selected_indices) > maximum
+                or len(set(selected_indices)) != len(selected_indices)
+                or any(
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or not 0 <= index < len(deduplicated)
+                    for index in selected_indices
+                )
+            ):
+                raise ValueError("candidate_selector returned invalid indices.")
+            for key, value in selection.diagnostics.items():
+                if (
+                    not isinstance(key, str)
+                    or not key.startswith("arm_shortlist_")
+                    or isinstance(value, (list, tuple, dict, set))
+                ):
+                    raise ValueError(
+                        "candidate_selector diagnostics must be scalar arm_shortlist fields."
+                    )
+                counts[key] = value
+            # Published candidates remain in descending proposal-score order so
+            # the existing point-grasp schema remains truthful. The selector
+            # admits a subset; the later reachability annotation does not reorder it.
+            selected_indices = tuple(sorted(selected_indices))
+        else:
+            # Without an embodiment selector, preserve the generic perception
+            # shortlist and reserve bounded capacity for physically re-admitted
+            # DMTAC variants.
+            variant_return_limit = min(3, max(0, maximum - 1))
+            support_variant_indices = [
+                index
+                for index, item in enumerate(deduplicated)
+                if item.pose_source == "dmtac_support_clearance_variant_v1"
+            ]
+            reserved_variant_indices = support_variant_indices[
+                : min(2, variant_return_limit)
+            ]
+            orientation_variant_slots = min(
+                GRASPGENX_DMTAC_ORIENTATION_VARIANT_RETURN_LIMIT,
+                variant_return_limit - len(reserved_variant_indices),
+            )
+            support_reserved_count = len(reserved_variant_indices)
+            reserved_variant_indices.extend(
+                index
+                for index, item in enumerate(deduplicated)
+                if item.pose_source == "dmtac_local_orientation_variant_v1"
+                and index not in reserved_variant_indices
+            )
+            reserved_variant_indices = reserved_variant_indices[
+                : support_reserved_count + orientation_variant_slots
+            ]
+            reserved_variant_set = set(reserved_variant_indices)
+            combined_indices = list(reserved_variant_indices)
+            combined_set = set(combined_indices)
+            for index in default_selected_indices:
+                if len(combined_indices) == maximum:
+                    break
+                if (
+                    deduplicated[index].pose_source != "model_scored"
+                    and index not in reserved_variant_set
+                ):
+                    continue
+                if index not in combined_set:
+                    combined_indices.append(index)
+                    combined_set.add(index)
+            selected_indices = combined_indices
+            selected_set = set(selected_indices)
+            for index in range(len(deduplicated)):
+                if len(selected_indices) == maximum:
+                    break
+                if deduplicated[index].pose_source != "model_scored":
+                    continue
+                if index not in selected_set:
+                    selected_indices.append(index)
+                    selected_set.add(index)
+            for index in range(len(deduplicated)):
+                if len(selected_indices) == maximum:
+                    break
+                if index not in selected_set:
+                    selected_indices.append(index)
+                    selected_set.add(index)
+            selected_indices = tuple(sorted(selected_indices))
+        selected = [deduplicated[index] for index in selected_indices]
         counts["candidate_family_count"] = len(family_indices)
         counts["candidate_variant_count"] = len(deduplicated)
         counts["distinct_approach_count"] = len(representative_indices)
         counts["selected"] = len(selected)
+        counts["orientation_variant_selected"] = sum(
+            item.pose_source == "dmtac_local_orientation_variant_v1"
+            for item in selected
+        )
+        counts["support_clearance_variant_selected"] = sum(
+            item.pose_source == "dmtac_support_clearance_variant_v1"
+            for item in selected
+        )
+        counts["arm_side_variant_selected"] = sum(
+            item.pose_source == "dmtac_arm_side_approach_variant_v1"
+            for item in selected
+        )
+        counts["orientation_variant_reserved"] = sum(
+            deduplicated[index].pose_source
+            == "dmtac_local_orientation_variant_v1"
+            for index in reserved_variant_indices
+        )
+        counts["support_clearance_variant_reserved"] = sum(
+            deduplicated[index].pose_source
+            == "dmtac_support_clearance_variant_v1"
+            for index in reserved_variant_indices
+        )
         if filter_summary is not None:
             filter_summary.update(counts)
-        geometry_from_tool = np.linalg.inv(self.solid_geometry.solid_pose(np.eye(4)))
-        return tuple(
-            PointGraspCandidate(
-                score=float(score),
-                model_score=float(model_score),
-                click_distance_m=float(click_distance),
-                gripper_width_m=float(width),
-                camera_from_tcp=tuple(
-                    float(value) for value in (
-                        camera_from_tcp @ geometry_from_tool
-                    ).reshape(-1)
-                ),
-                base_from_tcp=tuple(
-                    float(value) for value in (
-                        base_from_tcp @ geometry_from_tool
-                    ).reshape(-1)
-                ),
-                visible_collision_free=True,
-            )
-            for score, model_score, click_distance, width, camera_from_tcp, base_from_tcp in selected
-        )
+        return tuple(public_candidate(item) for item in selected)
 
     @staticmethod
     def _same_candidate_family(first: np.ndarray, second: np.ndarray) -> bool:
@@ -1158,6 +2182,7 @@ __all__ = [
     "GRASPGENX_CHECKPOINT_REVIEWED_REVISION",
     "GRASPGENX_GIT_URL",
     "GRASPGENX_REVIEWED_REVISION",
+    "GraspGenXCandidateSelection",
     "GraspGenXPointGraspModelSpec",
     "Sam2GraspGenXPointGraspPlanner",
 ]

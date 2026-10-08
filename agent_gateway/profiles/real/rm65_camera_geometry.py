@@ -13,6 +13,7 @@ import json
 import math
 import threading
 import xml.etree.ElementTree as ET
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -253,6 +254,10 @@ class RM65RgbCameraGeometry:
         self.max_frame_pose_skew_ms = max_frame_pose_skew_ms
         self._lock = threading.Lock()
         self._dynamic_cut_by_source: dict[str, RealRgbCameraGeometryCut] = {}
+        # Read-only history of the same lower-published samples used for FK.
+        # Frozen grasp observations use this history only while both arms are
+        # stationary; receiver timestamps are not treated as exposure times.
+        self._capture_history = deque(maxlen=128)
         self._semantic_content_hash = canonical_content_hash(
             {
                 "source_binding_hash": source_binding.semantic_content_hash,
@@ -341,6 +346,41 @@ class RM65RgbCameraGeometry:
             )
         with self._lock:
             self._dynamic_cut_by_source = cuts
+            if not self._capture_history or measured > self._capture_history[-1][0]:
+                pair = {side: np.array(qpos_by_side[side], dtype=float, copy=True)
+                        for side in ("left", "right")}
+                for q in pair.values():
+                    q.setflags(write=False)
+                self._capture_history.append((measured, available, pair, cuts, refs))
+
+    def stationary_geometry_cut(self, *, source_id: str, frame_acquired_at: float, now: float):
+        """Return a frame-near FK cut only with a sampled stationary history.
+
+        This first-stage contract deliberately does not authorize fusion during
+        motion. Sensor-clock/exposure alignment is needed before extending it.
+        """
+        captured = _finite_time(frame_acquired_at, field_name="frame_acquired_at")
+        current = _finite_time(now, field_name="now")
+        with self._lock:
+            history = tuple(self._capture_history)
+        if captured > current:
+            raise RuntimeError("grasp_observation_frame_pose_unavailable")
+        samples = [sample for sample in history if captured - 0.25 <= sample[0] <= current and sample[1] <= current]
+        if (len(samples) < 3 or samples[0][0] > captured - 0.10
+                or samples[-1][0] < captured - 0.05
+                or current-samples[-1][0] > self.max_pose_age_ms / 1000
+                or any(b[0]-a[0] > 0.10 for a, b in zip(samples, samples[1:]))):
+            raise RuntimeError("grasp_observation_stationary_history_unavailable")
+        if any(np.max(np.ptp(np.stack([sample[2][side] for sample in samples]), axis=0)) > 0.002
+               for side in ("left", "right")):
+            raise RuntimeError("grasp_observation_robot_not_stationary")
+        selected = min(samples, key=lambda sample: abs(sample[0]-captured))
+        measured, available, pair, cuts, refs = selected
+        if available > current or abs(measured-captured) > self.max_frame_pose_skew_ms / 1000:
+            raise RuntimeError("grasp_observation_frame_pose_unavailable")
+        geometry = (self.pose_cut(source_id=source_id, frame_acquired_at=captured, now=current)
+                    if source_id in self._static else cuts[source_id])
+        return geometry, pair, measured, available, refs
 
     def pose_cut(
         self,

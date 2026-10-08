@@ -10,6 +10,7 @@ from .control_runtime import (
     RealSkillMotionEmergencyStopReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
+    RealSkillMotionObservationPaused,
     RealSkillMotionObservationUnavailable,
     RealSkillMotionTargetSynchronizer,
 )
@@ -118,6 +119,7 @@ __all__ = [
     "RealSkillMotionEmergencyStopReceipt",
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
+    "RealSkillMotionObservationPaused",
     "RealSkillMotionObservationUnavailable",
     "RealSkillMotionTargetSynchronizer",
     "RegisteredTrajectoryAuthorityConsumptionReceipt",

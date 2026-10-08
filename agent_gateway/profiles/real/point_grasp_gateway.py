@@ -5,13 +5,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import io
+import json
 import logging
 import threading
 import time
-from contextlib import nullcontext
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from dataclasses import asdict
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,17 +30,16 @@ from agent_gateway.runtime.passive_read_executor import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.grasp_rgbd_snapshot import (
-    encode_grasp_rgbd_snapshot, GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
-    GRASP_RGBD_SNAPSHOT_MEDIA_TYPE, GRASP_RGBD_SNAPSHOT_ENCODING,
+    GRASP_RGBD_SNAPSHOT_ENCODING,
+    GRASP_RGBD_SNAPSHOT_MEDIA_TYPE,
+    GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
+    encode_grasp_rgbd_snapshot,
+    decode_grasp_rgbd_snapshot,
 )
-from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPort
-from robot_motion.grasp_visible_scene import (
-    ParallelJawSolidGeometry,
-    VisibleGraspScene,
+from dataset_contracts.grasp_multiview_snapshot import (
+    GRASP_MULTIVIEW_SCHEMA_ID, GRASP_MULTIVIEW_ENCODING, encode_grasp_multiview_snapshot,
 )
-from robot_motion.rm65.captured_robot_observations import (
-    RM65CapturedRobotObservationFilterResult,
-)
+from deployments.perception.grasp_multiview import GraspRgbdView, fuse_grasp_views
 from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
@@ -61,6 +60,15 @@ from deployments.perception.dmtac_grasp_overlay import (
     DmtacGraspOverlayCandidate,
     render_dmtac_grasp_overlays,
 )
+from robot_motion.grasp_visible_scene import (
+    PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
+    ParallelJawSolidGeometry,
+    VisibleGraspScene,
+)
+from robot_motion.rm65.captured_robot_observations import (
+    RM65CapturedRobotObservationFilterResult,
+)
+from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPort, RealAgentMotionMeasuredQposCut
 
 from .localization_gateway import (
     decode_bounded_image,
@@ -74,12 +82,14 @@ from .point_grasp_deployment import (
     REAL_POINT_GRASP_RGB_SLOT_ID_V1,
     RealPointGraspRegistration,
 )
-from .realsense_perception import RealSenseAgentPerceptionProvider
+from .realsense_perception import RealAlignedRgbdCapture, RealSenseAgentPerceptionProvider
 from .station_point_grasp_deployment import (
     REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2,
     REAL_STATION_POINT_GRASP_SNAPSHOT_SLOT_ID,
     StationBoundPointGraspRegistration,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -87,6 +97,7 @@ class PreparedPointGrasp:
     execution_result: dict[str, Any]
     annotated_jpeg: bytes
     rgbd_snapshot: bytes | None = None
+    multiview_snapshot: bool = False
 
 
 def _decode_depth(data: bytes, *, width: int, height: int) -> np.ndarray:
@@ -299,20 +310,36 @@ class PointGraspProvider:
         for ordinal, candidate in enumerate(planned.candidates):
             camera = list(candidate.camera_from_tcp)
             base = list(candidate.base_from_tcp)
-            candidates.append(
-                {
-                    "ordinal": ordinal,
-                    "score": candidate.score,
-                    "model_score": candidate.model_score,
-                    "click_distance_m": candidate.click_distance_m,
-                    "gripper_width_m": candidate.gripper_width_m,
-                    "T_camera_from_tcp": camera,
-                    "T_base_from_tcp": base,
-                    "tcp_xyz_camera_m": [camera[3], camera[7], camera[11]],
-                    "tcp_xyz_base_m": [base[3], base[7], base[11]],
-                    "visible_collision_free": candidate.visible_collision_free,
-                }
-            )
+            payload = {
+                "ordinal": ordinal,
+                "score": candidate.score,
+                "model_score": candidate.model_score,
+                "click_distance_m": candidate.click_distance_m,
+                "gripper_width_m": candidate.gripper_width_m,
+                "T_camera_from_tcp": camera,
+                "T_base_from_tcp": base,
+                "tcp_xyz_camera_m": [camera[3], camera[7], camera[11]],
+                "tcp_xyz_base_m": [base[3], base[7], base[11]],
+                "visible_collision_free": candidate.visible_collision_free,
+            }
+            if candidate.pose_source != "model_scored":
+                payload["pose_source"] = candidate.pose_source
+                if candidate.orientation_variant_axis is not None:
+                    payload.update(
+                        {
+                            "orientation_variant_axis": (
+                                candidate.orientation_variant_axis
+                            ),
+                            "orientation_variant_angle_deg": (
+                                candidate.orientation_variant_angle_deg
+                            ),
+                        }
+                    )
+                if candidate.support_clearance_world_z_m > 0.0:
+                    payload["support_clearance_world_z_m"] = (
+                        candidate.support_clearance_world_z_m
+                    )
+            candidates.append(payload)
         result = {
             "input_source": request.parameters["input_source"],
             "rgb_media_content_hash": hashlib.sha256(rgb_data).hexdigest(),
@@ -384,6 +411,7 @@ class StationBoundPointGraspProvider:
         motion_port: RealAgentMotionPort | None = None,
         captured_robot_observation_filter: Callable[..., object] | None = None,
         non_motion_read_window: Callable[[], object] | None = None,
+        observation_reader: Callable[..., object] | None = None,
     ) -> None:
         if not isinstance(registration, StationBoundPointGraspRegistration):
             raise TypeError("registration must be typed.")
@@ -448,6 +476,9 @@ class StationBoundPointGraspProvider:
         ):
             raise TypeError("non_motion_read_window must be callable or None")
         self.non_motion_read_window = non_motion_read_window
+        self.observation_reader = observation_reader
+        if registration.profile.frozen_observation and not callable(observation_reader):
+            raise ValueError("Frozen point-grasp requires its retained observation reader")
         self._lock = threading.Lock()
         self._started = False
 
@@ -492,12 +523,40 @@ class StationBoundPointGraspProvider:
             raise ValueError("Live Station point-grasp accepts no input Artifacts.")
         expected_revision = request.expected_station_revision
         with self._lock:
-            capture = self.perception_provider.capture_aligned_rgbd(
-                role=str(request.parameters["role"]),
-                expected_station_revision=expected_revision,
-            )
-            # Read the lower-owned mailbox; never reconstruct or advance control.
-            qpos_cut = None if self.motion_port is None else self.motion_port.latest_measured_qpos()
+            frozen_views = None
+            fused_observation = None
+            if self.registration.profile.frozen_observation:
+                view_blobs, observation_metadata = self.observation_reader(
+                    request.parameters["observation_operation_id"], expected_revision)
+                frozen_views = [decode_grasp_rgbd_snapshot(blob) for blob in view_blobs]
+                for arrays, metadata in frozen_views:
+                    if (metadata["source_binding_hash"] != self.registration.profile.source_binding_hash
+                            or metadata["frame_binding_hash"] != self.frame_binding.semantic_content_hash
+                            or metadata["station_revision"] != expected_revision
+                            or metadata.get("stationary_only") is not True
+                            or arrays["left_qpos"].shape != (6,)):
+                        raise ValueError("Frozen RGB-D view geometry or provenance differs")
+                selected = [(a, m) for a, m in frozen_views if m["role"] == request.parameters["role"]]
+                if len(selected) != 1:
+                    raise ValueError("Selected role is unavailable in the retained observation")
+                arrays, metadata = selected[0]
+                capture = RealAlignedRgbdCapture(
+                    source_id=metadata["source_id"], role=metadata["role"], acquired_at=metadata["acquired_at"],
+                    station_revision=expected_revision, source_generation=metadata["source_generation"],
+                    frame_index=metadata["frame_index"], capture_group_id=metadata["capture_group_id"],
+                    source_binding_hash=metadata["source_binding_hash"], width=arrays["rgb"].shape[1], height=arrays["rgb"].shape[0],
+                    intrinsics=metadata["camera_intrinsics"], source_from_camera=tuple(np.asarray(metadata["T_source_from_camera"]).reshape(-1)),
+                    rgb=arrays["rgb"], depth_m=arrays["depth_m"], rgb_content_hash=metadata["rgb_content_hash"],
+                    depth_content_hash=metadata["depth_content_hash"])
+                qpos = metadata["measured_qpos"]
+                qpos_cut = RealAgentMotionMeasuredQposCut(revision=0, measured_at=qpos["measured_at"], available_at=qpos["available_at"],
+                    qpos_by_side={side: arrays[side+"_qpos"] for side in ("left", "right")},
+                    source_evidence_refs=tuple(qpos["source_evidence_refs"]))
+            else:
+                capture = self.perception_provider.capture_aligned_rgbd(
+                    role=str(request.parameters["role"]), expected_station_revision=expected_revision)
+                # Read the lower-owned mailbox; never reconstruct or advance control.
+                qpos_cut = None if self.motion_port is None else self.motion_port.latest_measured_qpos()
             source_from_camera = np.asarray(
                 capture.source_from_camera, dtype=np.float64
             ).reshape(4, 4)
@@ -596,6 +655,7 @@ class StationBoundPointGraspProvider:
                         geometry=geometry,
                         capture_qpos_by_side=capture_qpos_by_side,
                         capture_self_observation_evidence=filtered.evidence,
+                        depth_filter=PRODUCTION_VISIBLE_GRASP_DEPTH_FILTER,
                     )
 
                 # Wire the capture-filtered visible scene into GraspGenX
@@ -604,6 +664,64 @@ class StationBoundPointGraspProvider:
                 # terminal background prefiltering is skipped.
                 visible_scene_factory = build_visible_scene
 
+            if frozen_views is not None:
+                if self.captured_robot_observation_filter is None:
+                    raise RuntimeError("Frozen multi-view inference requires capture-time robot filtering")
+                camera_from_reference = np.linalg.inv(reference_from_camera)
+                by_role = {m["role"]: (a, m) for a, m in frozen_views}
+                views = {role: GraspRgbdView(role=role, rgb=a["rgb"], depth_m=a["depth_m"],
+                    intrinsics=m["camera_intrinsics"], acquired_at=m["acquired_at"],
+                    reference_from_camera=camera_from_reference @ np.asarray(m["T_reference_from_camera"]).reshape(4, 4))
+                    for role, (a, m) in by_role.items()}
+
+                def clean_depth(view, mask):
+                    a, m = by_role[view.role]
+                    filtered = self.captured_robot_observation_filter(
+                        depth_m=view.depth_m, target_mask=mask, intrinsics=view.intrinsics,
+                        source_from_camera=np.asarray(m["T_source_from_camera"]).reshape(4, 4),
+                        capture_qpos_by_side={side: a[side+"_qpos"] for side in ("left", "right")})
+                    if not isinstance(filtered, RM65CapturedRobotObservationFilterResult):
+                        raise TypeError("Invalid captured-robot filter result")
+                    return filtered.depth_m
+
+                def build_fused_scene(*, depth_m, target_mask, intrinsics, geometry):
+                    nonlocal fused_observation
+                    fused_observation = fuse_grasp_views(
+                        anchor=views[capture.role], anchor_mask=target_mask,
+                        anchor_pixel_uv=pixel_uv,
+                        auxiliary=tuple(v for role, v in views.items() if role != capture.role)
+                            if request.parameters["view_policy"] == "auto" else (),
+                        geometry=geometry, segment_point=self.planner.point_segmenter.segment_point,
+                        clean_depth=clean_depth)
+                    return fused_observation.scene
+
+                visible_scene_factory = build_fused_scene
+
+            candidate_selector = None
+            if (
+                request.parameters.get("include_arm_reachability", False)
+                and self.registration.profile.backend_id == "graspgenx"
+                and self.arm_reachability_evaluator is not None
+            ):
+                selector = getattr(
+                    self.arm_reachability_evaluator, "select_candidates", None
+                )
+                if callable(selector):
+                    def select_candidates(
+                        candidates,
+                        target_point_reference_m,
+                        maximum,
+                    ):
+                        return selector(
+                            candidates,
+                            target_point_reference_m,
+                            maximum,
+                            measured_qpos_cut=qpos_cut,
+                            measurement_reference_time=float(capture.acquired_at),
+                        )
+
+                    candidate_selector = select_candidates
+
             planned = self.planner.plan(
                 image,
                 capture.depth_m,
@@ -611,12 +729,24 @@ class StationBoundPointGraspProvider:
                 intrinsics=capture.intrinsics,
                 base_from_camera=reference_from_camera,
                 max_candidates=request.parameters["max_candidates"],
+                **({"use_visible_target_points": True} if frozen_views is not None else {}),
                 **(
                     {"visible_scene_factory": visible_scene_factory}
                     if visible_scene_factory is not None
                     else {}
                 ),
+                **(
+                    {"candidate_selector": candidate_selector}
+                    if candidate_selector is not None
+                    else {}
+                ),
             )
+            filter_summary = getattr(self.planner, "last_filter_summary", None)
+            if isinstance(filter_summary, Mapping):
+                _LOGGER.info(
+                    "Point-grasp candidate filter summary: %s",
+                    json.dumps(dict(filter_summary), sort_keys=True),
+                )
             if self._current_station_revision() != expected_revision:
                 raise RuntimeError(
                     "Station revision changed during point-grasp model inference."
@@ -636,30 +766,46 @@ class StationBoundPointGraspProvider:
             for ordinal, candidate in enumerate(planned.candidates):
                 camera = list(candidate.camera_from_tcp)
                 reference = list(candidate.base_from_tcp)
-                candidates.append(
-                    {
-                        "ordinal": ordinal,
-                        "score": candidate.score,
-                        "model_score": candidate.model_score,
-                        "click_distance_m": candidate.click_distance_m,
-                        "gripper_width_m": candidate.gripper_width_m,
-                        "T_camera_from_tool_tcp": camera,
-                        "T_reference_from_tool_tcp": reference,
-                        "tool_tcp_xyz_camera_m": [
-                            camera[3],
-                            camera[7],
-                            camera[11],
-                        ],
-                        "tool_tcp_xyz_reference_m": [
-                            reference[3],
-                            reference[7],
-                            reference[11],
-                        ],
-                        "visible_scene_collision_free": (
-                            candidate.visible_collision_free
-                        ),
-                    }
-                )
+                payload = {
+                    "ordinal": ordinal,
+                    "score": candidate.score,
+                    "model_score": candidate.model_score,
+                    "click_distance_m": candidate.click_distance_m,
+                    "gripper_width_m": candidate.gripper_width_m,
+                    "T_camera_from_tool_tcp": camera,
+                    "T_reference_from_tool_tcp": reference,
+                    "tool_tcp_xyz_camera_m": [
+                        camera[3],
+                        camera[7],
+                        camera[11],
+                    ],
+                    "tool_tcp_xyz_reference_m": [
+                        reference[3],
+                        reference[7],
+                        reference[11],
+                    ],
+                    "visible_scene_collision_free": (
+                        candidate.visible_collision_free
+                    ),
+                }
+                if candidate.pose_source != "model_scored":
+                    payload["pose_source"] = candidate.pose_source
+                    if candidate.orientation_variant_axis is not None:
+                        payload.update(
+                            {
+                                "orientation_variant_axis": (
+                                    candidate.orientation_variant_axis
+                                ),
+                                "orientation_variant_angle_deg": (
+                                    candidate.orientation_variant_angle_deg
+                                ),
+                            }
+                        )
+                    if candidate.support_clearance_world_z_m > 0.0:
+                        payload["support_clearance_world_z_m"] = (
+                            candidate.support_clearance_world_z_m
+                        )
+                candidates.append(payload)
             reachability_context = None
             if request.parameters.get("include_arm_reachability", False):
                 if self.arm_reachability_evaluator is None:
@@ -740,6 +886,12 @@ class StationBoundPointGraspProvider:
             }
             if reachability_context is not None:
                 result["arm_reachability_context"] = reachability_context
+            if fused_observation is not None:
+                result["view_fusion"] = {
+                    "observation_operation_id": request.parameters["observation_operation_id"],
+                    "view_policy": request.parameters["view_policy"],
+                    "diagnostics_json": json.dumps(fused_observation.view_diagnostics),
+                }
             snapshot = None
             mask = getattr(self.planner, "last_target_mask", None)
             geometry = getattr(self.planner, "solid_geometry", None)
@@ -758,6 +910,11 @@ class StationBoundPointGraspProvider:
                         "evidence_refs": list(qpos_cut.evidence_refs),
                         "camera_skew_ms": (qpos_cut.measured_at-capture.acquired_at)*1000,
                     },
+                    "candidate_filter_summary": (
+                        dict(filter_summary)
+                        if isinstance(filter_summary, Mapping)
+                        else None
+                    ),
                     "scope": "visible_nominal_open_gripper_only_no_closure_or_attached_retreat",
                 }
                 snapshot = encode_grasp_rgbd_snapshot(
@@ -765,7 +922,20 @@ class StationBoundPointGraspProvider:
                     target_mask=np.asarray(mask), metadata=metadata,
                     qpos_by_side=None if qpos_cut is None else qpos_cut.qpos_by_side,
                 )
-            return PreparedPointGrasp(result, annotated, snapshot)
+                if fused_observation is not None:
+                    retained_views = []
+                    for a, m in frozen_views:
+                        target_mask = fused_observation.target_masks.get(m["role"])
+                        retained_views.append(encode_grasp_rgbd_snapshot(
+                            rgb=a["rgb"], depth_m=a["depth_m"],
+                            target_mask=np.zeros_like(a["target_mask"]) if target_mask is None else target_mask,
+                            qpos_by_side={side: a[side+"_qpos"] for side in ("left", "right")},
+                            metadata={**m, "target_mask_available": target_mask is not None}))
+                    snapshot = encode_grasp_multiview_snapshot(views=retained_views,
+                        metadata={**metadata, "schema_id": GRASP_MULTIVIEW_SCHEMA_ID, "scene_frame": "anchor_camera"},
+                        scene_points=fused_observation.scene.points,
+                        scene_target_mask=fused_observation.scene.target_mask)
+            return PreparedPointGrasp(result, annotated, snapshot, fused_observation is not None)
 
 
 def build_real_point_grasp_executor(
@@ -903,9 +1073,9 @@ def build_station_bound_point_grasp_executor(
         )]
         if prepared.rgbd_snapshot is not None:
             snapshot_ref = artifact_ref_for_bytes(
-                prepared.rgbd_snapshot, media_type=GRASP_RGBD_SNAPSHOT_MEDIA_TYPE,
-                schema_id=GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
-                encoding=GRASP_RGBD_SNAPSHOT_ENCODING, compression="zip",
+                prepared.rgbd_snapshot, media_type="application/zip" if prepared.multiview_snapshot else GRASP_RGBD_SNAPSHOT_MEDIA_TYPE,
+                schema_id=GRASP_MULTIVIEW_SCHEMA_ID if prepared.multiview_snapshot else GRASP_RGBD_SNAPSHOT_SCHEMA_ID,
+                encoding=GRASP_MULTIVIEW_ENCODING if prepared.multiview_snapshot else GRASP_RGBD_SNAPSHOT_ENCODING, compression="zip",
             )
             snapshot_ref = commit_artifact_bytes(
                 store=artifact_store, data=prepared.rgbd_snapshot, artifact=snapshot_ref,

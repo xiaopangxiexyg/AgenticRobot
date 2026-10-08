@@ -156,6 +156,7 @@ def _backend_config(
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
     *,
     side: str,
+    debug_rm65_stream_timing: bool = False,
 ) -> RM65ArmBackendConfig:
     position = profile.position_profile
     command = position.command_execution
@@ -182,6 +183,7 @@ def _backend_config(
         background_streaming_enabled=True,
         background_streaming_hz=position.rates.command_hz,
         background_streaming_no_catch_up_after_send=True,
+        background_streaming_debug_timing=debug_rm65_stream_timing,
         background_streaming_target_max_age_sec=command.reference_max_age_sec,
         background_streaming_target_admission_mode=(
             RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
@@ -262,6 +264,7 @@ def assemble_exclusive_rm65_skill_lower(
     *,
     profile: ResolvedExclusiveRM65SkillDeploymentProfile,
     debug_motion_skill: bool = False,
+    debug_rm65_stream_timing: bool = False,
     backend_factory: RM65SkillBackendFactory = RM65ArmBackend,
     target_builder_factory: RM65SkillTargetBuilderFactory = (
         DualArmCollisionAwareRetargeter
@@ -277,6 +280,8 @@ def assemble_exclusive_rm65_skill_lower(
         raise TypeError("profile must be resolved and typed.")
     if not isinstance(debug_motion_skill, bool):
         raise TypeError("debug_motion_skill must be bool.")
+    if not isinstance(debug_rm65_stream_timing, bool):
+        raise TypeError("debug_rm65_stream_timing must be bool.")
     for name, factory in (
         ("backend_factory", backend_factory),
         ("target_builder_factory", target_builder_factory),
@@ -290,7 +295,13 @@ def assemble_exclusive_rm65_skill_lower(
         target_builder_factory=target_builder_factory,
     )
     backends = {
-        side: backend_factory(_backend_config(profile, side=side))
+        side: backend_factory(
+            _backend_config(
+                profile,
+                side=side,
+                debug_rm65_stream_timing=debug_rm65_stream_timing,
+            )
+        )
         for side in ("left", "right")
     }
     for side, backend in backends.items():

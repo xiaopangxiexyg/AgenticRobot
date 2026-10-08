@@ -1584,6 +1584,7 @@ def _planner_without_assets(
         ),
     )
     planner.target_envelope_filter = None
+    planner.path_collision_scene_profile = "test_sparse_proxy"
     planner.trajectory_record_dir = None
     planner._solver_lock = threading.Lock()
     return planner
@@ -1645,6 +1646,9 @@ def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_bin
         assert leg.path.scene_hash == planner._path_search_oracle(
             planning_phase=phase, visible_scene=scene, side="right",
             start_qpos_by_side=start,
+            terminal_tool_tcp_world=(
+                np.eye(4) if phase == "grasp_target" else None
+            ),
         ).scene_hash
         assert leg.path.scene_hash != planner.scene.semantic_content_hash
         assert leg.path.metadata["requested_scene_hash"] is None
@@ -1759,10 +1763,10 @@ def test_grasp_planner_filters_once_at_capture_pose_before_path_search(has_captu
     assert len(view.points) == 3
 
 
-def test_real_grasp_capture_self_filter_margin_is_bounded_to_half_a_centimeter():
+def test_real_grasp_capture_self_filter_margin_covers_measured_six_millimeters():
     assert (
         grasp_trajectory_module.RM65_GRASP_CAPTURE_SELF_OBSERVATION_SURFACE_MARGIN_M
-        == pytest.approx(.005)
+        == pytest.approx(.006)
     )
 
 
@@ -1798,7 +1802,9 @@ def test_straight_ingress_collision_defers_to_global_grasp_target_search(monkeyp
         VisibleGraspScene,
     )
 
-    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        allow_unconstrained_terminal_fallback=True,
+    ))
     planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
     planner.profile.position_profile.ik_execution.joint_velocity_limit_profile = (
         "test-velocity"
@@ -1879,7 +1885,9 @@ def test_straight_ingress_collision_defers_to_global_grasp_target_search(monkeyp
 
 
 def test_local_pregrasp_failure_falls_back_to_global_grasp_target_search(monkeypatch):
-    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        allow_unconstrained_terminal_fallback=True,
+    ))
     planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
     planner.profile.position_profile.ik_execution.joint_velocity_limit_profile = (
         "test-velocity"
@@ -2085,7 +2093,9 @@ def test_local_chain_failure_never_spends_envelope_ingress_search_budget(failure
             grasp_tool_tcp_world=np.eye(4), deadline=10, monotonic=lambda: 0,
         )
     assert error.value.details["planning_phase"] == (
-        "local_pregrasp_ik" if failure_stage == "pregrasp_ik" else "local_approach_validation"
+        "terminal_branch_selection"
+        if failure_stage == "pregrasp_ik"
+        else "local_approach_validation"
     )
 
 
@@ -2604,7 +2614,11 @@ def test_planner_entrypoint_records_continuous_parameterization(
     )
 
     assert revalidated_sample_counts[0] == 5
-    assert revalidated_sample_counts[1] == trajectory.time_from_start_sec.size
+    assert len(revalidated_sample_counts) == 3
+    assert (
+        sum(revalidated_sample_counts[1:]) - 1
+        == trajectory.time_from_start_sec.size
+    )
     assert recorded["parameterization"]["mode"] == (
         RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2
     )
@@ -2685,6 +2699,195 @@ def test_constrained_approach_plans_fixed_orientation_monotonic_tcp_path() -> No
         (0, 0, 0.03),
     )
     np.testing.assert_allclose(leg.endpoint.qpos_by_side["left"], np.zeros(6))
+
+
+def test_constrained_approach_can_propagate_backward_from_terminal_branch() -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            pregrasp_distance_m=0.03,
+            approach_waypoint_spacing_m=0.01,
+        )
+    )
+    planner.target_builder = _CartesianQposBuilder()
+    planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
+    planner.oracle = SimpleNamespace(
+        check=lambda _qpos: JointConfigurationCheck(
+            safe=True,
+            minimum_distance_m=0.04,
+        )
+    )
+    pregrasp = np.eye(4)
+    grasp = np.eye(4)
+    grasp[2, 3] = 0.03
+    terminal_qpos = {side: np.zeros(6) for side in ("left", "right")}
+    terminal_qpos["right"][2] = 0.03
+    terminal = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=terminal_qpos,
+        seed_index=7,
+        solve_cycles=3,
+        position_residual_m=0.0,
+        orientation_residual_deg=0.0,
+    )
+
+    leg = planner._plan_constrained_approach_leg(
+        qpos_by_side=terminal_qpos,
+        side="right",
+        pregrasp_tool_tcp_world=pregrasp,
+        grasp_tool_tcp_world=grasp,
+        terminal_endpoint=terminal,
+    )
+
+    assert leg.endpoint is terminal
+    assert leg.path.metadata["solve_direction"] == "reverse_from_terminal"
+    assert len(leg.path.waypoints) == 4
+    np.testing.assert_allclose(
+        leg.path.waypoints[0]["right"][:3],
+        (0.0, 0.0, 0.0),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        leg.path.waypoints[-1]["right"][:3],
+        (0.0, 0.0, 0.03),
+    )
+    assert all(
+        item["solve_direction"] == "reverse_from_terminal"
+        for item in leg.search_attempts
+    )
+
+
+def test_local_chain_recovers_terminal_branch_hidden_by_pregrasp_ik(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            pregrasp_distance_m=0.03,
+            approach_waypoint_spacing_m=0.01,
+        )
+    )
+    planner.target_builder = _CartesianQposBuilder()
+    planner.scene = SimpleNamespace(semantic_content_hash="scene:test")
+    planner.oracle = SimpleNamespace(
+        check=lambda _qpos: JointConfigurationCheck(
+            safe=True,
+            minimum_distance_m=0.04,
+        )
+    )
+    pregrasp = np.eye(4)
+    grasp = np.eye(4)
+    grasp[2, 3] = 0.03
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    terminal_qpos = {side: values.copy() for side, values in current.items()}
+    terminal_qpos["right"][2] = 0.03
+    terminal = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=terminal_qpos,
+        seed_index=4,
+        solve_cycles=2,
+        position_residual_m=0.0,
+        orientation_residual_deg=0.0,
+    )
+
+    def endpoints(*, target_tool_tcp_world, **_kwargs):
+        target = np.asarray(target_tool_tcp_world, dtype=float)
+        if target[2, 3] == pytest.approx(0.0):
+            raise RM65GraspTrajectoryPlanningError(
+                "endpoint_collision_blocked"
+            )
+        return (terminal,)
+
+    monkeypatch.setattr(planner, "_endpoint_qpos_candidates", endpoints)
+
+    prepared = planner._prepare_grasp_approaches(
+        qpos_by_side=current,
+        side="right",
+        pregrasp_tool_tcp_world=pregrasp,
+        grasp_tool_tcp_world=grasp,
+        deadline=10.0,
+        monotonic=lambda: 0.0,
+    )
+
+    assert len(prepared.candidates) == 1
+    pregrasp_endpoint, approach = prepared.candidates[0]
+    np.testing.assert_allclose(
+        pregrasp_endpoint.qpos_by_side["right"][:3],
+        (0.0, 0.0, 0.0),
+        atol=1e-12,
+    )
+    assert approach.endpoint is terminal
+    assert tuple(
+        item["solve_direction"] for item in prepared.validation_attempts
+    ) == ("forward_from_pregrasp", "reverse_from_terminal")
+    assert prepared.validation_attempts[-1]["status"] == "local_chain_valid"
+
+
+@pytest.mark.parametrize("terminal_found", [False, True])
+def test_local_chain_reuses_terminal_search_only_within_one_assessment(terminal_found):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    target = np.eye(4)
+    terminal = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=current, seed_index=0, solve_cycles=1,
+        position_residual_m=0, orientation_residual_deg=0,
+    )
+    calls = []
+
+    def endpoints(*, target_tool_tcp_world, side, **kwargs):
+        is_terminal = np.array_equal(target_tool_tcp_world, target)
+        calls.append((side, is_terminal))
+        assert kwargs["prefer_closest_tolerance"] is False
+        if is_terminal and terminal_found:
+            return (terminal,)
+        raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+
+    reverse_attempts = []
+
+    def approach(**kwargs):
+        assert kwargs["terminal_endpoint"] is terminal
+        reverse_attempts.append(kwargs["pregrasp_tool_tcp_world"].copy())
+        raise RM65GraspTrajectoryPlanningError("approach_branch_discontinuous")
+
+    planner._endpoint_qpos_candidates = endpoints
+    planner._plan_constrained_approach_leg = approach
+    distances = len(planner._pregrasp_distance_candidates())
+    for side in ("left", "right", "left"):
+        calls.clear()
+        reverse_attempts.clear()
+        result = planner.assess_local_grasp_chain(
+            qpos_by_side=current, side=side, target_tool_tcp_world=target,
+            time_budget_sec=5, monotonic=lambda: 0,
+        )
+        assert result.feasible is False
+        assert len(result.attempts) == distances
+        assert calls.count((side, True)) == 1
+        assert calls.count((side, False)) == distances
+        assert len(reverse_attempts) == (distances if terminal_found else 0)
+
+
+def test_cached_terminal_miss_does_not_veto_a_different_forward_branch():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    target = np.eye(4)
+    endpoint = grasp_trajectory_module._EndpointIKCandidate(
+        qpos_by_side=current, seed_index=0, solve_cycles=1,
+        position_residual_m=0, orientation_residual_deg=0,
+    )
+    calls = []
+
+    def endpoints(*, target_tool_tcp_world, **_kwargs):
+        calls.append(float(target_tool_tcp_world[2, 3]))
+        if len(calls) <= 2:
+            raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+        return (endpoint,)
+
+    planner._endpoint_qpos_candidates = endpoints
+    planner._plan_constrained_approach_leg = lambda **_: SimpleNamespace()
+    result = planner.assess_local_grasp_chain(
+        qpos_by_side=current, side="left", target_tool_tcp_world=target,
+        time_budget_sec=5, monotonic=lambda: 0,
+    )
+    assert result.feasible is True
+    assert len(calls) == 3
+    assert calls[1] == 0
+    assert calls[0] != calls[2]
 
 
 def test_constrained_approach_rejects_lateral_tcp_bow() -> None:
@@ -2980,6 +3183,128 @@ def test_endpoint_planner_collects_distinct_exact_multistart_solutions() -> None
     # Endpoint optimization uses the read-only FK port and must not mutate the
     # online target builder's tracked state.
     assert builder.seed_history == []
+
+
+@pytest.mark.parametrize(
+    ("minimum_distance_m", "expected_reason"),
+    (
+        (0.003, "endpoint_clearance_blocked"),
+        (0.0, "endpoint_collision_blocked"),
+        (-0.003, "endpoint_collision_blocked"),
+    ),
+)
+def test_endpoint_planner_distinguishes_positive_gap_from_penetration(
+    monkeypatch: pytest.MonkeyPatch,
+    minimum_distance_m: float,
+    expected_reason: str,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            maximum_endpoint_solve_cycles=1,
+            endpoint_seed_count=1,
+        )
+    )
+    planner.target_builder = _MultistartBuilder()
+    planner.target_envelope_filter = lambda targets: targets
+    planner.oracle = SimpleNamespace(
+        check=lambda _qpos: JointConfigurationCheck(
+            safe=False,
+            collision_check_available=True,
+            reason="collision_clearance_violated",
+            minimum_distance_m=minimum_distance_m,
+            metadata={
+                "closest_geometry_names": ("arm", "camera_pole"),
+                "closest_obstacle_id": "camera_pole",
+            },
+        )
+    )
+    current = {side: np.zeros(6) for side in ("left", "right")}
+    solved = {side: value.copy() for side, value in current.items()}
+    monkeypatch.setattr(
+        planner,
+        "_endpoint_seed_qpos",
+        lambda *_args, **_kwargs: (current,),
+    )
+    monkeypatch.setattr(
+        planner,
+        "_least_squares_endpoint_from_seed",
+        lambda **_kwargs: (solved, 1, 0.001, 0.1),
+    )
+
+    with pytest.raises(
+        RM65GraspTrajectoryPlanningError,
+        match=expected_reason,
+    ) as error:
+        planner._endpoint_qpos_candidates(
+            qpos_by_side=current,
+            side="right",
+            target_tool_tcp_world=np.eye(4),
+        )
+
+    assert error.value.details["attempts"][0]["outcome"] == expected_reason
+    assert error.value.details["collision_examples"][0][
+        "minimum_distance_m"
+    ] == pytest.approx(minimum_distance_m)
+
+
+def test_endpoint_planner_uses_pose_tolerance_for_positive_gap_clearance_rescue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = _planner_without_assets(
+        config=RM65GraspTrajectoryPlanningConfig(
+            maximum_endpoint_solve_cycles=1,
+            endpoint_seed_count=1,
+        )
+    )
+    planner.target_builder = _CartesianQposBuilder()
+    planner.target_envelope_filter = lambda targets: targets
+    current = {side: np.zeros(6) for side in ("left", "right")}
+
+    def solve(*, target_tool_tcp_world, **_kwargs):
+        target = np.asarray(target_tool_tcp_world, dtype=float)
+        candidate = {side: value.copy() for side, value in current.items()}
+        candidate["right"][:3] = target[:3, 3]
+        candidate["right"][3:] = grasp_trajectory_module.Rotation.from_matrix(
+            target[:3, :3]
+        ).as_rotvec()
+        return candidate, 1, 0.0, 0.0
+
+    def check(qpos):
+        displaced = not np.allclose(qpos["right"], 0.0, atol=1e-12, rtol=0.0)
+        return JointConfigurationCheck(
+            safe=displaced,
+            collision_check_available=True,
+            reason=(
+                "collision_clearance_satisfied"
+                if displaced
+                else "collision_clearance_violated"
+            ),
+            minimum_distance_m=0.03 if displaced else 0.003,
+            metadata={
+                "closest_geometry_names": ("arm", "camera_pole"),
+                "closest_obstacle_id": "camera_pole",
+            },
+        )
+
+    planner.oracle = SimpleNamespace(check=check)
+    monkeypatch.setattr(
+        planner,
+        "_endpoint_seed_qpos",
+        lambda *_args, **_kwargs: (current,),
+    )
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+
+    candidates = planner._endpoint_qpos_candidates(
+        qpos_by_side=current,
+        side="right",
+        target_tool_tcp_world=np.eye(4),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].orientation_residual_deg < (
+        planner.config.endpoint_orientation_tolerance_deg
+    )
+    assert planner.oracle.check(candidates[0].qpos_by_side).safe is True
 
 
 def test_endpoint_planner_reports_best_multistart_residuals_on_exhaustion() -> None:

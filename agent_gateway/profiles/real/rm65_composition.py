@@ -86,7 +86,10 @@ from .rm65_camera_geometry import (
     RM65RgbCameraGeometry,
     build_rm65_rgb_camera_geometry,
 )
-from .rm65_grasp_reachability import RM65PointGraspReachabilityAdapter
+from .rm65_grasp_reachability import (
+    RM65PointGraspReachabilityAdapter,
+    arm_base_origin_in_candidate_frame,
+)
 from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
     StationPointGraspArmReachabilityProfile,
@@ -251,6 +254,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     camera_mount_urdf_path: str | Path | None = None,
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
+    enable_grasp_observation: bool = False,
     debug_render_object_coordinates: bool = False,
     enable_point_grasp_arm_reachability: bool = False,
     grasp_trajectory_config: RM65GraspTrajectoryPlanningConfig | None = None,
@@ -265,6 +269,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise TypeError("debug_render_object_coordinates must be bool.")
     if not isinstance(enable_point_grasp_arm_reachability, bool):
         raise TypeError("enable_point_grasp_arm_reachability must be bool.")
+    if not isinstance(enable_grasp_observation, bool):
+        raise TypeError("enable_grasp_observation must be bool.")
     if grasp_trajectory_config is not None and not isinstance(
         grasp_trajectory_config,
         RM65GraspTrajectoryPlanningConfig,
@@ -338,6 +344,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "provided together."
         )
     grasp_enabled = point_grasp_planner is not None
+    if enable_grasp_observation and (
+        not grasp_enabled or getattr(point_grasp_planner, "backend_id", None) != "graspgenx"
+    ):
+        raise ValueError("Frozen grasp observations require a GraspGenX planner.")
     if (object_localizer is None) != (point_grasp_planner is None):
         raise ValueError(
             "object_localizer and point_grasp_planner must be supplied together."
@@ -717,6 +727,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     station_manifest_hash=station_manifest_hash,
                     execution_manifest_hash=execution_manifest_hash,
                     current_mode="real_active",
+                    frozen_observation=enable_grasp_observation,
                     arm_reachability_profile=(
                         StationPointGraspArmReachabilityProfile(
                             arm_side=side,
@@ -834,6 +845,16 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 motion_port=port,
                 frame_graph=frame_graph,
                 candidate_reference_frame_id=station_frame.frame_id,
+                arm_base_origin_candidate_m=arm_base_origin_in_candidate_frame(
+                    scene_world_from_candidate=(
+                        lower.profile.scene_world_from_canonical_station
+                    ),
+                    scene_world_from_arm_base=(
+                        lower.profile.scene_world_from_arm_base_by_side[
+                            arm_reachability_profile.arm_side
+                        ]
+                    ),
+                ),
                 clock=clock,
             )
 

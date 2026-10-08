@@ -31,7 +31,7 @@ from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,
     LOCALIZATION_ANNOTATED_IMAGE_SCHEMA_ID_V1,
     LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
-    LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1,
+    LOCALIZATION_INPUT_IMAGE_SCHEMA_IDS_V1,
     LOCALIZATION_INPUT_JPEG_ENCODING_V1,
     LOCALIZATION_INPUT_JPEG_MEDIA_TYPE_V1,
     LOCALIZATION_INPUT_PNG_ENCODING_V1,
@@ -219,7 +219,7 @@ def build_real_object_localization_registration(
                     LOCALIZATION_INPUT_JPEG_MEDIA_TYPE_V1,
                     LOCALIZATION_INPUT_PNG_MEDIA_TYPE_V1,
                 ),
-                allowed_schema_ids=(LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1,),
+                allowed_schema_ids=LOCALIZATION_INPUT_IMAGE_SCHEMA_IDS_V1,
                 allowed_encodings=(
                     LOCALIZATION_INPUT_JPEG_ENCODING_V1,
                     LOCALIZATION_INPUT_PNG_ENCODING_V1,

@@ -16,6 +16,7 @@ from teleop_runtime.sources.camera.realsense_rgb import (
     REALSENSE_STARTUP_WARMUP_LEGACY,
     RealSenseRGBCameraConfig,
     RealSenseRGBSource,
+    load_realsense_camera_config_map,
 )
 
 
@@ -132,6 +133,7 @@ class _FakeHardwareDevice:
     def __init__(self, serial: str) -> None:
         self.serial = serial
         self.hardware_reset_calls = 0
+        self.reset_error: RuntimeError | None = None
 
     def get_info(self, info_key: object) -> str:
         if info_key != "serial_number":
@@ -140,6 +142,8 @@ class _FakeHardwareDevice:
 
     def hardware_reset(self) -> None:
         self.hardware_reset_calls += 1
+        if self.reset_error is not None:
+            raise self.reset_error
 
 
 def test_realsense_legacy_startup_resets_and_warms_up_front_without_depth() -> None:
@@ -274,12 +278,14 @@ def test_realsense_startup_does_not_hardware_reset_unsupported_profile() -> None
         )
     )
 
-    with pytest.raises(RuntimeError, match="configured profile was preserved"):
+    with pytest.raises(RuntimeError, match="configured profile was preserved") as raised:
         source._start_pipeline(fake_rs)
 
     assert len(fake_rs.pipelines) == 1
     assert fake_rs.pipelines[0].stop_calls == 1
     assert target_device.hardware_reset_calls == 0
+    assert '"failed_stage": "pipeline_start"' in str(raised.value)
+    assert '"pipeline_stop_error": "RuntimeError: stop before start"' in str(raised.value)
 
 
 def test_realsense_legacy_startup_retries_when_warmup_gets_no_frames() -> None:
@@ -365,13 +371,16 @@ def test_realsense_bounded_warmup_failure_does_not_immediately_reopen_pipeline()
         )
     )
 
-    with pytest.raises(RuntimeError, match="policy=bounded_first_frame"):
+    with pytest.raises(RuntimeError, match="policy=bounded_first_frame") as raised:
         source._start_pipeline(fake_rs)
 
     assert len(fake_rs.pipelines) == 1
     assert fake_rs.pipelines[0].wait_timeouts == [1000] * 5
     assert fake_rs.pipelines[0].stop_calls == 1
     assert target_device.hardware_reset_calls == 0
+    assert '"failed_stage": "first_frame_warmup"' in str(raised.value)
+    assert '"pipeline_start_sec":' in str(raised.value)
+    assert '"pipeline_stop_error": "RuntimeError: stop before start"' in str(raised.value)
 
 
 def test_realsense_bounded_warmup_leaves_deferred_retry_to_multi_camera_caller() -> None:
@@ -395,6 +404,94 @@ def test_realsense_bounded_warmup_leaves_deferred_retry_to_multi_camera_caller()
     assert fake_rs.pipelines[0].wait_timeouts == [1000] * 5
     assert fake_rs.pipelines[0].stop_calls == 1
     assert target_device.hardware_reset_calls == 0
+
+
+def test_realsense_bounded_warmup_can_reset_only_the_selected_camera() -> None:
+    fake_rs = _FakeRealSense()
+    front = _FakeHardwareDevice("FRONT123")
+    other = _FakeHardwareDevice("WRIST456")
+    fake_rs.devices = [front, other]
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            camera_key="front",
+            startup_reset=False,
+            startup_hardware_reset_on_failure=False,
+            startup_hardware_reset_on_warmup_failure=True,
+            startup_hardware_reset_sleep_sec=0.0,
+        )
+    )
+
+    pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert pipeline is fake_rs.pipelines[1]
+    assert len(fake_rs.pipelines) == 2
+    assert front.hardware_reset_calls == 1
+    assert other.hardware_reset_calls == 0
+    assert source.startup_timing["hardware_reset_retries"] == 1.0
+    assert source.startup_timing["total_with_recovery_sec"] >= 0.0
+
+
+def test_realsense_bounded_warmup_stops_if_target_reset_does_not_reconnect() -> None:
+    fake_rs = _FakeRealSense()
+    target = _FakeHardwareDevice("FRONT123")
+    fake_rs.devices = [target]
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_hardware_reset_on_failure=False,
+            startup_hardware_reset_on_warmup_failure=True,
+            startup_hardware_reset_sleep_sec=0.0,
+        )
+    )
+
+    with patch.object(source, "_wait_for_device_reconnect", return_value=False):
+        with pytest.raises(RuntimeError, match="startup_hardware_reset_failed"):
+            source._start_pipeline(fake_rs)
+
+    assert len(fake_rs.pipelines) == 1
+    assert target.hardware_reset_calls == 1
+
+
+def test_realsense_reset_error_requires_observed_reenumeration_before_retry() -> None:
+    fake_rs = _FakeRealSense()
+    front = _FakeHardwareDevice("FRONT123")
+    front.reset_error = RuntimeError("map_device_descriptor: No such device")
+    fake_rs.devices = [front]
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_hardware_reset_on_failure=False,
+            startup_hardware_reset_on_warmup_failure=True,
+        )
+    )
+
+    with patch.object(source, "_wait_for_device_reconnect", return_value=True) as reconnect:
+        pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert pipeline is fake_rs.pipelines[1]
+    reconnect.assert_called_once_with(fake_rs, require_disconnect=True)
+    assert front.hardware_reset_calls == 1
+
+
+def test_gateway_profile_limits_warmup_recovery_to_front_camera() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
+    )
+    configs = load_realsense_camera_config_map(config_path)
+    camera_runtime.apply_real_teleop_camera_startup_defaults(configs)
+
+    assert configs["front"].startup_hardware_reset_on_warmup_failure is True
+    assert configs["front"].startup_hardware_reset is False
+    assert configs["front"].startup_hardware_reset_retry_attempts == 1
+    assert configs["left_wrist"].startup_hardware_reset_on_warmup_failure is False
+    assert configs["right_wrist"].startup_hardware_reset_on_warmup_failure is False
 
 
 def test_realsense_bounded_warmup_uses_full_grace_not_legacy_frame_count() -> None:

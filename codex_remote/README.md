@@ -147,6 +147,28 @@ ssh dex-remote 'cd ~/DexTeleop && source ~/anaconda3/etc/profile.d/conda.sh && c
 module 和 pytest wrapper 只允许 L3 非控制执行；关键词检查只是误调用防线，不能证明
 任意代码没有设备副作用。设备或运动动作必须进入限制具体动作的专用 wrapper。
 
+### 冻结抓姿数据的限定探针
+
+只读抓姿场景实验另有两个限定入口，不能用普通 Python wrapper 启动真实 Gateway 来替代：
+
+- `remote_rm65_grasp_snapshot.sh`：明确设备只读授权后，提供 `--repo`、`--python`、
+  `--camera-config`、`--arm-ip-assignment` 和新的 `--output` 目录，采集双臂 qpos 与可用相机 RGB-D。
+  先检查既有连接/相机占用，不发送运动、HOLD、STOP、夹爪命令或相机 reset；固定 60 秒上限。
+  `--dry-run` 仅显示参数，不连接设备。相机缺失和稳定性验证失败保留原因，不冒充完整采集成功。
+  相机复用 rule-base / real-teleop 的 `RealSenseRGBSource`：按配置顺序错峰启动、持续采集完整
+  RGB-D、有界延迟重试、启动超时终止批次、按实际启动顺序反向关闭；没有独立的原生 pipeline
+  预热/轮询路径。探针始终禁用三种 hardware-reset 配置和自动曝光参数写入，保留分辨率、帧率、
+  对齐与标定角色。连续新鲜帧检查通过后才连接双臂只读采样，RGB/Depth 使用同一个 `VideoFrame`
+  的原始时间戳，不以读取缓存的时间替换。`capture_stages.jsonl` 实时保存阶段，`snapshot.json`
+  及帧数据先于设备关闭保存；`cleanup_complete=false` 不能解释为设备已释放。
+  用户态超时不能解除内核 `D` 状态；发现原生启动阻塞后不继续开启其他相机或连接机械臂。
+- `remote_grasp_snapshot_inference.sh`：`--python` 后用 `--` 传固定探针的 `--mode segment|infer`、
+  `--repo`、`--input`、`--output`、`--bundle`，以及分割用 `--pixel u v` 或推理用 `--source`。
+  只处理保存的数组、写入新目录；离线加载已有模型，固定 120 秒上限，不连接相机或机械臂。
+
+两个入口均须显式 `-H`，不接受任意远端程序或 shell 命令，不覆盖生产源码。
+抓姿实验与离线分臂回放见 [POINT_GRASP](../docs/agent_gateway/POINT_GRASP.md)。
+
 ### 3.1 远端受保护 Harness
 
 Harness preflight 和 portable exchange 不属于 Python 入口，不能通过

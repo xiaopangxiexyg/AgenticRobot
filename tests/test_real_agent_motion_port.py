@@ -218,6 +218,12 @@ def test_preplanned_joint_path_uses_control_clock_and_freezes_inactive_arm() -> 
     port.submit_activation(replace(_activation(), joint_trajectory=trajectory))
     port.apply_owner_requests(session=_Session(TeleopRunState.ARMED), now=1.0)
 
+    # Commit a regular control frame first.  A single 150 ms gap exercises the
+    # anti-catch-up cap, not interpolation under the normal control clock.
+    first_command = port.command_for_observation(
+        TeleopObservation(timestamp=1.05), 1.05,
+    )
+    port.observe_session_step(command=first_command, command_dispatched=True)
     command = port.command_for_observation(
         TeleopObservation(timestamp=1.15),
         1.15,
@@ -232,6 +238,42 @@ def test_preplanned_joint_path_uses_control_clock_and_freezes_inactive_arm() -> 
     assert operation["trajectory_interpolation_alpha"] == pytest.approx(0.5)
     assert operation["joint_trajectory_hash"] == trajectory.semantic_content_hash
     assert builder.targets == []
+
+
+@pytest.mark.parametrize("skip_delayed_frame", [False, True])
+def test_preplanned_joint_path_rebases_after_a_gap_without_catching_up(
+    skip_delayed_frame,
+) -> None:
+    trajectory = RealAgentJointTrajectory(
+        time_from_start_sec=np.array([0.0, 2.0]),
+        qpos_by_side={
+            "left": np.ones((2, 6)),
+            "right": np.array([[0.0] * 6, [2.0] * 6]),
+        },
+        planner_evidence_refs=("urdf-fcl-path:clock-gap-test",),
+    )
+    port = _port(_TargetBuilder(fail=True))
+    port.publish_measured_qpos_pair(
+        qpos_by_side={side: trajectory.qpos_by_side[side][0] for side in ("left", "right")},
+        measured_at=1.0, available_at=1.0,
+        source_evidence_refs=("hardware-qpos-cut:clock-gap-test",),
+    )
+    port.submit_activation(replace(_activation(expires_at=5.0), joint_trajectory=trajectory))
+    port.apply_owner_requests(session=_Session(TeleopRunState.ARMED), now=1.0)
+    first = port.command_for_observation(TeleopObservation(timestamp=1.05), 1.05)
+    port.observe_session_step(command=first, command_dispatched=True)
+
+    delayed = port.command_for_observation(TeleopObservation(timestamp=1.5), 1.5)
+    assert delayed.metadata["real_agent_motion_operation"]["trajectory_clock_advance_capped"]
+    np.testing.assert_allclose(delayed.commands["right_arm"].value, 0.15)
+    port.observe_session_step(command=delayed, command_dispatched=not skip_delayed_frame)
+
+    resumed = port.command_for_observation(TeleopObservation(timestamp=1.51), 1.51)
+    # Resume from the last dispatched sample, not from skipped wall-clock time.
+    np.testing.assert_allclose(
+        resumed.commands["right_arm"].value, 0.06 if skip_delayed_frame else 0.16,
+    )
+    np.testing.assert_allclose(resumed.commands["left_arm"].value, 1.0)
 
 
 def test_preplanned_joint_path_rechecks_start_at_owner_activation() -> None:

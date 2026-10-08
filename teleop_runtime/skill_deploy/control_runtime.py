@@ -63,6 +63,10 @@ class RealSkillMotionObservationUnavailable(RuntimeError):
     """
 
 
+class RealSkillMotionObservationPaused(RealSkillMotionObservationUnavailable):
+    """Observation publication is intentionally paused for read-only work."""
+
+
 class RealSkillMotionTargetSynchronizer(Protocol):
     """Lower numerical port that aligns the coupled target solver."""
 
@@ -354,6 +358,7 @@ class ExclusiveRealSkillControlRuntime:
         self._transient_observation_skip_count = 0
         self._consecutive_transient_observation_skips = 0
         self._last_transient_observation_error: str | None = None
+        self._non_motion_observation_pause_count = 0
         self._motion_trace_sink: RealSkillControlTraceSink | None = None
         self._motion_trace_error_count = 0
         self._last_motion_trace_error: str | None = None
@@ -393,6 +398,9 @@ class ExclusiveRealSkillControlRuntime:
                 ),
                 "last_transient_observation_error": (
                     self._last_transient_observation_error
+                ),
+                "non_motion_observation_pause_count": (
+                    self._non_motion_observation_pause_count
                 ),
                 "max_measurement_age_sec": self._max_measurement_age_sec,
                 "last_published_source_sequence_by_side": dict(
@@ -534,6 +542,37 @@ class ExclusiveRealSkillControlRuntime:
             raise RuntimeError("exclusive Skill runtime is not active.")
         try:
             cut = self._observation_provider()
+        except RealSkillMotionObservationPaused:
+            snapshot = self.motion_port.snapshot()
+            lifecycle = self.lifecycle
+            if (
+                lifecycle
+                not in {
+                    RealSkillControlLifecycle.RUNNING,
+                    RealSkillControlLifecycle.HOLD,
+                }
+                or snapshot.phase
+                not in {
+                    RealAgentMotionPhase.INACTIVE,
+                    RealAgentMotionPhase.HELD,
+                }
+            ):
+                raise
+            with self._lock:
+                self._non_motion_observation_pause_count += 1
+                self._consecutive_transient_observation_skips = 0
+            if trace is not None:
+                trace.port_snapshot = snapshot
+                trace.outcome = "non_motion_observation_paused"
+                trace.error = None
+            return RealSkillControlStep(
+                lifecycle=lifecycle,
+                port_snapshot=snapshot,
+                command_present=False,
+                dispatch_attempted=False,
+                dispatch_succeeded=False,
+                dispatch_evidence_refs=(),
+            )
         except RealSkillMotionObservationUnavailable as exc:
             snapshot = self.motion_port.snapshot()
             lifecycle = self.lifecycle
@@ -849,6 +888,7 @@ __all__ = [
     "RealSkillMotionEmergencyStopReceipt",
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
+    "RealSkillMotionObservationPaused",
     "RealSkillMotionObservationUnavailable",
     "RealSkillMotionTargetSynchronizer",
 ]

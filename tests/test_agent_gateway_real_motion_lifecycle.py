@@ -703,6 +703,45 @@ def test_grasp_approach_cannot_complete_before_planned_trajectory_elapsed() -> N
     )
 
 
+@pytest.mark.parametrize("publication_kind", ["pose", "qpos"])
+def test_grasp_activation_accepts_measurement_published_during_read(
+    monkeypatch, publication_kind
+) -> None:
+    bundle, port, _builder = _runtime_fixture(include_grasp_approach=True)
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _pose_request_and_operation(
+        bundle, clock=clock, speed_scale=0.2, skill_id="motion.approach_grasp_pose",
+    )
+    qpos = {side: np.zeros(6) for side in ("left", "right")}
+    _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+    method = "latest_measured_" + publication_kind
+    original_read = getattr(port, method)
+
+    def publish_during_read():
+        clock.value += 0.001
+        _publish_qpos(port, qpos_by_side=qpos, measured_at=clock(), available_at=clock())
+        return original_read()
+
+    monkeypatch.setattr(port, method, publish_during_read)
+
+    def lower_owner_sleep(duration):
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port, contract_bundle=bundle, route=route, binding=binding,
+        profile=bundle.pose_target_profile, request=request, operation=operation,
+        grasp_trajectory_planner=lambda **_kwargs: _stationary_grasp_trajectory(qpos),
+        clock=clock, sleep=lower_owner_sleep,
+    )
+    activation = lifecycle.activate(
+        request=request, operation=operation, cancel_requested=lambda: False,
+    )
+    assert activation.succeeded is True
+    assert port.snapshot().phase == RealAgentMotionPhase.ACTIVE
+
+
 def test_real_lifecycle_rejects_future_measured_tcp_pose() -> None:
     bundle, port, _builder = _runtime_fixture()
     clock = _Clock()

@@ -30,6 +30,8 @@ class AttachedBoxCollisionProxy:
     parent_frame_name: str
     center_xyz_m: tuple[float, float, float]
     size_xyz_m: tuple[float, float, float]
+    rotation_row_major: tuple[float, ...] = (1., 0., 0., 0., 1., 0., 0., 0., 1.)
+    collision_geometry_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.geometry_name.strip() or not self.parent_frame_name.strip():
@@ -42,6 +44,14 @@ class AttachedBoxCollisionProxy:
             raise ValueError(
                 "attached collision proxy size must be positive finite XYZ."
             )
+        rotation = np.asarray(self.rotation_row_major, dtype=float)
+        if (rotation.shape != (9,) or not np.isfinite(rotation).all()
+                or not np.allclose(rotation.reshape(3, 3).T @ rotation.reshape(3, 3), np.eye(3), atol=1e-6, rtol=0)
+                or not np.isclose(np.linalg.det(rotation.reshape(3, 3)), 1., atol=1e-6, rtol=0)):
+            raise ValueError("attached collision proxy requires a rigid rotation")
+        if (len(set(self.collision_geometry_names)) != len(self.collision_geometry_names)
+                or any(not name or name.strip() != name for name in self.collision_geometry_names)):
+            raise ValueError("attached collision pair names must be distinct nonempty names")
 
 
 # Conservative wrist-camera bounds shared by real URDF planning and MuJoCo
@@ -168,7 +178,7 @@ class RM65ObstacleCollisionOracle:
                 )
             frame = model.frames[frame_id]
             placement = frame.placement * pin.SE3(
-                np.eye(3), np.asarray(proxy.center_xyz_m, dtype=float)
+                np.asarray(proxy.rotation_row_major).reshape(3, 3), np.asarray(proxy.center_xyz_m, dtype=float)
             )
             collision_model.addGeometryObject(
                 pin.GeometryObject(
@@ -236,6 +246,18 @@ class RM65ObstacleCollisionOracle:
             tuple(sorted((int(pair.first), int(pair.second))))
             for pair in collision_model.collisionPairs
         }
+        # Carried objects need explicit pairs with robot proxies too, not only
+        # the static world. The application binds the reviewed contact pairs;
+        # default camera proxies retain their existing collision scope.
+        geometry_ids = {str(g.name): i for i, g in enumerate(collision_model.geometryObjects)}
+        for proxy in attached_box_proxies:
+            for name in proxy.collision_geometry_names:
+                if name not in geometry_ids or name == proxy.geometry_name:
+                    raise ValueError(f"Invalid attached collision pair: {proxy.geometry_name}, {name}")
+                key = tuple(sorted((geometry_ids[proxy.geometry_name], geometry_ids[name])))
+                if key not in existing_pairs:
+                    collision_model.addCollisionPair(pin.CollisionPair(*key))
+                    existing_pairs.add(key)
         for obstacle_geometry_id in obstacle_ids:
             for moving_geometry_id in obstacle_pair_geometry_ids:
                 key = tuple(sorted((obstacle_geometry_id, moving_geometry_id)))

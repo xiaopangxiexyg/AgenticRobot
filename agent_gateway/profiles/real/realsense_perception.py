@@ -180,6 +180,10 @@ class RealAlignedRgbdCapture:
     depth_m: np.ndarray
     rgb_content_hash: str
     depth_content_hash: str
+    capture_qpos_by_side: Mapping[str, np.ndarray] | None = None
+    pose_measured_at: float | None = None
+    pose_available_at: float | None = None
+    pose_evidence_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1119,6 +1123,7 @@ class RealSenseAgentPerceptionProvider:
         *,
         role: str,
         expected_station_revision: int,
+        require_stationary: bool = False,
     ) -> RealAlignedRgbdCapture:
         """Read RGB and aligned depth once from the same published VideoFrame."""
 
@@ -1209,7 +1214,17 @@ class RealSenseAgentPerceptionProvider:
             },
             domain="dexteleop.real_aligned_rgbd.depth_content.v1",
         )
-        if self.rgb_camera_geometry is None:
+        capture_qpos = None
+        qpos_measured_at = qpos_available_at = None
+        qpos_refs = ()
+        if require_stationary:
+            stationary = getattr(self.rgb_camera_geometry, "stationary_geometry_cut", None)
+            if not callable(stationary):
+                raise RuntimeError("grasp_observation_stationary_geometry_unavailable")
+            geometry, capture_qpos, qpos_measured_at, qpos_available_at, qpos_refs = stationary(
+                source_id=source_id, frame_acquired_at=source_at, now=float(self._clock())
+            )
+        elif self.rgb_camera_geometry is None:
             source_from_camera = self.source_binding.world_from_depth_camera_by_source[
                 source_id
             ]
@@ -1280,6 +1295,10 @@ class RealSenseAgentPerceptionProvider:
             depth_m=depth_m,
             rgb_content_hash=rgb_content_hash,
             depth_content_hash=depth_content_hash,
+            capture_qpos_by_side=capture_qpos,
+            pose_measured_at=qpos_measured_at,
+            pose_available_at=qpos_available_at,
+            pose_evidence_refs=qpos_refs,
         )
 
     def capture_rgb_geometry(

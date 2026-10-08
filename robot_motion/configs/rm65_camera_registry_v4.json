@@ -50,6 +50,11 @@
                 "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf",
                 "frame": "head_camera_frame",
                 "parent_frame": "left_arm_base_link"
+              },
+              {
+                "urdf": "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf",
+                "frame": "head_camera_frame",
+                "parent_frame": "left_arm_base_link"
               }
             ]
           }
@@ -76,6 +81,11 @@
                 "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf",
                 "frame": "left_camera_rgb",
                 "parent_frame": "left_arm_link6"
+              },
+              {
+                "urdf": "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf",
+                "frame": "left_camera_rgb",
+                "parent_frame": "left_arm_link6"
               }
             ]
           }
@@ -100,6 +110,11 @@
               },
               {
                 "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf",
+                "frame": "right_camera_rgb",
+                "parent_frame": "right_arm_link6"
+              },
+              {
+                "urdf": "assets/realman_dual_arm_inspire_gripper_dmtacm/realman_dual_arm_inspire_gripper_dmtacm.urdf",
                 "frame": "right_camera_rgb",
                 "parent_frame": "right_arm_link6"
               }

@@ -45,6 +45,7 @@ from .control_runtime import (
     RealSkillMotionEmergencyStopReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
+    RealSkillMotionObservationPaused,
     RealSkillMotionObservationUnavailable,
 )
 from .motion_port import REAL_AGENT_MOTION_COMMAND_METADATA_KEY
@@ -178,7 +179,7 @@ def _bounded_backend_diagnostics_state(
         if isinstance(raw_health_reasons, (list, tuple))
         else []
     )
-    return {
+    result = {
         "hardware_ready": state.get("hardware_ready"),
         "emergency_stopped": bool(state.get("emergency_stopped", False)),
         "send_result_code": state.get("send_result_code"),
@@ -217,6 +218,51 @@ def _bounded_backend_diagnostics_state(
         ),
         "background_join_timed_out": background_state.get("join_timed_out"),
     }
+    if bool(background_state.get("debug_timing_enabled", False)):
+        raw_percentiles = background_state.get("timing_percentiles")
+        bounded_percentiles: dict[str, dict[str, int | float | None]] = {}
+        if isinstance(raw_percentiles, Mapping):
+            for phase, raw_metrics in list(raw_percentiles.items())[:16]:
+                if not isinstance(raw_metrics, Mapping):
+                    continue
+                bounded_percentiles[str(phase)[:64]] = {
+                    key: raw_metrics.get(key)
+                    for key in ("count", "p50", "p95", "p99", "max")
+                }
+        raw_last_phase = background_state.get("last_phase_timing_ms")
+        last_phase = (
+            {
+                str(name)[:64]: float(value)
+                for name, value in list(raw_last_phase.items())[:16]
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            }
+            if isinstance(raw_last_phase, Mapping)
+            else {}
+        )
+        result["background_stream_timing"] = {
+            "target_hz": background_state.get("hz"),
+            "warning_threshold_hz": background_state.get(
+                "warning_threshold_hz"
+            ),
+            "actual_hz": background_state.get("actual_hz"),
+            "send_count": background_state.get("send_count"),
+            "scheduled_tick_count": background_state.get(
+                "scheduled_tick_count"
+            ),
+            "executed_tick_count": background_state.get(
+                "executed_tick_count"
+            ),
+            "skipped_tick_count": background_state.get("skipped_tick_count"),
+            "deadline_miss_count": background_state.get(
+                "deadline_miss_count"
+            ),
+            "low_rate_count": background_state.get("low_rate_count"),
+            "last_phase_timing_ms": last_phase,
+            "timing_percentiles": bounded_percentiles,
+        }
+    return result
 
 
 def _bounded_diagnostic_text(value: object, *, limit: int = 512) -> str | None:
@@ -347,6 +393,7 @@ class ExclusiveRM65SkillDeployPorts:
         self._measurement_transient_failure_count = 0
         self._measurement_consecutive_transient_failures = 0
         self._last_measurement_transient_failure: str | None = None
+        self._non_motion_read_window_active = False
 
     @property
     def resources_started(self) -> bool:
@@ -391,11 +438,19 @@ class ExclusiveRM65SkillDeployPorts:
                 "position force guard does not support non-motion read windows"
             )
         token = suspend()
+        window_marked_active = False
         measurement_lock_acquired = False
         previous_sample_count: int | None = None
         primary_error: BaseException | None = None
         cleanup_errors: list[BaseException] = []
         try:
+            with self._measurement_lock:
+                if self._non_motion_read_window_active:
+                    raise RuntimeError(
+                        "RM65 non-motion read windows cannot overlap."
+                    )
+                self._non_motion_read_window_active = True
+                window_marked_active = True
             if self.profile.background_measurement_sampling:
                 # If a sampler read is already in flight, wait for that one
                 # read to finish after stale admission has been suspended.
@@ -432,6 +487,10 @@ class ExclusiveRM65SkillDeployPorts:
                 resume(token)
             except BaseException as exc:  # noqa: BLE001 - retain evidence.
                 cleanup_errors.append(exc)
+
+            if window_marked_active:
+                with self._measurement_lock:
+                    self._non_motion_read_window_active = False
 
             if primary_error is not None:
                 for cleanup_error in cleanup_errors:
@@ -799,6 +858,9 @@ class ExclusiveRM65SkillDeployPorts:
                 self._measurement_consecutive_transient_failures
             )
             last_transient = self._last_measurement_transient_failure
+            non_motion_read_window_active = (
+                self._non_motion_read_window_active
+            )
         now = float(self.clock())
         return {
             "enabled": self.profile.background_measurement_sampling,
@@ -814,6 +876,9 @@ class ExclusiveRM65SkillDeployPorts:
                 RM65_MAX_CONSECUTIVE_RECOVERABLE_MEASUREMENT_FAILURES
             ),
             "last_transient_failure": last_transient,
+            "non_motion_read_window_active": (
+                non_motion_read_window_active
+            ),
             "latest_measurement_age_sec": (
                 None if cut is None else max(0.0, now - cut.measured_at)
             ),
@@ -852,6 +917,14 @@ class ExclusiveRM65SkillDeployPorts:
         with self._measurement_lock:
             cut = self._latest_observation_cut
             fault = self._measurement_fault
+            non_motion_read_window_active = (
+                self._non_motion_read_window_active
+            )
+        if non_motion_read_window_active:
+            raise RealSkillMotionObservationPaused(
+                "RM65 qpos publication is intentionally paused during a "
+                "non-motion read window."
+            )
         if fault is not None:
             raise RuntimeError("RM65 measurement sampler failed: " + fault)
         if cut is None:

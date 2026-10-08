@@ -300,6 +300,60 @@ def _stationary_trajectory(qpos_by_side) -> RealAgentJointTrajectory:
     )
 
 
+@pytest.mark.parametrize("publication_read", [1, 2, 3])
+def test_planning_dates_each_measurement_after_reading_it(monkeypatch, publication_read) -> None:
+    from contextlib import nullcontext
+
+    _, provider, _, port, request, operation = _planning_fixture(
+        planner=lambda **kwargs: _stationary_trajectory(kwargs["qpos_by_side"])
+    )
+    now = [10.0]
+    reads = [0]
+    original_read = port.latest_measured_qpos
+
+    def read_with_publication():
+        reads[0] += 1
+        if reads[0] == publication_read:
+            # A concurrent sampler publishes while the consumer acquires its cut.
+            now[0] += 0.01
+            port.publish_measured_qpos_pair(
+                qpos_by_side={side: np.zeros(6) for side in ("left", "right")},
+                measured_at=now[0], available_at=now[0],
+                source_evidence_refs=("measurement-published-during-read:test",),
+            )
+        return original_read()
+
+    provider._clock = lambda: now[0]
+    provider.non_motion_read_window = nullcontext
+    monkeypatch.setattr(port, "latest_measured_qpos", read_with_publication)
+    if publication_read == 3:
+        # Make the first post-plan cut stale to exercise the bounded hand-off retry.
+        def planner(**kwargs):
+            now[0] += 1.0
+            return _stationary_trajectory(kwargs["qpos_by_side"])
+        provider.grasp_trajectory_planner = planner
+
+    result, plan = provider.plan_request(request, operation)
+    assert result["planning_status"] == "path_found"
+    assert plan is not None
+
+
+@pytest.mark.parametrize("offset, reason", [(-0.3, "stale"), (0.01, "from_future")])
+def test_planning_still_rejects_genuinely_invalid_measurement_time(offset, reason) -> None:
+    _, provider, _, port, request, operation = _planning_fixture(
+        planner=lambda **_kwargs: pytest.fail("Invalid measurements must not start planning.")
+    )
+    provider._clock = lambda: 10.0 - min(offset, 0.0)
+    port.publish_measured_qpos_pair(
+        qpos_by_side={side: np.zeros(6) for side in ("left", "right")},
+        measured_at=10.0 + max(offset, 0.0), available_at=10.0 + max(offset, 0.0),
+        source_evidence_refs=("invalid-measurement:test",),
+    )
+    result, plan = provider.plan_request(request, operation)
+    assert result["reason_code"] == "grasp_path_measured_qpos_" + reason
+    assert plan is None
+
+
 def test_planning_route_deadline_outlives_internal_planner_budget() -> None:
     registration, *_ = _planning_fixture(planner=lambda **_kwargs: None)
 
