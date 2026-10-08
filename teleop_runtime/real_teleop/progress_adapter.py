@@ -989,11 +989,20 @@ class RealTeleopProgressEpisode:
             effective_at=effective_at,
             origin="episode_owner_stop",
         )
-        rule_based_window_completion = bool(
+        # The rule runtime emits this reason only after accepted-sample stage
+        # coverage passes. Preserve the binding's scope instead of treating
+        # every rule-written Episode as a partial recording window.
+        rule_based_completion = bool(
             normalized == _RULE_BASED_COMPLETION_REASON
-            and self.binding.recording_scope == "EVENT_WINDOW"
+            and self.binding.recording_scope in {"FULL_TASK", "EVENT_WINDOW"}
             and self.state.phase == "ACTIVE_ATTEMPT"
             and self.binding.entry_step_id == "right_write"
+            and self.state.current_progress_step_id == "right_write"
+            and (
+                self.binding.recording_scope == "EVENT_WINDOW"
+                or self.state.current_progress_step_id
+                in self.profile.terminal_step_ids
+            )
             and self.stage_profile is not None
             and self.stage_entry_binding is not None
             and tuple(
@@ -1008,10 +1017,10 @@ class RealTeleopProgressEpisode:
             and self.state.current_progress_step_id
             in self.profile.terminal_step_ids
         )
-        if normal_completion or rule_based_window_completion:
+        if normal_completion or rule_based_completion:
             self.controller.complete(
                 CompleteEpisodeProgressRequest(
-                    completed_progress_step=rule_based_window_completion,
+                    completed_progress_step=rule_based_completion,
                 ),
                 context=context,
             )

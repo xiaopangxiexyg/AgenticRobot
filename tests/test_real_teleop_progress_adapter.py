@@ -869,6 +869,165 @@ def test_progress_episode_prepare_bind_complete_and_seal(tmp_path: Path) -> None
     assert (episode.episode_dir / "manifest.cjson").is_file()
 
 
+def _rule_writing_episode(
+    tmp_path: Path,
+    *,
+    profile_id: str = "dmtac_rm65_right_gripper_rule_writing_progress_detailed",
+    entry_condition: str = "NOMINAL",
+) -> RealTeleopProgressEpisode:
+    bundle = load_real_teleop_managed_progress_profile_selection(profile_id)
+    return RealTeleopProgressEpisode(
+        dataset_root=tmp_path,
+        identity=_identity("episode-rule-writing"),
+        profile=bundle.progress_profile,
+        stage_profile=bundle.stage_profile,
+        entry_step_id="right_write",
+        entry_stage_id="right_write.pen_down",
+        entry_condition=entry_condition,
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "entry_condition", "scope", "cause", "outcome"),
+    [
+        (
+            "dmtac_rm65_right_gripper_rule_writing_progress_detailed",
+            "NOMINAL", "FULL_TASK", "FULL_TASK_COMPLETED", "SUCCESS",
+        ),
+        (
+            "dmtac_rm65_right_gripper_rule_writing_progress_detailed",
+            "RECOVERY_FROM_FAILURE", "EVENT_WINDOW", "WINDOW_COMPLETED",
+            "NOT_APPLICABLE",
+        ),
+        (
+            "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed",
+            "NOMINAL", "EVENT_WINDOW", "WINDOW_COMPLETED", "NOT_APPLICABLE",
+        ),
+    ],
+)
+def test_rule_completion_preserves_bound_scope_in_sealed_progress(
+    tmp_path: Path,
+    profile_id: str,
+    entry_condition: str,
+    scope: str,
+    cause: str,
+    outcome: str,
+) -> None:
+    episode = _rule_writing_episode(
+        tmp_path, profile_id=profile_id, entry_condition=entry_condition,
+    )
+    assert episode.binding.recording_scope == scope
+    episode.bind(started_at=10.0)
+
+    episode.terminate(reason="rule_based_complete", effective_at=12.0)
+    terminal = episode.store.facts[-1].payload
+    assert terminal.termination_cause == cause
+    assert terminal.active_attempt_disposition == "SUCCESS"
+    assert terminal.full_task_outcome == outcome
+    episode.seal(sealed_at=13.0)
+
+    loaded = load_sealed_progress_episode(episode.episode_dir)
+    assert loaded.binding == episode.binding
+    assert loaded.timeline.termination_cause == cause
+    assert loaded.timeline.full_task_outcome == outcome
+    assert loaded.timeline.attempts[0].outcome == "SUCCESS"
+
+
+@pytest.mark.parametrize("entry_condition", ["NOMINAL", "RECOVERY_FROM_FAILURE"])
+@pytest.mark.parametrize(
+    ("reason", "cause"),
+    [
+        ("rule_based_hold_cancel", "ABORTED"),
+        ("rule_based_abort", "ABORTED"),
+        ("runtime_estop", "SAFETY_STOP"),
+        ("quit_requested", "MANUAL_STOP"),
+    ],
+)
+def test_rule_interruption_never_claims_success(
+    tmp_path: Path, entry_condition: str, reason: str, cause: str,
+) -> None:
+    episode = _rule_writing_episode(tmp_path, entry_condition=entry_condition)
+    episode.bind(started_at=10.0)
+
+    episode.terminate(reason=reason, effective_at=12.0)
+    terminal = episode.store.facts[-1].payload
+    assert terminal.termination_cause == cause
+    assert terminal.active_attempt_disposition == "ABORTED"
+    assert terminal.full_task_outcome == (
+        "UNKNOWN" if episode.binding.recording_scope == "FULL_TASK"
+        else "NOT_APPLICABLE"
+    )
+    episode.seal(sealed_at=13.0)
+
+
+def test_rule_completion_while_failure_paused_does_not_claim_success(
+    tmp_path: Path,
+) -> None:
+    episode = _rule_writing_episode(tmp_path)
+    episode.bind(started_at=10.0)
+    effect = episode.report_failure(intent_id="writing-failure", effective_at=11.0)
+    episode.record_applied_hold_pause(
+        effect_request=effect,
+        requested_at=11.0,
+        application_hold_effective_at=11.1,
+        formal_capture_pause_effective_at=11.0,
+        available_at=11.2,
+    )
+
+    episode.terminate(reason="rule_based_complete", effective_at=12.0)
+    terminal = episode.store.facts[-1].payload
+    assert terminal.termination_cause == "ABORTED"
+    assert terminal.active_attempt_disposition == "NO_ACTIVE_ATTEMPT"
+    assert terminal.full_task_outcome == "UNKNOWN"
+    episode.seal(sealed_at=13.0)
+
+
+@pytest.mark.parametrize(
+    "profile_id",
+    [
+        "dmtac_rm65_right_gripper_rule_writing_progress",
+        "dmtac_rm65_right_gripper_rule_writing_progress_detailed",
+    ],
+)
+def test_rule_completion_requires_detailed_stage_binding(
+    tmp_path: Path, profile_id: str,
+) -> None:
+    bundle = load_real_teleop_managed_progress_profile_selection(profile_id)
+    episode = RealTeleopProgressEpisode(
+        dataset_root=tmp_path,
+        identity=_identity("episode-rule-wrong-stage-binding"),
+        profile=bundle.progress_profile,
+        stage_profile=(None if "detailed" in profile_id else bundle.stage_profile),
+    )
+    episode.bind(started_at=10.0)
+
+    episode.terminate(reason="rule_based_complete", effective_at=12.0)
+    terminal = episode.store.facts[-1].payload
+    assert terminal.termination_cause == "ABORTED"
+    assert terminal.active_attempt_disposition == "ABORTED"
+    assert terminal.full_task_outcome == "UNKNOWN"
+    episode.seal(sealed_at=13.0)
+
+
+def test_rule_completion_does_not_complete_a_different_active_step(
+    tmp_path: Path,
+) -> None:
+    episode = _rule_writing_episode(
+        tmp_path,
+        profile_id="dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed",
+    )
+    episode.bind(started_at=10.0)
+    episode.advance(intent_id="leave-writing", effective_at=11.0)
+    assert episode.state.current_progress_step_id == "right_return_brush"
+
+    episode.terminate(reason="rule_based_complete", effective_at=12.0)
+    terminal = episode.store.facts[-1].payload
+    assert terminal.termination_cause == "ABORTED"
+    assert terminal.active_attempt_disposition == "ABORTED"
+    assert terminal.full_task_outcome == "NOT_APPLICABLE"
+    episode.seal(sealed_at=13.0)
+
+
 def test_manual_stop_before_terminal_step_aborts_instead_of_claiming_success(
     tmp_path: Path,
 ) -> None:
@@ -1434,6 +1593,61 @@ def test_process_worker_mode_uses_the_same_progress_lifecycle(
     assert task.success
     assert task.progress_finalize_report is not None
     assert task.progress_episode.store.sealed
+
+
+@pytest.mark.parametrize(
+    ("entry_condition", "scope", "cause", "outcome"),
+    [
+        ("NOMINAL", "FULL_TASK", "FULL_TASK_COMPLETED", "SUCCESS"),
+        (
+            "RECOVERY_FROM_FAILURE", "EVENT_WINDOW", "WINDOW_COMPLETED",
+            "NOT_APPLICABLE",
+        ),
+    ],
+)
+def test_actual_v23_rule_writer_finalizes_with_matching_progress_outcome(
+    tmp_path: Path,
+    entry_condition: str,
+    scope: str,
+    cause: str,
+    outcome: str,
+) -> None:
+    pytest.importorskip("pyarrow")
+    recorder = _recorder(tmp_path, progress=True)
+    bundle = load_real_teleop_managed_progress_profile_selection(
+        "dmtac_rm65_right_gripper_rule_writing_progress_detailed"
+    )
+    recorder.select_progress_profile(
+        bundle.progress_profile,
+        stage_profile=bundle.stage_profile,
+    )
+    recorder.args.collection_progress_entry_step = "right_write"
+    recorder.args.collection_progress_entry_stage = "right_write.pen_down"
+    recorder.args.collection_progress_entry_condition = entry_condition
+    _use_actual_v23_writer(recorder, dataset_root=tmp_path)
+
+    task = _write_and_finalize_actual_v23_episode(
+        recorder,
+        reason="rule_based_complete",
+    )
+
+    assert task.progress_error == ""
+    assert task.progress_finalize_report is not None
+    assert task.progress_episode is not None
+    loaded = load_sealed_progress_episode(
+        task.progress_episode.episode_dir,
+        expected_episode_identity_hash=task.episode_identity.semantic_content_hash,
+        expected_profile_hash=bundle.progress_profile.semantic_content_hash,
+        expected_binding_hash=task.progress_episode.binding.semantic_content_hash,
+    )
+    assert loaded.binding.recording_scope == scope
+    assert loaded.timeline.termination_cause == cause
+    assert loaded.timeline.full_task_outcome == outcome
+    assert loaded.timeline.attempts[0].outcome == "SUCCESS"
+    validation = validate_v23_dataset(tmp_path)
+    assert validation.ok, validation.errors
+    assert validation.episode_count == 1
+    assert validation.frame_count == 1
 
 
 def test_actual_v23_writer_and_progress_artifacts_share_one_episode_identity(

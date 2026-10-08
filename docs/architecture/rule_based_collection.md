@@ -1,5 +1,21 @@
 # Rule-based collection boundary
 
+## 正式书写的 Progress 完成语义
+
+规则执行器通过靠近、书写、离开三阶段的已接纳样本覆盖检查后，才向正式 Episode
+所有者返回 `rule_based_complete`。Progress adapter 还要求有效的三阶段绑定、活动
+Attempt，以及当前步骤仍为 `right_write`，然后按既有录制范围完成，而不是将规则
+书写一律当作截取窗口：
+
+- `FULL_TASK` 还要求当前步骤为任务终点，封存结果为 `FULL_TASK_COMPLETED`、
+  Attempt `SUCCESS`、`full_task_outcome=SUCCESS`。
+- `EVENT_WINDOW` 保持 `WINDOW_COMPLETED`、Attempt `SUCCESS`、
+  `full_task_outcome=NOT_APPLICABLE`；不能把局部窗口声明为完整任务成功。
+
+中途 Hold、取消、急停、故障或无效完成绑定不走该成功分支。样本覆盖检查、正常
+writer 收尾和 Progress 封存仍由原有实现负责。本判断只修复后续 Episode 的收尾
+语义，不修改已封存历史数据、绑定或 manifest；历史修正需要另行授权的数据修复流程。
+
 ## 可回退的书写接触点校正
 
 书写专用启动脚本可选 `--correct-tcp`。默认不启用，普通遥操和原有规则采集仍使用右臂 DMTAC_M 配置的法兰局部 +Z 0.14 m `tool_tcp`。启用后，高度标定以法兰局部 +Z 0.20 m 的实际夹具末端为参考；书写、落笔下降、靠近/离开阶段的高度下限和对应可达性预检，都先按当前姿态把夹具末端高度换算成原有 `tool_tcp` 的目标。命令的受控坐标系仍是 `tool_tcp`，继续由原有 IK、碰撞、位置与受力安全链路处理。数据中的高度标定元数据会标出夹具末端参考系与 0.06 m 偏移。
