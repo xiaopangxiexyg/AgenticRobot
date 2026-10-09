@@ -22,6 +22,7 @@ from dataset_contracts.perception_artifacts import (
 from .pointcloud import render_intrinsics_from_fovy
 from .rgb_snapshot import EncodedMujocoRgbFrame, _encode_jpeg
 from .scene import MujocoCameraRenderer
+from .snapshot_renderer import SnapshotRendererCache
 
 
 @dataclass(frozen=True)
@@ -62,9 +63,9 @@ class MujocoDepthSnapshotSource:
             raise ValueError("max_renderer_dimensions must be positive.")
         self._capture_scene = capture_scene
         self._clock = clock
-        self._renderer_factory = renderer_factory
-        self._max_renderer_dimensions = max_renderer_dimensions
-        self._renderers: dict[tuple[int, int], Any] = {}
+        self._renderer_cache = SnapshotRendererCache(
+            renderer_factory, max_renderer_dimensions
+        )
         self._lock = threading.RLock()
         self._closed = False
 
@@ -164,30 +165,17 @@ class MujocoDepthSnapshotSource:
             raise ValueError(f"unknown depth view: {view_id!r}")
         metadata = scene.camera_metadata()[view_id]
         key = (int(metadata["width"]), int(metadata["height"]))
-        renderer = self._renderers.get(key)
-        if renderer is None:
-            if len(self._renderers) >= self._max_renderer_dimensions:
-                raise RuntimeError("depth renderer dimension cache is full.")
-            renderer = self._renderer_factory(scene, width=key[0], height=key[1])
-            self._renderers[key] = renderer
-        return render(renderer), metadata, float(self._clock())
+        rendered = self._renderer_cache.render(
+            scene, width=key[0], height=key[1], draw=render,
+        )
+        return rendered, metadata, float(self._clock())
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
-            renderers = tuple(self._renderers.values())
-            self._renderers.clear()
             self._closed = True
-        first_error: Exception | None = None
-        for renderer in renderers:
-            try:
-                renderer.close()
-            except Exception as exc:  # pragma: no cover - backend-specific cleanup
-                if first_error is None:
-                    first_error = exc
-        if first_error is not None:
-            raise first_error
+            self._renderer_cache.close()
 
     def _ensure_open(self) -> None:
         if self._closed:

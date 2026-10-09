@@ -21,6 +21,7 @@ from PIL import Image
 from dataset_contracts.perception_artifacts import RGB_FRAME_MEDIA_TYPE_V1
 
 from .scene import MujocoCameraRenderer
+from .snapshot_renderer import SnapshotRendererCache
 
 
 @dataclass(frozen=True)
@@ -67,9 +68,9 @@ class MujocoRgbSnapshotSource:
             raise ValueError("max_renderer_dimensions must be a positive integer.")
         self._capture_scene = capture_scene
         self._clock = clock
-        self._renderer_factory = renderer_factory
-        self._max_renderer_dimensions = max_renderer_dimensions
-        self._renderers: dict[tuple[int, int], Any] = {}
+        self._renderer_cache = SnapshotRendererCache(
+            renderer_factory, max_renderer_dimensions
+        )
         self._lock = threading.RLock()
         self._closed = False
 
@@ -107,18 +108,11 @@ class MujocoRgbSnapshotSource:
             missing = tuple(name for name in source_ids if name not in available)
             if missing:
                 raise ValueError(f"unknown visual sources: {list(missing)}")
-            key = (width, height)
-            renderer = self._renderers.get(key)
-            if renderer is None:
-                if len(self._renderers) >= self._max_renderer_dimensions:
-                    raise RuntimeError("visual renderer dimension cache is full.")
-                renderer = self._renderer_factory(
-                    scene,
-                    width=width,
-                    height=height,
-                )
-                self._renderers[key] = renderer
-            return renderer.render_all(source_ids), float(self._clock())
+            frames = self._renderer_cache.render(
+                scene, width=width, height=height,
+                draw=lambda renderer: renderer.render_all(source_ids),
+            )
+            return frames, float(self._clock())
 
         with self._lock:
             self._ensure_open()
@@ -153,18 +147,8 @@ class MujocoRgbSnapshotSource:
         with self._lock:
             if self._closed:
                 return
-            renderers = tuple(self._renderers.values())
-            self._renderers.clear()
             self._closed = True
-        first_error: Exception | None = None
-        for renderer in renderers:
-            try:
-                renderer.close()
-            except Exception as exc:  # noqa: BLE001  # pragma: no cover - backend-specific cleanup
-                if first_error is None:
-                    first_error = exc
-        if first_error is not None:
-            raise first_error
+            self._renderer_cache.close()
 
     def _ensure_open(self) -> None:
         if self._closed:

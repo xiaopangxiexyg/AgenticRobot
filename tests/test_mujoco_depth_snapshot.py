@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
 from PIL import Image
 
 from sim.mujoco.depth_snapshot import MujocoDepthSnapshotSource
+from sim.mujoco.rgb_snapshot import MujocoRgbSnapshotSource
 
 
 class _Scene:
@@ -168,3 +171,155 @@ def test_depth_snapshot_rejects_ambiguous_view_ids(view_id) -> None:
     source, _ = _source()
     with pytest.raises(ValueError, match="view_id"):
         source.capture_npy_frame(view_id=view_id)
+
+
+@pytest.mark.parametrize("kind", ["rgb", "depth", "rgbd"])
+def test_snapshot_renderer_lifetime_stays_on_one_thread(kind) -> None:
+    scene = _Scene()
+    scene_lock = threading.RLock()
+    events = []
+    fail_render = False
+
+    class AffineRenderer(_Renderer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.owner = threading.current_thread()
+            self.check("create")
+
+        def check(self, event):
+            assert threading.current_thread() is self.owner
+            events.append((event, self.owner))
+
+        def render(self, view_id):
+            self.check("rgb")
+            if fail_render:
+                raise RuntimeError("injected render failure")
+            return super().render(view_id)
+
+        def render_all(self, names):
+            return {name: self.render(name) for name in names}
+
+        def render_depth(self, view_id):
+            self.check("depth")
+            if fail_render:
+                raise RuntimeError("injected render failure")
+            return super().render_depth(view_id)
+
+        def close(self):
+            self.check("close")
+            super().close()
+
+    def capture_scene(callback):
+        # The calling application may already own this RLock. Moving this
+        # callback to a worker would deadlock; only rendering may move.
+        assert scene_lock._is_owned()
+        with scene_lock:
+            return callback(scene)
+
+    source_class = MujocoRgbSnapshotSource if kind == "rgb" else MujocoDepthSnapshotSource
+    source = source_class(
+        capture_scene=capture_scene, clock=lambda: 12.5,
+        renderer_factory=AffineRenderer,
+    )
+
+    def capture():
+        with scene_lock:
+            if kind == "rgb":
+                return source.capture_jpeg_snapshot(source_ids=("front",), width=2, height=2)
+            if kind == "depth":
+                return source.capture_npy_frame(view_id="front")
+            return source.capture_jpeg_npy_cut(view_id="front")
+
+    try:
+        capture()
+        with ThreadPoolExecutor(max_workers=1) as caller:
+            caller.submit(capture).result(timeout=5)
+            fail_render = True
+            with pytest.raises(RuntimeError, match="injected render failure"):
+                caller.submit(capture).result(timeout=5)
+            fail_render = False
+            caller.submit(capture).result(timeout=5)
+            caller.submit(source.close).result(timeout=5)
+        source.close()
+        assert [event for event, _ in events].count("create") == 1
+        assert [event for event, _ in events].count("close") == 1
+        assert len({thread for _, thread in events}) == 1
+        assert not events[0][1].is_alive()
+        with pytest.raises(RuntimeError, match="closed"):
+            capture()
+    finally:
+        source.close()
+
+
+def test_snapshot_renderer_factory_and_close_failures_release_worker() -> None:
+    scene = _Scene()
+    created = []
+    closed = []
+    fail_create = True
+
+    class FailingRenderer(_Renderer):
+        def __init__(self, *args, **kwargs):
+            if fail_create:
+                raise RuntimeError("injected factory failure")
+            super().__init__(*args, **kwargs)
+            self.owner = threading.current_thread()
+            created.append(self)
+
+        def close(self):
+            assert threading.current_thread() is self.owner
+            closed.append(self)
+            raise RuntimeError("injected close failure")
+
+    source = MujocoDepthSnapshotSource(
+        capture_scene=lambda callback: callback(scene), clock=lambda: 1.0,
+        renderer_factory=FailingRenderer,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="factory failure"):
+            source.capture_npy_frame(view_id="front")
+        fail_create = False
+        source.capture_npy_frame(view_id="front")
+        source.capture_npy_frame(view_id="wrist")
+        with pytest.raises(RuntimeError, match="close failure"):
+            source.close()
+        assert closed == created
+        assert len(closed) == 2
+        assert not created[0].owner.is_alive()
+        source.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            source.capture_npy_frame(view_id="front")
+    finally:
+        source.close()
+
+
+@pytest.mark.optional
+@pytest.mark.integration
+def test_real_mujoco_rgbd_context_survives_caller_thread_changes() -> None:
+    mujoco = pytest.importorskip("mujoco")
+    scene = _Scene()
+    scene.mujoco = mujoco
+    scene.model = mujoco.MjModel.from_xml_string(
+        '<mujoco><worldbody><camera name="front" pos="0 0 1" fovy="90"/>'
+        '<camera name="wrist" pos="0 0 1" fovy="60"/>'
+        '<geom type="plane" size="1 1 .1"/></worldbody></mujoco>'
+    )
+    scene.data = mujoco.MjData(scene.model)
+    mujoco.mj_forward(scene.model, scene.data)
+    source = MujocoDepthSnapshotSource(
+        capture_scene=lambda callback: callback(scene), clock=lambda: 1.0,
+    )
+    try:
+        source.capture_jpeg_npy_cut(view_id="front")
+        # Keep the first caller alive; EGL cannot silently inherit its context.
+        with ThreadPoolExecutor(max_workers=1) as caller:
+            for view_id in ("front", "wrist", "front"):
+                rgb, depth = caller.submit(
+                    source.capture_jpeg_npy_cut, view_id=view_id
+                ).result(timeout=10)
+                assert rgb.data.startswith(b"\xff\xd8")
+                values = np.load(io.BytesIO(depth.data), allow_pickle=False)
+                assert values.shape == ((2, 2) if view_id == "front" else (1, 3))
+                assert np.isfinite(values).all() and (values > 0).all()
+            caller.submit(source.close).result(timeout=10)
+    finally:
+        source.close()
