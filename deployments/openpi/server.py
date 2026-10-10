@@ -24,56 +24,24 @@ from deployments.openpi.camera_semantics import (
     validate_declared_camera_semantics,
     validate_legacy_swapped_wrist_artifact,
 )
+from deployments.openpi.cpu_resources import (
+    add_cpu_resource_arguments,
+)
+from deployments.openpi.cpu_resources import (
+    cpu_exclusion_plan as _server_cpu_exclusion_plan,
+)
+from deployments.openpi.cpu_resources import (
+    exclude_cpus_before_exec as _exclude_server_cpus_before_exec,
+)
+from deployments.openpi.cpu_resources import (
+    native_thread_environment as _native_thread_environment,
+)
 from deployments.openpi.image_wire import OpenPIImageWireServerConfig
 from deployments.openpi.prepared_deployment import (
     prepare_checkpoint_deployment_artifact,
     validate_prepared_deployment_artifact,
 )
 from deployments.policy_artifact import load_policy_artifact
-
-
-def _non_negative_cpu_id(text: str) -> int:
-    try:
-        value = int(text)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("CPU id must be an integer") from exc
-    if value < 0:
-        raise argparse.ArgumentTypeError("CPU id must be non-negative")
-    return value
-
-
-def _exclude_server_cpus_before_exec(
-    excluded_cpu_ids: tuple[int, ...],
-) -> dict[str, object]:
-    """Reduce the launcher-thread mask inherited by the exec'd server."""
-
-    getter = getattr(os, "sched_getaffinity", None)
-    setter = getattr(os, "sched_setaffinity", None)
-    if not callable(getter) or not callable(setter):
-        raise RuntimeError("server CPU affinity is unavailable on this platform")
-    before = set(int(cpu) for cpu in getter(0))
-    excluded = set(int(cpu) for cpu in excluded_cpu_ids)
-    missing = excluded.difference(before)
-    if missing:
-        raise RuntimeError(
-            "requested OpenPI server CPU exclusion is outside the launcher "
-            f"affinity mask: missing={sorted(missing)} allowed={sorted(before)}"
-        )
-    target = before.difference(excluded)
-    if not target:
-        raise RuntimeError("OpenPI server CPU exclusion leaves no runnable CPU")
-    setter(0, target)
-    after = set(int(cpu) for cpu in getter(0))
-    if after != target:
-        raise RuntimeError(
-            "failed to verify OpenPI server CPU exclusion: "
-            f"requested={sorted(target)} effective={sorted(after)}"
-        )
-    return {
-        "excluded_cpu_ids": sorted(excluded),
-        "effective_cpu_ids": sorted(after),
-        "native_threads_migrated": 1,
-    }
 
 
 def _openpi_root_from_checkpoint(checkpoint_dir: Path) -> Path | None:
@@ -340,18 +308,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--action-horizon", type=int, default=50)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8078)
-    parser.add_argument(
-        "--exclude-cpu",
-        type=_non_negative_cpu_id,
-        action="append",
-        default=[],
-        help=(
-            "Default-off process-local CPU exclusion applied immediately "
-            "before exec. Repeat once per control CPU reserved for another "
-            "process. The exec'd server and its future threads inherit the "
-            "reduced mask; omitting all occurrences is the rollback."
-        ),
-    )
+    add_cpu_resource_arguments(parser)
     parser.add_argument("--record", action="store_true")
     parser.add_argument(
         "--enable-rtc-continuation",
@@ -397,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    try:
+        cpu_plan = _server_cpu_exclusion_plan(args.exclude_cpu, args.exclude_llc_of_cpu)
+    except RuntimeError as exc:
+        parser.error(str(exc))
     try:
         image_wire_config = OpenPIImageWireServerConfig(
             profile=args.image_wire_profile,
@@ -623,6 +584,9 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.get("PYTHONPATH"),
         openpi_root=runtime_openpi_root,
     )
+    native_thread_environment = _native_thread_environment(
+        args.native_thread_count
+    )
     if args.dry_run:
         print(
             json.dumps(
@@ -632,10 +596,14 @@ def main(argv: list[str] | None = None) -> int:
                     "openpi_root_source": openpi_root_source,
                     "runtime_openpi_root": str(runtime_openpi_root),
                     "command": command,
-                    "environment": {"PYTHONPATH": runtime_pythonpath},
-                    "excluded_cpu_ids": sorted(
-                        set(int(cpu) for cpu in args.exclude_cpu)
+                    "environment": {
+                        "PYTHONPATH": runtime_pythonpath,
+                        **native_thread_environment,
+                    },
+                    "excluded_cpu_ids": (
+                        [] if cpu_plan is None else cpu_plan["excluded_cpu_ids"]
                     ),
+                    "cpu_resource_plan": cpu_plan,
                     "policy_artifact_json": (
                         str(artifact_path)
                         if policy_artifact_json is None
@@ -677,13 +645,25 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    excluded_cpu_ids = tuple(sorted(set(int(cpu) for cpu in args.exclude_cpu)))
-    if excluded_cpu_ids:
+    if cpu_plan is not None:
+        # Reject cpuset changes during model/config preparation; never execute
+        # with a mask different from the one shown in the resolved plan.
+        if sorted(os.sched_getaffinity(0)) != cpu_plan["allowed_cpu_ids_before"]:
+            raise RuntimeError("launcher CPU affinity changed after resource planning")
+        excluded_cpu_ids = tuple(cpu_plan["excluded_cpu_ids"])
         reservation = _exclude_server_cpus_before_exec(excluded_cpu_ids)
         print(
             "[OpenPICPU] READY: server process excludes control CPUs "
             f"{list(excluded_cpu_ids)}; migrated_native_threads="
-            f"{reservation['native_threads_migrated']} inherited_after_exec=true.",
+            f"{reservation['native_threads_migrated']} inherited_after_exec=true; "
+            f"resource_plan={json.dumps(cpu_plan, sort_keys=True)}",
+            flush=True,
+        )
+    if native_thread_environment:
+        os.environ.update(native_thread_environment)
+        print(
+            "[OpenPICPU] READY: native math thread pools capped at "
+            f"{args.native_thread_count}; inherited_after_exec=true.",
             flush=True,
         )
     os.environ["PYTHONPATH"] = runtime_pythonpath

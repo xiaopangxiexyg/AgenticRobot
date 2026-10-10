@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager, nullcontext
 import copy
 import dataclasses
 import hashlib
@@ -11,10 +10,20 @@ import importlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
 import types
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Any, Iterator, Mapping
+
+from deployments.openpi.cpu_resources import (
+    add_cpu_resource_arguments,
+    bootstrap_training_cpu_resources,
+    require_cpu_resource_cli,
+)
+
+if __name__ == "__main__":
+    bootstrap_training_cpu_resources("deployments.openpi.training.prepared_skill_launch")
 
 import numpy as np
 
@@ -3153,7 +3162,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save-interval", type=int, default=None)
     parser.add_argument("--skip-source-file-verification", action="store_true")
     parser.add_argument("--no-motion", action="store_true", help=argparse.SUPPRESS)
+    add_cpu_resource_arguments(parser, check_only=True)
     args = parser.parse_args(argv)
+    require_cpu_resource_cli(args, parser)
     if args.resume and args.overwrite:
         parser.error("--resume and --overwrite are mutually exclusive")
     if args.sample_load_images and args.command != "sample-check":

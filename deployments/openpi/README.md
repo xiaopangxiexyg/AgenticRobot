@@ -415,6 +415,26 @@ local_robot.output_action_dim=16
 dataset_adapter.camera_slots=[left_wrist_0_rgb,right_wrist_0_rgb]
 ```
 
+### 可选 CPU 资源隔离
+
+server 与训练入口支持默认关闭的 `--exclude-cpu`、`--exclude-llc-of-cpu` 和
+`--native-thread-count`。前两项从进程继承的 CPU mask 中排除指定 CPU 或其完整
+last-level cache 组；拓扑缺失、请求不合法或结果为空时停止，不扩大原有 mask。
+线程数选项在 exec 前设置 OMP/MKL/OpenBLAS/NumExpr/BLIS/Accelerate 环境变量，
+不代表限制全部 JAX/XLA 线程，也不授予系统级独占或实时保证。
+
+训练入口必须通过 `python -m` 在 NumPy、PyTorch 或 JAX 导入前应用资源选项；
+直接调用已初始化进程中的 `main()` 不能使用这些选项。可先检查资源计划：
+
+```bash
+python -m deployments.openpi.training.prepared_skill_launch \
+  --native-thread-count 1 --cpu-resource-check-only
+```
+
+该检查不修改亲和性、不加载模型，也不验证训练 profile。server 的 `--dry-run`
+会报告计划及 native thread 环境；真正 exec 前会再次核对 mask。省略资源选项时
+不读取拓扑、不修改亲和性或 native thread 环境；checkpoint、训练及 RTC 合同保持原路径。
+
 ## 4. 无硬件 websocket 预检
 
 此命令只连接 server、读取 metadata 并验证 artifact；不打开相机、不连接机械臂或夹爪、不发送动作。

@@ -7,6 +7,8 @@ from pathlib import Path
 import threading
 from typing import Any, Iterable
 
+from robot_motion.cpu_topology import cpu_last_level_cache_ids
+
 
 def available_cpu_ids() -> tuple[int, ...]:
     """Return CPUs currently available to the calling thread.
@@ -281,6 +283,7 @@ def exclude_cpu_ids_from_current_process(
 __all__ = [
     "available_cpu_ids",
     "bind_current_thread_to_cpu",
+    "cpu_last_level_cache_ids",
     "cpu_thread_sibling_ids",
     "exclude_cpu_ids_from_current_process",
 ]

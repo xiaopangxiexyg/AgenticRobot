@@ -19,6 +19,15 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from deployments.openpi.cpu_resources import (
+    add_cpu_resource_arguments,
+    bootstrap_training_cpu_resources,
+    require_cpu_resource_cli,
+)
+
+if __name__ == "__main__":
+    bootstrap_training_cpu_resources("deployments.openpi.corrected_train")
+
 from dataset_interface.camera_semantic_prepared_view import (
     is_camera_semantic_prepared_view,
     load_camera_semantic_prepared_view,
@@ -84,6 +93,7 @@ def _parser() -> argparse.ArgumentParser:
             "The view is rejected by default because it is not a full v2.3 dataset."
         ),
     )
+    add_cpu_resource_arguments(parser, check_only=True)
     return parser
 
 
@@ -307,7 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     wrapper_argv, training_argv = _split_args(
         sys.argv[1:] if argv is None else argv
     )
-    args = _parser().parse_args(wrapper_argv)
+    parser = _parser()
+    args = parser.parse_args(wrapper_argv)
+    require_cpu_resource_cli(args, parser)
     if args.sample_check and not args.dry_run:
         raise ValueError("--sample-check requires --dry-run.")
     registry = args.camera_role_registry.expanduser().resolve()

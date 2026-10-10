@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -12,9 +15,9 @@ from dataset_contracts import (
     PolicyCameraInputContract,
 )
 from dataset_contracts.v22 import PolicyIOLayout
+from deployments.openpi import cpu_resources
 from deployments.openpi import server as openpi_server
 from deployments.openpi.client import real as openpi_real
-
 
 pytestmark = pytest.mark.integration
 
@@ -105,6 +108,7 @@ def test_client_checkpoint_dir_rejects_missing_artifact(tmp_path: Path) -> None:
 def test_server_dry_run_builds_registry_from_artifact(
     tmp_path: Path, capsys, monkeypatch
 ) -> None:
+    monkeypatch.setattr(openpi_server.os, "sched_getaffinity", lambda _pid: {0, 1, 14, 15})
     openpi_root = tmp_path / "openpi"
     checkpoint, artifact = _write_checkpoint(openpi_root)
     (openpi_root / "scripts").mkdir()
@@ -129,6 +133,8 @@ def test_server_dry_run_builds_registry_from_artifact(
             "14",
             "--exclude-cpu",
             "15",
+            "--native-thread-count",
+            "3",
             "--dry-run",
         ]
     ) == 0
@@ -141,6 +147,8 @@ def test_server_dry_run_builds_registry_from_artifact(
         Path(openpi_server.__file__).resolve().parents[2]
     )
     assert report["excluded_cpu_ids"] == [14, 15]
+    for variable in cpu_resources.NATIVE_THREAD_ENVIRONMENT_VARIABLES:
+        assert report["environment"][variable] == "3"
     registry_path = Path(report["command"][report["command"].index("--registry") + 1])
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     entry = registry["models"][artifact.model_id]
@@ -231,6 +239,7 @@ def test_server_applies_process_cpu_exclusion_immediately_before_exec(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(openpi_server.os, "sched_getaffinity", lambda _pid: {0, 1, 14, 15})
     openpi_root = tmp_path / "openpi"
     checkpoint, _artifact = _write_checkpoint(openpi_root)
     (openpi_root / "scripts").mkdir()
@@ -245,6 +254,8 @@ def test_server_applies_process_cpu_exclusion_immediately_before_exec(
     )
     monkeypatch.setattr(openpi_server.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(openpi_server.os, "chdir", lambda _path: None)
+    inherited_environment: dict[str, str] = {}
+    monkeypatch.setattr(openpi_server.os, "environ", inherited_environment)
     calls: list[tuple[int, ...]] = []
 
     def fake_exclude(cpu_ids):
@@ -271,7 +282,178 @@ def test_server_applies_process_cpu_exclusion_immediately_before_exec(
             "15",
             "--exclude-cpu",
             "14",
+            "--native-thread-count",
+            "2",
         ]
     ) == 0
 
     assert calls == [(14, 15)]
+    assert inherited_environment["PYTHONPATH"].split(":")[0] == str(
+        Path(openpi_server.__file__).resolve().parents[2]
+    )
+    for variable in cpu_resources.NATIVE_THREAD_ENVIRONMENT_VARIABLES:
+        assert inherited_environment[variable] == "2"
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "not-an-int"))
+def test_server_rejects_invalid_native_thread_count(
+    tmp_path: Path,
+    capsys,
+    value: str,
+) -> None:
+    openpi_root = tmp_path / "openpi"
+    checkpoint, _artifact = _write_checkpoint(openpi_root)
+    _write_openpi_runtime_checkout(openpi_root)
+
+    with pytest.raises(SystemExit) as exc_info:
+        openpi_server.main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--openpi-root",
+                str(openpi_root),
+                "--native-thread-count",
+                value,
+                "--dry-run",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "thread count" in capsys.readouterr().err
+
+
+def test_server_default_does_not_read_or_change_cpu_affinity(monkeypatch):
+    monkeypatch.delattr(openpi_server.os, "sched_getaffinity", raising=False)
+    assert openpi_server._server_cpu_exclusion_plan([], []) is None
+
+
+def test_server_llc_plan_intersects_inherited_mask_without_broadening(monkeypatch):
+    monkeypatch.setattr(
+        openpi_server.os, "sched_getaffinity", lambda _pid: {7, 8, 23, 24}
+    )
+    monkeypatch.setattr(
+        cpu_resources,
+        "cpu_last_level_cache_ids",
+        lambda cpu: tuple(range(8)) + tuple(range(16, 24)),
+    )
+    monkeypatch.setattr(
+        openpi_server.os,
+        "sched_setaffinity",
+        lambda *a: pytest.fail("plan must be read-only"),
+    )
+    plan = openpi_server._server_cpu_exclusion_plan([24], [6, 6])
+    assert plan["excluded_cpu_ids"] == [7, 23, 24]
+    assert plan["effective_cpu_ids"] == [8]
+    assert plan["last_level_cache_groups"] == [
+        {"control_cpu": 6, "shared_cpu_ids": list(range(8)) + list(range(16, 24))}
+    ]
+
+
+def test_server_llc_plan_fails_closed_when_no_group_remains(monkeypatch):
+    monkeypatch.setattr(openpi_server.os, "sched_getaffinity", lambda _pid: {6, 22})
+    monkeypatch.setattr(cpu_resources, "cpu_last_level_cache_ids", lambda cpu: (6, 22))
+    with pytest.raises(RuntimeError, match="no runnable CPU"):
+        openpi_server._server_cpu_exclusion_plan([], [6])
+    with pytest.raises(RuntimeError, match="outside.*mask"):
+        openpi_server._server_cpu_exclusion_plan([7], [])
+
+
+def test_server_llc_dry_run_matches_exec_resource_plan(tmp_path, capsys, monkeypatch):
+    root = tmp_path / "openpi"
+    checkpoint, _ = _write_checkpoint(root)
+    _write_openpi_runtime_checkout(root)
+    monkeypatch.setattr(openpi_server.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        openpi_server.os, "sched_getaffinity", lambda _pid: set(range(32))
+    )
+    monkeypatch.setattr(
+        cpu_resources,
+        "cpu_last_level_cache_ids",
+        lambda cpu: tuple(range(8)) + tuple(range(16, 24)),
+    )
+    monkeypatch.setattr(
+        openpi_server.os,
+        "sched_setaffinity",
+        lambda *a: pytest.fail("dry-run must not bind"),
+    )
+    argv = [
+        "--checkpoint-dir",
+        str(checkpoint),
+        "--openpi-root",
+        str(root),
+        "--exclude-llc-of-cpu",
+        "6",
+        "--native-thread-count",
+        "1",
+    ]
+    assert openpi_server.main([*argv, "--dry-run"]) == 0
+    plan = json.loads(capsys.readouterr().out)["cpu_resource_plan"]
+    assert plan["effective_cpu_ids"] == list(range(8, 16)) + list(range(24, 32))
+    calls = []
+
+    def exclude(cpu_ids):
+        calls.append(list(cpu_ids))
+        return {"native_threads_migrated": 1}
+
+    monkeypatch.setattr(openpi_server, "_exclude_server_cpus_before_exec", exclude)
+    monkeypatch.setattr(openpi_server.os, "chdir", lambda path: None)
+    monkeypatch.setattr(openpi_server.os, "execv", lambda *a: None)
+    monkeypatch.setattr(openpi_server.os, "environ", {})
+    assert openpi_server.main(argv) == 0
+    assert calls == [plan["excluded_cpu_ids"]]
+    assert openpi_server.os.environ["OMP_NUM_THREADS"] == "1"
+    # A cpuset change during configuration must stop before exec/binding.
+    masks = iter([set(range(32)), {8, 24}])
+    monkeypatch.setattr(openpi_server.os, "sched_getaffinity", lambda _pid: next(masks))
+    monkeypatch.setattr(
+        openpi_server.os, "execv", lambda *a: pytest.fail("must not exec")
+    )
+    with pytest.raises(RuntimeError, match="affinity changed"):
+        openpi_server.main(argv)
+    assert len(calls) == 1
+
+
+def test_server_real_exec_inherits_resource_group_without_loading_model(tmp_path):
+    from robot_motion.runtime import cpu_last_level_cache_ids
+
+    if not hasattr(os, "sched_getaffinity"):
+        pytest.skip("Linux affinity is unavailable")
+    before = set(os.sched_getaffinity(0))
+    cpu = min(before)
+    shared = set(cpu_last_level_cache_ids(cpu))
+    target = before - shared
+    if not target:
+        pytest.skip("fixture requires two allowed cache domains")
+    root = tmp_path / "openpi"
+    checkpoint, _ = _write_checkpoint(root)
+    _write_openpi_runtime_checkout(root)
+    (root / "scripts/serve_dexteleop_policy.py").write_text(
+        "import json, os\n"
+        "print(json.dumps({'cpus': sorted(os.sched_getaffinity(0)), "
+        "'omp': os.environ['OMP_NUM_THREADS']}))\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "deployments.openpi.server",
+            "--checkpoint-dir",
+            str(checkpoint),
+            "--openpi-root",
+            str(root),
+            "--exclude-llc-of-cpu",
+            str(cpu),
+            "--native-thread-count",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+        cwd=Path(openpi_server.__file__).resolve().parents[2],
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    report = json.loads(result.stdout.splitlines()[-1])
+    assert report == {"cpus": sorted(target), "omp": "1"}
+    assert set(os.sched_getaffinity(0)) == before

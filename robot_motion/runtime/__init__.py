@@ -109,6 +109,7 @@ from .worker_drain import (
 from .thread_affinity import (
     available_cpu_ids,
     bind_current_thread_to_cpu,
+    cpu_last_level_cache_ids,
     cpu_thread_sibling_ids,
     exclude_cpu_ids_from_current_process,
 )
@@ -202,6 +203,7 @@ __all__ = [
     "available_cpu_ids",
     "assess_dispatch_seam_inventory",
     "bind_current_thread_to_cpu",
+    "cpu_last_level_cache_ids",
     "cpu_thread_sibling_ids",
     "exclude_cpu_ids_from_current_process",
     "format_readiness_report",

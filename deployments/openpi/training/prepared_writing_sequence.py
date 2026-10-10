@@ -10,13 +10,22 @@ will advance only after verifying a checkpoint at the configured target step.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
+
+from deployments.openpi.cpu_resources import (
+    add_cpu_resource_arguments,
+    bootstrap_training_cpu_resources,
+    require_cpu_resource_cli,
+)
+
+if __name__ == "__main__":
+    bootstrap_training_cpu_resources("deployments.openpi.training.prepared_writing_sequence")
 
 from deployments.openpi.model_rtc_profile import (
     load_prepared_model_rtc_profile,
@@ -296,7 +305,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Inspect and verify stage decisions without starting training.",
     )
+    add_cpu_resource_arguments(parser, check_only=True)
     args = parser.parse_args(argv)
+    require_cpu_resource_cli(args, parser)
     return run_sequence(dry_run=args.dry_run)
 
 

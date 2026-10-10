@@ -1,10 +1,65 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 
+from robot_motion import cpu_topology
 from robot_motion.runtime import thread_affinity
+
+
+@pytest.fixture
+def cache_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        cpu_topology,
+        "Path",
+        lambda path: tmp_path / str(path).removeprefix("/sys/devices/system/cpu/"),
+    )
+    return tmp_path
+
+
+def _cache(root: Path, index: int, level: int, kind: str, shared: str) -> None:
+    entry = root / "cpu6" / "cache" / f"index{index}"
+    entry.mkdir(parents=True)
+    for name, value in {
+        "level": str(level),
+        "type": kind,
+        "shared_cpu_list": shared,
+    }.items():
+        (entry / name).write_text(value, encoding="utf-8")
+
+
+def test_last_level_cache_uses_level_not_index_and_preserves_smt(cache_root):
+    _cache(cache_root, 9, 1, "Data", "6,22")
+    _cache(cache_root, 5, 2, "Unified", "6,22")
+    _cache(cache_root, 2, 3, "Unified", "0-7,16-23")
+    _cache(cache_root, 4, 4, "Instruction", "6")
+    assert thread_affinity.cpu_last_level_cache_ids(6) == tuple(range(8)) + tuple(
+        range(16, 24)
+    )
+
+
+@pytest.mark.parametrize("shared", ["", "7", "6,-1", "7-6", "6,", "six", "6-7-8"])
+def test_last_level_cache_rejects_malformed_topology(cache_root, shared):
+    _cache(cache_root, 0, 3, "Unified", shared)
+    with pytest.raises(RuntimeError, match="topology"):
+        thread_affinity.cpu_last_level_cache_ids(6)
+
+
+def test_last_level_cache_missing_or_ambiguous_is_not_smt_fallback(cache_root):
+    with pytest.raises(RuntimeError, match="unavailable"):
+        thread_affinity.cpu_last_level_cache_ids(6)
+    _cache(cache_root, 0, 3, "Unified", "6,22")
+    _cache(cache_root, 1, 3, "Data", "6-7,22-23")
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        thread_affinity.cpu_last_level_cache_ids(6)
+
+
+@pytest.mark.parametrize("cpu", [-1, True, 1.5])
+def test_last_level_cache_rejects_invalid_cpu(cpu):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        thread_affinity.cpu_last_level_cache_ids(cpu)
 
 
 def test_cpu_thread_sibling_ids_parses_linux_cpu_lists(monkeypatch) -> None:

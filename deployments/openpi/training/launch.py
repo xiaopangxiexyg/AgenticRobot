@@ -22,9 +22,18 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any, Mapping
+
+from deployments.openpi.cpu_resources import (
+    add_cpu_resource_arguments,
+    bootstrap_training_cpu_resources,
+    require_cpu_resource_cli,
+)
+
+if __name__ == "__main__":
+    bootstrap_training_cpu_resources("deployments.openpi.training.launch")
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.model_continuation import (
@@ -320,6 +329,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resolve and print contracts without loading data/model weights.",
     )
+    add_cpu_resource_arguments(parser, check_only=True)
     return parser
 
 
@@ -628,7 +638,9 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    require_cpu_resource_cli(args, parser)
     config, summary = build_train_config(args)
     print(json.dumps(summary, indent=2, sort_keys=True))
     if args.dry_run:
