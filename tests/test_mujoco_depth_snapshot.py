@@ -8,7 +8,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from robot_motion.deploy.schema import xyzquat_to_pose_matrix
 from sim.mujoco.depth_snapshot import MujocoDepthSnapshotSource
+from sim.mujoco.pointcloud import pointcloud_from_depth
 from sim.mujoco.rgb_snapshot import MujocoRgbSnapshotSource
 
 
@@ -93,7 +95,7 @@ def test_depth_snapshot_is_native_metric_float32_with_zero_invalid() -> None:
         "cy": 1.0,
         "fovy_deg": 90.0,
     }
-    assert frame.camera_pose_world_xyz_quat_xyzw == (0, 0, 1, 0, 0, 0, 1)
+    assert frame.camera_pose_world_xyz_quat_xyzw == (0, 0, 1, 1, 0, 0, 0)
 
     again = source.capture_npy_frame(view_id="front")
     assert again.data == frame.data
@@ -320,6 +322,22 @@ def test_real_mujoco_rgbd_context_survives_caller_thread_changes() -> None:
                 values = np.load(io.BytesIO(depth.data), allow_pickle=False)
                 assert values.shape == ((2, 2) if view_id == "front" else (1, 3))
                 assert np.isfinite(values).all() and (values > 0).all()
+                cloud = pointcloud_from_depth(
+                    values,
+                    fovy_deg=float(depth.intrinsics["fovy_deg"]),
+                    T_world_camera=xyzquat_to_pose_matrix(
+                        depth.camera_pose_world_xyz_quat_xyzw
+                    ),
+                    depth_min_m=0.05,
+                    depth_max_m=2.0,
+                )
+                assert cloud.points_world.size > 0
+                if view_id == "front":
+                    np.testing.assert_allclose(
+                        cloud.points_world[:, 2],
+                        0.0,
+                        atol=0.02,
+                    )
             caller.submit(source.close).result(timeout=10)
     finally:
         source.close()
