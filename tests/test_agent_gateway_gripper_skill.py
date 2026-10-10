@@ -216,6 +216,32 @@ def test_gateway_executes_closed_contact_settle_and_reuses_executor() -> None:
     assert len(port.holds) == 2
 
 
+def test_wire_adapter_observation_uses_receiver_admission_outcome() -> None:
+    port = FakeGripperPort([(0.2, False), (0.3, False)])
+    bundle = _sim_bundle(port)
+    session = assemble_gripper_agent_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        allowed_client_ids=("client:test",),
+        current_station_revision=lambda: 3,
+        clock_domain_id="clock:test",
+    )
+    adapter = session.wire_adapter(authenticated_client_id="client:test")
+
+    wire_snapshot = adapter.get_observation_snapshot()
+
+    admitted_snapshot = session.service.get_observation()
+    assert admitted_snapshot is not None
+    assert wire_snapshot == admitted_snapshot.to_wire()
+
+    session.close()
+    with pytest.raises(
+        RuntimeError,
+        match="Gateway observation publication failed: agent_gateway_service_closed",
+    ):
+        adapter.get_observation_snapshot()
+
+
 def test_open_result_cannot_claim_contact_settle() -> None:
     result = {
         "schema_version": SET_GRIPPER_STATE_RESULT_SCHEMA_V1,
