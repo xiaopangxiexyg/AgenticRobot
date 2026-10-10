@@ -859,12 +859,17 @@ class RealPerceptionGatewaySession:
     def close(self):
         with self._close_lock:
             if self._close_outcome is None:
-                self._close_outcome = self.service.close(
+                outcome = self.service.close(
                     current_station_revision=(
                         self.observation_producer.current_station_revision
                     )
                 )
-            outcome = self._close_outcome
+                if outcome.accepted:
+                    self._close_outcome = outcome
+            else:
+                outcome = self._close_outcome
+        if not outcome.accepted:
+            return outcome
         if not self.rgb_executor.wait_all(timeout_sec=5.0):
             raise RuntimeError("Passive RGB reads did not quiesce during close.")
         if not self.depth_executor.wait_all(timeout_sec=5.0):

@@ -77,6 +77,7 @@ class CameraOnlyRealPerceptionApplication:
         self.resources = resources
         self.server_factory = server_factory
         self._lock = threading.RLock()
+        self._close_lock = threading.Lock()
         self._state = CameraOnlyRealPerceptionApplicationState.CREATED
         self._server: object | None = None
 
@@ -89,11 +90,8 @@ class CameraOnlyRealPerceptionApplication:
         with self._lock:
             if self._state != CameraOnlyRealPerceptionApplicationState.CREATED:
                 raise RuntimeError("camera-only perception application starts once.")
-        resources_started = False
-        server = None
         try:
             self.resources.start()
-            resources_started = True
             # Publish one admitted planning snapshot before accepting requests.
             outcome = self.session.observation_producer.capture_and_publish(
                 self.session.service
@@ -101,36 +99,24 @@ class CameraOnlyRealPerceptionApplication:
             if not outcome.accepted or outcome.snapshot is None:
                 raise RuntimeError("camera-only startup observation was rejected.")
             server = self.server_factory()
+            with self._lock:
+                self._server = server
             for name in ("serve_forever", "shutdown", "server_close"):
                 if not callable(getattr(server, name, None)):
                     raise TypeError(f"server must expose {name}.")
             with self._lock:
-                self._server = server
                 self._state = CameraOnlyRealPerceptionApplicationState.RUNNING
         except Exception as start_error:
-            cleanup_errors = []
-            if server is not None:
-                try:
-                    server.server_close()
-                except Exception as exc:  # noqa: BLE001 - aggregate startup cleanup.
-                    cleanup_errors.append(f"gateway:{type(exc).__name__}:{exc}")
-            else:
-                try:
-                    self.session.close()
-                except Exception as exc:  # noqa: BLE001 - aggregate startup cleanup.
-                    cleanup_errors.append(f"gateway:{type(exc).__name__}:{exc}")
-            if resources_started:
-                try:
-                    self.resources.close()
-                except Exception as exc:  # noqa: BLE001 - aggregate startup cleanup.
-                    cleanup_errors.append(f"resources:{type(exc).__name__}:{exc}")
-            with self._lock:
-                self._state = CameraOnlyRealPerceptionApplicationState.FAULT
-            if cleanup_errors:
+            try:
+                self.close()
+            except Exception as cleanup_error:  # noqa: BLE001 - retain both failures.
                 raise RuntimeError(
                     "camera-only perception startup cleanup failed: "
-                    + "; ".join(cleanup_errors)
+                    f"{type(cleanup_error).__name__}:{cleanup_error}"
                 ) from start_error
+            finally:
+                with self._lock:
+                    self._state = CameraOnlyRealPerceptionApplicationState.FAULT
             raise
 
     def serve_forever(
@@ -161,35 +147,46 @@ class CameraOnlyRealPerceptionApplication:
         return True
 
     def close(self) -> None:
-        with self._lock:
-            if self._state == CameraOnlyRealPerceptionApplicationState.CLOSED:
-                return
-            server = self._server
-        errors = []
-        if server is not None:
+        """Fence reads and retain dependencies until workers are quiescent."""
+
+        with self._close_lock:
+            with self._lock:
+                if self._state == CameraOnlyRealPerceptionApplicationState.CLOSED:
+                    return
+                server = self._server
+            errors = []
+            gateway_closed = False
+            # Transport close can record callback errors without raising them.
+            # Confirm the session fence and worker drain at the application owner.
             try:
-                server.server_close()
-            except Exception as exc:  # noqa: BLE001 - resources still must close.
+                outcome = self.session.close()
+                if not outcome.accepted:
+                    raise RuntimeError(
+                        "camera-only Gateway close was rejected: " + outcome.reason_code
+                    )
+                gateway_closed = True
+            except Exception as exc:  # noqa: BLE001 - retain dependencies for retry.
                 errors.append(f"gateway:{type(exc).__name__}:{exc}")
-        else:
-            try:
-                self.session.close()
-            except Exception as exc:  # noqa: BLE001 - resources still must close.
-                errors.append(f"gateway:{type(exc).__name__}:{exc}")
-        try:
-            self.resources.close()
-        except Exception as exc:  # noqa: BLE001 - aggregate cleanup evidence.
-            errors.append(f"resources:{type(exc).__name__}:{exc}")
-        with self._lock:
-            self._state = (
-                CameraOnlyRealPerceptionApplicationState.CLOSED
-                if not errors
-                else CameraOnlyRealPerceptionApplicationState.FAULT
-            )
-        if errors:
-            raise RuntimeError(
-                "camera-only perception shutdown failed: " + "; ".join(errors)
-            )
+            if server is not None:
+                try:
+                    server.server_close()
+                except Exception as exc:  # noqa: BLE001 - still attempt safe cleanup.
+                    errors.append(f"transport:{type(exc).__name__}:{exc}")
+            if gateway_closed:
+                try:
+                    self.resources.close()
+                except Exception as exc:  # noqa: BLE001 - preserve retryable cleanup.
+                    errors.append(f"resources:{type(exc).__name__}:{exc}")
+            with self._lock:
+                self._state = (
+                    CameraOnlyRealPerceptionApplicationState.CLOSED
+                    if not errors
+                    else CameraOnlyRealPerceptionApplicationState.FAULT
+                )
+            if errors:
+                raise RuntimeError(
+                    "camera-only perception shutdown failed: " + "; ".join(errors)
+                )
 
 
 @dataclass(frozen=True)

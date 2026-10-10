@@ -508,6 +508,10 @@ motion action, or `--confirm`. The selected collision-scene profile is read only
 to derive fixed arm-base geometry for static camera poses; it does not construct
 or connect a robot backend.
 
+相机应用关闭时，先确认 Gateway 已停止准入且所有只读任务已经结束，再释放模型、
+相机和 Artifact store。任务等待超时或关闭被拒绝时，应用返回 `FAULT` 并保留这些依赖；
+任务结束后可再次调用 `close()` 完成清理。启动失败也使用同一关闭流程。
+
 `--enable-object-localization` adds the supplied-image localization Route after
 loading its reviewed model bundle. `--enable-point-grasp` is a separate,
 default-off module and requires that same localizer plus a reviewed point-grasp

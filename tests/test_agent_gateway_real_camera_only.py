@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from agent_gateway.profiles.real import perception_cli, realsense_perception
 from agent_gateway.profiles.real.perception_application import (
@@ -230,6 +231,178 @@ def test_camera_only_application_starts_cameras_before_socket_and_closes_cleanly
         "close-gateway",
         "close-cameras",
     ]
+
+
+def _trace_resource_close(composition, monkeypatch):
+    calls = []
+    original_close = composition.resources.close
+
+    def close():
+        calls.append("close-resources")
+        original_close()
+
+    monkeypatch.setattr(composition.resources, "close", close)
+    return calls
+
+
+@pytest.mark.parametrize("with_server", [False, True])
+def test_camera_only_close_retains_dependencies_until_reads_quiesce(
+    monkeypatch,
+    tmp_path,
+    with_server,
+) -> None:
+    composition = _composition(tmp_path)
+    settled = [False]
+    composition.session.segmentation_executor = SimpleNamespace(
+        wait_all=lambda **kwargs: settled[0],
+    )
+    calls = _trace_resource_close(composition, monkeypatch)
+    server = None
+    if with_server:
+        server = composition.application.server_factory()
+        composition.application._server = server
+    try:
+        with pytest.raises(RuntimeError, match="segmentation did not quiesce"):
+            composition.application.close()
+        assert (
+            composition.application.state
+            == CameraOnlyRealPerceptionApplicationState.FAULT
+        )
+        assert calls == []
+        if server is not None:
+            assert isinstance(server.gateway_close_error, RuntimeError)
+            assert not Path(server.socket_path).exists()
+
+        settled[0] = True
+        composition.application.close()
+        assert (
+            composition.application.state
+            == CameraOnlyRealPerceptionApplicationState.CLOSED
+        )
+        assert calls == ["close-resources"]
+        if server is not None:
+            assert server.gateway_close_error is None
+        composition.application.close()
+        assert calls == ["close-resources"]
+    finally:
+        settled[0] = True
+        composition.application.close()
+
+
+@pytest.mark.parametrize("with_server", [False, True])
+def test_camera_only_rejected_gateway_close_is_retryable(
+    monkeypatch,
+    tmp_path,
+    with_server,
+) -> None:
+    composition = _composition(tmp_path)
+    accepted = [False]
+    original_close = composition.session.service.close
+
+    def close_gateway(**kwargs):
+        if not accepted[0]:
+            return SimpleNamespace(
+                accepted=False, reason_code="injected_close_rejection"
+            )
+        return original_close(**kwargs)
+
+    monkeypatch.setattr(composition.session.service, "close", close_gateway)
+    calls = _trace_resource_close(composition, monkeypatch)
+    if with_server:
+        composition.application._server = composition.application.server_factory()
+    try:
+        with pytest.raises(RuntimeError, match="injected_close_rejection"):
+            composition.application.close()
+        assert (
+            composition.application.state
+            == CameraOnlyRealPerceptionApplicationState.FAULT
+        )
+        assert calls == []
+
+        accepted[0] = True
+        composition.application.close()
+        assert (
+            composition.application.state
+            == CameraOnlyRealPerceptionApplicationState.CLOSED
+        )
+        assert calls == ["close-resources"]
+    finally:
+        accepted[0] = True
+        composition.application.close()
+
+
+def test_camera_only_startup_cleanup_defers_dependencies_until_reads_quiesce(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        realsense_perception, "start_realsense_sources", lambda sources: None
+    )
+    monkeypatch.setattr(
+        realsense_perception, "admit_realsense_sources", lambda sources: None
+    )
+    composition = _composition(tmp_path)
+    settled = [False]
+    composition.session.segmentation_executor = SimpleNamespace(
+        wait_all=lambda **kwargs: settled[0],
+    )
+    calls = _trace_resource_close(composition, monkeypatch)
+
+    def fail_server_factory():
+        raise RuntimeError("socket allocation failed")
+
+    composition.application.server_factory = fail_server_factory
+    try:
+        with pytest.raises(RuntimeError, match="startup cleanup failed") as error:
+            composition.application.start()
+        assert str(error.value.__cause__) == "socket allocation failed"
+        assert (
+            composition.application.state
+            == CameraOnlyRealPerceptionApplicationState.FAULT
+        )
+        assert calls == []
+        settled[0] = True
+        composition.application.close()
+        assert (
+            composition.application.state
+            == CameraOnlyRealPerceptionApplicationState.CLOSED
+        )
+        assert calls == ["close-resources"]
+    finally:
+        settled[0] = True
+        composition.application.close()
+
+
+def test_camera_only_resource_cleanup_failure_remains_retryable(
+    monkeypatch, tmp_path
+) -> None:
+    composition = _composition(tmp_path)
+    calls = []
+    original_close = composition.resources.close
+
+    def fail_once():
+        calls.append("close-resources")
+        if len(calls) == 1:
+            raise RuntimeError("store close failed")
+        original_close()
+
+    monkeypatch.setattr(composition.resources, "close", fail_once)
+    try:
+        with pytest.raises(RuntimeError, match="store close failed"):
+            composition.application.close()
+        assert (
+            composition.application.state
+            == CameraOnlyRealPerceptionApplicationState.FAULT
+        )
+        composition.application.close()
+        assert (
+            composition.application.state
+            == CameraOnlyRealPerceptionApplicationState.CLOSED
+        )
+        composition.application.close()
+        assert calls == ["close-resources", "close-resources"]
+    finally:
+        composition.application.close()
 
 
 def test_real_perception_cli_is_discoverable_without_importing_hardware() -> None:
