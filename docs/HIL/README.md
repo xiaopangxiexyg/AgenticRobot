@@ -100,6 +100,9 @@ operator/browser
   和 capture finalize；
 - closing/refreshing browser 不等于结束 control runtime，browser 生命周期必须由
   application-owned handle 管理；
+- allocation cycle 在 policy/Human 接纳完成后关闭 source receiver cut，并在 allocation
+  basis 构造/发布后再次关闭 proposal cut；immediate target 随当前 cut 前移，scheduled
+  target 保留原定时刻。它不改 source 时间戳或 support deadline，过期 proposal 仍由下层拒绝；
 - ControlTrace 记录 source、composition、target/reference、measurement、difference、HOLD
   与 commit 事实，但不反向授予 authority；
 - 当前 ControlTrace core 不等同于包含相机、触觉和 native streams 的正式训练数据集；

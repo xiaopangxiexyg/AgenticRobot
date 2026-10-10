@@ -379,6 +379,15 @@ class MujocoAllocationControlCycleBinding(SimHILAllocationActivationBinding):
             allocation_cycle = self.allocation_publication_port.offer_basis(
                 lambda: basis
             )
+        # Basis construction/publication may admit receiver facts after the
+        # source cut. Close that boundary before proposal evaluation; an
+        # immediate target follows the new cut, while scheduled targets keep
+        # their exact deadline and remain subject to lower late admission.
+        cutoff_at = max(cutoff_at, float(self.runtime.clock()))
+        if self.runtime.reference_activation_spec.activation_mode == (
+            "immediate_target"
+        ):
+            target = max(target, cutoff_at)
         return source, allocation_cycle, cutoff_at, target
 
     def execute_lower(self, *, now: float) -> AuthoritativeControlStep:

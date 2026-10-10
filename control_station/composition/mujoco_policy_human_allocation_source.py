@@ -125,6 +125,7 @@ class MujocoPolicyHumanAllocationSourcePublisher:
                 policy_emission,
                 observed_at,
             )
+            observed_at = max(observed_at, float(self.clock()))
         human_submission = None
         if selected_human is not None:
             human_submission = self.publish_human_input(
@@ -132,6 +133,12 @@ class MujocoPolicyHumanAllocationSourcePublisher:
                 observed_at,
                 target,
             )
+            observed_at = max(observed_at, float(self.clock()))
+
+        # Receiver admission can take time too. The returned cut must include
+        # both completed receipts; it must not reuse the pre-admission cut and
+        # accidentally select an older input or allocation context. Source
+        # timestamps and their support deadlines are unchanged.
 
         # A non-null supplied human emission marks activation prime. Both
         # required contributors must cross their receiver boundary before the

@@ -175,6 +175,43 @@ def test_source_publisher_prime_requires_both_receiver_admissions() -> None:
         publisher(10.0, _emission(), human, False, 10.0)
 
 
+def test_source_cut_includes_completed_policy_and_human_admissions() -> None:
+    clock_state = {"now": 10.0}
+    observed_cuts = []
+    human = _human_emission(
+        sequence=1,
+        emitted_at=10.0,
+        arm_x=0.1,
+        hand_qpos=0.2,
+    )
+
+    def publish_policy(_emission, observed_at):
+        observed_cuts.append(("policy", observed_at))
+        clock_state["now"] = 10.02
+        return SimpleNamespace(accepted=True)
+
+    def publish_human(_emission, observed_at, _target):
+        observed_cuts.append(("human", observed_at))
+        clock_state["now"] = 10.03
+        return SimpleNamespace(accepted=True)
+
+    publisher = MujocoPolicyHumanAllocationSourcePublisher(
+        human_source=SimpleNamespace(
+            step=lambda **_kwargs: SimpleNamespace(emission=human)
+        ),
+        publish_policy_input=publish_policy,
+        publish_human_input=publish_human,
+        clock=lambda: clock_state["now"],
+        clock_domain_id="control.monotonic",
+    )
+
+    result = publisher(10.0, _emission(), None, True, 10.04)
+
+    assert observed_cuts == [("policy", 10.0), ("human", 10.02)]
+    assert result.observed_at == pytest.approx(10.03)
+    assert human.emitted_at == pytest.approx(10.0)
+
+
 def _cycle_port(
     fixture,
     *,
@@ -350,6 +387,43 @@ def test_post_source_observation_closes_basis_proposal_and_execution_cut() -> No
         assert cycle.composition_step.control_cut.cutoff_at == pytest.approx(10.03)
         assert basis_calls == [(10.03, 10.05)]
         assert lower_calls == [{"now": 10.03, "physics_ticks_after_dispatch": 0}]
+    finally:
+        port.close()
+        fixture.runtime.close()
+
+
+def test_proposal_cut_includes_time_spent_capturing_allocation_basis() -> None:
+    fixture = _fixture(enable_composer_authority=True)
+    source_calls = []
+    lower_calls = []
+
+    def capture_basis(_cutoff, _target) -> None:
+        fixture.clock.value = 10.07
+
+    port = _cycle_port(
+        fixture,
+        basis_factory=capture_basis,
+        source_calls=source_calls,
+        lower_calls=lower_calls,
+    )
+    try:
+        _activate_and_prime(port, fixture, now=10.01)
+        fixture.clock.value = 10.03
+        cycle = port.run_cycle(
+            now=10.03,
+            policy_emission=None,
+            poll_human=True,
+            target_effective_at=10.15,
+        )
+
+        assert cycle.publication.observed_at == pytest.approx(10.07)
+        assert cycle.composition_step.control_cut.cutoff_at == pytest.approx(10.07)
+        assert (
+            cycle.composition_step.submission.composition_evaluation.target_effective_at
+            == pytest.approx(10.15)
+        )
+        assert lower_calls == [{"now": 10.07, "physics_ticks_after_dispatch": 0}]
+        assert len(fixture.runtime.core.proposals) == 0
     finally:
         port.close()
         fixture.runtime.close()
