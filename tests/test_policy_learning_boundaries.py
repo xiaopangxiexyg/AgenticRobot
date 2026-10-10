@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from configparser import ConfigParser
 from pathlib import Path
 
@@ -10,14 +11,31 @@ from tests.support.repository_imports import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _registered_model_source_submodule_roots() -> tuple[Path, ...]:
+def _registered_model_source_submodule_roots(
+    repo_root: Path = REPO_ROOT,
+) -> tuple[Path, ...]:
     parser = ConfigParser()
-    parser.read(REPO_ROOT / ".gitmodules", encoding="utf-8")
-    model_root = REPO_ROOT / "model"
+    parser.read(repo_root / ".gitmodules", encoding="utf-8")
+    tracked = subprocess.run(
+        ["git", "ls-files", "--stage", "-z", "--", "model"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    gitlinks = {
+        path
+        for entry in tracked.split("\0")
+        if entry
+        for header, path in [entry.split("\t", 1)]
+        if header.split()[0] == "160000" and header.split()[2] == "0"
+    }
+    model_root = repo_root / "model"
     return tuple(
-        REPO_ROOT / parser.get(section, "path")
+        repo_root / parser.get(section, "path")
         for section in parser.sections()
-        if (REPO_ROOT / parser.get(section, "path")).parent == model_root
+        if parser.get(section, "path") in gitlinks
+        and model_root in (repo_root / parser.get(section, "path")).parents
     )
 
 
@@ -26,6 +44,31 @@ MODEL_SOURCE_SUBMODULE_ROOTS = _registered_model_source_submodule_roots()
 
 def _is_model_source_submodule_path(path: Path) -> bool:
     return any(root in path.parents for root in MODEL_SOURCE_SUBMODULE_ROOTS)
+
+
+def test_model_source_boundary_requires_registered_gitlinks(tmp_path: Path) -> None:
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "nested"]\npath = model/perception/vendor\n'
+        '[submodule "untracked"]\npath = model/untracked\n'
+        '[submodule "ordinary"]\npath = model/ordinary\n'
+        '[submodule "hardware"]\npath = hardware/vendor\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for path in ("model/perception/vendor", "model/unregistered", "hardware/vendor"):
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", "160000", "1" * 40, path],
+            cwd=tmp_path,
+            check=True,
+        )
+    ordinary = tmp_path / "model" / "ordinary"
+    ordinary.parent.mkdir()
+    ordinary.write_text("not a submodule", encoding="utf-8")
+    subprocess.run(["git", "add", "model/ordinary"], cwd=tmp_path, check=True)
+
+    assert _registered_model_source_submodule_roots(tmp_path) == (
+        tmp_path / "model/perception/vendor",
+    )
 
 
 def test_model_directory_is_artifact_only() -> None:
