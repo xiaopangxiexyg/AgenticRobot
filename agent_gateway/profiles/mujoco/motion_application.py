@@ -32,7 +32,11 @@ from sim.mujoco.depth_snapshot import (
     EncodedMujocoDepthFrame,
     MujocoDepthSnapshotSource,
 )
-from sim.mujoco.rgb_snapshot import EncodedMujocoRgbSnapshot, MujocoRgbSnapshotSource
+from sim.mujoco.rgb_snapshot import (
+    EncodedMujocoRgbFrame,
+    EncodedMujocoRgbSnapshot,
+    MujocoRgbSnapshotSource,
+)
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -343,27 +347,49 @@ class MujocoAgentSkillMotionApplication:
             )
             return MujocoAgentSkillMotionStep(admission, step)
 
+    def _capture_tcp_pose_from_scene(self, scene: Any) -> Mapping[str, tuple[float, ...]]:
+        if not bool(scene.state_is_finite()):
+            raise RuntimeError("MuJoCo scene state is non-finite.")
+        poses = capture_mujoco_sim_hil_tool_tcp_pose_by_side(scene, self.task_config)
+        vector = pose_matrix_to_xyzquat(poses["right"])
+        if vector is None:
+            raise RuntimeError("right_arm TCP pose is not representable.")
+        values = tuple(float(item) for item in vector)
+        if len(values) != 7 or not all(math.isfinite(item) for item in values):
+            raise RuntimeError("right_arm TCP pose is invalid.")
+        return {"right_arm": values}
+
     def capture_tcp_pose_by_component(self) -> Mapping[str, tuple[float, ...]]:
         """Capture measured TCP state under the application/rig lock."""
 
         with self._lock:
             if self._closed:
                 raise RuntimeError("Agent motion application is closed.")
+            return self.runtime.rig.capture_scene(self._capture_tcp_pose_from_scene)
 
-            def capture(scene: Any) -> Mapping[str, tuple[float, ...]]:
-                if not bool(scene.state_is_finite()):
-                    raise RuntimeError("MuJoCo scene state is non-finite.")
-                poses = capture_mujoco_sim_hil_tool_tcp_pose_by_side(
-                    scene,
-                    self.task_config,
-                )
-                vector = pose_matrix_to_xyzquat(poses["right"])
-                if vector is None:
-                    raise RuntimeError("right_arm TCP pose is not representable.")
-                values = tuple(float(item) for item in vector)
-                if len(values) != 7 or not all(math.isfinite(item) for item in values):
-                    raise RuntimeError("right_arm TCP pose is invalid.")
-                return {"right_arm": values}
+    def capture_arm_gripper_state(self) -> Mapping[str, object]:
+        """Read one measured scene cut for passive placement geometry."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+
+            def capture(scene: Any) -> Mapping[str, object]:
+                poses = self._capture_tcp_pose_from_scene(scene)
+                close = float(scene.get_gripper_close(self.task_config.right_gripper_name))
+                measured_at = float(self.runtime.clock())
+                if not math.isfinite(close) or not 0.0 <= close <= 1.0:
+                    raise RuntimeError("right_gripper close fraction is invalid.")
+                if not math.isfinite(measured_at):
+                    raise RuntimeError("MuJoCo measurement clock is non-finite.")
+                return {
+                    **poses,
+                    "right_gripper": {
+                        "close_fraction": close,
+                        "measured_at": measured_at,
+                        "state_source": "mujoco_scene_measured",
+                    },
+                }
 
             return self.runtime.rig.capture_scene(capture)
 
@@ -435,6 +461,18 @@ class MujocoAgentSkillMotionApplication:
         """Capture one passive native-resolution metric depth Artifact."""
 
         return self._depth_snapshot_source.capture_npy_frame(view_id=view_id)
+
+    def capture_visual_depth_cut(
+        self,
+        *,
+        view_id: str,
+    ) -> tuple[EncodedMujocoRgbFrame, EncodedMujocoDepthFrame]:
+        """Render RGB and depth from one rig-owned scene cut."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent motion application is closed.")
+            return self._depth_snapshot_source.capture_jpeg_npy_cut(view_id=view_id)
 
     def _capture_visual_scene(self, capture: Callable[[Any], Any]) -> Any:
         """Keep renderer access serialized with motion and lifecycle changes."""

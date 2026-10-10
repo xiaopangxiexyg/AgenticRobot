@@ -13,6 +13,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+from agent_gateway.profiles.segmentation import SegmentationRegistration
+from agent_gateway.profiles.placement import (
+    PlacementRegistration,
+    build_placement_registration,
+)
 from agent_gateway.protocol.skill_catalog import (
     AgentSkillSchemaCatalog,
     SkillDefinitionCatalog,
@@ -579,6 +584,8 @@ class RealAgentPrimitiveContractBundle:
     tcp_pose_observe: RealTcpPoseObserveContractBundle
     perception_capture: RealPerceptionCaptureRegistration | None = None
     localization_registration: RealObjectLocalizationRegistration | None = None
+    segmentation_registration: SegmentationRegistration | None = None
+    placement_registration: PlacementRegistration | None = None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -721,6 +728,29 @@ class RealAgentPrimitiveContractBundle:
             and self.perception_capture is None
         ):
             raise ValueError("Real point-grasp Routes require perception capture.")
+        if (
+            self.segmentation_registration is not None
+            and self.perception_capture is None
+        ):
+            raise ValueError("Real segmentation Route requires perception capture.")
+        if self.placement_registration is not None and (
+            self.segmentation_registration is None
+            or self.perception_capture is None
+            or self.perception_capture.back_projection is None
+        ):
+            raise ValueError(
+                "Real placement Route requires segmentation and back-projection."
+            )
+        if self.placement_registration is not None:
+            placement_profile = self.placement_registration.profile
+            if (
+                placement_profile.component_id != self.cardinal_profile.component_id
+                or placement_profile.reference_frame_id != public_frame[0]
+                or placement_profile.reference_frame_spec_hash != public_frame[1]
+                or placement_profile.frame_graph_hash
+                != self.frame_graph.semantic_content_hash
+            ):
+                raise ValueError("Real placement frame/component binding mismatch.")
         if grasp_approach_plan_enabled and not all(
             item is not None for item in optional_grasp
         ):
@@ -728,7 +758,13 @@ class RealAgentPrimitiveContractBundle:
         expected_route_count = (
             (11 + int(pose_target_enabled) + int(grasp_approach_enabled))
             + (2 if self.perception_capture is not None else 0)
+            + int(
+                self.perception_capture is not None
+                and self.perception_capture.back_projection is not None
+            )
             + (3 if self.localization_registration is not None else 0)
+            + int(self.segmentation_registration is not None)
+            + int(self.placement_registration is not None)
             + (2 if grasp_approach_plan_enabled else 0)
             + int(transport_enabled)
             + int(self.station_point_grasp_registration is not None
@@ -950,6 +986,7 @@ def build_real_agent_primitive_contract_bundle(
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     object_transport_registration: ObjectTransportRegistration | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
+    segmentation_registration: SegmentationRegistration | None = None,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -1494,11 +1531,35 @@ def build_real_agent_primitive_contract_bundle(
         )
     if localization_registration is not None and perception_capture is None:
         raise ValueError("Real point-grasp Routes require perception capture.")
+    if segmentation_registration is not None and perception_capture is None:
+        raise ValueError("Real segmentation Route requires perception capture.")
+    placement_registration = (
+        build_placement_registration(
+            segmentation=segmentation_registration,
+            back_projection=perception_capture.back_projection,
+            component_id=component_id,
+            destination_role="main",
+            runtime_session_id=attachment.runtime_session_id,
+            control_domain_id=attachment.control_domain_id,
+            target_binding_id=attachment.target_binding_id,
+            station_manifest_hash=attachment.station_manifest_hash,
+            execution_manifest_hash=attachment.execution_manifest_hash,
+        )
+        if segmentation_registration is not None
+        and perception_capture is not None
+        and perception_capture.back_projection is not None
+        else None
+    )
     perception_registrations = list(
         ()
         if perception_capture is None
         else (perception_capture.rgb, perception_capture.depth)
     )
+    if (
+        perception_capture is not None
+        and perception_capture.back_projection is not None
+    ):
+        perception_registrations.append(perception_capture.back_projection.skill)
     if localization_registration is not None:
         assert station_point_grasp_registration is not None
         assert station_point_grasp_render_registration is not None
@@ -1509,6 +1570,10 @@ def build_real_agent_primitive_contract_bundle(
                 station_point_grasp_render_registration.skill,
             )
         )
+    if segmentation_registration is not None:
+        perception_registrations.append(segmentation_registration.skill)
+    if placement_registration is not None:
+        perception_registrations.append(placement_registration.skill)
     if grasp_approach_plan_registration is not None:
         perception_registrations.append(grasp_approach_plan_registration.skill)
     grasp_observation_registration = (None if station_point_grasp_registration is None
@@ -1600,6 +1665,16 @@ def build_real_agent_primitive_contract_bundle(
                     ),
                 )
             )
+        if perception_capture.back_projection is not None:
+            back_projection = perception_capture.back_projection
+            route_items.append(
+                SkillRouteManifestEntry(
+                    route=back_projection.skill.routes[0],
+                    deployment_binding=back_projection.binding.to_ref(),
+                    evaluation_plan_hash=None,
+                    availability_hash=back_projection.availability_hash,
+                )
+            )
     if localization_registration is not None:
         assert station_point_grasp_registration is not None
         assert station_point_grasp_render_registration is not None
@@ -1628,6 +1703,24 @@ def build_real_agent_primitive_contract_bundle(
                     availability_hash=availability_hash,
                 )
             )
+    if segmentation_registration is not None:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=segmentation_registration.skill.routes[0],
+                deployment_binding=segmentation_registration.binding.to_ref(),
+                evaluation_plan_hash=None,
+                availability_hash=segmentation_registration.availability_hash,
+            )
+        )
+    if placement_registration is not None:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=placement_registration.skill.routes[0],
+                deployment_binding=placement_registration.binding.to_ref(),
+                evaluation_plan_hash=None,
+                availability_hash=placement_registration.availability_hash,
+            )
+        )
     if grasp_approach_plan_registration is not None:
         route_items.append(
             SkillRouteManifestEntry(
@@ -1779,7 +1872,14 @@ def build_real_agent_primitive_contract_bundle(
             *(
                 ()
                 if perception_capture is None
-                else perception_capture.payload_validators
+                else (
+                    *perception_capture.payload_validators,
+                    *(
+                        ()
+                        if perception_capture.back_projection is None
+                        else (perception_capture.back_projection.payload_validator,)
+                    ),
+                )
             ),
             *(
                 ()
@@ -1789,6 +1889,16 @@ def build_real_agent_primitive_contract_bundle(
                     station_point_grasp_registration.payload_validator,
                     station_point_grasp_render_registration.payload_validator,
                 )
+            ),
+            *(
+                ()
+                if segmentation_registration is None
+                else (segmentation_registration.payload_validator,)
+            ),
+            *(
+                ()
+                if placement_registration is None
+                else (placement_registration.payload_validator,)
             ),
             *(
                 ()
@@ -1815,6 +1925,8 @@ def build_real_agent_primitive_contract_bundle(
         tcp_pose_observe=tcp_pose_observe,
         perception_capture=perception_capture,
         localization_registration=localization_registration,
+        segmentation_registration=segmentation_registration,
+        placement_registration=placement_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration

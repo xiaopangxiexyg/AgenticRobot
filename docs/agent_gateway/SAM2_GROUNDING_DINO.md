@@ -1,11 +1,19 @@
-# SAM2 + Grounding DINO 物体定位 Skill
+# SAM2 + Grounding DINO 定位与分割 Skill
 
 `perception.localize_objects` 对一张 JPEG/PNG 执行只读物体定位：
 
 - `language_prompt=null`：SAM2 automatic mask generator 产生全图物体候选，再投影为 bounding box；
 - `language_prompt="apple"`：Grounding DINO 产生文本候选，SAM2 精化 mask，再返回 mask 的 bounding box；
 - 结果坐标固定为 `xyxy_pixel_0based_half_open`，同时返回一张画框后的 JPEG Artifact；
-- Skill 不读取相机、不控制机器人，也不取得 motion/HOLD authority。
+- 该 Skill 不读取相机、不控制机器人，也不取得 motion/HOLD authority。
+
+`perception.segment` 直接读取已注册的实时 RGB 相机，用同一个 SAM2 +
+Grounding DINO localizer 返回一个 mask：
+
+- 文本提示使用 Grounding DINO 定位后交给 SAM2 分割；
+- 像素点提示直接使用 SAM2；
+- 输出为 bool NPY mask 和 JPEG overlay 两个 Artifact；
+- Route 仍是 `read_only`，不发送运动或夹爪指令。
 
 ## 外部源码
 
@@ -122,6 +130,51 @@ python -m agent_gateway real-perception \
 
 模型在 Unix socket 发布前加载；缺少外部源码包、权重或正确 manifest 时启动失败。默认使用 `cuda`，
 调试 CPU 路径可显式传 `--object-localization-device cpu`，但不承诺实时性能。
+
+启用 object localizer 后，真机 perception Gateway 会在同一 endpoint 注册
+`perception.localize_objects` 和 `perception.segment`。RM65 主运动 Gateway 启用点抓姿
+组合时也会在同一 endpoint 注册 `perception.segment`，并复用点抓姿已加载的
+localizer，不再创建第二份模型。
+
+MuJoCo 主 Gateway 通过显式的可选资产参数启用同一 Skill：
+
+```bash
+python -m agent_gateway mujoco \
+  --artifact-root /absolute/path/to/runtime-artifacts \
+  --segmentation-asset-bundle \
+    "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
+  --segmentation-device cuda \
+  ...
+```
+
+不传模型 bundle 时不注册 `perception.segment`，也不加载模型；原有无模型
+Gateway 的 Route 和运行方式不变。
+
+## 实时分割输入
+
+`perception.segment` 要求一个相机角色、一个阈值，以及恰好一种 prompt：
+
+```json
+{
+  "role": "main",
+  "language_prompt": "red cube",
+  "target_pixel_uv": null,
+  "min_score": 0.35
+}
+```
+
+```json
+{
+  "role": "wrist_left",
+  "language_prompt": null,
+  "target_pixel_uv": [320, 240],
+  "min_score": 0.0
+}
+```
+
+对外 parameter schema 使用简单 nullable 字段；“文本或点恰好一个”由 Gateway 的
+权威 payload validator 再次检查。这避免将 provider 兼容性不稳定的 `oneOf/anyOf`
+交给 Planner，但没有放宽实际执行条件。
 
 ## 输入模式
 

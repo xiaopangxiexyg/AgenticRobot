@@ -146,6 +146,12 @@ class _Localizer:
     def localize(self, *_args, **_kwargs):
         raise AssertionError("default-off composition must not infer")
 
+    def segment(self, *_args, **_kwargs):
+        raise AssertionError("default-off composition must not infer")
+
+    def encode_segment_artifacts(self, *_args, **_kwargs):
+        raise AssertionError("default-off composition must not encode")
+
 
 class _PointGraspPlanner:
     model_spec = SimpleNamespace(
@@ -423,7 +429,7 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         assert session.service.protocol_runtime.session_capabilities.artifact_transfer_enabled
         assert session.rgb_executor is not None
         assert session.depth_executor is not None
-        assert len(session.contract_bundle.route_manifest.skill_routes) == 15
+        assert len(session.contract_bundle.route_manifest.skill_routes) == 16
         effects = {
             entry.route.skill_id: entry.route.control_effect_class
             for entry in session.contract_bundle.route_manifest.skill_routes
@@ -538,6 +544,8 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
             entry.route.skill_id: entry.route.control_effect_class
             for entry in session.contract_bundle.route_manifest.skill_routes
         }
+        assert routes["perception.segment"] == "read_only"
+        assert routes["perception.plan_placement"] == "read_only"
         assert routes["perception.plan_point_grasp"] == "read_only"
         assert routes["perception.render_point_grasp_candidate"] == "read_only"
         assert routes["perception.plan_grasp_approach"] == "read_only"
@@ -551,6 +559,9 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
             session.contract_bundle.route_manifest.explicit_exclusions
         )
         assert composition.station_point_grasp_registration is not None
+        assert composition.segmentation_registration is not None
+        assert session.segmentation_executor is not None
+        assert session.placement_executor is not None
         assert (
             composition.station_point_grasp_registration.skill.definition.skill_version
             == ("4" if frozen_observation else "2")
@@ -578,7 +589,10 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
             "state.read_tcp_pose",
             "perception.capture_rgb",
             "perception.capture_depth",
+            "perception.back_project",
             "perception.localize_objects",
+            "perception.segment",
+            "perception.plan_placement",
             "perception.plan_point_grasp",
             "perception.render_point_grasp_candidate",
             "perception.plan_grasp_approach",

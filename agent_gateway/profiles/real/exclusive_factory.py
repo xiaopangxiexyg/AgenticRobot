@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from agent_gateway.profiles.segmentation import SegmentationRegistration
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
@@ -146,7 +147,9 @@ def assemble_exclusive_real_agent_primitive_deployment(
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
+    segmentation_registration: SegmentationRegistration | None = None,
     localization_provider: ObjectLocalizationProvider | None = None,
+    segmentation_localizer: object | None = None,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -183,6 +186,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         convergence_profile=convergence_profile,
         perception_capture=perception_capture,
         localization_registration=localization_registration,
+        segmentation_registration=segmentation_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration
@@ -230,6 +234,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         max_retained_operations=max_retained_operations,
         perception_provider=perception_provider,
         localization_provider=localization_provider,
+        segmentation_localizer=segmentation_localizer,
         station_point_grasp_planner=station_point_grasp_planner,
         station_point_grasp_reachability_evaluator=(
             station_point_grasp_reachability_evaluator
@@ -263,7 +268,9 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     localization_registration: RealObjectLocalizationRegistration | None = None,
+    segmentation_registration: SegmentationRegistration | None = None,
     localization_provider: ObjectLocalizationProvider | None = None,
+    segmentation_localizer: object | None = None,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -316,7 +323,9 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         convergence_profile=convergence_profile,
         perception_capture=perception_capture,
         localization_registration=localization_registration,
+        segmentation_registration=segmentation_registration,
         localization_provider=localization_provider,
+        segmentation_localizer=segmentation_localizer,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration

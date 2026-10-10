@@ -7,7 +7,14 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from agent_gateway.profiles.back_projection import (
+    LiveBackProjectionProvider,
+    build_back_projection_registration,
+)
 from agent_gateway.profiles.real import realsense_perception
+from agent_gateway.profiles.real.back_projection import (
+    RealSenseBackProjectionCapturePort,
+)
 from agent_gateway.profiles.real.perception_deployment import (
     REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
     REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
@@ -324,6 +331,7 @@ def test_real_depth_v2_binds_and_transforms_nontrivial_station_frame() -> None:
     registration = build_real_perception_capture_registration_v2(
         rgb_source_catalog=provider.rgb_source_catalog(),
         depth_source_catalog=provider.depth_source_catalog(),
+        aligned_rgbd_source_catalog=provider.aligned_rgbd_source_catalog(),
         runtime_session_id="real-session:v2-test",
         control_domain_id="real-domain:v2-test",
         target_binding_id="real-target:v2-test",
@@ -411,6 +419,53 @@ def test_real_provider_captures_one_correlated_immutable_rgbd_frame() -> None:
     np.testing.assert_allclose(capture.depth_m[0], (0.0, 0.1, 0.2, 0.3))
     assert len(capture.rgb_content_hash) == 64
     assert len(capture.depth_content_hash) == 64
+
+
+def test_real_back_projection_uses_the_bound_station_camera_pose() -> None:
+    provider, _sources, _revision, _profile = _provider()
+    frame_binding = build_real_perception_station_frame_binding(
+        collision_scene_profile="back-projection-test",
+        scene_mount_hash="scene-mounts:back-projection-test",
+        scene_world_from_canonical_station=np.eye(4),
+    )
+    registration = build_back_projection_registration(
+        target_kind="real",
+        current_mode="real_active",
+        source_catalog=provider.aligned_rgbd_source_catalog(),
+        reference_frame_id=frame_binding.reference_frame_id,
+        reference_frame_spec_hash=frame_binding.reference_frame_spec_hash,
+        frame_graph_hash=frame_binding.frame_graph.semantic_content_hash,
+        runtime_session_id="real-session:back-projection",
+        control_domain_id="real-domain:back-projection",
+        target_binding_id="real-target:back-projection",
+        station_manifest_hash="station:back-projection",
+        execution_manifest_hash="execution:back-projection",
+    )
+    back_projection = LiveBackProjectionProvider(
+        capture_port=RealSenseBackProjectionCapturePort(
+            perception_provider=provider,
+            frame_binding=frame_binding,
+        ),
+        registration=registration,
+    )
+
+    result = back_projection.project_request(
+        SimpleNamespace(
+            expected_station_revision=7,
+            parameters={
+                "role": "main",
+                "target_pixel_uv": [2, 1],
+                "pixel_region_xyxy": None,
+                "world_z_min_m": None,
+                "world_z_max_m": None,
+            },
+        )
+    )
+
+    assert result["world_xyz_m"] == pytest.approx(
+        [0.1, 1.0 / 6.0, 0.5], abs=1e-6
+    )
+    assert result["capture_group_id"].startswith("real-aligned-rgbd:")
 
 
 def test_aligned_wrist_rgbd_uses_dynamic_geometry_from_the_same_frame_time() -> None:

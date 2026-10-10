@@ -6,9 +6,78 @@ from agent_gateway.protocol.skill_catalog import SkillDefinition
 
 CAPTURE_DEPTH_SKILL_ID_V1 = "perception.capture_depth"
 CAPTURE_RGB_SKILL_ID_V1 = "perception.capture_rgb"
+BACK_PROJECT_SKILL_ID_V1 = "perception.back_project"
 LOCALIZE_OBJECTS_SKILL_ID_V1 = "perception.localize_objects"
 PLAN_POINT_GRASP_SKILL_ID_V1 = "perception.plan_point_grasp"
+PLAN_PLACEMENT_SKILL_ID_V1 = "perception.plan_placement"
 RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1 = "perception.render_point_grasp_candidate"
+SEGMENT_SKILL_ID_V1 = "perception.segment"
+
+
+def back_project_skill_definition_v1() -> SkillDefinition:
+    """Describe passive pixel or region back-projection into Station XYZ."""
+
+    return SkillDefinition(
+        skill_id=BACK_PROJECT_SKILL_ID_V1,
+        skill_version="1",
+        skill_kind="inspection",
+        summary=(
+            "Back-project exactly one zero-based [u, v] pixel or one half-open "
+            "[x0, y0, x1, y1] image region from a live deployment-registered "
+            "aligned depth source into its bound Station reference frame. "
+            "Region mode may filter by Station Z and returns robust center, "
+            "median, bounds, and extent without moving the robot."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "registered_aligned_depth_role.exclusive_pixel_or_region."
+            "optional_station_z_band.v1"
+        ),
+        execution_result_semantics_id=(
+            "station_bound_depth_back_projection_geometry.v1"
+        ),
+        task_outcome_semantics_id="passive_depth_back_projection.v1",
+        entry_predicate_ids=("trusted_live_aligned_depth_binding_available.v1",),
+        task_outcome_predicate_ids=("depth_geometry_back_projected.v1",),
+    )
+
+
+def plan_placement_skill_definition_v1() -> SkillDefinition:
+    """Describe passive, offset-aware placement geometry planning."""
+
+    return SkillDefinition(
+        skill_id=PLAN_PLACEMENT_SKILL_ID_V1,
+        skill_version="1",
+        skill_kind="inspection",
+        summary=(
+            "Plan EEF lateral alignment and measured XY containment from two "
+            "completed text-prompt segmentation operations: one for the held "
+            "object and one for the fixed main-camera destination. The Gateway "
+            "uses their text prompts as identity anchors, segments fresh correlated "
+            "RGB-D cuts, back-projects them in the bound Station frame, and reads "
+            "the current EEF state. "
+            "This read-only Skill never moves the robot and does not prove object "
+            "identity, grasp success, collision-free descent, or task success."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "retained_held_and_destination_segment_operations.clearance.v1"
+        ),
+        execution_result_semantics_id=(
+            "station_bound_offset_aware_placement_geometry.v1"
+        ),
+        task_outcome_semantics_id="passive_placement_geometry_plan.v1",
+        entry_predicate_ids=(
+            "retained_text_segment_prompts_available.v1",
+            "live_correlated_rgbd_binding_available.v1",
+            "measured_tool_tcp_pose_available.v1",
+        ),
+        task_outcome_predicate_ids=("placement_geometry_assessed.v1",),
+    )
 
 
 def capture_depth_skill_definition_v1() -> SkillDefinition:
@@ -136,6 +205,36 @@ def localize_objects_skill_definition_v1() -> SkillDefinition:
     )
 
 
+def segment_skill_definition_v1() -> SkillDefinition:
+    """Describe passive text- or point-prompted image segmentation."""
+
+    return SkillDefinition(
+        skill_id=SEGMENT_SKILL_ID_V1,
+        skill_version="1",
+        skill_kind="inspection",
+        summary=(
+            "Segment one object in a live deployment-registered camera image "
+            "from exactly one language or pixel prompt, without changing "
+            "downstream control state."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "registered_rgb_role.exclusive_text_or_pixel_prompt.v1"
+        ),
+        execution_result_semantics_id=(
+            "pixel_mask_metadata_and_mask_overlay_artifacts.v1"
+        ),
+        task_outcome_semantics_id="passive_object_segmentation.v1",
+        entry_predicate_ids=(
+            "registered_visual_role_available.v1",
+            "segmentation_model_available.v1",
+        ),
+        task_outcome_predicate_ids=("object_mask_segmented.v1",),
+    )
+
+
 def plan_point_grasp_skill_definition_v1() -> SkillDefinition:
     """Describe passive point-conditioned RGB-D grasp pose planning."""
 
@@ -253,18 +352,24 @@ def render_point_grasp_candidate_skill_definition_v1() -> SkillDefinition:
 
 
 __all__ = [
+    "BACK_PROJECT_SKILL_ID_V1",
     "CAPTURE_DEPTH_SKILL_ID_V1",
     "CAPTURE_RGB_SKILL_ID_V1",
     "LOCALIZE_OBJECTS_SKILL_ID_V1",
+    "PLAN_PLACEMENT_SKILL_ID_V1",
     "PLAN_POINT_GRASP_SKILL_ID_V1",
     "RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1",
+    "SEGMENT_SKILL_ID_V1",
+    "back_project_skill_definition_v1",
     "capture_depth_skill_definition_v1",
     "capture_depth_skill_definition_v2",
     "capture_rgb_skill_definition_v1",
     "capture_rgb_skill_definition_v2",
     "localize_objects_skill_definition_v1",
+    "plan_placement_skill_definition_v1",
     "plan_point_grasp_skill_definition_v1",
     "plan_point_grasp_skill_definition_v2",
     "plan_point_grasp_skill_definition_v3",
     "render_point_grasp_candidate_skill_definition_v1",
+    "segment_skill_definition_v1",
 ]

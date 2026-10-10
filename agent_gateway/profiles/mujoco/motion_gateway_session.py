@@ -1,4 +1,4 @@
-"""Assemble the reusable no-model TCP-pose Agent Gateway session.
+"""Assemble the reusable TCP-pose Agent Gateway session.
 
 Construction is default-off: it creates contracts, executors and a service but
 does not start MuJoCo, advance physics, bind a socket or admit motion.  Each
@@ -12,10 +12,23 @@ import threading
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 
+from agent_gateway.profiles.back_projection import (
+    LiveBackProjectionProvider,
+    build_back_projection_executor,
+)
 from agent_gateway.profiles.motion_primitive_resolution import (
     MotionPrimitiveTargetResolution,
     resolve_level_tcp_orientation_primitive_target,
     resolve_tcp_displacement_primitive_target,
+)
+from agent_gateway.profiles.placement import (
+    PLACEMENT_MAX_OPERATION_DURATION_MS_V1,
+    PlacementProvider,
+    build_placement_executor,
+)
+from agent_gateway.profiles.segmentation import (
+    LiveSegmentationProvider,
+    build_segmentation_executor,
 )
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
@@ -61,8 +74,11 @@ from agent_gateway.skills.motion.definition import (
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from agent_gateway.skills.perception.definition import (
+    BACK_PROJECT_SKILL_ID_V1,
     CAPTURE_DEPTH_SKILL_ID_V1,
     CAPTURE_RGB_SKILL_ID_V1,
+    PLAN_PLACEMENT_SKILL_ID_V1,
+    SEGMENT_SKILL_ID_V1,
 )
 from agent_gateway.skills.perception.schemas import (
     RGB_FRAME_COMPRESSION_V1,
@@ -82,6 +98,7 @@ from collection_runtime.source_observation_history import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from .back_projection import MujocoBackProjectionCapturePort
 from .depth_deployment import MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import MujocoAgentTcpPoseContractBundle
@@ -93,7 +110,9 @@ from .observation import MujocoAgentObservationProducer
 from .observation_binding import (
     build_mujoco_agent_motion_observation_source_binding,
 )
+from .placement import MujocoPlacementRobotStatePort
 from .rgb_deployment import MUJOCO_CAPTURE_RGB_OUTPUT_SLOT_ID_V1
+from .segmentation import MujocoSegmentationCapturePort
 from .tcp_pose_history import MujocoAgentTcpPoseHistoryProvider
 from .visual_observation import MujocoAgentRgbCaptureProvider
 
@@ -131,6 +150,13 @@ class MujocoAgentTcpPoseGatewaySession:
     state_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor | None
     rgb_executor: PassiveReadSkillExecutor | None
+    back_projection_provider: LiveBackProjectionProvider | None
+    back_projection_executor: PassiveReadSkillExecutor | None
+    segmentation_localizer: object | None
+    segmentation_provider: LiveSegmentationProvider | None
+    segmentation_executor: PassiveReadSkillExecutor | None
+    placement_provider: PlacementProvider | None
+    placement_executor: PassiveReadSkillExecutor | None
     history_provider: MujocoAgentTcpPoseHistoryProvider | None
     history_executor: PassiveReadSkillExecutor | None
     history_recorder: SourceObservationHistoryRecorder | None
@@ -156,6 +182,11 @@ class MujocoAgentTcpPoseGatewaySession:
         repr=False,
     )
     _artifact_store_closed: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+    )
+    _segmentation_model_started: bool = field(
         default=False,
         init=False,
         repr=False,
@@ -193,6 +224,36 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError(
                 "RGB executor and Artifact store must be enabled together."
             )
+        back_projection_enabled = bool(
+            self.contract_bundle.depth_capture is not None
+            and self.contract_bundle.depth_capture.back_projection is not None
+        )
+        if back_projection_enabled != all(
+            item is not None
+            for item in (
+                self.back_projection_provider,
+                self.back_projection_executor,
+            )
+        ):
+            raise ValueError(
+                "MuJoCo back-projection registration and runtime resources disagree."
+            )
+        if (self.segmentation_provider is None) != (
+            self.segmentation_executor is None
+        ) or (self.segmentation_provider is None) != (
+            self.segmentation_localizer is None
+        ):
+            raise ValueError("MuJoCo segmentation resources must be all-or-none.")
+        if self.segmentation_provider is not None and self.artifact_store is None:
+            raise ValueError("MuJoCo segmentation requires the Artifact store.")
+        placement_enabled = self.contract_bundle.placement is not None
+        if placement_enabled != all(
+            item is not None
+            for item in (self.placement_provider, self.placement_executor)
+        ):
+            raise ValueError(
+                "MuJoCo placement registration and runtime resources disagree."
+            )
         if not isinstance(self.hardware_view_provider, HardwareViewProvider):
             raise TypeError("MuJoCo hardware view provider must be typed.")
 
@@ -207,8 +268,8 @@ class MujocoAgentTcpPoseGatewaySession:
             definition_catalog=self.contract_bundle.definition_catalog,
             schema_catalog=self.contract_bundle.schema_catalog,
             service=self.service,
-            publish_observation=lambda: (
-                self.observation_producer.capture_and_publish(self.service)
+            publish_observation=lambda: self.observation_producer.capture_and_publish(
+                self.service
             ),
             current_station_revision=lambda: (
                 self.observation_producer.current_station_revision
@@ -227,6 +288,35 @@ class MujocoAgentTcpPoseGatewaySession:
         return bool(active) and all(
             executor.wait(timeout_sec=timeout_sec) for executor in active
         )
+
+    def start_perception_resources(self) -> None:
+        """Start optional model resources before transport publication."""
+
+        with self._close_lock:
+            if self._close_outcome is not None:
+                raise RuntimeError("Closed Gateway session cannot start resources.")
+            if self.segmentation_localizer is None or self._segmentation_model_started:
+                return
+            start = getattr(self.segmentation_localizer, "start", None)
+            if not callable(start):
+                raise TypeError("Segmentation localizer must expose start().")
+            try:
+                start()
+            except Exception as start_error:
+                close_model = getattr(self.segmentation_localizer, "close", None)
+                if not callable(close_model):
+                    raise TypeError(
+                        "Segmentation model startup failed without a cleanup port."
+                    ) from start_error
+                try:
+                    close_model()
+                except Exception as cleanup_error:  # noqa: BLE001 - preserve both failures.
+                    raise RuntimeError(
+                        "Segmentation model startup cleanup failed: "
+                        f"{type(cleanup_error).__name__}:{cleanup_error}"
+                    ) from start_error
+                raise
+            self._segmentation_model_started = True
 
     def build_unix_json_server(
         self,
@@ -283,10 +373,7 @@ class MujocoAgentTcpPoseGatewaySession:
                 operation=None,
                 reason="agent_gateway_close_motion_route_fence",
             )
-            if (
-                executor_receipt.succeeded
-                and executor_receipt.proves_motion_or_hold
-            ):
+            if executor_receipt.succeeded and executor_receipt.proves_motion_or_hold:
                 executor.close_after_hold(hold_receipt=executor_receipt)
         workers = tuple(
             worker
@@ -294,8 +381,7 @@ class MujocoAgentTcpPoseGatewaySession:
             for worker in executor.workers
         )
         settled = all(
-            executor.active_operation_id is None
-            or executor.wait(timeout_sec=5.0)
+            executor.active_operation_id is None or executor.wait(timeout_sec=5.0)
             for executor in self._motion_executors()
         )
         if not workers or settled:
@@ -321,37 +407,116 @@ class MujocoAgentTcpPoseGatewaySession:
         """Fence admissions, establish lower HOLD, then close when quiescent."""
 
         with self._close_lock:
+            cleanup_errors: list[tuple[str, Exception]] = []
+            recorder_settled = True
             if self.history_recorder is not None:
-                self.history_recorder.close(timeout_sec=1.0)
+                try:
+                    recorder_settled = self.history_recorder.close(timeout_sec=1.0)
+                    if not recorder_settled:
+                        raise RuntimeError(
+                            "Planning history recorder did not quiesce before close."
+                        )
+                except Exception as error:  # noqa: BLE001 - continue owned cleanup.
+                    recorder_settled = False
+                    cleanup_errors.append(("history_recorder", error))
             if self._close_outcome is None:
-                self._close_outcome = self.service.close(
-                    current_station_revision=(
-                        self.observation_producer.current_station_revision
+                try:
+                    self._close_outcome = self.service.close(
+                        current_station_revision=(
+                            self.observation_producer.current_station_revision
+                        )
                     )
-                )
-            perception_settled = all(
-                executor is None or executor.wait_all(timeout_sec=5.0)
-                for executor in (self.depth_executor, self.rgb_executor)
-            )
-            if not perception_settled:
-                raise RuntimeError(
-                    "Passive perception capture did not quiesce before Gateway close."
-                )
-            self._finish_lower_close(self._close_outcome)
+                except Exception as error:  # noqa: BLE001 - continue owned cleanup.
+                    cleanup_errors.append(("gateway_service", error))
+            gateway_closed = self._close_outcome is not None
+            passive_settled = gateway_closed
+            if gateway_closed:
+                for name, executor, timeout_sec in (
+                    ("state", self.state_executor, 5.0),
+                    ("depth", self.depth_executor, 5.0),
+                    ("rgb", self.rgb_executor, 5.0),
+                    (
+                        "back_projection",
+                        getattr(self, "back_projection_executor", None),
+                        5.0,
+                    ),
+                    ("history", self.history_executor, 5.0),
+                    ("segmentation", self.segmentation_executor, 65.0),
+                    (
+                        "placement",
+                        getattr(self, "placement_executor", None),
+                        PLACEMENT_MAX_OPERATION_DURATION_MS_V1 / 1_000.0 + 5.0,
+                    ),
+                ):
+                    try:
+                        if executor is not None and not executor.wait_all(
+                            timeout_sec=timeout_sec
+                        ):
+                            passive_settled = False
+                            raise RuntimeError(
+                                f"Passive {name} reads did not quiesce before close."
+                            )
+                    except Exception as error:  # noqa: BLE001 - continue safe waits.
+                        passive_settled = False
+                        cleanup_errors.append((f"{name}_executor", error))
+            if passive_settled and self._segmentation_model_started:
+                close_model = getattr(self.segmentation_localizer, "close", None)
+                if not callable(close_model):
+                    cleanup_errors.append(
+                        (
+                            "segmentation_model",
+                            TypeError("Segmentation localizer must expose close()."),
+                        )
+                    )
+                else:
+                    try:
+                        close_model()
+                    except Exception as error:  # noqa: BLE001 - continue cleanup.
+                        cleanup_errors.append(("segmentation_model", error))
+                    else:
+                        self._segmentation_model_started = False
+            if passive_settled and recorder_settled:
+                try:
+                    assert self._close_outcome is not None
+                    self._finish_lower_close(self._close_outcome)
+                except Exception as error:  # noqa: BLE001 - continue owned cleanup.
+                    cleanup_errors.append(("lower_application", error))
             if (
-                self.owns_source_observation_history_store
+                gateway_closed
+                and passive_settled
+                and recorder_settled
+                and self.owns_source_observation_history_store
                 and self.source_observation_history_store is not None
                 and not self._source_observation_history_store_closed
             ):
-                self.source_observation_history_store.close()
-                self._source_observation_history_store_closed = True
+                try:
+                    self.source_observation_history_store.close()
+                except Exception as error:  # noqa: BLE001 - continue owned cleanup.
+                    cleanup_errors.append(("history_store", error))
+                else:
+                    self._source_observation_history_store_closed = True
             if (
-                self.owns_artifact_store
+                gateway_closed
+                and passive_settled
+                and self.owns_artifact_store
                 and self.artifact_store is not None
                 and not self._artifact_store_closed
             ):
-                self.artifact_store.close()
-                self._artifact_store_closed = True
+                try:
+                    self.artifact_store.close()
+                except Exception as error:  # noqa: BLE001 - preserve every failure.
+                    cleanup_errors.append(("artifact_store", error))
+                else:
+                    self._artifact_store_closed = True
+            if cleanup_errors:
+                details = "; ".join(
+                    f"{stage}:{type(error).__name__}:{error}"
+                    for stage, error in cleanup_errors
+                )
+                raise RuntimeError(
+                    "MuJoCo Gateway close cleanup failed: " + details
+                ) from cleanup_errors[0][1]
+            assert self._close_outcome is not None
             return self._close_outcome
 
 
@@ -386,6 +551,7 @@ def _mujoco_hardware_view_provider(
     application: MujocoAgentSkillMotionApplication,
     contract_bundle: MujocoAgentTcpPoseContractBundle,
     operation_store: BoundedInMemoryAgentSkillOperationStore,
+    segmentation_provider: LiveSegmentationProvider | None,
 ) -> HardwareViewProvider:
     """Map the single MuJoCo scene owner to its semantic Skill surface."""
 
@@ -394,20 +560,41 @@ def _mujoco_hardware_view_provider(
         for entry in contract_bundle.route_manifest.skill_routes
         if entry.route.control_effect_class in {"read_only", "motion"}
     )
+    segment_route_hash = (
+        None
+        if contract_bundle.segmentation is None
+        else contract_bundle.segmentation.skill.routes[0].semantic_content_hash
+    )
+    bindings = [
+        HardwareResourceBinding(
+            resource_id="simulation.runtime",
+            resource_kind="simulation_runtime",
+            route_hashes=route_hashes,
+            health_provider=lambda: _mujoco_runtime_health(application),
+            control_claimed_provider=lambda: _mujoco_runtime_control_claimed(
+                application
+            ),
+        )
+    ]
+    if segment_route_hash is not None:
+        bindings.append(
+            HardwareResourceBinding(
+                resource_id="perception.segmentation_model",
+                resource_kind="local_model",
+                route_hashes=(segment_route_hash,),
+                health_provider=lambda: (
+                    "ready"
+                    if segmentation_provider is not None
+                    and segmentation_provider.started
+                    else "unavailable"
+                ),
+                control_claimed_provider=lambda: False,
+            )
+        )
     return HardwareViewProvider(
         manifest=contract_bundle.route_manifest,
         operation_store=operation_store,
-        bindings=(
-            HardwareResourceBinding(
-                resource_id="simulation.runtime",
-                resource_kind="simulation_runtime",
-                route_hashes=route_hashes,
-                health_provider=lambda: _mujoco_runtime_health(application),
-                control_claimed_provider=lambda: (
-                    _mujoco_runtime_control_claimed(application)
-                ),
-            ),
-        ),
+        bindings=tuple(bindings),
     )
 
 
@@ -423,6 +610,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     owns_source_observation_history_store: bool = False,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
+    segmentation_localizer: object | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Wire exact Routes without starting the application or history recorder."""
 
@@ -459,6 +647,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         raise ValueError("Artifact store cannot be bound without an Artifact Skill.")
     if owns_artifact_store and artifact_store is None:
         raise ValueError("Owned Artifact store must be injected.")
+    segmentation_enabled = contract_bundle.segmentation is not None
+    if segmentation_enabled != (segmentation_localizer is not None):
+        raise ValueError("Segmentation registration and localizer must coexist.")
+    if segmentation_enabled and artifact_store is None:
+        raise ValueError("Enabled segmentation requires an Artifact store.")
     clients = tuple(
         _required(value, field_name="allowed_client_ids item")
         for value in allowed_client_ids
@@ -526,8 +719,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
     }
     fixed_cardinal_contract_by_skill_id = {
-        item.skill_id: item
-        for item in contract_bundle.fixed_cardinal_step_contracts
+        item.skill_id: item for item in contract_bundle.fixed_cardinal_step_contracts
     }
     fixed_orientation_entry_by_skill_id = {
         skill_id: contract_bundle.route_manifest.route(skill_id, "1")
@@ -558,12 +750,32 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         if depth_registration is not None
         else None
     )
+    back_projection_registration = (
+        None
+        if depth_registration is None
+        else depth_registration.back_projection
+    )
+    back_projection_entry = (
+        contract_bundle.route_manifest.route(BACK_PROJECT_SKILL_ID_V1, "1")
+        if back_projection_registration is not None
+        else None
+    )
     rgb_entry = (
         contract_bundle.route_manifest.route(
             CAPTURE_RGB_SKILL_ID_V1,
             contract_bundle.rgb_capture.registration.definition.skill_version,
         )
         if contract_bundle.rgb_capture is not None
+        else None
+    )
+    segmentation_entry = (
+        contract_bundle.route_manifest.route(SEGMENT_SKILL_ID_V1, "1")
+        if contract_bundle.segmentation is not None
+        else None
+    )
+    placement_entry = (
+        contract_bundle.route_manifest.route(PLAN_PLACEMENT_SKILL_ID_V1, "1")
+        if contract_bundle.placement is not None
         else None
     )
     observation_producer = MujocoAgentObservationProducer(
@@ -578,6 +790,97 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         application=application,
         current_station_revision=lambda: observation_producer.current_station_revision,
     )
+    segmentation_provider = None
+    segmentation_executor = None
+    if contract_bundle.segmentation is not None:
+        assert segmentation_localizer is not None
+        assert artifact_store is not None
+        segmentation_provider = LiveSegmentationProvider(
+            localizer=segmentation_localizer,
+            capture_port=MujocoSegmentationCapturePort(
+                rgb_provider=rgb_capture_provider,
+            ),
+            registration=contract_bundle.segmentation,
+        )
+        segmentation_executor = build_segmentation_executor(
+            registration=contract_bundle.segmentation,
+            provider=segmentation_provider,
+            artifact_store=artifact_store,
+            runtime_session_id=binding.runtime_session_id,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+            max_retained_operations=retention,
+            clock=runtime_clock,
+        )
+    back_projection_capture_port = None
+    back_projection_provider = None
+    back_projection_executor = None
+    if back_projection_registration is not None:
+        depth_binding = depth_registration.deployment_binding
+        back_projection_capture_port = MujocoBackProjectionCapturePort(
+            application=application,
+            source_id_by_role=dict(
+                back_projection_registration.profile.source_id_by_role
+            ),
+            source_frame_id=depth_binding.source_frame_id,
+            reference_frame_id=depth_binding.reference_frame_id,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+        )
+        back_projection_provider = LiveBackProjectionProvider(
+            capture_port=back_projection_capture_port,
+            registration=back_projection_registration,
+        )
+        back_projection_executor = build_back_projection_executor(
+            registration=back_projection_registration,
+            provider=back_projection_provider,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+            max_retained_operations=retention,
+            clock=runtime_clock,
+        )
+    placement_provider = None
+    placement_executor = None
+    if contract_bundle.placement is not None:
+        assert contract_bundle.segmentation is not None
+        assert segmentation_executor is not None
+        assert segmentation_provider is not None
+        assert back_projection_registration is not None
+        assert back_projection_capture_port is not None
+        placement_provider = PlacementProvider(
+            registration=contract_bundle.placement,
+            segmentation_registration=contract_bundle.segmentation,
+            segmentation_executor=segmentation_executor,
+            segmentation_provider=segmentation_provider,
+            back_projection_registration=back_projection_registration,
+            capture_port=back_projection_capture_port,
+            robot_state_port=MujocoPlacementRobotStatePort(
+                application=application,
+                component_id=contract_bundle.placement.profile.component_id,
+                source_frame_id=(
+                    contract_bundle.motion_profile.execution_reference_frame_id
+                    or contract_bundle.motion_profile.reference_frame_id
+                ),
+                reference_frame_id=(
+                    contract_bundle.placement.profile.reference_frame_id
+                ),
+                current_station_revision=lambda: (
+                    observation_producer.current_station_revision
+                ),
+            ),
+        )
+        placement_executor = build_placement_executor(
+            registration=contract_bundle.placement,
+            provider=placement_provider,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+            max_retained_operations=retention,
+            clock=runtime_clock,
+        )
     history_provider = (
         MujocoAgentTcpPoseHistoryProvider(
             observation_producer=observation_producer,
@@ -623,9 +926,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         requested_direction = str(parameters.get("direction"))
         if fixed_direction is not None and requested_direction != fixed_direction:
             raise ValueError("Fixed cardinal-step direction changed in request.")
-        primitive = contract_bundle.cardinal_step_profile.primitive(
-            requested_direction
-        )
+        primitive = contract_bundle.cardinal_step_profile.primitive(requested_direction)
 
         def resolve_target(
             measured_pose: tuple[float, ...],
@@ -675,20 +976,14 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             request=request,
             operation=operation,
             route=cardinal_step_route,
-            deployment_binding=(
-                contract_bundle.cardinal_step_deployment_binding
-            ),
-            evaluation_plan=(
-                contract_bundle.cardinal_step_evaluation_plan
-            ),
+            deployment_binding=(contract_bundle.cardinal_step_deployment_binding),
+            evaluation_plan=(contract_bundle.cardinal_step_evaluation_plan),
         )
 
     def domain_hold(*, operation, reason):
         transition = application.request_hold(
             reason=reason,
-            operation_id=(
-                None if operation is None else operation.operation_id
-            ),
+            operation_id=(None if operation is None else operation.operation_id),
         )
         return mujoco_agent_skill_hold_evidence_from_transition(
             transition,
@@ -711,9 +1006,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ),
         lifecycle_factory=lifecycle_factory,
         domain_hold=domain_hold,
-        current_station_revision=lambda: (
-            observation_producer.current_station_revision
-        ),
+        current_station_revision=lambda: observation_producer.current_station_revision,
         clock=runtime_clock,
     )
     cardinal_step_binding = contract_bundle.cardinal_step_deployment_binding
@@ -733,15 +1026,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             skill_version=cardinal_step_route.skill_version,
             route_id=cardinal_step_route.route_id,
             route_version=cardinal_step_route.route_version,
-            deployment_binding_hash=(
-                cardinal_step_binding.semantic_content_hash
-            ),
+            deployment_binding_hash=(cardinal_step_binding.semantic_content_hash),
         ),
         lifecycle_factory=cardinal_step_lifecycle_factory,
         domain_hold=domain_hold,
-        current_station_revision=lambda: (
-            observation_producer.current_station_revision
-        ),
+        current_station_revision=lambda: observation_producer.current_station_revision,
         clock=runtime_clock,
     )
     fixed_cardinal_step_executors: dict[
@@ -790,9 +1079,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                     skill_version=fixed_route.skill_version,
                     route_id=fixed_route.route_id,
                     route_version=fixed_route.route_version,
-                    deployment_binding_hash=(
-                        fixed_binding.semantic_content_hash
-                    ),
+                    deployment_binding_hash=(fixed_binding.semantic_content_hash),
                 ),
                 lifecycle_factory=fixed_cardinal_lifecycle_factory,
                 domain_hold=domain_hold,
@@ -831,9 +1118,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                     primitive=_profile.primitive,
                     reference_frame_spec=_reference_frame_spec,
                     frame_graph=frame_graph,
-                    measured_reference_frame_id=(
-                        _profile.execution_reference_frame_id
-                    ),
+                    measured_reference_frame_id=(_profile.execution_reference_frame_id),
                 )
 
             return MujocoAgentTcpPoseSkillLifecycle(
@@ -853,9 +1138,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                 ),
                 parameter_lineage={
                     "reference_frame_id": _profile.reference_frame_id,
-                    "reference_frame_spec_hash": (
-                        _profile.reference_frame_spec_hash
-                    ),
+                    "reference_frame_spec_hash": (_profile.reference_frame_spec_hash),
                     "controlled_frame_id": "tool_tcp",
                     "frame_graph_hash": _profile.frame_graph_hash,
                     "tool_config_hash": _profile.tool_config_hash,
@@ -886,9 +1169,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                     skill_version=orientation_route.skill_version,
                     route_id=orientation_route.route_id,
                     route_version=orientation_route.route_version,
-                    deployment_binding_hash=(
-                        orientation_binding.semantic_content_hash
-                    ),
+                    deployment_binding_hash=(orientation_binding.semantic_content_hash),
                 ),
                 lifecycle_factory=orientation_lifecycle_factory,
                 domain_hold=domain_hold,
@@ -911,14 +1192,10 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         )
 
     state_executor = PassiveReadSkillExecutor(
-        port_id=(
-            "agent-gateway:passive-tcp-pose:" + binding.runtime_session_id
-        ),
+        port_id=("agent-gateway:passive-tcp-pose:" + binding.runtime_session_id),
         executor_id=contract_bundle.state_deployment_binding.executor_id,
         read=read_tcp_pose,
-        current_station_revision=lambda: (
-            observation_producer.current_station_revision
-        ),
+        current_station_revision=lambda: observation_producer.current_station_revision,
         clock=runtime_clock,
         max_retained_operations=retention,
     )
@@ -974,13 +1251,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                 "depth_unit": "meter",
                 "invalid_depth_value": 0.0,
                 "reference_frame_id": depth_binding.reference_frame_id,
-                "reference_frame_spec_hash": (
-                    depth_binding.reference_frame_spec_hash
-                ),
+                "reference_frame_spec_hash": (depth_binding.reference_frame_spec_hash),
                 "frame_graph_hash": depth_binding.frame_graph_hash,
-                "camera_pose_reference_xyz_quat_xyzw": list(
-                    camera_pose_reference
-                ),
+                "camera_pose_reference_xyz_quat_xyzw": list(camera_pose_reference),
                 "intrinsics": dict(frame.intrinsics),
             }
             capture_ref = "mujoco-depth-capture:" + canonical_content_hash(
@@ -1056,11 +1329,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                         "ordinal": ordinal,
                         "source_id": source_id,
                         "role": role,
-                        **(
-                            {"acquired_at": capture.captured_at}
-                            if is_v2
-                            else {}
-                        ),
+                        **({"acquired_at": capture.captured_at} if is_v2 else {}),
                         "media_type": committed.media_type,
                         "width": frame.width,
                         "height": frame.height,
@@ -1198,6 +1467,18 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         execution_port_by_route_hash[rgb_entry.route.semantic_content_hash] = (
             rgb_executor
         )
+    if segmentation_entry is not None and segmentation_executor is not None:
+        execution_port_by_route_hash[segmentation_entry.route.semantic_content_hash] = (
+            segmentation_executor
+        )
+    if back_projection_entry is not None and back_projection_executor is not None:
+        execution_port_by_route_hash[
+            back_projection_entry.route.semantic_content_hash
+        ] = back_projection_executor
+    if placement_entry is not None and placement_executor is not None:
+        execution_port_by_route_hash[
+            placement_entry.route.semantic_content_hash
+        ] = placement_executor
     executor_registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -1289,6 +1570,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         application=application,
         contract_bundle=contract_bundle,
         operation_store=service.operation_store,
+        segmentation_provider=segmentation_provider,
     )
     history_recorder = (
         SourceObservationHistoryRecorder(
@@ -1315,6 +1597,13 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         state_executor=state_executor,
         depth_executor=depth_executor,
         rgb_executor=rgb_executor,
+        back_projection_provider=back_projection_provider,
+        back_projection_executor=back_projection_executor,
+        segmentation_localizer=segmentation_localizer,
+        segmentation_provider=segmentation_provider,
+        segmentation_executor=segmentation_executor,
+        placement_provider=placement_provider,
+        placement_executor=placement_executor,
         history_provider=history_provider,
         history_executor=history_executor,
         history_recorder=history_recorder,

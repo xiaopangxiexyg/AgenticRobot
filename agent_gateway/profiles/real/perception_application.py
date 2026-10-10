@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from agent_gateway.profiles.segmentation import (
+    LiveSegmentationProvider,
+    SegmentationRegistration,
+    build_segmentation_registration,
+)
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.transport.client_bindings import AgentGatewayUnixClientBindings
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -194,6 +199,8 @@ class CameraOnlyRealPerceptionComposition:
     registration: RealPerceptionCaptureRegistration
     localization_registration: RealObjectLocalizationRegistration | None
     localization_provider: ObjectLocalizationProvider | None
+    segmentation_registration: SegmentationRegistration | None
+    segmentation_provider: LiveSegmentationProvider | None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -309,6 +316,9 @@ def assemble_camera_only_real_perception_composition(
     registration = build_real_perception_capture_registration_v2(
         rgb_source_catalog=catalog_provider.rgb_source_catalog(),
         depth_source_catalog=catalog_provider.depth_source_catalog(),
+        aligned_rgbd_source_catalog=(
+            catalog_provider.aligned_rgbd_source_catalog()
+        ),
         runtime_session_id=runtime_id,
         control_domain_id=domain_id,
         target_binding_id=target_binding_id,
@@ -320,6 +330,7 @@ def assemble_camera_only_real_perception_composition(
     )
     localization_registration = None
     localization_provider = None
+    segmentation_registration = None
     if object_localizer is not None:
         model_spec = getattr(object_localizer, "model_spec", None)
         model_profile_id = str(getattr(model_spec, "model_profile_id", "")).strip()
@@ -343,6 +354,22 @@ def assemble_camera_only_real_perception_composition(
             localizer=object_localizer,
             registration=localization_registration,
             allowed_local_image_roots=(),
+        )
+        segmentation_registration = build_segmentation_registration(
+            target_kind="real",
+            current_mode="real_observe",
+            source_id_by_role={
+                str(item["role"]): str(item["source_id"])
+                for item in catalog_provider.rgb_source_catalog()
+            },
+            model_profile_id=model_profile_id,
+            model_profile_hash=model_profile_hash,
+            inference_implementation_hash=localizer_hash,
+            runtime_session_id=runtime_id,
+            control_domain_id=domain_id,
+            target_binding_id=target_binding_id,
+            station_manifest_hash=station_manifest_hash,
+            execution_manifest_hash=execution_manifest_hash,
         )
     station_point_grasp_registration = None
     station_point_grasp_render_registration = None
@@ -395,6 +422,7 @@ def assemble_camera_only_real_perception_composition(
         tool_config_hash=tool_config_hash,
         calibration_hash=source_binding.semantic_content_hash,
         localization_registration=localization_registration,
+        segmentation_registration=segmentation_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration
@@ -417,6 +445,7 @@ def assemble_camera_only_real_perception_composition(
             artifact_store=artifact_store,
             allowed_client_ids=client_bindings.allowed_client_ids,
             localization_provider=localization_provider,
+            segmentation_localizer=object_localizer,
             station_point_grasp_planner=point_grasp_planner,
             max_retained_operations=max_retained_operations,
             clock=clock,
@@ -476,6 +505,8 @@ def assemble_camera_only_real_perception_composition(
         registration=registration,
         localization_registration=localization_registration,
         localization_provider=localization_provider,
+        segmentation_registration=segmentation_registration,
+        segmentation_provider=session.segmentation_provider,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration

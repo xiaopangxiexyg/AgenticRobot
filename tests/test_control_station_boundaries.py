@@ -296,6 +296,13 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         _python_files(GATEWAY_ROOT),
         {"numpy", "scipy"},
     ) == {
+        # RGB-D decoding, projection, and mask geometry stay in concrete
+        # perception profiles; Gateway core remains numerical-neutral.
+        "agent_gateway/profiles/back_projection.py": ["numpy"],
+        "agent_gateway/profiles/mujoco/back_projection.py": ["numpy"],
+        "agent_gateway/profiles/placement.py": ["numpy"],
+        "agent_gateway/profiles/real/back_projection.py": ["numpy"],
+        "agent_gateway/profiles/segmentation.py": ["numpy"],
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         # The concrete real-RM65 CLI validates reviewed camera/tool geometry
         # while assembling its profile; Gateway core remains numerical-neutral.

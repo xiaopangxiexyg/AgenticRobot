@@ -29,6 +29,7 @@ from agent_gateway.profiles.real.one_shot_authorization import (
 from agent_gateway.profiles.real.perception_deployment import (
     build_real_perception_capture_registration,
 )
+from agent_gateway.profiles.real.placement import RealPlacementRobotStatePort
 from agent_gateway.profiles.real.realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
@@ -37,6 +38,7 @@ from agent_gateway.profiles.real.session_authorization import (
     REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
     RealAgentPrimitiveSessionAuthorization,
 )
+from agent_gateway.profiles.segmentation import build_segmentation_registration
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.runtime.access_policy import issue_skill_execution_grant
@@ -49,6 +51,10 @@ from agent_gateway.skills.motion.definition import (
 )
 from agent_gateway.skills.motion.schemas import CARDINAL_TCP_STEP_DIRECTIONS_V1
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
+from deployments.perception.sam2_grounding_dino import (
+    GroundedObjectSegment,
+    encode_grounded_object_segment_artifacts,
+)
 from robot_motion.coordinate_frames import (
     CoordinateFrameGraph,
     CoordinateFrameSpec,
@@ -275,6 +281,43 @@ def _runtime_fixture(
     return bundle, port, target_builder
 
 
+def test_real_placement_state_uses_fresh_station_frame_tcp_measurement() -> None:
+    station_from_execution = np.eye(4, dtype=float)
+    station_from_execution[:3, 3] = (0.2, -0.1, 0.3)
+    bundle, port, _ = _runtime_fixture(
+        station_from_execution=station_from_execution
+    )
+    clock = _Clock()
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:placement",),
+    )
+    state_port = RealPlacementRobotStatePort(
+        port=port,
+        frame_graph=bundle.frame_graph,
+        component_id=COMPONENT_ID,
+        execution_reference_frame_id=(
+            bundle.attachment.execution_reference_frame_id
+        ),
+        reference_frame_id=bundle.cardinal_profile.reference_frame_id,
+        maximum_measurement_age_ms=200,
+        current_station_revision=lambda: 4,
+        clock=clock,
+    )
+
+    captured = state_port.capture_placement_robot_state(
+        expected_station_revision=4
+    )
+
+    assert captured.tool_tcp_reference_xyz_quat_xyzw == pytest.approx(
+        (0.2, -0.1, 0.3, 0.0, 0.0, 0.0, 1.0)
+    )
+    assert captured.gripper_close_fraction is None
+    assert captured.station_revision == 4
+
+
 def _owner_state(bundle, *, captured_at: float) -> RealControlOwnerState:
     attachment = bundle.attachment
     return RealControlOwnerState(
@@ -314,9 +357,7 @@ def _request(
         FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
     ):
         profile = bundle.cardinal_profile
-        fixed_direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
-            skill_id
-        )
+        fixed_direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(skill_id)
         parameters = {
             "component_id": profile.component_id,
             "direction": fixed_direction or direction,
@@ -410,10 +451,7 @@ PRIMITIVE_CASES = (
         )
         for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
     ),
-    *tuple(
-        (skill_id, None)
-        for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-    ),
+    *tuple((skill_id, None) for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1),
 )
 
 
@@ -435,9 +473,7 @@ def test_real_wire_adapter_projects_lower_owned_arm_resource_while_idle() -> Non
     adapter = gateway.wire_adapter(authenticated_client_id=CLIENT_ID)
     resources = adapter.get_hardware_resource_views()
     assert resources["enabled"] is True
-    assert [item["resource_id"] for item in resources["resources"]] == [
-        COMPONENT_ID
-    ]
+    assert [item["resource_id"] for item in resources["resources"]] == [COMPONENT_ID]
     arm = resources["resources"][0]
     assert arm["resource_kind"] == "robot_arm"
     assert arm["properties"] == {"readable": True, "drivable": True}
@@ -594,9 +630,7 @@ def test_real_gateway_projects_solver_world_observation_into_station_axes() -> N
             "component_ids": [COMPONENT_ID],
             "reference_frame_id": bundle.attachment.reference_frame_id,
             "controlled_frame_id": "tool_tcp",
-            "max_measurement_age_ms": (
-                bundle.attachment.max_measurement_age_ms
-            ),
+            "max_measurement_age_ms": (bundle.attachment.max_measurement_age_ms),
         },
     )
     assert read.execution_result["reference_frame_id"] == "canonical_station"
@@ -687,9 +721,7 @@ def test_newer_owner_cut_does_not_revive_a_stale_measurement() -> None:
         available_at=clock(),
         source_evidence_refs=("real-hardware-cut:stale-deduplicated",),
     )
-    clock.value += (
-        bundle.convergence_profile.max_measurement_age_ms / 1_000.0
-    ) + 0.001
+    clock.value += (bundle.convergence_profile.max_measurement_age_ms / 1_000.0) + 0.001
     gateway = assemble_real_agent_primitive_gateway_session(
         contract_bundle=bundle,
         port=port,
@@ -731,6 +763,7 @@ def test_future_owner_cut_remains_rejected() -> None:
         gateway.observation_producer.capture_snapshot(
             active_operation_id=None,
         )
+
 
 @pytest.mark.parametrize(("skill_id", "direction"), PRIMITIVE_CASES)
 def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
@@ -936,8 +969,7 @@ def test_session_authorization_issues_a_distinct_bound_grant_per_request() -> No
     assert first_grant.client_id == second_grant.client_id == CLIENT_ID
     assert first_grant.max_invocations == second_grant.max_invocations == 1
     assert (
-        first_grant.authorized_request_hash
-        == first_request.authorization_content_hash
+        first_grant.authorized_request_hash == first_request.authorization_content_hash
     )
     assert (
         second_grant.authorized_request_hash
@@ -977,8 +1009,7 @@ def test_session_authorization_rejects_the_retired_one_shot_confirmation() -> No
 
 def test_historic_one_shot_authorization_import_is_a_session_alias() -> None:
     assert (
-        RealAgentPrimitiveOneShotAuthorization
-        is RealAgentPrimitiveSessionAuthorization
+        RealAgentPrimitiveOneShotAuthorization is RealAgentPrimitiveSessionAuthorization
     )
 
 
@@ -1082,9 +1113,7 @@ def test_one_gateway_session_executes_two_motion_requests_and_holds_between() ->
     operation_ids = []
 
     for client_sequence, direction in enumerate(("forward", "backward"), start=1):
-        observation = gateway.observation_producer.capture_and_publish(
-            gateway.service
-        )
+        observation = gateway.observation_producer.capture_and_publish(gateway.service)
         assert observation.accepted and observation.snapshot is not None
         request = _request(
             bundle,
@@ -1158,12 +1187,8 @@ def test_real_factory_attaches_gateway_and_realteleop_to_one_lower_port() -> Non
         port_config=port.config,
         observation_attachment=bundle.attachment,
         frame_graph=bundle.frame_graph,
-        primitive_reference_frame_id=(
-            bundle.cardinal_profile.reference_frame_id
-        ),
-        safety_envelope_refs=(
-            bundle.deployment_bindings[0].safety_envelope_refs
-        ),
+        primitive_reference_frame_id=(bundle.cardinal_profile.reference_frame_id),
+        safety_envelope_refs=(bundle.deployment_bindings[0].safety_envelope_refs),
         owner_state_provider=lambda: _owner_state(
             bundle,
             captured_at=clock(),
@@ -1335,6 +1360,22 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         execution_manifest_hash=base_bundle.attachment.execution_manifest_hash,
         source_binding_hash=source_binding.semantic_content_hash,
     )
+    segmentation = build_segmentation_registration(
+        target_kind="real",
+        current_mode="real_active",
+        source_id_by_role={
+            str(item["role"]): str(item["source_id"])
+            for item in catalog_provider.rgb_source_catalog()
+        },
+        model_profile_id="sam2:test",
+        model_profile_hash="sam2-model:test",
+        inference_implementation_hash="sam2-localizer:test",
+        runtime_session_id=base_bundle.attachment.runtime_session_id,
+        control_domain_id=base_bundle.attachment.control_domain_id,
+        target_binding_id=base_bundle.attachment.target_binding_id,
+        station_manifest_hash=base_bundle.attachment.station_manifest_hash,
+        execution_manifest_hash=base_bundle.attachment.execution_manifest_hash,
+    )
     envelope = SkillDeploymentSafetyEnvelopeRef(
         object_id="real-envelope:perception-test",
         schema="dexteleop.deployment_safety_envelope.v1",
@@ -1351,6 +1392,7 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         primitive_reference_frame_id="canonical_station",
         safety_envelope_refs=(envelope,),
         perception_capture=perception,
+        segmentation_registration=segmentation,
     )
     provider = RealSenseAgentPerceptionProvider(
         source_binding=source_binding,
@@ -1363,6 +1405,34 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         max_artifact_bytes=16 * 1024 * 1024,
         max_chunk_bytes=1024 * 1024,
     )
+
+    class _Segmenter:
+        semantic_content_hash = "sam2-localizer:test"
+        started = True
+        model_spec = SimpleNamespace(
+            model_profile_id="sam2:test",
+            semantic_content_hash="sam2-model:test",
+        )
+
+        @staticmethod
+        def segment(image, *, language_prompt, pixel_uv, min_score):
+            assert image.size == (4, 3)
+            assert language_prompt is None
+            assert pixel_uv == (1, 1)
+            mask = np.zeros((3, 4), dtype=bool)
+            mask[1, 1:3] = True
+            return GroundedObjectSegment(
+                mask=mask,
+                score=max(0.9, min_score),
+                label=None,
+                box_xyxy=(1, 1, 3, 2),
+            )
+
+        encode_segment_artifacts = staticmethod(
+            encode_grounded_object_segment_artifacts
+        )
+
+    segmenter = _Segmenter()
     port.publish_measured_pose(
         pose_world_by_component={COMPONENT_ID: np.eye(4)},
         measured_at=clock(),
@@ -1375,16 +1445,20 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
         allowed_client_ids=(CLIENT_ID,),
         perception_provider=provider,
+        segmentation_localizer=segmenter,
         artifact_store=store,
         clock=clock,
     )
     adapter = gateway.wire_adapter(authenticated_client_id=CLIENT_ID)
     resources = adapter.get_hardware_resource_views()["resources"]
-    assert [item["resource_id"] for item in resources] == [
+    assert {item["resource_id"] for item in resources} == {
         "perception.cameras",
+        "perception.object_localization_model",
         COMPONENT_ID,
-    ]
-    perception_resource = resources[0]
+    }
+    perception_resource = next(
+        item for item in resources if item["resource_id"] == "perception.cameras"
+    )
     assert perception_resource["resource_kind"] == "camera_bundle"
     assert perception_resource["properties"] == {
         "readable": True,
@@ -1393,6 +1467,7 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
     assert {item["skill_id"] for item in perception_resource["read_skill_refs"]} == {
         "perception.capture_depth",
         "perception.capture_rgb",
+        "perception.segment",
     }
     statuses = {
         item["resource_id"]: item
@@ -1455,7 +1530,10 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         assert operation is not None and operation.status == "completed"
         assert len(operation.output_artifact_bindings) == 1
         artifact = operation.output_artifact_bindings[0].artifact
-        assert store.managed_read_path(artifact.artifact_id).read_bytes()[:2] == b"\xff\xd8"
+        assert (
+            store.managed_read_path(artifact.artifact_id).read_bytes()[:2]
+            == b"\xff\xd8"
+        )
 
         depth_entry = bundle.route_manifest.route("perception.capture_depth", "1")
         depth_route = depth_entry.route
@@ -1509,6 +1587,59 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         )
         assert depth_array.dtype == np.float32
         assert depth_array.shape == (3, 4)
+
+        segment_entry = bundle.route_manifest.route("perception.segment", "1")
+        segment_route = segment_entry.route
+        segment_profile = segment_route.allowed_parameter_profiles[0]
+        segment_request = AgentSkillRequest(
+            client_id=CLIENT_ID,
+            request_id="request:real-segment",
+            idempotency_key="idempotency:real-segment",
+            client_sequence=3,
+            runtime_session_id=bundle.route_manifest.runtime_session_id,
+            skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+            expected_station_revision=observation.snapshot.station_revision,
+            skill_id=segment_route.skill_id,
+            skill_version=segment_route.skill_version,
+            skill_definition_hash=segment_route.skill_definition_hash,
+            route_id=segment_route.route_id,
+            route_version=segment_route.route_version,
+            route_hash=segment_route.semantic_content_hash,
+            deployment_binding_hash=(
+                segment_entry.deployment_binding.deployment_binding_hash
+            ),
+            parameter_profile_id=segment_profile.parameter_profile_id,
+            parameter_profile_hash=segment_profile.parameter_profile_hash,
+            parameters={
+                "role": "main",
+                "language_prompt": None,
+                "target_pixel_uv": [1, 1],
+                "min_score": 0.5,
+            },
+            observation_snapshot_id=observation.snapshot.snapshot_id,
+            requested_mode="real_active",
+            requested_timeout_ms=60_000,
+        )
+        segment_submitted = gateway.service.submit_request(
+            request=segment_request,
+            current_station_revision=(
+                gateway.observation_producer.current_station_revision
+            ),
+            now=clock(),
+        )
+        assert segment_submitted.accepted and segment_submitted.operation is not None
+        assert gateway.service.launch_operation(
+            segment_submitted.operation.operation_id
+        ).accepted
+        assert gateway.segmentation_executor is not None
+        assert gateway.segmentation_executor.wait_all(timeout_sec=1.0)
+        segment_operation = gateway.service.get_operation(
+            segment_submitted.operation.operation_id
+        )
+        assert segment_operation is not None
+        assert segment_operation.status == "completed"
+        assert segment_operation.execution_result["mask_pixel_count"] == 2
+        assert len(segment_operation.output_artifact_bindings) == 2
         assert port.snapshot().dispatch_count == 0
     finally:
         store.close()

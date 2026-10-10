@@ -7,6 +7,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from agent_gateway.profiles.placement import (
+    PlacementRegistration,
+    build_placement_registration,
+)
+from agent_gateway.profiles.segmentation import (
+    SegmentationRegistration,
+    build_segmentation_registration,
+)
 from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
@@ -678,6 +686,8 @@ class MujocoAgentTcpPoseContractBundle:
     execution_manifest: Any
     depth_capture: MujocoDepthCaptureRegistration | None = None
     rgb_capture: MujocoRgbCaptureRegistration | None = None
+    segmentation: SegmentationRegistration | None = None
+    placement: PlacementRegistration | None = None
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None
     history_source_binding: SourceObservationHistoryBinding | None = None
     history_deployment_binding: (
@@ -724,6 +734,32 @@ class MujocoAgentTcpPoseContractBundle:
                 rgb_capture.deployment_binding.semantic_content_hash
             ):
                 raise ValueError("RGB Route uses another deployment binding.")
+        segmentation = self.segmentation
+        if segmentation is not None:
+            if not isinstance(segmentation, SegmentationRegistration):
+                raise TypeError("segmentation must be a typed registration.")
+            segment_entry = self.route_manifest.route(
+                segmentation.skill.definition.skill_id,
+                segmentation.skill.definition.skill_version,
+            )
+            if segment_entry.deployment_binding.deployment_binding_hash != (
+                segmentation.binding.semantic_content_hash
+            ):
+                raise ValueError("Segmentation Route uses another deployment binding.")
+        placement = self.placement
+        if placement is not None:
+            if not isinstance(placement, PlacementRegistration):
+                raise TypeError("placement must be a typed registration.")
+            placement_entry = self.route_manifest.route(
+                placement.skill.definition.skill_id,
+                placement.skill.definition.skill_version,
+            )
+            if placement_entry.deployment_binding.deployment_binding_hash != (
+                placement.binding.semantic_content_hash
+            ):
+                raise ValueError("Placement Route uses another deployment binding.")
+            if segmentation is None or depth_capture is None:
+                raise ValueError("Placement requires segmentation and depth capture.")
         if motion_entry.deployment_binding.deployment_binding_hash != (
             self.deployment_binding.semantic_content_hash
         ):
@@ -1671,6 +1707,9 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     application: Any,
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None,
     enable_artifact_perception: bool = False,
+    segmentation_model_profile_id: str | None = None,
+    segmentation_model_profile_hash: str | None = None,
+    segmentation_inference_implementation_hash: str | None = None,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -1681,6 +1720,17 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         raise TypeError("history_profile must be typed or None.")
     if not isinstance(enable_artifact_perception, bool):
         raise TypeError("enable_artifact_perception must be boolean.")
+    segmentation_identity = (
+        segmentation_model_profile_id,
+        segmentation_model_profile_hash,
+        segmentation_inference_implementation_hash,
+    )
+    if any(item is not None for item in segmentation_identity) and not all(
+        item is not None for item in segmentation_identity
+    ):
+        raise ValueError("MuJoCo segmentation model identity is all-or-none.")
+    if segmentation_model_profile_id is not None and not enable_artifact_perception:
+        raise ValueError("MuJoCo segmentation requires Artifact perception.")
     exact = _exact_application(application)
     station, execution = _build_station_manifests(application)
     runtime = application.runtime
@@ -1768,6 +1818,47 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             execution_manifest_hash=execution.semantic_content_hash,
         )
         if enable_artifact_perception
+        else None
+    )
+    segmentation = (
+        build_segmentation_registration(
+            target_kind="sim",
+            current_mode="sim_active",
+            source_id_by_role={
+                mujoco_rgb_role_for_source(source["source_id"]): str(
+                    source["source_id"]
+                )
+                for source in application.visual_source_catalog()
+            },
+            model_profile_id=segmentation_model_profile_id,
+            model_profile_hash=segmentation_model_profile_hash,
+            inference_implementation_hash=(
+                segmentation_inference_implementation_hash
+            ),
+            runtime_session_id=exact["runtime_session_id"],
+            control_domain_id=exact["control_domain_id"],
+            target_binding_id=target_binding.binding_id,
+            station_manifest_hash=station.semantic_content_hash,
+            execution_manifest_hash=execution.semantic_content_hash,
+        )
+        if segmentation_model_profile_id is not None
+        else None
+    )
+    placement = (
+        build_placement_registration(
+            segmentation=segmentation,
+            back_projection=depth_capture.back_projection,
+            component_id="right_arm",
+            destination_role="main",
+            runtime_session_id=exact["runtime_session_id"],
+            control_domain_id=exact["control_domain_id"],
+            target_binding_id=target_binding.binding_id,
+            station_manifest_hash=station.semantic_content_hash,
+            execution_manifest_hash=execution.semantic_content_hash,
+        )
+        if segmentation is not None
+        and depth_capture is not None
+        and depth_capture.back_projection is not None
         else None
     )
     if any(
@@ -2701,9 +2792,18 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if depth_capture is not None:
         definition_items.append(depth_capture.registration.definition)
         schema_items.append(depth_capture.registration.schema_entry)
+        if depth_capture.back_projection is not None:
+            definition_items.append(depth_capture.back_projection.skill.definition)
+            schema_items.append(depth_capture.back_projection.skill.schema_entry)
     if rgb_capture is not None:
         definition_items.append(rgb_capture.registration.definition)
         schema_items.append(rgb_capture.registration.schema_entry)
+    if segmentation is not None:
+        definition_items.append(segmentation.skill.definition)
+        schema_items.append(segmentation.skill.schema_entry)
+    if placement is not None:
+        definition_items.append(placement.skill.definition)
+        schema_items.append(placement.skill.schema_entry)
     definitions = SkillDefinitionCatalog(
         catalog_id="dexteleop.agent_skill_definitions.agent_tcp_pose_session",
         catalog_version="1",
@@ -2856,6 +2956,16 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=depth_capture.availability_hash,
             )
         )
+        if depth_capture.back_projection is not None:
+            back_projection = depth_capture.back_projection
+            route_items.append(
+                SkillRouteManifestEntry(
+                    route=back_projection.skill.routes[0],
+                    deployment_binding=back_projection.binding.to_ref(),
+                    evaluation_plan_hash=None,
+                    availability_hash=back_projection.availability_hash,
+                )
+            )
     if rgb_capture is not None:
         rgb_route = rgb_capture.registration.routes[0]
         route_items.append(
@@ -2866,11 +2976,29 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=rgb_capture.availability_hash,
             )
         )
+    if segmentation is not None:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=segmentation.skill.routes[0],
+                deployment_binding=segmentation.binding.to_ref(),
+                evaluation_plan_hash=None,
+                availability_hash=segmentation.availability_hash,
+            )
+        )
+    if placement is not None:
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=placement.skill.routes[0],
+                deployment_binding=placement.binding.to_ref(),
+                evaluation_plan_hash=None,
+                availability_hash=placement.availability_hash,
+            )
+        )
     io_contract_by_skill = {}
     for item in route_items:
         route_item = item.route
         key = (route_item.skill_id, route_item.skill_version)
-        artifact_contracts = tuple(
+        explicit_contracts = tuple(
             registration.registration.io_contract
             for registration in (depth_capture, rgb_capture)
             if registration is not None
@@ -2880,9 +3008,29 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 registration.registration.definition.skill_version,
             )
         )
+        if (
+            depth_capture is not None
+            and depth_capture.back_projection is not None
+            and key
+            == (
+                depth_capture.back_projection.skill.definition.skill_id,
+                depth_capture.back_projection.skill.definition.skill_version,
+            )
+        ):
+            explicit_contracts += (depth_capture.back_projection.skill.io_contract,)
+        if segmentation is not None and key == (
+            segmentation.skill.definition.skill_id,
+            segmentation.skill.definition.skill_version,
+        ):
+            explicit_contracts += (segmentation.skill.io_contract,)
+        if placement is not None and key == (
+            placement.skill.definition.skill_id,
+            placement.skill.definition.skill_version,
+        ):
+            explicit_contracts += (placement.skill.io_contract,)
         contract = (
-            artifact_contracts[0]
-            if artifact_contracts
+            explicit_contracts[0]
+            if explicit_contracts
             else inline_only_skill_io_contract(
                 skill_id=route_item.skill_id,
                 skill_version=route_item.skill_version,
@@ -2934,7 +3082,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "agent_resume",
             "hand_control",
             "hardware_backend",
-            "model_inference",
+            *(("model_inference",) if segmentation is None else ()),
             "raw_action_submission",
             "second_dispatch_owner",
         ),
@@ -2995,8 +3143,14 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         )
     if depth_capture is not None:
         validator_items.append(depth_capture.payload_validator)
+        if depth_capture.back_projection is not None:
+            validator_items.append(depth_capture.back_projection.payload_validator)
     if rgb_capture is not None:
         validator_items.append(rgb_capture.payload_validator)
+    if segmentation is not None:
+        validator_items.append(segmentation.payload_validator)
+    if placement is not None:
+        validator_items.append(placement.payload_validator)
     validators = AgentSkillPayloadValidatorRegistry(
         registry_id=(
             "dexteleop.agent_skill_payload_validators.agent_tcp_pose_session:"
@@ -3023,6 +3177,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         execution_manifest=execution,
         depth_capture=depth_capture,
         rgb_capture=rgb_capture,
+        segmentation=segmentation,
+        placement=placement,
         history_profile=history_profile,
         history_source_binding=history_source_binding,
         history_deployment_binding=history_binding,

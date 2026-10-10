@@ -13,6 +13,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_gateway.profiles.segmentation import (
+    SegmentationRegistration,
+    build_segmentation_registration,
+)
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
@@ -155,6 +159,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
     rgb_camera_geometry: RM65RgbCameraGeometry | None
     localization_registration: RealObjectLocalizationRegistration | None
     localization_provider: ObjectLocalizationProvider | None
+    segmentation_registration: SegmentationRegistration | None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None
     station_point_grasp_render_registration: (
         StationBoundPointGraspRenderRegistration | None
@@ -196,6 +201,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
                     self.rgb_camera_geometry,
                     self.localization_registration,
                     self.localization_provider,
+                    self.segmentation_registration,
                     self.station_point_grasp_registration,
                     self.station_point_grasp_render_registration,
                     self.point_grasp_planner,
@@ -217,6 +223,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
             self.rgb_camera_geometry,
             self.localization_registration,
             self.localization_provider,
+            self.segmentation_registration,
             self.station_point_grasp_registration,
             self.station_point_grasp_render_registration,
             self.point_grasp_planner,
@@ -590,6 +597,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     rgb_camera_geometry = None
     localization_registration = None
     localization_provider = None
+    segmentation_registration = None
     station_point_grasp_registration = None
     station_point_grasp_render_registration = None
     artifact_store = None
@@ -636,6 +644,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         perception_capture = build_real_perception_capture_registration_v2(
             rgb_source_catalog=catalog_provider.rgb_source_catalog(),
             depth_source_catalog=catalog_provider.depth_source_catalog(),
+            aligned_rgbd_source_catalog=(
+                catalog_provider.aligned_rgbd_source_catalog()
+            ),
             runtime_session_id=runtime_id,
             control_domain_id=domain_id,
             target_binding_id=target_binding_id,
@@ -697,6 +708,22 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 localizer=object_localizer,
                 registration=localization_registration,
                 allowed_local_image_roots=(),
+            )
+            segmentation_registration = build_segmentation_registration(
+                target_kind="real",
+                current_mode="real_active",
+                source_id_by_role={
+                    str(item["role"]): str(item["source_id"])
+                    for item in catalog_provider.rgb_source_catalog()
+                },
+                model_profile_id=localization_model_id,
+                model_profile_hash=localization_model_hash,
+                inference_implementation_hash=localizer_hash,
+                runtime_session_id=runtime_id,
+                control_domain_id=domain_id,
+                target_binding_id=target_binding_id,
+                station_manifest_hash=station_manifest_hash,
+                execution_manifest_hash=execution_manifest_hash,
             )
             station_point_grasp_registration = (
                 build_station_bound_point_grasp_registration(
@@ -869,7 +896,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             allowed_client_ids=client_bindings.allowed_client_ids,
             perception_capture=perception_capture,
             localization_registration=localization_registration,
+            segmentation_registration=segmentation_registration,
             localization_provider=localization_provider,
+            segmentation_localizer=(
+                object_localizer if segmentation_registration is not None else None
+            ),
             station_point_grasp_registration=station_point_grasp_registration,
             station_point_grasp_render_registration=(
                 station_point_grasp_render_registration
@@ -962,6 +993,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         rgb_camera_geometry=rgb_camera_geometry,
         localization_registration=localization_registration,
         localization_provider=localization_provider,
+        segmentation_registration=segmentation_registration,
         station_point_grasp_registration=station_point_grasp_registration,
         station_point_grasp_render_registration=(
             station_point_grasp_render_registration

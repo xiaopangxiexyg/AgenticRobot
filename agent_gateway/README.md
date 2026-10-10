@@ -305,14 +305,30 @@ disconnect handling, so the safety channel does not weaken HOLD-on-disconnect.
 
 `--artifact-root` is optional and default-off. Supplying a real,
 non-world-writable directory enables the read-only
-`perception.capture_depth` and `perception.capture_rgb` Skills. Depth returns
-role-selected native-resolution float32 metric data; RGB returns one
-role-selected JPEG per output Artifact ordinal. Production RGB v2 also reports
-the admitted Station revision, an explicit capture window, and each frame's
-acquisition timestamp while preserving the requested semantic-role order. The
-trusted MuJoCo profile maps semantic roles to lower camera sources. Inline
-results contain only bounded metadata and content hashes. Pixel arrays never
-enter the control frame.
+`perception.capture_depth`, `perception.capture_rgb`, and
+`perception.back_project` Skills. A motion Gateway that also has the optional
+segmentation model exposes `perception.segment` and
+`perception.plan_placement`. The placement planner consumes two retained
+text-prompt segment operation IDs as identity anchors, reruns the registered
+localizer on current correlated RGB-D cuts, and returns compact Station-frame
+placement geometry. It never dispatches motion, and callers must
+use a separate motion Skill after checking
+`geometry_eligible_for_motion_planning`. Depth returns role-selected native-resolution
+float32 metric data; RGB returns one role-selected JPEG per output Artifact
+ordinal. Back-projection takes either one pixel or a half-open pixel region,
+captures aligned live depth internally, and returns bounded geometry in the
+registered Station frame; raw depth does not enter its control result.
+Production RGB v2 also reports the admitted Station revision, an explicit
+capture window, and each frame's acquisition timestamp while preserving the
+requested semantic-role order. The trusted MuJoCo profile maps semantic roles
+to lower camera sources. Inline capture results contain only bounded metadata
+and content hashes. Pixel arrays never enter the control frame.
+
+本次接入保留既有 `manipulation.set_gripper_state` 夹爪合同，不注册新的开合或夹爪
+状态 Skill。MuJoCo 放置几何读取同一个 scene cut 的 TCP 与实测夹爪状态；当前真机
+适配器尚未绑定夹爪测量，因此返回 `held_gripper_state_unavailable`，不会将结果标为
+可用于运动规划。`geometry_eligible_for_motion_planning` 也不代表通过了轨迹碰撞准入、
+已抓住物体或可直接执行放置；执行仍需独立运动授权和下层校验。
 
 `python -m control_station agent-gateway-mujoco ...` remains a compatibility
 forwarder. It creates no Gateway implementation or runtime state inside
@@ -481,8 +497,9 @@ python -m agent_gateway real-perception \
   --artifact-root /absolute/private/artifact_cache
 ```
 
-By default, `real-perception` exposes exactly `perception.capture_rgb` and
-`perception.capture_depth` in `real_observe` mode. It owns the configured
+By default, `real-perception` exposes `perception.capture_rgb`,
+`perception.capture_depth`, and `perception.back_project` in
+`real_observe` mode. It owns the configured
 RealSense inventory and transient Artifact store, starts and admits cameras
 before publishing the Unix socket, and has no RM65 backend, motion Route,
 operator Grant, command owner, dispatch path, or domain HOLD path. It therefore

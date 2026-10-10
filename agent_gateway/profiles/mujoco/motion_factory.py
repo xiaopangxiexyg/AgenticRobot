@@ -345,6 +345,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     trace_sink: Callable[[Any], None] | None = None,
     history_storage: MujocoAgentTcpPoseHistoryStorageConfig | None = None,
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
+    segmentation_localizer: object | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
@@ -358,6 +359,21 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         MujocoAgentArtifactStorageConfig,
     ):
         raise TypeError("artifact_storage must be typed or None.")
+    if segmentation_localizer is not None:
+        for name in ("start", "close", "segment"):
+            if not callable(getattr(segmentation_localizer, name, None)):
+                raise TypeError(f"segmentation_localizer must expose {name}().")
+        if artifact_storage is None:
+            raise ValueError("MuJoCo segmentation requires Artifact storage.")
+        model_spec = getattr(segmentation_localizer, "model_spec", None)
+        if not str(getattr(model_spec, "model_profile_id", "")).strip() or not str(
+            getattr(model_spec, "semantic_content_hash", "")
+        ).strip():
+            raise ValueError("segmentation_localizer must expose a verified model_spec.")
+        if not str(
+            getattr(segmentation_localizer, "semantic_content_hash", "")
+        ).strip():
+            raise ValueError("segmentation_localizer must expose semantic_content_hash.")
     if target_config.station_pose_contract_path is None:
         target_config = replace(
             target_config,
@@ -465,6 +481,21 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 None if history_storage is None else history_storage.profile
             ),
             enable_artifact_perception=artifact_storage is not None,
+            segmentation_model_profile_id=(
+                None
+                if segmentation_localizer is None
+                else segmentation_localizer.model_spec.model_profile_id
+            ),
+            segmentation_model_profile_hash=(
+                None
+                if segmentation_localizer is None
+                else segmentation_localizer.model_spec.semantic_content_hash
+            ),
+            segmentation_inference_implementation_hash=(
+                None
+                if segmentation_localizer is None
+                else segmentation_localizer.semantic_content_hash
+            ),
         )
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding
@@ -497,6 +528,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             owns_source_observation_history_store=history_store is not None,
             artifact_store=artifact_store,
             owns_artifact_store=artifact_store is not None,
+            segmentation_localizer=segmentation_localizer,
         )
     except Exception:
         if history_store is not None:

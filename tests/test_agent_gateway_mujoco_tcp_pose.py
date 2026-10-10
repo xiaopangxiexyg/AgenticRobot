@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image
 
 import agent_gateway.profiles.mujoco.motion_deployment as deployment
 import agent_gateway.profiles.mujoco.observation as observation_module
@@ -36,6 +37,7 @@ from agent_gateway.profiles.mujoco.motion_factory import (
     validate_mujoco_agent_tcp_pose_target_config,
 )
 from agent_gateway.profiles.mujoco.motion_gateway_session import (
+    MujocoAgentTcpPoseGatewaySession,
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
 from agent_gateway.profiles.mujoco.motion_primitive_profiles import (
@@ -50,6 +52,10 @@ from agent_gateway.profiles.mujoco.motion_skill import (
 )
 from agent_gateway.profiles.mujoco.observation import (
     MujocoAgentObservationProducer,
+)
+from agent_gateway.profiles.segmentation import (
+    SEGMENT_MASK_OUTPUT_SLOT_ID_V1,
+    SEGMENT_OVERLAY_OUTPUT_SLOT_ID_V1,
 )
 from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
@@ -73,6 +79,12 @@ from agent_gateway.skills.motion.definition import (
 from agent_gateway.skills.perception.definition import (
     CAPTURE_DEPTH_SKILL_ID_V1,
     CAPTURE_RGB_SKILL_ID_V1,
+    PLAN_PLACEMENT_SKILL_ID_V1,
+    SEGMENT_SKILL_ID_V1,
+)
+from deployments.perception.sam2_grounding_dino import (
+    GroundedObjectSegment,
+    encode_grounded_object_segment_artifacts,
 )
 from robot_motion.coordinate_frames import (
     CoordinateFrameGraph,
@@ -110,6 +122,98 @@ def test_motion_primitive_organization_preserves_legacy_profile_exports() -> Non
     assert motion_skill.resolve_level_tcp_orientation_primitive_target is (
         resolve_level_tcp_orientation_primitive_target
     )
+
+
+def test_segmentation_model_startup_failure_closes_partial_resources() -> None:
+    class _FaultyLocalizer:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def start(self) -> None:
+            raise RuntimeError("model allocation failed")
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    localizer = _FaultyLocalizer()
+    session = SimpleNamespace(
+        _close_lock=threading.Lock(),
+        _close_outcome=None,
+        segmentation_localizer=localizer,
+        _segmentation_model_started=False,
+    )
+
+    with pytest.raises(RuntimeError, match="model allocation failed"):
+        MujocoAgentTcpPoseGatewaySession.start_perception_resources(session)
+
+    assert localizer.close_calls == 1
+    assert session._segmentation_model_started is False
+
+
+def test_unsettled_passive_read_defers_owned_dependency_cleanup() -> None:
+    wait_timeouts = []
+
+    class _Executor:
+        settled = False
+
+        def wait_all(self, *, timeout_sec):
+            wait_timeouts.append(timeout_sec)
+            return self.settled
+
+    class _Localizer:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class _Store:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    executor = _Executor()
+    localizer = _Localizer()
+    artifact_store = _Store()
+    lower_close_calls = []
+    outcome = object()
+    session = SimpleNamespace(
+        _close_lock=threading.Lock(),
+        history_recorder=None,
+        _close_outcome=None,
+        service=SimpleNamespace(close=lambda **_kwargs: outcome),
+        observation_producer=SimpleNamespace(current_station_revision=0),
+        state_executor=executor,
+        depth_executor=None,
+        rgb_executor=None,
+        history_executor=None,
+        segmentation_executor=None,
+        placement_executor=executor,
+        _segmentation_model_started=True,
+        segmentation_localizer=localizer,
+        _finish_lower_close=lambda value: lower_close_calls.append(value),
+        owns_source_observation_history_store=False,
+        source_observation_history_store=None,
+        _source_observation_history_store_closed=False,
+        owns_artifact_store=True,
+        artifact_store=artifact_store,
+        _artifact_store_closed=False,
+    )
+
+    with pytest.raises(RuntimeError, match="state_executor"):
+        MujocoAgentTcpPoseGatewaySession.close(session)
+    assert 130.0 in wait_timeouts
+    assert localizer.close_calls == 0
+    assert lower_close_calls == []
+    assert artifact_store.close_calls == 0
+
+    executor.settled = True
+    assert MujocoAgentTcpPoseGatewaySession.close(session) is outcome
+    assert localizer.close_calls == 1
+    assert lower_close_calls == [outcome]
+    assert artifact_store.close_calls == 1
 
 
 def _profile_and_schema(component_id: str = "right_arm"):
@@ -181,9 +285,57 @@ def test_cardinal_step_target_is_derived_from_lower_activation_pose() -> None:
         for item in resolution.evidence_refs
     )
     assert any(
-        item.startswith("tcp-displacement-target:")
-        for item in resolution.evidence_refs
+        item.startswith("tcp-displacement-target:") for item in resolution.evidence_refs
     )
+
+
+@pytest.mark.parametrize("close", [0.75, -0.1, 1.1, float("nan")])
+def test_passive_placement_state_uses_one_measured_scene_cut(monkeypatch, close) -> None:
+    events = []
+
+    def measured_pose(scene, config):
+        events.append("tcp")
+        return {"right": np.eye(4)}
+
+    def measured_close(name):
+        assert name == "right-gripper"
+        events.append("gripper")
+        return close
+
+    scene = SimpleNamespace(
+        state_is_finite=lambda: True,
+        get_gripper_close=measured_close,
+    )
+
+    def capture_scene(callback):
+        events.append("scene_cut")
+        return callback(scene)
+
+    monkeypatch.setattr(
+        "agent_gateway.profiles.mujoco.motion_application."
+        "capture_mujoco_sim_hil_tool_tcp_pose_by_side",
+        measured_pose,
+    )
+    application = object.__new__(MujocoAgentSkillMotionApplication)
+    application._lock = threading.RLock()
+    application._closed = False
+    application.task_config = SimpleNamespace(right_gripper_name="right-gripper")
+    application.runtime = SimpleNamespace(
+        rig=SimpleNamespace(capture_scene=capture_scene), clock=lambda: 10.0
+    )
+
+    if not math.isfinite(close) or not 0.0 <= close <= 1.0:
+        with pytest.raises(RuntimeError, match="close fraction is invalid"):
+            application.capture_arm_gripper_state()
+    else:
+        state = application.capture_arm_gripper_state()
+        assert state["right_arm"] == pytest.approx((0, 0, 0, 0, 0, 0, 1))
+        assert state["right_gripper"] == {
+            "close_fraction": close,
+            "measured_at": 10.0,
+            "state_source": "mujoco_scene_measured",
+        }
+    assert events == ["scene_cut", "tcp", "gripper"]
 
 
 def test_fixed_level_orientation_is_absolute_and_preserves_tcp_position() -> None:
@@ -253,14 +405,20 @@ def test_cardinal_step_uses_station_axes_not_rotated_arm_base_axes() -> None:
     )
 
     assert resolution.target_pose[:3] == pytest.approx((1.0, -0.03, 0.5))
-    assert sum(
-        item.startswith("tcp-primitive-frame-resolution:")
-        for item in resolution.evidence_refs
-    ) == 1
-    assert sum(
-        item.startswith("tcp-execution-frame-resolution:")
-        for item in resolution.evidence_refs
-    ) == 1
+    assert (
+        sum(
+            item.startswith("tcp-primitive-frame-resolution:")
+            for item in resolution.evidence_refs
+        )
+        == 1
+    )
+    assert (
+        sum(
+            item.startswith("tcp-execution-frame-resolution:")
+            for item in resolution.evidence_refs
+        )
+        == 1
+    )
 
 
 def test_fixed_orientation_is_defined_in_station_then_returned_in_arm_base() -> None:
@@ -325,9 +483,7 @@ def test_absolute_station_target_is_converted_only_at_execution_boundary() -> No
         target_frame_id=execution_frame.frame_id,
     )
     poses = [execution_start, execution_target, execution_target, execution_target]
-    application.capture_tcp_pose_by_component = lambda: {
-        "right_arm": poses.pop(0)
-    }
+    application.capture_tcp_pose_by_component = lambda: {"right_arm": poses.pop(0)}
     request, operation = _request_and_operation(
         route,
         binding,
@@ -360,9 +516,7 @@ def test_absolute_station_target_is_converted_only_at_execution_boundary() -> No
         cancel_requested=lambda: False,
     )
     assert completion.succeeded
-    submitted = calls["submit"][0]["action"].values_by_component[
-        "right_arm"
-    ].values
+    submitted = calls["submit"][0]["action"].values_by_component["right_arm"].values
     assert submitted == pytest.approx(execution_target)
 
 
@@ -388,24 +542,24 @@ def test_tcp_observation_transforms_raw_arm_base_pose_before_publication(
     producer.execution_reference_frame_id = "right_arm_base"
     producer.reference_frame_id = station.frame_id
 
-    projection = producer._capture_scene(
-        SimpleNamespace(state_is_finite=lambda: True)
-    )
+    projection = producer._capture_scene(SimpleNamespace(state_is_finite=lambda: True))
 
     expected = application.transform_tcp_pose_xyzquat(
         raw_execution_pose,
         source_frame_id="right_arm_base",
         target_frame_id=station.frame_id,
     )
-    assert projection["pose_xyz_quat_xyzw_by_component"][
-        "right_arm"
-    ] == pytest.approx(expected)
+    assert projection["pose_xyz_quat_xyzw_by_component"]["right_arm"] == pytest.approx(
+        expected
+    )
     assert projection["pose_xyz_quat_xyzw_by_component"]["right_arm"] != (
         pytest.approx(raw_execution_pose)
     )
 
 
-def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope() -> None:
+def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope() -> (
+    None
+):
     runtime = _build_standard_tcp_pose_envelope_runtime(
         prepared=SimpleNamespace(
             target_frame_profile=SimpleNamespace(
@@ -424,9 +578,7 @@ def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope()
     )
     entry_by_id = {entry.envelope_id: entry for entry in runtime.catalog_entries}
     standard = entry_by_id[MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1]
-    orientation = entry_by_id[
-        MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1
-    ]
+    orientation = entry_by_id[MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1]
 
     assert standard.profile.side_config_by_side["right"].max_rotation_rad == (
         pytest.approx(0.2617993877991494)
@@ -434,15 +586,15 @@ def test_mujoco_fixed_orientation_routes_use_a_separate_full_rotation_envelope()
     assert orientation.profile.side_config_by_side["right"].max_rotation_rad == (
         pytest.approx(3.141592653589793)
     )
-    assert orientation.profile.side_config_by_side[
-        "right"
-    ].relative_min_xyz_m == (0.0, 0.0, 0.0)
+    assert orientation.profile.side_config_by_side["right"].relative_min_xyz_m == (
+        0.0,
+        0.0,
+        0.0,
+    )
     assert set(orientation.allowed_route_ids) == set(
         MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()
     )
-    assert set(standard.allowed_route_ids).isdisjoint(
-        orientation.allowed_route_ids
-    )
+    assert set(standard.allowed_route_ids).isdisjoint(orientation.allowed_route_ids)
 
 
 def _contracts(motion_profile):
@@ -561,9 +713,7 @@ def _request_and_operation(
         parameters={
             "pose_targets_by_component": {component_id: list(target_pose)},
             "reference_frame_id": motion_profile.reference_frame_id,
-            "reference_frame_spec_hash": (
-                motion_profile.reference_frame_spec_hash
-            ),
+            "reference_frame_spec_hash": (motion_profile.reference_frame_spec_hash),
             "controlled_frame_id": "tool_tcp",
             "frame_graph_hash": motion_profile.frame_graph_hash,
             "tool_config_hash": motion_profile.tool_config_hash,
@@ -838,17 +988,14 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
                     ),
                     authoritative_step=SimpleNamespace(
                         status=(
-                            "target_support_expired_before_submission_"
-                            "keep_existing"
+                            "target_support_expired_before_submission_keep_existing"
                         ),
                         decision=SimpleNamespace(decision_id="decision:fixture"),
                         publication_attempt=SimpleNamespace(accepted=True),
                         directive=SimpleNamespace(
                             global_status="normal",
                             directive_by_selection_group={
-                                "arms": SimpleNamespace(
-                                    directive="publish_selected"
-                                )
+                                "arms": SimpleNamespace(directive="publish_selected")
                             },
                         ),
                         action_adaptation=SimpleNamespace(
@@ -895,9 +1042,7 @@ def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
                     safety_result=None,
                     resolution_failure=None,
                     dispatch_receipts=None,
-                    trace_facts=(
-                        SimpleNamespace(fact_id="publication-miss:fixture"),
-                    ),
+                    trace_facts=(SimpleNamespace(fact_id="publication-miss:fixture"),),
                     target_execution_request=None,
                 ),
             )
@@ -973,9 +1118,7 @@ def test_tcp_pose_lifecycle_fails_closed_on_unclassified_keep_existing() -> None
                 directive=SimpleNamespace(
                     global_status="normal",
                     directive_by_selection_group={
-                        "arms": SimpleNamespace(
-                            directive="keep_existing_until_expiry"
-                        )
+                        "arms": SimpleNamespace(directive="keep_existing_until_expiry")
                     },
                 ),
                 cancellation=None,
@@ -1052,12 +1195,10 @@ def test_lifecycle_resolves_cardinal_target_at_lower_activation_boundary() -> No
         motion_profile=motion_profile,
         request=request,
         operation=operation,
-        target_resolver=lambda measured: (
-            resolve_tcp_displacement_primitive_target(
-                measured_pose=measured,
-                primitive=cardinal_tcp_short_step("forward"),
-                reference_frame_spec=reference_frame,
-            )
+        target_resolver=lambda measured: resolve_tcp_displacement_primitive_target(
+            measured_pose=measured,
+            primitive=cardinal_tcp_short_step("forward"),
+            reference_frame_spec=reference_frame,
         ),
         clock=lambda: 12.0,
         sleep=lambda _seconds: None,
@@ -1078,9 +1219,7 @@ def test_lifecycle_resolves_cardinal_target_at_lower_activation_boundary() -> No
     assert activation.succeeded
     assert lifecycle.target_pose == pytest.approx(target_pose)
     assert completion.succeeded
-    submitted = calls["submit"][0]["action"].values_by_component[
-        "right_arm"
-    ].values
+    submitted = calls["submit"][0]["action"].values_by_component["right_arm"].values
     assert submitted == pytest.approx(target_pose)
     assert any(
         ref.startswith("tcp-displacement-target:")
@@ -1141,12 +1280,10 @@ def test_lifecycle_resolves_fixed_level_orientation_for_either_arm(
         motion_profile=motion_profile,
         request=request,
         operation=operation,
-        target_resolver=lambda measured: (
-            resolve_level_tcp_orientation_primitive_target(
-                measured_pose=measured,
-                primitive=primitive,
-                reference_frame_spec=reference_frame,
-            )
+        target_resolver=lambda measured: resolve_level_tcp_orientation_primitive_target(
+            measured_pose=measured,
+            primitive=primitive,
+            reference_frame_spec=reference_frame,
         ),
         clock=lambda: 12.0,
         sleep=lambda _seconds: None,
@@ -1220,10 +1357,7 @@ def test_fixed_orientation_lifecycle_slerps_large_rotation_references() -> None:
     )
 
     assert completion.succeeded
-    submitted = [
-        call["action"].value("right_arm").values
-        for call in calls["submit"]
-    ]
+    submitted = [call["action"].value("right_arm").values for call in calls["submit"]]
     assert len(submitted) == 2
     assert submitted[0][:3] == pytest.approx(start_pose[:3])
     assert submitted[1][:3] == pytest.approx(start_pose[:3])
@@ -1332,6 +1466,7 @@ def _build_no_model_contract_bundle_fixture(
     monkeypatch,
     *,
     enable_artifact_perception: bool = False,
+    segmentation_identity: tuple[str, str, str] | None = None,
 ):
     _profile, action_schema = _profile_and_schema()
     observation_plan = SimpleNamespace(
@@ -1339,9 +1474,7 @@ def _build_no_model_contract_bundle_fixture(
         reference_mode="full_frames",
         measurement_mode="full_frames",
         component_ids=("right_arm",),
-        required_representation_by_component={
-            "right_arm": "cartesian_pose"
-        },
+        required_representation_by_component={"right_arm": "cartesian_pose"},
         semantic_content_hash="observation-plan:agent-motion-fixture",
     )
     direct = MujocoDirectComponentProposalSource(
@@ -1459,7 +1592,7 @@ def _build_no_model_contract_bundle_fixture(
         ),
     )
     application.depth_source_catalog = lambda: (
-        {"view_id": "front", "native_width": 2, "native_height": 2},
+        {"view_id": "front", "native_width": 640, "native_height": 480},
     )
     application.visual_source_catalog = lambda: (
         {"source_id": "front", "native_width": 640, "native_height": 480},
@@ -1500,6 +1633,15 @@ def _build_no_model_contract_bundle_fixture(
     bundle = build_mujoco_agent_tcp_pose_contract_bundle(
         application=application,
         enable_artifact_perception=enable_artifact_perception,
+        segmentation_model_profile_id=(
+            None if segmentation_identity is None else segmentation_identity[0]
+        ),
+        segmentation_model_profile_hash=(
+            None if segmentation_identity is None else segmentation_identity[1]
+        ),
+        segmentation_inference_implementation_hash=(
+            None if segmentation_identity is None else segmentation_identity[2]
+        ),
     )
     return application, runtime, direct, bundle, captured_manifest_args
 
@@ -1528,9 +1670,7 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
             "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0]
         },
         "reference_frame_id": bundle.motion_profile.reference_frame_id,
-        "reference_frame_spec_hash": (
-            bundle.motion_profile.reference_frame_spec_hash
-        ),
+        "reference_frame_spec_hash": (bundle.motion_profile.reference_frame_spec_hash),
         "controlled_frame_id": "tool_tcp",
         "frame_graph_hash": bundle.motion_profile.frame_graph_hash,
         "tool_config_hash": "tool-config:fixture",
@@ -1547,24 +1687,18 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "frame_graph_hash": bundle.cardinal_step_profile.frame_graph_hash,
         "tool_config_hash": bundle.cardinal_step_profile.tool_config_hash,
         "calibration_hash": bundle.cardinal_step_profile.calibration_hash,
-        "primitive_catalog_hash": (
-            bundle.cardinal_step_profile.primitive_catalog_hash
-        ),
+        "primitive_catalog_hash": (bundle.cardinal_step_profile.primitive_catalog_hash),
     }
 
     assert bundle.route_manifest.current_mode == "sim_active"
     assert motion_entry.route.control_effect_class == "motion"
     assert motion_entry.route.privilege_tier == "t1_sim_or_no_motion"
-    assert motion_entry.route.route_id == (
-        "sim.mujoco.rm65.agent_skill_tcp_pose"
-    )
+    assert motion_entry.route.route_id == ("sim.mujoco.rm65.agent_skill_tcp_pose")
     assert cardinal_step_entry.route.control_effect_class == "motion"
     assert cardinal_step_entry.route.route_id == (
         "sim.mujoco.rm65.agent_skill_tcp_cardinal_step"
     )
-    assert bundle.cardinal_step_profile.reference_frame_id == (
-        "mujoco_sim_hil/station"
-    )
+    assert bundle.cardinal_step_profile.reference_frame_id == ("mujoco_sim_hil/station")
     assert bundle.motion_profile.reference_frame_id == "mujoco_sim_hil/station"
     assert bundle.motion_profile.execution_reference_frame_id == "right_arm_base"
     assert bundle.state_deployment_binding.reference_frame_id == (
@@ -1582,14 +1716,15 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     }
     assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= published_skill_ids
     assert set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) <= published_skill_ids
-    assert "distance_m" not in bundle.schema_catalog.entry(
-        "motion.step_tcp_cardinal",
-        "1",
-    ).parameter_schema["properties"]
+    assert (
+        "distance_m"
+        not in bundle.schema_catalog.entry(
+            "motion.step_tcp_cardinal",
+            "1",
+        ).parameter_schema["properties"]
+    )
     assert state_entry.route.control_effect_class == "read_only"
-    assert "requested_duration_ms" not in schema_entry.parameter_schema[
-        "properties"
-    ]
+    assert "requested_duration_ms" not in schema_entry.parameter_schema["properties"]
     assert captured_manifest_args["motion_authority_sources"] == (
         "agent_skill:control-station-agent-skill-fixture",
     )
@@ -1607,15 +1742,21 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
             fixed_contract.skill_id,
             "1",
         ).route
-        assert fixed_route.route_id == (
-            MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[
-                fixed_contract.skill_id
-            ]
+        assert (
+            fixed_route.route_id
+            == (
+                MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[
+                    fixed_contract.skill_id
+                ]
+            )
         )
-        assert fixed_contract.direction == (
-            FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
-                fixed_contract.skill_id
-            ]
+        assert (
+            fixed_contract.direction
+            == (
+                FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
+                    fixed_contract.skill_id
+                ]
+            )
         )
         fixed_parameters = {
             **cardinal_parameters,
@@ -1636,10 +1777,13 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
             orientation_profile.skill_id,
             "1",
         ).route
-        assert orientation_route.route_id == (
-            MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[
-                orientation_profile.skill_id
-            ]
+        assert (
+            orientation_route.route_id
+            == (
+                MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[
+                    orientation_profile.skill_id
+                ]
+            )
         )
         assert orientation_profile.reference_frame_id == "mujoco_sim_hil/station"
         assert orientation_profile.execution_reference_frame_id == "right_arm_base"
@@ -1663,9 +1807,7 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
             "frame_graph_hash": orientation_profile.frame_graph_hash,
             "tool_config_hash": orientation_profile.tool_config_hash,
             "calibration_hash": orientation_profile.calibration_hash,
-            "primitive_hash": (
-                orientation_profile.primitive.semantic_content_hash
-            ),
+            "primitive_hash": (orientation_profile.primitive.semantic_content_hash),
         }
         bundle.payload_validators.validate_parameters(
             route=orientation_route,
@@ -1708,14 +1850,12 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         for item in session.service.executor_registry.bindings
     }
     assert route_to_port["motion.move_tcp_to_pose"] is session.motion_executor
-    assert route_to_port["motion.step_tcp_cardinal"] is (
-        session.cardinal_step_executor
-    )
+    assert route_to_port["motion.step_tcp_cardinal"] is (session.cardinal_step_executor)
     assert set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) <= set(route_to_port)
     for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
-        assert route_to_port[skill_id] is session.fixed_cardinal_step_executors[
-            skill_id
-        ]
+        assert (
+            route_to_port[skill_id] is session.fixed_cardinal_step_executors[skill_id]
+        )
     assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= set(route_to_port)
     for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
         assert route_to_port[skill_id] is session.fixed_orientation_executors[
@@ -1747,8 +1887,8 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert configured["reason_code"] == "lower_control_claim_free"
     assert configured["active_operation_id"] is None
 
-    motion_application.runtime.capture_execution_gate_snapshot = (
-        lambda **_kwargs: SimpleNamespace(status="hold")
+    motion_application.runtime.capture_execution_gate_snapshot = lambda **_kwargs: (
+        SimpleNamespace(status="hold")
     )
     motion_application._started = True
     motion_application._held = True
@@ -1776,6 +1916,11 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
         _build_no_model_contract_bundle_fixture(
             monkeypatch,
             enable_artifact_perception=True,
+            segmentation_identity=(
+                "sam2:test",
+                "sam2-model:test",
+                "sam2-localizer:test",
+            ),
         )
     )
     depth_entry = bundle.route_manifest.route(CAPTURE_DEPTH_SKILL_ID_V1, "2")
@@ -1785,11 +1930,9 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     assert not depth_entry.route.may_open_publication
     assert bundle.depth_capture is not None
     depth_payload = io.BytesIO()
-    np.save(
-        depth_payload,
-        np.asarray([[1.0, 2.0], [3.0, 0.0]], dtype=np.float32),
-        allow_pickle=False,
-    )
+    initial_depth = np.zeros((480, 640), dtype=np.float32)
+    initial_depth[0, 1] = 2.0
+    np.save(depth_payload, initial_depth, allow_pickle=False)
     depth_bytes = depth_payload.getvalue()
 
     motion_application = object.__new__(MujocoAgentSkillMotionApplication)
@@ -1804,8 +1947,8 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
         EncodedMujocoDepthFrame(
             view_id="front",
             captured_at=10.0,
-            width=2,
-            height=2,
+            width=640,
+            height=480,
             media_type="application/x-npy",
             schema_id="dexteleop.perception.depth_image_meters.v1",
             encoding="npy.float32.c_order.v1",
@@ -1813,8 +1956,8 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
             data=depth_bytes,
             camera_pose_world_xyz_quat_xyzw=(0, 0, 1, 0, 0, 0, 1),
             intrinsics={
-                "width": 2,
-                "height": 2,
+                "width": 640,
+                "height": 480,
                 "fx": 1.0,
                 "fy": 1.0,
                 "cx": 1.0,
@@ -1823,21 +1966,94 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
             },
         )
     )
-    rgb_bytes = b"bounded-rgb-jpeg"
-    motion_application.capture_visual_jpeg_snapshot = lambda **_kwargs: (
-        EncodedMujocoRgbSnapshot(
+
+    def encoded_rgb(width: int, height: int) -> bytes:
+        output = io.BytesIO()
+        Image.new("RGB", (width, height), (48, 96, 144)).save(output, format="JPEG")
+        return output.getvalue()
+
+    rgb_bytes = encoded_rgb(32, 24)
+
+    def capture_visual_jpeg_snapshot(*, source_ids, width, height):
+        assert source_ids == ("front",)
+        return EncodedMujocoRgbSnapshot(
             captured_at=10.0,
             frames={
                 "front": EncodedMujocoRgbFrame(
                     source_id="front",
-                    width=32,
-                    height=24,
+                    width=width,
+                    height=height,
                     media_type="image/jpeg",
-                    data=rgb_bytes,
+                    data=encoded_rgb(width, height),
                 )
             },
         )
+
+    motion_application.capture_visual_jpeg_snapshot = capture_visual_jpeg_snapshot
+    motion_application.capture_visual_depth_cut = lambda *, view_id: (
+        capture_visual_jpeg_snapshot(
+            source_ids=(view_id,),
+            width=640,
+            height=480,
+        ).frames[view_id],
+        motion_application.capture_depth_npy_frame(view_id=view_id),
     )
+
+    class _Segmenter:
+        semantic_content_hash = "sam2-localizer:test"
+        model_spec = SimpleNamespace(
+            model_profile_id="sam2:test",
+            semantic_content_hash="sam2-model:test",
+        )
+
+        def __init__(self) -> None:
+            self.started = False
+            self.closed = False
+            self.fail_close = False
+            self.prompts = []
+            self.advance_inference_clock = None
+
+        def start(self):
+            self.started = True
+
+        def close(self):
+            self.started = False
+            self.closed = True
+            if self.fail_close:
+                raise RuntimeError("model release failed")
+
+        def segment(self, image, *, language_prompt, pixel_uv, min_score):
+            assert self.started
+            assert image.size == (640, 480)
+            self.prompts.append(language_prompt)
+            if self.advance_inference_clock is not None:
+                self.advance_inference_clock()
+            mask = np.zeros((480, 640), dtype=bool)
+            if language_prompt == "destination surface":
+                assert pixel_uv is None
+                mask[180:301, 240:401] = True
+            else:
+                assert language_prompt in {None, "held object"}
+                assert pixel_uv == ((320, 240) if language_prompt is None else None)
+                mask[235:246, 315:326] = True
+            ys, xs = np.nonzero(mask)
+            return GroundedObjectSegment(
+                mask=mask,
+                score=max(0.95, min_score),
+                label=language_prompt,
+                box_xyxy=(
+                    int(xs.min()),
+                    int(ys.min()),
+                    int(xs.max()) + 1,
+                    int(ys.max()) + 1,
+                ),
+            )
+
+        encode_segment_artifacts = staticmethod(
+            encode_grounded_object_segment_artifacts
+        )
+
+    segmenter = _Segmenter()
     artifact_store = RecoverableAgentArtifactStore(
         root=tmp_path / "artifacts",
         quota_bytes=32 * 1024 * 1024,
@@ -1848,29 +2064,44 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
         application=motion_application,
         contract_bundle=bundle,
         allowed_client_ids=("rpent:fixture",),
-        max_retained_operations=3,
+        max_retained_operations=8,
         artifact_store=artifact_store,
         owns_artifact_store=True,
+        segmentation_localizer=segmenter,
     )
+    session.start_perception_resources()
     route_to_port = {
         item.skill_id: item.execution_port
         for item in session.service.executor_registry.bindings
     }
     assert route_to_port[CAPTURE_DEPTH_SKILL_ID_V1] is session.depth_executor
     assert route_to_port[CAPTURE_RGB_SKILL_ID_V1] is session.rgb_executor
+    assert route_to_port["perception.back_project"] is (
+        session.back_projection_executor
+    )
+    assert route_to_port[PLAN_PLACEMENT_SKILL_ID_V1] is (
+        session.placement_executor
+    )
     assert session.depth_executor is not session.motion_executor
     assert session.service.domain_control_port is session.motion_executor
     hardware_resources = session.wire_adapter(
         authenticated_client_id="rpent:fixture"
     ).get_hardware_resource_views()["resources"]
     assert [item["resource_id"] for item in hardware_resources] == [
-        "simulation.runtime"
+        "perception.segmentation_model",
+        "simulation.runtime",
     ]
-    assert {
-        item["skill_id"] for item in hardware_resources[0]["read_skill_refs"]
-    } == {
+    simulation_resource = next(
+        item
+        for item in hardware_resources
+        if item["resource_id"] == "simulation.runtime"
+    )
+    assert {item["skill_id"] for item in simulation_resource["read_skill_refs"]} == {
+        "perception.back_project",
         "perception.capture_depth",
         "perception.capture_rgb",
+        "perception.plan_placement",
+        "perception.segment",
         "state.read_tcp_pose",
     }
     capabilities = session.service.protocol_runtime.session_capabilities
@@ -1964,9 +2195,15 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     assert completed.execution_result["frame_graph_hash"] == (
         bundle.depth_capture.deployment_binding.frame_graph_hash
     )
-    assert completed.execution_result[
-        "camera_pose_reference_xyz_quat_xyzw"
-    ] == (0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    assert completed.execution_result["camera_pose_reference_xyz_quat_xyzw"] == (
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
     assert "camera_pose_world_xyz_quat_xyzw" not in completed.execution_result
     assert len(completed.output_artifact_bindings) == 1
     output_binding = completed.output_artifact_bindings[0]
@@ -2058,8 +2295,190 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     )
     assert session.motion_executor.workers == ()
 
-    session.close()
+    def run_passive_skill(
+        skill_id: str,
+        *,
+        sequence: int,
+        parameters: dict[str, object],
+        timeout_ms: int,
+    ) -> AgentSkillOperation:
+        entry = bundle.route_manifest.route(skill_id, "1")
+        route = entry.route
+        profile_ref = route.allowed_parameter_profiles[0]
+        request = AgentSkillRequest(
+            client_id="rpent:fixture",
+            request_id=f"request:{skill_id}:{sequence}",
+            idempotency_key=f"idempotency:{skill_id}:{sequence}",
+            client_sequence=sequence,
+            runtime_session_id=bundle.route_manifest.runtime_session_id,
+            skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+            expected_station_revision=0,
+            skill_id=route.skill_id,
+            skill_version=route.skill_version,
+            skill_definition_hash=route.skill_definition_hash,
+            route_id=route.route_id,
+            route_version=route.route_version,
+            route_hash=route.semantic_content_hash,
+            deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+            parameter_profile_id=profile_ref.parameter_profile_id,
+            parameter_profile_hash=profile_ref.parameter_profile_hash,
+            parameters=parameters,
+            observation_snapshot_id=snapshot.snapshot_id,
+            requested_mode="sim_active",
+            requested_timeout_ms=timeout_ms,
+        )
+        admitted = session.service.submit_request(
+            request=request,
+            current_station_revision=0,
+            now=10.0,
+        )
+        assert admitted.accepted and admitted.operation is not None
+        assert session.service.launch_operation(admitted.operation.operation_id).accepted
+        executor = route_to_port[skill_id]
+        assert executor.wait(admitted.operation.operation_id, timeout_sec=1.0)
+        completed = session.service.operation_store.get(
+            admitted.operation.operation_id
+        )
+        assert completed is not None and completed.status == "completed"
+        return completed
+
+    projected = run_passive_skill(
+        "perception.back_project",
+        sequence=3,
+        parameters={
+            "role": "main",
+            "target_pixel_uv": [1, 0],
+            "pixel_region_xyxy": None,
+            "world_z_min_m": None,
+            "world_z_max_m": None,
+        },
+        timeout_ms=1_000,
+    )
+    assert projected.execution_result["coordinate_mode"] == "pixel"
+    assert projected.execution_result["world_xyz_m"] == pytest.approx(
+        [0.0, -2.0, 3.0]
+    )
+    assert projected.execution_result["depth_m"] == 2.0
+    assert projected.output_artifact_bindings == ()
+
+    segmented = run_passive_skill(
+        SEGMENT_SKILL_ID_V1,
+        sequence=4,
+        parameters={
+            "role": "main",
+            "language_prompt": None,
+            "target_pixel_uv": [320, 240],
+            "min_score": 0.5,
+        },
+        timeout_ms=60_000,
+    )
+    assert segmented.execution_result["mask_pixel_count"] == 121
+    assert [binding.slot_id for binding in segmented.output_artifact_bindings] == [
+        SEGMENT_MASK_OUTPUT_SLOT_ID_V1,
+        SEGMENT_OVERLAY_OUTPUT_SLOT_ID_V1,
+    ]
+    mask_path = artifact_store.managed_read_path(
+        segmented.output_artifact_bindings[0].artifact.artifact_id
+    )
+    mask = np.load(mask_path, allow_pickle=False)
+    assert mask.dtype == np.bool_
+    assert mask.shape == (480, 640)
+    with Image.open(
+        artifact_store.managed_read_path(
+            segmented.output_artifact_bindings[1].artifact.artifact_id
+        )
+    ) as overlay:
+        assert overlay.format == "JPEG"
+        assert overlay.size == (640, 480)
+
+    placement_depth = io.BytesIO()
+    np.save(
+        placement_depth,
+        np.full((480, 640), 0.1, dtype=np.float32),
+        allow_pickle=False,
+    )
+    placement_depth_bytes = placement_depth.getvalue()
+    motion_application.capture_depth_npy_frame = lambda **_kwargs: (
+        EncodedMujocoDepthFrame(
+            view_id="front",
+            captured_at=10.0,
+            width=640,
+            height=480,
+            media_type="application/x-npy",
+            schema_id="dexteleop.perception.depth_image_meters.v1",
+            encoding="npy.float32.c_order.v1",
+            compression="none",
+            data=placement_depth_bytes,
+            camera_pose_world_xyz_quat_xyzw=(0, 0, 1, 0, 0, 0, 1),
+            intrinsics={
+                "width": 640,
+                "height": 480,
+                "fx": 600.0,
+                "fy": 600.0,
+                "cx": 320.0,
+                "cy": 240.0,
+                "fovy_deg": 43.6,
+            },
+        )
+    )
+    motion_application.capture_arm_gripper_state = lambda: {
+        "right_arm": (0.0, 0.0, 1.1, 0.0, 0.0, 0.0, 1.0),
+        "right_gripper": {
+            "qpos": (0.5,),
+            "close_fraction": 0.7,
+            "measured_at": 10.0,
+            "state_source": "mujoco_measured_joint_state",
+        },
+    }
+
+    def run_text_segment(prompt: str, sequence: int) -> AgentSkillOperation:
+        return run_passive_skill(
+            SEGMENT_SKILL_ID_V1,
+            sequence=sequence,
+            parameters={
+                "role": "main",
+                "language_prompt": prompt,
+                "target_pixel_uv": None,
+                "min_score": 0.5,
+            },
+            timeout_ms=60_000,
+        )
+
+    held_segment = run_text_segment("held object", 5)
+    destination_segment = run_text_segment("destination surface", 6)
+    placement_clock = {"now": 10.0}
+    assert session.placement_executor is not None
+    session.placement_executor._clock = lambda: placement_clock["now"]
+
+    def advance_inference_clock() -> None:
+        placement_clock["now"] += 30.0
+
+    segmenter.advance_inference_clock = advance_inference_clock
+    placement = run_passive_skill(
+        PLAN_PLACEMENT_SKILL_ID_V1,
+        sequence=7,
+        parameters={
+            "held_segment_operation_id": held_segment.operation_id,
+            "destination_segment_operation_id": destination_segment.operation_id,
+            "clearance_m": 0.005,
+        },
+        timeout_ms=120_000,
+    )
+    assert placement.execution_result["planning_status"] == "planned"
+    assert placement.execution_result["geometry_eligible_for_motion_planning"]
+    assert placement.execution_result["held_gripper_state_checked"]
+    assert placement.execution_result["motion_or_hold_performed"] is False
+    assert segmenter.prompts.count("held object") == 2
+    assert segmenter.prompts.count("destination surface") == 2
+    assert placement_clock["now"] == 70.0
+    assert session.motion_executor.workers == ()
+
+    segmenter.fail_close = True
+    with pytest.raises(RuntimeError, match="segmentation_model"):
+        session.close()
     assert session._artifact_store_closed
+    assert segmenter.closed
+    assert motion_application.closed
 
 
 @pytest.mark.integration
@@ -2079,9 +2498,7 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "rpent_dexteleop.gateway.session",
         reason="paired RPent integration wheel is not installed",
     )
-    InMemoryDexTeleopGatewayClient = (
-        client_module.InMemoryDexTeleopGatewayClient
-    )
+    InMemoryDexTeleopGatewayClient = client_module.InMemoryDexTeleopGatewayClient
     DexTeleopToolkit = toolkit_module.DexTeleopToolkit
     DexTeleopConsumerSession = session_module.DexTeleopConsumerSession
     _application, runtime, direct, bundle, _captured_manifest_args = (
@@ -2100,9 +2517,7 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
             "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0]
         },
         "reference_frame_id": bundle.motion_profile.reference_frame_id,
-        "reference_frame_spec_hash": (
-            bundle.motion_profile.reference_frame_spec_hash
-        ),
+        "reference_frame_spec_hash": (bundle.motion_profile.reference_frame_spec_hash),
         "controlled_frame_id": "tool_tcp",
         "frame_graph_hash": bundle.motion_profile.frame_graph_hash,
         "tool_config_hash": "tool-config:fixture",
@@ -2119,9 +2534,7 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
         "frame_graph_hash": bundle.cardinal_step_profile.frame_graph_hash,
         "tool_config_hash": bundle.cardinal_step_profile.tool_config_hash,
         "calibration_hash": bundle.cardinal_step_profile.calibration_hash,
-        "primitive_catalog_hash": (
-            bundle.cardinal_step_profile.primitive_catalog_hash
-        ),
+        "primitive_catalog_hash": (bundle.cardinal_step_profile.primitive_catalog_hash),
     }
 
     source_slot = bundle.station_manifest.source_slots[0]
@@ -2174,9 +2587,7 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
     )
 
     assert set(motion_spec["input_schema"]["properties"]) == set(parameters)
-    assert "requested_duration_ms" not in motion_spec["input_schema"][
-        "properties"
-    ]
+    assert "requested_duration_ms" not in motion_spec["input_schema"]["properties"]
     response = toolkit.execute_tool(
         motion_spec["name"],
         parameters,
@@ -2185,9 +2596,7 @@ def test_installed_rpent_toolkit_consumes_exact_motion_and_state_routes(
     assert client.submitted_requests[0]["route_hash"] == (
         motion_entry.route.semantic_content_hash
     )
-    assert set(cardinal_spec["input_schema"]["properties"]) == set(
-        cardinal_parameters
-    )
+    assert set(cardinal_spec["input_schema"]["properties"]) == set(cardinal_parameters)
     assert "distance_m" not in cardinal_spec["input_schema"]["properties"]
     cardinal_response = toolkit.execute_tool(
         cardinal_spec["name"],
