@@ -48,6 +48,7 @@ _CAMERA_REGISTRY = _REPO_ROOT / "robot_motion/configs/rm65_camera_registry.json"
 _COLLISION_SCENE_PROFILE = "dual_arm_hand_proxy_open"
 _RGB_SKILL_ID = "perception.capture_rgb"
 _DEPTH_SKILL_ID = "perception.capture_depth"
+_BACK_PROJECT_SKILL_ID = "perception.back_project"
 _SKILL_VERSION_BY_ID = {
     _RGB_SKILL_ID: "2",
     _DEPTH_SKILL_ID: "2",
@@ -154,6 +155,7 @@ def _assert_no_motion_surface(composition: Any) -> None:
     if {entry.route.skill_id for entry in entries} != {
         _RGB_SKILL_ID,
         _DEPTH_SKILL_ID,
+        _BACK_PROJECT_SKILL_ID,
     }:
         raise RuntimeError("probe route surface is not perception-only.")
     for entry in entries:

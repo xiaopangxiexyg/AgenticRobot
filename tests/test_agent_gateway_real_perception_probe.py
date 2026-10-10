@@ -195,6 +195,44 @@ def test_camera_only_probe_loads_complete_typed_station_frame_graph() -> None:
     assert len(frame_binding.frame_graph.semantic_content_hash) == 64
 
 
+@pytest.mark.parametrize("violation", ["unexpected_route", "back_projection_motion"])
+def test_real_perception_probe_rejects_unexpected_or_motion_routes(violation) -> None:
+    routes = [
+        SimpleNamespace(
+            skill_id=skill_id,
+            route_id=skill_id + ":test",
+            control_effect_class="read_only",
+            privilege_tier="t0_read_only",
+            may_move_robot=False,
+            may_open_publication=False,
+            requires_operator_confirmation=False,
+            requires_deadman=False,
+        )
+        for skill_id in (
+            "perception.capture_rgb",
+            "perception.capture_depth",
+            "perception.back_project",
+        )
+    ]
+    entries = [SimpleNamespace(route=route) for route in routes]
+    composition = SimpleNamespace(
+        contract_bundle=SimpleNamespace(
+            route_manifest=SimpleNamespace(skill_routes=entries)
+        ),
+        resources=SimpleNamespace(),
+    )
+    perception_probe._assert_no_motion_surface(composition)
+    if violation == "unexpected_route":
+        entries.append(SimpleNamespace(route=SimpleNamespace(skill_id="perception.extra")))
+        message = "probe route surface is not perception-only"
+    else:
+        routes[-1].control_effect_class = "motion"
+        routes[-1].may_move_robot = True
+        message = "probe route is not strictly passive"
+    with pytest.raises(RuntimeError, match=message):
+        perception_probe._assert_no_motion_surface(composition)
+
+
 def test_real_perception_probe_runs_both_skills_and_validates_artifacts(
     monkeypatch,
     tmp_path,
