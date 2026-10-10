@@ -171,6 +171,17 @@ hold/rearm 和所有失败路径仍独立保留。这里减少两个重复建场
 physics tick 或复位动作，不减少断言或验收 selector；合并用例的前置断言失败时，
 后续断言不会执行。
 
+自定义 compose rate、residual schema/相对输入和非 off observation plan 三个接线用例
+使用已有 `rm65_right_cube_lift_rl_normal_full_grasp_stage1_v1.json`，不再为这些断言执行
+contact curriculum 的完整脚本抓取准备。该任务与原场景采用相同 base contract、
+arm/gripper profile、home、工具坐标及 1000 Hz physics；仍真实构建 MuJoCo、安装 runtime，
+并保留输入提交或观测 start/step 和全部原断言。不共享跨用例的可变 scene/runtime。
+
+这属于接线与任务初始化场景的解耦，不是生产 reset 的加速：不再重复覆盖三种接线配置与
+scripted contact reset 的交叉组合。默认频率与 measured-reset session-anchor 用例仍执行
+contact curriculum 的真实 reset，V5 scripted pregrasp reset 也独立保留。测试节点、
+marker、skip 条件、physics 频率、安全间距、TTL 与验收 selector 均不变。
+
 ## Cost gates in parallel worktrees
 
 Use the fast unit and integration selectors plus the exact tests for the owner

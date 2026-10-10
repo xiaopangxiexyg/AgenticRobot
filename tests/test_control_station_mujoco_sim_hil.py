@@ -107,6 +107,13 @@ from teleop_runtime.configs import (
 from teleop_runtime.schemas import ObservationChannel, TeleopObservation
 
 
+# Wiring tests need a real target, not the contact curriculum's scripted grasp.
+# Dedicated reset/session-anchor tests below retain the scripted task profiles.
+_WIRING_TASK_CONFIG_PATH = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_full_grasp_stage1_v1.json"
+)
+
+
 def _require_mujoco_runtime() -> None:
     pytest.importorskip("mujoco")
 
@@ -1936,10 +1943,7 @@ def test_sim_hil_target_accepts_a_profile_selected_compose_rate() -> None:
     )
     target = build_mujoco_sim_hil_target(
         config=MujocoSimHILTargetConfig(
-            task_config_path=Path(
-                "sim/configs/tasks/"
-                "rm65_right_cube_lift_rl_normal_contact_curriculum_v3.json"
-            ),
+            task_config_path=_WIRING_TASK_CONFIG_PATH,
             realtime_worker=False,
             composer_producer_id=composer_id,
             # The historical position profile keeps the source-compatible
@@ -2029,10 +2033,7 @@ def test_sim_hil_residual_schema_wiring_and_relative_human_submission() -> None:
     )
     target = build_mujoco_sim_hil_target(
         config=MujocoSimHILTargetConfig(
-            task_config_path=Path(
-                "sim/configs/tasks/"
-                "rm65_right_cube_lift_rl_normal_contact_curriculum_v3.json"
-            ),
+            task_config_path=_WIRING_TASK_CONFIG_PATH,
             realtime_worker=False,
         ),
         contracts=profile.sim_hil_contracts,
@@ -2188,10 +2189,7 @@ def test_sim_hil_target_binds_non_off_execution_observation_plan() -> None:
     trace_facts = []
     target = build_mujoco_sim_hil_target(
         config=MujocoSimHILTargetConfig(
-            task_config_path=Path(
-                "sim/configs/tasks/"
-                "rm65_right_cube_lift_rl_normal_contact_curriculum_v3.json"
-            ),
+            task_config_path=_WIRING_TASK_CONFIG_PATH,
             realtime_worker=False,
             composer_producer_id=composer_id,
             execution_observation_plan=plan,
