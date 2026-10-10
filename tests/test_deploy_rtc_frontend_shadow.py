@@ -989,6 +989,131 @@ def test_conditioned_completion_starvation_holds_before_same_tick_emission() -> 
     frontend.close(now=base + 0.8)
 
 
+@pytest.fixture
+def poll_delayed_frontend(monkeypatch):
+    """Finish a real worker after tick capture, before poll returns."""
+    clock = [100.0]
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Policy(_ChunkPolicy):
+        def predict(self, observation):
+            entered.set()
+            if not release.wait(2.0):
+                raise TimeoutError("test worker was not released")
+            return super().predict(observation)
+
+    runtime = PolicyDeployRuntime(_runtime().config, monotonic_clock=lambda: clock[0])
+    frontend = RtcPolicyShadowFrontend(
+        config=_config(session="rtc-poll-clock"),
+        deploy_runtime=runtime,
+        policy=Policy(),
+        preparer=_pipeline(),
+        created_at=clock[0],
+        clock=lambda: clock[0],
+    )
+    poll = frontend._worker.poll_completion
+
+    def delay_poll(receive_after, *, future_release=False, invalid_clock=False):
+        assert entered.wait(1.0)
+
+        def delayed_poll():
+            clock[0] = 100.01
+            release.set()
+            _wait_for(lambda: frontend.pending_completion_count == 1)
+            completion = poll()
+            clock[0] = 100.0 + receive_after
+            if future_release:
+                completion = replace(completion, released_at=clock[0] + 1.0)
+            if invalid_clock:
+                clock[0] = float("nan")
+            return completion
+
+        monkeypatch.setattr(frontend._worker, "poll_completion", delayed_poll)
+
+    frontend.start()
+    try:
+        yield frontend, delay_poll
+    finally:
+        release.set()
+        clock[0] = 101.0
+        monkeypatch.setattr(frontend._worker, "poll_completion", poll)
+        frontend.close(now=101.0)
+
+
+@pytest.mark.parametrize("preflight", [False, True])
+def test_completion_admission_refreshes_clock_after_poll(poll_delayed_frontend, preflight):
+    frontend, delay_poll = poll_delayed_frontend
+    kwargs = {"preflight_timeout_sec": 0.5} if preflight else {}
+    frontend.step(
+        _observation(timestamp=100.0, step_index=0), now=100.0,
+        allow_output=False, allow_request=True, **kwargs,
+    )
+    delay_poll(0.06)
+    step = frontend.step(
+        _observation(timestamp=100.0, step_index=1), now=100.0,
+        allow_output=False, allow_request=False, **kwargs,
+    )
+    timing = step.completion_timing
+    assert timing.worker_released_at == 100.01
+    assert timing.result_admitted_at == 100.06
+    assert timing.release_to_admission_sec == pytest.approx(0.05)
+    assert timing.request_to_admission_sec == pytest.approx(0.06)
+    assert frontend._delay_state.latency_samples_sec[-1] == pytest.approx(0.06)
+    if preflight:
+        assert step.preflight_completion
+        assert not step.state.plan.keyframes
+    else:
+        assert step.result_transition.receipt.accepted
+        assert step.result_transition.merge_receipt.actual_cursor_at == 100.06
+        assert step.completion.result.observation_timestamp == 100.0
+        assert all(row.target_effective_at >= 100.06 for row in step.state.plan.keyframes)
+
+
+@pytest.mark.parametrize("preflight", [False, True])
+def test_completion_polled_after_original_deadline_is_not_admitted(poll_delayed_frontend, preflight):
+    frontend, delay_poll = poll_delayed_frontend
+    kwargs = {"preflight_timeout_sec": 0.5} if preflight else {}
+    frontend.step(
+        _observation(timestamp=100.0, step_index=0), now=100.0,
+        allow_output=False, allow_request=True, **kwargs,
+    )
+    request = frontend._preflight_request if preflight else frontend.state.active_request
+    deadline = request.valid_until
+    delay_poll(deadline - 100.0 + 0.001)
+    step = frontend.step(
+        _observation(timestamp=100.0, step_index=1), now=100.0,
+        allow_output=False, allow_request=False, **kwargs,
+    )
+    assert step.completion.released_at < deadline
+    assert step.state.lifecycle_state == POLICY_ASYNC_PRODUCER_FAULT
+    assert step.emission_result.emission is None
+    assert not step.state.plan.keyframes
+    if preflight:
+        assert not step.preflight_completion
+    else:
+        assert not step.result_transition.receipt.accepted
+        assert "request_deadline_expired" in step.result_transition.receipt.reasons
+
+
+@pytest.mark.parametrize("invalid_clock", [False, True])
+def test_poll_refresh_does_not_accept_invalid_timing(poll_delayed_frontend, invalid_clock):
+    frontend, delay_poll = poll_delayed_frontend
+    frontend.step(
+        _observation(timestamp=100.0, step_index=0), now=100.0,
+        allow_output=False, allow_request=True,
+    )
+    delay_poll(0.06, future_release=not invalid_clock, invalid_clock=invalid_clock)
+    message = "control_clock must be finite" if invalid_clock else "timing stages must be monotonically ordered"
+    with pytest.raises(ValueError, match=message):
+        frontend.step(
+            _observation(timestamp=100.0, step_index=1), now=100.0,
+            allow_output=False, allow_request=False,
+        )
+    assert frontend.selected_emission_count == 0
+    assert not frontend.state.plan.keyframes
+
+
 def test_completion_timing_includes_control_poll_before_result_admission() -> None:
     runtime = _runtime()
     policy = _ChunkPolicy(chunk_size=4)

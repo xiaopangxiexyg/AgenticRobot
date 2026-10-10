@@ -1921,6 +1921,14 @@ class RtcPolicyShadowFrontend:
             else bool(allow_request)
         )
         completion = self._worker.poll_completion()
+        if completion is not None:
+            # A worker may finish while this control tick is descheduled. Use
+            # the receiving boundary for admission/expiry, without rewriting
+            # observation T0 or trusting a future-dated worker timestamp.
+            decision_at = max(
+                decision_at,
+                _finite(self.clock(), field_name="control_clock"),
+            )
         result_transition = None
         lifecycle_transition = None
         preflight_completion = False
