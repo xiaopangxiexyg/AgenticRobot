@@ -68,6 +68,8 @@ ready 后才发布；配置未变的 ready recorder 直接复用，不重新扫�
 writer，recorder 自身不再提供关闭后原地重建的第二套生命周期。旧的
 `prepare_startup_dataset_recorder()` 与 `reconfigure_for_current_args()` 已退役；现行配置校验、
 候选失败回收、旧 recorder 可恢复边界和单次进程启动约束保持不变。
+控制循环上下文直接引用同一个 `EpisodeRecordingRuntime`，不再逐项重新声明和装配录制能力。
+倒计时与事务过渡门控由该对象的只读视图提供；逐帧调用顺序和 provider 刷新时点保持不变。
 
 ## 执行模式边界
 

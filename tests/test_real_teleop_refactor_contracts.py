@@ -1678,6 +1678,19 @@ def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
             return False
 
     noop = lambda *args, **kwargs: None
+    recording_callbacks = {
+        item.name: noop
+        for item in fields(episode_recording_runtime.EpisodeRecordingRuntime)
+    }
+    recording_callbacks.update(
+        recording_active=lambda: False,
+        countdown_deadline=lambda: None,
+        collection_transition_active=lambda: False,
+        poll_dataset_finalize=lambda now: events.append("dataset.poll_finalize"),
+        cancel_recording_countdown=(
+            lambda now, *, reason: events.append(f"countdown.cancel:{reason}")
+        ),
+    )
     values = {
         item.name: noop
         for item in fields(control_loop.RealTeleopControlLoopContext)
@@ -1696,6 +1709,9 @@ def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
             ),
             "debug_timing_state": SimpleNamespace(),
             "episode_recorder": SimpleNamespace(),
+            "episode_recording_runtime": (
+                episode_recording_runtime.EpisodeRecordingRuntime(**recording_callbacks)
+            ),
             "ik_debug_log_recorder": SimpleNamespace(active=False),
             "ik_debug_profile_base_enabled": False,
             "main_loop_watchdog": FakeWatchdog(),
@@ -1703,17 +1719,11 @@ def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
             "position_audit_fanout": None,
             "position_force_guard_monitor": None,
             "preview_camera_sources": {},
-            "recording_active": lambda: False,
             "dataset_recorder": lambda: None,
             "visualization_state": lambda: (None, False, None),
-            "episode_start_countdown_deadline": lambda: None,
             "episode_last_state": lambda: None,
             "step_index": lambda: 0,
             "sync_foot_pad_runtime_status": lambda: events.append("foot_pad.sync"),
-            "poll_dataset_finalize": lambda now: events.append("dataset.poll_finalize"),
-            "cancel_recording_countdown": (
-                lambda now, *, reason: events.append(f"countdown.cancel:{reason}")
-            ),
         }
     )
     monkeypatch.setattr(
