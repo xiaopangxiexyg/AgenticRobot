@@ -80,6 +80,7 @@ from .debug_log_frames import (
 from .debug_timing import record_position_loop_timings as _record_position_loop_timings
 from .debug_timing_payload import _channels_log_payload, _faults_log_payload
 from .defaults import runtime_home_fresh_data_timeout_sec
+from .episode_recording_runtime import EpisodeRecordingRuntime
 from .episode_runtime import _build_episode_frame
 from .gripper_control import _dispatch_q6_gripper_control
 from .gripper_status import (
@@ -1568,11 +1569,9 @@ def _apply_pending_progress_arm_target_after_home(
 class RealTeleopControlLoopContext:
     action_debug_log_recorder: Any
     actuator_trace_recorder: Any
-    advance_recording_countdown: Callable[..., None]
     args: Any
     camera_preview_rate: Any
     camera_sources: Mapping[str, Any]
-    cancel_recording_countdown: Callable[..., None]
     close_camera_preview: Callable[..., None]
     close_tactile_preview: Callable[..., None]
     clutch_input: Any
@@ -1583,6 +1582,7 @@ class RealTeleopControlLoopContext:
     debug_timing_modules: Any
     debug_timing_state: Any
     episode_recorder: Any
+    episode_recording_runtime: EpisodeRecordingRuntime
     fix_hold_coordinator: Any
     gripper_warmup_probe_running: Callable[[], bool]
     guard_impedance_force_control: Callable[..., bool]
@@ -1597,57 +1597,49 @@ class RealTeleopControlLoopContext:
     open_tactile_preview: Callable[[float], None]
     orientation_gate: Any
     outer_control_hz: float
-    pause_recording: Callable[..., None]
-    poll_dataset_finalize: Callable[[float], None]
     pose_snapshot_recorder: Any
     position_audit_fanout: Any
     position_force_guard_monitor: Any
     position_admittance_shadow: Any
     preview_camera_sources: Mapping[str, Any]
-    publish_collection_frequency_warning: Callable[..., None]
-    record_debug_event: Callable[..., bool]
-    record_debug_frame: Callable[..., bool]
-    recording_active: Callable[[], bool]
     recording_auto_stop_reason: Callable[[Any], str | None]
-    recording_frame_count: Callable[[], int]
-    recording_frequency_status: Callable[[], Mapping[str, object]]
-    recording_path: Callable[[], str]
-    recording_pause_reason: Callable[[], str]
-    recording_paused: Callable[[], bool]
     recording_warmup_status: Callable[..., tuple[bool, str]]
     real_hand_render_qpos: Callable[[Any, str], np.ndarray]
-    resume_recording_if_ready: Callable[..., None]
     retry_failed_devices: Callable[[], None]
     sample_rate_gate: Any
-    schedule_recording_countdown: Callable[..., None]
     status_gate: Any
     status_heartbeat_sec: float
-    stop_recording: Callable[..., None]
-    sync_fix_hold: Callable[[float], None]
     sync_foot_pad_runtime_status: Callable[[], None]
     tactile_preview_rate: Any
     tactile_sum_gate: Any
     dataset_recorder: Callable[[], Any]
     visualization_state: Callable[[], tuple[Any, bool, Any]]
-    episode_start_countdown_deadline: Callable[[], float | None]
     episode_last_state: Callable[[], str | None]
     set_episode_last_state: Callable[[str | None], None]
     step_index: Callable[[], int]
     set_step_index: Callable[[int], None]
-    collection_transition_active: Callable[[], bool] = lambda: False
     runtime_extension: object | None = None
     startup_device_errors: dict[str, str] | None = None
     publish_runtime_hardware_status: Callable[[], None] | None = None
 
+    @property
+    def collection_transition_active(self) -> Callable[[], bool]:
+        return self.episode_recording_runtime.collection_transition_active
+
+    @property
+    def episode_start_countdown_deadline(self) -> Callable[[], float | None]:
+        return self.episode_recording_runtime.countdown_deadline
+
 
 def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
+    episode_recording_runtime = context.episode_recording_runtime
     action_debug_log_recorder = context.action_debug_log_recorder
     actuator_trace_recorder = context.actuator_trace_recorder
-    advance_recording_countdown = context.advance_recording_countdown
+    advance_recording_countdown = episode_recording_runtime.advance_recording_countdown
     args = context.args
     camera_preview_rate = context.camera_preview_rate
     camera_sources = context.camera_sources
-    cancel_recording_countdown = context.cancel_recording_countdown
+    cancel_recording_countdown = episode_recording_runtime.cancel_recording_countdown
     close_camera_preview = context.close_camera_preview
     close_tactile_preview = context.close_tactile_preview
     clutch_input = context.clutch_input
@@ -1681,33 +1673,35 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     open_tactile_preview = context.open_tactile_preview
     orientation_gate = context.orientation_gate
     outer_control_hz = context.outer_control_hz
-    pause_recording = context.pause_recording
-    poll_dataset_finalize = context.poll_dataset_finalize
+    pause_recording = episode_recording_runtime.pause_recording
+    poll_dataset_finalize = episode_recording_runtime.poll_dataset_finalize
     pose_snapshot_recorder = context.pose_snapshot_recorder
     position_audit_fanout = context.position_audit_fanout
     position_force_guard_monitor = context.position_force_guard_monitor
     position_admittance_shadow = context.position_admittance_shadow
     preview_camera_sources = context.preview_camera_sources
-    publish_collection_frequency_warning = context.publish_collection_frequency_warning
-    record_debug_event = context.record_debug_event
-    record_debug_frame = context.record_debug_frame
-    recording_active = context.recording_active
+    publish_collection_frequency_warning = (
+        episode_recording_runtime.publish_collection_frequency_warning
+    )
+    record_debug_event = episode_recording_runtime.record_debug_event
+    record_debug_frame = episode_recording_runtime.record_debug_frame
+    recording_active = episode_recording_runtime.recording_active
     recording_auto_stop_reason = context.recording_auto_stop_reason
-    recording_frame_count = context.recording_frame_count
-    recording_frequency_status = context.recording_frequency_status
-    recording_path = context.recording_path
-    recording_pause_reason = context.recording_pause_reason
-    recording_paused = context.recording_paused
+    recording_frame_count = episode_recording_runtime.recording_frame_count
+    recording_frequency_status = episode_recording_runtime.recording_frequency_status
+    recording_path = episode_recording_runtime.recording_path
+    recording_pause_reason = episode_recording_runtime.recording_pause_reason
+    recording_paused = episode_recording_runtime.recording_paused
     recording_warmup_status = context.recording_warmup_status
     _real_hand_render_qpos = context.real_hand_render_qpos
-    resume_recording_if_ready = context.resume_recording_if_ready
+    resume_recording_if_ready = episode_recording_runtime.resume_recording_if_ready
     retry_failed_devices = context.retry_failed_devices
     sample_rate_gate = context.sample_rate_gate
-    schedule_recording_countdown = context.schedule_recording_countdown
+    schedule_recording_countdown = episode_recording_runtime.schedule_recording_countdown
     status_gate = context.status_gate
     status_heartbeat_sec = context.status_heartbeat_sec
-    stop_recording = context.stop_recording
-    sync_fix_hold = context.sync_fix_hold
+    stop_recording = episode_recording_runtime.stop_recording
+    sync_fix_hold = episode_recording_runtime.sync_fix_hold
     sync_foot_pad_runtime_status = context.sync_foot_pad_runtime_status
     tactile_preview_rate = context.tactile_preview_rate
     tactile_sum_gate = context.tactile_sum_gate

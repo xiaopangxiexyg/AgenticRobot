@@ -2576,48 +2576,15 @@ def run_real_teleop(
                 episode_recording_runtime.schedule_dataset_selection,
                 transactional=True,
             )
+        # Generic shutdown consumes these callbacks from its partial-startup
+        # locals snapshot. The control loop binds the recording owner itself.
         recording_active = episode_recording_runtime.recording_active
-        recording_paused = episode_recording_runtime.recording_paused
-        recording_pause_reason = episode_recording_runtime.recording_pause_reason
-        recording_frame_count = episode_recording_runtime.recording_frame_count
-        recording_path = episode_recording_runtime.recording_path
-        recording_frequency_status = (
-            episode_recording_runtime.recording_frequency_status
-        )
-        publish_collection_frequency_warning = (
-            episode_recording_runtime.publish_collection_frequency_warning
-        )
-        record_debug_event = episode_recording_runtime.record_debug_event
-        record_debug_frame = episode_recording_runtime.record_debug_frame
-        start_recording = episode_recording_runtime.start_recording
-        schedule_recording_countdown = (
-            episode_recording_runtime.schedule_recording_countdown
-        )
-        cancel_recording_countdown = (
-            episode_recording_runtime.cancel_recording_countdown
-        )
-        advance_recording_countdown = (
-            episode_recording_runtime.advance_recording_countdown
-        )
         stop_recording = episode_recording_runtime.stop_recording
-        pause_recording = episode_recording_runtime.pause_recording
-        resume_recording_if_ready = (
-            episode_recording_runtime.resume_recording_if_ready
-        )
-        sync_fix_hold = episode_recording_runtime.sync_fix_hold
-        poll_dataset_finalize = episode_recording_runtime.poll_dataset_finalize
-
-
-
-
-
-
-
-
-
 
         if args.record_auto_start:
-            schedule_recording_countdown(time.time(), start_reason="auto_start")
+            episode_recording_runtime.schedule_recording_countdown(
+                time.time(), start_reason="auto_start"
+            )
 
         def current_visualization_state() -> tuple[object | None, bool, object | None]:
             return camera_previewer, bool(camera_preview_active), tactile_visualizer
@@ -2635,7 +2602,7 @@ def run_real_teleop(
                         episode_recorder=episode_recorder,
                         control_ui=control_ui,
                         recording_active=recording_active,
-                        pause_recording=pause_recording,
+                        pause_recording=episode_recording_runtime.pause_recording,
                         collection_transition_active=(
                             episode_recording_runtime.collection_transition_active
                         ),
@@ -2652,11 +2619,9 @@ def run_real_teleop(
             RealTeleopControlLoopContext(
                 action_debug_log_recorder=action_debug_log_recorder,
                 actuator_trace_recorder=actuator_trace_recorder,
-                advance_recording_countdown=advance_recording_countdown,
                 args=args,
                 camera_preview_rate=camera_preview_rate,
                 camera_sources=camera_sources,
-                cancel_recording_countdown=cancel_recording_countdown,
                 close_camera_preview=close_camera_preview,
                 close_tactile_preview=close_tactile_preview,
                 clutch_input=clutch_input,
@@ -2667,6 +2632,7 @@ def run_real_teleop(
                 debug_timing_modules=debug_timing_modules,
                 debug_timing_state=debug_timing_state,
                 episode_recorder=episode_recorder,
+                episode_recording_runtime=episode_recording_runtime,
                 fix_hold_coordinator=fix_hold_coordinator,
                 gripper_warmup_probe_running=gripper_warmup_probe_running,
                 guard_impedance_force_control=_guard_impedance_force_control,
@@ -2683,46 +2649,23 @@ def run_real_teleop(
                 open_tactile_preview=open_tactile_preview,
                 orientation_gate=orientation_gate,
                 outer_control_hz=outer_control_hz,
-                pause_recording=pause_recording,
-                poll_dataset_finalize=poll_dataset_finalize,
                 pose_snapshot_recorder=pose_snapshot_recorder,
                 position_audit_fanout=position_audit_fanout,
                 position_force_guard_monitor=position_force_guard_monitor,
                 position_admittance_shadow=position_admittance_shadow,
                 preview_camera_sources=preview_camera_sources,
-                publish_collection_frequency_warning=(
-                    publish_collection_frequency_warning
-                ),
-                record_debug_event=record_debug_event,
-                record_debug_frame=record_debug_frame,
-                recording_active=recording_active,
-                collection_transition_active=(
-                    episode_recording_runtime.collection_transition_active
-                ),
                 recording_auto_stop_reason=recording_auto_stop_reason,
-                recording_frame_count=recording_frame_count,
-                recording_frequency_status=recording_frequency_status,
-                recording_path=recording_path,
-                recording_pause_reason=recording_pause_reason,
-                recording_paused=recording_paused,
                 recording_warmup_status=recording_warmup_status,
                 real_hand_render_qpos=_real_hand_render_qpos,
-                resume_recording_if_ready=resume_recording_if_ready,
                 retry_failed_devices=retry_failed_devices,
                 sample_rate_gate=sample_rate_gate,
-                schedule_recording_countdown=schedule_recording_countdown,
                 status_gate=status_gate,
                 status_heartbeat_sec=status_heartbeat_sec,
-                stop_recording=stop_recording,
-                sync_fix_hold=sync_fix_hold,
                 sync_foot_pad_runtime_status=sync_foot_pad_runtime_status,
                 tactile_preview_rate=tactile_preview_rate,
                 tactile_sum_gate=tactile_sum_gate,
                 dataset_recorder=current_dataset_recorder,
                 visualization_state=current_visualization_state,
-                episode_start_countdown_deadline=(
-                    episode_recording_runtime.countdown_deadline
-                ),
                 episode_last_state=current_episode_last_state,
                 set_episode_last_state=set_current_episode_last_state,
                 step_index=current_step_index,
