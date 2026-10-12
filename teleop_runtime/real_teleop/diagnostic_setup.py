@@ -379,8 +379,14 @@ def _new_actuator_command_trace_recorder(
     command_hz = float(
         getattr(resolved, "position_background_streaming_hz", 0.0)
     )
+    from .vive_calibration_profiles import vive_configuration_metadata
+
     metadata = {
         "entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
+        "vive_startup_configuration": vive_configuration_metadata(
+            args, components.session.calibration, tuple(components.active_sides),
+            tuple(components.session.sources),
+        ),
         "active_sides": list(components.active_sides),
         "logical_arm_ip_mapping": dict(components.logical_arm_ip_mapping),
         **_arm_execution_profile_metadata(args),

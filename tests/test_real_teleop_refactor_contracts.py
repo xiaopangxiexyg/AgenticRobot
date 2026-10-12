@@ -923,8 +923,17 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 452
-    assert sum(len(action.option_strings) for action in parser._actions) == 513
+    pin_actions = [action for action in parser._actions if action.dest == "expected_vive_profile_sha256"]
+    assert len(pin_actions) == 1
+    assert pin_actions[0].option_strings == ["--expected-vive-profile-sha256"]
+    assert pin_actions[0].default is None
+    legacy_actions = [action for action in parser._actions if action.dest != "expected_vive_profile_sha256"]
+    # The VIVE startup pin adds one option without changing development's existing parser surface.
+    assert len(legacy_actions) == 452
+    assert sum(len(action.option_strings) for action in legacy_actions) == 513
+    assert len(parser._actions) == 453
+    assert sum(len(action.option_strings) for action in parser._actions) == 514
+    assert parser.parse_args(["--expected-vive-profile-sha256", "a" * 64]).expected_vive_profile_sha256 == "a" * 64
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
     assert parser.parse_args([]).artifact_layout == "legacy"

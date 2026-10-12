@@ -2715,6 +2715,15 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--expected-vive-profile-sha256",
+        type=str,
+        default=None,
+        help=(
+            "Optional exact VIVE calibration digest checked before arm construction; "
+            "GUI recapture creates a new binding."
+        ),
+    )
+    parser.add_argument(
         "--load-initial-alignment",
         type=str,
         default="",

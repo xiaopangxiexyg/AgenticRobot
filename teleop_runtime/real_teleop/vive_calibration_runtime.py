@@ -62,6 +62,9 @@ class ViveCoordinateCalibrationContext:
     source: object
     calibration: TeleopCalibration
     active_sides: tuple[str, ...]
+    # Real teleop consumes offsets by source role. Station coordinate profiles
+    # retain their existing logical-channel contract when this is omitted.
+    tracker_offset_role_by_channel: Mapping[str, str] | None = None
 
 
 def _context_calibration(context: object) -> TeleopCalibration | None:
@@ -903,6 +906,18 @@ def calibrate_vive_coordinate_profile(
     calibration = _context_calibration(context)
     if calibration is None:
         raise RuntimeError("No active calibration is attached to the teleop session.")
+    offset_roles = getattr(context, "tracker_offset_role_by_channel", None)
+    source_bound = offset_roles is not None
+    offset_roles = (
+        dict(offset_roles)
+        if source_bound
+        else {f"{side}_wrist_pose": f"{side}_wrist" for side in active_sides}
+    )
+    required_channels = tuple(f"{side}_wrist_pose" for side in active_sides)
+    if any(not offset_roles.get(channel) for channel in required_channels):
+        raise ValueError("Wrist calibration is missing a tracker-offset role binding.")
+    if len({offset_roles[channel] for channel in required_channels}) != len(required_channels):
+        raise ValueError("Wrist calibration tracker-offset roles must be unique.")
 
     def _sweep_validator(poses: list[np.ndarray]) -> str | None:
         fit = fit_signed_axis_from_poses(poses)
@@ -1074,8 +1089,18 @@ def calibrate_vive_coordinate_profile(
     if not isinstance(tracker_metadata, dict):
         tracker_metadata = {}
         calibration.metadata["tracker_offset_calibration"] = tracker_metadata
+    if source_bound and dict(source.source_role_by_output_channel) != offset_roles:
+        raise RuntimeError("VIVE source mapping changed during coordinate calibration; recapture is required.")
+    # A newly fitted global frame invalidates offsets from an earlier frame,
+    # including any wrist not recaptured in a single-side workflow.
+    calibration.tracker_offsets.clear()
+    tracker_metadata.clear()
+    calibration.metadata["tracker_offset_role_binding"] = (
+        "source_role" if source_bound else "logical_channel"
+    )
     for side, poses in per_side_poses.items():
-        tracker_role = f"{side}_wrist"
+        channel_name = f"{side}_wrist_pose"
+        tracker_role = offset_roles[channel_name]
         canonical_rpy_deg = canonical_hand_rpy_default()
         hand_rotation_virtual = euler_xyz_deg_to_matrix(canonical_rpy_deg)
         tracker_pose_virtual = average_pose(poses)
@@ -1086,6 +1111,8 @@ def calibrate_vive_coordinate_profile(
         )
         calibration.set_tracker_offset(tracker_role, offset)
         tracker_metadata[tracker_role] = {
+            "capture_channel": channel_name,
+            "offset_role": tracker_role,
             "method": "runtime_gui_wrist_neutral_capture",
             "canonical_hand_rpy_deg": canonical_rpy_deg.tolist(),
             "canonical_hand_frame_version": TRACKER_OFFSET_CALIBRATION_VERSION,
@@ -1118,18 +1145,37 @@ def calibrate_gui_vive_coordinate_profile(
     calibration = components.session.calibration
     if calibration is None:
         raise RuntimeError("No active calibration is attached to the teleop session.")
-    result = calibrate_vive_coordinate_profile(
+    # Interactive capture may fail/cancel after fitting the frame. Install
+    # only a completely captured and saved draft, never a partial frame.
+    draft = TeleopCalibration.from_dict(calibration.to_dict())
+    calibrate_vive_coordinate_profile(
         args,
         ViveCoordinateCalibrationContext(
             source=source,
-            calibration=calibration,
+            calibration=draft,
             active_sides=tuple(components.active_sides),
+            tracker_offset_role_by_channel=source.source_role_by_output_channel,
         ),
         ui,
-        save_profile=lambda workflow_args, _context: save_profile(workflow_args, components),
+        save_on_complete=False,
     )
-    if result is None:
-        raise RuntimeError("VIVE coordinate calibration did not produce a profile path.")
+    components.session.calibration = draft
+    try:
+        result = save_profile(args, components)
+        if result is None:
+            raise RuntimeError("VIVE coordinate calibration did not produce a profile path.")
+    finally:
+        components.session.calibration = calibration
+    # Preserve the installed calibration identity and target/tool objects.
+    calibration.T_W_O = draft.T_W_O
+    calibration.T_O_D = draft.T_O_D
+    calibration.tracker_offsets = draft.tracker_offsets
+    calibration.metadata.clear()
+    calibration.metadata.update(draft.metadata)
+    calibration.clear_home_state()
+    components.left_retargeter.clear_home_anchors()
+    components.right_retargeter.clear_home_anchors()
+    setattr(args, "load_profile", str(result))
     return result
 
 __all__ = [

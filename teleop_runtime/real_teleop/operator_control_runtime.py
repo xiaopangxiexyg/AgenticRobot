@@ -3805,6 +3805,15 @@ class RealTeleopControlInput:
                 self._last_calibration_started_from_hold = True
             self._gripper_control_enabled = False
             self._tracker_swap_locked = True
+            from .vive_calibration_profiles import vive_configuration_metadata
+
+            _log("InputMapping", "runtime_home_configuration=" + json.dumps(
+                vive_configuration_metadata(
+                    self.args, self.components.session.calibration,
+                    tuple(self.components.active_sides),
+                    tuple(self.components.session.sources),
+                ), sort_keys=True,
+            ))
             if self.ui is not None:
                 self._publish_ui_observation(
                     context="runtime Home request admission",

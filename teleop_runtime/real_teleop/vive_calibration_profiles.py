@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,8 @@ import numpy as np
 from project_paths import calibration_profiles_dir
 
 from ..calibration import TeleopCalibration
+from ..log_utils import log_event
+from ..sources.pose import VivePoseSource
 from .components import RealTeleopComponents
 from .movement import movement_multiple_value as _movement_multiple_value
 from .side_mapping import (
@@ -28,6 +31,79 @@ from .workspace import (
 
 
 DEFAULT_CALIBRATION_PROFILE_DIR = calibration_profiles_dir()
+
+
+def _profile_identity(
+    path: Path, data: bytes, calibration: TeleopCalibration
+) -> dict[str, Any]:
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "offset_role_binding": calibration.metadata.get(
+            "tracker_offset_role_binding", "legacy_unmarked"
+        ),
+        "saved_tracker_input_mapping": calibration.metadata.get(
+            "tracker_input_mapping"
+        ),
+        "saved_movement_multiple": calibration.metadata.get("movement_multiple"),
+    }
+
+
+def load_vive_calibration_profile(
+    path: str | Path, *, expected_sha256: str | None = None
+) -> TeleopCalibration:
+    """Load and identify the same bytes without restoring operator settings."""
+    path = Path(path).expanduser()
+    data = path.read_bytes()
+    if expected_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError(
+                "Expected VIVE profile SHA256 must be 64 lowercase hexadecimal characters."
+            )
+        if hashlib.sha256(data).hexdigest() != expected_sha256:
+            raise ValueError(
+                "VIVE calibration profile SHA256 differs from the approved startup binding."
+            )
+    calibration = TeleopCalibration.from_dict(json.loads(data))
+    if calibration.metadata.get("tracker_offset_role_binding") not in (
+        None,
+        "source_role",
+    ):
+        raise ValueError(
+            "Real teleop requires source-role tracker offsets, not a logical-channel coordinate profile."
+        )
+    identity = _profile_identity(path, data, calibration)
+    calibration.metadata["runtime_vive_profile"] = identity
+    log_event(
+        "ViveCalibration", "loaded_profile=" + json.dumps(identity, sort_keys=True)
+    )
+    return calibration
+
+
+def vive_configuration_metadata(
+    args: argparse.Namespace,
+    calibration: TeleopCalibration | None,
+    active_sides: tuple[str, ...],
+    sources: tuple[object, ...] = (),
+) -> dict[str, Any]:
+    """Snapshot selected configuration; physical pairing still needs live data."""
+    metadata = {} if calibration is None else calibration.metadata
+    actual_mapping = next(
+        (source.source_role_by_output_channel for source in sources if isinstance(source, VivePoseSource)),
+        None,
+    )
+    return {
+        "profile": metadata.get("runtime_vive_profile"),
+        "source_role_by_output_channel": actual_mapping,
+        "tracker_input_mapping": {
+            side: _tracker_source_side_for_logical_side(args, side)
+            for side in active_sides
+        },
+        "swap_operator_sides": bool(getattr(args, "swap_operator_sides", False)),
+        "swap_arm_sides": bool(getattr(args, "swap_arm_sides", False)),
+        "movement_multiple": _movement_multiple_value(args),
+        "physical_pairing_verified": False,
+    }
 
 
 def _calibration_profile_latest_sort_key(path: Path) -> tuple[int, str, float, str]:
@@ -117,6 +193,7 @@ def _calibration_profile_payload_without_workspace(
             metadata.pop("workspace_override_runtime", None)
     metadata = payload.setdefault("metadata", {})
     if isinstance(metadata, dict):
+        metadata.pop("runtime_vive_profile", None)
         metadata.pop("workspace_config_runtime", None)
         metadata.pop("workspace_override_runtime", None)
         metadata["workspace_policy"] = "managed_by_teleop_runtime_config"
@@ -134,7 +211,7 @@ def _save_gui_vive_calibration_profile(
     calibration = components.session.calibration
     if calibration is None:
         raise RuntimeError("No active calibration is attached to the teleop session.")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     resolved_profile_dir = (
         DEFAULT_CALIBRATION_PROFILE_DIR
         if profile_dir is None
@@ -168,7 +245,13 @@ def _save_gui_vive_calibration_profile(
         workspace_config_path=_arm_workspace_config_path(args),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    serialized = json.dumps(payload, indent=2)
+    with output_path.open("x", encoding="utf-8") as stream:
+        stream.write(serialized)
+    identity = _profile_identity(output_path, serialized.encode("utf-8"), profile)
+    calibration.metadata["runtime_vive_profile"] = identity
+    setattr(args, "expected_vive_profile_sha256", identity["sha256"])
+    log_event("ViveCalibration", "saved_profile=" + json.dumps(identity, sort_keys=True))
     setattr(args, "gui_last_vive_calibration_profile", str(output_path))
     return output_path
 
@@ -183,7 +266,9 @@ def _load_gui_vive_calibration_profile(
         args,
         profile_dir=profile_dir,
     )
-    loaded = TeleopCalibration.load_json(path)
+    loaded = load_vive_calibration_profile(
+        path, expected_sha256=getattr(args, "expected_vive_profile_sha256", None)
+    )
     current = components.session.calibration
     if current is None:
         current = loaded
@@ -219,6 +304,8 @@ def _load_gui_vive_calibration_profile(
             "virtual_desk_post_yaw_deg",
             "virtual_desk_scene_alignment_defaulted",
             "tracker_offset_calibration",
+            "tracker_offset_role_binding",
+            "runtime_vive_profile",
             "profile_scope",
             "home_policy",
             "workspace_policy",
@@ -243,6 +330,7 @@ def _load_gui_vive_calibration_profile(
     components.right_retargeter.clear_home_anchors()
     setattr(args, "load_profile", str(path))
     setattr(args, "gui_last_vive_calibration_profile", str(path))
+    setattr(args, "expected_vive_profile_sha256", loaded.metadata["runtime_vive_profile"]["sha256"])
     return path
 
 __all__ = [
@@ -253,4 +341,6 @@ __all__ = [
     "_load_gui_vive_calibration_profile",
     "_runtime_home_was_available",
     "_save_gui_vive_calibration_profile",
+    "load_vive_calibration_profile",
+    "vive_configuration_metadata",
 ]

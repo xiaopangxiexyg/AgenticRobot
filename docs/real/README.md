@@ -65,6 +65,12 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui
 ```
 
+VIVE 坐标 profile、RM65 工具/TCP profile 与 runtime Home 分别管理。Sender 当前按设备名排序分配 `left_wrist` / `right_wrist`，不判断 Tracker 实际佩戴在哪只手；`--swap-operator-sides` 或 GUI 交换按钮只调换 Tracker 输入，`--swap-arm-sides` 才改变机械臂 IP 的逻辑归属。双臂开始准备后 Tracker 映射会锁定。
+
+真实遥操按 VIVE source role 读取 wrist offset；GUI 重新标定也按当前 source role 保存。失败或取消的标定不会安装半成品坐标，生成新全局坐标后不会沿用旧坐标系下未重采的 wrist offset。带 `logical_channel` 标记的独立 Control Station 坐标 profile 不能直接作为真实遥操 profile 使用；没有绑定标记的旧 profile 保持原读取解释，不会自动交换偏置。旧 profile 若曾在互换 Tracker 后重新标定，须现场核对或重新标定。
+
+加载 profile 不会恢复其保存的 Tracker 互换或运动倍率；当前 CLI 默认运动倍率为 `1.35`。如需固定启动文件，可使用 `--load-profile <绝对路径>` 和 `--expected-vive-profile-sha256 <64位小写SHA256>`；摘要会在构造机械臂 backend 前校验。启动、GUI 保存/加载和 Home 请求会记录文件身份、实际 source mapping、选定 Tracker mapping 与倍率。runtime Home 采集当前人体和机械臂锚点，不会让机械臂回固定零位；更换坐标后仍须重新采 Home。
+
 进入 runtime Home 前，系统会用已标定的 VIVE desk 横向轴检查左右 wrist tracker：
 三轴标定中的“身体右侧 → 身体左侧”定义为操作者坐标 `+Y`。检查会先去除配置的
 `virtual_desk_post_yaw_deg`，因此默认 `180°` 场景旋转不会把左右判断颠倒。

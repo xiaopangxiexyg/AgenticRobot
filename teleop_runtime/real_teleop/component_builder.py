@@ -265,6 +265,7 @@ from .workspace import (
     apply_workspace_config as _apply_workspace_config,
     apply_workspace_overrides as _apply_workspace_overrides,
 )
+from .vive_calibration_profiles import load_vive_calibration_profile
 
 
 def _collision_debug_box_templates(
@@ -574,7 +575,10 @@ def build_real_teleop_components(
         else None
     )
     if args.load_profile:
-        calibration = TeleopCalibration.load_json(args.load_profile)
+        calibration = load_vive_calibration_profile(
+            args.load_profile,
+            expected_sha256=getattr(args, "expected_vive_profile_sha256", None),
+        )
     else:
         calibration = build_annotated_dual_rm65_calibration(
             left_right_base_distance=args.left_right_base_distance
