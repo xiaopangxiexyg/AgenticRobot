@@ -1704,6 +1704,20 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert bundle.state_deployment_binding.reference_frame_id == (
         "mujoco_sim_hil/station"
     )
+    state_parameters = {
+        "component_ids": ["right_arm"],
+        "reference_frame_id": bundle.state_deployment_binding.reference_frame_id,
+        "controlled_frame_id": "tool_tcp",
+        "max_measurement_age_ms": 100,
+    }
+    bundle.payload_validators.validate_parameters(
+        route=state_entry.route, payload=state_parameters,
+    )
+    with pytest.raises(ValueError, match="reference frame mismatch"):
+        bundle.payload_validators.validate_parameters(
+            route=state_entry.route,
+            payload={**state_parameters, "reference_frame_id": "right_arm_base"},
+        )
     assert bundle.cardinal_step_profile.execution_reference_frame_id == (
         "right_arm_base"
     )

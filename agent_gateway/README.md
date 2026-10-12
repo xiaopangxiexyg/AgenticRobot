@@ -1086,6 +1086,10 @@ when the lower Skill is activated. Distance, frame/tool/calibration identities,
 primitive hash, safety envelope, IK, dispatch, evaluation, and HOLD remain
 trusted deployment facts.
 
+MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。
+其参数及结果校验从公开 state binding 获取坐标身份，不使用内部 IK execution frame；
+Agent 必须按当前 schema 查询和复制身份，不能以 arm-base 查询替代 Station 查询。
+
 Target-independent motion semantics and payload schemas live in
 `skills/motion`. They also define fixed level-orientation Skills for forward,
 forward-left 30 degrees, and forward-right 30 degrees. Together, the cardinal
