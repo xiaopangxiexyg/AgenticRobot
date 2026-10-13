@@ -647,6 +647,36 @@ from a teleoperation Home record. A capture invocation itself has no downstream
 control effect. Repository offline tests establish neither live camera nor
 robot execution for either profile.
 
+### 独立真机 TCP 只读采样
+
+没有运行中的控制 owner 时，可使用同一 dispatcher 的 `real-tcp-observe` profile：
+
+```bash
+python -m agent_gateway real-tcp-observe \
+  --socket-path /absolute/private/gateway.sock \
+  --arm-ip-assignment /absolute/rm65_arm_ips.json \
+  --left-tool-profile /absolute/left_tool.json \
+  --right-tool-profile /absolute/right_tool.json \
+  --envelope-profile /absolute/absolute_standard.json \
+  --client-id operator.readonly
+```
+
+该会话由一个采样线程持有双 RM65 原始 SDK 连接，读取
+`Get_Current_Arm_State(retry=0)`，复用既有 URDF/tool FK 与 Station frame graph
+发布 `state.read_tcp_pose@1`。采样 owner 启动前检查本机已有的 RM65 TCP 连接，
+发现占用即拒绝。Gateway 只消费缓存，发布 `readonly_sampling` /
+`unavailable_no_command_owner`，控制 epoch/generation 为零；没有运动、夹爪、
+HOLD/STOP 或直接刷新设备的调用端口。
+
+工具 profile 决定 TCP；envelope 文件仅作为既有部署 profile 的配置输入，
+不裁剪实际测量，也不授予运动准入。SDK 没有传感器时间戳，测量时间采用双臂请求
+的最早开始时刻，保守计入等待、双臂时差与 FK；时钟异常、超过 200 ms 的 cut
+或 SDK 错误均停止采样，不重连或回退到旧值。启动超时锁定失败并请求取消。
+
+关闭时先取消后续读取与发布，采样线程在在途调用返回后关闭自己持有的 handle；
+调用阻塞时显式报告清理未完成。transport 仅在初始观测就绪后发布，启动失败也会
+回收已持有的资源。本仓库离线和假 SDK 测试不构成真实设备验收。
+
 The combined three-view point-grasp profile is an explicit opt-in. It uses the
 reviewed v4 head-camera placement and derives both wrist-camera poses from the
 fresh measured dual-arm qpos consumed by the sole lower control loop:
