@@ -460,6 +460,7 @@ class _EndpointIKCandidate:
     solve_cycles: int
     position_residual_m: float
     orientation_residual_deg: float
+    search_attempt_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -2111,6 +2112,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         prefer_closest_tolerance: bool = True,
+        stop_on_first_feasible: bool = False,
         orientation_tolerance_deg: float | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
@@ -2121,6 +2123,7 @@ class RM65GraspJointTrajectoryPlanner:
                 side=side,
                 target_tool_tcp_world=target_tool_tcp_world,
                 prefer_closest_tolerance=prefer_closest_tolerance,
+                stop_on_first_feasible=stop_on_first_feasible,
                 orientation_tolerance_deg=orientation_tolerance_deg,
                 deadline=deadline,
                 monotonic=monotonic,
@@ -2371,6 +2374,7 @@ class RM65GraspJointTrajectoryPlanner:
         side: str,
         target_tool_tcp_world: np.ndarray,
         prefer_closest_tolerance: bool = True,
+        stop_on_first_feasible: bool = False,
         orientation_tolerance_deg: float | None = None,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
@@ -2532,6 +2536,10 @@ class RM65GraspJointTrajectoryPlanner:
                     **collision_detail,
                 }
             )
+            # Only the advisory existence probe requests this. Admission
+            # and path consumers still search every normal IK branch.
+            if stop_on_first_feasible and accepted:
+                break
         # Pose-only least squares converges to the exact target and therefore
         # cannot use the already-authorized endpoint tolerance to improve a
         # positive but insufficient clearance.  Starting from the best such
@@ -2688,7 +2696,10 @@ class RM65GraspJointTrajectoryPlanner:
                 current_qpos=current,
                 side=side,
             )
-            return ordered[: self.config.maximum_endpoint_candidates]
+            return tuple(
+                replace(candidate, search_attempt_count=len(attempts))
+                for candidate in ordered[: self.config.maximum_endpoint_candidates]
+            )
         if collision_unavailable:
             reason = "endpoint_collision_check_unavailable"
         elif endpoint_envelope_blocked:
@@ -2901,9 +2912,10 @@ class RM65GraspJointTrajectoryPlanner:
 
         This uses the same endpoint solver, envelope and sparse URDF/FCL oracle
         as production planning.  The deadline is intentionally small and is
-        checked between deterministic seeds, so every non-success result is
-        advisory and must not remove the candidate from the later full-chain
-        search.
+        checked between deterministic seeds. A fully checked positive witness
+        ends only this advisory query; full-chain searches still enumerate all
+        normal branches. Every non-success result remains advisory and must
+        not remove the candidate from the later full-chain search.
         """
 
         if side not in _SIDES:
@@ -2922,6 +2934,7 @@ class RM65GraspJointTrajectoryPlanner:
                 qpos_by_side=qpos_by_side,
                 side=side,
                 target_tool_tcp_world=target,
+                stop_on_first_feasible=True,
                 deadline=started + budget,
                 monotonic=monotonic,
             )
@@ -2968,7 +2981,10 @@ class RM65GraspJointTrajectoryPlanner:
             elapsed_ms=max(0.0, (float(monotonic()) - started) * 1_000.0),
             reason_code=reason_code,
             best_minimum_distance_m=(max(distances) if distances else None),
-            attempted_seed_count=len(attempts),
+            attempted_seed_count=(
+                max(candidate.search_attempt_count for candidate in candidates)
+                if classification == "clearance_safe" else len(attempts)
+            ),
         )
 
     def _revalidate(

@@ -1579,6 +1579,79 @@ def _planner_without_assets(
     return planner
 
 
+@pytest.mark.parametrize("first_outcome", ("safe", "pose_miss", "envelope", "collision", "unavailable"))
+def test_endpoint_probe_stops_only_after_a_fully_checked_witness(first_outcome, monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        endpoint_seed_count=3, maximum_endpoint_solve_cycles=20))
+    planner.target_builder = _CartesianQposBuilder()
+    pair = {s: np.zeros(6) for s in ("left", "right")}
+    seeds = tuple({"left": pair["left"].copy(), "right": np.full(6, value)} for value in (.1, .2, .3))
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_a, **_k: seeds)
+    solves, checks, envelopes = [], [], []
+
+    def solve(**kwargs):
+        value = float(kwargs["seed_qpos"][0])
+        solves.append(value)
+        position = .01 if value == .1 and first_outcome == "pose_miss" else .001
+        return ({"left": pair["left"].copy(), "right": kwargs["seed_qpos"].copy()}, 3, position, .5)
+
+    def envelope(candidate, **_kwargs):
+        value = float(candidate["right"][0])
+        envelopes.append(value)
+        return value != .1 or first_outcome != "envelope"
+
+    def collision(candidate):
+        value = float(candidate["right"][0])
+        checks.append(value)
+        return JointConfigurationCheck(
+            safe=value != .1 or first_outcome not in {"collision", "unavailable"},
+            collision_check_available=value != .1 or first_outcome != "unavailable",
+            minimum_distance_m=-.01 if value == .1 and first_outcome == "collision" else .1)
+
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    monkeypatch.setattr(planner, "_qpos_is_within_target_envelope", envelope)
+    planner.oracle = SimpleNamespace(check=collision)
+    result = planner.probe_grasp_endpoint_clearance(qpos_by_side=pair, side="right",
+        target_tool_tcp_world=np.eye(4), time_budget_sec=.35, monotonic=lambda: 0.)
+    assert result.classification == "clearance_safe"
+    expected = [.1] if first_outcome == "safe" else [.1, .2]
+    assert solves == expected
+    assert result.attempted_seed_count == len(expected)
+    assert checks[-1] == expected[-1] and envelopes[-1] == expected[-1]
+    # The same planner still enumerates all normal branches for actual planning.
+    solves.clear()
+    endpoints = planner._endpoint_qpos_candidates(qpos_by_side=pair, side="right",
+        target_tool_tcp_world=np.eye(4), monotonic=lambda: 0.)
+    assert solves == [.1, .2, .3]
+    assert endpoints and all(c.search_attempt_count == 3 for c in endpoints)
+
+
+def test_endpoint_probe_negative_result_keeps_full_search_and_has_no_safety_authority(monkeypatch):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig(
+        endpoint_seed_count=3, maximum_endpoint_solve_cycles=20))
+    planner.target_builder = _CartesianQposBuilder()
+    pair = {s: np.zeros(6) for s in ("left", "right")}
+    seeds = tuple({"left": pair["left"].copy(), "right": np.full(6, value)} for value in (.1, .2, .3))
+    monkeypatch.setattr(planner, "_endpoint_seed_qpos", lambda *_a, **_k: seeds)
+    calls = []
+
+    def solve(**kwargs):
+        calls.append(float(kwargs["seed_qpos"][0]))
+        return ({"left": pair["left"].copy(), "right": kwargs["seed_qpos"].copy()}, 3, .001, .5)
+
+    monkeypatch.setattr(planner, "_least_squares_endpoint_from_seed", solve)
+    planner.oracle = SimpleNamespace(check=lambda _pair: JointConfigurationCheck(
+        safe=False, collision_check_available=True, minimum_distance_m=-.01))
+    result = planner.probe_grasp_endpoint_clearance(qpos_by_side=pair, side="right",
+        target_tool_tcp_world=np.eye(4), time_budget_sec=.35, monotonic=lambda: 0.)
+    assert result.classification == "collision_blocked"
+    assert calls == [.1, .2, .3] and result.attempted_seed_count == 3
+    calls.clear()
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="endpoint_collision_blocked"):
+        planner._endpoint_qpos_candidates(qpos_by_side=pair, side="right", target_tool_tcp_world=np.eye(4))
+    assert calls == [.1, .2, .3]
+
+
 @pytest.mark.parametrize("atol", (1e-9, 1e-5))
 def test_joint_proposal_dedup_matches_original_absolute_tolerance(atol):
     random = np.random.default_rng(45)
