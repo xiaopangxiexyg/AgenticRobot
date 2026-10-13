@@ -663,7 +663,8 @@ python -m agent_gateway real-tcp-observe \
 
 该会话由一个采样线程持有双 RM65 原始 SDK 连接，读取
 `Get_Current_Arm_State(retry=0)`，复用既有 URDF/tool FK 与 Station frame graph
-发布 `state.read_tcp_pose@1`。采样 owner 启动前检查本机已有的 RM65 TCP 连接，
+发布 `state.read_tcp_pose@1`。左右臂须绑定不同端点，重复配置在 FK 构造与连接前拒绝。
+采样 owner 启动前检查本机已有的 RM65 TCP 连接，
 发现占用即拒绝。Gateway 只消费缓存，发布 `readonly_sampling` /
 `unavailable_no_command_owner`，控制 epoch/generation 为零；没有运动、夹爪、
 HOLD/STOP 或直接刷新设备的调用端口。

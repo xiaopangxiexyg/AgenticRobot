@@ -81,6 +81,13 @@ class RM65ReadonlyTcpSampler:
         target_builder=None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        # One physical endpoint cannot provide two independently mounted arms.
+        endpoints = {
+            str(profile.arm_ip_by_side[side]).strip().casefold()
+            for side in ("left", "right")
+        }
+        if len(endpoints) != 2:
+            raise ValueError("Read-only dual-arm sampling requires distinct RM65 endpoints")
         self.profile = profile
         self.target_builder = (
             build_exclusive_rm65_skill_target_builder(profile)

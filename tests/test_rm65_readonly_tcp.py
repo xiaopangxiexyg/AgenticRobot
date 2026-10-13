@@ -281,3 +281,13 @@ def test_sampler_start_checks_occupancy_before_creating_a_worker(profile, monkey
     assert sampler._thread is None and calls == []
     assert sampler._stop.is_set()
     sampler.close()
+
+
+@pytest.mark.parametrize("right_ip", ["left.fixture", " LEFT.FIXTURE "])
+def test_duplicate_arm_endpoints_are_rejected_before_fk_or_sdk(profile, monkeypatch, right_ip):
+    calls = []
+    profile.arm_ip_by_side["right"] = right_ip
+    monkeypatch.setattr(lower, "build_exclusive_rm65_skill_target_builder", lambda _: calls.append("FK") or FakeFK())
+    with pytest.raises(ValueError, match="distinct RM65 endpoints"):
+        lower.RM65ReadonlyTcpSampler(profile, arm_factory=lambda ip: calls.append(ip))
+    assert calls == []
