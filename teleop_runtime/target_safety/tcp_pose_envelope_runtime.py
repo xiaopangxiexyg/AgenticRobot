@@ -34,6 +34,7 @@ from robot_motion.target_safety.tcp_pose_envelope import (
     TCPPoseEnvelopeSideConfig,
     project_tcp_pose_envelope,
     project_tcp_pose_envelope_side,
+    tcp_pose_envelope_requires_projection,
 )
 
 
@@ -870,6 +871,39 @@ class TCPPoseEnvelopeTargetFilter:
             side: self.reference_tool_tcp_world_target_from_solver_tool_tcp_world_target(
                 target
             )
+            for side, target in targets.items()
+        }
+
+    def project_for_planning(
+        self, targets: Mapping[str, np.ndarray],
+    ) -> Mapping[str, np.ndarray] | None:
+        """Check every bound pose without publishing a successful sample.
+
+        Dense offline planning needs admission, not thousands of immutable
+        report hashes. Modified targets still use the ordinary projection and
+        publish its full diagnostics. Shadow/control calls remain unchanged.
+        """
+
+        if not self.apply_to_target:
+            return self(targets)
+        with self._lock:
+            execution_epoch = int(self._execution_epoch)
+            anchor_receipt = self._anchor_receipt
+        tool_targets = self._reference_tool_targets(self._tool_targets(targets))
+        modified = tcp_pose_envelope_requires_projection(
+            tool_targets,
+            profile=self.profile,
+            target_frame_binding_hash=self._current_target_frame_binding_hash(),
+            tool_frame_binding_hash_by_side=self._tool_frame_binding_hash_by_side,
+            controlled_frame_id=TCP_CONTROLLED_FRAME_ID,
+            reference_frame_by_side=self.profile.reference_frame_by_side,
+            execution_epoch=execution_epoch,
+            anchor_receipt=anchor_receipt,
+        )
+        if modified:
+            return self(targets)
+        return {
+            side: np.asarray(target, dtype=float).copy()
             for side, target in targets.items()
         }
 

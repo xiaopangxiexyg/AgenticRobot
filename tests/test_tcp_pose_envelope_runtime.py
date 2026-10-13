@@ -264,6 +264,183 @@ def test_shadow_observes_final_target_but_returns_it_unchanged() -> None:
     assert snapshot.projection["side_projection_by_side"]["left"]["modified"] is True
 
 
+@pytest.mark.parametrize("apply", (False, True))
+def test_planning_projection_preserves_outputs_and_only_reports_modified_targets(apply):
+    calibration, retargeter, profile = _fixture()
+    def observer():
+        return TCPPoseEnvelopeTargetFilter(retargeter=retargeter, profile=profile,
+            calibration=calibration, execution_epoch=7,
+            anchor_receipt=_anchor(calibration, profile), apply_to_target=apply)
+    normal, planning = observer(), observer()
+    for x in (1.2, 1.3, 1.3 + 1e-10, 1.3 + 2e-9, 1.5):
+        raw = {"left": _pose((x, 0., 0.16)), "right": _pose((-1.2, 0., -0.15))}
+        expected = normal(raw)
+        prior_count = planning.snapshot().frame_count
+        actual = planning.project_for_planning(raw)
+        for side, value in raw.items():
+            np.testing.assert_array_equal(actual[side], expected[side])
+            if apply:
+                assert not np.shares_memory(actual[side], value)
+        if normal.snapshot().projection["side_projection_by_side"]["left"]["modified"] or not apply:
+            assert planning.snapshot().frame_count == prior_count + 1
+            assert planning.snapshot().projection == normal.snapshot().projection
+        else:
+            assert planning.snapshot().frame_count == prior_count
+
+
+def test_planning_projection_and_planner_fail_closed_after_binding_changes():
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+        RM65GraspJointTrajectoryPlanner,
+        RM65GraspTrajectoryPlanningError,
+    )
+    calibration, retargeter, profile = _fixture()
+    observer = TCPPoseEnvelopeTargetFilter(retargeter=retargeter, profile=profile,
+        calibration=calibration, execution_epoch=7,
+        anchor_receipt=_anchor(calibration, profile), apply_to_target=True)
+    planner = object.__new__(RM65GraspJointTrajectoryPlanner)
+    planner.target_envelope_filter = observer
+    raw = {"left": _pose((1.2, 0., 0.16)), "right": _pose((-1.2, 0., -0.15))}
+    planner._require_unmodified_target_envelope(raw, sides=("left", "right"), phase="path_target")
+    calibration.transforms["left"][0, 3] += 0.01
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
+        planner._require_unmodified_target_envelope(raw, sides=("left", "right"), phase="path_target")
+    assert raised.value.reason_code == "path_target_safety_envelope_unavailable"
+
+
+def test_planning_query_retains_rejection_diagnostics_and_custom_filter_port():
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+        RM65GraspJointTrajectoryPlanner,
+        RM65GraspTrajectoryPlanningError,
+    )
+    calibration, retargeter, profile = _fixture()
+    class CustomFilter(TCPPoseEnvelopeTargetFilter):
+        def project_for_planning(self, _targets):
+            pytest.fail("Subclass must keep its callable contract")
+    for filter_type in (TCPPoseEnvelopeTargetFilter, CustomFilter):
+        observer = filter_type(retargeter=retargeter, profile=profile,
+            calibration=calibration, execution_epoch=7,
+            anchor_receipt=_anchor(calibration, profile), apply_to_target=True)
+        planner = object.__new__(RM65GraspJointTrajectoryPlanner)
+        planner.target_envelope_filter = observer
+        raw = {"left": _pose((1.5, 0., 0.16)), "right": _pose((-1.2, 0., -0.15))}
+        with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
+            planner._require_unmodified_target_envelope(raw, sides=("left", "right"), phase="path_target")
+        assert raised.value.reason_code == "path_target_safety_envelope_blocked"
+        assert raised.value.details["modified_sides"] == ("left",)
+        assert raised.value.details["envelope_projection_by_side"]["left"]["translation_adjustment_m"] == pytest.approx(0.2)
+
+
+def test_planning_projection_matches_canonical_for_rotated_paired_targets():
+    from scipy.spatial.transform import Rotation
+
+    calibration, retargeter, profile = _fixture()
+    normal = TCPPoseEnvelopeTargetFilter(
+        retargeter=retargeter, profile=profile, calibration=calibration,
+        execution_epoch=7, anchor_receipt=_anchor(calibration, profile),
+        apply_to_target=True,
+    )
+    planning = TCPPoseEnvelopeTargetFilter(
+        retargeter=retargeter, profile=profile, calibration=calibration,
+        execution_epoch=7, anchor_receipt=_anchor(calibration, profile),
+        apply_to_target=True,
+    )
+    random = np.random.default_rng(37)
+    for _ in range(80):
+        raw = {
+            "left": _pose(random.uniform((0.9, -0.2, 0.0), (1.5, 0.2, 0.5))),
+            "right": _pose(random.uniform((-2.2, -1.2, -1.2), (0.2, 1.2, 1.2))),
+        }
+        for pose in raw.values():
+            pose[:3, :3] = Rotation.from_rotvec(random.normal(size=3)).as_matrix()
+        before = {side: value.copy() for side, value in raw.items()}
+        expected = normal(raw)
+        count = planning.snapshot().frame_count
+        actual = planning.project_for_planning(raw)
+        for side, value in raw.items():
+            np.testing.assert_array_equal(actual[side], expected[side])
+            np.testing.assert_array_equal(value, before[side])
+        projection = normal.snapshot().projection
+        if any(
+            side["modified"] for side in projection["side_projection_by_side"].values()
+        ):
+            assert planning.snapshot().frame_count == count + 1
+            assert planning.snapshot().projection == projection
+        else:
+            assert planning.snapshot().frame_count == count
+
+
+def test_native_planning_query_omits_report_without_mutating_control_snapshot(monkeypatch):
+    from robot_motion.target_safety import tcp_pose_envelope as envelope_module
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+        RM65GraspJointTrajectoryPlanner,
+    )
+
+    calibration, retargeter, profile = _fixture()
+    observer = TCPPoseEnvelopeTargetFilter(
+        retargeter=retargeter, profile=profile, calibration=calibration,
+        execution_epoch=7, anchor_receipt=_anchor(calibration, profile),
+        apply_to_target=True,
+    )
+    planner = object.__new__(RM65GraspJointTrajectoryPlanner)
+    planner.target_envelope_filter = observer
+    raw = {"left": _pose((1.2, 0.0, 0.16)), "right": _pose((-1.2, 0.0, -0.15))}
+    before = observer.snapshot()
+
+    def unexpected_report(**_kwargs):
+        pytest.fail("An unmodified planning target must not allocate a lineage report")
+
+    monkeypatch.setattr(envelope_module, "_projection_result", unexpected_report)
+    planner._require_unmodified_target_envelope(
+        raw, sides=("left", "right"), phase="path_target",
+    )
+    assert observer.snapshot() == before
+    assert retargeter.tool_to_solver_calls == 0
+    projected = observer.project_for_planning(raw)
+    for side, value in raw.items():
+        np.testing.assert_array_equal(projected[side], value)
+        assert not np.shares_memory(projected[side], value)
+
+
+def test_native_planning_query_uses_new_home_and_epoch_without_cached_admission():
+    from teleop_runtime.skill_deploy.rm65_grasp_trajectory import (
+        RM65GraspJointTrajectoryPlanner,
+        RM65GraspTrajectoryPlanningError,
+    )
+
+    calibration, retargeter, profile = _fixture()
+    observer = TCPPoseEnvelopeTargetFilter(
+        retargeter=retargeter, profile=profile, calibration=calibration,
+        execution_epoch=7, anchor_receipt=_anchor(calibration, profile),
+        apply_to_target=True,
+    )
+    planner = object.__new__(RM65GraspJointTrajectoryPlanner)
+    planner.target_envelope_filter = observer
+    raw = {"left": _pose((1.2, 0.0, 0.16)), "right": _pose((-1.2, 0.0, -0.15))}
+    planner._require_unmodified_target_envelope(
+        raw, sides=("left", "right"), phase="path_target",
+    )
+    assert observer.snapshot().frame_count == 0
+    calibration.homes["left"] = _pose((1.5, 0.0, 0.3))
+    anchor = capture_tcp_pose_envelope_anchor(
+        anchor_id="new-home", profile=profile, calibration=calibration,
+        execution_epoch=8, clock_domain_id="runtime-wall", captured_at=11.0,
+    )
+    observer.rebind(execution_epoch=8, anchor_receipt=anchor)
+    with pytest.raises(RM65GraspTrajectoryPlanningError) as raised:
+        planner._require_unmodified_target_envelope(
+            raw, sides=("left", "right"), phase="path_target",
+        )
+    assert raised.value.reason_code == "path_target_safety_envelope_blocked"
+    assert raised.value.details["modified_sides"] == ("left",)
+    assert raised.value.details["envelope_projection_by_side"]["left"][
+        "translation_adjustment_m"
+    ] == pytest.approx(0.2)
+    snapshot = observer.snapshot()
+    assert snapshot.execution_epoch == 8
+    assert snapshot.anchor_hash == anchor.semantic_content_hash
+    assert snapshot.frame_count == 1
+
+
 def test_active_projects_tcp_then_converts_back_without_ik_or_fk() -> None:
     calibration, retargeter, profile = _fixture()
     anchor = _anchor(calibration, profile)

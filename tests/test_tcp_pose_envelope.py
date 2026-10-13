@@ -18,6 +18,7 @@ from robot_motion.target_safety.tcp_pose_envelope import (
     TCPPoseEnvelopeSideConfig,
     project_tcp_pose_envelope,
     project_tcp_pose_envelope_side,
+    tcp_pose_envelope_requires_projection,
 )
 
 
@@ -104,6 +105,107 @@ def _project(
         execution_epoch=execution_epoch,
         anchor_receipt=anchor,
     )
+
+
+@pytest.mark.parametrize("relative,rotation,disabled", (
+    (False, False, False), (True, False, False),
+    (True, True, False), (True, True, True),
+))
+def test_planning_projection_query_matches_canonical_projection(relative, rotation, disabled):
+    configs = {
+        "left": TCPPoseEnvelopeSideConfig(
+            enabled=not disabled,
+            absolute_min_xyz_m=(-0.4, -0.7, 0.03),
+            absolute_max_xyz_m=(0.75, 0.7, 0.85),
+            relative_min_xyz_m=(-0.15, -0.15, -0.15) if relative else None,
+            relative_max_xyz_m=(0.15, 0.15, 0.15) if relative else None,
+            max_rotation_rad=0.5 if rotation else None,
+        ),
+    }
+    if disabled:
+        configs["right"] = TCPPoseEnvelopeSideConfig(
+            absolute_min_xyz_m=(-5., -5., -5.), absolute_max_xyz_m=(5., 5., 5.))
+    profile = _profile(configs)
+    anchor = _anchor(profile, {"left": _pose((0.2, 0.1, 0.4),
+                    rotation=Rotation.from_euler("xyz", (0.2, -0.3, 0.1)))}) if relative else None
+    bindings = {"profile": profile, "target_frame_binding_hash": TARGET_HASH,
+        "tool_frame_binding_hash_by_side": TOOL_HASH_BY_SIDE,
+        "controlled_frame_id": TCP_CONTROLLED_FRAME_ID, "reference_frame_by_side": REFERENCE_BY_SIDE,
+        "execution_epoch": 4, "anchor_receipt": anchor}
+    random = np.random.default_rng(19)
+    poses = [_pose(random.uniform((-0.5, -0.8, 0.), (0.8, 0.8, 0.9)),
+                   rotation=Rotation.from_rotvec(random.normal(size=3))) for _ in range(150)]
+    for x in (-0.4, 0.75):
+        for offset in (0., 1e-10, 1e-9, 2e-9, -2e-9):
+            poses.append(_pose((x + offset, 0., 0.4)))
+    for pose in poses:
+        raw = {"left": pose, "right": _pose((4., 4., 4.))}
+        before = {s: p.copy() for s, p in raw.items()}
+        projection = project_tcp_pose_envelope(raw, **bindings)
+        assert tcp_pose_envelope_requires_projection(raw, **bindings) == bool(projection.modified_sides)
+        for side, value in raw.items():
+            np.testing.assert_array_equal(value, before[side])
+
+
+@pytest.mark.parametrize("fault", ("target", "tool", "frame", "epoch", "missing", "nan", "rotation", "cut_locus"))
+def test_planning_projection_query_retains_all_binding_and_numeric_errors(fault):
+    profile = _profile({"left": TCPPoseEnvelopeSideConfig(
+        relative_min_xyz_m=(-0.1, -0.1, -0.1),
+        relative_max_xyz_m=(0.1, 0.1, 0.1), max_rotation_rad=0.5)})
+    raw = {"left": _pose()}
+    bindings = {"profile": profile, "target_frame_binding_hash": TARGET_HASH,
+        "tool_frame_binding_hash_by_side": TOOL_HASH_BY_SIDE,
+        "controlled_frame_id": TCP_CONTROLLED_FRAME_ID, "reference_frame_by_side": REFERENCE_BY_SIDE,
+        "execution_epoch": 4, "anchor_receipt": _anchor(profile, raw)}
+    if fault == "target":
+        bindings["target_frame_binding_hash"] = "wrong"
+    elif fault == "tool":
+        bindings["tool_frame_binding_hash_by_side"] = {"left": "wrong"}
+    elif fault == "frame":
+        bindings["reference_frame_by_side"] = {"left": "wrong"}
+    elif fault == "epoch":
+        bindings["execution_epoch"] = 5
+    elif fault == "missing":
+        raw = {"right": _pose()}
+    elif fault == "nan":
+        raw["left"][0, 3] = np.nan
+    elif fault == "rotation":
+        raw["left"][0, 0] = 2.
+    else:
+        raw["left"] = _pose(rotation=Rotation.from_rotvec((math.pi, 0., 0.)))
+    with pytest.raises(TCPPoseEnvelopeError) as original:
+        project_tcp_pose_envelope(raw, **bindings)
+    with pytest.raises(type(original.value)) as checked:
+        tcp_pose_envelope_requires_projection(raw, **bindings)
+    assert str(checked.value) == str(original.value)
+
+
+def test_planning_query_checks_second_arm_after_first_arm_needs_projection():
+    profile = _profile({
+        "left": TCPPoseEnvelopeSideConfig(
+            absolute_min_xyz_m=(-0.1, -0.1, -0.1),
+            absolute_max_xyz_m=(0.1, 0.1, 0.1),
+        ),
+        "right": TCPPoseEnvelopeSideConfig(max_rotation_rad=0.5),
+    })
+    raw = {
+        "left": _pose((0.5, 0.0, 0.0)),
+        "right": _pose(rotation=Rotation.from_rotvec((math.pi, 0.0, 0.0))),
+    }
+    bindings = {
+        "profile": profile,
+        "target_frame_binding_hash": TARGET_HASH,
+        "tool_frame_binding_hash_by_side": TOOL_HASH_BY_SIDE,
+        "controlled_frame_id": TCP_CONTROLLED_FRAME_ID,
+        "reference_frame_by_side": REFERENCE_BY_SIDE,
+        "execution_epoch": 4,
+        "anchor_receipt": _anchor(profile, {"left": _pose(), "right": _pose()}),
+    }
+    with pytest.raises(TCPPoseEnvelopeRotationCutLocusError) as original:
+        project_tcp_pose_envelope(raw, **bindings)
+    with pytest.raises(type(original.value)) as checked:
+        tcp_pose_envelope_requires_projection(raw, **bindings)
+    assert str(checked.value) == str(original.value)
 
 
 def test_single_side_projection_preserves_pair_contract_and_profile_identity() -> None:
