@@ -115,6 +115,11 @@ _RM65_GLOBAL_GRASP_TARGET_FALLBACK_REASONS = frozenset(
 )
 
 
+def _joint_proposals_match(first: np.ndarray, second: np.ndarray, *, atol: float) -> bool:
+    """Compare normalized finite joint proposals at zero relative tolerance."""
+    return bool(np.all(np.abs(first - second) <= atol))
+
+
 class RM65GraspTrajectoryPlanningError(RuntimeError):
     """Typed zero-motion failure produced before lower activation."""
 
@@ -2163,7 +2168,7 @@ class RM65GraspJointTrajectoryPlanner:
             candidate = {name: value.copy() for name, value in baseline.items()}
             candidate[side] = np.asarray(values, dtype=float).copy()
             if any(
-                np.allclose(candidate[side], existing[side], atol=1e-9, rtol=0.0)
+                _joint_proposals_match(candidate[side], existing[side], atol=1e-9)
                 for existing in seeds
             ):
                 continue
@@ -2182,7 +2187,7 @@ class RM65GraspJointTrajectoryPlanner:
             candidate = {name: value.copy() for name, value in baseline.items()}
             candidate[side] = lower + unit * (upper - lower)
             if any(
-                np.allclose(candidate[side], existing[side], atol=1e-9, rtol=0.0)
+                _joint_proposals_match(candidate[side], existing[side], atol=1e-9)
                 for existing in seeds
             ):
                 continue
@@ -2453,11 +2458,10 @@ class RM65GraspJointTrajectoryPlanner:
                     endpoint_envelope_blocked = True
                     outcome = "endpoint_safety_envelope_blocked"
                 elif any(
-                    np.allclose(
+                    _joint_proposals_match(
                         candidate[side],
                         item.qpos_by_side[side],
                         atol=1e-5,
-                        rtol=0.0,
                     )
                     for item in accepted
                 ):

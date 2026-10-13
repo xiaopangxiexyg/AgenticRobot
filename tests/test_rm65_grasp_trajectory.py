@@ -1579,6 +1579,72 @@ def _planner_without_assets(
     return planner
 
 
+@pytest.mark.parametrize("atol", (1e-9, 1e-5))
+def test_joint_proposal_dedup_matches_original_absolute_tolerance(atol):
+    random = np.random.default_rng(45)
+    lower = np.asarray(grasp_trajectory_module.RM65_ABSOLUTE_Q_MIN_RAD)
+    upper = np.asarray(grasp_trajectory_module.RM65_ABSOLUTE_Q_MAX_RAD)
+    centers = [np.zeros(6), lower, upper, *random.uniform(lower, upper, (40, 6))]
+    for first in centers:
+        for joint in range(6):
+            for delta in (
+                0.0,
+                np.nextafter(atol, 0.0),
+                atol,
+                np.nextafter(atol, np.inf),
+                -atol,
+                -2 * atol,
+            ):
+                second = first.copy()
+                second[joint] += delta
+                before = first.copy(), second.copy()
+                expected = np.allclose(first, second, atol=atol, rtol=0.0)
+                assert grasp_trajectory_module._joint_proposals_match(
+                    first, second, atol=atol
+                ) == expected
+                np.testing.assert_array_equal(first, before[0])
+                np.testing.assert_array_equal(second, before[1])
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+@pytest.mark.parametrize("count", (1, 8, 24, 64))
+def test_endpoint_seed_dedup_preserves_sequence_and_detached_guesses(monkeypatch, side, count):
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    lower = np.asarray(grasp_trajectory_module.RM65_ABSOLUTE_Q_MIN_RAD)
+    upper = np.asarray(grasp_trajectory_module.RM65_ABSOLUTE_Q_MAX_RAD)
+    original_match = grasp_trajectory_module._joint_proposals_match
+    default_pair = {
+        name: np.asarray(getattr(grasp_trajectory_module, f"DEFAULT_{name.upper()}_ARM_QPOS"))
+        for name in ("left", "right")
+    }
+    for pair in (
+        FIELD_TRACE_QPOS,
+        default_pair,
+        {"left": lower.copy(), "right": upper.copy()},
+    ):
+        before = {name: value.copy() for name, value in pair.items()}
+        # The canonical NumPy predicate reconstructs the old sequence using
+        # the unchanged local/default/Halton seed-generation algorithm.
+        with monkeypatch.context() as context:
+            context.setattr(
+                grasp_trajectory_module,
+                "_joint_proposals_match",
+                lambda a, b, *, atol: bool(np.allclose(a, b, atol=atol, rtol=0.0)),
+            )
+            expected = planner._endpoint_seed_qpos(pair, side=side, seed_count=count)
+        actual = planner._endpoint_seed_qpos(pair, side=side, seed_count=count)
+        assert grasp_trajectory_module._joint_proposals_match is original_match
+        assert len(actual) == len(expected) == count
+        for first, second in zip(actual, expected, strict=True):
+            for name in ("left", "right"):
+                np.testing.assert_array_equal(first[name], second[name])
+                assert not np.shares_memory(first[name], pair[name])
+        actual[0][side][0] = 0.0
+        for name, value in pair.items():
+            np.testing.assert_array_equal(value, before[name])
+        assert np.all(actual[-1][side] >= lower) and np.all(actual[-1][side] <= upper)
+
+
 @pytest.mark.parametrize("phase", ["envelope_ingress", "pregrasp_target", "grasp_target"])
 @pytest.mark.parametrize("obstruction", ["clear", "visible_target", "visible_background", "visible_start", "production"])
 def test_path_leg_search_uses_actual_composed_oracle_without_duplicate_scene_binding(phase, obstruction):
