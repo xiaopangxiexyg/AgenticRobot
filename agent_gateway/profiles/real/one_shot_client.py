@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import math
+import os
 import socket
+import stat
 import struct
+import tempfile
 import time
 import uuid
 from collections.abc import Mapping
@@ -99,6 +103,99 @@ class _Client:
                 f"{error.get('message')}"
             )
         return response.get("result")
+
+
+def _read_client_sequences(path: Path) -> dict[str, dict[str, int]]:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("Client sequence state must be an operator-owned regular file.")
+        if info.st_mode & 0o022:
+            raise ValueError("Client sequence state must not be writable by other users.")
+        state = json.load(stream)
+    if not isinstance(state, dict) or any(
+        not isinstance(session, str)
+        or not isinstance(clients, dict)
+        or any(
+            not isinstance(client_id, str)
+            or type(sequence) is not int
+            or sequence < 1
+            for client_id, sequence in clients.items()
+        )
+        for session, clients in state.items()
+    ):
+        raise ValueError("Invalid client sequence state; refusing to reset or submit.")
+    return state
+
+
+
+def _submit_with_client_sequence(
+    client: _Client,
+    request: Mapping[str, Any],
+    *,
+    socket_path: str,
+    timeout_sec: float,
+) -> Any:
+    # The lock covers allocation AND submission so another process cannot send
+    # a later sequence first. It never covers motion or terminal polling.
+    timeout_sec = float(timeout_sec)
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0.0:
+        raise ValueError("Client sequence timeout_sec must be finite and positive.")
+    state_path = Path(socket_path + ".client-sequences.json")
+    fd = os.open(
+        str(state_path) + ".lock",
+        os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+    )
+    with os.fdopen(fd, "r+") as lock:
+        info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("Client sequence lock must be an operator-owned regular file.")
+        if info.st_mode & 0o022:
+            raise ValueError("Client sequence lock must not be writable by other users.")
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for client sequence submission lock.")
+                time.sleep(min(0.01, remaining))
+        state = _read_client_sequences(state_path)
+        clients = state.setdefault(request["runtime_session_id"], {})
+        sequence = clients.get(request["client_id"], 0) + 1
+        clients[request["client_id"]] = sequence
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=state_path.parent,
+                prefix=state_path.name + ".", delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                json.dump(state, stream, allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, state_path)
+            directory_fd = os.open(state_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        # Reserve durably before RPC: a lost response must not reuse a sequence
+        # or automatically resend a potentially executed hardware action.
+        return client.call(
+            "submit_skill_request", {**request, "client_sequence": sequence}
+        )
+
 
 
 def _route_entry(manifest: Mapping[str, Any], *, skill_id: str) -> Mapping[str, Any]:
@@ -512,10 +609,13 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             route=route,
         )
         snapshot = client.call("get_observation_snapshot", None)
-        if snapshot["lifecycle_state"] != "running" or (
-            snapshot["execution_gate"] != "ready"
-        ):
-            raise RuntimeError("Lower real Skill owner is not RUNNING/READY.")
+        # Re-entry still requires a fresh lower grant and activation. A prior
+        # successful HOLD is released only by the existing lower owner.
+        owner_state = (snapshot["lifecycle_state"], snapshot["execution_gate"])
+        if owner_state not in {("running", "ready"), ("hold", "hold")}:
+            raise RuntimeError(
+                "Lower real Skill owner is not RUNNING/READY or confirmed HOLD."
+            )
         if relative_delta_xyz_m is not None:
             absolute_tcp_pose = _relative_tcp_target_from_snapshot(
                 snapshot=snapshot,
@@ -563,7 +663,6 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             "client_id": args.client_id,
             "request_id": "real-primitive-request:" + request_nonce,
             "idempotency_key": "real-primitive-idempotency:" + request_nonce,
-            "client_sequence": 1,
             "runtime_session_id": manifest["runtime_session_id"],
             "skill_route_manifest_hash": manifest["route_manifest_hash"],
             "expected_station_revision": snapshot["station_revision"],
@@ -588,7 +687,9 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             "deployment_safety_envelope_hash": envelope["content_hash"],
             "safety_constraint_set_hash": envelope["constraint_set_hash"],
         }
-        submission = client.call("submit_skill_request", request)
+        submission = _submit_with_client_sequence(
+            client, request, socket_path=args.socket_path, timeout_sec=args.timeout_sec
+        )
         if not bool(submission.get("accepted", False)):
             raise RuntimeError(
                 "Primitive request was not admitted: "

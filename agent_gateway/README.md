@@ -900,6 +900,19 @@ independent launcher is the preferred path. `one_shot_client` is only an
 authenticated one-request
 Unix client and never initializes or dispatches hardware itself.
 
+同一 Gateway 会话可反复启动 `one_shot_client`；客户端在 socket 旁的
+`<socket>.client-sequences.json` 保存按 runtime session / client ID 分组的递增序号，
+并用同目录的 `.lock` 文件串行化序号预留和请求提交。目录须允许当前操作者写入；
+状态文件不属于源码或机器人配置，不要在当前会话中删除、改写或跨主机复制。
+提交前原子保存序号；请求被拒绝或响应丢失也不回退，不自动重发可能已执行的动作。
+锁等待受 `--timeout-sec` 限制，状态损坏或写入失败会阻止提交；终态轮询和运动执行
+不持有此客户端锁。新 Gateway session 使用独立计数，旧会话的计数仍保留，避免并行旧
+客户端覆盖新会话状态。Gateway 的防重放、单操作槽、授权和 HOLD 检查保持不变。
+
+客户端可从 `running/ready` 或 `hold/hold` 提交已授权的新请求。HOLD 再入仍须由下层
+取得新 Grant/activation，并验证前一次成功的 HOLD 回执；客户端不调用 resume，
+故障或生命周期与执行门禁不一致时拒绝提交。该行为不依赖夹爪 Route 是否存在。
+
 The absolute grasp-pose Route is authorized explicitly with
 `--authorized-action move_tcp_to_pose`; publishing the Route without this
 operator action does not mint a motion Grant. The matching local client accepts
