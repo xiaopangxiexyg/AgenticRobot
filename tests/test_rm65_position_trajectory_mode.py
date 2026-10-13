@@ -595,9 +595,24 @@ def test_synchronous_target_admission_remains_explicit_rollback() -> None:
         finally:
             completed.set()
 
+    attempted_send_lock = threading.Event()
+    original_send_lock = backend._send_lock
+
+    class _ObservedSendLock:
+        def __enter__(self):
+            if threading.current_thread() is thread:
+                attempted_send_lock.set()
+            return original_send_lock.__enter__()
+
+        def __exit__(self, *args):
+            return original_send_lock.__exit__(*args)
+
+    thread = threading.Thread(target=admit_target, daemon=True)
+    backend._send_lock = _ObservedSendLock()
     with backend._send_lock:
-        thread = threading.Thread(target=admit_target, daemon=True)
         thread.start()
+        # Pre-lock work must not consume the interval that proves contention.
+        assert attempted_send_lock.wait(0.5)
         assert not completed.wait(0.03)
     assert completed.wait(0.25)
     thread.join(timeout=0.25)
