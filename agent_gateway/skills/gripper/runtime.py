@@ -26,6 +26,7 @@ from agent_gateway.runtime.reusable_station_executor import (
     ReusableStationAgentSkillOperationExecutor,
 )
 from agent_gateway.runtime.service import (
+    AgentGatewayObservationOutcome,
     AgentGatewayOperationOutcome,
     AgentGatewayService,
 )
@@ -517,7 +518,7 @@ class GripperAgentGatewaySession:
         default=None, init=False, repr=False
     )
 
-    def publish_observation(self) -> AgentObservationSnapshot:
+    def _publish_observation_outcome(self) -> AgentGatewayObservationOutcome:
         sample = self.port.observe_state()
         binding = self.contract_bundle.deployment_binding
         revision = int(self.current_station_revision())
@@ -557,13 +558,18 @@ class GripperAgentGatewaySession:
             fault_class=sample.fault_code,
             fault_rearmable=False,
         )
-        outcome = self.service.publish_observation(
+        return self.service.publish_observation(
             snapshot=snapshot,
             now=snapshot.available_at,
         )
+
+    def publish_observation(self) -> AgentObservationSnapshot:
+        outcome = self._publish_observation_outcome()
         if not outcome.accepted:
             raise RuntimeError(f"gripper observation rejected: {outcome.reason_code}")
-        return snapshot
+        if outcome.snapshot is None:
+            raise RuntimeError("gripper observation accepted without a snapshot")
+        return outcome.snapshot
 
     def wire_adapter(
         self, *, authenticated_client_id: str
@@ -573,7 +579,7 @@ class GripperAgentGatewaySession:
             definition_catalog=self.contract_bundle.definition_catalog,
             schema_catalog=self.contract_bundle.schema_catalog,
             service=self.service,
-            publish_observation=self.publish_observation,
+            publish_observation=self._publish_observation_outcome,
             current_station_revision=self.current_station_revision,
             operation_launcher=self.service.launch_operation,
         )

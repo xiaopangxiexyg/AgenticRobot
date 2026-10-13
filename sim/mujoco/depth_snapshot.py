@@ -27,6 +27,8 @@ from .snapshot_renderer import SnapshotRendererCache
 
 @dataclass(frozen=True)
 class EncodedMujocoDepthFrame:
+    """Depth image whose camera pose uses optical x-right/y-down/z-forward axes."""
+
     view_id: str
     captured_at: float
     width: int
@@ -194,12 +196,20 @@ def _encoded_depth_frame(
     width = int(metadata["width"])
     height = int(metadata["height"])
     depth = _normalized_depth(raw_depth, width=width, height=height)
-    pose = tuple(float(item) for item in metadata["camera_pose_world_xyz_quat_xyzw"])
-    if len(pose) != 7 or not all(math.isfinite(item) for item in pose):
+    render_pose = tuple(
+        float(item) for item in metadata["camera_pose_world_xyz_quat_xyzw"]
+    )
+    if len(render_pose) != 7 or not all(math.isfinite(item) for item in render_pose):
         raise RuntimeError("MuJoCo depth camera pose is invalid.")
-    quaternion_norm = math.sqrt(sum(item * item for item in pose[3:]))
+    quaternion_norm = math.sqrt(sum(item * item for item in render_pose[3:]))
     if abs(quaternion_norm - 1.0) > 1e-5:
         raise RuntimeError("MuJoCo depth camera quaternion is not normalized.")
+    # MJCF stores the render camera at optical->OpenGL Rx(pi). Depth pixels
+    # use optical axes (+x right, +y down, +z forward), so undo that local
+    # rotation when publishing the camera pose: T_world_optical is
+    # T_world_render * Rx(pi). Quaternion composition is right multiplication.
+    x, y, z, w = render_pose[3:]
+    pose = (*render_pose[:3], w, z, -y, -x)
     intrinsics = render_intrinsics_from_fovy(
         width=width,
         height=height,
