@@ -9,6 +9,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import numpy as np
@@ -104,6 +105,40 @@ def vive_configuration_metadata(
         "movement_multiple": _movement_multiple_value(args),
         "physical_pairing_verified": False,
     }
+
+
+def validate_vive_profile_for_home(
+    components: RealTeleopComponents, *, capture_sides: tuple[str, ...] | None = None
+) -> None:
+    """Require actual mapped offsets for explicitly source-bound profiles.
+
+    Unmarked legacy profiles retain their existing interpretation. This is a
+    real-teleop admission rule, not a change to generic calibration defaults.
+    """
+    calibration = components.session.calibration
+    if (
+        calibration is None
+        or calibration.metadata.get("tracker_offset_role_binding") != "source_role"
+    ):
+        return
+    sources = [
+        source for source in components.session.sources
+        if isinstance(source, VivePoseSource)
+    ]
+    if len(sources) != 1:
+        raise ValueError("VIVE source-role calibration requires one authoritative VIVE source.")
+    mapping = sources[0].source_role_by_output_channel
+    sides = components.active_sides if capture_sides is None else capture_sides
+    for side in sides:
+        channel = f"{side}_wrist_pose"
+        role = mapping.get(channel)
+        if not role:
+            raise ValueError(f"VIVE source mapping is missing {channel}; recapture is required.")
+        if role not in calibration.tracker_offsets:
+            raise ValueError(
+                f"VIVE calibration is missing tracker offset for {channel}<-{role}; "
+                "recapture is required."
+            )
 
 
 def _calibration_profile_latest_sort_key(path: Path) -> tuple[int, str, float, str]:
@@ -246,13 +281,28 @@ def _save_gui_vive_calibration_profile(
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, indent=2)
-    with output_path.open("x", encoding="utf-8") as stream:
-        stream.write(serialized)
+    temporary_path = None
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", dir=output_path.parent,
+            prefix=".vive-profile-", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Publish complete bytes atomically without replacing an existing
+        # profile. Temporary files are never candidates for latest discovery.
+        os.link(temporary_path, output_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
     identity = _profile_identity(output_path, serialized.encode("utf-8"), profile)
     calibration.metadata["runtime_vive_profile"] = identity
+    args.load_profile = str(output_path)
     setattr(args, "expected_vive_profile_sha256", identity["sha256"])
-    log_event("ViveCalibration", "saved_profile=" + json.dumps(identity, sort_keys=True))
     setattr(args, "gui_last_vive_calibration_profile", str(output_path))
+    log_event("ViveCalibration", "saved_profile=" + json.dumps(identity, sort_keys=True))
     return output_path
 
 
@@ -342,5 +392,6 @@ __all__ = [
     "_runtime_home_was_available",
     "_save_gui_vive_calibration_profile",
     "load_vive_calibration_profile",
+    "validate_vive_profile_for_home",
     "vive_configuration_metadata",
 ]

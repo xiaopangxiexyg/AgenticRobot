@@ -142,6 +142,7 @@ from .tracker_side_check import evaluate_tracker_side_assignment
 from .vive_calibration_profiles import (
     _load_gui_vive_calibration_profile,
     _save_gui_vive_calibration_profile,
+    validate_vive_profile_for_home,
 )
 from .vive_calibration_runtime import (
     _vive_pose_source_from_components,
@@ -3791,6 +3792,23 @@ class RealTeleopControlInput:
                         control_hint="运行中重采前请先点击 Hold / 冻结；Hold 只停臂，不会自动重采。",
                         teleop_running=self._teleop_arm_dispatch_confirmed(),
                         gripper_control_enabled=self.gripper_control_enabled(),
+                    )
+                return False
+            try:
+                validate_vive_profile_for_home(self.components)
+            except ValueError as exc:
+                message = f"runtime Home 未启动：{exc} 请重新标定当前 Tracker。"
+                _log("ViveCalibration", message)
+                self._append_ui_message_observation(
+                    "ViveCalibration", message,
+                    context="runtime Home rejected with incomplete VIVE profile",
+                )
+                if self.ui is not None:
+                    self._publish_ui_observation(
+                        context="runtime Home rejected with incomplete VIVE profile",
+                        active_controls=self._current_active_controls(),
+                        control_hint=message, home_ready=False,
+                        teleop_running=False, gripper_control_enabled=False,
                     )
                 return False
             if request_from_hold:
