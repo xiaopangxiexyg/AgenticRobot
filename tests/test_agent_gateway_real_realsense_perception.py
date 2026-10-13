@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -854,3 +855,34 @@ def test_gateway_camera_startup_delegates_to_formal_teleop_lifecycle(
     start_realsense_sources(sources)
 
     assert calls == [sources]
+
+
+def test_camera_only_resources_do_not_claim_close_until_native_stop_finishes():
+    from teleop_runtime.sources.camera import (
+        RealSenseRGBCameraConfig,
+        RealSenseRGBSource,
+    )
+    release = threading.Event()
+    calls = []
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="unit", pipeline_stop_timeout_sec=.02))
+    def stop():
+        calls.append("stop")
+        release.wait(2)
+    source._pipeline = SimpleNamespace(stop=stop)
+    resources = CameraOnlyRealPerceptionResources(
+        camera_sources={"left_wrist": source},
+        artifact_store=SimpleNamespace(close=lambda: calls.append("store.close")),
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="pipeline.stop"):
+                resources.close()
+            assert not resources._closed
+            assert not resources._cameras_closed
+        assert calls == ["stop", "store.close"]
+    finally:
+        release.set()
+        assert source.wait_for_pending_pipeline_stop(timeout_sec=1) is None
+        resources.close()
+    assert resources._closed and resources._cameras_closed
+    assert calls == ["stop", "store.close"]

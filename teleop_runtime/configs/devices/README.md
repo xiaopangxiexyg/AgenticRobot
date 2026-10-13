@@ -65,6 +65,13 @@ wait 调用/异常、原始 RGB/深度、完整帧组及对齐结果。`frameset
 仅表示没有帧组返回，不能推断 RGB、深度各自是否产生。失败诊断保留启动时
 SDK 设备身份与 `physical_port`，不为取得这些信息另建 pipeline。
 
+相机关闭、启动失败回收与运行中恢复共用原生清理操作。关闭超时后，后续
+`close()` 继续等待同一次 stop；仍在运行或已经报错的操作不会被当作清理成功，
+也不能据此重开相机或复位。`device_info().pipeline_stop` 提供操作阶段与错误；
+`startup_worker_alive` 区分尚未退出的启动线程。清理阻塞时，多相机启动中止后续
+相机。显式 `pipeline_stop_timeout_sec` 仅设置原生关闭预算，缺省仍按
+`wait_timeout_ms` 派生，采集线程 join 预算和既有启动重试／复位策略保持原义。
+
 Shared RM65/Rig camera geometry and URDF placements live in
 `robot_motion/configs/rm65_camera_registry.json`. Runtime intrinsics may be
 overlaid into dataset snapshots; do not put those snapshots or new device

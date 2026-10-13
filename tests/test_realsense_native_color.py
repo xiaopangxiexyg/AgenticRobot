@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -14,6 +15,164 @@ import utils.hand_eye.camera as hand_camera
 import utils.head_eye.camera as head_camera
 from utils.hand_eye.camera import RealSenseConfig, _color_image_to_bgr
 from utils.head_eye.camera import RealSenseConfig as HeadEyeRealSenseConfig
+
+
+@pytest.mark.parametrize("module", [head_camera, hand_camera])
+def test_calibration_close_retains_pending_native_operation(module):
+    release, entered = threading.Event(), threading.Event()
+    calls = []
+    camera = object.__new__(module.RealSenseCamera)
+    camera._init_camera_lifecycle()
+    camera.config = module.RealSenseConfig(pipeline_stop_timeout_sec=.02)
+    camera.settings_report = {}
+    camera._settings_snapshot = []
+    camera._active_color_format = camera.config.color_format
+    def stop():
+        calls.append("stop")
+        entered.set()
+        release.wait(2)
+    camera._pipeline = SimpleNamespace(stop=stop)
+    try:
+        with pytest.raises(RuntimeError, match="did not finish"):
+            camera.stop()
+        assert entered.is_set()
+        with pytest.raises(RuntimeError, match="did not finish"):
+            camera.stop()
+        with pytest.raises(RuntimeError, match="cleanup is not complete"):
+            camera.start()
+        assert calls == ["stop"]
+        assert camera._native_pipeline_stop.worker.is_alive()
+    finally:
+        release.set()
+        assert camera._native_pipeline_stop.wait(1) is None
+        camera.stop()
+    assert calls == ["stop"]
+
+
+@pytest.mark.parametrize("module", [head_camera, hand_camera])
+def test_calibration_failed_start_cannot_fallback_or_reset_before_cleanup(module, monkeypatch):
+    release = threading.Event()
+    calls = []
+    class Pipeline:
+        def start(self, config):
+            calls.append("start")
+            raise RuntimeError("Couldn't resolve requests")
+        def stop(self):
+            calls.append("stop")
+            release.wait(2)
+    rs = SimpleNamespace(
+        pipeline=lambda: Pipeline(), config=lambda: SimpleNamespace(
+            enable_device=lambda *args: None, enable_stream=lambda *args: None,
+        ), stream=SimpleNamespace(color="color", depth="depth"),
+        format=SimpleNamespace(yuyv="yuyv", z16="z16"),
+    )
+    monkeypatch.setattr(module, "_require_pyrealsense2", lambda: rs)
+    kwargs = {"startup_hardware_reset_on_failure": True} if module is hand_camera else {}
+    camera = module.RealSenseCamera(module.RealSenseConfig(serial="unit", pipeline_stop_timeout_sec=.02, **kwargs))
+    monkeypatch.setattr(camera, "_fallback_stream_config", lambda _: calls.append("fallback"))
+    if module is hand_camera:
+        monkeypatch.setattr(camera, "_hardware_reset_device", lambda _: calls.append("reset"))
+    try:
+        with pytest.raises(RuntimeError, match="cleanup"):
+            camera.start()
+        assert calls == ["start", "stop"]
+    finally:
+        release.set()
+        assert camera._native_pipeline_stop.wait(1) is None
+        camera.stop()
+
+
+def test_calibration_settings_restore_is_inside_the_close_budget(monkeypatch):
+    release, entered = threading.Event(), threading.Event()
+    camera = object.__new__(hand_camera.RealSenseCamera)
+    camera._init_camera_lifecycle()
+    camera.config = hand_camera.RealSenseConfig(pipeline_stop_timeout_sec=.02)
+    camera.settings_report = {}
+    calls = []
+    camera._pipeline = SimpleNamespace(stop=lambda: calls.append("stop"))
+    def restore():
+        entered.set()
+        release.wait(2)
+        calls.append("restore")
+    monkeypatch.setattr(camera, "_before_pipeline_stop", restore)
+    try:
+        with pytest.raises(RuntimeError, match="did not finish"):
+            camera.stop()
+        assert entered.is_set() and calls == []
+        diagnostic = camera.settings_report["pipeline.stop"]
+        assert diagnostic["phase"] == "before_stop"
+        assert diagnostic["sdk_call_sec"] is None
+        assert diagnostic["before_stop_sec"] > 0
+    finally:
+        release.set()
+        assert camera._native_pipeline_stop.wait(1) is None
+        camera.stop()
+    assert calls == ["restore", "stop"]
+
+
+@pytest.mark.parametrize("module", [head_camera, hand_camera])
+def test_calibration_cancelled_lock_wait_never_opens_pipeline(module, monkeypatch):
+    from hardware.realsense.lifecycle import SDK_LIFECYCLE_LOCK
+    calls = []
+    rs = SimpleNamespace(
+        pipeline=lambda: calls.append("pipeline"), config=lambda: SimpleNamespace(
+            enable_device=lambda *args: None, enable_stream=lambda *args: None,
+        ), stream=SimpleNamespace(color="color", depth="depth"),
+        format=SimpleNamespace(yuyv="yuyv", z16="z16"),
+    )
+    monkeypatch.setattr(module, "_require_pyrealsense2", lambda: rs)
+    monkeypatch.setattr(module, "CALIBRATION_CAMERA_STARTUP_TIMEOUT_SEC", .02)
+    camera = module.RealSenseCamera(module.RealSenseConfig(serial="unit", auto_select_supported_profile=False))
+    with SDK_LIFECYCLE_LOCK:
+        with pytest.raises(TimeoutError):
+            camera.__enter__()
+        with pytest.raises(RuntimeError, match="startup worker is still active"):
+            camera.stop()
+        assert calls == []
+    camera._startup_worker.join(1)
+    assert not camera._startup_worker.is_alive()
+    assert calls == []
+    camera.stop()
+
+
+@pytest.mark.parametrize("module", [head_camera, hand_camera])
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_calibration_rejects_invalid_pipeline_stop_budget(module, timeout):
+    with pytest.raises(ValueError, match="pipeline_stop_timeout_sec"):
+        module.RealSenseConfig(pipeline_stop_timeout_sec=timeout)
+
+
+def test_calibration_reset_cancelled_while_waiting_for_sdk_lock(monkeypatch):
+    from hardware.realsense.lifecycle import SDK_LIFECYCLE_LOCK
+
+    camera = object.__new__(hand_camera.RealSenseCamera)
+    camera._init_camera_lifecycle()
+    camera.config = hand_camera.RealSenseConfig(serial="unit", startup_hardware_reset_sleep_sec=0)
+    camera._rs = object()
+    waiting = threading.Event()
+    calls, errors = [], []
+    monkeypatch.setattr(camera, "_check_pending_stop", waiting.set)
+    monkeypatch.setattr(hand_camera, "_device_from_serial", lambda *args: SimpleNamespace(
+        hardware_reset=lambda: calls.append("reset"),
+    ))
+    monkeypatch.setattr(camera, "_wait_for_device_reconnect", lambda _: calls.append("reconnect"))
+
+    def reset():
+        try:
+            camera._hardware_reset_device("unit")
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    with SDK_LIFECYCLE_LOCK:
+        worker = threading.Thread(target=reset)
+        worker.start()
+        assert waiting.wait(1)
+        camera._startup_timeout_event.set()
+        assert calls == []
+    worker.join(1)
+    assert not worker.is_alive()
+    assert calls == []
+    assert len(errors) == 1 and "no reset was issued" in errors[0]
 
 
 class RealSenseNativeColorTest(unittest.TestCase):

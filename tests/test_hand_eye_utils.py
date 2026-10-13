@@ -215,6 +215,7 @@ class HandEyeRealSenseSettingsTest(unittest.TestCase):
         self.assertEqual(sensor.values["exposure"], 8000.0)
 
         camera = object.__new__(RealSenseCamera)
+        camera._init_camera_lifecycle()
         camera.config = RealSenseConfig(restore_settings_on_stop=True)
         pipeline = _FakePipeline()
         camera._pipeline = pipeline
@@ -254,6 +255,7 @@ class HandEyeRealSenseSettingsTest(unittest.TestCase):
             snapshot=snapshot,
         )
         camera = object.__new__(RealSenseCamera)
+        camera._init_camera_lifecycle()
         camera.config = RealSenseConfig(restore_settings_on_stop=False)
         camera._pipeline = _FakePipeline()
         camera._align = object()

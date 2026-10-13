@@ -26,6 +26,8 @@ def start_real_sense_source_with_containment(
     normalized_timeout_sec = float(timeout_sec)
     if not math.isfinite(normalized_timeout_sec) or normalized_timeout_sec < 0.0:
         raise ValueError("timeout_sec must be finite and >= 0.")
+    if source._startup_worker is not None and source._startup_worker.is_alive():
+        raise RuntimeError("prior RealSense startup worker is still active; no new SDK call was issued")
     errors: list[BaseException] = []
     start_method_is_base = (
         getattr(source.start, "__func__", source.start) is RealSenseRGBSource.start
@@ -55,6 +57,7 @@ def start_real_sense_source_with_containment(
         name=f"{source.name}_startup",
         daemon=True,
     )
+    source._startup_worker = worker
     worker.start()
     worker.join(timeout=normalized_timeout_sec)
     if worker.is_alive():
@@ -65,6 +68,12 @@ def start_real_sense_source_with_containment(
             "attempted"
         )
     if errors:
+        pending_stop = source.device_info().get("pipeline_stop")
+        if pending_stop and pending_stop["worker_alive"]:
+            raise TimeoutError(
+                f"{source.name} startup failed and native cleanup remains active; "
+                f"do not start sibling cameras or retry this session: {errors[0]}"
+            ) from errors[0]
         raise errors[0]
 
 
@@ -107,5 +116,10 @@ class BoundedRealSenseSessionSource(ObservationSource):
         return self.source.expected_channel_names()
 
     def close(self) -> None:
-        if not self._native_start_timed_out:
-            self.source.close()
+        if self._native_start_timed_out:
+            worker = self.source._startup_worker
+            if worker is None or worker.is_alive():
+                raise RuntimeError(
+                    "RealSense startup timed out; native cleanup is not proved complete"
+                )
+        self.source.close()

@@ -16,6 +16,11 @@ from hardware.realsense.color import (
     color_image_to_bgr as _color_image_to_bgr,
     normalize_color_format as _normalize_color_format,
 )
+from hardware.realsense.lifecycle import (
+    NativePipelineStop as _NativePipelineStop,
+    SDK_LIFECYCLE_LOCK as _REALSENSE_SDK_LIFECYCLE_LOCK,
+    clear_native_tracebacks,
+)
 
 from robot_motion.runtime.lifecycle import LifecycleFailure, raise_lifecycle_failures
 
@@ -32,11 +37,6 @@ REALSENSE_STARTUP_WARMUP_POLICIES = (
     REALSENSE_STARTUP_WARMUP_LEGACY,
     REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
 )
-
-# librealsense pipeline start/stop/reset operations share native process state.
-# Serialize only those native lifecycle edges across source instances; frame
-# capture remains one worker per camera.
-_REALSENSE_SDK_LIFECYCLE_LOCK = threading.RLock()
 
 _LIFECYCLE_STOPPED = "stopped"
 _LIFECYCLE_STARTING = "starting"
@@ -72,6 +72,9 @@ class RealSenseRGBCameraConfig:
     # budget.  RealSense may take several seconds to produce the first frame
     # when another camera is already streaming.
     wait_timeout_ms: int = 1000
+    # None preserves the historical wait_timeout-derived close budget. Some
+    # SDK backends need a longer, explicitly configured native stop window.
+    pipeline_stop_timeout_sec: float | None = None
     startup_wait_timeout_ms: int = 5000
     startup_frame_grace_sec: float = 5.0
     stale_after_sec: float = 2.0
@@ -94,6 +97,8 @@ class RealSenseRGBCameraConfig:
     # Zero preserves the historical unbounded retry behavior.
     restart_max_attempts_without_complete_frame: int = 0
     restart_cooldown_sec: float = 0.5
+    # Historical name: this only enables a pre-start settling delay. A newly
+    # constructed pipeline is not streaming; hardware reset is separate below.
     startup_reset: bool = True
     startup_reset_sleep_sec: float = 0.2
     startup_warmup_frames: int = 10
@@ -143,6 +148,10 @@ class RealSenseRGBCameraConfig:
             raise ValueError("keep_last must be positive.")
         if int(self.wait_timeout_ms) <= 0:
             raise ValueError("wait_timeout_ms must be positive.")
+        if self.pipeline_stop_timeout_sec is not None:
+            self.pipeline_stop_timeout_sec = float(self.pipeline_stop_timeout_sec)
+            if not math.isfinite(self.pipeline_stop_timeout_sec) or self.pipeline_stop_timeout_sec <= 0:
+                raise ValueError("pipeline_stop_timeout_sec must be finite and positive.")
         if int(self.startup_wait_timeout_ms) <= 0:
             raise ValueError("startup_wait_timeout_ms must be positive.")
         if float(self.startup_frame_grace_sec) < 0.0:
@@ -211,6 +220,7 @@ class RealSenseRGBCameraConfig:
                 "keep_last": int(self.keep_last),
                 "color_space": self.color_space,
                 "wait_timeout_ms": int(self.wait_timeout_ms),
+                "pipeline_stop_timeout_sec": self.pipeline_stop_timeout_sec,
                 "startup_wait_timeout_ms": int(self.startup_wait_timeout_ms),
                 "startup_frame_grace_sec": float(self.startup_frame_grace_sec),
                 "stale_after_sec": float(self.stale_after_sec),
@@ -294,10 +304,13 @@ class RealSenseRGBSource(ObservationSource):
         self._pipeline_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._thread: threading.Thread | None = None
+        self._startup_worker: threading.Thread | None = None
+        self._native_pipeline_stop: _NativePipelineStop | None = None
         self._running = False
         self._lifecycle_state = _LIFECYCLE_STOPPED
         self._generation = 0
         self._shutdown_event = threading.Event()
+        self._recovery_request: tuple[str, str] | None = None
         self._lock = threading.RLock()
         self._latest_frame: VideoFrame | None = None
         self._frame_counter = 0
@@ -386,6 +399,8 @@ class RealSenseRGBSource(ObservationSource):
     def start(self, *, startup_software_retry_attempts: int | None = None) -> None:
         with self._lifecycle_lock:
             with self._lock:
+                if self._native_pipeline_stop is not None and self._native_pipeline_stop.worker.is_alive():
+                    raise RuntimeError(f"{self.name} cannot start while native pipeline stop is still active")
                 if self._running and self._lifecycle_state == _LIFECYCLE_RUNNING:
                     return
                 worker = self._thread
@@ -399,42 +414,45 @@ class RealSenseRGBSource(ObservationSource):
                         f"{self.name} cannot start from faulted state; "
                         "call close() again after the prior worker exits or rebuild the source"
                     )
+                self._native_pipeline_stop = None
                 self._lifecycle_state = _LIFECYCLE_STARTING
                 self._generation += 1
                 generation = int(self._generation)
                 shutdown_event = threading.Event()
                 self._shutdown_event = shutdown_event
+                self._recovery_request = None
                 self._last_error = None
                 self._last_runtime_error = None
             pipeline = None
             try:
                 rs = _load_pyrealsense2()
-                with self._pipeline_lock:
-                    leftover_pipeline = self._pipeline
-                    self._pipeline = None
-                    self._profile = None
-                    self._depth_align = None
-                with _REALSENSE_SDK_LIFECYCLE_LOCK:
-                    self._stop_pipeline_quietly(leftover_pipeline)
-                    if startup_software_retry_attempts is None:
-                        pipeline, profile = self._start_pipeline(rs)
-                    else:
-                        pipeline, profile = self._start_pipeline(
-                            rs,
-                            software_retry_attempts=startup_software_retry_attempts,
-                        )
+                self._require_pipeline_cleanup()
+                if startup_software_retry_attempts is None:
+                    pipeline, profile = self._start_pipeline(rs)
+                else:
+                    pipeline, profile = self._start_pipeline(
+                        rs,
+                        software_retry_attempts=startup_software_retry_attempts,
+                    )
                 if not self._is_startup_generation_active(
                     generation,
                     shutdown_event,
                 ):
-                    self._stop_pipeline_quietly(pipeline)
+                    with self._pipeline_lock:
+                        self._pipeline = pipeline
                     pipeline = None
+                    profile = None
+                    self._require_pipeline_cleanup()
                     raise RuntimeError("startup_cancelled:shutdown_requested")
                 device_info = self._device_info_from_profile(profile)
                 with self._pipeline_lock:
                     self._pipeline = pipeline
                     self._profile = profile
+                pipeline = None
+                profile = None
                 with self._lock:
+                    if not self._is_startup_generation_active(generation, shutdown_event):
+                        raise RuntimeError("startup_cancelled:shutdown_requested")
                     self._device_info = device_info
                     self._started_at = time.time()
                     self._running = True
@@ -469,24 +487,28 @@ class RealSenseRGBSource(ObservationSource):
                 )
                 self._thread = worker
                 worker.start()
-            except BaseException:
+                return
+            except BaseException as exc:  # noqa: BLE001 - clean up partial startup on interruption.
                 shutdown_event.set()
                 with self._lock:
                     self._running = False
                     if self._lifecycle_state != _LIFECYCLE_FAULTED:
                         self._lifecycle_state = _LIFECYCLE_STOPPED
-                with self._pipeline_lock:
-                    installed_pipeline = self._pipeline
-                    self._pipeline = None
-                    self._profile = None
-                    self._depth_align = None
-                cleanup_pipeline = (
-                    installed_pipeline if installed_pipeline is not None else pipeline
-                )
-                with _REALSENSE_SDK_LIFECYCLE_LOCK:
-                    self._stop_pipeline_quietly(cleanup_pipeline)
+                # Exceptions from native setup may otherwise retain pipeline
+                # locals, moving handle destruction out of its cleanup worker.
+                clear_native_tracebacks(exc)
+                if pipeline is not None:
+                    with self._pipeline_lock:
+                        self._pipeline = pipeline
+                    pipeline = None
+                profile = None
                 self._thread = None
-                raise
+                failure = exc
+            try:
+                self._require_pipeline_cleanup()
+            except RuntimeError as cleanup_exc:
+                raise RuntimeError(f"{failure}; {cleanup_exc}") from failure
+            raise failure
 
     def _is_generation_active(
         self,
@@ -521,6 +543,8 @@ class RealSenseRGBSource(ObservationSource):
         *,
         software_retry_attempts: int | None = None,
     ) -> tuple[Any, Any]:
+        """Start a stream only after prior native cleanup has completed."""
+        self._require_pipeline_cleanup()
         recovery_started = time.perf_counter()
         reset_attempt_count = 0
         self._hardware_reset_device_if_requested(rs, reason="configured_startup_reset")
@@ -557,6 +581,8 @@ class RealSenseRGBSource(ObservationSource):
                         )
                 return pipeline, profile
             except RuntimeError as exc:
+                if self._lifecycle_state == _LIFECYCLE_FAULTED:
+                    raise
                 message = str(exc)
                 if (
                     software_retries_remaining > 0
@@ -605,11 +631,41 @@ class RealSenseRGBSource(ObservationSource):
                     ) from exc
 
     def _start_pipeline_once(self, rs: Any) -> tuple[Any, Any]:
+        try:
+            with _REALSENSE_SDK_LIFECYCLE_LOCK:
+                if self._shutdown_event.is_set():
+                    raise RuntimeError("startup_cancelled:shutdown_requested")
+                return self._start_pipeline_attempt(rs)
+        except BaseException as exc:  # noqa: BLE001 - partial startup must also be cleaned on interruption.
+            clear_native_tracebacks(exc)
+            failure = exc
+        # Leave the handled-exception block before joining cleanup: CPython
+        # can retain its original traceback while that block is active even
+        # after error.__traceback__ is cleared.
+        stop_started = time.perf_counter()
+        try:
+            self._require_pipeline_cleanup(allow_not_started=self._profile is None)
+        except RuntimeError as cleanup_exc:
+            with self._lock:
+                self._last_error = f"{failure}; {cleanup_exc}"
+            raise RuntimeError(f"{failure}; {cleanup_exc}") from failure
+        if isinstance(failure, RuntimeError):
+            raise RuntimeError(  # noqa: TRY004 - augment a native error, not type validation.
+                f"{failure}; cleanup_diagnostic=" + json.dumps({
+                    "pipeline_stop_sec": round(time.perf_counter() - stop_started, 3),
+                    "pipeline_stop_error": None,
+                }, sort_keys=True)
+            ) from failure
+        raise failure
+
+    def _start_pipeline_attempt(self, rs: Any) -> tuple[Any, Any]:
         startup_started = time.perf_counter()
         with self._lock:
             self._startup_frame_diagnostic = {}
             self._startup_device_identity = {}
         pipeline = rs.pipeline()
+        with self._pipeline_lock:
+            self._pipeline = pipeline
         stream_config = rs.config()
         stream_config.enable_device(self.config.serial)
         color_format = _color_format_value(rs, self.config.color_format)
@@ -629,17 +685,18 @@ class RealSenseRGBSource(ObservationSource):
                 int(self.config.depth_fps),
             )
         if bool(self.config.startup_reset):
-            self._stop_pipeline_quietly(pipeline)
+            # This freshly constructed pipeline cannot be streaming yet.
+            # Preserve the legacy settling delay without a vacuous SDK stop.
             reset_sleep_sec = float(self.config.startup_reset_sleep_sec)
             if reset_sleep_sec > 0.0:
                 time.sleep(reset_sleep_sec)
         pipeline_start_started = time.perf_counter()
         try:
             profile = pipeline.start(stream_config)
+            self._profile = profile
             pipeline_start_elapsed = time.perf_counter() - pipeline_start_started
         except RuntimeError as exc:
             diagnostic = self._failed_startup_diagnostic(
-                pipeline,
                 stage="pipeline_start",
                 startup_started=startup_started,
                 stage_started=pipeline_start_started,
@@ -678,7 +735,6 @@ class RealSenseRGBSource(ObservationSource):
             warmup_elapsed = time.perf_counter() - stage_started
         except RuntimeError as exc:
             diagnostic = self._failed_startup_diagnostic(
-                pipeline,
                 stage=stage,
                 startup_started=startup_started,
                 stage_started=stage_started,
@@ -698,7 +754,6 @@ class RealSenseRGBSource(ObservationSource):
 
     def _failed_startup_diagnostic(
         self,
-        pipeline: Any,
         *,
         stage: str,
         startup_started: float,
@@ -707,12 +762,6 @@ class RealSenseRGBSource(ObservationSource):
         sensor_configure_sec: float | None = None,
     ) -> str:
         failure_time = time.perf_counter()
-        stop_started = failure_time
-        stop_error: str | None = None
-        try:
-            pipeline.stop()
-        except Exception as exc:  # noqa: BLE001 - retain the original startup failure.
-            stop_error = f"{type(exc).__name__}: {exc}"
         diagnostic = {
             "camera_key": self.config.camera_key,
             "serial": self.config.serial,
@@ -723,8 +772,6 @@ class RealSenseRGBSource(ObservationSource):
             "startup_elapsed_sec": round(failure_time - startup_started, 3),
             "pipeline_start_sec": pipeline_start_sec,
             "sensor_configure_sec": sensor_configure_sec,
-            "pipeline_stop_sec": round(time.perf_counter() - stop_started, 3),
-            "pipeline_stop_error": stop_error,
             "device_identity": dict(self._startup_device_identity),
             "first_frame": dict(self._startup_frame_diagnostic),
         }
@@ -743,59 +790,53 @@ class RealSenseRGBSource(ObservationSource):
         )
         return f"{color}, {depth}, align_depth_to_color={bool(self.config.align_depth_to_color)}"
 
-    @staticmethod
-    def _stop_pipeline_quietly(pipeline: Any | None) -> None:
-        if pipeline is None:
-            return
-        try:
-            pipeline.stop()
-        except Exception:  # noqa: BLE001
-            pass
+    def _pipeline_stop_timeout(self) -> float:
+        return (self.config.pipeline_stop_timeout_sec
+                if self.config.pipeline_stop_timeout_sec is not None else
+                max(1.5, float(self.config.wait_timeout_ms) / 1000.0 + 0.5))
 
-    @staticmethod
+    def _require_pipeline_cleanup(self, *, allow_not_started: bool = False) -> None:
+        with self._pipeline_lock:
+            self._profile = None
+            self._depth_align = None
+        error = self._stop_pipeline_bounded(
+            timeout_sec=self._pipeline_stop_timeout(), allow_not_started=allow_not_started,
+        )
+        if error is not None:
+            message = f"pipeline_cleanup_failed:{type(error).__name__}:{error}"
+            self._mark_faulted(message)
+            with self._lock:
+                if message not in str(self._last_error):
+                    self._last_error = f"{self._last_error}; {message}"
+            raise RuntimeError(message) from error
+
     def _stop_pipeline_bounded(
-        pipeline: Any | None,
+        self,
         *,
         timeout_sec: float,
+        allow_not_started: bool = False,
     ) -> BaseException | None:
-        """Attempt native stop without allowing teardown to block forever.
-
-        The stop worker is daemonized because Python cannot interrupt a native
-        SDK call that is already blocked in the kernel.  A timeout is reported
-        as a lifecycle failure and the source is left faulted; a later explicit
-        rebuild can then deal with the still-running native worker.
-        """
-
-        if pipeline is None:
-            return None
-        normalized_timeout_sec = float(timeout_sec)
-        if not math.isfinite(normalized_timeout_sec) or normalized_timeout_sec < 0.0:
+        """Repeated close waits for the same invocation, never loses or duplicates it."""
+        timeout_sec = float(timeout_sec)
+        if not math.isfinite(timeout_sec) or timeout_sec < 0:
             raise ValueError("timeout_sec must be finite and >= 0.")
-        errors: list[BaseException] = []
+        with self._pipeline_lock:
+            if self._pipeline is not None:
+                if self._native_pipeline_stop is not None and self._native_pipeline_stop.worker.is_alive():
+                    raise RuntimeError("prior native pipeline stop is still active")
+                self._native_pipeline_stop = _NativePipelineStop(
+                    self._pipeline, allow_not_started=allow_not_started,
+                )
+                # Transfer ownership before starting: final handle destruction
+                # must stay inside the joined worker, not race into this caller.
+                self._pipeline = None
+                self._native_pipeline_stop.start()
+        return self.wait_for_pending_pipeline_stop(timeout_sec=timeout_sec)
 
-        def stop_native() -> None:
-            try:
-                with _REALSENSE_SDK_LIFECYCLE_LOCK:
-                    pipeline.stop()
-            except BaseException as exc:  # noqa: BLE001 - preserve teardown evidence.
-                errors.append(exc)
-
-        worker = threading.Thread(
-            target=stop_native,
-            name="realsense_pipeline_stop",
-            daemon=True,
-        )
-        try:
-            worker.start()
-            worker.join(timeout=normalized_timeout_sec)
-        except BaseException as exc:  # noqa: BLE001 - report startup teardown failure.
-            return exc
-        if worker.is_alive():
-            return TimeoutError(
-                "native RealSense pipeline.stop did not finish within "
-                f"{normalized_timeout_sec:.3f}s"
-            )
-        return errors[0] if errors else None
+    def wait_for_pending_pipeline_stop(self, *, timeout_sec: float) -> BaseException | None:
+        """Observe existing native cleanup only; this cannot issue a stop command."""
+        operation = self._native_pipeline_stop
+        return None if operation is None else operation.wait(timeout_sec)
 
     def _warmup_pipeline(self, pipeline: Any) -> None:
         warmup_frames = int(self.config.startup_warmup_frames)
@@ -1037,10 +1078,18 @@ class RealSenseRGBSource(ObservationSource):
     def _hardware_reset_device_if_requested(self, rs: Any, *, reason: str) -> None:
         if not bool(self.config.startup_hardware_reset):
             return
-        self._hardware_reset_device(rs, reason=reason, force=True)
+        if not self._hardware_reset_device(rs, reason=reason, force=True):
+            raise RuntimeError(f"startup_hardware_reset_failed:{self._last_runtime_error}")
 
     def _hardware_reset_device(self, rs: Any, *, reason: str, force: bool = False) -> bool:
         if not force and not bool(self.config.startup_hardware_reset):
+            return False
+        self._require_pipeline_cleanup()
+        with _REALSENSE_SDK_LIFECYCLE_LOCK:
+            return self._hardware_reset_device_locked(rs, reason=reason)
+
+    def _hardware_reset_device_locked(self, rs: Any, *, reason: str) -> bool:
+        if self._shutdown_event.is_set():
             return False
         try:
             target_device = self._find_device_by_serial(rs)
@@ -1167,6 +1216,7 @@ class RealSenseRGBSource(ObservationSource):
             self.config.startup_hardware_reset_on_failure
             and self._is_startup_connection_error(message)
         )
+
 
     def _configure_depth_state(self, rs: Any, profile: Any) -> None:
         if not bool(self.config.enable_depth):
@@ -1372,6 +1422,27 @@ class RealSenseRGBSource(ObservationSource):
         generation: int | None = None,
         shutdown_event: threading.Event | None = None,
     ) -> None:
+        # Shutdown must not detach a pipeline while its capture owner is
+        # replacing it. A blocked recovery remains visible to close(), which
+        # cancels the generation and reports incomplete cleanup without waiting
+        # behind another native SDK operation.
+        if not self._lifecycle_lock.acquire(blocking=False):
+            return
+        try:
+            self._restart_pipeline_locked(
+                message, reason=reason, generation=generation, shutdown_event=shutdown_event,
+            )
+        finally:
+            self._lifecycle_lock.release()
+
+    def _restart_pipeline_locked(
+        self,
+        message: str,
+        *,
+        reason: str,
+        generation: int | None = None,
+        shutdown_event: threading.Event | None = None,
+    ) -> None:
         if generation is None:
             with self._lock:
                 generation = int(self._generation)
@@ -1407,34 +1478,24 @@ class RealSenseRGBSource(ObservationSource):
                 self._last_error = f"restarting_after_{reason}: {message}"
                 self._last_runtime_error = str(message)
         if circuit_open:
-            with self._pipeline_lock:
-                faulted_pipeline = self._pipeline
-                self._pipeline = None
-                self._profile = None
-                self._depth_align = None
-            with _REALSENSE_SDK_LIFECYCLE_LOCK:
-                self._stop_pipeline_quietly(faulted_pipeline)
+            try:
+                self._require_pipeline_cleanup()
+            except RuntimeError as exc:
+                with self._lock:
+                    self._last_error = f"{self._last_error}; {exc}"
             self._frame_buffer.clear()
             with self._lock:
                 self._latest_frame = None
             return
         rs = _load_pyrealsense2()
-        with _REALSENSE_SDK_LIFECYCLE_LOCK:
-            if not self._is_generation_active(generation, shutdown_event):
-                return
-            with self._pipeline_lock:
-                old_pipeline = self._pipeline
-                self._pipeline = None
-                self._profile = None
-                self._depth_align = None
-            if old_pipeline is not None:
-                try:
-                    old_pipeline.stop()
-                except Exception as exc:  # noqa: BLE001
-                    with self._lock:
-                        self._last_runtime_error = (
-                            f"pipeline_stop_failed:{type(exc).__name__}:{exc}"
-                        )
+        try:
+            self._require_pipeline_cleanup()
+        except RuntimeError:
+            # Faulting cleanup is terminal: reopening/resetting a still-owned
+            # device is not a recovery operation.
+            with self._lock:
+                self._restart_failure_count += 1
+            return
         self._frame_buffer.clear()
         with self._lock:
             self._latest_frame = None
@@ -1444,10 +1505,7 @@ class RealSenseRGBSource(ObservationSource):
         if not self._is_generation_active(generation, shutdown_event):
             return
         try:
-            with _REALSENSE_SDK_LIFECYCLE_LOCK:
-                if not self._is_generation_active(generation, shutdown_event):
-                    return
-                pipeline, profile = self._start_pipeline(rs)
+            pipeline, profile = self._start_pipeline(rs)
         except Exception as exc:  # noqa: BLE001
             if not self._is_generation_active(generation, shutdown_event):
                 return
@@ -1458,7 +1516,25 @@ class RealSenseRGBSource(ObservationSource):
                 )
                 self._last_runtime_error = self._last_error
             return
-        with self._pipeline_lock:
+        metadata_failure = None
+        try:
+            device_info = self._device_info_from_profile(profile)
+        except BaseException as exc:  # noqa: BLE001 - retain invalid recovery profile and clean up.
+            clear_native_tracebacks(exc)
+            metadata_failure = exc
+        if metadata_failure is not None:
+            pipeline = profile = None
+            message = f"pipeline_restart_metadata_failed:{type(metadata_failure).__name__}:{metadata_failure}"
+            self._mark_faulted(message)
+            try:
+                self._require_pipeline_cleanup()
+            except RuntimeError as cleanup_error:
+                message += f"; {cleanup_error}"
+            with self._lock:
+                self._restart_failure_count += 1
+                self._last_error = self._last_runtime_error = message
+            return
+        with self._pipeline_lock, self._lock:
             install_pipeline = self._is_generation_active(
                 generation,
                 shutdown_event,
@@ -1466,27 +1542,38 @@ class RealSenseRGBSource(ObservationSource):
             if install_pipeline:
                 self._pipeline = pipeline
                 self._profile = profile
+                self._device_info = device_info
+                self._started_at = time.time()
+                self._last_error = None
+                self._last_runtime_error = None
+                self._last_frame_receive_timestamp = None
+                self._consecutive_timeout_count = 0
+                self._consecutive_incomplete_frameset_count = 0
+                self._consecutive_black_frame_count = 0
+                self._last_sampled_max_value = None
+                self._restart_count += 1
+                self._last_restart_timestamp = time.time()
         if not install_pipeline:
-            with _REALSENSE_SDK_LIFECYCLE_LOCK:
-                self._stop_pipeline_quietly(pipeline)
+            with self._pipeline_lock:
+                self._pipeline = pipeline
+            pipeline = None
+            profile = None
+            try:
+                self._require_pipeline_cleanup()
+            except RuntimeError:
+                pass  # The source retains the fault and owned stop operation.
             return
-        with self._lock:
-            self._device_info = self._device_info_from_profile(profile)
-            self._started_at = time.time()
-            self._last_error = None
-            self._last_runtime_error = None
-            self._last_frame_receive_timestamp = None
-            self._consecutive_timeout_count = 0
-            self._consecutive_incomplete_frameset_count = 0
-            self._consecutive_black_frame_count = 0
-            self._last_sampled_max_value = None
-            self._restart_count += 1
-            self._last_restart_timestamp = time.time()
-
     def _restart_pipeline_after_stale_timeout(self, message: str) -> None:
         # Compatibility seam for callers/tests that exercised the previous
         # timeout-only recovery method directly.
         self._restart_pipeline(message, reason="frame_timeout")
+
+    def request_pipeline_recovery(self) -> None:
+        """Let the capture owner perform an explicitly requested recovery."""
+        with self._lock:
+            if not self._running or self._lifecycle_state != _LIFECYCLE_RUNNING:
+                raise RuntimeError("camera is not running; recovery cannot be requested")
+            self._recovery_request = ("explicit_recovery_request", "requested_recovery")
 
     def _is_near_zero_frame(self, image: np.ndarray) -> tuple[bool, int]:
         """Detect an uninitialised all-zero payload using at most ~1K pixels."""
@@ -1528,12 +1615,8 @@ class RealSenseRGBSource(ObservationSource):
             bool(self.config.restart_on_black_frames)
             and streak >= int(self.config.restart_after_black_frames)
         ):
-            self._restart_pipeline(
-                self._last_error or "near_zero_color_frame",
-                reason="black_frame",
-                generation=generation,
-                shutdown_event=shutdown_event,
-            )
+            with self._lock:
+                self._recovery_request = (self._last_error or "near_zero_color_frame", "black_frame")
         return True
 
     def _capture_loop(
@@ -1543,7 +1626,18 @@ class RealSenseRGBSource(ObservationSource):
     ) -> None:
         rs = _load_pyrealsense2()
         while self._is_generation_active(generation, shutdown_event):
+            recovery: tuple[str, str] | None = None
             try:
+                with self._lock:
+                    requested_recovery = self._recovery_request
+                    self._recovery_request = None
+                if requested_recovery is not None:
+                    message, reason = requested_recovery
+                    self._restart_pipeline(
+                        message, reason=reason,
+                        generation=generation, shutdown_event=shutdown_event,
+                    )
+                    continue
                 with self._pipeline_lock:
                     pipeline = self._pipeline
                 if pipeline is None:
@@ -1554,9 +1648,12 @@ class RealSenseRGBSource(ObservationSource):
                         shutdown_event=shutdown_event,
                     )
                     continue
-                frames = pipeline.wait_for_frames(
-                    timeout_ms=int(self.config.wait_timeout_ms)
-                )
+                try:
+                    frames = pipeline.wait_for_frames(
+                        timeout_ms=int(self.config.wait_timeout_ms)
+                    )
+                finally:
+                    pipeline = None
                 received_at = time.time()
                 color_frame, depth_frame = self._required_stream_frames(frames)
                 if not self._required_streams_complete(color_frame, depth_frame):
@@ -1565,6 +1662,9 @@ class RealSenseRGBSource(ObservationSource):
                         depth_frame,
                         received_at=received_at,
                     ):
+                        # Release rejected native frame buffers before stop;
+                        # some SDK backends wait for those buffers to return.
+                        frames = color_frame = depth_frame = None
                         self._restart_pipeline(
                             self._last_error or "incomplete_frameset",
                             reason="incomplete_frameset",
@@ -1671,17 +1771,13 @@ class RealSenseRGBSource(ObservationSource):
                     self._consecutive_timeout_count = 0
                     self._restart_attempts_without_complete_frame = 0
             except RuntimeError as exc:
+                clear_native_tracebacks(exc)
                 if not self._is_generation_active(generation, shutdown_event):
                     break
                 message = str(exc)
                 if self._is_frame_timeout_error(message):
                     if self._set_transient_or_stale_timeout_error(message):
-                        self._restart_pipeline(
-                            message,
-                            reason="frame_timeout",
-                            generation=generation,
-                            shutdown_event=shutdown_event,
-                        )
+                        recovery = (message, "frame_timeout")
                 else:
                     with self._lock:
                         self._last_runtime_error = message
@@ -1690,13 +1786,9 @@ class RealSenseRGBSource(ObservationSource):
                         bool(self.config.restart_on_runtime_error)
                         and self._is_recoverable_runtime_error(message)
                     ):
-                        self._restart_pipeline(
-                            message,
-                            reason="runtime_error",
-                            generation=generation,
-                            shutdown_event=shutdown_event,
-                        )
+                        recovery = (message, "runtime_error")
             except Exception as exc:  # noqa: BLE001
+                clear_native_tracebacks(exc)
                 message = f"{type(exc).__name__}: {exc}"
                 with self._lock:
                     self._last_runtime_error = message
@@ -1705,12 +1797,7 @@ class RealSenseRGBSource(ObservationSource):
                     bool(self.config.restart_on_runtime_error)
                     and self._is_recoverable_runtime_error(message)
                 ):
-                    self._restart_pipeline(
-                        message,
-                        reason="runtime_error",
-                        generation=generation,
-                        shutdown_event=shutdown_event,
-                    )
+                    recovery = (message, "runtime_error")
                 elif self._is_generation_active(generation, shutdown_event):
                     time.sleep(
                         min(
@@ -1718,6 +1805,16 @@ class RealSenseRGBSource(ObservationSource):
                             max(0.01, float(self.config.restart_cooldown_sec)),
                         )
                     )
+            finally:
+                frames = color_frame = depth_frame = image = None
+            if recovery is not None:
+                # Do not keep a native read's handled-exception traceback
+                # alive while stopping/reopening the same device.
+                message, reason = recovery
+                self._restart_pipeline(
+                    message, reason=reason, generation=generation, shutdown_event=shutdown_event,
+                )
+
 
     def get_latest_frame(self) -> VideoFrame | None:
         with self._lock:
@@ -1784,15 +1881,24 @@ class RealSenseRGBSource(ObservationSource):
             )
             info["stale_after_sec"] = float(self.config.stale_after_sec)
             info["startup_wait_timeout_ms"] = int(self.config.startup_wait_timeout_ms)
+            info["pipeline_stop_timeout_sec"] = self.config.pipeline_stop_timeout_sec
             info["startup_frame_grace_sec"] = float(self.config.startup_frame_grace_sec)
             info["running"] = bool(self._running)
             info["lifecycle_state"] = str(self._lifecycle_state)
             info["generation"] = int(self._generation)
             worker = self._thread
             info["worker_alive"] = bool(worker is not None and worker.is_alive())
+            info["startup_worker_alive"] = bool(
+                self._startup_worker is not None and self._startup_worker.is_alive()
+            )
+            info["pipeline_stop"] = None if self._native_pipeline_stop is None else self._native_pipeline_stop.snapshot()
         return info
 
     def close(self) -> None:
+        if (self._startup_worker is not None and self._startup_worker.is_alive()
+                and self._startup_worker is not threading.current_thread()):
+            self._mark_faulted("close_startup_worker_still_active")
+            raise RuntimeError("RealSense startup worker is still active; cleanup is not complete")
         if not self._lifecycle_lock.acquire(blocking=False):
             message = (
                 f"{self.name} close could not acquire its lifecycle lock; "
@@ -1823,19 +1929,13 @@ class RealSenseRGBSource(ObservationSource):
             shutdown_event = self._shutdown_event
             shutdown_event.set()
         with self._pipeline_lock:
-            pipeline = self._pipeline
-            self._pipeline = None
             self._profile = None
             self._depth_align = None
         self._active_color_format = self.config.color_format
-        if pipeline is not None:
+        if self._pipeline is not None or self._native_pipeline_stop is not None:
             try:
-                join_timeout_sec = max(
-                    1.5,
-                    float(self.config.wait_timeout_ms) / 1000.0 + 0.5,
-                )
+                join_timeout_sec = self._pipeline_stop_timeout()
                 stop_error = self._stop_pipeline_bounded(
-                    pipeline,
                     timeout_sec=join_timeout_sec,
                 )
             except BaseException as exc:  # noqa: BLE001 - preserve teardown evidence.
