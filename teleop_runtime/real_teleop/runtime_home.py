@@ -49,6 +49,7 @@ from .arm_runtime import _sync_dual_arm_retargeter_from_preview
 from .arm_state_sync import _qpos_summary, _state_qpos
 from .component_builder import _collision_debug_box_templates
 from .components import RealTeleopComponents
+from .vive_calibration_profiles import validate_vive_profile_for_home
 
 _TRACKER_BEFORE_CORRECTION_MARKER_SIZE_M = (0.018, 0.018, 0.018)
 _TRACKER_AFTER_CORRECTION_MARKER_SIZE_M = (0.024, 0.024, 0.024)
@@ -729,6 +730,9 @@ def _runtime_home_calibration(
                 f"requested={requested_sides!r} active={active_sides!r}"
             )
         home_sides = requested_sides
+    # Direct callers share the same admission rule as operator Home requests,
+    # before any source sampling, robot reads or Home-state changes.
+    validate_vive_profile_for_home(components, capture_sides=home_sides)
     tracker_expectations = ", ".join(
         f"{side}_wrist_pose<-{calibration.metadata.get(f'{side}_tracker_name') or f'{side}_wrist role'}"
         for side in home_sides
