@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -91,6 +92,9 @@ class _FakePipeline:
 
     def wait_for_frames(self, *, timeout_ms: int) -> _FakeFrameSet:
         self.wait_timeouts.append(timeout_ms)
+        if self.owner is not None and self.owner.clock is not None:
+            elapsed = timeout_ms / 1000 if self.owner.wait_errors else self.owner.frame_period_sec
+            self.owner.clock.advance(elapsed)
         if self.owner is not None and self.owner.wait_errors:
             raise self.owner.wait_errors.pop(0)
         if self.owner is not None and self.owner.wait_frames:
@@ -103,7 +107,9 @@ class _FakePipeline:
 
 
 class _FakeRealSense:
-    def __init__(self) -> None:
+    def __init__(self, *, clock=None) -> None:
+        self.clock = clock
+        self.frame_period_sec = .05
         self.stream = SimpleNamespace(color="color", depth="depth")
         self.format = SimpleNamespace(bgr8="bgr8", yuyv="yuyv", z16="z16")
         self.camera_info = SimpleNamespace(serial_number="serial_number")
@@ -361,8 +367,8 @@ def test_realsense_bounded_warmup_returns_after_first_valid_frame() -> None:
     assert 1 <= pipeline.wait_timeouts[0] <= 1000
 
 
-def test_realsense_bounded_warmup_failure_does_not_immediately_reopen_pipeline() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_bounded_warmup_failure_does_not_immediately_reopen_pipeline(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
     target_device = _FakeHardwareDevice("FRONT123")
     fake_rs.devices = [target_device]
     fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
@@ -387,8 +393,8 @@ def test_realsense_bounded_warmup_failure_does_not_immediately_reopen_pipeline()
     assert '"pipeline_stop_error": "RuntimeError: stop before start"' in str(raised.value)
 
 
-def test_realsense_bounded_warmup_leaves_deferred_retry_to_multi_camera_caller() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_bounded_warmup_leaves_deferred_retry_to_multi_camera_caller(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
     target_device = _FakeHardwareDevice("FRONT123")
     fake_rs.devices = [target_device]
     fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
@@ -410,8 +416,8 @@ def test_realsense_bounded_warmup_leaves_deferred_retry_to_multi_camera_caller()
     assert target_device.hardware_reset_calls == 0
 
 
-def test_realsense_bounded_warmup_can_reset_only_the_selected_camera() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_bounded_warmup_can_reset_only_the_selected_camera(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
     front = _FakeHardwareDevice("FRONT123")
     other = _FakeHardwareDevice("WRIST456")
     fake_rs.devices = [front, other]
@@ -437,8 +443,8 @@ def test_realsense_bounded_warmup_can_reset_only_the_selected_camera() -> None:
     assert source.startup_timing["total_with_recovery_sec"] >= 0.0
 
 
-def test_realsense_bounded_warmup_stops_if_target_reset_does_not_reconnect() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_bounded_warmup_stops_if_target_reset_does_not_reconnect(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
     target = _FakeHardwareDevice("FRONT123")
     fake_rs.devices = [target]
     fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 5
@@ -460,8 +466,8 @@ def test_realsense_bounded_warmup_stops_if_target_reset_does_not_reconnect() -> 
     assert target.hardware_reset_calls == 1
 
 
-def test_realsense_reset_error_requires_observed_reenumeration_before_retry() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_reset_error_requires_observed_reenumeration_before_retry(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
     front = _FakeHardwareDevice("FRONT123")
     front.reset_error = RuntimeError("map_device_descriptor: No such device")
     fake_rs.devices = [front]
@@ -793,8 +799,8 @@ def test_wrist_depth_smoke_clears_inherited_hardware_reset() -> None:
     assert config.startup_hardware_reset_retry_attempts == 0
 
 
-def test_realsense_bounded_warmup_uses_full_grace_not_legacy_frame_count() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_bounded_warmup_uses_full_grace_not_legacy_frame_count(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
     fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")] * 10
     source = RealSenseRGBSource(
         RealSenseRGBCameraConfig(
@@ -937,8 +943,8 @@ def test_realsense_reviewed_near_zero_frames_are_published_without_error() -> No
     assert info["last_error"] is None
 
 
-def test_realsense_software_startup_retry_rebuilds_without_hardware_reset() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_software_startup_retry_rebuilds_without_hardware_reset(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
     target_device = _FakeHardwareDevice("FRONT123")
     fake_rs.devices = [target_device]
     fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")]
@@ -965,8 +971,8 @@ def test_realsense_software_startup_retry_rebuilds_without_hardware_reset() -> N
     wait_mock.assert_called_once_with(0.25)
 
 
-def test_realsense_software_startup_retry_sleep_honours_shutdown() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_software_startup_retry_sleep_honours_shutdown(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
     fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")]
     source = RealSenseRGBSource(
         RealSenseRGBCameraConfig(
@@ -1152,8 +1158,9 @@ def test_realsense_compatibility_warmup_accepts_historical_any_frameset() -> Non
     assert pipeline.wait_timeouts == [1000]
 
 
-def test_realsense_bounded_warmup_rejects_alternating_color_and_depth() -> None:
-    fake_rs = _FakeRealSense()
+def test_realsense_bounded_warmup_rejects_alternating_color_and_depth(warmup_clock) -> None:
+    fake_rs = _FakeRealSense(clock=warmup_clock)
+    fake_rs.frame_period_sec = 1.0
     fake_rs.wait_frames = [
         _FakeFrameSet(color=True, depth=False),
         _FakeFrameSet(color=False, depth=True),
@@ -1403,3 +1410,142 @@ def test_real_teleop_camera_timeout_suppresses_deferred_retry() -> None:
     assert set(errors) == {"front", "left_wrist", "right_wrist"}
     assert "deferred_startup_retry_failed" not in errors["front"]
     assert errors["right_wrist"].startswith("startup_aborted_after_timeout:")
+
+
+@pytest.fixture
+def warmup_clock(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+
+    def advance(seconds):
+        clock.now = round(clock.now + seconds, 9)
+
+    clock.advance = advance
+    monkeypatch.setattr(realsense_rgb, "time", SimpleNamespace(
+        monotonic=lambda: clock.now,
+        perf_counter=time.perf_counter,
+        time=time.time,
+        sleep=time.sleep,
+    ))
+    return clock
+
+
+def test_realsense_bounded_warmup_does_not_count_partial_frames_as_timeouts(warmup_clock):
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(
+        serial="LEFT123", enable_depth=True, require_complete_frameset=True,
+        startup_frame_grace_sec=5.0, startup_reset=False,
+    ))
+    fake_rs = _FakeRealSense()
+    fake_rs.wait_frames = [_FakeFrameSet(color=True, depth=False)] * 10 + [
+        _FakeFrameSet(color=True, depth=True),
+    ]
+    pipeline = fake_rs.pipeline()
+    native_wait = pipeline.wait_for_frames
+
+    def wait(**kwargs):
+        warmup_clock.advance(.05)
+        return native_wait(**kwargs)
+
+    pipeline.wait_for_frames = wait
+    source._warmup_pipeline(pipeline)
+
+    assert len(pipeline.wait_timeouts) == 11
+    assert warmup_clock.now == pytest.approx(.55)
+    assert pipeline.stop_calls == 0
+    diagnostic = source.device_info()["startup_frame_diagnostic"]
+    assert diagnostic["raw_color_frames"] == 11
+    assert diagnostic["raw_depth_frames"] == 1
+    assert diagnostic["aligned_complete_framesets"] == 1
+    assert diagnostic["stage"] == "complete_rgbd"
+
+
+def test_realsense_warmup_immediate_errors_yield_until_deadline(monkeypatch, warmup_clock):
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(
+        serial="LEFT123", startup_reset=False, startup_frame_grace_sec=.1,
+    ))
+    calls = []
+
+    def wait(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("device has not delivered a frameset")
+
+    monkeypatch.setattr(source._shutdown_event, "wait", warmup_clock.advance)
+    with pytest.raises(RuntimeError, match="startup_warmup_failed"):
+        source._warmup_pipeline(SimpleNamespace(wait_for_frames=wait))
+
+    assert warmup_clock.now == pytest.approx(.1)
+    assert len(calls) == 10
+    diagnostic = source.device_info()["startup_frame_diagnostic"]
+    assert diagnostic["elapsed_sec"] == pytest.approx(.1)
+    assert diagnostic["framesets_received"] == 0
+
+
+def test_realsense_warmup_distinguishes_raw_frames_from_alignment_failure(warmup_clock):
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(
+        serial="LEFT123", enable_depth=True, require_complete_frameset=True,
+        startup_reset=False, startup_frame_grace_sec=.15,
+    ))
+    fake_rs = _FakeRealSense(clock=warmup_clock)
+    fake_rs.wait_frames = [_FakeFrameSet(color=True, depth=True)] * 3
+
+    def align(_frames):
+        raise RuntimeError("alignment unavailable")
+
+    source._depth_align = SimpleNamespace(process=align)
+    with pytest.raises(RuntimeError, match="alignment unavailable"):
+        source._warmup_pipeline(fake_rs.pipeline())
+
+    diagnostic = source.device_info()["startup_frame_diagnostic"]
+    assert diagnostic["raw_complete_framesets"] == 3
+    assert diagnostic["alignment_errors"] == 3
+    assert diagnostic["aligned_complete_framesets"] == 0
+    assert diagnostic["stage"] == "aligning_depth"
+
+
+def test_realsense_warmup_releases_rejected_native_frames_before_next_wait(warmup_clock):
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(
+        serial="LEFT123", enable_depth=True, require_complete_frameset=True, startup_reset=False,
+    ))
+    observed = []
+
+    def wait(**kwargs):
+        warmup_clock.advance(.05)
+        if not observed:
+            frames = _FakeFrameSet(color=True, depth=False)
+            observed.append(weakref.ref(frames))
+            return frames
+        assert observed[0]() is None
+        return _FakeFrameSet(color=True, depth=True)
+
+    source._warmup_pipeline(SimpleNamespace(wait_for_frames=wait))
+
+
+def test_realsense_warmup_rejects_frames_returned_after_deadline(warmup_clock):
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(
+        serial="LEFT123", startup_reset=False, startup_frame_grace_sec=.1,
+    ))
+
+    def wait(**kwargs):
+        warmup_clock.advance(.15)
+        return _FakeFrameSet(color=True)
+
+    with pytest.raises(RuntimeError, match="returned after the first-frame deadline"):
+        source._warmup_pipeline(SimpleNamespace(wait_for_frames=wait))
+    assert source.device_info()["startup_frame_diagnostic"]["stage"] == "first_frame_deadline_exceeded"
+
+
+def test_realsense_failed_warmup_retains_device_identity(monkeypatch, warmup_clock):
+    fake_rs = _FakeRealSense(clock=warmup_clock)
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive")] * 5
+    fake_rs.camera_info = SimpleNamespace(**{key: key for key in (
+        "name", "serial_number", "firmware_version", "physical_port", "usb_type_descriptor",
+    )})
+    identity = {"name": "D405", "serial_number": "LEFT123", "firmware_version": "test",
+        "physical_port": "/sys/devices/usb2/2-4.1", "usb_type_descriptor": "3.2"}
+    monkeypatch.setattr(_FakeDevice, "get_info", lambda _self, token: identity[token], raising=False)
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="LEFT123", startup_reset=False))
+    with pytest.raises(RuntimeError, match="physical_port") as error:
+        source._start_pipeline(fake_rs)
+
+    assert source.device_info()["startup_device_identity"] == identity
+    assert '"framesets_received": 0' in str(error.value)
+    assert len(fake_rs.pipelines) == 1

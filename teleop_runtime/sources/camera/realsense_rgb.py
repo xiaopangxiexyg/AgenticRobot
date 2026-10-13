@@ -324,6 +324,8 @@ class RealSenseRGBSource(ObservationSource):
         self._restart_attempts_without_complete_frame = 0
         self._device_info: dict[str, Any] = {}
         self._startup_timing: dict[str, float] = {}
+        self._startup_frame_diagnostic: dict[str, Any] = {}
+        self._startup_device_identity: dict[str, Any] = {}
         self._depth_align = None
         self._depth_scale_m_per_unit: float | None = None
         self._active_color_format = self.config.color_format
@@ -604,6 +606,9 @@ class RealSenseRGBSource(ObservationSource):
 
     def _start_pipeline_once(self, rs: Any) -> tuple[Any, Any]:
         startup_started = time.perf_counter()
+        with self._lock:
+            self._startup_frame_diagnostic = {}
+            self._startup_device_identity = {}
         pipeline = rs.pipeline()
         stream_config = rs.config()
         stream_config.enable_device(self.config.serial)
@@ -652,6 +657,18 @@ class RealSenseRGBSource(ObservationSource):
         stage_started = time.perf_counter()
         configure_elapsed: float | None = None
         try:
+            # Capture identity before warmup so a no-frame device can still be
+            # associated with its USB port. USB and SDK serials can differ.
+            identity = {}
+            device = profile.get_device()
+            for key in ("name", "serial_number", "firmware_version", "physical_port", "usb_type_descriptor"):
+                token = getattr(rs.camera_info, key, None)
+                try:
+                    identity[key] = device.get_info(token) if token is not None else None
+                except Exception:  # noqa: BLE001 - optional identity diagnostics.
+                    identity[key] = None
+            with self._lock:
+                self._startup_device_identity = identity
             self._configure_sensor_options(profile)
             self._configure_depth_state(rs, profile)
             configure_elapsed = time.perf_counter() - stage_started
@@ -708,6 +725,8 @@ class RealSenseRGBSource(ObservationSource):
             "sensor_configure_sec": sensor_configure_sec,
             "pipeline_stop_sec": round(time.perf_counter() - stop_started, 3),
             "pipeline_stop_error": stop_error,
+            "device_identity": dict(self._startup_device_identity),
+            "first_frame": dict(self._startup_frame_diagnostic),
         }
         return "startup_diagnostic=" + json.dumps(diagnostic, sort_keys=True)
 
@@ -841,7 +860,8 @@ class RealSenseRGBSource(ObservationSource):
         """
 
         grace_sec = float(self.config.startup_frame_grace_sec)
-        deadline = time.monotonic() + grace_sec
+        started = time.monotonic()
+        deadline = started + grace_sec
         configured_timeout_ms = int(self.config.startup_wait_timeout_ms)
         # Keep each SDK call short even when startup_wait_timeout_ms equals the
         # entire grace period (the default is 5000/5000). This preserves the
@@ -853,24 +873,20 @@ class RealSenseRGBSource(ObservationSource):
         )
         failure_count = 0
         last_error: str | None = None
-        # ``warmup_frames`` belongs to the legacy N-frame policy.  It must not
-        # truncate this policy's time budget: stations commonly configure only
-        # two legacy warmup frames while using a 1 s SDK wait and a 5 s bounded
-        # first-frame grace period.  The previous implementation therefore
-        # reported a 5 s budget after actually making only two 1 s attempts.
-        # Bound the number of calls from the grace/timeout pair so mocked or
-        # immediately failing SDK calls cannot spin, while a real blocking SDK
-        # receives the complete configured deadline.
+        # Partial framesets and immediate SDK errors consume calls, not a full
+        # timeout. Only the monotonic deadline may exhaust this time budget.
         del warmup_frames
-        attempt_budget = max(
-            1,
-            int(
-                math.ceil(
-                    (grace_sec * 1000.0) / max(1, attempt_timeout_ms)
-                )
-            ),
-        )
-        for _ in range(attempt_budget):
+        diagnostic = {
+            "budget_sec": grace_sec, "elapsed_sec": 0.0,
+            "wait_calls": 0, "wait_errors": 0, "framesets_received": 0,
+            "raw_color_frames": 0, "raw_depth_frames": 0,
+            "raw_complete_framesets": 0, "alignment_errors": 0,
+            "aligned_complete_framesets": 0,
+            "stage": "waiting_frameset", "last_error": None,
+        }
+        with self._lock:
+            self._startup_frame_diagnostic = dict(diagnostic)
+        while True:
             if self._shutdown_event.is_set():
                 raise RuntimeError("startup_cancelled:shutdown_requested")
             remaining_sec = deadline - time.monotonic()
@@ -880,21 +896,62 @@ class RealSenseRGBSource(ObservationSource):
                 1,
                 min(attempt_timeout_ms, int(remaining_sec * 1000.0)),
             )
+            attempt_started = time.monotonic()
+            diagnostic["wait_calls"] += 1
+            diagnostic["stage"] = "waiting_frameset"
             try:
                 frames = pipeline.wait_for_frames(timeout_ms=timeout_ms)
+                diagnostic["framesets_received"] += 1
+                if time.monotonic() > deadline:
+                    diagnostic["stage"] = "first_frame_deadline_exceeded"
+                    raise TimeoutError("frameset returned after the first-frame deadline")
                 if not bool(self.config.require_complete_frameset):
+                    diagnostic["stage"] = "complete_frameset_not_required"
                     return
-                color_frame, depth_frame = self._required_stream_frames(frames)
+                diagnostic["stage"] = "checking_raw_streams"
+                color_frame = frames.get_color_frame()
+                depth_frame = frames.get_depth_frame() if self.config.enable_depth else None
+                diagnostic["raw_color_frames"] += int(bool(color_frame))
+                diagnostic["raw_depth_frames"] += int(bool(depth_frame))
+                if not self._required_streams_complete(color_frame, depth_frame):
+                    diagnostic["stage"] = "raw_incomplete_frameset"
+                    raise RuntimeError(self._incomplete_frameset_message(color_frame, depth_frame))
+                diagnostic["raw_complete_framesets"] += 1
+                if self.config.enable_depth and self._depth_align is not None:
+                    diagnostic["stage"] = "aligning_depth"
+                    color_frame, depth_frame = self._required_stream_frames(frames)
+                if time.monotonic() > deadline:
+                    diagnostic["stage"] = "first_frame_deadline_exceeded"
+                    raise TimeoutError("alignment returned after the first-frame deadline")
                 if self._required_streams_complete(color_frame, depth_frame):
+                    diagnostic["aligned_complete_framesets"] += 1
+                    diagnostic["stage"] = "complete_rgbd"
                     return
-                failure_count += 1
-                last_error = self._incomplete_frameset_message(
-                    color_frame,
-                    depth_frame,
-                )
+                diagnostic["stage"] = "aligned_incomplete_frameset"
+                raise RuntimeError(self._incomplete_frameset_message(color_frame, depth_frame))
             except Exception as exc:  # noqa: BLE001
                 failure_count += 1
                 last_error = f"{type(exc).__name__}: {exc}"
+                if diagnostic["stage"] == "waiting_frameset":
+                    diagnostic["wait_errors"] += 1
+                elif diagnostic["stage"] == "aligning_depth":
+                    diagnostic["alignment_errors"] += 1
+                diagnostic["last_error"] = last_error
+            finally:
+                # SDK frames own native buffers. Release this rejected set
+                # before waiting for another, rather than retaining it across
+                # a potentially blocking wait_for_frames call.
+                frames = color_frame = depth_frame = None
+                diagnostic["elapsed_sec"] = time.monotonic() - started
+                with self._lock:
+                    self._startup_frame_diagnostic = dict(diagnostic)
+            # Do not spin if the SDK fails immediately. This yields without
+            # reopening the pipeline, and remains cancellable within 10 ms.
+            pause = min(.01 - (time.monotonic() - attempt_started), deadline - time.monotonic())
+            if pause > 0:
+                self._shutdown_event.wait(pause)
+        with self._lock:
+            self._startup_frame_diagnostic["elapsed_sec"] = time.monotonic() - started
         raise RuntimeError(
             "startup_warmup_failed:"
             "policy=bounded_first_frame:"
@@ -1718,6 +1775,8 @@ class RealSenseRGBSource(ObservationSource):
             )
             info["missing_color_frame_count"] = int(self._missing_color_frame_count)
             info["missing_depth_frame_count"] = int(self._missing_depth_frame_count)
+            info["startup_frame_diagnostic"] = dict(self._startup_frame_diagnostic)
+            info["startup_device_identity"] = dict(self._startup_device_identity)
             info["last_frame_age_sec"] = (
                 None
                 if self._last_frame_receive_timestamp is None

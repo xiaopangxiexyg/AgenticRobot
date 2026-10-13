@@ -54,6 +54,17 @@ is kept as configured; startup first-frame waiting is longer than the runtime
 freshness timeout so a multi-camera negotiation does not trigger a pipeline
 restart loop.
 
+`bounded_first_frame` 的预算由单调时钟截止时间决定，不按 SDK 调用次数耗尽。
+快速到达的不完整 RGB-D 帧组会在同一条 pipeline 中继续等待；立即失败的调用
+短暂让出线程，截止时间之后返回的帧组或对齐结果仍会被拒绝。被拒绝帧组的
+原生引用在下一次等待前释放。原有流配置、reset/reopen 策略和后续跨相机
+新鲜度准入保持原义。
+
+`device_info().startup_frame_diagnostic` 与失败文本的 `first_frame` 字段记录
+wait 调用/异常、原始 RGB/深度、完整帧组及对齐结果。`framesets_received=0`
+仅表示没有帧组返回，不能推断 RGB、深度各自是否产生。失败诊断保留启动时
+SDK 设备身份与 `physical_port`，不为取得这些信息另建 pipeline。
+
 Shared RM65/Rig camera geometry and URDF placements live in
 `robot_motion/configs/rm65_camera_registry.json`. Runtime intrinsics may be
 overlaid into dataset snapshots; do not put those snapshots or new device
