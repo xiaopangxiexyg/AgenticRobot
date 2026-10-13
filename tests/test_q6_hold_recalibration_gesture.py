@@ -241,7 +241,7 @@ class Q6HoldRecalibrationGestureTests(unittest.TestCase):
             right_hand_backend=None,
             left_gripper_retargeter=None,
             right_gripper_retargeter=None,
-            session=SimpleNamespace(sources=[source]),
+            session=SimpleNamespace(sources=[source], calibration=None),
             gripper_policy={},
         )
         return build_control_input(
