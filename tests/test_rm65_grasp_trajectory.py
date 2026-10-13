@@ -1,4 +1,5 @@
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1575,7 +1576,10 @@ def _planner_without_assets(
     planner.target_envelope_filter = None
     planner.path_collision_scene_profile = "test_sparse_proxy"
     planner.trajectory_record_dir = None
+    planner.oracle = SimpleNamespace()
     planner._solver_lock = threading.Lock()
+    planner._local_chain_cache_lock = threading.Lock()
+    planner._local_chain_cache = OrderedDict()
     return planner
 
 
@@ -3744,3 +3748,357 @@ def test_path_planner_shares_goal_set_in_every_expanding_corridor(
     assert np.any(first_widths[2] > first_widths[1])
     assert np.all(first_widths[3] >= first_widths[2])
     np.testing.assert_allclose(trajectory.qpos_by_side["right"][-1], 0.2)
+
+
+def _local_chain_reuse_fixture():
+    planner = _planner_without_assets(config=RM65GraspTrajectoryPlanningConfig())
+    planner.oracle = SimpleNamespace(scene_hash="scene-1")
+    planner.target_builder = SimpleNamespace()
+    current = {s: np.zeros(6) for s in ("left", "right")}
+    grasp = np.eye(4)
+    pregrasp = grasp.copy()
+    pregrasp[2, 3] = -.06
+    counts = {"ik": 0, "approach": 0, "native": 0, "geometry": 0, "visible": 0}
+    def endpoints(**kw):
+        counts["ik"] += 1
+        return tuple(grasp_trajectory_module._EndpointIKCandidate(
+            qpos_by_side={"left": current["left"], "right": np.full(6, x)}, seed_index=i,
+            solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.,
+        ) for i, x in enumerate((.1, .2)))
+    def approach(**kw):
+        counts["approach"] += 1
+        start = kw["qpos_by_side"]
+        end = {s:q.copy() for s,q in start.items()}
+        end["right"][0] += .03
+        endpoint = grasp_trajectory_module._EndpointIKCandidate(qpos_by_side=end,
+            seed_index=counts["approach"], solve_cycles=1, position_residual_m=0., orientation_residual_deg=0.)
+        return grasp_trajectory_module._PlannedPathLeg(endpoint,
+            JointPathPlanResult(status=JointPathStatus.PATH_FOUND, start_qpos_by_component=start,
+                target_qpos_by_component=end, movable_components=("right",), waypoints=(start,end), scene_hash="scene-1"),
+            {}, ())
+    def native(*_a, **_kw):
+        counts["native"] += 1
+        return {"checks": 10}
+    def geometry(*_a, **_kw):
+        counts["geometry"] += 1
+        return {"checks": 10}
+    def visible(*_a, **_kw):
+        counts["visible"] += 1
+        return {"checks": 10}
+    planner._endpoint_qpos_candidates = endpoints
+    planner._plan_constrained_approach_leg = approach
+    planner._revalidate = native
+    planner._validate_constrained_approach_geometry = geometry
+    planner._revalidate_visible_gripper_path = visible
+    args = {"qpos_by_side": current, "side": "right", "pregrasp_tool_tcp_world": pregrasp,
+        "grasp_tool_tcp_world": grasp, "deadline": 10., "monotonic": lambda: 0.}
+    first = planner._prepare_grasp_approaches(**args)
+    return planner, args, first, counts
+
+
+def test_local_chain_reuses_exact_prepared_branches_but_rechecks_all_current_safety():
+    planner, args, first, counts = _local_chain_reuse_fixture()
+    second = planner._prepare_grasp_approaches(**args, visible_scene=object())
+    assert counts == {"ik":1, "approach":2, "native":2, "geometry":2, "visible":2}
+    for old, new in zip(first.candidates, second.candidates, strict=True):
+        assert old[0] is new[0]
+        assert old[1].path is new[1].path
+        assert not new[1].path.waypoints[-1]["right"].flags.writeable
+    assert second.validation_attempts[-1]["status"] == "revalidated"
+    assert second.validation_attempts[-1]["branch_count"] == 2
+
+
+@pytest.mark.parametrize("changed", ("left", "right", "grasp", "pregrasp", "side", "scene", "oracle", "builder", "filter", "config"))
+def test_local_chain_reuse_never_crosses_state_pose_scene_or_owner(changed):
+    planner, args, _first, counts = _local_chain_reuse_fixture()
+    if changed in ("left", "right"):
+        args["qpos_by_side"][changed][0] = 1e-6
+    elif changed in ("grasp", "pregrasp"):
+        args[changed+"_tool_tcp_world"][0,3] = 1e-6
+    elif changed == "side":
+        args["side"] = "left"
+    elif changed == "scene":
+        planner.oracle.scene_hash = "scene-2"
+    elif changed == "oracle":
+        planner.oracle = SimpleNamespace(scene_hash="scene-1")
+    elif changed == "builder":
+        planner.target_builder = SimpleNamespace()
+    elif changed == "filter":
+        planner.target_envelope_filter = lambda p: p
+    else:
+        planner.config = RM65GraspTrajectoryPlanningConfig()
+    planner._prepare_grasp_approaches(**args)
+    assert counts["ik"] == 2 and counts["approach"] == 4
+    assert counts["native"] == 0
+
+
+@pytest.mark.parametrize("blocked_seed", (0, None))
+def test_local_chain_reuse_checks_new_visible_obstacles_and_searches_if_all_retained_branches_fail(blocked_seed):
+    planner, args, _first, counts = _local_chain_reuse_fixture()
+    observed = object()
+    def visible(waypoints, **kw):
+        assert kw["visible_scene"] is observed
+        if blocked_seed is None or waypoints[0]["right"][0] == .1:
+            raise RM65GraspTrajectoryPlanningError("visible_gripper_path_collision")
+        return {"checked_new_scene": True}
+    planner._revalidate_visible_gripper_path = visible
+    prepared = planner._prepare_grasp_approaches(**args, visible_scene=observed)
+    if blocked_seed is None:
+        assert counts["ik"] == 2  # Failed proposals are not a veto on fresh branch search.
+        assert counts["approach"] == 4
+    else:
+        assert counts["ik"] == 1 and len(prepared.candidates) == 1
+        assert prepared.candidates[0][0].seed_index == 1
+
+
+@pytest.mark.parametrize("reason", ("path_collision_check_unavailable", "path_planning_time_budget_exhausted"))
+def test_local_chain_reuse_does_not_hide_unavailable_safety_or_deadlines(reason):
+    planner, args, _first, counts = _local_chain_reuse_fixture()
+    def invalid(*_a, **_kw):
+        raise RM65GraspTrajectoryPlanningError(reason)
+    planner._revalidate = invalid
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match=reason):
+        planner._prepare_grasp_approaches(**args)
+    assert counts["ik"] == 1
+
+
+def test_local_chain_cache_is_bounded_and_expired_request_cannot_use_it():
+    planner, args, _first, _counts = _local_chain_reuse_fixture()
+    for i in range(25):
+        args["grasp_tool_tcp_world"][0,3] = .01*i
+        planner._prepare_grasp_approaches(**args)
+    assert len(planner._local_chain_cache) == 20
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="time_budget_exhausted"):
+        planner._prepare_grasp_approaches(**{**args, "monotonic": lambda: 10.})
+
+
+def test_pregrasp_priority_tries_solved_distance_without_removing_other_routes():
+    planner, args, _first, _counts = _local_chain_reuse_fixture()
+    nominal = planner._pregrasp_distance_candidates()
+    assert nominal[0] == .06
+    prepared = next(iter(planner._local_chain_cache.values()))[1]
+    planner._local_chain_cache.clear()
+    planner._remember_local_approaches(prepared, qpos_by_side=args["qpos_by_side"], side="right",
+        pregrasp=planner._pregrasp_target_pose(args["grasp_tool_tcp_world"], distance_m=.02),
+        grasp=args["grasp_tool_tcp_world"])
+    distances = planner._ordered_pregrasp_distances(qpos_by_side=args["qpos_by_side"], side="right",
+        grasp=args["grasp_tool_tcp_world"])
+    assert distances == (.02, *nominal[:-1])
+    args["qpos_by_side"]["left"][0] += 1e-6
+    assert planner._ordered_pregrasp_distances(qpos_by_side=args["qpos_by_side"], side="right",
+        grasp=args["grasp_tool_tcp_world"]) == nominal
+
+
+@pytest.mark.parametrize("reason", ("path_search_exhausted", "path_target_collision_blocked",
+    "path_collision_blocked", "visible_gripper_path_collision", "path_target_safety_envelope_blocked",
+    "path_collision_check_unavailable", "path_target_safety_envelope_unavailable",
+    "endpoint_collision_check_unavailable", "path_planning_time_budget_exhausted"))
+def test_retained_local_branches_never_veto_fresh_connection_search_or_hide_faults(reason):
+    planner, args, _first, counts = _local_chain_reuse_fixture()
+    retained = planner._prepare_grasp_approaches(**args)
+    calls = []
+    def connect(**kw):
+        assert kw["deadline"] == args["deadline"]  # No new time budget.
+        calls.append(kw["endpoint_candidates"])
+        if len(calls) == 1:
+            raise RM65GraspTrajectoryPlanningError(reason)
+        endpoint = kw["endpoint_candidates"][-1]
+        assert endpoint is not calls[0][-1]
+        return grasp_trajectory_module._PlannedPathLeg(endpoint,
+            SimpleNamespace(waypoints=(args["qpos_by_side"], endpoint.qpos_by_side)), {}, ())
+    planner._plan_path_leg = connect
+    if reason.endswith("unavailable") or reason == "path_planning_time_budget_exhausted":
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=reason):
+            planner._plan_pregrasp_and_approach(**args, prepared_approaches=retained)
+        assert counts["ik"] == 1 and len(calls) == 1
+    else:
+        far, near = planner._plan_pregrasp_and_approach(**args, prepared_approaches=retained)
+        assert counts["ik"] == 2 and counts["approach"] == 4
+        assert far.endpoint.qpos_by_side is near.path.start_qpos_by_component
+        assert far.search_attempts[0]["status"] == "fresh_search_after_rejection"
+
+
+@pytest.mark.parametrize("direction", ("forward", "reverse"))
+@pytest.mark.parametrize("failure", (
+    "path_planning_time_budget_exhausted",
+    "path_collision_check_unavailable",
+    "path_target_safety_envelope_unavailable",
+))
+def test_later_local_branch_timeout_retains_only_complete_validated_proposals(direction, failure):
+    planner, args, _first, _counts = _local_chain_reuse_fixture()
+    planner._local_chain_cache.clear()
+    native_endpoints = planner._endpoint_qpos_candidates
+    native_approach = planner._plan_constrained_approach_leg
+    endpoint_calls = 0
+    approach_calls = 0
+    validated = []
+
+    def endpoints(**kw):
+        nonlocal endpoint_calls
+        endpoint_calls += 1
+        if direction == "reverse" and endpoint_calls == 1:
+            raise RM65GraspTrajectoryPlanningError("ik_search_exhausted")
+        return native_endpoints(**kw)
+
+    def approach(**kw):
+        nonlocal approach_calls
+        approach_calls += 1
+        if approach_calls == 2:
+            raise RM65GraspTrajectoryPlanningError(failure)
+        result = native_approach(**kw)
+        validated.append(result)
+        return result
+
+    planner._endpoint_qpos_candidates = endpoints
+    planner._plan_constrained_approach_leg = approach
+    planner.target_builder = SimpleNamespace(tool_tcp_world_targets_for_qpos_pair=
+        lambda **_kw: {"left": np.eye(4), "right": args["pregrasp_tool_tcp_world"].copy()})
+    if failure.endswith("unavailable"):
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=failure):
+            planner._prepare_grasp_approaches(**args, reuse_previous=False)
+        assert not planner._local_chain_cache
+    else:
+        result = planner._prepare_grasp_approaches(**args, reuse_previous=False)
+        assert len(result.candidates) == 1
+        assert result.candidates[0][1].path is validated[0].path
+        assert result.validation_attempts[-1]["reason_code"] == failure
+        assert result.validation_attempts[-1]["status"] == "search_budget_exhausted"
+        assert not result.candidates[0][1].path.waypoints[0]["right"].flags.writeable
+        assert len(planner._local_chain_cache) == 1
+    assert approach_calls == 2
+
+
+def test_first_local_branch_timeout_cannot_be_returned_as_a_proposal():
+    planner, args, _first, _counts = _local_chain_reuse_fixture()
+    planner._local_chain_cache.clear()
+
+    def timeout(**_kw):
+        raise RM65GraspTrajectoryPlanningError("path_planning_time_budget_exhausted")
+
+    planner._plan_constrained_approach_leg = timeout
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="time_budget_exhausted"):
+        planner._prepare_grasp_approaches(**args, reuse_previous=False)
+    assert not planner._local_chain_cache
+
+
+def test_complete_local_proposal_cannot_bypass_an_expired_full_path_deadline():
+    planner, args, prepared, _counts = _local_chain_reuse_fixture()
+    with pytest.raises(RM65GraspTrajectoryPlanningError, match="time_budget_exhausted"):
+        planner._plan_path_leg(
+            qpos_by_side=args["qpos_by_side"], side="right",
+            target_tool_tcp_world=args["pregrasp_tool_tcp_world"],
+            planning_phase="pregrasp_target",
+            endpoint_candidates=tuple(endpoint for endpoint, _ in prepared.candidates),
+            deadline=args["deadline"], monotonic=lambda: args["deadline"] + 1.,
+        )
+
+
+@pytest.mark.parametrize("failure", ("path_planning_time_budget_exhausted", "path_collision_check_unavailable"))
+def test_later_reuse_timeout_keeps_only_branches_revalidated_for_the_current_scene(failure):
+    planner, args, _first, _counts = _local_chain_reuse_fixture()
+    native_revalidate = planner._revalidate
+    calls = 0
+
+    def revalidate(*a, **kw):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RM65GraspTrajectoryPlanningError(failure)
+        return native_revalidate(*a, **kw)
+
+    planner._revalidate = revalidate
+    if failure.endswith("unavailable"):
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=failure):
+            planner._prepare_grasp_approaches(**args, visible_scene=object())
+    else:
+        result = planner._prepare_grasp_approaches(**args, visible_scene=object())
+        assert len(result.candidates) == 1
+        assert result.candidates[0][1].dense_revalidation["visible_scene"]["checks"] == 10
+        assert result.validation_attempts[-2]["status"] == "search_budget_exhausted"
+        assert result.validation_attempts[-1]["branch_count"] == 1
+    assert calls == 2
+
+
+def test_local_chain_unknown_scene_owner_uses_fresh_search_without_cache():
+    planner, args, _first, counts = _local_chain_reuse_fixture()
+    planner.oracle = SimpleNamespace()
+    planner._local_chain_cache.clear()
+    first = planner._prepare_grasp_approaches(**args)
+    second = planner._prepare_grasp_approaches(**args)
+    assert counts["ik"] == 3 and counts["approach"] == 6
+    assert first.candidates[0][0] is not second.candidates[0][0]
+    assert not planner._local_chain_cache
+
+
+@pytest.mark.parametrize("phase", ("native", "geometry", "visible"))
+@pytest.mark.parametrize("failure", (
+    "path_planning_time_budget_exhausted",
+    "path_collision_check_unavailable",
+    "path_target_safety_envelope_unavailable",
+))
+def test_cache_keeps_only_completed_current_checks_when_later_validation_fails(phase, failure):
+    planner, args, _first, _counts = _local_chain_reuse_fixture()
+    methods = {
+        "native": "_revalidate",
+        "geometry": "_validate_constrained_approach_geometry",
+        "visible": "_revalidate_visible_gripper_path",
+    }
+    method = methods[phase]
+    original = getattr(planner, method)
+    calls = 0
+
+    def check(*a, **kw):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RM65GraspTrajectoryPlanningError(failure)
+        return original(*a, **kw)
+
+    setattr(planner, method, check)
+    if failure.endswith("unavailable"):
+        with pytest.raises(RM65GraspTrajectoryPlanningError, match=failure):
+            planner._prepare_grasp_approaches(**args, visible_scene=object())
+    else:
+        prepared = planner._prepare_grasp_approaches(**args, visible_scene=object())
+        assert len(prepared.candidates) == 1
+        assert prepared.candidates[0][1].dense_revalidation["visible_scene"]["checks"] == 10
+    assert calls == 2
+
+
+@pytest.mark.parametrize("mode", (
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_SEGMENTED_STOP,
+    RM65_GRASP_TRAJECTORY_PARAMETERIZATION_CONTINUOUS_C2,
+))
+def test_native_warm_local_chain_preserves_complete_field_trace_trajectory(mode, tmp_path, monkeypatch):
+    profile = _real_profile()
+    builder = build_exclusive_rm65_skill_target_builder(profile)
+    planner = RM65GraspJointTrajectoryPlanner(
+        profile=profile, planning_target_builder=builder,
+        target_envelope_filter=builder.pre_ik_target_safety_filter,
+        config=RM65GraspTrajectoryPlanningConfig(trajectory_parameterization=mode),
+        trajectory_record_dir=tmp_path,
+    )
+    records = []
+    # Observe the real planner's record payload; only disk persistence is replaced.
+    monkeypatch.setattr(grasp_trajectory_module, "write_grasp_trajectory_record",
+        lambda _directory, _trajectory, **kw: records.append(kw))
+    arguments = {
+        "qpos_by_side": {side: values.copy() for side, values in FIELD_TRACE_QPOS.items()},
+        "side": "right",
+        "target_tool_tcp_world": xyzquat_to_pose_matrix(
+            FIELD_TRACE_TARGET_XYZQUAT, name="warm_field_trace_target"),
+        "speed_scale": 0.2,
+    }
+    cold = planner(**arguments)
+    warm = planner(**arguments)
+    assert len(records) == 2
+    assert records[0]["planning_timing"]["local_chain_reuse_count"] == 0
+    assert records[1]["planning_timing"]["local_chain_reuse_count"] == 1
+    assert records[1]["planning_timing"]["local_chain_revalidation_wall_duration_sec"] > 0
+    np.testing.assert_allclose(warm.time_from_start_sec, cold.time_from_start_sec, atol=1e-8, rtol=0)
+    for side in ("left", "right"):
+        np.testing.assert_allclose(warm.qpos_by_side[side], cold.qpos_by_side[side], atol=1e-8, rtol=0)
+        np.testing.assert_array_equal(arguments["qpos_by_side"][side], FIELD_TRACE_QPOS[side])
+    waypoints = tuple({side: values[index] for side, values in warm.qpos_by_side.items()}
+        for index in range(warm.time_from_start_sec.size))
+    assert planner._revalidate(waypoints, moving_side="right")["sample_count"] > 0
