@@ -9,12 +9,15 @@ import pytest
 
 from teleop_runtime.real_teleop import collection_control_plane as control_plane_module
 from teleop_runtime.real_teleop import dataset_recorder as dataset_recorder_module
+from teleop_runtime.real_teleop import (
+    episode_recording_runtime as episode_recording_module,
+)
 from teleop_runtime.real_teleop.collection_control_plane import (
     CollectionControlOperationBusy,
     CollectionControlPlane,
 )
-from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
 from teleop_runtime.real_teleop.dataset_finalize import RealDatasetFinalizeTask
+from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
 from tests.support.real_teleop_recording import _Clutch, _episode_runtime
 
 
@@ -31,6 +34,26 @@ def _wait_for_result(
             return result
         time.sleep(0.001)
     raise AssertionError(f"operation {generation} did not complete")
+
+
+class _PauseWorkerAfterUnlock:
+    """Use a real lock, with one legal scheduling cut after worker release."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.worker: threading.Thread | None = None
+        self.reached = threading.Event()
+        self.release = threading.Event()
+
+    def __enter__(self):
+        self.lock.acquire()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.lock.release()
+        if threading.current_thread() is self.worker and not self.reached.is_set():
+            self.reached.set()
+            assert self.release.wait(timeout=2.0)
 
 
 def test_submit_never_waits_for_blocked_operation() -> None:
@@ -515,17 +538,23 @@ def test_cancelled_result_is_cleaned_before_completion_is_published() -> None:
     release = threading.Event()
     cleaned: list[object] = []
     candidate = object()
-    plane = CollectionControlPlane(name="unit-test")
+    clock_value = [10.0]
+    plane = CollectionControlPlane(name="unit-test", clock=lambda: clock_value[0])
 
     def prepare() -> object:
         entered.set()
         assert release.wait(timeout=1.0)
+        clock_value[0] = 20.0
         return candidate
+
+    def discard(value: object) -> None:
+        cleaned.append(value)
+        clock_value[0] = 30.0
 
     generation = plane.submit(
         "prepare",
         prepare,
-        discard_value=cleaned.append,
+        discard_value=discard,
     )
     assert entered.wait(timeout=1.0)
     assert plane.cancel(generation)
@@ -537,7 +566,70 @@ def test_cancelled_result_is_cleaned_before_completion_is_published() -> None:
     assert not result.succeeded
     assert result.value is None
     assert cleaned == [candidate]
+    assert result.started_at == 10.0
+    assert result.completed_at == 20.0
+    assert result.elapsed_sec == 10.0
     assert not plane.busy
+
+
+@pytest.mark.parametrize("action", ("cancel", "close"))
+def test_request_at_worker_publication_cut_discards_once_before_drain(
+    action: str,
+) -> None:
+    plane = CollectionControlPlane(name="publication-cut-test")
+    cut = _PauseWorkerAfterUnlock()
+    plane._lock = cut
+    candidate = object()
+    cleaned: list[object] = []
+    cleanup_entered = threading.Event()
+    cleanup_release = threading.Event()
+
+    def prepare() -> object:
+        cut.worker = threading.current_thread()
+        return candidate
+
+    def discard(value: object) -> None:
+        cleanup_entered.set()
+        assert cleanup_release.wait(timeout=2.0)
+        cleaned.append(value)
+
+    generation = plane.submit("prepare", prepare, discard_value=discard)
+    try:
+        assert cut.reached.wait(timeout=1.0)
+        if action == "cancel":
+            assert plane.cancel(generation)
+        else:
+            assert not plane.close(timeout_sec=0.0)
+        cut.release.set()
+        assert cleanup_entered.wait(timeout=1.0)
+        assert plane.busy
+        assert plane.active_operation == (generation, "prepare")
+        assert plane.poll(generation) is None
+        if action == "close":
+            assert not plane.close(timeout_sec=0.0)
+        if action == "cancel":
+            with pytest.raises(CollectionControlOperationBusy, match="prepare"):
+                plane.submit("next", object)
+            assert plane.wait(generation, timeout_sec=0.0) is None
+        cleanup_release.set()
+        if action == "cancel":
+            result = _wait_for_result(plane, generation)
+            assert result.cancelled
+            assert not result.succeeded
+            assert result.value is None
+            assert result.error is None
+            assert result.discard_error is None
+        else:
+            assert plane.close(timeout_sec=1.0)
+            assert plane.poll(generation) is None
+        assert cleaned == [candidate]
+        assert not plane.busy
+    finally:
+        cut.release.set()
+        cleanup_release.set()
+        plane.close(timeout_sec=1.0)
+        if cut.worker is not None:
+            cut.worker.join(timeout=1.0)
 
 
 def test_cancel_of_completed_value_keeps_cleanup_off_the_caller_and_single_flight() -> None:
@@ -583,6 +675,89 @@ def test_cancel_of_completed_value_keeps_cleanup_off_the_caller_and_single_fligh
     assert not plane.busy
 
 
+@pytest.mark.parametrize("cancel_after_completion", (False, True))
+def test_close_unconsumed_cancelled_completion_does_not_discard_again(
+    cancel_after_completion: bool,
+) -> None:
+    plane = CollectionControlPlane(name="cancelled-completion-test")
+    candidate = object()
+    cleaned: list[object] = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def prepare() -> object:
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return candidate
+
+    generation = plane.submit("prepare", prepare, discard_value=cleaned.append)
+    assert entered.wait(timeout=1.0)
+    try:
+        if cancel_after_completion:
+            release.set()
+            deadline = time.monotonic() + 1.0
+            while plane.busy and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert not plane.busy
+        assert plane.cancel(generation)
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while plane.busy and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert not plane.busy
+        assert plane.close(timeout_sec=1.0)
+        assert cleaned == [candidate]
+        assert plane.poll(generation) is None
+    finally:
+        release.set()
+        plane.close(timeout_sec=1.0)
+
+
+@pytest.mark.parametrize("cancel_after_completion", (False, True))
+def test_cancelled_cleanup_failure_remains_one_consumable_result(
+    cancel_after_completion: bool,
+) -> None:
+    plane = CollectionControlPlane(name="discard-failure-test")
+    candidate = object()
+    failure = RuntimeError("candidate retirement failed")
+    cleaned: list[object] = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def prepare() -> object:
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return candidate
+
+    def discard(value: object) -> None:
+        cleaned.append(value)
+        raise failure
+
+    generation = plane.submit("prepare", prepare, discard_value=discard)
+    assert entered.wait(timeout=1.0)
+    try:
+        if cancel_after_completion:
+            release.set()
+            deadline = time.monotonic() + 1.0
+            while plane.busy and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert not plane.busy
+        assert plane.cancel(generation)
+        release.set()
+        result = _wait_for_result(plane, generation)
+        assert result.cancelled
+        assert not result.succeeded
+        assert result.value is None
+        assert result.error is None
+        assert result.discard_error is failure
+        assert cleaned == [candidate]
+        assert plane.poll(generation) is None
+        assert plane.active_operation is None
+    finally:
+        release.set()
+        plane.close(timeout_sec=1.0)
+
+
 def test_close_discards_unconsumed_success_and_rejects_new_work() -> None:
     cleaned: list[object] = []
     candidate = object()
@@ -602,6 +777,95 @@ def test_close_discards_unconsumed_success_and_rejects_new_work() -> None:
     assert plane.poll(generation) is None
     with pytest.raises(RuntimeError, match="closed"):
         plane.submit("prepare", lambda: None)
+
+
+def test_close_completed_value_does_not_wait_beyond_cleanup_budget() -> None:
+    plane = CollectionControlPlane(name="completed-close-budget-test")
+    candidate = object()
+    cleaned: list[object] = []
+    cleanup_entered = threading.Event()
+    cleanup_release = threading.Event()
+    close_returned = threading.Event()
+    close_results: list[bool] = []
+
+    def discard(value: object) -> None:
+        cleanup_entered.set()
+        assert cleanup_release.wait(timeout=2.0)
+        cleaned.append(value)
+
+    plane.submit("prepare", lambda: candidate, discard_value=discard)
+    deadline = time.monotonic() + 1.0
+    while plane.busy and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert not plane.busy
+
+    def close() -> None:
+        close_results.append(plane.close(timeout_sec=0.0))
+        close_returned.set()
+
+    caller = threading.Thread(target=close, daemon=True)
+    caller.start()
+    try:
+        assert cleanup_entered.wait(timeout=1.0)
+        assert close_returned.wait(timeout=0.25)
+        assert close_results == [False]
+        assert plane.busy
+        assert plane.poll() is None
+        assert not plane.close(timeout_sec=0.0)
+        with pytest.raises(RuntimeError, match="closed"):
+            plane.submit("next", object)
+        cleanup_release.set()
+        assert plane.close(timeout_sec=1.0)
+        assert cleaned == [candidate]
+    finally:
+        cleanup_release.set()
+        caller.join(timeout=1.0)
+        plane.close(timeout_sec=1.0)
+
+
+@pytest.mark.parametrize("action", ("cancel", "close"))
+@pytest.mark.parametrize("failure_point", ("construction", "start"))
+def test_completed_cleanup_worker_failure_retains_candidate_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    failure_point: str,
+) -> None:
+    plane = CollectionControlPlane(name="cleanup-submission-test")
+    candidate = object()
+    cleaned: list[object] = []
+    generation = plane.submit("prepare", lambda: candidate, discard_value=cleaned.append)
+    deadline = time.monotonic() + 1.0
+    while plane.busy and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert not plane.busy
+
+    def fail(*_args, **_kwargs) -> None:
+        raise RuntimeError("cleanup worker unavailable")
+
+    with monkeypatch.context() as failure_patch:
+        if failure_point == "construction":
+            failure_patch.setattr(control_plane_module.threading, "Thread", fail)
+        else:
+            failure_patch.setattr(control_plane_module.threading.Thread, "start", fail)
+        if action == "cancel":
+            assert not plane.cancel(generation)
+        else:
+            assert not plane.close(timeout_sec=0.0)
+            assert plane.poll(generation) is None
+        assert cleaned == []
+        assert plane.active_operation == (generation, "prepare")
+
+    if action == "cancel":
+        assert plane.cancel(generation)
+        result = _wait_for_result(plane, generation)
+        assert result.cancelled
+        assert result.value is None
+    else:
+        assert plane.close(timeout_sec=1.0)
+        assert plane.poll(generation) is None
+    assert cleaned == [candidate]
+    assert plane.active_operation is None
+    assert plane.close(timeout_sec=1.0)
 
 
 def test_close_waits_for_running_operation_and_its_discard_cleanup() -> None:
@@ -2815,10 +3079,20 @@ def test_dataset_selection_without_formal_collection_remains_contract_only(
     runtime.close()
 
 
-def test_cancelled_prepare_never_publishes_candidate(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cancel_cut", ("ready_handshake", "publication"))
+def test_cancelled_prepare_never_publishes_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_cut: str,
+) -> None:
     entered = threading.Event()
     release = threading.Event()
     instances: list[object] = []
+    plane = CollectionControlPlane(name="prepare-publication-test")
+    cut = _PauseWorkerAfterUnlock()
+    if cancel_cut == "publication":
+        plane._lock = cut
+    monkeypatch.setattr(episode_recording_module, "CollectionControlPlane", lambda **_kwargs: plane)
 
     class Recorder:
         def __init__(self, **_kwargs: object) -> None:
@@ -2829,15 +3103,23 @@ def test_cancelled_prepare_never_publishes_candidate(tmp_path: Path) -> None:
             self.dataset_root = tmp_path
             self.writer_started = False
             self.closed = False
+            self.close_calls = 0
             instances.append(self)
 
         def ensure_started(self) -> None:
-            entered.set()
-            assert release.wait(timeout=1.0)
+            if cancel_cut == "publication":
+                cut.worker = threading.current_thread()
+            else:
+                entered.set()
+                assert release.wait(timeout=1.0)
             self.writer_started = True
+
+        def poll_finalize_tasks(self):
+            return []
 
         def close(self) -> None:
             self.closed = True
+            self.close_calls += 1
 
     slot: list[object | None] = [None]
     clutch = _Clutch()
@@ -2850,19 +3132,27 @@ def test_cancelled_prepare_never_publishes_candidate(tmp_path: Path) -> None:
     )
 
     assert runtime.schedule_recording_countdown(time.time(), start_reason="unit")
-    assert entered.wait(timeout=1.0)
-    assert runtime.cancel_recording_countdown(time.time(), reason="unit_cancel")
-    assert runtime.countdown_deadline() == float("inf")
-    release.set()
-    deadline = time.monotonic() + 1.0
-    while runtime.countdown_deadline() is not None and time.monotonic() < deadline:
-        runtime.poll_dataset_finalize(time.time())
-        time.sleep(0.001)
+    try:
+        ready = cut.reached if cancel_cut == "publication" else entered
+        assert ready.wait(timeout=1.0)
+        assert runtime.cancel_recording_countdown(time.time(), reason="unit_cancel")
+        assert runtime.countdown_deadline() == float("inf")
+        release.set()
+        cut.release.set()
+        deadline = time.monotonic() + 1.0
+        while runtime.countdown_deadline() is not None and time.monotonic() < deadline:
+            runtime.poll_dataset_finalize(time.time())
+            time.sleep(0.001)
 
-    assert slot[0] is None
-    assert instances[0].closed is True
-    assert clutch.recording_states[-1]["event_status"] == "idle"
-    runtime.close()
+        assert slot[0] is None
+        assert instances[0].closed is True
+        assert instances[0].close_calls == 1
+        assert runtime.countdown_deadline() is None
+        assert clutch.recording_states[-1]["event_status"] == "idle"
+    finally:
+        release.set()
+        cut.release.set()
+        runtime.close()
 
 
 def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path) -> None:
