@@ -613,7 +613,18 @@ def test_runtime_home_invalidates_terminal_writing_reachability_result() -> None
     assert extension.status().writing_reachability_detail == ""
 
 
-def test_writing_reachability_oracle_accepts_production_fast_path_config() -> None:
+@pytest.mark.parametrize("calibrated_z,contact_offset,rotation_deg", [
+    (0.2, 0.0, 0.0), (0.6, 0.0, 0.0), (0.2, 0.06, 0.0), (0.2, 0.06, 35.0),
+])
+def test_writing_reachability_oracle_accepts_production_fast_path_config(
+    calibrated_z: float, contact_offset: float, rotation_deg: float,
+) -> None:
+    def probe_pose(z):
+        pose = _pose(z=z)
+        angle = np.deg2rad(rotation_deg) / 2.0
+        pose[3:] = [0.0, np.sin(angle), 0.0, np.cos(angle)]
+        return pose
+
     source = _group()
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
@@ -633,7 +644,13 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
                 "enabled": True,
                 "left_hold_pose_canonical_desk": _pose().tolist(),
                 "probes": [
-                    {"name": name, "right_pose_canonical_desk": _pose().tolist()}
+                    {
+                        "name": name,
+                        "right_pose_canonical_desk": probe_pose(
+                            0.54 if name.startswith("pen_up_") else 0.5
+                        ).tolist(),
+                        "writing_end_pose_canonical_desk": probe_pose(0.5).tolist(),
+                    }
                     for name in (
                         "left", "right", "top", "bottom", "pen_up_mid", "pen_up_end"
                     )
@@ -642,12 +659,13 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
         },
     )
     extension._height_calibration = RuleBasedWritingHeightCalibration(
-        calibrated_z_m=0.3,
+        calibrated_z_m=calibrated_z,
         lower_tolerance_m=0.001,
         upper_tolerance_m=0.001,
         captured_at=1.0,
         source_timestamp=1.0,
         pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+        contact_offset_tool_tcp_m=contact_offset,
     )
     production_config = DualArmCollisionAwareRetargeterConfig(
         output_qpos_smoothing_alpha=0.14,
@@ -677,6 +695,9 @@ def test_writing_reachability_oracle_accepts_production_fast_path_config() -> No
     assert request["probes"][0]["envelope_modified_sides"] == ("left",)
     assert request["probes"][4]["active_sides"] == ("right",)
     assert request["probes"][5]["active_sides"] == ("right",)
+    writing_z = request["probes"][0]["target_pose_by_side"]["right"][2, 3]
+    for probe in request["probes"][4:]:
+        assert probe["target_pose_by_side"]["right"][2, 3] - writing_z == pytest.approx(0.04)
     assert np.isclose(request["probes"][0]["target_pose_by_side"]["left"][0, 3], 0.01)
     assert request["oracle_config"].output_qpos_smoothing_alpha == 1.0
     assert request["oracle_config"].output_qpos_admittance_fast_path_alpha == 1.0
@@ -5198,7 +5219,8 @@ def test_manual_gripper_close_requires_strict_endpoint_and_sends_final_target() 
     assert extension.status().gripper_action_status == "夹爪实测已闭紧"
 
 
-def test_manual_gripper_endpoint_waits_for_post_command_fresh_frames() -> None:
+@pytest.mark.parametrize("interruption", ["moving", "stale", "outside_endpoint"])
+def test_manual_gripper_endpoint_waits_for_post_command_fresh_frames(interruption: str) -> None:
     extension = RuleBasedRealTeleopExtension(
         deployment=_deployment(),
         plan=RuleBasedCollectionPlan(
@@ -5220,6 +5242,7 @@ def test_manual_gripper_endpoint_waits_for_post_command_fresh_frames() -> None:
             self.timestamp = 9.0
             self.status_code = 2
             self.is_moving = False
+            self.age = 0.0
 
         def latest_at_or_before(self, _now, **_kwargs):
             measured = np.zeros(6, dtype=np.float32)
@@ -5227,7 +5250,7 @@ def test_manual_gripper_endpoint_waits_for_post_command_fresh_frames() -> None:
             return {
                 "right": {
                     "measured_joint_pos": measured,
-                    "joint_age_sec": 0.0,
+                    "joint_age_sec": self.age,
                     "joint_timestamp": self.timestamp,
                     "gripper_status_code": self.status_code,
                     "gripper_is_moving": self.is_moving,
@@ -5271,9 +5294,120 @@ def test_manual_gripper_endpoint_waits_for_post_command_fresh_frames() -> None:
         session.command_override_provider(SimpleNamespace(), now)
         assert extension._pending_gripper_action == "close_grippers"
     hand_poller.timestamp = 10.5
+    if interruption == "moving":
+        hand_poller.is_moving = True
+    elif interruption == "stale":
+        hand_poller.age = 1.0
+    else:
+        # Outside the endpoint, but not reverse motion from the baseline.
+        # Generic incremental control can resend; subsequent samples must
+        # also be newer than that dispatch.
+        hand_poller.value = 0.99
+        hand_poller.status_code = 3
     session.command_override_provider(SimpleNamespace(), 10.6)
+    assert extension._pending_gripper_action == "close_grippers"
+    hand_poller.age = 0.0
+    hand_poller.is_moving = False
+    hand_poller.value = 1.0
+    hand_poller.status_code = 2
+    for timestamp in (10.7, 10.8):
+        hand_poller.timestamp = timestamp
+        session.command_override_provider(SimpleNamespace(), timestamp + 0.1)
+        assert extension._pending_gripper_action == "close_grippers"
+    hand_poller.timestamp = 10.9
+    session.command_override_provider(SimpleNamespace(), 11.0)
     assert extension._pending_gripper_action is None
     assert extension.status().gripper_action_status == "夹爪实测已闭紧"
+
+
+@pytest.mark.parametrize("interruption", [
+    {"gripper_status_code": 4},
+    {"gripper_is_moving": True},
+    {"gripper_error_code": 16},
+    {"telemetry_error": "read timeout"},
+    {"gripper_recovery_phase": "recovering"},
+    {"gripper_status_code": "invalid"},
+    {"joint_timestamp": 10.0},
+    {"joint_timestamp": 10.05},
+])
+def test_gripper_settle_requires_consecutive_distinct_feedback(interruption) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(steps=(RuleBasedCustomAction(
+            step_id="collect", action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+        ),)),
+        trajectory_groups={},
+    )
+    extension._manual_gripper_last_dispatch_at_by_side["right"] = 10.0
+
+    def sample(timestamp, **updates):
+        return extension._manual_gripper_endpoint_settled(
+            {"joint_timestamp": timestamp, "gripper_status_code": 6, **updates},
+            side="right", now=timestamp + 0.01, final_target=1.0,
+        )[0]
+
+    assert not sample(10.1)
+    assert not sample(10.2, **interruption)
+    assert not sample(10.3)
+    assert not sample(10.4, **interruption)
+    assert not sample(10.5)
+    assert not sample(10.5)  # Duplicate does not increment or erase the streak.
+    assert not sample(10.6)
+    assert sample(10.7)
+
+
+@pytest.mark.parametrize("intent", ["release_grippers", "release_right_gripper"])
+@pytest.mark.parametrize("dispatch_failure", [False, True, "rejected"])
+def test_right_release_invalidates_height_until_explicit_recapture(
+    intent: str, dispatch_failure: bool | str,
+) -> None:
+    extension = RuleBasedRealTeleopExtension(
+        deployment=_deployment(),
+        plan=RuleBasedCollectionPlan(steps=(RuleBasedCustomAction(
+            step_id="collect", action=RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+        ),)),
+        trajectory_groups={},
+        config=RuleBasedRealTeleopConfig(gripper_sides=("right",)),
+        source_selection={"collection_mode": "rule_based_writing"},
+    )
+    recorder = _Recorder(_Poller())
+    session, _clutch, ui = _bind(extension, recorder, arm=False, hand_sides=("right",))
+    extension._height_calibration = RuleBasedWritingHeightCalibration(
+        calibrated_z_m=0.2, lower_tolerance_m=0.001, upper_tolerance_m=0.001,
+        captured_at=1.0, source_timestamp=1.0,
+        pose_frame_contract_hash=extension.runtime_pose_frame_contract.contract_hash,
+    )
+    extension._components.right_hand_backend.set_measured_scalar(0.9)
+    if dispatch_failure is True:
+        def failed_dispatch(*_args, **_kwargs):
+            raise OSError("ambiguous transport failure after release write")
+
+        session.dispatch_external_command = failed_dispatch
+    elif dispatch_failure == "rejected":
+        session.dispatch_external_command = lambda *_args, **_kwargs: SimpleNamespace(
+            dispatched=False, rejection_reason="synthetic safety rejection",
+        )
+    ui.intents.append(intent)
+    extension.after_control_input_poll(now=10.0)
+    assert extension._height_calibration is not None  # Queueing is not motion.
+    session.command_override_provider(SimpleNamespace(), 10.0)
+    assert extension._height_calibration is None
+    assert "rule.writing_height" in extension.status().readiness_blockers
+    extension._clear_manual_gripper_action()
+    assert extension.status().height_calibration_available
+    assert extension.status().gripper_control_available
+    ui.intents.append("rule_start")
+    extension.after_control_input_poll(now=10.1)
+    assert not extension.status().armed
+    raw = extension.runtime_pose_frame_contract.canonical_desk_pose_vector_to_storage(
+        _pose(z=0.25), side="right",
+    )
+    extension._commit_writing_height(
+        {"current_tcp_pose": _matrix(raw), "measured_timestamp": 11.0},
+        now=11.1, requested_at=11.0, lower_tolerance_m=0.001, upper_tolerance_m=0.001,
+    )
+    assert "rule.writing_height" not in extension.status().readiness_blockers
+    assert extension._height_calibration.calibrated_z_m == pytest.approx(0.25)
 
 
 def test_manual_gripper_stops_on_measured_reverse_motion() -> None:

@@ -2048,6 +2048,34 @@ def test_task_chain_configures_once_then_reuses_runtime_prepared_attempt() -> No
     assert state["rule_source_selection"]["selection_ordinal"] == 1
 
 
+def test_standalone_release_invalidates_grasp_cycle_without_blocking_preparation() -> None:
+    application = RuleBasedWritingApplication(task_chain_choice_index=lambda _count: 0)
+    options, first, _second = _task_chain_configuration()
+    application.bind_rule_runtime()
+    application.configure_rule_options(options, first)
+    chain = application._task_chain
+    chain.phase = RuleWritingTaskChainPhase.COMPLETE
+    chain.grasp_adjustment_initialized = True
+    chain.episodes_since_grasp_adjustment = 3
+    application.observe_rule_status(_task_chain_ready_status())
+    assert application.submit_intent(RuleBasedWritingIntent.RELEASE_GRIPPERS)
+    assert application.consume_rule_intents() == ("release_grippers",)
+    application.observe_rule_status(_task_chain_ready_status(
+        gripper_action_id=1, gripper_action_intent="release_grippers",
+        gripper_action_result="succeeded", gripper_action_pending=False, rule_start_available=False,
+        readiness_blockers={"rule.writing_height": "recalibrate after release"},
+        height_calibration_enabled=False,
+    ))
+    assert chain.grasp_adjustment_due
+    assert chain.episodes_since_grasp_adjustment == 3
+    assert application.snapshot()["can_start"] is False
+    assert application.snapshot()["can_close_grippers"] is True
+    assert application.submit_task_chain_advance({"event": "advance"})
+    assert application.consume_rule_intents() == ("release_right_gripper",)
+    assert "episode_start" not in application.consume_runtime_events()
+    assert chain.phase is RuleWritingTaskChainPhase.INITIAL_RELEASE_PENDING
+
+
 def test_task_chain_grasp_adjustment_interval_counts_only_successes() -> None:
     chain = RuleWritingTaskChain()
     chain.configure_grasp_adjustment_interval(2)
