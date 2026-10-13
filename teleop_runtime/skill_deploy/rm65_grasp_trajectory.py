@@ -49,6 +49,9 @@ from robot_motion.rm65.obstacle_collision import (
 )
 from robot_motion.rm65.scene_profiles import fixed_scene_aabb_obstacles
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
+from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
+    TCPPoseEnvelopeTargetFilter,
+)
 
 from .grasp_trajectory_record import write_grasp_trajectory_record
 from .motion_port import RealAgentJointTrajectory
@@ -894,7 +897,14 @@ class RM65GraspJointTrajectoryPlanner:
                 for name, value in solver_targets.items()
             }
         try:
-            projected = self.target_envelope_filter(
+            # Only the native filter's read-only planning port omits report
+            # construction. Injected/subclassed filters retain their contract.
+            project = (
+                self.target_envelope_filter.project_for_planning
+                if type(self.target_envelope_filter) is TCPPoseEnvelopeTargetFilter
+                else self.target_envelope_filter
+            )
+            projected = project(
                 {
                     name: np.asarray(value, dtype=float).copy()
                     for name, value in solver_targets.items()
