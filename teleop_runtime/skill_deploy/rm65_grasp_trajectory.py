@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from itertools import pairwise
@@ -697,6 +698,9 @@ class RM65GraspJointTrajectoryPlanner:
                 raise ValueError("trajectory_record_dir must be an existing real directory.")
             self.trajectory_record_dir = record_dir
         self._solver_lock = threading.Lock()
+        self._local_chain_cache_lock = threading.Lock()
+        # Bounded session-local proposals; all admission checks run again.
+        self._local_chain_cache: OrderedDict[tuple, tuple] = OrderedDict()
         self.planner_config = planner_config or JointPathPlannerConfig(
             shortcut_attempts=80,
             adaptive_edge_resolution_rad=self.config.final_edge_resolution_rad,
@@ -3875,6 +3879,111 @@ class RM65GraspJointTrajectoryPlanner:
             search_attempts=tuple(attempts),
         )
 
+    def _local_chain_cache_key(self, *, qpos_by_side, side, pregrasp, grasp):
+        return (side, tuple(np.asarray(qpos_by_side["left"]).reshape(-1)),
+            tuple(np.asarray(qpos_by_side["right"]).reshape(-1)),
+            tuple(np.asarray(pregrasp).reshape(-1)), tuple(np.asarray(grasp).reshape(-1)))
+
+    def _local_chain_cache_context(self):
+        scene_hash = getattr(self.oracle, "scene_hash", None)
+        if scene_hash is None:
+            # An injected/unknown oracle supplies no immutable scene identity.
+            return None
+        return (scene_hash, self.oracle, self.target_builder, self.target_envelope_filter,
+            self.config)
+
+    def _remember_local_approaches(self, prepared, *, qpos_by_side, side, pregrasp, grasp):
+        context = self._local_chain_cache_context()
+        if context is None:
+            return prepared
+        # The native JointPathPlanResult already owns copied, read-only qpos.
+        # Bind endpoint records to that same immutable branch representation.
+        prepared = replace(prepared, candidates=tuple((
+            replace(endpoint, qpos_by_side=approach.path.start_qpos_by_component),
+            replace(approach, endpoint=replace(approach.endpoint,
+                qpos_by_side=approach.path.target_qpos_by_component)),
+        ) for endpoint, approach in prepared.candidates))
+        key = self._local_chain_cache_key(qpos_by_side=qpos_by_side, side=side,
+            pregrasp=pregrasp, grasp=grasp)
+        with self._local_chain_cache_lock:
+            self._local_chain_cache[key] = (context, prepared)
+            self._local_chain_cache.move_to_end(key)
+            while len(self._local_chain_cache) > 20:
+                self._local_chain_cache.popitem(last=False)
+        return prepared
+
+    def _retained_local_approaches(self, *, qpos_by_side, side, pregrasp, grasp):
+        context = self._local_chain_cache_context()
+        if context is None:
+            return None
+        key = self._local_chain_cache_key(qpos_by_side=qpos_by_side, side=side,
+            pregrasp=pregrasp, grasp=grasp)
+        with self._local_chain_cache_lock:
+            entry = self._local_chain_cache.get(key)
+        if entry is None or entry[0][0] != context[0] or any(
+            old is not new for old, new in zip(entry[0][1:], context[1:], strict=True)
+        ):
+            return None
+        return entry[1]
+
+    def _ordered_pregrasp_distances(self, *, qpos_by_side, side, grasp):
+        distances = self._pregrasp_distance_candidates()
+        # Try an already solved local branch before repeating rejected nominal
+        # distances. This is request ordering only: every distance stays in the
+        # list and its branch is rechecked against current visible geometry.
+        return tuple(sorted(distances, key=lambda distance: self._retained_local_approaches(
+            qpos_by_side=qpos_by_side, side=side,
+            pregrasp=self._pregrasp_target_pose(grasp, distance_m=distance), grasp=grasp) is None))
+
+    def _reuse_local_approaches(self, *, qpos_by_side, side, pregrasp, grasp,
+                               visible_scene, deadline, monotonic):
+        prepared = self._retained_local_approaches(qpos_by_side=qpos_by_side, side=side,
+            pregrasp=pregrasp, grasp=grasp)
+        if prepared is None:
+            return None
+        started = float(monotonic())
+        self._remaining_path_planning_time_sec(deadline=deadline, monotonic=monotonic,
+            planning_phase="local_grasp_chain_reuse")
+        candidates = []
+        attempts = []
+        for endpoint, approach in prepared.candidates:
+            try:
+                # A cached solve is not a proof for the current observed scene.
+                # Keep the same full-resolution native, envelope, near-channel
+                # and visible-contact checks before any global connection.
+                dense = self._revalidate(approach.path.waypoints, moving_side=side,
+                    deadline=deadline, monotonic=monotonic)
+                geometry = self._validate_constrained_approach_geometry(
+                    approach.path.waypoints, moving_side=side,
+                    pregrasp_tool_tcp_world=pregrasp, grasp_tool_tcp_world=grasp,
+                    deadline=deadline, monotonic=monotonic)
+                if visible_scene is not None:
+                    dense["visible_scene"] = self._revalidate_visible_gripper_path(
+                        approach.path.waypoints, moving_side=side, visible_scene=visible_scene,
+                        terminal_tool_tcp_world=grasp, deadline=deadline, monotonic=monotonic)
+            except RM65GraspTrajectoryPlanningError as error:
+                if candidates and error.reason_code == "path_planning_time_budget_exhausted":
+                    # Only earlier fully revalidated branches survive. This is
+                    # a proposal, not permission to skip later path admission.
+                    attempts.append({"planning_phase": "local_grasp_chain_reuse", "status": "search_budget_exhausted",
+                        "endpoint_seed_index": endpoint.seed_index, "reason_code": error.reason_code})
+                    break
+                if error.reason_code.endswith("unavailable") or error.reason_code == "path_planning_time_budget_exhausted":
+                    raise
+                attempts.append({"planning_phase": "local_grasp_chain_reuse", "status": "rejected",
+                    "endpoint_seed_index": endpoint.seed_index, "reason_code": error.reason_code})
+                continue
+            candidates.append((endpoint, replace(approach,
+                dense_revalidation={**dense, "approach_geometry": geometry})))
+        if not candidates:
+            # A new obstacle can invalidate all retained branches, not every IK
+            # solution. The ordinary search still gets the remaining budget.
+            return None
+        attempts.append({"planning_phase": "local_grasp_chain_reuse", "status": "revalidated",
+            "branch_count": len(candidates), "elapsed_ms": max(0., (float(monotonic())-started)*1000.)})
+        return _PreparedGraspApproaches(tuple(candidates), prepared.validation_attempts + tuple(attempts))
+
+
     def _prepare_grasp_approaches(
         self,
         *,
@@ -3888,6 +3997,7 @@ class RM65GraspJointTrajectoryPlanner:
         terminal_endpoint_search: Callable[
             [], tuple[_EndpointIKCandidate, ...]
         ] | None = None,
+        reuse_previous: bool = True,
     ) -> _PreparedGraspApproaches:
         """Validate local branches before spending global/ingress budget.
 
@@ -3898,6 +4008,12 @@ class RM65GraspJointTrajectoryPlanner:
         treated as proof that every terminal branch lacks an approach.
         """
 
+        reused = None if not reuse_previous else self._reuse_local_approaches(
+            qpos_by_side=qpos_by_side, side=side,
+            pregrasp=pregrasp_tool_tcp_world, grasp=grasp_tool_tcp_world,
+            visible_scene=visible_scene, deadline=deadline, monotonic=monotonic)
+        if reused is not None:
+            return reused
         fatal_reasons = {
             "path_collision_check_unavailable",
             "path_planning_time_budget_exhausted",
@@ -3970,6 +4086,11 @@ class RM65GraspJointTrajectoryPlanner:
                     attempt.update(
                         {"status": "rejected", "reason_code": error.reason_code}
                     )
+                    if candidates and error.reason_code == "path_planning_time_budget_exhausted":
+                        # Retain only earlier complete local proposals. Later
+                        # connection and trajectory checks keep their deadline.
+                        attempt["status"] = "search_budget_exhausted"
+                        break
                     if error.reason_code in fatal_reasons:
                         raise RM65GraspTrajectoryPlanningError(
                             error.reason_code,
@@ -3982,7 +4103,10 @@ class RM65GraspJointTrajectoryPlanner:
                 attempt["status"] = "local_chain_valid"
                 candidates.append((endpoint, approach))
         if candidates:
-            return _PreparedGraspApproaches(tuple(candidates), tuple(attempts))
+            return self._remember_local_approaches(
+                _PreparedGraspApproaches(tuple(candidates), tuple(attempts)),
+                qpos_by_side=qpos_by_side, side=side,
+                pregrasp=pregrasp_tool_tcp_world, grasp=grasp_tool_tcp_world)
 
         # A forward solve can converge to a convenient pregrasp branch that
         # has no continuous route to any valid terminal IK branch.  Search the
@@ -4049,6 +4173,11 @@ class RM65GraspJointTrajectoryPlanner:
                     attempt.update(
                         {"status": "rejected", "reason_code": error.reason_code}
                     )
+                    if candidates and error.reason_code == "path_planning_time_budget_exhausted":
+                        # Retain only earlier complete local proposals. Later
+                        # connection and trajectory checks keep their deadline.
+                        attempt["status"] = "search_budget_exhausted"
+                        break
                     if error.reason_code in fatal_reasons:
                         raise RM65GraspTrajectoryPlanningError(
                             error.reason_code,
@@ -4085,7 +4214,10 @@ class RM65GraspJointTrajectoryPlanner:
                 attempt["status"] = "local_chain_valid"
                 candidates.append((pregrasp_endpoint, approach))
         if candidates:
-            return _PreparedGraspApproaches(tuple(candidates), tuple(attempts))
+            return self._remember_local_approaches(
+                _PreparedGraspApproaches(tuple(candidates), tuple(attempts)),
+                qpos_by_side=qpos_by_side, side=side,
+                pregrasp=pregrasp_tool_tcp_world, grasp=grasp_tool_tcp_world)
         assert last_error is not None
         raise RM65GraspTrajectoryPlanningError(
             last_error.reason_code,
@@ -4266,6 +4398,26 @@ class RM65GraspJointTrajectoryPlanner:
                 deadline=deadline, monotonic=monotonic,
             )
         except RM65GraspTrajectoryPlanningError as error:
+            if error.reason_code in {"path_search_exhausted", "path_target_collision_blocked",
+                "path_collision_blocked", "visible_gripper_path_collision", "path_target_safety_envelope_blocked"} and any(
+                item.get("planning_phase") == "local_grasp_chain_reuse"
+                for item in prepared.validation_attempts
+            ):
+                # A retained branch is a head start, not the complete IK set.
+                # If its connection fails, resume the canonical fresh search
+                # for this same pose and deadline, including after ingress.
+                fresh = self._prepare_grasp_approaches(qpos_by_side=qpos_by_side, side=side,
+                    pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+                    grasp_tool_tcp_world=grasp_tool_tcp_world, visible_scene=visible_scene,
+                    deadline=deadline, monotonic=monotonic, reuse_previous=False)
+                fresh = replace(fresh, validation_attempts=({
+                    "planning_phase": "local_grasp_chain_reuse_connection",
+                    "status": "fresh_search_after_rejection", "reason_code": error.reason_code,
+                },) + fresh.validation_attempts)
+                return self._plan_pregrasp_and_approach(qpos_by_side=qpos_by_side, side=side,
+                    pregrasp_tool_tcp_world=pregrasp_tool_tcp_world,
+                    grasp_tool_tcp_world=grasp_tool_tcp_world, visible_scene=visible_scene,
+                    deadline=deadline, monotonic=monotonic, prepared_approaches=fresh)
             raise RM65GraspTrajectoryPlanningError(
                 error.reason_code,
                 details={**error.details,
@@ -4559,7 +4711,9 @@ class RM65GraspJointTrajectoryPlanner:
                 ),
             )
         else:
-            for distance_m in self._pregrasp_distance_candidates():
+            for distance_m in self._ordered_pregrasp_distances(
+                qpos_by_side=current, side=selected_side, grasp=target_pose,
+            ):
                 candidate_pregrasp = self._pregrasp_target_pose(
                     target_pose,
                     distance_m=distance_m,
@@ -5343,6 +5497,13 @@ class RM65GraspJointTrajectoryPlanner:
             "path_planning_time_budget_sec": float(
                 self.config.path_planning_time_budget_sec
             ),
+            "local_chain_reuse_count": sum(
+                item.get("planning_phase") == "local_grasp_chain_reuse"
+                and item.get("status") == "revalidated" for item in search_attempts),
+            "local_chain_revalidation_wall_duration_sec": sum(
+                float(item["elapsed_ms"]) / 1_000.0 for item in search_attempts
+                if item.get("planning_phase") == "local_grasp_chain_reuse"
+                and item.get("status") == "revalidated"),
         }
         evidence_hash = canonical_content_hash(
             {
