@@ -2639,10 +2639,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 )
                 candidate_q_before_q5_stabilization = candidate_q.copy()
                 candidate_q, selected_wrist_q5_metadata = (
-                    self._stabilize_wrist_q5_candidate(
+                    self._stabilize_wrist_q5_step(
                         reference_full_q=pre_solve_q,
                         candidate_full_q=candidate_q,
                         current_targets=current_targets,
+                        stage="candidate",
                     )
                 )
                 self._last_wrist_coaxial_metadata = (
@@ -4568,10 +4569,11 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         # directional, one-step q5 escape after smoothing and before the final
         # action FK. This path is enabled only for the explicit position-mode
         # single-step solver; legacy/impedance callers remain unchanged.
-        smoothed_full_q, wrist_q5_escape = self._stabilize_wrist_q5_full_step(
+        smoothed_full_q, wrist_q5_escape = self._stabilize_wrist_q5_step(
             reference_full_q=np.asarray(previous, dtype=float).reshape(raw_full_q.shape),
             candidate_full_q=smoothed_full_q,
             current_targets=current_targets,
+            stage="output",
         )
         metadata["wrist_q5_escape"] = dict(wrist_q5_escape)
         self._last_output_qpos_smoothing_full_q = smoothed_full_q.copy()
@@ -4658,19 +4660,21 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         metadata["reason"] = "target_error"
         return sides, metadata
 
-    def _stabilize_wrist_q5_full_step(
+    def _stabilize_wrist_q5_step(
         self,
         *,
         reference_full_q: np.ndarray,
         candidate_full_q: np.ndarray,
         current_targets: dict[str, np.ndarray] | None = None,
+        stage: Literal["candidate", "output"],
     ) -> tuple[np.ndarray, dict[str, object]]:
-        """Keep the final position qref outside the RM65 wrist gate.
+        """Apply the same bounded q5 guard at candidate and output admission.
 
         This is intentionally separate from q4/q6 canonicalization: q5 is an
         observable wrist bend, so the only safe intervention is a small,
         signed task relaxation toward the previous side of the coaxial point.
-        The existing execution profile supplies the per-cycle q5 cap.
+        The existing execution profile supplies the per-cycle q5 cap. Candidate
+        and output stages retain their distinct applied/reason metadata.
         """
 
         enabled = bool(
@@ -4685,6 +4689,8 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             "escape_threshold_deg": None,
             "sides": {},
         }
+        if stage == "candidate":
+            metadata["hysteresis_release_threshold_deg"] = None
         reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
         candidate = np.asarray(candidate_full_q, dtype=float).reshape(-1).copy()
         if not enabled:
@@ -4702,7 +4708,17 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             float(self.config.wrist_coaxial_hard_threshold_deg)
             + float(self.config.wrist_q5_escape_margin_deg),
         )
+        release_threshold_deg = (
+            None
+            if float(self.config.wrist_q5_hysteresis_release_deg) <= 0.0
+            else max(
+                escape_threshold_deg,
+                float(self.config.wrist_q5_hysteresis_release_deg),
+            )
+        )
         metadata["escape_threshold_deg"] = escape_threshold_deg
+        if stage == "candidate":
+            metadata["hysteresis_release_threshold_deg"] = release_threshold_deg
         metadata["hysteresis_requires_escape_latch"] = bool(
             self.config.wrist_q5_hysteresis_requires_escape_latch
         )
@@ -4728,14 +4744,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             release_threshold = (
                 None
                 if far_target_sides.get(side, False) or not hysteresis_allowed
-                else (
-                    None
-                    if float(self.config.wrist_q5_hysteresis_release_deg) <= 0.0
-                    else max(
-                        escape_threshold_deg,
-                        float(self.config.wrist_q5_hysteresis_release_deg),
-                    )
-                )
+                else release_threshold_deg
             )
             output_side, side_metadata = stabilize_rm65_wrist_q5_step(
                 reference_by_side[side],
@@ -4759,121 +4768,20 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             left_qpos=output_by_side["left"],
             right_qpos=output_by_side["right"],
         )
-        metadata["applied"] = any(
-            bool(side_metadata.get("applied", False))
-            for side_metadata in metadata["sides"].values()
-        )
-        metadata["reason"] = (
-            "q5_escape" if metadata["applied"] else "outside_escape_band"
-        )
-        return output, metadata
-
-    def _stabilize_wrist_q5_candidate(
-        self,
-        *,
-        reference_full_q: np.ndarray,
-        candidate_full_q: np.ndarray,
-        current_targets: dict[str, np.ndarray] | None = None,
-    ) -> tuple[np.ndarray, dict[str, object]]:
-        """Apply q5 escape hysteresis before jump-gate admission.
-
-        The post-smoothing q5 guard protects the emitted qref, but the
-        candidate trace can still alternate between a raw near-boundary
-        result and a one-step singularity-escape result.  Apply the same
-        q5-only, step-capped rule to the selected candidate first so the
-        canonical IK trace and the later qref smoother see one continuous
-        side.  This is limited to the opt-in single-step position path and
-        never changes q4/q6 or the ordinary/legacy branch.
-        """
-
-        enabled = bool(
-            self.config.solve_step_mode
-            == IK_STEP_MODE_SINGLE_STEP_SINGULARITY_AWARE
-            and self.config.wrist_coaxial_continuity_enabled
-        )
-        metadata: dict[str, object] = {
-            "enabled": enabled,
-            "applied": False,
-            "reason": "disabled_or_legacy_mode" if not enabled else "outside_escape_band",
-            "escape_threshold_deg": None,
-            "hysteresis_release_threshold_deg": None,
-            "sides": {},
-        }
-        reference = np.asarray(reference_full_q, dtype=float).reshape(-1)
-        candidate = np.asarray(candidate_full_q, dtype=float).reshape(-1).copy()
-        if not enabled:
-            return candidate, metadata
-
-        escape_threshold_deg = max(
-            float(self.config.wrist_singularity_threshold_deg)
-            + float(self.config.wrist_q5_escape_margin_deg),
-            float(self.config.wrist_coaxial_hard_threshold_deg)
-            + float(self.config.wrist_q5_escape_margin_deg),
-        )
-        release_threshold_deg = (
-            None
-            if float(self.config.wrist_q5_hysteresis_release_deg) <= 0.0
-            else max(
-                escape_threshold_deg,
-                float(self.config.wrist_q5_hysteresis_release_deg),
-            )
-        )
-        metadata["escape_threshold_deg"] = escape_threshold_deg
-        metadata["hysteresis_release_threshold_deg"] = release_threshold_deg
-        metadata["hysteresis_requires_escape_latch"] = bool(
-            self.config.wrist_q5_hysteresis_requires_escape_latch
-        )
-        step_by_side: dict[str, np.ndarray | None] = {"left": None, "right": None}
-        if self._full_execution_joint_step is not None:
-            left_step, right_step = self._split_solution(self._full_execution_joint_step)
-            step_by_side = {"left": left_step, "right": right_step}
-        reference_by_side = dict(zip(("left", "right"), self._split_solution(reference)))
-        candidate_by_side = dict(zip(("left", "right"), self._split_solution(candidate)))
-        far_target_sides, far_target_metadata = self._wrist_q5_far_target_sides(
-            current_targets=current_targets,
-            reference_full_q=reference,
-        )
-        metadata["far_target_hysteresis_relaxation"] = far_target_metadata
-        output_by_side: dict[str, np.ndarray] = {}
-        for side in ("left", "right"):
-            max_step = step_by_side[side]
-            latch_armed = bool(self._wrist_q5_hysteresis_escape_latch[side])
-            hysteresis_allowed = bool(
-                not self.config.wrist_q5_hysteresis_requires_escape_latch
-                or latch_armed
-            )
-            side_release_threshold = (
-                None
-                if far_target_sides.get(side, False) or not hysteresis_allowed
-                else release_threshold_deg
-            )
-            output_side, side_metadata = stabilize_rm65_wrist_q5_step(
-                reference_by_side[side],
-                candidate_by_side[side],
-                escape_threshold_deg=escape_threshold_deg,
-                max_step_rad=None if max_step is None else float(max_step[4]),
-                hysteresis_release_threshold_deg=side_release_threshold,
-            )
-            side_metadata["far_target_hysteresis_relaxed"] = bool(
-                far_target_sides.get(side, False)
-            )
-            side_metadata["hysteresis_latch_required"] = bool(
-                self.config.wrist_q5_hysteresis_requires_escape_latch
-            )
-            side_metadata["hysteresis_latch_armed"] = latch_armed
-            side_metadata["hysteresis_allowed"] = hysteresis_allowed
-            output_by_side[side] = output_side
-            metadata["sides"][side] = side_metadata
-        output = self._embed_arm_qpos(
-            current_full_q=candidate,
-            left_qpos=output_by_side["left"],
-            right_qpos=output_by_side["right"],
-        )
-        metadata["applied"] = bool(
+        metadata["applied"] = (
             not np.allclose(output, candidate, rtol=0.0, atol=1e-12)
+            if stage == "candidate"
+            else any(
+                bool(side_metadata.get("applied", False))
+                for side_metadata in metadata["sides"].values()
+            )
         )
         metadata["reason"] = (
-            "q5_candidate_hysteresis_or_escape"
+            (
+                "q5_candidate_hysteresis_or_escape"
+                if stage == "candidate"
+                else "q5_escape"
+            )
             if metadata["applied"]
             else "outside_escape_band"
         )

@@ -1193,10 +1193,11 @@ def test_far_target_relaxes_q5_hysteresis_but_keeps_escape_boundary() -> None:
         "right": _target_pose(),
     }
 
-    output, metadata = retargeter._stabilize_wrist_q5_candidate(
+    output, metadata = retargeter._stabilize_wrist_q5_step(
         reference_full_q=reference,
         candidate_full_q=candidate,
         current_targets=targets,
+        stage="candidate",
     )
 
     # The old fixed 6 deg release band would have held +5 deg.  Far-target
@@ -3692,14 +3693,68 @@ def test_single_step_candidate_q5_hysteresis_stabilizes_inward_escape_toggle() -
     candidate = reference.copy()
     candidate[4] = np.deg2rad(-3.7)
 
-    output, metadata = retargeter._stabilize_wrist_q5_candidate(
+    output, metadata = retargeter._stabilize_wrist_q5_step(
         reference_full_q=reference,
         candidate_full_q=candidate,
+        stage="candidate",
     )
 
     assert metadata["applied"] is True
     assert metadata["sides"]["left"]["hysteresis_hold"] is True
     assert np.rad2deg(output[4]) == pytest.approx(-5.0)
+
+
+def test_q5_stabilization_stages_share_guard_but_keep_metadata_contracts() -> None:
+    retargeter = DualArmCollisionAwareRetargeter(
+        DualArmCollisionAwareRetargeterConfig(
+            solver_frequency=60.0,
+            solve_step_mode="single_step_singularity_aware",
+            wrist_q5_hysteresis_release_deg=6.0,
+            ik_safety_profile=_profile(),
+            joint_velocity_profile=_velocity(),
+        ),
+        ik_solver=_FakeDualArmSolver(),
+    )
+    reference = np.zeros(12, dtype=float)
+    reference[4] = np.deg2rad(5.0)
+    candidate = reference.copy()
+    candidate[4] = np.deg2rad(2.0)
+
+    candidate_output, candidate_metadata = retargeter._stabilize_wrist_q5_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        stage="candidate",
+    )
+    final_output, final_metadata = retargeter._stabilize_wrist_q5_step(
+        reference_full_q=reference,
+        candidate_full_q=candidate,
+        stage="output",
+    )
+
+    np.testing.assert_array_equal(candidate_output, final_output)
+    assert np.rad2deg(final_output[4]) == pytest.approx(5.0)
+    assert candidate_metadata["sides"] == final_metadata["sides"]
+    assert candidate_metadata["applied"] is True
+    assert final_metadata["applied"] is True
+    assert candidate_metadata["reason"] == "q5_candidate_hysteresis_or_escape"
+    assert final_metadata["reason"] == "q5_escape"
+    assert candidate_metadata["hysteresis_release_threshold_deg"] == pytest.approx(6.0)
+    assert "hysteresis_release_threshold_deg" not in final_metadata
+
+    retargeter.config.solve_step_mode = "legacy_iterative"
+    for stage in ("candidate", "output"):
+        disabled_output, disabled_metadata = retargeter._stabilize_wrist_q5_step(
+            reference_full_q=reference,
+            candidate_full_q=candidate,
+            stage=stage,
+        )
+        np.testing.assert_array_equal(disabled_output, candidate)
+        assert disabled_metadata["reason"] == "disabled_or_legacy_mode"
+        assert disabled_metadata["applied"] is False
+        assert disabled_metadata["sides"] == {}
+        assert ("hysteresis_release_threshold_deg" in disabled_metadata) is (
+            stage == "candidate"
+        )
 
 
 def test_dual_arm_output_qpos_smoothing_adapts_to_valid_tracker_speed() -> None:
@@ -4342,9 +4397,10 @@ def test_q5_hysteresis_latch_arms_only_after_admitted_escape() -> None:
     ordinary_candidate = ordinary_reference.copy()
     ordinary_candidate[4] = np.deg2rad(-3.7)
 
-    ordinary_output, ordinary_metadata = retargeter._stabilize_wrist_q5_candidate(
+    ordinary_output, ordinary_metadata = retargeter._stabilize_wrist_q5_step(
         reference_full_q=ordinary_reference,
         candidate_full_q=ordinary_candidate,
+        stage="candidate",
     )
 
     assert np.rad2deg(ordinary_output[4]) == pytest.approx(-3.7)
@@ -4355,9 +4411,10 @@ def test_q5_hysteresis_latch_arms_only_after_admitted_escape() -> None:
     escape_reference[4] = np.deg2rad(-3.4)
     escape_candidate = escape_reference.copy()
     escape_candidate[4] = np.deg2rad(-2.0)
-    escaped, escape_metadata = retargeter._stabilize_wrist_q5_candidate(
+    escaped, escape_metadata = retargeter._stabilize_wrist_q5_step(
         reference_full_q=escape_reference,
         candidate_full_q=escape_candidate,
+        stage="candidate",
     )
     latch_metadata = retargeter._update_wrist_q5_hysteresis_escape_latch(
         reference_full_q=escape_reference,
@@ -4374,9 +4431,10 @@ def test_q5_hysteresis_latch_arms_only_after_admitted_escape() -> None:
 
     inward_candidate = escaped.copy()
     inward_candidate[4] = np.deg2rad(-3.0)
-    held, held_metadata = retargeter._stabilize_wrist_q5_candidate(
+    held, held_metadata = retargeter._stabilize_wrist_q5_step(
         reference_full_q=escaped,
         candidate_full_q=inward_candidate,
+        stage="candidate",
     )
 
     assert held_metadata["sides"]["left"]["hysteresis_allowed"] is True
