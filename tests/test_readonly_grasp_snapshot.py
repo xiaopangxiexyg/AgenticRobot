@@ -221,7 +221,8 @@ def test_blocked_native_start_aborts_batch_and_never_connects_arms(capture_args,
     assert [event[1] for event in camera_rig.events if event[0] == "start"] == expected
     assert not any(event[0] == "arm_open" for event in camera_rig.events)
     assert not result["cleanup_complete"]
-    assert "lifecycle lock" in result["cleanup_errors"][0]
+    assert "startup worker is still active" in result["cleanup_errors"][0]
+    assert camera_rig.sources[blocked_key].device_info()["startup_worker_alive"]
     assert json.loads((capture_args.output / "snapshot.json").read_text())["status"] == "failed"
 
 

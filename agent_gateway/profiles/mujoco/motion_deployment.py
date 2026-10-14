@@ -3087,6 +3087,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             "second_dispatch_owner",
         ),
     )
+    # Passive state schemas expose the Station frame, not the IK execution frame.
+    public_state_exact = {
+        **exact,
+        "reference_frame_id": state_binding.reference_frame_id,
+        "reference_frame_spec_hash": state_binding.reference_frame_spec_hash,
+    }
     validator_items = [
         _motion_validators(
             route=route,
@@ -3100,7 +3106,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         _state_validators(
             route=state_route,
             schema_entry=state_schema,
-            exact=exact,
+            exact=public_state_exact,
         ),
     ]
     validator_items[2:2] = [
@@ -3136,7 +3142,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             _history_validators(
                 route=history_route,
                 schema_entry=history_schema,
-                exact=exact,
+                exact=public_state_exact,
                 profile=history_profile,
                 source_binding=history_source_binding,
             )

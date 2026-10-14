@@ -506,3 +506,105 @@ def test_arm_state_poller_close_attempts_threads_in_reverse_and_keeps_live_worke
         "worker[second]"
     ]
     assert poller._threads == [second]
+
+
+def test_realsense_native_stop_timeout_cannot_be_forgotten_by_second_close(monkeypatch) -> None:
+    release, finished = threading.Event(), threading.Event()
+    calls = []
+    class Pipeline:
+        def stop(self):
+            calls.append("stop")
+            try:
+                release.wait(3)
+            finally:
+                finished.set()
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="unit", camera_key="front"))
+    source._pipeline = Pipeline()
+    original = source._stop_pipeline_bounded
+    monkeypatch.setattr(source, "_stop_pipeline_bounded", lambda **kw: original(timeout_sec=.02))
+    try:
+        with pytest.raises(LifecycleCleanupError, match="pipeline.stop"):
+            source.close()
+        # The capture thread may be gone while native SDK cleanup is still active.
+        with pytest.raises(LifecycleCleanupError, match="pipeline.stop"):
+            source.close()
+        assert calls == ["stop"]
+        assert source.device_info()["lifecycle_state"] == "faulted"
+        assert source.device_info()["pipeline_stop"]["worker_alive"] is True
+        with pytest.raises(RuntimeError, match="native pipeline stop"):
+            source.start()
+    finally:
+        release.set()
+        assert finished.wait(1)
+    assert source.wait_for_pending_pipeline_stop(timeout_sec=1) is None
+    source.close()
+    assert calls == ["stop"]
+    assert source.device_info()["lifecycle_state"] == "stopped"
+
+
+def test_realsense_native_handle_release_is_part_of_owned_stop(monkeypatch) -> None:
+    release, entered = threading.Event(), threading.Event()
+    class Pipeline:
+        def stop(self):
+            pass
+        def __del__(self):
+            entered.set()
+            release.wait(3)
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="unit", camera_key="front"))
+    source._pipeline = Pipeline()
+    original = source._stop_pipeline_bounded
+    monkeypatch.setattr(source, "_stop_pipeline_bounded", lambda **kw: original(timeout_sec=.02))
+    try:
+        with pytest.raises(LifecycleCleanupError, match="pipeline.stop"):
+            source.close()
+        assert entered.is_set()
+        assert source.device_info()["pipeline_stop"]["phase"] == "releasing_native_handle"
+    finally:
+        release.set()
+    assert source.wait_for_pending_pipeline_stop(timeout_sec=1) is None
+    source.close()
+
+
+def test_realsense_native_stop_error_remains_faulted_after_worker_returns() -> None:
+    calls = []
+    class Pipeline:
+        def stop(self):
+            calls.append("stop")
+            raise RuntimeError("native failure")
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="unit", camera_key="front"))
+    source._pipeline = Pipeline()
+    for _ in range(2):
+        with pytest.raises(LifecycleCleanupError, match="native failure"):
+            source.close()
+    assert calls == ["stop"]
+    assert source.device_info()["lifecycle_state"] == "faulted"
+    assert source.device_info()["pipeline_stop"]["worker_alive"] is False
+
+
+def test_realsense_explicit_native_stop_budget_does_not_change_capture_join_budget() -> None:
+    budgets = []
+    class Pipeline:
+        def stop(self):
+            pass
+    class Worker:
+        name = "capture"
+        def join(self, timeout=None):
+            budgets.append(timeout)
+        def is_alive(self):
+            return False
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="unit", pipeline_stop_timeout_sec=5))
+    source._pipeline = Pipeline()
+    source._thread = Worker()
+    original = source._stop_pipeline_bounded
+    def stop(**kwargs):
+        budgets.append(kwargs["timeout_sec"])
+        return original(**kwargs)
+    source._stop_pipeline_bounded = stop
+    source.close()
+    assert budgets == [5, 1.5]
+
+
+@pytest.mark.parametrize("budget", [0, -1, float("nan"), float("inf")])
+def test_realsense_native_stop_budget_rejects_invalid_config(budget) -> None:
+    with pytest.raises(ValueError, match="pipeline_stop_timeout_sec"):
+        RealSenseRGBCameraConfig(serial="unit", pipeline_stop_timeout_sec=budget)

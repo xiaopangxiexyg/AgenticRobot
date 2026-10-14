@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1852,6 +1853,74 @@ def test_launcher_dry_run_accepts_cross_dataset_source_pool(tmp_path: Path) -> N
     assert "--rule-source-dataset" not in output
     assert "--rule-source-episode" not in output
     assert "--rule-detail-annotation-dir" not in output
+
+
+def test_launcher_resolves_new_run_seed_and_replays_explicit_seed(tmp_path: Path) -> None:
+    manifest = tmp_path / "source-pool.json"
+    manifest.write_text("{}", encoding="utf-8")
+    base_command = [
+        "/bin/bash",
+        str(LAUNCHER),
+        "--source-pool-manifest",
+        str(manifest),
+        "--random-trajectory-ids",
+        "latin_a_v1,latin_b_v1",
+        "--dry-run",
+    ]
+
+    def dry_run(*seed_args: str) -> tuple[str, int]:
+        result = subprocess.run(
+            [*base_command[:-1], *seed_args, "--dry-run"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        match = re.search(r"--rule-source-selection-seed ([0-9]+)", result.stdout)
+        assert match is not None
+        return result.stdout, int(match.group(1))
+
+    first_output, first_seed = dry_run()
+    _, second_seed = dry_run()
+    _, explicit_auto_seed = dry_run("--selection-seed", "auto")
+    assert len({first_seed, second_seed, explicit_auto_seed}) == 3
+    assert all(0 <= seed < 2**63 for seed in (first_seed, second_seed, explicit_auto_seed))
+
+    replay_output, replay_seed = dry_run("--selection-seed", str(first_seed))
+    assert replay_seed == first_seed
+    assert replay_output == first_output
+
+
+def test_launcher_forwards_seed_for_legacy_random_writing(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    detail = tmp_path / "detail"
+    source.mkdir()
+    detail.mkdir()
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(LAUNCHER),
+            "--source-dataset",
+            str(source),
+            "--source-episode",
+            "0",
+            "--detail-annotation-dir",
+            str(detail),
+            "--random-trajectory-ids",
+            "latin_a_v1,latin_b_v1",
+            "--selection-seed",
+            "17",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--rule-source-selection-seed 17" in result.stdout
 
 
 def test_launcher_forwards_random_writing_and_reachability_options(

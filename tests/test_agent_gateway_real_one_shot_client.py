@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import subprocess
+import sys
 from argparse import Namespace
 from typing import ClassVar
 
@@ -349,12 +352,12 @@ class _FakeRelativePoseClient(_FakeAbsolutePoseClient):
     ]
 
 
-def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch) -> None:
+def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch, tmp_path) -> None:
     _FakeClient.instances.clear()
     monkeypatch.setattr(one_shot_client, "_Client", _FakeClient)
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
-        socket_path="/tmp/primitive.sock",
+        socket_path=str(tmp_path / "primitive.sock"),
         side="left",
         action="forward",
         client_id="dexteleop-local-primitive-operator",
@@ -387,12 +390,13 @@ def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch) -> None:
 
 def test_one_shot_client_submits_absolute_dmtac_tcp_in_canonical_station(
     monkeypatch,
+    tmp_path,
 ) -> None:
     _FakeClient.instances.clear()
     monkeypatch.setattr(one_shot_client, "_Client", _FakeAbsolutePoseClient)
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
-        socket_path="/tmp/absolute-pose.sock",
+        socket_path=str(tmp_path / "absolute-pose.sock"),
         side="right",
         action="move_tcp_to_pose",
         target_xyz_m=(0.31, -0.12, 0.28),
@@ -411,12 +415,13 @@ def test_one_shot_client_submits_absolute_dmtac_tcp_in_canonical_station(
 
 def test_one_shot_client_resolves_relative_station_delta_from_same_snapshot(
     monkeypatch,
+    tmp_path,
 ) -> None:
     _FakeClient.instances.clear()
     monkeypatch.setattr(one_shot_client, "_Client", _FakeRelativePoseClient)
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
-        socket_path="/tmp/relative-pose.sock",
+        socket_path=str(tmp_path / "relative-pose.sock"),
         side="right",
         action="move_tcp_to_pose",
         target_xyz_m=None,
@@ -449,12 +454,13 @@ def test_one_shot_client_resolves_relative_station_delta_from_same_snapshot(
 
 def test_absolute_pose_client_requires_a_complete_pose_before_connect(
     monkeypatch,
+    tmp_path,
 ) -> None:
     _FakeClient.instances.clear()
     monkeypatch.setattr(one_shot_client, "_Client", _FakeAbsolutePoseClient)
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
-        socket_path="/tmp/absolute-pose.sock",
+        socket_path=str(tmp_path / "absolute-pose.sock"),
         side="right",
         action="move_tcp_to_pose",
         target_xyz_m=(0.31, -0.12, 0.28),
@@ -540,7 +546,7 @@ def test_one_shot_client_resolves_camera_grasp_before_motion_submit(
     )
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
-        socket_path="/tmp/absolute-pose.sock",
+        socket_path=str(tmp_path / "absolute-pose.sock"),
         side="right",
         action="move_tcp_to_pose",
         target_xyz_m=None,
@@ -606,12 +612,12 @@ def test_relative_delta_is_mutually_exclusive_with_direct_target() -> None:
         one_shot_client._absolute_tcp_input_from_args(args)
 
 
-def test_relative_delta_rejects_zero_without_connecting(monkeypatch) -> None:
+def test_relative_delta_rejects_zero_without_connecting(monkeypatch, tmp_path) -> None:
     _FakeClient.instances.clear()
     monkeypatch.setattr(one_shot_client, "_Client", _FakeAbsolutePoseClient)
     args = Namespace(
         confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
-        socket_path="/tmp/relative-pose.sock",
+        socket_path=str(tmp_path / "relative-pose.sock"),
         side="left",
         action="move_tcp_to_pose",
         target_xyz_m=None,
@@ -628,3 +634,211 @@ def test_relative_delta_rejects_zero_without_connecting(monkeypatch) -> None:
         one_shot_client.execute_one_shot(args)
 
     assert _FakeClient.instances == []
+
+
+class _SubmissionClient:
+    def __init__(self):
+        self.requests = []
+        self.error = None
+
+    def call(self, method, payload):
+        assert method == "submit_skill_request"
+        self.requests.append(payload)
+        if self.error is not None:
+            raise self.error
+        return {"accepted": False, "reason_code": "active_operation_exists_no_queue"}
+
+def _sequence_request(client, socket_path, *, session="session:one", client_id="operator"):
+    return one_shot_client._submit_with_client_sequence(
+        client, {"runtime_session_id": session, "client_id": client_id},
+        socket_path=str(socket_path), timeout_sec=1,
+    )
+
+def test_client_sequence_persists_and_is_scoped_to_session_client_and_endpoint(tmp_path):
+    endpoint = tmp_path / "gateway.sock"
+    client = _SubmissionClient()
+    _sequence_request(client, endpoint)
+    # A rejected RPC still consumes its reserved sequence; no automatic retry.
+    _sequence_request(client, endpoint)
+    _sequence_request(client, endpoint, session="session:two")
+    _sequence_request(client, endpoint, client_id="another")
+    _sequence_request(client, tmp_path / "another.sock")
+    _sequence_request(client, endpoint)
+    assert [request["client_sequence"] for request in client.requests] == [1, 2, 1, 1, 1, 3]
+    assert (tmp_path / "gateway.sock.client-sequences.json").stat().st_mode & 0o777 == 0o600
+
+def test_client_sequence_is_not_reused_after_lost_rpc_response(tmp_path):
+    client = _SubmissionClient()
+    client.error = TimeoutError("lost response")
+    with pytest.raises(TimeoutError, match="lost response"):
+        _sequence_request(client, tmp_path / "gateway.sock")
+    assert len(client.requests) == 1
+    client.error = None
+    _sequence_request(client, tmp_path / "gateway.sock")
+    assert [request["client_sequence"] for request in client.requests] == [1, 2]
+
+@pytest.mark.parametrize("contents", ["", "{", "[]", '{"s":{"c":true}}', '{"s":{"c":0}}'])
+def test_invalid_client_sequence_state_fails_without_submission(tmp_path, contents):
+    (tmp_path / "gateway.sock.client-sequences.json").write_text(contents)
+    client = _SubmissionClient()
+    with pytest.raises(ValueError):
+        _sequence_request(client, tmp_path / "gateway.sock")
+    assert not client.requests
+
+@pytest.mark.parametrize("suffix", [".client-sequences.json", ".client-sequences.json.lock"])
+def test_client_sequence_refuses_symlink_state_or_lock(tmp_path, suffix):
+    target = tmp_path / "other.json"
+    target.write_text("{}")
+    (tmp_path / ("gateway.sock" + suffix)).symlink_to(target)
+    client = _SubmissionClient()
+    with pytest.raises(OSError):
+        _sequence_request(client, tmp_path / "gateway.sock")
+    assert not client.requests
+    assert target.read_text() == "{}"
+
+def test_sequence_storage_failure_does_not_submit_or_discard_existing_state(monkeypatch, tmp_path):
+    client = _SubmissionClient()
+    endpoint = tmp_path / "gateway.sock"
+    _sequence_request(client, endpoint)
+    state_path = tmp_path / "gateway.sock.client-sequences.json"
+    previous = state_path.read_bytes()
+
+    def fail_replace(*args):
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(one_shot_client.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="storage unavailable"):
+        _sequence_request(client, endpoint)
+    assert len(client.requests) == 1
+    assert state_path.read_bytes() == previous
+    assert set(tmp_path.iterdir()) == {state_path, tmp_path / (state_path.name + ".lock")}
+
+def test_client_sequence_lock_wait_is_bounded_and_does_not_submit(tmp_path):
+    lock_path = tmp_path / "gateway.sock.client-sequences.json.lock"
+    with lock_path.open("w") as lock:
+        lock_path.chmod(0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        client = _SubmissionClient()
+        with pytest.raises(TimeoutError, match="submission lock"):
+            one_shot_client._submit_with_client_sequence(
+                client, {"runtime_session_id": "s", "client_id": "c"},
+                socket_path=str(tmp_path / "gateway.sock"), timeout_sec=0.02,
+            )
+        assert not client.requests
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_invalid_client_sequence_timeout_does_not_reserve_or_submit(tmp_path, timeout):
+    client = _SubmissionClient()
+    with pytest.raises(ValueError, match="finite and positive"):
+        one_shot_client._submit_with_client_sequence(
+            client, {"runtime_session_id": "s", "client_id": "c"},
+            socket_path=str(tmp_path / "gateway.sock"), timeout_sec=timeout,
+        )
+    assert client.requests == []
+    assert list(tmp_path.iterdir()) == []
+
+@pytest.mark.parametrize("suffix", [".client-sequences.json", ".client-sequences.json.lock"])
+def test_client_sequence_rejects_other_user_writable_files(tmp_path, suffix):
+    path = tmp_path / ("gateway.sock" + suffix)
+    path.write_text("{}")
+    path.chmod(0o666)
+    client = _SubmissionClient()
+    with pytest.raises(ValueError, match="writable by other users"):
+        _sequence_request(client, tmp_path / "gateway.sock")
+    assert not client.requests
+
+def test_concurrent_processes_reserve_and_submit_in_sequence_order(tmp_path):
+    code = '''
+import json, sys, time
+from pathlib import Path
+from agent_gateway.profiles.real.one_shot_client import _submit_with_client_sequence
+class Client:
+    def call(self, method, payload):
+        time.sleep(0.02)
+        with Path(sys.argv[2]).open("a") as stream:
+            stream.write(json.dumps(payload) + "\\n")
+        return {"accepted": False}
+_submit_with_client_sequence(Client(), {"runtime_session_id":"same", "client_id":"same"},
+    socket_path=sys.argv[1], timeout_sec=5)
+'''
+    output = tmp_path / "submissions.jsonl"
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", code, str(tmp_path / "gateway.sock"), str(output)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for _ in range(6)
+    ]
+    try:
+        for child in children:
+            _, error = child.communicate(timeout=10)
+            assert child.returncode == 0, error
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=3)
+    requests = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [request["client_sequence"] for request in requests] == list(range(1, 7))
+
+@pytest.mark.parametrize(
+    "lifecycle,gate,allowed",
+    [
+        ("hold", "hold", True),
+        ("running", "ready", True),
+        ("fault", "fault", False),
+        ("hold", "fault", False),
+        ("closed", "hold", False),
+    ],
+)
+def test_motion_client_reenters_confirmed_hold_without_gripper_route(
+    monkeypatch, tmp_path, lifecycle, gate, allowed,
+):
+    class Client(_FakeAbsolutePoseClient):
+        def call(self, method, payload):
+            result = super().call(method, payload)
+            if method == "get_observation_snapshot":
+                result["lifecycle_state"] = lifecycle
+                result["execution_gate"] = gate
+            return result
+
+    _FakeClient.instances.clear()
+    monkeypatch.setattr(one_shot_client, "_Client", Client)
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path=str(tmp_path / "state.sock"), side="right", action="move_tcp_to_pose",
+        target_xyz_m=(0.31, -0.12, 0.28), target_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
+        speed_scale=0.2, client_id="operator", timeout_sec=1.0, operation_timeout_sec=None,
+    )
+    if allowed:
+        assert one_shot_client.execute_one_shot(args)["status"] == "completed"
+    else:
+        with pytest.raises(RuntimeError, match="Lower real Skill owner"):
+            one_shot_client.execute_one_shot(args)
+        assert not (tmp_path / "state.sock.client-sequences.json").exists()
+    assert _FakeClient.instances[0].closed
+
+
+def test_repeated_one_shot_calls_do_not_replay_the_first_sequence(monkeypatch, tmp_path):
+    sequences = []
+
+    class Client(_FakeAbsolutePoseClient):
+        def call(self, method, payload):
+            if method == "submit_skill_request":
+                sequence = payload["client_sequence"]
+                if sequences and sequence <= sequences[-1]:
+                    return {"accepted": False, "reason_code": "client_sequence_not_monotonic"}
+                sequences.append(sequence)
+            return super().call(method, payload)
+
+    monkeypatch.setattr(one_shot_client, "_Client", Client)
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path=str(tmp_path / "repeat.sock"), side="right", action="move_tcp_to_pose",
+        target_xyz_m=(0.31, -0.12, 0.28), target_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
+        speed_scale=0.2, client_id="operator", timeout_sec=1.0, operation_timeout_sec=None,
+    )
+    for _ in range(2):
+        assert one_shot_client.execute_one_shot(args)["status"] == "completed"
+    assert sequences == [1, 2]

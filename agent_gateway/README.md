@@ -324,9 +324,19 @@ requested semantic-role order. The trusted MuJoCo profile maps semantic roles
 to lower camera sources. Inline capture results contain only bounded metadata
 and content hashes. Pixel arrays never enter the control frame.
 
+既有原子夹爪 Skill 完成开合时必须得到 `moving=False` 的实测状态；目标位置接近但仍在
+运动或状态未知时不能完成。真机停止 ACK 之后还须在有限等待内读取新鲜、无故障的停稳反馈，
+早于停止请求、过期、未来时间或不可用反馈均不能确认 HOLD。只读反馈沿用已启动 backend，
+不在 Skill 层新建线程、重连或关闭设备。
+
+原生命令下发仅对明确表示未写入设备的 `io_busy` 做有限重试，每次尝试前检查撤销与操作到期；
+硬件故障、异常或不确定 ACK 不重试。同步调用返回后、最终状态读取后和 HOLD 确认后也检查
+操作截止时间，迟到结果不能标为成功。重试预算不抢占正在进行的原生 I/O；原生调用依赖 backend
+自身的 I/O 超时，返回后仍执行失败与 HOLD 处理。撤销与 HOLD 始终引用激活时的下层 owner。
+
 本次接入保留既有 `manipulation.set_gripper_state` 夹爪合同，不注册新的开合或夹爪
 状态 Skill。MuJoCo 放置几何读取同一个 scene cut 的 TCP 与实测夹爪状态；当前真机
-适配器尚未绑定夹爪测量，因此返回 `held_gripper_state_unavailable`，不会将结果标为
+放置几何适配器尚未绑定夹爪测量，因此返回 `held_gripper_state_unavailable`，不会将结果标为
 可用于运动规划。`geometry_eligible_for_motion_planning` 也不代表通过了轨迹碰撞准入、
 已抓住物体或可直接执行放置；执行仍需独立运动授权和下层校验。
 
@@ -647,6 +657,37 @@ from a teleoperation Home record. A capture invocation itself has no downstream
 control effect. Repository offline tests establish neither live camera nor
 robot execution for either profile.
 
+### 独立真机 TCP 只读采样
+
+没有运行中的控制 owner 时，可使用同一 dispatcher 的 `real-tcp-observe` profile：
+
+```bash
+python -m agent_gateway real-tcp-observe \
+  --socket-path /absolute/private/gateway.sock \
+  --arm-ip-assignment /absolute/rm65_arm_ips.json \
+  --left-tool-profile /absolute/left_tool.json \
+  --right-tool-profile /absolute/right_tool.json \
+  --envelope-profile /absolute/absolute_standard.json \
+  --client-id operator.readonly
+```
+
+该会话由一个采样线程持有双 RM65 原始 SDK 连接，读取
+`Get_Current_Arm_State(retry=0)`，复用既有 URDF/tool FK 与 Station frame graph
+发布 `state.read_tcp_pose@1`。左右臂须绑定不同端点，重复配置在 FK 构造与连接前拒绝。
+采样 owner 启动前检查本机已有的 RM65 TCP 连接，
+发现占用即拒绝。Gateway 只消费缓存，发布 `readonly_sampling` /
+`unavailable_no_command_owner`，控制 epoch/generation 为零；没有运动、夹爪、
+HOLD/STOP 或直接刷新设备的调用端口。
+
+工具 profile 决定 TCP；envelope 文件仅作为既有部署 profile 的配置输入，
+不裁剪实际测量，也不授予运动准入。SDK 没有传感器时间戳，测量时间采用双臂请求
+的最早开始时刻，保守计入等待、双臂时差与 FK；时钟异常、超过 200 ms 的 cut
+或 SDK 错误均停止采样，不重连或回退到旧值。启动超时锁定失败并请求取消。
+
+关闭时先取消后续读取与发布，采样线程在在途调用返回后关闭自己持有的 handle；
+调用阻塞时显式报告清理未完成。transport 仅在初始观测就绪后发布，启动失败也会
+回收已持有的资源。本仓库离线和假 SDK 测试不构成真实设备验收。
+
 The combined three-view point-grasp profile is an explicit opt-in. It uses the
 reviewed v4 head-camera placement and derives both wrist-camera poses from the
 fresh measured dual-arm qpos consumed by the sole lower control loop:
@@ -900,6 +941,19 @@ independent launcher is the preferred path. `one_shot_client` is only an
 authenticated one-request
 Unix client and never initializes or dispatches hardware itself.
 
+同一 Gateway 会话可反复启动 `one_shot_client`；客户端在 socket 旁的
+`<socket>.client-sequences.json` 保存按 runtime session / client ID 分组的递增序号，
+并用同目录的 `.lock` 文件串行化序号预留和请求提交。目录须允许当前操作者写入；
+状态文件不属于源码或机器人配置，不要在当前会话中删除、改写或跨主机复制。
+提交前原子保存序号；请求被拒绝或响应丢失也不回退，不自动重发可能已执行的动作。
+锁等待受 `--timeout-sec` 限制，状态损坏或写入失败会阻止提交；终态轮询和运动执行
+不持有此客户端锁。新 Gateway session 使用独立计数，旧会话的计数仍保留，避免并行旧
+客户端覆盖新会话状态。Gateway 的防重放、单操作槽、授权和 HOLD 检查保持不变。
+
+客户端可从 `running/ready` 或 `hold/hold` 提交已授权的新请求。HOLD 再入仍须由下层
+取得新 Grant/activation，并验证前一次成功的 HOLD 回执；客户端不调用 resume，
+故障或生命周期与执行门禁不一致时拒绝提交。该行为不依赖夹爪 Route 是否存在。
+
 The absolute grasp-pose Route is authorized explicitly with
 `--authorized-action move_tcp_to_pose`; publishing the Route without this
 operator action does not mint a motion Grant. The matching local client accepts
@@ -1041,6 +1095,10 @@ level orientations.
 when the lower Skill is activated. Distance, frame/tool/calibration identities,
 primitive hash, safety envelope, IK, dispatch, evaluation, and HOLD remain
 trusted deployment facts.
+
+MuJoCo 的 ``state.read_tcp_pose`` 与可选 TCP history 发布同一公开 Station 坐标系。
+其参数及结果校验从公开 state binding 获取坐标身份，不使用内部 IK execution frame；
+Agent 必须按当前 schema 查询和复制身份，不能以 arm-base 查询替代 Station 查询。
 
 Target-independent motion semantics and payload schemas live in
 `skills/motion`. They also define fixed level-orientation Skills for forward,

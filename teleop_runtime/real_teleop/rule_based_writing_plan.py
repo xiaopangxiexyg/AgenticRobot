@@ -1838,6 +1838,9 @@ def _relative_pen_up_reachability_probes(
             "right_pose_canonical_desk": np.asarray(
                 action.arm_pose_by_side["right"], dtype=float
             ).reshape(7).tolist(),
+            "writing_end_pose_canonical_desk": pose_matrix_to_xyzquat(
+                writing_end.pose_by_side["right"]
+            ).tolist(),
         })
     return probes
 

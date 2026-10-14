@@ -160,6 +160,11 @@ python -m utils.hand_eye.visualize_handeye \
 
 ## 采样建议
 
+相机关闭使用与头部标定共用的[原生清理生命周期](../head_eye/README.md#realsense-profile-兼容)。
+恢复传感器设置、停止流与释放句柄均计入 `pipeline_stop_timeout_sec`（默认 5 秒）；
+启动失败时也保留清理错误，不能在尚未完成关闭时继续 fallback/reset。显式启用的
+恢复设置及其次数保持不变，未新增自动重试或硬件 reset。
+
 推荐使用 ChArUco 板，而不是单个 ArUco：
 
 ```bash

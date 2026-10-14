@@ -72,6 +72,8 @@ def test_relative_pen_up_probes_use_temporal_midpoint_and_last(monkeypatch: pyte
     assert [probe["name"] for probe in probes] == ["pen_up_mid", "pen_up_end"]
     assert [probe["target_index"] for probe in probes] == [2, 3]
     assert [call[0] for call in calls] == [2, 3]
+    for probe in probes:
+        assert probe["writing_end_pose_canonical_desk"] == [0, 0, 0, 0, 0, 0, 1]
 
 
 def _manifest_payload(candidates: list[dict[str, object]]) -> dict[str, object]:

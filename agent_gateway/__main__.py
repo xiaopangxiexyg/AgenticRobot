@@ -20,6 +20,10 @@ def main(argv: list[str] | None = None) -> int:
         from .profiles.real.perception_cli import main as real_perception_main
 
         return int(real_perception_main(values[1:]))
+    if values and values[0] == "real-tcp-observe":
+        from .profiles.real.readonly_tcp_cli import main as readonly_tcp_main
+
+        return int(readonly_tcp_main(values[1:]))
     if values and values[0] == "allocate-unix-endpoint":
         from .transport.endpoint_cli import main as endpoint_main
 
@@ -40,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
             "mujoco",
             "real-rm65",
             "real-perception",
+            "real-tcp-observe",
             "allocate-unix-endpoint",
             "ssh-readonly-proxy",
         ),
