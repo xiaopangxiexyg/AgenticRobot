@@ -315,6 +315,16 @@ def test_manual_episode_stop_precedes_replayed_hold_in_control_loop() -> None:
     assert stop_index < hold_index
 
 
+def test_progress_admission_precedes_arm_authority_and_home_pending() -> None:
+    source = inspect.getsource(run_real_teleop_control_loop)
+    commands = source[source.index("for progress_intent in progress_intents:") :]
+    admission = commands.index("availability.allows_mutation(progress_intent.kind)")
+
+    assert admission < commands.index("build_progress_arm_transition_plan(")
+    assert admission < commands.index("_reconcile_active_progress_intent_arm_control(")
+    assert admission < commands.index("pending_progress_arm_transition = intent_pending")
+
+
 def test_existing_manual_hold_is_promoted_without_moving_pause_cut(
     tmp_path: Path,
 ) -> None:
@@ -330,6 +340,13 @@ def test_existing_manual_hold_is_promoted_without_moving_pause_cut(
         application_hold_effective_at=40.01,
         hold_reason="manual",
     )
+    held = workflow.availability(
+        application_held=True,
+        promotable_hold_pause=candidate,
+    )
+    assert held.allows_mutation("REPORT_FAILURE")
+    assert not held.allows_mutation("ADVANCE_PROGRESS")
+    assert not held.allows_mutation("UNDO_LAST_ADVANCE")
     calls = {"hold": 0, "pause_reasons": []}
 
     result = workflow.handle_command(
@@ -395,6 +412,9 @@ def test_hold_progress_controls_fail_closed_without_same_episode_cut(
     )
     assert held.application_held
     assert not held.failure_promotes_existing_hold
+    assert not held.allows_mutation("REPORT_FAILURE")
+    assert not held.allows_mutation("ADVANCE_PROGRESS")
+    assert not held.allows_mutation("UNDO_LAST_ADVANCE")
     with pytest.raises(RuntimeError, match="same uninterrupted Hold"):
         workflow.handle_command(
             ProgressMutationCommand("bad-promotion", "REPORT_FAILURE"),
