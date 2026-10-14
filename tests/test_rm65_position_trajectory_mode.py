@@ -471,11 +471,25 @@ def test_qpos_init_acceleration_planner_keeps_target_admission_nonblocking(
         finally:
             completed.set()
 
-    with backend._send_lock:
-        thread = threading.Thread(target=admit_target, daemon=True)
-        thread.start()
-        assert completed.wait(0.25), "acceleration qpos admission waited for _send_lock"
-    thread.join(timeout=0.25)
+    reached_admission = threading.Event()
+    original_stamp = backend._stamp_final_action_target
+
+    def stamp_and_observe_admission(*args, **kwargs):
+        # Keep real final-target FK/metadata preparation. Its cold work or
+        # process GC is upstream of the sender-lock admission under test.
+        original_stamp(*args, **kwargs)
+        reached_admission.set()
+
+    backend._stamp_final_action_target = stamp_and_observe_admission
+    try:
+        with backend._send_lock:
+            thread = threading.Thread(target=admit_target, daemon=True)
+            thread.start()
+            assert reached_admission.wait(0.5), "command preparation did not reach admission"
+            assert completed.wait(0.25), "acceleration qpos admission waited for _send_lock"
+        thread.join(timeout=0.25)
+    finally:
+        del backend._stamp_final_action_target
 
     assert not errors
     assert len(receipts) == 1
