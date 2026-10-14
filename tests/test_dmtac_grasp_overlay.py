@@ -10,6 +10,7 @@ from deployments.perception.dmtac_grasp_overlay import (
     DMTAC_M_GRASPGENX_MAX_OPENING_M,
     DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
     DMTAC_M_GRASPGENX_PALM_Z_M,
+    DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M,
     DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
     DmtacGraspOverlayCandidate,
     _wireframe_segments,
@@ -102,11 +103,27 @@ def test_graspgenx_dmtac_profile_is_separate_from_legacy_4b2_profile() -> None:
     assert legacy.pad_height_m == pytest.approx(0.0255)
     assert graspgenx.maximum_opening_m == pytest.approx(DMTAC_M_GRASPGENX_MAX_OPENING_M)
     assert graspgenx.palm_z_m == pytest.approx(DMTAC_M_GRASPGENX_PALM_Z_M)
-    assert graspgenx.finger_length_m == pytest.approx(DMTAC_M_GRASPGENX_FINGER_LENGTH_M)
+    assert graspgenx.finger_length_m == pytest.approx(
+        DMTAC_M_GRASPGENX_FINGER_LENGTH_M + DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M)
     assert graspgenx.finger_thickness_m == pytest.approx(DMTAC_M_GRASPGENX_FINGER_THICKNESS_M)
     assert graspgenx.pad_height_m == pytest.approx(DMTAC_M_GRASPGENX_PAD_HEIGHT_M)
     assert graspgenx != legacy
     assert graspgenx.solid_pose(np.eye(4)).shape == (4, 4)
+
+
+@pytest.mark.parametrize("finger_sign", [-1, 1])
+def test_distal_proxy_covers_observed_cad_tip_without_moving_tcp_or_model(finger_sign):
+    from robot_motion.grasp_visible_scene import VisibleGraspScene
+    geometry = reviewed_graspgenx_dmtac_solid_geometry()
+    # Maximum distal CAD coordinate in the calibrated model frame, measured
+    # on both open DMTAC fingers. The original nominal boundary was 71 mm.
+    tip = np.array([[finger_sign*.04, 0., .07159621825942611]])
+    solid_from_tool = geometry.solid_pose(np.eye(4))
+    point = tip @ solid_from_tool[:3, :3].T + solid_from_tool[:3, 3]
+    view = VisibleGraspScene(points=point, target_mask=np.array([False]), geometry=geometry)
+    assert view.collision_counts(np.eye(4), opening_m=geometry.maximum_opening_m) == (0, 1)
+    assert DMTAC_M_GRASPGENX_FINGER_LENGTH_M == .100
+    assert geometry.palm_z_m + geometry.finger_length_m == pytest.approx(.072)
 
 
 def test_projection_classifies_full_partial_outside_and_behind() -> None:

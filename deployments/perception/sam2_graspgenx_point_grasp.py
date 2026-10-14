@@ -31,6 +31,7 @@ from .dmtac_grasp_overlay import (
     DMTAC_M_GRASPGENX_MAX_OPENING_M,
     DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
     DMTAC_M_GRASPGENX_PALM_Z_M,
+    DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M,
     DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
     reviewed_graspgenx_dmtac_solid_geometry,
 )
@@ -513,9 +514,9 @@ class Sam2GraspGenXPointGraspPlanner:
                 )
             preferred_origin = tuple(float(value) for value in preferred_origin_array)
         self.preferred_approach_origin_base_m = preferred_origin
-        nominal_geometry = ParallelJawSolidGeometry(
+        expected_collision_geometry = ParallelJawSolidGeometry(
             DMTAC_M_GRASPGENX_PALM_Z_M,
-            DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
+            DMTAC_M_GRASPGENX_FINGER_LENGTH_M + DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M,
             DMTAC_M_GRASPGENX_FINGER_THICKNESS_M,
             DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
             self.max_gripper_width_m,
@@ -536,7 +537,7 @@ class Sam2GraspGenXPointGraspPlanner:
                 solid_yaw_rad=0,
                 tool_from_solid_rotation=_DMTAC_GRASPGENX_IDENTITY_ROTATION,
             )
-            != nominal_geometry
+            != expected_collision_geometry
         ):
             raise ValueError(
                 "GraspGenX adapter requires the reviewed nominal DMTAC M dimensions"

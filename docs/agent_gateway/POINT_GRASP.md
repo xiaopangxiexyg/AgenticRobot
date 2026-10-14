@@ -505,6 +505,10 @@ IK、生产 URDF/FCL 场景和完整关节路径规划；不会接受调用方�
 
 ## DMTAC M 和坐标语义
 
+DMTAC/GraspGenX 的名义模型指长仍为 100 mm；碰撞及渲染 proxy 在最前端单独加长 1 mm，
+覆盖开口 q=0 CAD 指尖约 0.596 mm 的轴向漏包。TCP、模型输入尺寸、抓取中心和原版 4B2
+profile 保持原值；这不补偿相机外参偏差，也不表示外壳横向已完全包络。
+
 当前 simulation 默认 URDF 由 `sim/contracts/scene/spec.py` 选定为：
 
 ```text

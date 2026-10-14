@@ -53,6 +53,9 @@ DMTAC_M_PAD_HEIGHT_M = 0.0255
 DMTAC_M_GRASPGENX_MAX_OPENING_M = 0.0705
 DMTAC_M_GRASPGENX_PALM_Z_M = -0.029
 DMTAC_M_GRASPGENX_FINGER_LENGTH_M = 0.100
+# The CAD fingertips extend 0.5963 mm beyond the nominal model solid. Only
+# extend the collision/overlay envelope; inference dimensions and TCP stay fixed.
+DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M = 0.001
 DMTAC_M_GRASPGENX_FINGER_THICKNESS_M = 0.0199
 DMTAC_M_GRASPGENX_PAD_HEIGHT_M = 0.030
 DMTAC_M_GRASPGENX_GRASP_CENTER_FROM_TACTILE_XYZ_M = (0.0, 0.0, -0.022)
@@ -116,7 +119,8 @@ def reviewed_graspgenx_dmtac_solid_geometry(
     """
     return ParallelJawSolidGeometry(
         palm_z_m=DMTAC_M_GRASPGENX_PALM_Z_M,
-        finger_length_m=DMTAC_M_GRASPGENX_FINGER_LENGTH_M,
+        finger_length_m=(DMTAC_M_GRASPGENX_FINGER_LENGTH_M
+                         + DMTAC_M_GRASPGENX_PROXY_FINGERTIP_EXTENSION_M),
         finger_thickness_m=DMTAC_M_GRASPGENX_FINGER_THICKNESS_M,
         pad_height_m=DMTAC_M_GRASPGENX_PAD_HEIGHT_M,
         maximum_opening_m=maximum_opening_m,
