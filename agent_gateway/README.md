@@ -324,9 +324,19 @@ requested semantic-role order. The trusted MuJoCo profile maps semantic roles
 to lower camera sources. Inline capture results contain only bounded metadata
 and content hashes. Pixel arrays never enter the control frame.
 
+既有原子夹爪 Skill 完成开合时必须得到 `moving=False` 的实测状态；目标位置接近但仍在
+运动或状态未知时不能完成。真机停止 ACK 之后还须在有限等待内读取新鲜、无故障的停稳反馈，
+早于停止请求、过期、未来时间或不可用反馈均不能确认 HOLD。只读反馈沿用已启动 backend，
+不在 Skill 层新建线程、重连或关闭设备。
+
+原生命令下发仅对明确表示未写入设备的 `io_busy` 做有限重试，每次尝试前检查撤销与操作到期；
+硬件故障、异常或不确定 ACK 不重试。同步调用返回后、最终状态读取后和 HOLD 确认后也检查
+操作截止时间，迟到结果不能标为成功。重试预算不抢占正在进行的原生 I/O；原生调用依赖 backend
+自身的 I/O 超时，返回后仍执行失败与 HOLD 处理。撤销与 HOLD 始终引用激活时的下层 owner。
+
 本次接入保留既有 `manipulation.set_gripper_state` 夹爪合同，不注册新的开合或夹爪
 状态 Skill。MuJoCo 放置几何读取同一个 scene cut 的 TCP 与实测夹爪状态；当前真机
-适配器尚未绑定夹爪测量，因此返回 `held_gripper_state_unavailable`，不会将结果标为
+放置几何适配器尚未绑定夹爪测量，因此返回 `held_gripper_state_unavailable`，不会将结果标为
 可用于运动规划。`geometry_eligible_for_motion_planning` 也不代表通过了轨迹碰撞准入、
 已抓住物体或可直接执行放置；执行仍需独立运动授权和下层校验。
 

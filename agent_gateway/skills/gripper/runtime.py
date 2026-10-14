@@ -168,7 +168,9 @@ class GripperControlPort(Protocol):
 
     def readiness(self) -> GripperReadiness: ...
 
-    def command_close(self, target_close: float) -> GripperCommandReceipt: ...
+    def command_close(
+        self, target_close: float, *, cancel_requested: Callable[[], bool] | None = None,
+    ) -> GripperCommandReceipt: ...
 
     def observe_state(self) -> GripperStateSample: ...
 
@@ -351,11 +353,21 @@ class GripperSkillLifecycle:
             raise ValueError("run does not match activation.")
         target_state = str(request.parameters["target_state"])
         target_close = 0.0 if target_state == "open" else 1.0
-        command = self.port.command_close(target_close)
-        self._lower_operation_id = command.lower_operation_id
-        if not command.accepted:
+        command = self.port.command_close(
+            target_close,
+            cancel_requested=lambda: bool(cancel_requested())
+            or float(self.clock()) >= operation.deadline_at,
+        )
+        # Cancellation and HOLD stay bound to the activation's lower owner.
+        cancelled = bool(cancel_requested())
+        expired = float(self.clock()) >= operation.deadline_at
+        if not command.accepted or cancelled or expired:
             return self._failed_completion(
-                reason_code="gripper_command_rejected",
+                reason_code=(
+                    "gripper_execution_preempted" if cancelled
+                    else "gripper_convergence_timeout" if expired
+                    else "gripper_command_rejected"
+                ),
                 evidence_refs=command.evidence_refs,
             )
         started_at = float(self.clock())
@@ -378,13 +390,22 @@ class GripperSkillLifecycle:
                     *evidence[:command_evidence_count],
                     *evidence[-(120 - command_evidence_count) :],
                 ]
+            # A synchronous read may complete after cancellation or expiry.
+            cancelled = bool(cancel_requested())
+            expired = float(self.clock()) >= operation.deadline_at
+            if cancelled or expired:
+                return self._failed_completion(
+                    reason_code=("gripper_execution_preempted" if cancelled
+                        else "gripper_convergence_timeout"),
+                    evidence_refs=tuple(evidence),
+                )
             if sample.fault_code is not None:
                 return self._failed_completion(
                     reason_code="gripper_fault_during_execution",
                     evidence_refs=tuple(evidence),
                 )
-            target_reached = abs(sample.measured_close - target_close) <= (
-                self.convergence.target_tolerance
+            target_reached = sample.moving is False and (
+                abs(sample.measured_close - target_close) <= self.convergence.target_tolerance
             )
             contact_settled = bool(
                 target_state == "closed"
@@ -427,6 +448,14 @@ class GripperSkillLifecycle:
                     dict.fromkeys((*evidence, *hold.evidence_refs))
                 ),
                 terminal_hold_confirmed=False,
+            )
+        cancelled = bool(cancel_requested())
+        expired = float(self.clock()) >= operation.deadline_at
+        if cancelled or expired:
+            return self._failed_completion(
+                reason_code=("gripper_execution_preempted" if cancelled
+                    else "gripper_convergence_timeout"),
+                evidence_refs=tuple(evidence),
             )
         result = {
             "schema_version": SET_GRIPPER_STATE_RESULT_SCHEMA_V1,

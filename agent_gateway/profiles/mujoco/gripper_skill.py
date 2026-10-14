@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 from agent_gateway.skills.gripper.deployment import (
@@ -83,8 +84,16 @@ class MujocoGripperControlPort:
             evidence_refs=(ref,),
         )
 
-    def command_close(self, target_close: float) -> GripperCommandReceipt:
+    def command_close(
+        self, target_close: float, *, cancel_requested: Callable[[], bool] | None = None,
+    ) -> GripperCommandReceipt:
         target = float(target_close)
+        if cancel_requested is not None and cancel_requested():
+            return GripperCommandReceipt(
+                accepted=False,
+                lower_operation_id=f"mujoco-gripper:{self.gripper_name}:preempted",
+                evidence_refs=(self._ref("command_preempted", {"target_close": target}),),
+            )
         sequence = self.rig.queue_gripper_close_targets({self.gripper_name: target})
         return GripperCommandReceipt(
             accepted=True,

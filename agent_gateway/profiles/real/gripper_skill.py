@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import time
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from agent_gateway.skills.gripper.deployment import (
@@ -20,6 +23,8 @@ from agent_gateway.skills.gripper.runtime import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+_LOG = logging.getLogger(__name__)
+
 
 class RealDmtacGripperControlPort:
     """Adapt an already-started DMTAC backend without owning its lifecycle."""
@@ -27,7 +32,11 @@ class RealDmtacGripperControlPort:
     component_id = "right_gripper"
     target_kind = "real"
 
-    def __init__(self, *, backend: Any, clock=time.monotonic) -> None:
+    def __init__(
+        self, *, backend: Any, clock=time.monotonic,
+        command_submission_timeout_sec: float = 0.1,
+        hold_confirmation_timeout_sec: float = 0.5,
+    ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable.")
         for method_name in (
@@ -43,6 +52,14 @@ class RealDmtacGripperControlPort:
         self.backend = backend
         self.clock = clock
         self._sequence = 0
+        for name, value in (
+            ("command_submission_timeout_sec", command_submission_timeout_sec),
+            ("hold_confirmation_timeout_sec", hold_confirmation_timeout_sec),
+        ):
+            if not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(f"{name} must be finite and positive.")
+        self.command_submission_timeout_sec = float(command_submission_timeout_sec)
+        self.hold_confirmation_timeout_sec = float(hold_confirmation_timeout_sec)
         config = getattr(backend, "config", None)
         side = str(getattr(config, "side", "right"))
         if side != "right":
@@ -66,6 +83,8 @@ class RealDmtacGripperControlPort:
             "side": side,
             "gripper_port": str(getattr(config, "gripper_port", "bound")),
             "gripper_id": int(getattr(config, "gripper_id", 1)),
+            "command_submission_timeout_sec": self.command_submission_timeout_sec,
+            "hold_confirmation_timeout_sec": self.hold_confirmation_timeout_sec,
         }
         self.port_binding_hash = canonical_content_hash(
             identity,
@@ -93,23 +112,84 @@ class RealDmtacGripperControlPort:
             evidence_refs=(ref,),
         )
 
-    def command_close(self, target_close: float) -> GripperCommandReceipt:
+    def command_close(
+        self, target_close: float, *, cancel_requested: Callable[[], bool] | None = None,
+    ) -> GripperCommandReceipt:
         target = float(target_close)
-        accepted = bool(self.backend.send_fixed_joint_pos(target))
+        started_at = time.monotonic()
+        deadline = started_at + self.command_submission_timeout_sec
+        attempts = 0
+        diagnostic: dict[str, object] = {}
+        accepted = False
+        while True:
+            if cancel_requested is not None and cancel_requested():
+                diagnostic = {"gripper_last_send_status": "preempted_before_dispatch"}
+                break
+            attempts += 1
+            accepted = bool(self.backend.send_fixed_joint_pos(target))
+            if accepted:
+                break
+            try:
+                state = self.backend.get_state(
+                    include_tactile_arrays=False, include_tactile_vector=False,
+                )
+                diagnostic = {
+                    key: state.get(key) for key in (
+                        "gripper_last_send_status", "gripper_last_send_skip_reason",
+                        "gripper_send_elapsed_s", "gripper_send_lock_wait_s",
+                        "gripper_error_code", "gripper_status_code", "gripper_status_text",
+                        "gripper_is_moving", "gripper_measured_scalar", "telemetry_error",
+                    )
+                }
+            except Exception as error:  # noqa: BLE001 - preserve failure and still allow HOLD.
+                diagnostic = {"diagnostic_error": f"{type(error).__name__}: {error}"}
+            remaining = deadline - time.monotonic()
+            # io_busy means the nonblocking backend did not write to the device.
+            # Never retry hardware faults, SDK exceptions or uncertain ACKs.
+            if diagnostic.get("gripper_last_send_status") != "io_busy" or remaining <= 0:
+                break
+            time.sleep(min(0.005, remaining))
+            if time.monotonic() >= deadline:
+                break
+        command_ref = self._ref("command", {"target_close": target, "accepted": accepted})
+        if not accepted:
+            _LOG.error(
+                "DMTAC Skill command rejected: component=%s target_close=%s "
+                "attempts=%s elapsed_sec=%.6f receipt=%s diagnostic=%r",
+                self.component_id, target, attempts, time.monotonic() - started_at,
+                command_ref, diagnostic,
+            )
         return GripperCommandReceipt(
             accepted=accepted,
-            lower_operation_id=f"dmtac-gripper-command:{self._sequence + 1}",
-            evidence_refs=(
-                self._ref("command", {"target_close": target, "accepted": accepted}),
-            ),
+            lower_operation_id=f"dmtac-gripper-command:{self._sequence}",
+            evidence_refs=(command_ref,),
         )
 
     def observe_state(self) -> GripperStateSample:
-        self.backend.read_gripper_state_now()
+        read_started = time.monotonic()
+        reading = self.backend.read_gripper_state_now()
+        if time.monotonic() - read_started > 0.2:
+            raise RuntimeError(
+                "DMTAC fresh gripper state read exceeded its 200 ms budget."
+            )
+        if reading is None:
+            raise RuntimeError("DMTAC fresh gripper state read is unavailable.")
+        if not isinstance(reading, Mapping) or "timestamp" not in reading:
+            raise RuntimeError(
+                "DMTAC fresh gripper state lacks its acquisition timestamp."
+            )
+        measured_at = float(reading["timestamp"])
         state = self.backend.get_state(
             include_tactile_arrays=False,
             include_tactile_vector=False,
         )
+        # Include cached-state access in the acquisition window. A slow getter
+        # must not make an old read look fresh by assigning a later timestamp.
+        if time.monotonic() - read_started > 0.2:
+            raise RuntimeError("DMTAC fresh gripper state read exceeded its 200 ms budget.")
+        age = time.time() - measured_at
+        if not math.isfinite(age) or not 0.0 <= age <= 0.2:
+            raise RuntimeError("DMTAC measured gripper state is stale or future-dated.")
         measured = state.get("gripper_measured_scalar")
         if measured is None:
             raise RuntimeError("DMTAC backend has no measured gripper scalar.")
@@ -119,7 +199,7 @@ class RealDmtacGripperControlPort:
         )
         moving_raw = state.get("gripper_is_moving")
         moving = None if moving_raw is None else bool(moving_raw)
-        observed_at = float(self.clock())
+        observed_at = float(self.clock()) - age
         return GripperStateSample(
             measured_close=float(measured),
             moving=moving,
@@ -140,13 +220,48 @@ class RealDmtacGripperControlPort:
         return self.observe_state()
 
     def hold(self, *, reason: str) -> GripperHoldReceipt:
-        succeeded = bool(self.backend.hold_gripper_motion(reason))
-        return GripperHoldReceipt(
+        started_at = time.monotonic()
+        deadline = started_at + self.hold_confirmation_timeout_sec
+        stop_requested_at = float(self.clock())
+        acknowledged = bool(self.backend.hold_gripper_motion(reason))
+        sample = None
+        samples = []
+        succeeded = False
+        while acknowledged and time.monotonic() < deadline:
+            try:
+                sample = self.observe_state()
+            except Exception:
+                _LOG.exception("DMTAC Skill HOLD state read failed: component=%s reason=%s", self.component_id, reason)
+                raise
+            samples.append(sample.evidence_ref)
+            # A pre-stop sample cannot confirm this stop request.
+            if sample.observed_at < stop_requested_at or sample.fault_code is not None:
+                break
+            if sample.moving is False:
+                succeeded = time.monotonic() <= deadline
+                break
+            if sample.moving is None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.01, remaining))
+        if not succeeded:
+            _LOG.error(
+                "DMTAC Skill HOLD not confirmed: component=%s reason=%s "
+                "stop_ack=%s samples=%s elapsed_sec=%.6f moving=%s fault=%s measured_close=%s",
+                self.component_id, reason, acknowledged, len(samples),
+                time.monotonic() - started_at, sample.moving if sample else None,
+                sample.fault_code if sample else None, sample.measured_close if sample else None,
+            )
+        receipt = GripperHoldReceipt(
             succeeded=succeeded,
             evidence_refs=(
                 self._ref("hold", {"reason": reason, "succeeded": succeeded}),
+                *samples,
             ),
         )
+        return receipt
 
 
 def build_real_dmtac_gripper_skill_contract_bundle(
