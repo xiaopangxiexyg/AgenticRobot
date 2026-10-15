@@ -7,7 +7,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,14 +28,19 @@ from .control_profile import arm_control_mode as _canonical_arm_control_mode_arg
 from .dataset_recorder import RealTeleopDatasetRecorder as _RealTeleopDatasetRecorder
 from .episode_runtime import (
     _build_episode_metadata as _canonical_build_episode_metadata,
+)
+from .episode_runtime import (
     _episode_root_dir as _canonical_episode_root_dir,
+)
+from .episode_runtime import (
     _start_episode_recording as _canonical_start_episode_recording,
+)
+from .episode_runtime import (
     _stop_episode_recording as _canonical_stop_episode_recording,
 )
 from .runtime_debug import (
     _dataset_recording_debug_text as _canonical_dataset_recording_debug_text,
 )
-
 
 DEFAULT_EPISODE_START_COUNTDOWN_SEC = 3.0
 
@@ -101,8 +106,8 @@ class _DatasetStopCompletion:
 
 
 @dataclass
-class _DatasetSelectionCleanup:
-    """One retained old-recorder retirement transaction.
+class _DatasetRecorderRetirement:
+    """One retained recorder retirement transaction.
 
     The recorder, completion callback, and retry history share one ownership
     lifetime.  Keeping them in one object prevents the pending/active parallel
@@ -288,7 +293,7 @@ def build_episode_recording_runtime(
     episode_stop_frame_count = 0
     episode_stop_reason = ""
     dataset_selection_transaction: _DatasetSelectionTransaction | None = None
-    dataset_selection_cleanup: _DatasetSelectionCleanup | None = None
+    recorder_retirement: _DatasetRecorderRetirement | None = None
     finalize_failure_count = 0
     debug_episode_quarantined = False
 
@@ -537,7 +542,7 @@ def build_episode_recording_runtime(
     def collection_transition_active() -> bool:
         return bool(
             collection_control_plane.active_operation is not None
-            or dataset_selection_cleanup is not None
+            or recorder_retirement is not None
         )
 
     def recording_active() -> bool:
@@ -1125,8 +1130,8 @@ def build_episode_recording_runtime(
             except BaseException:
                 pass
 
-    def submit_pending_dataset_selection_cleanup() -> bool:
-        cleanup = dataset_selection_cleanup
+    def submit_recorder_retirement() -> bool:
+        cleanup = recorder_retirement
         if cleanup is None:
             return False
 
@@ -1146,7 +1151,7 @@ def build_episode_recording_runtime(
             if changed:
                 _log(
                     "Dataset",
-                    "dataset selection cleanup worker did not start; the old "
+                    "dataset recorder retirement worker did not start; the old "
                     "recorder remains owned and collection transitions stay blocked "
                     f"until retry in {retry_delay:.2f}s: {detail}",
                 )
@@ -1154,29 +1159,29 @@ def build_episode_recording_runtime(
         cleanup.retry_at = 0.0
         return True
 
-    def schedule_dataset_selection_cleanup(
+    def schedule_recorder_retirement(
         recorder: Any,
         *,
         cleanup_kind: str,
         on_complete: Callable[[], None] | None,
     ) -> None:
-        nonlocal dataset_selection_cleanup
+        nonlocal recorder_retirement
         if (
             collection_control_plane.active_operation is not None
-            or dataset_selection_cleanup is not None
+            or recorder_retirement is not None
         ):
             raise CollectionControlOperationBusy(
-                "dataset selection cleanup is already owned"
+                "dataset recorder retirement is already owned"
             )
-        dataset_selection_cleanup = _DatasetSelectionCleanup(
+        recorder_retirement = _DatasetRecorderRetirement(
             recorder=recorder,
             kind=str(cleanup_kind),
             on_complete=on_complete,
         )
-        if not submit_pending_dataset_selection_cleanup():
+        if not submit_recorder_retirement():
             raise RuntimeError(
-                dataset_selection_cleanup.last_error
-                or "dataset selection cleanup worker did not start"
+                recorder_retirement.last_error
+                or "dataset recorder retirement worker did not start"
             )
 
     def schedule_dataset_selection(
@@ -2302,6 +2307,34 @@ def build_episode_recording_runtime(
         nonlocal episode_prepare_cancel_reason, episode_start_failure_message
         nonlocal episode_prepare_previous
         nonlocal episode_prepare_previous_retirement_started
+        if (
+            episode_prepare_cancel_reason
+            and result.succeeded
+            and isinstance(result.value, _PreparedDatasetRecorder)
+        ):
+            # A failed cancellation-worker launch leaves the ready result in
+            # the control plane.  The application still owns the revoked
+            # admission and must retire its candidate before publishing idle.
+            prepared = result.value
+            cancelled_result = replace(result, value=None, cancelled=True)
+            if prepared.owned_candidate:
+                try:
+                    schedule_recorder_retirement(
+                        prepared.recorder,
+                        cleanup_kind="discard_prepare_candidate",
+                        on_complete=lambda: publish_prepare_completion(
+                            cancelled_result, now=time.time(),
+                        ),
+                    )
+                except Exception as exc:  # ownership is retained for retry
+                    _log(
+                        "Dataset",
+                        "cancelled writer preparation retirement is retained "
+                        f"for retry: {type(exc).__name__}: {exc}",
+                        now=now,
+                    )
+                return
+            result = cancelled_result
         previous_recorder = episode_prepare_previous
         previous_recoverable = bool(
             previous_recorder is not None
@@ -2463,7 +2496,7 @@ def build_episode_recording_runtime(
             publish_failure(exc)
             if prepared.recorder is not None:
                 try:
-                    schedule_dataset_selection_cleanup(
+                    schedule_recorder_retirement(
                         prepared.recorder,
                         cleanup_kind="discard_selection_candidate",
                         on_complete=None,
@@ -2498,7 +2531,7 @@ def build_episode_recording_runtime(
             publish_completion_callback()
             return
         try:
-            schedule_dataset_selection_cleanup(
+            schedule_recorder_retirement(
                 previous_recorder,
                 cleanup_kind="retire_selection_previous",
                 on_complete=transaction.on_complete,
@@ -2516,24 +2549,24 @@ def build_episode_recording_runtime(
                 now=now,
             )
 
-    def publish_dataset_selection_cleanup(
+    def publish_recorder_retirement(
         result: CollectionControlOperationResult,
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_selection_cleanup
-        cleanup = dataset_selection_cleanup
+        nonlocal recorder_retirement
+        cleanup = recorder_retirement
         if cleanup is None:
             _log(
                 "Dataset",
-                "dataset selection cleanup completion had no retained owner: "
+                "dataset recorder retirement completion had no retained owner: "
                 f"kind={result.kind} generation={result.generation}",
                 now=now,
             )
             return
         if not result.succeeded:
             failure = result.error or result.discard_error or RuntimeError(
-                f"{cleanup.kind or 'dataset selection cleanup'} was cancelled"
+                f"{cleanup.kind or 'dataset recorder retirement'} was cancelled"
             )
             # RealTeleopDatasetRecorder.close() is deliberately best-effort
             # and repeatable.  The transaction keeps the exact recorder when
@@ -2543,8 +2576,7 @@ def build_episode_recording_runtime(
                 now=time.monotonic(),
             )
             message = (
-                "dataset selection cleanup did not complete; the old recorder "
-                "remains owned, the selected ready writer remains authoritative, "
+                "dataset recorder retirement did not complete; the old recorder remains owned "
                 f"and collection transitions stay blocked until retry in "
                 f"{retry_delay:.2f}s: {detail}"
             )
@@ -2553,12 +2585,12 @@ def build_episode_recording_runtime(
                 publish_control_ui_message(
                     "Dataset",
                     message,
-                    context="dataset selection cleanup failure",
+                    context="dataset recorder retirement failure",
                     now=now,
                 )
             return
         completion_callback = cleanup.on_complete
-        dataset_selection_cleanup = None
+        recorder_retirement = None
         if completion_callback is not None:
             try:
                 completion_callback()
@@ -2939,11 +2971,11 @@ def build_episode_recording_runtime(
     def poll_dataset_finalize(now: float) -> None:
         nonlocal finalize_failure_count
         if (
-            dataset_selection_cleanup is not None
+            recorder_retirement is not None
             and collection_control_plane.active_operation is None
-            and time.monotonic() >= dataset_selection_cleanup.retry_at
+            and time.monotonic() >= recorder_retirement.retry_at
         ):
-            submit_pending_dataset_selection_cleanup()
+            submit_recorder_retirement()
         active_operation = collection_control_plane.active_operation
         if active_operation is not None:
             generation, kind = active_operation
@@ -2957,7 +2989,7 @@ def build_episode_recording_runtime(
                 }
                 publish = publishers.get(
                     kind,
-                    publish_dataset_selection_cleanup,
+                    publish_recorder_retirement,
                 )
                 publish(result, now=now)
         if collection_transition_active():
@@ -3106,7 +3138,7 @@ def build_episode_recording_runtime(
         summary: Mapping[str, object] | None = None,
         timeout_sec: float = 15.0,
     ) -> bool:
-        nonlocal runtime_closing, dataset_selection_cleanup
+        nonlocal runtime_closing, recorder_retirement
         timeout = float(timeout_sec)
         if not math.isfinite(timeout) or timeout < 0.0:
             raise ValueError(
@@ -3194,47 +3226,47 @@ def build_episode_recording_runtime(
 
         runtime_closing = True
         if (
-            dataset_selection_cleanup is not None
+            recorder_retirement is not None
             and collection_control_plane.active_operation is None
         ):
             # Ignore normal retry backoff during shutdown and give the bounded
             # control plane one final attempt before its cancellation barrier.
-            dataset_selection_cleanup.retry_at = 0.0
-            submit_pending_dataset_selection_cleanup()
-        cleanup = dataset_selection_cleanup
+            recorder_retirement.retry_at = 0.0
+            submit_recorder_retirement()
+        cleanup = recorder_retirement
         cleanup_generation = (
             None if cleanup is None else transition_generation(cleanup.kind)
         )
         if cleanup_generation is not None and not wait_and_publish(
             cleanup_generation,
-            publish_dataset_selection_cleanup,
+            publish_recorder_retirement,
         ):
             lifecycle_committed = False
         if (
-            dataset_selection_cleanup is not None
+            recorder_retirement is not None
             and collection_control_plane.active_operation is None
         ):
             # The worker either could not start or returned after a complete
             # best-effort close attempt.  At shutdown no future poll can own a
             # retry, so synchronously make one final idempotent attempt.  Do
             # not do this for an active generation: that would race the worker.
-            retained_recorder = dataset_selection_cleanup.recorder
-            dataset_selection_cleanup = None
+            retained_recorder = recorder_retirement.recorder
+            recorder_retirement = None
             try:
                 retained_recorder.close()
             except BaseException as exc:
                 lifecycle_committed = False
                 _log(
                     "Dataset",
-                    "retained dataset selection cleanup failed during shutdown: "
+                    "retained dataset recorder retirement failed during shutdown: "
                     f"{type(exc).__name__}: {exc}",
                     now=shutdown_now,
                 )
         active_operation = collection_control_plane.active_operation
         cleanup_was_active = bool(
-            dataset_selection_cleanup is not None
+            recorder_retirement is not None
             and active_operation is not None
-            and active_operation[1] == dataset_selection_cleanup.kind
+            and active_operation[1] == recorder_retirement.kind
         )
         if active_operation is not None:
             collection_control_plane.cancel(active_operation[0])
@@ -3247,7 +3279,7 @@ def build_episode_recording_runtime(
             # A timed-out wait can be followed by a successful bounded drain.
             # The worker has returned, so clearing this reference is safe.  A
             # failed close was already counted as an uncommitted shutdown.
-            dataset_selection_cleanup = None
+            recorder_retirement = None
         if not lifecycle_committed:
             _log(
                 "Dataset",

@@ -18,7 +18,11 @@ from teleop_runtime.real_teleop.collection_control_plane import (
 )
 from teleop_runtime.real_teleop.dataset_finalize import RealDatasetFinalizeTask
 from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
-from tests.support.real_teleop_recording import _Clutch, _episode_runtime
+from tests.support.real_teleop_recording import (
+    _Clutch,
+    _episode_runtime,
+    poll_recording_transition,
+)
 
 
 def _wait_for_result(
@@ -3153,6 +3157,136 @@ def test_cancelled_prepare_never_publishes_candidate(
         release.set()
         cut.release.set()
         runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("origin", "cleanup_failure"),
+    [
+        ("new", None),
+        ("replacement", None),
+        ("reused", None),
+        ("new", "submit"),
+        ("replacement", "submit"),
+        ("new", "close"),
+        ("replacement", "close"),
+    ],
+)
+def test_prepare_cancel_launch_failure_keeps_candidate_out_of_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    cleanup_failure: str | None,
+) -> None:
+    release = threading.Event()
+    instances: list[object] = []
+    candidate = None
+    plane = CollectionControlPlane(name="prepare-cancel-failure")
+    monkeypatch.setattr(
+        episode_recording_module, "CollectionControlPlane", lambda **_kwargs: plane,
+    )
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            self.dataset_root = tmp_path
+            self.finalizing = False
+            self.is_recording = False
+            self.is_paused = False
+            self.frame_count = 0
+            self.writer_started = False
+            self.closed = False
+            self.close_calls = 0
+            instances.append(self)
+
+        def configured_for_current_args(self) -> bool:
+            return origin == "reused"
+
+        def ensure_started(self) -> None:
+            self.writer_started = True
+
+        def write_camera_device_config(self) -> None:
+            pass
+
+        def poll_finalize_tasks(self):
+            return []
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self is candidate:
+                if cleanup_failure == "close" and self.close_calls == 1:
+                    raise RuntimeError("simulated candidate close failure")
+                assert release.wait(timeout=1.0)
+            self.closed = True
+
+    previous = None if origin == "new" else Recorder()
+    if previous is not None:
+        previous.writer_started = True
+    slot: list[object | None] = [previous]
+    clutch = _Clutch()
+    runtime, _args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+
+    def fail_start(_thread: threading.Thread) -> None:
+        raise RuntimeError("simulated candidate worker unavailable")
+
+    try:
+        assert runtime.schedule_recording_countdown(time.time(), start_reason="unit")
+        deadline = time.monotonic() + 1.0
+        while plane.busy and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert not plane.busy and plane.active_kind == "prepare_writer"
+        candidate = instances[-1]
+        assert slot[0] is None
+        with monkeypatch.context() as failure_patch:
+            failure_patch.setattr(control_plane_module.threading.Thread, "start", fail_start)
+            assert runtime.cancel_recording_countdown(time.time(), reason="operator_hold")
+            if cleanup_failure == "submit":
+                runtime.poll_dataset_finalize(time.time())
+        if cleanup_failure != "submit":
+            started_at = time.perf_counter()
+            runtime.poll_dataset_finalize(time.time())
+            assert time.perf_counter() - started_at < 0.05
+
+        if origin == "reused":
+            assert slot[0] is previous
+            assert candidate.close_calls == 0
+        else:
+            assert slot[0] is None
+            assert not candidate.closed
+            assert runtime.collection_transition_active()
+            assert not runtime.schedule_recording_countdown(time.time(), start_reason="retry")
+            if previous is not None:
+                assert previous.closed
+                assert previous.close_calls == 1
+            if cleanup_failure is not None:
+                deadline = time.monotonic() + 1.0
+                while not any("simulated candidate" in message for _, message in logs):
+                    assert time.monotonic() < deadline
+                    runtime.poll_dataset_finalize(time.time())
+                    time.sleep(0.001)
+            release.set()
+            poll_recording_transition(runtime, timeout_sec=2.0)
+            assert candidate.closed
+            assert candidate.close_calls == (2 if cleanup_failure == "close" else 1)
+            assert slot[0] is None
+
+        assert not runtime.collection_transition_active()
+        assert runtime.countdown_deadline() is None
+        assert clutch.recording_states[-1]["event_status"] == "idle"
+        # A new admission must not inherit the cancelled transaction's reason.
+        assert runtime.schedule_recording_countdown(time.time(), start_reason="new_request")
+        poll_recording_transition(runtime)
+        assert slot[0] is not None
+        assert not slot[0].closed
+        assert runtime.countdown_deadline() is not None
+        assert runtime.cancel_recording_countdown(time.time(), reason="test_cleanup")
+    finally:
+        release.set()
+        runtime.close(timeout_sec=1.0)
 
 
 def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path) -> None:
