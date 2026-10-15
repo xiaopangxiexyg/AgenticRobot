@@ -20,6 +20,7 @@ from dataset_interface.capture_modalities import (
 
 from ..log_utils import log_event as _canonical_log
 from .collection_control_plane import (
+    CollectionControlCleanupError,
     CollectionControlOperationBusy,
     CollectionControlOperationResult,
     CollectionControlPlane,
@@ -199,6 +200,46 @@ def build_episode_recording_runtime(
     _stop_episode_recording = _canonical_stop_episode_recording
     bind_capture_modality_contract = _bind_capture_modality_contract
 
+    def cleanup_failed_operation(error: BaseException, *recorders: Any) -> None:
+        # Preserve the original error, each still-owned recorder and any earlier
+        # failed cleanup. Only the control-plane worker may retry these closures.
+        original = error.operation_error if isinstance(error, CollectionControlCleanupError) else error
+        pending = []
+        failures = []
+        if isinstance(error, CollectionControlCleanupError):
+            pending.append(error.cleanup)
+            failures.append(error.cleanup_error)
+        seen = set()
+        for recorder in recorders:
+            if recorder is None or id(recorder) in seen:
+                continue
+            seen.add(id(recorder))
+            close = recorder if callable(recorder) and not hasattr(recorder, "close") else recorder.close
+            try:
+                close()
+            except BaseException as failure:
+                pending.append(close)
+                failures.append(failure)
+        if not pending:
+            return
+
+        def retry() -> None:
+            remaining = []
+            errors = []
+            for close in pending:
+                try:
+                    close()
+                except BaseException as failure:
+                    remaining.append(close)
+                    errors.append(failure)
+            pending[:] = remaining
+            if errors:
+                raise RuntimeError("resource cleanup incomplete: " + "; ".join(
+                    f"{type(failure).__name__}: {failure}" for failure in errors
+                )) from errors[0]
+
+        raise CollectionControlCleanupError(original, retry, failures[0]) from error
+
     def construct_started_dataset_recorder(
         previous: Any | None = None,
         *,
@@ -246,11 +287,8 @@ def build_episode_recording_runtime(
             else:
                 candidate.start()
                 candidate.write_camera_device_config()
-        except BaseException:
-            try:
-                candidate.close()
-            except BaseException:
-                pass
+        except BaseException as error:
+            cleanup_failed_operation(error, candidate)
             raise
         return candidate
 
@@ -901,7 +939,7 @@ def build_episode_recording_runtime(
                     debug_started=debug_started,
                     debug_error=debug_error,
                 )
-            except BaseException:
+            except BaseException as error:
                 if debug_started or episode_recorder.is_recording:
                     try:
                         _stop_episode_recording(
@@ -925,10 +963,7 @@ def build_episode_recording_runtime(
                             )
                     except BaseException:
                         pass
-                    try:
-                        formal_recorder.close()
-                    except BaseException:
-                        pass
+                audit_close = None
                 if position_debug_started or (
                     current_position_episode_debug_recorder() is not None
                 ):
@@ -936,10 +971,16 @@ def build_episode_recording_runtime(
                         audit_close = stop_position_episode_debug(
                             reason="dataset_start_failed"
                         )
-                        if audit_close is not None:
-                            audit_close()
                     except BaseException:
                         pass
+                close_formal = bool(formal_recorder is not None and
+                    (episode_open_start_attempted or runtime_closing))
+                def close_failed_open() -> None:
+                    if close_formal:
+                        formal_recorder.close()
+                    if audit_close is not None:
+                        audit_close()
+                cleanup_failed_operation(error, close_failed_open)
                 raise
 
         def discard_open_completion(value: Any) -> None:
@@ -966,10 +1007,7 @@ def build_episode_recording_runtime(
                         )
                     except BaseException:
                         pass
-                try:
-                    value.recorder.close()
-                except BaseException:
-                    pass
+                value.recorder.close()
             if current_position_episode_debug_recorder() is not None:
                 audit_close = stop_position_episode_debug(
                     reason="episode_open_cancelled"
@@ -1105,25 +1143,24 @@ def build_episode_recording_runtime(
             return
         if not value.owned_candidate and not runtime_closing:
             return
-        try:
-            value.recorder.close()
-        except BaseException:
-            pass
+        value.recorder.close()
 
     def discard_prepared_dataset_selection(value: Any) -> None:
         if not isinstance(value, _PreparedDatasetSelection):
             return
-        if value.recorder is not None:
-            try:
-                value.recorder.close()
-            except BaseException:
-                pass
-        previous_recorder = value.transaction.previous_recorder
-        if runtime_closing and previous_recorder is not None:
-            try:
-                previous_recorder.close()
-            except BaseException:
-                pass
+        failures: list[BaseException] = []
+        recorders = [value.recorder]
+        if runtime_closing:
+            recorders.append(value.transaction.previous_recorder)
+        for recorder in recorders:
+            if recorder is not None:
+                try:
+                    recorder.close()
+                except BaseException as error:
+                    failures.append(error)
+        if failures:
+            raise RuntimeError("cancelled dataset selection cleanup failed: " +
+                "; ".join(f"{type(error).__name__}: {error}" for error in failures)) from failures[0]
 
     def submit_pending_dataset_selection_cleanup() -> bool:
         cleanup = dataset_selection_cleanup
@@ -1273,12 +1310,9 @@ def build_episode_recording_runtime(
                     args_snapshot=dict(vars(staged_args)),
                     transaction=transaction,
                 )
-            except BaseException:
+            except BaseException as error:
                 if runtime_closing:
-                    try:
-                        existing_recorder.close()
-                    except BaseException:
-                        pass
+                    cleanup_failed_operation(error, existing_recorder)
                 raise
 
         dataset_selection_transaction = transaction
@@ -1399,26 +1433,17 @@ def build_episode_recording_runtime(
                     episode_prepare_previous_retirement_started = True
                     try:
                         existing_recorder.close()
-                    except BaseException:
-                        try:
-                            candidate.close()
-                        except BaseException:
-                            pass
+                    except BaseException as error:
+                        cleanup_failed_operation(error, candidate, existing_recorder)
                         raise
                 return _PreparedDatasetRecorder(
                     recorder=candidate,
                     owned_candidate=True,
                 )
-            except BaseException:
-                if (
-                    runtime_closing
-                    and existing_recorder is not None
-                    and not episode_prepare_previous_retirement_started
-                ):
-                    try:
-                        existing_recorder.close()
-                    except BaseException:
-                        pass
+            except BaseException as error:
+                if (runtime_closing and existing_recorder is not None
+                    and not episode_prepare_previous_retirement_started):
+                    cleanup_failed_operation(error, existing_recorder)
                 raise
 
         episode_prepare_reason = str(start_reason)
@@ -1492,7 +1517,10 @@ def build_episode_recording_runtime(
         prepare_generation = transition_generation("prepare_writer")
         if prepare_generation is not None:
             episode_prepare_cancel_reason = str(reason)
-            collection_control_plane.cancel(prepare_generation)
+            cancel_accepted = collection_control_plane.cancel(prepare_generation)
+            if not cancel_accepted and collection_control_plane.cleanup_error is not None:
+                _log("Dataset", "writer 预备取消已阻止接纳，回收仍待重试："
+                    f"{collection_control_plane.cleanup_error}", now=now)
             episode_start_warmup_ready_since = None
             episode_start_warmup_last_message = None
             message = f"数采 writer 预备正在取消并回收：{reason}。"
@@ -1516,7 +1544,10 @@ def build_episode_recording_runtime(
             # admission before the completion is made sample-visible.
             if not episode_open_cancel_reason:
                 episode_open_cancel_reason = str(reason)
-            collection_control_plane.cancel(open_generation)
+            cancel_accepted = collection_control_plane.cancel(open_generation)
+            if not cancel_accepted and collection_control_plane.cleanup_error is not None:
+                _log("Dataset", "Episode取消已阻止接纳，回收仍待重试："
+                    f"{collection_control_plane.cleanup_error}", now=now)
             episode_start_warmup_ready_since = None
             episode_start_warmup_last_message = None
             message = f"数采 Episode 正在取消并安全回收：{reason}。"
@@ -1785,7 +1816,7 @@ def build_episode_recording_runtime(
                     frame_count=int(frame_count),
                     debug_error=debug_error,
                 )
-            except BaseException:
+            except BaseException as error:
                 if debug_was_recording and not debug_stopped:
                     try:
                         _stop_episode_recording(
@@ -1796,21 +1827,19 @@ def build_episode_recording_runtime(
                         )
                     except BaseException:
                         pass
-                if formal_recorder is not None:
-                    try:
+                def close_failed_stop() -> None:
+                    if formal_recorder is not None:
                         formal_recorder.close()
-                    except BaseException:
-                        pass
+                    if audit_close is not None:
+                        audit_close()
+                cleanup_failed_operation(error, close_failed_stop)
                 raise
 
         def discard_stop_completion(value: Any) -> None:
             if not isinstance(value, _DatasetStopCompletion):
                 return
             if value.recorder is not None:
-                try:
-                    value.recorder.close()
-                except BaseException:
-                    pass
+                value.recorder.close()
 
         try:
             stop_generation = collection_control_plane.submit(
@@ -2314,8 +2343,11 @@ def build_episode_recording_runtime(
                 dataset_recorder = previous_recorder
                 set_dataset_recorder(previous_recorder)
             reason = episode_prepare_cancel_reason or "operator_cancelled"
-            episode_prepare_cancel_reason = ""
+            if result.discard_error is None:
+                episode_prepare_cancel_reason = ""
             message = f"数采 writer 预备已取消：{reason}。"
+            if result.discard_error is not None:
+                message += f"回收失败，资源仍保留并等待重试：{result.discard_error}"
             _log("Dataset", message, now=now)
             publish_control_ui_message(
                 "Dataset",
@@ -2327,8 +2359,9 @@ def build_episode_recording_runtime(
                 active=False,
                 episode_dir=recording_path(),
                 frame_count=recording_frame_count(),
-                event_status="idle",
-                event_message="writer 预备已取消；可重新开始数采。",
+                event_status="idle" if result.discard_error is None else "error",
+                event_message=("writer 预备已取消；可重新开始数采。"
+                    if result.discard_error is None else message),
             )
             return
         if not result.succeeded or not isinstance(
@@ -2606,6 +2639,8 @@ def build_episode_recording_runtime(
                 f"数采 Episode 启动已取消：{reason}；"
                 "未向控制循环发布可采样 Episode。"
             )
+            if result.discard_error is not None:
+                message += f"回收失败，资源仍保留并等待重试：{result.discard_error}"
             episode_start_failure_message = None
             _log("Dataset", message, now=now)
             publish_control_ui_message(
@@ -2618,7 +2653,7 @@ def build_episode_recording_runtime(
                 active=False,
                 episode_dir=recording_path(),
                 frame_count=recording_frame_count(),
-                event_status="idle",
+                event_status="idle" if result.discard_error is None else "error",
                 event_message=message,
             )
             return

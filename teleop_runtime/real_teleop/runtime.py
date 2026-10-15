@@ -218,7 +218,10 @@ from .runtime_metadata import (
 from .runtime_metadata import (
     position_ik_iteration_metadata as _position_ik_iteration_metadata,
 )
-from .shutdown_runtime import shutdown_real_teleop_runtime
+from .shutdown_runtime import (
+    CollectionShutdownPendingError,
+    shutdown_real_teleop_runtime,
+)
 from .side_mapping import (
     resolve_logical_side_assignments as _resolve_logical_side_assignments,
 )
@@ -375,6 +378,21 @@ def _close_episode_recording_runtime_before_resources(
             timeout_sec=15.0,
         )
     )
+
+
+def _shutdown_resources_preserving_exit(
+    runtime_state: Mapping[str, Any],
+    *,
+    terminal_error: BaseException | None,
+    emergency_stop_error: BaseException | None,
+) -> None:
+    try:
+        shutdown_real_teleop_runtime(runtime_state, terminal_error=terminal_error)
+    except CollectionShutdownPendingError as pending_cleanup:
+        primary = terminal_error or emergency_stop_error
+        if primary is None:
+            raise
+        primary.collection_shutdown_pending = pending_cleanup
 
 
 def _emergency_stop_runtime_arms_before_collection_drain(
@@ -2696,9 +2714,9 @@ def run_real_teleop(
                 "formal collection shutdown completed with a recoverable "
                 f"failure: {type(exc).__name__}: {exc}",
             )
-        shutdown_real_teleop_runtime(
-            locals(),
-            terminal_error=terminal_error,
+        _shutdown_resources_preserving_exit(
+            locals(), terminal_error=terminal_error,
+            emergency_stop_error=emergency_stop_error,
         )
         if terminal_error is None:
             if emergency_stop_error is not None:

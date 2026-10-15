@@ -721,6 +721,7 @@ def test_cancelled_cleanup_failure_remains_one_consumable_result(
     candidate = object()
     failure = RuntimeError("candidate retirement failed")
     cleaned: list[object] = []
+    fail_cleanup = True
     entered = threading.Event()
     release = threading.Event()
 
@@ -731,7 +732,8 @@ def test_cancelled_cleanup_failure_remains_one_consumable_result(
 
     def discard(value: object) -> None:
         cleaned.append(value)
-        raise failure
+        if fail_cleanup:
+            raise failure
 
     generation = plane.submit("prepare", prepare, discard_value=discard)
     assert entered.wait(timeout=1.0)
@@ -752,8 +754,21 @@ def test_cancelled_cleanup_failure_remains_one_consumable_result(
         assert result.discard_error is failure
         assert cleaned == [candidate]
         assert plane.poll(generation) is None
+        assert plane.active_operation == (generation, "prepare")
+        assert plane.busy
+        assert plane.cleanup_error is failure
+        with pytest.raises(CollectionControlOperationBusy):
+            plane.submit("next", object)
+        fail_cleanup = False
+        deadline = time.monotonic() + 1.0
+        while not plane.close(timeout_sec=0.05) and time.monotonic() < deadline:
+            pass
+        assert plane.close(timeout_sec=0.05)
         assert plane.active_operation is None
+        assert plane.cleanup_error is None
+        assert all(value is candidate for value in cleaned)
     finally:
+        fail_cleanup = False
         release.set()
         plane.close(timeout_sec=1.0)
 
@@ -852,6 +867,11 @@ def test_completed_cleanup_worker_failure_retains_candidate_for_retry(
         else:
             assert not plane.close(timeout_sec=0.0)
             assert plane.poll(generation) is None
+        assert plane.poll(generation) is None
+        assert plane.busy
+        assert isinstance(plane.cleanup_error, RuntimeError)
+        with pytest.raises(RuntimeError, match="closed" if action == "close" else "pending"):
+            plane.submit("next", object)
         assert cleaned == []
         assert plane.active_operation == (generation, "prepare")
 
@@ -1515,9 +1535,11 @@ def test_episode_open_configuration_failure_republishes_unmutated_recorder(
     assert clutch.recording_states[-1]["event_status"] == "error"
 
 
+@pytest.mark.parametrize("cleanup_fails", (False, True))
 def test_episode_open_rpc_failure_isolates_attempted_writer_for_fresh_retry(
-    tmp_path: Path,
+    tmp_path: Path, cleanup_fails: bool,
 ) -> None:
+    fail_cleanup = cleanup_fails
     class Recorder:
         def __init__(self, **_kwargs: object) -> None:
             self.dataset_root = tmp_path
@@ -1542,6 +1564,8 @@ def test_episode_open_rpc_failure_isolates_attempted_writer_for_fresh_retry(
             return []
 
         def close(self) -> None:
+            if fail_cleanup:
+                raise RuntimeError("open cleanup unavailable")
             self.closed = True
 
     recorder = Recorder()
@@ -1556,6 +1580,15 @@ def test_episode_open_rpc_failure_isolates_attempted_writer_for_fresh_retry(
     )
 
     assert runtime.start_recording(time.time(), start_reason="unit")
+    if cleanup_fails:
+        deadline = time.monotonic() + 1.0
+        while not args.dataset_startup_error and time.monotonic() < deadline:
+            runtime.poll_dataset_finalize(time.time())
+            time.sleep(.001)
+        assert runtime.collection_transition_active()
+        assert slot[0] is None and not recorder.closed
+        assert "process reply timeout" in args.dataset_startup_error
+        fail_cleanup = False
     deadline = time.monotonic() + 1.0
     while runtime.collection_transition_active() and time.monotonic() < deadline:
         runtime.poll_dataset_finalize(time.time())
@@ -3524,7 +3557,9 @@ def test_close_stops_and_publishes_an_active_episode_before_plane_shutdown(
     assert clutch.round_trip_advances == 1
 
 
-def test_failed_stop_isolated_recorder_and_allows_fresh_retry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cleanup_fails", (False, True))
+def test_failed_stop_isolated_recorder_and_allows_fresh_retry(tmp_path: Path, cleanup_fails: bool) -> None:
+    fail_cleanup = cleanup_fails
     entered = threading.Event()
     release = threading.Event()
     recorder = SimpleNamespace(
@@ -3544,7 +3579,11 @@ def test_failed_stop_isolated_recorder_and_allows_fresh_retry(tmp_path: Path) ->
         raise RuntimeError("sample drain failed")
 
     recorder.stop_episode = stop_episode
-    recorder.close = lambda: setattr(recorder, "closed", True)
+    def close_recorder():
+        if fail_cleanup:
+            raise RuntimeError("stop cleanup unavailable")
+        recorder.closed = True
+    recorder.close = close_recorder
 
     class Recorder:
         def __init__(self, **_kwargs: object) -> None:
@@ -3563,8 +3602,16 @@ def test_failed_stop_isolated_recorder_and_allows_fresh_retry(tmp_path: Path) ->
     assert runtime.stop_recording(time.time(), end_reason="unit")
     assert entered.wait(timeout=1.0)
     release.set()
+    if cleanup_fails:
+        deadline = time.monotonic() + 1.0
+        while not args.dataset_startup_error and time.monotonic() < deadline:
+            runtime.poll_dataset_finalize(time.time())
+            time.sleep(.001)
+        assert runtime.collection_transition_active()
+        assert slot[0] is None and not recorder.closed
+        fail_cleanup = False
     deadline = time.monotonic() + 1.0
-    while clutch.recording_states[-1]["event_status"] == "stopping" and time.monotonic() < deadline:
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
         runtime.poll_dataset_finalize(time.time())
         time.sleep(0.001)
 
@@ -3574,3 +3621,141 @@ def test_failed_stop_isolated_recorder_and_allows_fresh_retry(tmp_path: Path) ->
     assert clutch.hold_reasons == ["dataset_stop_failure"]
     assert args.dataset_startup_error == "RuntimeError: sample drain failed"
     runtime.close()
+
+
+
+@pytest.mark.parametrize("failure_point", ("start", "close"))
+def test_cancelled_ready_prepare_retains_cleanup_and_never_admits_candidate(tmp_path, monkeypatch, failure_point):
+    instances = []
+    fail_cleanup = True
+    plane = CollectionControlPlane(name="retained-prepare-test")
+    monkeypatch.setattr(episode_recording_module, "CollectionControlPlane", lambda **_: plane)
+
+    class Recorder:
+        def __init__(self, **_):
+            self.finalizing = self.is_recording = self.is_paused = False
+            self.frame_count = self.close_calls = 0
+            self.dataset_root = tmp_path
+            self.writer_started = self.closed = False
+            instances.append(self)
+        def ensure_started(self):
+            self.writer_started = True
+        def poll_finalize_tasks(self):
+            return []
+        def close(self):
+            self.close_calls += 1
+            if failure_point == "close" and fail_cleanup:
+                raise RuntimeError("candidate close unavailable")
+            self.closed = True
+
+    slot, clutch = [None], _Clutch()
+    runtime, _args, logs = _episode_runtime(tmp_path=tmp_path, recorder_type=Recorder,
+        dataset_slot=slot, clutch=clutch, transition_calls=[])
+    assert runtime.schedule_recording_countdown(time.time(), start_reason="unit")
+    deadline = time.monotonic() + 1.0
+    while plane.busy and time.monotonic() < deadline:
+        time.sleep(.001)
+    assert not plane.busy
+    try:
+        with monkeypatch.context() as failure_patch:
+            if failure_point == "start":
+                def fail_start(_thread):
+                    raise RuntimeError("cleanup thread unavailable")
+                failure_patch.setattr(control_plane_module.threading.Thread, "start", fail_start)
+            assert runtime.cancel_recording_countdown(time.time(), reason="operator_cancel")
+            deadline = time.monotonic() + 1.0
+            while plane.cleanup_error is None and time.monotonic() < deadline:
+                runtime.poll_dataset_finalize(time.time())
+                time.sleep(.001)
+            runtime.poll_dataset_finalize(time.time())
+            assert plane.cleanup_error is not None
+            assert slot[0] is None
+            assert runtime.collection_transition_active()
+            assert runtime.countdown_deadline() == float("inf")
+            assert not instances[0].closed
+            if failure_point == "close":
+                assert clutch.recording_states[-1]["event_status"] == "error"
+            assert any("回收" in str(message) for message in logs)
+        fail_cleanup = False
+        deadline = time.monotonic() + 1.0
+        while runtime.collection_transition_active() and time.monotonic() < deadline:
+            runtime.poll_dataset_finalize(time.time())
+            time.sleep(.001)
+        assert slot[0] is None
+        assert instances[0].closed
+        assert runtime.countdown_deadline() is None
+        assert plane.cleanup_error is None
+        assert clutch.recording_states[-1]["event_status"] == "idle"
+    finally:
+        fail_cleanup = False
+        runtime.close()
+
+
+def test_retained_cleanup_poll_retries_are_rate_limited(monkeypatch):
+    plane = CollectionControlPlane(name="retry-budget-test")
+    generation = plane.submit("prepare", object, discard_value=lambda _: None)
+    deadline = time.monotonic() + 1.0
+    while plane.busy and time.monotonic() < deadline:
+        time.sleep(.001)
+    clock, attempts = [0.0], []
+    def fail_start(_):
+        attempts.append(clock[0])
+        raise RuntimeError("unavailable")
+    with monkeypatch.context() as patch:
+        patch.setattr(control_plane_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        patch.setattr(control_plane_module.threading.Thread, "start", fail_start)
+        assert not plane.cancel(generation)
+        for _ in range(100):
+            assert plane.poll(generation) is None
+        assert attempts == [0.0]
+        clock[0] = .051
+        assert plane.poll(generation) is None
+        assert attempts == [0.0, .051]
+    assert plane.close(timeout_sec=1.0)
+
+
+
+def test_failed_ready_handshake_retains_candidate_until_failed_close_recovers(tmp_path, monkeypatch):
+    instances, fail_cleanup = [], [True]
+    plane = CollectionControlPlane(name="failed-ready-cleanup")
+    monkeypatch.setattr(episode_recording_module, "CollectionControlPlane", lambda **_: plane)
+    class Recorder:
+        def __init__(self, **_):
+            self.finalizing = self.is_recording = self.is_paused = False
+            self.frame_count = 0
+            self.dataset_root = tmp_path
+            self.writer_started = self.closed = False
+            instances.append(self)
+        def ensure_started(self):
+            raise RuntimeError("ready handshake failed")
+        def close(self):
+            if fail_cleanup[0]:
+                raise RuntimeError("failed candidate close unavailable")
+            self.closed = True
+        def poll_finalize_tasks(self):
+            return []
+    slot, clutch = [None], _Clutch()
+    runtime, args, _ = _episode_runtime(tmp_path=tmp_path, recorder_type=Recorder,
+        dataset_slot=slot, clutch=clutch, transition_calls=[])
+    try:
+        assert runtime.schedule_recording_countdown(time.time(), start_reason="unit")
+        deadline = time.monotonic() + 1.0
+        while not args.dataset_startup_error and time.monotonic() < deadline:
+            runtime.poll_dataset_finalize(time.time())
+            time.sleep(.001)
+        assert args.dataset_startup_error == "RuntimeError: ready handshake failed"
+        assert plane.cleanup_error is not None
+        assert runtime.collection_transition_active()
+        assert slot[0] is None and not instances[0].closed
+        fail_cleanup[0] = False
+        deadline = time.monotonic() + 1.0
+        while runtime.collection_transition_active() and time.monotonic() < deadline:
+            runtime.poll_dataset_finalize(time.time())
+            time.sleep(.001)
+        assert not runtime.collection_transition_active()
+        assert instances[0].closed
+        assert slot[0] is None and runtime.countdown_deadline() is None
+        assert args.dataset_startup_error == "RuntimeError: ready handshake failed"
+    finally:
+        fail_cleanup[0] = False
+        runtime.close()

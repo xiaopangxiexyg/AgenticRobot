@@ -30,11 +30,36 @@ from .impedance_force_runtime import (
 )
 
 
+class CollectionShutdownPendingError(RuntimeError):
+    """Keep dependency ownership reachable until collection can finish draining."""
+
+    def __init__(self, runtime_state: Mapping[str, Any]) -> None:
+        super().__init__(
+            "collection shutdown remains pending; camera/session dependencies "
+            "are retained and have not been torn down"
+        )
+        self.runtime_state = dict(runtime_state)
+
+
 def shutdown_real_teleop_runtime(
     runtime_state: Mapping[str, Any],
     *,
     terminal_error: BaseException | None,
 ) -> None:
+    collection = runtime_state.get("episode_recording_runtime")
+    if collection is not None and collection.collection_transition_active():
+        # A bounded close returning False is not a dependency-release barrier.
+        # The existing collection owner and its exact resources stay reachable
+        # through the exception; a caller may retry that owner's bounded close.
+        pending = CollectionShutdownPendingError(runtime_state)
+        watchdog = runtime_state.get("main_loop_watchdog")
+        if watchdog is not None:
+            try:
+                watchdog.stop()
+            except BaseException as error:  # noqa: BLE001 - retain the pending owner.
+                pending.watchdog_error = error
+        _log("Shutdown", str(pending))
+        raise pending
     args = runtime_state["args"]
     startup_progress = runtime_state["startup_progress"]
     position_force_guard_monitor = runtime_state["position_force_guard_monitor"]
@@ -374,4 +399,4 @@ def shutdown_real_teleop_runtime(
             raise
 
 
-__all__ = ["shutdown_real_teleop_runtime"]
+__all__ = ["CollectionShutdownPendingError", "shutdown_real_teleop_runtime"]
