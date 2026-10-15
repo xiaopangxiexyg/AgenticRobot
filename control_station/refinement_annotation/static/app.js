@@ -59,6 +59,8 @@ let episodeSummaryFlushTimer = 0;
 const pendingEpisodeSummaryIds = new Set();
 const inFlightEpisodeSummaryIds = new Set();
 const episodeSummaryRefreshedAt = new Map();
+const episodeSummaryCommitEpoch = new Map();
+let pendingEpisodeCommitRefresh = null;
 const episodeRowNodes = new Map();
 const episodeRowSignatures = new Map();
 const datasetBrowserCache = new Map();
@@ -111,97 +113,13 @@ function compareEpisodeOrder(left, right) {
   );
 }
 
-function legacyEpisodeStatus(item) {
-  const badges = [];
-  const add = (code, label, tone, priority) => {
-    badges.push({code, label, tone, priority});
-  };
-  const failureStageCount = Number(item.failure_stage_count) || 0;
-  const failureAttemptCount = Number(item.failure_attempt_count) || 0;
-  if (item.whole_episode_abnormal) {
-    add(
-      "WHOLE_EPISODE_ABNORMAL",
-      `整条异常${item.whole_episode_abnormal_reason ? ` · ${item.whole_episode_abnormal_reason}` : ""}`,
-      "CRITICAL",
-      10,
-    );
-  }
-  if (failureStageCount > 0) {
-    add(
-      "ANNOTATED_FAILURE",
-      `失败阶段标注 ×${failureStageCount}`,
-      "FAILURE",
-      18,
-    );
-  }
-  if (failureAttemptCount > 0) {
-    add(
-      "FAILURE_ATTEMPT",
-      `原始失败 Attempt ×${failureAttemptCount}`,
-      "FAILURE",
-      19,
-    );
-  }
-  if (item.review_state === "PENDING" || item.needs_second_review) {
-    add("SECOND_REVIEW_PENDING", "待二次复核", "WARNING", 20);
-  } else if (
-    item.review_state === "COMPLETED"
-    || (
-      item.review_state == null
-      && item.latest_annotation_mode === "SECOND_REVIEW"
-      && !item.needs_second_review
-    )
-  ) {
-    add("SECOND_REVIEW_COMPLETED", "二次复核完成", "SUCCESS", 50);
-  }
-  const detailState = String(item.detail_annotation_state || "").toUpperCase();
-  if (item.detail_annotation_complete === true || detailState === "COMPLETE") {
-    add("DETAIL_COMPLETE", "详细标注完成", "SUCCESS", 60);
-  } else if (detailState === "PENDING") {
-    add("DETAIL_PENDING", "待详细标注", "INFO", 40);
-  } else if (detailState === "STALE") {
-    add("DETAIL_STALE", "详细标注需重做", "WARNING", 25);
-  } else if (detailState === "ERROR") {
-    add("DETAIL_ERROR", "详细标注状态异常", "CRITICAL", 15);
-  }
-  if (item.annotation_set_count) {
-    add(
-      "COARSE_SEALED",
-      `已封存 ${item.annotation_set_count} 版`,
-      "SEALED",
-      70,
-    );
-  }
-  if (item.draft_requires_seal) {
-    add("LOCAL_DRAFT", "有未封存草稿", "DRAFT", 30);
-  }
-  badges.sort((left, right) => left.priority - right.priority);
-  const attentionLevel = item.whole_episode_abnormal || detailState === "ERROR"
-    ? "CRITICAL"
-    : item.review_state === "PENDING"
-      || detailState === "STALE"
-      || failureStageCount > 0
-      || failureAttemptCount > 0
-      ? "WARNING"
-      : "NONE";
-  return {
-    loaded: Boolean(item.annotation_summary_loaded),
-    attention_level: attentionLevel,
-    attention_required: attentionLevel !== "NONE",
-    primary_label: item.whole_episode_abnormal
-      ? "整条异常"
-      : item.review_state === "PENDING"
-        ? "待二次复核"
-        : detailState === "STALE"
-          ? "详细标注需重做"
-          : failureStageCount > 0
-            ? "失败阶段标注"
-            : failureAttemptCount > 0
-              ? "含失败 Attempt"
-              : "状态正常",
-    badges,
-  };
-}
+const STATUS_LOADING = {
+  loaded: false,
+  attention_level: "LOADING",
+  attention_required: null,
+  primary_label: "状态读取中",
+  badges: [{code: "STATUS_LOADING", label: "状态读取中", tone: "LOADING"}],
+};
 
 function episodeStatus(item) {
   const status = item?.annotation_status;
@@ -210,7 +128,43 @@ function episodeStatus(item) {
     && status.schema === "dexteleop.refinement_annotation.episode_status.v1"
     && Array.isArray(status.badges)
   ) return status;
-  return legacyEpisodeStatus(item || {});
+  // Badge meaning belongs to the server; missing status is not reconstructed
+  // from the flattened episode fields.
+  return STATUS_LOADING;
+}
+
+function applyCommittedEpisodeSummary(payload, {markCommit = true} = {}) {
+  const episodeUuid = state.detail?.episode_uuid;
+  if (episodeUuid && markCommit) {
+    episodeSummaryCommitEpoch.set(
+      episodeUuid,
+      (episodeSummaryCommitEpoch.get(episodeUuid) || 0) + 1,
+    );
+  }
+  const summary = payload.episode_summary;
+  const valid = summary?.episode_uuid === episodeUuid
+    && summary.annotation_summary_loaded === true
+    && episodeStatus(summary) !== STATUS_LOADING;
+  const error = valid
+    ? null
+    : String(payload.episode_summary_error || "服务端未返回有效的 Episode 状态摘要。");
+  if (valid) Object.assign(state.detail, summary);
+  const index = state.episodes.findIndex(
+    (item) => item.episode_uuid === episodeUuid,
+  );
+  if (index >= 0) {
+    state.episodes[index] = valid
+      ? {...state.episodes[index], ...summary, annotation_summary_error: null}
+      : {
+          ...state.episodes[index],
+          annotation_status: null,
+          annotation_summary_loaded: false,
+          annotation_summary_error: error,
+        };
+    if (valid) episodeSummaryRefreshedAt.set(episodeUuid, Date.now());
+    else episodeSummaryRefreshedAt.delete(episodeUuid);
+  }
+  return error;
 }
 
 function annotationSummarySignature(item) {
@@ -301,6 +255,17 @@ function showToast(message, kind = "info", timeout = 3200) {
   showToast.timer = window.setTimeout(() => {
     toast.className = "toast hidden";
   }, timeout);
+}
+
+function commitWarnings(report) {
+  const warnings = [];
+  if (report?.draft_cache_warning) {
+    warnings.push(`工作缓存更新失败：${report.draft_cache_warning}`);
+  }
+  if (report?.status_refresh_warning) {
+    warnings.push(`Episode 状态读取失败：${report.status_refresh_warning}`);
+  }
+  return warnings;
 }
 
 function setServerOnline(online) {
@@ -560,14 +525,15 @@ async function ensureAnnotationsSealedBeforeTransition(targetLabel) {
       : detailChanged
         ? await publishDetailAnnotations()
         : null;
+    const warnings = commitWarnings(report);
     showToast(
-      report?.draft_cache_warning
-        ? `标注已封存，但工作缓存更新失败：${report.draft_cache_warning}`
+      warnings.length
+        ? `标注已封存，但${warnings.join("；")}`
         : report?.pending_coarse
           ? "详细草稿已保存；粗标注仍可独立编辑，继续切换。"
           : "当前修改已校验并保存，继续切换。",
-      report?.draft_cache_warning ? "error" : "info",
-      report?.draft_cache_warning ? 9000 : 4200,
+      warnings.length ? "error" : "info",
+      warnings.length ? 9000 : 4200,
     );
     return !report?.draft_cache_warning;
   } catch (error) {
@@ -961,6 +927,11 @@ function resetAnnotationStateForWorkspace() {
   pendingEpisodeSummaryIds.clear();
   inFlightEpisodeSummaryIds.clear();
   episodeSummaryRefreshedAt.clear();
+  episodeSummaryCommitEpoch.clear();
+  if (pendingEpisodeCommitRefresh) {
+    pendingEpisodeCommitRefresh.resolve(false);
+    pendingEpisodeCommitRefresh = null;
+  }
   episodeRowNodes.clear();
   episodeRowSignatures.clear();
   if (episodeSummaryObserver) episodeSummaryObserver.disconnect();
@@ -2696,18 +2667,30 @@ async function loadEpisodes({
   silent = false,
   force = false,
   append = false,
+  afterCommit = false,
 } = {}) {
-  if (
-    state.episodeRefreshInFlight
-    || state.episodePageInFlight
-    || !state.workspaceConfigured
-    || (append && !state.episodeHasMore)
-  ) return false;
+  if (!state.workspaceConfigured || (append && !state.episodeHasMore)) return false;
+  if (state.episodeRefreshInFlight || state.episodePageInFlight) {
+    if (!afterCommit) return false;
+    // Commit callers await one shared refresh after the current request. Their
+    // existing summary restoration then runs after that refresh, not before it.
+    if (!pendingEpisodeCommitRefresh) {
+      let resolve;
+      const promise = new Promise((done) => { resolve = done; });
+      pendingEpisodeCommitRefresh = {
+        promise, resolve, force: false, generation: state.workspaceGeneration,
+      };
+    }
+    pendingEpisodeCommitRefresh.force ||= force;
+    return pendingEpisodeCommitRefresh.promise;
+  }
   state.episodeRefreshInFlight = true;
   state.episodePageInFlight = append;
   const previousIds = new Set(
     state.episodes.map((value) => value.episode_uuid),
   );
+  const workspaceGeneration = state.workspaceGeneration;
+  const requestedCommitEpochs = new Map(episodeSummaryCommitEpoch);
   try {
     const params = new URLSearchParams();
     params.set("stale_ok", "1");
@@ -2716,6 +2699,7 @@ async function loadEpisodes({
     if (force) params.set("refresh", "1");
     const query = `?${params.toString()}`;
     const payload = await requestJson(`/api/episodes${query}`);
+    if (workspaceGeneration !== state.workspaceGeneration) return false;
     setServerOnline(true);
     state.episodeScanInProgress = Boolean(payload.refreshing);
     renderCatalogScanProgress(payload);
@@ -2731,11 +2715,25 @@ async function loadEpisodes({
       || state.episodeRevision !== nextRevision;
     const replaceLoadedPage = !append
       && (state.episodeRevision === null || state.episodes.length === 0);
+    // A catalog request issued before a commit must not replace its newer
+    // authoritative status when that older request finishes later.
+    const committedSinceRequest = (episodeUuid) => (
+      (episodeSummaryCommitEpoch.get(episodeUuid) || 0)
+        !== (requestedCommitEpochs.get(episodeUuid) || 0)
+    );
+    const retainNewerCommit = (item, existing) => (
+      existing && committedSinceRequest(item.episode_uuid)
+    ) ? existing : item;
     if (append) {
       const byId = new Map(
         state.episodes.map((value) => [value.episode_uuid, value]),
       );
-      for (const item of payload.episodes) byId.set(item.episode_uuid, item);
+      for (const item of payload.episodes) {
+        byId.set(
+          item.episode_uuid,
+          retainNewerCommit(item, byId.get(item.episode_uuid)),
+        );
+      }
       state.episodes = Array.from(byId.values()).sort(
         compareEpisodeOrder,
       );
@@ -2743,18 +2741,21 @@ async function loadEpisodes({
       // Retain already loaded pages (and the currently selected row) during a
       // background revision update.  Only the first page is replaced; this
       // avoids pulling the entire catalog back over the wire every 4 seconds.
-      const selectedItem = state.episodes.find(
-        (value) => value.episode_uuid === state.selectedEpisode,
+      const retainedItems = state.episodes.filter(
+        (value) => value.episode_uuid === state.selectedEpisode
+          || committedSinceRequest(value.episode_uuid),
       );
       const byId = new Map(
-        (replaceLoadedPage
-          ? (selectedItem ? [selectedItem] : [])
-          : state.episodes
-        ).map(
+        (replaceLoadedPage ? retainedItems : state.episodes).map(
           (value) => [value.episode_uuid, value],
         ),
       );
-      for (const item of payload.episodes) byId.set(item.episode_uuid, item);
+      for (const item of payload.episodes) {
+        byId.set(
+          item.episode_uuid,
+          retainNewerCommit(item, byId.get(item.episode_uuid)),
+        );
+      }
       state.episodes = Array.from(byId.values()).sort(
         compareEpisodeOrder,
       );
@@ -2831,6 +2832,15 @@ async function loadEpisodes({
   } finally {
     state.episodeRefreshInFlight = false;
     state.episodePageInFlight = false;
+    const queued = pendingEpisodeCommitRefresh;
+    pendingEpisodeCommitRefresh = null;
+    if (queued) {
+      if (queued.generation === state.workspaceGeneration && state.workspaceConfigured) {
+        void loadEpisodes({silent: true, force: queued.force}).then(
+          queued.resolve, () => queued.resolve(false),
+        );
+      } else queued.resolve(false);
+    }
   }
 }
 
@@ -2864,6 +2874,12 @@ async function flushEpisodeSummaryQueue() {
     0,
     EPISODE_SUMMARY_BATCH_SIZE,
   );
+  const requestedCommitEpochs = new Map(
+    episodeUuids.map((episodeUuid) => [
+      episodeUuid,
+      episodeSummaryCommitEpoch.get(episodeUuid) || 0,
+    ]),
+  );
   if (!episodeUuids.length || !state.workspaceConfigured) return;
   for (const episodeUuid of episodeUuids) {
     pendingEpisodeSummaryIds.delete(episodeUuid);
@@ -2876,11 +2892,13 @@ async function flushEpisodeSummaryQueue() {
       body: JSON.stringify({episode_uuids: episodeUuids}),
     });
     if (workspaceGeneration !== state.workspaceGeneration) return;
+    const isCurrent = (value) => requestedCommitEpochs.get(value.episode_uuid)
+      === (episodeSummaryCommitEpoch.get(value.episode_uuid) || 0);
     const byId = new Map(
-      payload.summaries.map((value) => [value.episode_uuid, value]),
+      payload.summaries.filter(isCurrent).map((value) => [value.episode_uuid, value]),
     );
     const errorsById = new Map(
-      payload.errors.map((value) => [value.episode_uuid, value.error]),
+      payload.errors.filter(isCurrent).map((value) => [value.episode_uuid, value.error]),
     );
     let summariesChanged = false;
     state.episodes = state.episodes.map((item) => {
@@ -2907,9 +2925,9 @@ async function flushEpisodeSummaryQueue() {
     for (const episodeUuid of byId.keys()) {
       episodeSummaryRefreshedAt.set(episodeUuid, refreshedAt);
     }
-    if (payload.errors.length) {
+    if (errorsById.size) {
       showToast(
-        `有 ${payload.errors.length} 个 Episode 的标注摘要暂时无法读取。`,
+        `有 ${errorsById.size} 个 Episode 的标注摘要暂时无法读取。`,
         "error",
         7000,
       );
@@ -3069,6 +3087,8 @@ function renderEpisodeList({preserveViewport = true} = {}) {
     episodeRowNodes.delete(episodeUuid);
     episodeRowSignatures.delete(episodeUuid);
     episodeSummaryRefreshedAt.delete(episodeUuid);
+    // Commit ordering outlives DOM rows, including rows scrolled off screen.
+    // The workspace reset clears these epochs with the catalog itself.
   }
   if (renderedEpisodes.length < state.episodes.length) {
     const remaining = state.episodes.length - renderedEpisodes.length;
@@ -4467,25 +4487,16 @@ async function publishDetailAnnotations() {
     : report.detail_annotation?.available
       ? "PENDING"
       : "NOT_APPLICABLE";
-  const episodeIndex = state.episodes.findIndex(
-    (value) => value.episode_uuid === state.detail.episode_uuid,
-  );
-  if (episodeIndex >= 0) {
-    state.episodes[episodeIndex] = {
-      ...state.episodes[episodeIndex],
-      detail_annotation_complete: state.detail.detail_annotation_complete,
-      detail_annotation_state: state.detail.detail_annotation_state,
-      annotation_status: null,
-      annotation_summary_loaded: true,
-      annotation_summary_error: null,
-    };
-    episodeSummaryRefreshedAt.set(state.detail.episode_uuid, Date.now());
-  }
+  const statusRefreshWarning = applyCommittedEpisodeSummary(payload);
   setSavedDraftSnapshot(state.draft);
   renderTimeline();
   renderEpisodeList({preserveViewport: true});
-  await loadEpisodes();
-  return report;
+  await loadEpisodes({afterCommit: true});
+  // A changed catalog revision may replace the hydrated row with a lightweight
+  // one. Restore the summary returned by this successful commit afterward.
+  applyCommittedEpisodeSummary(payload, {markCommit: false});
+  renderEpisodeList({preserveViewport: true});
+  return {...report, status_refresh_warning: statusRefreshWarning};
 }
 
 async function commitDetailAnnotations() {
@@ -4493,14 +4504,15 @@ async function commitDetailAnnotations() {
   state.busy = true;
   try {
     const report = await publishDetailAnnotations();
+    const warnings = commitWarnings(report);
     showToast(
       report.pending_coarse
         ? "详细草稿已保存；粗标注仍可独立编辑，稍后封存粗标注后再发布 detail overlay。"
-        : report.draft_cache_warning
-        ? "详细补充已封存，但工作缓存更新失败：" + report.draft_cache_warning
+        : warnings.length
+        ? `详细补充已封存，但${warnings.join("；")}`
         : "详细补充校验通过，已发布不可变 detail overlay。",
-      report.draft_cache_warning ? "error" : "info",
-      report.draft_cache_warning ? 9000 : 5000,
+      warnings.length ? "error" : "info",
+      warnings.length ? 9000 : 5000,
     );
   } catch (error) {
     showToast("详细补充封存失败：" + error.message, "error", 9000);
@@ -4584,37 +4596,19 @@ async function publishCurrentAnnotations() {
   );
   state.detail.whole_episode_abnormal_reason =
     state.draft.episode_abnormal?.reason_code || null;
-  const episodeIndex = state.episodes.findIndex(
-    (value) => value.episode_uuid === state.detail.episode_uuid,
-  );
-  if (episodeIndex >= 0) {
-    state.episodes[episodeIndex] = {
-      ...state.episodes[episodeIndex],
-      annotation_set_count: state.detail.annotation_set_count,
-      needs_second_review: state.detail.needs_second_review,
-      review_state: state.detail.review_state,
-      latest_annotation_mode: state.detail.latest_annotation_mode,
-      whole_episode_abnormal: state.detail.whole_episode_abnormal,
-      whole_episode_abnormal_reason:
-        state.detail.whole_episode_abnormal_reason,
-      detail_annotation_complete: state.detail.detail_annotation_complete,
-      detail_annotation_state: state.detail.detail_annotation_state,
-      annotation_status: null,
-      annotation_summary_loaded: true,
-      annotation_summary_error: null,
-    };
-    episodeSummaryRefreshedAt.set(state.detail.episode_uuid, Date.now());
-  }
-  renderEpisodeList();
   state.detail.draft_persistence_state = state.volatilePostSealDraft
     ? "VOLATILE_POST_SEAL_DETAIL_DRAFT"
     : "SEALED_SNAPSHOT";
   state.detail.draft_requires_seal = false;
+  const statusRefreshWarning = applyCommittedEpisodeSummary(payload);
+  renderEpisodeList();
   renderSealedReeditControls();
   $("coverage-preview").textContent =
     `已封存 ${report.annotation_set_id} · coverage=${report.coverage_status} · 排除区间 ${report.exclusion_count}`;
-  await loadEpisodes();
-  return report;
+  await loadEpisodes({afterCommit: true});
+  applyCommittedEpisodeSummary(payload, {markCommit: false});
+  renderEpisodeList({preserveViewport: true});
+  return {...report, status_refresh_warning: statusRefreshWarning};
 }
 
 async function persistVolatilePostSealDraft() {
@@ -4656,12 +4650,13 @@ async function commitAnnotations() {
       return;
     }
     const report = await publishCurrentAnnotations();
+    const warnings = commitWarnings(report);
     showToast(
-      report.draft_cache_warning
-        ? `不可变标注已发布，但工作缓存更新失败：${report.draft_cache_warning}`
+      warnings.length
+        ? `不可变标注已发布，但${warnings.join("；")}`
         : "标注校验通过，已发布不可变 annotation set。",
-      report.draft_cache_warning ? "error" : "info",
-      report.draft_cache_warning ? 9000 : 5000,
+      warnings.length ? "error" : "info",
+      warnings.length ? 9000 : 5000,
     );
   } catch (error) {
     showToast(`封存失败：${error.message}`, "error", 9000);

@@ -20,6 +20,17 @@ class CollectionControlOperationBusy(RuntimeError):
     """Another collection control-plane operation has not been consumed yet."""
 
 
+class CollectionControlCleanupError(RuntimeError):
+    """Transfer failed-operation cleanup to the same control-plane owner."""
+
+    def __init__(self, operation_error: BaseException, cleanup: Callable[[], None],
+                 cleanup_error: BaseException) -> None:
+        super().__init__(f"{operation_error}; cleanup remains pending: {cleanup_error}")
+        self.operation_error = operation_error
+        self.cleanup = cleanup
+        self.cleanup_error = cleanup_error
+
+
 @dataclass(frozen=True)
 class CollectionControlOperationResult:
     generation: int
@@ -52,6 +63,13 @@ class _PendingOperation:
     cancelled: bool = False
 
 
+@dataclass(frozen=True)
+class _RetainedCleanup:
+    result: CollectionControlOperationResult
+    discard_value: Callable[[Any], None]
+    retry_at: float
+
+
 class CollectionControlPlane:
     """Run one blocking lifecycle operation without waiting in the caller.
 
@@ -81,20 +99,23 @@ class CollectionControlPlane:
         self._completed_discard: Callable[[Any], None] | None = None
         self._worker: threading.Thread | None = None
         self._closed = False
+        self._retained_cleanup: _RetainedCleanup | None = None
+        self._cleanup_error: BaseException | None = None
 
     @property
     def busy(self) -> bool:
         with self._lock:
-            return self._pending is not None
+            return self._pending is not None or self._retained_cleanup is not None
 
     @property
     def active_kind(self) -> str | None:
         with self._lock:
-            if self._pending is not None:
-                return self._pending.kind
-            if self._completed is not None:
-                return self._completed.kind
-            return None
+            return self.active_kind_unlocked()
+
+    @property
+    def cleanup_error(self) -> BaseException | None:
+        with self._lock:
+            return self._cleanup_error
 
     @property
     def active_operation(self) -> tuple[int, str] | None:
@@ -105,6 +126,9 @@ class CollectionControlPlane:
                 return self._pending.generation, self._pending.kind
             if self._completed is not None:
                 return self._completed.generation, self._completed.kind
+            if self._retained_cleanup is not None:
+                result = self._retained_cleanup.result
+                return result.generation, result.kind
             return None
 
     def submit(
@@ -124,7 +148,7 @@ class CollectionControlPlane:
         with self._lock:
             if self._closed:
                 raise RuntimeError("collection control plane is closed")
-            if self._pending is not None or self._completed is not None:
+            if self._pending is not None or self._completed is not None or self._retained_cleanup is not None:
                 active_kind = self.active_kind_unlocked()
                 raise CollectionControlOperationBusy(
                     f"collection control-plane operation already pending: {active_kind}"
@@ -160,6 +184,8 @@ class CollectionControlPlane:
             return self._pending.kind
         if self._completed is not None:
             return self._completed.kind
+        if self._retained_cleanup is not None:
+            return self._retained_cleanup.result.kind
         return None
 
     def _run(
@@ -172,6 +198,21 @@ class CollectionControlPlane:
         error: BaseException | None = None
         try:
             value = operation()
+        except CollectionControlCleanupError as exc:
+            retained = CollectionControlOperationResult(
+                generation=pending.generation, kind=pending.kind,
+                started_at=started_at, completed_at=float(self._clock()),
+                value=exc, error=exc.operation_error,
+            )
+            with self._lock:
+                self._retained_cleanup = _RetainedCleanup(
+                    retained, lambda failed: failed.cleanup(), time.monotonic() + 0.05,
+                )
+                self._cleanup_error = exc.cleanup_error
+                self._publish_result_unlocked(pending, replace(
+                    retained, value=None, discard_error=exc.cleanup_error,
+                ), None)
+            return
         except BaseException as exc:  # completion, not the daemon, owns failure
             error = exc
         result = CollectionControlOperationResult(
@@ -256,66 +297,70 @@ class CollectionControlPlane:
             # Running-operation timing excludes retirement; an already
             # published value retains its historical cleanup-completion timing.
             completed_at=(
+                result.completed_at if result.error is not None else
                 float(self._clock()) if completed_at is None else completed_at
             ),
-            cancelled=True,
+            cancelled=result.error is None,
             discard_error=discard_error,
         )
         with self._lock:
-            self._publish_result_unlocked(pending, cancelled_result, None)
+            if self._pending is pending:
+                if discard_error is not None:
+                    # The error is observable once, but its resource remains
+                    # owned and blocks admission until a later cleanup succeeds.
+                    self._retained_cleanup = _RetainedCleanup(
+                        result, discard_value, time.monotonic() + 0.05,
+                    )
+                    self._cleanup_error = discard_error
+                else:
+                    self._cleanup_error = None
+            if result.error is not None:
+                # The operation error was published before its retained cleanup.
+                # Recovery must not repeat stop/failure side effects in consumers.
+                if self._pending is pending:
+                    self._pending = None
+                if self._worker is threading.current_thread():
+                    self._worker = None
+            else:
+                self._publish_result_unlocked(pending, cancelled_result, None)
 
-    def _start_completed_discard_unlocked(
-        self,
-        result: CollectionControlOperationResult,
-        discard_value: Callable[[Any], None],
-    ) -> bool:
-        """Transfer a ready value to retirement, or retain it for a retry."""
-
-        pending = _PendingOperation(
-            generation=result.generation,
-            kind=result.kind,
-            discard_value=None,
-            cancelled=True,
-        )
-        self._completed = None
+    def _start_completed_discard_unlocked(self, result, discard_value) -> bool:
+        """Transfer retirement, retaining exact ownership if its thread cannot start."""
+        pending = _PendingOperation(result.generation, result.kind, None, cancelled=True)
+        error_event = self._completed if result.error is not None and not self._closed else None
+        self._completed = error_event
         self._completed_discard = None
+        self._retained_cleanup = None
         try:
-            worker = threading.Thread(
-                target=self._discard_cancelled_completion,
+            worker = threading.Thread(target=self._discard_cancelled_completion,
                 args=(pending, result, discard_value),
-                name=f"{self.name}:{result.kind}:cancel:{result.generation}",
-                daemon=True,
-            )
-            self._pending = pending
-            self._worker = worker
+                name=f"{self.name}:{result.kind}:cancel:{result.generation}", daemon=True)
+            self._pending, self._worker = pending, worker
             worker.start()
-        except BaseException:
-            # Neither construction nor start transferred ownership.  Closed
-            # planes retain the same value too, for a later close() retry.
-            self._pending = None
-            self._worker = None
-            self._completed = result
-            self._completed_discard = discard_value
+        except BaseException as error:
+            self._pending, self._worker = None, None
+            self._retained_cleanup = _RetainedCleanup(result, discard_value, time.monotonic() + 0.05)
+            self._cleanup_error = error
             return False
         return True
 
-    def poll(
-        self,
-        generation: int | None = None,
-    ) -> CollectionControlOperationResult | None:
+    def poll(self, generation: int | None = None) -> CollectionControlOperationResult | None:
         with self._lock:
             if self._closed:
-                # A failed retirement submission may retain a ready value for
-                # retry, but shutdown must never publish it to a consumer.
                 return None
             result = self._completed
-            if result is None:
-                return None
-            if generation is not None and int(generation) != result.generation:
-                return None
-            self._completed = None
-            self._completed_discard = None
-            return result
+            if result is not None:
+                if generation is not None and int(generation) != result.generation:
+                    return None
+                self._completed = None
+                self._completed_discard = None
+                return result
+            retained = self._retained_cleanup
+            if (retained is not None
+                and (generation is None or int(generation) == retained.result.generation)
+                and time.monotonic() >= retained.retry_at):
+                self._start_completed_discard_unlocked(retained.result, retained.discard_value)
+            return None
 
     def wait(
         self,
@@ -354,18 +399,16 @@ class CollectionControlPlane:
 
     def cancel(self, generation: int) -> bool:
         with self._lock:
-            if (
-                self._pending is not None
-                and self._pending.generation == int(generation)
-            ):
+            retained = self._retained_cleanup
+            if retained is not None and retained.result.generation == int(generation):
+                return self._start_completed_discard_unlocked(retained.result, retained.discard_value)
+            if self._pending is not None and self._pending.generation == int(generation):
                 if self._pending.cancelled:
                     return False
                 self._pending.cancelled = True
                 return True
             result = self._completed
-            if result is None or result.generation != int(generation):
-                return False
-            if result.cancelled:
+            if result is None or result.generation != int(generation) or result.cancelled:
                 return False
             discard_value = self._completed_discard
             if result.error is not None or discard_value is None:
@@ -375,33 +418,21 @@ class CollectionControlPlane:
             return self._start_completed_discard_unlocked(result, discard_value)
 
     def close(self, *, timeout_sec: float = 5.0) -> bool:
-        """Cancel publication, discard owned output, and wait for the worker.
-
-        Running Python callables cannot be interrupted safely.  Closing is
-        therefore cooperative, but unlike :meth:`cancel` it is also a bounded
-        resource barrier: ``True`` means the submitted callable and its
-        cancellation cleanup have both returned.  A ``False`` result means
-        the caller must not treat dependencies used by that callable as fully
-        quiesced yet; a later call may finish draining the same closed plane.
-        Already completed values use the same retirement worker as cancel(),
-        so their blocking cleanup is included in this wait budget.  Failure to
-        start that worker returns False and retains the value for a later retry.
-        """
-
+        """Bound one drain attempt; False retains resources for a later retry."""
         timeout = float(timeout_sec)
         if not math.isfinite(timeout) or timeout < 0.0:
-            raise ValueError(
-                "collection control-plane close timeout must be finite "
-                "and non-negative"
-            )
+            raise ValueError("collection control-plane close timeout must be finite and non-negative")
         deadline = time.monotonic() + timeout
         with self._lock:
             self._closed = True
             if self._pending is not None:
                 self._pending.cancelled = True
-            if self._completed is not None:
-                result = self._completed
-                discard_value = self._completed_discard
+            retained = self._retained_cleanup
+            if retained is not None:
+                if not self._start_completed_discard_unlocked(retained.result, retained.discard_value):
+                    return False
+            elif self._completed is not None:
+                result, discard_value = self._completed, self._completed_discard
                 if result.error is None and discard_value is not None:
                     if not self._start_completed_discard_unlocked(result, discard_value):
                         return False
@@ -409,15 +440,16 @@ class CollectionControlPlane:
                     self._completed = None
                     self._completed_discard = None
             worker = self._worker
-        if worker is None:
-            return True
         if worker is threading.current_thread():
             return False
-        worker.join(timeout=max(0.0, deadline - time.monotonic()))
-        return not worker.is_alive()
+        if worker is not None:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            return self._pending is None and self._retained_cleanup is None
 
 
 __all__ = [
+    "CollectionControlCleanupError",
     "CollectionControlOperationBusy",
     "CollectionControlOperationResult",
     "CollectionControlPlane",

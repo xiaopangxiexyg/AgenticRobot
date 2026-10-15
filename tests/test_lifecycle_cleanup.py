@@ -608,3 +608,81 @@ def test_realsense_explicit_native_stop_budget_does_not_change_capture_join_budg
 def test_realsense_native_stop_budget_rejects_invalid_config(budget) -> None:
     with pytest.raises(ValueError, match="pipeline_stop_timeout_sec"):
         RealSenseRGBCameraConfig(serial="unit", pipeline_stop_timeout_sec=budget)
+
+
+
+@pytest.mark.parametrize("watchdog_fails", (False, True))
+def test_collection_pending_shutdown_retains_dependencies_until_owner_drains(monkeypatch, watchdog_fails):
+    from types import SimpleNamespace
+
+    from teleop_runtime.real_teleop import shutdown_runtime as shutdown
+
+    calls, active = [], [True]
+    def stop_watchdog():
+        calls.append("watchdog")
+        if watchdog_fails:
+            raise RuntimeError("watchdog unavailable")
+    state = {name: None for name in (
+        "startup_progress", "position_force_guard_monitor", "dataset_recorder", "camera_previewer",
+        "tactile_visualizer", "actuator_trace_recorder", "position_debug_session_recorder",
+        "position_episode_debug_runtime", "original_stdout", "silenced_stdout",
+    )}
+    state.update(args=SimpleNamespace(),
+        episode_recording_runtime=SimpleNamespace(collection_transition_active=lambda: active[0]),
+        main_loop_watchdog=SimpleNamespace(stop=stop_watchdog),
+        episode_recorder=_LifecycleResource("episode", calls),
+        clutch_input=_LifecycleResource("clutch", calls), camera_sources={"main": object()},
+        components=SimpleNamespace(session=_LifecycleResource("session", calls),
+            human_shadow_frontend=None, arm_state_read_executor=None,
+            left_hand_backend=None, right_hand_backend=None, left_state_backend=None, right_state_backend=None),
+        position_audit_fanout=[], position_debug_close_threads=[],
+        update_control_debug_runtime_metadata=lambda **_: None)
+    monkeypatch.setattr(shutdown, "_arm_control_mode_arg", lambda _: "position")
+    monkeypatch.setattr(shutdown, "_terminal_force_collision_summary", lambda *_, **__: {})
+    monkeypatch.setattr(shutdown, "_close_camera_sources", lambda _: calls.append("cameras"))
+    for name in ("_attach_position_audit_sink", "_attach_ik_shadow_trace_sink", "_attach_singularity_transition_trace_sink"):
+        monkeypatch.setattr(shutdown, name, lambda *_, **__: None)
+    with pytest.raises(shutdown.CollectionShutdownPendingError) as error:
+        shutdown.shutdown_real_teleop_runtime(state, terminal_error=None)
+    assert calls == ["watchdog"]
+    assert error.value.runtime_state["components"] is state["components"]
+    assert error.value.runtime_state["camera_sources"] is state["camera_sources"]
+    if watchdog_fails:
+        assert isinstance(error.value.watchdog_error, RuntimeError)
+    active[0] = False
+    if watchdog_fails:
+        with pytest.raises(LifecycleCleanupError):
+            shutdown.shutdown_real_teleop_runtime(error.value.runtime_state, terminal_error=None)
+    else:
+        shutdown.shutdown_real_teleop_runtime(error.value.runtime_state, terminal_error=None)
+    for name in ("close:episode", "close:clutch", "cameras", "close:session"):
+        assert calls.count(name) == 1
+
+
+@pytest.mark.parametrize("primary_kind", ("none", "runtime", "interrupt", "emergency", "falsey"))
+def test_pending_collection_shutdown_preserves_primary_exit_and_resource_owner(monkeypatch, primary_kind):
+    from teleop_runtime.real_teleop import runtime
+    from teleop_runtime.real_teleop.shutdown_runtime import (
+        CollectionShutdownPendingError,
+    )
+
+    resource = object()
+    pending = CollectionShutdownPendingError({"resource": resource})
+    def fail(*_, **__):
+        raise pending
+    monkeypatch.setattr(runtime, "shutdown_real_teleop_runtime", fail)
+    class FalseyError(RuntimeError):
+        def __bool__(self):
+            return False
+    primary = (FalseyError("original") if primary_kind == "falsey" else
+        KeyboardInterrupt() if primary_kind == "interrupt" else RuntimeError("original"))
+    terminal = primary if primary_kind in ("runtime", "interrupt", "falsey") else None
+    emergency = primary if primary_kind == "emergency" else None
+    if primary_kind == "none":
+        with pytest.raises(CollectionShutdownPendingError) as error:
+            runtime._shutdown_resources_preserving_exit({}, terminal_error=terminal, emergency_stop_error=emergency)
+        assert error.value is pending
+    else:
+        runtime._shutdown_resources_preserving_exit({}, terminal_error=terminal, emergency_stop_error=emergency)
+        assert primary.collection_shutdown_pending is pending
+        assert primary.collection_shutdown_pending.runtime_state["resource"] is resource
