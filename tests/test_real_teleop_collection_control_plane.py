@@ -2001,6 +2001,15 @@ def test_formal_resume_requires_the_writer_pause_gate_to_clear(
 
     recorder.pause_episode = pause_episode
     recorder.resume_episode = resume_episode
+    # Model the successful stop boundary too: shutdown now retains an active
+    # recorder until its actual stop and debug-stop mutations are published.
+    def stop_formal(**_kwargs):
+        recorder.is_recording = False
+
+    def stop_debug(target, **_kwargs):
+        target.is_recording = False
+
+    recorder.stop_episode = stop_formal
     debug_recorder = SimpleNamespace(
         config=SimpleNamespace(enabled=True),
         is_recording=True,
@@ -2018,6 +2027,7 @@ def test_formal_resume_requires_the_writer_pause_gate_to_clear(
         transition_calls=[],
         debug_episode_enabled=True,
         episode_recorder_override=debug_recorder,
+        stop_episode_recording=stop_debug,
     )
 
     assert runtime.pause_recording(time.time(), reason="unit_hold")
@@ -4121,5 +4131,182 @@ def test_dataset_selection_shutdown_retains_retirement_until_bounded_recovery(
     finally:
         monkeypatch.setattr(control_plane_module.threading.Thread, "start", original_start)
         allow_close = True
+        release.set()
+        runtime.close(timeout_sec=1.0)
+
+
+@pytest.mark.parametrize("cut", ["completed", "publication_gap"])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_open_rejection_shutdown_retains_writer_across_result_publication(
+    tmp_path: Path, monkeypatch, cut: str, close_fails: bool,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    clock_calls = 0
+    close_threads = []
+    caller = threading.get_ident()
+
+    def clock():
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 2:
+            entered.set()
+            assert release.wait(timeout=2.0)
+        return time.monotonic()
+
+    plane = CollectionControlPlane(name="open-publication-shutdown", clock=clock)
+    monkeypatch.setattr(episode_recording_module, "CollectionControlPlane", lambda **_kwargs: plane)
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path, writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True, finalizing=False, is_recording=False,
+        is_paused=False, frame_count=0, active_episode_index=None,
+        camera_sources={}, closed=False, close_calls=0, poll_finalize_tasks=list,
+    )
+
+    def reject_configuration():
+        raise OSError("original pre-mutation profile rejection")
+
+    def close_recorder():
+        close_threads.append(threading.get_ident())
+        recorder.close_calls += 1
+        if close_fails and recorder.close_calls == 1:
+            raise RuntimeError("writer close remains pending")
+        recorder.closed = True
+
+    recorder.require_configured_for_current_args = reject_configuration
+    recorder.close = close_recorder
+    slot = [recorder]
+    runtime, _args, logs = _episode_runtime(
+        tmp_path=tmp_path, recorder_type=lambda **_kwargs: None,
+        dataset_slot=slot, clutch=_Clutch(), transition_calls=[],
+    )
+    try:
+        assert runtime.start_recording(time.time(), start_reason="shutdown-test")
+        assert entered.wait(timeout=1.0) and slot[0] is None
+        if cut == "completed":
+            release.set()
+            deadline = time.monotonic() + 1.0
+            while plane.busy and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert not plane.busy
+        else:
+            started = time.monotonic()
+            assert runtime.close(timeout_sec=0.02) is False
+            assert time.monotonic() - started < 0.25
+            assert runtime.collection_transition_active()
+            assert recorder.close_calls == 0
+            release.set()
+        deadline = time.monotonic() + 1.0
+        drained = False
+        while time.monotonic() < deadline:
+            drained = runtime.close(timeout_sec=0.05)
+            if drained:
+                break
+            time.sleep(0.001)
+        assert drained
+        assert recorder.closed
+        assert recorder.close_calls == (2 if close_fails else 1)
+        assert caller not in close_threads
+        assert slot[0] is None
+        assert not runtime.collection_transition_active()
+        assert sum(tag == "Dataset" and "original pre-mutation profile rejection" in message
+                   for tag, message in logs) == 1
+    finally:
+        release.set()
+        runtime.close(timeout_sec=1.0)
+
+
+@pytest.mark.parametrize("phase", ["open", "stop", "finalize"])
+def test_bounded_shutdown_retries_publish_normal_episode_seal(
+    tmp_path: Path, monkeypatch, phase: str,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    clock_calls = 0
+    task = SimpleNamespace(
+        episode_index=4, frame_count=12, queued_at=10.0, started_at=10.1,
+        completed_at=10.2, stage_timings_ms={}, success=True, error="",
+        v25p_error="", v25p_native_error="", progress_error="",
+    )
+    calls = []
+    results = []
+
+    def clock():
+        nonlocal clock_calls
+        clock_calls += 1
+        if (phase == "open" and clock_calls == 2) or (phase == "stop" and clock_calls == 4):
+            entered.set()
+            assert release.wait(timeout=2.0)
+        return time.monotonic()
+
+    plane = CollectionControlPlane(name="normal-seal-retry", clock=clock)
+    monkeypatch.setattr(episode_recording_module, "CollectionControlPlane", lambda **_kwargs: plane)
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path, writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True, finalizing=False, is_recording=False,
+        is_paused=False, frame_count=12, active_episode_index=None,
+        camera_sources={}, require_configured_for_current_args=lambda: None,
+        collection_frequency_status=lambda: {"sample_hz": 15.0},
+        close=lambda: calls.append("close"),
+    )
+
+    def start_episode(_metadata, *, now):
+        calls.append("start")
+        recorder.is_recording = True
+        recorder.active_episode_index = 4
+        return 4
+
+    def stop_episode(**_kwargs):
+        calls.append("stop")
+        recorder.is_recording = False
+        recorder.finalizing = True
+        results.append(task)
+        return task
+
+    def poll_finalize_tasks():
+        if phase == "finalize" and not release.is_set():
+            entered.set()
+            return []
+        if not results:
+            return []
+        recorder.finalizing = False
+        return [results.pop(0)]
+
+    recorder.start_episode = start_episode
+    recorder.stop_episode = stop_episode
+    recorder.poll_finalize_tasks = poll_finalize_tasks
+    slot = [recorder]
+    clutch = _Clutch()
+    runtime, args, _logs = _episode_runtime(
+        tmp_path=tmp_path, recorder_type=lambda **_kwargs: None,
+        dataset_slot=slot, clutch=clutch, transition_calls=[],
+    )
+    try:
+        assert runtime.start_recording(time.time(), start_reason="shutdown-test")
+        if phase == "open":
+            assert entered.wait(timeout=1.0)
+        started = time.monotonic()
+        assert runtime.close(timeout_sec=0.03) is False
+        assert time.monotonic() - started < 0.25
+        assert entered.is_set()
+        assert runtime.collection_transition_active()
+        assert not runtime.start_recording(time.time(), start_reason="late")
+        assert not runtime.schedule_recording_countdown(time.time(), start_reason="late")
+        with pytest.raises(RuntimeError, match="shutdown"):
+            runtime.schedule_dataset_selection(
+                dict(vars(args)), bind_dataset_contract=False,
+                on_commit=lambda _snapshot: None, on_complete=lambda: None,
+                on_failure=lambda _error: None,
+            )
+        assert clutch.finalize_states == []
+        assert "close" not in calls
+        release.set()
+        assert runtime.close(timeout_sec=1.0)
+        assert not runtime.collection_transition_active()
+        assert slot[0] is recorder
+        assert calls == ["start", "stop"]
+        assert len(clutch.finalize_states) == 1
+        assert clutch.finalize_states[0]["status"] == "saved"
+        assert clutch.round_trip_advances == 1
+        assert clutch.plus_episode_indices == [4, 4]
+    finally:
         release.set()
         runtime.close(timeout_sec=1.0)

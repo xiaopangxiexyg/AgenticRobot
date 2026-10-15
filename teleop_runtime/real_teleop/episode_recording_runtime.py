@@ -588,12 +588,26 @@ def build_episode_recording_runtime(
             now=now,
         )
 
-    def collection_transition_active() -> bool:
+    def collection_worker_transition_active() -> bool:
         return bool(
             collection_control_plane.active_operation is not None
             or recorder_retirement is not None
             or dataset_preparation is not None
             or dataset_selection_transaction is not None
+        )
+
+    def collection_transition_active() -> bool:
+        # During bounded shutdown the published recording/finalizer also owns
+        # camera/session dependencies until normal stop/seal publication.
+        return bool(
+            collection_worker_transition_active()
+            or (runtime_closing and (
+                (dataset_recorder is not None and (
+                    dataset_recorder.is_recording
+                    or bool(getattr(dataset_recorder, "finalizing", False))
+                ))
+                or (episode_recorder.is_recording and not debug_episode_quarantined)
+            ))
         )
 
     def recording_active() -> bool:
@@ -786,7 +800,7 @@ def build_episode_recording_runtime(
         nonlocal episode_start_failure_message, dataset_recorder
         refresh_runtime_views()
         episode_start_failure_message = None
-        if collection_transition_active():
+        if runtime_closing or collection_transition_active():
             episode_start_failure_message = "数采 lifecycle 仍在过渡中。"
             return False
         admitted, admission_message = clutch_input.episode_start_admission()
@@ -969,7 +983,7 @@ def build_episode_recording_runtime(
                     except BaseException:
                         pass
                 if formal_recorder is not None and (
-                    episode_open_start_attempted or runtime_closing
+                    episode_open_start_attempted
                 ):
                     try:
                         if formal_recorder.is_recording:
@@ -992,7 +1006,7 @@ def build_episode_recording_runtime(
                     except BaseException:
                         pass
                 close_formal = bool(formal_recorder is not None and
-                    (episode_open_start_attempted or runtime_closing))
+                    (episode_open_start_attempted))
                 def close_failed_open() -> None:
                     if close_formal:
                         formal_recorder.close()
@@ -1045,9 +1059,11 @@ def build_episode_recording_runtime(
                 discard_value=discard_open_completion,
             )
         except CollectionControlOperationBusy as exc:
+            episode_open_recorder = None
             episode_start_failure_message = str(exc)
             return False
         except Exception as exc:  # noqa: BLE001 - recorder ownership was not transferred.
+            episode_open_recorder = None
             message = (
                 "正式 dataset episode 后台打开任务未能启动；"
                 "writer 仍保持当前所有权，可重试："
@@ -1252,6 +1268,8 @@ def build_episode_recording_runtime(
         """
 
         nonlocal dataset_recorder, dataset_selection_transaction
+        if runtime_closing:
+            raise RuntimeError("dataset selection is unavailable during shutdown")
         refresh_runtime_views()
         if collection_transition_active():
             active_kind = collection_control_plane.active_kind or "collection_transition"
@@ -1352,6 +1370,8 @@ def build_episode_recording_runtime(
 
     def schedule_recording_countdown(now: float, *, start_reason: str) -> bool:
         nonlocal dataset_preparation, episode_start_failure_message, dataset_recorder
+        if runtime_closing:
+            return False
         refresh_runtime_views()
         if recording_active():
             return False
@@ -1707,7 +1727,7 @@ def build_episode_recording_runtime(
         nonlocal episode_stop_frame_count, episode_stop_reason, dataset_recorder
         nonlocal episode_recording_paused, episode_recording_pause_reason
         refresh_runtime_views()
-        if collection_transition_active():
+        if collection_worker_transition_active():
             return False
         formal_recorder = (
             dataset_recorder
@@ -2678,8 +2698,7 @@ def build_episode_recording_runtime(
                 # The worker failed or was cancelled before mutating the writer.
                 # Its ready process remains reusable because no cancellation
                 # discard owned a successful open completion.
-                dataset_recorder = opened_recorder
-                set_dataset_recorder(opened_recorder)
+                restore_or_retire_previous_recorder(opened_recorder)
             else:
                 # A successful open completion is stopped/closed by the control
                 # plane's discard callback before this cancelled result becomes
@@ -2720,8 +2739,7 @@ def build_episode_recording_runtime(
                 # Configuration rejection happened before the process writer
                 # was asked to mutate episode state, so the ready recorder is
                 # still safe to reuse after the operator corrects the profile.
-                dataset_recorder = opened_recorder
-                set_dataset_recorder(opened_recorder)
+                restore_or_retire_previous_recorder(opened_recorder)
             else:
                 dataset_recorder = None
             detail = f"{type(failure).__name__}: {failure}"
@@ -3046,7 +3064,7 @@ def build_episode_recording_runtime(
                     publish_recorder_retirement,
                 )
                 publish(result, now=now)
-        if collection_transition_active():
+        if collection_worker_transition_active():
             # The active worker exclusively owns its detached recorder.  In
             # particular, do not poll finalize/status state concurrently with
             # prepare, episode open, or sample drain/stop.
@@ -3213,15 +3231,25 @@ def build_episode_recording_runtime(
             publish: Callable[..., None],
         ) -> bool:
             result = collection_control_plane.wait(
-                generation,
-                timeout_sec=remaining_sec(),
+                generation, timeout_sec=remaining_sec(),
             )
-            if result is None:
-                return False
-            publish(result, now=time.time())
-            return True
+            if result is not None:
+                publish(result, now=time.time())
+            if collection_control_plane.active_operation is None:
+                return True
+            if collection_control_plane.cleanup_error is not None:
+                # An original failure is published once; its cleanup retry has
+                # no second failure event. Keep the plane open until it retires.
+                collection_control_plane.cancel(generation)
+                recovered = collection_control_plane.wait(
+                    generation, timeout_sec=remaining_sec(),
+                )
+                if recovered is not None:
+                    publish(recovered, now=time.time())
+                return collection_control_plane.active_operation is None
+            return result is not None
 
-        initial_close = not runtime_closing
+        runtime_closing = True
         for kind, owner, publish in (
             ("prepare_writer", dataset_preparation, publish_prepare_completion),
             ("prepare_selection", dataset_selection_transaction,
@@ -3246,62 +3274,69 @@ def build_episode_recording_runtime(
             # With no transaction, its original error was already published.
             # A retained failed-operation cleanup has no second error event.
 
-        if initial_close:
-            # An episode-open RPC may already have crossed the writer boundary
-            # when the operator exits.  Publish that exact completion first so
-            # a successfully opened episode is stopped through the normal
-            # drain/seal lifecycle rather than discarded as an unknown partial
-            # mutation.
-            open_generation = transition_generation("open_episode")
-            if open_generation is not None:
-                lifecycle_committed = wait_and_publish(
-                    open_generation,
-                    publish_open_completion,
-                )
+        # An episode-open RPC may already have crossed the writer boundary
+        # when the operator exits.  Publish that exact completion first so
+        # a successfully opened episode is stopped through the normal
+        # drain/seal lifecycle rather than discarded as an unknown partial
+        # mutation.
+        open_generation = transition_generation("open_episode")
+        if open_generation is not None:
+            lifecycle_committed = wait_and_publish(
+                open_generation,
+                publish_open_completion,
+            )
+            if not lifecycle_committed:
+                return False
+        stop_generation = transition_generation("stop_episode")
+        if lifecycle_committed and stop_generation is not None:
+            lifecycle_committed = wait_and_publish(
+                stop_generation,
+                publish_stop_completion,
+            )
+            if not lifecycle_committed:
+                return False
+        if lifecycle_committed and recording_active():
+            lifecycle_committed = stop_recording(
+                shutdown_now,
+                end_reason=str(end_reason),
+                summary=shutdown_summary,
+            )
+            if not lifecycle_committed:
+                return False
             stop_generation = transition_generation("stop_episode")
             if lifecycle_committed and stop_generation is not None:
                 lifecycle_committed = wait_and_publish(
                     stop_generation,
                     publish_stop_completion,
                 )
-            if lifecycle_committed and recording_active():
-                lifecycle_committed = stop_recording(
-                    shutdown_now,
-                    end_reason=str(end_reason),
-                    summary=shutdown_summary,
-                )
-                stop_generation = transition_generation("stop_episode")
-                if lifecycle_committed and stop_generation is not None:
-                    lifecycle_committed = wait_and_publish(
-                        stop_generation,
-                        publish_stop_completion,
-                    )
-            # stop_episode() only hands the sample drain to the writer's
-            # finalize lifecycle.  Shutdown is not complete until that task is
-            # published as saved/error; otherwise round-trip/progress/Plus
-            # state would be skipped even though generic recorder.close()
-            # later wrote the files successfully.
+                if not lifecycle_committed:
+                    return False
+        # stop_episode() only hands the sample drain to the writer's
+        # finalize lifecycle.  Shutdown is not complete until that task is
+        # published as saved/error; otherwise round-trip/progress/Plus
+        # state would be skipped even though generic recorder.close()
+        # later wrote the files successfully.
+        refresh_runtime_views()
+        while (
+            lifecycle_committed
+            and dataset_recorder is not None
+            and bool(getattr(dataset_recorder, "finalizing", False))
+            and remaining_sec() > 0.0
+        ):
+            poll_dataset_finalize(time.time())
             refresh_runtime_views()
-            while (
-                lifecycle_committed
-                and dataset_recorder is not None
-                and bool(getattr(dataset_recorder, "finalizing", False))
-                and remaining_sec() > 0.0
-            ):
-                poll_dataset_finalize(time.time())
-                refresh_runtime_views()
-                if (
-                    dataset_recorder is not None
-                    and bool(getattr(dataset_recorder, "finalizing", False))
-                ):
-                    time.sleep(min(0.01, remaining_sec()))
             if (
                 dataset_recorder is not None
                 and bool(getattr(dataset_recorder, "finalizing", False))
             ):
-                lifecycle_committed = False
-            if finalize_failure_count > finalize_failures_before:
-                lifecycle_committed = False
+                time.sleep(min(0.01, remaining_sec()))
+        if (
+            dataset_recorder is not None
+            and bool(getattr(dataset_recorder, "finalizing", False))
+        ):
+            return False
+        if finalize_failure_count > finalize_failures_before:
+            lifecycle_committed = False
 
         runtime_closing = True
         if (
@@ -3340,7 +3375,7 @@ def build_episode_recording_runtime(
                 "Dataset",
                 "formal collection shutdown could not publish the normal "
                 "episode stop lifecycle within the bounded timeout; pending "
-                "work was cancelled and isolated",
+                "lifecycle reported a failure",
                 now=shutdown_now,
             )
         if not drained:
