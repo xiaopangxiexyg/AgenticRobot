@@ -8,11 +8,11 @@ It owns no robot command, dataset schema, episode policy, or GUI state.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
 import math
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -174,50 +174,66 @@ class CollectionControlPlane:
             value = operation()
         except BaseException as exc:  # completion, not the daemon, owns failure
             error = exc
-        completed_at = float(self._clock())
-
-        with self._lock:
-            current = self._pending
-            cancelled = bool(
-                self._closed
-                or current is not pending
-                or pending.cancelled
-            )
-        discard_error: BaseException | None = None
-        if cancelled and error is None and pending.discard_value is not None:
-            try:
-                pending.discard_value(value)
-            except BaseException as exc:  # cleanup evidence belongs to completion
-                discard_error = exc
-
         result = CollectionControlOperationResult(
             generation=pending.generation,
             kind=pending.kind,
             started_at=started_at,
-            completed_at=completed_at,
-            value=None if cancelled else value,
+            completed_at=float(self._clock()),
+            value=value,
             error=error,
-            cancelled=cancelled,
-            discard_error=discard_error,
         )
         with self._lock:
-            if self._pending is not pending:
-                if self._worker is threading.current_thread():
-                    self._worker = None
+            cancelled = bool(
+                self._closed
+                or self._pending is not pending
+                or pending.cancelled
+            )
+            if not cancelled:
+                # Publication and cancellation share this linearization point.
+                # A later cancel owns a completed value, never an old snapshot
+                # that can still be published as success after cancellation.
+                self._publish_result_unlocked(pending, result, pending.discard_value)
                 return
-            self._pending = None
-            if not self._closed:
-                self._completed = result
-                self._completed_discard = pending.discard_value
-            if self._worker is threading.current_thread():
-                self._worker = None
+            if error is not None or pending.discard_value is None:
+                self._publish_result_unlocked(
+                    pending,
+                    replace(result, value=None, cancelled=True),
+                    None,
+                )
+                return
 
-    def _discard_completed_after_cancel(
+        # Keep the pending generation and its worker until retirement returns.
+        # Blocking cleanup runs outside the lock and never on the control thread.
+        self._discard_cancelled_completion(
+            pending,
+            result,
+            pending.discard_value,
+            completed_at=result.completed_at,
+        )
+
+    def _publish_result_unlocked(
         self,
         pending: _PendingOperation,
         result: CollectionControlOperationResult,
-        value: Any,
+        discard_value: Callable[[Any], None] | None,
+    ) -> None:
+        """Transfer one terminal result while the caller holds the plane lock."""
+
+        if self._pending is pending:
+            self._pending = None
+            if not self._closed:
+                self._completed = result
+                self._completed_discard = discard_value
+        if self._worker is threading.current_thread():
+            self._worker = None
+
+    def _discard_cancelled_completion(
+        self,
+        pending: _PendingOperation,
+        result: CollectionControlOperationResult,
         discard_value: Callable[[Any], None],
+        *,
+        completed_at: float | None = None,
     ) -> None:
         """Retire an unconsumed completed value without blocking its caller.
 
@@ -231,35 +247,67 @@ class CollectionControlPlane:
 
         discard_error: BaseException | None = None
         try:
-            discard_value(value)
+            discard_value(result.value)
         except BaseException as exc:  # cleanup evidence belongs to completion
             discard_error = exc
-        cancelled_result = CollectionControlOperationResult(
-            generation=result.generation,
-            kind=result.kind,
-            started_at=result.started_at,
-            completed_at=float(self._clock()),
-            error=result.error,
+        cancelled_result = replace(
+            result,
+            value=None,
+            # Running-operation timing excludes retirement; an already
+            # published value retains its historical cleanup-completion timing.
+            completed_at=(
+                float(self._clock()) if completed_at is None else completed_at
+            ),
             cancelled=True,
             discard_error=discard_error,
         )
         with self._lock:
-            if self._pending is not pending:
-                if self._worker is threading.current_thread():
-                    self._worker = None
-                return
+            self._publish_result_unlocked(pending, cancelled_result, None)
+
+    def _start_completed_discard_unlocked(
+        self,
+        result: CollectionControlOperationResult,
+        discard_value: Callable[[Any], None],
+    ) -> bool:
+        """Transfer a ready value to retirement, or retain it for a retry."""
+
+        pending = _PendingOperation(
+            generation=result.generation,
+            kind=result.kind,
+            discard_value=None,
+            cancelled=True,
+        )
+        self._completed = None
+        self._completed_discard = None
+        try:
+            worker = threading.Thread(
+                target=self._discard_cancelled_completion,
+                args=(pending, result, discard_value),
+                name=f"{self.name}:{result.kind}:cancel:{result.generation}",
+                daemon=True,
+            )
+            self._pending = pending
+            self._worker = worker
+            worker.start()
+        except BaseException:
+            # Neither construction nor start transferred ownership.  Closed
+            # planes retain the same value too, for a later close() retry.
             self._pending = None
-            if not self._closed:
-                self._completed = cancelled_result
-                self._completed_discard = None
-            if self._worker is threading.current_thread():
-                self._worker = None
+            self._worker = None
+            self._completed = result
+            self._completed_discard = discard_value
+            return False
+        return True
 
     def poll(
         self,
         generation: int | None = None,
     ) -> CollectionControlOperationResult | None:
         with self._lock:
+            if self._closed:
+                # A failed retirement submission may retain a ready value for
+                # retry, but shutdown must never publish it to a consumer.
+                return None
             result = self._completed
             if result is None:
                 return None
@@ -321,42 +369,10 @@ class CollectionControlPlane:
                 return False
             discard_value = self._completed_discard
             if result.error is not None or discard_value is None:
-                self._completed = CollectionControlOperationResult(
-                    generation=result.generation,
-                    kind=result.kind,
-                    started_at=result.started_at,
-                    completed_at=result.completed_at,
-                    error=result.error,
-                    cancelled=True,
-                )
+                self._completed = replace(result, value=None, cancelled=True)
                 self._completed_discard = None
                 return True
-
-            pending = _PendingOperation(
-                generation=result.generation,
-                kind=result.kind,
-                discard_value=None,
-                cancelled=True,
-            )
-            worker = threading.Thread(
-                target=self._discard_completed_after_cancel,
-                args=(pending, result, result.value, discard_value),
-                name=f"{self.name}:{result.kind}:cancel:{result.generation}",
-                daemon=True,
-            )
-            self._completed = None
-            self._completed_discard = None
-            try:
-                self._pending = pending
-                self._worker = worker
-                worker.start()
-            except BaseException:
-                self._pending = None
-                self._worker = None
-                self._completed = result
-                self._completed_discard = discard_value
-                return False
-        return True
+            return self._start_completed_discard_unlocked(result, discard_value)
 
     def close(self, *, timeout_sec: float = 5.0) -> bool:
         """Cancel publication, discard owned output, and wait for the worker.
@@ -367,6 +383,9 @@ class CollectionControlPlane:
         cancellation cleanup have both returned.  A ``False`` result means
         the caller must not treat dependencies used by that callable as fully
         quiesced yet; a later call may finish draining the same closed plane.
+        Already completed values use the same retirement worker as cancel(),
+        so their blocking cleanup is included in this wait budget.  Failure to
+        start that worker returns False and retains the value for a later retry.
         """
 
         timeout = float(timeout_sec)
@@ -375,32 +394,26 @@ class CollectionControlPlane:
                 "collection control-plane close timeout must be finite "
                 "and non-negative"
             )
-        value_to_discard: Any | None = None
-        discard_value: Callable[[Any], None] | None = None
+        deadline = time.monotonic() + timeout
         with self._lock:
             self._closed = True
             if self._pending is not None:
                 self._pending.cancelled = True
             if self._completed is not None:
-                if self._completed.error is None:
-                    value_to_discard = self._completed.value
-                    discard_value = self._completed_discard
-                self._completed = None
-                self._completed_discard = None
+                result = self._completed
+                discard_value = self._completed_discard
+                if result.error is None and discard_value is not None:
+                    if not self._start_completed_discard_unlocked(result, discard_value):
+                        return False
+                else:
+                    self._completed = None
+                    self._completed_discard = None
             worker = self._worker
-        if discard_value is not None:
-            try:
-                discard_value(value_to_discard)
-            except BaseException:
-                # Shutdown has no remaining publication channel.  Cleanup is
-                # deliberately best-effort here; cancel()/poll() retain cleanup
-                # failures when the runtime is still able to surface them.
-                pass
         if worker is None:
             return True
         if worker is threading.current_thread():
             return False
-        worker.join(timeout=timeout)
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
         return not worker.is_alive()
 
 
