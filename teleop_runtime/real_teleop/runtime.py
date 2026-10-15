@@ -389,7 +389,7 @@ def _shutdown_resources_preserving_exit(
     try:
         shutdown_real_teleop_runtime(runtime_state, terminal_error=terminal_error)
     except CollectionShutdownPendingError as pending_cleanup:
-        primary = terminal_error or emergency_stop_error
+        primary = terminal_error if terminal_error is not None else emergency_stop_error
         if primary is None:
             raise
         primary.collection_shutdown_pending = pending_cleanup

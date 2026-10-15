@@ -659,7 +659,7 @@ def test_collection_pending_shutdown_retains_dependencies_until_owner_drains(mon
         assert calls.count(name) == 1
 
 
-@pytest.mark.parametrize("primary_kind", ("none", "runtime", "interrupt", "emergency"))
+@pytest.mark.parametrize("primary_kind", ("none", "runtime", "interrupt", "emergency", "falsey"))
 def test_pending_collection_shutdown_preserves_primary_exit_and_resource_owner(monkeypatch, primary_kind):
     from teleop_runtime.real_teleop import runtime
     from teleop_runtime.real_teleop.shutdown_runtime import (
@@ -671,8 +671,12 @@ def test_pending_collection_shutdown_preserves_primary_exit_and_resource_owner(m
     def fail(*_, **__):
         raise pending
     monkeypatch.setattr(runtime, "shutdown_real_teleop_runtime", fail)
-    primary = KeyboardInterrupt() if primary_kind == "interrupt" else RuntimeError("original")
-    terminal = primary if primary_kind in ("runtime", "interrupt") else None
+    class FalseyError(RuntimeError):
+        def __bool__(self):
+            return False
+    primary = (FalseyError("original") if primary_kind == "falsey" else
+        KeyboardInterrupt() if primary_kind == "interrupt" else RuntimeError("original"))
+    terminal = primary if primary_kind in ("runtime", "interrupt", "falsey") else None
     emergency = primary if primary_kind == "emergency" else None
     if primary_kind == "none":
         with pytest.raises(CollectionShutdownPendingError) as error:
